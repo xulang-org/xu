@@ -1,0 +1,1526 @@
+@main
+
+#xu/types
+
+// Known-function resolution is an optional direct-call optimization.  Keep
+// its metadata walk bounded; when any cap is exceeded the caller simply uses
+// the generic fat-pointer ABI, which has identical semantics and no table
+// scan.  These limits mirror the vreg direct-call admission budget without
+// changing the MFn/Frame ABI.
+const fnval_lookup_fn_cap = 4096
+const fnval_lookup_instr_cap = 65536
+const fnval_lookup_label_cap = 4096
+// Function-value provenance is only a peephole fast path.  A malformed MIR
+// copy/local cycle must therefore degrade to the generic fat-pointer ABI,
+// rather than recurse until the compiler stack is exhausted.
+const fnval_lookup_depth_cap = 64
+
+fn mir_instr_label_hash(m &types.Mir, fi int, ii int) int {
+    mut h := 5381
+    n := types.mir_isval_len(m, fi, ii)
+    for j in 0:n {
+        h = ((h << 5) + h) + (types.mir_isval_byte(m, fi, ii, j) & 255)
+        h = h & 2147483647
+    }
+    << h
+}
+
+fn mir_fn_label_hash(m &types.Mir, fi int) int {
+    mut h := 5381
+    n := types.mir_fn_label_len(m, fi)
+    for j in 0:n {
+        h = ((h << 5) + h) + (types.mir_fn_label_byte(m, fi, j) & 255)
+        h = h & 2147483647
+    }
+    << h
+}
+
+fn string_label_hash(s &string) int {
+    mut h := 5381
+    for j in 0:s.len {
+        h = ((h << 5) + h) + (s[j] & 255)
+        h = h & 2147483647
+    }
+    << h
+}
+
+// Read-only: if &fat came from LoadFnAddr of a named fn, return its real label.
+// The proof is a call-site reaching definition: the unique LoadFnAddr (kind
+// 38) that defines the fat-pointer temp on every path to this call.
+// Ambiguous code (rebind after the call, joins, loops) fails closed to the
+// generic fat-pointer ABI.
+fn fnval_known_real(m &types.Mir, fi int, bi int, ii int, ptr_temp int) string {
+    << types.mir_fnval_known_label(m, fi, bi, ii, ptr_temp)
+}
+
+fn fnval_callee_index(m &types.Mir, real string) int {
+    if real == "" || real.len > fnval_lookup_label_cap || m.fns.len <= 0 || m.fns.len > fnval_lookup_fn_cap {
+        << -1
+    }
+    for j in 0:m.fns.len {
+        if types.mir_fn_is_extern(m, j) { -> }
+        // Check the borrowed length before materializing each function label;
+        // this keeps the lookup allocation-free for unrelated/oversized
+        // entries and bounds its total byte work by the caps above.
+        ll := types.mir_fn_label_len(m, j)
+        if ll != real.len || ll > fnval_lookup_label_cap { -> }
+        if types.mir_fn_label(m, j) == real {
+            << j
+        }
+    }
+    << -1
+}
+
+// Check that `real` corresponds to an in-unit MIR fn label, so a hash-only
+// ARM64 fixup can resolve it during fixup_all. Mirrors fnval_callee_index
+// but returns a bool for the conditional emit path.
+fn fn_label_in_unit(m &types.Mir, real string) bool {
+    if real == "" || real.len > fnval_lookup_label_cap || m.fns.len <= 0 || m.fns.len > fnval_lookup_fn_cap {
+        << false
+    }
+    for j in 0:m.fns.len {
+        if types.mir_fn_is_extern(m, j) { -> }
+        ll := types.mir_fn_label_len(m, j)
+        if ll != real.len || ll > fnval_lookup_label_cap { -> }
+        if types.mir_fn_label(m, j) == real {
+            << true
+        }
+    }
+    << false
+}
+
+// MIR-only shape of `fn(x int) int { << x ±/* k }` — no Assembler side effects.
+// Shared by the emit peep and product_rc admission so a named fn-value call
+// that lowers to a binop is not treated as an ABI-crossing `bl`.
+// On success out[0]=op (1/2/3) and out[1]=imm.
+fn fnval_binop_imm_shape(m &types.Mir, cfi int, out &mut []int) bool {
+    if out.len < 2 {
+        << false
+    }
+    if types.mir_fn_receiver(m, cfi) {
+        << false
+    }
+    if types.mir_fn_nparams(m, cfi) != 1 || types.mir_fn_ret_nslots(m, cfi) != 1 {
+        << false
+    }
+    if types.mir_nblocks(m, cfi) <= 0 {
+        << false
+    }
+    // Same as mir_scalar_leaf: the real return is blocks[0]. Scanning every
+    // Return overwrites that with a fail/empty epilogue dest and misses bump.
+    mut retv := -1
+    if types.mir_btkind(m, cfi, 0) == 3 {
+        retv = types.mir_bta(m, cfi, 0)
+    }
+    if retv < 0 {
+        for bi in 0:types.mir_nblocks(m, cfi) {
+            if types.mir_btkind(m, cfi, bi) == 3 && types.mir_bta(m, cfi, bi) >= 0 {
+                retv = types.mir_bta(m, cfi, bi)
+                <-
+            }
+        }
+    }
+    if retv < 0 {
+        << false
+    }
+    mut p0 := -1
+    mut op := 0
+    mut imm := 0
+    mut saw_bin := false
+    nins := types.mir_nins(m, cfi)
+    mut ii := 0
+    while ii < nins {
+        k := types.mir_ikind(m, cfi, ii)
+        if k == 2 {
+            if types.mir_ib(m, cfi, ii) == 0 {
+                p0 = types.mir_ia(m, cfi, ii)
+            }
+        } else if k == 4 {
+            if types.mir_ia(m, cfi, ii) == retv {
+                op = types.mir_ib(m, cfi, ii)
+                l := types.mir_ic(m, cfi, ii)
+                r := types.mir_id(m, cfi, ii)
+                if p0 >= 0 && l == p0 && r <= -2 {
+                    cidx := 0 - r - 2
+                    if cidx >= 0 && cidx < types.mir_nconsts(m, cfi) {
+                        imm = types.mir_const_at(m, cfi, cidx)
+                        saw_bin = true
+                    }
+                } else if p0 >= 0 && r == p0 && l <= -2 {
+                    if op == 1 || op == 3 {
+                        cidx := 0 - l - 2
+                        if cidx >= 0 && cidx < types.mir_nconsts(m, cfi) {
+                            imm = types.mir_const_at(m, cfi, cidx)
+                            saw_bin = true
+                        }
+                    }
+                }
+            }
+        }
+        ii += 1
+    }
+    if !saw_bin {
+        << false
+    }
+    if op != 1 && op != 2 && op != 3 {
+        << false
+    }
+    out[0] = op
+    out[1] = imm
+    << true
+}
+
+// Call site: indirect Call through a fat pointer that resolves to a named
+// in-unit `x ±/* k` leaf. Fail-closed: unknown provenance stays a real call.
+fn mir_fnval_call_is_binop_peep(m &types.Mir, fi int, ii int) bool {
+    if types.mir_ikind(m, fi, ii) != 7 || types.mir_ib(m, fi, ii) != 80 {
+        << false
+    }
+    ic := types.mir_ic(m, fi, ii)
+    if ic < 0 {
+        << false
+    }
+    v0 := types.mir_marg_v(m, fi, ic)
+    user := types.mir_marg_next(m, fi, ic)
+    if user < 0 || types.mir_marg_next(m, fi, user) >= 0 {
+        << false
+    }
+    real := fnval_known_real(m, fi, types.mir_bi_of_ii(m, fi, ii), ii, v0)
+    if real == "" {
+        << false
+    }
+    cfi := fnval_callee_index(m, real)
+    if cfi < 0 {
+        << false
+    }
+    mut box := []int{}
+    box.push(0)
+    box.push(0)
+    << fnval_binop_imm_shape(m, cfi, mut &box)
+}
+
+// `fn(x int) int { << x + k }` / `x - k` / `x * k` — emit as a binop, no call.
+fn emit_fnval_binop_imm(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ia int, cfi int, arg_v int) bool {
+    mut box := []int{}
+    box.push(0)
+    box.push(0)
+    if !fnval_binop_imm_shape(m, cfi, mut &box) {
+        << false
+    }
+    op := box[0]
+    imm := box[1]
+    dst := emit_int_alu_home(fr, ia)
+    src := emit_load_value_reg(a, m, fi, fr, arg_v, dst)
+    if src != dst {
+        a.mov(dst, src)
+    }
+    if op == 1 {
+        a.vm_add_imm(dst, dst, imm)
+    } else if op == 2 {
+        a.vm_sub_imm(dst, dst, imm)
+    } else if op == 3 {
+        mut ir := 1
+        if dst == 1 { ir = 0 }
+        a.vm_mov_imm(ir, imm)
+        a.mul(dst, dst, ir)
+    } else {
+        << false
+    }
+    if ia >= 0 && types.mir_temp_nslots(m, fi, ia) == 1 {
+        if dst == 0 || ia >= fr.temp_slot.len || !is_vreg_slot(fr.temp_slot[ia]) {
+            emit_store_scalar_temp(a, m, fi, fr, ia, dst)
+        }
+    }
+    << true
+}
+
+fn emit_instr_call_user_indirect(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ia := types.mir_ia(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    if ic >= 0 {
+        v0 := types.mir_marg_v(m, fi, ic)
+        // Resolve the named callee through the stable MIR shim label.  The
+        // ARM64 fixup sink hashes the borrowed label immediately, so no
+        // owning string is retained in the delayed relocation record.
+        mut real := ""
+        mut cfi := -1
+        real = fnval_known_real(m, fi, types.mir_bi_of_ii(m, fi, ii), ii, v0)
+        if cfi < 0 && real != "" {
+            cfi = fnval_callee_index(m, real)
+        }
+        if cfi >= 0 {
+            user := types.mir_marg_next(m, fi, ic)
+            if cfi >= 0 && user >= 0 {
+                arg0 := types.mir_marg_v(m, fi, user)
+                if types.mir_marg_next(m, fi, user) < 0 {
+                    if emit_fnval_binop_imm(a, m, fi, fr, ia, cfi, arg0) {
+                        <<
+                    }
+                }
+            }
+            mut ai := user
+            mut i := 0
+            while ai >= 0 && i < 6 {
+                v := types.mir_marg_v(m, fi, ai)
+                emit_load_value(a, m, fi, fr, v, 0)
+                a.mov(arg_reg(i), 0)
+                i += 1
+                ai = types.mir_marg_next(m, fi, ai)
+            }
+            mut ai3 := user
+            while ai3 >= 0 {
+                v := types.mir_marg_v(m, fi, ai3)
+                if v >= 0 {
+                    rc_forget_slot(a, fr.temp_slot[v])
+                }
+                ai3 = types.mir_marg_next(m, fi, ai3)
+            }
+            rc_spill_across_call(a)
+            if ia >= 0 && types.mir_temp_nslots(m, fi, ia) > 1 {
+                a.mov(0, 15)
+                a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+            }
+            // Executables can bind the verified in-unit callee by MIR ID.
+            // Objects retain a full-name symbol for external relocation.
+            if a.arch == 0 && a.lib == 0 && cfi >= 0 {
+                a.call_fn_index(cfi)
+            } else if a.arch == 0 && real != "" && fn_label_in_unit(m, real) {
+                a.bl_ref(&real)
+            } else {
+                // bl_ref encodes ARM64 bytes. Other targets must use the
+                // backend call adapter (x64 CALL rel32, etc.).
+                a.call(real)
+            }
+            if ia >= 0 && types.mir_temp_nslots(m, fi, ia) == 1 {
+                a.mov(0, 14)
+                emit_store_temp(a, fr, ia, 0)
+            }
+            <<
+        }
+    }
+    // M103/M109: indirect — args[0]=&fat(code,env); A0=env; A1..=user
+    mut ai := ic
+    v0 := types.mir_marg_v(m, fi, ai)
+    emit_load_value(a, m, fi, fr, v0, 0) // &fat → V0
+    a.load(1, 0, 0) // code* → V1
+    a.load(18, 0, -8) // env* → A0
+    ai = types.mir_marg_next(m, fi, ai)
+    mut i := 0
+    while ai >= 0 {
+        v := types.mir_marg_v(m, fi, ai)
+        emit_load_value(a, m, fi, fr, v, 0)
+        a.mov(arg_reg(i + 1), 0)
+        i += 1
+        ai = types.mir_marg_next(m, fi, ai)
+    }
+    mut ai3 := ic
+    // skip fat ptr arg (index 0); forget user arg temps only
+    if ai3 >= 0 {
+        ai3 = types.mir_marg_next(m, fi, ai3)
+    }
+    while ai3 >= 0 {
+        v := types.mir_marg_v(m, fi, ai3)
+        if v >= 0 {
+            rc_forget_slot(a, fr.temp_slot[v])
+        }
+        ai3 = types.mir_marg_next(m, fi, ai3)
+    }
+    rc_spill_across_call(a)
+    if ia >= 0 && types.mir_temp_nslots(m, fi, ia) > 1 {
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+    }
+    a.call_reg(1)
+    if ia >= 0 && types.mir_temp_nslots(m, fi, ia) == 1 {
+        a.mov(0, 14)
+        emit_store_temp(a, fr, ia, 0)
+    }
+    <<
+}
+
+// Hosted canonical math.sqrt intrinsic.  Xu passes f64 as raw bits in the
+// ordinary GPR ABI, so the backend helper consumes/produces the same V0 bits
+// as a 1xf64 -> f64 user call.  Keep the match deliberately fail-closed: a
+// label collision, malformed margs chain, or signature drift must retain the
+// software call on every target.
+fn direct_math_sqrt_call_ok(a &Assembler, m &types.Mir, fi int, ii int) bool {
+    if a.os == 3 || (a.arch != 0 && a.arch != 1 && a.arch != 4) {
+        << false
+    }
+    if types.mir_ikind(m, fi, ii) != 7 || types.mir_ib(m, fi, ii) != 1 {
+        << false
+    }
+    if types.mir_isval(m, fi, ii) != "_xu_math_sqrt" {
+        << false
+    }
+
+    dest := types.mir_ia(m, fi, ii)
+    if dest < 0 || dest >= types.mir_ntemps(m, fi) {
+        << false
+    }
+    if types.mir_temp_ty(m, fi, dest) != 4 || types.mir_temp_nslots(m, fi, dest) != 1 {
+        << false
+    }
+
+    ap := types.mir_ic(m, fi, ii)
+    if ap < 0 || ap >= m.fns[fi].margs.len {
+        << false
+    }
+    if types.mir_marg_next(m, fi, ap) != -1 {
+        << false
+    }
+    arg := types.mir_marg_v(m, fi, ap)
+    if arg == -1 {
+        << false
+    }
+    if arg >= 0 {
+        if arg >= types.mir_ntemps(m, fi) {
+            << false
+        }
+        if types.mir_temp_ty(m, fi, arg) != 4 || types.mir_temp_nslots(m, fi, arg) != 1 {
+            << false
+        }
+    } else {
+        ci := 0 - arg - 2
+        if ci < 0 || ci >= types.mir_nconsts(m, fi) {
+            << false
+        }
+    }
+
+    mut callee := -1
+    for cfi in 0:m.fns.len {
+        if callee < 0 && !types.mir_fn_is_extern(m, cfi) && types.mir_fn_label(m, cfi) == "_xu_math_sqrt" {
+            callee = cfi
+        }
+    }
+    if callee < 0 || types.mir_fn_is_extern(m, callee) || types.mir_fn_receiver(m, callee) {
+        << false
+    }
+    if types.mir_fn_nparams(m, callee) != 1 || types.mir_nlocals(m, callee) < 1 {
+        << false
+    }
+    if types.mir_local_ty(m, callee, 0) != 4 || types.mir_local_nslots(m, callee, 0) != 1 {
+        << false
+    }
+    if types.mir_fn_ret(m, callee) != 4 || types.mir_fn_ret_nslots(m, callee) != 1 {
+        << false
+    }
+    << true
+}
+
+fn hosted_bit_op_ok(arch int, kind int) bool {
+    if arch == 0 {
+        << true
+    }
+    if arch == 4 {
+        // Only operations with a complete LoongArch lowering are ABI-free.
+        << kind == 1 || kind == 2 || kind == 3 || kind == 8
+    }
+    if arch == 1 {
+        << kind == 1 || kind == 2 || kind == 4 || kind == 8
+    }
+    << false
+}
+
+fn bits_call_label_ok(m &types.Mir, fi int, ii int, kind int) bool {
+    // Fresh literals each time: string == consumes both operands, so a
+    // helper that reuses one `label` parameter use-after-moves on the
+    // callee scan (that SIGSEGV'd math_b3a at O1).
+    if kind == 1 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_leading_zeros"
+    }
+    if kind == 2 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_trailing_zeros"
+    }
+    if kind == 3 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_reverse"
+    }
+    if kind == 4 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_reverse_bytes"
+    }
+    if kind == 5 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_ones_count"
+    }
+    if kind == 6 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_rotate_left"
+    }
+    if kind == 7 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_rotate_right"
+    }
+    if kind == 8 {
+        << types.mir_isval(m, fi, ii) == "_xu_math_bits_len"
+    }
+    << false
+}
+
+fn bits_callee_ok(m &types.Mir, cfi int, kind int) bool {
+    if types.mir_fn_is_extern(m, cfi) {
+        << false
+    }
+    if kind == 1 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_leading_zeros"
+    }
+    if kind == 2 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_trailing_zeros"
+    }
+    if kind == 3 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_reverse"
+    }
+    if kind == 4 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_reverse_bytes"
+    }
+    if kind == 5 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_ones_count"
+    }
+    if kind == 6 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_rotate_left"
+    }
+    if kind == 7 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_rotate_right"
+    }
+    if kind == 8 {
+        << types.mir_fn_label(m, cfi) == "_xu_math_bits_len"
+    }
+    << false
+}
+
+fn direct_unary_int_call_ok(a &Assembler, m &types.Mir, fi int, ii int, kind int) bool {
+    if a.os == 3 || !hosted_bit_op_ok(a.arch, kind) {
+        << false
+    }
+    if types.mir_ikind(m, fi, ii) != 7 || types.mir_ib(m, fi, ii) != 1 {
+        << false
+    }
+    if !bits_call_label_ok(m, fi, ii, kind) {
+        << false
+    }
+    dest := types.mir_ia(m, fi, ii)
+    if dest < 0 || dest >= types.mir_ntemps(m, fi) {
+        << false
+    }
+    if types.mir_temp_ty(m, fi, dest) != 1 || types.mir_temp_nslots(m, fi, dest) != 1 {
+        << false
+    }
+    ap := types.mir_ic(m, fi, ii)
+    if ap < 0 || ap >= m.fns[fi].margs.len {
+        << false
+    }
+    if types.mir_marg_next(m, fi, ap) != -1 {
+        << false
+    }
+    arg := types.mir_marg_v(m, fi, ap)
+    if arg == -1 {
+        << false
+    }
+    if arg >= 0 {
+        if arg >= types.mir_ntemps(m, fi) {
+            << false
+        }
+        if types.mir_temp_ty(m, fi, arg) != 1 || types.mir_temp_nslots(m, fi, arg) != 1 {
+            << false
+        }
+    } else {
+        ci := 0 - arg - 2
+        if ci < 0 || ci >= types.mir_nconsts(m, fi) {
+            << false
+        }
+    }
+    mut callee := -1
+    for cfi in 0:m.fns.len {
+        if callee < 0 && bits_callee_ok(m, cfi, kind) {
+            callee = cfi
+        }
+    }
+    if callee < 0 || types.mir_fn_is_extern(m, callee) || types.mir_fn_receiver(m, callee) {
+        << false
+    }
+    if types.mir_fn_nparams(m, callee) != 1 || types.mir_nlocals(m, callee) < 1 {
+        << false
+    }
+    if types.mir_local_ty(m, callee, 0) != 1 || types.mir_local_nslots(m, callee, 0) != 1 {
+        << false
+    }
+    if types.mir_fn_ret(m, callee) != 1 || types.mir_fn_ret_nslots(m, callee) != 1 {
+        << false
+    }
+    << true
+}
+
+fn direct_rotate_call_ok(a &Assembler, m &types.Mir, fi int, ii int, kind int) bool {
+    if a.os == 3 || (a.arch != 0 && a.arch != 1) {
+        << false
+    }
+    if types.mir_ikind(m, fi, ii) != 7 || types.mir_ib(m, fi, ii) != 1 {
+        << false
+    }
+    if kind == 6 {
+        if types.mir_isval(m, fi, ii) != "_xu_math_bits_rotate_left" { << false }
+    } else if kind == 7 {
+        if types.mir_isval(m, fi, ii) != "_xu_math_bits_rotate_right" { << false }
+    } else {
+        << false
+    }
+    dest := types.mir_ia(m, fi, ii)
+    if dest < 0 || dest >= types.mir_ntemps(m, fi) { << false }
+    if types.mir_temp_ty(m, fi, dest) != 1 || types.mir_temp_nslots(m, fi, dest) != 1 { << false }
+    ap := types.mir_ic(m, fi, ii)
+    if ap < 0 || ap >= m.fns[fi].margs.len { << false }
+    ap2 := types.mir_marg_next(m, fi, ap)
+    if ap2 < 0 || ap2 >= m.fns[fi].margs.len || types.mir_marg_next(m, fi, ap2) != -1 { << false }
+    arg0 := types.mir_marg_v(m, fi, ap)
+    if arg0 == -1 { << false }
+    if arg0 >= 0 {
+        if arg0 >= types.mir_ntemps(m, fi) || types.mir_temp_ty(m, fi, arg0) != 1 || types.mir_temp_nslots(m, fi, arg0) != 1 { << false }
+    } else {
+        ci0 := 0 - arg0 - 2
+        if ci0 < 0 || ci0 >= types.mir_nconsts(m, fi) { << false }
+    }
+    arg1 := types.mir_marg_v(m, fi, ap2)
+    if arg1 >= -1 { << false }
+    ci1 := 0 - arg1 - 2
+    if ci1 < 0 || ci1 >= types.mir_nconsts(m, fi) { << false }
+    mut callee := -1
+    for cfi in 0:m.fns.len {
+        if callee < 0 && bits_callee_ok(m, cfi, kind) { callee = cfi }
+    }
+    if callee < 0 || types.mir_fn_nparams(m, callee) != 2 || types.mir_nlocals(m, callee) < 2 { << false }
+    if types.mir_local_ty(m, callee, 0) != 1 || types.mir_local_ty(m, callee, 1) != 1 { << false }
+    if types.mir_fn_ret(m, callee) != 1 || types.mir_fn_ret_nslots(m, callee) != 1 { << false }
+    << true
+}
+
+fn emit_int_alu_home(fr &Frame, dest int) int {
+    if dest >= 0 && dest < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[dest]) {
+        << vreg_slot_home(fr.temp_slot[dest])
+    }
+    << 0
+}
+
+fn emit_call_is_isel_peep(a &Assembler, m &types.Mir, fi int, ii int) bool {
+    if types.mir_ikind(m, fi, ii) != 7 {
+        << false
+    }
+    ck := types.mir_ib(m, fi, ii)
+    if ck == 80 {
+        << mir_fnval_call_is_binop_peep(m, fi, ii)
+    }
+    if ck != 1 {
+        << false
+    }
+    if direct_rotate_call_ok(a, m, fi, ii, 6) {
+        << true
+    }
+    if direct_rotate_call_ok(a, m, fi, ii, 7) {
+        << true
+    }
+    if direct_unary_int_call_ok(a, m, fi, ii, 1) {
+        << true
+    }
+    if direct_unary_int_call_ok(a, m, fi, ii, 2) {
+        << true
+    }
+    if direct_unary_int_call_ok(a, m, fi, ii, 3) {
+        << true
+    }
+    if direct_unary_int_call_ok(a, m, fi, ii, 4) {
+        << true
+    }
+    if direct_unary_int_call_ok(a, m, fi, ii, 5) {
+        << true
+    }
+    if direct_unary_int_call_ok(a, m, fi, ii, 8) {
+        << true
+    }
+    << false
+}
+
+fn bits_call_is_peep_label(m &types.Mir, fi int, ii int) bool {
+    if types.mir_ikind(m, fi, ii) != 7 || types.mir_ib(m, fi, ii) != 1 {
+        << false
+    }
+    if bits_call_label_ok(m, fi, ii, 1) { << true }
+    if bits_call_label_ok(m, fi, ii, 2) { << true }
+    if bits_call_label_ok(m, fi, ii, 3) { << true }
+    if bits_call_label_ok(m, fi, ii, 4) { << true }
+    if bits_call_label_ok(m, fi, ii, 5) { << true }
+    if bits_call_label_ok(m, fi, ii, 6) { << true }
+    if bits_call_label_ok(m, fi, ii, 7) { << true }
+    if bits_call_label_ok(m, fi, ii, 8) { << true }
+    << false
+}
+
+fn emit_bits_dest_home(a &Assembler, m &types.Mir, fi int, fr &Frame, dest int, ni int) int {
+    pin := rc_coalesce_store_pin(a, m, fi, fr, dest, ni)
+    if pin >= 0 {
+        << pin
+    }
+    ch := emit_copy_chain_dest_home(m, fi, fr, dest, ni)
+    if ch >= 0 {
+        << ch
+    }
+    << emit_int_alu_home(fr, dest)
+}
+
+fn emit_bits_src_home(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int, arg int, dst int) int {
+    sh := emit_copy_chain_src_home(m, fi, fr, a.rc_cur_bi, ii, arg)
+    if sh >= 0 {
+        << sh
+    }
+    << emit_load_value_reg(a, m, fi, fr, arg, dst)
+}
+
+fn emit_direct_rotate(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int, kind int) bool {
+    if !direct_rotate_call_ok(&*a, m, fi, ii, kind) { << false }
+    ap := types.mir_ic(m, fi, ii)
+    arg0 := types.mir_marg_v(m, fi, ap)
+    ap2 := types.mir_marg_next(m, fi, ap)
+    shift := types.mir_const_at(m, fi, 0 - types.mir_marg_v(m, fi, ap2) - 2) & 63
+    dest := types.mir_ia(m, fi, ii)
+    ni := types.mir_inext(m, fi, ii)
+    pin := rc_coalesce_store_pin(&*a, m, fi, fr, dest, ni)
+    mut dst := emit_bits_dest_home(&*a, m, fi, fr, dest, ni)
+    mut coalesced := 0
+    if pin >= 0 {
+        dst = pin
+        coalesced = 1
+    }
+    src := emit_bits_src_home(a, m, fi, fr, ii, arg0, dst)
+    if shift != 0 {
+        mut rotation := shift
+        if kind == 6 { rotation = 64 - shift }
+        a.be_ror_imm(dst, src, rotation)
+    } else if src != dst {
+        a.mov(dst, src)
+    }
+    if coalesced == 1 {
+        rc_commit_alu(a, m, fi, fr, dest, dst, 1, ni)
+        mut last := ni
+        if types.mir_ikind(m, fi, ni) == 1 {
+            n2 := types.mir_inext(m, fi, ni)
+            if n2 >= 0 && types.mir_ikind(m, fi, n2) == 3 {
+                last = n2
+            }
+        }
+        a.rc_fp_skip_n = isel_skip_count(m, fi, ni, last)
+        << true
+    }
+    emit_skip_copy_dest_chain(a, m, fi, fr, dest, ni)
+    if dst == 0 || dest < 0 || dest >= fr.temp_slot.len || !is_vreg_slot(fr.temp_slot[dest]) {
+        emit_store_scalar_temp(a, m, fi, fr, dest, dst)
+    }
+    << true
+}
+
+fn emit_direct_math_sqrt(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) bool {
+    if !direct_math_sqrt_call_ok(&*a, m, fi, ii) {
+        << false
+    }
+    dest := types.mir_ia(m, fi, ii)
+    ap := types.mir_ic(m, fi, ii)
+    arg := types.mir_marg_v(m, fi, ap)
+    ni := types.mir_inext(m, fi, ii)
+    // Prefer SIMD homes (d2–d7) when the hosted FP cache is on: nbody
+    // advance keeps d2/dist in homes and a GPR-bit fsqrt via d0 forces a
+    // stack round-trip every pair.
+    // Keep the FP-home sqrt path disabled until its cross-call/cache
+    // coherence is proven; the GPR hardware sqrt below is still an intrinsic
+    // fast path and preserves the software sqrt's observable result.
+    if false {
+        mut dd := -1
+        mut home_pin := false
+        fd := rc_coalesce_f64_fd(&*a, m, fi, fr, dest, ni)
+        if fd >= 0 {
+            dd = fd
+            home_pin = true
+        } else {
+            p0 := rc_fp_index_alias(&*a, fr.temp_slot[dest])
+            if p0 >= 0 {
+                dd = rc_fp_d(p0)
+                home_pin = true
+            } else {
+                sp := rc_fp_pick_scratch(&*a)
+                if sp >= 0 {
+                    dd = rc_fp_d(sp)
+                }
+            }
+        }
+        if dd >= 0 {
+            mut dn := rc_fp_operand_d(a, m, fi, fr, arg, 0)
+            if dn < 0 {
+                // Const / stack operand: materialize bits into d0.
+                emit_load_value(a, m, fi, fr, arg, 0)
+                a.be_fmov_d_from_gpr(0, 0)
+                dn = 0
+            }
+            a.be_fsqrt_dd(dd, dn)
+            p := dd - 2
+            if p >= 0 && p < rc_fp_homes() {
+                a.rc_fp_dirty[p] = 1
+                if home_pin {
+                    rc_fp_set_alias(a, p, fr.temp_slot[dest])
+                } else {
+                    a.rc_fp_alias2[p] = -1
+                    a.rc_fp_alias[p] = fr.temp_slot[dest]
+                }
+            }
+            mut skip_mat := home_pin
+            if !skip_mat && p >= 0 && p < rc_fp_homes() {
+                if f64_can_skip_materialize(m, fi, dest, ni) {
+                    skip_mat = true
+                }
+            }
+            if !skip_mat {
+                a.be_fmov_gpr_from_d(0, dd)
+                emit_store_scalar_temp(a, m, fi, fr, dest, 0)
+            } else if home_pin {
+                // Keep the frame slot coherent for later non-FP consumers.
+                a.be_fmov_gpr_from_d(0, dd)
+                emit_store_scalar_temp(a, m, fi, fr, dest, 0)
+            }
+            rc_fp_kill_dead_temp(a, m, fi, fr, arg, ni)
+            << true
+        }
+    }
+    emit_load_value(a, m, fi, fr, arg, 0)
+    a.be_fsqrt(0, 0)
+    emit_store_scalar_temp(a, m, fi, fr, dest, 0)
+    << true
+}
+
+// len(x)+clz(x)==64, including x==0. Match exact MIR value identities,
+// never physical homes: disjoint values may legally share a register.
+// Both a direct sum and (acc+len(x))+clz(x) are eligible. Every skipped
+// result must have one whole-function use, including successor/Copy uses.
+fn bits_sum_single_use(m &types.Mir, fi int, t int) bool {
+    if t < 0 || types.mir_nins(m, fi) > 2048 { << false }
+    mut uses := 0
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_ikind(m, fi, ii) == 4 {
+                if types.mir_ic(m, fi, ii) == t { uses += 1 }
+                if types.mir_id(m, fi, ii) == t { uses += 1 }
+            } else if mir_instr_uses_temp(m, fi, ii, t) { uses += 1 }
+            if uses > 1 { << false }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        tk := types.mir_btkind(m, fi, bi)
+        if (tk == 2 || tk == 3) && types.mir_bta(m, fi, bi) == t { uses += 1 }
+        if uses > 1 { << false }
+    }
+    << uses == 1
+}
+
+fn emit_bits_len_clz_sum(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int, kind int) bool {
+    if kind != 1 && kind != 8 { << false }
+    if !frame_has_vregs(fr) { << false }
+    if !direct_unary_int_call_ok(&*a, m, fi, ii, kind) { << false }
+    d0 := types.mir_ia(m, fi, ii)
+    arg := types.mir_marg_v(m, fi, types.mir_ic(m, fi, ii))
+    if d0 == arg || !bits_sum_single_use(m, fi, d0) { << false }
+    next := types.mir_inext(m, fi, ii)
+    if next < 0 { << false }
+    mut other_call := next
+    mut partial := -1
+    mut acc := -1
+    if types.mir_ikind(m, fi, next) == 4 && types.mir_ib(m, fi, next) == 1 {
+        lhs := types.mir_ic(m, fi, next)
+        rhs := types.mir_id(m, fi, next)
+        if lhs == d0 { acc = rhs } else if rhs == d0 { acc = lhs } else { << false }
+        partial = types.mir_ia(m, fi, next)
+        if partial == arg || partial == d0 || partial < 0 { << false }
+        if types.mir_temp_ty(m, fi, partial) != 1 || !bits_sum_single_use(m, fi, partial) { << false }
+        other_call = types.mir_inext(m, fi, next)
+    }
+    mut complement := 1
+    if kind == 1 { complement = 8 }
+    if other_call < 0 || !direct_unary_int_call_ok(&*a, m, fi, other_call, complement) { << false }
+    other_arg := types.mir_marg_v(m, fi, types.mir_ic(m, fi, other_call))
+    if arg != other_arg { << false }
+    d1 := types.mir_ia(m, fi, other_call)
+    if d1 == arg || d1 == d0 || d1 == partial { << false }
+    if acc >= 0 && d1 == acc { << false }
+    if !bits_sum_single_use(m, fi, d1) { << false }
+    last := types.mir_inext(m, fi, other_call)
+    if last < 0 || types.mir_ikind(m, fi, last) != 4 || types.mir_ib(m, fi, last) != 1 { << false }
+    mut first_sum := d0
+    if partial >= 0 { first_sum = partial }
+    lhs := types.mir_ic(m, fi, last)
+    rhs := types.mir_id(m, fi, last)
+    if !((lhs == first_sum && rhs == d1) || (rhs == first_sum && lhs == d1)) { << false }
+    dest := types.mir_ia(m, fi, last)
+    if dest < 0 || types.mir_temp_ty(m, fi, dest) != 1 { << false }
+    dst := emit_int_alu_home(fr, dest)
+    if partial < 0 {
+        a.vm_mov_imm(dst, 64)
+    } else {
+        src := emit_load_value_reg(a, m, fi, fr, acc, dst)
+        a.be_add_imm(dst, src, 64)
+    }
+    emit_store_scalar_temp(a, m, fi, fr, dest, dst)
+    a.rc_fp_skip_n = isel_skip_count(m, fi, next, last)
+    << true
+}
+
+fn emit_direct_unary_int(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int, kind int) bool {
+    if emit_bits_len_clz_sum(a, m, fi, fr, ii, kind) { << true }
+    if !direct_unary_int_call_ok(&*a, m, fi, ii, kind) {
+        << false
+    }
+    ap := types.mir_ic(m, fi, ii)
+    arg := types.mir_marg_v(m, fi, ap)
+    dest := types.mir_ia(m, fi, ii)
+    ni := types.mir_inext(m, fi, ii)
+    pin := rc_coalesce_store_pin(&*a, m, fi, fr, dest, ni)
+    mut dst := emit_bits_dest_home(&*a, m, fi, fr, dest, ni)
+    mut coalesced := 0
+    if pin >= 0 {
+        dst = pin
+        coalesced = 1
+    }
+    src := emit_bits_src_home(a, m, fi, fr, ii, arg, dst)
+    if kind == 5 {
+        a.be_popcount64(dst, src)
+    } else if kind == 1 {
+        a.be_clz(dst, src)
+    } else if kind == 2 {
+        a.be_ctz(dst, src)
+    } else if kind == 3 {
+        a.be_rbit(dst, src)
+    } else if kind == 4 {
+        a.be_rev64(dst, src)
+    } else if kind == 8 {
+        a.be_clz(dst, src)
+        a.be_neg(dst, dst)
+        a.be_add_imm(dst, dst, 64)
+    } else {
+        << false
+    }
+    if coalesced == 1 {
+        rc_commit_alu(a, m, fi, fr, dest, dst, 1, ni)
+        mut last := ni
+        if ni >= 0 && types.mir_ikind(m, fi, ni) == 1 {
+            n2 := types.mir_inext(m, fi, ni)
+            if n2 >= 0 && types.mir_ikind(m, fi, n2) == 3 {
+                last = n2
+            }
+        }
+        if ni >= 0 {
+            a.rc_fp_skip_n = isel_skip_count(m, fi, ni, last)
+        }
+        << true
+    }
+    emit_skip_copy_dest_chain(a, m, fi, fr, dest, ni)
+    if dst == 0 || dest < 0 || dest >= fr.temp_slot.len || !is_vreg_slot(fr.temp_slot[dest]) {
+        emit_store_scalar_temp(a, m, fi, fr, dest, dst)
+    }
+    << true
+}
+
+// Wave C: direct user call (ib==1) — split from emit_instr_call_user (W3).
+fn emit_instr_call_user_direct(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ia := types.mir_ia(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    // Intrinsics that do not cross an ABI seam must return before call-point
+    // splits, argument alias invalidation, or caller-save spilling.
+    if emit_direct_math_sqrt(a, m, fi, fr, ii) {
+        <<
+    }
+    if emit_direct_rotate(a, m, fi, fr, ii, 6) {
+        <<
+    }
+    if emit_direct_rotate(a, m, fi, fr, ii, 7) {
+        <<
+    }
+    nlab := types.mir_isval_len(m, fi, ii)
+    if nlab == 27 {
+        if emit_direct_unary_int(a, m, fi, fr, ii, 1) {
+            <<
+        }
+    }
+    if nlab == 28 {
+        if emit_direct_unary_int(a, m, fi, fr, ii, 2) {
+            <<
+        }
+    }
+    if nlab == 21 {
+        if emit_direct_unary_int(a, m, fi, fr, ii, 3) {
+            <<
+        }
+    }
+    if nlab == 27 {
+        if emit_direct_unary_int(a, m, fi, fr, ii, 4) {
+            <<
+        }
+    }
+    if nlab == 24 {
+        if emit_direct_unary_int(a, m, fi, fr, ii, 5) {
+            <<
+        }
+    }
+    if nlab == 17 {
+        if emit_direct_unary_int(a, m, fi, fr, ii, 8) {
+            <<
+        }
+    }
+    // Caller-saved FP homes must be captured before loading call arguments,
+    // because argument materialization is allowed to use FP/GPR scratch.
+    emit_vreg_call_fp_splits(a, m, fi, fr, ii, false)
+    mut ai := ic
+    mut nargs := 0
+    mut ai2 := ic
+    while ai2 >= 0 {
+        nargs += 1
+        ai2 = types.mir_marg_next(m, fi, ai2)
+    }
+    mut n_stack := 0
+    if nargs > 6 { n_stack = nargs - 6 }
+    spill := stack_spill_bytes(n_stack)
+    mut i := 0
+    while ai >= 0 && i < 6 {
+        v := types.mir_marg_v(m, fi, ai)
+        loc := temp_ref_alias_local(m, fi, fr, v)
+        if loc >= 0 {
+            a.load(arg_reg(i), 15, slot_off(fr.local_slot[loc]))
+        } else {
+            r := emit_load_value_reg(a, m, fi, fr, v, 0)
+            if r != arg_reg(i) {
+                a.mov(arg_reg(i), r)
+            }
+        }
+        i += 1
+        ai = types.mir_marg_next(m, fi, ai)
+    }
+    if spill > 0 {
+        a.vm_sub_imm(16, 16, spill) // Sp
+        mut j := 0
+        while ai >= 0 {
+            v := types.mir_marg_v(m, fi, ai)
+            loc2 := temp_ref_alias_local(m, fi, fr, v)
+            if loc2 >= 0 {
+                a.load(0, 15, slot_off(fr.local_slot[loc2]))
+            } else {
+                emit_load_value(a, m, fi, fr, v, 0)
+            }
+            a.store(16, j * 8, 0)
+            j += 1
+            ai = types.mir_marg_next(m, fi, ai)
+        }
+    }
+    // Args live in A0–A5 / stack; drop parks so spill does not write them back.
+    mut ai3 := ic
+    while ai3 >= 0 {
+        v := types.mir_marg_v(m, fi, ai3)
+        if v >= 0 {
+            rc_forget_slot(a, fr.temp_slot[v])
+        }
+        ai3 = types.mir_marg_next(m, fi, ai3)
+    }
+    rc_spill_across_call(a)
+    if ia >= 0 && types.mir_temp_nslots(m, fi, ia) > 1 {
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+    }
+    mut target_lab := types.mir_isval(m, fi, ii) + ""
+    if target_lab == "_xu_crypto_aes_aes_hw_supported" {
+        target_lab = "_rt_aes_hw_supported"
+    } else if target_lab == "_xu_crypto_aes_aes_hw_block_enc" {
+        if a.arch == 0 {
+            target_lab = "_rt_aes_arm64_block_enc"
+        } else if a.arch == 1 {
+            target_lab = "_rt_aes_x64_block_enc"
+        }
+    } else if target_lab == "_xu_crypto_aes_aes_hw_block_dec" {
+        if a.arch == 0 {
+            target_lab = "_rt_aes_arm64_block_dec"
+        } else if a.arch == 1 {
+            target_lab = "_rt_aes_x64_block_dec"
+        }
+    } else if target_lab == "_xu_crypto_aes_aes_hw_drk" {
+        if a.arch == 0 {
+            target_lab = "_rt_aes_arm64_drk"
+        } else {
+            target_lab = "_rt_aes_arm64_drk"
+        }
+    } else if target_lab == "_xu_hash_crc32_crc32_hw_ieee_supported" {
+        target_lab = "_rt_crc32_hw_ieee_supported"
+    } else if target_lab == "_xu_hash_crc32_crc32_hw_cas_supported" {
+        target_lab = "_rt_crc32_hw_cas_supported"
+    } else if target_lab == "_xu_hash_crc32_crc32_hw_ieee" {
+        if a.arch == 0 {
+            target_lab = "_rt_crc32_arm64_ieee"
+        } else {
+            target_lab = "_rt_crc32_fallback_ieee"
+        }
+    } else if target_lab == "_xu_hash_crc32_crc32_hw_castagnoli" {
+        if a.arch == 0 {
+            target_lab = "_rt_crc32_arm64_castagnoli"
+        } else if a.arch == 1 {
+            target_lab = "_rt_crc32_x64_castagnoli"
+        } else {
+            target_lab = "_rt_crc32_fallback_castagnoli"
+        }
+    } else if target_lab == "_xu_crypto_sha256_sha256_hw_supported" {
+        target_lab = "_rt_sha256_hw_supported"
+    } else if target_lab == "_xu_crypto_sha256_sha256_hw_compress_block" {
+        if a.arch == 0 {
+            target_lab = "_rt_sha256_arm64_compress"
+        } else {
+            target_lab = "_rt_sha256_arm64_compress"
+        }
+    } else if target_lab == "_xu_crypto_sha512_sha512_hw_supported" {
+        target_lab = "_rt_sha512_hw_supported"
+    } else if target_lab == "_xu_crypto_sha512_sha512_hw_compress_block" {
+        if a.arch == 0 {
+            target_lab = "_rt_sha512_arm64_compress"
+        } else {
+            target_lab = "_rt_sha512_arm64_compress"
+        }
+    } else if target_lab == "_xu_crypto_sha1_sha1_hw_supported" {
+        target_lab = "_rt_sha1_hw_supported"
+    } else if target_lab == "_xu_crypto_sha1_sha1_hw_compress_block" {
+        if a.arch == 0 {
+            target_lab = "_rt_sha1_arm64_compress"
+        } else {
+            target_lab = "_rt_sha1_arm64_compress"
+        }
+    } else if target_lab == "_xu_crypto_sm4_sm4_hw_supported" {
+        target_lab = "_rt_sm4_hw_supported"
+    } else if target_lab == "_xu_crypto_sm4_sm4_hw_crypt" {
+        if a.arch == 0 {
+            target_lab = "_rt_sm4_arm64_crypt"
+        } else {
+            target_lab = "_rt_sm4_arm64_crypt"
+        }
+    } else if a.arch == 1 && target_lab == "_xu_math_bits_ones_count" {
+        target_lab = "_rt_math_bits_ones_count"
+    } else if target_lab == "_xu_math_bits_mul64_hi" {
+        target_lab = "_rt_math_bits_mul64_hi"
+    } else if target_lab == "_xu_encoding_hex_hex_hw_supported" {
+        target_lab = "_rt_hex_hw_supported"
+    } else if target_lab == "_xu_encoding_hex_hex_hw_encode" {
+        if a.arch == 0 {
+            target_lab = "_rt_hex_arm64_encode"
+        } else {
+            target_lab = "_rt_hex_arm64_encode"
+        }
+    } else if target_lab == "_xu_encoding_base64_base64_hw_supported" {
+        target_lab = "_rt_base64_hw_supported"
+    } else if target_lab == "_xu_encoding_base64_base64_hw_encode" {
+        if a.arch == 0 {
+            target_lab = "_rt_base64_arm64_encode"
+        } else {
+            target_lab = "_rt_base64_arm64_encode"
+        }
+    } else if target_lab == "_xu_math_math_hw_supported" {
+        target_lab = "_rt_math_hw_supported"
+    } else if target_lab == "_xu_math_math_hw_floor" {
+        target_lab = "_rt_math_hw_floor"
+    } else if target_lab == "_xu_math_math_hw_ceil" {
+        target_lab = "_rt_math_hw_ceil"
+    } else if target_lab == "_xu_math_math_hw_trunc" {
+        target_lab = "_rt_math_hw_trunc"
+    } else if target_lab == "_xu_math_math_hw_round_to_even" {
+        target_lab = "_rt_math_hw_round_to_even"
+    } else if target_lab == "_xu_math_math_hw_fma" {
+        target_lab = "_rt_math_hw_fma"
+    }
+    a.call_user(target_lab)
+    if ia >= 0 && types.mir_temp_nslots(m, fi, ia) == 1 {
+        a.mov(0, 14)
+        emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        if a.rc_s_pool && a.arch == 0 && a.cs_pairs >= 1 {
+            slot := fr.temp_slot[ia]
+            mut lim := a.cs_pairs * 2
+            if lim > 4 {
+                lim = 4
+            }
+            mut placed := 0
+            for p in 0:lim {
+                // Match bootstrap hold_call_dest: s_hold (not pin_alias) so
+                // AddrOf rematerialize into rc_addr_vr cannot clobber then
+                // materialize the wrong value onto the call-dest frame slot.
+                if placed == 0 && a.rc_pin[p] < 0 && a.rc_pin_alias[p] < 0 && a.rc_s_hold[p] == -1 {
+                    a.mov(8 + p, 14)
+                    a.rc_s_hold[p] = slot
+                    placed = 1
+                }
+            }
+        }
+    }
+    // The call destination has now reached its interference-proved home;
+    // restore values that were live before and after this exact call point.
+    emit_vreg_call_fp_splits(a, m, fi, fr, ii, true)
+    if ia < 0 && spill == 0 && a.rc_on {
+        mask := callee_preserves_arg_mask(&*a, m, types.mir_isval(m, fi, ii) + "")
+        if mask != 0 {
+            mut ai4 := ic
+            mut ai_i := 0
+            while ai4 >= 0 && ai_i < 6 {
+                if (mask & (1 << ai_i)) != 0 {
+                    v := types.mir_marg_v(m, fi, ai4)
+                    if v >= 0 {
+                        a.rc_arg_alias[ai_i] = fr.temp_slot[v]
+                        a.rc_arg[ai_i] = -1
+                    }
+                }
+                ai_i += 1
+                ai4 = types.mir_marg_next(m, fi, ai4)
+            }
+        }
+    }
+    if spill > 0 {
+        a.vm_add_imm(16, 16, spill)
+    }
+    <<
+}
+
+// Wave C: thin dispatcher over indirect/direct — split emit_instr_call_user (W3).
+fn emit_instr_call_user(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ib := types.mir_ib(m, fi, ii)
+    if ib == 80 {
+        emit_instr_call_user_indirect(a, m, fi, fr, ii)
+        <<
+    }
+    if ib == 1 {
+        emit_instr_call_user_direct(a, m, fi, fr, ii)
+        <<
+    }
+    if ib == 95 {
+        emit_instr_call_rmw(a, m, fi, fr, ii)
+        <<
+    }
+    <<
+}
+
+// Wave 3b+: void mut-method leaf `recv.field op= arg` — no bl, no call spill.
+// Mirror Acc.add leaf: A0=recv, A1=arg, V0(x8)=field scratch.
+fn emit_instr_call_rmw(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ic := types.mir_ic(m, fi, ii)
+    packed := types.mir_id(m, fi, ii)
+    op := packed - (packed / 64) * 64
+    slot := packed / 64
+    m0 := ic
+    m1 := types.mir_marg_next(m, fi, m0)
+    recv := types.mir_marg_v(m, fi, m0)
+    arg := types.mir_marg_v(m, fi, m1)
+    a0 := arg_reg(0)
+    a1 := arg_reg(1)
+    mut pr := emit_load_value_reg(a, m, fi, fr, recv, a0)
+    if pr != a0 {
+        a.mov(a0, pr)
+        pr = a0
+    }
+    mut ar := emit_load_value_reg(a, m, fi, fr, arg, a1)
+    if ar != a1 {
+        a.mov(a1, ar)
+        ar = a1
+    }
+    w := slot / 8
+    r := slot - w * 8
+    if w > 0 {
+        a.mov(2, a0)
+        a.vm_sub_imm(2, 2, w * 8)
+        pr = 2
+    }
+    // V0 (=x8) holds the field word — same scratch Acc.add uses via x10/x8 path.
+    a.load(0, pr, r)
+    if op == 1 { a.add(0, 0, ar) }
+    if op == 2 { a.sub(0, 0, ar) }
+    if op == 3 { a.mul(0, 0, ar) }
+    if op == 14 { a.iand(0, 0, ar) }
+    if op == 15 { a.ior(0, 0, ar) }
+    if op == 16 { a.ixor(0, 0, ar) }
+    if op == 17 { a.shl(0, 0, ar) }
+    if op == 18 { a.shr(0, 0, ar) }
+    a.store(pr, r, 0)
+    if recv >= 0 {
+        a.rc_arg_alias[0] = fr.temp_slot[recv]
+        a.rc_arg[0] = -1
+    }
+    if a.rc_addr_local >= 0 && a.rc_addr_local < fr.local_slot.len {
+        rc_sync_s_after_store(a, fr.local_slot[a.rc_addr_local], 0)
+    }
+    <<
+}
+
+// M174: os / env / atomic / net helpers.
+// Wave C: dial/listen/connect — split from emit_instr_call_net (W3).
+fn emit_instr_call_net_dial(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ia := types.mir_ia(m, fi, ii)
+    ib := types.mir_ib(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    if ib == 65 { // sys_connect4(fd, a,b,c,d,port) → sret tagged slot
+        m0 := ic
+        m1 := types.mir_marg_next(m, fi, m0)
+        m2 := types.mir_marg_next(m, fi, m1)
+        m3 := types.mir_marg_next(m, fi, m2)
+        m4 := types.mir_marg_next(m, fi, m3)
+        m5 := types.mir_marg_next(m, fi, m4)
+        v0 := types.mir_marg_v(m, fi, m0)
+        v1 := types.mir_marg_v(m, fi, m1)
+        v2 := types.mir_marg_v(m, fi, m2)
+        v3 := types.mir_marg_v(m, fi, m3)
+        v4 := types.mir_marg_v(m, fi, m4)
+        v5 := types.mir_marg_v(m, fi, m5)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        emit_load_value(a, m, fi, fr, v2, 20)
+        emit_load_value(a, m, fi, fr, v3, 21)
+        emit_load_value(a, m, fi, fr, v4, 22)
+        emit_load_value(a, m, fi, fr, v5, 23)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_connect4")
+        <<
+    }
+    if ib == 66 { // net_listen_tcp4(a,b,c,d,port) → sret tagged slot
+        m0 := ic
+        m1 := types.mir_marg_next(m, fi, m0)
+        m2 := types.mir_marg_next(m, fi, m1)
+        m3 := types.mir_marg_next(m, fi, m2)
+        m4 := types.mir_marg_next(m, fi, m3)
+        v0 := types.mir_marg_v(m, fi, m0)
+        v1 := types.mir_marg_v(m, fi, m1)
+        v2 := types.mir_marg_v(m, fi, m2)
+        v3 := types.mir_marg_v(m, fi, m3)
+        v4 := types.mir_marg_v(m, fi, m4)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        emit_load_value(a, m, fi, fr, v2, 20)
+        emit_load_value(a, m, fi, fr, v3, 21)
+        emit_load_value(a, m, fi, fr, v4, 22)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_listen_tcp4")
+        <<
+    }
+    <<
+}
+
+// Low-level socket / bind4 / listen_fd (MIR b=93/96/97).
+fn emit_instr_call_net_ll(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ia := types.mir_ia(m, fi, ii)
+    ib := types.mir_ib(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    if ib == 135 { // sys_interface_data(name) → sret tagged string
+        v0 := types.mir_marg_v(m, fi, ic)
+        a.load(0, 15, slot_off(fr.temp_slot[v0]))
+        a.mov(18, 0)
+        a.load(0, 15, slot_off(fr.temp_slot[v0]) - 8)
+        a.mov(19, 0)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_interface_data")
+        <<
+    }
+    if ib == 93 { // net_socket(domain, typ, proto) → sret tagged slot
+        m0 := ic
+        m1 := types.mir_marg_next(m, fi, m0)
+        m2 := types.mir_marg_next(m, fi, m1)
+        v0 := types.mir_marg_v(m, fi, m0)
+        v1 := types.mir_marg_v(m, fi, m1)
+        v2 := types.mir_marg_v(m, fi, m2)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        emit_load_value(a, m, fi, fr, v2, 20)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_socket")
+        <<
+    }
+    if ib == 96 { // net_bind4(fd, a,b,c,d,port) → sret tagged slot
+        m0 := ic
+        m1 := types.mir_marg_next(m, fi, m0)
+        m2 := types.mir_marg_next(m, fi, m1)
+        m3 := types.mir_marg_next(m, fi, m2)
+        m4 := types.mir_marg_next(m, fi, m3)
+        m5 := types.mir_marg_next(m, fi, m4)
+        v0 := types.mir_marg_v(m, fi, m0)
+        v1 := types.mir_marg_v(m, fi, m1)
+        v2 := types.mir_marg_v(m, fi, m2)
+        v3 := types.mir_marg_v(m, fi, m3)
+        v4 := types.mir_marg_v(m, fi, m4)
+        v5 := types.mir_marg_v(m, fi, m5)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        emit_load_value(a, m, fi, fr, v2, 20)
+        emit_load_value(a, m, fi, fr, v3, 21)
+        emit_load_value(a, m, fi, fr, v4, 22)
+        emit_load_value(a, m, fi, fr, v5, 23)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_bind4")
+        <<
+    }
+    if ib == 131 || ib == 132 { // sys_bind6/connect6(fd, ip16, port)
+        first := ic
+        second := types.mir_marg_next(m, fi, first)
+        third := types.mir_marg_next(m, fi, second)
+        v0 := types.mir_marg_v(m, fi, first)
+        v1 := types.mir_marg_v(m, fi, second)
+        v2 := types.mir_marg_v(m, fi, third)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]))
+        a.mov(19, 0)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]) - 8)
+        a.mov(20, 0)
+        emit_load_value(a, m, fi, fr, v2, 21)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        if ib == 131 { a.call("_rt_bind6") }
+        if ib == 132 { a.call("_rt_connect6") }
+        <<
+    }
+    if ib == 133 || ib == 134 { // sys_bind_unix/connect_unix(fd, path)
+        first := ic
+        second := types.mir_marg_next(m, fi, first)
+        v0 := types.mir_marg_v(m, fi, first)
+        v1 := types.mir_marg_v(m, fi, second)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]))
+        a.mov(19, 0)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]) - 8)
+        a.mov(20, 0)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        if ib == 133 { a.call("_rt_bind_unix") }
+        if ib == 134 { a.call("_rt_connect_unix") }
+        <<
+    }
+    if ib == 97 { // net_listen_fd(fd, backlog) → sret tagged slot
+        first := ic
+        second := types.mir_marg_next(m, fi, first)
+        v0 := types.mir_marg_v(m, fi, first)
+        v1 := types.mir_marg_v(m, fi, second)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_listen_fd")
+        <<
+    }
+    if ib == 94 { // net_udp_sendto(fd, addr, data) → sret tagged slot
+        m0 := ic
+        m1 := types.mir_marg_next(m, fi, m0)
+        m2 := types.mir_marg_next(m, fi, m1)
+        v0 := types.mir_marg_v(m, fi, m0)
+        v1 := types.mir_marg_v(m, fi, m1)
+        v2 := types.mir_marg_v(m, fi, m2)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]))
+        a.mov(19, 0)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]) - 8)
+        a.mov(20, 0)
+        a.load(0, 15, slot_off(fr.temp_slot[v2]))
+        a.mov(21, 0)
+        a.load(0, 15, slot_off(fr.temp_slot[v2]) - 8)
+        a.mov(22, 0)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_udp_sendto")
+        <<
+    }
+    if ib == 104 { // net_udp_recvfrom(fd, max) → sret throw slot
+        first := ic
+        second := types.mir_marg_next(m, fi, first)
+        v0 := types.mir_marg_v(m, fi, first)
+        v1 := types.mir_marg_v(m, fi, second)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_udp_recvfrom")
+        <<
+    }
+    if ib == 121 { // sys_setsockopt_timeo(fd, ns) → sret tagged slot
+        first := ic
+        second := types.mir_marg_next(m, fi, first)
+        v0 := types.mir_marg_v(m, fi, first)
+        v1 := types.mir_marg_v(m, fi, second)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_setsockopt_timeo")
+        <<
+    }
+    <<
+}
+
+// Wave C: accept/close — split from emit_instr_call_net (W3).
+fn emit_instr_call_net_fd(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ia := types.mir_ia(m, fi, ii)
+    ib := types.mir_ib(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    if ib == 67 || ib == 68 { // net_accept(fd) / net_conn_close(fd) → sret tagged slot
+        v0 := types.mir_marg_v(m, fi, ic)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        if ib == 67 { a.call("_rt_accept") }
+        if ib == 68 { a.call("_rt_conn_close") }
+        <<
+    }
+    <<
+}
+
+// Wave C: conn write/read — split from emit_instr_call_net (W3).
+fn emit_instr_call_net_rw(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ia := types.mir_ia(m, fi, ii)
+    ib := types.mir_ib(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    if ib == 69 { // net_conn_write(fd, data) → sret tagged slot
+        first := ic
+        second := types.mir_marg_next(m, fi, first)
+        v0 := types.mir_marg_v(m, fi, first)
+        v1 := types.mir_marg_v(m, fi, second)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]))
+        a.mov(19, 0)
+        a.load(0, 15, slot_off(fr.temp_slot[v1]) - 8)
+        a.mov(20, 0)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_conn_write")
+        <<
+    }
+    if ib == 70 { // net_conn_read(fd, max) → sret throw slot
+        first := ic
+        second := types.mir_marg_next(m, fi, first)
+        v0 := types.mir_marg_v(m, fi, first)
+        v1 := types.mir_marg_v(m, fi, second)
+        emit_load_value(a, m, fi, fr, v0, 18)
+        emit_load_value(a, m, fi, fr, v1, 19)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ia]))
+        a.call("_rt_conn_read")
+        <<
+    }
+    <<
+}
+
+// Wave C: thin dispatcher over dial/fd/rw — split emit_instr_call_net (W3).
+fn emit_instr_call_net(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    ib := types.mir_ib(m, fi, ii)
+    if ib == 65 || ib == 66 {
+        emit_instr_call_net_dial(a, m, fi, fr, ii)
+        <<
+    }
+    if ib == 93 || ib == 94 || ib == 96 || ib == 97 || ib == 104 || ib == 121 || ib == 131 || ib == 132 || ib == 133 || ib == 134 || ib == 135 {
+        emit_instr_call_net_ll(a, m, fi, fr, ii)
+        <<
+    }
+    if ib == 67 || ib == 68 {
+        emit_instr_call_net_fd(a, m, fi, fr, ii)
+        <<
+    }
+    if ib == 69 || ib == 70 {
+        emit_instr_call_net_rw(a, m, fi, fr, ii)
+        <<
+    }
+    <<
+}
+
+// Wave C: pid..env / host / cwd / tmp — split from emit_instr_call_sys (W3).

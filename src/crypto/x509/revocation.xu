@@ -1,0 +1,348 @@
+@crypto/x509
+
+#encoding/asn1
+#errors
+#time
+
+pub const revocation_off = 0
+pub const revocation_if_present = 1
+pub const revocation_require = 2
+
+pub struct RevocationList {
+    pub raw string
+    pub raw_tbs string
+    pub raw_issuer string
+    pub signature string
+    pub signature_algorithm int
+    pub this_update time.Time
+    pub next_update time.Time
+    pub next_update_present bool
+    pub authority_key_id string
+    pub number int
+    pub revoked_serials []string
+    pub has_unhandled_critical_extension bool
+}
+
+fn normalize_serial_bytes(raw &string) string {
+    mut first := 0
+    while first + 1 < raw.len && (raw[first] & 255) == 0 {
+        first = first + 1
+    }
+    if raw.len == 0 {
+        << ""
+    }
+    // Materialize the suffix instead of borrowing a dynamic slice. Besides
+    // keeping the returned serial independent from the DER input, this avoids
+    // backend-specific bounds handling for a slice whose start is computed
+    // from the INTEGER's sign padding.
+    mut out := []int{}
+    mut i := first
+    while i < raw.len {
+        out.push(raw[i] & 255)
+        i = i + 1
+    }
+    << string_from_bytes(out)
+}
+
+fn parse_enumerated_int(v &asn1.Value) int {
+    if v.class != asn1.class_universal || v.tag != 10 || v.constructed != 0 || v.bytes.len == 0 || (v.bytes[0] & 128) != 0 {
+        >> errors.new("x509: invalid CRL reason")
+    }
+    mut n := 0
+    mut i := 0
+    while i < v.bytes.len {
+        n = n * 256 + (v.bytes[i] & 255)
+        i = i + 1
+    }
+    << n
+}
+
+fn parse_crl_entry_extensions(v &asn1.Value) int {
+    if v.tag != asn1.tag_sequence || v.constructed == 0 {
+        >> errors.new("x509: invalid CRL entry extensions")
+    }
+    mut d := asn1.new_decoder(&v.bytes)
+    mut reason := -1
+    while !d.done() {
+        ext := d.next() or >>
+        if ext.tag != asn1.tag_sequence || ext.constructed == 0 {
+            >> errors.new("x509: invalid CRL entry extension")
+        }
+        mut ed := asn1.new_decoder(&ext.bytes)
+        oidv := ed.next() or >>
+        nxt := ed.next() or >>
+        ntag := nxt.tag
+        mut critical := false
+        mut payload := nxt
+        if ntag == asn1.tag_boolean {
+            critical = payload.as_bool() or >>
+            payload = ed.next() or >>
+        }
+        if payload.tag != asn1.tag_octet_string || !ed.done() {
+            >> errors.new("x509: invalid CRL entry extension")
+        }
+        arcs := oidv.as_oid() or >>
+        mut handled := false
+        if oid_eq4(&arcs, 2, 5, 29, 21) {
+            inner := asn1.unmarshal(&payload.bytes) or >>
+            reason = parse_enumerated_int(&inner) or >>
+            handled = true
+        }
+        if critical && !handled {
+            >> errors.new("x509: unhandled critical CRL entry extension")
+        }
+    }
+    << reason
+}
+
+struct ParsedCRLExtensions {
+    authority_key_id string
+    number int
+    unhandled bool
+}
+
+fn parse_crl_extensions(v &asn1.Value) ParsedCRLExtensions {
+    mut wrap := asn1.new_decoder(&v.bytes)
+    seq := wrap.next() or >>
+    if seq.tag != asn1.tag_sequence || seq.constructed == 0 || !wrap.done() {
+        >> errors.new("x509: invalid CRL extensions")
+    }
+    mut d := asn1.new_decoder(&seq.bytes)
+    mut aki := ""
+    mut number := -1
+    mut unhandled := false
+    while !d.done() {
+        ext := d.next() or >>
+        if ext.tag != asn1.tag_sequence || ext.constructed == 0 {
+            >> errors.new("x509: invalid CRL extension")
+        }
+        mut ed := asn1.new_decoder(&ext.bytes)
+        oidv := ed.next() or >>
+        nxt := ed.next() or >>
+        ntag := nxt.tag
+        mut critical := false
+        mut payload := nxt
+        if ntag == asn1.tag_boolean {
+            critical = payload.as_bool() or >>
+            payload = ed.next() or >>
+        }
+        if payload.tag != asn1.tag_octet_string || !ed.done() {
+            >> errors.new("x509: invalid CRL extension")
+        }
+        arcs := oidv.as_oid() or >>
+        mut handled := false
+        if oid_eq4(&arcs, 2, 5, 29, 35) {
+            aki = parse_authority_key_id(payload.bytes + "") or >>
+            handled = true
+        } else if oid_eq4(&arcs, 2, 5, 29, 20) {
+            value := asn1.unmarshal(&payload.bytes) or >>
+            if value.tag != asn1.tag_integer || value.rest.len != 0 {
+                >> errors.new("x509: invalid CRL number")
+            }
+            number = value.as_int() or >>
+            if number < 0 {
+                >> errors.new("x509: invalid CRL number")
+            }
+            handled = true
+        }
+        if critical && !handled {
+            unhandled = true
+        }
+    }
+    << ParsedCRLExtensions{authority_key_id: aki, number: number, unhandled: unhandled}
+}
+
+pub fn parse_revocation_list(der string) RevocationList {
+    raw := der + ""
+    top := asn1.unmarshal(&raw) or >>
+    if top.tag != asn1.tag_sequence || top.constructed == 0 || top.rest.len != 0 {
+        >> errors.new("x509: malformed CRL")
+    }
+    body := top.bytes + ""
+    tbs := asn1.parse_at(&body, 0) or >>
+    tbs_end := body.len - tbs.rest.len
+    raw_tbs := body[0:tbs_end]
+    outer_alg := asn1.parse_at(&body, tbs_end) or >>
+    outer_alg_end := body.len - outer_alg.rest.len
+    signature_v := asn1.parse_at(&body, outer_alg_end) or >>
+    signature_oid := parse_algo_oid(outer_alg) or >>
+    signature_algorithm := sig_algo_from_oid(&signature_oid)
+    signature := signature_v.as_bit_string() or >>
+
+    tbs_body := tbs.bytes + ""
+    mut off := 0
+    mut current := asn1.parse_at(&tbs_body, off) or >>
+    if current.tag == asn1.tag_integer {
+        version := current.as_int() or >>
+        if version != 1 {
+            >> errors.new("x509: unsupported CRL version")
+        }
+        off = tbs_body.len - current.rest.len
+        current = asn1.parse_at(&tbs_body, off) or >>
+    }
+    current_rest_len := current.rest.len
+    inner_alg_oid := parse_algo_oid(current) or >>
+    if sig_algo_from_oid(&inner_alg_oid) != signature_algorithm {
+        >> errors.new("x509: CRL signature algorithm mismatch")
+    }
+    off = tbs_body.len - current_rest_len
+
+    issuer_start := off
+    issuer := asn1.parse_at(&tbs_body, off) or >>
+    off = tbs_body.len - issuer.rest.len
+    raw_issuer := tbs_body[issuer_start:off]
+
+    this_v := asn1.parse_at(&tbs_body, off) or >>
+    this_rest_len := this_v.rest.len
+    this_update := parse_time(&this_v) or >>
+    off = tbs_body.len - this_rest_len
+    mut next_update := time.unix(0, 0)
+    mut next_present := false
+    if off < tbs_body.len {
+        next_v := asn1.parse_at(&tbs_body, off) or >>
+        next_tag := next_v.tag
+        if next_tag == asn1.tag_utc_time || next_tag == asn1.tag_generalized_time {
+            next_rest_len := next_v.rest.len
+            next_update = parse_time(&next_v) or >>
+            next_present = true
+            off = tbs_body.len - next_rest_len
+        }
+    }
+
+    mut revoked := []string{}
+    if off < tbs_body.len {
+        revoked_v := asn1.parse_at(&tbs_body, off) or >>
+        if revoked_v.tag == asn1.tag_sequence && revoked_v.class == asn1.class_universal {
+            revoked_rest_len := revoked_v.rest.len
+            mut rd := asn1.new_decoder(&revoked_v.bytes)
+            while !rd.done() {
+                entry := rd.next() or >>
+                if entry.tag != asn1.tag_sequence || entry.constructed == 0 {
+                    >> errors.new("x509: invalid revoked certificate entry")
+                }
+                mut ed := asn1.new_decoder(&entry.bytes)
+                serial_v := ed.next() or >>
+                date_v := ed.next() or >>
+                if serial_v.tag != asn1.tag_integer {
+                    >> errors.new("x509: invalid revoked certificate serial")
+                }
+                revocation_date := parse_time(&date_v) or >>
+                mut reason := -1
+                if !ed.done() {
+                    extensions := ed.next() or >>
+                    reason = parse_crl_entry_extensions(&extensions) or >>
+                }
+                if !ed.done() || revocation_date.sec < 0 {
+                    >> errors.new("x509: invalid revoked certificate entry")
+                }
+                // removeFromCRL is meaningful only with delta CRLs, which are
+                // unsupported. Do not report the entry as revoked.
+                if reason != 8 {
+                    serial := normalize_serial_bytes(&serial_v.bytes)
+                    revoked.push(serial)
+                }
+            }
+            off = tbs_body.len - revoked_rest_len
+        }
+    }
+
+    mut aki := ""
+    mut number := -1
+    mut unhandled := false
+    if off < tbs_body.len {
+        extensions_v := asn1.parse_at(&tbs_body, off) or >>
+        if extensions_v.class != asn1.class_context || extensions_v.tag != 0 || extensions_v.constructed == 0 {
+            >> errors.new("x509: invalid CRL trailing data")
+        }
+        extensions_rest_len := extensions_v.rest.len
+        ext := parse_crl_extensions(&extensions_v) or >>
+        aki = ext.authority_key_id + ""
+        number = ext.number
+        unhandled = ext.unhandled
+        off = tbs_body.len - extensions_rest_len
+    }
+    if off != tbs_body.len {
+        >> errors.new("x509: invalid CRL trailing data")
+    }
+    << RevocationList{
+        raw: raw,
+        raw_tbs: raw_tbs,
+        raw_issuer: raw_issuer,
+        signature: signature,
+        signature_algorithm: signature_algorithm,
+        this_update: this_update,
+        next_update: next_update,
+        next_update_present: next_present,
+        authority_key_id: aki,
+        number: number,
+        revoked_serials: revoked,
+        has_unhandled_critical_extension: unhandled
+    }
+}
+
+fn serial_is_revoked(serial &string, revoked &[]string) bool {
+    mut i := 0
+    while i < revoked.len {
+        if revoked[i] == (serial + "") {
+            << true
+        }
+        i = i + 1
+    }
+    << false
+}
+
+// -1 = relevant material invalid/revoked, 0 = no material, 1 = valid/good.
+fn crl_status(cert_serial &string, cert_raw_issuer &string, issuer_public_key_algorithm int, issuer_public_key &string, issuer_key_usage_present bool, issuer_key_usage int, issuer_subject_key_id &string, lists &[]string, now time.Time) int {
+    // CRL parsing allocates. Snapshot borrowed pool fields first so verification
+    // never depends on a borrow surviving those allocations.
+    issuer_key := issuer_public_key + ""
+    issuer_ski := issuer_subject_key_id + ""
+    wanted_issuer := cert_raw_issuer + ""
+    wanted_serial := cert_serial + ""
+    mut saw_relevant := false
+    mut good := false
+    mut i := 0
+    while i < lists.len {
+        encoded := lists[i] + ""
+        list := parse_revocation_list(encoded) or (err) {
+            << -1
+        }
+        if list.raw_issuer == wanted_issuer {
+            saw_relevant = true
+            if (!issuer_key_usage_present || (issuer_key_usage & key_usage_crl_sign) != 0) && !list.has_unhandled_critical_extension && !now.before(list.this_update) && list.next_update_present && !now.after(list.next_update) {
+                if list.authority_key_id.len == 0 || issuer_ski.len == 0 || list.authority_key_id == issuer_ski {
+                    verify_sig(issuer_public_key_algorithm, issuer_key + "", list.signature_algorithm, list.raw_tbs + "", list.signature + "") or (err) {
+                        i = i + 1
+                        ->
+                    }
+                    good = true
+                    if serial_is_revoked(&wanted_serial, &list.revoked_serials) {
+                        << -1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if good {
+        << 1
+    }
+    if saw_relevant {
+        << -1
+    }
+    << 0
+}
+
+fn revocation_edge_ok(cert_serial &string, cert_raw_issuer &string, issuer_public_key_algorithm int, issuer_public_key &string, issuer_key_usage_present bool, issuer_key_usage int, issuer_subject_key_id &string, lists &[]string, mode int, now time.Time) bool {
+    if mode == revocation_off {
+        << true
+    }
+    if mode != revocation_if_present && mode != revocation_require {
+        << false
+    }
+    status := crl_status(cert_serial, cert_raw_issuer, issuer_public_key_algorithm, issuer_public_key, issuer_key_usage_present, issuer_key_usage, issuer_subject_key_id, lists, now)
+    if status < 0 || (mode == revocation_require && status != 1) {
+        << false
+    }
+    << true
+}

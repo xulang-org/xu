@@ -1,0 +1,258 @@
+@main
+
+#internal/semver
+#internal/modulepath
+#internal/modulezip
+#encoding/json
+#os
+#os/exec
+#path
+#path/filepath
+
+fn require_version(s &string) string {
+    version := semver.canonical(s)
+    if semver.valid(&version) { << version }
+    << ""
+}
+
+fn require_check_version(root &string, key &string, locator &string) {
+    version := require_version(locator)
+    if version.len == 0 { << }
+    manifest := root + "/xu.xun"
+    body := read_file(manifest) or (err) { eprintln("require: missing version manifest")
+        <<< 1 }
+    lines := split_lines(body)
+    for i in 0:lines.len {
+        row := lines[i]
+        if val_has_prefix(&row, "version:") {
+            mut raw := xun_scalar_text(xun_trim(row[8:row.len]))
+            if raw.len >= 2 && raw[0] == 34 && raw[raw.len - 1] == 34 { raw = raw[1:raw.len - 1] }
+            actual := semver.canonical(&raw)
+            if actual != version { eprintln("require '" + key + "': requested version does not match xu.xun")
+                <<< 1 }
+            <<
+        }
+    }
+    eprintln("require '" + key + "': missing module version")
+    <<< 1
+}
+
+fn require_version_vendor(project &string, key &string, locator &string) string {
+    vdir := project + "/vendor/.xu-versions"
+    source := require_source_key(key, locator)
+    << vdir + "/" + source
+}
+
+fn require_proxy_private(key &string) bool {
+    config := os.lookup_env("XUNOPROXY")
+    mut patterns := config.value + ""
+    if !config.found { patterns = env_get("XUPRIVATE") }
+    mut start := 0
+    for i in 0:patterns.len + 1 {
+        if i != patterns.len && patterns[i] != 44 { -> }
+        pattern := patterns[start:i]
+        start = i + 1
+        if pattern.len == 0 { -> }
+        mut want := 0
+        for j in 0:pattern.len { if pattern[j] == 47 { want += 1 } }
+        mut end := key.len
+        mut slashes := 0
+        for j in 0:key.len {
+            if key[j] == 47 {
+                if slashes == want { end = j
+                    <- }
+                slashes += 1
+            }
+        }
+        prefix := key[0:end]
+        matched := path.matches(&pattern, &prefix) or (err) { eprintln("require: invalid XUNOPROXY/XUPRIVATE pattern")
+            <<< 1 }
+        if matched { << true }
+    }
+    << false
+}
+
+// Return an HTTP status, or -1 for a transport error. Keep status handling
+// separate from parsing so a malformed successful response never falls back.
+fn require_proxy_get(url &string, dest &string) int {
+    if val_has_prefix(url, "file://") {
+        name := url[7:url.len]
+        if !filepath.is_abs(&name) { eprintln("require: file proxy must use an absolute path")
+            <<< 1 }
+        body := read_file(name) or (err) { << 404 }
+        write_file(dest + "", body) or (err) { eprintln("require: cannot write proxy response")
+            <<< 1 }
+        << 200
+    }
+    mut command := exec.command("curl", "-sSL", "--connect-timeout", "3", "--max-time", "20", "--max-filesize", "67108864", "--proto", "=http,https", "--proto-redir", "=http,https", "--write-out", "%{http_code}", "-o", dest + "", "--", url + "")
+    status := command.output() or (err) { << -1 }
+    mut code := 0
+    if status.len != 3 { << -1 }
+    for i in 0:status.len {
+        if status[i] < 48 || status[i] > 57 { << -1 }
+        code = code * 10 + status[i] - 48
+    }
+    << code
+}
+
+fn require_proxy_bundle(base &string, key &string, version &string, stage &string) int {
+    escaped := modulepath.storage_path(key)
+    escaped_version := modulepath.storage_path(version)
+    prefix := base + "/" + escaped + "/@v/" + escaped_version
+    mut bodies := []string{}
+    suffixes := [".info", ".mod", ".zip"]
+    // Download outside the content stage; transport artifacts never become
+    // source bytes or vendor content and cannot override cache markers.
+    for i in 0:suffixes.len {
+        response := stage + ".response"
+        url := prefix + suffixes[i]
+        status := require_proxy_get(&url, &response)
+        if status != 200 {
+            os.remove(response) or (err) { << status }
+            << status
+        }
+        body := read_file(response + "") or (err) { eprintln("require: cannot read proxy response")
+            <<< 1 }
+        os.remove(response) or (err) { eprintln("require: cannot remove proxy response")
+            <<< 1 }
+        bodies.push(body)
+    }
+    info := bodies[0]
+    doc := json.parse(&info)
+    if !doc.ok() || !doc.is_dict(doc.root()) { eprintln("require: malformed proxy .info")
+        <<< 1 }
+    vi := doc.get(doc.root(), "Version")
+    if vi < 0 || !doc.is_string(vi) { eprintln("require: proxy .info version mismatch")
+        <<< 1 }
+    reported := doc.as_string(vi) or (err) { eprintln("require: invalid proxy version field")
+        <<< 1 }
+    if !str_eq(&reported, version) { eprintln("require: proxy .info version mismatch")
+        <<< 1 }
+    manifest := bodies[1]
+    identity := xun_manifest_module("proxy .mod", manifest + "")
+    if !str_eq(&identity, key) { eprintln("require: proxy .mod module mismatch")
+        <<< 1 }
+    archive := bodies[2]
+    modulezip.extract(&archive, stage, key, version) or (err) { eprintln(err.msg())
+        <<< 1 }
+    archived_manifest := read_file(stage + "/xu.xun") or (err) { eprintln("require: module ZIP has no xu.xun")
+        <<< 1 }
+    if archived_manifest != manifest { eprintln("require: proxy .mod differs from module ZIP xu.xun")
+        <<< 1 }
+    require_check_external_root(stage, key)
+    require_check_version(stage, key, version)
+    << 200
+}
+
+fn require_direct_version(stage &string, key &string, version &string) {
+    // The registered GitHub organisation has an unambiguous repository root.
+    // Other hosts use an explicit git: locator or an XUPROXY endpoint.
+    if !val_has_prefix(key, "github.com/") { eprintln("require: direct version discovery supports github.com; configure XUPROXY or use git:URL@ref")
+        <<< 1 }
+    mut cut := key.len
+    mut slashes := 0
+    for i in 0:key.len {
+        if key[i] == 47 {
+            slashes += 1
+            if slashes == 3 { cut = i
+                <- }
+        }
+    }
+    repo := key[0:cut]
+    mut sub := ""
+    if cut < key.len { sub = key[cut + 1:key.len] }
+    mut ref := version + ""
+    mut tag_sub := sub + ""
+    // The semantic /vN suffix is absent from a repository's tag prefix.
+    // A nested module client/v2 uses client/v2.0.0, not client/v2/v2.0.0.
+    if sub.len > 0 {
+        raw := version[1:version.len]
+        mut major_end := 0
+        for i in 0:raw.len { if raw[i] == 46 { major_end = i
+            <- } }
+        major := "v" + raw[0:major_end]
+        if sub == major { tag_sub = "" }
+        else {
+            suffix := "/" + major
+            if str_ends_with(&sub, &suffix) { tag_sub = sub[0:sub.len - suffix.len] }
+        }
+        if tag_sub.len > 0 { ref = tag_sub + "/" + version }
+    }
+    url := "https://" + repo + ".git"
+    mut clone := exec.command("git", "-c", "protocol.ext.allow=never", "clone", "--no-checkout", "--", url, stage + "")
+    clone.run() or (err) { eprintln("require: direct git clone failed")
+        <<< 1 }
+    mut checkout := exec.command("git", "-C", stage + "", "checkout", "--detach", ref, "--")
+    checkout.run() or (err) { eprintln("require: direct git checkout failed")
+        <<< 1 }
+    if sub.len > 0 {
+        mut child := stage + "/" + sub
+        mut child_manifest := child + "/xu.xun"
+        if !path_exists(&child_manifest) && tag_sub.len > 0 && tag_sub != sub {
+            child = stage + "/" + tag_sub
+            child_manifest = child + "/xu.xun"
+        }
+        if path_exists(&child_manifest) {
+            module_stage := stage + ".module"
+            vendor_copy_tree(child, module_stage + "")
+            vendor_remove_tree(stage + "")
+            os.rename(module_stage, stage + "") or (err) { eprintln("require: cannot stage direct submodule")
+                <<< 1 }
+        } else {
+            if tag_sub.len > 0 { eprintln("require: direct submodule is missing")
+                <<< 1 }
+        }
+    }
+    require_check_external_root(stage, key)
+    require_check_version(stage, key, version)
+}
+
+fn resolve_semver_require(project &string, mod_id string, want string) string {
+    version := require_version(&want)
+    require_validate_locator(&mod_id, &version)
+    root := require_cache_root(&mod_id, &version)
+    stamp := root + "/.ok"
+    if path_exists(&stamp) { require_verify_cache(project, &mod_id, &version, &root)
+        require_check_version(&root, &mod_id, &version)
+        << root }
+    require_download_allowed(&mod_id)
+    mut guard := require_cache_guard(&root)
+    if path_exists(&stamp) { require_verify_cache(project, &mod_id, &version, &root)
+        guard.close() or (err) { eprintln(err.msg())
+            <<< 1 }
+        << root }
+    stage := require_stage(&root)
+    mut proxies := env_get("XUPROXY")
+    if proxies.len == 0 || require_proxy_private(&mod_id) { proxies = "direct" }
+    mut start := 0
+    mut ready := false
+    for i in 0:proxies.len + 1 {
+        if i != proxies.len && proxies[i] != 44 && proxies[i] != 124 { -> }
+        mut proxy := xun_trim(proxies[start:i])
+        start = i + 1
+        if proxy == "off" { eprintln("require: XUPROXY=off forbids version downloads")
+            <<< 1 }
+        if proxy == "direct" { require_direct_version(&stage, &mod_id, &version)
+            ready = true
+            <- }
+        if proxy.len == 0 { eprintln("require: empty XUPROXY entry")
+            <<< 1 }
+        if !val_has_prefix(&proxy, "https://") && !val_has_prefix(&proxy, "http://") && !val_has_prefix(&proxy, "file://") { eprintln("require: XUPROXY must use http(s), file://, direct or off")
+            <<< 1 }
+        mut trim_floor := 0
+        if val_has_prefix(&proxy, "file://") { trim_floor = 7 }
+        while proxy.len > trim_floor && proxy[proxy.len - 1] == 47 { proxy = proxy[0:proxy.len - 1] }
+        status := require_proxy_bundle(&proxy, &mod_id, &version, &stage)
+        if status == 200 { ready = true
+            <- }
+        if i == proxies.len || (proxies[i] != 124 && status != 404 && status != 410) { eprintln("require: proxy request failed (status " + str(status) + ")")
+            <<< 1 }
+    }
+    if !ready { eprintln("require: no proxy provided the module version")
+        <<< 1 }
+    require_publish(stage, root + "")
+    require_verify_cache(project, &mod_id, &version, &root)
+    guard.close() or (err) { eprintln(err.msg())
+        <<< 1 }
+    << root
+}

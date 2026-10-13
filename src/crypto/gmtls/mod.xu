@@ -1,0 +1,425 @@
+@crypto/gmtls
+
+#errors
+#net
+#crypto/sm3
+
+// GMTLS/TLCP (GB/T 38636) client subset. Xu addition — Go has no
+// crypto/gmtls. Cipher suites ECC/ECDHE × SM4-GCM/CBC-SM3; dual SM2
+// certs. ECDHE uses GM/T 0003.3 (server=initiator) and requires client
+// dual certs. CBC is TLS 1.1 style (explicit IV, HMAC-SM3 then SM4-CBC).
+// Record/handshake are software; does not use crypto/tls platform ncall.
+// In-process peer is server() over net.pipe — not a Listen/Accept
+// product API. After handshake, Conn.close sends an encrypted
+// close_notify (warning, description 0); Conn.read throws
+// "crypto/gmtls: close notify" on that record. Other alerts still
+// throw "crypto/gmtls: alert". Does not close the pipe.
+//
+// ECC SKE is GM/T 0009 DER SEQUENCE{r,s}; CKE is DER SM2Cipher.
+// ECDHE SKE/CKE carry named curveSM2 (41) + uncompressed point.
+// Peers that still send raw r||s (64) or C1||C3||C2 (leading 0x04) are
+// accepted on the ECC path. Zero C, not a commercial-crypto certification.
+
+pub const version_gmtls11 = 257
+pub const ecc_sm4_gcm_sm3 = 57427
+pub const ecdhe_sm4_gcm_sm3 = 57425
+pub const ecc_sm4_cbc_sm3 = 57363
+pub const ecdhe_sm4_cbc_sm3 = 57361
+
+// sign_key / enc_key: 32-byte raw d, PKCS#8/SEC1 DER, or PEM
+// (PRIVATE KEY / EC PRIVATE KEY / SM2 PRIVATE KEY).
+// sign_cert / enc_cert: DER or PEM CERTIFICATE / X509 CERTIFICATE.
+// server_name: ClientHello SNI (RFC 6066) when non-empty; client also
+// matches it against the server sign certificate DNS SAN / CN unless
+// empty or insecure_skip_verify.
+// client_name: ECDHE server matches it against the client sign
+// certificate DNS SAN / CN unless empty or insecure_skip_verify
+// (does not check the encryption certificate).
+// ECDHE client Config.sign_cert/enc_cert are the client's dual certs
+// and need not match the server. Conn.peer_sign_cert / peer_enc_cert
+// are the peer's presented dual certs (DER). ECC server leaves them
+// empty (no client certs).
+pub struct Config {
+    pub server_name string
+    pub client_name string
+    pub insecure_skip_verify bool
+    pub sign_cert string
+    pub sign_key string
+    pub enc_cert string
+    pub enc_key string
+    pub cipher_suite int
+}
+
+pub struct Conn {
+    pipe net.PipeConn
+    pub handshake_complete bool
+    pub cipher_suite int
+    pub server_name string
+    pub peer_sign_cert string
+    pub peer_enc_cert string
+    ver int
+    wkey string
+    rkey string
+    wiv string
+    riv string
+    wmac string
+    rmac string
+    wseq int
+    rseq int
+    sent_close int
+}
+
+fn suite_of(cfg &Config) int {
+    s := cfg.cipher_suite
+    if s == 0 {
+        << ecc_sm4_gcm_sm3
+    }
+    if s != ecc_sm4_gcm_sm3 && s != ecdhe_sm4_gcm_sm3 && s != ecc_sm4_cbc_sm3 && s != ecdhe_sm4_cbc_sm3 {
+        >> errors.new("crypto/gmtls: cipher suite")
+    }
+    << s
+}
+
+fn is_ecdhe(suite int) bool {
+    << suite == ecdhe_sm4_gcm_sm3 || suite == ecdhe_sm4_cbc_sm3
+}
+
+fn is_cbc(suite int) bool {
+    << suite == ecc_sm4_cbc_sm3 || suite == ecdhe_sm4_cbc_sm3
+}
+
+fn split_keys(kb &string, client_write bool) []string {
+    raw := kb + ""
+    ck := raw[0:16] + ""
+    sk := raw[16:32] + ""
+    civ := raw[32:36] + ""
+    siv := raw[36:40] + ""
+    mut out := []string{}
+    if client_write {
+        out.push(ck)
+        out.push(sk)
+        out.push(civ)
+        out.push(siv)
+    } else {
+        out.push(sk)
+        out.push(ck)
+        out.push(siv)
+        out.push(civ)
+    }
+    empty := ""
+    out.push(empty + "")
+    out.push(empty + "")
+    << out
+}
+
+fn split_keys_cbc(kb &string, client_write bool) []string {
+    raw := kb + ""
+    cm := raw[0:32] + ""
+    sm := raw[32:64] + ""
+    ck := raw[64:80] + ""
+    sk := raw[80:96] + ""
+    empty := ""
+    mut out := []string{}
+    if client_write {
+        out.push(ck)
+        out.push(sk)
+        out.push(empty + "")
+        out.push(empty + "")
+        out.push(cm)
+        out.push(sm)
+    } else {
+        out.push(sk)
+        out.push(ck)
+        out.push(empty + "")
+        out.push(empty + "")
+        out.push(sm)
+        out.push(cm)
+    }
+    << out
+}
+
+fn derive_keys(suite int, ms &string, cr &string, sr &string, client_write bool) []string {
+    if is_cbc(suite) {
+        kb := key_block_n(ms, cr, sr, 96)
+        << split_keys_cbc(&kb, client_write)
+    }
+    kb := key_block(ms, cr, sr)
+    << split_keys(&kb, client_write)
+}
+
+pub fn client(c net.PipeConn, cfg &Config) Conn {
+    suite := suite_of(cfg) or >>
+    if is_ecdhe(suite) {
+        << client_ecdhe(c, cfg, suite)
+    }
+    ver := version_gmtls11
+    skip := cfg.insecure_skip_verify
+    name := cfg.server_name + ""
+    cr := make_random() or >>
+    ch := make_client_hello(ver, &cr, suite, &name)
+    rec := rec_wrap(rec_hs, ver, &ch)
+    pipe_write(c, rec) or >>
+    mut hs := sm3.new()
+    hs.write(&ch)
+
+    shf := read_hs_frag(c) or >>
+    sht := parse_hs(&shf) or >>
+    if sht != hs_sh {
+        >> errors.new("crypto/gmtls: expected server hello")
+    }
+    shb := hs_body(&shf) or >>
+    sr := parse_server_hello(shb, suite) or >>
+    hs.write(&shf)
+
+    cf := read_hs_frag(c) or >>
+    ct := parse_hs(&cf) or >>
+    if ct != hs_cert {
+        >> errors.new("crypto/gmtls: expected certificate")
+    }
+    cb := hs_body(&cf) or >>
+    certs := parse_two_certs(cb) or >>
+    hs.write(&cf)
+    sign_der := certs[0] + ""
+    enc_der := certs[1] + ""
+    maybe_verify_cert(&sign_der, skip) or >>
+    maybe_verify_cert(&enc_der, skip) or >>
+    verify_server_name(&sign_der, &name, skip) or >>
+    sign_pub := cert_pub(&sign_der) or >>
+    enc_pub := cert_pub(&enc_der) or >>
+
+    kf := read_hs_frag(c) or >>
+    kt := parse_hs(&kf) or >>
+    if kt != hs_ske {
+        >> errors.new("crypto/gmtls: expected server key exchange")
+    }
+    kbod := hs_body(&kf) or >>
+    parse_ske(kbod, &cr, &sr, &enc_der, &sign_pub) or >>
+    hs.write(&kf)
+
+    df := read_hs_frag(c) or >>
+    dt := parse_hs(&df) or >>
+    if dt != hs_shd {
+        >> errors.new("crypto/gmtls: expected server hello done")
+    }
+    hs.write(&df)
+
+    pms := make_pms(ver) or >>
+    cke := make_cke(&enc_pub, &pms) or >>
+    crec := rec_wrap(rec_hs, ver, &cke)
+    pipe_write(c, crec) or >>
+    hs.write(&cke)
+
+    ms := master_secret(&pms, &cr, &sr)
+    keys := derive_keys(suite, &ms, &cr, &sr, true)
+    wkey := keys[0] + ""
+    rkey := keys[1] + ""
+    wiv := keys[2] + ""
+    riv := keys[3] + ""
+    wmac := keys[4] + ""
+    rmac := keys[5] + ""
+
+    ccs := ccs_rec(ver)
+    pipe_write(c, ccs) or >>
+
+    th := hs.sum_bytes()
+    clab := "client finished"
+    fin := make_finished(&ms, &clab, &th)
+    erec := rec_seal(suite, &wkey, &wiv, &wmac, 0, rec_hs, ver, &fin) or >>
+    pipe_write(c, erec) or >>
+    hs.write(&fin)
+
+    sraw := pipe_read(c) or >>
+    expect_ccs(sraw) or >>
+
+    fraw := pipe_read(c) or >>
+    fpt := rec_open(suite, &rkey, &riv, &rmac, 0, fraw) or >>
+    ft := parse_hs(&fpt) or >>
+    if ft != hs_fin {
+        >> errors.new("crypto/gmtls: expected finished")
+    }
+    fb := hs_body(&fpt) or >>
+    th2 := hs.sum_bytes()
+    slab := "server finished"
+    parse_finished(fb, &ms, &slab, &th2) or >>
+
+    << Conn{
+        pipe: c,
+        handshake_complete: true,
+        cipher_suite: suite,
+        server_name: name,
+        peer_sign_cert: sign_der,
+        peer_enc_cert: enc_der,
+        ver: ver,
+        wkey: wkey,
+        rkey: rkey,
+        wiv: wiv,
+        riv: riv,
+        wmac: wmac,
+        rmac: rmac,
+        wseq: 1,
+        rseq: 1,
+        sent_close: 0
+    }
+}
+
+pub fn server(c net.PipeConn, cfg &Config) Conn {
+    suite := suite_of(cfg) or >>
+    if is_ecdhe(suite) {
+        << server_ecdhe(c, cfg, suite)
+    }
+    ver := version_gmtls11
+    sign_der := decode_sm2_cert(&cfg.sign_cert) or >>
+    enc_der := decode_sm2_cert(&cfg.enc_cert) or >>
+    sign_key := decode_sm2_key(&cfg.sign_key) or >>
+    enc_key := decode_sm2_key(&cfg.enc_key) or >>
+    if sign_der.len == 0 || enc_der.len == 0 || sign_key.len != 32 || enc_key.len != 32 {
+        >> errors.new("crypto/gmtls: server needs dual SM2 certificates and keys")
+    }
+
+    chf := read_hs_frag(c) or >>
+    cht := parse_hs(&chf) or >>
+    if cht != hs_ch {
+        >> errors.new("crypto/gmtls: expected client hello")
+    }
+    chb := hs_body(&chf) or >>
+    hello := parse_client_hello(chb, suite) or >>
+    cr := hello[0] + ""
+    sni := hello[1] + ""
+    mut hs := sm3.new()
+    hs.write(&chf)
+
+    sr := make_random() or >>
+    sh := make_server_hello(ver, &sr, suite)
+    pipe_write(c, rec_wrap(rec_hs, ver, &sh)) or >>
+    hs.write(&sh)
+
+    cert := make_certificate(&sign_der, &enc_der)
+    pipe_write(c, rec_wrap(rec_hs, ver, &cert)) or >>
+    hs.write(&cert)
+
+    ske := make_ske(&cr, &sr, &enc_der, &sign_key) or >>
+    pipe_write(c, rec_wrap(rec_hs, ver, &ske)) or >>
+    hs.write(&ske)
+
+    shd := make_shd()
+    pipe_write(c, rec_wrap(rec_hs, ver, &shd)) or >>
+    hs.write(&shd)
+
+    ckf := read_hs_frag(c) or >>
+    ckt := parse_hs(&ckf) or >>
+    if ckt != hs_cke {
+        >> errors.new("crypto/gmtls: expected client key exchange")
+    }
+    ckb := hs_body(&ckf) or >>
+    pms := parse_cke(ckb, &enc_key) or >>
+    hs.write(&ckf)
+
+    ms := master_secret(&pms, &cr, &sr)
+    keys := derive_keys(suite, &ms, &cr, &sr, false)
+    wkey := keys[0] + ""
+    rkey := keys[1] + ""
+    wiv := keys[2] + ""
+    riv := keys[3] + ""
+    wmac := keys[4] + ""
+    rmac := keys[5] + ""
+
+    craw := pipe_read(c) or >>
+    expect_ccs(craw) or >>
+
+    fraw := pipe_read(c) or >>
+    fpt := rec_open(suite, &rkey, &riv, &rmac, 0, fraw) or >>
+    ft := parse_hs(&fpt) or >>
+    if ft != hs_fin {
+        >> errors.new("crypto/gmtls: expected finished")
+    }
+    fb := hs_body(&fpt) or >>
+    th := hs.sum_bytes()
+    clab := "client finished"
+    parse_finished(fb, &ms, &clab, &th) or >>
+    hs.write(&fpt)
+
+    ccs := ccs_rec(ver)
+    pipe_write(c, ccs) or >>
+    th2 := hs.sum_bytes()
+    slab := "server finished"
+    fin := make_finished(&ms, &slab, &th2)
+    erec := rec_seal(suite, &wkey, &wiv, &wmac, 0, rec_hs, ver, &fin) or >>
+    pipe_write(c, erec) or >>
+
+    << Conn{
+        pipe: c,
+        handshake_complete: true,
+        cipher_suite: suite,
+        server_name: sni,
+        peer_sign_cert: "",
+        peer_enc_cert: "",
+        ver: ver,
+        wkey: wkey,
+        rkey: rkey,
+        wiv: wiv,
+        riv: riv,
+        wmac: wmac,
+        rmac: rmac,
+        wseq: 1,
+        rseq: 1,
+        sent_close: 0
+    }
+}
+
+pub fn (c &mut Conn) write(data &string) int {
+    wk := c.wkey + ""
+    wiv := c.wiv + ""
+    wmac := c.wmac + ""
+    seq := c.wseq
+    ver := c.ver
+    suite := c.cipher_suite
+    rec := rec_seal(suite, &wk, &wiv, &wmac, seq, rec_app, ver, data) or >>
+    p := c.pipe
+    pipe_write(p, rec) or >>
+    c.wseq = c.wseq + 1
+    << data.len
+}
+
+pub fn (c &mut Conn) read() string {
+    rk := c.rkey + ""
+    riv := c.riv + ""
+    rmac := c.rmac + ""
+    seq := c.rseq
+    suite := c.cipher_suite
+    p := c.pipe
+    raw := pipe_read(p) or >>
+    typ := parse_rec(&raw) or >>
+    if typ == rec_alert {
+        pt := rec_open(suite, &rk, &riv, &rmac, seq, raw) or >>
+        c.rseq = c.rseq + 1
+        if alert_is_close(&pt) {
+            >> errors.new("crypto/gmtls: close notify")
+        }
+        >> errors.new("crypto/gmtls: alert")
+    }
+    if typ != rec_app {
+        >> errors.new("crypto/gmtls: expected application data")
+    }
+    pt := rec_open(suite, &rk, &riv, &rmac, seq, raw) or >>
+    c.rseq = c.rseq + 1
+    << pt + ""
+}
+
+pub fn (c &mut Conn) close() int {
+    if c.sent_close != 0 {
+        << 0
+    }
+    wk := c.wkey + ""
+    wiv := c.wiv + ""
+    wmac := c.wmac + ""
+    seq := c.wseq
+    ver := c.ver
+    suite := c.cipher_suite
+    body := close_notify_body()
+    rec := rec_seal(suite, &wk, &wiv, &wmac, seq, rec_alert, ver, &body) or >>
+    p := c.pipe
+    pipe_write(p, rec) or >>
+    c.wseq = c.wseq + 1
+    c.sent_close = 1
+    << 0
+}

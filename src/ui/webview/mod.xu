@@ -1,0 +1,1056 @@
+@ui/webview
+
+#errors
+#ui
+#os
+#strings
+
+// Content backend for ui.Window: system WebView + IPC (`#ui/webview`).
+// attach() registers a ContentPlugin with per-OS host sources; #ui shell picks
+// the current OS at App.run(). Shell/window/menu/tray stay in #ui.
+//
+// two content modes (no local HTTP server in either):
+//   1. Local — stage_www_root / bind_ipc_www + xu://app/ (scheme flag "xu"; host intercepts).
+//      Packed oneexe sets XU_UI_WWW=:mem: and serves www/icon from the binary (no TEMP extract).
+//   2. Remote — load_url("http(s)://…"); we do not serve that origin. Adapted remote pages
+//      may still call xu://app/__xu/* (and optional xu://app/ static) into the app.
+// UI host must be statically linked (pack_*ui_oneexe.py); no external host process.
+
+pub struct WebView {
+    pub id int
+    pub window_id int
+    pub html string
+    pub url string
+    pub ipc_names []string
+    pub emit_q []string
+    pub sim int
+}
+
+pub fn attach(w &mut ui.Window) WebView {
+    id := w.id
+    w.set_content_slot(ui.content_webview, id)
+    _ := ui.register_content_plugin(ui.content_plugin_webview())
+    << WebView{id: id, window_id: w.id, html: "", url: "", ipc_names: []string{}, emit_q: []string{}, sim: 0}
+}
+
+fn require_wv_host() int {
+    os := ui.target_os()
+    if os != ui.os_macos && os != ui.os_linux && os != ui.os_windows {
+        >> errors.new("webview: unsupported on this target")
+    }
+    if env_get("XU_UI_SIM") == "1" {
+        << 1
+    }
+    if !ui.host_enabled() {
+        >> errors.new("webview: host not available")
+    }
+    << 2
+}
+
+// Same mailbox as #ui host. Pack → ":xu:"; real XU_UI_TMP only for non-pack/dev.
+fn wv_tmp() string {
+    d := env_get("XU_UI_TMP")
+    if d.len > 0 && d != ":xu:" && d != ":mem:" {
+        << d + ""
+    }
+    if env_get("XU_UI_PACK") == "1" || env_get("XU_UI_WWW") == ":mem:" {
+        << ":xu:"
+    }
+    << tmp_dir()
+}
+
+fn worker_trace(step string) {
+    // Pack: no disk worker trace (mailbox-only). Optional when XU_UI_TMP is a real dir.
+    d := env_get("XU_UI_TMP")
+    if d.len == 0 || d == ":xu:" {
+        <<
+    }
+    _ := write_file(d + "/xu_worker_trace.txt", step + "\n") or (err) {
+        <<
+    }
+}
+
+fn page_html_path() string {
+    << wv_tmp() + "/xu_ui_page.html"
+}
+
+fn page_url_path() string {
+    << wv_tmp() + "/xu_ui_page.url"
+}
+
+fn ipc_req_path() string {
+    << wv_tmp() + "/xu_ui_ipc_req.txt"
+}
+
+fn ipc_resp_path() string {
+    << wv_tmp() + "/xu_ui_ipc_resp.txt"
+}
+
+fn emit_q_path() string {
+    << wv_tmp() + "/xu_ui_emit_q.txt"
+}
+
+fn scheme_flag_path() string {
+    << wv_tmp() + "/xu_ui_scheme.txt"
+}
+
+fn www_root_flag_path() string {
+    << wv_tmp() + "/xu_ui_www_root.txt"
+}
+
+fn bridge_js_path() string {
+    << wv_tmp() + "/xu_ui_bridge.js"
+}
+
+pub fn www_root_path() string {
+    << www_root_flag_path()
+}
+
+fn www_has_index(dir &string) bool {
+    _ := read_file(dir + "/index.html") or (err) {
+        << false
+    }
+    << true
+}
+
+fn abs_www_dir(dir &string) string {
+    d := dir + ""
+    if d.len == 0 {
+        << d
+    }
+    b0 := d[0] & 255
+    if b0 == 47 {
+        << d
+    }
+    // Windows drive: C:\ or C:/
+    if d.len >= 3 {
+        b1 := d[1] & 255
+        b2 := d[2] & 255
+        if b1 == 58 && (b2 == 92 || b2 == 47) {
+            << d
+        }
+    }
+    wd := os.getwd()
+    if wd.len == 0 {
+        << d
+    }
+    << wd + "/" + d
+}
+
+fn pack_www_mem() bool {
+    env := env_get("XU_UI_WWW")
+    if env == ":mem:" {
+        << true
+    }
+    if env_get("XU_UI_PACK") == "1" {
+        << true
+    }
+    << false
+}
+
+// Resolve www dir: pack/:mem: always wins (never materialize www/ under TEMP).
+// Else: XU_UI_WWW path > explicit dir with index.html > ./www/index.html.
+pub fn resolve_www_dir(want string) string {
+    if pack_www_mem() {
+        << ":mem:"
+    }
+    env := env_get("XU_UI_WWW")
+    if env == ":mem:" {
+        << ":mem:"
+    }
+    if env.len > 0 {
+        if !www_has_index(&env) {
+            >> errors.new("webview: XU_UI_WWW missing index.html: " + env)
+        }
+        << abs_www_dir(&env)
+    }
+    if want == ":mem:" {
+        << ":mem:"
+    }
+    if want.len > 0 && www_has_index(&want) {
+        << abs_www_dir(&want)
+    }
+    w := "www"
+    if www_has_index(&w) {
+        << abs_www_dir(&w)
+    }
+    // Packed oneexe / missing disk tree: host serves xu_pack_www_files from the binary.
+    << ":mem:"
+}
+
+fn ensure_bridge_ref(dir &string) int {
+    d := dir + ""
+    if d == ":mem:" {
+        << 0
+    }
+    idx_path := d + "/index.html"
+    body := read_file(idx_path) or >>
+    // Page may mention window.__XU__ without loading the bridge — require explicit script.
+    if strings.contains(&body, "__xu/bridge") {
+        << 0
+    }
+    tag := "<script src=\"xu://app/__xu/bridge.js\"></script>\n"
+    mut out := body + ""
+    if strings.contains(&out, "</head>") {
+        out = strings.replace(&out, "</head>", tag + "</head>", 1)
+    } else {
+        out = tag + out
+    }
+    // Staged index overlay under TMP; host prefers it for / and /index.html.
+    write_file(wv_tmp() + "/xu_ui_www_index.html", out) or >>
+    << 0
+}
+
+pub fn stage_www_root(dir0 string) int {
+    dir := resolve_www_dir(dir0) or >>
+    write_file(www_root_flag_path(), dir + "") or >>
+    write_file(page_url_path(), app_scheme_url()) or >>
+    write_file(scheme_flag_path(), "xu") or >>
+    if dir == ":mem:" {
+        // Pack serves www + __xu/bridge.js from PE. Do not write www tree / bridge / brand to TEMP.
+        write_file(ipc_req_path(), "") or >>
+        write_file(ipc_resp_path(), "") or >>
+        write_file(emit_q_path(), "") or >>
+        << 0
+    }
+    // Dev / disk www: bridge file for host inject + optional brand copy.
+    write_file(bridge_js_path(), bridge_script()) or >>
+    ovr := write_file(wv_tmp() + "/xu_ui_www_index.html", "") or (err) {
+        << 0
+    }
+    if ovr < 0 {
+    }
+    br := ensure_bridge_ref(&dir) or (err) {
+        << 0
+    }
+    if br < 0 {
+    }
+    write_file(ipc_req_path(), "") or >>
+    write_file(ipc_resp_path(), "") or >>
+    write_file(emit_q_path(), "") or >>
+    // Fallback single-file page (host uses if www miss).
+    idx := read_file(dir + "/index.html") or (err) {
+        << 0
+    }
+    pg := write_file(page_html_path(), idx) or (err) {
+        << 0
+    }
+    if pg < 0 {
+    }
+    mk := os.mkdir_all(wv_tmp() + "/brand") or (err) {
+        << 0
+    }
+    if mk < 0 {
+    }
+    stage_brand_named("xu_app_logo.png")
+    stage_brand_named("xu_app_icon.png")
+    stage_brand_named("xu_classic.svg")
+    stage_brand_named("xu_classic.png")
+    stage_brand_named("icon.png")
+    << 0
+}
+
+fn stage_page_and_assets(page string) int {
+    // Compat: materialize inline HTML as a one-file www tree under TMP.
+    base := wv_tmp() + "/xu_ui_www"
+    mk2 := os.mkdir_all(base + "") or (err) {
+        << 0
+    }
+    if mk2 < 0 {
+    }
+    write_file(base + "/index.html", page + "") or >>
+    << stage_www_root(base + "") or >>
+}
+
+// --- XUN wire format for IPC (https://github.com/qorm/xun) ---
+// Request / emit event:
+//   name: ping
+//   payload: hi
+// Response:
+//   ok: true
+//   result: pong:hi
+
+fn xun_needs_s_tag(s string) bool {
+    if s.len == 0 {
+        << true
+    }
+    mut i := 0
+    while i < s.len {
+        b := s[i] & 255
+        if b == 10 || b == 13 || b == 9 || b == 35 || b == 58 {
+            << true
+        }
+        if i == 0 && (b == 32 || b == 33 || b == 64 || b == 36) {
+            << true
+        }
+        i = i + 1
+    }
+    << false
+}
+
+fn xun_scalar(s string) string {
+    t := s + ""
+    if xun_needs_s_tag(t + "") {
+        << "!s " + t
+    }
+    << t + ""
+}
+
+pub fn ipc_encode_xun(name string, payload string) string {
+    << "name: " + xun_scalar(name) + "\npayload: " + xun_scalar(payload) + "\n"
+}
+
+pub fn ipc_encode_result(ok bool, result string, err string) string {
+    if ok {
+        << "ok: true\nresult: " + xun_scalar(result) + "\n"
+    }
+    << "ok: false\nerror: " + xun_scalar(err) + "\n"
+}
+
+fn ipc_line_field(line0 string, key string) string {
+    line := trim_shell_cr(line0 + "")
+    // Strip leading spaces (host/bridge never indent; tolerate anyway).
+    mut s := line + ""
+    while s.len > 0 {
+        b := s[0] & 255
+        if b == 32 || b == 9 {
+            s = s[1:s.len]
+        } else {
+            <-
+        }
+    }
+    pref := key + ": "
+    if s.len >= pref.len {
+        mut ok := true
+        mut i := 0
+        while i < pref.len {
+            if (s[i] & 255) != (pref[i] & 255) {
+                ok = false
+                <-
+            }
+            i = i + 1
+        }
+        if ok {
+            v := s[pref.len:s.len]
+            if v.len >= 3 {
+                if (v[0] & 255) == 33 && (v[1] & 255) == 115 && (v[2] & 255) == 32 {
+                    << v[3:v.len]
+                }
+            }
+            << v
+        }
+    }
+    pref2 := key + ":"
+    if s == pref2 {
+        << ""
+    }
+    << ""
+}
+
+// IPC wire format is a tiny XUN subset (name/payload/ok/result/error lines).
+// Do NOT run the full encoding/xun tree parser here — untrusted/misrouted
+// bodies (HTML, JS, binary) have caused index-OOB in Doc accessors on Windows.
+fn ipc_decode_field(raw0 &string, key string) string {
+    raw := raw0 + ""
+    if raw.len == 0 {
+        << ""
+    }
+    mut i := 0
+    mut start := 0
+    while i <= raw.len {
+        mut hit := false
+        if i == raw.len {
+            hit = true
+        } else {
+            b := raw[i] & 255
+            if b == 10 || b == 13 {
+                hit = true
+            }
+        }
+        if hit {
+            if i > start {
+                v := ipc_line_field(raw[start:i], key)
+                // Distinguish "missing key" from "key: " empty value: check prefix.
+                line := trim_shell_cr(raw[start:i])
+                mut s := line + ""
+                while s.len > 0 {
+                    b0 := s[0] & 255
+                    if b0 == 32 || b0 == 9 {
+                        s = s[1:s.len]
+                    } else {
+                        <-
+                    }
+                }
+                pref := key + ":"
+                if s.len >= pref.len {
+                    mut matched := true
+                    mut j := 0
+                    while j < pref.len {
+                        if (s[j] & 255) != (pref[j] & 255) {
+                            matched = false
+                            <-
+                        }
+                        j = j + 1
+                    }
+                    if matched {
+                        << v
+                    }
+                }
+            }
+            if i < raw.len {
+                b := raw[i] & 255
+                i = i + 1
+                if b == 13 && i < raw.len {
+                    if (raw[i] & 255) == 10 {
+                        i = i + 1
+                    }
+                }
+            } else {
+                i = i + 1
+            }
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    << ""
+}
+
+pub fn ipc_decode_name(raw string) string {
+    << ipc_decode_field(&raw, "name")
+}
+
+pub fn ipc_decode_payload(raw string) string {
+    << ipc_decode_field(&raw, "payload")
+}
+
+pub fn ipc_decode_result(raw string) string {
+    // Prefer simple line decode; fall back to raw text for diagnostics.
+    ok := ipc_decode_field(&raw, "ok")
+    if ok == "false" || ok == "0" {
+        e := ipc_decode_field(&raw, "error")
+        if e.len > 0 {
+            << e
+        }
+        << "error"
+    }
+    r := ipc_decode_field(&raw, "result")
+    if r.len > 0 || ok == "true" || ok == "1" {
+        << r
+    }
+    << raw + ""
+}
+
+// Same-origin xu://app bridge; bodies are XUN documents.
+// macOS: WKScriptMessageHandlerWithReply (postMessage → Promise). Emit is host-pushed.
+pub fn bridge_script() string {
+    << "window.__XU__=window.__XU__||{};" +
+        "(function(X){" +
+        "function sc(s){s=String(s==null?'':s);if(!s.length)return '!s ';for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);if(c===10||c===13||c===9||c===35||c===58||c===32||c===33||c===64||c===36)return '!s '+s;}return s;}" +
+        "function enc(n,p){return 'name: '+sc(n)+'\\npayload: '+sc(p)+'\\n';}" +
+        "function dec(t){var o={};String(t||'').split('\\n').forEach(function(line){var i=line.indexOf(': ');if(i>0){var k=line.slice(0,i),v=line.slice(i+2);if(v.indexOf('!s ')===0)v=v.slice(3);o[k]=v;}});return o;}" +
+        "var B='xu://app/__xu';" +
+        "X._deliver=function(n,p){var cb=(X._L||{})[n];if(cb)try{cb(p);}catch(e){}};" +
+        "X.invoke=function(n,p){" +
+        "var wh=window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.xuInvoke;" +
+        "if(wh){var body={name:String(n==null?'':n),payload:String(p==null?'':p)};var pr=wh.postMessage(body);if(pr&&typeof pr.then==='function')return pr;}" +
+        "return fetch(B+'/invoke',{method:'POST',headers:{'Content-Type':'text/xun; charset=utf-8'},body:enc(n,p)}).then(function(r){return r.text();}).then(function(t){var o=dec(t);if(o.ok==='false'||o.ok==='0')throw new Error(o.error||'error');return o.result!=null?o.result:t;});" +
+        "};" +
+        "X.listen=function(n,cb){(X._L=X._L||{})[n]=cb;};" +
+        "window.invoke=X.invoke;window.listen=function(n,cb){return X.listen(n,cb);};" +
+        "})(window.__XU__);"
+}
+
+pub fn app_scheme_url() string {
+    << "xu://app/"
+}
+
+// Deprecated: TCP IPC address (use bind_ipc + xu://app/).
+pub fn default_ipc_addr() string {
+    << "127.0.0.1:19287"
+}
+
+pub fn default_ipc_port() string {
+    << "19287"
+}
+
+pub fn (wv &mut WebView) load_html(html string) int {
+    mode := require_wv_host() or >>
+    wv.html = html + ""
+    wv.url = ""
+    if mode == 2 {
+        write_file(page_html_path(), html) or >>
+        write_file(page_url_path(), "") or >>
+    }
+    wv.sim = 1
+    << 0
+}
+
+pub fn (wv &mut WebView) load_url(url string) int {
+    mode := require_wv_host() or >>
+    wv.url = url + ""
+    wv.html = ""
+    if mode == 2 {
+        write_file(page_url_path(), url) or >>
+        // Remote http(s): clear local-scheme flag so host does not force xu://app/.
+        if starts_with(url, "http://") || starts_with(url, "https://") {
+            if !starts_with(url, "http://app.xu") && !starts_with(url, "https://app.xu") {
+                write_file(scheme_flag_path(), "") or >>
+                write_file(page_html_path(), "") or >>
+                wv.sim = 1
+                << 0
+            }
+        }
+        // xu://app/ (local intercept) — do not wipe www / staged page.
+        if !starts_with(url, "xu://") && !starts_with(url, "http://app.xu") {
+            write_file(page_html_path(), "") or >>
+        }
+    }
+    wv.sim = 1
+    << 0
+}
+
+// load_remote: remote HTTP(S) document; Xu does not host it. xu:// IPC still available to adapted pages.
+pub fn (wv &mut WebView) load_remote(url string) int {
+    << wv.load_url(url) or >>
+}
+
+pub fn (wv &mut WebView) load_file(path string) int {
+    body := ui.load_asset(path) or >>
+    << wv.load_html(body) or >>
+}
+
+fn eval_js_path() string {
+    << wv_tmp() + "/xu_ui_eval.js"
+}
+
+// Queue JS for the native WKWebView host (file bridge). No-op under XU_UI_SIM=1.
+pub fn native_eval(js string) int {
+    if env_get("XU_UI_SIM") == "1" {
+        << 0
+    }
+    write_file(eval_js_path(), js + "") or >>
+    << 0
+}
+
+pub fn native_reload() int {
+    << ui.append_wv_cmd("reload") or >>
+}
+
+pub fn native_open_devtools() int {
+    << ui.append_wv_cmd("devtools") or >>
+}
+
+// zoom_percent: 100 = 1.0, 125 = 1.25, …
+pub fn native_set_zoom(zoom_percent int) int {
+    if zoom_percent < 25 {
+        << ui.append_wv_cmd("zoom\t0.25") or >>
+    }
+    if zoom_percent > 500 {
+        << ui.append_wv_cmd("zoom\t5") or >>
+    }
+    // Integer percent → "1.25" style factor without float fmt.
+    whole := zoom_percent / 100
+    frac := zoom_percent % 100
+    mut s := str(whole) + "."
+    if frac < 10 {
+        s = s + "0" + str(frac)
+    } else {
+        s = s + str(frac)
+    }
+    << ui.append_wv_cmd("zoom\t" + s) or >>
+}
+
+pub fn native_go_back() int {
+    << ui.append_wv_cmd("back") or >>
+}
+
+pub fn native_go_forward() int {
+    << ui.append_wv_cmd("forward") or >>
+}
+
+pub fn native_stop() int {
+    << ui.append_wv_cmd("stop") or >>
+}
+
+pub fn native_print() int {
+    << ui.append_wv_cmd("print") or >>
+}
+
+// Eval JS and wait for stringified result (or "err:…").
+pub fn native_eval_result(js string) string {
+    if !ui.host_enabled() {
+        << ""
+    }
+    pending := "__XU_EVAL_PENDING__"
+    write_file(ui.host_tmp() + "/xu_ui_eval_result.txt", pending) or (err) {
+        << ""
+    }
+    write_file(ui.host_tmp() + "/xu_ui_eval_want.txt", "1") or (err) {
+        << ""
+    }
+    write_file(ui.host_tmp() + "/xu_ui_eval.js", js) or (err) {
+        << ""
+    }
+    mut i := 0
+    while i < 50 {
+        sleep_ns(100000000)
+        body := read_file(ui.host_tmp() + "/xu_ui_eval_result.txt") or (err) {
+            << ""
+        }
+        if body != pending {
+            << body
+        }
+        i = i + 1
+    }
+    << ""
+}
+
+pub fn native_find(text string) int {
+    if !ui.host_enabled() {
+        << 0
+    }
+    write_file(ui.host_tmp() + "/xu_ui_find_result.txt", "__XU_FIND_PENDING__") or (err) {
+        << 0
+    }
+    write_file(ui.host_tmp() + "/xu_ui_find.txt", text) or (err) {
+        << 0
+    }
+    _ := ui.append_wv_cmd("find") or (err) {
+        << 0
+    }
+    mut i := 0
+    while i < 30 {
+        sleep_ns(100000000)
+        body := read_file(ui.host_tmp() + "/xu_ui_find_result.txt") or (err) {
+            << 0
+        }
+        if body != "__XU_FIND_PENDING__" {
+            if body == "1" {
+                << 1
+            }
+            << 0
+        }
+        i = i + 1
+    }
+    << 0
+}
+
+pub fn native_find_clear() int {
+    << ui.append_wv_cmd("find_clear") or (err) {
+        << 0
+    }
+}
+
+pub fn native_set_user_agent(ua string) int {
+    if !ui.host_enabled() {
+        << 0
+    }
+    write_file(ui.host_tmp() + "/xu_ui_ua.txt", ua) or (err) {
+        << 0
+    }
+    << ui.append_wv_cmd("set_ua") or (err) {
+        << 0
+    }
+}
+
+// Returns "x y w h" in screen coordinates.
+
+pub fn native_inject_css(css string) int {
+    if !ui.host_enabled() {
+        << 0
+    }
+    write_file(ui.host_tmp() + "/xu_ui_inject.css", css) or (err) {
+        << 0
+    }
+    << ui.append_wv_cmd("inject_css") or (err) {
+        << 0
+    }
+}
+
+pub fn native_clear_cache() int {
+    << ui.append_wv_cmd("clear_cache") or (err) {
+        << 0
+    }
+}
+
+pub fn native_set_muted(on int) int {
+    if on != 0 {
+        << ui.append_wv_cmd("mute") or (err) {
+            << 0
+        }
+    }
+    << ui.append_wv_cmd("unmute") or (err) {
+        << 0
+    }
+}
+
+pub fn native_set_background(hex string) int {
+    << ui.append_wv_cmd("bgcolor\t" + hex) or (err) {
+        << 0
+    }
+}
+
+pub fn native_set_context_menu(on int) int {
+    if on != 0 {
+        << ui.append_wv_cmd("context_menu\t1") or (err) {
+            << 0
+        }
+    }
+    << ui.append_wv_cmd("context_menu\t0") or (err) {
+        << 0
+    }
+}
+
+pub fn native_set_magnification(on int) int {
+    if on != 0 {
+        << ui.append_wv_cmd("magnify\t1") or (err) {
+            << 0
+        }
+    }
+    << ui.append_wv_cmd("magnify\t0") or (err) {
+        << 0
+    }
+}
+
+// Returns lines "name=value;domain=…;path=…".
+pub fn native_cookies_get() string {
+    if !ui.host_enabled() {
+        << ""
+    }
+    write_file(ui.host_tmp() + "/xu_ui_cookies.txt", "__XU_COOKIES_PENDING__") or (err) {
+        << ""
+    }
+    _ := ui.append_wv_cmd("cookies_get") or (err) {
+        << ""
+    }
+    mut i := 0
+    while i < 40 {
+        sleep_ns(100000000)
+        body := read_file(ui.host_tmp() + "/xu_ui_cookies.txt") or (err) {
+            << ""
+        }
+        if body != "__XU_COOKIES_PENDING__" {
+            << body
+        }
+        i = i + 1
+    }
+    << ""
+}
+
+pub fn native_cookies_clear() int {
+    << ui.append_wv_cmd("cookies_clear") or (err) {
+        << 0
+    }
+}
+
+pub fn native_cookie_set(name string, value string, domain string) int {
+    if !ui.host_enabled() {
+        << 0
+    }
+    mut d := domain + ""
+    if d.len == 0 {
+        d = "127.0.0.1"
+    }
+    write_file(ui.host_tmp() + "/xu_ui_cookie_set.txt", name + "\t" + value + "\t" + d) or (err) {
+        << 0
+    }
+    _ := ui.append_wv_cmd("cookie_set") or (err) {
+        << 0
+    }
+    sleep_ns(250000000)
+    << 0
+}
+
+
+pub fn (wv &mut WebView) eval(js string) string {
+    mode := require_wv_host() or >>
+    if mode == 2 {
+        write_file(eval_js_path(), js + "") or >>
+    }
+    wv.sim = 1
+    << js + ""
+}
+
+pub fn (wv &mut WebView) on(name string) {
+    wv.ipc_names.push(name + "")
+}
+
+pub fn (wv &mut WebView) invoke(name string, payload string, dispatch fn(string, string) string) string {
+    n := wv.ipc_names.len
+    if n < 0 {
+        << ""
+    }
+    << dispatch(name, payload)
+}
+
+pub fn bus_emit(emit_ch chan string, name string, payload string) {
+    emit_ch <- ipc_encode_xun(name, payload)
+}
+
+pub fn (wv &mut WebView) emit(name string, payload string) int {
+    js := "window.__XU_EMIT__&&window.__XU_EMIT__(\"" + name + "\"," + json_str(payload) + ");"
+    wv.emit_q.push(js)
+    << 0
+}
+
+pub fn (wv &mut WebView) emit_pending_count() int {
+    << wv.emit_q.len
+}
+
+pub fn (wv &mut WebView) clear_emits() {
+    wv.emit_q = []string{}
+}
+
+fn json_str(s string) string {
+    << "\"" + s + "\""
+}
+
+fn path_only(p string) string {
+    mut i := 0
+    while i < p.len {
+        if (p[i] & 255) == 63 {
+            << p[0:i]
+        }
+        i = i + 1
+    }
+    << p + ""
+}
+
+fn split_invoke(body string) string {
+    mut i := 0
+    while i < body.len {
+        if (body[i] & 255) == 10 {
+            << body[0:i]
+        }
+        i = i + 1
+    }
+    << body + ""
+}
+
+fn invoke_payload(body string) string {
+    mut i := 0
+    while i < body.len {
+        if (body[i] & 255) == 10 {
+            << body[(i + 1):body.len]
+        }
+        i = i + 1
+    }
+    << ""
+}
+
+fn shell_event_path() string {
+    << wv_tmp() + "/xu_ui_shell_event.txt"
+}
+
+fn trim_shell_cr(s string) string {
+    mut out := s + ""
+    while out.len > 0 {
+        c := out[out.len - 1] & 255
+        if c == 13 {
+            out = out[0:out.len - 1]
+        } else {
+            <-
+        }
+    }
+    << out
+}
+
+fn push_shell_payload(shell_ch chan ui.Event, pl0 string) {
+    pl := trim_shell_cr(pl0 + "")
+    if pl.len > 0 {
+        mut preview := pl + ""
+        if preview.len > 48 {
+            preview = preview[0:48]
+        }
+        worker_trace("push_shell [" + preview + "]")
+    }
+    ui.push_host_event(shell_ch, pl0)
+}
+
+fn stage_brand_named(name string) {
+    body := read_file_or_empty("brand/" + name)
+    if body.len == 0 {
+        <<
+    }
+    w := write_file(wv_tmp() + "/brand/" + name, body) or (err) {
+        <<
+    }
+    if w < 0 {
+    }
+}
+
+fn read_file_or_empty(path string) string {
+    body := read_file(path) or (err) {
+        << ""
+    }
+    << body
+}
+
+fn ipc_idle_park() {
+    // Short park so a missed wake still recovers quickly.
+    n := write_file(":xu:/__ipc_wait", "50") or (err) {
+        sleep_ns(10000000)
+        <<
+    }
+    if n == 0 {
+        sleep_ns(10000000)
+    }
+}
+
+fn process_one_invoke(dispatch fn(string, string) string, emit_ch chan string, shell_ch chan ui.Event) {
+    // Scheme invoke: Host xu_ui_invoke_sync ↔ __invoke_take / __invoke_reply (no req/resp files).
+    mut sync := 0
+    mut raw := read_file_or_empty(":xu:/__invoke_take")
+    if raw.len > 0 {
+        sync = 1
+    } else {
+        // Legacy: menu/tray may still post xu_ui_ipc_req.txt
+        raw = read_file_or_empty(ipc_req_path())
+        if raw.len == 0 {
+            <<
+        }
+        write_file(ipc_req_path(), "") or (err) {
+            <<
+        }
+    }
+    // Cap runaway bodies (misrouted HTML/binary must not enter decode).
+    if raw.len > 65536 {
+        worker_trace("invoke reject huge len=" + str(raw.len))
+        enc := ipc_encode_result(false, "", "invoke body too large")
+        if sync == 1 {
+            write_file(":xu:/__invoke_reply", enc) or (err) { << }
+        } else {
+            write_file(ipc_resp_path(), enc) or (err) { << }
+        }
+        <<
+    }
+    mut preview := raw + ""
+    if preview.len > 80 {
+        preview = preview[0:80]
+    }
+    worker_trace("invoke len=" + str(raw.len) + " preview=[" + preview + "]")
+    raw = trim_shell_cr(raw + "")
+    worker_trace("invoke decode")
+    mut name := ipc_decode_name(raw + "")
+    mut payload := ipc_decode_payload(raw + "")
+    // Legacy fallback: name\\npayload (pre-XUN).
+    if name.len == 0 {
+        name = split_invoke(raw + "")
+        payload = invoke_payload(raw + "")
+        // If legacy split returned the whole blob as "name", treat as unknown.
+        if name.len > 64 || strings.contains(&name, "<") || strings.contains(&name, "{") {
+            name = ""
+            payload = ""
+        }
+    }
+    name = trim_shell_cr(name + "")
+    payload = trim_shell_cr(payload + "")
+    worker_trace("invoke name=[" + name + "]")
+    is_menu := name == "menu"
+    is_tray := name == "tray"
+    is_shell := name == "shell"
+    worker_trace("invoke dispatch")
+    out := dispatch(name + "", payload + "")
+    worker_trace("invoke dispatched")
+    if is_menu || is_tray {
+        mut kind := ui.ev_menu_clicked
+        if is_tray {
+            kind = ui.ev_tray_menu_clicked
+        }
+        mid := payload + ""
+        shell_ch <- ui.Event{kind: kind, window_id: 0, menu_id: mid, width: 0, height: 0}
+        select {
+            emit_ch <- ipc_encode_xun(name + "", payload + "") {
+            }
+            else {
+            }
+        }
+    }
+    if is_shell {
+        push_shell_payload(shell_ch, payload + "")
+    }
+    enc := ipc_encode_result(true, out + "", "")
+    if sync == 1 {
+        write_file(":xu:/__invoke_reply", enc) or (err) {
+            <<
+        }
+    } else {
+        write_file(ipc_resp_path(), enc) or (err) {
+            <<
+        }
+    }
+    worker_trace("invoke done")
+}
+
+fn drain_emit_to_file(emit_ch chan string) {
+    // Non-blocking drain. select/else uses ChanTryRecv which must free its
+    // scratch (fixed in emit); keep else so we never block the IPC park loop.
+    select {
+        msg := <-emit_ch {
+            if msg.len == 0 {
+                <<
+            }
+            mut cur := read_file_or_empty(emit_q_path())
+            rs := string_from_byte(30)
+            // Cap runaway queue (misbehaving producer must not OOM the host).
+            if cur.len > 1048576 {
+                cur = ""
+            }
+            write_file(emit_q_path(), cur + msg + rs) or (err) {
+                <<
+            }
+        }
+        else {
+        }
+    }
+}
+
+fn ipc_mailbox_prime() {
+    // Ensure ":xu:" slots exist so idle poll does not hit missing-slot paths.
+    write_file(shell_event_path(), "") or (err) { << }
+    write_file(ipc_req_path(), "") or (err) { << }
+    write_file(ipc_resp_path(), "") or (err) { << }
+    write_file(emit_q_path(), "") or (err) { << }
+}
+
+// bind_ipc_www: #ui/webview xu://app/ scheme intercept. Host serves static files from www_dir;
+// this loop handles XUN invoke + emit (no TCP listen in Xu).
+// Host shell events are pumped by #ui (new_app / new_app_events), not here.
+fn ipc_emit_drain_loop(emit_ch chan string) {
+    while true {
+        drain_emit_to_file(emit_ch)
+        sleep_ns(10000000)
+    }
+}
+
+pub fn bind_ipc_www(www_dir string, dispatch fn(string, string) string, emit_ch chan string, shell_ch chan ui.Event) int {
+    worker_trace("bind_ipc_www begin")
+    stage_www_root(www_dir) or >>
+    ipc_mailbox_prime()
+    // Emit drain MUST NOT share the invoke thread.
+    xu ipc_emit_drain_loop(emit_ch)
+    worker_trace("bind_ipc_www loop")
+    while true {
+        process_one_invoke(dispatch, emit_ch, shell_ch)
+        ipc_idle_park()
+    }
+    << 0
+}
+
+// bind_ipc: inline HTML → TMP www/index.html, then same as bind_ipc_www.
+pub fn bind_ipc(page string, dispatch fn(string, string) string, emit_ch chan string, shell_ch chan ui.Event) int {
+    stage_page_and_assets(page) or >>
+    ipc_mailbox_prime()
+    xu ipc_emit_drain_loop(emit_ch)
+    while true {
+        process_one_invoke(dispatch, emit_ch, shell_ch)
+        ipc_idle_park()
+    }
+    << 0
+}
+
+// Deprecated: TCP listen IPC. Use bind_ipc_www / bind_ipc + xu://app/.
+pub fn serve_ipc(addr string, page string, dispatch fn(string, string) string, emit_ch chan string, shell_ch chan ui.Event) int {
+    >> errors.new("webview: serve_ipc removed; use bind_ipc_www + xu://app/")
+}

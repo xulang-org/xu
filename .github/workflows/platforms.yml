@@ -1,0 +1,187 @@
+name: platforms
+
+# Cross-platform *run* evidence for the hosted compiler
+# (docs/audit/OVERALL_OPTIMIZATION_PLAN_2026-09.md, A1 / §5.3).
+#
+# Evidence lane: ORACLE (not product).  CI has no hosted seed, so every job
+# derives Gen1 from the frozen Rust primer and then self-hosts on the job's
+# own OS/ISA (Gen1 -> Gen2 -> Gen3 -> Gen4, cmp Gen3 Gen4) before running the
+# fixture corpus with that Gen4.  bootstrap/FROZEN.md: this proves the hosted
+# compiler *code* builds, self-hosts and passes fixtures on the platform.
+# It is not product/release evidence and never installs bin/xu.
+#
+# Lane taxonomy (OPEN_ADVANCED_PROGRAMMER_IMPLEMENTATION_PLAN.md §8):
+#   oracle      — primer-seeded diagnostic (this workflow by default)
+#   product     — hosted-seed product chain (product-nightly.yml / local
+#                 product_gate.sh); the only lane that may claim release evidence
+#   compile-only— cross-compile without a native runner
+#   qemu        — emulator run, not a native product runner
+#   native      — real OS/ISA product runner
+#
+# Not a PR gate: nightly / push to main / dispatch so the platform matrix
+# accumulates evidence before it becomes required.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  XU_CI_LANE: oracle
+
+jobs:
+  hosted:
+    name: hosted chain + fixtures (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: linux-arm64
+            # GitHub-hosted arm64 runner (public repos; needs a plan on private
+            # repos).  The qemu job below is the fallback evidence path.
+            os: ubuntu-24.04-arm
+          - name: windows-x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bootstrap-checkout
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .ci/bootstrap
+      - name: python3 shim (Git Bash on Windows only ships `python`)
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            PYTHON_BIN=$(command -v python)
+            cp "$PYTHON_BIN" "$(dirname "$PYTHON_BIN")/python3.exe"
+          fi
+      - name: temp dir in POSIX form
+        # $RUNNER_TEMP is D:\a\_temp on Windows; the scripts want a POSIX path.
+        run: |
+          T=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || printf '%s' "$RUNNER_TEMP")
+          echo "T=$T" >> "$GITHUB_ENV"
+      - name: boundary contract (strict)
+        run: python3 scripts/check_bootstrap_xu_boundary.py --strict-freeze
+      - name: build frozen primer (oracle seed)
+        run: cargo build --manifest-path .ci/bootstrap/Cargo.toml -p xu --bin xu
+      - name: oracle chain on this platform (Gen1 -> Gen4, cmp Gen3 Gen4)
+        # Explicit oracle lane: primer-seeded, nothing installed into bin/.
+        run: XU_CI_LANE=oracle ./scripts/oracle_platform_chain.sh "$T/xu-oracle" --keep
+      - name: chain sidecar
+        run: cat "$T/xu-oracle/chain.env" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: fixtures with the platform Gen4 (dual lane, explicit compiler)
+        run: |
+          XU="$T/xu-oracle/xu"
+          [ -x "$XU" ] || XU="$T/xu-oracle/xu.exe"
+          FIXTURE_TIMEOUT=120 ./scripts/run_fixtures.sh --xu="$XU" --sub=build \
+            --label="${{ matrix.name }}-oracle-gen4" --skip-net 2>&1 | tee "$T/fixtures.log"
+          grep -E '^fixtures\[' "$T/fixtures.log" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: optimization / RA differential matrix (quick subset)
+        run: |
+          XU="$T/xu-oracle/xu"
+          [ -x "$XU" ] || XU="$T/xu-oracle/xu.exe"
+          ./scripts/run_fixture_matrix.sh --xu="$XU" --quick --skip-net \
+            --out="$T/matrix" 2>&1 | tee "$T/matrix.log"
+          grep -E '^matrix:' "$T/matrix.log" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: upload platform evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xu-oracle-${{ matrix.name }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/xu-oracle/xu
+            ${{ runner.temp }}/xu-oracle/xu.exe
+            ${{ runner.temp }}/xu-oracle/chain.env
+            ${{ runner.temp }}/xu-oracle/chain/*.log
+            ${{ runner.temp }}/fixtures.log
+            ${{ runner.temp }}/matrix.log
+            ${{ runner.temp }}/matrix/matrix.tsv
+
+  qemu-user:
+    # Loong64 / RISC-V 64 (and arm64 as a fallback when the arm64 runner is
+    # unavailable): Xu emits fully static ELF, so qemu-user-static runs the
+    # fixture binaries directly.  Compile-only was the previous evidence level
+    # for these targets; this is the first run-level evidence.
+    name: qemu-user fixtures (${{ matrix.target }})
+    needs: hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-riscv64
+            runner: qemu-riscv64-static
+          - target: linux-loongarch64
+            runner: qemu-loongarch64-static
+          - target: linux-arm64
+            runner: qemu-aarch64-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bootstrap-checkout
+      - uses: actions/download-artifact@v4
+        with:
+          name: xu-oracle-linux-x64
+          path: ${{ runner.temp }}/xu-oracle
+      - name: install qemu-user-static
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+          "${{ matrix.runner }}" --version | head -1
+      - name: cross-compile + run fixtures under ${{ matrix.runner }}
+        run: |
+          XU="$RUNNER_TEMP/xu-oracle/xu"
+          chmod +x "$XU"
+          FIXTURE_TIMEOUT=300 ./scripts/run_fixtures.sh --xu="$XU" --sub=build \
+            --label="${{ matrix.target }}-qemu-oracle-gen4" --skip-net \
+            --target="${{ matrix.target }}" --runner="${{ matrix.runner }}" 2>&1 | tee "$RUNNER_TEMP/fixtures.log"
+          grep -E '^fixtures\[' "$RUNNER_TEMP/fixtures.log" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: upload qemu evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xu-qemu-${{ matrix.target }}
+          path: ${{ runner.temp }}/fixtures.log
+
+  determinism:
+    # A2 (cross determinism) needs a hosted seed on two platforms; until then
+    # this job checks the weaker, single-host property the 2026-09-10 audit
+    # found broken on macOS: the compiler unit's bytes must not depend on the
+    # size of the process environment.
+    name: build determinism (linux-x64)
+    needs: hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bootstrap-checkout
+      - uses: actions/download-artifact@v4
+        with:
+          name: xu-oracle-linux-x64
+          path: ${{ runner.temp }}/xu-oracle
+      - name: compiler unit, two environment sizes
+        run: |
+          XU="$RUNNER_TEMP/xu-oracle/xu"
+          chmod +x "$XU"
+          ./scripts/build_determinism.sh --xu="$XU" --pads=0,2000 2>&1 | tee "$RUNNER_TEMP/determinism.log"
+          grep -E '^build_determinism: (PASS|FAIL|DIFF)' "$RUNNER_TEMP/determinism.log" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: upload determinism evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xu-determinism-linux-x64
+          path: ${{ runner.temp }}/determinism.log

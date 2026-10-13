@@ -1,0 +1,401 @@
+@net
+
+#errors
+
+// Minimal DNS-over-TCP client (RFC 1035 / RFC 7766). PacketConn UDP I/O is
+// separate; this resolver queries TCP/53 against configured nameservers. Unix
+// reads /etc/resolv.conf; Windows accepts XU_DNS_SERVER (or DNS_SERVER) and
+// otherwise falls back to public resolvers.
+
+const dns_type_a = 1
+const dns_type_ns = 2
+const dns_type_cname = 5
+const dns_type_ptr = 12
+const dns_type_mx = 15
+const dns_type_txt = 16
+const dns_type_aaaa = 28
+const dns_type_srv = 33
+const dns_class_in = 1
+
+struct DnsName {
+    text string
+    off int
+}
+
+struct DnsRR {
+    name string
+    typ int
+    class int
+    ttl int
+    data string
+    next int
+}
+
+struct DnsMsg {
+    id int
+    flags int
+    question []DnsRR
+    answer []DnsRR
+}
+
+fn dns_pack_name(name string) string {
+    src := strip_trailing_dot(name + "")
+    if src.len == 0 {
+        mut z := ""
+        z.push_byte(0)
+        << z
+    }
+    mut out := ""
+    mut start := 0
+    mut i := 0
+    while i <= src.len {
+        at_end := i == src.len
+        mut at_dot := false
+        if !at_end {
+            at_dot = (src[i] & 255) == 46
+        }
+        if at_end || at_dot {
+            n := i - start
+            if n <= 0 || n > 63 {
+                >> errors.new("dns: invalid name")
+            }
+            out.push_byte(n)
+            for k in start:i {
+                out.push_byte(src[k] & 255)
+            }
+            if at_end {
+                <-
+            }
+            i = i + 1
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    out.push_byte(0)
+    << out
+}
+
+fn dns_unpack_name(msg &string, start int) DnsName {
+    mut off := start
+    mut name := ""
+    mut hops := 0
+    mut jumped := false
+    mut end_off := start
+    while hops < 128 {
+        hops = hops + 1
+        if off >= msg.len {
+            >> errors.new("dns: name overflow")
+        }
+        n := msg[off] & 255
+        if n == 0 {
+            off = off + 1
+            if !jumped {
+                end_off = off
+            }
+            if name.len == 0 {
+                << DnsName{text: ".", off: end_off}
+            }
+            << DnsName{text: name, off: end_off}
+        }
+        if (n & 192) == 192 {
+            if off + 1 >= msg.len {
+                >> errors.new("dns: pointer overflow")
+            }
+            ptr := ((n & 63) << 8) | (msg[off + 1] & 255)
+            if ptr >= msg.len {
+                >> errors.new("dns: bad pointer")
+            }
+            if !jumped {
+                end_off = off + 2
+                jumped = true
+            }
+            off = ptr
+            ->
+        }
+        if (n & 192) != 0 {
+            >> errors.new("dns: invalid label")
+        }
+        off = off + 1
+        if off + n > msg.len {
+            >> errors.new("dns: label overflow")
+        }
+        if name.len > 0 {
+            name.push_byte(46)
+        }
+        for k in 0:n {
+            name.push_byte(msg[off + k] & 255)
+        }
+        off = off + n
+    }
+    >> errors.new("dns: name loop")
+    << DnsName{text: "", off: 0}
+}
+
+fn dns_pack_query(id int, name string, qtype int) string {
+    mut q := ""
+    q = q + be16(id)
+    q = q + be16(256)
+    q = q + be16(1)
+    q = q + be16(0)
+    q = q + be16(0)
+    q = q + be16(0)
+    packed := dns_pack_name(name) or >>
+    q = q + packed
+    q = q + be16(qtype)
+    q = q + be16(dns_class_in)
+    << q
+}
+
+fn conn_read_full(fd int, n int) string {
+    mut out := ""
+    mut guard := 0
+    while out.len < n {
+        if guard > 4096 {
+            >> errors.new("dns: read stalled")
+        }
+        chunk := conn_read(fd, n - out.len)
+        if chunk.len == 0 {
+            >> errors.new("dns: unexpected eof")
+        }
+        out = out + chunk
+        guard = guard + 1
+    }
+    << out
+}
+
+fn conn_write_all(fd int, data string) int {
+    mut sent := 0
+    src := data + ""
+    while sent < src.len {
+        rest := src[sent:src.len]
+        n := conn_write(fd, &rest)
+        if n <= 0 {
+            >> errors.new("dns: short write")
+        }
+        sent = sent + n
+    }
+    << sent
+}
+
+fn dns_unpack_rr(msg &string, start int) DnsRR {
+    nm := dns_unpack_name(msg, start)
+    mut off := nm.off
+    if off + 10 > msg.len {
+        >> errors.new("dns: rr overflow")
+    }
+    typ := u16_be(msg, off)
+    class := u16_be(msg, off + 2)
+    ttl := u32_be(msg, off + 4)
+    rdlen := u16_be(msg, off + 8)
+    off = off + 10
+    if typ < 0 || class < 0 || rdlen < 0 || off + rdlen > msg.len {
+        >> errors.new("dns: rdlen overflow")
+    }
+    next := off + rdlen
+    mut data := ""
+    if typ == dns_type_a || typ == dns_type_aaaa || typ == dns_type_txt {
+        data = append_bytes("", msg, off, off + rdlen)
+    } else {
+        if typ == dns_type_cname || typ == dns_type_ns || typ == dns_type_ptr {
+            dnm := dns_unpack_name(msg, off)
+            data = dnm.text + ""
+        } else {
+            if typ == dns_type_mx {
+                if rdlen < 2 {
+                    >> errors.new("dns: mx overflow")
+                }
+                pref := u16_be(msg, off)
+                dnm := dns_unpack_name(msg, off + 2)
+                data = be16(pref) + dnm.text
+            } else {
+                if typ == dns_type_srv {
+                    if rdlen < 6 {
+                        >> errors.new("dns: srv overflow")
+                    }
+                    prio := u16_be(msg, off)
+                    weight := u16_be(msg, off + 2)
+                    port := u16_be(msg, off + 4)
+                    dnm := dns_unpack_name(msg, off + 6)
+                    data = be16(prio) + be16(weight) + be16(port) + dnm.text
+                } else {
+                    data = append_bytes("", msg, off, off + rdlen)
+                }
+            }
+        }
+    }
+    << DnsRR{name: nm.text, typ: typ, class: class, ttl: ttl, data: data, next: next}
+}
+
+fn dns_unpack_msg(msg &string) DnsMsg {
+    if msg.len < 12 {
+        >> errors.new("dns: short header")
+    }
+    id := u16_be(msg, 0)
+    flags := u16_be(msg, 2)
+    qd := u16_be(msg, 4)
+    an := u16_be(msg, 6)
+    if id < 0 || flags < 0 || qd < 0 || an < 0 {
+        >> errors.new("dns: bad header")
+    }
+    mut off := 12
+    mut qi := 0
+    while qi < qd {
+        nm := dns_unpack_name(msg, off)
+        off = nm.off + 4
+        if off > msg.len {
+            >> errors.new("dns: question overflow")
+        }
+        qi = qi + 1
+    }
+    mut answers := []DnsRR{}
+    mut ai := 0
+    while ai < an {
+        rr := dns_unpack_rr(msg, off)
+        off = rr.next
+        answers.push(rr)
+        ai = ai + 1
+    }
+    << DnsMsg{id: id, flags: flags, question: []DnsRR{}, answer: answers}
+}
+
+fn dns_exchange_tcp(ip4 string, port int, name string, qtype int) DnsMsg {
+    if ip4.len != 4 {
+        >> errors.new("dns: nameserver is not IPv4")
+    }
+    mut id := now_ns() & 65535
+    if id == 0 {
+        id = 1
+    }
+    q := dns_pack_query(id, name, qtype)
+    frame := be16(q.len) + q
+    fd := sys_dial_tcp4(ip4[0] & 255, ip4[1] & 255, ip4[2] & 255, ip4[3] & 255, port)
+    conn_write_all(fd, frame) or (err) {
+        close_quiet(fd)
+        >> err
+    }
+    hdr := conn_read_full(fd, 2) or (err) {
+        close_quiet(fd)
+        >> err
+    }
+    ln := u16_be(&hdr, 0)
+    if ln < 12 || ln > 65535 {
+        close_quiet(fd)
+        >> errors.new("dns: bad length")
+    }
+    body := conn_read_full(fd, ln) or (err) {
+        close_quiet(fd)
+        >> err
+    }
+    close_quiet(fd)
+    msg := dns_unpack_msg(&body)
+    if msg.id != id {
+        >> errors.new("dns: id mismatch")
+    }
+    rcode := msg.flags & 15
+    if rcode == 3 {
+        >> errors.new("no such host")
+    }
+    if rcode != 0 {
+        >> errors.new("dns: rcode " + str(rcode))
+    }
+    << msg
+}
+
+fn resolv_conf_path() string {
+    << "/etc/resolv.conf"
+}
+
+fn windows_nameserver() []string {
+    mut out := []string{}
+    mut raw := env_get("XU_DNS_SERVER")
+    if raw.len == 0 {
+        raw = env_get("DNS_SERVER")
+    }
+    if raw.len > 0 {
+        ip := parse_ip(&raw)
+        if ip.len == 4 {
+            out.push(raw + "")
+        }
+    }
+    << out
+}
+
+fn default_nameservers() []string {
+    mut s := []string{}
+    s.push("8.8.8.8")
+    s.push("1.1.1.1")
+    << s
+}
+
+fn read_nameservers() []string {
+    mut out := []string{}
+    if xu_target_os() == 2 {
+        out = windows_nameserver()
+        if out.len > 0 {
+            << out
+        }
+        << default_nameservers()
+    }
+    body := read_file(resolv_conf_path()) or (err) {
+        << default_nameservers()
+    }
+    mut i := 0
+    while i < body.len {
+        mut line_end := i
+        while line_end < body.len {
+            if (body[line_end] & 255) == 10 {
+                <-
+            }
+            line_end = line_end + 1
+        }
+        mut line := body[i:line_end]
+        if line.len > 0 {
+            c0 := line[0] & 255
+            if c0 != 35 && c0 != 59 {
+                f := get_fields(&line)
+                if f.len >= 2 {
+                    f0 := f[0] + ""
+                    k := ascii_lower(&f0)
+                    if k == "nameserver" {
+                        addr := f[1] + ""
+                        ip := parse_ip(&addr)
+                        if ip.len == 4 {
+                            out.push(addr)
+                        }
+                    }
+                }
+            }
+        }
+        if line_end < body.len {
+            i = line_end + 1
+        } else {
+            i = body.len
+        }
+    }
+    if out.len == 0 {
+        << default_nameservers()
+    }
+    << out
+}
+
+fn dns_query(name string, qtype int) DnsMsg {
+    servers := read_nameservers()
+    if servers.len == 0 {
+        >> errors.new("dns: no nameservers")
+    }
+    mut i := 0
+    mut last := "dns: no nameservers"
+    while i < servers.len {
+        addr := servers[i] + ""
+        ip := parse_ip(&addr)
+        msg := dns_exchange_tcp(ip, 53, name, qtype) or (err) {
+            last = err.msg()
+            i = i + 1
+            ->
+        }
+        << msg
+    }
+    >> errors.new(last)
+    << DnsMsg{id: 0, flags: 0, question: []DnsRR{}, answer: []DnsRR{}}
+}

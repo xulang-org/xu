@@ -1,0 +1,648 @@
+@xu/types
+
+// Bounded readers for complete lower-bound loops. Kind 1 is pre-test;
+// kind 2 has an initial guard and latch (mir_29_latch_loop_plan). Preserve
+// the actual instruction/edge order and makes no movement, range, NoTrap,
+// register, or emission claim. Consume only with the same immutable MIR.
+// Reasons: 0 success, 1 context, 2 budget, 3 metadata/facts, 4 CFG,
+// 5 unsupported instruction, 6 expression, 7 edge update, 8 escaping use,
+// 9 reference/layout. Public reason alone cannot make a rejected plan valid.
+pub struct MirLoopPlan {
+    pub reason int
+    valid bool
+    nl int
+    nt int
+    // Field schema (all ids retain their actual immutable MIR points):
+    // 0 entry; 1 header; 2 body; 3/4 true/false starts; 5 exit start;
+    // 6/7 lo storage kind/id; 8/9 hi storage kind/id (Local=1, Temp=2);
+    // 10 mid arithmetic destination TempId at its original definition,
+    //    not a promise that this Temp still contains mid at body end;
+    // 11 needle formal origin LocalId, not an available frame home;
+    // 12 immutable array formal origin; 13 descriptor opcode 17/26 or
+    //    0 for tagged Local Index base; 14 descriptor producer Temp/-1;
+    // 15 checked Index InstrId; 16 entry length InstrId/-1;
+    // 17 header LT InstrId; 18 element LT InstrId;
+    // 19/20 edge tails; 21 entry tail; 22 exit Return block;
+    // 23 permissions=0: no range, NoTrap, move/delete, RA or emission;
+    // 24/25/26 lo initial origin kind/value/first definition;
+    // 27/28/29 hi initial origin kind/value/first definition;
+    //    origin kind 1=formal LocalId, 2=literal value, 3=length InstrId;
+    // 30 exact mid Add InstrId. Index field 15 reads its actual operand c
+    //    at that point; element LT field 18 reads actual needle operand d.
+    //    These points retain old Temp snapshots even after redefinitions.
+    // 31 entry length formal root/-1; 32 length opcode 17/26/-1;
+    // 33 body memory read count (Index plus optional descriptor).
+    fields []int
+    // Four chains: entry, true edge, false edge, normal exit. Flat starts
+    // delimit the chains; no nested MFn or array borrow survives a call.
+    starts []int
+    blocks []int
+    // Header-entry, body-branch, exit-branch roles for all storage cells:
+    // 0 unknown, 1 lo, 2 hi, 3 hi-lo, 4 arithmetic (hi-lo)>>1, 5 mid,
+    // 6 element, 7 saved needle, 8 root reference, 9 full descriptor,
+    // 10 loop LT, 11 element LT, 12 wrapping mid+1, 14 literal 1,
+    // 15 literal 0, 16 another literal. Unknown or dead values are not
+    // deletion permissions; original entry/header/body writes remain.
+    roles []int
+    // Actual sequential edge plans, four lanes per cell, true then false.
+    edges []int
+}
+
+struct MirLoopOrigin {
+    kind int
+    value int
+    definition int
+}
+
+fn mir_loop_blank() MirLoopPlan {
+    << MirLoopPlan{reason: 1, valid: false, nl: 0, nt: 0, fields: []int{}, starts: []int{}, blocks: []int{}, roles: []int{}, edges: []int{}}
+}
+
+fn mir_loop_int_cell(m &Mir, fi int, cell int, nl int) bool {
+    if cell < 0 { << false }
+    if cell < nl { << mir_local_ty(m, fi, cell) == 1 && mir_local_nslots(m, fi, cell) == 1 }
+    ti := cell - nl
+    << ti < mir_ntemps(m, fi) && mir_temp_ty(m, fi, ti) == 1 && mir_temp_nslots(m, fi, ti) == 1
+}
+
+fn mir_loop_cell_version(m &Mir, fi int, f &MirValueFacts, bi int, before int, cell int) int {
+    if cell < f.nl { << mir_value_facts_version(m, fi, f, bi, before, 1, cell) }
+    << mir_value_facts_version(m, fi, f, bi, before, 2, cell - f.nl)
+}
+
+// Find the exact bool computation controlling this terminator. Do not
+// infer control from the presence of an unrelated comparison in the block.
+fn mir_loop_condition(m &Mir, fi int, f &MirValueFacts, bi int) int {
+    mut value := mir_bta(m, fi, bi)
+    mut before := -1
+    for _ in 0:32 {
+        if value < 0 { << -1 }
+        ii := mir_value_facts_version(m, fi, f, bi, before, 2, value)
+        if ii < 0 || ii >= f.ni || mir_value_facts_owner(f, ii) != bi { << -1 }
+        if mir_ikind(m, fi, ii) == 4 && mir_ib(m, fi, ii) == 8 { << ii }
+        if mir_ikind(m, fi, ii) != 1 { << -1 }
+        value = mir_ib(m, fi, ii)
+        before = ii
+    }
+    << -1
+}
+
+// Resolve only the header's Copy/LoadLocal prefix. A cell observed on
+// header entry is a dynamic state snapshot, even if its facts key is a
+// merge token. Different state cells are never equated by that token.
+fn mir_loop_header_cell(m &Mir, fi int, f &MirValueFacts, header int, before int, value int) int {
+    if value < 0 { << -1 }
+    mut cell := f.nl + value
+    mut point := before
+    for _ in 0:32 {
+        ver := mir_loop_cell_version(m, fi, f, header, point, cell)
+        if ver < 0 { << -1 }
+        if ver >= f.ni || mir_value_facts_owner(f, ver) != header { << cell }
+        k := mir_ikind(m, fi, ver)
+        if k == 1 {
+            source := mir_ib(m, fi, ver)
+            if source < 0 { << -1 }
+            cell = f.nl + source
+        } else if k == 2 { cell = mir_ib(m, fi, ver) }
+        else { << -1 }
+        point = ver
+    }
+    << -1
+}
+
+// Resolve a scalar at the precise point through actual old definitions.
+// A conflicting merge, arithmetic, or a redefined formal is not invariant.
+fn mir_loop_scalar_origin(m &Mir, fi int, f &MirValueFacts, bi int, before int, kind int, id int) MirLoopOrigin {
+    mut r := MirLoopOrigin{kind: 0, value: -1, definition: -1}
+    mut block := bi
+    mut point := before
+    mut ck := kind
+    mut cid := id
+    for _ in 0:32 {
+        if ck == 3 {
+            ci := mir_scalar_const_index(m, fi, cid)
+            if ci < 0 { << r }
+            r.kind = 2
+            r.value = mir_const_at(m, fi, ci)
+            << r
+        }
+        ver := mir_value_facts_version(m, fi, f, block, point, ck, cid)
+        if ver < 0 { << r }
+        if r.definition < 0 { r.definition = ver }
+        if ck == 1 && cid < f.np && ver == f.ni + cid && mir_local_ty(m, fi, cid) == 1 {
+            r.kind = 1
+            r.value = cid
+            << r
+        }
+        if ver >= f.ni { << r }
+        block = mir_value_facts_owner(f, ver)
+        if block < 0 { << r }
+        point = ver
+        k := mir_ikind(m, fi, ver)
+        if k == 1 || k == 3 {
+            ck = 2
+            cid = mir_ib(m, fi, ver)
+            if cid < 0 { ck = 3 }
+        } else if k == 2 { ck = 1
+            cid = mir_ib(m, fi, ver) }
+        else if (k == 17 || k == 26) && mir_ic(m, fi, ver) == 8 && mir_id(m, fi, ver) == 1 {
+            r.kind = 3
+            r.value = ver
+            << r
+        } else { << r }
+    }
+    << r
+}
+
+fn mir_loop_value_role(m &Mir, fi int, roles &[]int, nl int, value int) int {
+    if value >= 0 {
+        cell := nl + value
+        if cell >= roles.len { << 0 }
+        << roles[cell]
+    }
+    ci := mir_scalar_const_index(m, fi, value)
+    if ci >= 0 {
+        if mir_const_at(m, fi, ci) == 1 { << 14 }
+        if mir_const_at(m, fi, ci) == 0 { << 15 }
+        << 16
+    }
+    << 0
+}
+
+// All chains are private, ordered Jump paths. Entry starts at block zero;
+// exit ends at Return. Reaching the join consumes no instructions there.
+fn mir_loop_chain(m &Mir, fi int, f &MirValueFacts, start int, join int, pred int, entry bool, exit bool) []int {
+    mut out := []int{}
+    mut bi := start
+    mut previous := pred
+    mut steps := 0
+    for _ in 0:9 {
+        if bi == join { << out }
+        if bi < 0 || bi >= f.nb || !mir_value_facts_reachable(f, bi) { << []int{} }
+        for j in 0:out.len { if out[j] == bi { << []int{} } }
+        if out.len >= 8 { << []int{} }
+        if entry && bi == 0 {
+            if mir_value_facts_pred_count(f, bi) != 0 { << []int{} }
+        } else {
+            if mir_value_facts_pred_count(f, bi) != 1 { << []int{} }
+            soff := mir_value_facts_off(f, 3)
+            poff := mir_value_facts_off(f, 4)
+            if f.data[poff + f.data[soff + bi]] != previous { << []int{} }
+        }
+        out.push(bi)
+        mut ii := mir_bhead(m, fi, bi)
+        for _ in 0:f.ni {
+            if ii == -1 { <- }
+            steps += 1
+            if steps > 128 { << []int{} }
+            ii = mir_inext(m, fi, ii)
+        }
+        tk := mir_btkind(m, fi, bi)
+        if exit && tk == 3 { << out }
+        if tk != 1 { << []int{} }
+        previous = bi
+        bi = mir_bta(m, fi, bi)
+    }
+    << []int{}
+}
+
+fn mir_loop_same_edge_role(e &MirScalarEdgePlan, roles &[]int, cell int) int {
+    n := e.nl + e.nt
+    if cell < 0 || cell >= n || !e.valid || e.reason != 0 || e.values[cell] != 1 { << 0 }
+    source := e.values[n + cell]
+    if source < 0 || source >= roles.len { << 0 }
+    role := roles[source]
+    add := e.values[n * 2 + cell]
+    if add == 0 { << role }
+    if add == 1 && role == 5 { << 12 }
+    << 0
+}
+
+// Shared body grammar for both pre-test and initial-guard/latch CFGs.
+// Inputs are roles at body entry; all original instruction points survive.
+fn mir_loop_scan_body(m &Mir, fi int, facts &MirValueFacts, p &mut MirLoopPlan, roles &mut []int) int {
+    // Rejection is local to this helper; callers may enter with reason=0.
+    p.reason = 5
+    body := p.fields[2]
+    mut lo := p.fields[7]
+    if p.fields[6] == 2 { lo += p.nl }
+    mut hi := p.fields[9]
+    if p.fields[8] == 2 { hi += p.nl }
+    index_instr := p.fields[15]
+    element_cmp := p.fields[18]
+    mut descriptor_instr := -1
+    if p.fields[14] >= 0 {
+        mut di := mir_bhead(m, fi, body)
+        for _ in 0:facts.ni {
+            if di == -1 { <- }
+            dk := mir_ikind(m, fi, di)
+            if dk == 17 || dk == 26 { descriptor_instr = di }
+            di = mir_inext(m, fi, di)
+        }
+    }
+    mut base_kind := 2
+    if mir_ib(m, fi, index_instr) >= 1073741824 { base_kind = 1 }
+    mut sub_count := 0
+    mut shift_count := 0
+    mut mid_count := 0
+    mut pred_count := 0
+    mut mid_temp := -1
+    mut mid_instr := -1
+    mut mid_local := -1
+    mut ii := mir_bhead(m, fi, body)
+    for _ in 0:facts.ni {
+        if ii == -1 { <- }
+        k := mir_ikind(m, fi, ii)
+        if k != 0 {
+            dest := mir_scalar_def_cell(m, fi, ii, p.nl)
+            if dest == lo || dest == hi { p.reason = 8
+                << p.reason }
+            mut role := 0
+            if k == 1 { role = mir_loop_value_role(m, fi, &*roles, p.nl, mir_ib(m, fi, ii)) }
+            else if k == 2 { role = roles[mir_ib(m, fi, ii)] }
+            else if k == 3 {
+                role = mir_loop_value_role(m, fi, &*roles, p.nl, mir_ib(m, fi, ii))
+                if role != 5 || (mid_local >= 0 && mid_local != dest) { p.reason = 8
+                    << p.reason }
+                mid_local = dest
+            } else if k == 4 {
+                op := mir_ib(m, fi, ii)
+                c := mir_loop_value_role(m, fi, &*roles, p.nl, mir_ic(m, fi, ii))
+                d := mir_loop_value_role(m, fi, &*roles, p.nl, mir_id(m, fi, ii))
+                if op == 2 && c == 2 && d == 1 { role = 3
+                    sub_count += 1 }
+                else if op == 18 && c == 3 && d == 14 { role = 4
+                    shift_count += 1 }
+                else if op == 1 && ((c == 1 && d == 4) || (c == 4 && d == 1)) { role = 5
+                    mid_count += 1
+                    mid_temp = mir_ia(m, fi, ii)
+                    mid_instr = ii }
+                else if ii == element_cmp && op == 8 && c == 6 && d == 7 { role = 11
+                    pred_count += 1 }
+                else { p.reason = 6
+                    << p.reason }
+            } else if k == 17 || k == 26 {
+                if ii != descriptor_instr || mir_loop_value_role(m, fi, &*roles, p.nl, mir_ib(m, fi, ii)) != 8 { p.reason = 9
+                    << p.reason }
+                role = 9
+            } else if k == 14 {
+                if ii != index_instr || mir_loop_value_role(m, fi, &*roles, p.nl, mir_ic(m, fi, ii)) != 5 { p.reason = 6
+                    << p.reason }
+                mut base_role := 0
+                base := mir_ib(m, fi, ii)
+                if base >= 1073741824 { base_role = roles[base - 1073741824] }
+                else { base_role = mir_loop_value_role(m, fi, &*roles, p.nl, base) }
+                if (base_kind == 1 && base_role != 8) || (base_kind == 2 && base_role != 9) { p.reason = 9
+                    << p.reason }
+                role = 6
+            } else { << p.reason }
+            // Unknown Copy/Load sources in the region cannot be dropped.
+            if role == 0 { p.reason = 6
+                << p.reason }
+            roles[dest] = role
+        }
+        ii = mir_inext(m, fi, ii)
+    }
+    p.reason = 6
+    if sub_count != 1 || shift_count != 1 || mid_count != 1 || pred_count != 1 || mir_loop_value_role(m, fi, &*roles, p.nl, mir_bta(m, fi, body)) != 11 { << p.reason }
+    p.fields[10] = mid_temp
+    p.fields[30] = mid_instr
+    << 0
+}
+
+fn mir_loop_match_values(m &Mir, fi int, facts &MirValueFacts, p &mut MirLoopPlan) int {
+    n := p.nl + p.nt
+    header := p.fields[1]
+    body := p.fields[2]
+    true_start := p.fields[3]
+    false_start := p.fields[4]
+    mut lo := p.fields[7]
+    if p.fields[6] == 2 { lo += p.nl }
+    mut hi := p.fields[9]
+    if p.fields[8] == 2 { hi += p.nl }
+    needle := p.fields[11]
+    root := p.fields[12]
+    loop_cmp := p.fields[17]
+    exit_tail := p.fields[22]
+    mut ii := -1
+    mut roles := []int{}
+    for _ in 0:n { roles.push(0) }
+    for cell in 0:n {
+        mut kind := 2
+        mut id := cell - p.nl
+        if cell < p.nl { kind = 1
+            id = cell }
+        point := mir_bhead(m, fi, header)
+        origin := mir_loop_scalar_origin(m, fi, facts, header, point, kind, id)
+        if origin.kind == 1 && origin.value == needle { roles[cell] = 7 }
+        rr := mir_readonly_value_root(m, fi, facts, header, point, kind, id)
+        if rr == root {
+            roles[cell] = 8
+            if kind == 2 && mir_readonly_array_type(m, mir_temp_ty(m, fi, id)) { roles[cell] = 9 }
+        }
+    }
+    roles[lo] = 1
+    roles[hi] = 2
+    for cell in 0:n { p.roles.push(roles[cell]) }
+    p.reason = 5
+    mut cmp_count := 0
+    ii = mir_bhead(m, fi, header)
+    for _ in 0:facts.ni {
+        if ii == -1 { <- }
+        k := mir_ikind(m, fi, ii)
+        if k != 0 {
+            dest := p.nl + mir_ia(m, fi, ii)
+            if dest == lo || dest == hi { << p.reason }
+            mut role := 0
+            if k == 1 { role = mir_loop_value_role(m, fi, &roles, p.nl, mir_ib(m, fi, ii)) }
+            else if k == 2 { role = roles[mir_ib(m, fi, ii)] }
+            else if k == 4 && ii == loop_cmp {
+                if mir_loop_value_role(m, fi, &roles, p.nl, mir_ic(m, fi, ii)) != 1 || mir_loop_value_role(m, fi, &roles, p.nl, mir_id(m, fi, ii)) != 2 { p.reason = 6
+                    << p.reason }
+                role = 10
+                cmp_count += 1
+            } else { << p.reason }
+            roles[dest] = role
+        }
+        ii = mir_inext(m, fi, ii)
+    }
+    if cmp_count != 1 || mir_loop_value_role(m, fi, &roles, p.nl, mir_bta(m, fi, header)) != 10 { p.reason = 6
+        << p.reason }
+    // Keep the header false-edge snapshot separately from the body state.
+    mut exit_roles := []int{}
+    for cell in 0:n { exit_roles.push(roles[cell]) }
+    scanned := mir_loop_scan_body(m, fi, facts, p, mut &roles)
+    if scanned != 0 { << scanned }
+    for cell in 0:n { p.roles.push(roles[cell]) }
+    mut te := mir_read_scalar_edge(m, fi, facts, body, true_start, header)
+    mut fe := mir_read_scalar_edge(m, fi, facts, body, false_start, header)
+    p.reason = 7
+    if !te.valid || te.reason != 0 || !fe.valid || fe.reason != 0 { << p.reason }
+    if mir_loop_same_edge_role(&te, &roles, lo) != 12 || mir_loop_same_edge_role(&te, &roles, hi) != 2 || mir_loop_same_edge_role(&fe, &roles, lo) != 1 || mir_loop_same_edge_role(&fe, &roles, hi) != 5 { << p.reason }
+    // Retain every intermediate/final edge write, including Phi destruction
+    // scratch copies. Reject unrelated Local writes and unsupported sources.
+    for arm in 0:2 {
+        for cell in 0:n {
+            mut touched := te.values[n * 3 + cell]
+            mut role := mir_loop_same_edge_role(&te, &roles, cell)
+            if arm == 1 { touched = fe.values[n * 3 + cell]
+                role = mir_loop_same_edge_role(&fe, &roles, cell) }
+            if touched != 0 {
+                if cell < p.nl && cell != lo && cell != hi { p.reason = 8
+                    << p.reason }
+                if role != 1 && role != 2 && role != 5 && role != 12 { << p.reason }
+            }
+        }
+        for at in 0:n * 4 {
+            mut value := te.values[at]
+            if arm == 1 { value = fe.values[at] }
+            p.edges.push(value)
+        }
+    }
+    p.reason = 8
+    for b in p.starts[3]:p.starts[4] {
+        bi := p.blocks[b]
+        ii = mir_bhead(m, fi, bi)
+        for _ in 0:facts.ni {
+            if ii == -1 { <- }
+            k := mir_ikind(m, fi, ii)
+            if k != 0 {
+                dest := mir_scalar_def_cell(m, fi, ii, p.nl)
+                mut role := 0
+                if k == 1 || k == 3 { role = mir_loop_value_role(m, fi, &exit_roles, p.nl, mir_ib(m, fi, ii)) }
+                else if k == 2 { role = exit_roles[mir_ib(m, fi, ii)] }
+                else { << p.reason }
+                if role != 1 || (k == 3 && dest != lo) { << p.reason }
+                exit_roles[dest] = role
+            }
+            ii = mir_inext(m, fi, ii)
+        }
+    }
+    if mir_loop_value_role(m, fi, &exit_roles, p.nl, mir_bta(m, fi, exit_tail)) != 1 { << p.reason }
+    for cell in 0:n { p.roles.push(exit_roles[cell]) }
+    << 0
+}
+
+pub fn new_mir_lower_bound_loop_plan(m &Mir, fi int, header int) MirLoopPlan {
+    mut p := mir_loop_blank()
+    if fi < 0 || fi >= m.fns.len { << p }
+    mut facts := new_mir_readonly_value_facts(m, fi)
+    p.reason = 3
+    if !facts.valid || facts.reason != 0 {
+        if facts.reason == 2 { p.reason = 2 }
+        << p }
+    p.nl = facts.nl
+    p.nt = facts.nt
+    n := p.nl + p.nt
+    p.reason = 4
+    if header <= 0 || header >= facts.nb || mir_btkind(m, fi, header) != 2 || mir_value_facts_pred_count(&facts, header) != 3 { << p }
+    body := mir_btb(m, fi, header)
+    exit_start := mir_btc(m, fi, header)
+    if body == exit_start || body == header || exit_start == header || mir_btkind(m, fi, body) != 2 || mir_value_facts_pred_count(&facts, body) != 1 { << p }
+    true_start := mir_btb(m, fi, body)
+    false_start := mir_btc(m, fi, body)
+    if true_start == false_start { << p }
+    mut entry_blocks := mir_loop_chain(m, fi, &facts, 0, header, -1, true, false)
+    mut true_blocks := mir_loop_chain(m, fi, &facts, true_start, header, body, false, false)
+    mut false_blocks := mir_loop_chain(m, fi, &facts, false_start, header, body, false, false)
+    mut exit_blocks := mir_loop_chain(m, fi, &facts, exit_start, -1, header, false, true)
+    if entry_blocks.len == 0 || true_blocks.len == 0 || false_blocks.len == 0 || exit_blocks.len == 0 { << p }
+    mut owners := []int{}
+    for _ in 0:facts.nb { owners.push(0) }
+    owners[header] = 1
+    if owners[body] != 0 { << p }
+    owners[body] = 2
+    p.starts.push(0)
+    for part in 0:4 {
+        mut count := entry_blocks.len
+        if part == 1 { count = true_blocks.len }
+        if part == 2 { count = false_blocks.len }
+        if part == 3 { count = exit_blocks.len }
+        for j in 0:count {
+            mut bi := 0
+            if part == 0 { bi = entry_blocks[j] }
+            if part == 1 { bi = true_blocks[j] }
+            if part == 2 { bi = false_blocks[j] }
+            if part == 3 { bi = exit_blocks[j] }
+            if owners[bi] != 0 { << p }
+            owners[bi] = part + 3
+            p.blocks.push(bi)
+        }
+        chain_end := p.blocks.len
+        p.starts.push(chain_end)
+    }
+    for bi in 0:facts.nb { if mir_value_facts_reachable(&facts, bi) && owners[bi] == 0 { << p } }
+    // Header's predecessor set is exactly entry and both backedge tails.
+    entry_tail := entry_blocks[entry_blocks.len - 1]
+    true_tail := true_blocks[true_blocks.len - 1]
+    false_tail := false_blocks[false_blocks.len - 1]
+    if !mir_scalar_cfg_edge(m, fi, entry_tail, header) || !mir_scalar_cfg_edge(m, fi, true_tail, header) || !mir_scalar_cfg_edge(m, fi, false_tail, header) { << p }
+    p.reason = 6
+    loop_cmp := mir_loop_condition(m, fi, &facts, header)
+    element_cmp := mir_loop_condition(m, fi, &facts, body)
+    if loop_cmp < 0 || element_cmp < 0 { << p }
+    lo := mir_loop_header_cell(m, fi, &facts, header, loop_cmp, mir_ic(m, fi, loop_cmp))
+    hi := mir_loop_header_cell(m, fi, &facts, header, loop_cmp, mir_id(m, fi, loop_cmp))
+    if lo == hi || !mir_loop_int_cell(m, fi, lo, p.nl) || !mir_loop_int_cell(m, fi, hi, p.nl) { << p }
+    needle_origin := mir_loop_scalar_origin(m, fi, &facts, body, element_cmp, 2, mir_id(m, fi, element_cmp))
+    if needle_origin.kind != 1 { << p }
+    needle := needle_origin.value
+    mut index_instr := -1
+    mut descriptor_instr := -1
+    mut length_instr := -1
+    mut ii := mir_bhead(m, fi, body)
+    for _ in 0:facts.ni {
+        if ii == -1 { <- }
+        k := mir_ikind(m, fi, ii)
+        if k == 14 { if index_instr >= 0 { << p }
+            index_instr = ii }
+        if k == 17 || k == 26 {
+            if descriptor_instr >= 0 || mir_ic(m, fi, ii) != 0 || mir_id(m, fi, ii) != 3 { << p }
+            descriptor_instr = ii
+        }
+        ii = mir_inext(m, fi, ii)
+    }
+    if index_instr < 0 { << p }
+    mut base_kind := 2
+    mut base_id := mir_ib(m, fi, index_instr)
+    if base_id >= 1073741824 { base_kind = 1
+        base_id -= 1073741824 }
+    root := mir_readonly_value_root(m, fi, &facts, body, index_instr, base_kind, base_id)
+    p.reason = 9
+    if root < 0 { << p }
+    if base_kind == 2 && descriptor_instr < 0 { << p }
+    if base_kind == 1 && descriptor_instr >= 0 { << p }
+    mut layout := 0
+    mut descriptor_temp := -1
+    if descriptor_instr >= 0 { layout = mir_ikind(m, fi, descriptor_instr)
+        descriptor_temp = mir_ia(m, fi, descriptor_instr) }
+    // Entry instructions execute before the zero-trip test. Preserve their
+    // order and permit only scalar initialization/ref loads and length reads.
+    p.reason = 5
+    for b in 0:entry_blocks.len {
+        bi := entry_blocks[b]
+        ii = mir_bhead(m, fi, bi)
+        for _ in 0:facts.ni {
+            if ii == -1 { <- }
+            k := mir_ikind(m, fi, ii)
+            if k == 17 || k == 26 {
+                if length_instr >= 0 || mir_ic(m, fi, ii) != 8 || mir_id(m, fi, ii) != 1 { << p }
+                length_instr = ii
+            } else if k < 0 || k > 3 { << p }
+            ii = mir_inext(m, fi, ii)
+        }
+    }
+    lo_origin := mir_loop_scalar_origin(m, fi, &facts, entry_tail, -1, 2, lo - p.nl)
+    mut low := lo_origin
+    if lo < p.nl { low = mir_loop_scalar_origin(m, fi, &facts, entry_tail, -1, 1, lo) }
+    hi_origin := mir_loop_scalar_origin(m, fi, &facts, entry_tail, -1, 2, hi - p.nl)
+    mut high := hi_origin
+    if hi < p.nl { high = mir_loop_scalar_origin(m, fi, &facts, entry_tail, -1, 1, hi) }
+    p.reason = 6
+    if low.kind == 0 || high.kind == 0 { << p }
+    mut entry_length_root := -1
+    mut entry_length_layout := -1
+    if length_instr >= 0 {
+        lb := mir_value_facts_owner(&facts, length_instr)
+        entry_length_root = mir_readonly_value_root(m, fi, &facts, lb, length_instr, 2, mir_ib(m, fi, length_instr))
+        entry_length_layout = mir_ikind(m, fi, length_instr)
+        if entry_length_root != root { p.reason = 9
+            << p }
+    }
+    exit_tail := exit_blocks[exit_blocks.len - 1]
+    for _ in 0:34 { p.fields.push(-1) }
+    p.fields[0] = 0
+    p.fields[1] = header
+    p.fields[2] = body
+    p.fields[3] = true_start
+    p.fields[4] = false_start
+    p.fields[5] = exit_start
+    p.fields[6] = 2
+    p.fields[7] = lo - p.nl
+    if lo < p.nl { p.fields[6] = 1
+        p.fields[7] = lo }
+    p.fields[8] = 2
+    p.fields[9] = hi - p.nl
+    if hi < p.nl { p.fields[8] = 1
+        p.fields[9] = hi }
+    p.fields[10] = -1
+    p.fields[11] = needle
+    p.fields[12] = root
+    p.fields[13] = layout
+    p.fields[14] = descriptor_temp
+    p.fields[15] = index_instr
+    p.fields[16] = length_instr
+    p.fields[17] = loop_cmp
+    p.fields[18] = element_cmp
+    p.fields[19] = true_tail
+    p.fields[20] = false_tail
+    p.fields[21] = entry_tail
+    p.fields[22] = exit_tail
+    p.fields[23] = 0
+    p.fields[24] = low.kind
+    p.fields[25] = low.value
+    p.fields[26] = low.definition
+    p.fields[27] = high.kind
+    p.fields[28] = high.value
+    p.fields[29] = high.definition
+    p.fields[30] = -1
+    p.fields[31] = entry_length_root
+    p.fields[32] = entry_length_layout
+    p.fields[33] = 1
+    if descriptor_instr >= 0 { p.fields[33] = 2 }
+    matched := mir_loop_match_values(m, fi, &facts, mut &p)
+    if matched != 0 { p.reason = matched
+        << p }
+    p.reason = 0
+    p.valid = true
+    << p
+}
+
+pub fn mir_loop_plan_field(p &MirLoopPlan, field int) int {
+    if !p.valid || p.reason != 0 || field < 0 || field >= p.fields.len { << -1 }
+    << p.fields[field]
+}
+
+pub fn mir_loop_plan_block_count(p &MirLoopPlan, part int) int {
+    if !p.valid || p.reason != 0 || part < 0 || part >= p.starts.len - 1 { << -1 }
+    << p.starts[part + 1] - p.starts[part]
+}
+
+pub fn mir_loop_plan_block(p &MirLoopPlan, part int, index int) int {
+    count := mir_loop_plan_block_count(p, part)
+    if index < 0 || index >= count { << -1 }
+    << p.blocks[p.starts[part] + index]
+}
+
+pub fn mir_loop_plan_cell_role(p &MirLoopPlan, phase int, kind int, id int) int {
+    if !p.valid || p.reason != 0 { << -1 }
+    mut phases := 3
+    if p.fields.len == 49 { phases = 5 }
+    if phase < 0 || phase >= phases { << -1 }
+    mut cell := -1
+    if kind == 1 && id >= 0 && id < p.nl { cell = id }
+    if kind == 2 && id >= 0 && id < p.nt { cell = p.nl + id }
+    if cell < 0 { << -1 }
+    << p.roles[phase * (p.nl + p.nt) + cell]
+}
+
+pub fn mir_loop_plan_edge_value(p &MirLoopPlan, arm int, kind int, id int, lane int) int {
+    if !p.valid || p.reason != 0 { << -1 }
+    mut arms := 2
+    if p.fields.len == 49 { arms = 6 }
+    if arm < 0 || arm >= arms || lane < 0 || lane > 3 { << -1 }
+    mut cell := -1
+    if kind == 1 && id >= 0 && id < p.nl { cell = id }
+    if kind == 2 && id >= 0 && id < p.nt { cell = p.nl + id }
+    if cell < 0 { << -1 }
+    << p.edges[(arm * 4 + lane) * (p.nl + p.nt) + cell]
+}
+
+// Kind 1 has a pre-test header; kind 2 has an initial guard and latch.
+// It describes shape only, without granting transformation permissions.
+pub fn mir_loop_plan_kind(p &MirLoopPlan) int {
+    if !p.valid || p.reason != 0 { << -1 }
+    if p.fields.len == 34 { << 1 }
+    if p.fields.len == 49 && p.fields[34] == 2 { << 2 }
+    << -1
+}

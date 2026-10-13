@@ -1,0 +1,607 @@
+@main
+
+#xu/types
+
+struct IfLocalAssign {
+    ok   int
+    dst  int
+    src  int
+    inc  int
+    join int
+}
+
+fn mir_diamond_has_mem(m &types.Mir, fi int, bi int) bool {
+    if bi < 0 || bi >= types.mir_nblocks(m, fi) { << false }
+    mut xi := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if xi < 0 { << false }
+        xkind := types.mir_ikind(m, fi, xi)
+        if xkind == 7 || xkind == 11 || xkind == 18 || xkind == 20 || xkind == 25 || xkind == 46 || xkind == 47 || xkind == 48 {
+            << true
+        }
+        xi = types.mir_inext(m, fi, xi)
+    }
+    << false
+}
+
+fn mir_skip_empty_jumps(m &types.Mir, fi int, start int) int {
+    mut bi := start
+    for _ in 0:types.mir_nblocks(m, fi) {
+        if bi < 0 || bi >= types.mir_nblocks(m, fi) { << -1 }
+        if types.mir_bhead(m, fi, bi) >= 0 || types.mir_btkind(m, fi, bi) != 1 { << bi }
+        to := types.mir_bta(m, fi, bi)
+        if to == bi { << bi }
+        bi = to
+    }
+    << -1
+}
+
+// Recognize one side of a scalar assignment diamond:
+//   x = y       or       x = y + 1
+// followed by a jump to the merge.  This is ordinary if-conversion legality,
+// not a binary-search/function-name matcher.
+fn mir_if_local_assign(m &types.Mir, fi int, start int) IfLocalAssign {
+    bi := mir_skip_empty_jumps(m, fi, start)
+    mut out := IfLocalAssign{ok: 0, dst: -1, src: -1, inc: 0, join: -1}
+    if bi < 0 || types.mir_btkind(m, fi, bi) != 1 { << out }
+    mut load_t := -1
+    mut load_l := -1
+    mut add_t := -1
+    mut store_n := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == 2 && load_t < 0 {
+            load_t = types.mir_ia(m, fi, ii)
+            load_l = types.mir_ib(m, fi, ii)
+        } else if k == 4 && add_t < 0 && types.mir_ib(m, fi, ii) == 1 {
+            c0 := types.mir_ic(m, fi, ii)
+            d0 := types.mir_id(m, fi, ii)
+            if (c0 == load_t && rc_const_u32(m, fi, d0) == 1) || (d0 == load_t && rc_const_u32(m, fi, c0) == 1) {
+                add_t = types.mir_ia(m, fi, ii)
+            } else { << out }
+        } else if k == 3 && store_n == 0 {
+            val := types.mir_ib(m, fi, ii)
+            if val == load_t {
+                out.inc = 0
+            } else if val == add_t && add_t >= 0 {
+                out.inc = 1
+            } else { << out }
+            out.dst = types.mir_ia(m, fi, ii)
+            store_n = 1
+        } else {
+            << out
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if load_l < 0 || store_n != 1 { << out }
+    out.src = load_l
+    out.join = mir_skip_empty_jumps(m, fi, types.mir_bta(m, fi, bi))
+    if out.join < 0 { << out }
+    out.ok = 1
+    << out
+}
+
+fn fn_has_assign_diamond(m &types.Mir, fi int) bool {
+    for bi in 0:types.mir_nblocks(m, fi) {
+        if types.mir_btkind(m, fi, bi) != 2 { -> }
+        yes := mir_if_local_assign(m, fi, types.mir_btb(m, fi, bi))
+        no := mir_if_local_assign(m, fi, types.mir_btc(m, fi, bi))
+        if yes.ok == 1 && no.ok == 1 && yes.join == no.join && yes.dst != no.dst && yes.src == no.src {
+            << true
+        }
+    }
+    << false
+}
+
+fn rc_mark_pin_dirty_local(a &mut Assembler, fr &Frame, loc int) bool {
+    if loc < 0 || loc >= fr.local_slot.len { << false }
+    p := rc_pin_index(&*a, fr.local_slot[loc])
+    if p < 0 { << false }
+    vr := rc_pin_vr(&*a, p)
+    if a.rc_s_pool && a.arch == 0 {
+        a.rc_pin_dirty[p] = 1
+        a.rc_pin_alias[p] = -1
+    } else if vr >= 2 && vr < rc_home_hi(&*a) {
+        a.rc_dirty[vr] = 1
+        a.rc_alias[vr] = -1
+    }
+    << true
+}
+
+fn emit_if_converted_locals(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, then_b int, else_b int, cc int) bool {
+    // ARM64 has native csel/csinc and wins here.  The equivalent X64
+    // lea+cmov sequence is correct but slower than retaining the branch.
+    if a.arch != 0 || !a.rc_on { << false }
+    // Csel updates pin registers and jumps to join. Only kernel 1
+    // forward `_ht` skips the join reload; kernel 0/2 reloaded stale
+    // lo/hi and search hung.
+    if a.rc_kernel != 1 { << false }
+    if mir_diamond_has_mem(m, fi, then_b) || mir_diamond_has_mem(m, fi, else_b) {
+        << false
+    }
+    yes := mir_if_local_assign(m, fi, then_b)
+    no := mir_if_local_assign(m, fi, else_b)
+    if yes.ok == 0 || no.ok == 0 || yes.join != no.join || yes.dst == no.dst || yes.src != no.src { << false }
+    yp := rc_pin_index(&*a, fr.local_slot[yes.dst])
+    np := rc_pin_index(&*a, fr.local_slot[no.dst])
+    sp := rc_pin_index(&*a, fr.local_slot[yes.src])
+    if yp < 0 || np < 0 || sp < 0 { << false }
+    yr := rc_pin_vr(&*a, yp)
+    nr := rc_pin_vr(&*a, np)
+    sr := rc_pin_vr(&*a, sp)
+    if yes.inc == 0 {
+        a.vm_csel(yr, sr, yr, cc)
+    } else {
+        a.vm_csinc(yr, yr, sr, invert_cc(cc))
+    }
+    if no.inc == 0 {
+        a.vm_csel(nr, nr, sr, cc)
+    } else {
+        a.vm_csinc(nr, nr, sr, cc)
+    }
+    rc_mark_pin_dirty_local(a, fr, yes.dst)
+    rc_mark_pin_dirty_local(a, fr, no.dst)
+    rc_spill_except_temps(a, rc_temp_cutoff(fr))
+    a.jmp(rc_back_lbl(&*a, m, fi, bi, yes.join))
+    << true
+}
+
+fn emit_cover_tables(a &mut Assembler, ct &CoverTable) {
+    n := ct.files.len
+    a.data_label("_xu_cover_n")
+    rt_emit_u64(a, n)
+    a.data_label("_xu_cover_files")
+    for i in 0:n {
+        rt_emit_u64(a, ct.files[i])
+    }
+    a.data_label("_xu_cover_lines")
+    for i in 0:n {
+        rt_emit_u64(a, ct.lines[i])
+    }
+    a.data_label("_xu_cover_counts")
+    rt_emit_zeros(a, n * 8)
+    <<
+}
+
+// m33/m32: file-name table for assert / cover dump (rt_file_str).
+fn emit_file_table(a &mut Assembler, m &types.Mir) {
+    n := m.files.len
+    a.data_label("_xuf_n")
+    rt_emit_u64(a, n)
+    a.data_label("_xuf_off")
+    mut off := 0
+    for i in 0:n {
+        rt_emit_u64(a, off)
+        off = off + m.files[i].len + 1
+    }
+    rt_emit_u64(a, off)
+    a.data_label("_xuf_all")
+    for i in 0:n {
+        emit_str_data(a, m.files[i])
+        a.emit_data([0])
+    }
+    <<
+}
+
+fn emit_str_data(a &mut Assembler, s string) {
+    rt_emit_bytes(a, s)
+    <<
+}
+
+fn emit_edge_pins(a &mut Assembler, m &types.Mir, fi int, fr &Frame, from int, to int, pins &[]int) {
+    if to < 0 { << }
+    // FP-only mode has no GPR pin array. Preserve the SIMD loop layout and
+    // let rc_emit_edge_fp handle only the f64 residency state.
+    if !a.rc_on {
+        if a.rc_fp_only {
+            mut natural_edge := false
+            if from >= 0 && from < a.rc_loop_hot.len && to < a.rc_loop_hot.len {
+                natural_edge = a.rc_loop_hot[from] > 0 && a.rc_loop_hot[to] > 0
+            }
+            // Keep the loop-carried f64 live only across hot natural edges.
+            // Any exit/cold transition must materialize the dirty SIMD home.
+            if !natural_edge {
+                rc_writeback_dirty_fp(a)
+            }
+            rc_emit_edge_fp(a, m, fi, fr, from, to)
+        }
+        <<
+    }
+    if pins.len < (to + 1) * 4 { << }
+    mut same := true
+    if from < 0 || pins.len < (from + 1) * 4 {
+        same = false
+    } else {
+        for p in 0:4 {
+            if pins[from * 4 + p] != pins[to * 4 + p] {
+                same = false
+            }
+        }
+    }
+    if same {
+        mut same_fp := true
+        nh := rc_fp_homes()
+        if a.rc_fp_blk.len >= (to + 1) * nh && from >= 0 && a.rc_fp_blk.len >= (from + 1) * nh {
+            for p in 0:nh {
+                if a.rc_fp_blk[from * nh + p] != a.rc_fp_blk[to * nh + p] {
+                    same_fp = false
+                }
+            }
+        } else if a.rc_fp_blk.len >= (to + 1) * nh {
+            for p in 0:nh {
+                if a.rc_fp_blk[to * nh + p] >= 0 {
+                    same_fp = false
+                }
+            }
+        }
+        if same_fp {
+            mut natural_edge := false
+            if from >= 0 && from < a.rc_loop_hot.len && to < a.rc_loop_hot.len {
+                natural_edge = a.rc_loop_hot[from] > 0 && a.rc_loop_hot[to] > 0
+            }
+            // Two-way split writeback lives in emit_term (before the branch)
+            // so exit sees the last increment. Forward natural edges must
+            // not store every iter (`f64_sum` / `search_ints`).
+            if !natural_edge || from == to {
+                rc_writeback_dirty_gpr_pins(a)
+            }
+            mut hot_self := false
+            if from == to && from >= 0 && from < a.rc_loop_hot.len {
+                hot_self = a.rc_loop_hot[from] > 0
+            }
+            if !natural_edge || (from == to && !hot_self) {
+                rc_writeback_dirty_fp(a)
+            }
+            for p in 0:4 {
+                loc := pins[to * 4 + p]
+                if loc >= 0 && loc < fr.local_slot.len {
+                    vr := rc_pin_vr(&*a, p)
+                    slot := fr.local_slot[loc]
+                    if rc_find(&*a, slot) == vr {
+                        ->
+                    }
+                    a.load(vr, 15, slot_off(slot))
+                    rc_park(a, vr, slot)
+                }
+            }
+            rc_emit_edge_fp(a, m, fi, fr, from, to)
+            <<
+        }
+    }
+    // Layout changed: sync dirty pins, then reload (no mov-shuffle).
+    if a.rc_s_pool && a.arch == 0 {
+        for p in 0:4 {
+            if a.rc_pin[p] >= 0 && a.rc_pin_dirty[p] == 1 {
+                a.store(15, slot_off(a.rc_pin[p]), 8 + p)
+                a.rc_pin_dirty[p] = 0
+            }
+        }
+    }
+    rc_writeback_dirty_fp(a)
+    for p in 0:4 {
+        a.rc_pin[p] = -1
+        a.rc_pin_dirty[p] = 0
+        a.rc_pin_alias[p] = -1
+        a.rc_s_hold[p] = -1
+    }
+    if rc_fp_on(&*a) {
+        nh := rc_fp_homes()
+        for p in 0:nh {
+            a.rc_fp_pin[p] = -1
+            a.rc_fp_dirty[p] = 0
+            a.rc_fp_alias[p] = -1
+            a.rc_fp_alias2[p] = -1
+        }
+    }
+    for p in 0:4 {
+        loc := pins[to * 4 + p]
+        if loc >= 0 && loc < fr.local_slot.len {
+            vr := rc_pin_vr(&*a, p)
+            slot := fr.local_slot[loc]
+            a.load(vr, 15, slot_off(slot))
+            rc_park(a, vr, slot)
+        }
+    }
+    rc_emit_edge_fp(a, m, fi, fr, from, to)
+    <<
+}
+
+fn emit_skip_jmp(m &types.Mir, fi int, b int) int {
+    mut t := b
+    n := types.mir_nblocks(m, fi)
+    for _ in 0:8 {
+        if t < 0 || t >= n { << b }
+        if types.mir_bhead(m, fi, t) >= 0 { << t }
+        if types.mir_btkind(m, fi, t) != 1 { << t }
+        nxt := types.mir_bta(m, fi, t)
+        if nxt == t { << t }
+        t = nxt
+    }
+    << t
+}
+
+fn emit_skip_target(m &types.Mir, fi int, tkind int, b int, want int) int {
+    if tkind != want { << b }
+    << emit_skip_jmp(m, fi, b)
+}
+
+fn emit_term(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, pins &[]int) {
+    if emit_select_pair_term(a, m, fi, fr, bi) { << }
+    tkind := types.mir_btkind(m, fi, bi)
+    ta := emit_skip_target(m, fi, tkind, types.mir_bta(m, fi, bi), 1)
+    tb := emit_skip_target(m, fi, tkind, types.mir_btb(m, fi, bi), 2)
+    tc := emit_skip_target(m, fi, tkind, types.mir_btc(m, fi, bi), 2)
+    cutoff := rc_temp_cutoff(fr)
+    if tkind == 1 { // Jump
+        mut to_pinned := false
+        if pins.len >= (ta + 1) * 4 {
+            for p in 0:4 {
+                if pins[ta * 4 + p] >= 0 {
+                    to_pinned = true
+                }
+            }
+        }
+        mut hot_edge := false
+        if bi < a.rc_loop_hot.len && ta >= 0 && ta < a.rc_loop_hot.len {
+            if a.rc_loop_hot[bi] > 0 && a.rc_loop_hot[ta] > 0 {
+                if bi > ta || a.rc_kernel == 1 || (a.arch == 0 && a.rc_fwd_ht) {
+                    hot_edge = true
+                }
+            }
+        }
+        if ta == bi {
+            rc_spill_except_temps_keep_fp(a, cutoff)
+        } else if rc_edge_can_carry(&*a, pins, bi, ta) {
+            rc_carry_save(a, ta)
+        } else if a.arch == 0 && a.rc_fwd_ht && hot_edge {
+        } else if to_pinned {
+            rc_spill_except_temps(a, cutoff)
+        } else {
+            rc_spill(a)
+        }
+        emit_edge_pins(a, m, fi, fr, bi, ta, pins)
+        if ta != bi + 1 || hot_edge {
+            a.jmp(rc_back_lbl(&*a, m, fi, bi, ta))
+        }
+        <<
+    }
+    if tkind == 2 { // Branch
+        mut fused := a.rc_fused_cc
+        a.rc_fused_cc = -1
+        if fused < 0 {
+            cr := rc_load_reg(a, m, fi, fr, ta, 0)
+            a.vm_cmp_imm(cr, 0)
+        }
+        pref := types.mir_fn_label(m, fi) + "_bb"
+        if fused >= 0 && emit_if_converted_locals(a, m, fi, fr, bi, tb, tc, fused) {
+            <<
+        }
+        if fused >= 0 && tb == bi && (a.rc_leaf || a.rc_wb) {
+            // Flush dirty parks/pins before the back-edge. `_ht` skips
+            // block-entry pin reloads; body LoadLocals that miss a live pin
+            // read stack. StoreLocal may only dirty an S/V home — without a
+            // stack writeback, induction (nbody `for i in 0 → n`) reloads 0
+            // forever when register pressure keeps `i` out of a stable pin.
+            rc_spill_except_temps(a, cutoff)
+            // Integer induction must hit the frame if a later LoadLocal
+            // misses the pin. f64 stays in SIMD until the exit spill —
+            // fstore here was the f64_sum 4× tax.
+            rc_writeback_dirty_gpr_pins(a)
+            if a.rc_hot_lbl.len == 0 {
+                rc_writeback_dirty_fp(a)
+            }
+            emit_jcc(a, fused, rc_back_lbl(&*a, m, fi, bi, tb))
+            // Fall-through exit: spill then reload pins for else (else entry
+            // only marks pin homes — without this, parks stay stale).
+            rc_spill(a)
+            emit_edge_pins(a, m, fi, fr, bi, tc, pins)
+            a.jmp(pref + str(tc))
+            <<
+        }
+        if tb == bi {
+            // Writeback before the split. Single-pass RA: emitting the
+            // continue edge first used to clear dirty, so the exit path
+            // (`_rs`) never stored. f64 `while xr >= 2` is unfused and
+            // lost the last `m += 1` (log(4) → ln2).
+            if !rc_ht_skip_pin_wb(&*a, m, fi, fr, bi) {
+                rc_spill_except_temps(a, cutoff)
+                rc_writeback_dirty_gpr_pins(a)
+                rc_writeback_dirty_fp(a)
+            }
+            if fused >= 0 {
+                emit_jcc(a, invert_cc(fused), types.mir_fn_label(m, fi) + "_bb" + str(bi) + "_rs")
+            } else {
+                a.jeq(types.mir_fn_label(m, fi) + "_bb" + str(bi) + "_rs")
+            }
+            emit_edge_pins(a, m, fi, fr, bi, tb, pins)
+            a.jmp(rc_back_lbl(&*a, m, fi, bi, tb))
+            a.label(types.mir_fn_label(m, fi) + "_bb" + str(bi) + "_rs")
+            rc_spill(a)
+            emit_edge_pins(a, m, fi, fr, bi, tc, pins)
+            a.jmp(pref + str(tc))
+            <<
+        }
+        mut eff_tc := tc
+        mut else_lbl := pref + str(tc)
+        mut else_hot := false
+        mut natural_else_exit := false
+        if bi < a.rc_loop_hot.len && tc >= 0 && tc < a.rc_loop_hot.len {
+            if a.arch == 0 && a.rc_loop_hot[bi] > 0 && a.rc_loop_hot[tc] > 0 && tc != bi && (bi > tc || a.rc_kernel == 1 || a.rc_fwd_ht) {
+                else_lbl = pref + str(tc) + "_ht"
+                else_hot = true
+            } else if a.rc_loop_hot[bi] > 0 && a.rc_loop_hot[tc] == 0 {
+                natural_else_exit = true
+                else_lbl = pref + str(bi) + "_ne"
+            }
+        }
+        // An admitted hot edge preserves the live pin layout and bypasses
+        // frame reloads. Empty-jump canonicalization must not replace that
+        // entry with the ordinary label: skipped stores leave its frame
+        // copy stale. The true successor already observes the same rule.
+        if !natural_else_exit && !else_hot {
+            skip_tc := mir_skip_empty_jumps(m, fi, tc)
+            if skip_tc >= 0 {
+                eff_tc = skip_tc
+                else_lbl = pref + str(eff_tc)
+            }
+        }
+        // Writeback before the split so the else block (often just a
+        // label reload from stack) sees the last induction store. Then
+        // edge emit used to clear dirty first (`natural_else_exit`).
+        // Small indexed kernels keep pins in S homes and jump to `_ht`;
+        // a per-iter stur here is the 4e6-loop tax. Exit uses `_ne`
+        // writeback_all.
+        mut skip_ht_wb := false
+        if a.arch == 0 && bi < a.rc_loop_hot.len && a.rc_loop_hot[bi] > 0 {
+            if a.rc_kernel == 1 || a.rc_fwd_ht || a.rc_fp_only {
+                skip_ht_wb = true
+            }
+        }
+        if !skip_ht_wb {
+            rc_writeback_dirty_gpr_pins(a)
+            rc_writeback_dirty_fp(a)
+        }
+        if fused >= 0 {
+            emit_jcc(a, invert_cc(fused), else_lbl)
+        } else {
+            a.jeq(else_lbl)
+        }
+        mut eff_tb := tb
+        mut then_lbl := pref + str(tb)
+        mut then_hot := false
+        if bi < a.rc_loop_hot.len && tb >= 0 && tb < a.rc_loop_hot.len {
+            if a.arch == 0 && a.rc_loop_hot[bi] > 0 && a.rc_loop_hot[tb] > 0 && (bi > tb || a.rc_kernel == 1 || a.rc_fwd_ht) {
+                then_lbl = pref + str(tb) + "_ht"
+                then_hot = true
+            }
+        }
+        mut then_pinned := false
+        if pins.len >= (tb + 1) * 4 {
+            for p in 0:4 {
+                if pins[tb * 4 + p] >= 0 {
+                    then_pinned = true
+                }
+            }
+        }
+        if !then_hot && !then_pinned {
+            skip_tb := mir_skip_empty_jumps(m, fi, tb)
+            if skip_tb >= 0 {
+                eff_tb = skip_tb
+                then_lbl = pref + str(eff_tb)
+            }
+        }
+        if rc_edge_can_carry(&*a, pins, bi, tb) {
+            rc_carry_save(a, tb)
+        } else if a.rc_fwd_ht && then_hot {
+            // ALU copies of lo/hi/mid are dead on the diamond; pins
+            // already stored. Spilling them is the per-iter x17 tax.
+        } else if then_pinned {
+            rc_spill_except_temps(a, cutoff)
+        } else {
+            rc_spill(a)
+        }
+        emit_edge_pins(a, m, fi, fr, bi, tb, pins)
+        if eff_tb != bi + 1 || then_hot || natural_else_exit {
+            a.jmp(then_lbl)
+        }
+        if natural_else_exit {
+            a.label(else_lbl)
+            // Both indexed kernels and one-slot array forwarding keep
+            // loop-carried pins dirty in S homes on the hot edge.  The cold
+            // exit must materialize those homes before its first LoadLocal;
+            // otherwise a user-sized (<64 MIR fn) fwd_ht loop returns the
+            // entry value instead of the final induction value.
+            if a.rc_kernel == 1 || a.rc_fwd_ht {
+                rc_writeback_all_gpr_pins(a)
+            }
+            // FP-only residency keeps the accumulator live on the hot edge;
+            // the cold exit is the first point where its frame value is needed.
+            if a.rc_fp_only {
+                rc_writeback_dirty_fp(a)
+            }
+            rc_spill(a)
+            emit_edge_pins(a, m, fi, fr, bi, tc, pins)
+            a.jmp(pref + str(tc))
+        }
+        <<
+    }
+    if tkind == 3 && ta != -1 { // Return with value (int/bool temp or const)
+        emit_push_cursor_clear(a)
+        if types.mir_fn_ret_nslots(m, fi) > 1 {
+            a.load(0, 15, slot_off(fr.sret_slot))
+            for i in 0:types.mir_fn_ret_nslots(m, fi) {
+                a.load(1, 15, slot_off(fr.temp_slot[ta]) - i * 8)
+                a.store(0, -i * 8, 1)
+            }
+        } else {
+            if ta >= 0 && ta < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[ta]) {
+                // Fixed-home scalar returns can flow directly to Ret, saving
+                // the old temp-home -> V0 -> Ret shuffle.
+                a.mov(14, vreg_slot_home(fr.temp_slot[ta]))
+            } else {
+                emit_load_value(a, m, fi, fr, ta, 0)
+                a.mov(14, 0)
+            }
+        }
+        a.epilogue()
+        <<
+    }
+    emit_push_cursor_clear(a)
+    a.epilogue()
+    <<
+}
+
+// m33: DWARF DebugInfo from MIR + assembler labels (mirrors bootstrap xu::collect_debug_info).
+fn collect_debug_info(a &Assembler, m &types.Mir) DebugInfo {
+    mut files := []string{}
+    if m.files.len == 0 {
+        files.push("<input>")
+    } else {
+        for i in 0:m.files.len {
+            files.push(m.files[i] + "")
+        }
+    }
+    mut rows := []DLineRow{}
+    mut funcs := []DFuncRow{}
+    mut starts := []int{}
+    order := emit_function_order(m)
+    for oi in 0:order.len {
+        fi := order[oi]
+        start := a.label_offset(types.mir_fn_label(m, fi))
+        starts.push(start)
+        mut decl_line := 1
+        mut found := 0
+        for bi in 0:types.mir_nblocks(m, fi) {
+            if found == 0 {
+                if types.mir_bline(m, fi, bi) != 0 {
+                    decl_line = types.mir_bline(m, fi, bi)
+                    found = 1
+                }
+            }
+        }
+        for bi in 0:types.mir_nblocks(m, fi) {
+            if types.mir_bline(m, fi, bi) != 0 {
+                mut off := a.label_offset(types.mir_fn_label(m, fi) + "_bb" + str(bi)) - start
+                if off < 0 {
+                    off = 0
+                }
+                rows.push(DLineRow{offset: off, file: types.mir_fn_file(m, fi), line: types.mir_bline(m, fi, bi)})
+            }
+        }
+        funcs.push(DFuncRow{name: m.fns[fi].name + "", file: types.mir_fn_file(m, fi), line: decl_line, start: start, size: 0})
+    }
+    for i in 0:funcs.len {
+        mut end := a.code.len
+        if i + 1 < starts.len {
+            end = starts[i + 1]
+        }
+        mut sz := end - starts[i]
+        if sz < 0 {
+            sz = 0
+        }
+        funcs[i].size = sz
+    }
+    << DebugInfo{files: files, rows: rows, funcs: funcs}
+}

@@ -1,0 +1,563 @@
+@net/http2
+
+#crypto/tls
+#errors
+#net
+#strconv
+
+// Minimal HTTP/2 client (RFC 7540 / HPACK RFC 7541 subset).
+//
+// v1:
+//   * frame codec (encode_frame / decode_frame)
+//   * GET headers HPACK (static table + raw literals, no Huffman)
+//   * h2c TcpClient (prior knowledge)
+//   * TlsClient via dial_tls (ClientHello ALPN offers h2 + http/1.1)
+//
+// Throw note: method may-throw is matched by caller-module name only
+// (check_06_throw.ast_method_call_propagates_throw), so `conn.read` from
+// net.http2 does not see tls.Conn.read's throw. tls_read_exact therefore
+// absorbs errors with `or (err) { << got }` instead of `or >>`.
+//
+// Not in v1: POST/DATA out, HPACK Huffman, dynamic table, flow control,
+// GOAWAY retry, server push.
+
+const frame_data = 0
+const frame_headers = 1
+const frame_settings = 4
+const frame_goaway = 7
+const flag_end_stream = 1
+const flag_end_headers = 4
+const flag_ack = 1
+
+pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+pub struct Frame {
+    pub typ int
+    pub flags int
+    pub stream_id int
+    pub payload string
+}
+
+pub struct Decoded {
+    pub f Frame
+    pub need int
+}
+
+pub struct Response {
+    pub status int
+    pub body string
+    pub ok bool
+    pub err string
+}
+
+fn be24(n int) string {
+    mut b := []int{}
+    b.push((n >> 16) & 255)
+    b.push((n >> 8) & 255)
+    b.push(n & 255)
+    << string_from_bytes(b)
+}
+
+fn be32(n int) string {
+    mut b := []int{}
+    b.push((n >> 24) & 255)
+    b.push((n >> 16) & 255)
+    b.push((n >> 8) & 255)
+    b.push(n & 255)
+    << string_from_bytes(b)
+}
+
+fn u24_at(s &string, off int) int {
+    << ((s[off] & 255) << 16) | ((s[off + 1] & 255) << 8) | (s[off + 2] & 255)
+}
+
+fn u32_at(s &string, off int) int {
+    << ((s[off] & 255) << 24) | ((s[off + 1] & 255) << 16) | ((s[off + 2] & 255) << 8) | (s[off + 3] & 255)
+}
+
+// encode_frame builds a raw HTTP/2 frame.
+pub fn encode_frame(typ int, flags int, sid int, payload string) string {
+    mut out := ""
+    out = out + be24(payload.len)
+    out.push_byte(typ & 255)
+    out.push_byte(flags & 255)
+    out = out + be32(sid)
+    out = out + payload
+    << out
+}
+
+// decode_frame parses one frame. need=0 when buf is short.
+pub fn decode_frame(buf string) Decoded {
+    if buf.len < 9 {
+        << Decoded{f: Frame{typ: 0, flags: 0, stream_id: 0, payload: ""}, need: 0}
+    }
+    ln := u24_at(&buf, 0)
+    total := 9 + ln
+    if buf.len < total {
+        << Decoded{f: Frame{typ: 0, flags: 0, stream_id: 0, payload: ""}, need: 0}
+    }
+    typ := buf[3] & 255
+    flags := buf[4] & 255
+    sid := u32_at(&buf, 5) & 2147483647
+    payload := buf[9:total]
+    << Decoded{f: Frame{typ: typ, flags: flags, stream_id: sid, payload: payload}, need: total}
+}
+
+fn hpack_int(n int, prefix_bits int) string {
+    maxv := (1 << prefix_bits) - 1
+    if n < maxv {
+        << string_from_byte(n)
+    }
+    mut b := ""
+    b.push_byte(maxv)
+    mut v := n - maxv
+    while v >= 128 {
+        b.push_byte((v & 127) | 128)
+        v = v / 128
+    }
+    b.push_byte(v)
+    << b
+}
+
+fn hpack_lit_indexed_name(name_idx int, value string) string {
+    mut out := ""
+    if name_idx < 63 {
+        out.push_byte(64 | name_idx)
+    } else {
+        out.push_byte(64 | 63)
+        out = out + hpack_int(name_idx - 63, 7)
+    }
+    out = out + hpack_int(value.len, 7)
+    out = out + value
+    << out
+}
+
+// encode_get_headers builds a HEADERS payload for GET.
+pub fn encode_get_headers(authority string, path string) string {
+    mut blk := ""
+    blk.push_byte(130)
+    if path == "/" {
+        blk.push_byte(132)
+    } else {
+        blk = blk + hpack_lit_indexed_name(4, path)
+    }
+    blk.push_byte(135)
+    blk = blk + hpack_lit_indexed_name(1, authority)
+    << blk
+}
+
+// encode_post_headers builds HEADERS for POST with content-type + optional bearer.
+pub fn encode_post_headers(authority string, path string, content_type string, authorization string) string {
+    mut blk := ""
+    blk.push_byte(131) // :method POST
+    if path == "/" {
+        blk.push_byte(132)
+    } else {
+        blk = blk + hpack_lit_indexed_name(4, path)
+    }
+    blk.push_byte(135) // :scheme https
+    blk = blk + hpack_lit_indexed_name(1, authority)
+    // content-type: incremental indexing, static name index 31
+    blk.push_byte(95)
+    blk = blk + hpack_int(content_type.len, 7)
+    blk = blk + content_type
+    if authorization.len > 0 {
+        blk.push_byte(0)
+        blk = blk + hpack_int(13, 7)
+        blk = blk + "authorization"
+        blk = blk + hpack_int(authorization.len, 7)
+        blk = blk + authorization
+    }
+    << blk
+}
+
+// parse_status extracts :status from a HEADERS payload.
+pub fn parse_status(blk string) int {
+    if blk.len == 0 {
+        << 0
+    }
+    mut i := 0
+    while i < blk.len {
+        b0 := blk[i] & 255
+        if (b0 & 128) != 0 {
+            idx := b0 & 127
+            if idx == 8 {
+                << 200
+            }
+            if idx == 9 {
+                << 204
+            }
+            if idx == 10 {
+                << 203
+            }
+            if idx == 11 {
+                << 304
+            }
+            if idx == 12 {
+                << 404
+            }
+            if idx == 13 {
+                << 500
+            }
+            i = i + 1
+            ->
+        }
+        if (b0 & 192) == 64 {
+            name_idx := b0 & 63
+            mut off := i + 1
+            if name_idx >= 63 || off >= blk.len {
+                << 0
+            }
+            if (blk[off] & 128) != 0 {
+                << 0
+            }
+            vlen := blk[off] & 127
+            off = off + 1
+            if off + vlen > blk.len {
+                << 0
+            }
+            if name_idx == 8 {
+                vs := blk[off:off + vlen]
+                << strconv.atoi(&vs) or (err) {
+                    << 0
+                }
+            }
+            i = off + vlen
+            ->
+        }
+        if (b0 & 224) == 32 {
+            name_idx := b0 & 31
+            mut off := i + 1
+            if off >= blk.len {
+                << 0
+            }
+            vlen := blk[off] & 127
+            off = off + 1
+            if off + vlen > blk.len {
+                << 0
+            }
+            if name_idx == 8 {
+                vs := blk[off:off + vlen]
+                << strconv.atoi(&vs) or (err) {
+                    << 0
+                }
+            }
+            i = off + vlen
+            ->
+        }
+        if (b0 & 240) == 0 {
+            mut off := i + 1
+            if off >= blk.len {
+                << 0
+            }
+            nlen := blk[off] & 127
+            off = off + 1 + nlen
+            if off >= blk.len {
+                << 0
+            }
+            vlen := blk[off] & 127
+            i = off + 1 + vlen
+            ->
+        }
+        << 0
+    }
+    << 0
+}
+
+// ---- h2c over net.Conn ----
+
+pub struct TcpClient {
+    c net.Conn
+    next_sid int
+}
+
+fn (t &mut TcpClient) wr(data &string) {
+    c := &t.c
+    c.write(data) or (err) {
+        <<
+    }
+}
+
+fn (t &mut TcpClient) rd_exact(n int) string {
+    mut got := ""
+    mut guard := 0
+    while got.len < n && guard < 64 {
+        c := &t.c
+        chunk := c.read(n - got.len) or >>
+        if chunk.len == 0 {
+            >> errors.new("http2: eof")
+        }
+        got = got + chunk
+        guard = guard + 1
+    }
+    if got.len < n {
+        >> errors.new("http2: short read")
+    }
+    << got
+}
+
+fn (t &mut TcpClient) rd_frame() Frame {
+    hdr := t.rd_exact(9) or >>
+    ln := u24_at(&hdr, 0)
+    typ := hdr[3] & 255
+    flags := hdr[4] & 255
+    sid := u32_at(&hdr, 5) & 2147483647
+    mut payload := ""
+    if ln > 0 {
+        payload = t.rd_exact(ln) or >>
+    }
+    << Frame{typ: typ, flags: flags, stream_id: sid, payload: payload}
+}
+
+// dial_tcp speaks prior-knowledge h2c (no TLS).
+pub fn dial_tcp(addr string) TcpClient {
+    nc := net.dial_to("tcp", addr) or >>
+    mut t := TcpClient{c: nc, next_sid: 1}
+    pf := preface + ""
+    t.wr(&pf)
+    sf := encode_frame(frame_settings, 0, 0, "")
+    t.wr(&sf)
+    mut guard := 0
+    while guard < 16 {
+        f := t.rd_frame() or >>
+        if f.typ == frame_settings {
+            if (f.flags & flag_ack) == 0 {
+                af := encode_frame(frame_settings, flag_ack, 0, "")
+                t.wr(&af)
+                << t
+            }
+        }
+        if f.typ == frame_goaway {
+            >> errors.new("http2: goaway")
+        }
+        guard = guard + 1
+    }
+    << t
+}
+
+// Get issues GET on a new stream and collects the body.
+pub fn (t &mut TcpClient) get(authority string, path string) Response {
+    sid := t.next_sid
+    t.next_sid = t.next_sid + 2
+    blk := encode_get_headers(authority, path)
+    flags := flag_end_headers | flag_end_stream
+    fr := encode_frame(frame_headers, flags, sid, blk)
+    t.wr(&fr)
+    mut status := 0
+    mut body := ""
+    mut guard := 0
+    while guard < 64 {
+        f := t.rd_frame() or (err) {
+            << Response{status: 0, body: "", ok: false, err: err.msg()}
+        }
+        if f.stream_id == 0 || f.stream_id != sid {
+            ->
+        }
+        if f.typ == frame_headers {
+            ps := f.payload + ""
+            st := parse_status(ps)
+            if st > 0 {
+                status = st
+            }
+        }
+        if f.typ == frame_data {
+            body = body + f.payload
+        }
+        if f.typ == frame_goaway {
+            << Response{status: status, body: body, ok: false, err: "goaway"}
+        }
+        if (f.flags & flag_end_stream) != 0 {
+            if f.typ == frame_data || f.typ == frame_headers {
+                if status == 0 {
+                    << Response{status: 0, body: body, ok: false, err: "no status"}
+                }
+                << Response{status: status, body: body, ok: true, err: ""}
+            }
+        }
+        guard = guard + 1
+    }
+    if status == 0 {
+        << Response{status: 0, body: body, ok: false, err: "no status"}
+    }
+    << Response{status: status, body: body, ok: true, err: ""}
+}
+
+pub fn (t &mut TcpClient) close() {
+    c := mut &t.c
+    c.close() or (err) {
+        <<
+    }
+}
+
+// ---- TLS client (ALPN h2) ----
+
+pub struct TlsClient {
+    c tls.Conn
+    next_sid int
+}
+
+// tls_read_exact absorbs IO errors (method throw is not visible cross-package).
+fn tls_read_exact(conn &mut tls.Conn, n int) string {
+    mut got := ""
+    mut guard := 0
+    while got.len < n && guard < 64 {
+        chunk := conn.read(n - got.len) or (err) {
+            << got
+        }
+        if chunk.len == 0 {
+            << got
+        }
+        got = got + chunk
+        guard = guard + 1
+    }
+    << got
+}
+
+fn tls_wr(conn &mut tls.Conn, data &string) {
+    conn.write(data) or (err) {
+        <<
+    }
+}
+
+// dial_tls connects with ALPN h2 and performs the HTTP/2 preface.
+pub fn dial_tls(addr string, server_name string) TlsClient {
+    cfg := tls.new_config(server_name)
+    d := tls.Dialer{timeout_ns: 30000000000, config: cfg}
+    conn := d.dial("tcp", addr) or >>
+    mut t := TlsClient{c: conn, next_sid: 1}
+    pf := preface + ""
+    tc1 := mut &t.c
+    tls_wr(tc1, &pf)
+    sf := encode_frame(frame_settings, 0, 0, "")
+    tc2 := mut &t.c
+    tls_wr(tc2, &sf)
+    ok := t.read_settings()
+    if !ok {
+        >> errors.new("http2: tls settings")
+    }
+    << t
+}
+
+// read_settings drains until server SETTINGS and ACKs. false on failure.
+fn (t &mut TlsClient) read_settings() bool {
+    mut guard := 0
+    while guard < 16 {
+        conn := mut &t.c
+        hdr := tls_read_exact(conn, 9)
+        if hdr.len < 9 {
+            << false
+        }
+        ln := u24_at(&hdr, 0)
+        typ := hdr[3] & 255
+        flags := hdr[4] & 255
+        if ln > 0 {
+            pay := tls_read_exact(conn, ln)
+            if pay.len < ln {
+                << false
+            }
+        }
+        if typ == frame_goaway {
+            << false
+        }
+        if typ == frame_settings {
+            if (flags & flag_ack) == 0 {
+                af := encode_frame(frame_settings, flag_ack, 0, "")
+                tc := mut &t.c
+                tls_wr(tc, &af)
+                << true
+            }
+        }
+        guard = guard + 1
+    }
+    << false
+}
+
+fn (t &mut TlsClient) tls_rd_frame() Frame {
+    conn := mut &t.c
+    hdr := tls_read_exact(conn, 9)
+    if hdr.len < 9 {
+        << Frame{typ: frame_goaway, flags: 0, stream_id: 0, payload: ""}
+    }
+    ln := u24_at(&hdr, 0)
+    typ := hdr[3] & 255
+    flags := hdr[4] & 255
+    sid := u32_at(&hdr, 5) & 2147483647
+    mut payload := ""
+    if ln > 0 {
+        payload = tls_read_exact(conn, ln)
+    }
+    << Frame{typ: typ, flags: flags, stream_id: sid, payload: payload}
+}
+
+// get issues GET over TLS.
+pub fn (t &mut TlsClient) get(authority string, path string) Response {
+    sid := t.next_sid
+    t.next_sid = t.next_sid + 2
+    blk := encode_get_headers(authority, path)
+    flags := flag_end_headers | flag_end_stream
+    fr := encode_frame(frame_headers, flags, sid, blk)
+    tc := mut &t.c
+    tls_wr(tc, &fr)
+    << t.collect_response(sid)
+}
+
+// post issues POST with a body (HEADERS then DATA+END_STREAM).
+pub fn (t &mut TlsClient) post(authority string, path string, content_type string, authorization string, body string) Response {
+    sid := t.next_sid
+    t.next_sid = t.next_sid + 2
+    blk := encode_post_headers(authority, path, content_type, authorization)
+    fr := encode_frame(frame_headers, flag_end_headers, sid, blk)
+    tc := mut &t.c
+    tls_wr(tc, &fr)
+    mut data := body + ""
+    dfr := encode_frame(frame_data, flag_end_stream, sid, data)
+    tc2 := mut &t.c
+    tls_wr(tc2, &dfr)
+    << t.collect_response(sid)
+}
+
+fn (t &mut TlsClient) collect_response(sid int) Response {
+    mut status := 0
+    mut body := ""
+    mut guard := 0
+    while guard < 64 {
+        f := t.tls_rd_frame()
+        if f.typ == frame_goaway {
+            << Response{status: status, body: body, ok: false, err: "goaway"}
+        }
+        if f.stream_id == 0 || f.stream_id != sid {
+            guard = guard + 1
+            ->
+        }
+        if f.typ == frame_headers {
+            ps := f.payload + ""
+            st := parse_status(ps)
+            if st > 0 {
+                status = st
+            }
+        }
+        if f.typ == frame_data {
+            body = body + f.payload
+        }
+        if (f.flags & flag_end_stream) != 0 {
+            if f.typ == frame_data || f.typ == frame_headers {
+                if status == 0 {
+                    << Response{status: 0, body: body, ok: false, err: "no status"}
+                }
+                << Response{status: status, body: body, ok: true, err: ""}
+            }
+        }
+        guard = guard + 1
+    }
+    if status == 0 {
+        << Response{status: 0, body: body, ok: false, err: "no status"}
+    }
+    << Response{status: status, body: body, ok: true, err: ""}
+}
+
+pub fn (t &mut TlsClient) close() {
+    c := mut &t.c
+    c.close() or (err) {
+        <<
+    }
+}

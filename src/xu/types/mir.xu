@@ -1,0 +1,2753 @@
+@xu/types
+// MIR lowering for the Gen1 compiler (M6b2-s3a), a subset port of
+// bootstrap/crates/xumir: checked AST -> basic blocks + three-address code.
+//
+// Scope/discipline notes:
+// - Temp numbering, block creation order and instruction order are stable,
+//   which is required for the confirmed Gen3/Gen4 byte identity (Gen2 is a
+//   documented warm-up hop).
+// - Scope tracking emits Drop instructions for owning locals. The hosted
+//   emitter frees them type-directedly (cap>0 strings/arrays, recursive
+//   struct/throw-slot); see docs/BOOTSTRAP.md.
+//
+// MIR is fully self-contained per function (MFn owns its instr/block/const
+// pools; ids are function-local, matching the Rust MirFunction).
+//
+// Instr kinds (fields a/b/c/d, sval):
+//   1 Copy{a=dest temp, b=src value}
+//   2 LoadLocal{a=dest temp, b=local}
+//   3 StoreLocal{a=local, b=src value}
+//   4 Bin{a=dest, b=op (ast.xu tags), c=lhs value, d=rhs value}
+//   5 Un{a=dest, b=op (1 Neg, 2 Not), c=src value}
+//   6 StrConst{a=dest, b=intern index}
+//   7 Call{a=dest/-1, b=target kind, c=args chain head/-1, sval=label}
+//     target kinds: 1 user fn, 2 println_int, 3 println_bool, 4 println_str
+//     20 string slice, 83 array slice (d=elem bytes, sval=rt_array_slice[str])
+//     84..92 native map (MS8b/c): new/get/insert/has/len/delete/take/get_or/iter_next
+//     98 map val ptr (`&m[k]` → `_rt_map_val_ptr`)
+//     95 field RMW leaf inline (d=slot*64+op; args=recv_ptr, rhs) — Wave 3b+
+//     40 raise_irq(n), 41 volatile_store(addr,val), 42 volatile_store8,
+//     43 volatile_load(addr)->int, 44 volatile_load8 (freestanding only)
+//     45..56 os sysinfo (getpid..tmp_dir), 57 stat, 58 mkdir, 59 rename,
+//     60 remove (M35), 61 atomic_load, 62 atomic_store, 63 atomic_add,
+//     64 atomic_cas (M35), 65..70 net, 71 os_system (M183), 129 os_exec,
+//     81 s.bytes(), 82 s.runes() (MS9b)
+//   8 Drop{a=local}
+//   9 StrClone{a=dest temp, b=src value}  (cap-checked heap copy of a string)
+//  10 LoadField{a=dest temp, b=src temp, c=field slot offset, d=slot count}
+//  11 StoreField{a=src temp, b=dest temp, c=field slot offset, d=slot count}
+//  16 Addr{a=dest pointer temp, b=local/temp, c=0 local or 1 temp}
+//  17 LoadPtr{a=dest temp, b=pointer temp, c=slot offset, d=slot count}
+//  18 StorePtr{a=src value, b=pointer temp, c=slot offset, d=slot count}
+//  19 ThrowUnwrap{a=dest temp, b=result temp, d=payload slot count}
+//  20 StoreIndex{a=array temp, b=index value, c=value, d=element bytes}
+//  47 IndexRMW{a=array, b=index, c=rhs, d=elem bytes (±nocheck), col=binop}
+//     `a[i] = a[i] op rhs` / `a[i] op=` — one bounds check + load/op/store.
+//  48 FieldRMW{a=ptr, b=0 frame/1 buf, c=rhs, d=field type tag, col=binop,
+//     line=byte offset} — `p.f op=` through pointer (nbody `[N]Body` fields).
+//  21 DropField{a=base temp, b=field slot offset, c=field type tag}
+//     (frame layout, dir=-1; overwriting an owning field)
+//  22 DropPtrField{a=pointer temp, b=field slot offset, c=field type tag}
+//     (pointer points at word 0; word k at [ptr-8k], same dir=-1)
+//  23 ElemAddr{a=dest pointer temp, b=array descriptor temp, c=index value,
+//     d=element bytes} — bounds-checked element address (loud via rt_oob);
+//     d<0 (M172) = skip check, elem bytes = -d. Same convention on 14/20.
+//  24 DropBufField{a=pointer temp (buffer), b=field slot offset, c=field
+//     type tag} — ascending layout (+8k), dir=+1
+//  25 StoreBufPtr{a=src value, b=pointer temp (buffer), c=field slot offset,
+//     d=slot count} — ascending layout (+8k)
+//  26 LoadBufPtr{a=dest temp, b=pointer temp (buffer), c=field slot offset,
+//     d=slot count} — ascending layout (+8k)
+//  30 ChanNew{a=dest temp, b=elem_slots, c=cap value} (M17)
+//  31 ChanSend{a=chan value, b=src value, c=elem_slots}
+//  32 ChanRecv{a=dest temp, b=chan value, c=elem_slots, d=status temp or -1}
+//     d>=0: store Ret 1=data / 2=closed-empty (MS9e for-in); -1 ignore (<-ch)
+//  33 Xu{sval=fn label, c=args chain head/-1}
+//  34 ChanClose{a=chan value}
+//  35 ChanTrySend{a=status dest, b=chan, c=src temp, d=elem_slots}
+//  36 ChanTryRecv{a=status dest, b=value dest, c=chan, d=elem_slots}
+//  37 XuPump
+//  38 LoadFnAddr{a=dest temp, sval=label} — M103/M109 fat fn (code, env=0)
+//  39 MakeClosure{a=dest, b=env temp, c=env struct id, sval=body label}
+//  40 BoxInterface{a=dest, b=src, c=concrete struct id, sval=itable label}
+//  41 InterfaceIs{a=dest bool, b=iface, c=concrete struct id or temp tag}
+//  42 InterfaceAs{a=dest T, b=iface, c=type_id, d=concrete type tag,
+//     sval="keep" = copy/clone out without freeing the box (`any`)}
+//  43 InterfaceMethod{a=dest, b=iface, c=method slot, d=extra args chain, sval=name}
+//  44 BoxTemp{a=dest, b=src, c=value tag, sval=itable label}
+//  45 ThrowUnwrapErr{a=dest temp, b=result temp, d=payload slot count} (M157)
+// Block terminator (tkind): 0 open, 1 Jump(ta=bb), 2 Branch(ta=cond value,
+// tb=then bb, tc=else bb), 3 Return(ta=value/-1).
+// Values: >= 0 temp; -1 none; <= -2 const at consts[-v-2].
+// Call.b=80: indirect call (args[0]=callee; args[1..]=user params).
+
+#xu/parser
+
+// Indexed stores into MFn slice fields — same Gen1 large-struct field-index
+// OOB workaround as checker_set_i.
+fn mfn_set_marg(a &mut []MArg, i int, v MArg) { a[i] = v }
+fn mfn_set_instr(a &mut []MInstr, i int, v MInstr) { a[i] = v }
+fn mfn_set_block(a &mut []MBlock, i int, v MBlock) { a[i] = v }
+fn mfn_set_i(a &mut []int, i int, v int) { a[i] = v }
+fn mfn_set_b(a &mut []bool, i int, v bool) { a[i] = v }
+fn mfn_push_i(a &mut []int, v int) { a.push(v) }
+
+// Field reads/writes on `MFn.instrs[i].x` miscompile under Gen1 (large
+// struct-in-slice). Free-fn `a[i]` on `&[]MInstr` is the working path.
+pub fn mfn_ikind(a &[]MInstr, i int) int { << a[i].kind }
+pub fn mfn_ia(a &[]MInstr, i int) int { << a[i].a }
+pub fn mfn_ib(a &[]MInstr, i int) int { << a[i].b }
+pub fn mfn_ic(a &[]MInstr, i int) int { << a[i].c }
+pub fn mfn_id(a &[]MInstr, i int) int { << a[i].d }
+
+// Tiny 3-level field reads. A pointer into `m.fns[fi]` (including
+// `&m.fns[fi].instrs`) is a Gen1 miscompile; returning a scalar from a
+// one-line helper is the path both seed and hosted gen1 lower correctly.
+pub fn mir_nins(m &Mir, fi int) int { << m.fns[fi].instrs.len }
+pub fn mir_nmargs(m &Mir, fi int) int { << m.fns[fi].margs.len }
+pub fn mir_ntemps(m &Mir, fi int) int { << m.fns[fi].temps.len }
+pub fn mir_nlocals(m &Mir, fi int) int { << m.fns[fi].locals.len }
+pub fn mir_nblocks(m &Mir, fi int) int { << m.fns[fi].blocks.len }
+pub fn mir_nconsts(m &Mir, fi int) int { << m.fns[fi].consts.len }
+pub fn mir_temp_ty(m &Mir, fi int, t int) int { << m.fns[fi].temps[t] }
+pub fn mir_temp_nslots(m &Mir, fi int, t int) int { << m.fns[fi].temps_nslots[t] }
+pub fn mir_local_ty(m &Mir, fi int, i int) int { << m.fns[fi].locals[i] }
+pub fn mir_local_nslots(m &Mir, fi int, i int) int { << m.fns[fi].locals_nslots[i] }
+pub fn mir_const_at(m &Mir, fi int, i int) int { << m.fns[fi].consts[i] }
+pub fn mir_ikind(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].kind }
+pub fn mir_ia(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].a }
+pub fn mir_ib(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].b }
+pub fn mir_ic(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].c }
+pub fn mir_id(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].d }
+pub fn mir_inext(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].next }
+pub fn mir_iline(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].line }
+pub fn mir_icol(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].col }
+pub fn mir_ifile(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].file }
+pub fn mir_isval(m &Mir, fi int, ii int) string { << m.fns[fi].instrs[ii].sval + "" }
+pub fn mir_isval_len(m &Mir, fi int, ii int) int { << m.fns[fi].instrs[ii].sval.len }
+pub fn mir_isval_byte(m &Mir, fi int, ii int, i int) int { << m.fns[fi].instrs[ii].sval[i] }
+pub fn mir_bhead(m &Mir, fi int, bi int) int { << m.fns[fi].blocks[bi].head }
+pub fn mir_btail(m &Mir, fi int, bi int) int { << m.fns[fi].blocks[bi].tail }
+pub fn mir_btkind(m &Mir, fi int, bi int) int { << m.fns[fi].blocks[bi].tkind }
+pub fn mir_bta(m &Mir, fi int, bi int) int { << m.fns[fi].blocks[bi].ta }
+pub fn mir_btb(m &Mir, fi int, bi int) int { << m.fns[fi].blocks[bi].tb }
+pub fn mir_btc(m &Mir, fi int, bi int) int { << m.fns[fi].blocks[bi].tc }
+pub fn mir_bline(m &Mir, fi int, bi int) int { << m.fns[fi].blocks[bi].line }
+pub fn mir_marg_v(m &Mir, fi int, i int) int { << m.fns[fi].margs[i].v }
+pub fn mir_marg_next(m &Mir, fi int, i int) int { << m.fns[fi].margs[i].next }
+pub fn mir_fn_label(m &Mir, fi int) string { << m.fns[fi].label + "" }
+// Checker function index retained on each concrete MIR function.  The
+// checker keeps templates in `c.fns`, while `Mir.fns` omits them, so a raw
+// checker index cannot safely be used as a code-emission index.
+pub fn mir_fn_name_len(m &Mir, fi int) int { << m.fns[fi].name.len }
+pub fn mir_fn_name_byte(m &Mir, fi int, i int) int { << m.fns[fi].name[i] }
+pub fn mir_fn_label_len(m &Mir, fi int) int { << m.fns[fi].label.len }
+pub fn mir_fn_label_byte(m &Mir, fi int, i int) int { << m.fns[fi].label[i] }
+pub fn mir_fn_decl_is_extern(m &Mir, fi int) bool { << m.fns[fi].is_extern }
+pub fn mir_fn_is_extern(m &Mir, fi int) bool {
+    if m.fns[fi].is_extern { << true }
+    if fi >= 0 && fi < m.superseded.len { << mfn_get_i(&m.superseded, fi) != 0 }
+    << false
+}
+pub fn mir_fn_nparams(m &Mir, fi int) int { << m.fns[fi].nparams }
+pub fn mir_fn_ret(m &Mir, fi int) int { << m.fns[fi].ret }
+pub fn mir_fn_ret_nslots(m &Mir, fi int) int { << m.fns[fi].ret_nslots }
+pub fn mir_fn_receiver(m &Mir, fi int) bool { << m.fns[fi].receiver }
+pub fn mir_fn_file(m &Mir, fi int) int { << m.fns[fi].file }
+pub fn mir_fn_facts_gen(m &Mir, fi int) int { << m.fns[fi].facts_gen }
+pub fn mir_fn_facts_bits(m &Mir, fi int) int { << m.fns[fi].facts_bits }
+pub fn mir_fn_facts_nins(m &Mir, fi int) int { << m.fns[fi].facts_nins }
+pub fn mir_fn_facts_nblocks(m &Mir, fi int) int { << m.fns[fi].facts_nblocks }
+pub fn mfn_inext(a &[]MInstr, i int) int { << a[i].next }
+pub fn mfn_iline(a &[]MInstr, i int) int { << a[i].line }
+pub fn mfn_icol(a &[]MInstr, i int) int { << a[i].col }
+pub fn mfn_ifile(a &[]MInstr, i int) int { << a[i].file }
+pub fn mfn_isval(a &[]MInstr, i int) string { << a[i].sval + "" }
+fn mfn_isval_len(a &[]MInstr, i int) int { << a[i].sval.len }
+fn mfn_isval_byte(a &[]MInstr, i int, j int) int { << a[i].sval[j] }
+pub fn mfn_marg_v(a &[]MArg, i int) int { << a[i].v }
+pub fn mfn_marg_next(a &[]MArg, i int) int { << a[i].next }
+pub fn mfn_get_i(a &[]int, i int) int { << a[i] }
+
+fn mfn_sval_clone_owned(a &[]MInstr, i int) string {
+    n := mfn_isval_len(a, i)
+    if n == 0 { << "" }
+    mut out := []int{}
+    for j in 0:n {
+        out.push(mfn_isval_byte(a, i, j))
+    }
+    << string_from_bytes(out)
+}
+
+// Whole-element store is the Gen1-correct write. Field stores `a[i].x =`
+// through a large struct-in-slice still SIGSEGV in hosted generations.
+fn mfn_instr_snap(a &mut []MInstr, i int) MInstr {
+    mut x := mkinstr(a[i].kind)
+    x.a = a[i].a
+    x.b = a[i].b
+    x.c = a[i].c
+    x.d = a[i].d
+    x.sval = mfn_sval_clone_owned(&*a, i)
+    x.next = a[i].next
+    x.line = a[i].line
+    x.col = a[i].col
+    x.file = a[i].file
+    << x
+}
+
+fn mfn_set_ia(a &mut []MInstr, i int, v int) {
+    mut x := mfn_instr_snap(a, i)
+    x.a = v
+    a[i] = x
+}
+
+fn mir_nop_mfni(a &mut []MInstr, i int) {
+    if i < 0 || i >= a.len { << }
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 0
+    x.a = -1
+    x.b = -1
+    x.c = -1
+    x.d = -1
+    x.sval = ""
+    a[i] = x
+}
+fn mfn_set_ib(a &mut []MInstr, i int, v int) {
+    mut x := mfn_instr_snap(a, i)
+    x.b = v
+    a[i] = x
+}
+fn mfn_set_ic(a &mut []MInstr, i int, v int) {
+    mut x := mfn_instr_snap(a, i)
+    x.c = v
+    a[i] = x
+}
+fn mfn_set_id(a &mut []MInstr, i int, v int) {
+    mut x := mfn_instr_snap(a, i)
+    x.d = v
+    a[i] = x
+}
+fn mfn_set_inext(a &mut []MInstr, i int, v int) {
+    mut x := mfn_instr_snap(a, i)
+    x.next = v
+    a[i] = x
+}
+
+fn mfn_set_copy(a &mut []MInstr, i int, src int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 1
+    x.b = src
+    x.c = 0
+    x.d = 0
+    a[i] = x
+}
+
+// Whole-element rewrites. `a[i].field =` through []MInstr SIGSEGVs / smashes
+// the size-class freelist under Gen1 (MInstr carries a string).
+fn mfn_become_copy(a &mut []MInstr, i int, src int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 1
+    x.b = src
+    x.c = 0
+    x.d = 0
+    x.sval = ""
+    a[i] = x
+}
+
+fn mfn_become_copy_to(a &mut []MInstr, i int, dest int, src int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 1
+    x.a = dest
+    x.b = src
+    x.c = 0
+    x.d = 0
+    x.sval = ""
+    a[i] = x
+}
+
+fn mfn_become_load_local(a &mut []MInstr, i int, dest int, loc int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 2
+    x.a = dest
+    x.b = loc
+    x.c = 0
+    x.d = 0
+    x.col = 0
+    x.line = 0
+    x.sval = ""
+    a[i] = x
+}
+
+fn mfn_become_store_local(a &mut []MInstr, i int, loc int, src int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 3
+    x.a = loc
+    x.b = src
+    x.c = 0
+    x.d = 0
+    x.col = 0
+    x.line = 0
+    x.sval = ""
+    a[i] = x
+}
+
+fn mfn_become_bin(a &mut []MInstr, i int, op int, lhs int, rhs int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 4
+    x.b = op
+    x.c = lhs
+    x.d = rhs
+    x.sval = ""
+    a[i] = x
+}
+
+fn mfn_become_un(a &mut []MInstr, i int, op int, src int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 5
+    x.b = op
+    x.c = src
+    x.d = -1
+    x.sval = ""
+    a[i] = x
+}
+
+fn mfn_become_call_field_rmw(a &mut []MInstr, i int, packed int) {
+    mut x := mfn_instr_snap(a, i)
+    x.b = 95
+    x.d = packed
+    x.sval = ""
+    a[i] = x
+}
+
+fn mfn_set_bd(a &mut []MInstr, i int, b int, d int) {
+    mut x := mfn_instr_snap(a, i)
+    x.b = b
+    x.d = d
+    a[i] = x
+}
+
+fn mfn_set_cd(a &mut []MInstr, i int, c int, d int) {
+    mut x := mfn_instr_snap(a, i)
+    x.c = c
+    x.d = d
+    a[i] = x
+}
+
+fn mfn_set_bcd(a &mut []MInstr, i int, b int, c int, d int) {
+    mut x := mfn_instr_snap(a, i)
+    x.b = b
+    x.c = c
+    x.d = d
+    a[i] = x
+}
+
+struct MInstr {
+pub:
+    kind int
+    a    int
+    b    int
+    c    int
+    d    int
+    sval string
+    next int
+    // m32: call-site location for Assert (b=24); 0/-1 elsewhere.
+    line int
+    col  int
+    file int
+}
+
+struct MArg {
+pub:
+    v    int
+    next int
+}
+
+// Persistent SSA merge metadata.  Phi nodes deliberately live beside the
+// legacy linked-list instruction stream: the emitter still receives the
+// historical non-SSA contract after SSA simplification and Phi destruction.
+// The optimizer and verifier can inspect the real merge shape during the
+// SSA window.
+struct MPhi {
+pub:
+    block     int
+    local     int
+    dest      int
+    ty        int
+    arg_head  int
+    arg_count int
+}
+
+struct MPhiArg {
+pub:
+    pred  int
+    value int
+}
+
+struct MBlock {
+pub:
+    head  int
+    tail  int
+    tkind int
+    ta    int
+    tb    int
+    tc    int
+    // m32: source line of the block's first statement (0 = synthetic).
+    line  int
+}
+
+struct MFn {
+pub:
+    name    string
+    label   string
+    ret     int
+    ret_nslots int
+    nparams int
+    receiver bool
+    receiver_mut bool
+    is_extern bool
+    locals  []int
+    locals_nslots []int
+    locals_owning []bool
+    temps   []int
+    temps_nslots []int
+    instrs  []MInstr
+    margs   []MArg
+    phis    []MPhi
+    phi_args []MPhiArg
+    blocks  []MBlock
+    consts  []int
+    cur     int
+    dead    bool
+    // Scope stack: each frame is a list of local ids (not a contiguous
+    // range — loop vars are not always the next id after outer lets).
+    // scope_ids is the flat storage; scopes[i]/scount[i] is the slice
+    // scope_ids[scopes[i] .. scopes[i]+scount[i]).
+    scope_ids []int
+    scopes  []int
+    scount  []int
+    moved   []bool
+    // MS6 field-level `as`: per-local bitmask of consumed temp/struct@ fields.
+    fcons   []int
+    // Synthetic []T hold for the most recent fixed ArrayLit (-1 = none).
+    lit_hold int
+    // Let of a string array element used only by reference. The index
+    // lowering skips StrClone, and the local is marked non-owning.
+    alias_on bool
+    alias_node int
+    alias_hit bool
+    // Loop stack for <-/-> (M8): end bb and ->-target bb.
+    loop_break []int
+    loop_cont  []int
+    // Scope depth to retain on a loop transfer.  Body-local drops must run
+    // before `break`/`continue` jump past the lexical body scope.
+    loop_scope_depth []int
+    // m32: source file id of the function (into Mir.files).
+    file     int
+    // Checker fn index (for monomorph type-arg metadata during lowering).
+    src_fi   int
+    // m32: source line of the statement currently being lowered.
+    cur_line int
+    // M176: for i in 0 -< a.len induction while lowering the body.
+    induct_var []int
+    induct_arr []int
+    // Intra-block ElemAddr CSE (mirror xumir elem_cse): arr local, index
+    // local (-1 = const in ea_iconst), nocheck, pointer temp.
+    ea_arr []int
+    ea_ilocal []int
+    ea_iconst []int
+    ea_nc []int
+    ea_ptr []int
+    sdesc_lid []int
+    sdesc_temp []int
+    opt_level int
+    // Phase-local observation cache. facts_gen==0 is invalid (blank, clone,
+    // or in-progress rewrite). Published owners fill these on the local MFn
+    // before `m.fns.push`; later passes must not write `m.fns[fi].facts_*`.
+    facts_gen int
+    facts_bits int
+    facts_nins int
+    facts_nblocks int
+}
+
+pub struct Mir {
+    pub fns []MFn
+    // Optimizer replacements append a new owned MFn and keep the old storage
+    // alive until the Mir is dropped. This avoids dangling cross-function
+    // label/sval aliases without mutating large owning structs in-place.
+    pub superseded []int
+    pub strings []string
+    // m32: source file paths in load order (file id 0 = first CLI file).
+    pub files []string
+    // Type tables copied from Checker so the emitter can free owning values
+    // without re-running the checker (needed for Drop / DropField / index
+    // overwrite). Indices match type tags through struct_type(i); arrays use 200+i,
+    // throw-slot 300+i, enum 500+i, fn 700+i.
+    pub structs []CStruct
+    pub arrays []CArray
+    pub throws []CThrow
+    pub enums []CEnum
+    pub chans []CChan
+    pub maps []CMap
+    pub fn_sigs []CFnSig
+    // `-On` MIR tier (0 = no fold/inline/invert/BCE). Default 1.
+    pub opt_level int
+    // Stage 0 OptStats: observation only, never changes MIR/RA results.
+    pub opt_nfn int
+    pub opt_nins int
+    pub opt_nins_out int
+    pub opt_clone int
+    pub opt_commit int
+    pub opt_commit_skip int
+    pub opt_summary_hit int
+    pub opt_summary_scan int
+    pub opt_facts_fill int
+    pub opt_inline_ok int
+    pub opt_inline_skip int
+}
+
+// Slot count for a type tag (mirror Checker.type_slots; used by emit).
+// Keep the layout arithmetic bounded even when a malformed/generated type
+// table reaches the emitter.  The frame planner has the same word limit; a
+// zero result below is an invalid layout and all mixed/vreg admission checks
+// treat it as fail-closed rather than trusting a wrapped product.
+pub const mir_max_layout_words = 1048576
+pub const mir_max_layout_bytes = 8388608
+const mir_type_slots_depth_cap = 64
+
+// The ordinary source checker rejects recursive by-value layouts, but the
+// emitter also accepts serialized/generated MIR.  Keep a bounded resolver at
+// this boundary so a cyclic throw/fixed-array table cannot recurse until the
+// compiler stack is exhausted.  Struct/enum widths are already materialized
+// in their tables; only layout forms whose width depends on a child type need
+// recursive descent here.
+fn mir_type_slots_depth(m &Mir, ty int, depth int) int {
+    if depth > mir_type_slots_depth_cap { << 0 }
+    if ty == 3 { << 3 }
+    if is_ref_type(ty) { << 1 }
+    if is_chan_type(ty) {
+        ci := ty - 600
+        if ci < 0 || ci >= m.chans.len { << 0 }
+        << 1
+    }
+    if is_fn_type(ty) {
+        si := ty - 700
+        if si < 0 || si >= m.fn_sigs.len { << 0 }
+        << 2
+    }
+    if is_temp_type(ty) { << 2 }
+    if is_any_type(ty) { << 2 }
+    if is_interface_type(ty) { << 2 }
+    if is_throw_type(ty) {
+        ri := ty - 300
+        if ri >= 0 && ri < m.throws.len {
+            ok_s := mir_type_slots_depth(m, m.throws[ri].ok_ty, depth + 1)
+            er_s := mir_type_slots_depth(m, m.throws[ri].err_ty, depth + 1)
+            mut payload := er_s
+            if ok_s > payload { payload = ok_s }
+            if payload <= 0 || payload >= mir_max_layout_words { << 0 }
+            << 1 + payload
+        }
+        << 1
+    }
+    if is_enum_type(ty) {
+        ei := ty - 500
+        if ei >= 0 && ei < m.enums.len {
+            ns := m.enums[ei].nslots
+            if ns <= 0 || ns > mir_max_layout_words { << 0 }
+            << ns
+        }
+        << 1
+    }
+    if is_array_type(ty) {
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << 0 }
+        fl := m.arrays[ai].fixed_len
+        if fl < 0 { << 0 }
+        if fl > 0 {
+            es := mir_type_slots_depth(m, m.arrays[ai].elem_ty, depth + 1)
+            // `int` is signed 64-bit. Bound both factors before the
+            // multiplication so malformed serialized metadata cannot wrap
+            // the fixed-array slot count.
+            if es <= 0 || es > mir_max_layout_words || fl > mir_max_layout_words { << 0 }
+            if fl * es > mir_max_layout_words { << 0 }
+            << fl * es
+        }
+        << 3
+    }
+    if is_map_type(ty) {
+        mi := ty - 50
+        if mi < 0 || mi >= m.maps.len { << 0 }
+        << 1
+    }
+    if is_struct_type(ty) {
+        si := struct_index(ty)
+        if si >= 0 && si < m.structs.len {
+            ns := m.structs[si].nslots
+            if ns <= 0 || ns > mir_max_layout_words { << 0 }
+            << ns
+        }
+        << 0
+    }
+    << 1
+}
+
+pub fn (m &Mir) type_slots(ty int) int {
+    << mir_type_slots_depth(m, ty, 0)
+}
+
+pub fn (m &Mir) type_size_bytes(ty int) int {
+    if ty == 10 { << 1 }
+    if ty == 8 || ty == 9 { << 4 }
+    if ty == 0 { << 0 }
+    if ty == 3 { << 24 }
+    if is_array_type(ty) {
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << 0 }
+        fl := m.arrays[ai].fixed_len
+        if fl < 0 { << 0 }
+        if fl > 0 {
+            eb := m.arrays[ai].elem_bytes
+            // Both operands are bounded to 8 MiB before multiplication; the
+            // resulting product is well within signed i64.
+            if eb <= 0 || eb > mir_max_layout_bytes || fl > mir_max_layout_bytes { << 0 }
+            if fl * eb > mir_max_layout_bytes { << 0 }
+            << fl * eb
+        }
+        << 24
+    }
+    if is_fn_type(ty) { << 16 }
+    if is_temp_type(ty) { << 16 }
+    if is_any_type(ty) { << 16 }
+    if is_interface_type(ty) { << 16 }
+    if is_struct_type(ty) {
+        si := struct_index(ty)
+        if si >= 0 && si < m.structs.len {
+            bytes := m.structs[si].size_bytes
+            if bytes <= 0 || bytes > mir_max_layout_bytes { << 0 }
+            << bytes
+        }
+        << 0
+    }
+    if is_throw_type(ty) {
+        ns := m.type_slots(ty)
+        if ns <= 0 || ns > mir_max_layout_bytes / 8 { << 0 }
+        << ns * 8
+    }
+    if is_enum_type(ty) {
+        ns := m.type_slots(ty)
+        if ns <= 0 || ns > mir_max_layout_bytes / 8 { << 0 }
+        << ns * 8
+    }
+    << 8
+}
+pub fn (m &Mir) type_owning(ty int) bool {
+    if ty == 3 { << true }
+    if is_ref_type(ty) { << false }
+    if is_temp_type(ty) { << true }
+    if is_any_type(ty) { << true }
+    if is_interface_type(ty) { << true }
+    if is_fn_type(ty) {
+        si := ty - 700
+        if si >= 0 && si < m.fn_sigs.len {
+            << m.fn_sigs[si].has_env == 1
+        }
+        << false
+    }
+    if is_throw_type(ty) {
+        ri := ty - 300
+        if ri >= 0 && ri < m.throws.len {
+            << m.type_owning(m.throws[ri].ok_ty) || m.type_owning(m.throws[ri].err_ty)
+        }
+        << false
+    }
+    if is_enum_type(ty) {
+        ei := ty - 500
+        if ei >= 0 && ei < m.enums.len {
+            << m.enums[ei].owns
+        }
+        << false
+    }
+    if is_array_type(ty) {
+        fl := array_fixed_len_at(&m.arrays, ty)
+        if fl > 0 {
+            ai := ty - 200
+            << m.type_owning(m.arrays[ai].elem_ty)
+        }
+        << true
+    }
+    if is_map_type(ty) { << true }
+    if is_struct_type(ty) {
+        si := struct_index(ty)
+        if si >= 0 && si < m.structs.len {
+            if m.structs[si].drop_label.len > 0 { << true }
+            for i in 0:m.structs[si].fields.len {
+                if m.type_owning(m.structs[si].fields[i].ty) { << true }
+            }
+        }
+    }
+    << false
+}
+
+// ===== FnBuilder (methods on MFn, mirroring xumir's FnBuilder) =====
+
+pub fn empty_mir() Mir {
+    << Mir{
+        fns: []MFn{},
+        superseded: []int{},
+        strings: []string{},
+        files: []string{},
+        structs: []CStruct{},
+        arrays: []CArray{},
+        throws: []CThrow{},
+        enums: []CEnum{},
+        chans: []CChan{},
+        maps: []CMap{},
+        fn_sigs: []CFnSig{},
+        opt_level: 1,
+        opt_nfn: 0,
+        opt_nins: 0,
+        opt_nins_out: 0,
+        opt_clone: 0,
+        opt_commit: 0,
+        opt_commit_skip: 0,
+        opt_summary_hit: 0,
+        opt_summary_scan: 0,
+        opt_facts_fill: 0,
+        opt_inline_ok: 0,
+        opt_inline_skip: 0
+    }
+}
+
+pub fn mir_dump_opt_stats(m &Mir) {
+    eprintln("opt-stats: nfn=" + str(m.opt_nfn) + " nins=" + str(m.opt_nins) + " nins_out=" + str(m.opt_nins_out) + " clone=" + str(m.opt_clone) + " commit=" + str(m.opt_commit) + " commit_skip=" + str(m.opt_commit_skip) + " summary_hit=" + str(m.opt_summary_hit) + " summary_scan=" + str(m.opt_summary_scan) + " facts_fill=" + str(m.opt_facts_fill) + " inline_ok=" + str(m.opt_inline_ok) + " inline_skip=" + str(m.opt_inline_skip))
+}
+
+pub fn (c &mut Checker) lower_program(p &parser.Parser, m &mut Mir) {
+    for i in 0:c.strings.len {
+        m.strings.push(c.strings[i])
+    }
+    for i in 0:p.file_names.len {
+        m.files.push(p.file_names[i])
+    }
+    for i in 0:c.structs.len {
+        mut st := CStruct{
+            name: c.structs[i].name,
+            fields: []CField{},
+            nslots: c.structs[i].nslots,
+            size_bytes: c.structs[i].size_bytes,
+            align_bytes: c.structs[i].align_bytes,
+            mod_id: c.structs[i].mod_id,
+            is_pub: c.structs[i].is_pub,
+            origin: c.structs[i].origin,
+        drop_label: c.structs[i].drop_label
+        }
+        for j in 0:c.structs[i].fields.len {
+            st.fields.push(CField{
+                name: c.structs[i].fields[j].name,
+                ty: c.structs[i].fields[j].ty,
+                slot: c.structs[i].fields[j].slot,
+                life: c.structs[i].fields[j].life,
+                is_pub: c.structs[i].fields[j].is_pub
+            })
+        }
+        m.structs.push(st)
+    }
+    for i in 0:c.arrays.len {
+        // An array descriptor can be interned while a cross-module struct is
+        // still being laid out (the recursive-slice case).  In that window
+        // `intern_array_type_n` records an intentionally provisional zero
+        // stride.  All declarations and monomorphisations have completed by
+        // the MIR boundary, so refresh the stride from the final type table
+        // before copying it into Mir.  Keeping the old non-zero value as a
+        // fallback preserves generated descriptors whose element layout is
+        // deliberately opaque, while preventing a stale zero from making
+        // StoreIndex/drop helpers walk one byte at a time.
+        mut elem_bytes := c.arrays[i].elem_bytes
+        fresh_bytes := c.type_size_bytes(c.arrays[i].elem_ty)
+        if fresh_bytes > 0 && fresh_bytes <= mir_max_layout_bytes {
+            elem_bytes = fresh_bytes
+        }
+        m.arrays.push(CArray{
+            elem_ty: c.arrays[i].elem_ty,
+            elem_bytes: elem_bytes,
+            fixed_len: c.arrays[i].fixed_len
+        })
+    }
+    for i in 0:c.chans.len {
+        m.chans.push(CChan{elem_ty: c.chans[i].elem_ty, elem_slots: c.chans[i].elem_slots})
+    }
+    for i in 0:c.maps.len {
+        m.maps.push(CMap{key_ty: c.maps[i].key_ty, val_ty: c.maps[i].val_ty, kkind: c.maps[i].kkind, vkind: c.maps[i].vkind, vslots: c.maps[i].vslots})
+    }
+    for i in 0:c.throws.len {
+        m.throws.push(CThrow{ok_ty: c.throws[i].ok_ty, err_ty: c.throws[i].err_ty})
+    }
+    for i in 0:c.enums.len {
+        mut args := []int{}
+        for k in 0:c.enums[i].args.len {
+            args.push(c.enums[i].args[k])
+        }
+        mut en := CEnum{
+            name: c.enums[i].name,
+            variants: []CEnumVariant{},
+            nslots: c.enums[i].nslots,
+            owns: c.enums[i].owns,
+            mod_id: c.enums[i].mod_id,
+            is_pub: c.enums[i].is_pub,
+            origin: c.enums[i].origin,
+            args: args
+        }
+        for j in 0:c.enums[i].variants.len {
+            mut fields := []int{}
+            for k in 0:c.enums[i].variants[j].fields.len {
+                fields.push(c.enums[i].variants[j].fields[k])
+            }
+            en.variants.push(CEnumVariant{
+                name: c.enums[i].variants[j].name,
+                fields: fields,
+                field_slots: c.enums[i].variants[j].field_slots
+            })
+        }
+        m.enums.push(en)
+    }
+    for i in 0:c.fn_sigs.len {
+        mut ps := []int{}
+        for j in 0:c.fn_sigs[i].params.len {
+            ps.push(c.fn_sigs[i].params[j])
+        }
+        m.fn_sigs.push(CFnSig{
+            params: ps,
+            ret: c.fn_sigs[i].ret,
+            has_env: c.fn_sigs[i].has_env,
+            env_struct: c.fn_sigs[i].env_struct
+        })
+    }
+    // Concrete functions and monomorphized instances only (templates skipped).
+    // Instance bodies were checked at instantiation; restore shared AST tags.
+    for fi in 0:c.fns.len {
+        if !c.fns[fi].is_template {
+            if c.is_inst[fi] != 0 {
+                c.restore_instance(fi)
+            }
+            d := c.fndecl[fi]
+            mut f := lower_fn(p, c, d, fi)
+            mir_align_index_widths(mut &f, &*m)
+            mir_fn_facts_fill_f(mut &f)
+            m.fns.push(f)
+            m.superseded.push(0)
+        }
+    }
+    // Count after the large lower_fn sret window. Writing m.opt_* between
+    // lower_fn and fns.push made the product-hosted gen1 reload a null &Mir.
+    m.opt_facts_fill = m.fns.len
+    // rustc-shaped one pipeline: `-On` only raises gates. Default is still O1
+    // (rustc's default is `-Copt-level=0`). O2 simplify clones into a local
+    // MFn (not `mut &m.fns[fi]` — that aliases slice headers), rewrites
+    // scalar fields, copies scalars back.
+    if m.opt_level >= 1 {
+        m.opt_nfn = mir_nfn_live(&*m)
+        mut nins0 := 0
+        for si in 0:m.fns.len {
+            if mir_fn_is_extern(&*m, si) { -> }
+            nins0 += mir_nins(&*m, si)
+        }
+        m.opt_nins = nins0
+        // Const/scalar/rmw leaves use a per-caller instruction budget so a
+        // `#math` import does not disable user kernels. Compiler-sized
+        // callers (thousands of instructions) still skip. CFG loop-leaf
+        // inlining keeps the live-fn gate below: that pass SEGV'd
+        // time.date / unix_nano on compiler units.
+        mir_inline_const_leaves(m)
+        mir_inline_scalar_leaves(m)
+        mir_inline_rmw_leaves(m)
+        // CFG loop-leaf inlining must see the pre-SimplifyCFG body.
+        // Primer O1 order is inline_cfg before copy_prop; Gen1 previously
+        // simplified index kernels first, which made search_ints fail
+        // leaf_safe (algorithm_search stayed a Call). Compiler units
+        // (nfn≥64) skip the O1 pass inside mir_inline_cfg_leaves.
+        mir_inline_cfg_leaves(m)
+        // 1-slot struct field RMW → scalar local in self-loops (method_sum).
+        // Clone+append commit, same nfn/instr caps as CSE. Runs before LICM so the
+        // latch no longer has AddrOf (LICM used to skip the whole block).
+        mir_each_clone_lism(m)
+        // Small units only (`nfn < 64` inside). Turns counted for-range
+        // into self-loops so O1 matmul / byte-scan match the O2 inner loop.
+        mir_each_clone_simplify(m)
+        mir_each_clone_cse(m)
+        if m.opt_level >= 2 {
+            mir_each_clone_late_opt(m)
+        }
+        // Final canonicalization only after every slot-shaped peephole,
+        // SimplifyCFG and O3 unroll has run. SROA first splits eligible
+        // aggregate locals; promotion then commits formal SSA/Phi metadata
+        // to each MFn; a separate whole-program pass lowers it to the edge
+        // copies consumed by fixed homes.
+        // Aggregate SROA keeps its small-unit gate. Scalar promotion below
+        // has separate escape/SSA proofs and a bounded FP index loop exception.
+        promote_small_unit := m.fns.len < 64
+        if promote_small_unit {
+            mir_each_sroa_scalar_fields(m)
+        }
+        // Promotion has its own bounded function/escape/SSA proofs. Imported
+        // library functions must not disable otherwise identical FP loops;
+        // large units admit bounded integer CFGs and the proven FP memory shapes.
+        // Optimizer commits leave old MFn records as tombstones. Their
+        // storage count must not disable scalar SSA for the same live unit
+        // at a higher optimization tier. Keep SROA's separate gate above.
+        scalar_small_unit := mir_nfn_live(&*m) < 64
+        mir_each_promote_scalar_locals(m, scalar_small_unit)
+        mir_each_phi_elim(m)
+        mir_each_late_const(m)
+    }
+    m.opt_nfn = mir_nfn_live(&*m)
+    mut nins_out := 0
+    for si in 0:m.fns.len {
+        if mir_fn_is_extern(&*m, si) { -> }
+        nins_out += mir_nins(&*m, si)
+    }
+    if m.opt_level == 0 { m.opt_nins = nins_out }
+    m.opt_nins_out = nins_out
+}
+
+// M180: rewrite Call→Copy for const-<< leaf callees (depth-1 scan).
+struct ScalarLeaf {
+    kind int
+    op   int
+    cval int
+    li   int
+    ri   int
+}
+
+fn mir_call_arg(margs &[]MArg, head int, idx int) int {
+    mut p := head
+    mut n := 0
+    while p >= 0 {
+        if n == idx {
+            << mfn_marg_v(margs, p)
+        }
+        n += 1
+        p = mfn_marg_next(margs, p)
+    }
+    << 0
+}
+
+pub fn mir_scalar_ty(ty int) bool {
+    k := mir_type_abi_class(ty)
+    if k == ty_abi_gpr { << true }
+    if k == ty_abi_fp { << true }
+    << false
+}
+
+// Match emit abi_pass_by_value / bootstrap lower_call_arg: scalars, refs,
+// chan, map in registers; string/struct/fn/array/throw as hidden pointers —
+// including 1-slot structs (Point), which type_slots>1 would miss.
+fn mir_abi_pass_by_value(ty int) bool {
+    k := mir_type_abi_class(ty)
+    if k == ty_abi_gpr { << true }
+    if k == ty_abi_fp { << true }
+    if k == ty_abi_handle { << true }
+    << false
+}
+
+fn mir_abi_by_pointer(ty int) bool {
+    << !mir_abi_pass_by_value(ty)
+}
+
+fn mir_scalar_leaf(m &Mir, fi int) ScalarLeaf {
+    mut z := ScalarLeaf{kind: 0, op: 0, cval: 0, li: 0, ri: 0}
+    if mir_fn_is_extern(m, fi) { << z }
+    if mir_fn_receiver(m, fi) { << z }
+    np := mir_fn_nparams(m, fi)
+    if np < 1 || np > 2 { << z }
+    if mir_fn_ret_nslots(m, fi) != 1 { << z }
+    if !mir_scalar_ty(mir_fn_ret(m, fi)) { << z }
+    for i in 0:np {
+        if mir_local_nslots(m, fi, i) != 1 { << z }
+        if !mir_scalar_ty(mir_local_ty(m, fi, i)) { << z }
+    }
+    nb := mir_nblocks(m, fi)
+    if nb == 0 { << z }
+    if mir_btkind(m, fi, 0) != 3 { << z }
+    for bi in 1:nb {
+        if mir_bhead(m, fi, bi) >= 0 { << z }
+    }
+    retv := mir_bta(m, fi, 0)
+    if retv < 0 { << z }
+    mut kinds := []int{}
+    mut ia := []int{}
+    mut ib := []int{}
+    mut ic := []int{}
+    mut id := []int{}
+    mut ii := mir_bhead(m, fi, 0)
+    for _ in 0:9 {
+        if ii < 0 { <- }
+        kinds.push(mir_ikind(m, fi, ii))
+        ia.push(mir_ia(m, fi, ii))
+        ib.push(mir_ib(m, fi, ii))
+        ic.push(mir_ic(m, fi, ii))
+        id.push(mir_id(m, fi, ii))
+        ii = mir_inext(m, fi, ii)
+    }
+    if ii >= 0 { << z }
+    nins := kinds.len
+    if nins == 0 || nins > 8 { << z }
+    mut p0 := -1
+    mut p1 := -1
+    for i in 0:nins {
+        k := kinds[i]
+        if k == 2 { // LoadLocal
+            loc := ib[i]
+            if loc < 0 || loc >= np { << z }
+            if loc == 0 { p0 = ia[i] }
+            if loc == 1 { p1 = ia[i] }
+            ->
+        }
+        if k == 4 { // Bin
+            if ia[i] != retv { << z }
+            op := ib[i]
+            if op == 4 || op == 5 { << z }
+            l := ic[i]
+            r := id[i]
+            if np == 2 && p0 >= 0 && p1 >= 0 {
+                if l == p0 && r == p1 {
+                    z.kind = 2
+                    z.op = op
+                    z.li = 0
+                    z.ri = 1
+                    << z
+                }
+                if l == p1 && r == p0 {
+                    z.kind = 2
+                    z.op = op
+                    z.li = 1
+                    z.ri = 0
+                    << z
+                }
+            }
+            if p0 >= 0 && r <= -2 && l == p0 {
+                z.kind = 3
+                z.op = op
+                z.cval = mir_const_at(m, fi, 0 - r - 2)
+                z.li = 0
+                z.ri = 1
+                << z
+            }
+            if p0 >= 0 && l <= -2 && r == p0 {
+                z.kind = 3
+                z.op = op
+                z.cval = mir_const_at(m, fi, 0 - l - 2)
+                z.li = 1
+                z.ri = 0
+                << z
+            }
+            << z
+        }
+        if k == 5 { // Un
+            if ia[i] != retv { << z }
+            if p0 >= 0 && ic[i] == p0 {
+                z.kind = 4
+                z.op = ib[i]
+                << z
+            }
+            << z
+        }
+        if k == 1 { // Copy
+            if ia[i] != retv { << z }
+            if p0 >= 0 && ib[i] == p0 {
+                z.kind = 1
+                << z
+            }
+            << z
+        }
+        << z
+    }
+    if np == 1 && p0 == retv {
+        z.kind = 1
+        << z
+    }
+    << z
+}
+
+// Function-value label conversions must return independently-owned strings.
+// A slice of an owning string followed by `+` can retain the source backing
+// allocation under the hosted Gen1 ABI; when the source is consumed this
+// leaves a dangling label (observed as random bytes + `_pressure`).  Build the
+// result byte-by-byte instead, so every caller can safely pass a shared ref.
+pub fn mir_fnval_real_to_shim(real &string) string {
+    mut out := []int{}
+    out.push(95)  // _
+    out.push(120) // x
+    out.push(117) // u
+    out.push(95)  // _
+    out.push(102) // f
+    out.push(110) // n
+    out.push(118) // v
+    out.push(97)  // a
+    out.push(108) // l
+    out.push(95)  // _
+    mut start := 0
+    if real.len > 4 && real[0] == 95 && real[1] == 120 && real[2] == 117 && real[3] == 95 {
+        start = 4
+    }
+    for i in start:real.len {
+        out.push(real[i])
+    }
+    << string_from_bytes(out)
+}
+
+pub fn mir_fnval_shim_to_real(shim &string) string {
+    p := "_xu_fnval_"
+    if shim.len <= p.len {
+        << ""
+    }
+    for i in 0:p.len {
+        if shim[i] != p[i] {
+            << ""
+        }
+    }
+    mut out := []int{}
+    out.push(95)  // _
+    out.push(120) // x
+    out.push(117) // u
+    out.push(95)  // _
+    for i in p.len:shim.len {
+        out.push(shim[i])
+    }
+    << string_from_bytes(out)
+}
+
+// Unique predecessor block of bi, or -1 when bi has zero or
+// several predecessors (including a self edge). Backward reaching-def walks must not
+// cross a join: every path to bi goes through the unique predecessor.
+pub fn mir_unique_pred_of(m &Mir, fi int, bi int) int {
+    mut pred := -1
+    for pi in 0:mir_nblocks(m, fi) {
+        mut hits := false
+        tk := mir_btkind(m, fi, pi)
+        if tk == 1 && mir_bta(m, fi, pi) == bi { hits = true }
+        if tk == 2 && (mir_btb(m, fi, pi) == bi || mir_btc(m, fi, pi) == bi) { hits = true }
+        if hits {
+            if pred >= 0 { << -1 }
+            pred = pi
+        }
+    }
+    << pred
+}
+
+// Block containing instruction ii, or -1.
+pub fn mir_bi_of_ii(m &Mir, fi int, ii int) int {
+    if ii < 0 { << -1 }
+    for bi in 0:mir_nblocks(m, fi) {
+        mut p := mir_bhead(m, fi, bi)
+        for _ in 0:mir_nins(m, fi) {
+            if p < 0 { <- }
+            if p == ii { << bi }
+            p = mir_inext(m, fi, p)
+        }
+    }
+    << -1
+}
+
+// Reaching definition of temp t at (bi, before_ii): the unique LoadFnAddr
+// (kind 38) that defines t on every path to that point. Walks backward
+// inside the block, then follows the single-predecessor chain; joins, loops
+// and ambiguous code fail closed. Copy kinds 1 (temp := temp) and 2
+// (temp := local) are chased to their source. A last write of any other
+// kind (call results, binops, ...) is not a proof: fail closed.
+pub fn mir_fnval_reaching_loadfn(m &Mir, fi int, bi int, before_ii int, t int, depth int) int {
+    if t < 0 || bi < 0 || depth >= 64 { << -1 }
+    mut cur_bi := bi
+    mut cur_before := before_ii
+    mut cur_t := t
+    mut d := depth
+    for _ in 0:64 {
+        mut last_ii := -1
+        mut last_k := 0
+        mut last_ib := -1
+        mut ii := mir_bhead(m, fi, cur_bi)
+        for _ in 0:mir_nins(m, fi) {
+            if ii < 0 || ii == cur_before { <- }
+            k := mir_ikind(m, fi, ii)
+            // Kind 3 writes a local through ia; never confuse it with a temp.
+            if k != 3 && mir_ia(m, fi, ii) == cur_t {
+                last_ii = ii
+                last_k = k
+                last_ib = mir_ib(m, fi, ii)
+            }
+            ii = mir_inext(m, fi, ii)
+        }
+        if last_ii >= 0 {
+            if last_k == 38 {
+                << last_ii
+            }
+            d += 1
+            if d >= 64 { << -1 }
+            if last_k == 1 {
+                cur_t = last_ib
+                cur_before = last_ii
+                ->
+            }
+            if last_k == 2 {
+                << mir_fnval_reaching_loadfn_local(m, fi, cur_bi, last_ii, last_ib, d)
+            }
+            << -1
+        }
+        pred := mir_unique_pred_of(m, fi, cur_bi)
+        if pred < 0 { << -1 }
+        cur_bi = pred
+        cur_before = -1
+    }
+    << -1
+}
+
+// Reaching definition of local lid at (bi, before_ii), via kind-3 stores.
+// The stored temp is resolved with mir_fnval_reaching_loadfn at the store.
+pub fn mir_fnval_reaching_loadfn_local(m &Mir, fi int, bi int, before_ii int, lid int, depth int) int {
+    if lid < 0 || bi < 0 || depth >= 64 { << -1 }
+    mut cur_bi := bi
+    mut cur_before := before_ii
+    mut d := depth
+    for _ in 0:64 {
+        mut last_ii := -1
+        mut last_ib := -1
+        mut ii := mir_bhead(m, fi, cur_bi)
+        for _ in 0:mir_nins(m, fi) {
+            if ii < 0 || ii == cur_before { <- }
+            if mir_ikind(m, fi, ii) == 3 && mir_ia(m, fi, ii) == lid {
+                // Any last write truncates the search: only a valid temp
+                // continues resolution. A negative ib (cleared/constant/
+                // illegal source) fails closed at the use site below.
+                last_ii = ii
+                last_ib = mir_ib(m, fi, ii)
+            }
+            ii = mir_inext(m, fi, ii)
+        }
+        if last_ii >= 0 {
+            if last_ib < 0 { << -1 }
+            d += 1
+            if d >= 64 { << -1 }
+            << mir_fnval_reaching_loadfn(m, fi, cur_bi, last_ii, last_ib, d)
+        }
+        pred := mir_unique_pred_of(m, fi, cur_bi)
+        if pred < 0 { << -1 }
+        cur_bi = pred
+        cur_before = -1
+    }
+    << -1
+}
+
+// Reaching definition of the fat-pointer temp itself at the call site:
+// kind 16 (fnval materialize) or kind 38 (direct LoadFnAddr). Any other
+// last write is not a proof: fail closed.
+pub fn mir_fnval_ptr_def_before(m &Mir, fi int, bi int, before_ii int, ptr_temp int) int {
+    if ptr_temp < 0 || bi < 0 { << -1 }
+    mut cur_bi := bi
+    mut cur_before := before_ii
+    for _ in 0:64 {
+        mut last_ii := -1
+        mut last_k := 0
+        mut ii := mir_bhead(m, fi, cur_bi)
+        for _ in 0:mir_nins(m, fi) {
+            if ii < 0 || ii == cur_before { <- }
+            k := mir_ikind(m, fi, ii)
+            if k != 3 && mir_ia(m, fi, ii) == ptr_temp {
+                last_ii = ii
+                last_k = k
+            }
+            ii = mir_inext(m, fi, ii)
+        }
+        if last_ii >= 0 {
+            if last_k == 16 || last_k == 38 {
+                << last_ii
+            }
+            << -1
+        }
+        pred := mir_unique_pred_of(m, fi, cur_bi)
+        if pred < 0 { << -1 }
+        cur_bi = pred
+        cur_before = -1
+    }
+    << -1
+}
+
+// A named function initialized exactly once in the entry block remains the
+// same target through joins and loops. Any address use beyond the fn-value
+// call's first ABI argument can expose the descriptor to mutation, so reject
+// it. This complements the local reaching-def walk; it never guesses at a
+// function parameter, a reassigned local, or a captured closure environment.
+fn mir_fnval_ptr_call_only(f &MFn, ptr int) bool {
+    if ptr < 0 || ptr >= f.temps.len || ptr >= f.temps_nslots.len { << false }
+    if f.temps_nslots[ptr] != 1 { << false }
+    mut defs := 0
+    for bi in 0:f.blocks.len {
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            k := mfn_ikind(&f.instrs, ii)
+            if k != 3 && mir_instr_has_dest(k) && mfn_ia(&f.instrs, ii) == ptr { defs += 1 }
+            if f.instr_uses_temp(ii, ptr) {
+                if k != 7 || mfn_ib(&f.instrs, ii) != 80 { << false }
+                ap := mfn_ic(&f.instrs, ii)
+                if ap < 0 || f.margs[ap].v != ptr { << false }
+                mut rest := f.margs[ap].next
+                for _ in 0:f.margs.len {
+                    if rest < 0 { <- }
+                    if f.margs[rest].v == ptr { << false }
+                    rest = f.margs[rest].next
+                }
+            }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+        tk := f.blocks[bi].tkind
+        if (tk == 2 || tk == 3) && f.blocks[bi].ta == ptr { << false }
+    }
+    << defs == 1
+}
+
+fn mir_fnval_invariant_entry_store(m &Mir, fi int, bi int, before_ii int, lid int) int {
+    if bi < 0 || bi >= mir_nblocks(m, fi) || before_ii < 0 || before_ii >= mir_nins(m, fi) { << -1 }
+    if lid < mir_fn_nparams(m, fi) || lid >= mir_nlocals(m, fi) { << -1 }
+    if !is_fn_type(mir_local_ty(m, fi, lid)) || mir_local_nslots(m, fi, lid) != 2 { << -1 }
+    if mir_nblocks(m, fi) > 128 || mir_nins(m, fi) > 1024 || mir_ntemps(m, fi) > 768 { << -1 }
+    mut f := mir_cfg_clone_fn(m, fi, false)
+    mut store := -1
+    mut before_seen := false
+    for pi in 0:f.blocks.len {
+        tk := f.blocks[pi].tkind
+        // The entry initialization must execute once and dominate every use.
+        if (tk == 1 && f.blocks[pi].ta == 0) || (tk == 2 && (f.blocks[pi].tb == 0 || f.blocks[pi].tc == 0)) { << -1 }
+        mut ii := f.blocks[pi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            if pi == bi && ii == before_ii { before_seen = true }
+            k := mfn_ikind(&f.instrs, ii)
+            if k == 3 && mfn_ia(&f.instrs, ii) == lid {
+                if store >= 0 || pi != 0 || (bi == 0 && before_seen) { << -1 }
+                store = ii
+            }
+            if k == 8 && mfn_ia(&f.instrs, ii) == lid { << -1 }
+            if k == 16 && mfn_ic(&f.instrs, ii) == 0 {
+                if mfn_ib(&f.instrs, ii) == lid {
+                    ptr := mfn_ia(&f.instrs, ii)
+                    if !mir_fnval_ptr_call_only(&f, ptr) { << -1 }
+                }
+            }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    << store
+}
+
+// Shared call-site source proof for MIR transforms and target emission.
+// Empty means no unique reaching definition; retain the fat-pointer ABI.
+pub fn mir_fnval_known_label(m &Mir, fi int, bi int, ii int, ptr_temp int) string {
+    if fi < 0 || fi >= m.fns.len || m.fns.len > 4096 { << "" }
+    if ptr_temp < 0 || ptr_temp >= mir_ntemps(m, fi) { << "" }
+    nins := mir_nins(m, fi)
+    if nins <= 0 || nins > 65536 || ii < 0 || ii >= nins || bi < 0 { << "" }
+    pdef := mir_fnval_ptr_def_before(m, fi, bi, ii, ptr_temp)
+    if pdef < 0 { << "" }
+    pbi := mir_bi_of_ii(m, fi, pdef)
+    mut src := pdef
+    if mir_ikind(m, fi, pdef) == 16 {
+        if mir_ic(m, fi, pdef) == 0 {
+            lid := mir_ib(m, fi, pdef)
+            src = mir_fnval_reaching_loadfn_local(m, fi, pbi, pdef, lid, 0)
+            if src < 0 {
+                entry_store := mir_fnval_invariant_entry_store(m, fi, pbi, pdef, lid)
+                if entry_store >= 0 {
+                    src = mir_fnval_reaching_loadfn(m, fi, 0, entry_store, mir_ib(m, fi, entry_store), 0)
+                }
+            }
+        } else {
+            src = mir_fnval_reaching_loadfn(m, fi, pbi, pdef, mir_ib(m, fi, pdef), 0)
+        }
+    }
+    if src < 0 || src >= nins || mir_ikind(m, fi, src) != 38 { << "" }
+    n := mir_isval_len(m, fi, src)
+    if n <= 0 || n > 4096 { << "" }
+    sval := mir_isval(m, fi, src)
+    << mir_fnval_shim_to_real(&sval)
+}
+
+struct RmwLeaf {
+    ok    int
+    op    int
+    slot  int
+    fty   int
+}
+
+struct LismField {
+    ok  int
+    fty int
+    off int
+}
+
+struct LismRmw {
+    ok  int
+    loc int
+    off int
+    rhs int
+    op  int
+    buf int
+    ptr int
+    fty int
+}
+
+fn mir_rmw_leaf(m &mut Mir, fi int) RmwLeaf {
+    mut z := RmwLeaf{ok: 0, op: 0, slot: 0, fty: 1}
+    if mir_fn_is_extern(&*m, fi) { << z }
+    if !m.fns[fi].receiver || !m.fns[fi].receiver_mut { << z }
+    if m.fns[fi].nparams != 2 { << z }
+    if m.fns[fi].locals_nslots[0] != 1 { << z }
+    if m.fns[fi].locals_nslots[1] != 1 { << z }
+    if !mir_scalar_ty(m.fns[fi].locals[1]) { << z }
+    if m.fns[fi].blocks.len == 0 { << z }
+    // Void: Return with ta==-1 (ret_nslots may still be 1 for unit-shaped MIR).
+    if m.fns[fi].blocks[0].tkind != 3 || m.fns[fi].blocks[0].ta != -1 { << z }
+    for bi in 1:m.fns[fi].blocks.len {
+        if m.fns[fi].blocks[bi].head >= 0 { << z }
+    }
+    mut f := mir_clone_fn(m, fi, false)
+    mut kinds := []int{}
+    mut ia := []int{}
+    mut ib := []int{}
+    mut ic := []int{}
+    mut id := []int{}
+    mut cols := []int{}
+    mut lines := []int{}
+    mut ii := f.blocks[0].head
+    for _ in 0:6 {
+        if ii < 0 { <- }
+        kinds.push(mfn_ikind(&f.instrs, ii))
+        ia.push(mfn_ia(&f.instrs, ii))
+        ib.push(mfn_ib(&f.instrs, ii))
+        ic.push(mfn_ic(&f.instrs, ii))
+        id.push(mfn_id(&f.instrs, ii))
+        cols.push(mfn_icol(&f.instrs, ii))
+        lines.push(mfn_iline(&f.instrs, ii))
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    if ii >= 0 { << z }
+    // LoadLocal recv; LoadLocal arg; FieldRMW recv, arg (a.n += x).
+    if kinds.len == 3 {
+        if kinds[0] != 2 || ib[0] != 0 { << z }
+        rp := ia[0]
+        if kinds[1] != 2 || ib[1] != 1 { << z }
+        ra := ia[1]
+        if kinds[2] != 48 { << z }
+        if ia[2] != rp { << z }
+        if ic[2] != ra { << z }
+        if ib[2] != 0 { << z }
+        op3 := cols[2]
+        if op3 == 4 || op3 == 5 { << z }
+        z.ok = 1
+        z.op = op3
+        z.slot = lines[2]
+        z.fty = id[2]
+        << z
+    }
+    if kinds.len != 5 { << z }
+    // LoadLocal recv,0
+    if kinds[0] != 2 || ib[0] != 0 { << z }
+    p0 := ia[0]
+    // LoadPtr cur, recv, slot, 1
+    if kinds[1] != 17 || ib[1] != p0 || id[1] != 1 { << z }
+    slot := ic[1]
+    cur := ia[1]
+    // LoadLocal arg,1
+    if kinds[2] != 2 || ib[2] != 1 { << z }
+    p1 := ia[2]
+    // Bin val, op, cur, arg  (field is lhs — matches `field op= arg`)
+    if kinds[3] != 4 || ic[3] != cur || id[3] != p1 { << z }
+    op := ib[3]
+    if op == 4 || op == 5 { << z } // no div/mod
+    val := ia[3]
+    // StorePtr val, recv, slot, 1
+    if kinds[4] != 18 || ia[4] != val || ib[4] != p0 || ic[4] != slot || id[4] != 1 {
+        << z
+    }
+    z.ok = 1
+    z.op = op
+    z.slot = slot
+    if cur >= 0 && cur < f.temps.len {
+        z.fty = mfn_get_i(&f.temps, cur)
+    }
+    << z
+}
+
+fn mfn_become_field_rmw(a &mut []MInstr, i int, ptr int, rhs int, op int, slot int, fty int) {
+    mut x := mfn_instr_snap(a, i)
+    x.kind = 48
+    x.a = ptr
+    x.b = 0
+    x.c = rhs
+    x.d = fty
+    x.col = op
+    x.line = slot
+    x.sval = ""
+    a[i] = x
+}
+
+fn mir_find_const(f &mut MFn, cv int) int {
+    for k in 0:f.consts.len {
+        if f.consts[k] == cv { << 0 - k - 2 }
+    }
+    << -1
+}
+
+fn mir_fn_commit(m &mut Mir, fi int, f MFn) int {
+    if m.fns.len != m.superseded.len { << -1 }
+    if fi < 0 || fi >= m.fns.len { << -1 }
+    if mir_fn_is_extern(&*m, fi) { << -1 }
+    // Every optimizer rewrite enters through this append-only seam.  Keep a
+    // cheap structural gate here so malformed block/next/operand/Phi data
+    // falls back to the previous owner instead of reaching the emitter.  The
+    // gate is intentionally lighter than the dominance verifier and never
+    // copies the large MFn value used by the hosted 75-function compiler.
+    if !mir_verify_shape_mfn_f(&f) {
+        m.opt_commit_skip += 1
+        << -1
+    }
+    // The shape gate can only validate local MFn indexes.  Calls also cross
+    // the Mir function table, so validate known user labels and the two
+    // fixed-shape ABI call kinds before publishing the replacement.  Keep
+    // this in the same append-only commit seam so every optimizer rewrite
+    // receives identical fail-closed treatment.
+    if !mir_verify_call_refs_f(&*m, &f) {
+        m.opt_commit_skip += 1
+        << -1
+    }
+    seq := m.fns.len
+    mut owned := f
+    mir_fn_facts_fill_f(mut &owned)
+    m.opt_facts_fill += 1
+    mfn_set_i(mut &m.superseded, fi, 1)
+    m.fns.push(owned)
+    m.superseded.push(0)
+    m.opt_commit += 1
+    << seq
+}
+
+pub fn mir_nfn_live(m &Mir) int {
+    // Optimizer commits retain superseded owners in the pool. Gates that use
+    // m.fns.len would skip SimplifyCFG on #math units after a few inlines.
+    mut n := 0
+    for i in 0:m.fns.len {
+        if mir_fn_is_extern(m, i) { -> }
+        n += 1
+    }
+    << n
+}
+
+const mir_sum_index = 1
+const mir_sum_string_index_store = 2
+const mir_sum_field_rmw = 4
+const mir_sum_arr_push = 8
+const mir_sum_has_call = 16
+const mir_sum_has_descriptor = 32
+const mir_sum_has_owning = 64
+const mir_sum_has_drop = 128
+const mir_sum_admission_mask = 15
+
+fn mir_ty_is_descriptor(ty int) bool {
+    if ty == 3 { << true }
+    if is_array_type(ty) { << true }
+    if is_map_type(ty) { << true }
+    << false
+}
+
+fn mir_fn_facts_invalidate_f(f &mut MFn) {
+    f.facts_gen = 0
+    f.facts_bits = 0
+    f.facts_nins = 0
+    f.facts_nblocks = 0
+}
+
+// One walk of the live instruction lists. Admission bits (index / string
+// index+store / FieldRMW / ArrPush) match `mir_fn_summary_scan`; extra bits
+// are observation-only and must not change pass admission.
+fn mir_fn_facts_compute_f(f &MFn) int {
+    mut s := 0
+    mut has_string_index := false
+    mut has_ptr_store := false
+    mut has_call := false
+    mut has_xu := false
+    mut has_drop := false
+    mut has_owning := false
+    mut has_descriptor := false
+    nins := f.instrs.len
+    ntemps := f.temps.len
+    for i in 0:f.locals.len {
+        ty := f.locals[i]
+        if mir_ty_is_descriptor(ty) { has_descriptor = true }
+    }
+    for i in 0:ntemps {
+        ty := f.temps[i]
+        if mir_ty_is_descriptor(ty) { has_descriptor = true }
+    }
+    for i in 0:f.locals_owning.len {
+        if f.locals_owning[i] { has_owning = true }
+    }
+    for bi in 0:f.blocks.len {
+        mut ii := f.blocks[bi].head
+        for _ in 0:nins {
+            if ii < 0 { <- }
+            k := mfn_ikind(&f.instrs, ii)
+            if k == 14 || k == 20 || k == 23 || k == 47 {
+                s = s | mir_sum_index
+            }
+            if k == 14 {
+                base := mfn_ib(&f.instrs, ii)
+                if base >= 0 && base < ntemps && f.temps[base] == 3 {
+                    has_string_index = true
+                }
+            }
+            if k == 7 {
+                has_call = true
+                if mfn_ib(&f.instrs, ii) == 95 {
+                    s = s | mir_sum_field_rmw
+                }
+            }
+            if k == 33 {
+                has_xu = true
+            }
+            if k == 11 || k == 18 || k == 25 || k == 48 {
+                has_ptr_store = true
+            }
+            if k == 48 {
+                s = s | mir_sum_field_rmw
+            }
+            if k == 13 || k == 46 {
+                s = s | mir_sum_arr_push
+                has_descriptor = true
+            }
+            if k == 8 || k == 21 || k == 22 || k == 24 {
+                has_drop = true
+                has_owning = true
+            }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    // Pointer or field stores can alias a string index through a different
+    // temp (Hash.write, regexp). A call in another block, such as
+    // make_string before the loop, does not. LICM and duplicate-check
+    // elimination already refuse a latch that itself contains a call.
+    if has_string_index && has_ptr_store {
+        s = s | mir_sum_string_index_store
+    }
+    if has_call || has_xu { s = s | mir_sum_has_call }
+    if has_descriptor { s = s | mir_sum_has_descriptor }
+    if has_owning { s = s | mir_sum_has_owning }
+    if has_drop { s = s | mir_sum_has_drop }
+    << s
+}
+
+fn mir_fn_facts_fill_f(f &mut MFn) {
+    f.facts_bits = mir_fn_facts_compute_f(&*f)
+    f.facts_nins = f.instrs.len
+    f.facts_nblocks = f.blocks.len
+    f.facts_gen = 1
+}
+
+// Compute all optimizer admission facts in one read-only scan. These facts
+// used to be collected by four helpers, each cloning and walking the same
+// MFn. The summary only reads stable MIR fields, so cloning adds allocation
+// and slice-copy cost without providing isolation.
+fn mir_fn_summary_scan(m &Mir, fi int) int {
+    mut s := 0
+    mut has_string_index := false
+    mut has_ptr_store := false
+    nins := mir_nins(m, fi)
+    ntemps := mir_ntemps(m, fi)
+    for bi in 0:mir_nblocks(m, fi) {
+        mut ii := mir_bhead(m, fi, bi)
+        for _ in 0:nins {
+            if ii < 0 { <- }
+            k := mir_ikind(m, fi, ii)
+            if k == 14 || k == 20 || k == 23 || k == 47 {
+                s = s | mir_sum_index
+            }
+            if k == 14 {
+                base := mir_ib(m, fi, ii)
+                if base >= 0 && base < ntemps && mir_temp_ty(m, fi, base) == 3 {
+                    has_string_index = true
+                }
+            }
+            if k == 7 && mir_ib(m, fi, ii) == 95 {
+                s = s | mir_sum_field_rmw
+            }
+            if k == 11 || k == 18 || k == 25 || k == 48 {
+                has_ptr_store = true
+            }
+            if k == 48 {
+                s = s | mir_sum_field_rmw
+            }
+            if k == 13 || k == 46 {
+                s = s | mir_sum_arr_push
+            }
+            ii = mir_inext(m, fi, ii)
+        }
+    }
+    // Same admission as mir_fn_facts_compute_f: calls are per-loop, pointer
+    // stores stay function-wide.
+    if has_string_index && has_ptr_store {
+        s = s | mir_sum_string_index_store
+    }
+    << s
+}
+
+fn mir_fn_summary(m &mut Mir, fi int) int {
+    if fi < 0 || fi >= m.fns.len { << 0 }
+    if mir_fn_facts_gen(&*m, fi) != 0 {
+        m.opt_summary_hit += 1
+        << mir_fn_facts_bits(&*m, fi) & mir_sum_admission_mask
+    }
+    m.opt_summary_scan += 1
+    << mir_fn_summary_scan(&*m, fi)
+}
+
+fn mir_summary_has(s int, bit int) bool {
+    << (s & bit) != 0
+}
+
+// String byte loops that also store through a pointer need to retain their
+// original block shape.  A receiver field load (for example Hash.state in
+// Hash.write, or Parser.pos/class_data in regexp) can be materialized through
+// a different pointer temp than the following StoreField/FieldRMW.  The
+// hosted slot-model LICM cannot prove those pointer temps alias, so running
+// the index-kernel CFG/LICM rewrite would hoist a stale field value.  A call
+// that is not in the latch does not set this bit: per-loop LICM already
+// refuses to hoist across a call.  Integer and array index kernels remain
+// eligible for the normal O1/O2 path.
+fn mir_each_clone_simplify(m &mut Mir) {
+    n0 := m.fns.len
+    mut fi := 0
+    while fi < n0 {
+        if mir_fn_is_extern(&*m, fi) {
+            fi += 1
+            ->
+        }
+        // Unit size is not an admission gate. A program that imports the
+        // standard library used to skip every non-FieldRMW function once
+        // the live count passed 256, so the same loop was optimized in a
+        // microbench and left alone in a real program. Admission is the
+        // function's own shape. The instruction cap avoids cloning a
+        // compiler-sized body (Gen1 bus-errors on that store).
+        summary := mir_fn_summary(m, fi)
+        if m.fns[fi].instrs.len >= 512 {
+            fi += 1
+            ->
+        }
+        // Index kernels only (matmul / byte scan / SHA W[]). Recursion
+        // (fib) got slower when SimplifyCFG rearranged the `n<2` diamond;
+        // dense match lost the Copy+Eq+Mul latch the jump-table peep
+        // needs. O2 does not re-open this — admission is not slower than O1.
+        if !mir_summary_has(summary, mir_sum_index) {
+            fi += 1
+            ->
+        }
+        // ArrPush mutates the descriptor. SimplifyCFG/LICM can hoist a
+        // LoadPtr of the buffer above the grow; later StoreIndex writes
+        // through the old pointer (matmul O2/O3 printed 0). O1 already
+        // skipped this; O2 must not be weaker. Bootstrap treats ArrPush
+        // as Call for the same alias reason.
+        if mir_summary_has(summary, mir_sum_arr_push) {
+            fi += 1
+            ->
+        }
+        // String byte loops with pointer field writes are alias-sensitive;
+        // keep receiver state updates in their original CFG (see helper).
+        if mir_summary_has(summary, mir_sum_string_index_store) {
+            fi += 1
+            ->
+        }
+        mut f := mir_clone_fn(m, fi, false)
+        // LICM on search diamonds SIGSEGV'd Gen1 (search_mini).
+        if mir_fn_keeps_branch_diamond(&f) {
+            fi += 1
+            ->
+        }
+        mir_copy_prop_fn(mut &f)
+        mir_licm_self_loops(mut &f)
+        // After hoisting `mi := sys[i].mass`, LoadLocal of `mi` is no
+        // longer stored-in-loop. A second pass pulls those loads out so
+        // `dx*mj*mag` sits next to FieldRMW.
+        mir_licm_self_loops(mut &f)
+        mir_bce_dup_self_loops(mut &f)
+        mir_simplify_cfg(mut &f)
+        // Whole-element store of a large MFn into []MFn drops LICM (nbody
+        // advance). The append-only commit path retains the prior owner.
+        mir_fn_commit(m, fi, f)
+        fi += 1
+    }
+}
+
+fn mir_late_opt_one(m &mut Mir, fi int) {
+    // Staged after-inline cleanup. CopyProp + SimplifyCfg run first. O2/O3
+    // then run LICM; the hoist itself still requires LoopMemFacts version 0.
+    // O3 additionally unrolls counted self-loops that mir_unroll_self_loop_ok
+    // accepts (no call, ArrPush, drop, pointer store, or FieldRMW).
+    // ArrPush mutates the descriptor. The pre-inline simplify pass
+    // already skips ArrPush fns; late_opt must too. Bootstrap treats
+    // ArrPush as Call so it does not hoist a LoadLocal across grow.
+    summary := mir_fn_summary(m, fi)
+    if mir_summary_has(summary, mir_sum_arr_push) {
+        <<
+    }
+    if mir_summary_has(summary, mir_sum_string_index_store) {
+        <<
+    }
+    mut f := mir_clone_fn(m, fi, true)
+    mir_copy_prop_fn(mut &f)
+    mir_simplify_cfg(mut &f)
+    mir_copy_prop_fn(mut &f)
+    if m.opt_level >= 2 {
+        mir_licm_self_loops(mut &f)
+    }
+    if m.opt_level >= 3 {
+        mir_unroll_self_loops(mut &f)
+    }
+    // Keep the per-candidate check cheap. The full dominance/SSA verifier is
+    // intentionally reserved for dedicated promotion/SROA checks; running it
+    // for every post-inline clone costs more than this cleanup saves. The
+    // shape gate still rejects malformed block/operand metadata before the
+    // append-only commit, and the commit seam repeats the same guard.
+    if !mir_verify_shape_mfn_f(&f) {
+        <<
+    }
+    mir_fn_commit(m, fi, f)
+}
+
+fn mir_each_clone_late_opt(m &mut Mir) {
+    // O2/O3 late copy/CFG, then LICM. O3 also unrolls self-loops whose
+    // LoopMemFacts allow it. ArrPush and string-index bodies stay out.
+    n0 := m.fns.len
+    mut fi := 0
+    while fi < n0 {
+        if mir_fn_is_extern(&*m, fi) {
+            fi += 1
+            ->
+        }
+        // Same index-kernel gate as pre-inline simplify / CSE. FieldRMW is
+        // not required: an integer or byte loop is the same shape in user
+        // code and in the standard library.
+        summary := mir_fn_summary(m, fi)
+        if !mir_summary_has(summary, mir_sum_index) {
+            fi += 1
+            ->
+        }
+        // Cost gate, not a name special case: cloning a post-inline body of
+        // hundreds of MInstrs and running 8 simplify rounds Bus-errors
+        // (O3 sort). Pre-inline simplify already ran. FieldRMW kernels
+        // (nbody `advance`) are larger than 256 after inlining sqrt's
+        // callers' surrounding math; still well below the O3-sort size.
+        // Keep this pass bounded: unlike the pre-inline rounds, the clone is
+        // made after expansion and its cost grows with the full inlined body.
+        // 512 instructions is large enough for compact kernels while avoiding
+        // multi-second compile-time spikes on library-heavy units.
+        mut cap := 512
+        if m.fns[fi].instrs.len >= cap {
+            fi += 1
+            ->
+        }
+        mir_late_opt_one(m, fi)
+        fi += 1
+    }
+}
+
+fn mir_subst_val(v int, subst_on &[]bool, subst_v &[]int) int {
+    if v < 0 { << v }
+    if v >= subst_on.len { << v }
+    if subst_on[v] { << subst_v[v] }
+    << v
+}
+
+fn mir_subst_temp(v int, subst_on &[]bool, subst_v &[]int) int {
+    nv := mir_subst_val(v, subst_on, subst_v)
+    if nv >= 0 { << nv }
+    << v
+}
+
+fn mir_kill_temp(subst_on &mut []bool, subst_v &mut []int, t int) {
+    if t < 0 { << }
+    if t < subst_on.len {
+        mfn_set_b(subst_on, t, false)
+    }
+    for i in 0:subst_on.len {
+        if subst_on[i] && subst_v[i] == t {
+            mfn_set_b(subst_on, i, false)
+        }
+    }
+}
+
+fn mir_rewrite_instr(f &mut MFn, ii int, subst_on &[]bool, subst_v &[]int) {
+    k := mfn_ikind(&f.instrs, ii)
+    ia := mfn_ia(&f.instrs, ii)
+    ib := mfn_ib(&f.instrs, ii)
+    ic := mfn_ic(&f.instrs, ii)
+    id := mfn_id(&f.instrs, ii)
+    if k == 1 || k == 3 || k == 9 {
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_val(ib, subst_on, subst_v))
+    } else if k == 4 {
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_val(ic, subst_on, subst_v))
+        mfn_set_id(mut &f.instrs, ii, mir_subst_val(id, subst_on, subst_v))
+    } else if k == 5 {
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_val(ic, subst_on, subst_v))
+    } else if k == 7 || k == 33 {
+        mut ap := ic
+        for _ in 0:f.margs.len {
+            if ap < 0 { <- }
+            ov := f.margs[ap].v
+            nxt := f.margs[ap].next
+            nv := mir_subst_val(ov, subst_on, subst_v)
+            if !(ov >= 0 && nv < 0) {
+                mfn_set_marg(mut &f.margs, ap, MArg{v: nv, next: nxt})
+            }
+            ap = nxt
+        }
+    } else if k == 13 || k == 46 {
+        // Growth writes descriptor memory; the descriptor TempId is a use.
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_temp(ia, subst_on, subst_v))
+        if k == 13 {
+            mfn_set_ib(mut &f.instrs, ii, mir_subst_temp(ib, subst_on, subst_v))
+        } else {
+            mut ap := ib
+            for _ in 0:f.margs.len {
+                if ap < 0 || ap >= f.margs.len { <- }
+                ov := f.margs[ap].v
+                nxt := f.margs[ap].next
+                nv := mir_subst_val(ov, subst_on, subst_v)
+                mfn_set_marg(mut &f.margs, ap, MArg{v: nv, next: nxt})
+                ap = nxt
+            }
+        }
+    } else if k == 10 || k == 17 || k == 26 {
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_temp(ib, subst_on, subst_v))
+    } else if k == 11 {
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_temp(ia, subst_on, subst_v))
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_temp(ib, subst_on, subst_v))
+    } else if k == 14 || k == 23 {
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_temp(ib, subst_on, subst_v))
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_val(ic, subst_on, subst_v))
+    } else if k == 16 {
+        if ic == 1 {
+            mfn_set_ib(mut &f.instrs, ii, mir_subst_temp(ib, subst_on, subst_v))
+        }
+    } else if k == 18 || k == 25 {
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_val(ia, subst_on, subst_v))
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_temp(ib, subst_on, subst_v))
+    } else if k == 21 || k == 22 || k == 24 {
+        // DropField / DropPtrField / DropBufField: keep the base in lockstep
+        // with StorePtr. Leaving it unrewritten lets CSE turn the LoadLocal
+        // into a Copy, copy-prop rewrite the store, and DCE drop the load
+        // while drop still uses the dead temp (SHA-3 Digest.reset).
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_temp(ia, subst_on, subst_v))
+    } else if k == 20 || k == 47 {
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_temp(ia, subst_on, subst_v))
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_val(ib, subst_on, subst_v))
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_val(ic, subst_on, subst_v))
+    } else if k == 30 {
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_val(ic, subst_on, subst_v))
+    } else if k == 31 {
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_val(ia, subst_on, subst_v))
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_temp(ib, subst_on, subst_v))
+    } else if k == 35 {
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_val(ib, subst_on, subst_v))
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_temp(ic, subst_on, subst_v))
+    } else if k == 32 {
+        mfn_set_ib(mut &f.instrs, ii, mir_subst_val(ib, subst_on, subst_v))
+    } else if k == 34 {
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_val(ia, subst_on, subst_v))
+    } else if k == 36 {
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_val(ic, subst_on, subst_v))
+    } else if k == 48 {
+        mfn_set_ia(mut &f.instrs, ii, mir_subst_temp(ia, subst_on, subst_v))
+        mfn_set_ic(mut &f.instrs, ii, mir_subst_val(ic, subst_on, subst_v))
+    }
+}
+
+// This describes fresh TempId definitions, not effects on descriptor memory.
+// NoOp retains irrelevant tombstone operands; pushes read their existing base.
+pub fn mir_instr_has_dest(k int) bool {
+    if k == 0 || k == 13 || k == 46 || k == 3 || k == 8 || k == 11 || k == 18 || k == 20 || k == 21 || k == 22 || k == 24 || k == 25 || k == 31 || k == 33 || k == 34 || k == 37 || k == 47 || k == 48 {
+        << false
+    }
+    << true
+}
+
+fn (f &MFn) copy_after(ii int, subst_on &mut []bool, subst_v &mut []int) {
+    k := mfn_ikind(&f.instrs, ii)
+    a := mfn_ia(&f.instrs, ii)
+    b := mfn_ib(&f.instrs, ii)
+    // True Call / index / xu: do not copy-prop temps across (non-SSA emit).
+    // Field RMW (kind 7 b=95) is not a call barrier.
+    // Hardware fsqrt is a pure unop (`_xu_math_sqrt`); a Copy of `d2`
+    // used as both the sqrt arg and `d2 * dist` must survive the Call.
+    // ArrPush/ArrPush4 are kind 13/46 here but Call in bootstrap — they
+    // mutate the descriptor in place, so a LoadPtr copy of h.a must not
+    // survive to the following StoreIndex (StrHeap.push).
+    mut kill_all := false
+    if k == 7 && b != 95 {
+        if mfn_isval(&f.instrs, ii) != "_xu_math_sqrt" {
+            kill_all = true
+        }
+    }
+    if k == 12 || k == 13 || k == 46 {
+        kill_all = true
+    }
+    // LoadPtr (17) is a read; wiping subst here keeps a Copy of an
+    // element pointer live so the next field load re-stores x24.
+    if k == 14 || k == 18 || k == 20 || k == 23 || k == 47 || k == 48 {
+        kill_all = true
+    }
+    if k >= 30 && k <= 37 {
+        kill_all = true
+    }
+    if kill_all {
+        for i in 0:subst_on.len {
+            mfn_set_b(subst_on, i, false)
+        }
+    }
+    if k == 36 {
+        mir_kill_temp(subst_on, subst_v, a)
+        mir_kill_temp(subst_on, subst_v, mfn_ib(&f.instrs, ii))
+    } else if mir_instr_has_dest(k) {
+        if k != 7 || a >= 0 {
+            mir_kill_temp(subst_on, subst_v, a)
+        }
+    }
+    if k == 1 && a >= 0 && a < subst_on.len {
+        mfn_set_b(subst_on, a, true)
+        mfn_set_i(subst_v, a, b)
+    }
+}
+
+fn mir_copy_after(f &MFn, ii int, subst_on &mut []bool, subst_v &mut []int) {
+    f.copy_after(ii, subst_on, subst_v)
+}
+
+fn mir_copy_prop_fn(f &mut MFn) {
+    n := f.temps.len
+    for bi in 0:f.blocks.len {
+        mut subst_on := []bool{}
+        mut subst_v := []int{}
+        for _ in 0:n {
+            subst_on.push(false)
+            subst_v.push(0)
+        }
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            mir_rewrite_instr(f, ii, &subst_on, &subst_v)
+            f.copy_after(ii, mut &subst_on, mut &subst_v)
+            ii = mfn_inext(&f.instrs, ii)
+        }
+        mut b := f.blocks[bi]
+        if b.tkind == 2 || b.tkind == 3 {
+            b.ta = mir_subst_val(b.ta, &subst_on, &subst_v)
+            mfn_set_block(mut &f.blocks, bi, b)
+        }
+    }
+}
+
+fn (f &MFn) is_self_loop(bi int) bool {
+    tk := f.blocks[bi].tkind
+    if tk == 1 && f.blocks[bi].ta == bi { << true }
+    if tk == 2 && (f.blocks[bi].tb == bi || f.blocks[bi].tc == bi) { << true }
+    << false
+}
+
+fn mir_block_is_self_loop(f &MFn, bi int) bool {
+    << f.is_self_loop(bi)
+}
+
+fn mir_fn_block_is_self_loop(m &Mir, fi int, bi int) bool {
+    if bi < 0 || bi >= m.fns[fi].blocks.len { << false }
+    tk := m.fns[fi].blocks[bi].tkind
+    if tk == 1 && m.fns[fi].blocks[bi].ta == bi { << true }
+    if tk == 2 && (m.fns[fi].blocks[bi].tb == bi || m.fns[fi].blocks[bi].tc == bi) { << true }
+    << false
+}
+
+fn (f &MFn) unique_ext_pred(bi int) int {
+    mut pred := -1
+    for pi in 0:f.blocks.len {
+        if pi == bi { -> }
+        mut hits := false
+        tk := f.blocks[pi].tkind
+        if tk == 1 && f.blocks[pi].ta == bi { hits = true }
+        if tk == 2 && (f.blocks[pi].tb == bi || f.blocks[pi].tc == bi) { hits = true }
+        if hits {
+            if pred >= 0 { << -1 }
+            pred = pi
+        }
+    }
+    << pred
+}
+
+fn mir_unique_ext_pred(f &MFn, bi int) int {
+    << f.unique_ext_pred(bi)
+}
+
+// Detach for movement: preserve the instruction identity and full payload.
+// A missing/wrong owner must not retire an instruction in another block.
+fn mir_detach_instr(f &mut MFn, bi int, ii int) bool {
+    if bi < 0 || bi >= f.blocks.len || ii < 0 || ii >= f.instrs.len { << false }
+    mut b := f.blocks[bi]
+    mut prev := -1
+    mut p := b.head
+    for _ in 0:f.instrs.len {
+        if p < 0 { <- }
+        if p >= f.instrs.len { << false }
+        if p == ii {
+            nxt := mfn_inext(&f.instrs, p)
+            if nxt < -1 || nxt >= f.instrs.len || nxt == ii { << false }
+            if prev < 0 {
+                b.head = nxt
+            } else {
+                mfn_set_inext(mut &f.instrs, prev, nxt)
+            }
+            if b.tail == ii {
+                b.tail = prev
+            }
+            mfn_set_inext(mut &f.instrs, ii, 0 - 1)
+            mfn_set_block(mut &f.blocks, bi, b)
+            << true
+        }
+        prev = p
+        p = mfn_inext(&f.instrs, p)
+    }
+    << false
+}
+
+// The caller supplies the existing deletion proof (DCE, replacement, or
+// unreachable CFG). Do not infer purity from removal or from an orphan.
+// Only successful ownership removal may turn the stable InstrId into NoOp.
+fn mir_delete_instr(f &mut MFn, bi int, ii int) bool {
+    if !mir_detach_instr(f, bi, ii) { << false }
+    mir_nop_mfni(mut &f.instrs, ii)
+    << true
+}
+
+fn mir_opt_add_local(f &mut MFn, ty int) int {
+    id := f.locals.len
+    f.locals.push(ty)
+    f.locals_nslots.push(1)
+    f.locals_owning.push(false)
+    f.moved.push(false)
+    f.fcons.push(0)
+    << id
+}
+
+fn mir_opt_add_temp(f &mut MFn, ty int) int {
+    id := f.temps.len
+    f.temps.push(ty)
+    f.temps_nslots.push(1)
+    << id
+}
+
+fn mir_prepend_instr(f &mut MFn, bi int, ins0 MInstr) int {
+    mut ins := ins0
+    idx := f.instrs.len
+    mut blk := f.blocks[bi]
+    ins.next = blk.head
+    f.instrs.push(ins)
+    blk.head = idx
+    if blk.tail < 0 {
+        blk.tail = idx
+    }
+    mfn_set_block(mut &f.blocks, bi, blk)
+    << idx
+}
+
+fn mir_insert_after(f &mut MFn, bi int, ii int, ins0 MInstr) int {
+    mut ins := ins0
+    idx := f.instrs.len
+    ins.next = mfn_inext(&f.instrs, ii)
+    f.instrs.push(ins)
+    mfn_set_inext(mut &f.instrs, ii, idx)
+    mut blk := f.blocks[bi]
+    if blk.tail == ii {
+        blk.tail = idx
+        mfn_set_block(mut &f.blocks, bi, blk)
+    }
+    << idx
+}
+
+fn mir_append_instr(f &mut MFn, bi int, ii int) {
+    mut b := f.blocks[bi]
+    mfn_set_inext(mut &f.instrs, ii, 0 - 1)
+    if b.head < 0 {
+        b.head = ii
+        b.tail = ii
+    } else {
+        tail := b.tail
+        mfn_set_inext(mut &f.instrs, tail, ii)
+        b.tail = ii
+    }
+    mfn_set_block(mut &f.blocks, bi, b)
+}
+
+fn mir_is_cmp_op(op int) bool {
+    << op >= 6 && op <= 11
+}
+
+fn mir_eval_cmp(op int, a int, b int) int {
+    if op == 6 { if a == b { << 1 } << 0 }
+    if op == 7 { if a != b { << 1 } << 0 }
+    if op == 8 { if a < b { << 1 } << 0 }
+    if op == 9 { if a <= b { << 1 } << 0 }
+    if op == 10 { if a > b { << 1 } << 0 }
+    if op == 11 { if a >= b { << 1 } << 0 }
+    << 0
+}
+
+fn mir_swap_cmp(op int) int {
+    if op == 8 { << 10 }
+    if op == 9 { << 11 }
+    if op == 10 { << 8 }
+    if op == 11 { << 9 }
+    << op
+}
+
+fn (f &MFn) val_const(v int) int {
+    if v > -2 { << 0 }
+    i := 0 - v - 2
+    if i < 0 || i >= f.consts.len { << 0 }
+    << f.consts[i]
+}
+
+fn mir_val_const(f &MFn, v int) int {
+    << f.val_const(v)
+}
+
+fn (f &MFn) val_is_const(v int) bool {
+    if v > -2 { << false }
+    i := 0 - v - 2
+    << i >= 0 && i < f.consts.len
+}
+
+fn mir_val_is_const(f &MFn, v int) bool {
+    << f.val_is_const(v)
+}
+
+fn (f &MFn) last_def(bi int, t int) int {
+    mut last := -1
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := f.instrs[ii].kind
+        if (k == 1 || k == 2 || k == 4 || k == 5) && f.instrs[ii].a == t {
+            last = ii
+        }
+        ii = f.instrs[ii].next
+    }
+    << last
+}
+
+fn mir_last_def(f &MFn, bi int, t int) int {
+    << f.last_def(bi, t)
+}
+
+fn (f &MFn) slot_cmp(bi int, v int, slot &mut []int) bool {
+    if slot.len < 3 { << false }
+    if v < 0 { << false }
+    ii := f.last_def(bi, v)
+    if ii < 0 { << false }
+    kind := f.instrs[ii].kind
+    if kind == 2 {
+        mfn_set_i(slot, 0, f.instrs[ii].b)
+        mfn_set_i(slot, 1, 7)
+        mfn_set_i(slot, 2, 0)
+        << true
+    }
+    if kind == 1 {
+        << f.slot_cmp(bi, f.instrs[ii].b, slot)
+    }
+    if kind == 4 {
+        bop := f.instrs[ii].b
+        if !mir_is_cmp_op(bop) { << false }
+        lhs := f.instrs[ii].c
+        rhs := f.instrs[ii].d
+        if lhs >= 0 {
+            li := f.last_def(bi, lhs)
+            if li >= 0 && f.instrs[li].kind == 2 && f.val_is_const(rhs) {
+                mfn_set_i(slot, 0, f.instrs[li].b)
+                mfn_set_i(slot, 1, bop)
+                mfn_set_i(slot, 2, f.val_const(rhs))
+                << true
+            }
+        }
+        if rhs >= 0 {
+            ri := f.last_def(bi, rhs)
+            if ri >= 0 && f.instrs[ri].kind == 2 && f.val_is_const(lhs) {
+                mfn_set_i(slot, 0, f.instrs[ri].b)
+                mfn_set_i(slot, 1, mir_swap_cmp(bop))
+                mfn_set_i(slot, 2, f.val_const(lhs))
+                << true
+            }
+        }
+    }
+    << false
+}
+
+fn mir_slot_cmp(f &MFn, bi int, v int, slot &mut []int) bool {
+    << f.slot_cmp(bi, v, slot)
+}
+
+fn (f &MFn) block_clobbers_local(bi int, local int) bool {
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := f.instrs[ii].kind
+        if k == 3 && f.instrs[ii].a == local { << true }
+        if k == 8 && f.instrs[ii].a == local { << true }
+        if k == 16 && f.instrs[ii].c == 0 && f.instrs[ii].b == local { << true }
+        ii = f.instrs[ii].next
+    }
+    << false
+}
+
+fn mir_block_clobbers_local(f &MFn, bi int, local int) bool {
+    << f.block_clobbers_local(bi, local)
+}
+
+fn mir_invert_cmp(op int) int {
+    if op == 6 { << 7 }
+    if op == 7 { << 6 }
+    if op == 8 { << 11 }
+    if op == 9 { << 10 }
+    if op == 10 { << 9 }
+    if op == 11 { << 8 }
+    << 0 - 1
+}
+
+fn (f &MFn) cond_known(pi int, pc int, edge_then bool, si int, sc int) int {
+    if pc == sc && f.blocks[si].head < 0 {
+        if edge_then { << 1 }
+        << 0
+    }
+    mut ps := []int{}
+    ps.push(0)
+    ps.push(0)
+    ps.push(0)
+    mut ss := []int{}
+    ss.push(0)
+    ss.push(0)
+    ss.push(0)
+    if !f.slot_cmp(pi, pc, mut &ps) { << 0 - 1 }
+    if !f.slot_cmp(si, sc, mut &ss) { << 0 - 1 }
+    if ps[0] != ss[0] { << 0 - 1 }
+    if ps[1] == ss[1] && ps[2] == ss[2] {
+        if edge_then { << 1 }
+        << 0
+    }
+    inv := mir_invert_cmp(ps[1])
+    if inv == ss[1] && ps[2] == ss[2] {
+        if edge_then { << 0 }
+        << 1
+    }
+    << 0 - 1
+}
+
+fn mir_cond_known(f &MFn, pi int, pc int, edge_then bool, si int, sc int) int {
+    << f.cond_known(pi, pc, edge_then, si, sc)
+}
+
+fn (f &MFn) val_is_const_k(v int, k int) bool {
+    if !f.val_is_const(v) { << false }
+    << f.val_const(v) == k
+}
+
+fn mir_val_is_const_k(f &MFn, v int, k int) bool {
+    << f.val_is_const_k(v, k)
+}
+
+fn mir_val_is_temp_t(v int, t int) bool {
+    << t >= 0 && v == t
+}
+
+fn (f &MFn) instr_uses_temp(ii int, t int) bool {
+    if t < 0 || t >= f.temps.len { << false }
+    if ii < 0 || ii >= f.instrs.len { << true }
+    k := mfn_ikind(&f.instrs, ii)
+    a := mfn_ia(&f.instrs, ii)
+    b := mfn_ib(&f.instrs, ii)
+    c := mfn_ic(&f.instrs, ii)
+    d := mfn_id(&f.instrs, ii)
+    schema := mir_instr_use_schema(k, c)
+    if mir_instr_use_fields_match(schema, a, b, c, d, t) { << true }
+    mut ap := mir_instr_use_arg_head(schema, b, c, d)
+    mut limit := mir_verify_max_arg_chain
+    if f.margs.len < limit { limit = f.margs.len }
+    for _ in 0:limit {
+        if ap == -1 { << false }
+        if ap < 0 || ap >= f.margs.len { << true }
+        if f.margs[ap].v == t { << true }
+        ap = f.margs[ap].next
+    }
+    << ap != -1
+}
+
+fn mir_instr_uses_temp(f &MFn, ii int, t int) bool {
+    << f.instr_uses_temp(ii, t)
+}
+
+fn mir_temp_used_outside(f &MFn, t int, home int) bool {
+    << f.temp_used_outside(t, home)
+}
+
+fn (f &MFn) temp_used_outside(t int, home int) bool {
+    if t < 0 { << false }
+    for bi in 0:f.blocks.len {
+        if bi == home { -> }
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            if f.instr_uses_temp(ii, t) { << true }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+        tk := f.blocks[bi].tkind
+        if tk == 2 || tk == 3 {
+            if mir_val_is_temp_t(f.blocks[bi].ta, t) { << true }
+        }
+    }
+    << false
+}
+
+// Index / ptr / FieldRMW(48) / Xu: whole-block skip. True Call (kind 7,
+// not b=95) is a mid-block live clear, not a skip. ArrPush mutates the
+// descriptor (bootstrap models it as Call).
+fn (f &MFn) instr_observes_local(ii int, loc int) bool {
+    k := f.instrs[ii].kind
+    if k == 2 && f.instrs[ii].b == loc { << true }
+    if k == 8 && f.instrs[ii].a == loc { << true }
+    if k == 16 && f.instrs[ii].c == 0 && f.instrs[ii].b == loc { << true }
+    << false
+}
+
+fn mir_instr_observes_local(f &MFn, ii int, loc int) bool {
+    << f.instr_observes_local(ii, loc)
+}
+
+fn (f &MFn) pure_int_dest(ii int) int {
+    k := f.instrs[ii].kind
+    a := f.instrs[ii].a
+    if k == 4 {
+        op := f.instrs[ii].b
+        // Word wrapping arithmetic, comparisons and bit operations have
+        // no observable exceptional result. Div/Mod and unknown operators
+        // retain their trap contract even if the result is unused.
+        if !((op >= 1 && op <= 3) || (op >= 6 && op <= 11) || (op >= 14 && op <= 18)) { << -1 }
+        if f.instrs[ii].sval.len != 0 { << -1 }
+    }
+    if k == 5 {
+        op := f.instrs[ii].b
+        if op < 1 || op > 3 || f.instrs[ii].sval.len != 0 { << -1 }
+    }
+    if k == 1 || k == 4 || k == 5 {
+        if f.temp_cse_ok(a) { << a }
+        << -1
+    }
+    if k == 2 {
+        loc := f.instrs[ii].b
+        if f.temp_cse_ok(a) && f.local_dse_ok(loc) { << a }
+        << -1
+    }
+    if k == 16 {
+        if f.temp_cse_ok(a) { << a }
+        << -1
+    }
+    << -1
+}
+
+fn mir_pure_int_dest(f &MFn, ii int) int {
+    << f.pure_int_dest(ii)
+}
+
+fn (f &MFn) temp_is_used(t int) bool {
+    if t < 0 { << false }
+    for bi in 0:f.blocks.len {
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            if f.instr_uses_temp(ii, t) { << true }
+            ii = f.instrs[ii].next
+        }
+        tk := f.blocks[bi].tkind
+        if tk == 2 || tk == 3 {
+            if mir_val_is_temp_t(f.blocks[bi].ta, t) { << true }
+        }
+    }
+    << false
+}
+
+fn mir_temp_is_used(f &MFn, t int) bool {
+    << f.temp_is_used(t)
+}
+
+fn mir_bin_commutes(op int) bool {
+    << op == 1 || op == 3 || op == 6 || op == 7 || op == 14 || op == 15 || op == 16
+}
+
+fn mir_thread_implied(f &mut MFn) bool {
+    n := f.blocks.len
+    mut changed := false
+    for pi in 0:n {
+        if f.is_self_loop(pi) { -> }
+        if f.blocks[pi].tkind != 2 { -> }
+        pcond := f.blocks[pi].ta
+        then_bb := f.blocks[pi].tb
+        else_bb := f.blocks[pi].tc
+        for e in 0:2 {
+            mut dest := then_bb
+            mut edge_then := true
+            if e == 1 {
+                dest = else_bb
+                edge_then = false
+            }
+            if dest < 0 || dest >= n { -> }
+            if f.is_self_loop(dest) { -> }
+            if f.blocks[dest].head >= 0 { -> }
+            if f.blocks[dest].tkind != 2 { -> }
+            known := f.cond_known(pi, pcond, edge_then, dest, f.blocks[dest].ta)
+            if known < 0 { -> }
+            mut take := f.blocks[dest].tb
+            if known == 0 { take = f.blocks[dest].tc }
+            if mir_retarget_edge(f, pi, dest, take) { changed = true }
+        }
+    }
+    for bi in 0:n {
+        if f.is_self_loop(bi) { -> }
+        if f.blocks[bi].tkind != 2 { -> }
+        pi := f.unique_ext_pred(bi)
+        if pi < 0 { -> }
+        if f.is_self_loop(pi) { -> }
+        if f.blocks[pi].tkind != 2 { -> }
+        mut edge_then := false
+        if f.blocks[pi].tb == bi && f.blocks[pi].tc != bi {
+            edge_then = true
+        } else if f.blocks[pi].tc == bi && f.blocks[pi].tb != bi {
+            edge_then = false
+        } else {
+            ->
+        }
+        known := f.cond_known(pi, f.blocks[pi].ta, edge_then, bi, f.blocks[bi].ta)
+        if known < 0 { -> }
+        mut ss := []int{}
+        ss.push(0)
+        ss.push(0)
+        ss.push(0)
+        if f.slot_cmp(bi, f.blocks[bi].ta, mut &ss) {
+            if f.block_clobbers_local(bi, ss[0]) { -> }
+        } else if f.blocks[bi].head >= 0 {
+            ->
+        }
+        mut take := f.blocks[bi].tb
+        if known == 0 { take = f.blocks[bi].tc }
+        mut b := f.blocks[bi]
+        b.tkind = 1
+        b.ta = take
+        b.tb = -1
+        b.tc = -1
+        mfn_set_block(mut &f.blocks, bi, b)
+        changed = true
+    }
+    << changed
+}
+
+fn mir_hoist_ok_kind(k int) bool {
+    << k == 1 || k == 2 || k == 4 || k == 5
+}
+
+fn (f &MFn) hoist_payload_eq(ia int, ib int) bool {
+    if ia < 0 || ib < 0 { << false }
+    ka := f.instrs[ia].kind
+    if ka != f.instrs[ib].kind { << false }
+    if !mir_hoist_ok_kind(ka) { << false }
+    if ka == 1 || ka == 2 {
+        << f.instrs[ia].b == f.instrs[ib].b
+    }
+    if ka == 4 {
+        if f.instrs[ia].b != f.instrs[ib].b { << false }
+        if f.instrs[ia].c != f.instrs[ib].c { << false }
+        << f.instrs[ia].d == f.instrs[ib].d
+    }
+    if ka == 5 {
+        if f.instrs[ia].b != f.instrs[ib].b { << false }
+        << f.instrs[ia].c == f.instrs[ib].c
+    }
+    << false
+}
+
+fn mir_hoist_payload_eq(f &MFn, ia int, ib int) bool {
+    << f.hoist_payload_eq(ia, ib)
+}
+
+fn (f &MFn) block_mentions_temp(bi int, t int) bool {
+    if t < 0 { << false }
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if mir_instr_has_dest(f.instrs[ii].kind) && f.instrs[ii].a == t { << true }
+        if f.instr_uses_temp(ii, t) { << true }
+        ii = f.instrs[ii].next
+    }
+    tk := f.blocks[bi].tkind
+    if (tk == 2 || tk == 3) && f.blocks[bi].ta == t { << true }
+    << false
+}
+
+fn mir_block_mentions_temp(f &MFn, bi int, t int) bool {
+    << f.block_mentions_temp(bi, t)
+}
+
+// Clang HoistThenElseCodeToIf: identical pure first instrs of a diamond
+// lift above the branch. Different dests remap else uses to the hoisted dest
+// (or become copy t2, t1 if t2 is live outside the else arm).
+fn mir_hoist_common_branch(f &mut MFn) bool {
+    mut changed := false
+    n := f.blocks.len
+    for bi in 0:n {
+        if f.is_self_loop(bi) { -> }
+        if f.blocks[bi].tkind != 2 { -> }
+        tb := f.blocks[bi].tb
+        tc := f.blocks[bi].tc
+        if tb == tc { -> }
+        if tb < 0 || tc < 0 || tb >= n || tc >= n { -> }
+        if f.is_self_loop(tb) { -> }
+        if f.is_self_loop(tc) { -> }
+        if f.unique_ext_pred(tb) != bi { -> }
+        if f.unique_ext_pred(tc) != bi { -> }
+        for _ in 0:f.instrs.len {
+            th := f.blocks[tb].head
+            el := f.blocks[tc].head
+            if !f.hoist_payload_eq(th, el) { <- }
+            d1 := f.instrs[th].a
+            d2 := f.instrs[el].a
+            if f.block_mentions_temp(bi, d1) { <- }
+            if d1 != d2 && f.block_mentions_temp(bi, d2) { <- }
+            mir_detach_instr(f, tb, th)
+            mir_append_instr(f, bi, th)
+            if d1 == d2 {
+                mir_delete_instr(f, tc, el)
+            } else if f.temp_used_outside(d2, tc) {
+                mfn_become_copy_to(mut &f.instrs, el, d2, d1)
+            } else {
+                mir_delete_instr(f, tc, el)
+                mut subst_on := []bool{}
+                mut subst_v := []int{}
+                for _ in 0:f.temps.len {
+                    subst_on.push(false)
+                    subst_v.push(0)
+                }
+                if d2 >= 0 && d2 < subst_on.len {
+                    mfn_set_b(mut &subst_on, d2, true)
+                    mfn_set_i(mut &subst_v, d2, d1)
+                }
+                mut ii := f.blocks[tc].head
+                for _ in 0:f.instrs.len {
+                    if ii < 0 { <- }
+                    mir_rewrite_instr(f, ii, &subst_on, &subst_v)
+                    ii = f.instrs[ii].next
+                }
+                mut eb := f.blocks[tc]
+                if eb.tkind == 2 || eb.tkind == 3 {
+                    eb.ta = mir_subst_val(eb.ta, &subst_on, &subst_v)
+                    mfn_set_block(mut &f.blocks, tc, eb)
+                }
+            }
+            changed = true
+        }
+    }
+    << changed
+}
+
+fn mir_block_is_scalar_assign(f &MFn, start int) bool {
+    bi := mir_skip_empty_jump_fn(f, start)
+    if bi < 0 || bi >= f.blocks.len { << false }
+    if f.blocks[bi].tkind != 1 { << false }
+    mut n := 0
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := f.instrs[ii].kind
+        if k != 2 && k != 3 && k != 4 { << false }
+        n += 1
+        if n > 4 { << false }
+        ii = f.instrs[ii].next
+    }
+    << n >= 1 && n <= 4
+}
+
+// Keep `x=y` / `x=y+1` branch diamonds for if-conversion (search_ints).
+// O2 SimplifyCFG was merging them and dropping csel (~2× slower).
+fn mir_fn_keeps_branch_diamond(f &MFn) bool {
+    for bi in 0:f.blocks.len {
+        if f.blocks[bi].tkind != 2 { -> }
+        tb := mir_skip_empty_jump_fn(f, f.blocks[bi].tb)
+        tc := mir_skip_empty_jump_fn(f, f.blocks[bi].tc)
+        if tb < 0 || tc < 0 || tb >= f.blocks.len || tc >= f.blocks.len { -> }
+        if f.blocks[tb].tkind != 1 || f.blocks[tc].tkind != 1 { -> }
+        ja := mir_skip_empty_jump_fn(f, f.blocks[tb].ta)
+        jb := mir_skip_empty_jump_fn(f, f.blocks[tc].ta)
+        if ja < 0 || ja != jb { -> }
+        if mir_block_is_scalar_assign(f, tb) && mir_block_is_scalar_assign(f, tc) {
+            << true
+        }
+    }
+    << false
+}
+
+fn mir_temp_loads_local(f &MFn, bi int, v int, loc int) bool {
+    if v < 0 { << false }
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if f.instrs[ii].kind == 2 && f.instrs[ii].a == v && f.instrs[ii].b == loc {
+            << true
+        }
+        ii = f.instrs[ii].next
+    }
+    << false
+}
+
+fn mir_is_add1_of_local(f &MFn, bi int, src int, loc int) bool {
+    if src < 0 { << false }
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if f.instrs[ii].kind == 4 && f.instrs[ii].b == 1 && f.instrs[ii].a == src {
+            lhs := f.instrs[ii].c
+            rhs := f.instrs[ii].d
+            if f.val_is_const(rhs) && f.val_const(rhs) == 1 && mir_temp_loads_local(f, bi, lhs, loc) {
+                << true
+            }
+            if f.val_is_const(lhs) && f.val_const(lhs) == 1 && mir_temp_loads_local(f, bi, rhs, loc) {
+                << true
+            }
+        }
+        ii = f.instrs[ii].next
+    }
+    << false
+}
+
+fn mir_last_store_const(f &MFn, bi int, loc int, out &mut int) bool {
+    mut ok := false
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if f.instrs[ii].kind == 3 && f.instrs[ii].a == loc {
+            src := f.instrs[ii].b
+            if f.val_is_const(src) {
+                *out = f.val_const(src)
+                ok = true
+            } else {
+                ok = false
+            }
+        }
+        ii = f.instrs[ii].next
+    }
+    << ok
+}

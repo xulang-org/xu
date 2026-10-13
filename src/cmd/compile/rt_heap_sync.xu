@@ -1,0 +1,1097 @@
+@main
+
+#xu/types
+
+// Gen1 allocator ledger: default OFF. Flip at **product emit time** with
+// XU_GEN1_HEAP_LEDGER=1 when building a user program — no source edit needed.
+// Crypto/x509 live-sets can exceed a fixed table; sm9 is too slow when every
+// alloc takes the heap lock + probe. Scope-drop for owning structs is
+// independent of this gate.
+const gen1_heap_ledger_enabled = 0
+const gen1_heap_ledger_slots = 262144
+const gen1_heap_ledger_mask = 262143
+const gen1_medium_first_class = 128
+const gen1_medium_class_end = 133
+const gen1_medium_limit = 65536
+const gen1_medium_keep = 4
+
+fn gen1_heap_ledger_on() bool {
+    << env_get("XU_GEN1_HEAP_LEDGER") == "1"
+}
+
+// Hosted allocator diagnostics/statistics data.  Keep this in the Gen1
+// runtime source (rather than relying on an external C object) so every
+// target receives the same seven-field ABI as bootstrap.  The strings are
+// emitted once, before helper code, and contain no allocator references.
+fn rt_emit_heap_data(a &mut Assembler) {
+    a.data_label("_rt_heap_diag_unknown")
+    rt_emit_bytes(a, "xu heap: unknown pointer passed to _rt_free\n")
+    a.data_label("_rt_heap_diag_double")
+    rt_emit_bytes(a, "xu heap: double free detected\n")
+    a.data_label("_rt_heap_diag_corrupt")
+    rt_emit_bytes(a, "xu heap: allocator metadata corrupt\n")
+    a.data_label("_rt_heap_diag_overflow")
+    rt_emit_bytes(a, "xu heap: ledger capacity exceeded\n")
+    a.data_label("_rt_heap_stats_env")
+    rt_emit_bytes(a, "XU_HEAP_STATS=1")
+    a.emit_data([0])
+    a.data_label("_rt_heap_stats_live")
+    rt_emit_bytes(a, "xu_heap_stats live_bytes=")
+    a.data_label("_rt_heap_stats_peak")
+    rt_emit_bytes(a, "xu_heap_stats peak_bytes=")
+    a.data_label("_rt_heap_stats_allocs")
+    rt_emit_bytes(a, "xu_heap_stats allocs=")
+    a.data_label("_rt_heap_stats_frees")
+    rt_emit_bytes(a, "xu_heap_stats frees=")
+    a.data_label("_rt_heap_stats_unknown")
+    rt_emit_bytes(a, "xu_heap_stats unknown_frees=")
+    a.data_label("_rt_heap_stats_double")
+    rt_emit_bytes(a, "xu_heap_stats double_frees=")
+    a.data_label("_rt_heap_stats_overflow")
+    rt_emit_bytes(a, "xu_heap_stats ledger_overflows=")
+    <<
+}
+
+// V4 = word addr, V3 = expected. Darwin ulock_wait / Linux futex WAIT.
+fn rt_os_word_wait(a &mut Assembler) {
+    if a.os == 0 {
+        a.mov(19, 4)
+        a.vm_mov_imm(18, 5)
+        a.mov(20, 3)
+        a.vm_mov_imm(21, 0)
+        a.vm_syscall(syscall_number(a.os, a.arch, 33))
+        <<
+    }
+    a.mov(18, 4)
+    a.vm_mov_imm(19, 128)
+    a.mov(20, 3)
+    a.vm_mov_imm(21, 0)
+    a.vm_mov_imm(22, 0)
+    a.vm_mov_imm(23, 0)
+    a.vm_syscall(syscall_number(a.os, a.arch, 8))
+    <<
+}
+
+// V4 = word addr. all != 0 wakes everyone.
+fn rt_os_word_wake(a &mut Assembler, all int) {
+    if a.os == 0 {
+        a.mov(19, 4)
+        if all != 0 {
+            a.vm_mov_imm(18, 261)
+        } else {
+            a.vm_mov_imm(18, 5)
+        }
+        a.vm_mov_imm(20, 0)
+        a.vm_mov_imm(21, 0)
+        a.vm_syscall(syscall_number(a.os, a.arch, 34))
+        <<
+    }
+    a.mov(18, 4)
+    a.vm_mov_imm(19, 129)
+    if all != 0 {
+        a.vm_mov_imm(20, 2147483647)
+    } else {
+        a.vm_mov_imm(20, 1)
+    }
+    a.vm_mov_imm(21, 0)
+    a.vm_mov_imm(22, 0)
+    a.vm_mov_imm(23, 0)
+    a.vm_syscall(syscall_number(a.os, a.arch, 8))
+    <<
+}
+
+fn rt_os_mutex_lock(a &mut Assembler) {
+    if a.os == 2 {
+        a.vm_call_iat("_iat_AcquireSRWLockExclusive")
+        <<
+    }
+    // Unix TAS: 0=free, 1=locked, 2=locked+waiters. Uncontended is CAS 0→1.
+    a.mov(4, 18)
+    a.drop_seq = a.drop_seq + 1
+    n := a.drop_seq
+    mut labs := []string{}
+    labs.push("_rt_mc_lkc_" + str(n))
+    labs.push("_rt_mc_lkd_" + str(n))
+    a.vm_mov_imm(1, 0)
+    a.vm_mov_imm(2, 1)
+    a.vm_atomic_cas(0, 18, 1, 2)
+    a.vm_cbnz(0, labs[1])
+    a.label(labs[0])
+    a.mov(18, 4)
+    a.vm_mov_imm(1, 0)
+    a.vm_mov_imm(2, 2)
+    a.vm_atomic_cas(0, 18, 1, 2)
+    a.vm_cbnz(0, labs[1])
+    a.mov(18, 4)
+    a.vm_mov_imm(1, 1)
+    a.vm_mov_imm(2, 2)
+    a.vm_atomic_cas(0, 18, 1, 2)
+    a.vm_mov_imm(3, 2)
+    rt_os_word_wait(a)
+    a.jmp(labs[0])
+    a.label(labs[1])
+    <<
+}
+
+fn rt_os_mutex_unlock(a &mut Assembler) {
+    if a.os == 2 {
+        a.vm_call_iat("_iat_ReleaseSRWLockExclusive")
+        <<
+    }
+    a.mov(4, 18)
+    a.vm_mov_imm(1, 0)
+    a.vm_atomic_xchg(0, 18, 1)
+    a.drop_seq = a.drop_seq + 1
+    n := a.drop_seq
+    a.vm_cmp_imm(0, 1)
+    a.jeq("_rt_mc_ukd_" + str(n))
+    rt_os_word_wake(a, 0)
+    a.label("_rt_mc_ukd_" + str(n))
+    <<
+}
+
+fn rt_os_cond_wait(a &mut Assembler) {
+    if a.os == 0 {
+        a.vm_call_iat("_iat_pthread_cond_wait")
+        <<
+    }
+    if a.os == 2 {
+        a.vm_mov_imm(20, 4294967295)
+        a.vm_mov_imm(21, 0)
+        a.vm_call_iat("_iat_SleepConditionVariableSRW")
+        <<
+    }
+    a.mov(5, 18)
+    a.mov(2, 19)
+    a.load(3, 5, 0)
+    a.mov(18, 2)
+    rt_os_mutex_unlock(a)
+    a.mov(4, 5)
+    rt_os_word_wait(a)
+    a.mov(18, 2)
+    rt_os_mutex_lock(a)
+    <<
+}
+
+fn rt_os_cond_signal(a &mut Assembler) {
+    if a.os == 0 {
+        a.vm_call_iat("_iat_pthread_cond_signal")
+        <<
+    }
+    if a.os == 2 {
+        a.vm_call_iat("_iat_WakeConditionVariable")
+        <<
+    }
+    a.mov(4, 18)
+    a.load(0, 18, 0)
+    a.vm_add_imm(0, 0, 1)
+    a.store(18, 0, 0)
+    rt_os_word_wake(a, 0)
+    <<
+}
+
+fn rt_os_cond_broadcast(a &mut Assembler) {
+    if a.os == 0 {
+        a.vm_call_iat("_iat_pthread_cond_broadcast")
+        <<
+    }
+    if a.os == 2 {
+        a.vm_call_iat("_iat_WakeAllConditionVariable")
+        <<
+    }
+    a.mov(4, 18)
+    a.load(0, 18, 0)
+    a.vm_add_imm(0, 0, 1)
+    a.store(18, 0, 0)
+    rt_os_word_wake(a, 1)
+    <<
+}
+
+fn rt_heap_lock(a &mut Assembler) {
+    a.lea(18, "_rt_heap_mu")
+    rt_os_mutex_lock(a)
+    <<
+}
+
+fn rt_heap_unlock(a &mut Assembler) {
+    a.lea(18, "_rt_heap_mu")
+    rt_os_mutex_unlock(a)
+    <<
+}
+
+fn rt_emit_alloc_bump(a &mut Assembler) {
+    a.label("_rt_alloc")
+    a.prologue(16)
+    a.vm_cmp_imm(18, 0)
+    a.jlt("_rt_al_oom_bare")
+    a.vm_cbnz(18, "_rt_al_nz")
+    a.vm_mov_imm(18, 8)
+    a.label("_rt_al_nz")
+    a.vm_add_imm(18, 18, 7)
+    a.vm_cmp_imm(18, 8)
+    a.jlt("_rt_al_oom_bare")
+    a.vm_mov_imm(0, 0 - 8)
+    a.iand(18, 18, 0)
+    a.irq_off()
+    a.lea(1, "_rt_heap_cur")
+    a.load(2, 1, 0)
+    a.add(3, 2, 18)
+    a.cmp(3, 2)
+    a.jlt("_rt_al_oom_irq")
+    a.lea(0, "_xu_heap_end")
+    a.cmp(3, 0)
+    a.jgt("_rt_al_oom_irq")
+    a.store(1, 0, 3)
+    a.irq_on()
+    a.mov(14, 2)
+    a.epilogue()
+    a.label("_rt_al_oom_irq")
+    a.irq_on()
+    a.label("_rt_al_oom")
+    a.label("_rt_al_oom_bare")
+    a.jmp("_rt_exit")
+    <<
+}
+
+// Hash a hosted heap pointer into the ledger table.  Include high
+// address bits: mmap's 64-KiB chunks otherwise repeat the low page index.
+// `ptr` and `dest` are virtual-register numbers; V5 (5) is scratch.
+fn rt_emit_heap_hash(a &mut Assembler, ptr int, dest int) {
+    a.shr_imm(dest, ptr, 4)
+    a.shr_imm(5, ptr, 16)
+    a.ixor(dest, dest, 5)
+    a.shr_imm(5, ptr, 32)
+    a.ixor(dest, dest, 5)
+    // Large masks are not reliable as AND-immediate; materialize then AND.
+    a.vm_mov_imm(5, gen1_heap_ledger_mask)
+    a.iand(dest, dest, 5)
+    <<
+}
+
+// Common fail-loud tail for ledger validation.  The caller tells us whether
+// it owns the allocator mutex; diagnostics always release it before calling
+// `_rt_write`/`_rt_exit`, which may clobber all scratch registers.
+fn rt_emit_heap_diag_exit(a &mut Assembler, locked int, counter string, msg string, msg_len int) {
+    a.lea(1, counter)
+    a.load(2, 1, 0)
+    a.vm_add_imm(2, 2, 1)
+    a.store(1, 0, 2)
+    if locked == 1 { rt_heap_unlock(a) }
+    a.lea(18, msg)
+    a.vm_mov_imm(19, msg_len)
+    a.vm_mov_imm(20, 2)
+    a.call("_rt_write")
+    rt_exit(a, 1)
+    <<
+}
+
+// `_rt_heap_record_alloc`: internal ABI A0=pointer, A1=requested bytes.
+// The allocator has already released its lock before this helper is called;
+// the helper takes it again on M:N targets, then updates the fixed open
+// addressing table and counters.  A tombstone (pointer!=0, size+1==0) may be
+// reused, while a live duplicate is treated as allocator corruption.
+fn rt_emit_heap_record_alloc(a &mut Assembler, locked int) {
+    a.label("_rt_heap_record_alloc")
+    if !gen1_heap_ledger_on() {
+        a.vm_ret()
+        <<
+    }
+    a.prologue(64)
+    a.store(15, -8, 18) // pointer
+    a.store(15, -16, 19) // requested bytes
+    if locked == 1 { rt_heap_lock(a) }
+    a.load(0, 15, -8)
+    rt_emit_heap_hash(a, 0, 1)
+    a.store(15, -24, 1) // probe index
+    a.vm_mov_imm(2, 0)
+    a.store(15, -32, 2) // probe count
+
+    a.label("_rt_hra_probe")
+    a.lea(2, "_rt_heap_ledger")
+    a.load(1, 15, -24)
+    a.shl_imm(3, 1, 4) // 16-byte slot
+    a.add(2, 2, 3)
+    a.store(15, -40, 2)
+    a.load(3, 2, 0) // old pointer
+    a.vm_cbz(3, "_rt_hra_insert")
+    a.load(4, 2, 8) // size+1; zero is tombstone
+    a.cmp(3, 0)
+    a.jeq("_rt_hra_same")
+    a.vm_cbz(4, "_rt_hra_insert")
+    a.load(5, 15, -32)
+    a.vm_add_imm(5, 5, 1)
+    a.store(15, -32, 5)
+    a.vm_cmp_imm(5, gen1_heap_ledger_slots)
+    a.jge("_rt_hra_fail")
+    a.load(1, 15, -24)
+    a.vm_add_imm(1, 1, 1)
+    a.vm_mov_imm(5, gen1_heap_ledger_mask)
+    a.iand(1, 1, 5)
+    a.store(15, -24, 1)
+    a.jmp("_rt_hra_probe")
+
+    a.label("_rt_hra_same")
+    // A same pointer is valid only when the old slot is a tombstone (address
+    // reuse after free); a live duplicate indicates a caller/allocator bug.
+    a.vm_cbz(4, "_rt_hra_insert")
+    a.jmp("_rt_hra_fail")
+
+    a.label("_rt_hra_insert")
+    a.load(4, 15, -16)
+    a.mov(5, 4)
+    a.vm_add_imm(5, 5, 1) // encode zero-byte requests as one
+    a.cmp(5, 4)
+    a.jlt("_rt_hra_fail")
+    a.load(2, 15, -40)
+    a.load(0, 15, -8)
+    a.store(2, 0, 0)
+    a.store(2, 8, 5)
+    // live += requested; peak = max(peak, live); allocs++.
+    a.lea(1, "_rt_heap_live_bytes")
+    a.load(2, 1, 0)
+    a.add(3, 2, 4)
+    a.cmp(3, 2)
+    a.jlt("_rt_hra_fail")
+    a.store(1, 0, 3)
+    a.lea(1, "_rt_heap_peak_bytes")
+    a.load(2, 1, 0)
+    a.cmp(3, 2)
+    a.jle("_rt_hra_no_peak")
+    a.store(1, 0, 3)
+    a.label("_rt_hra_no_peak")
+    a.lea(1, "_rt_heap_allocs")
+    a.load(2, 1, 0)
+    a.vm_add_imm(2, 2, 1)
+    a.store(1, 0, 2)
+    if locked == 1 { rt_heap_unlock(a) }
+    a.epilogue()
+
+    a.label("_rt_hra_fail")
+    // Overflow is diagnostic, not a hard stop: crypto/x509 programs can have
+    // a live set larger than the fixed table. Count and continue untracked.
+    a.lea(1, "_rt_heap_ledger_overflows")
+    a.load(2, 1, 0)
+    a.vm_add_imm(2, 2, 1)
+    a.store(1, 0, 2)
+    if locked == 1 { rt_heap_unlock(a) }
+    a.epilogue()
+    <<
+}
+
+// `_rt_heap_record_free`: internal ABI A0=pointer.  `_rt_free` invokes this
+// while holding the allocator lock on M:N targets, so ledger removal and the
+// subsequent freelist/munmap mutation stay one critical section.  A zero
+// size field is a tombstone and diagnoses an immediate double free.
+fn rt_emit_heap_record_free(a &mut Assembler, locked int) {
+    a.label("_rt_heap_record_free")
+    if !gen1_heap_ledger_on() {
+        a.vm_ret()
+        <<
+    }
+    a.prologue(64)
+    a.store(15, -8, 18)
+    a.load(0, 15, -8)
+    rt_emit_heap_hash(a, 0, 1)
+    a.store(15, -24, 1)
+    a.vm_mov_imm(2, 0)
+    a.store(15, -32, 2)
+
+    a.label("_rt_hrf_probe")
+    a.lea(2, "_rt_heap_ledger")
+    a.load(1, 15, -24)
+    a.shl_imm(3, 1, 4)
+    a.add(2, 2, 3)
+    a.load(3, 2, 0)
+    a.vm_cbz(3, "_rt_hrf_unknown")
+    a.cmp(3, 0)
+    a.jeq("_rt_hrf_found")
+    a.load(5, 15, -32)
+    a.vm_add_imm(5, 5, 1)
+    a.store(15, -32, 5)
+    a.vm_cmp_imm(5, gen1_heap_ledger_slots)
+    a.jge("_rt_hrf_unknown")
+    a.load(1, 15, -24)
+    a.vm_add_imm(1, 1, 1)
+    a.vm_mov_imm(5, gen1_heap_ledger_mask)
+    a.iand(1, 1, 5)
+    a.store(15, -24, 1)
+    a.jmp("_rt_hrf_probe")
+
+    a.label("_rt_hrf_found")
+    a.load(4, 2, 8)
+    a.vm_cbz(4, "_rt_hrf_double")
+    a.vm_sub_imm(4, 4, 1) // requested bytes
+    a.lea(1, "_rt_heap_live_bytes")
+    a.load(3, 1, 0)
+    a.cmp(3, 4)
+    a.jlt("_rt_hrf_corrupt")
+    a.sub(3, 3, 4)
+    a.store(1, 0, 3)
+    a.lea(1, "_rt_heap_frees")
+    a.load(3, 1, 0)
+    a.vm_add_imm(3, 3, 1)
+    a.store(1, 0, 3)
+    // Keep pointer as a tombstone so immediate address reuse is distinguishable
+    // from an unrelated unknown pointer.
+    a.lea(1, "_rt_heap_ledger")
+    a.load(3, 15, -24)
+    a.shl_imm(3, 3, 4)
+    a.add(1, 1, 3)
+    a.vm_mov_imm(3, 0)
+    a.store(1, 8, 3)
+    a.epilogue()
+
+    a.label("_rt_hrf_unknown")
+    // Untracked free: if the ledger overflowed, this block was never recorded.
+    // Count and continue; a true wild free without overflow still fail-louds.
+    a.lea(1, "_rt_heap_ledger_overflows")
+    a.load(3, 1, 0)
+    a.vm_cbnz(3, "_rt_hrf_unknown_soft")
+    rt_emit_heap_diag_exit(a, locked, "_rt_heap_unknown_frees", "_rt_heap_diag_unknown", 44)
+    a.label("_rt_hrf_unknown_soft")
+    a.lea(1, "_rt_heap_unknown_frees")
+    a.load(3, 1, 0)
+    a.vm_add_imm(3, 3, 1)
+    a.store(1, 0, 3)
+    a.epilogue()
+    a.label("_rt_hrf_double")
+    rt_emit_heap_diag_exit(a, locked, "_rt_heap_double_frees", "_rt_heap_diag_double", 30)
+    a.label("_rt_hrf_corrupt")
+    rt_emit_heap_diag_exit(a, locked, "_rt_heap_unknown_frees", "_rt_heap_diag_corrupt", 36)
+    <<
+}
+
+// Emit one `key=<decimal>\n` line for the hosted heap report.  The key bytes
+// are written to stderr first; `_rt_println_int` appends the decimal value
+// and newline using its normal ABI (A0=value, A2=fd).
+fn rt_emit_heap_stats_line(a &mut Assembler, key string, key_len int, slot int) {
+    a.lea(18, key)
+    a.vm_mov_imm(19, key_len)
+    a.vm_mov_imm(20, 2)
+    a.call("_rt_write")
+    a.load(18, 15, slot)
+    a.vm_mov_imm(20, 2)
+    a.call("_rt_println_int")
+    <<
+}
+
+// `_rt_heap_stats`: hosted-only, no-op unless the process environment has an
+// exact `XU_HEAP_STATS=1` entry.  Unix scans the original envp without any
+// allocator calls; Windows scans/frees GetEnvironmentStringsA's temporary
+// block.  Counter snapshots are taken under the same lock as allocator
+// mutations and emitted after unlocking.
+fn rt_emit_heap_stats(a &mut Assembler, locked int) {
+    a.label("_rt_heap_stats")
+    if !gen1_heap_ledger_on() {
+        // Capability-gated until Gen1 scope-drop/aggregate ownership parity
+        // is complete.  The symbol remains present because `_start` keeps a
+        // stable call site across compiler generations.
+        a.vm_ret()
+        <<
+    }
+    if a.os == 3 {
+        a.vm_ret()
+        <<
+    }
+    a.prologue(112)
+    if a.os == 2 {
+        a.vm_call_iat("_iat_GetEnvironmentStringsA")
+        a.vm_cbz(14, "_rt_hs_done")
+        a.store(15, -8, 14) // block
+        a.store(15, -16, 14) // cursor
+        a.label("_rt_hsw_entry")
+        a.load(0, 15, -16)
+        a.load_byte(1, 0, 0)
+        a.vm_cbz(1, "_rt_hsw_free")
+        a.store(15, -24, 0) // entry
+        a.vm_mov_imm(2, 0)
+        a.store(15, -32, 2)
+        a.label("_rt_hsw_cmp")
+        a.load(2, 15, -32)
+        a.vm_cmp_imm(2, 15)
+        a.jge("_rt_hsw_nul")
+        a.load(0, 15, -24)
+        a.add(0, 0, 2)
+        a.load_byte(3, 0, 0)
+        a.lea(4, "_rt_heap_stats_env")
+        a.add(4, 4, 2)
+        a.load_byte(4, 4, 0)
+        a.cmp(3, 4)
+        a.jne("_rt_hsw_skip")
+        a.vm_add_imm(2, 2, 1)
+        a.store(15, -32, 2)
+        a.jmp("_rt_hsw_cmp")
+        a.label("_rt_hsw_nul")
+        a.load(0, 15, -24)
+        a.vm_add_imm(0, 0, 15)
+        a.load_byte(3, 0, 0)
+        a.vm_cbnz(3, "_rt_hsw_skip")
+        a.jmp("_rt_hsw_free_emit")
+        a.label("_rt_hsw_skip")
+        a.load(0, 15, -16)
+        a.label("_rt_hsw_skip_bytes")
+        a.load_byte(1, 0, 0)
+        a.vm_cbz(1, "_rt_hsw_skip_nul")
+        a.vm_add_imm(0, 0, 1)
+        a.jmp("_rt_hsw_skip_bytes")
+        a.label("_rt_hsw_skip_nul")
+        a.vm_add_imm(0, 0, 1)
+        a.store(15, -16, 0)
+        a.jmp("_rt_hsw_entry")
+        a.label("_rt_hsw_free")
+        a.load(18, 15, -8)
+        a.vm_call_iat("_iat_FreeEnvironmentStringsA")
+        a.jmp("_rt_hs_done")
+        a.label("_rt_hsw_free_emit")
+        a.load(18, 15, -8)
+        a.vm_call_iat("_iat_FreeEnvironmentStringsA")
+        a.jmp("_rt_hs_emit")
+    } else {
+        if a.os == 0 {
+            a.vm_call_iat("_iat__NSGetEnviron")
+            a.load(0, 14, 0)
+        } else {
+            // Linux envp = argv + (argc + 1) * sizeof(char *).
+            a.lea(0, "_rt_entry_argc")
+            a.load(1, 0, 0)
+            a.vm_add_imm(1, 1, 1)
+            a.shl_imm(1, 1, 3)
+            a.lea(0, "_rt_entry_argv")
+            a.load(0, 0, 0)
+            a.add(0, 0, 1)
+        }
+        a.store(15, -8, 0) // envp cursor
+        a.label("_rt_hs_env_loop")
+        a.load(0, 15, -8)
+        a.load(1, 0, 0)
+        a.vm_cbz(1, "_rt_hs_done")
+        a.store(15, -16, 1) // entry
+        a.vm_mov_imm(2, 0)
+        a.store(15, -24, 2)
+        a.label("_rt_hs_cmp")
+        a.load(2, 15, -24)
+        a.vm_cmp_imm(2, 15)
+        a.jge("_rt_hs_check_nul")
+        a.load(0, 15, -16)
+        a.add(0, 0, 2)
+        a.load_byte(3, 0, 0)
+        a.lea(4, "_rt_heap_stats_env")
+        a.add(4, 4, 2)
+        a.load_byte(4, 4, 0)
+        a.cmp(3, 4)
+        a.jne("_rt_hs_next")
+        a.vm_add_imm(2, 2, 1)
+        a.store(15, -24, 2)
+        a.jmp("_rt_hs_cmp")
+        a.label("_rt_hs_check_nul")
+        a.load(0, 15, -16)
+        a.vm_add_imm(0, 0, 15)
+        a.load_byte(3, 0, 0)
+        a.vm_cbnz(3, "_rt_hs_next")
+        a.jmp("_rt_hs_emit")
+        a.label("_rt_hs_next")
+        a.load(0, 15, -8)
+        a.vm_add_imm(0, 0, 8)
+        a.store(15, -8, 0)
+        a.jmp("_rt_hs_env_loop")
+    }
+
+    a.label("_rt_hs_emit")
+    if locked == 1 { rt_heap_lock(a) }
+    a.lea(0, "_rt_heap_live_bytes")
+    a.load(1, 0, 0)
+    a.store(15, -40, 1)
+    a.lea(0, "_rt_heap_peak_bytes")
+    a.load(1, 0, 0)
+    a.store(15, -48, 1)
+    a.lea(0, "_rt_heap_allocs")
+    a.load(1, 0, 0)
+    a.store(15, -56, 1)
+    a.lea(0, "_rt_heap_frees")
+    a.load(1, 0, 0)
+    a.store(15, -64, 1)
+    a.lea(0, "_rt_heap_unknown_frees")
+    a.load(1, 0, 0)
+    a.store(15, -72, 1)
+    a.lea(0, "_rt_heap_double_frees")
+    a.load(1, 0, 0)
+    a.store(15, -80, 1)
+    a.lea(0, "_rt_heap_ledger_overflows")
+    a.load(1, 0, 0)
+    a.store(15, -88, 1)
+    if locked == 1 { rt_heap_unlock(a) }
+    rt_emit_heap_stats_line(a, "_rt_heap_stats_live", 25, -40)
+    rt_emit_heap_stats_line(a, "_rt_heap_stats_peak", 25, -48)
+    rt_emit_heap_stats_line(a, "_rt_heap_stats_allocs", 21, -56)
+    rt_emit_heap_stats_line(a, "_rt_heap_stats_frees", 20, -64)
+    rt_emit_heap_stats_line(a, "_rt_heap_stats_unknown", 28, -72)
+    rt_emit_heap_stats_line(a, "_rt_heap_stats_double", 27, -80)
+    rt_emit_heap_stats_line(a, "_rt_heap_stats_overflow", 31, -88)
+    a.epilogue()
+    a.label("_rt_hs_done")
+    a.epilogue()
+    <<
+}
+
+fn irq_slot(name string) int {
+    if name.len < 5 {
+        << -1
+    }
+    if name[0] != 105 || name[1] != 114 || name[2] != 113 || name[3] != 95 {
+        << -1
+    }
+    mut n := 0
+    for i in 4:name.len {
+        ch := name[i]
+        if ch < 48 || ch > 57 {
+            << -1
+        }
+        n = n * 10 + (ch - 48)
+    }
+    if n >= 32 {
+        << -1
+    }
+    << n
+}
+
+fn rt_emit_bare_metal_glue(a &mut Assembler, m &types.Mir, pump_idle int) {
+    // reset is FIRST for RV32: QEMU virt boots at the code segment start.
+    // It initializes SP/heap/UART, binds irq_N handlers, then runs main and
+    // halts; putc/raise_irq/isr follow and are only reachable by call.
+    a.label("_reset")
+    if a.arch == 3 {
+        a.vm_mov_imm(0, 2264924160) // 0x87000000 stack top
+    } else {
+        a.vm_mov_imm(0, 536903680)
+    }
+    a.mov(16, 0)
+    a.lea(0, "_xu_heap_start")
+    a.lea(1, "_rt_heap_cur")
+    a.store(1, 0, 0)
+    if a.arch != 3 {
+        a.vm_mov_imm(0, 1073758208)
+        a.vm_mov_imm(1, 16)
+        a.store(0, 16, 1)
+        a.vm_mov_imm(1, 1)
+        a.store(0, 8, 1)
+    }
+    for fi in 0:m.fns.len {
+        if types.mir_fn_is_extern(m, fi) { -> }
+        nm := m.fns[fi].name
+        slot := irq_slot(nm)
+        if slot >= 0 {
+            a.lea(0, types.mir_fn_label(m, fi))
+            a.lea(1, "_xu_irq_tab")
+            a.store(1, slot * 4, 0)
+        }
+    }
+    a.call("_xu_main")
+    a.label("_rt_exit")
+    if pump_idle == 1 {
+        a.call("_rt_xu_pump")
+    }
+    a.halt()
+    a.jmp("_rt_exit")
+    a.label("_xu_putc")
+    if a.arch == 3 {
+        // NS16550 at 0x10000000 (QEMU virt): write byte straight out.
+        a.vm_mov_imm(0, 268435456)
+        a.store_byte(0, 0, 18)
+        a.vm_ret()
+    } else {
+        a.vm_mov_imm(0, 1073758208)
+        a.label("_xu_putc_wait")
+        a.load(1, 0, 4)
+        a.vm_mov_imm(2, 2)
+        a.iand(1, 1, 2)
+        a.vm_cbnz(1, "_xu_putc_wait")
+        a.store_byte(0, 0, 18)
+        a.vm_ret()
+    }
+    a.align_data(4)
+    a.data_label("_xu_irq_tab")
+    rt_emit_zeros(a, 128)
+    a.label("_xu_raise_irq")
+    a.vm_cmp_imm(18, 0)
+    a.jlt("_xu_irq_skip")
+    a.vm_cmp_imm(18, 32)
+    a.jge("_xu_irq_skip")
+    a.lea(0, "_xu_irq_tab")
+    a.shl_imm(1, 18, 2)
+    a.add(0, 0, 1)
+    a.load(0, 0, 0)
+    a.vm_cbz(0, "_xu_irq_skip")
+    a.call_reg(0)
+    a.label("_xu_irq_skip")
+    a.vm_ret()
+    a.label("_xu_isr")
+    a.read_ipsr(18)
+    a.call("_xu_raise_irq")
+    a.vm_ret()
+    <<
+}
+
+
+// ===== rt_alloc: A0 = requested payload size -> Ret = user pointer =====
+fn rt_emit_alloc(a &mut Assembler, locked int) {
+    if a.os == 3 {
+        rt_emit_alloc_bump(a)
+        <<
+    }
+    a.data_label("_rt_oom_msg")
+    rt_emit_bytes(a, "xu: out of memory\n")
+    a.label("_rt_alloc")
+    a.prologue(48)
+    a.store(15, -8, 18)
+    if locked == 1 {
+        rt_heap_lock(a)
+        a.load(18, 15, -8)
+    }
+    a.vm_cmp_imm(18, 0)
+    a.jlt("_rt_alloc_oom")
+    // 128 small classes of 16 bytes: 16..2048, followed by five medium
+    // classes. 254 is the freelist tombstone; 255 is dedicated mmap.
+    a.vm_cmp_imm(18, 2048)
+    a.jgt("_rt_al_medium_check")
+
+    // ---- Small path: size class freelist ----
+    // V1 = class count = max(1, (size + 15) >> 4); V2 = class index; V3 = payload
+    a.mov(1, 18)
+    a.vm_add_imm(1, 1, 15)
+    // Reject wrap before the rounding bias can select a tiny size class for a
+    // near-word-limit request.  This mirrors bootstrap xurt's checked path.
+    a.cmp(1, 18)
+    a.jae("_rt_al_small_round_ok")
+    a.jmp("_rt_alloc_oom")
+    a.label("_rt_al_small_round_ok")
+    a.shr_imm(1, 1, 4)
+    a.vm_cbnz(1, "_rt_al_classed")
+    a.vm_mov_imm(1, 1)
+    a.label("_rt_al_classed")
+    a.vm_sub_imm(2, 1, 1)
+    a.shl_imm(3, 1, 4)
+
+    // V4 = &freelists[idx]; V5 = head
+    a.lea(4, "_rt_freelists")
+    a.shl_imm(5, 2, 3)
+    a.add(4, 4, 5)
+    a.load(5, 4, 0)
+    a.vm_cbz(5, "_rt_al_bump")
+    // Pop: freelist[idx] = [head + 8]; restore class header; << head + 8
+    a.load(0, 5, 8)
+    a.store(4, 0, 0)
+    a.store(5, 0, 2) // header = class index (was 0xFE while free)
+    a.vm_add_imm(14, 5, 8)
+    a.store(15, -16, 14)
+    if locked == 1 { rt_heap_unlock(a) }
+    a.load(18, 15, -16)
+    a.load(19, 15, -8)
+    if gen1_heap_ledger_on() {
+        a.call("_rt_heap_record_alloc")
+    }
+    a.load(14, 15, -16)
+    a.epilogue()
+
+    // ---- Bump-allocate from the current chunk ----
+    a.label("_rt_al_bump")
+    a.lea(4, "_rt_chunk_cursor")
+    a.load(5, 4, 0) // V5 = cursor = block candidate
+    a.add(0, 5, 3)
+    a.vm_add_imm(0, 0, 8) // new cursor
+    // Check both additions before comparing with the chunk end; a wrapped
+    // cursor must fail closed instead of escaping the mmap chunk.
+    a.cmp(0, 5)
+    a.jae("_rt_al_cursor_ok")
+    a.jmp("_rt_alloc_oom")
+    a.label("_rt_al_cursor_ok")
+    a.lea(1, "_rt_chunk_end")
+    a.load(1, 1, 0)
+    a.cmp(0, 1)
+    a.jgt("_rt_al_newchunk")
+    // Carve in place.
+    a.lea(1, "_rt_chunk_cursor")
+    a.store(1, 0, 0)
+    a.jmp("_rt_al_have")
+
+    // ---- New 64KB chunk ----
+    a.label("_rt_al_newchunk")
+    // VirtualAlloc (Windows IAT) clobbers caller-saved V2/V3; Linux mmap
+    // only writes x0. Spill class (V2) and payload (V3) across the call.
+    a.store(15, -16, 2)
+    a.store(15, -24, 3)
+    a.vm_mov_imm(0, 65536)
+    rt_emit_mmap(a, 0)
+    a.vm_cmp_imm(14, 0)
+    a.jlt("_rt_alloc_oom")
+    a.vm_cmp_imm(14, 4096)
+    a.jae("_rt_al_chunk_ok")
+    a.jmp("_rt_alloc_oom")
+    a.label("_rt_al_chunk_ok")
+    a.load(2, 15, -16)
+    a.load(3, 15, -24)
+    a.mov(5, 14) // V5 = block = chunk base (mmap result)
+    a.lea(1, "_rt_chunk_end")
+    a.mov(0, 14)
+    a.vm_add_imm(0, 0, 65536)
+    a.store(1, 0, 0) // chunk_end = chunk + 64KB
+    a.add(0, 14, 3)
+    a.vm_add_imm(0, 0, 8)
+    a.lea(1, "_rt_chunk_cursor")
+    a.store(1, 0, 0) // cursor = chunk + header + payload
+
+    // ---- Finish small alloc: V5 = block ----
+    a.label("_rt_al_have")
+    a.store(5, 0, 2) // header = class index
+    a.vm_add_imm(14, 5, 8)
+    a.store(15, -16, 14)
+    if locked == 1 { rt_heap_unlock(a) }
+    a.load(18, 15, -16)
+    a.load(19, 15, -8)
+    if gen1_heap_ledger_on() {
+        a.call("_rt_heap_record_alloc")
+    }
+    a.load(14, 15, -16)
+    a.epilogue()
+
+    // ---- Medium path: bounded reuse, with the large 16-byte header ----
+    // Each pool retains at most four mappings. Active allocations remain
+    // independent; full pools release excess mappings through the large path.
+    a.label("_rt_al_medium_check")
+    a.vm_cmp_imm(18, gen1_medium_limit)
+    a.jgt("_rt_al_large")
+    a.vm_mov_imm(2, gen1_medium_first_class)
+    a.vm_mov_imm(3, 4096)
+    a.label("_rt_al_medium_class")
+    a.cmp(18, 3)
+    a.jle("_rt_al_medium_classed")
+    a.shl_imm(3, 3, 1)
+    a.vm_add_imm(2, 2, 1)
+    a.jmp("_rt_al_medium_class")
+    a.label("_rt_al_medium_classed")
+    a.store(15, -24, 2)
+    a.vm_sub_imm(0, 2, gen1_medium_first_class)
+    a.shl_imm(0, 0, 3)
+    a.lea(4, "_rt_medium_heads")
+    a.add(4, 4, 0)
+    a.load(5, 4, 0)
+    a.vm_cbz(5, "_rt_al_medium_new")
+    a.load(6, 5, 0)
+    a.store(4, 0, 6)
+    a.lea(4, "_rt_medium_counts")
+    a.add(4, 4, 0)
+    a.load(6, 4, 0)
+    a.vm_cmp_imm(6, 0)
+    a.jle("_rt_alloc_oom")
+    a.vm_sub_imm(6, 6, 1)
+    a.store(4, 0, 6)
+    a.store(5, -8, 2) // restore class from the freed tombstone
+    a.store(15, -16, 5)
+    a.jmp("_rt_al_medium_return")
+    a.label("_rt_al_medium_new")
+    // Bucket payloads are page multiples. One additional 4 KiB page covers
+    // the 16-byte header; 64 KiB + 4 KiB is bounded and cannot overflow.
+    a.vm_add_imm(0, 3, 4096)
+    a.store(15, -16, 0)
+    rt_emit_mmap(a, 0)
+    a.vm_cmp_imm(14, 0)
+    a.jlt("_rt_alloc_oom")
+    a.vm_cmp_imm(14, 4096)
+    a.jlt("_rt_alloc_oom")
+    a.load(2, 15, -16)
+    a.store(14, 0, 2)
+    a.load(2, 15, -24)
+    a.store(14, 8, 2)
+    a.vm_add_imm(14, 14, 16)
+    a.store(15, -16, 14)
+    a.label("_rt_al_medium_return")
+    if locked == 1 { rt_heap_unlock(a) }
+    a.load(18, 15, -16)
+    a.load(19, 15, -8)
+    if gen1_heap_ledger_on() { a.call("_rt_heap_record_alloc") }
+    a.load(14, 15, -16)
+    a.epilogue()
+
+    // ---- Large path: dedicated mmap ----
+    // Layout: [map_size:u64][class=0xFF][user...]; class always at user-8.
+    // map_size is page-rounded total mapping length (header included).
+    a.label("_rt_al_large")
+    a.vm_add_imm(0, 18, 16) // payload + 16-byte header
+    a.cmp(0, 18)
+    a.jae("_rt_al_large_add_ok")
+    a.jmp("_rt_alloc_oom")
+    a.label("_rt_al_large_add_ok")
+    // page-align: ((n + 4095) >> 12) << 12.  Check the rounding-bias add
+    // separately; payload+16 can be valid while this second add wraps.
+    a.mov(1, 0)
+    a.vm_add_imm(0, 0, 4095)
+    a.cmp(0, 1)
+    a.drop_seq = a.drop_seq + 1
+    n := a.drop_seq
+    a.jae("_rt_al_large_round_ok_" + str(n))
+    a.jmp("_rt_alloc_oom")
+    a.label("_rt_al_large_round_ok_" + str(n))
+    a.shr_imm(0, 0, 12)
+    a.shl_imm(0, 0, 12)
+    a.mov(2, 0) // V2 = map_size
+    a.store(15, -16, 2)
+    rt_emit_mmap(a, 0)
+    a.vm_cmp_imm(14, 0)
+    a.jlt("_rt_alloc_oom")
+    a.vm_cmp_imm(14, 4096)
+    a.jae("_rt_al_large_ok")
+    a.jmp("_rt_alloc_oom")
+    a.label("_rt_al_large_ok")
+    a.load(2, 15, -16)
+    a.store(14, 0, 2) // base+0 = map_size
+    a.vm_mov_imm(0, 255)
+    a.store(14, 8, 0) // base+8 = LARGE_CLASS
+    a.vm_add_imm(14, 14, 16)
+    a.store(15, -16, 14)
+    if locked == 1 { rt_heap_unlock(a) }
+    a.load(18, 15, -16)
+    a.load(19, 15, -8)
+    if gen1_heap_ledger_on() {
+        a.call("_rt_heap_record_alloc")
+    }
+    a.load(14, 15, -16)
+    a.epilogue()
+    // The allocator owns the heap lock on the failure paths above. Keep this
+    // lock-owning tail distinct from `_rt_al_oom`, which is used by helpers
+    // that reject malformed sizes before entering `_rt_alloc`.
+    a.label("_rt_alloc_oom")
+    if locked == 1 {
+        rt_heap_unlock(a)
+    }
+    a.lea(18, "_rt_oom_msg")
+    a.vm_mov_imm(19, 18)
+    a.vm_mov_imm(20, 2)
+    a.call("_rt_write")
+    rt_exit(a, 1)
+    // No-lock fail-closed tail for pre-allocation validation in other
+    // runtime helpers. Unlocking here would release an unheld mutex on the
+    // multicore (Darwin) path.
+    a.label("_rt_al_oom")
+    a.lea(18, "_rt_oom_msg")
+    a.vm_mov_imm(19, 18)
+    a.vm_mov_imm(20, 2)
+    a.call("_rt_write")
+    rt_exit(a, 1)
+    <<
+}
+
+// ===== rt_free: A0 = user pointer. Small class -> freelist; LARGE_CLASS
+// (0xFF, 16-byte header) -> munmap. Heap-allocated strings / arrays /
+// structs always go through here when their owning binding goes out of scope.
+fn rt_emit_free(a &mut Assembler, locked int) {
+    if a.os == 3 {
+        a.label("_rt_free")
+        a.vm_ret()
+        <<
+    }
+    a.label("_rt_free")
+    a.prologue(32)
+    a.store(15, -8, 18)
+    // Null remains the ABI's no-op.  Capability-off Gen1 intentionally keeps
+    // the historical tolerant free contract, so reject low/sentinel pointers
+    // before dereferencing their allocator header.  Strict ledger mode uses
+    // the ledger helper as the authoritative pointer validation path.
+    if !gen1_heap_ledger_on() {
+        a.vm_cmp_imm(18, 4096)
+        a.jlt("_rt_fr_done")
+    } else {
+        a.vm_cmp_imm(18, 0)
+        a.jeq("_rt_fr_done")
+    }
+    if locked == 1 {
+        rt_heap_lock(a)
+        a.load(18, 15, -8)
+    }
+    a.load(18, 15, -8)
+    if gen1_heap_ledger_on() {
+        a.call("_rt_heap_record_free")
+    }
+    a.load(18, 15, -8)
+    // class always at user-8 (small: 8B header; large: 16B header).
+    a.vm_sub_imm(0, 18, 8)
+    a.load(1, 0, 0) // V1 = class
+    a.vm_cmp_imm(1, 255)
+    a.jeq("_rt_fr_large")
+    a.vm_cmp_imm(1, gen1_medium_first_class)
+    a.jae("_rt_fr_check_medium")
+    a.label("_rt_fr_small")
+    // Mark freed before linking so a second free of the same user ptr is a no-op.
+    a.vm_mov_imm(3, 254)
+    a.store(0, 0, 3)
+    a.lea(2, "_rt_freelists")
+    a.shl_imm(3, 1, 3)
+    a.add(2, 2, 3) // V2 = &freelists[class]
+    a.load(4, 2, 0) // V4 = old head
+    a.store(0, 8, 4) // block->next = head
+    a.store(2, 0, 0) // head = block
+    a.jmp("_rt_fr_unlock")
+
+    a.label("_rt_fr_check_medium")
+    a.vm_cmp_imm(1, gen1_medium_class_end)
+    a.jae("_rt_fr_not_class")
+    a.jmp("_rt_fr_medium")
+    a.label("_rt_fr_not_class")
+    // Unsigned class comparisons also reject negative/corrupt headers.
+    // Preserve tolerant free without the ledger; strict builds fail loudly.
+    if gen1_heap_ledger_on() {
+        a.jmp("_rt_fr_bad_class")
+    } else {
+        a.jmp("_rt_fr_unlock")
+    }
+
+    a.label("_rt_fr_medium")
+    a.vm_sub_imm(3, 1, gen1_medium_first_class)
+    a.shl_imm(3, 3, 3)
+    a.lea(2, "_rt_medium_heads")
+    a.add(2, 2, 3)
+    a.lea(4, "_rt_medium_counts")
+    a.add(3, 4, 3)
+    a.load(4, 3, 0)
+    a.vm_cmp_imm(4, gen1_medium_keep)
+    a.jae("_rt_fr_large")
+    a.load(5, 2, 0)
+    a.store(18, 0, 5)
+    a.store(2, 0, 18)
+    a.vm_add_imm(4, 4, 1)
+    a.store(3, 0, 4)
+    a.vm_mov_imm(5, 254)
+    a.store(0, 0, 5)
+    a.jmp("_rt_fr_unlock")
+
+    a.label("_rt_fr_large")
+    // Layout: [map_size][class][user...]; class at user-8, size at user-16.
+    a.load(2, 0, -8) // V2 = map_size
+    a.vm_sub_imm(0, 0, 8) // V0 = mmap base
+    if a.os == 2 {
+        a.mov(18, 0)
+        a.vm_mov_imm(19, 0)
+        a.vm_mov_imm(20, 32768) // MEM_RELEASE = 0x8000
+        a.vm_call_iat("_iat_VirtualFree")
+    } else {
+        a.mov(18, 0) // A0 = base
+        a.mov(19, 2) // A1 = len
+        a.vm_syscall(syscall_number(a.os, a.arch, 3))
+    }
+    a.label("_rt_fr_unlock")
+    if locked == 1 {
+        rt_heap_unlock(a)
+    }
+    a.label("_rt_fr_done")
+    a.epilogue()
+    a.label("_rt_fr_bad_class")
+    if locked == 1 { rt_heap_unlock(a) }
+    a.lea(18, "_rt_heap_diag_corrupt")
+    a.vm_mov_imm(19, 36)
+    a.vm_mov_imm(20, 2)
+    a.call("_rt_write")
+    rt_exit(a, 1)
+    <<
+}
+
+// ===== rt_arr_push: A0 = &array descriptor, A1 = &element value,
+// A2 = element size in bytes. Descriptor words use descending stack-slot
+// layout (ptr@0,len@-8,cap@-16); buffer element words are ascending.

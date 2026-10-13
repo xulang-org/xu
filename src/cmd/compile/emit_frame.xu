@@ -1,0 +1,3511 @@
+@main
+
+#xu/types
+
+// Stack frame layout (slots, CoverTable). RA lives in emit_ra_gpr/fp/loop.xu.
+
+// Fixed-home metadata is compiler input, not an unbounded work queue.  Keep
+// the call-split action stream deliberately small: one pair is two words
+// (Call InstrId, TempId), and the limit leaves a bounded fallback path when a
+// hostile MIR contains a very large number of call/live-scalar intersections.
+// The value is intentionally well above the hosted compiler's normal count
+// while keeping the worst-case retained metadata below roughly one MiB.
+const vreg_max_fp_split_pairs = 65536
+const vreg_max_fp_split_words = 131072
+const vreg_max_plan_words = 131584
+// Unrolled const-K triangles (nbody 10 pairs) allocate a new temp per copy.
+const vreg_plan_temp_cap = 2048
+
+// Direct-call validation used to scan every MFn for every Call.  These caps
+// make that lookup a bounded admission check: ordinary units remain on the
+// fast path, while an attacker-sized function universe/call stream falls back
+// to the legacy frame allocator before quadratic work is allocated.
+const vreg_direct_call_fn_cap = 4096
+const vreg_direct_call_count_cap = 4096
+const vreg_direct_call_work_cap = 16777216
+const vreg_direct_call_label_cap = 4096
+// Hashing a candidate function label touches every byte.  Bound that second
+// dimension too; otherwise 4096 calls × 4096 functions × 4096-byte labels
+// would still be an attacker-controlled multi-billion-byte scan.
+const vreg_direct_call_char_work_cap = 67108864
+
+struct Frame {
+    local_slot []int
+    temp_slot  []int
+    // [0..ntemps): real backup slot for a call-split scalar home, or -1.
+    // Historical field name; the schema is shared by GPR and FP homes.
+    // Remaining words are exact (call InstrId, TempId) action pairs.
+    fp_split   []int
+    select_pairs []int // frozen pre-layout machine actions; same owner through emit
+    sret_slot  int
+    size       int
+    plan_reason int // exact failed planner phase; zero is a completed proof
+    plan_instr  int // instruction rejected by the operand/emitter contract
+}
+
+// Byte offset from FP for a slot index (slots grow downward from FP-8).
+// unused_slot (2^51) is a layout marker, not an address. Encoding it as
+// `sub fp, #imm` wraps to 2^54+8 and the ARM64 assembler rejects it.
+fn slot_off(slot int) int {
+    if is_unused_slot(slot) {
+        eprintln("internal compiler error: omitted frame slot used during emit")
+        <<< 1
+    }
+    << -8 * (slot + 1)
+}
+
+fn frame_byte_off(slot int, b int) int {
+    << slot_off(slot) - (b / 8) * 8 + (b % 8)
+}
+
+fn emit_wrap_int(a &mut Assembler, ty int) {
+    if ty == 10 {
+        a.vm_mov_imm(1, 255)
+        a.iand(0, 0, 1)
+    }
+    if ty == 9 {
+        a.vm_mov_imm64(1, 4294967295)
+        a.iand(0, 0, 1)
+    }
+    if ty == 8 {
+        a.shl_imm(0, 0, 32)
+        a.vm_mov_imm(1, 32)
+        a.shr(0, 0, 1)
+    }
+    <<
+}
+
+// m32 coverage: deduped (file,line) slots allocated before emission. The
+// runtime counter table and dump iterate slots in this exact order.
+struct CoverTable {
+    files []int
+    lines []int
+}
+
+fn cover_slot(ct &CoverTable, file int, line int) int {
+    for si in 0:ct.files.len {
+        if ct.files[si] == file && ct.lines[si] == line {
+            << si
+        }
+    }
+    << -1
+}
+
+// M192d: mark temps referenced by MIR (over-approx OK; under-approx is unsafe).
+fn frame_temp_used(m &types.Mir, fi int) []int {
+    n := types.mir_ntemps(m, fi)
+    mut used := []int{}
+    for _ in 0:n {
+        used.push(0)
+    }
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 {
+                <-
+            } else {
+                ik := types.mir_ikind(m, fi, ii)
+                ia := types.mir_ia(m, fi, ii)
+                ib := types.mir_ib(m, fi, ii)
+                ic := types.mir_ic(m, fi, ii)
+                id := types.mir_id(m, fi, ii)
+                if ia >= 0 && ia < n {
+                    used[ia] = 1
+                }
+                if ik != 2 {
+                    if ib >= 0 && ib < n {
+                        used[ib] = 1
+                    }
+                }
+                if ik != 14 && ik != 20 && ik != 23 {
+                    if ic >= 0 && ic < n {
+                        used[ic] = 1
+                    }
+                } else {
+                    if ic >= 0 && ic < n {
+                        used[ic] = 1
+                    }
+                }
+                // Call/chan status in d; skip raw elem-size encodings (14/20/23).
+                if ik != 14 && ik != 20 && ik != 23 && ik != 47 {
+                    if id >= 0 && id < n {
+                        used[id] = 1
+                    }
+                }
+                // Call / xu / iface-method / ArrPush4 args live in the marg
+                // chain, not in c/d as TempIds. Missing them omits a live
+                // temp (unused_slot = 2^51) and ARM64 sub_imm then dies.
+                mut ap := -1
+                if ik == 7 || ik == 33 { ap = ic }
+                if ik == 43 { ap = id }
+                if ik == 46 { ap = ib }
+                for _ in 0:4096 {
+                    if ap < 0 { <- }
+                    v := types.mir_marg_v(m, fi, ap)
+                    if v >= 0 && v < n { used[v] = 1 }
+                    ap = types.mir_marg_next(m, fi, ap)
+                }
+                ii = types.mir_inext(m, fi, ii)
+            }
+        }
+        tkind := types.mir_btkind(m, fi, bi)
+        if tkind == 2 || tkind == 3 {
+            ta := types.mir_bta(m, fi, bi)
+            if ta >= 0 && ta < n {
+                used[ta] = 1
+            }
+        }
+    }
+    nphi := m.fns[fi].phis.len
+    for pi in 0:nphi {
+        p := m.fns[fi].phis[pi]
+        if p.dest >= 0 && p.dest < n { used[p.dest] = 1 }
+        mut aj := 0
+        while aj < p.arg_count {
+            idx := p.arg_head + aj
+            if idx >= 0 && idx < m.fns[fi].phi_args.len {
+                v := m.fns[fi].phi_args[idx].value
+                if v >= 0 && v < n { used[v] = 1 }
+            }
+            aj += 1
+        }
+    }
+    << used
+}
+
+// Locals removed by final MIR scalar promotion keep their LocalId metadata so
+// diagnostics and temp types stay stable, but no longer need a frame word.
+// Keep this query scalar: another slice-return local in frame_layout corrupts
+// the returned Frame descriptor under Gen1→Gen2's frozen slice ABI.
+fn frame_local_is_used(m &types.Mir, fi int, want int) bool {
+    if want < types.mir_fn_nparams(m, fi) { << true }
+    << frame_local_is_referenced(m, fi, want)
+}
+
+// Parameters retain ABI frame slots, but an unused borrowed parameter need
+// not disable scalar register caching. Scan the live MIR, including tagged
+// local operands and phi metadata, independently of frame-slot retention.
+fn frame_local_is_referenced(m &types.Mir, fi int, want int) bool {
+    n := types.mir_nlocals(m, fi)
+    tag := 1073741824
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            ia := types.mir_ia(m, fi, ii)
+            ib := types.mir_ib(m, fi, ii)
+            ic := types.mir_ic(m, fi, ii)
+            id := types.mir_id(m, fi, ii)
+            mut loc := -1
+            if k == 2 { loc = ib }
+            if k == 3 || k == 8 { loc = ia }
+            if k == 16 && ic == 0 { loc = ib }
+            if loc == want { << true }
+            // Index / ArrPush / RMW may name a local as 1<<30+id without a
+            // LoadLocal. Omitting that local makes emit slot_off(2^51).
+            if k == 13 || k == 20 || k == 46 || k == 47 { loc = ia }
+            if k == 14 || k == 23 { loc = ib }
+            if loc >= tag { loc = loc - tag }
+            if loc >= 0 && loc < n && loc == want { << true }
+            if ia >= tag && ia - tag == want { << true }
+            if ib >= tag && ib - tag == want { << true }
+            if ic >= tag && ic - tag == want { << true }
+            if id >= tag && id - tag == want { << true }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    nphi := m.fns[fi].phis.len
+    for pi in 0:nphi {
+        p := m.fns[fi].phis[pi]
+        if p.local == want { << true }
+        mut aj := 0
+        while aj < p.arg_count {
+            idx := p.arg_head + aj
+            if idx >= 0 && idx < m.fns[fi].phi_args.len {
+                v := m.fns[fi].phi_args[idx].value
+                if v == want { << true }
+                if v >= tag && v - tag == want { << true }
+            }
+            aj += 1
+        }
+    }
+    << false
+}
+
+fn frame_local_slot_at(m &types.Mir, fi int, want int, omit_promoted bool) int {
+    // Omission is a small-frame optimization.  Calling
+    // frame_local_is_used for every local would otherwise turn a hostile
+    // (locals × instructions) MIR shape into a quadratic compiler walk.
+    mut omit := omit_promoted
+    nlocal := m.fns[fi].locals_nslots.len
+    nins := types.mir_nins(m, fi)
+    if nlocal > 512 || nlocal * nins > 16 * 1024 * 1024 { omit = false }
+    mut next := 0
+    for i in 0:m.fns[fi].locals_nslots.len {
+        if omit && i >= types.mir_fn_nparams(m, fi) && !frame_local_is_used(m, fi, i) {
+            if i == want { << unused_slot() }
+            ->
+        }
+        if i == want { << next }
+        next += types.mir_local_nslots(m, fi, i)
+    }
+    << unused_slot()
+}
+
+fn frame_temp_addr_taken(m &types.Mir, fi int) []int {
+    n := types.mir_ntemps(m, fi)
+    mut taken := []int{}
+    for _ in 0:n {
+        taken.push(0)
+    }
+    for ii in 0:types.mir_nins(m, fi) {
+        ik := types.mir_ikind(m, fi, ii)
+        ib := types.mir_ib(m, fi, ii)
+        ic := types.mir_ic(m, fi, ii)
+        // 10/11 LoadField/StoreField: value-in-frame temp base.
+        if ik == 10 || ik == 11 {
+            if ib >= 0 && ib < n {
+                taken[ib] = 1
+            }
+        }
+        if ik == 10 {
+            ia := types.mir_ia(m, fi, ii)
+            if ia >= 0 && ia < n {
+                taken[ia] = 1
+            }
+        }
+        // 16 Addr: c==1 → temp base.
+        if ik == 16 && ic == 1 {
+            if ib >= 0 && ib < n {
+                taken[ib] = 1
+            }
+        }
+    }
+    << taken
+}
+
+fn fn_omits_temp_frame(m &types.Mir, fi int) int {
+    if types.mir_nblocks(m, fi) != 1 {
+        << 0
+    }
+    if fn_uses_s_scratch(m, fi) != 0 {
+        << 0
+    }
+    if fn_ncalls(m, fi) != 0 {
+        << 0
+    }
+    nloc := types.mir_nlocals(m, fi)
+    mut loads := []int{}
+    for _ in 0:nloc {
+        loads.push(0)
+    }
+    for ii in 0:types.mir_nins(m, fi) {
+        if types.mir_ikind(m, fi, ii) == 2 {
+            loc := types.mir_ib(m, fi, ii)
+            if loc < 0 || loc >= nloc {
+                << 0
+            }
+            loads[loc] = loads[loc] + 1
+            if loads[loc] > 1 {
+                << 0
+            }
+        }
+    }
+    << 1
+}
+
+// Slot domains must never overlap. Real frame slots are bounded below 2^50;
+// synthetic cache-only temp keys occupy [2^50, 2^51), and 2^51 is the
+// explicit unused marker. The old 16384/999999 values collided with legal
+// large frames and could make a real spill look synthetic.
+fn synth_slot_base() int { << 1125899906842624 }
+fn unused_slot() int { << 2251799813685248 }
+
+fn synth_slot(temp_id int) int { << synth_slot_base() + temp_id }
+
+fn is_synth_slot(slot int) bool {
+    << slot >= synth_slot_base() && slot < unused_slot()
+}
+
+fn is_unused_slot(slot int) bool { << slot == unused_slot() }
+
+// Fixed virtual-register homes use a negative slot sentinel. The value is
+// deliberately outside the frame-slot/synthetic ranges so every legacy path
+// can reject it before calculating an FP-relative address.
+fn vreg_slot(home int) int {
+    << -100 - home
+}
+
+// Fixed FP virtual-register homes use a separate encoded range.  Keeping
+// them distinct from integer homes is important: the legacy GPR helpers may
+// inspect a vreg sentinel before the FP emitter gets a chance to handle it.
+// Home → physical D/XMM mapping lives in TargetDesc (`td_fp_phys`).
+fn fp_vreg_slot(home int) int {
+    << -200 - home
+}
+
+fn is_vreg_slot(slot int) bool {
+    // V2–V7 are caller-saved scalar homes. Arm64 direct-call live ranges
+    // additionally use callee-saved S0–S5 (homes 8–13).
+    << slot <= -102 && slot >= -113
+}
+
+fn is_fp_vreg_slot(slot int) bool {
+    << td_fp_slot_ok(slot)
+}
+
+fn vreg_slot_home(slot int) int {
+    << -100 - slot
+}
+
+fn fp_vreg_slot_home(slot int) int {
+    << -200 - slot
+}
+
+fn fp_vreg_slot_d(slot int) int {
+    << td_fp_phys(fp_vreg_slot_home(slot))
+}
+
+fn frame_plan_uses_fp(fr &Frame) bool {
+    for i in 0:fr.temp_slot.len {
+        if is_fp_vreg_slot(fr.temp_slot[i]) { << true }
+    }
+    << false
+}
+
+// RC S-pool pins occupy homes 8..11. A vreg plan that already colored
+// one of those cannot share the function with callee-saved pins.
+// S0–S5 are the push_byte header cache (S1–S4) and the vreg callee homes.
+fn frame_vreg_uses_s_regs(fr &Frame) bool {
+    for i in 0:fr.temp_slot.len {
+        if is_vreg_slot(fr.temp_slot[i]) {
+            h := vreg_slot_home(fr.temp_slot[i])
+            if h >= 8 && h <= 13 { << true }
+        }
+    }
+    << false
+}
+
+fn frame_vreg_uses_pin_window(fr &Frame) bool {
+    for i in 0:fr.temp_slot.len {
+        if is_vreg_slot(fr.temp_slot[i]) {
+            h := vreg_slot_home(fr.temp_slot[i])
+            if h >= 8 && h < 12 { << true }
+        }
+    }
+    << false
+}
+
+fn frame_vreg_gpr_mask(fr &Frame) int {
+    mut mask := 0
+    for i in 0:fr.temp_slot.len {
+        if is_vreg_slot(fr.temp_slot[i]) {
+            h := vreg_slot_home(fr.temp_slot[i])
+            if h >= 0 && h < 31 {
+                mask = mask | (1 << h)
+            }
+        }
+    }
+    << mask
+}
+
+fn frame_has_vregs(fr &Frame) bool {
+    for i in 0:fr.temp_slot.len {
+        if is_vreg_slot(fr.temp_slot[i]) || is_fp_vreg_slot(fr.temp_slot[i]) {
+            << true
+        }
+    }
+    << false
+}
+
+fn frame_vreg_callee_pairs(fr &Frame, arch int) int {
+    if arch != 0 { << 0 }
+    mut pairs := 0
+    for i in 0:fr.temp_slot.len {
+        slot := fr.temp_slot[i]
+        if is_vreg_slot(slot) {
+            home := vreg_slot_home(slot)
+            if home >= 8 && home <= 13 {
+                need := (home - 8) / 2 + 1
+                if need > pairs { pairs = need }
+            }
+        }
+    }
+    << pairs
+}
+
+fn vreg_scalar_type(ty int) bool {
+    // Integer scalar values plus f64. Strings, refs and boxes remain
+    // frame-backed. FP homes are selected by vreg_color_homes below.
+    << types.mir_scalar_ty(ty)
+}
+
+// Mixed aggregate kernels keep descriptors/references in ordinary frame
+// slots.  Only one-word scalar temps may receive a fixed virtual-register
+// home; this predicate is deliberately centralized so every data-flow helper
+// makes the same decision.
+fn vreg_temp_eligible(m &types.Mir, fi int, t int) bool {
+    if t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+    << types.mir_temp_nslots(m, fi, t) == 1 && vreg_scalar_type(types.mir_temp_ty(m, fi, t))
+}
+
+fn vreg_container_struct_ok(m &types.Mir, ty int, ns int) bool {
+    if !types.is_struct_type(ty) || ns < 1 || ns > 64 { << false }
+    si := types.struct_index(ty)
+    if si < 0 || si >= m.structs.len { << false }
+    mut has_slice := false
+    for i in 0:m.structs[si].fields.len {
+        fty := m.structs[si].fields[i].ty
+        fns := m.type_slots(fty)
+        if fns == 1 && vreg_scalar_type(fty) { -> }
+        if fns == 3 && types.is_array_type(fty) {
+            ai := fty - 200
+            if ai >= 0 && ai < m.arrays.len && m.arrays[ai].fixed_len == 0 {
+                ety := m.arrays[ai].elem_ty
+                if (vreg_scalar_type(ety) && m.type_slots(ety) == 1) || (types.is_struct_type(ety) && !m.type_owning(ety) && m.type_slots(ety) >= 1 && m.type_slots(ety) <= 64) {
+                    has_slice = true
+                    ->
+                }
+            }
+        }
+        << false
+    }
+    << has_slice
+}
+
+fn vreg_general_frame_value_ok(m &types.Mir, ty int, ns int) bool {
+    if ns == 1 && vreg_scalar_type(ty) { << true }
+    if ns == 1 && types.is_ref_type(ty) { << true }
+    if ns >= 1 && ns <= 64 && types.is_struct_type(ty) && (!m.type_owning(ty) || vreg_container_struct_ok(m, ty, ns)) { << true }
+    if ns == 3 && types.is_array_type(ty) {
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << false }
+        if m.arrays[ai].fixed_len == 0 {
+            ety := m.arrays[ai].elem_ty
+            if vreg_scalar_type(ety) && m.type_slots(ety) == 1 { << true }
+            if types.is_struct_type(ety) && !m.type_owning(ety) && m.type_slots(ety) >= 1 && m.type_slots(ety) <= 16 { << true }
+        }
+        << false
+    }
+    if ns >= 1 && ns <= 64 && types.is_throw_type(ty) { << true }
+    if ns == 2 && types.is_interface_type(ty) { << true }
+    << false
+}
+
+fn vreg_direct_ref_inner(ty int) int {
+    // 1000/2000 are the compact immutable/mutable reference encodings.  The
+    // 3000+ nested-reference table lives only in Checker, so mixed planning
+    // rejects those rather than guessing a pointee descriptor shape.
+    if ty >= 1000 && ty < 2000 { << ty - 1000 }
+    if ty >= 2000 && ty < 3000 { << ty - 2000 }
+    << -1
+}
+
+fn vreg_call_mutates_container(m &types.Mir, fi int) bool {
+    tag := 1073741824
+    for ii in 0:types.mir_nins(m, fi) {
+        if types.mir_ikind(m, fi, ii) == 7 {
+            mut ap := types.mir_ic(m, fi, ii)
+            while ap >= 0 {
+                v := types.mir_marg_v(m, fi, ap)
+                mut ty := 0
+                if v >= tag {
+                    li := v - tag
+                    if li >= 0 && li < types.mir_nlocals(m, fi) {
+                        ty = types.mir_local_ty(m, fi, li)
+                    }
+                } else if v >= 0 && v < types.mir_ntemps(m, fi) {
+                    ty = types.mir_temp_ty(m, fi, v)
+                }
+                if types.is_ref_type(ty) && ty >= 2000 {
+                    inner := vreg_direct_ref_inner(ty)
+                    if inner >= 0 {
+                        if types.is_array_type(inner) { << true }
+                        if types.is_struct_type(inner) && (m.type_owning(inner) || vreg_container_struct_ok(m, inner, m.type_slots(inner))) {
+                            << true
+                        }
+                    }
+                }
+                ap = types.mir_marg_next(m, fi, ap)
+            }
+        }
+    }
+    << false
+}
+
+fn vreg_general_frame_types_ok(m &types.Mir, fi int) bool {
+    if vreg_call_mutates_container(m, fi) { << false }
+    for l in 0:types.mir_nlocals(m, fi) {
+        if !vreg_general_frame_value_ok(m, types.mir_local_ty(m, fi, l), types.mir_local_nslots(m, fi, l)) { << false }
+    }
+    for t in 0:types.mir_ntemps(m, fi) {
+        if !vreg_general_frame_value_ok(m, types.mir_temp_ty(m, fi, t), types.mir_temp_nslots(m, fi, t)) { << false }
+    }
+    << true
+}
+
+fn vreg_scalar_operand(m &types.Mir, fi int, v int) int {
+    if v >= 0 && !vreg_temp_eligible(m, fi, v) { << -1 }
+    << v
+}
+
+// `vreg_scalar_operand` is used by the data-flow graph and deliberately
+// returns -1 for an ineligible TempId.  That sentinel is not sufficient for
+// validation: treating an aggregate source as "no use" would let the emitter
+// read its first word while the allocator ignores the remaining descriptor.
+// Keep a separate boolean predicate for every scalar-only MIR operand.
+fn vreg_scalar_value_ok(m &types.Mir, fi int, v int) bool {
+    if !vreg_value_ok(m, fi, v) { << false }
+    if v >= 0 { << vreg_temp_eligible(m, fi, v) }
+    << true
+}
+
+fn vreg_index_value_ok(m &types.Mir, fi int, v int) bool {
+    if !vreg_scalar_value_ok(m, fi, v) { << false }
+    if v < 0 { << true }
+    << types.is_integer_type(types.mir_temp_ty(m, fi, v))
+}
+
+fn vreg_scalar_width(m &types.Mir, fi int, t int) int {
+    if t < 0 || t >= types.mir_ntemps(m, fi) || !vreg_temp_eligible(m, fi, t) { << 0 }
+    ty := types.mir_temp_ty(m, fi, t)
+    if !vreg_scalar_type(ty) { << 0 }
+    sz := m.type_size_bytes(ty)
+    if sz == 1 || sz == 4 || sz == 8 { << sz }
+    << 0
+}
+
+// LoadIndex's `d` is a byte width (negative means "skip bounds check" in
+// ordinary MIR).  Mixed fixed-home allocation has no proof object for the
+// latter, so it admits only checked scalar loads and only the widths emitted
+// by the scalar load paths.  Rejecting negative/odd widths is intentional:
+// emit_instr_index_mem otherwise falls through to a zero-chunk or multi-word
+// store that can overrun a one-slot fixed home.
+fn vreg_index_width_ok(m &types.Mir, fi int, d int, encoded_width int) bool {
+    if d < 0 || d >= types.mir_ntemps(m, fi) || !vreg_temp_eligible(m, fi, d) { << false }
+    if encoded_width <= 0 || encoded_width > 8 { << false }
+    if encoded_width != 1 && encoded_width != 4 && encoded_width != 8 { << false }
+    << encoded_width == vreg_scalar_width(m, fi, d)
+}
+
+
+// A LoadIndex descriptor is either an inline dynamic-array descriptor (three
+// frame words) or a direct reference to a dynamic-array descriptor.  Fixed
+// arrays and strings use separate emitter paths and are kept out of this
+// mixed-home extension.  A ref to a struct/scalar has the same one-word ABI
+// but is not an indexable descriptor; passing it to emit_index_desc_addr would
+// interpret its pointee as ptr/len.
+fn vreg_array_base_temp(m &types.Mir, fi int, t int, need_dynamic int) bool {
+    tag := 1073741824
+    mut ns := 0
+    mut ty := 0
+    if t >= tag {
+        loc := t - tag
+        if loc < 0 || loc >= types.mir_nlocals(m, fi) { << false }
+        ns = types.mir_local_nslots(m, fi, loc)
+        ty = types.mir_local_ty(m, fi, loc)
+    } else {
+        if t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+        ns = types.mir_temp_nslots(m, fi, t)
+        ty = types.mir_temp_ty(m, fi, t)
+    }
+    if ns == 3 && types.is_array_type(ty) {
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << false }
+        if need_dynamic != 0 && m.arrays[ai].fixed_len != 0 { << false }
+        << true
+    }
+    if ns == 1 && types.is_array_type(ty) {
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << false }
+        if m.arrays[ai].fixed_len <= 0 { << false }
+        if need_dynamic != 0 { << false }
+        << true
+    }
+    if ns != 1 || !types.is_ref_type(ty) { << false }
+    inner := vreg_direct_ref_inner(ty)
+    if !types.is_array_type(inner) { << false }
+    ai := inner - 200
+    if ai < 0 || ai >= m.arrays.len { << false }
+    if need_dynamic != 0 && m.arrays[ai].fixed_len != 0 { << false }
+    << true
+}
+
+fn vreg_index_base_temp(m &types.Mir, fi int, t int) bool {
+    << vreg_array_base_temp(m, fi, t, 1)
+}
+
+fn vreg_any_array_base(m &types.Mir, fi int, t int) bool {
+    if vreg_array_base_temp(m, fi, t, 0) { << true }
+    if vreg_pointer_base_temp(m, fi, t) { << true }
+    tag := 1073741824
+    if t >= tag {
+        loc := t - tag
+        if loc < 0 || loc >= types.mir_nlocals(m, fi) { << false }
+        << types.is_array_type(types.mir_local_ty(m, fi, loc))
+    }
+    if t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+    << types.is_array_type(types.mir_temp_ty(m, fi, t))
+}
+
+// sha256 `s[o]`: byte LoadIndex of a string descriptor (3-word or `&string`).
+fn vreg_string_base_temp(m &types.Mir, fi int, t int) bool {
+    tag := 1073741824
+    mut ns := 0
+    mut ty := 0
+    if t >= tag {
+        loc := t - tag
+        if loc < 0 || loc >= types.mir_nlocals(m, fi) { << false }
+        ns = types.mir_local_nslots(m, fi, loc)
+        ty = types.mir_local_ty(m, fi, loc)
+    } else {
+        if t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+        ns = types.mir_temp_nslots(m, fi, t)
+        ty = types.mir_temp_ty(m, fi, t)
+    }
+    if ty == 3 && ns == 3 { << true }
+    if ns != 1 || !types.is_ref_type(ty) { << false }
+    << vreg_direct_ref_inner(ty) == 3
+}
+
+fn vreg_index_elem_ty(m &types.Mir, fi int, t int) int {
+    tag := 1073741824
+    mut ty := 0
+    mut ns := 0
+    if t >= tag {
+        loc := t - tag
+        if loc < 0 || loc >= types.mir_nlocals(m, fi) { << -1 }
+        ty = types.mir_local_ty(m, fi, loc)
+        ns = types.mir_local_nslots(m, fi, loc)
+    } else {
+        if t < 0 || t >= types.mir_ntemps(m, fi) { << -1 }
+        ty = types.mir_temp_ty(m, fi, t)
+        ns = types.mir_temp_nslots(m, fi, t)
+    }
+    mut arr_ty := ty
+    if ns == 1 && types.is_ref_type(ty) {
+        arr_ty = vreg_direct_ref_inner(ty)
+    }
+    if !types.is_array_type(arr_ty) { << -1 }
+    ai := arr_ty - 200
+    if ai < 0 || ai >= m.arrays.len || m.arrays[ai].fixed_len != 0 { << -1 }
+    << m.arrays[ai].elem_ty
+}
+
+// LoadPtr consumes a live pointer/reference value, not an inline aggregate.
+// In particular, an ns=3 array descriptor must first be addressed/loaded;
+// handing it to emit_mem_load_ptr would treat word 0 (the data pointer) as a
+// pointer to another object and is an immediate Gen2→Gen3 corruption hazard.
+fn vreg_pointer_base_temp(m &types.Mir, fi int, t int) bool {
+    tag := 1073741824
+    if t >= tag {
+        loc := t - tag
+        if loc < 0 || loc >= types.mir_nlocals(m, fi) { << false }
+        if types.mir_local_nslots(m, fi, loc) != 1 { << false }
+        lty := types.mir_local_ty(m, fi, loc)
+        if types.is_ref_type(lty) { << true }
+        << lty == 1
+    }
+    if t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+    if types.mir_temp_nslots(m, fi, t) != 1 { << false }
+    ty := types.mir_temp_ty(m, fi, t)
+    if types.is_ref_type(ty) { << true }
+    // ElemAddr of `&mut [N]T` currently materializes the element address as
+    // a one-slot integer. FieldRMW/LoadBufPtr consume that address.
+    << ty == 1
+}
+
+// LoadField reads bytes from an aggregate copy in the frame.  A one-word ref
+// is a pointer and must use LoadPtr/LoadBufPtr instead; accepting it here made
+// `rc_materialize_temp` silently read the pointer word as an inline field.
+fn vreg_inline_field_base_ok(m &types.Mir, fi int, t int) bool {
+    if t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+    ns := types.mir_temp_nslots(m, fi, t)
+    ty := types.mir_temp_ty(m, fi, t)
+    if ns < 1 || ns > 1048576 || vreg_temp_eligible(m, fi, t) { << false }
+    if types.is_ref_type(ty) { << false }
+    << types.is_array_type(ty) || types.is_struct_type(ty) || types.is_throw_type(ty)
+}
+
+fn vreg_loadfield_ok(m &types.Mir, fi int, d int, b int, off int, slots int) bool {
+    if d < 0 || d >= types.mir_ntemps(m, fi) { << false }
+    if !vreg_inline_field_base_ok(m, fi, b) || off < 0 || slots < 1 || slots > 64 { << false }
+    base_slots := types.mir_temp_nslots(m, fi, b)
+    if base_slots < 1 || base_slots > 1048576 { << false }
+    base_bytes := base_slots * 8
+    if off + slots * 8 > base_bytes { << false }
+    bty := types.mir_temp_ty(m, fi, b)
+    size := m.type_size_bytes(bty)
+    if size <= 0 || off + slots * 8 > size { << false }
+    if slots == 1 && vreg_temp_eligible(m, fi, d) {
+        width := vreg_scalar_width(m, fi, d)
+        if width <= 0 { << false }
+        << true
+    }
+    if !vreg_temp_eligible(m, fi, d) && slots == types.mir_temp_nslots(m, fi, d) {
+        << true
+    }
+    << false
+}
+
+fn vreg_storeindex_f64_ok(m &types.Mir, fi int, arr int, idx int, val int, width int) bool {
+    mut w := width
+    if w < 0 {
+        w = 0 - w
+    }
+    if w != 8 { << false }
+    if !vreg_index_value_ok(m, fi, idx) { << false }
+    if !vreg_any_array_base(m, fi, arr) { << false }
+    if val < 0 || val >= types.mir_ntemps(m, fi) || !vreg_temp_eligible(m, fi, val) { << false }
+    if types.mir_temp_ty(m, fi, val) != 4 { << false }
+    << true
+}
+
+fn vreg_storeindex_int_ok(m &types.Mir, fi int, arr int, idx int, val int, width int) bool {
+    mut w := width
+    if w < 0 {
+        w = 0 - w
+    }
+    if w != 8 { << false }
+    if !vreg_index_value_ok(m, fi, idx) { << false }
+    if !vreg_any_array_base(m, fi, arr) { << false }
+    // Pooled raw words are not TempIds. Admit them only for dynamic []int,
+    // with the same overflow-safe pool bounds check as other scalar uses.
+    // Missing (-1) or malformed IDs and other element types stay rejected.
+    if val < 0 {
+        if vreg_index_elem_ty(m, fi, arr) != 1 { << false }
+        << vreg_value_ok(m, fi, val)
+    }
+    if val >= types.mir_ntemps(m, fi) || !vreg_temp_eligible(m, fi, val) { << false }
+    if types.mir_temp_ty(m, fi, val) != 1 { << false }
+    << true
+}
+
+fn vreg_storeindex_byte_ok(m &types.Mir, fi int, arr int, idx int, val int, width int) bool {
+    mut w := width
+    if w < 0 {
+        w = 0 - w
+    }
+    if w != 1 { << false }
+    if !vreg_index_value_ok(m, fi, idx) { << false }
+    if !vreg_any_array_base(m, fi, arr) { << false }
+    if val < 0 || val >= types.mir_ntemps(m, fi) || !vreg_temp_eligible(m, fi, val) { << false }
+    ty := types.mir_temp_ty(m, fi, val)
+    << ty == 8 || ty == 9 || ty == 10
+}
+
+fn vreg_indexrmw_int_ok(m &types.Mir, fi int, arr int, idx int, rhs int, width int) bool {
+    mut w := width
+    if w < 0 {
+        w = 0 - w
+    }
+    if w != 8 { << false }
+    if !vreg_index_value_ok(m, fi, idx) { << false }
+    if !vreg_any_array_base(m, fi, arr) { << false }
+    if !vreg_scalar_value_ok(m, fi, rhs) { << false }
+    if rhs >= 0 && types.mir_temp_ty(m, fi, rhs) != 1 { << false }
+    << true
+}
+
+fn vreg_loadindex_ok(m &types.Mir, fi int, d int, b int, idx int, width int, fixed_len int) bool {
+    if !vreg_index_base_temp(m, fi, b) { << false }
+    if !vreg_index_value_ok(m, fi, idx) { << false }
+    if fixed_len != 0 { << false }
+    // Mixed homes stay frame-backed while the index operation itself remains
+    // bounds checked.  Width is matched to the destination's scalar ABI.
+    if !vreg_index_width_ok(m, fi, d, width) { << false }
+    ety := vreg_index_elem_ty(m, fi, b)
+    if ety < 0 || !vreg_scalar_type(ety) || m.type_slots(ety) != 1 { << false }
+    if m.type_size_bytes(ety) != width || types.mir_temp_ty(m, fi, d) != ety { << false }
+    << true
+}
+
+fn vreg_loadptr_ok(m &types.Mir, fi int, d int, b int, off int, slots int) bool {
+    if d < 0 || d >= types.mir_ntemps(m, fi) || !vreg_pointer_base_temp(m, fi, b) { << false }
+    if off < 0 || slots < 1 || slots > 1048576 { << false }
+    // A direct reference carries the pointee type in its tag.  Check the
+    // packed byte offset against that object before allowing a fixed-home
+    // plan; otherwise a malformed LoadPtr could read past a valid frame/heap
+    // object even though its base itself is a legal one-word reference.
+    inner := vreg_direct_ref_inner(types.mir_temp_ty(m, fi, b))
+    if inner < 0 { << false }
+    // `type_size_bytes` has a one-word fallback for unknown tags.  Validate
+    // the tag domain/index first so that fallback is never used as a proof of
+    // a valid pointee. Keep this inline to preserve the Gen1 function-count
+    // and frame ABI (adding another helper crosses a known self-host limit).
+    mut domain := 0
+    if inner == 1 || inner == 2 || inner == 3 || inner == 4 || inner == 8 || inner == 9 || inner == 10 {
+        domain = 1
+    }
+    if inner == 800 || inner == 801 || (inner >= 810 && inner < 1000) {
+        domain = 1
+    }
+    if inner >= 50 && inner < 100 {
+        if inner - 50 < 0 || inner - 50 >= m.maps.len { << false }
+        domain = 1
+    }
+    if inner >= 100 && inner < 200 {
+        si := types.struct_index(inner)
+        if si < 0 || si >= m.structs.len { << false }
+        domain = 1
+    }
+    if inner >= 5000 && inner < 65000 {
+        si := types.struct_index(inner)
+        if si < 0 || si >= m.structs.len { << false }
+        domain = 1
+    }
+    if inner >= 200 && inner < 300 {
+        if inner - 200 < 0 || inner - 200 >= m.arrays.len { << false }
+        domain = 1
+    }
+    if inner >= 300 && inner < 400 {
+        if inner - 300 < 0 || inner - 300 >= m.throws.len { << false }
+        domain = 1
+    }
+    if inner >= 500 && inner < 600 {
+        if inner - 500 < 0 || inner - 500 >= m.enums.len { << false }
+        domain = 1
+    }
+    if inner >= 600 && inner < 700 {
+        if inner - 600 < 0 || inner - 600 >= m.chans.len { << false }
+        domain = 1
+    }
+    if inner >= 700 && inner < 800 {
+        if inner - 700 < 0 || inner - 700 >= m.fn_sigs.len { << false }
+        domain = 1
+    }
+    if domain == 0 { << false }
+    size := m.type_size_bytes(inner)
+    if size <= 0 { << false }
+    mut width := slots * 8
+    if vreg_temp_eligible(m, fi, d) {
+        if slots != 1 { << false }
+        width = vreg_scalar_width(m, fi, d)
+    }
+    if width <= 0 || width > size || off > size - width { << false }
+    if !vreg_temp_eligible(m, fi, d) && slots != types.mir_temp_nslots(m, fi, d) { << false }
+    << true
+}
+
+fn vreg_elemaddr_ok(m &types.Mir, fi int, d int, b int, idx int, width int) bool {
+    if !vreg_pointer_base_temp(m, fi, d) { << false }
+    if !vreg_index_value_ok(m, fi, idx) { << false }
+    mut w := width
+    if w < 0 { w = 0 - w }
+    // Struct elements (nbody `Body`) are larger than one slot. The result is
+    // a pointer, so the width is only a scale for the index.
+    if w <= 0 || w > 4096 { << false }
+    if vreg_array_base_temp(m, fi, b, 0) { << true }
+    if vreg_pointer_base_temp(m, fi, b) { << true }
+    << false
+}
+
+fn vreg_sqrt_unop_ok(m &types.Mir, fi int, ii int, arch int) bool {
+    if !td_has_hw_fsqrt(arch) { << false }
+    if types.mir_ikind(m, fi, ii) != 7 || types.mir_ib(m, fi, ii) != 1 { << false }
+    if types.mir_isval(m, fi, ii) != "_xu_math_sqrt" { << false }
+    dest := types.mir_ia(m, fi, ii)
+    if dest < 0 || dest >= types.mir_ntemps(m, fi) { << false }
+    if types.mir_temp_ty(m, fi, dest) != 4 || types.mir_temp_nslots(m, fi, dest) != 1 { << false }
+    ap := types.mir_ic(m, fi, ii)
+    if ap < 0 || ap >= m.fns[fi].margs.len { << false }
+    if types.mir_marg_next(m, fi, ap) != -1 { << false }
+    arg := types.mir_marg_v(m, fi, ap)
+    << vreg_scalar_value_ok(m, fi, arg) && (arg < 0 || types.mir_temp_ty(m, fi, arg) == 4)
+}
+
+fn vreg_field_rmw_ok(m &types.Mir, fi int, ii int) bool {
+    if types.mir_ikind(m, fi, ii) != 48 { << false }
+    ptr := types.mir_ia(m, fi, ii)
+    rhs := types.mir_ic(m, fi, ii)
+    fty := types.mir_id(m, fi, ii)
+    op := types.mir_icol(m, fi, ii)
+    off := types.mir_iline(m, fi, ii)
+    if !vreg_pointer_base_temp(m, fi, ptr) { << false }
+    if fty != 1 && fty != 2 && fty != 4 && fty != 8 && fty != 9 && fty != 10 { << false }
+    if op != 1 && op != 2 && op != 3 && op != 14 && op != 15 && op != 16 { << false }
+    if off < 0 { << false }
+    if !vreg_scalar_value_ok(m, fi, rhs) { << false }
+    if rhs >= 0 && types.mir_temp_ty(m, fi, rhs) != fty { << false }
+    << true
+}
+
+fn vreg_store_scalar_ptr_ok(m &types.Mir, fi int, src int, ptr int, off int, slots int) bool {
+    if !vreg_pointer_base_temp(m, fi, ptr) { << false }
+    if off < 0 || slots != 1 { << false }
+    if !vreg_scalar_value_ok(m, fi, src) { << false }
+    << true
+}
+
+// Scalar MIR operations may coexist with aggregate descriptor traffic, but a
+// scalar fixed home must never be fed an aggregate first word.  Aggregate
+// LoadLocal/StoreLocal remain ordinary frame operations and are checked for an
+// exact type/width pair here.
+fn vreg_basic_instr_ok(m &types.Mir, fi int, ii int) bool {
+    k := types.mir_ikind(m, fi, ii)
+    a := types.mir_ia(m, fi, ii)
+    b := types.mir_ib(m, fi, ii)
+    c := types.mir_ic(m, fi, ii)
+    d := types.mir_id(m, fi, ii)
+    n := types.mir_ntemps(m, fi)
+    if k == 1 {
+        if a < 0 || a >= n { << false }
+        if vreg_temp_eligible(m, fi, a) {
+            if !vreg_scalar_value_ok(m, fi, b) { << false }
+            if b >= 0 && types.mir_temp_ty(m, fi, b) != types.mir_temp_ty(m, fi, a) { << false }
+            << true
+        }
+        // Pointer/descriptor copies stay frame-backed. Same type and width.
+        if !vreg_value_ok(m, fi, b) { << false }
+        if b >= 0 {
+            if types.mir_temp_ty(m, fi, b) != types.mir_temp_ty(m, fi, a) { << false }
+            if types.mir_temp_nslots(m, fi, b) != types.mir_temp_nslots(m, fi, a) { << false }
+        }
+        << true
+    }
+    if k == 2 {
+        if a < 0 || a >= n || b < 0 || b >= types.mir_nlocals(m, fi) { << false }
+        if vreg_temp_eligible(m, fi, a) {
+            if types.mir_local_nslots(m, fi, b) == 1 &&
+                vreg_scalar_type(types.mir_local_ty(m, fi, b)) &&
+                types.mir_local_ty(m, fi, b) == types.mir_temp_ty(m, fi, a) {
+                << true
+            }
+            // Address of a one-slot ref local loaded as integer bits.
+            << types.mir_temp_ty(m, fi, a) == 1 && types.mir_local_nslots(m, fi, b) == 1 &&
+                types.is_ref_type(types.mir_local_ty(m, fi, b))
+        }
+        << types.mir_local_ty(m, fi, b) == types.mir_temp_ty(m, fi, a) &&
+            types.mir_local_nslots(m, fi, b) == types.mir_temp_nslots(m, fi, a)
+    }
+    if k == 3 {
+        if a < 0 || a >= types.mir_nlocals(m, fi) || !vreg_value_ok(m, fi, b) { << false }
+        if vreg_scalar_type(types.mir_local_ty(m, fi, a)) && types.mir_local_nslots(m, fi, a) == 1 {
+            if !vreg_scalar_value_ok(m, fi, b) { << false }
+            if b >= 0 && types.mir_temp_ty(m, fi, b) != types.mir_local_ty(m, fi, a) { << false }
+            << true
+        }
+        if b < 0 || b >= n { << false }
+        if types.mir_temp_ty(m, fi, b) == 1 && types.mir_local_nslots(m, fi, a) == 1 &&
+            types.is_ref_type(types.mir_local_ty(m, fi, a)) {
+            << true
+        }
+        << types.mir_temp_ty(m, fi, b) == types.mir_local_ty(m, fi, a) &&
+            types.mir_temp_nslots(m, fi, b) == types.mir_local_nslots(m, fi, a)
+    }
+    if k == 4 {
+        << a >= 0 && a < n && vreg_temp_eligible(m, fi, a) &&
+            vreg_scalar_value_ok(m, fi, c) && vreg_scalar_value_ok(m, fi, d)
+    }
+    if k == 5 {
+        << a >= 0 && a < n && vreg_temp_eligible(m, fi, a) && vreg_scalar_value_ok(m, fi, c)
+    }
+    << false
+}
+
+// A mixed function may still contain an unused aggregate parameter/local.
+// Promote only the scalar body in that case: no aggregate temp may be
+// materialized and no instruction may observe the aggregate local. This is
+// the safe shape used by large-frame pressure probes.
+fn vreg_mixed_scalar_body_shape(m &types.Mir, fi int) bool {
+    if types.mir_fn_ret_nslots(m, fi) != 1 || !vreg_scalar_type(types.mir_fn_ret(m, fi)) {
+        << false
+    }
+    mut has_aggregate_local := false
+    for i in 0:types.mir_nlocals(m, fi) {
+        ns := types.mir_local_nslots(m, fi, i)
+        ty := types.mir_local_ty(m, fi, i)
+        if ns == 1 && vreg_scalar_type(ty) { -> }
+        // Large fixed arrays remain frame-backed; only reject impossible or
+        // overflow-prone widths here. Their payload is never copied into the
+        // scalar graph in this shape.
+        if ns < 1 || ns > 1048576 { << false }
+        if !types.is_ref_type(ty) && !types.is_array_type(ty) && !types.is_struct_type(ty) { << false }
+        has_aggregate_local = true
+    }
+    if !has_aggregate_local { << false }
+    for t in 0:types.mir_ntemps(m, fi) {
+        if !vreg_temp_eligible(m, fi, t) { << false }
+    }
+    mut useful := false
+    for ii in 0:types.mir_nins(m, fi) {
+        k := types.mir_ikind(m, fi, ii)
+        if k == 0 { -> }
+        if k == 1 {
+            d := types.mir_ia(m, fi, ii)
+            s := types.mir_ib(m, fi, ii)
+            if !vreg_temp_eligible(m, fi, d) || !vreg_value_ok(m, fi, s) { << false }
+            useful = true
+            ->
+        }
+        if k == 2 {
+            d := types.mir_ia(m, fi, ii)
+            loc := types.mir_ib(m, fi, ii)
+            if !vreg_temp_eligible(m, fi, d) || loc < 0 || loc >= types.mir_nlocals(m, fi) { << false }
+            if types.mir_local_nslots(m, fi, loc) != 1 || !vreg_scalar_type(types.mir_local_ty(m, fi, loc)) { << false }
+            useful = true
+            ->
+        }
+        if k == 3 {
+            loc := types.mir_ia(m, fi, ii)
+            s := types.mir_ib(m, fi, ii)
+            if loc < 0 || loc >= types.mir_nlocals(m, fi) || !vreg_temp_eligible(m, fi, s) { << false }
+            if types.mir_local_nslots(m, fi, loc) != 1 || !vreg_scalar_type(types.mir_local_ty(m, fi, loc)) { << false }
+            useful = true
+            ->
+        }
+        if k == 4 {
+            d := types.mir_ia(m, fi, ii)
+            if !vreg_temp_eligible(m, fi, d) || !vreg_value_ok(m, fi, types.mir_ic(m, fi, ii)) || !vreg_value_ok(m, fi, types.mir_id(m, fi, ii)) { << false }
+            useful = true
+            ->
+        }
+        if k == 5 {
+            d := types.mir_ia(m, fi, ii)
+            if !vreg_temp_eligible(m, fi, d) || !vreg_value_ok(m, fi, types.mir_ic(m, fi, ii)) { << false }
+            useful = true
+            ->
+        }
+        // Calls, memory operations, address formation and ownership/drop
+        // operations are intentionally outside this scalar-only extension.
+        << false
+    }
+    for bi in 0:types.mir_nblocks(m, fi) {
+        tk := types.mir_btkind(m, fi, bi)
+        if tk == 2 || tk == 3 {
+            v := types.mir_bta(m, fi, bi)
+            if v >= 0 && !vreg_temp_eligible(m, fi, v) { << false }
+            if v < -1 && !vreg_value_ok(m, fi, v) { << false }
+        } else if tk != 1 && tk != 0 {
+            << false
+        }
+    }
+    << useful
+}
+
+// Non-owning struct locals/temps plus scalars. Strings, maps and owning
+// structs stay on the whole-function dump: encoding_json / matmul_tiny
+// SIGILL'd when those shapes entered fixed homes. Scalar-element `[]T`
+// descriptors are admitted separately and stay frame-backed.
+fn vreg_mixed_struct_scalar_ok(m &types.Mir, fi int) bool {
+    mut saw := false
+    for i in 0:types.mir_nlocals(m, fi) {
+        ty := types.mir_local_ty(m, fi, i)
+        ns := types.mir_local_nslots(m, fi, i)
+        if ns == 1 && vreg_scalar_type(ty) { -> }
+        if m.type_owning(ty) && !vreg_container_struct_ok(m, ty, ns) { << false }
+        if !types.is_struct_type(ty) { << false }
+        if ns < 1 || ns > 64 { << false }
+        saw = true
+    }
+    for t in 0:types.mir_ntemps(m, fi) {
+        if vreg_temp_eligible(m, fi, t) { -> }
+        ty := types.mir_temp_ty(m, fi, t)
+        ns := types.mir_temp_nslots(m, fi, t)
+        if m.type_owning(ty) && !vreg_container_struct_ok(m, ty, ns) { << false }
+        if !types.is_struct_type(ty) { << false }
+        if ns < 1 || ns > 64 { << false }
+        saw = true
+    }
+    << saw
+}
+
+// Dynamic `[]T` descriptors (three words) plus scalars. The descriptor
+// never receives a fixed home; only `vreg_temp_eligible` temps are
+// colored. Element type must be a one-word scalar so LoadIndex/StoreIndex
+// write a single GPR/FP home. Strings, maps, nested arrays and owning
+// struct elements stay on the whole-function dump.
+fn vreg_mixed_array_scalar_ok(m &types.Mir, fi int) bool {
+    mut saw := false
+    for i in 0:types.mir_nlocals(m, fi) {
+        ty := types.mir_local_ty(m, fi, i)
+        ns := types.mir_local_nslots(m, fi, i)
+        if ns == 1 && vreg_scalar_type(ty) { -> }
+        if ns == 1 && types.is_ref_type(ty) {
+            inner := vreg_direct_ref_inner(ty)
+            if types.is_array_type(inner) {
+                ai := inner - 200
+                if ai >= 0 && ai < m.arrays.len && m.arrays[ai].fixed_len == 0 {
+                    ety := m.arrays[ai].elem_ty
+                    if vreg_scalar_type(ety) && m.type_slots(ety) == 1 {
+                        saw = true
+                        ->
+                    }
+                }
+            }
+            << false
+        }
+        if !types.is_array_type(ty) || ns != 3 { << false }
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << false }
+        if m.arrays[ai].fixed_len != 0 { << false }
+        ety := m.arrays[ai].elem_ty
+        if !vreg_scalar_type(ety) || m.type_slots(ety) != 1 { << false }
+        saw = true
+    }
+    for t in 0:types.mir_ntemps(m, fi) {
+        if vreg_temp_eligible(m, fi, t) { -> }
+        ty := types.mir_temp_ty(m, fi, t)
+        ns := types.mir_temp_nslots(m, fi, t)
+        if ns == 1 && types.is_ref_type(ty) {
+            inner := vreg_direct_ref_inner(ty)
+            if types.is_array_type(inner) {
+                ai := inner - 200
+                if ai >= 0 && ai < m.arrays.len && m.arrays[ai].fixed_len == 0 {
+                    ety := m.arrays[ai].elem_ty
+                    if vreg_scalar_type(ety) && m.type_slots(ety) == 1 {
+                        saw = true
+                        ->
+                    }
+                }
+            }
+            << false
+        }
+        if !types.is_array_type(ty) || ns != 3 { << false }
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << false }
+        if m.arrays[ai].fixed_len != 0 { << false }
+        ety := m.arrays[ai].elem_ty
+        if !vreg_scalar_type(ety) || m.type_slots(ety) != 1 { << false }
+        saw = true
+    }
+    << saw
+}
+
+// Mixed aggregate promotion is intentionally limited to read-only indexed
+// search kernels.  Descriptor/ref values never receive a fixed home; the
+// only memory instructions admitted here are LoadPtr/LoadIndex (and the
+// scalar LoadField form).  This shape gate keeps compiler/runtime helpers
+// containing ownership writes, calls, or unusual aggregate layouts on the
+// conservative frame-backed path.
+fn vreg_mixed_memory_shape(m &types.Mir, fi int) bool {
+    if types.mir_fn_ret_nslots(m, fi) != 1 || !vreg_scalar_type(types.mir_fn_ret(m, fi)) {
+        << false
+    }
+    mut mixed := false
+    mut ref_locals := 0
+    for i in 0:types.mir_nlocals(m, fi) {
+        ty := types.mir_local_ty(m, fi, i)
+        ns := types.mir_local_nslots(m, fi, i)
+        if ns != 1 || !vreg_scalar_type(ty) {
+            mixed = true
+            if ns != 1 || !types.is_ref_type(ty) { << false }
+            ref_locals += 1
+        }
+    }
+    if ref_locals != 1 { << false }
+    mut has_idx := 0
+    mut has_ptr := 0
+    mut has_field := 0
+    for t in 0:types.mir_ntemps(m, fi) {
+        ty := types.mir_temp_ty(m, fi, t)
+        ns := types.mir_temp_nslots(m, fi, t)
+        if ns == 1 && vreg_scalar_type(ty) { -> }
+        mixed = true
+        // References are one-word pointers; array descriptors are the only
+        // aggregate values allowed in this pass (three words).
+        if ns == 1 && types.is_ref_type(ty) { -> }
+        if ns == 3 && types.is_array_type(ty) { -> }
+        << false
+    }
+    for ii in 0:types.mir_nins(m, fi) {
+        k := types.mir_ikind(m, fi, ii)
+        if k == 14 {
+            has_idx += 1
+            if !vreg_loadindex_ok(m, fi, types.mir_ia(m, fi, ii), types.mir_ib(m, fi, ii), types.mir_ic(m, fi, ii), types.mir_id(m, fi, ii), types.mir_icol(m, fi, ii)) { << false }
+            ->
+        }
+        if k == 17 {
+            has_ptr += 1
+            d := types.mir_ia(m, fi, ii)
+            b := types.mir_ib(m, fi, ii)
+            if !vreg_loadptr_ok(m, fi, d, b, types.mir_ic(m, fi, ii), types.mir_id(m, fi, ii)) { << false }
+            ->
+        }
+        if k == 10 {
+            has_field += 1
+            d := types.mir_ia(m, fi, ii)
+            b := types.mir_ib(m, fi, ii)
+            // Scalar field extraction is safe; aggregate field copies are
+            // left out until their multi-word writeback has a dedicated proof.
+            if !vreg_loadfield_ok(m, fi, d, b, types.mir_ic(m, fi, ii), types.mir_id(m, fi, ii)) { << false }
+            ->
+        }
+        if k == 1 || k == 2 || k == 3 || k == 4 || k == 5 {
+            if !vreg_basic_instr_ok(m, fi, ii) { << false }
+            ->
+        }
+        // Empty/no-op instruction records are harmless; every other kind
+        // (calls, stores, address formation, drops, etc.) can clobber or
+        // alias a fixed home and therefore rejects the mixed plan.
+        if k == 0 { -> }
+        << false
+    }
+    // Require an actual indexed loop; this excludes incidental aggregate
+    // plumbing in compiler helpers while admitting lower_bound-style kernels.
+    if has_idx == 0 || has_ptr == 0 || has_field > 1 { << false }
+    if fn_has_natural_loop(m, fi) == 0 && fn_has_self_loop(m, fi) == 0 { << false }
+    << mixed
+}
+
+// A register-allocation Copy affinity is intentionally narrower than the
+// general scalar class: both TempIds must have exactly the same type and one
+// slot. Different integer widths share the GPR bank for ordinary coloring,
+// but never become a zero-move alias through this helper.
+fn vreg_typed_copy_source(m &types.Mir, fi int, ii int, n int) int {
+    if types.mir_ikind(m, fi, ii) != 1 { << -1 }
+    dest := types.mir_ia(m, fi, ii)
+    src := types.mir_ib(m, fi, ii)
+    if dest < 0 || dest >= n || src < 0 || src >= n || dest == src { << -1 }
+    if !vreg_temp_eligible(m, fi, dest) || !vreg_temp_eligible(m, fi, src) { << -1 }
+    if types.mir_temp_ty(m, fi, dest) != types.mir_temp_ty(m, fi, src) { << -1 }
+    << src
+}
+
+// Hardware fsqrt is a unary FP op: dest may reuse the source home when the
+// source dies (`fsqrt dN, dN`).  Live-after source still interferes through
+// the ordinary active set.  Same affinity cell as typed Copy.
+fn vreg_fp_unop_source(m &types.Mir, fi int, ii int, n int) int {
+    if types.mir_ikind(m, fi, ii) != 7 { << -1 }
+    if types.mir_isval(m, fi, ii) != "_xu_math_sqrt" { << -1 }
+    dest := types.mir_ia(m, fi, ii)
+    if dest < 0 || dest >= n || !vreg_temp_eligible(m, fi, dest) { << -1 }
+    if types.mir_temp_ty(m, fi, dest) != 4 { << -1 }
+    ap := types.mir_ic(m, fi, ii)
+    if ap < 0 || ap >= m.fns[fi].margs.len { << -1 }
+    src := types.mir_marg_v(m, fi, ap)
+    if src < 0 || src >= n || src == dest { << -1 }
+    if !vreg_temp_eligible(m, fi, src) { << -1 }
+    if types.mir_temp_ty(m, fi, src) != 4 { << -1 }
+    << src
+}
+
+// ARM64 fadd/fmul/fsqrt and the x64 SSE helper are three-address (or
+// rewrite dest==src). A dying operand may share the dest home
+// (`fmul d2, d6, d2`). Live-after operands still interfere via `active`.
+fn vreg_fp_dest_reuse_ok(m &types.Mir, fi int, ii int) bool {
+    k := types.mir_ikind(m, fi, ii)
+    if k == 4 {
+        op := types.mir_ib(m, fi, ii)
+        if op < 1 || op > 4 { << false }
+        d := types.mir_ia(m, fi, ii)
+        if d < 0 || d >= types.mir_ntemps(m, fi) { << false }
+        if types.mir_temp_ty(m, fi, d) == 4 && types.mir_temp_nslots(m, fi, d) == 1 {
+            << true
+        }
+        c := types.mir_ic(m, fi, ii)
+        id := types.mir_id(m, fi, ii)
+        if (op == 1 || op == 2) && (id < 0 || c < 0) {
+            if types.mir_temp_ty(m, fi, d) == 1 && types.mir_temp_nslots(m, fi, d) == 1 {
+                << true
+            }
+        }
+        << false
+    }
+    << vreg_fp_unop_source(m, fi, ii, types.mir_ntemps(m, fi)) >= 0
+}
+
+fn vreg_value_ok(m &types.Mir, fi int, v int) bool {
+    if v >= 0 { << v < types.mir_ntemps(m, fi) }
+    if v > -2 { << false }
+    // Compute the constant index as -(v+2), not 0-v-2.  The latter
+    // overflows for the minimum signed integer and could turn a malformed
+    // value into an apparently in-range const index.
+    ci := 0 - (v + 2)
+    << ci >= 0 && ci < types.mir_nconsts(m, fi)
+}
+
+fn vreg_instr_def(m &types.Mir, fi int, ii int) int {
+    << vreg_scalar_operand(m, fi, types.mir_instr_def_m(m, fi, ii))
+}
+
+fn vreg_instr_use(m &types.Mir, fi int, ii int, pos int) int {
+    << vreg_scalar_operand(m, fi, types.mir_instr_read_m(m, fi, ii, pos))
+}
+
+// A non-escaping one-word local is its own snapshot while this block
+// leaves it unchanged. Re-read it after a call rather than creating a
+// callee-saved dependency or an extra spill copy. This is a bounded proof,
+// not permission to rematerialize pointer loads or cross CFG edges.
+fn vreg_call_local_alias(m &types.Mir, fi int, t int) int {
+    n := types.mir_ntemps(m, fi)
+    ni := types.mir_nins(m, fi)
+    nb := types.mir_nblocks(m, fi)
+    if n <= 0 || n > 512 || ni <= 0 || ni > 4096 || n * ni > 262144 || nb <= 0 || nb > 64 { << -1 }
+    if t < 0 || t >= n || !vreg_temp_eligible(m, fi, t) || types.mir_temp_ty(m, fi, t) == 4 { << -1 }
+    if m.fns[fi].phis.len != 0 { << -1 }
+    mut def := -1
+    mut local := -1
+    for ii in 0:ni {
+        if types.mir_instr_def_m(m, fi, ii) != t { -> }
+        if def >= 0 || types.mir_ikind(m, fi, ii) != 2 { << -1 }
+        def = ii
+        local = types.mir_ib(m, fi, ii)
+    }
+    if def < 0 || local < 0 || local >= types.mir_nlocals(m, fi) { << -1 }
+    if types.mir_local_ty(m, fi, local) != types.mir_temp_ty(m, fi, t) || types.mir_local_nslots(m, fi, local) != 1 { << -1 }
+    for ii in 0:ni {
+        k := types.mir_ikind(m, fi, ii)
+        if k == 16 {
+            if types.mir_ic(m, fi, ii) == 0 && types.mir_ib(m, fi, ii) == local { << -1 }
+            if types.mir_ic(m, fi, ii) != 0 && types.mir_ib(m, fi, ii) == t { << -1 }
+        }
+        // Tagged operands can operate on a local without Load/StoreLocal.
+        tag := 1073741824 + local
+        if types.mir_ia(m, fi, ii) == tag || types.mir_ib(m, fi, ii) == tag || types.mir_ic(m, fi, ii) == tag || types.mir_id(m, fi, ii) == tag { << -1 }
+    }
+    mut def_block := -1
+    for bi in 0:nb {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:ni {
+            if ii < 0 { <- }
+            if ii >= ni { << -1 }
+            if ii == def {
+                if def_block >= 0 { << -1 }
+                def_block = bi
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        if ii >= 0 { << -1 }
+    }
+    if def_block < 0 { << -1 }
+    mut cross_call := false
+    for bi in 0:nb {
+        tk := types.mir_btkind(m, fi, bi)
+        if (tk == 2 || tk == 3) && types.mir_bta(m, fi, bi) == t { << -1 }
+        mut started := false
+        mut changed := false
+        mut called := false
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:ni {
+            if ii < 0 { <- }
+            if ii == def { started = true }
+            if types.mir_instr_uses_temp_m(m, fi, ii, t) {
+                if bi != def_block || !started || changed { << -1 }
+                if called { cross_call = true }
+            }
+            if started {
+                k := types.mir_ikind(m, fi, ii)
+                if (k == 3 || k == 8) && types.mir_ia(m, fi, ii) == local { changed = true }
+                if types.mir_instr_call_live_m(m, fi, ii) { called = true }
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    if !cross_call { << -1 }
+    << local
+}
+
+// Admit an ordinary MIR user call whose margs chain is scalar and
+// register-passed. The return may be a one-word scalar (graph dest) or a
+// multi-word frame dest (`[]T` sret). Runtime helpers have no matching
+// non-extern MFn and therefore stay fail-closed, as do receivers.
+fn vreg_direct_call_ok(m &types.Mir, fi int, ii int) bool {
+    if types.mir_ikind(m, fi, ii) != 7 || types.mir_ib(m, fi, ii) != 1 {
+        << false
+    }
+    // A direct-call lookup is an admission check, not a general symbol
+    // resolver.  Refuse an attacker-sized function universe before touching
+    // any label/string data; vreg_plan's call-count/work budget below bounds
+    // the number of these scans per caller as well.
+    if m.fns.len <= 0 || m.fns.len > vreg_direct_call_fn_cap {
+        << false
+    }
+    lab_len := types.mir_isval_len(m, fi, ii)
+    if lab_len <= 0 || lab_len > vreg_direct_call_label_cap {
+        << false
+    }
+    // Copy the label only after its source-owned length has passed the cap;
+    // `mir_isval` materializes a by-value string and would otherwise let a
+    // malformed giant label allocate before this admission check runs.
+    lab := types.mir_isval(m, fi, ii)
+    // `mir_fn_label_hash` is O(label length).  The function and label caps
+    // above make one candidate scan at most 4096*4096 bytes; use checked
+    // multiplication so this proof does not rely on a wrapping product.
+    // The two admission caps make this product at most (4096+1)*4096,
+    // comfortably below a signed 32-bit `int`; keep the explicit cap check
+    // before multiplying so malformed metadata cannot wrap the work budget.
+    scan_bytes := (m.fns.len + 1) * lab_len
+    if scan_bytes > vreg_direct_call_char_work_cap { << false }
+    // Hash/length prefilters keep the bounded fallback scan integer-only for
+    // almost all candidates.  The final string equality remains mandatory so
+    // a hash collision cannot select the wrong callee.
+    lab_hash := string_label_hash(&lab)
+    mut cfi := -1
+    for j in 0:m.fns.len {
+        if types.mir_fn_is_extern(m, j) { -> }
+        fn_lab_len := types.mir_fn_label_len(m, j)
+        if fn_lab_len != lab_len || fn_lab_len > vreg_direct_call_label_cap { -> }
+        if mir_fn_label_hash(m, j) != lab_hash { -> }
+        if types.mir_fn_label(m, j) == lab {
+            cfi = j
+            <-
+        }
+    }
+    if cfi < 0 {
+        if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: callee not found for label " + lab) }
+        << false
+    }
+    if types.mir_fn_is_extern(m, cfi) {
+        if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: callee is extern") }
+        << false
+    }
+    ret := types.mir_fn_ret(m, cfi)
+    rslots := types.mir_fn_ret_nslots(m, cfi)
+    dest := types.mir_ia(m, fi, ii)
+    if ret == 0 {
+        if (rslots != 0 && rslots != 1) || dest >= 0 {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: ret=0 but rslots=" + str(rslots) + " or dest=" + str(dest)) }
+            << false
+        }
+    } else {
+        if dest < 0 || dest >= types.mir_ntemps(m, fi) {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: dest out of range") }
+            << false
+        }
+        if types.mir_temp_ty(m, fi, dest) != ret {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: dest type mismatch") }
+            << false
+        }
+        if types.mir_temp_nslots(m, fi, dest) != rslots {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: dest nslots mismatch") }
+            << false
+        }
+        if rslots == 1 && vreg_scalar_type(ret) {
+            if !vreg_temp_eligible(m, fi, dest) {
+                if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: dest not eligible") }
+                << false
+            }
+        } else {
+            if vreg_temp_eligible(m, fi, dest) {
+                if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: multi-word dest eligible") }
+                << false
+            }
+            if rslots < 1 || rslots > 64 {
+                if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: multi-word dest slots out of bounds") }
+                << false
+            }
+        }
+    }
+    nparams := types.mir_fn_nparams(m, cfi)
+    if nparams < 0 || nparams > 6 || nparams > types.mir_nlocals(m, cfi) {
+        if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: nparams " + str(nparams) + " invalid") }
+        << false
+    }
+    for p in 0:nparams {
+        pty := types.mir_local_ty(m, cfi, p)
+        if types.mir_local_nslots(m, cfi, p) != 1 {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: pty slot != 1 for param " + str(p)) }
+            << false
+        }
+        if !vreg_scalar_type(pty) && vreg_direct_ref_inner(pty) < 0 {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: param " + str(p) + " neither scalar nor direct ref, pty=" + str(pty)) }
+            << false
+        }
+    }
+    mut ap := types.mir_ic(m, fi, ii)
+    if ap < -1 {
+        if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: ap < -1") }
+        << false
+    }
+    mut nargs := 0
+    while ap >= 0 && nargs < 7 {
+        if ap >= m.fns[fi].margs.len {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: ap >= margs.len") }
+            << false
+        }
+        v := types.mir_marg_v(m, fi, ap)
+        if !vreg_value_ok(m, fi, v) || nargs >= nparams {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: value_ok failed or nargs >= nparams") }
+            << false
+        }
+        pty := types.mir_local_ty(m, cfi, nargs)
+        if v >= 0 {
+            aty := types.mir_temp_ty(m, fi, v)
+            if types.mir_temp_nslots(m, fi, v) != 1 {
+                if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: arg " + str(nargs) + " nslots != 1") }
+                << false
+            }
+            if vreg_scalar_type(pty) {
+                if !vreg_scalar_type(aty) {
+                    if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: arg " + str(nargs) + " expected scalar") }
+                    << false
+                }
+            } else {
+                if vreg_direct_ref_inner(aty) != vreg_direct_ref_inner(pty) {
+                    if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: ref inner mismatch arg " + str(nargs) + " aty=" + str(aty) + " (" + str(vreg_direct_ref_inner(aty)) + ") vs pty=" + str(pty) + " (" + str(vreg_direct_ref_inner(pty)) + ")") }
+                    << false
+                }
+                if pty >= 2000 && aty < 2000 {
+                    if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: mutability mismatch arg " + str(nargs)) }
+                    << false
+                }
+            }
+        } else if !vreg_scalar_type(pty) {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: const passed to non-scalar") }
+            << false
+        }
+        nargs += 1
+        next := types.mir_marg_next(m, fi, ap)
+        if next < -1 {
+            if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: next < -1") }
+            << false
+        }
+        ap = next
+    }
+    if ap >= 0 || nargs != nparams || nargs > 6 {
+        if env_get("XU_RA_REJ") == "1" { eprintln("call-rej: nargs != nparams: nargs=" + str(nargs) + " nparams=" + str(nparams)) }
+        << false
+    }
+    << true
+}
+
+fn vreg_cfg_edge_to(m &types.Mir, fi int, from int, to int) bool {
+    tk := types.mir_btkind(m, fi, from)
+    if tk == 1 { << types.mir_bta(m, fi, from) == to }
+    if tk == 2 {
+        << types.mir_btb(m, fi, from) == to || types.mir_btc(m, fi, from) == to
+    }
+    << false
+}
+
+// Validate the linked-list/CFG metadata before any mixed-shape helper walks
+// it.  Normal MIR is already checked by the frontend verifier, but the vreg
+// planner is also an ABI boundary: a malformed producer must disable the
+// optimization instead of turning a bad `next`/block edge into an unchecked
+// slice access.  Keep this preflight allocation-free so it does not perturb
+// the self-host frame layout.
+fn vreg_mir_shape_ok(m &types.Mir, fi int) bool {
+    if fi < 0 || fi >= m.fns.len { << false }
+    nins := types.mir_nins(m, fi)
+    ntemp := types.mir_ntemps(m, fi)
+    nlocal := types.mir_nlocals(m, fi)
+    nblk := types.mir_nblocks(m, fi)
+    if nins < 0 || ntemp < 0 || nlocal < 0 || nblk <= 0 { << false }
+    if nins > 1000000 || ntemp > 1000000 || nlocal > 1000000 || nblk > 1000000 { << false }
+    if m.fns[fi].temps_nslots.len != ntemp || m.fns[fi].locals_nslots.len != nlocal { << false }
+    // Frame.layout later sums slot widths and multiplies by eight.  Cap the
+    // aggregate before that arithmetic so malformed metadata cannot request
+    // an unbounded frame or wrap the byte-size calculation.  The limit is
+    // intentionally far above all normal hosted/self-host functions.
+    max_words := 1048576
+    mut words := 0
+    for i in 0:nlocal {
+        ns := m.fns[fi].locals_nslots[i]
+        // 0-slot homes are legal (DCE/tombstone). Only negative/absurd widths
+        // are malformed; skip zeros in the frame-word sum.
+        if ns < 0 || ns > 1000000 {
+            << false
+        }
+        if ns > 0 {
+            if words > max_words - ns { << false }
+            words += ns
+        }
+    }
+    for i in 0:ntemp {
+        ns := m.fns[fi].temps_nslots[i]
+        if ns < 0 || ns > 1000000 {
+            << false
+        }
+        if ns > 0 {
+            if words > max_words - ns { << false }
+            words += ns
+        }
+    }
+    ret_ns := types.mir_fn_ret_nslots(m, fi)
+    if ret_ns < 0 || ret_ns > max_words {
+        << false
+    }
+    if words > max_words - ret_ns { << false }
+    // Each block owns a linked-list head, but malformed/legacy metadata may
+    // accidentally make several heads walk the same instruction chain.  The
+    // per-block bound below prevents an infinite cycle; this cumulative cap
+    // also prevents an otherwise finite nblk*nins walk from becoming a
+    // compiler-time DoS.  Keep this allocation-free so a failed admission
+    // still falls back to the ordinary frame path.
+    max_walk := 16 * 1024 * 1024
+    mut walked := 0
+    for bi in 0:nblk {
+        head := types.mir_bhead(m, fi, bi)
+        tail := types.mir_btail(m, fi, bi)
+        if head < -1 || head >= nins || tail < -1 || tail >= nins {
+            << false
+        }
+        // CFG/DCE may leave a tombstoned block with a stale tail.  The
+        // emitter still emits a terminator for every block, however, so its
+        // kind/edge/value fields must remain in-range even when the
+        // instruction chain is empty.  Only the linked-list tail is allowed
+        // to be stale on an empty block.
+        tk := types.mir_btkind(m, fi, bi)
+        if tk == 0 {
+            if head != -1 { << false }
+        } else if tk == 1 {
+            to := types.mir_bta(m, fi, bi)
+            if to < 0 || to >= nblk { << false }
+        } else if tk == 2 {
+            cond := types.mir_bta(m, fi, bi)
+            tb := types.mir_btb(m, fi, bi)
+            tc := types.mir_btc(m, fi, bi)
+            if !vreg_value_ok(m, fi, cond) || tb < 0 || tb >= nblk || tc < 0 || tc >= nblk { << false }
+        } else if tk == 3 {
+            result := types.mir_bta(m, fi, bi)
+            if result != -1 && !vreg_value_ok(m, fi, result) { << false }
+        } else if tk != 3 {
+            << false
+        }
+        if head < 0 { -> }
+        mut ii := head
+        mut last := -1
+        for _ in 0:nins + 1 {
+            if ii < 0 { <- }
+            if ii >= nins { << false }
+            if walked >= max_walk { << false }
+            walked += 1
+            last = ii
+            next := types.mir_inext(m, fi, ii)
+            if next < -1 || next >= nins { << false }
+            ii = next
+        }
+        if ii >= 0 || last != tail { << false }
+    }
+    << true
+}
+
+// Append a CSR predecessor index to the reach owner. MIR terminators have at
+// most two successors, so the index needs at most 4*nblk+2 extra words:
+// starts[nblk+1], fill-cursors[nblk+1], predecessors[2*nblk]. Keeping it in
+// the existing owner avoids another long-lived slice in the bootstrap frame.
+fn vreg_build_pred_index(reach &mut []int, m &types.Mir, fi int, nblk int) bool {
+    if reach.len != nblk { << false }
+    start_off := nblk
+    cursor_off := start_off + nblk + 1
+    pred_off := cursor_off + nblk + 1
+    total := pred_off + nblk * 2
+    for _ in reach.len:total { reach.push(0) }
+
+    for from in 0:nblk {
+        if reach[from] == 0 { -> }
+        tk := types.mir_btkind(m, fi, from)
+        if tk == 1 {
+            to := types.mir_bta(m, fi, from)
+            if to < 0 || to >= nblk || reach[to] == 0 { << false }
+            reach[start_off + to] += 1
+        } else if tk == 2 {
+            tb := types.mir_btb(m, fi, from)
+            tc := types.mir_btc(m, fi, from)
+            if tb < 0 || tb >= nblk || tc < 0 || tc >= nblk || reach[tb] == 0 || reach[tc] == 0 { << false }
+            reach[start_off + tb] += 1
+            reach[start_off + tc] += 1
+        } else if tk != 3 {
+            << false
+        }
+    }
+
+    mut sum := 0
+    for bi in 0:nblk {
+        count := reach[start_off + bi]
+        reach[start_off + bi] = sum
+        reach[cursor_off + bi] = sum
+        sum += count
+    }
+    reach[start_off + nblk] = sum
+    reach[cursor_off + nblk] = sum
+    if sum > nblk * 2 { << false }
+
+    for from in 0:nblk {
+        if reach[from] == 0 { -> }
+        tk := types.mir_btkind(m, fi, from)
+        if tk == 1 {
+            to := types.mir_bta(m, fi, from)
+            at := reach[cursor_off + to]
+            reach[pred_off + at] = from
+            reach[cursor_off + to] = at + 1
+        } else if tk == 2 {
+            tb := types.mir_btb(m, fi, from)
+            tc := types.mir_btc(m, fi, from)
+            atb := reach[cursor_off + tb]
+            reach[pred_off + atb] = from
+            reach[cursor_off + tb] = atb + 1
+            atc := reach[cursor_off + tc]
+            reach[pred_off + atc] = from
+            reach[cursor_off + tc] = atc + 1
+        }
+    }
+    << true
+}
+
+// Fill work[0..nblk) with natural-loop nesting depth.  A tail->header edge is
+// a backedge only when header dominates tail; each loop is the header plus the
+// reverse predecessor closure from its tail.  Irreducible SCCs without a
+// dominator backedge conservatively keep depth zero, matching the Rust tier.
+// `work` is the now-dead must-def owner, reused to avoid another long-lived
+// slice descriptor in vreg_plan's frozen self-host frame.
+fn vreg_natural_loop_depths(work &mut []int, m &types.Mir, fi int, reach &[]int, nblk int) bool {
+    start_off := nblk
+    pred_off := nblk + (nblk + 1) * 2
+    if nblk <= 0 || reach.len < pred_off + nblk * 2 { << false }
+    dom_off := nblk
+    member_off := dom_off + nblk * nblk
+    stack_off := member_off + nblk
+    need := stack_off + nblk
+    for _ in work.len:need { work.push(0) }
+    for i in 0:need { work[i] = 0 }
+
+    // Classic iterative dominator bit matrix: dom[b,d] means d dominates b.
+    for bi in 0:nblk {
+        if reach[bi] == 0 { -> }
+        if bi == 0 {
+            work[dom_off] = 1
+        } else {
+            for di in 0:nblk {
+                if reach[di] == 1 { work[dom_off + bi * nblk + di] = 1 }
+            }
+        }
+    }
+    mut round := 0
+    while round <= nblk + 1 {
+        mut changed := false
+        for bi in 1:nblk {
+            if reach[bi] == 0 { -> }
+            p0 := reach[start_off + bi]
+            p1 := reach[start_off + bi + 1]
+            for di in 0:nblk {
+                mut nv := 0
+                if di == bi {
+                    nv = 1
+                } else {
+                    mut have := false
+                    nv = 1
+                    for ei in p0:p1 {
+                        pi := reach[pred_off + ei]
+                        if pi < 0 || pi >= nblk || reach[pi] == 0 { << false }
+                        have = true
+                        if work[dom_off + pi * nblk + di] == 0 { nv = 0 }
+                    }
+                    if !have { nv = 0 }
+                }
+                at := dom_off + bi * nblk + di
+                if work[at] != nv {
+                    work[at] = nv
+                    changed = true
+                }
+            }
+        }
+        if !changed { <- }
+        round += 1
+    }
+
+    for tail in 0:nblk {
+        if reach[tail] == 0 { -> }
+        for header in 0:nblk {
+            if reach[header] == 0 || !vreg_cfg_edge_to(m, fi, tail, header) { -> }
+            if work[dom_off + tail * nblk + header] == 0 { -> }
+            for bi in 0:nblk { work[member_off + bi] = 0 }
+            work[member_off + header] = 1
+            work[member_off + tail] = 1
+            mut nstack := 0
+            if tail != header {
+                work[stack_off] = tail
+                nstack = 1
+            }
+            while nstack > 0 {
+                nstack -= 1
+                block := work[stack_off + nstack]
+                p0 := reach[start_off + block]
+                p1 := reach[start_off + block + 1]
+                for ei in p0:p1 {
+                    pi := reach[pred_off + ei]
+                    if pi < 0 || pi >= nblk || reach[pi] == 0 { << false }
+                    if work[member_off + pi] == 0 {
+                        work[member_off + pi] = 1
+                        if pi != header {
+                            if nstack >= nblk { << false }
+                            work[stack_off + nstack] = pi
+                            nstack += 1
+                        }
+                    }
+                }
+            }
+            for bi in 0:nblk {
+                if work[member_off + bi] == 1 && work[bi] < 9 {
+                    work[bi] += 1
+                }
+            }
+        }
+    }
+    << true
+}
+
+fn vreg_block_spill_weight(depth int) int {
+    if depth <= 0 { << 0 }
+    mut d := depth
+    if d > 9 { d = 9 }
+    mut w := 1
+    for _ in 0:d { w *= 10 }
+    << w
+}
+
+fn vreg_spill_weight_add(old int, add int) int {
+    max := 9223372036854775807
+    if add > 0 && old > max - add { << max }
+    << old + add
+}
+
+// Interference edges are immutable bits during coloring. Store 64 neighbors
+// per machine word instead of one int per pair; this preserves O(1) queries
+// while cutting the planner's quadratic edge storage by 64x.
+fn vreg_edge_words(n int) int {
+    << (n + 63) / 64
+}
+
+fn vreg_edge_has(edge &[]int, n int, a int, b int) bool {
+    if a < 0 || b < 0 || a >= n || b >= n { << false }
+    words := vreg_edge_words(n)
+    cell := a * words + (b / 64)
+    if cell < 0 || cell >= edge.len { << false }
+    << (edge[cell] & (1 << (b & 63))) != 0
+}
+
+fn vreg_edge_set(edge &mut []int, n int, a int, b int) {
+    if a < 0 || b < 0 || a >= n || b >= n { << }
+    words := vreg_edge_words(n)
+    cell := a * words + (b / 64)
+    if cell < 0 || cell >= edge.len { << }
+    edge[cell] = edge[cell] | (1 << (b & 63))
+}
+
+// Keep graph coloring in a separate frame. The frozen Gen1 self-host ABI is
+// sensitive to the number of simultaneously-live slice descriptors in one
+// function; leaving degree/order in vreg_plan corrupted those slices in the
+// compiler produced by Gen1. Mutating the caller-owned homes slice also avoids
+// introducing another slice-return value at this boundary.
+fn vreg_color_homes(homes &mut []int, edge &[]int, referenced &[]int, call_live &[]int, n int, arch int) {
+    mut degree := []int{}
+    mut order := []int{}
+    for t in 0:n {
+        mut d := 0
+        for u in 0:n {
+            if vreg_edge_has(edge, n, t, u) { d += 1 }
+        }
+        degree.push(d)
+        order.push(t)
+    }
+    for i in 0:n {
+        mut best := i
+        for j in i + 1:n {
+            bj := order[best]
+            tj := order[j]
+            mut wb := 0
+            mut wt := 0
+            if call_live.len >= n * 2 {
+                wb = call_live[n + bj]
+                wt = call_live[n + tj]
+            }
+            if wt > wb || (wt == wb && (degree[tj] > degree[bj] || (degree[tj] == degree[bj] && tj < bj))) {
+                best = j
+            }
+        }
+        if best != i {
+            swap := order[i]
+            order[i] = order[best]
+            order[best] = swap
+        }
+    }
+    for oi in 0:n {
+        t := order[oi]
+        if referenced[t] == 0 { -> }
+        mut lo := td_gpr_caller_lo(arch)
+        mut hi := td_gpr_caller_hi(arch)
+        cls := call_live[t] & 3
+        if cls == 0 && arch == 0 && (call_live[t] & 8) != 0 {
+            // Proven integer field/index bodies may use both GPR pools.
+            // These ranges cross no call; index-scratch coverage still
+            // excludes S4/S5. Entry/exit save the selected S homes normally.
+            hi = td_gpr_callee_hi(arch)
+            if (call_live[t] & 4) != 0 { hi = 12 }
+        }
+        if cls >= 2 {
+            // FP values, including call-live ranges, keep a fixed caller-saved
+            // home. Exact call points get a real backup slot during layout and
+            // are saved/reloaded by emit_instr_call_user_direct.
+            lo = td_fp_home_lo()
+            hi = td_fp_home_hi(arch)
+        } else if cls == 1 {
+            lo = td_gpr_callee_lo(arch)
+            hi = td_gpr_callee_hi(arch)
+            // S4/S5 are the index emitter's length/address scratch. A
+            // scalar live across an indexed access, or consumed after its
+            // address preparation, may only use the remaining S homes.
+            if arch == 0 && (call_live[t] & 4) != 0 { hi = 12 }
+        }
+        // Prefer an already-colored typed Copy partner. The interference
+        // graph remains authoritative: a later redefinition or overlapping
+        // live range leaves an edge and therefore rejects this hint. Requiring
+        // the hinted home to be inside this TempId's pool also enforces the
+        // Arm64 caller/callee-saved class and the independent FP bank.
+        mut hinted := -1
+        if referenced.len >= n * 2 {
+            partner := referenced[n + t]
+            if partner >= 0 && partner < n {
+                ph := homes[partner]
+                if ph >= lo && ph < hi && !regplan_home_reserved(call_live[t], ph) {
+                    mut busy := false
+                    for u in 0:n {
+                        if homes[u] == ph && vreg_edge_has(edge, n, t, u) { busy = true }
+                    }
+                    if !busy { hinted = ph }
+                }
+            }
+        }
+        if hinted >= 0 {
+            homes[t] = hinted
+            ->
+        }
+        for r in lo:hi {
+            if regplan_home_reserved(call_live[t], r) { -> }
+            mut busy := false
+            for u in 0:n {
+                if homes[u] == r && vreg_edge_has(edge, n, t, u) { busy = true }
+            }
+            if !busy {
+                homes[t] = r
+                <-
+            }
+        }
+    }
+}
+
+fn vreg_build_interference(edge &mut []int, call_live &mut []int, referenced &mut []int, split_points &mut []int, loop_depth &[]int, m &types.Mir, fi int, arch int, reach &[]int, live_matrix &[]int, n int, nblk int) bool {
+    empty := []int{}
+    << vreg_build_interference_selected(edge, call_live, referenced, split_points, loop_depth, m, fi, arch, reach, live_matrix, n, nblk, &empty)
+}
+
+fn vreg_build_interference_selected(edge &mut []int, call_live &mut []int, referenced &mut []int, split_points &mut []int, loop_depth &[]int, m &types.Mir, fi int, arch int, reach &[]int, live_matrix &[]int, n int, nblk int, actions &[]int) bool {
+    // `split_points` aliases the planner's homes owner.  Reserve the first
+    // `n` words for colors and cap the trailing action stream before any push;
+    // returning false lets the caller discard the whole fixed-home plan and
+    // use the conservative frame path.  No partial pair is retained.
+    if n < 0 || n > vreg_plan_temp_cap || split_points.len < n || split_points.len > n + vreg_max_fp_split_words {
+        << false
+    }
+    split_limit := n + vreg_max_fp_split_words
+    total := nblk * n
+    for bi in 0:nblk {
+        if reach[bi] == 0 { -> }
+        mut block_weight := 0
+        if bi < loop_depth.len { block_weight = vreg_block_spill_weight(loop_depth[bi]) }
+        mut active := []int{}
+        for t in 0:n { active.push(live_matrix[total + bi * n + t]) }
+        tk := types.mir_btkind(m, fi, bi)
+        if tk == 2 || tk == 3 {
+            tv := types.mir_bta(m, fi, bi)
+            if vreg_temp_eligible(m, fi, tv) {
+                if call_live.len >= n * 2 {
+                    call_live[n + tv] = vreg_spill_weight_add(call_live[n + tv], block_weight)
+                }
+                // A branch/return operand is consumed while every live-out
+                // value still has to survive the terminator.  Keep its home
+                // distinct even though there is no following MIR definition
+                // in this block to create the edge for us.
+                for t in 0:n {
+                    if t != tv && active[t] == 1 {
+                        vreg_edge_set(edge, n, tv, t)
+                        vreg_edge_set(edge, n, t, tv)
+                    }
+                }
+                active[tv] = 1
+            }
+        }
+        selected := select_pair_at(actions, bi)
+        if selected >= 0 {
+            select_pair_interference(edge, mut &active, call_live, actions, selected, live_matrix, n, nblk, block_weight, arch)
+        }
+        mut seq := []int{}
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            seq.push(ii)
+            ii = types.mir_inext(m, fi, ii)
+        }
+        mut si := seq.len - 1
+        while si >= 0 {
+            xi := seq[si]
+            d := vreg_instr_def(m, fi, xi)
+            move_src := vreg_typed_copy_source(m, fi, xi, n)
+            mut copy_src := move_src
+            if copy_src < 0 {
+                copy_src = vreg_fp_unop_source(m, fi, xi, n)
+            }
+            if copy_src < 0 && types.mir_ikind(m, fi, xi) == 4 {
+                op := types.mir_ib(m, fi, xi)
+                id := types.mir_id(m, fi, xi)
+                c := types.mir_ic(m, fi, xi)
+                if (op == 1 || op == 2) && id < 0 && c >= 0 && c < n {
+                    copy_src = c
+                } else if op == 1 && c < 0 && id >= 0 && id < n {
+                    copy_src = id
+                }
+            }
+            if d >= 0 && call_live.len >= n * 2 {
+                call_live[n + d] = vreg_spill_weight_add(call_live[n + d], block_weight)
+                // fsqrt dest is a hot FP result (nbody `dist`). One extra
+                // loop-weighted def so first-fit does not hand the last FP
+                // home to a colder Copy while dist stays a frame slot.
+                if copy_src >= 0 && types.mir_ikind(m, fi, xi) == 7 {
+                    call_live[n + d] = vreg_spill_weight_add(call_live[n + d], block_weight)
+                }
+            }
+            if call_live.len >= n * 2 {
+                for up in 0:6 {
+                    u := vreg_instr_use(m, fi, xi, up)
+                    if u < 0 { -> }
+                    mut seen := false
+                    for prev in 0:up {
+                        if vreg_instr_use(m, fi, xi, prev) == u { seen = true }
+                    }
+                    if !seen {
+                        call_live[n + u] = vreg_spill_weight_add(call_live[n + u], block_weight)
+                    }
+                }
+            }
+            ikx := types.mir_ikind(m, fi, xi)
+            reserved := regplan_instr_reserved_homes(m, fi, xi, arch) << 8
+            if reserved != 0 {
+                for t in 0:n {
+                    if t != d && active[t] == 1 { call_live[t] = call_live[t] | reserved }
+                }
+                // Some stores read their RHS after preparing the address or
+                // scratch value. Dying inputs must obey the same exclusions.
+                for up in 0:6 {
+                    u := vreg_instr_use(m, fi, xi, up)
+                    if u >= 0 { call_live[u] = call_live[u] | reserved }
+                }
+            }
+            if ikx == 14 || ikx == 20 || ikx == 23 || ikx == 47 {
+                // Record physical scratch coverage as well as ABI calls.
+                // Exclude the new load dest from live-after, but include all
+                // input operands: StoreIndex reads its RHS after preparing
+                // the address, so a dying RHS must also avoid S4/S5.
+                for t in 0:n {
+                    if t != d && active[t] == 1 { call_live[t] = call_live[t] | 4 }
+                }
+                for up in 0:6 {
+                    u := vreg_instr_use(m, fi, xi, up)
+                    if u >= 0 { call_live[u] = call_live[u] | 4 }
+                }
+            }
+            mut call_live_here := types.mir_instr_call_live_m(m, fi, xi)
+            // The MIR call marker for sqrt is target-selected: keep the
+            // existing hardware lowering on targets with a native fsqrt.
+            if ikx == 7 && vreg_sqrt_unop_ok(m, fi, xi, arch) {
+                call_live_here = false
+            }
+            if call_live_here {
+                for t in 0:n {
+                    if t != d && active[t] == 1 {
+                        call_live[t] = call_live[t] | 1
+                        if ikx != 7 { call_live[t] = call_live[t] | 16 }
+                        if types.mir_temp_ty(m, fi, t) == 4 {
+                            // Only explicit calls have FP save/reload emitters.
+                            // A hidden returning call must discard the complete
+                            // plan, not retain an unsupported action stream.
+                            if ikx != 7 { << false }
+                            // `active` is the precise live-after set at this
+                            // program point. The call destination is excluded:
+                            // it does not exist until the call returns.
+                            if split_points.len > split_limit - 2 {
+                                << false
+                            }
+                            split_points.push(xi)
+                            split_points.push(t)
+                        }
+                    }
+                }
+            }
+            if d >= 0 {
+                for t in 0:n {
+                    // Move-aware: a typed Copy dest may share the source
+                    // home. fsqrt is not a Copy — a live-after source (nbody
+                    // `d2 * dist`) must keep a distinct home from dest.
+                    if t != d && active[t] == 1 && !(move_src == t) {
+                        vreg_edge_set(edge, n, d, t)
+                        vreg_edge_set(edge, n, t, d)
+                    }
+                }
+                // Integer emitters may pick either operand order through
+                // x0. f64 add/mul/div/sqrt write `dd, dn, dm` / `dd, dn`
+                // directly, so a dying operand may share dest.
+                if !vreg_fp_dest_reuse_ok(m, fi, xi) {
+                    for up in 0:6 {
+                        u := vreg_instr_use(m, fi, xi, up)
+                        if u >= 0 && u != d && !(move_src == u) {
+                            vreg_edge_set(edge, n, d, u)
+                            vreg_edge_set(edge, n, u, d)
+                        }
+                    }
+                }
+                active[d] = 0
+            }
+            // All operands are simultaneously available at the instruction.
+            // This is especially important for values defined on different
+            // incoming paths, where no local definition necessarily creates
+            // the pairwise interference edge.
+            for up in 0:6 {
+                u := vreg_instr_use(m, fi, xi, up)
+                if u < 0 { -> }
+                for vp in up + 1:6 {
+                    v := vreg_instr_use(m, fi, xi, vp)
+                    if v >= 0 && v != u {
+                        vreg_edge_set(edge, n, u, v)
+                        vreg_edge_set(edge, n, v, u)
+                    }
+                }
+            }
+            for up in 0:6 {
+                u := vreg_instr_use(m, fi, xi, up)
+                if u >= 0 { active[u] = 1 }
+            }
+            if copy_src >= 0 && d >= 0 && referenced.len >= n * 2 {
+                // One deterministic reciprocal hint is sufficient: whichever
+                // partner is colored second can inherit the first one's home.
+                if referenced[n + d] < 0 { referenced[n + d] = copy_src }
+                if referenced[n + copy_src] < 0 { referenced[n + copy_src] = d }
+                if call_live.len >= n * 2 {
+                    call_live[n + d] = vreg_spill_weight_add(call_live[n + d], block_weight * 4)
+                }
+            }
+            si -= 1
+        }
+    }
+    << true
+}
+
+fn vreg_solve_must(must &mut []int, m &types.Mir, fi int, reach &[]int, bdef &[]int, n int, nblk int) bool {
+    total := nblk * n
+    if must.len != total * 2 { << false }
+    start_off := nblk
+    pred_off := nblk + (nblk + 1) * 2
+    if reach.len < pred_off + nblk * 2 { << false }
+    for bi in 0:nblk {
+        for t in 0:n {
+            mut v := 0
+            if reach[bi] == 1 && bi != 0 { v = 1 }
+            must[bi * n + t] = v
+        }
+    }
+    for bi in 0:nblk {
+        for t in 0:n {
+            mut v := 0
+            if reach[bi] == 1 && bi != 0 { v = 1 }
+            if v == 1 || bdef[bi * n + t] == 1 {
+                must[total + bi * n + t] = 1
+            } else {
+                must[total + bi * n + t] = 0
+            }
+        }
+    }
+    mut mi := 0
+    // A monotone must-def lattice over a CFG converges in at most one pass
+    // per block on the reverse-height chain; the old `nblk*n` bound turned
+    // large scalar CFGs into an accidental quadratic-in-the-matrix spin.
+    while mi <= nblk + 1 {
+        mut changed := false
+        for bi in 0:nblk {
+            if reach[bi] == 0 { -> }
+            for t in 0:n {
+                mut nv := 0
+                if bi != 0 {
+                    mut have_pred := false
+                    nv = 1
+                    p0 := reach[start_off + bi]
+                    p1 := reach[start_off + bi + 1]
+                    for ei in p0:p1 {
+                        pi := reach[pred_off + ei]
+                        if pi < 0 || pi >= nblk || reach[pi] == 0 { << false }
+                        if !have_pred {
+                            nv = must[total + pi * n + t]
+                            have_pred = true
+                        }
+                        if must[total + pi * n + t] == 0 { nv = 0 }
+                    }
+                    if !have_pred { nv = 0 }
+                }
+                at := bi * n + t
+                if must[at] != nv {
+                    must[at] = nv
+                    changed = true
+                }
+                mut ov := nv
+                if bdef[at] == 1 { ov = 1 }
+                if must[total + at] != ov {
+                    must[total + at] = ov
+                    changed = true
+                }
+            }
+        }
+        if !changed { <- }
+        mi += 1
+    }
+    << true
+}
+
+fn vreg_validate_must(must &mut []int, m &types.Mir, fi int, reach &[]int, n int, nblk int) bool {
+    empty := []int{}
+    << vreg_validate_must_selected(must, m, fi, reach, n, nblk, &empty)
+}
+
+fn vreg_validate_must_selected(must &mut []int, m &types.Mir, fi int, reach &[]int, n int, nblk int, actions &[]int) bool {
+    if must.len != nblk * n * 2 { << false }
+    for bi in 0:nblk {
+        if reach[bi] == 0 { -> }
+        base := bi * n
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            for up in 0:6 {
+                u := vreg_instr_use(m, fi, ii, up)
+                if u >= 0 && must[base + u] == 0 { << false }
+            }
+            d := vreg_instr_def(m, fi, ii)
+            if d >= 0 { must[base + d] = 1 }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        tk := types.mir_btkind(m, fi, bi)
+        if tk == 2 || tk == 3 {
+            tv := types.mir_bta(m, fi, bi)
+            if vreg_temp_eligible(m, fi, tv) && must[base + tv] == 0 { << false }
+        }
+        selected := select_pair_at(actions, bi)
+        if selected >= 0 {
+            for pos in 0:9 {
+                u := select_pair_use(actions, selected, pos)
+                if u >= 0 && must[base + u] == 0 { << false }
+            }
+        }
+    }
+    << true
+}
+
+fn vreg_solve_liveness(live &mut []int, m &types.Mir, fi int, reach &[]int, buse &[]int, bdef &[]int, n int, nblk int) bool {
+    total := nblk * n
+    if live.len != total * 2 { << false }
+    // [0,total) is IN; [total,2*total) is OUT.
+    mut li := 0
+    // Liveness is the same finite-height bit lattice; bound iterations by
+    // blocks, not by the number of block×temp cells.
+    while li <= nblk + 1 {
+        mut changed := false
+        mut bi := nblk - 1
+        while bi >= 0 {
+            if reach[bi] == 1 {
+                tk := types.mir_btkind(m, fi, bi)
+                for t in 0:n {
+                    mut ov := 0
+                    if tk == 1 {
+                        to := types.mir_bta(m, fi, bi)
+                        if live[to * n + t] == 1 { ov = 1 }
+                    } else if tk == 2 {
+                        tb := types.mir_btb(m, fi, bi)
+                        tc := types.mir_btc(m, fi, bi)
+                        if live[tb * n + t] == 1 || live[tc * n + t] == 1 { ov = 1 }
+                    }
+                    at := bi * n + t
+                    mut iv := buse[at]
+                    if ov == 1 && bdef[at] == 0 { iv = 1 }
+                    if live[total + at] != ov {
+                        live[total + at] = ov
+                        changed = true
+                    }
+                    if live[at] != iv {
+                        live[at] = iv
+                        changed = true
+                    }
+                }
+            }
+            bi -= 1
+        }
+        if !changed { <- }
+        li += 1
+    }
+    << true
+}
+
+// Whole-function fixed-home allocator for scalar MIR. Promoted locals arrive
+// as de-SSA TempIds plus edge copies; legacy scalar Temps may still be
+// redefined, and every definition assigned a home writes that fixed home.
+// Must-def rejects a merge use unless every incoming path defines the TempId;
+// liveness + interference then prevents distinct live TempIds sharing a home.
+// Direct scalar calls are admitted after their full margs chain is checked.
+// Values live across an Arm64 call use callee-saved S0–S5 homes.
+fn vreg_trace_exit(m &types.Mir, fi int, tag string) {
+}
+
+fn vreg_plan(m &types.Mir, fi int, arch int) []int {
+    empty := []int{}
+    << vreg_plan_selected(m, fi, arch, &empty)
+}
+
+fn vreg_scan_block_def_use(m &types.Mir, fi int, arch int, n int, nblk int, field_kernel bool, index_acc bool, int_index bool, scalar_fp bool, ret int, reach &[]int, buse &mut []int, bdef &mut []int, referenced &mut []int, actions &[]int, instruction &mut int) bool {
+    mut direct_calls := 0
+    for bi in 0:nblk {
+        base := bi * n
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            *instruction = ii
+            ik := types.mir_ikind(m, fi, ii)
+            if ik == 12 {
+                n_elems := types.mir_ib(m, fi, ii)
+                if n_elems != 0 { << false }
+                d12 := types.mir_ia(m, fi, ii)
+                if d12 < 0 || d12 >= types.mir_ntemps(m, fi) { << false }
+                if vreg_temp_eligible(m, fi, d12) { << false }
+                if types.mir_temp_nslots(m, fi, d12) != 3 { << false }
+                if types.mir_ic(m, fi, ii) != -1 { << false }
+            }
+            if ik == 46 {
+                << false
+            }
+            if ik == 13 && types.mir_id(m, fi, ii) != 8 { << false }
+            if ik != 1 && ik != 2 && ik != 3 && ik != 4 && ik != 5 && ik != 7 && ik != 8 && ik != 10 && ik != 11 && ik != 12 && ik != 13 && ik != 14 && ik != 16 && ik != 17 && ik != 18 && ik != 20 && ik != 23 && ik != 25 && ik != 26 && ik != 47 && ik != 48 {
+                << false
+            }
+            if ik == 7 {
+                if !vreg_sqrt_unop_ok(m, fi, ii, arch) {
+                    ck := types.mir_ib(m, fi, ii)
+                    if ck != 2 && ck != 3 && ck != 4 && ck != 22 {
+                        if ck != 1 {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: call ck=" + str(ck) + " != 1") }
+                            << false
+                        }
+                        if direct_calls >= vreg_direct_call_count_cap {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: direct_calls >= cap") }
+                            << false
+                        }
+                        direct_calls += 1
+                        if m.fns.len <= 0 || m.fns.len > vreg_direct_call_fn_cap {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: fns.len out of cap") }
+                            << false
+                        }
+                        if direct_calls * m.fns.len > vreg_direct_call_work_cap {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: direct_calls * fns.len > work_cap") }
+                            << false
+                        }
+                        lab_len := types.mir_isval_len(m, fi, ii)
+                        if lab_len <= 0 || lab_len > vreg_direct_call_label_cap {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: lab_len out of cap: " + str(lab_len)) }
+                            << false
+                        }
+                        scan_bytes := (m.fns.len + 1) * lab_len
+                        if scan_bytes > vreg_direct_call_char_work_cap {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: scan_bytes > char_work_cap") }
+                            << false
+                        }
+                        if direct_calls * scan_bytes > vreg_direct_call_char_work_cap {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: direct_calls * scan_bytes > char_work_cap") }
+                            << false
+                        }
+                        if !vreg_direct_call_ok(m, fi, ii) {
+                            if env_get("XU_RA_REJ") == "1" { eprintln("vreg_scan: vreg_direct_call_ok failed for fn " + m.fns[fi].name) }
+                            << false
+                        }
+                    }
+                }
+            }
+            if ik == 1 || ik == 2 || ik == 3 || ik == 4 || ik == 5 {
+                if !vreg_basic_instr_ok(m, fi, ii) {
+                    << false
+                }
+            }
+            if ik == 10 || ik == 17 {
+                d := types.mir_ia(m, fi, ii)
+                b := types.mir_ib(m, fi, ii)
+                if ik == 10 {
+                    if !vreg_loadfield_ok(m, fi, d, b, types.mir_ic(m, fi, ii), types.mir_id(m, fi, ii)) {
+                        << false
+                    }
+                } else {
+                    off := types.mir_ic(m, fi, ii)
+                    slots := types.mir_id(m, fi, ii)
+                    if !vreg_loadptr_ok(m, fi, d, b, off, slots) {
+                        if field_kernel && vreg_pointer_base_temp(m, fi, b) && slots == 1 && off >= 0 && vreg_temp_eligible(m, fi, d) {
+                            width := vreg_scalar_width(m, fi, d)
+                            if width <= 0 || off + width > 4096 { << false }
+                        } else if !field_kernel && !index_acc && !int_index && !scalar_fp && vreg_pointer_base_temp(m, fi, b) && slots == 1 && off >= 0 && vreg_temp_eligible(m, fi, d) {
+                            width := vreg_scalar_width(m, fi, d)
+                            if width <= 0 || off + width > 4096 { << false }
+                        } else if d >= 0 && d < types.mir_ntemps(m, fi) {
+                            if vreg_temp_eligible(m, fi, d) { << false }
+                            if slots < 1 || slots != types.mir_temp_nslots(m, fi, d) { << false }
+                            if !vreg_pointer_base_temp(m, fi, b) { << false }
+                        } else {
+                            << false
+                        }
+                    }
+                }
+            }
+            if ik == 14 {
+                d := types.mir_ia(m, fi, ii)
+                b := types.mir_ib(m, fi, ii)
+                c := types.mir_ic(m, fi, ii)
+                if !vreg_loadindex_ok(m, fi, d, b, c, types.mir_id(m, fi, ii), types.mir_icol(m, fi, ii)) {
+                    if !vreg_index_value_ok(m, fi, c) {
+                        << false
+                    }
+                    if !vreg_any_array_base(m, fi, b) && !(int_index && vreg_string_base_temp(m, fi, b)) {
+                        << false
+                    }
+                    if d < 0 || d >= types.mir_ntemps(m, fi) || !vreg_temp_eligible(m, fi, d) {
+                        << false
+                    }
+                    mut load_width := types.mir_id(m, fi, ii)
+                    if load_width < 0 { load_width = 0 - load_width }
+                    if !vreg_index_width_ok(m, fi, d, load_width) {
+                        // A string byte is zero-extended into the language int.
+                        if !int_index || load_width != 1 || types.mir_temp_ty(m, fi, d) != 1 || !vreg_string_base_temp(m, fi, b) { << false }
+                    }
+                    dty := types.mir_temp_ty(m, fi, d)
+                    if index_acc && !field_kernel {
+                        if dty != 4 { << false }
+                    } else if int_index && !index_acc && !field_kernel && !scalar_fp {
+                        if dty != 1 { << false }
+                    } else if scalar_fp && !index_acc && !field_kernel {
+                        if dty != 1 && dty != 4 && dty != 8 && dty != 9 && dty != 10 { << false }
+                    } else if !vreg_scalar_type(dty) {
+                        << false
+                    }
+                }
+            }
+            if ik == 23 {
+                if !vreg_elemaddr_ok(m, fi, types.mir_ia(m, fi, ii), types.mir_ib(m, fi, ii), types.mir_ic(m, fi, ii), types.mir_id(m, fi, ii)) {
+                    << false
+                }
+            }
+            if ik == 26 {
+                d := types.mir_ia(m, fi, ii)
+                b := types.mir_ib(m, fi, ii)
+                slots := types.mir_id(m, fi, ii)
+                off := types.mir_ic(m, fi, ii)
+                if off < 0 || !vreg_pointer_base_temp(m, fi, b) {
+                    << false
+                }
+                if slots == 1 && vreg_temp_eligible(m, fi, d) {
+                    if b < types.mir_ntemps(m, fi) && types.is_ref_type(types.mir_temp_ty(m, fi, b)) {
+                        if !vreg_loadptr_ok(m, fi, d, b, off, slots) { << false }
+                    }
+                } else {
+                    if d < 0 || d >= types.mir_ntemps(m, fi) { << false }
+                    if vreg_temp_eligible(m, fi, d) { << false }
+                    if slots < 1 || slots != types.mir_temp_nslots(m, fi, d) { << false }
+                }
+            }
+            if ik == 20 {
+                ia20 := types.mir_ia(m, fi, ii)
+                ib20 := types.mir_ib(m, fi, ii)
+                ic20 := types.mir_ic(m, fi, ii)
+                id20 := types.mir_id(m, fi, ii)
+                if index_acc {
+                    if !vreg_storeindex_f64_ok(m, fi, ia20, ib20, ic20, id20) {
+                        << false
+                    }
+                } else if int_index {
+                    if !vreg_storeindex_int_ok(m, fi, ia20, ib20, ic20, id20) {
+                        << false
+                    }
+                } else if scalar_fp {
+                    if !vreg_storeindex_byte_ok(m, fi, ia20, ib20, ic20, id20) {
+                        if !vreg_storeindex_int_ok(m, fi, ia20, ib20, ic20, id20) {
+                            if !vreg_storeindex_f64_ok(m, fi, ia20, ib20, ic20, id20) {
+                                << false
+                            }
+                        }
+                    }
+                } else {
+                    if !vreg_storeindex_int_ok(m, fi, ia20, ib20, ic20, id20) {
+                        if !vreg_storeindex_f64_ok(m, fi, ia20, ib20, ic20, id20) {
+                            if !vreg_storeindex_byte_ok(m, fi, ia20, ib20, ic20, id20) {
+                                << false
+                            }
+                        }
+                    }
+                }
+            }
+            if ik == 47 {
+                if !int_index && types.mir_id(m, fi, ii) < 0 { << false }
+                if !vreg_indexrmw_int_ok(m, fi, types.mir_ia(m, fi, ii), types.mir_ib(m, fi, ii), types.mir_ic(m, fi, ii), types.mir_id(m, fi, ii)) {
+                    << false
+                }
+            }
+            if ik == 16 {
+                dest := types.mir_ia(m, fi, ii)
+                src := types.mir_ib(m, fi, ii)
+                mode := types.mir_ic(m, fi, ii)
+                if dest < 0 || dest >= n || vreg_temp_eligible(m, fi, dest) { << false }
+                inner := vreg_direct_ref_inner(types.mir_temp_ty(m, fi, dest))
+                if mode == 0 {
+                    if src < 0 || src >= types.mir_nlocals(m, fi) { << false }
+                    // A typed local address must describe its actual frame
+                    // object. Reject malformed MIR before assigning homes.
+                    if inner >= 0 {
+                        if types.mir_temp_nslots(m, fi, dest) != 1 || types.mir_local_ty(m, fi, src) != inner || types.mir_local_nslots(m, fi, src) != m.type_slots(inner) { << false }
+                    }
+                } else if mode == 1 {
+                    if src < 0 || src >= n || vreg_temp_eligible(m, fi, src) { << false }
+                    if inner >= 0 {
+                        if types.mir_temp_nslots(m, fi, dest) != 1 || types.mir_temp_ty(m, fi, src) != inner || types.mir_temp_nslots(m, fi, src) != m.type_slots(inner) { << false }
+                    }
+                } else { << false }
+            }
+            if ik == 8 || ik == 16 {
+                ii = types.mir_inext(m, fi, ii)
+                ->
+            }
+            if ik == 18 || ik == 25 {
+                if !vreg_store_scalar_ptr_ok(m, fi, types.mir_ia(m, fi, ii), types.mir_ib(m, fi, ii), types.mir_ic(m, fi, ii), types.mir_id(m, fi, ii)) {
+                    << false
+                }
+            }
+            if ik == 48 {
+                if !vreg_field_rmw_ok(m, fi, ii) {
+                    << false
+                }
+            }
+            if ik == 2 || ik == 3 {
+                mut loc := types.mir_ib(m, fi, ii)
+                if ik == 3 { loc = types.mir_ia(m, fi, ii) }
+                if loc < 0 || loc >= types.mir_nlocals(m, fi) { << false }
+                if ik == 2 && vreg_temp_eligible(m, fi, types.mir_ia(m, fi, ii)) {
+                    lty := types.mir_local_ty(m, fi, loc)
+                    if types.mir_local_nslots(m, fi, loc) != 1 { << false }
+                    if !vreg_scalar_type(lty) && !(types.mir_temp_ty(m, fi, types.mir_ia(m, fi, ii)) == 1 && types.is_ref_type(lty)) {
+                        << false
+                    }
+                }
+                if ik == 3 {
+                    src := types.mir_ib(m, fi, ii)
+                    if vreg_temp_eligible(m, fi, src) {
+                        lty := types.mir_local_ty(m, fi, loc)
+                        if types.mir_local_nslots(m, fi, loc) != 1 { << false }
+                        if !vreg_scalar_type(lty) && !(types.mir_temp_ty(m, fi, src) == 1 && types.is_ref_type(lty)) {
+                            << false
+                        }
+                    }
+                }
+                if types.mir_local_ty(m, fi, loc) == 4 && !field_kernel && !index_acc && !scalar_fp && !vreg_mixed_array_scalar_ok(m, fi) {
+                    vreg_trace_exit(m, fi, "E5_loc_f64")
+                    << false
+                }
+            }
+            for up in 0:6 {
+                u := vreg_instr_use(m, fi, ii, up)
+                if u >= n { << false }
+                if u >= 0 && reach[bi] == 1 {
+                    referenced[u] = 1
+                    if bdef[base + u] == 0 { buse[base + u] = 1 }
+                }
+            }
+            d := vreg_instr_def(m, fi, ii)
+            if ik != 3 && ik != 7 && d < 0 {
+                if ik != 1 && ik != 2 && ik != 8 && ik != 10 && ik != 11 && ik != 12 && ik != 13 && ik != 14 && ik != 16 && ik != 17 && ik != 18 && ik != 20 && ik != 23 && ik != 25 && ik != 26 && ik != 47 && ik != 48 {
+                    vreg_trace_exit(m, fi, "E6_ik_" + str(ik))
+                    << false
+                }
+                if ik != 1 && ik != 8 && ik != 11 && ik != 12 && ik != 13 && ik != 16 && ik != 18 && ik != 20 && ik != 23 && ik != 25 && ik != 47 && ik != 48 {
+                    if vreg_temp_eligible(m, fi, types.mir_ia(m, fi, ii)) {
+                        << false
+                    }
+                }
+            }
+            if d >= n { << false }
+            if d >= 0 && reach[bi] == 1 {
+                referenced[d] = 1
+                bdef[base + d] = 1
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        tk := types.mir_btkind(m, fi, bi)
+        if tk == 1 {
+            to := types.mir_bta(m, fi, bi)
+            if to < 0 || to >= nblk { << false }
+        } else if tk == 2 {
+            tb := types.mir_btb(m, fi, bi)
+            tc := types.mir_btc(m, fi, bi)
+            if tb < 0 || tb >= nblk || tc < 0 || tc >= nblk { << false }
+        } else if tk != 3 && tk != 0 {
+            << false
+        }
+        mut tv := -1
+        if tk == 2 || tk == 3 { tv = types.mir_bta(m, fi, bi) }
+        if tk == 2 && !vreg_value_ok(m, fi, tv) { << false }
+        if tk == 2 && tv >= 0 && !vreg_temp_eligible(m, fi, tv) { << false }
+        if tk == 3 {
+            if reach[bi] == 0 {
+                if tv >= 0 && !vreg_value_ok(m, fi, tv) { << false }
+            } else if ret == 0 {
+                if tv != -1 { << false }
+            } else if !vreg_value_ok(m, fi, tv) {
+                << false
+            } else if tv >= 0 && !vreg_temp_eligible(m, fi, tv) {
+                << false
+            }
+        }
+        if tv >= n { << false }
+        if vreg_temp_eligible(m, fi, tv) && reach[bi] == 1 {
+            referenced[tv] = 1
+            if bdef[base + tv] == 0 { buse[base + tv] = 1 }
+        }
+        selected := select_pair_at(actions, bi)
+        if selected >= 0 && reach[bi] == 1 {
+            for pos in 0:9 {
+                u := select_pair_use(actions, selected, pos)
+                if u >= 0 {
+                    referenced[u] = 1
+                    if bdef[base + u] == 0 { buse[base + u] = 1 }
+                }
+            }
+        }
+    }
+    << true
+}
+
+fn vreg_plan_selected(m &types.Mir, fi int, arch int, actions &[]int) []int {
+    mut reason := 0
+    mut instruction := -1
+    << vreg_plan_diagnosed(m, fi, arch, actions, mut &reason, mut &instruction)
+}
+
+fn vreg_plan_diagnosed(m &types.Mir, fi int, arch int, actions &[]int, reason &mut int, instruction &mut int) []int {
+    *reason = 1
+    *instruction = -1
+    if !select_pair_verify_interface(actions, m, fi) { << []int{} }
+    if fi < 0 || fi >= m.fns.len { << []int{} }
+    n := types.mir_ntemps(m, fi)
+    nblk := types.mir_nblocks(m, fi)
+    if n < 0 || n > vreg_plan_temp_cap || nblk <= 0 || nblk > 256 {
+        vreg_trace_exit(m, fi, "E1_size")
+        << []int{}
+    }
+    mut homes := []int{}
+    for _ in 0:n {
+        homes.push(0)
+    }
+    *reason = 2
+    if !vreg_mir_shape_ok(m, fi) {
+        vreg_trace_exit(m, fi, "E2_shape")
+        << homes
+    }
+    *reason = 3
+    if !td_has_vreg(arch) {
+        vreg_trace_exit(m, fi, "E3_arch")
+        << homes
+    }
+    // A receiver is an ordinary frame-backed local. It must not disable
+    // independent scalar TempIds in a method; receiver field/address paths
+    // still fail closed below because their MIR instructions are unsupported.
+    if nblk == 0 {
+        << homes
+    }
+    *reason = 4
+    ret := types.mir_fn_ret(m, fi)
+    rslots := types.mir_fn_ret_nslots(m, fi)
+    if ret == 0 {
+        // Void/unit-shaped MIR may retain one ABI slot even though every
+        // return terminator carries no value. Admit that representation for
+        // fixed-home allocation only after checking every reachable return;
+        // malformed value-bearing void returns stay on the conservative path.
+        if rslots != 0 && rslots != 1 { << homes }
+    } else {
+        if !vreg_scalar_type(ret) || rslots != 1 { << homes }
+    }
+    mut has_mixed_types := false
+    for li in 0:types.mir_nlocals(m, fi) {
+        if !vreg_scalar_type(types.mir_local_ty(m, fi, li)) || types.mir_local_nslots(m, fi, li) != 1 {
+            has_mixed_types = true
+        }
+    }
+    for ti in 0:n {
+        if !vreg_temp_eligible(m, fi, ti) {
+            has_mixed_types = true
+        }
+    }
+    field_kernel := fn_is_f64_field_rmw_kernel(m, fi)
+    index_acc := fn_is_f64_index_acc_kernel(m, fi)
+    int_index := fn_is_int_index_kernel(m, fi) || fn_is_int_field_index_kernel(m, fi) || fn_is_readonly_i64_index(m, fi)
+    scalar_fp := fn_is_f64_scalar_loop_kernel(m, fi)
+    scalar_int := fn_is_i64_scalar_loop_kernel(m, fi)
+    *reason = 5
+    if has_mixed_types && !vreg_general_frame_types_ok(m, fi) && !vreg_mixed_memory_shape(m, fi) && !vreg_mixed_scalar_body_shape(m, fi) && !vreg_mixed_struct_scalar_ok(m, fi) && !vreg_mixed_array_scalar_ok(m, fi) && !field_kernel && !index_acc && !int_index && !scalar_fp && !scalar_int && !(arch == 0 && (fn_is_int_container_leaf(m, fi) || fn_is_int_record_container_leaf(m, fi))) {
+        vreg_trace_exit(m, fi, "E4_mixed")
+        << homes
+    }
+    // The bounds above keep the quadratic interference table finite. Larger
+    // valid functions retain their ordinary frame slots and legacy allocator
+    // path through the empty-plan return.
+    // Mixed kernels may carry aggregate/ref descriptors through memory ops.
+    // They remain frame-backed; only `vreg_temp_eligible` temps participate in
+    // the scalar graph below.  Do not reject the whole function merely for a
+    // non-scalar temp, but keep all unsupported instruction kinds fail-closed.
+
+    // Reachability also validates all reachable terminators and edge ids.
+    mut reach := []int{}
+    for _ in 0:nblk { reach.push(0) }
+    reach[0] = 1
+    for _ in 0:nblk {
+        mut changed := false
+        for bi in 0:nblk {
+            if reach[bi] == 0 { -> }
+            tk := types.mir_btkind(m, fi, bi)
+            if tk == 1 {
+                to := types.mir_bta(m, fi, bi)
+                if to < 0 || to >= nblk { << homes }
+                if reach[to] == 0 {
+                    reach[to] = 1
+                    changed = true
+                }
+            } else if tk == 2 {
+                tb := types.mir_btb(m, fi, bi)
+                tc := types.mir_btc(m, fi, bi)
+                if tb < 0 || tb >= nblk || tc < 0 || tc >= nblk { << homes }
+                if reach[tb] == 0 {
+                    reach[tb] = 1
+                    changed = true
+                }
+                if reach[tc] == 0 {
+                    reach[tc] = 1
+                    changed = true
+                }
+            } else if tk != 3 {
+                << homes
+            }
+        }
+        if !changed { <- }
+    }
+    if ret == 0 && rslots == 1 {
+        for bi in 0:nblk {
+            if reach[bi] == 1 && types.mir_btkind(m, fi, bi) == 3 && types.mir_bta(m, fi, bi) != -1 {
+                << homes
+            }
+        }
+    }
+    if !vreg_build_pred_index(mut &reach, m, fi, nblk) {
+        << homes
+    }
+
+    // Per-block use-before-def and def sets.
+    mut buse := []int{}
+    mut bdef := []int{}
+    mut referenced := []int{}
+    for _ in 0:nblk * n { buse.push(0) }
+    for _ in 0:nblk * n { bdef.push(0) }
+    for _ in 0:n {
+        referenced.push(0)
+    }
+    // The second half is a compact typed-Copy affinity map. Keeping it in the
+    // referenced owner avoids another long-lived slice descriptor in this
+    // self-host-sensitive allocator frame.
+    for _ in 0:n { referenced.push(-1) }
+    *reason = 6
+    if !vreg_scan_block_def_use(m, fi, arch, n, nblk, field_kernel, index_acc, int_index, scalar_fp, ret, &reach, mut &buse, mut &bdef, mut &referenced, actions, instruction) {
+        << homes
+    }
+
+    *instruction = -1
+    *reason = 7
+    status := vreg_plan_color_selected(m, fi, arch, n, nblk, int_index, mut &homes, &reach, &buse, &bdef, mut &referenced, actions)
+    if status > 0 { *reason = 0 }
+    if status < 0 { << []int{} }
+    << homes
+}
+
+fn vreg_plan_color(m &types.Mir, fi int, arch int, n int, nblk int, int_index bool, homes &mut []int, reach &[]int, buse &[]int, bdef &[]int, referenced &mut []int) int {
+    empty := []int{}
+    << vreg_plan_color_selected(m, fi, arch, n, nblk, int_index, homes, reach, buse, bdef, referenced, &empty)
+}
+
+fn vreg_plan_color_selected(m &types.Mir, fi int, arch int, n int, nblk int, int_index bool, homes &mut []int, reach &[]int, buse &[]int, bdef &[]int, referenced &mut []int, actions &[]int) int {
+    mut must_work := []int{}
+    for _ in 0:nblk * n * 2 { must_work.push(0) }
+    if !vreg_solve_must(mut &must_work, m, fi, reach, bdef, n, nblk) {
+        << 0
+    }
+    if !vreg_validate_must_selected(mut &must_work, m, fi, reach, n, nblk, actions) {
+        << 0
+    }
+    if !vreg_natural_loop_depths(mut &must_work, m, fi, reach, nblk) {
+        << 0
+    }
+
+    // Backward block liveness.
+    mut live_work := []int{}
+    for _ in 0:nblk * n * 2 { live_work.push(0) }
+    if !vreg_solve_liveness(mut &live_work, m, fi, reach, buse, bdef, n, nblk) {
+        << 0
+    }
+
+    // Build the interference matrix by walking each block backwards.
+    mut edge := []int{}
+    edge_words := vreg_edge_words(n)
+    for _ in 0:n * edge_words { edge.push(0) }
+    mut call_live := []int{}
+    // First half: bit 0 call-live, bit 1 FP, bit 2 index-scratch coverage,
+    // bit 3 allows the proven field/index body to use both GPR pools;
+    // bit 4 forbids GPR splitting across a hidden ABI call;
+    // bits 8..39 encode reviewed GPR scratch exclusions by home number.
+    // Second half: natural-loop spill weight.
+    for _ in 0:n * 2 { call_live.push(0) }
+    // `homes` owns the compact call-point metadata after its first n color
+    // cells, avoiding another slice in this self-host-sensitive frame.
+    if !vreg_build_interference_selected(mut &edge, mut &call_live, referenced, homes, &must_work, m, fi, arch, reach, &live_work, n, nblk, actions) {
+        // A split budget overflow invalidates the complete fixed-home plan;
+        // do not color/retain a truncated action stream.
+        << -1
+    }
+
+    // Integer LoadIndex kernels (sha256 round state) need both GPR pools:
+    // 8 live words do not fit in the 6 caller-saved homes, and the
+    // callee-saved pool is also 6. Restricted to this kernel so the
+    // spill-weight internal gate keeps t6 in the caller class.
+    if int_index {
+        callee_n := td_gpr_callee_hi(arch) - td_gpr_callee_lo(arch)
+        mut n_callee_tagged := 0
+        for t in 0:n {
+            if (call_live[t] & 1) != 0 { n_callee_tagged += 1 }
+        }
+        live_total := nblk * n
+        for bi in 0:nblk {
+            if reach[bi] == 0 { -> }
+            if must_work[bi] <= 0 { -> }
+            for t in 0:n {
+                if live_work[bi * n + t] != 1 { -> }
+                if live_work[live_total + bi * n + t] != 1 { -> }
+                if (call_live[t] & 1) != 0 { -> }
+                if types.mir_temp_ty(m, fi, t) == 4 { -> }
+                if n_callee_tagged < callee_n {
+                    call_live[t] = call_live[t] | 1
+                    n_callee_tagged += 1
+                }
+            }
+        }
+    }
+
+    if fn_is_int_field_index_kernel(m, fi) {
+        for t in 0:n { call_live[t] = call_live[t] | 8 }
+    }
+
+    // Reuse the call-live cell as a compact type tag for coloring: bit 0 is
+    // call liveness, bit 1 selects the independent FP register bank. This
+    // avoids growing the self-host-sensitive vreg_color_homes call frame.
+    for t in 0:n {
+        if types.mir_temp_ty(m, fi, t) == 4 {
+            call_live[t] += 2
+        }
+    }
+
+    // Proven local snapshots need no fixed home across the call. The graph
+    // and must-def proof remain intact; frame layout rechecks the alias.
+    for t in 0:n {
+        if (call_live[t] & 1) != 0 && vreg_call_local_alias(m, fi, t) >= 0 {
+            referenced[t] = 0
+        }
+    }
+
+    // Deterministic weight-desc, degree-desc coloring (TempId tie-break).
+    // Natural-loop uses/defs are expensive to spill; cold code retains the
+    // old degree/TempId order. Every candidate checks all already-colored
+    // interfering nodes regardless of its TempId. Uncolorable nodes keep
+    // frame slots.
+    vreg_color_homes(homes, &edge, &*referenced, &call_live, n, arch)
+    // Machine selections have their own virtual operand stream. Keep that
+    // path until the call-point walker also consumes those actions.
+    if actions.len == 0 && !vreg_split_gpr_calls(homes, &edge, &*referenced, &call_live, &must_work, m, fi, arch, reach, &live_work, n, nblk) { << -1 }
+    << 1
+}
+
+// Exercise the public types-side legacy-MIR fixtures through the actual
+// whole-function planner.  Keeping each fixture and homes owner inside a
+// small scalar-return helper avoids adding long-lived slice descriptors to
+// layout_temps, whose frame is sensitive to the frozen Gen1 slice ABI.
+fn vreg_plan_copy_gate(kind int, arch int, lo int, hi int, want_same bool) bool {
+    m := types.mir_vreg_gate_fixture(kind)
+    homes := vreg_plan(&m, 0, arch)
+    if homes.len < 2 { << false }
+    if homes[0] < lo || homes[0] >= hi || homes[1] < lo || homes[1] >= hi { << false }
+    if want_same { << homes[0] == homes[1] }
+    << homes[0] != homes[1]
+}
+
+fn vreg_plan_call_gate(arch int) bool {
+    m := types.mir_vreg_gate_fixture(3)
+    homes := vreg_plan(&m, 0, arch)
+    if homes.len < 3 { << false }
+    if arch == 0 {
+        // t0 is live across the direct call and must use Arm64 S0-S5;
+        // the call result t1 and add result t2 stay in V2-V7.
+        if homes[0] < 8 || homes[0] >= 14 { << false }
+        if homes[1] < 2 || homes[1] >= 8 || homes[2] < 2 || homes[2] >= 8 { << false }
+    } else {
+        // The x64 fixed-home pool maps V2-V5 to ABI-preserved registers, so
+        // both call-live and ordinary ranges use the same class.
+        for t in 0:3 {
+            if homes[t] < 2 || homes[t] >= 6 { << false }
+        }
+    }
+    // All three fixture values overlap at the add/call boundary.
+    << homes[0] != homes[1] && homes[0] != homes[2] && homes[1] != homes[2]
+}
+
+fn vreg_plan_drop_gate(kind int, arch int) bool {
+    m := types.mir_vreg_drop_gate_fixture(kind)
+    homes := vreg_plan(&m, 0, arch)
+    // Hidden-call FP has no save/reload action yet: reject the whole plan
+    // before verification or frame layout can retain a partial split stream.
+    if kind == 2 { << homes.len == 0 }
+    if homes.len < 11 { << false }
+    mut count := 0
+    for t in 0:6 {
+        h := homes[t]
+        if h == 0 { -> }
+        if arch == 0 {
+            if h == 9 { << false }
+            if kind == 0 && (h < 8 || h >= 14) { << false }
+            if kind == 1 && (h < 2 || h >= 8) { << false }
+        } else if arch != 1 || h < 2 || h >= 6 { << false }
+        for u in 0:t { if homes[u] == h { << false } }
+        count += 1
+    }
+    if arch == 1 { << count == 4 }
+    if kind == 0 { << count == 5 }
+    // Integer Bin reserves a distinct result from its dying inputs, so the
+    // first reduction still spills one value from the six caller homes.
+    << count == 5
+}
+
+// Keep the Mir aggregate owner and the returned homes slice in separate
+// self-host frames.  With both locals in one helper, the frozen Gen1 ABI can
+// corrupt the homes header in the Gen1-produced compiler; unrelated debug
+// locals merely move the frame and hide the failure.
+fn vreg_plan_spill_weight_gate_m(m &types.Mir, arch int) bool {
+    homes := vreg_plan(m, 0, arch)
+    if homes.len < 13 { << false }
+    mut hot_lo := 2
+    mut hot_hi := 8
+    if arch == 1 { hot_hi = 6 }
+    if homes[6] < hot_lo || homes[6] >= hot_hi { << false }
+    // Seven mutually-live inputs exceed either hosted pool. The only use in
+    // a natural loop is t6, so weight (not TempId order) must retain its home.
+    mut cold_spill := false
+    for t in 0:6 {
+        if homes[t] == 0 { cold_spill = true }
+    }
+    << cold_spill
+}
+
+fn vreg_plan_spill_weight_gate(arch int) bool {
+    m := types.mir_vreg_spill_weight_gate_fixture()
+    << vreg_plan_spill_weight_gate_m(&m, arch)
+}
+
+fn vreg_plan_sqrt_gate(arch int) bool {
+    if !td_has_hw_fsqrt(arch) || !td_has_vreg(arch) { << true }
+    m := types.mir_vreg_sqrt_gate_fixture()
+    homes := vreg_plan(&m, 0, arch)
+    if homes.len < 2 { << false }
+    lo := td_fp_home_lo()
+    hi := td_fp_home_hi(arch)
+    if homes[1] < lo || homes[1] >= hi { << false }
+    << true
+}
+
+// Test the shared coloring boundary at actual register pressure. Scratch
+// flags must restrict only the GPR ranges that cross an indexed operation;
+// call-only ranges retain all six S homes and FP keeps its own bank.
+fn vreg_scratch_color_gate(tag int, lo int, hi int, want_spill int) bool {
+    mut n := 6
+    if (tag & 8) != 0 { n = 12 }
+    mut homes := []int{}
+    mut edge := []int{}
+    mut refs := []int{}
+    mut live := []int{}
+    for _ in 0:n {
+        homes.push(0)
+        edge.push((1 << n) - 1)
+        refs.push(1)
+        live.push(tag)
+    }
+    for _ in 0:n { refs.push(-1)
+        live.push(0) }
+    vreg_color_homes(mut &homes, &edge, &refs, &live, n, 0)
+    mut spill := 0
+    for t in 0:n {
+        h := homes[t]
+        if h == 0 { spill += 1
+            -> }
+        if h < lo || h >= hi { << false }
+        if regplan_home_reserved(tag, h) { << false }
+        for u in 0:t { if homes[u] == h { << false } }
+    }
+    << spill == want_spill
+}
+
+fn vreg_scratch_hint_gate(arch int) bool {
+    mut homes := [0, 0]
+    edge := [0, 0]
+    refs := [1, 1, 1, 0]
+    live := [0, 1024, 0, 0] // t1 forbids V2, the preferred Copy home.
+    vreg_color_homes(mut &homes, &edge, &refs, &live, 2, arch)
+    << homes[0] == 2 && homes[1] == 3
+}
+
+fn vreg_plan_internal_gate() bool {
+    if !td_internal_gate() { << false }
+    if !intfield_bounds_internal_gate() { << false }
+    if !intfield_descriptor_internal_gate() { << false }
+    if !isel_ror32_internal_gate() { << false }
+    if !vreg_scratch_color_gate(1, 8, 14, 0) { << false }
+    if !vreg_scratch_color_gate(5, 8, 12, 2) { << false }
+    if !vreg_scratch_color_gate(4, 2, 8, 0) { << false }
+    if !vreg_scratch_color_gate(7, 32, 54, 0) { << false }
+    if !vreg_scratch_color_gate(1 | (1 << 17), 8, 14, 1) { << false }
+    if !vreg_scratch_color_gate(1 << 10, 2, 8, 1) { << false }
+    if !vreg_scratch_hint_gate(0) || !vreg_scratch_hint_gate(1) { << false }
+    if !vreg_scratch_color_gate(8, 2, 14, 0) { << false }
+    if !vreg_scratch_color_gate(12, 2, 12, 2) { << false }
+    if !vreg_scratch_color_gate(13, 8, 12, 8) { << false }
+    if !vreg_scratch_color_gate(10, 32, 54, 0) { << false }
+    // Same-typed, one-word Copy affinities should remove the physical move
+    // in both GPR and FP banks on both hosted architectures.
+    if !vreg_plan_copy_gate(0, 0, 2, 8, true) { << false }
+    if !vreg_plan_copy_gate(0, 1, 2, 6, true) { << false }
+    if !vreg_plan_copy_gate(1, 0, 32, 38, true) { << false }
+    if !vreg_plan_copy_gate(1, 1, 32, 36, true) { << false }
+
+    // A later redefinition while the copied value remains live creates real
+    // interference and must override the affinity hint.
+    if !vreg_plan_copy_gate(2, 0, 2, 8, false) { << false }
+    if !vreg_plan_copy_gate(2, 1, 2, 6, false) { << false }
+
+    if !vreg_plan_call_gate(0) { << false }
+    if !vreg_plan_call_gate(1) { << false }
+    for kind in 0:3 {
+        if !vreg_plan_drop_gate(kind, 0) { << false }
+        if !vreg_plan_drop_gate(kind, 1) { << false }
+    }
+    if !vreg_plan_sqrt_gate(0) {
+        eprintln("internal error: Arm64 virtual-register sqrt-home gate failed")
+        << false
+    }
+    if !vreg_plan_sqrt_gate(1) {
+        eprintln("internal error: x64 virtual-register sqrt-home gate failed")
+        << false
+    }
+    if !vreg_plan_spill_weight_gate(0) {
+        eprintln("internal error: Arm64 virtual-register spill-weight gate failed")
+        << false
+    }
+    if !vreg_plan_spill_weight_gate(1) {
+        eprintln("internal error: x64 virtual-register spill-weight gate failed")
+        << false
+    }
+    << true
+}
+
+fn vreg_plan_gate_at(m &types.Mir, fi int) bool {
+    // Extern declarations are not emitted, so function zero is not always
+    // the first layout.  Stop at the first earlier concrete function; in the
+    // common case this examines only index zero for every later function.
+    for i in 0:fi {
+        if !types.mir_fn_is_extern(m, i) { << false }
+    }
+    << !types.mir_fn_is_extern(m, fi)
+}
+
+// Scalar wrapper for large callers. Keeping the returned homes slice inside
+// this helper prevents emit_function's long-lived local frame from crossing
+// the frozen self-host slice-header limit.
+fn vreg_plan_any(m &types.Mir, fi int, arch int) bool {
+    homes := vreg_plan(m, fi, arch)
+    n := types.mir_ntemps(m, fi)
+    for i in 0:n {
+        if i >= homes.len { <- }
+        if homes[i] >= 2 { << true }
+    }
+    << false
+}
+
+fn vreg_plan_callee_pairs(m &types.Mir, fi int, arch int) int {
+    if arch != 0 { << 0 }
+    homes := vreg_plan(m, fi, arch)
+    mut pairs := 0
+    n := types.mir_ntemps(m, fi)
+    for t in 0:n {
+        if t >= homes.len { <- }
+        home := homes[t]
+        if home >= 8 && home <= 13 {
+            need := (home - 8) / 2 + 1
+            if need > pairs { pairs = need }
+        }
+    }
+    << pairs
+}
+
+// Real FP-backed slot index (not synth / unused / const-hold sentinel).
+fn is_frame_slot(slot int) bool {
+    << slot >= 0 && slot < synth_slot_base()
+}
+
+// The vreg plan stores exact (call InstrId, TempId) pairs after its n color
+// cells. Only a temp assigned an actionable scalar home needs a backup slot.
+fn vreg_plan_temp_has_fp_split(plan &[]int, n int, t int) bool {
+    if n < 0 || n > 1048576 || plan.len < n || plan.len - n > vreg_max_fp_split_words || (plan.len - n) % 2 != 0 {
+        << false
+    }
+    mut p := n
+    while p + 1 < plan.len {
+        if plan[p + 1] == t { << true }
+        p += 2
+    }
+    << false
+}
+
+// Return the ordinal actionable TempId at one exact call program point.
+// Both the pre-call save and post-call reload use this same selector.
+fn frame_call_fp_split_temp_at(fr &Frame, n int, ii int, want int) int {
+    if n < 0 || n > 1048576 || fr.fp_split.len < n || fr.fp_split.len - n > vreg_max_fp_split_words || (fr.fp_split.len - n) % 2 != 0 || want < 0 || want >= vreg_max_fp_split_pairs {
+        << -1
+    }
+    mut seen := 0
+    mut p := n
+    while p + 1 < fr.fp_split.len {
+        if fr.fp_split[p] == ii {
+            t := fr.fp_split[p + 1]
+            if t >= 0 && t < n && fr.fp_split[t] >= 0 {
+                if seen == want { << t }
+                seen += 1
+            }
+        }
+        p += 2
+    }
+    << -1
+}
+
+// Container/action gate: call 10 has two live values, call 20 has one, t2 is
+// dead at call 10, and a non-call point has no action.
+fn frame_call_fp_split_internal_gate() bool {
+    mut ts := []int{}
+    ts.push(fp_vreg_slot(32))
+    ts.push(fp_vreg_slot(33))
+    ts.push(fp_vreg_slot(34))
+    mut fs := []int{}
+    fs.push(4)
+    fs.push(5)
+    fs.push(6)
+    fs.push(10)
+    fs.push(0)
+    fs.push(10)
+    fs.push(1)
+    fs.push(20)
+    fs.push(2)
+    fr := Frame{local_slot: []int{}, temp_slot: ts, fp_split: fs, select_pairs: []int{}, sret_slot: -1, size: 64, plan_reason: 0, plan_instr: -1}
+    if frame_call_fp_split_temp_at(&fr, 3, 10, 0) != 0 { << false }
+    if frame_call_fp_split_temp_at(&fr, 3, 10, 1) != 1 { << false }
+    if frame_call_fp_split_temp_at(&fr, 3, 10, 2) != -1 { << false }
+    if frame_call_fp_split_temp_at(&fr, 3, 20, 0) != 2 { << false }
+    if frame_call_fp_split_temp_at(&fr, 3, 20, 1) != -1 { << false }
+    << frame_call_fp_split_temp_at(&fr, 3, 15, 0) == -1
+}
+
+// Populate temp slots in a non-returning helper so its slice descriptors do
+// not overlap frame_layout's returned Frame under the frozen self-host ABI.
+// The scalar return is the next free frame word.
+fn (fr &mut Frame) layout_temps(m &types.Mir, fi int, park_temps int, arch int, use_vregs bool, next0 int) int {
+    // Run once per emitted unit.  A failed allocator invariant is a compiler
+    // error, not a reason to silently fall back to frame slots.
+    if use_vregs && vreg_plan_gate_at(m, fi) {
+        if !vreg_plan_internal_gate() || !frame_call_fp_split_internal_gate() || !regplan_internal_gate() {
+            eprintln("internal error: virtual-register allocator gate failed")
+            <<< 1
+        }
+    }
+    // Check the descriptor length before allocating the two temporary
+    // liveness arrays below.  A malformed producer must not make the
+    // conservative/fallback frame path allocate attacker-sized `used` or
+    // `taken` buffers before its metadata budget is consulted.
+    nt := m.fns[fi].temps_nslots.len
+    if nt < 0 || nt > 1048576 {
+        eprintln("internal compiler error: virtual-register temp metadata exceeds budget")
+        <<< 1
+    }
+    mut next := next0
+    used := frame_temp_used(m, fi)
+    taken := frame_temp_addr_taken(m, fi)
+    // Keep vhomes last among slice-return locals; it remains live only inside
+    // this helper and is never forwarded across the returned Frame boundary.
+    mut vhomes := []int{}
+    if use_vregs {
+        mut reason := 0
+        mut instruction := -1
+        vhomes = vreg_plan_diagnosed(m, fi, arch, &fr.select_pairs, mut &reason, mut &instruction)
+        fr.plan_reason = reason
+        fr.plan_instr = instruction
+        if !regplan_verify(m, fi, arch, &vhomes) {
+            eprintln("internal compiler error: register plan failed call-clobber/descriptor checks")
+            <<< 1
+        }
+    }
+    if vhomes.len > vreg_max_plan_words {
+        eprintln("internal compiler error: virtual-register action stream exceeds budget")
+        <<< 1
+    }
+    for _ in 0:nt { fr.fp_split.push(-1) }
+    mut has_vreg := false
+    for i in 0:nt {
+        if i >= vhomes.len { <- }
+        if vhomes[i] >= 2 { has_vreg = true }
+    }
+    // A fixed-home function disables the legacy cache. Do not create
+    // cache-only synthetic slots for its spills; ordinary non-vreg functions
+    // retain the existing single-block leaf parking path.
+    mut omit := 0
+    if !has_vreg && park_temps != 0 && fn_omits_temp_frame(m, fi) != 0 {
+        omit = 1
+    }
+    field_index := has_vreg && intfield_receiver_frame_ok(&*fr) && (fn_is_int_field_index_kernel(m, fi) || fn_is_readonly_i64_field_index(m, fi))
+    for i in 0:nt {
+        if has_vreg && (elemaddr_elided_descriptor(m, fi, i) || elemaddr_elided_receiver(m, fi, i)) {
+            fr.temp_slot.push(unused_slot())
+            ->
+        }
+        if field_index && intfield_elided_frame_temp(m, fi, i) {
+            fr.temp_slot.push(unused_slot())
+            ->
+        }
+        if i < vhomes.len && vhomes[i] >= 2 {
+            if vhomes[i] >= 32 {
+                fr.temp_slot.push(fp_vreg_slot(vhomes[i]))
+                if vreg_plan_temp_has_fp_split(&vhomes, nt, i) {
+                    fr.fp_split[i] = next
+                    next += 1
+                }
+            } else {
+                fr.temp_slot.push(vreg_slot(vhomes[i]))
+                if vreg_plan_temp_has_fp_split(&vhomes, nt, i) {
+                    fr.fp_split[i] = next
+                    next += 1
+                }
+            }
+            ->
+        }
+        if has_vreg && (i >= taken.len || taken[i] == 0) {
+            local := vreg_call_local_alias(m, fi, i)
+            if local >= 0 && local < fr.local_slot.len && is_frame_slot(fr.local_slot[local]) {
+                lslot := fr.local_slot[local]
+                fr.temp_slot.push(lslot)
+                ->
+            }
+        }
+        if i < used.len && used[i] == 0 {
+            fr.temp_slot.push(unused_slot())
+        } else if omit == 1 && types.mir_temp_nslots(m, fi, i) == 1 && (i >= taken.len || taken[i] == 0) {
+            fr.temp_slot.push(synth_slot(i))
+        } else {
+            fr.temp_slot.push(next)
+            next += types.mir_temp_nslots(m, fi, i)
+        }
+    }
+    // Keep only actionable pairs: an uncolorable call-live scalar remains
+    // conservatively frame-backed and therefore needs no save/reload action.
+    mut split_pairs := 0
+    mut p := nt
+    while p + 1 < vhomes.len {
+        ii := vhomes[p]
+        t := vhomes[p + 1]
+        if t >= 0 && t < nt && fr.fp_split[t] >= 0 {
+            if split_pairs >= vreg_max_fp_split_pairs || fr.fp_split.len > nt + vreg_max_fp_split_words - 2 {
+                eprintln("internal compiler error: virtual-register scalar split budget exceeded")
+                <<< 1
+            }
+            fr.fp_split.push(ii)
+            fr.fp_split.push(t)
+            split_pairs += 1
+        }
+        p += 2
+    }
+    << next
+}
+
+// Compute the frame layout of a function: local/temp slot indices and the
+// 16-byte-aligned frame size. MIR carries exact local/temp slot widths.
+// park_temps!=0: 1-block leaf may omit 1-slot non-addr-taken temps (synth keys).
+fn (fr &mut Frame) layout(m &types.Mir, fi int, park_temps int, arch int, use_vregs bool) {
+    // Keep promoted-local omission bounded: the query below walks the MIR,
+    // and repeating it for a large local set has no material runtime benefit.
+    mut omit_promoted := park_temps
+    nlocal := m.fns[fi].locals_nslots.len
+    nins := types.mir_nins(m, fi)
+    if nlocal > 512 || nlocal * nins > 16 * 1024 * 1024 { omit_promoted = 0 }
+    mut next := 0
+    for i in 0:m.fns[fi].locals_nslots.len {
+        if omit_promoted != 0 && i >= types.mir_fn_nparams(m, fi) && !frame_local_is_used(m, fi, i) {
+            fr.local_slot.push(unused_slot())
+        } else {
+            fr.local_slot.push(next)
+            next += types.mir_local_nslots(m, fi, i)
+        }
+    }
+    next = fr.layout_temps(m, fi, park_temps, arch, use_vregs, next)
+    if types.mir_fn_ret_nslots(m, fi) > 1 {
+        fr.sret_slot = next
+        next += 1
+    }
+    // The shape gate bounds ordinary local/temp words, but call-split scalar
+    // backups are appended by layout_temps.  Re-check the aggregate here
+    // before converting words to bytes, and align without `next * 8` so a
+    // future metadata regression cannot wrap the byte arithmetic.
+    if next < 0 || next > 1048576 {
+        eprintln("internal compiler error: frame word count overflow")
+        <<< 1
+    }
+    mut aligned := (next / 2) * 16
+    if next % 2 != 0 { aligned += 16 }
+    fr.size = aligned
+}
+
+// Materialization barrier plus fail-closed ABI check. The frozen Gen1
+// compiler has known large-frame slice-header hazards; consume both headers
+// immediately after layout so a malformed Frame never reaches code emission.
+fn frame_validate(fr &Frame, m &types.Mir, fi int) {
+    nt := types.mir_ntemps(m, fi)
+    if fr.local_slot.len != types.mir_nlocals(m, fi) || fr.temp_slot.len != nt || fr.fp_split.len < nt {
+        eprintln("internal compiler error: invalid frame layout")
+        <<< 1
+    }
+    // The first `nt` entries are per-temp backup slots; only the trailing
+    // words are action pairs.  Check the subtraction before parity/limit so
+    // malformed lengths cannot wrap an integer or drive an unbounded scan.
+    if fr.fp_split.len - nt > vreg_max_fp_split_words || (fr.fp_split.len - nt) % 2 != 0 {
+        eprintln("internal compiler error: invalid frame layout")
+        <<< 1
+    }
+    if fr.size < 0 || fr.size % 16 != 0 || fr.size / 8 > 1048576 || fr.size / 8 >= synth_slot_base() {
+        eprintln("internal compiler error: invalid frame size")
+        <<< 1
+    }
+    words := fr.size / 8
+    nparams := types.mir_fn_nparams(m, fi)
+    for i in 0:fr.local_slot.len {
+        slot := fr.local_slot[i]
+        width := types.mir_local_nslots(m, fi, i)
+        if is_unused_slot(slot) {
+            if i < nparams || frame_local_is_used(m, fi, i) {
+                eprintln("internal compiler error: live local omitted from frame")
+                <<< 1
+            }
+        } else if !is_frame_slot(slot) || width <= 0 || slot > words {
+            eprintln("internal compiler error: invalid local frame slot")
+            <<< 1
+        } else if width > words - slot {
+            eprintln("internal compiler error: invalid local frame slot")
+            <<< 1
+        }
+    }
+    for i in 0:fr.temp_slot.len {
+        slot := fr.temp_slot[i]
+        width := types.mir_temp_nslots(m, fi, i)
+        split_slot := fr.fp_split[i]
+        if split_slot >= 0 {
+            if is_vreg_slot(slot) && vreg_slot_home(slot) >= 8 {
+                eprintln("internal compiler error: non-caller GPR split home")
+                <<< 1
+            }
+            if (!is_fp_vreg_slot(slot) && !is_vreg_slot(slot)) || !is_frame_slot(split_slot) || split_slot >= words {
+                eprintln("internal compiler error: invalid scalar call-split backup")
+                <<< 1
+            }
+        }
+        if is_unused_slot(slot) || width <= 0 {
+            // 0-width / tombstone temps have no frame home to validate.
+            ->
+        }
+        if is_vreg_slot(slot) {
+            if width != 1 || types.mir_temp_ty(m, fi, i) == 4 || !vreg_scalar_type(types.mir_temp_ty(m, fi, i)) {
+                eprintln("internal compiler error: invalid virtual-register slot")
+                <<< 1
+            }
+        } else if is_fp_vreg_slot(slot) {
+            if width != 1 || types.mir_temp_ty(m, fi, i) != 4 {
+                eprintln("internal compiler error: invalid FP virtual-register slot")
+                <<< 1
+            }
+        } else if is_synth_slot(slot) {
+            if width != 1 {
+                eprintln("internal compiler error: invalid synthetic temp slot")
+                <<< 1
+            }
+        } else if !is_frame_slot(slot) || width <= 0 || slot > words {
+            eprintln("internal compiler error: invalid temp frame slot")
+            <<< 1
+        } else if width > words - slot {
+            eprintln("internal compiler error: invalid temp frame slot")
+            <<< 1
+        }
+    }
+    mut p := nt
+    while p + 1 < fr.fp_split.len {
+        ii := fr.fp_split[p]
+        t := fr.fp_split[p + 1]
+        if ii < 0 || ii >= types.mir_nins(m, fi) || types.mir_ikind(m, fi, ii) != 7 {
+            eprintln("internal compiler error: invalid scalar call-split action")
+            <<< 1
+        }
+        if t < 0 || t >= nt || fr.fp_split[t] < 0 || (!is_fp_vreg_slot(fr.temp_slot[t]) && !is_vreg_slot(fr.temp_slot[t])) {
+            eprintln("internal compiler error: invalid scalar call-split temp")
+            <<< 1
+        }
+        if types.mir_instr_def_m(m, fi, ii) == t {
+            eprintln("internal compiler error: call result in split action")
+            <<< 1
+        }
+        p += 2
+    }
+    rslots := types.mir_fn_ret_nslots(m, fi)
+    if rslots > 1 {
+        if !is_frame_slot(fr.sret_slot) || fr.sret_slot >= words {
+            eprintln("internal compiler error: invalid sret frame slot")
+            <<< 1
+        }
+    } else if fr.sret_slot != -1 {
+        eprintln("internal compiler error: unexpected sret frame slot")
+        <<< 1
+    }
+}
+
+// ===== value helpers =====
+
+fn emit_wrap_at(a &mut Assembler, dest int, ty int) {
+    if dest == 0 {
+        emit_wrap_int(a, ty)
+        <<
+    }
+    if ty != 8 && ty != 9 && ty != 10 {
+        <<
+    }
+    mut scratch := 1
+    if dest == 1 {
+        scratch = 0
+    }
+    if ty == 10 {
+        a.vm_mov_imm(scratch, 255)
+        a.iand(dest, dest, scratch)
+    }
+    if ty == 9 {
+        a.vm_mov_imm64(scratch, 4294967295)
+        a.iand(dest, dest, scratch)
+    }
+    if ty == 8 {
+        a.shl_imm(dest, dest, 32)
+        a.vm_mov_imm(scratch, 32)
+        a.shr(dest, dest, scratch)
+    }
+    <<
+}

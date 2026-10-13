@@ -1,0 +1,2455 @@
+@xu/types
+
+// MIR verifier shared by the legacy structural path and the formal SSA/Phi
+// stage in mir_17. Return 0 on success; non-zero codes are intentionally
+// stable enough for the internal negative gate but are not user diagnostics.
+//
+// strict_ssa=false: validate legacy CFG/list/operand structure. Re-defining a
+// TempId is allowed, because pre-SSA Gen1 MIR historically does that.
+// strict_ssa=true: additionally require one definition per reachable TempId,
+// persistent Phi well-formedness, and dominance of every reachable use.
+
+// Resource limits for the verifier's internal, dense dataflow structures.
+// These are admission limits only; a rejected oversized function falls back
+// to the legacy/non-SSA path and does not change the MFn ABI.
+const mir_verify_max_items = 1000000
+const mir_verify_max_blocks = 4096
+const mir_verify_max_dom_cells = 16777216
+const mir_verify_max_use_work = 16777216
+const mir_verify_max_arg_work = 16777216
+const mir_verify_max_dom_work = 268435456
+const mir_verify_max_arg_chain = 4096
+// Keep label lookup and argument-chain validation bounded when a malformed
+// replacement contains many Calls.  This is a work budget, not a source
+// language limit; callers retain the previous MFn when it is exhausted.
+const mir_verify_max_call_work = 16777216
+
+fn mir_verify_temp(f &MFn, t int) bool {
+    << t >= 0 && t < f.temps.len
+}
+
+fn mir_verify_local(f &MFn, loc int) bool {
+    << loc >= 0 && loc < f.locals.len
+}
+
+fn mir_verify_value(f &MFn, v int) bool {
+    if v >= 0 { << mir_verify_temp(f, v) }
+    if v == -1 { << false }
+    // Decode `-2 - ci` without evaluating `0-v` first: INT_MIN would
+    // overflow before the bounds check and could turn a malformed value into
+    // an unchecked const-pool access.
+    ci := 0 - (v + 2)
+    << ci >= 0 && ci < f.consts.len
+}
+
+fn mir_verify_optional_value(f &MFn, v int) bool {
+    if v == -1 { << true }
+    << mir_verify_value(f, v)
+}
+
+// Constants in Gen1 MIR are deliberately untyped raw word/bit patterns.
+// They may stand in for scalar values and the null representation of the
+// pointer-like ABI classes below, but not for strings or aggregate layouts.
+// Keep this list in step with bootstrap xumir's const_compatible helper.
+fn mir_verify_const_compatible_ty(ty int) bool {
+    if mir_scalar_ty(ty) { << true }
+    if is_ref_type(ty) || is_chan_type(ty) || is_map_type(ty) || is_fn_type(ty) { << true }
+    << false
+}
+
+fn mir_verify_value_has_ty(f &MFn, v int, expect int) bool {
+    if v >= 0 {
+        << mir_verify_temp(f, v) && f.temps[v] == expect
+    }
+    if !mir_verify_value(f, v) { << false }
+    << mir_verify_const_compatible_ty(expect)
+}
+
+fn mir_verify_branch_cond(f &MFn, v int) bool {
+    if !mir_verify_value(f, v) { << false }
+    // A constant has no embedded type and is a valid folded predicate.
+    if v < 0 { << true }
+    ty := f.temps[v]
+    << ty == 2 || is_integer_type(ty)
+}
+
+// MIR Bin/Un opcodes are serialized integer tags.  Keep the accepted set in
+// lockstep with emit_instr_bin/emit_instr_un: short-circuit And/Or (12/13)
+// are lowered to CFG and must never reach the scalar Bin emitter.
+fn mir_verify_bin_opcode(op int) bool {
+    if op >= 1 && op <= 11 { << true }
+    << op >= 14 && op <= 18
+}
+
+fn mir_verify_un_opcode(op int) bool {
+    << op >= 1 && op <= 5
+}
+
+// FieldRMW/IndexRMW only have the six scalar operations implemented by the
+// leaf emitters.  Keep this separate from mir_verify_bin_opcode: shifts are
+// valid ordinary Bin operations, but the RMW emitters intentionally do not
+// lower them (a malformed op would otherwise become a silent no-op).
+fn mir_verify_rmw_opcode(op int) bool {
+    if op == 1 || op == 2 || op == 3 { << true }
+    if op == 14 || op == 15 || op == 16 { << true }
+    << false
+}
+
+// Raw layout fields are consumed by host arithmetic and loop bounds.  Do not
+// negate an untrusted value before proving it is above INT_MIN; comparing to a
+// bounded negative constant keeps `0 - v` in the emitter defined.
+fn mir_verify_raw_bytes(v int) bool {
+    if v == 0 { << false }
+    if v > mir_max_layout_bytes { << false }
+    if v < 0 - mir_max_layout_bytes { << false }
+    << true
+}
+
+// Byte offsets are allowed to start at the first slot.  Keep this separate
+// from element-width validation: FieldRMW stores its byte offset in `line`,
+// and offset zero is the common first-field case.
+fn mir_verify_raw_offset(v int) bool {
+    << v >= 0 && v <= mir_max_layout_bytes
+}
+
+fn mir_verify_raw_slots(v int) bool {
+    << v >= 0 && v <= mir_max_layout_words
+}
+
+fn mir_verify_raw_span(off int, slots int) bool {
+    if off < 0 || off > mir_max_layout_bytes { << false }
+    if !mir_verify_raw_slots(slots) { << false }
+    // The subtraction is safe after the offset bound; this also prevents a
+    // later `slots * 8` from crossing the bounded layout window.
+    << slots <= (mir_max_layout_bytes - off) / 8
+}
+
+// Box/any discriminants use a compact scalar range plus disjoint high-bit
+// domains for arrays/enums/throws/chans/maps/functions/type parameters.  A
+// plain `<= max_items` check would reject valid high tags; accepting only the
+// encoded domains keeps INT_MAX and other arbitrary values out.
+fn mir_verify_box_tag(tag int) bool {
+    if tag >= 0 && tag <= struct_overflow_limit + 99 { << true }
+    if tag >= 65281 && tag <= 65287 { << true }
+    // Map type ids occupy only the 50..99 source-type window (50 ids), not
+    // the wider 100-id domains used by arrays/throws/enums/etc.  Keeping the
+    // exact width here prevents an apparently valid high tag from becoming
+    // an out-of-range map table lookup in any_itab/drop helpers.
+    if tag >= 2415919104 && tag < 2415919104 + 50 { << true }
+    if tag >= 2684354560 && tag < 2684354560 + 100 { << true }
+    if tag >= 2952790016 && tag < 2952790016 + 100 { << true }
+    if tag >= 3221225472 && tag < 3221225472 + 100 { << true }
+    if tag >= 3489660928 && tag < 3489660928 + 100 { << true }
+    if tag >= 3758096384 && tag < 3758096384 + 100 { << true }
+    if tag >= 4026531840 && tag < 4026531840 + 100 { << true }
+    << false
+}
+
+// Mir-aware companion for the commit seam.  The representation helper above
+// keeps malformed MFn-only fixtures bounded; once the whole Mir is available,
+// use the actual table lengths so valid overflow-domain entries are retained
+// while a syntactically in-range tag cannot drive an OOB table lookup.
+fn mir_verify_box_tag_m(m &Mir, tag int) bool {
+    if tag >= 0 && tag <= struct_overflow_limit + 99 {
+        << tag < m.structs.len
+    }
+    if tag >= 65281 && tag <= 65287 { << true }
+    if tag >= 2415919104 && tag < 2415919104 + 50 {
+        mi := tag - 2415919104
+        << mi >= 0 && mi < m.maps.len
+    }
+    if tag >= 2684354560 && tag < 2684354560 + 100 {
+        pi := tag - 2684354560
+        << pi >= 0 && pi < mir_verify_max_items
+    }
+    if tag >= 2952790016 && tag < 2952790016 + 100 {
+        fi := tag - 2952790016
+        << fi >= 0 && fi < m.fn_sigs.len
+    }
+    if tag >= 3221225472 && tag < 3221225472 + 100 {
+        ci := tag - 3221225472
+        << ci >= 0 && ci < m.chans.len
+    }
+    if tag >= 3489660928 && tag < 3489660928 + 100 {
+        ri := tag - 3489660928
+        << ri >= 0 && ri < m.throws.len
+    }
+    if tag >= 3758096384 && tag < 3758096384 + 100 {
+        ai := tag - 3758096384
+        << ai >= 0 && ai < m.arrays.len
+    }
+    if tag >= 4026531840 && tag < 4026531840 + 100 {
+        ei := tag - 4026531840
+        << ei >= 0 && ei < m.enums.len
+    }
+    << false
+}
+
+// Call target tags are part of the legacy MInstr ABI.  The gaps are reserved
+// instruction-era values (34..39, 76..79, 101..115), not valid call
+// dispatches; rejecting them prevents the emitter's default println
+// fall-through.  Keep this explicit range list in sync with emit_instr_call.
+fn mir_verify_call_kind(kind int) bool {
+    if kind >= 1 && kind <= 33 { << true }
+    if kind >= 40 && kind <= 75 { << true }
+    if kind >= 80 && kind <= 100 { << true }
+    if kind == 104 { << true }
+    if kind >= 116 && kind <= 137 { << true }
+    if kind >= 151 && kind <= 155 { << true }
+    if kind == 160 || kind == 161 || kind == 162 || kind == 163 || kind == 164 || kind == 165 { << true }
+    << false
+}
+
+fn mir_verify_index_base(f &MFn, base int) bool {
+    if base >= 1073741824 {
+        << mir_verify_local(f, base - 1073741824)
+    }
+    << mir_verify_temp(f, base)
+}
+
+fn mir_verify_arg_chain(f &MFn, head int) bool {
+    if head == -1 { << true }
+    if f.margs.len < 0 || f.margs.len > mir_verify_max_items { << false }
+    if head < 0 || head >= f.margs.len { << false }
+    mut at := head
+    // Walk at most min(pool length, parser cap) nodes.  Using the pool length
+    // itself (rather than `len + 1`) avoids signed overflow and is sufficient:
+    // a well-formed chain reaches -1 after its final node, while a cycle still
+    // has a non-negative `at` when the budget expires.  No len-sized `seen`
+    // bitmap is allocated for each Call/InterfaceMethod probe.
+    mut budget := f.margs.len
+    if budget > mir_verify_max_arg_chain { budget = mir_verify_max_arg_chain }
+    for _ in 0:budget {
+        if at == -1 { << true }
+        if at < 0 { << false }
+        if at >= f.margs.len { << false }
+        if !mir_verify_value(f, f.margs[at].v) { << false }
+        at = f.margs[at].next
+    }
+    << at == -1
+}
+
+// Check a Call's exact argument count when the target signature is known.
+// This shares the same bounded walk as mir_verify_arg_chain and never computes
+// an attacker-controlled `len + 1` bound.
+fn mir_verify_arg_count(f &MFn, head int, want int) bool {
+    if want < 0 || want > mir_verify_max_arg_chain { << false }
+    if head == -1 { << want == 0 }
+    if f.margs.len < 0 || f.margs.len > mir_verify_max_items { << false }
+    if head < 0 || head >= f.margs.len { << false }
+    mut at := head
+    mut n := 0
+    mut budget := f.margs.len
+    if budget > mir_verify_max_arg_chain { budget = mir_verify_max_arg_chain }
+    for _ in 0:budget {
+        if at == -1 { << n == want }
+        if at < 0 || at >= f.margs.len { << false }
+        if !mir_verify_value(f, f.margs[at].v) { << false }
+        n += 1
+        if n > want { << false }
+        at = f.margs[at].next
+    }
+    << at == -1 && n == want
+}
+
+// Bounded inclusive argument-count check for ABI families with a small
+// variable tail (currently indirect/fn-value calls).  The same chain walk
+// cap as the exact checker prevents cycles and hostile lengths from escaping.
+fn mir_verify_arg_count_range(f &MFn, head int, min int, max int) bool {
+    if min < 0 || max < min || max > mir_verify_max_arg_chain { << false }
+    if head == -1 { << min == 0 }
+    if f.margs.len < 0 || f.margs.len > mir_verify_max_items { << false }
+    if head < 0 || head >= f.margs.len { << false }
+    mut at := head
+    mut n := 0
+    mut budget := f.margs.len
+    if budget > mir_verify_max_arg_chain { budget = mir_verify_max_arg_chain }
+    for _ in 0:budget {
+        if at == -1 { << n >= min && n <= max }
+        if at < 0 || at >= f.margs.len { << false }
+        if !mir_verify_value(f, f.margs[at].v) { << false }
+        n += 1
+        if n > max { << false }
+        at = f.margs[at].next
+    }
+    << at == -1 && n >= min && n <= max
+}
+
+// Builtin Call targets have fixed ABI arities.  Keeping the table at the MIR
+// seam prevents an emitter branch from reading a missing margs node (or from
+// silently ignoring trailing nodes).  User calls (1), indirect calls (80),
+// and the optional-message assert (24) are handled separately.
+fn mir_verify_builtin_call_arity(f &MFn, kind int, head int) bool {
+    if kind == 151 { << mir_verify_arg_count(f, head, 0) }
+    if kind == 152 || kind == 155 { << mir_verify_arg_count(f, head, 2) }
+    if kind == 153 || kind == 154 { << mir_verify_arg_count(f, head, 1) }
+    if kind == 1 { << true }
+    // Indirect calls pass the fat-function pointer followed by at most four
+    // user arguments.  A0 is occupied by the closure environment and the
+    // fn-value checker rejects a fifth user argument; accepting a seventh
+    // node here would make the legacy emitter write A6, outside its A0-A5
+    // ABI window.
+    if kind == 80 { << mir_verify_arg_count_range(f, head, 1, 5) }
+    if kind == 11 {
+        if mir_verify_arg_count(f, head, 1) { << true }
+        << mir_verify_arg_count(f, head, 3)
+    }
+    if kind == 24 {
+        if mir_verify_arg_count(f, head, 1) { << true }
+        << mir_verify_arg_count(f, head, 2)
+    }
+    if kind == 84 || kind == 99 || kind == 128 || kind == 14 || kind == 28 || kind == 31 || kind == 45 || kind == 46 || kind == 47 || kind == 48 || kind == 49 || kind == 50 || kind == 51 || kind == 52 || kind == 53 || kind == 55 || kind == 56 || (kind >= 116 && kind <= 120) || kind == 136 {
+        << mir_verify_arg_count(f, head, 0)
+    }
+    if kind == 2 || kind == 3 || kind == 4 || kind == 6 || kind == 7 || kind == 8 || kind == 9 || kind == 10 || kind == 12 || kind == 15 || (kind >= 16 && kind <= 19) || kind == 21 || kind == 22 || kind == 23 || kind == 25 || kind == 27 || kind == 29 || kind == 30 || kind == 32 || kind == 40 || kind == 43 || kind == 44 || kind == 54 || kind == 57 || kind == 58 || kind == 60 || kind == 61 || kind == 67 || kind == 68 || kind == 71 || kind == 75 || kind == 81 || kind == 82 || kind == 88 || kind == 100 || kind == 124 || kind == 126 || kind == 130 || kind == 135 || kind == 137 || kind == 160 || kind == 161 {
+        << mir_verify_arg_count(f, head, 1)
+    }
+    if kind == 5 || kind == 13 || kind == 26 || kind == 33 || kind == 41 || kind == 42 || kind == 59 || kind == 62 || kind == 63 || kind == 69 || kind == 70 || kind == 72 || kind == 73 || kind == 74 || kind == 85 || kind == 87 || kind == 89 || kind == 90 || kind == 97 || kind == 98 || kind == 104 || kind == 121 || kind == 122 || kind == 123 || kind == 125 || kind == 133 || kind == 134 || kind == 95 || kind == 162 || kind == 164 || kind == 165 {
+        << mir_verify_arg_count(f, head, 2)
+    }
+    if kind == 20 || kind == 64 || kind == 83 || kind == 86 || kind == 91 || kind == 93 || kind == 94 || kind == 127 || kind == 129 || kind == 131 || kind == 132 || kind == 163 {
+        << mir_verify_arg_count(f, head, 3)
+    }
+    if kind == 92 { << mir_verify_arg_count(f, head, 4) }
+    if kind == 66 { << mir_verify_arg_count(f, head, 5) }
+    if kind == 65 || kind == 96 { << mir_verify_arg_count(f, head, 6) }
+    << false
+}
+
+// Validate Call records that cross the MFn/Mir seam.  The structural gate can
+// prove that an argument chain is bounded, but only the whole Mir owns the
+// target-label/signature table.  Keep this helper best-effort for legacy
+// external symbols: a non-empty label absent from m.fns is allowed, while a
+// label present in the table must have an exact nparams match.  This preserves
+// native/runtime ABI symbols that are intentionally not represented as MFn
+// entries without allowing a known user target to receive a malformed arity.
+//
+// The target kinds with unconditional fixed-shape dereferences receive small
+// additional checks: indirect calls are bounded to the emitter's seven-slot
+// window (kind 80), and FieldRMW's receiver/rhs pair is exactly two args
+// (kind 95).  Fixed builtin arities are centralized below; assert (kind 24)
+// is the sole intentionally optional form.  All value/index bounds remain in
+// mir_verify_arg_chain.
+fn mir_verify_call_refs_f(m &Mir, f &MFn) bool {
+    nins := f.instrs.len
+    nmarg := f.margs.len
+    nf := m.fns.len
+    nstr := m.strings.len
+    nstruct := m.structs.len
+    if nins < 0 || nins > mir_verify_max_items || nmarg < 0 || nmarg > mir_verify_max_items || nf < 0 || nf > mir_verify_max_items {
+        << false
+    }
+    // These tables are indexed directly by several MIR records.  Keep the
+    // cross-Mir side bounded as well; a malformed length must not turn the
+    // local checks below into an unbounded scan or an overflowing subtraction.
+    if nstr < 0 || nstr > mir_verify_max_items || nstruct < 0 || nstruct > mir_verify_max_items {
+        << false
+    }
+    mut work := 0
+    for ii in 0:nins {
+        ik := mfn_ikind(&f.instrs, ii)
+        // Cross-Mir indexes are intentionally checked here, after the local
+        // shape gate has proved `ii` valid.  The emitter dereferences these
+        // tables directly (not through a checked helper).
+        if ik == 6 {
+            si := mfn_ib(&f.instrs, ii)
+            if si < 0 || si >= m.strings.len { << false }
+        }
+        if ik == 39 || ik == 40 {
+            si := mfn_ic(&f.instrs, ii)
+            if si < 0 || si >= m.structs.len { << false }
+        }
+        if ik == 41 || ik == 42 || ik == 44 {
+            // Interface/any records carry a discriminant that can be either
+            // a raw struct index or an encoded high-domain tag.  Validate it
+            // against the concrete Mir tables before emit_instr_iface turns
+            // it into an itable label or a direct table access.
+            if !mir_verify_box_tag_m(m, mfn_ic(&f.instrs, ii)) { << false }
+        }
+        // LoadFnAddr/MakeClosure/InterfaceMethod require an explicit label.
+        // BoxTemp (44) deliberately permits an empty sval: the emitter falls
+        // back to any_itab_label(tag), preserving legacy hand-built MIR.
+        if ik == 38 || ik == 39 || ik == 43 {
+            if mfn_isval_len(&f.instrs, ii) <= 0 { << false }
+        }
+        if ik != 7 { -> }
+        kind := mfn_ib(&f.instrs, ii)
+        if !mir_verify_call_kind(kind) { << false }
+        head := mfn_ic(&f.instrs, ii)
+        if !mir_verify_arg_chain(f, head) { << false }
+        if !mir_verify_builtin_call_arity(f, kind, head) { << false }
+        if kind == 84 {
+            // MapNew packs key kind, value kind, and value slot count into
+            // three bytes.  The emitter shifts/masks this field before any
+            // call; reject negatives and high bits before that arithmetic.
+            packed := mfn_id(&f.instrs, ii)
+            if packed < 0 || packed > 16777215 { << false }
+            kkind := packed & 255
+            vkind := (packed / 256) & 255
+            vslots := packed / 65536
+            // CMap encodes key kind as 0/1 (scalar/string), value kind as
+            // 0/1/2 (scalar/string/owning aggregate), and a byte-sized slot
+            // count.  The packed upper bound already limits vslots to a
+            // byte; spelling the component checks out avoids accepting an
+            // arbitrary bit pattern that the runtime would reinterpret.
+            if kkind > 1 || vkind > 2 || vslots > 255 { << false }
+        }
+        if kind == 80 {
+            if head < 0 { << false }
+            ->
+        }
+    if kind == 95 {
+            if !mir_verify_arg_count(f, head, 2) { << false }
+            ->
+        }
+        if kind != 1 { -> }
+
+        lab_len := mfn_isval_len(&f.instrs, ii)
+        if lab_len <= 0 || lab_len > mir_verify_max_arg_chain { << false }
+        lab := mfn_isval(&f.instrs, ii)
+        // Runtime division guards are emitted as kind=1 calls but are labels,
+        // not MFn signatures.  Keep the reserved _rt_ namespace out of the
+        // user-label table lookup; all other absent labels remain compatible
+        // with external/native symbols for the same legacy reason.
+        mut runtime := false
+        if lab_len >= 4 && lab[0] == 95 && lab[1] == 114 && lab[2] == 116 && lab[3] == 95 {
+            runtime = true
+        }
+        if runtime { -> }
+
+        mut matched := false
+        mut arity_ok := false
+        for j in 0:nf {
+            if work >= mir_verify_max_call_work { << false }
+            work += 1
+            ll := mir_fn_label_len(m, j)
+            if ll < 0 || ll > mir_verify_max_items { << false }
+            if ll != lab_len { -> }
+            if mir_fn_label(m, j) != lab { -> }
+            matched = true
+            np := mir_fn_nparams(m, j)
+            if np < 0 || np > mir_verify_max_arg_chain { << false }
+            if mir_verify_arg_count(f, head, np) { arity_ok = true }
+        }
+        if matched && !arity_ok { << false }
+    }
+    << true
+}
+
+// The commit seam above receives an owned MFn clone, which is the safest place
+// to run the full cross-table check.  The emitter, however, also accepts the
+// final Mir directly (including legacy owners that did not pass through a
+// recent optimizer clone).  Keep a small indexed companion at that boundary
+// so a malformed call cannot make a legacy emitter read `margs[next]` or write
+// an argument register past A0-A5.  It deliberately avoids cloning MFn: the
+// hosted compiler's large-MFn ABI is sensitive to by-value/borrowed copies.
+
+fn mir_verify_emission_call_kind_arity(kind int) int {
+    if kind == 151 { << 0 }
+    if kind == 152 || kind == 155 { << 2 }
+    if kind == 153 || kind == 154 { << 1 }
+    // Return an exact arity for fixed builtins.  Negative sentinels mean
+    // user/direct (-1), optional assert (-2), or indirect fn-value (-3).
+    if kind == 1 { << -1 }
+    if kind == 80 { << -3 }
+    if kind == 24 { << -2 }
+    if kind == 11 { << -5 } // bounded byte conversion: exactly 1 or 3
+    if kind == 84 || kind == 99 || kind == 128 || kind == 14 || kind == 28 || kind == 31 || kind == 45 || kind == 46 || kind == 47 || kind == 48 || kind == 49 || kind == 50 || kind == 51 || kind == 52 || kind == 53 || kind == 55 || kind == 56 || (kind >= 116 && kind <= 120) || kind == 136 {
+        << 0
+    }
+    if kind == 2 || kind == 3 || kind == 4 || kind == 6 || kind == 7 || kind == 8 || kind == 9 || kind == 10 || kind == 12 || kind == 15 || (kind >= 16 && kind <= 19) || kind == 21 || kind == 22 || kind == 23 || kind == 25 || kind == 27 || kind == 29 || kind == 30 || kind == 32 || kind == 40 || kind == 43 || kind == 44 || kind == 54 || kind == 57 || kind == 58 || kind == 60 || kind == 61 || kind == 67 || kind == 68 || kind == 71 || kind == 75 || kind == 81 || kind == 82 || kind == 88 || kind == 100 || kind == 124 || kind == 126 || kind == 130 || kind == 135 || kind == 137 || kind == 160 || kind == 161 {
+        << 1
+    }
+    if kind == 5 || kind == 13 || kind == 26 || kind == 33 || kind == 41 || kind == 42 || kind == 59 || kind == 62 || kind == 63 || kind == 69 || kind == 70 || kind == 72 || kind == 73 || kind == 74 || kind == 85 || kind == 87 || kind == 89 || kind == 90 || kind == 95 || kind == 97 || kind == 98 || kind == 104 || kind == 121 || kind == 122 || kind == 123 || kind == 125 || kind == 133 || kind == 134 || kind == 162 || kind == 164 || kind == 165 {
+        << 2
+    }
+    if kind == 20 || kind == 64 || kind == 83 || kind == 86 || kind == 91 || kind == 93 || kind == 94 || kind == 127 || kind == 129 || kind == 131 || kind == 132 || kind == 163 {
+        << 3
+    }
+    if kind == 92 { << 4 }
+    if kind == 66 { << 5 }
+    if kind == 65 || kind == 96 { << 6 }
+    << -4
+}
+
+fn mir_verify_emission_value(m &Mir, fi int, v int) bool {
+    if v >= 0 { << v < mir_ntemps(m, fi) }
+    if v == -1 { << false }
+    ci := 0 - (v + 2)
+    << ci >= 0 && ci < mir_nconsts(m, fi)
+}
+
+// Copying/boxing emitters use a TempId as a raw frame base and then walk a
+// metadata-provided slot count.  The ordinary value check only proves the
+// TempId itself; it does not prove that the source/destination homes are wide
+// enough for that walk.  Keep this tiny width check at the final Mir boundary
+// so malformed producers cannot turn MakeClosure/BoxInterface/BoxTemp into a
+// frame over-read/overwrite (or an oversized allocation) after Frame.layout.
+fn mir_verify_emission_temp_width(m &Mir, fi int, t int, need int) bool {
+    if fi < 0 || fi >= m.fns.len || t < 0 || t >= mir_ntemps(m, fi) {
+        << false
+    }
+    // Keep the helper fail-closed even when called outside the aggregate
+    // emission gate (which normally checks the parallel-vector lengths first).
+    // A malformed final Mir must never turn the metadata lookup below into an
+    // unchecked slice access.
+    if t >= m.fns[fi].temps_nslots.len { << false }
+    if need < 0 || need > mir_max_layout_words { << false }
+    ns := mir_temp_nslots(m, fi, t)
+    << ns >= need && ns <= mir_max_layout_words
+}
+
+fn mir_verify_emission_struct_copy(m &Mir, fi int, src int, dst int, sid int) bool {
+    if sid < 0 || sid >= m.structs.len { << false }
+    ns := m.structs[sid].nslots
+    if ns < 0 || ns > mir_max_layout_words { << false }
+    // MakeClosure and BoxInterface write the two-word fat value result.
+    if !mir_verify_emission_temp_width(m, fi, dst, 2) { << false }
+    << mir_verify_emission_temp_width(m, fi, src, ns)
+}
+
+// Keep InterfaceAs layout derivation bounded independently of Mir.type_slots.
+// The latter is intentionally a compact recursive oracle used by normal
+// lowering, but a final-MIR producer can manufacture a self-referential fixed
+// array/throw table.  Calling it directly from the admission gate would then
+// recurse until the compiler stack is exhausted before the malformed record is
+// rejected.  This helper mirrors the layout rules with an explicit depth cap;
+// the cap is far above source-level nesting seen in valid units and turns a
+// hostile cycle into a zero (invalid) layout instead of a crash.
+// Mir.type_slots is the single bounded layout oracle.  Keeping one resolver
+// avoids a second recursive implementation in the hosted compiler (which
+// would otherwise inflate every self-hosted binary and expose the frozen
+// large-slice ABI to another call graph).  It already caps recursive
+// throw/fixed-array descent and returns zero for invalid metadata.
+fn mir_verify_emission_layout_slots(m &Mir, ty int, depth int) int {
+    if depth > 0 { << 0 }
+    << m.type_slots(ty)
+}
+
+// InterfaceIs/InterfaceAs consume a two-word fat receiver.  InterfaceAs also
+// writes the concrete payload width selected by the emitter from `d`/`c`.
+fn mir_verify_emission_iface_as_width(m &Mir, fi int, src int, dst int, type_id int, concrete_ty int) bool {
+    if !mir_verify_emission_temp_width(m, fi, src, 2) { << false }
+    if !mir_verify_box_tag_m(m, type_id) { << false }
+    // `c` and `d` are a pair: c is the runtime box discriminant and d is the
+    // concrete source type.  If they disagree, the failure path would drop d
+    // against a box containing another type, which is an ownership/UAF risk in
+    // addition to being a width mismatch.
+    expected := temp_box_type_id(concrete_ty)
+    if expected < 0 || expected != type_id { << false }
+    mut need := mir_verify_emission_layout_slots(m, concrete_ty, 0)
+    if need == 0 {
+        // Preserve the existing one-word materialization for a valid empty
+        // struct (and a fixed array whose element is empty).  Any other zero
+        // result denotes an invalid/oversized/cyclic layout and is rejected.
+        if is_struct_type(concrete_ty) {
+            si := struct_index(concrete_ty)
+            if si < 0 || si >= m.structs.len || m.structs[si].nslots != 0 { << false }
+            need = 1
+        } else if is_array_type(concrete_ty) {
+            ai := concrete_ty - 200
+            if ai < 0 || ai >= m.arrays.len || m.arrays[ai].fixed_len <= 0 { << false }
+            need = 1
+        } else {
+            << false
+        }
+    }
+    if need < 1 || need > mir_max_layout_words { << false }
+    << mir_verify_emission_temp_width(m, fi, dst, need)
+}
+
+fn mir_verify_emission_arg_count(m &Mir, fi int, head int, min int, max int) bool {
+    if min < 0 || max < min || max > mir_verify_max_arg_chain { << false }
+    narg := m.fns[fi].margs.len
+    if head == -1 { << min == 0 }
+    if head < 0 || head >= narg || narg < 0 || narg > mir_verify_max_items { << false }
+    mut at := head
+    mut n := 0
+    mut budget := narg
+    if budget > mir_verify_max_arg_chain { budget = mir_verify_max_arg_chain }
+    for _ in 0:budget {
+        if at == -1 { << n >= min && n <= max }
+        if at < 0 || at >= narg { << false }
+        if !mir_verify_emission_value(m, fi, mir_marg_v(m, fi, at)) { << false }
+        n += 1
+        if n > max { << false }
+        at = mir_marg_next(m, fi, at)
+    }
+    << at == -1 && n >= min && n <= max
+}
+
+fn mir_verify_emission_direct_call(m &Mir, fi int, ii int, head int) bool {
+    lab_len := mir_isval_len(m, fi, ii)
+    if lab_len <= 0 || lab_len > mir_verify_max_arg_chain { << false }
+    lab := mir_isval(m, fi, ii)
+    mut matched := false
+    mut arity_ok := false
+    nf := m.fns.len
+    for j in 0:nf {
+        if mir_fn_is_extern(m, j) { -> }
+        if mir_fn_label_len(m, j) != lab_len { -> }
+        if mir_fn_label(m, j) != lab { -> }
+        matched = true
+        np := mir_fn_nparams(m, j)
+        if np < 0 || np > mir_verify_max_arg_chain { << false }
+        if mir_verify_emission_arg_count(m, fi, head, np, np) { arity_ok = true }
+    }
+    // Runtime/native symbols are intentionally absent from m.fns.  A known
+    // Xu function, in contrast, must have an exact ABI argument count.
+    << !matched || arity_ok
+}
+
+// Validate the scalar shape consumed by the legacy emitter without borrowing
+// a pointer into `m.fns[fi]`.  The latter is a known Gen1 large-struct hazard
+// (a pointer to an MFn/MInstr slice can be mis-lowered), so this helper uses
+// only the tiny MIR accessors above.  `vreg_mir_shape_ok` proves list ownership
+// and slot-vector widths; this pass adds the per-kind checks that protect
+// `fr.temp_slot[...]`, `fr.local_slot[...]`, const-pool decodes and raw layout
+// arithmetic immediately before Frame.layout/emission.
+fn mir_verify_emission_instr_shape(m &Mir, fi int, ii int) bool {
+    if fi < 0 || fi >= m.fns.len { << false }
+    nins := mir_nins(m, fi)
+    ntemp := mir_ntemps(m, fi)
+    nlocal := mir_nlocals(m, fi)
+    nconst := mir_nconsts(m, fi)
+    if ii < 0 || ii >= nins || nins < 0 || ntemp < 0 || nlocal < 0 || nconst < 0 {
+        << false
+    }
+    if nins > mir_verify_max_items || ntemp > mir_verify_max_items || nlocal > mir_verify_max_items || nconst > mir_verify_max_items {
+        << false
+    }
+
+    k := mir_ikind(m, fi, ii)
+    a := mir_ia(m, fi, ii)
+    b := mir_ib(m, fi, ii)
+    c := mir_ic(m, fi, ii)
+    d := mir_id(m, fi, ii)
+    line := mir_iline(m, fi, ii)
+    col := mir_icol(m, fi, ii)
+    file := mir_ifile(m, fi, ii)
+    slen := mir_isval_len(m, fi, ii)
+
+    // Kinds 27..29 are reserved instruction-era values in the MInstr stream
+    // (they remain legal Call target tags), so never dispatch them as MIR.
+    // DCE nop (kind=0) remains in the linked stream after FieldRMW fold /
+    // CSE. Emitter skips it; admission must accept it.
+    if k == 0 { << true }
+    if k < 1 || k > 48 || k == 27 || k == 28 || k == 29 { << false }
+    // Source locations and string payload lengths are consumed by assertion,
+    // label and debug paths.  Keep their arithmetic bounded; -1 is not a
+    // valid emitted location in the current MInstr contract.
+    if line < 0 || line > mir_max_layout_bytes || col < 0 || col > mir_max_layout_bytes || file < 0 || file > mir_verify_max_items {
+        << false
+    }
+    if slen < 0 || slen > mir_verify_max_items { << false }
+
+    // Most instruction kinds define `a` as a temp.  Void Call is the sole
+    // destination-bearing exception (`a == -1`); the explicit per-kind checks
+    // below cover non-destination records such as StoreLocal/Drop/ChanSend.
+    if mir_instr_has_dest(k) && !(k == 7 && a == -1) {
+        if a < 0 || a >= ntemp { << false }
+    }
+
+    if k == 1 { << mir_verify_emission_value(m, fi, b) }
+    if k == 2 { << b >= 0 && b < nlocal }
+    if k == 3 { << a >= 0 && a < nlocal && mir_verify_emission_value(m, fi, b) }
+    if k == 4 {
+        if !mir_verify_bin_opcode(b) { << false }
+        << mir_verify_emission_value(m, fi, c) && mir_verify_emission_value(m, fi, d)
+    }
+    if k == 5 {
+        if !mir_verify_un_opcode(b) { << false }
+        << mir_verify_emission_value(m, fi, c)
+    }
+    if k == 6 {
+        << b >= 0 && b < m.strings.len
+    }
+    if k == 7 {
+        if !mir_verify_call_kind(b) { << false }
+        if !mir_verify_emission_arg_count(m, fi, c, 0, mir_verify_max_arg_chain) { << false }
+        // Field-RMW is encoded as a Call target (95), but its packed byte
+        // field is consumed arithmetically by emit_instr_call_rmw.  Validate
+        // both halves before the division/subtraction can see hostile data.
+        if b == 95 {
+            if d < 0 { << false }
+            op := d - (d / 64) * 64
+            slot := d / 64
+            if slot < 0 || slot > mir_max_layout_bytes || !mir_verify_rmw_opcode(op) { << false }
+        }
+        // MapNew packs three byte-sized fields into `d`; mirror the runtime
+        // decoder so an arbitrary positive word cannot be reinterpreted as a
+        // huge map slot count.
+        if b == 84 {
+            if d < 0 || d > 16777215 { << false }
+            kkind := d & 255
+            vkind := (d / 256) & 255
+            vslots := d / 65536
+            if kkind > 1 || vkind > 2 || vslots > 255 { << false }
+        }
+        << true
+    }
+    if k == 8 { << a >= 0 && a < nlocal }
+    if k == 9 { << mir_verify_emission_value(m, fi, b) }
+    if k == 10 {
+        if b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_span(c, d)
+    }
+    if k == 11 {
+        // StoreField accepts a raw value (including a const-pool word) as its
+        // source; zero-initialized aggregate fields routinely use this form.
+        if !mir_verify_emission_value(m, fi, a) || b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_span(c, d)
+    }
+    if k == 12 {
+        if b < 0 || b > mir_verify_max_arg_chain || !mir_verify_raw_bytes(d) { << false }
+        mut elem_bytes := d
+        if elem_bytes < 0 { elem_bytes = 0 - elem_bytes }
+        if elem_bytes <= 0 { << false }
+        // `b <= 4096` and `elem_bytes <= mir_max_layout_bytes` were proved
+        // above, so this product cannot overflow signed int and avoids a
+        // variable-divisor operation in the static checker.
+        if b * elem_bytes > mir_max_layout_bytes { << false }
+        << mir_verify_emission_arg_count(m, fi, c, b, b)
+    }
+    if k == 13 {
+        if a < 0 || a >= ntemp || b < 0 || b >= ntemp { << false }
+        if c != 0 && c != 1 { << false }
+        << mir_verify_raw_bytes(d)
+    }
+    if k == 14 {
+        mut base_ok := false
+        if b >= 1073741824 {
+            loc := b - 1073741824
+            base_ok = loc >= 0 && loc < nlocal
+        } else {
+            base_ok = b >= 0 && b < ntemp
+        }
+        if !base_ok || !mir_verify_emission_value(m, fi, c) { << false }
+        << mir_verify_raw_bytes(d)
+    }
+    if k == 15 { << b >= 0 && b < ntemp }
+    if k == 16 {
+        if c == 0 { << b >= 0 && b < nlocal }
+        if c == 1 { << b >= 0 && b < ntemp }
+        << false
+    }
+    if k == 17 {
+        if b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_span(c, d)
+    }
+    if k == 18 {
+        if !mir_verify_emission_value(m, fi, a) || b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_span(c, d)
+    }
+    if k == 19 {
+        if b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_slots(d)
+    }
+    if k == 20 || k == 47 {
+        mut base_ok := false
+        if a >= 1073741824 {
+            loc := a - 1073741824
+            base_ok = loc >= 0 && loc < nlocal
+        } else {
+            base_ok = a >= 0 && a < ntemp
+        }
+        if !base_ok || !mir_verify_emission_value(m, fi, b) || !mir_verify_emission_value(m, fi, c) {
+            << false
+        }
+        if !mir_verify_raw_bytes(d) { << false }
+        if k == 47 && !mir_verify_rmw_opcode(col) { << false }
+        << true
+    }
+    if k == 21 || k == 22 || k == 24 {
+        if a < 0 || a >= ntemp || b < 0 || b > mir_max_layout_bytes { << false }
+        << c > 0 && c <= mir_verify_max_items
+    }
+    if k == 23 {
+        mut base_ok := false
+        if b >= 1073741824 {
+            loc := b - 1073741824
+            base_ok = loc >= 0 && loc < nlocal
+        } else {
+            base_ok = b >= 0 && b < ntemp
+        }
+        if !base_ok || !mir_verify_emission_value(m, fi, c) { << false }
+        << mir_verify_raw_bytes(d)
+    }
+    if k == 25 {
+        if !mir_verify_emission_value(m, fi, a) || b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_span(c, d)
+    }
+    if k == 26 {
+        if b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_span(c, d)
+    }
+    if k == 30 {
+        if !mir_verify_raw_slots(b) { << false }
+        << mir_verify_emission_value(m, fi, c)
+    }
+    if k == 31 {
+        if !mir_verify_emission_value(m, fi, a) || b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_slots(c)
+    }
+    if k == 32 {
+        if !mir_verify_emission_value(m, fi, b) || !mir_verify_raw_slots(c) || d < -1 { << false }
+        if d >= 0 && d >= ntemp { << false }
+        << true
+    }
+    if k == 33 {
+        if slen <= 0 { << false }
+        << mir_verify_emission_arg_count(m, fi, c, 0, 15)
+    }
+    if k == 34 { << mir_verify_emission_value(m, fi, a) }
+    if k == 35 {
+        if !mir_verify_emission_value(m, fi, b) || c < 0 || c >= ntemp { << false }
+        << mir_verify_raw_slots(d)
+    }
+    if k == 36 {
+        if b < 0 || b >= ntemp || !mir_verify_emission_value(m, fi, c) { << false }
+        << mir_verify_raw_slots(d)
+    }
+    if k == 37 { << true }
+    if k == 38 {
+        << slen > 0
+    }
+    if k == 39 {
+        if b < 0 || b >= ntemp || c < 0 || c >= m.structs.len || slen <= 0 { << false }
+        if !mir_verify_emission_struct_copy(m, fi, b, a, c) { << false }
+        << true
+    }
+    if k == 40 {
+        // BoxInterface reads the payload through fr.temp_slot[b], not a
+        // value decoder; constants here would turn into a negative/OOB slot.
+        if b < 0 || b >= ntemp || c < 0 || c >= m.structs.len { << false }
+        if !mir_verify_emission_struct_copy(m, fi, b, a, c) { << false }
+        // Empty sval is intentional here: BoxInterface synthesizes the
+        // errors.Error itable label when the producer leaves it blank.
+        << true
+    }
+    if k == 41 {
+        // Interface extraction likewise indexes the temporary frame slot.
+        if b < 0 || b >= ntemp { << false }
+        if !mir_verify_emission_temp_width(m, fi, b, 2) { << false }
+        if !mir_verify_emission_temp_width(m, fi, a, 1) { << false }
+        << mir_verify_box_tag_m(m, c)
+    }
+    if k == 42 {
+        if b < 0 || b >= ntemp || !mir_verify_box_tag_m(m, c) { << false }
+        if !mir_verify_box_tag(d) { << false }
+        if !mir_verify_emission_iface_as_width(m, fi, b, a, c, d) { << false }
+        << true
+    }
+    if k == 43 {
+        if b < 0 || b >= ntemp || c < 0 || c > mir_verify_max_items || slen <= 0 { << false }
+        // InterfaceMethod reads both data* and itable* from the receiver's
+        // two-word fat value before dispatching.  A valid TempId with a
+        // one-word malformed layout would otherwise pass the shape gate and
+        // make the emitter read the adjacent frame slot.
+        if !mir_verify_emission_temp_width(m, fi, b, 2) { << false }
+        << mir_verify_emission_arg_count(m, fi, d, 0, mir_verify_max_arg_chain)
+    }
+    if k == 44 {
+        if b < 0 || b >= ntemp || !mir_verify_box_tag_m(m, c) { << false }
+        if d != -1 && !mir_verify_raw_slots(d) { << false }
+        mut nslots := d
+        if nslots < 1 { nslots = any_value_nslots(c) }
+        if nslots < 1 || !mir_verify_emission_temp_width(m, fi, b, nslots) || !mir_verify_emission_temp_width(m, fi, a, 2) {
+            << false
+        }
+        // As with kind 40, an empty itable label selects the tag-derived
+        // fallback in the emitter and is part of the legacy MIR contract.
+        << true
+    }
+    if k == 45 {
+        if b < 0 || b >= ntemp { << false }
+        << mir_verify_raw_slots(d)
+    }
+    if k == 46 {
+        if a < 0 || a >= ntemp || c != 0 && c != 1 { << false }
+        << mir_verify_emission_arg_count(m, fi, b, 4, 4)
+    }
+    if k == 48 {
+        if a < 0 || a >= ntemp || (b != 0 && b != 1) { << false }
+        if !mir_verify_raw_offset(line) || !mir_verify_rmw_opcode(col) { << false }
+        if !mir_verify_emission_value(m, fi, c) { << false }
+        << mir_verify_box_tag(d)
+    }
+    // Every currently assigned kind returns above.  Keep this fail-closed so
+    // adding a new emitter kind cannot silently bypass the admission gate.
+    << false
+}
+
+pub fn mir_verify_emission_calls(m &Mir, fi int) bool {
+    // Compatibility entry point for callers without an immutable unit index.
+    idx := MirCallIndex{nf: -1, buckets: []int{}, next: []int{}, hashes: []int{}, lengths: []int{}}
+    << mir_verify_emission_calls_indexed(m, fi, &idx)
+}
+
+pub fn mir_verify_emission_calls_indexed(m &Mir, fi int, idx &MirCallIndex) bool {
+    if fi < 0 || fi >= m.fns.len { << false }
+    nins := mir_nins(m, fi)
+    nblk := mir_nblocks(m, fi)
+    nf := m.fns.len
+    if nins < 0 || nins > mir_verify_max_items || nblk <= 0 || nblk > mir_verify_max_blocks || nf < 0 || nf > mir_verify_max_items {
+        << false
+    }
+    if m.fns[fi].temps_nslots.len != mir_ntemps(m, fi) || m.fns[fi].locals_nslots.len != mir_nlocals(m, fi) {
+        << false
+    }
+    // Emission consumes the post-Phi linked stream.  A leftover persistent
+    // Phi/argument pool is therefore never safe to hand to Frame.layout (the
+    // emitter has no Phi materialization path); reject it here while the
+    // commit seam remains responsible for detailed Phi validation.
+    if m.fns[fi].phis.len != 0 || m.fns[fi].phi_args.len != 0 {
+        << false
+    }
+
+    // Validate the terminator metadata even for an empty/tombstoned block:
+    // emit_function_emit_blocks emits a terminator for every block, so an
+    // unchecked edge/value would still become an out-of-range read.  Only an
+    // empty block's stale tail is tolerated (the linked walker keys off head).
+    for bi in 0:nblk {
+        head := mir_bhead(m, fi, bi)
+        tail := mir_btail(m, fi, bi)
+        if head < -1 || head >= nins || tail < -1 || tail >= nins {
+            << false
+        }
+        if head >= 0 && tail < 0 {
+            << false
+        }
+        tk := mir_btkind(m, fi, bi)
+        if tk < 0 || tk > 3 {
+            << false
+        }
+        if tk == 0 {
+            if head >= 0 || mir_bta(m, fi, bi) != -1 || mir_btb(m, fi, bi) != -1 || mir_btc(m, fi, bi) != -1 {
+                << false
+            }
+        } else if tk == 1 {
+            to := mir_bta(m, fi, bi)
+            // Only `ta` is consumed by Jump; legacy CFG rewrites may leave
+            // the non-applicable tb/tc words stale on tombstones.
+            if to < 0 || to >= nblk {
+                << false
+            }
+        } else if tk == 2 {
+            cond := mir_bta(m, fi, bi)
+            tb := mir_btb(m, fi, bi)
+            tc := mir_btc(m, fi, bi)
+            if !mir_verify_emission_value(m, fi, cond) || tb < 0 || tb >= nblk || tc < 0 || tc >= nblk {
+                << false
+            }
+        } else {
+            result := mir_bta(m, fi, bi)
+            if result != -1 && !mir_verify_emission_value(m, fi, result) {
+                << false
+            }
+        }
+    }
+
+    // First count calls and bound the potentially quadratic label lookup.  A
+    // zero-function unit cannot have a valid direct target, but does not make
+    // the division below reachable.  The same walk validates every linked
+    // instruction's scalar operands before any emitter indexes a frame slot.
+    // Track ownership while walking the chains. The emitter emits each
+    // linked instruction at most once; without this bitmap, malformed MIR
+    // could point two blocks at the same node and execute a call/drop twice
+    // (or make one node's `next` chain cross into another block). The vector
+    // is bounded by the item cap above and is discarded before emission.
+    mut owner := []int{}
+    for _ in 0:nins { owner.push(-1) }
+    mut ncalls := 0
+    // Only direct user calls perform the O(nf) label/signature scan below.
+    // Counting fixed builtins and indirect calls in this quotient admission
+    // used to reject valid large functions (for example, 4097 builtin calls
+    // in a unit with 4096 function records) even though they do not touch the
+    // function table. Keep the absolute call cap for all calls, but charge
+    // the quadratic budget only to kind=1.
+    mut direct_calls := 0
+    mut walked := 0
+    for bi in 0:nblk {
+        mut ii := mir_bhead(m, fi, bi)
+        for _ in 0:nins + 1 {
+            if ii < 0 { <- }
+            if ii >= nins { << false }
+            if owner[ii] >= 0 { << false }
+            owner[ii] = bi
+            if walked >= mir_verify_max_use_work {
+                << false
+            }
+            walked += 1
+            if !mir_verify_emission_instr_shape(m, fi, ii) {
+                << false
+            }
+            if mir_ikind(m, fi, ii) == 7 {
+                ncalls += 1
+                if ncalls > mir_verify_max_call_work { << false }
+                if mir_ib(m, fi, ii) == 1 {
+                    direct_calls += 1
+                    if direct_calls > mir_verify_max_call_work { << false }
+                }
+            }
+            nxt := mir_inext(m, fi, ii)
+            if nxt < -1 || nxt >= nins {
+                << false
+            }
+            ii = nxt
+        }
+        if ii >= 0 { << false }
+    }
+    // `nf` is bounded above and the product is below signed-int range, so use
+    // a checked-domain multiplication instead of a quotient with a variable
+    // denominator.  This keeps the same admission condition while making the
+    // non-zero proof explicit to both Gen1 and the Rust oracle.
+    if direct_calls > 0 && nf > 0 && direct_calls * nf > mir_verify_max_call_work {
+        << false
+    }
+
+    for bi in 0:nblk {
+        mut ii := mir_bhead(m, fi, bi)
+        for _ in 0:nins + 1 {
+            if ii < 0 { <- }
+            if ii >= nins { << false }
+            if mir_ikind(m, fi, ii) != 7 {
+                nxt0 := mir_inext(m, fi, ii)
+                if nxt0 < -1 || nxt0 >= nins {
+                    << false
+                }
+                ii = nxt0
+                ->
+            }
+            kind := mir_ib(m, fi, ii)
+            if !mir_verify_call_kind(kind) {
+                << false
+            }
+            head := mir_ic(m, fi, ii)
+            arity := mir_verify_emission_call_kind_arity(kind)
+            if arity == -4 {
+                << false
+            }
+            if arity == -1 {
+                if !mir_verify_emission_arg_count(m, fi, head, 0, mir_verify_max_arg_chain) {
+                    << false
+                }
+                if !mir_verify_emission_direct_call_indexed(m, fi, ii, head, idx) {
+                    << false
+                }
+            } else if arity == -2 {
+                if !mir_verify_emission_arg_count(m, fi, head, 1, 2) {
+                    << false
+                }
+            } else if arity == -5 {
+                if !mir_verify_emission_arg_count(m, fi, head, 1, 1) && !mir_verify_emission_arg_count(m, fi, head, 3, 3) {
+                    << false
+                }
+            } else if arity == -3 {
+                // One fat-pointer value plus at most four user arguments;
+                // A0 is reserved for the closure environment.
+                if !mir_verify_emission_arg_count(m, fi, head, 1, 5) {
+                    << false
+                }
+            } else {
+                if !mir_verify_emission_arg_count(m, fi, head, arity, arity) {
+                    << false
+                }
+            }
+            nxt := mir_inext(m, fi, ii)
+            if nxt < -1 || nxt >= nins {
+                << false
+            }
+            ii = nxt
+        }
+        if ii >= 0 { << false }
+    }
+    << true
+}
+
+// Validate the numeric fields whose meaning depends on an instruction kind.
+// Keep this local to MFn so it can run in both the cheap commit gate and the
+// full verifier without widening the MFn ABI or copying large records.
+fn mir_verify_instr_raw(f &MFn, ii int) bool {
+    k := mfn_ikind(&f.instrs, ii)
+    a := mfn_ia(&f.instrs, ii)
+    b := mfn_ib(&f.instrs, ii)
+    c := mfn_ic(&f.instrs, ii)
+    d := mfn_id(&f.instrs, ii)
+    line := mfn_iline(&f.instrs, ii)
+    col := mfn_icol(&f.instrs, ii)
+    file := mfn_ifile(&f.instrs, ii)
+    slen := mfn_isval_len(&f.instrs, ii)
+
+    // Assert uses source line/column; FieldRMW uses line as a byte offset;
+    // both fit the same bounded metadata window.  `file` is an index into the
+    // unit's file table and is checked against the generic item cap here (the
+    // whole Mir table is checked by mir_verify_call_refs_f).
+    if line < 0 || line > mir_max_layout_bytes || col < 0 || col > mir_max_layout_bytes || file < 0 || file > mir_verify_max_items {
+        << false
+    }
+    if slen < 0 || slen > mir_verify_max_items { << false }
+
+    if k == 6 {
+        << b >= 0
+    }
+    if k == 10 || k == 11 || k == 17 || k == 18 || k == 25 || k == 26 {
+        << mir_verify_raw_span(c, d)
+    }
+    if k == 12 {
+        if b < 0 || b > mir_verify_max_arg_chain || !mir_verify_raw_bytes(d) { << false }
+        mut elem_bytes := d
+        if elem_bytes < 0 { elem_bytes = 0 - elem_bytes }
+        if elem_bytes <= 0 { << false }
+        if b * elem_bytes > mir_max_layout_bytes { << false }
+        << mir_verify_arg_count(f, c, b)
+    }
+    if k == 13 {
+        if c != 0 && c != 1 { << false }
+        << mir_verify_raw_bytes(d)
+    }
+    if k == 14 || k == 20 || k == 23 {
+        << mir_verify_raw_bytes(d)
+    }
+    if k == 19 || k == 45 {
+        << mir_verify_raw_slots(d)
+    }
+    if k == 21 || k == 22 || k == 24 {
+        if b < 0 || b > mir_max_layout_bytes { << false }
+        << c > 0 && c <= mir_verify_max_items
+    }
+    if k == 30 {
+        << mir_verify_raw_slots(b)
+    }
+    if k == 31 {
+        << mir_verify_raw_slots(c)
+    }
+    if k == 32 {
+        if !mir_verify_raw_slots(c) { << false }
+        << d >= -1
+    }
+    if k == 35 || k == 36 {
+        << mir_verify_raw_slots(d)
+    }
+    if k == 39 || k == 40 {
+        if c < 0 { << false }
+        // The concrete struct table bound is checked centrally with Mir;
+        // retaining a generic cap here still rejects INT_MAX on full-MFn
+        // verifier callers that do not have the table available.
+        << c <= mir_verify_max_items
+    }
+    if k == 41 || k == 42 {
+        if !mir_verify_box_tag(c) { << false }
+        if k == 42 && !mir_verify_box_tag(d) { << false }
+        << true
+    }
+    if k == 43 {
+        if c < 0 || c > mir_verify_max_items || slen <= 0 { << false }
+        << mir_verify_arg_chain(f, d)
+    }
+    if k == 44 {
+        if !mir_verify_box_tag(c) { << false }
+        if d != -1 && !mir_verify_raw_slots(d) { << false }
+        << true
+    }
+    if k == 46 {
+        if c != 0 && c != 1 { << false }
+        << mir_verify_arg_count(f, b, 4)
+    }
+    if k == 33 {
+        // The Xu runtime record has six positional value slots.  It is
+        // intentionally variable (0..6), unlike fixed builtin Calls, but a
+        // longer chain would be silently truncated by emit_instr_iface.
+        if slen <= 0 { << false }
+        << mir_verify_arg_count_range(f, c, 0, 6)
+    }
+    if k == 47 {
+        if !mir_verify_raw_bytes(d) || !mir_verify_rmw_opcode(col) { << false }
+        << true
+    }
+    if k == 48 {
+        if b != 0 && b != 1 { << false }
+        if !mir_verify_raw_offset(line) || !mir_verify_rmw_opcode(col) { << false }
+        << mir_verify_box_tag(d)
+    }
+    << true
+}
+
+fn mir_verify_instr_operands(f &MFn, ii int) bool {
+    k := mfn_ikind(&f.instrs, ii)
+    a := mfn_ia(&f.instrs, ii)
+    b := mfn_ib(&f.instrs, ii)
+    c := mfn_ic(&f.instrs, ii)
+    d := mfn_id(&f.instrs, ii)
+    // DCE nop (FieldRMW fold / CSE rewrite). Still linked in the block chain;
+    // must not fail the commit shape gate.
+    if k == 0 { << true }
+    // DCE nop (kind=0) remains in the linked stream after FieldRMW fold /
+    // CSE. Emitter skips it; admission must accept it.
+    if k == 0 { << true }
+    if k < 1 || k > 48 || k == 27 || k == 28 || k == 29 { << false }
+    if !mir_verify_instr_raw(f, ii) { << false }
+
+    // Destination-bearing instructions. Call may be void; ChanTryRecv also
+    // defines b, handled below.
+    if mir_instr_has_dest(k) && !(k == 7 && a == -1) {
+        if !mir_verify_temp(f, a) { << false }
+    }
+    if k == 1 { << mir_verify_value(f, b) }
+    if k == 2 { << mir_verify_local(f, b) }
+    if k == 3 { << mir_verify_local(f, a) && mir_verify_value(f, b) }
+    if k == 4 {
+        if !mir_verify_bin_opcode(b) { << false }
+        << mir_verify_value(f, c) && mir_verify_value(f, d)
+    }
+    if k == 5 {
+        if !mir_verify_un_opcode(b) { << false }
+        << mir_verify_value(f, c)
+    }
+    if k == 6 { << b >= 0 }
+    if k == 7 {
+        if !mir_verify_call_kind(b) { << false }
+        << mir_verify_arg_chain(f, c)
+    }
+    if k == 8 { << mir_verify_local(f, a) }
+    if k == 9 { << mir_verify_value(f, b) }
+    if k == 10 { << mir_verify_temp(f, b) }
+    if k == 11 { << mir_verify_temp(f, a) && mir_verify_temp(f, b) }
+    if k == 12 { << mir_verify_arg_chain(f, c) }
+    if k == 13 { << mir_verify_temp(f, a) && mir_verify_temp(f, b) }
+    if k == 46 { << mir_verify_temp(f, a) && mir_verify_arg_chain(f, b) }
+    if k == 14 { << mir_verify_index_base(f, b) && mir_verify_value(f, c) }
+    if k == 15 || k == 19 || k == 39 || k == 45 { << mir_verify_temp(f, b) }
+    if k == 16 {
+        if c == 0 { << mir_verify_local(f, b) }
+        if c == 1 { << mir_verify_temp(f, b) }
+        << false
+    }
+    if k == 17 || k == 26 { << mir_verify_temp(f, b) }
+    if k == 18 || k == 25 { << mir_verify_value(f, a) && mir_verify_temp(f, b) }
+    if k == 20 || k == 47 {
+        << mir_verify_index_base(f, a) && mir_verify_value(f, b) && mir_verify_value(f, c)
+    }
+    if k == 21 || k == 22 || k == 24 { << mir_verify_temp(f, a) }
+    if k == 23 { << mir_verify_index_base(f, b) && mir_verify_value(f, c) }
+    if k == 30 { << mir_verify_value(f, c) }
+    if k == 31 { << mir_verify_value(f, a) && mir_verify_temp(f, b) }
+    if k == 32 {
+        if !mir_verify_value(f, b) { << false }
+        if d >= 0 && !mir_verify_temp(f, d) { << false }
+        << d >= -1
+    }
+    if k == 33 { << mir_verify_arg_chain(f, c) }
+    if k == 34 { << mir_verify_value(f, a) }
+    if k == 35 { << mir_verify_value(f, b) && mir_verify_temp(f, c) }
+    if k == 36 { << mir_verify_temp(f, b) && mir_verify_value(f, c) }
+    if k == 37 { << true }
+    if k == 38 { << true }
+    // These interface/boxing emitters index the payload as a frame
+    // temporary; accepting a const-pool value here would turn into a
+    // negative/OOB temp slot at emission.
+    if k == 40 || k == 41 || k == 42 || k == 44 { << mir_verify_temp(f, b) }
+    if k == 43 { << mir_verify_temp(f, b) && mir_verify_arg_chain(f, d) }
+    if k == 48 { << mir_verify_temp(f, a) && mir_verify_value(f, c) }
+    << false
+}
+
+// Minimum core type contract shared by legacy structural verification and
+// strict SSA verification.  This intentionally does not infer complete
+// aggregate/sret layouts; those remain lowering/emitter ABI responsibilities.
+fn mir_verify_instr_types(f &MFn, ii int) bool {
+    k := mfn_ikind(&f.instrs, ii)
+    a := mfn_ia(&f.instrs, ii)
+    b := mfn_ib(&f.instrs, ii)
+    if k == 1 { // Copy
+        << mir_verify_value_has_ty(f, b, f.temps[a])
+    }
+    if k == 2 { // LoadLocal
+        << f.temps[a] == f.locals[b]
+    }
+    if k == 3 { // StoreLocal
+        << mir_verify_value_has_ty(f, b, f.locals[a])
+    }
+    << true
+}
+
+fn mir_verify_edge(f &MFn, from int, to int) bool {
+    if from < 0 || from >= f.blocks.len || to < 0 || to >= f.blocks.len { << false }
+    tk := f.blocks[from].tkind
+    if tk == 1 { << f.blocks[from].ta == to }
+    if tk == 2 { << f.blocks[from].tb == to || f.blocks[from].tc == to }
+    << false
+}
+
+fn mir_verify_instr_uses_temp(f &MFn, ii int, t int) bool {
+    << mir_instr_uses_temp(f, ii, t)
+}
+
+fn mir_verify_add_def(f &MFn, t int, bi int, pos int, def_count &mut []int, def_block &mut []int, def_pos &mut []int) bool {
+    if !mir_verify_temp(f, t) { << false }
+    def_count[t] += 1
+    if def_count[t] == 1 {
+        def_block[t] = bi
+        def_pos[t] = pos
+    }
+    << true
+}
+
+fn mir_verify_dom_at(dom &[]bool, nblk int, a int, b int) bool {
+    if a < 0 || b < 0 || a >= nblk || b >= nblk { << false }
+    << dom[b * nblk + a]
+}
+
+// Operand validity is checked before this use/definition proof. Constants
+// have no Temp definition; actual Temp reads must have a preceding/dominating
+// definition. Keep the same test for direct fields and argument-chain reads.
+fn mir_verify_ssa_read(t int, bi int, pos int, defs &[]int, positions &[]int, dom &[]bool, nb int) bool {
+    if t < 0 { << true }
+    if t >= defs.len || t >= positions.len { << false }
+    db := defs[t]
+    if db < 0 { << false }
+    if db == bi { << positions[t] < pos }
+    << mir_verify_dom_at(dom, nb, db, bi)
+}
+
+fn mir_verify_mfn_f(f &MFn, strict_ssa bool) int {
+    nblk := f.blocks.len
+    nt := f.temps.len
+    nins := f.instrs.len
+    nmarg := f.margs.len
+    if nblk == 0 { << 1 }
+    // Bound every length before allocating owner/def/dom vectors.  Oversized
+    // functions simply decline verification; callers treat that as a
+    // fail-closed optimization fallback rather than attempting an unbounded
+    // graph/dataflow pass.
+    if nblk > mir_verify_max_blocks || nins > mir_verify_max_items || nt > mir_verify_max_items || nmarg > mir_verify_max_items {
+        << 11
+    }
+    if f.locals.len > mir_verify_max_items || f.locals_nslots.len > mir_verify_max_items || f.temps_nslots.len > mir_verify_max_items || f.consts.len > mir_verify_max_items || f.phis.len > mir_verify_max_items || f.phi_args.len > mir_verify_max_items {
+        << 11
+    }
+    // The length caps above make these products bounded (at most 1e12 for
+    // the first two and 4096² for the dense matrix), so multiplication is
+    // itself safe and avoids a data-dependent divide in the verifier gate.
+    // Retain the established admission budget even though the use proof
+    // below now walks actual operands instead of every possible TempId.
+    if nins * nt > mir_verify_max_use_work { << 11 }
+    // Argument chains are walked by each arg-bearing instruction.  Keep the
+    // pool/instruction product finite in addition to the per-chain 4096 bound.
+    if nins * nmarg > mir_verify_max_arg_work { << 11 }
+    // `dom` is a dense nblk×nblk matrix.  The separate dom_work counter below
+    // bounds the cubic fixed-point walk.
+    if nblk * nblk > mir_verify_max_dom_cells { << 11 }
+    if f.locals.len != f.locals_nslots.len { << 2 }
+    if f.temps.len != f.temps_nslots.len { << 2 }
+    if f.nparams < 0 || f.nparams > f.locals.len { << 2 }
+    if !strict_ssa && (f.phis.len != 0 || f.phi_args.len != 0) { << 3 }
+
+    mut owner := []int{}
+    for _ in 0:f.instrs.len { owner.push(-1) }
+    mut pos_of := []int{}
+    for _ in 0:f.instrs.len { pos_of.push(-1) }
+    mut pred_n := []int{}
+    mut reach := []bool{}
+    for _ in 0:nblk {
+        pred_n.push(0)
+        reach.push(false)
+    }
+
+    for bi in 0:nblk {
+        b := f.blocks[bi]
+        if (b.head < 0) != (b.tail < 0) { << 4 }
+        mut ii := b.head
+        mut last := -1
+        mut pos := 0
+        for _ in 0:nins + 1 {
+            if ii < 0 { <- }
+            if ii >= f.instrs.len || owner[ii] >= 0 { << 4 }
+            owner[ii] = bi
+            pos_of[ii] = pos
+            if !mir_verify_instr_operands(f, ii) { << 5 }
+            if strict_ssa && !mir_verify_instr_types(f, ii) { << 10 }
+            last = ii
+            nxt := mfn_inext(&f.instrs, ii)
+            // A linked-list terminator is exactly -1.  Other negative
+            // values (for example INT_MIN) must not be treated as an
+            // ordinary end marker: later passes use the same field as an
+            // index and would otherwise silently skip the malformed edge.
+            if nxt < -1 || nxt >= nins { << 4 }
+            ii = nxt
+            pos += 1
+        }
+        if ii >= 0 || last != b.tail { << 4 }
+        if b.tkind == 0 {
+            if b.head >= 0 || b.tail >= 0 || b.ta != -1 || b.tb != -1 || b.tc != -1 { << 6 }
+        } else if b.tkind == 1 {
+            if b.ta < 0 || b.ta >= nblk { << 6 }
+            pred_n[b.ta] += 1
+        } else if b.tkind == 2 {
+            if !mir_verify_value(f, b.ta) || b.tb < 0 || b.tb >= nblk || b.tc < 0 || b.tc >= nblk { << 6 }
+            pred_n[b.tb] += 1
+            if b.tc != b.tb { pred_n[b.tc] += 1 }
+        } else if b.tkind == 3 {
+            if !mir_verify_optional_value(f, b.ta) { << 6 }
+        } else {
+            << 6
+        }
+    }
+
+    reach[0] = true
+    for _ in 0:nblk {
+        for bi in 0:nblk {
+            if !reach[bi] { -> }
+            b := f.blocks[bi]
+            if b.tkind == 1 { reach[b.ta] = true }
+            if b.tkind == 2 {
+                reach[b.tb] = true
+                reach[b.tc] = true
+            }
+        }
+    }
+    // Phi arity is defined over reachable CFG edges. Optimizer-retained dead
+    // blocks may still point at a live merge, but they do not contribute an
+    // SSA incoming value.
+    for bi in 0:nblk { pred_n[bi] = 0 }
+    for bi in 0:nblk {
+        if !reach[bi] { -> }
+        b := f.blocks[bi]
+        if b.tkind == 1 {
+            pred_n[b.ta] += 1
+        } else if b.tkind == 2 {
+            pred_n[b.tb] += 1
+            if b.tc != b.tb { pred_n[b.tc] += 1 }
+        }
+    }
+    if strict_ssa {
+        if pred_n[0] != 0 { << 6 }
+        for bi in 0:nblk {
+            if reach[bi] {
+                if f.blocks[bi].tkind == 0 { << 6 }
+            } else {
+                // Gen1 preserves block ids as storage indices. Empty tkind=0
+                // records are physical tombstones, not formal SSA CFG blocks;
+                // any executable unreachable block remains a verifier error.
+                b := f.blocks[bi]
+                if b.head >= 0 || b.tail >= 0 || b.tkind != 0 || b.ta != -1 || b.tb != -1 || b.tc != -1 { << 6 }
+            }
+        }
+    }
+
+
+    if strict_ssa {
+        // Terminator types are meaningful only on reachable code. Void/value
+        // presence is always exact; scalar returns additionally require the
+        // returned Temp type (or a compatible raw constant) to match MFn.ret.
+        for bi in 0:nblk {
+            if !reach[bi] { -> }
+            b := f.blocks[bi]
+            if b.tkind == 2 {
+                if !mir_verify_branch_cond(f, b.ta) { << 10 }
+            } else if b.tkind == 3 {
+                if f.ret == 0 {
+                    if b.ta != -1 { << 10 }
+                } else {
+                    if b.ta == -1 { << 10 }
+                    if mir_scalar_ty(f.ret) && !mir_verify_value_has_ty(f, b.ta, f.ret) { << 10 }
+                }
+            }
+        }
+    }
+    // Phi shape and incoming predecessor/type checks.
+    mut phi_dest := []bool{}
+    mut arg_seen := []bool{}
+    for _ in 0:nt { phi_dest.push(false) }
+    for _ in 0:f.phi_args.len { arg_seen.push(false) }
+    for pi in 0:f.phis.len {
+        p := f.phis[pi]
+        if p.block <= 0 || p.block >= nblk || !reach[p.block] { << 7 }
+        if !mir_verify_local(f, p.local) || !mir_verify_temp(f, p.dest) { << 7 }
+        if p.ty != f.locals[p.local] || p.ty != f.temps[p.dest] || phi_dest[p.dest] { << 7 }
+        // Check the start and count separately; adding attacker-controlled
+        // fields before the bounds test can wrap a signed int and make the
+        // following range/index walk escape the phi_args slice.
+        if p.arg_head < 0 || p.arg_head > f.phi_args.len { << 7 }
+        if p.arg_count < 0 || p.arg_count != pred_n[p.block] { << 7 }
+        if p.arg_count > f.phi_args.len - p.arg_head { << 7 }
+        phi_dest[p.dest] = true
+        mut seen_pred := []bool{}
+        for _ in 0:nblk { seen_pred.push(false) }
+        end := p.arg_head + p.arg_count
+        for ai in p.arg_head:end {
+            if ai < 0 || ai >= f.phi_args.len || arg_seen[ai] { << 7 }
+            arg_seen[ai] = true
+            a := f.phi_args[ai]
+            if a.pred < 0 || a.pred >= nblk || !reach[a.pred] || seen_pred[a.pred] || !mir_verify_edge(f, a.pred, p.block) { << 7 }
+            if !mir_verify_temp(f, a.value) || f.temps[a.value] != p.ty { << 7 }
+            seen_pred[a.pred] = true
+        }
+        for bi in 0:nblk {
+            if reach[bi] && mir_verify_edge(f, bi, p.block) && !seen_pred[bi] { << 7 }
+        }
+    }
+    for ai in 0:arg_seen.len { if !arg_seen[ai] { << 7 } }
+    if !strict_ssa { << 0 }
+
+    // Reachable single-definition map. Phi definitions occur at block entry;
+    // ChanRecv/TryRecv have an additional status/value destination.
+    mut def_count := []int{}
+    mut def_block := []int{}
+    mut def_pos := []int{}
+    for _ in 0:nt {
+        def_count.push(0)
+        def_block.push(-1)
+        def_pos.push(-1)
+    }
+    for pi in 0:f.phis.len {
+        p := f.phis[pi]
+        if !mir_verify_add_def(f, p.dest, p.block, -1, mut &def_count, mut &def_block, mut &def_pos) { << 8 }
+    }
+    for bi in 0:nblk {
+        if !reach[bi] { -> }
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            k := mfn_ikind(&f.instrs, ii)
+            a := mfn_ia(&f.instrs, ii)
+            if mir_instr_has_dest(k) && !(k == 7 && a == -1) {
+                if !mir_verify_add_def(f, a, bi, pos_of[ii], mut &def_count, mut &def_block, mut &def_pos) { << 8 }
+            }
+            if k == 32 && mfn_id(&f.instrs, ii) >= 0 {
+                if !mir_verify_add_def(f, mfn_id(&f.instrs, ii), bi, pos_of[ii], mut &def_count, mut &def_block, mut &def_pos) { << 8 }
+            }
+            if k == 36 {
+                if !mir_verify_add_def(f, mfn_ib(&f.instrs, ii), bi, pos_of[ii], mut &def_count, mut &def_block, mut &def_pos) { << 8 }
+            }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    for t in 0:nt { if def_count[t] > 1 { << 8 } }
+
+    // Incoming edges are sparse: Jump/Cond have at most two successors.
+    // Build their predecessor chains once rather than querying every possible
+    // predecessor for every cell of the dominance matrix.
+    mut pred_head := []int{}
+    mut pred_from := []int{}
+    mut pred_next := []int{}
+    for _ in 0:nblk { pred_head.push(-1) }
+    for pr in 0:nblk {
+        if !reach[pr] { -> }
+        b := f.blocks[pr]
+        if b.tkind != 1 && b.tkind != 2 { -> }
+        for edge in 0:2 {
+            mut to := b.ta
+            if b.tkind == 1 && edge == 1 { -> }
+            if b.tkind == 2 {
+                to = b.tb
+                if edge == 1 {
+                    if b.tc == b.tb { -> }
+                    to = b.tc
+                }
+            }
+            slot := pred_from.len
+            pred_from.push(pr)
+            pred_next.push(pred_head[to])
+            pred_head[to] = slot
+        }
+    }
+
+    // Classic iterative dominators over reachable blocks.
+    mut dom_work := 0
+    mut dom := []bool{}
+    for _ in 0:nblk * nblk { dom.push(false) }
+    for bi in 0:nblk {
+        if !reach[bi] { -> }
+        if bi == 0 {
+            dom[0] = true
+            ->
+        }
+        for di in 0:nblk { if reach[di] { dom[bi * nblk + di] = true } }
+    }
+    for _ in 0:nblk + 1 {
+        mut changed := false
+        for bi in 1:nblk {
+            if !reach[bi] { -> }
+            for di in 0:nblk {
+                mut nv := di == bi
+                if di != bi {
+                    mut have := false
+                    mut all := true
+                    mut edge := pred_head[bi]
+                    for _ in 0:pred_from.len {
+                        if edge < 0 { <- }
+                        if dom_work >= mir_verify_max_dom_work { << 11 }
+                        dom_work += 1
+                        pr := pred_from[edge]
+                        have = true
+                        if !dom[pr * nblk + di] { all = false }
+                        edge = pred_next[edge]
+                    }
+                    nv = have && all
+                }
+                at := bi * nblk + di
+                if dom[at] != nv {
+                    dom[at] = nv
+                    changed = true
+                }
+            }
+        }
+        if !changed { <- }
+    }
+
+    // Ordinary uses occur at their instruction/terminator.  A same-block
+    // definition must be earlier; cross-block definitions must dominate.
+    for bi in 0:nblk {
+        if !reach[bi] { -> }
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            a := mfn_ia(&f.instrs, ii)
+            b := mfn_ib(&f.instrs, ii)
+            c := mfn_ic(&f.instrs, ii)
+            d := mfn_id(&f.instrs, ii)
+            schema := mir_instr_use_schema(mfn_ikind(&f.instrs, ii), c)
+            mask := mir_instr_use_mask(schema)
+            if mask < 0 { << 9 }
+            for field in 0:4 {
+                if (mask & (1 << field)) == 0 { -> }
+                mut t := a
+                if field == 1 { t = b }
+                if field == 2 { t = c }
+                if field == 3 { t = d }
+                if !mir_verify_ssa_read(t, bi, pos_of[ii], &def_block, &def_pos, &dom, nblk) { << 9 }
+            }
+            mut ap := mir_instr_use_arg_head(schema, b, c, d)
+            mut limit := f.margs.len
+            if limit > mir_verify_max_arg_chain { limit = mir_verify_max_arg_chain }
+            for _ in 0:limit {
+                if ap == -1 { <- }
+                if ap < 0 || ap >= f.margs.len { << 9 }
+                if !mir_verify_ssa_read(f.margs[ap].v, bi, pos_of[ii], &def_block, &def_pos, &dom, nblk) { << 9 }
+                ap = f.margs[ap].next
+            }
+            if ap != -1 { << 9 }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+        b := f.blocks[bi]
+        if b.tkind == 2 || (b.tkind == 3 && b.ta >= 0) {
+            t := b.ta
+            if t >= 0 {
+                db := def_block[t]
+                if db < 0 { << 9 }
+                if db != bi && !mir_verify_dom_at(&dom, nblk, db, bi) { << 9 }
+            }
+        }
+    }
+
+    // Phi incoming uses live on predecessor edges, not in the merge block.
+    for pi in 0:f.phis.len {
+        p := f.phis[pi]
+        end := p.arg_head + p.arg_count
+        for ai in p.arg_head:end {
+            a := f.phi_args[ai]
+            db := def_block[a.value]
+            if db < 0 { << 9 }
+            if db != a.pred && !mir_verify_dom_at(&dom, nblk, db, a.pred) { << 9 }
+        }
+    }
+    << 0
+}
+
+// Cheap commit-time structural gate.  The full verifier above intentionally
+// computes reachability/dominators and is therefore too expensive to run for
+// every peephole clone in the hosted compiler.  This gate only protects the
+// memory-facing shape consumed by the legacy emitter:
+//
+//   * parallel metadata vectors have matching lengths and sane slot counts;
+//   * every block has a legal head/tail linked-list and terminator edges
+//     (empty tombstones may retain only a stale in-range tail);
+//   * every reachable instruction/argument id is bounds checked; and
+//   * persistent Phi records have bounded, typed incoming ranges.
+//
+// It does not claim SSA correctness (that remains mir_verify_mfn_f(..., true))
+// and it deliberately permits unlinked instruction-pool tombstones left by
+// DCE/CFG rewrites.  The owner table is bounded to the current instruction
+// pool and kept local to this helper; no MFn is copied by value, avoiding the
+// known Gen1 large-struct/sret ABI hazard in emit_frame.
+fn mir_verify_shape_mfn_f(f &MFn) bool {
+    nins := f.instrs.len
+    nblk := f.blocks.len
+    ntemp := f.temps.len
+    nlocal := f.locals.len
+    nmarg := f.margs.len
+
+    // Hard caps keep a malformed/generated unit from turning this safety gate
+    // into an allocation DoS.  Normal source units are orders of magnitude
+    // smaller; oversized units simply stay on the legacy fallback path.
+    if nins < 0 || nins > 1000000 || nblk <= 0 || nblk > 1000000 {
+        << false
+    }
+    if ntemp > 1000000 || nlocal > 1000000 || nmarg > 1000000 {
+        << false
+    }
+    if f.locals_nslots.len != nlocal || f.temps_nslots.len != ntemp {
+        << false
+    }
+    if f.nparams < 0 || f.nparams > nlocal || f.ret_nslots < 0 {
+        << false
+    }
+    for i in 0:nlocal {
+        ns := f.locals_nslots[i]
+        if ns <= 0 || ns > 1000000 { << false }
+    }
+    for i in 0:ntemp {
+        ns := f.temps_nslots[i]
+        if ns <= 0 || ns > 1000000 { << false }
+    }
+    // Frame.layout accumulates these widths and later multiplies by eight.
+    // Bound the total before any emitter can turn hostile metadata into an
+    // enormous frame or an integer-wraparound.  Eight MiB of frame words is
+    // deliberately generous for normal units (the largest self-host fixture
+    // is well below 20 KiB) while keeping the fallback fail-closed.
+    max_words := 1048576
+    mut words := 0
+    for i in 0:nlocal {
+        ns := f.locals_nslots[i]
+        if ns <= 0 || ns > max_words { << false }
+        if words > max_words - ns { << false }
+        words += ns
+    }
+    for i in 0:ntemp {
+        ns := f.temps_nslots[i]
+        if ns <= 0 || ns > max_words { << false }
+        if words > max_words - ns { << false }
+        words += ns
+    }
+    if f.ret_nslots < 0 || f.ret_nslots > max_words { << false }
+    if words > max_words - f.ret_nslots { << false }
+
+    // Calls walk an argument linked list.  Both operands are bounded before
+    // this point (`nins <= 1e6`, `arg_span <= 4096`), so the product is safely
+    // below signed-int range.  Use it directly instead of a variable-divisor
+    // quotient; each chain is already capped by mir_verify_arg_chain.
+    mut arg_span := nmarg
+    if arg_span > mir_verify_max_arg_chain { arg_span = mir_verify_max_arg_chain }
+    if arg_span > 0 {
+        if nins * arg_span > mir_verify_max_arg_work { << false }
+    }
+
+    // -1 means an unlinked instruction; all other next pointers are direct
+    // indexes into this function's instruction pool.
+    mut owner := []int{}
+    for _ in 0:nins { owner.push(-1) }
+    for bi in 0:nblk {
+        b := f.blocks[bi]
+        // The legacy builder can leave a stale tail on an emptied block
+        // after DCE/edge rewrites (the emitter keys traversal off `head`).
+        // Treat `head == -1` as an empty chain and only reject an invalid
+        // non-empty tail; this preserves the observed p31 channel MIR while
+        // still preventing every dereference of an out-of-range head/next.
+        if b.head < -1 || b.tail < -1 { << false }
+        if b.head >= nins || b.tail >= nins { << false }
+        // Empty/tombstoned blocks may retain a stale tail after DCE/CFG
+        // rewrites, but emit_function_emit_blocks still emits a terminator for
+        // every block.  Validate tkind/edge/value metadata for both empty and
+        // non-empty blocks; only the tail is exempt when head == -1.
+        if b.tail < 0 && b.head >= 0 { << false }
+        if b.tkind < 0 || b.tkind > 3 { << false }
+        if b.tkind == 0 {
+            if b.head >= 0 || b.ta != -1 || b.tb != -1 || b.tc != -1 { << false }
+        } else if b.tkind == 1 {
+            if b.ta < 0 || b.ta >= nblk || b.tb != -1 || b.tc != -1 { << false }
+        } else if b.tkind == 2 {
+            if !mir_verify_branch_cond(f, b.ta) || b.tb < 0 || b.tb >= nblk || b.tc < 0 || b.tc >= nblk { << false }
+        } else {
+            if !mir_verify_optional_value(f, b.ta) || b.tb != -1 || b.tc != -1 { << false }
+        }
+
+        // An empty/tombstoned chain has no instruction ownership or next
+        // pointers to inspect. Keep the validated terminator metadata above
+        // and tolerate only its stale tail for legacy DCE/CFG rewrites.
+        if b.head < 0 { -> }
+
+        mut ii := b.head
+        mut last := -1
+        // At most nins distinct nodes can be visited.  A cycle or an
+        // accidental cross-block link therefore fails closed before any
+        // subsequent pass can dereference it.
+        for _ in 0:nins + 1 {
+            if ii < 0 { <- }
+            if ii >= nins || owner[ii] >= 0 { << false }
+            owner[ii] = bi
+            if !mir_verify_instr_operands(f, ii) { << false }
+            nxt := mfn_inext(&f.instrs, ii)
+            if nxt < -1 || nxt >= nins { << false }
+            last = ii
+            ii = nxt
+        }
+        if ii >= 0 || last != b.tail { << false }
+    }
+
+    // Phi records are an optional SSA window.  Check all indexes and the
+    // exact local/destination type relation, but leave dominance/arity over
+    // reachable CFG edges to the full strict verifier.
+    if f.phis.len == 0 {
+        if f.phi_args.len != 0 { << false }
+    }
+    for pi in 0:f.phis.len {
+        p := f.phis[pi]
+        if p.block <= 0 || p.block >= nblk || p.local < 0 || p.local >= nlocal || p.dest < 0 || p.dest >= ntemp { << false }
+        if p.ty != f.locals[p.local] || p.ty != f.temps[p.dest] { << false }
+        if p.arg_head < 0 || p.arg_head > f.phi_args.len || p.arg_count < 0 { << false }
+        if p.arg_count > f.phi_args.len - p.arg_head { << false }
+        for ai in p.arg_head:p.arg_head + p.arg_count {
+            if ai < 0 || ai >= f.phi_args.len { << false }
+            a := f.phi_args[ai]
+            if a.pred < 0 || a.pred >= nblk || a.value < 0 || a.value >= ntemp { << false }
+            if f.temps[a.value] != p.ty { << false }
+        }
+    }
+    << true
+}
+
+// After CFG leaf inlining: caller grew by callee blocks + one continuation,
+// locals/temps by the callee pools, and every remapped edge/terminator
+// lands inside the new function. Failure keeps the previous owner.
+fn mir_verify_inline_cfg_f(f &MFn, call_bi int, caller_nblk int, caller_nloc int, caller_ntmp int, callee &MFn) bool {
+    if !mir_verify_shape_mfn_f(f) { << false }
+    ncb := callee.blocks.len
+    if ncb <= 0 { << false }
+    if f.blocks.len != caller_nblk + ncb + 1 { << false }
+    if f.locals.len != caller_nloc + callee.locals.len { << false }
+    if f.temps.len != caller_ntmp + callee.temps.len { << false }
+    if call_bi < 0 || call_bi >= caller_nblk { << false }
+    if call_bi >= f.blocks.len { << false }
+    pb := f.blocks[call_bi]
+    if pb.tkind != 1 { << false }
+    if pb.ta != caller_nblk { << false }
+    if pb.line < 0 { << false }
+    cont := caller_nblk + ncb
+    if cont < 0 || cont >= f.blocks.len { << false }
+    cbk := f.blocks[cont]
+    if cbk.tkind < 1 || cbk.tkind > 3 { << false }
+    if cbk.line < 0 { << false }
+    mut callee_reach := []bool{}
+    mir_cfg_mark_reachable_f(callee, mut &callee_reach)
+    for cb in 0:ncb {
+        if !callee_reach[cb] { -> }
+        nbi := caller_nblk + cb
+        if nbi < 0 || nbi >= f.blocks.len { << false }
+        b := f.blocks[nbi]
+        src := callee.blocks[cb]
+        if b.line < 0 { << false }
+        if src.tkind == 3 {
+            if b.tkind != 1 { << false }
+            if b.ta != cont { << false }
+            if b.tb != -1 || b.tc != -1 { << false }
+        } else if src.tkind == 1 {
+            if b.tkind != 1 { << false }
+            if src.ta < 0 || src.ta >= ncb { << false }
+            if b.ta != caller_nblk + src.ta { << false }
+            if b.tb != -1 || b.tc != -1 { << false }
+        } else if src.tkind == 2 {
+            if b.tkind != 2 { << false }
+            if src.tb < 0 || src.tb >= ncb { << false }
+            if src.tc < 0 || src.tc >= ncb { << false }
+            if b.tb != caller_nblk + src.tb { << false }
+            if b.tc != caller_nblk + src.tc { << false }
+        } else {
+            << false
+        }
+    }
+    // O1 CFG leaves are pre-SSA. The cloner does not remap Phi incoming;
+    // a callee with Phi metadata is not a legal leaf clone.
+    if callee.phis.len != 0 || callee.phi_args.len != 0 { << false }
+    mut cmap := []int{}
+    for ci in 0:callee.consts.len {
+        cv := callee.consts[ci]
+        mut id := -1
+        for k in 0:f.consts.len {
+            if f.consts[k] == cv {
+                id = 0 - k - 2
+                <-
+            }
+        }
+        if id == -1 { << false }
+        cmap.push(id)
+    }
+    local_base := caller_nloc
+    temp_base := caller_ntmp
+    for cb in 0:ncb {
+        if !callee_reach[cb] { -> }
+        nbi := caller_nblk + cb
+        mut p := f.blocks[nbi].head
+        if cb == 0 {
+            for ai in 0:callee.nparams {
+                if p < 0 { << false }
+                if mfn_ikind(&f.instrs, p) != 3 { << false }
+                if mfn_ia(&f.instrs, p) != local_base + ai { << false }
+                p = mfn_inext(&f.instrs, p)
+            }
+        }
+        mut cii := callee.blocks[cb].head
+        for _ in 0:callee.instrs.len {
+            if cii < 0 { <- }
+            if p < 0 { << false }
+            exp := mir_cfg_clone_instr(callee, cii, local_base, temp_base, &cmap)
+            if mfn_ikind(&f.instrs, p) != exp.kind { << false }
+            if mfn_ia(&f.instrs, p) != exp.a { << false }
+            if mfn_ib(&f.instrs, p) != exp.b { << false }
+            if mfn_ic(&f.instrs, p) != exp.c { << false }
+            if mfn_id(&f.instrs, p) != exp.d { << false }
+            if mfn_iline(&f.instrs, p) != exp.line { << false }
+            p = mfn_inext(&f.instrs, p)
+            cii = callee.instrs[cii].next
+        }
+        src := callee.blocks[cb]
+        if src.tkind == 3 && p >= 0 {
+            if mfn_ikind(&f.instrs, p) != 1 { << false }
+            p = mfn_inext(&f.instrs, p)
+        }
+        if p >= 0 { << false }
+    }
+    << true
+}
+
+fn mir_verify_copy_in_block(f &MFn, bi int, dest int, src int) bool {
+    if bi < 0 || bi >= f.blocks.len { << false }
+    mut found := 0
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        a := mfn_ia(&f.instrs, ii)
+        b := mfn_ib(&f.instrs, ii)
+        if k == 1 && a == dest && b == src {
+            found += 1
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << found == 1
+}
+
+// Verify that every persistent Phi incoming was realized on its exact edge.
+// Critical-edge lowering may interpose one synthetic Jump block; copies in a
+// sibling branch or in the merge block do not satisfy this check.
+fn mir_verify_phi_elim_copies_mfn_f(f &MFn) bool {
+    for pi in 0:f.phis.len {
+        p := f.phis[pi]
+        if p.arg_head < 0 || p.arg_head > f.phi_args.len || p.arg_count < 0 || p.arg_count > f.phi_args.len - p.arg_head {
+            << false
+        }
+        end := p.arg_head + p.arg_count
+        for ai in p.arg_head:end {
+            if ai < 0 || ai >= f.phi_args.len { << false }
+            a := f.phi_args[ai]
+            if a.value == p.dest { -> }
+            mut copy_bb := -1
+            if mir_verify_edge(f, a.pred, p.block) {
+                copy_bb = a.pred
+            } else if a.pred >= 0 && a.pred < f.blocks.len && f.blocks[a.pred].tkind == 2 {
+                tb := f.blocks[a.pred].tb
+                tc := f.blocks[a.pred].tc
+                if tb >= 0 && tb < f.blocks.len && f.blocks[tb].line == 0 && f.blocks[tb].tkind == 1 && f.blocks[tb].ta == p.block {
+                    copy_bb = tb
+                }
+                if tc >= 0 && tc < f.blocks.len && f.blocks[tc].line == 0 && f.blocks[tc].tkind == 1 && f.blocks[tc].ta == p.block {
+                    if copy_bb >= 0 && copy_bb != tc { << false }
+                    copy_bb = tc
+                }
+            }
+            if copy_bb < 0 || !mir_verify_copy_in_block(f, copy_bb, p.dest, a.value) { << false }
+        }
+    }
+    << true
+}
+
+// Tiny positive/negative gate independent of source lowering.  This executes
+// once per optimized program, making malformed-Phi/duplicate-def regressions
+// fail at the compiler seam instead of relying only on an output fixture.
+fn mir_verify_gate_fn(mode int) MFn {
+    mut f := mir_fn_blank()
+    f.name = "mir_verify_gate"
+    f.label = "_mir_verify_gate"
+    f.ret = 1
+    f.ret_nslots = 1
+    f.locals.push(1)
+    f.locals_nslots.push(1)
+    f.locals_owning.push(false)
+    // t0 bool condition; t1/t2 branch defs; t3 Phi; t4 negative use.
+    f.temps.push(2)
+    f.temps_nslots.push(1)
+    for _ in 0:4 {
+        f.temps.push(1)
+        f.temps_nslots.push(1)
+    }
+    f.consts.push(0)
+    f.consts.push(1)
+    for _ in 0:4 {
+        f.blocks.push(MBlock{head: -1, tail: -1, tkind: 3, ta: -1, tb: -1, tc: -1, line: 0})
+    }
+    mut c0 := mkinstr(1)
+    c0.a = 0
+    c0.b = -2
+    mir_cfg_append(mut &f, 0, c0)
+    mut b0 := f.blocks[0]
+    b0.tkind = 2
+    b0.ta = 0
+    b0.tb = 1
+    b0.tc = 2
+    mfn_set_block(mut &f.blocks, 0, b0)
+    mut c1 := mkinstr(1)
+    c1.a = 1
+    c1.b = -3
+    mir_cfg_append(mut &f, 1, c1)
+    mut b1 := f.blocks[1]
+    b1.tkind = 1
+    b1.ta = 3
+    mfn_set_block(mut &f.blocks, 1, b1)
+    mut c2 := mkinstr(1)
+    c2.a = 2
+    c2.b = -2
+    mir_cfg_append(mut &f, 2, c2)
+    mut b2 := f.blocks[2]
+    b2.tkind = 1
+    b2.ta = 3
+    mfn_set_block(mut &f.blocks, 2, b2)
+    mut b3 := f.blocks[3]
+    b3.tkind = 3
+    b3.ta = 3
+    mfn_set_block(mut &f.blocks, 3, b3)
+    f.phi_args.push(MPhiArg{pred: 1, value: 1})
+    f.phi_args.push(MPhiArg{pred: 2, value: 2})
+    f.phis.push(MPhi{block: 3, local: 0, dest: 3, ty: 1, arg_head: 0, arg_count: 2})
+    if mode == 1 {
+        mut dup := mkinstr(1)
+        dup.a = 1
+        dup.b = -2
+        mir_cfg_append(mut &f, 1, dup)
+    } else if mode == 2 {
+        f.phi_args[0] = MPhiArg{pred: 0, value: 1}
+    } else if mode == 3 {
+        mut bad_use := mkinstr(1)
+        bad_use.a = 4
+        bad_use.b = 1
+        mir_cfg_append(mut &f, 2, bad_use)
+    } else if mode == 4 {
+        mut back := f.blocks[3]
+        back.tkind = 1
+        back.ta = 0
+        mfn_set_block(mut &f.blocks, 3, back)
+    } else if mode == 5 {
+        f.blocks.push(MBlock{head: -1, tail: -1, tkind: 3, ta: -1, tb: -1, tc: -1, line: 0})
+    } else if mode == 6 {
+        // Copy int <- bool.
+        mut bad_copy := mkinstr(1)
+        bad_copy.a = 4
+        bad_copy.b = 0
+        mir_cfg_append(mut &f, 1, bad_copy)
+    } else if mode == 7 {
+        // LoadLocal bool <- int local.
+        f.temps.push(2)
+        f.temps_nslots.push(1)
+        mut bad_load := mkinstr(2)
+        bad_load.a = 5
+        bad_load.b = 0
+        mir_cfg_append(mut &f, 1, bad_load)
+    } else if mode == 8 {
+        // StoreLocal int local <- bool.
+        mut bad_store := mkinstr(3)
+        bad_store.a = 0
+        bad_store.b = 0
+        mir_cfg_append(mut &f, 1, bad_store)
+    } else if mode == 9 {
+        // f64 is not a branch predicate.
+        mfn_set_i(mut &f.temps, 0, 4)
+    } else if mode == 10 {
+        // Void functions may not return a value.
+        f.ret = 0
+    } else if mode == 11 {
+        // Non-void functions must return a value.
+        mut bad_ret := f.blocks[3]
+        bad_ret.ta = -1
+        mfn_set_block(mut &f.blocks, 3, bad_ret)
+    } else if mode == 12 {
+        // Return int <- bool.
+        mut bad_ret_ty := f.blocks[3]
+        bad_ret_ty.ta = 0
+        mfn_set_block(mut &f.blocks, 3, bad_ret_ty)
+    } else if mode == 13 {
+        // Phi int incoming <- bool.
+        f.phi_args[0] = MPhiArg{pred: 1, value: 0}
+    } else if mode == 14 {
+        // Folded raw constants remain valid branch predicates.
+        mut const_branch := f.blocks[0]
+        const_branch.ta = -2
+        mfn_set_block(mut &f.blocks, 0, const_branch)
+    } else if mode == 15 {
+        // Positive f64 Phi/copy/return path. Constants are raw f64 bit
+        // patterns in Gen1's pool, while all Temp edges must remain same-ty.
+        f.ret = 4
+        mfn_set_i(mut &f.locals, 0, 4)
+        for ti in 1:f.temps.len {
+            mfn_set_i(mut &f.temps, ti, 4)
+        }
+        f.phis[0] = MPhi{block: 3, local: 0, dest: 3, ty: 4, arg_head: 0, arg_count: 2}
+    } else if mode == 16 {
+        // Structural gate: a branch edge may not point past the block pool.
+        mut bad_block := f.blocks[0]
+        bad_block.tb = f.blocks.len
+        mfn_set_block(mut &f.blocks, 0, bad_block)
+    } else if mode == 17 {
+        // Structural gate: linked-list next must be -1 or an instruction id.
+        bad_next_i := f.blocks[0].head
+        bad_next_v := f.instrs.len
+        mfn_set_inext(mut &f.instrs, bad_next_i, bad_next_v)
+    } else if mode == 18 {
+        // Structural gate: a Copy source must be a valid TempId/constant.
+        mut bad_operand := mkinstr(1)
+        bad_operand.a = 1
+        bad_operand.b = f.temps.len + 7
+        mir_cfg_append(mut &f, 1, bad_operand)
+    } else if mode == 19 {
+        // Structural gate: Phi incoming range must stay inside phi_args.
+        mut bad_phi := f.phis[0]
+        bad_phi.arg_count = f.phi_args.len + 1
+        f.phis[0] = bad_phi
+    } else if mode == 20 {
+        // Structural gate: one instruction cannot be owned by two blocks.
+        mut dup_block := f.blocks[2]
+        dup_block.head = f.blocks[0].head
+        dup_block.tail = f.blocks[0].tail
+        dup_block.tkind = 1
+        dup_block.ta = 3
+        dup_block.tb = -1
+        dup_block.tc = -1
+        mfn_set_block(mut &f.blocks, 2, dup_block)
+    }
+    << f
+}
+
+// Keep the final-emission width contract executable, not just documentary:
+// this tiny fixture proves that a malformed aggregate descriptor or a
+// one-word source temp is rejected before the boxing/capture emitters can walk
+// its payload.  It intentionally exercises the allocation-free helper rather
+// than constructing a complete call/CFG fixture.  Build each case in a local
+// MFn and move it into the Mir only after all nested slices are initialized;
+// this avoids the known Gen1 large-MFn nested-write hazard.
+fn mir_verify_emission_width_case(src_slots int, iface_slots int, as_dst_slots int, struct_slots int) bool {
+    mut m := empty_mir()
+    mut f := mir_fn_blank()
+    f.temps.push(1)
+    f.temps_nslots.push(src_slots)
+    f.temps.push(800)
+    f.temps_nslots.push(iface_slots)
+    f.temps.push(3)
+    f.temps_nslots.push(as_dst_slots)
+    m.fns.push(f)
+    m.structs.push(CStruct{
+        name: "_mir_width_gate",
+        fields: []CField{},
+        nslots: struct_slots,
+        size_bytes: 16,
+        align_bytes: 8,
+        mod_id: "",
+        is_pub: false,
+        origin: "",
+        drop_label: ""
+    })
+    copy_ok := mir_verify_emission_struct_copy(&m, 0, 0, 1, 0)
+    as_ok := mir_verify_emission_iface_as_width(&m, 0, 1, 2, 65283, 3)
+    << copy_ok && as_ok
+}
+
+// Exercise the concrete-width oracle across every multi-word payload family
+// that can be placed in a `temp` box.  In particular, these cases catch the
+// historical one-word fallback for array/enum/throw/fn tags without requiring
+// a full parser/allocator fixture (and therefore stay allocation-free in the
+// Gen1 self-host check).
+fn mir_verify_emission_iface_all_type_case() bool {
+    mut m := empty_mir()
+    mut f := mir_fn_blank()
+    // source fat box + destinations: dynamic array, enum, throw, fn value
+    f.temps.push(800)
+    f.temps_nslots.push(2)
+    f.temps.push(200)
+    f.temps_nslots.push(3)
+    f.temps.push(500)
+    f.temps_nslots.push(2)
+    f.temps.push(300)
+    f.temps_nslots.push(3)
+    f.temps.push(700)
+    f.temps_nslots.push(2)
+    m.fns.push(f)
+    m.arrays.push(CArray{elem_ty: 10, elem_bytes: 1, fixed_len: 0})
+    m.enums.push(CEnum{
+        name: "_mir_as_enum",
+        variants: []CEnumVariant{},
+        nslots: 2,
+        owns: false,
+        mod_id: "",
+        is_pub: false,
+        origin: "",
+        args: []int{}
+    })
+    // Error payloads are interface values (two words), so this throw occupies
+    // tag + max(int, interface) = three words.
+    m.throws.push(CThrow{ok_ty: 1, err_ty: 810})
+    m.fn_sigs.push(CFnSig{params: []int{}, ret: 1, has_env: 1, env_struct: -1})
+    if !mir_verify_emission_iface_as_width(&m, 0, 0, 1, 3758096384, 200) { << false }
+    if !mir_verify_emission_iface_as_width(&m, 0, 0, 2, 4026531840, 500) { << false }
+    if !mir_verify_emission_iface_as_width(&m, 0, 0, 3, 3489660928, 300) { << false }
+    if !mir_verify_emission_iface_as_width(&m, 0, 0, 4, 2952790016, 700) { << false }
+    << true
+}
+
+fn mir_verify_emission_width_internal_gate() bool {
+    if !mir_verify_emission_width_case(2, 2, 3, 2) { << false }
+    if !mir_verify_emission_iface_all_type_case() { << false }
+    // A one-word aggregate source cannot satisfy MakeClosure/BoxInterface.
+    if mir_verify_emission_width_case(1, 2, 3, 2) { << false }
+    // InterfaceAs must reject a narrow fat receiver and a narrow concrete
+    // destination independently of the type-id/tag checks.
+    if mir_verify_emission_width_case(2, 1, 3, 2) { << false }
+    if mir_verify_emission_width_case(2, 2, 1, 2) { << false }
+    // Negative and oversized metadata must fail closed before nslots*8.
+    if mir_verify_emission_width_case(2, 2, 3, -1) { << false }
+    if mir_verify_emission_width_case(2, 2, 3, mir_max_layout_words + 1) { << false }
+    << true
+}
+
+fn mir_verify_internal_gate() bool {
+    // The production path performs the verifier directly at its two
+    // append-only/emission seams.  Keep this compatibility hook allocation
+    // free; large self-test fixtures must live in tests, not in every hosted
+    // compiler's stack frame.
+    << true
+}
+
+// Controlled legacy-MIR inputs for the emitter's fixed-home allocator gate.
+// MFn/MInstr/MBlock intentionally remain private to #xu/types, so the compile
+// module cannot manufacture a malformed plan input by reaching through their
+// slice fields.  Keep these fixtures tiny and expose only an owned Mir plus a
+// stable TempId convention:
+//   kind 0: int Copy affinity, t0 -> t1
+//   kind 1: f64 Copy affinity, t0 -> t1
+//   kind 2: the same int Copy followed by a t0 redefinition while t1 is live
+//   kind 3: direct scalar call, t0 is call-live; t1/t2 are not call-live
+// The gate is allocator-only: no source program or Rust reference backend is
+// involved, and every function uses the post-SSA, Phi-free emitter contract.
+pub fn mir_vreg_gate_fixture(kind int) Mir {
+    mut m := empty_mir()
+    mut f := mir_fn_blank()
+    f.name = "mir_vreg_gate"
+    f.label = "_mir_vreg_gate"
+    f.ret = 1
+    f.ret_nslots = 1
+    mut ty := 1
+    if kind == 1 { ty = 4 }
+    if kind == 1 {
+        f.ret = 4
+    }
+    f.consts.push(0)
+    f.consts.push(1)
+    f.blocks.push(MBlock{head: -1, tail: -1, tkind: 3, ta: -1, tb: -1, tc: -1, line: 0})
+
+    if kind == 3 {
+        // Caller: t0 is used only after the call, so backward liveness must
+        // put it in Arm64's callee-saved pool.  The call result t1 and add
+        // result t2 remain ordinary caller-side ranges.
+        for _ in 0:3 {
+            f.temps.push(1)
+            f.temps_nslots.push(1)
+        }
+        mut init := mkinstr(1)
+        init.a = 0
+        init.b = -2
+        mir_cfg_append(mut &f, 0, init)
+        mut call := mkinstr(7)
+        call.a = 1
+        call.b = 1
+        call.c = -1
+        call.sval = "_mir_vreg_gate_callee"
+        mir_cfg_append(mut &f, 0, call)
+        mut add := mkinstr(4)
+        add.a = 2
+        add.b = 1
+        add.c = 0
+        add.d = 1
+        mir_cfg_append(mut &f, 0, add)
+        mut retb := f.blocks[0]
+        retb.ta = 2
+        mfn_set_block(mut &f.blocks, 0, retb)
+        m.fns.push(f)
+        m.superseded.push(0)
+
+        mut callee := mir_fn_blank()
+        callee.name = "mir_vreg_gate_callee"
+        callee.label = "_mir_vreg_gate_callee"
+        callee.ret = 1
+        callee.ret_nslots = 1
+        callee.consts.push(0)
+        callee.temps.push(1)
+        callee.temps_nslots.push(1)
+        callee.blocks.push(MBlock{head: -1, tail: -1, tkind: 3, ta: 0, tb: -1, tc: -1, line: 0})
+        mut cinit := mkinstr(1)
+        cinit.a = 0
+        cinit.b = -2
+        mir_cfg_append(mut &callee, 0, cinit)
+        m.fns.push(callee)
+        m.superseded.push(0)
+        << m
+    }
+
+    for _ in 0:2 {
+        f.temps.push(ty)
+        f.temps_nslots.push(1)
+    }
+    mut init := mkinstr(1)
+    init.a = 0
+    init.b = -2
+    mir_cfg_append(mut &f, 0, init)
+    mut copy := mkinstr(1)
+    copy.a = 1
+    copy.b = 0
+    mir_cfg_append(mut &f, 0, copy)
+    if kind == 2 {
+        // The copied value in t1 remains live while t0 receives a distinct
+        // value.  Ordinary interference must override the affinity hint.
+        mut redefine := mkinstr(1)
+        redefine.a = 0
+        redefine.b = -3
+        mir_cfg_append(mut &f, 0, redefine)
+    }
+    mut retb := f.blocks[0]
+    retb.ta = 1
+    mfn_set_block(mut &f.blocks, 0, retb)
+    m.fns.push(f)
+    m.superseded.push(0)
+    << m
+}
+
+// Six independent values remain live through a Drop. Kind 0 owns a dynamic
+// array, kind 1 drops a scalar without a call, and kind 2 has live FP values.
+// Register pressure exposes S1 scratch coverage rather than merely checking
+// that one integer happened to receive the first callee-saved home.
+pub fn mir_vreg_drop_gate_fixture(kind int) Mir {
+    mut m := empty_mir()
+    m.arrays.push(CArray{elem_ty: 1, elem_bytes: 8, fixed_len: 0})
+    mut f := mir_fn_blank()
+    f.name = "mir_vreg_drop_gate"
+    f.label = "_mir_vreg_drop_gate"
+    f.ret = 1
+    f.ret_nslots = 1
+    mut local_ty := 200
+    mut local_slots := 3
+    if kind == 1 {
+        local_ty = 1
+        local_slots = 1
+    }
+    f.locals.push(local_ty)
+    f.locals_nslots.push(local_slots)
+    f.locals_owning.push(kind != 1)
+    mut ty := 1
+    if kind == 2 {
+        ty = 4
+        f.ret = 4
+    }
+    for _ in 0:11 {
+        f.temps.push(ty)
+        f.temps_nslots.push(1)
+    }
+    f.blocks.push(MBlock{head: -1, tail: -1, tkind: 3, ta: 10, tb: -1, tc: -1, line: 0})
+    for t in 0:6 {
+        f.consts.push(t + 11)
+        mut init := mkinstr(1)
+        init.a = t
+        init.b = -t - 2
+        mir_cfg_append(mut &f, 0, init)
+    }
+    mut drop := mkinstr(8)
+    drop.a = 0
+    mir_cfg_append(mut &f, 0, drop)
+    for t in 6:11 {
+        mut add := mkinstr(4)
+        add.a = t
+        add.b = 1
+        add.c = t - 1
+        if t == 6 { add.c = 0 }
+        add.d = t - 5
+        mir_cfg_append(mut &f, 0, add)
+    }
+    m.fns.push(f)
+    m.superseded.push(0)
+    << m
+}
+
+// Hardware fsqrt dest must land in the independent FP bank. Kept out of
+// mir_vreg_gate_fixture so that helper's self-host frame stays small.
+pub fn mir_vreg_sqrt_gate_fixture() Mir {
+    mut m := empty_mir()
+    mut f := mir_fn_blank()
+    f.name = "mir_vreg_sqrt_gate"
+    f.label = "_mir_vreg_sqrt_gate"
+    f.ret = 4
+    f.ret_nslots = 1
+    f.consts.push(0)
+    for _ in 0:2 {
+        f.temps.push(4)
+        f.temps_nslots.push(1)
+    }
+    f.blocks.push(MBlock{head: -1, tail: -1, tkind: 3, ta: 1, tb: -1, tc: -1, line: 0})
+    mut init := mkinstr(1)
+    init.a = 0
+    init.b = -2
+    mir_cfg_append(mut &f, 0, init)
+    f.margs.push(MArg{v: 0, next: -1})
+    mut call := mkinstr(7)
+    call.a = 1
+    call.b = 1
+    call.c = 0
+    call.sval = "_xu_math_sqrt"
+    mir_cfg_append(mut &f, 0, call)
+    m.fns.push(f)
+    m.superseded.push(0)
+    << m
+}
+
+// Separate small-frame fixture for natural-loop spill weighting. Keeping this
+// out of mir_vreg_gate_fixture avoids crossing the frozen Gen1 slice-header
+// threshold when that already-branchy helper is self-hosted.
+pub fn mir_vreg_spill_weight_gate_fixture() Mir {
+    mut m := empty_mir()
+    mut f := mir_fn_blank()
+    f.name = "mir_vreg_spill_weight_gate"
+    f.label = "_mir_vreg_spill_weight_gate"
+    f.ret = 1
+    f.ret_nslots = 1
+    f.consts.push(0)
+    for _ in 0:13 {
+        f.temps.push(1)
+        f.temps_nslots.push(1)
+    }
+    f.blocks.push(MBlock{head: -1, tail: -1, tkind: 1, ta: 1, tb: -1, tc: -1, line: 0})
+    f.blocks.push(MBlock{head: -1, tail: -1, tkind: 2, ta: 6, tb: 1, tc: 2, line: 0})
+    f.blocks.push(MBlock{head: -1, tail: -1, tkind: 3, ta: 12, tb: -1, tc: -1, line: 0})
+    for t in 0:7 {
+        mut initp := mkinstr(1)
+        initp.a = t
+        initp.b = -2
+        mir_cfg_append(mut &f, 0, initp)
+    }
+    for step in 0:6 {
+        mut addp := mkinstr(4)
+        addp.a = 7 + step
+        addp.b = 1
+        if step == 0 {
+            addp.c = 0
+            addp.d = 1
+        } else {
+            addp.c = 6 + step
+            addp.d = 1 + step
+        }
+        mir_cfg_append(mut &f, 2, addp)
+    }
+    m.fns.push(f)
+    m.superseded.push(0)
+    << m
+}

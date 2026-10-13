@@ -1,0 +1,150 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  XU_CI_LANE: oracle
+
+jobs:
+  fast:
+    name: fast (ncall + fixtures)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      XU_CI_LANE: oracle
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/bootstrap-checkout
+      - name: module versions
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            BASE=HEAD
+          else
+            BASE=$(git merge-base "$BASE_SHA" HEAD)
+          fi
+          python3 scripts/module_versions.py --check --base "$BASE"
+          if ! git diff --quiet "$BASE" -- VERSION; then
+            python3 scripts/module_versions.py --check-release
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .ci/bootstrap
+      - name: bootstrap/Xu boundary contract
+        run: python3 scripts/check_bootstrap_xu_boundary.py
+      - name: frozen primer registration (strict)
+        # This checks that any new bootstrap Rust/Cargo implementation is
+        # explicitly classified as oracle/auxiliary and cannot masquerade as
+        # product self-host evidence.
+        run: python3 scripts/check_bootstrap_xu_boundary.py --strict-freeze
+      - name: bootstrap unit tests
+        # Rust tests are oracle evidence only; they do not certify bin/xu.
+        run: cargo test --manifest-path .ci/bootstrap/Cargo.toml
+      - name: oracle HTTP server local lifecycle smoke
+        # CI fast has no hosted bin/xu seed yet.  Keep this an explicit
+        # primer/oracle smoke; it must never be mistaken for product evidence.
+        run: XU_COMPILER="$PWD/.ci/bootstrap/target/debug/xu" ./scripts/deploy_xu_server.sh smoke-local --oracle --opt O1
+      - name: oracle HTTP server Linux x64 artifact check
+        # Same oracle lane, with the lane visible in the command itself.
+        run: XU_COMPILER="$PWD/.ci/bootstrap/target/debug/xu" ./scripts/deploy_xu_server.sh check-linux --oracle --opt O1 --output /tmp/xu-server-linux-x64.xin
+      - name: ncall registry
+        run: python3 scripts/check_ncall_registry.py
+      - name: standard-library source/API matrix
+        run: python3 scripts/generate_stdlib_matrix.py --check
+      - name: fixture runner diagnostics
+        run: ./scripts/test_fixture_runtime_result.sh
+      - name: oracle fixtures
+        # The fast job has no hosted seed; keep this explicit primer evidence.
+        run: ./scripts/run_fixtures.sh --xu="$PWD/.ci/bootstrap/target/debug/xu" --label=oracle
+
+  safety:
+    name: safety_test (+ cross-target loud)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs: fast
+    env:
+      XU_CI_LANE: oracle
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bootstrap-checkout
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .ci/bootstrap
+      - name: safety_test
+        run: ./scripts/safety_test.sh
+      - name: safety_cross_target
+        run: ./scripts/safety_cross_target.sh
+      - name: safety_embedded
+        run: ./scripts/safety_embedded.sh
+
+  opt-oracle:
+    name: oracle O0/O3 differential
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs: fast
+    env:
+      XU_CI_LANE: oracle
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bootstrap-checkout
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .ci/bootstrap
+      - name: build frozen primer
+        run: cargo build --manifest-path .ci/bootstrap/Cargo.toml -p xu --bin xu
+      - name: paired O0-O3 stdout vs clang (explicit oracle lane)
+        run: |
+          XU="$PWD/.ci/bootstrap/target/debug/xu"
+          printf '%s\n' '@main' 'fn main() int {' '    mut s := 0' '    mut i := 0' '    while i < 100 {' '        s = s + i' '        i = i + 1' '    }' '    println(s)' '    << 0' '}' > /tmp/late_loop.xu
+          printf '%s\n' '#include <stdio.h>' '#include <stdint.h>' 'int main(void) {' '    int64_t s = 0, i = 0;' '    while (i < 100) { s += i; i += 1; }' '    printf("%lld\n", (long long)s);' '    return 0;' '}' > /tmp/late_loop.c
+          XUPATH="$PWD/src"
+          export XUPATH
+          for n in 0 1 2 3; do
+            "$XU" build /tmp/late_loop.xu -o "/tmp/late-xu-O$n" "-O$n"
+            clang "-O$n" -o "/tmp/late-clang-O$n" /tmp/late_loop.c
+            "/tmp/late-xu-O$n" > "/tmp/late-xu-O$n.out"
+            "/tmp/late-clang-O$n" > "/tmp/late-clang-O$n.out"
+            diff -u "/tmp/late-clang-O$n.out" "/tmp/late-xu-O$n.out"
+          done
+          echo "XU_CI_LANE=oracle paired O0-O3 stdout ok"
+
+  product-gate:
+    name: product-gate (explicit)
+    runs-on: macos-latest
+    timeout-minutes: 180
+    env:
+      XU_CI_LANE: product
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bootstrap-checkout
+      - name: restore hosted seed
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: xu-product-seed
+          path: bin
+          github-token: ${{ github.token }}
+          run-id: ${{ vars.XU_PRODUCT_SEED_RUN_ID || github.run_id }}
+      - name: product gate or fail closed
+        run: |
+          if [ -f bin/xu ]; then
+            chmod +x bin/xu
+            echo "XU_CI_LANE=product seed present" | tee -a "$GITHUB_STEP_SUMMARY"
+            ./scripts/product_gate.sh --quick --out="$RUNNER_TEMP/product-gate"
+          else
+            echo "product-pr: BLOCKED — hosted seed missing; not product evidence" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Set repository variable XU_PRODUCT_SEED_RUN_ID to a run containing xu-product-seed (xu + provenance)." >&2
+            exit 1
+          fi

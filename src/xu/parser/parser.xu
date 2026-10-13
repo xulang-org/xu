@@ -1,0 +1,953 @@
+@xu/parser
+// Recursive-descent parser for the Gen1 front end (M6b2-s2), ported from
+// bootstrap/crates/xuparse/src/parser.rs.
+//
+// Tokens -> AST node pool (see src/xu/ast/ast.xu for the pool design and the tag
+// tables). Newlines act as statement separators; inside expressions they are
+// allowed after any binary operator and after `(`, `,`, `->`.
+//
+// The first error prints `path:line:col: error: message` (when file_name
+// is set) and exit(1)s, matching the bootstrap's stop-at-first-error behavior.
+//
+// Loop idiom: consume loops use `while` on the real exit condition
+// (token kind, done flag, etc.). Do not scan `for k in 0 -> (tokens.len-pos)`
+// with a body guard — that iterates the whole tail after `done` and makes
+// parse quadratic on long files (see skip_newlines).
+//
+// Deliberate difference from the Rust parser: the `Name<args>{...}` struct
+// literal is recognized by a pure token-scan lookahead
+// (`generic_init_ahead`) instead of a backtracking `parse_type_args` try,
+// because this parser cannot abort a speculative parse without exiting.
+// Both accept exactly the same well-formed inputs.
+
+
+#xu/ast
+#internal/modulepath
+
+pub struct Parser {
+    pub tokens []ast.Token
+    pub pos int
+    pub pending_gt bool
+    pub no_struct_lit bool
+    pub nodes []ast.Node
+    pub nfn int
+    pub nstruct int
+    pub niface int
+    pub decls []int
+    pub decl_file []int
+    // Path of each merged file, indexed by decl_file id (file 0 = first CLI).
+    pub file_names []string
+    // Path of THIS parser's own source (parse-stage diagnostics).
+    pub file_name string
+    // M9: file module id ("" = legacy global unit) and import paths.
+    pub module_id string
+    pub compile_tags []string
+    pub imports []string
+    // After multi-file merge: each import belongs to a file id (Go: file-scoped).
+    pub imp_owner []string
+    pub imp_path []string
+    pub imp_alias []string
+    pub imp_file []int
+    pub next_file int
+    // Distinct module ids seen (including empty modules).
+    pub mod_ids []string
+}
+
+pub fn new_parser(tokens []ast.Token) Parser {
+    << Parser{
+        tokens: tokens,
+        pos: 0,
+        pending_gt: false,
+        no_struct_lit: false,
+        nodes: []ast.Node{},
+        nfn: 0,
+        nstruct: 0,
+        niface: 0,
+        decls: []int{},
+        decl_file: []int{},
+        file_names: []string{},
+        file_name: "",
+        module_id: "",
+        compile_tags: []string{},
+        imports: []string{},
+        imp_owner: []string{},
+        imp_path: []string{},
+        imp_alias: []string{},
+        imp_file: []int{},
+        next_file: 0,
+        mod_ids: []string{}
+    }
+}
+
+fn (p &mut Parser) ensure_maps_import() {
+    // MS8b: language map[K]V is native Type::Map; do not auto-load src/maps.
+}
+
+pub fn is_known_compile_tag(tag string) bool {
+    if tag == "linux" { << true }
+    if tag == "macos" { << true }
+    if tag == "darwin" { << true }
+    if tag == "windows" { << true }
+    if tag == "none" { << true }
+    if tag == "unix" { << true }
+    if tag == "hosted" { << true }
+    if tag == "arm64" { << true }
+    if tag == "aarch64" { << true }
+    if tag == "x64" { << true }
+    if tag == "amd64" { << true }
+    if tag == "x86_64" { << true }
+    if tag == "loong64" { << true }
+    if tag == "loongarch64" { << true }
+    if tag == "riscv64" { << true }
+    if tag == "thumb" { << true }
+    if tag == "arm32" { << true }
+    if tag == "armv7" { << true }
+    if tag == "arm" { << true }
+    if tag == "riscv32" { << true }
+    << false
+}
+
+pub fn compile_tags_match(tags &[]string, os string, arch string) bool {
+    for i in 0:tags.len {
+        if !compile_tag_matches(tags[i], os, arch) { << false }
+    }
+    << true
+}
+
+fn compile_tag_matches(tag string, os string, arch string) bool {
+    if tag == "linux" { << os == "linux" }
+    if tag == "macos" { << os == "macos" }
+    if tag == "darwin" { << os == "macos" }
+    if tag == "windows" { << os == "windows" }
+    if tag == "none" { << os == "none" }
+    if tag == "unix" { << os == "linux" || os == "macos" }
+    if tag == "hosted" { << os != "none" }
+    if tag == "arm64" { << arch == "arm64" }
+    if tag == "aarch64" { << arch == "arm64" }
+    if tag == "x64" { << arch == "x64" }
+    if tag == "amd64" { << arch == "x64" }
+    if tag == "x86_64" { << arch == "x64" }
+    if tag == "loong64" { << arch == "loong64" }
+    if tag == "loongarch64" { << arch == "loong64" }
+    if tag == "riscv64" { << arch == "riscv64" }
+    if tag == "thumb" { << arch == "thumb" }
+    if tag == "arm32" { << arch == "thumb" }
+    if tag == "armv7" { << arch == "thumb" }
+    if tag == "arm" { << arch == "thumb" }
+    if tag == "riscv32" { << arch == "riscv32" }
+    << false
+}
+
+// ===== Token plumbing =====
+
+// Current token kind; a half-consumed `>>` reads as `>`.
+fn (p &Parser) kind() int {
+    if p.pending_gt {
+        << 35 // Gt
+    }
+    if p.pos < 0 || p.pos >= p.tokens.len {
+        << ast.tok_eof
+    }
+    << p.tokens[p.pos].kind
+}
+
+// Kind `ahead` tokens forward (clamped at eof); ignores pending_gt, like
+// the Rust peek_at.
+fn (p &Parser) kind_at(ahead int) int {
+    if p.tokens.len == 0 {
+        << ast.tok_eof
+    }
+    mut idx := p.pos + ahead
+    if idx >= p.tokens.len {
+        idx = p.tokens.len - 1
+    }
+    if idx < 0 {
+        << ast.tok_eof
+    }
+    << p.tokens[idx].kind
+}
+
+fn (p &Parser) line() int {
+    if p.pos < 0 || p.pos >= p.tokens.len {
+        << 1
+    }
+    << p.tokens[p.pos].line
+}
+fn (p &Parser) col() int {
+    if p.pos < 0 || p.pos >= p.tokens.len {
+        << 1
+    }
+    << p.tokens[p.pos].col
+}
+fn (p &Parser) ival() int {
+    if p.pos < 0 || p.pos >= p.tokens.len {
+        << 0
+    }
+    << p.tokens[p.pos].ival
+}
+fn (p &Parser) sval() string {
+    if p.pos < 0 || p.pos >= p.tokens.len {
+        << ""
+    }
+    // Token strings are owned by the lexer pool.  A direct field return is
+    // lowered as a move by the Gen1 native emitter; the caller may then keep
+    // the value in an AST node while the token pool still drops it.  Clone at
+    // this single accessor so every parser call site gets an ownership-safe
+    // snapshot (and never aliases lexer storage).
+    << p.tokens[p.pos].sval + ""
+}
+
+fn (p &mut Parser) bump() {
+    if p.pending_gt {
+        // The `>>` token now stands in for its second `>`: consume it
+        // (mirrors the Rust bump exactly).
+        p.pending_gt = false
+    }
+    if p.pos < p.tokens.len - 1 {
+        p.pos += 1
+    }
+}
+
+fn (p &mut Parser) skip_newlines() {
+    // O(newlines skipped), not O(tokens.len): a full-array scan here makes
+    // every statement boundary O(n) -> quadratic parse on long files.
+    // (Matches the Rust reference `while matches!(peek(), Newline)`.)
+    while p.kind() == 53 { // Newline
+        if p.pos >= p.tokens.len - 1 {
+            <-
+        }
+        p.pos += 1
+    }
+}
+
+fn (p &Parser) describe_here() string {
+    k := p.kind()
+    if k == 1 { << "identifier '" + p.sval() + "'" }
+    if k == 2 { << "integer " + str(p.ival()) }
+    if k == 3 { << "string literal" }
+    if k == 53 { << "end of line" }
+    if k == 54 { << "end of file" }
+    << "'" + ast.tok_name(k) + "'"
+}
+
+fn (p &Parser) fail(msg string) {
+    mut prefix := ""
+    if p.file_name.len > 0 {
+        prefix = p.file_name + ":"
+    }
+    eprintln(prefix + str(p.line()) + ":" + str(p.col()) + ": error: " + msg)
+    <<< 1
+}
+
+fn (p &Parser) fail_removed_ident() {
+    w := p.sval()
+    if w == "return" { p.fail("`return` is removed; use `<<` / `<< expr`") }
+    if w == "break" { p.fail("`break` is removed; use `<-`") }
+    if w == "continue" { p.fail("`continue` is removed; use `->`") }
+    if w == "exit" { p.fail("`exit` is removed; use `<<< expr`") }
+    if w == "throw" { p.fail("`throw` is removed; use `>> expr` to propagate errors") }
+    if w == "interface" { p.fail("`interface` is removed; use struct@ Name { ... }") }
+    if w == "module" { p.fail("`module` is removed; use @name") }
+    if w == "import" { p.fail("`import` is removed; use #path") }
+}
+
+fn (p &mut Parser) expect(kind int, what string) {
+    // `>>` half-consumes as `>` (nested generics like Box<Box<int>>).
+    if kind == 35 && p.kind() == 43 {
+        p.pending_gt = true
+        <<
+    }
+    if p.kind() == kind {
+        p.bump()
+        <<
+    }
+    p.fail("expected " + what + ", found " + p.describe_here())
+}
+
+fn is_import_path_seg_char(c int) bool {
+    if c >= 48 && c <= 57 { << true }
+    if c >= 65 && c <= 90 { << true }
+    if c >= 97 && c <= 122 { << true }
+    if c == 95 { << true }
+    << false
+}
+
+fn (p &mut Parser) take_hash_path() string {
+    raw := p.sval()
+    if raw.len == 0 {
+        p.bump()
+        if p.kind() != 3 { p.fail("expected path after #") }
+        quoted := p.sval() + ""
+        if !modulepath.valid_path(&quoted) { p.fail("invalid external package path") }
+        p.bump()
+        << modulepath.identity(&quoted)
+    }
+    if raw[0] == 34 {
+        if raw.len < 3 || raw[raw.len - 1] != 34 { p.fail("invalid external package path") }
+        quoted := raw[1:raw.len - 1]
+        if !modulepath.valid_path(&quoted) { p.fail("invalid external package path") }
+        p.bump()
+        << modulepath.identity(&quoted)
+    }
+    if !modulepath.valid_path(&raw) { p.fail("invalid #path; use '/' between path elements") }
+    if modulepath.is_external(&raw) {
+        mut slash := false
+        for i in 0:raw.len { if raw[i] == 47 { slash = true } }
+        if !slash { p.fail("dot module separators are removed; quote an external domain path") }
+    }
+    p.bump()
+    << raw + ""
+
+}
+
+fn (p &mut Parser) expect_import_alias() string {
+    if p.kind() != 1 {
+        p.fail("expected alias identifier after 'as', found " + p.describe_here())
+    }
+    << p.expect_ident()
+}
+
+fn (p &mut Parser) expect_ident() string {
+    if p.kind() == 1 {
+        name := p.sval()
+        p.bump()
+        << name
+    }
+    p.fail("expected identifier, found " + p.describe_here())
+    << ""
+}
+
+// `xu` is the spawn keyword (Go `go`) but a legal package path segment
+// in `@xu/parser`.
+fn (p &mut Parser) expect_path_ident() string {
+    if p.kind() == 1 {
+        name := p.sval()
+        p.bump()
+        << name
+    }
+    if p.kind() == 69 { // xu
+        p.bump()
+        << "xu"
+    }
+    p.fail("expected identifier, found " + p.describe_here())
+    << ""
+}
+
+// ===== Node pool helpers =====
+
+// Push a node, << its index.
+fn (p &mut Parser) add(n ast.Node) int {
+    p.nodes.push(n)
+    << p.nodes.len - 1
+}
+
+// Copy of node `i` (fields read one by one: whole elements own strings and
+// cannot move out of the array).
+fn (p &Parser) get_node(i int) ast.Node {
+    mut n := ast.mknode(0, 0, 0)
+    n.kind = p.nodes[i].kind
+    n.line = p.nodes[i].line
+    n.col = p.nodes[i].col
+    n.ival = p.nodes[i].ival
+    // `Node` owns both string descriptors.  Gen1's native emitter may lower
+    // an array-field load as a move; clone here because this helper is a
+    // semantic copy and the pool must retain ownership of its original slot.
+    n.sval = p.nodes[i].sval + ""
+    n.sval2 = p.nodes[i].sval2 + ""
+    n.a = p.nodes[i].a
+    n.b = p.nodes[i].b
+    n.c = p.nodes[i].c
+    n.d = p.nodes[i].d
+    n.e = p.nodes[i].e
+    n.next = p.nodes[i].next
+    << n
+}
+
+fn (p &mut Parser) set_node(i int, n ast.Node) { p.nodes[i] = n }
+
+fn is_test_fn_name(name string) bool {
+    if name.len <= 5 {
+        << false
+    }
+    if name[0] != 116 || name[1] != 101 || name[2] != 115 || name[3] != 116 || name[4] != 95 {
+        << false
+    }
+    << true
+}
+
+fn is_bench_fn_name(name string) bool {
+    if name.len <= 6 {
+        << false
+    }
+    if name[0] != 98 || name[1] != 101 || name[2] != 110 || name[3] != 99 || name[4] != 104 || name[5] != 95 {
+        << false
+    }
+    << true
+}
+
+fn path_basename(path string) string {
+    mut i := path.len
+    while i > 0 {
+        i = i - 1
+        if path[i] == 47 || path[i] == 92 {
+            << path[i + 1:path.len]
+        }
+    }
+    << path
+}
+
+// test.<method>.xu — ≥3 `.` sections, first `test`, last `xu`.
+fn is_test_component_basename(name string) bool {
+    mut parts := []string{}
+    mut start := 0
+    for i in 0:name.len {
+        if name[i] == 46 {
+            parts.push(name[start:i])
+            start = i + 1
+        }
+    }
+    parts.push(name[start:name.len])
+    if parts.len < 3 {
+        << false
+    }
+    if parts[0] != "test" {
+        << false
+    }
+    if parts[parts.len - 1] != "xu" {
+        << false
+    }
+    << true
+}
+
+// Rename user main and << discovered test names (only from test.<name>.xu).
+// Reject fn test_* in non-test-component sources.
+pub fn (p &mut Parser) inject_test_harness() []string {
+    mut names := []string{}
+    for i in 0:p.decls.len {
+        d := p.decls[i]
+        if p.nodes[d].kind == 40 {
+            if p.nodes[d].d < 0 && p.nodes[d].sval == "main" {
+                mut n := p.get_node(d)
+                n.sval = "_xu_user_main"
+                p.set_node(d, n)
+            }
+            if p.nodes[d].d < 0 && is_test_fn_name(p.nodes[d].sval) {
+                fid := p.file_of(d)
+                mut base := ""
+                if fid >= 0 && fid < p.file_names.len {
+                    base = path_basename(p.file_names[fid] + "")
+                }
+                if !is_test_component_basename(base + "") {
+                    p.fail_test("fn '" + p.nodes[d].sval + "' is only allowed in test.<name>.xu files")
+                }
+                if p.nodes[d].a >= 0 || p.nodes[d].e >= 0 {
+                    p.fail_test("test function '" + p.nodes[d].sval + "' must take no parameters and no type parameters")
+                }
+                if p.nodes[d].b >= 0 {
+                    p.fail_test("test function '" + p.nodes[d].sval + "' must not declare a return type")
+                }
+                mid := p.nodes[d].sval2
+                if mid != "" && mid != "main" {
+                    p.fail_test("test function '" + p.nodes[d].sval + "' must live in @main")
+                }
+                names.push(p.nodes[d].sval)
+            }
+            if p.nodes[d].d < 0 && is_bench_fn_name(p.nodes[d].sval) {
+                fid := p.file_of(d)
+                mut base := ""
+                if fid >= 0 && fid < p.file_names.len {
+                    base = path_basename(p.file_names[fid] + "")
+                }
+                if !is_test_component_basename(base + "") {
+                    p.fail_test("fn '" + p.nodes[d].sval + "' is only allowed in test.<name>.xu files")
+                }
+                if p.nodes[d].a >= 0 || p.nodes[d].e >= 0 {
+                    p.fail_test("bench function '" + p.nodes[d].sval + "' must take no parameters and no type parameters")
+                }
+                if p.nodes[d].b >= 0 {
+                    p.fail_test("bench function '" + p.nodes[d].sval + "' must not declare a return type")
+                }
+                mid := p.nodes[d].sval2
+                if mid != "" && mid != "main" {
+                    p.fail_test("bench function '" + p.nodes[d].sval + "' must live in @main")
+                }
+            }
+        }
+    }
+    if names.len == 0 {
+        benches := p.collect_bench_names()
+        if benches.len == 0 {
+            p.fail_test("no test functions (want fn test_* or fn bench_* in test.<name>.xu)")
+        }
+    }
+    << names
+}
+
+pub fn (p &Parser) collect_bench_names() []string {
+    mut benches := []string{}
+    for i in 0:p.decls.len {
+        d := p.decls[i]
+        if p.nodes[d].kind == 40 {
+            if p.nodes[d].d < 0 && is_bench_fn_name(p.nodes[d].sval) {
+                benches.push(p.nodes[d].sval)
+            }
+        }
+    }
+    << benches
+}
+
+/// Reject `fn test_*` outside `test.<name>.xu` (build / check).
+pub fn (p &Parser) enforce_test_fn_placement() {
+    for i in 0:p.decls.len {
+        d := p.decls[i]
+        if p.nodes[d].kind != 40 {
+            ->
+        }
+        if p.nodes[d].d >= 0 {
+            ->
+        }
+        if !is_test_fn_name(p.nodes[d].sval) && !is_bench_fn_name(p.nodes[d].sval) {
+            ->
+        }
+        fid := p.file_of(d)
+        mut base := ""
+        if fid >= 0 && fid < p.file_names.len {
+            base = path_basename(p.file_names[fid] + "")
+        }
+        if is_test_component_basename(base + "") {
+            ->
+        }
+        mut prefix := ""
+        if fid >= 0 && fid < p.file_names.len {
+            prefix = p.file_names[fid] + ":"
+        }
+        eprintln(prefix + str(p.nodes[d].line) + ":" + str(p.nodes[d].col) + ": error: fn '" + p.nodes[d].sval + "' is only allowed in test.<name>.xu files")
+        <<< 1
+    }
+}
+
+fn (p &mut Parser) push_decl(d int) {
+    p.decls.push(d)
+    p.decl_file.push(0)
+}
+
+pub fn (p &Parser) file_of(d int) int {
+    for i in 0:p.decls.len {
+        if p.decls[i] == d {
+            << p.decl_file[i]
+        }
+    }
+    << 0
+}
+
+fn (p &mut Parser) set_next(i int, next int) {
+    mut n := p.get_node(i)
+    n.next = next
+    p.set_node(i, n)
+}
+
+// Append `idx` to the chain headed by `head`/`last` (both -1 when empty).
+// Returns nothing; callers keep head/last in locals:
+//   if head < 0 { head = idx } else { p.set_next(last, idx) }
+//   last = idx
+
+fn (p &mut Parser) mk_binop(op int, lhs int, rhs int, line int, col int) int {
+    << p.add(ast.n_binop(line, col, op, lhs, rhs))
+}
+
+fn (p &mut Parser) mk_type_is(expr int, ty int, line int, col int) int {
+    << p.add(ast.n_type_is(line, col, expr, ty))
+}
+
+fn (p &mut Parser) mk_type_as(expr int, ty int, line int, col int) int {
+    << p.add(ast.n_type_as(line, col, expr, ty))
+}
+
+fn is_ident_start_byte(c int) bool {
+    if c >= 65 && c <= 90 { << true }
+    if c >= 97 && c <= 122 { << true }
+    if c == 95 { << true }
+    << false
+}
+
+fn is_ident_cont_byte(c int) bool {
+    if is_ident_start_byte(c) { << true }
+    if c >= 48 && c <= 57 { << true }
+    << false
+}
+
+fn (p &Parser) decode_string_escape(e int, line int, col int) int {
+    if e == 110 { << 10 }      // \n
+    if e == 116 { << 9 }       // \t
+    if e == 114 { << 13 }      // \r
+    if e == 92 { << 92 }       // \\
+    if e == 39 { << 39 }       // \'
+    if e == 34 { << 34 }       // \"
+    if e == 36 { << 36 }       // \$
+    p.fail_at2(line, col, "unknown escape sequence '\\" + string_from_byte(e) + "'")
+    << 0
+}
+
+// Cook `\n \t \r \\ \' \" \$` for const / match; `$` is left as-is.
+fn (p &Parser) cook_string_escapes(s string, line int, col int) string {
+    mut has_bs := false
+    mut i := 0
+    while i < s.len {
+        if s[i] == 92 {
+            has_bs = true
+            <-
+        }
+        i = i + 1
+    }
+    if !has_bs {
+        << s
+    }
+    mut lit := []int{}
+    i = 0
+    while i < s.len {
+        c := s[i]
+        if c == 92 {
+            if i + 1 >= s.len {
+                p.fail_at2(line, col, "unterminated string escape")
+            }
+            lit.push(p.decode_string_escape(s[i + 1], line, col))
+            i = i + 2
+        } else {
+            lit.push(c)
+            i = i + 1
+        }
+    }
+    << string_from_bytes(lit)
+}
+
+// M14: `"a $x b"` → `"a " + str(x) + " b"`. Same pass as escapes so `"\$1"`
+// is a literal `$1`. `$$` remains a literal `$`.
+fn (p &mut Parser) expand_string_interp(s string, line int, col int) int {
+    mut has_special := false
+    mut j := 0
+    while j < s.len {
+        if s[j] == 36 || s[j] == 92 {
+            has_special = true
+            <-
+        }
+        j = j + 1
+    }
+    if !has_special {
+        mut n := ast.mknode(3, line, col)
+        n.sval = s
+        << p.add(n)
+    }
+    mut acc := -1
+    mut lit := []int{}
+    mut i := 0
+    while i < s.len {
+        c := s[i]
+        if c == 92 {
+            if i + 1 >= s.len {
+                p.fail_at2(line, col, "unterminated string escape")
+            }
+            lit.push(p.decode_string_escape(s[i + 1], line, col))
+            i = i + 2
+        } else if c != 36 {
+            lit.push(c)
+            i = i + 1
+        } else if i + 1 < s.len && s[i + 1] == 36 {
+            lit.push(36)
+            i = i + 2
+        } else if i + 1 < s.len && is_ident_start_byte(s[i + 1]) {
+            if lit.len > 0 {
+                mut ln := ast.mknode(3, line, col)
+                ln.sval = string_from_bytes(lit)
+                lit = []int{}
+                lit_idx := p.add(ln)
+                if acc < 0 {
+                    acc = lit_idx
+                } else {
+                    acc = p.mk_binop(1, acc, lit_idx, line, col)
+                }
+            }
+            i = i + 1
+            name_start := i
+            while i < s.len && is_ident_cont_byte(s[i]) {
+                i = i + 1
+            }
+            mut idn := ast.mknode(4, line, col)
+            idn.sval = s[name_start:i]
+            id_idx := p.add(idn)
+            mut calln := ast.mknode(5, line, col)
+            calln.sval = "str"
+            calln.a = id_idx
+            call_idx := p.add(calln)
+            if acc < 0 {
+                acc = call_idx
+            } else {
+                acc = p.mk_binop(1, acc, call_idx, line, col)
+            }
+        } else {
+            p.fail_at2(line, col, "invalid string interpolation: expected $$ident, \\$$, or $$$$")
+        }
+    }
+    if lit.len > 0 || acc < 0 {
+        mut ln2 := ast.mknode(3, line, col)
+        ln2.sval = string_from_bytes(lit)
+        lit_idx2 := p.add(ln2)
+        if acc < 0 {
+            acc = lit_idx2
+        } else {
+            acc = p.mk_binop(1, acc, lit_idx2, line, col)
+        }
+    }
+    << acc
+}
+
+fn (p &mut Parser) mk_unop(op int, expr int, line int, col int) int {
+    mut n := ast.mknode(16, line, col)
+    n.ival = op
+    n.a = expr
+    << p.add(n)
+}
+
+// ===== Module & declarations =====
+
+// Local package declarations use slash-separated identifier elements.
+fn (p &mut Parser) parse_mod_path() string {
+    if p.kind() == 3 {
+        quoted := p.sval() + ""
+        if !modulepath.valid_path(&quoted) { p.fail("invalid external package path") }
+        p.bump()
+        << modulepath.identity(&quoted)
+    }
+    mut path := p.expect_path_ident()
+    mut done := false
+    while !done {
+            if p.kind() == 51 {
+                p.fail("dot module separators are removed; use '/' (quote external domain paths)")
+            }
+            if p.kind() == 29 { // /
+                p.bump()
+                seg := p.expect_path_ident()
+                // Stepwise concat: chained `a+b+c` moves `a` twice under M2b.
+                mut tmp := path + "/"
+                path = tmp + seg
+            } else {
+                done = true
+            }
+    }
+    << path
+}
+
+fn (p &mut Parser) note_mod_id() {
+    // Compare/push via field access each time (string params move).
+    mut found := false
+    for i in 0:p.mod_ids.len {
+        if p.mod_ids[i] == p.module_id {
+            found = true
+        }
+    }
+    if !found {
+        // Clone module_id into the table (field read is a move out of mut struct
+        // only when bound to a local; re-read via concat with empty? push field).
+        mut id := ""
+        id = id + p.module_id
+        p.mod_ids.push(id)
+    }
+}
+
+// Stamp pub (ival) + module id (sval2) on a top-level decl node.
+fn (p &mut Parser) stamp_decl(d int, is_pub int) {
+    mut n := p.get_node(d)
+    n.ival = is_pub
+    // Clone module_id into the node (avoid moving Parser.module_id).
+    mut mid := ""
+    mid = mid + p.module_id
+    n.sval2 = mid
+    p.set_node(d, n)
+}
+
+pub fn (p &mut Parser) parse_module() {
+    // `@name` is mandatory and must occupy line 1. No space after `@`.
+    p.skip_newlines()
+    if p.kind() != 84 {
+        if p.kind() == 1 && p.sval() == "module" {
+            p.fail("`module` is removed; use @name")
+        }
+        p.fail("expected @package declaration")
+    }
+    if p.line() != 1 {
+        p.fail("package declaration must be the first line of the file")
+    }
+    p.bump()
+    p.module_id = p.parse_mod_path()
+    p.skip_newlines()
+    p.note_mod_id()
+    p.compile_tags = []string{}
+    while p.kind() == 90 { // tok_dollar
+        p.bump()
+        mut n := 0
+        while p.kind() == 1 {
+            tag := p.sval() + ""
+            if !is_known_compile_tag(tag + "") {
+                p.fail("unknown compile tag '" + tag + "'")
+            }
+            p.compile_tags.push(tag)
+            p.bump()
+            n += 1
+        }
+        if n == 0 {
+            p.fail("expected compile tag after '$$'")
+        }
+        p.skip_newlines()
+    }
+    // Zero or more `#path` / `alias #path` / `#path as alias`.
+    mut imp_done := false
+    while !imp_done {
+            p.skip_newlines()
+            mut alias := ""
+            if (p.kind() == 1 || p.kind() == 69) && p.kind_at(1) == 85 {
+                alias = p.expect_path_ident()
+            }
+            if p.kind() != 85 {
+                imp_done = true
+            } else {
+                path := p.take_hash_path()
+                if alias.len > 0 {
+                    if p.kind() == 77 {
+                        p.fail("import alias is `alias #path` or `#path as alias`, not both")
+                    }
+                } else if p.kind() == 77 {
+                    p.bump()
+                    alias = p.expect_import_alias()
+                }
+                if modulepath.is_external(&path) && alias.len == 0 {
+                    p.fail("external imports require an explicit alias")
+                }
+                mut path2 := ""
+                path2 = path2 + path
+                p.imports.push(path)
+                mut owner := ""
+                owner = owner + p.module_id
+                p.imp_owner.push(owner)
+                p.imp_path.push(path2)
+                p.imp_alias.push(alias)
+                p.imp_file.push(0)
+            }
+    }
+    mut done := false
+    while !done {
+            p.skip_newlines()
+            k2 := p.kind()
+            if k2 == 54 { // eof
+                done = true
+            } else if k2 == 65 { // pub
+                p.bump()
+                p.skip_newlines()
+                k3 := p.kind()
+                if k3 == 4 {
+                    d := p.parse_fn()
+                    p.stamp_decl(d, 1)
+                    p.push_decl(d)
+                } else if k3 == 11 && p.kind_at(1) == 84 { // pub struct@
+                    d := p.parse_interface()
+                    p.stamp_decl(d, 1)
+                    p.push_decl(d)
+                } else if k3 == 11 {
+                    d := p.parse_struct()
+                    p.stamp_decl(d, 1)
+                    p.push_decl(d)
+                } else if k3 == 68 {
+                    d := p.parse_enum()
+                    p.stamp_decl(d, 1)
+                    p.push_decl(d)
+                } else if k3 == 58 {
+                    d := p.parse_const()
+                    p.stamp_decl(d, 1)
+                    p.push_decl(d)
+                } else {
+                    p.fail("expected function, struct, enum, struct@ or const after pub, found " + p.describe_here())
+                }
+            } else if k2 == 4 { // fn
+                d := p.parse_fn()
+                p.stamp_decl(d, 0)
+                p.push_decl(d)
+            } else if k2 == 11 && p.kind_at(1) == 84 { // struct@
+                d := p.parse_interface()
+                p.stamp_decl(d, 0)
+                p.push_decl(d)
+            } else if k2 == 11 { // struct
+                d := p.parse_struct()
+                p.stamp_decl(d, 0)
+                p.push_decl(d)
+            } else if k2 == 68 { // enum
+                d := p.parse_enum()
+                p.stamp_decl(d, 0)
+                p.push_decl(d)
+            } else if k2 == 58 { // const
+                d := p.parse_const()
+                p.stamp_decl(d, 0)
+                p.push_decl(d)
+            } else if k2 == 84 {
+                p.fail("'@' package declaration must be the first line of the file")
+            } else if k2 == 85 {
+                p.fail("'#' import must appear before function/struct/const declarations")
+            } else if k2 == 90 {
+                p.fail("'$$' compile tag must appear before '#' imports and declarations")
+            } else {
+                if k2 == 1 {
+                    p.fail_removed_ident()
+                }
+                p.fail("expected function, struct, enum, struct@ or const declaration, found " + p.describe_here())
+            }
+    }
+}
+
+// Append all nodes/decls/imports from `src` into `p`, remapping indices.
+pub fn (p &mut Parser) merge_from(src &Parser) {
+    off := p.nodes.len
+    fid := p.next_file
+    p.next_file += 1
+    nlen := src.nodes.len
+    for i in 0:nlen {
+        // Explicit temp: nested `ast.shift(src.get_node(i), off)` clobbered the
+        // `&Parser` receiver across the Node sret (second iter x0=1 → SEGV).
+        mut n := src.get_node(i)
+        if n.a >= 0 { n.a = n.a + off }
+        if n.b >= 0 { n.b = n.b + off }
+        if n.c >= 0 { n.c = n.c + off }
+        // ArmRange: d is integer hi, e unused (not child indices).
+        if n.kind != ast.nk_arm_range {
+            if n.d >= 0 { n.d = n.d + off }
+            if n.e >= 0 { n.e = n.e + off }
+        }
+        if n.next >= 0 { n.next = n.next + off }
+        p.nodes.push(n)
+    }
+    for i in 0:src.decls.len {
+        p.decls.push(src.decls[i] + off)
+        p.decl_file.push(fid)
+    }
+    p.nfn += src.nfn
+    p.nstruct += src.nstruct
+    p.niface += src.niface
+    for i in 0:src.imp_path.len {
+        // `src` is a short-lived parser in the import loader. These owning
+        // strings must be cloned across the merge boundary; moving indexed
+        // fields leaves the merged parser dangling when `src` is dropped.
+        p.imp_owner.push(src.imp_owner[i] + "")
+        p.imp_path.push(src.imp_path[i] + "")
+        p.imp_alias.push(src.imp_alias[i] + "")
+        p.imp_file.push(fid)
+    }
+    for i in 0:src.mod_ids.len {
+        // Dedup into p.mod_ids without moving through a shared helper param.
+        mut found := false
+        for j in 0:p.mod_ids.len {
+            if p.mod_ids[j] == src.mod_ids[i] {
+                found = true
+            }
+        }
+        if !found {
+            // Module IDs are owned by the source parser as well.
+            p.mod_ids.push(src.mod_ids[i] + "")
+        }
+    }
+}

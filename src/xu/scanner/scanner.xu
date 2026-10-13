@@ -1,0 +1,1058 @@
+@xu/scanner
+// Lexer for the Gen1 front end (M6b2-s2), ported from
+// bootstrap/crates/xuparse/src/lexer.rs.
+//
+// Newlines are significant (statement separators, V-style). `//` line and
+// `/* */` block comments. Double-quoted strings keep raw backslash sequences
+// (`\$` / `$ident` cooked at parse). Backtick raw strings skip both. Single
+// quotes are rejected (L1).
+//
+// Errors print `path:line:col: error: message` (when file_name is set) and
+// <<< 1 — the first error stops, matching the bootstrap's behavior. One deliberate difference: the
+// Rust lexer validates that string literals are valid UTF-8; Xu strings
+// are byte strings, so that check does not exist here.
+//
+// Loop idiom: per-token scans run as `while` loops whose condition is the
+// consuming guard (`&&` short-circuits), so a scan stops at its terminator
+// instead of spinning to the end of the source; a full-remainder bound here
+// makes lexing quadratic on long files.
+
+
+#xu/ast
+
+struct Lexer {
+    src           string
+    i             int
+    line          int
+    col           int
+    tokens        []ast.Token
+    keep_comments int
+    file_name     string
+}
+
+// Byte at `i + off`, or -1 past the end.
+fn (l Lexer) at(off int) int {
+    j := l.i + off
+    if j >= l.src.len {
+        << -1
+    }
+    << l.src[j]
+}
+
+fn (l &mut Lexer) bump() {
+    l.i += 1
+    l.col += 1
+}
+
+fn (l &mut Lexer) bump_n(n int) {
+    l.i += n
+    l.col += n
+}
+
+fn (l &mut Lexer) push_tok(kind int) {
+    // Hoisted: the push mutably borrows `l`, so l.line/l.col cannot be
+    // read inside the same call expression.
+    line := l.line
+    col := l.col
+    l.tokens.push(ast.token(kind, line, col, 0, ""))
+}
+
+fn (l Lexer) fail(msg string) {
+    eprintln(l.fname_prefix() + str(l.line) + ":" + str(l.col) + ": error: " + msg)
+    <<< 1
+}
+
+fn (l Lexer) fail_at(line int, col int, msg string) {
+    eprintln(l.fname_prefix() + str(line) + ":" + str(col) + ": error: " + msg)
+    <<< 1
+}
+
+fn (l Lexer) fname_prefix() string {
+    if l.file_name.len > 0 {
+        << l.file_name + ":"
+    }
+    << ""
+}
+
+fn keyword(word string) int {
+    << ast.lookup_keyword(word)
+}
+
+// Hex digit value 0..15, or -1 if not a hex digit.
+fn hex_digit_val(c int) int {
+    if c >= 48 && c <= 57 { << c - 48 }       // 0-9
+    if c >= 65 && c <= 70 { << c - 65 + 10 }  // A-F
+    if c >= 97 && c <= 102 { << c - 97 + 10 } // a-f
+    << -1
+}
+
+// ===== decimal f64 literal → IEEE754 bits (exact, correctly rounded) =====
+// The decimal value is rounded to nearest-even f64 with an exact
+// little-endian base-2^30 bignum. This mirrors src/strconv/mod.xu's
+// parse_float (which is itself aligned with Go strconv.ParseFloat and the
+// Rust bootstrap's `str::parse::<f64>`). Gen1 has no host f64 parse, so the
+// IEEE bits are produced directly instead of going through an f64 value.
+
+const fb_lb = 30
+const fb_lm = 1073741823        // 2^30 - 1
+const fb_inf = 9218868437227405312 // 0x7ff0000000000000 (+Inf)
+const fb_split = 4503599627370496 // 2^52
+
+// ---- base-2^30 bignum (little-endian limbs, non-negative) ----
+
+fn fb_trim(a &[]int) []int {
+    mut n := a.len
+    while n > 0 {
+        if a[n - 1] != 0 {
+            <-
+        }
+        n -= 1
+    }
+    mut out := []int{}
+    for i in 0:n {
+        out.push(a[i])
+    }
+    << out
+}
+
+fn fb_one() []int {
+    << [1]
+}
+
+// a * 10 + d (digit accumulation, d in 0..9)
+fn fb_append_digit(a &[]int, d int) []int {
+    mut c := []int{}
+    mut carry := d
+    for i in 0:a.len {
+        p := a[i] * 10 + carry
+        c.push(p & fb_lm)
+        carry = p >> fb_lb
+    }
+    if carry > 0 {
+        c.push(carry)
+    }
+    << fb_trim(&c)
+}
+
+fn fb_mul_small(a &[]int, b int) []int {
+    if b == 0 {
+        << []int{}
+    }
+    mut c := []int{}
+    mut carry := 0
+    for i in 0:a.len {
+        p := a[i] * b + carry
+        c.push(p & fb_lm)
+        carry = p >> fb_lb
+    }
+    if carry > 0 {
+        c.push(carry)
+    }
+    << fb_trim(&c)
+}
+
+fn fb_add(a &[]int, b &[]int) []int {
+    mut n := a.len
+    if b.len > n {
+        n = b.len
+    }
+    mut c := []int{}
+    mut carry := 0
+    for i in 0:n {
+        mut s := carry
+        if i < a.len {
+            s = s + a[i]
+        }
+        if i < b.len {
+            s = s + b[i]
+        }
+        c.push(s & fb_lm)
+        carry = s >> fb_lb
+    }
+    if carry > 0 {
+        c.push(carry)
+    }
+    << fb_trim(&c)
+}
+
+fn fb_sub(a &[]int, b &[]int) []int {
+    mut c := []int{}
+    mut borrow := 0
+    for i in 0:a.len {
+        mut sb := 0
+        if i < b.len {
+            sb = b[i]
+        }
+        if sb + borrow > a[i] {
+            c.push((a[i] + (1 << fb_lb)) - sb - borrow)
+            borrow = 1
+        } else {
+            c.push(a[i] - sb - borrow)
+            borrow = 0
+        }
+    }
+    << fb_trim(&c)
+}
+
+fn fb_cmp(a &[]int, b &[]int) int {
+    na := fb_trim(a)
+    nb := fb_trim(b)
+    if na.len != nb.len {
+        if na.len < nb.len {
+            << -1
+        }
+        << 1
+    }
+    mut i := na.len - 1
+    while i >= 0 {
+        if na[i] != nb[i] {
+            if na[i] < nb[i] {
+                << -1
+            }
+            << 1
+        }
+        i -= 1
+    }
+    << 0
+}
+
+fn fb_shl(a &[]int, s int) []int {
+    word := s / fb_lb
+    bit := s % fb_lb
+    mut c := []int{}
+    for i in 0:a.len + word + 1 {
+        c.push(0)
+    }
+    for i in 0:a.len {
+        v := a[i] << bit
+        c[i + word] = c[i + word] | (v & fb_lm)
+        if bit > 0 {
+            c[i + word + 1] = c[i + word + 1] | (a[i] >> (fb_lb - bit))
+        }
+    }
+    << fb_trim(&c)
+}
+
+fn fb_shr1(a &[]int) []int {
+    mut c := []int{}
+    for i in 0:a.len {
+        mut v := a[i] >> 1
+        if i + 1 < a.len {
+            v = v | ((a[i + 1] & 1) << (fb_lb - 1))
+        }
+        c.push(v)
+    }
+    << fb_trim(&c)
+}
+
+fn fb_bitlen(a &[]int) int {
+    t := fb_trim(a)
+    if t.len == 0 {
+        << 0
+    }
+    top := t[t.len - 1]
+    mut n := 0
+    mut x := top
+    while x > 0 {
+        x = x >> 1
+        n += 1
+    }
+    << (t.len - 1) * fb_lb + n
+}
+
+fn fb_bit_of(a &[]int, i int) int {
+    w := i / fb_lb
+    if w >= a.len {
+        << 0
+    }
+    << (a[w] >> (i % fb_lb)) & 1
+}
+
+// Compare n/d with 2^p: returns -1/0/1.
+fn fb_cmp_ratio_pow2(n &[]int, d &[]int, p int) int {
+    if p >= 0 {
+        sh := fb_shl(d, p)
+        << fb_cmp(n, &sh)
+    }
+    sh := fb_shl(n, 0 - p)
+    << fb_cmp(&sh, d)
+}
+
+struct FbQr {
+    q []int
+    r []int
+}
+
+// floor(n * 2^shift / d) and remainder, via long division.
+fn fb_div_shift(a &[]int, d &[]int, shift int) FbQr {
+    mut rem := []int{}
+    mut q := []int{}
+    total := fb_bitlen(a) + shift
+    mut i := total - 1
+    while i >= 0 {
+        rem = fb_shl(&rem, 1)
+        if i >= shift {
+            if fb_bit_of(a, i - shift) == 1 {
+                one := fb_one()
+                rem = fb_add(&rem, &one)
+            }
+        }
+        mut qb := 0
+        cmp_res := fb_cmp(&rem, d)
+        if cmp_res >= 0 {
+            rem = fb_sub(&rem, d)
+            qb = 1
+        }
+        q = fb_shl(&q, 1)
+        if qb == 1 {
+            one := fb_one()
+            q = fb_add(&q, &one)
+        }
+        i -= 1
+    }
+    << FbQr{q: q, r: rem}
+}
+
+// Convert a (small, < 2^63) bignum back to a plain int.
+fn fb_to_int(a &[]int) int {
+    mut m := 0
+    mut i := a.len - 1
+    while i >= 0 {
+        m = (m << fb_lb) | a[i]
+        i -= 1
+    }
+    << m
+}
+
+// round(n * 2^shift / d) to nearest integer (half-even), as a bignum.
+fn fb_round_frac(n &[]int, d &[]int, shift int) []int {
+    res := fb_div_shift(n, d, shift)
+    two_rem := fb_shl(&res.r, 1)
+    cmp := fb_cmp(&two_rem, d)
+    if cmp > 0 {
+        one := fb_one()
+        << fb_add(&res.q, &one)
+    }
+    if cmp == 0 {
+        if (res.q[0] & 1) == 1 {
+            one := fb_one()
+            << fb_add(&res.q, &one)
+        }
+    }
+    << fb_trim(&res.q)
+}
+
+// Finish rounding a 54-bit quotient q (in [2^53, 2^54)) to a 53-bit mantissa
+// and << the IEEE bits for value = q * 2^(k0-53). Caller guarantees the
+// result is normal (k >= -1022).
+fn fb_finish_round(q &[]int, has_rem bool, k0 int) int {
+    mut k := k0
+    mut qq := fb_trim(q)
+    if (qq[0] & 1) == 1 {
+        if has_rem || ((qq[0] >> 1) & 1) == 1 {
+            one := fb_one()
+            qq = fb_add(&qq, &one)
+        }
+    }
+    qbl := fb_bitlen(&qq)
+    if qbl == 55 {
+        qq = fb_shr1(&qq)
+        k += 1
+    }
+    mant := fb_shr1(&qq)
+    m := fb_to_int(&mant)
+    biased := k + 1023
+    if biased >= 2047 {
+        << fb_inf
+    }
+    << (biased << 52) | (m - fb_split)
+}
+
+// Round n/d (n>=0, d>0 bignums) to nearest-even f64, as non-negative IEEE bits.
+fn fb_round_ratio_bits(n &[]int, d &[]int) int {
+    if n.len == 0 {
+        << 0
+    }
+    nb := fb_bitlen(n)
+    db := fb_bitlen(d)
+    mut k := nb - db
+    if fb_cmp_ratio_pow2(n, d, k) < 0 {
+        k -= 1
+    } else if fb_cmp_ratio_pow2(n, d, k + 1) >= 0 {
+        k += 1
+    }
+    // Denormal / sub-denormal: value < 2^-1022. Round v * 2^1074 to an integer
+    // f in [0, 2^52] and encode it as a subnormal (biased exponent 0).
+    if k < -1022 {
+        f := fb_round_frac(n, d, 1074)
+        fi := fb_to_int(&f)
+        if fi == 0 {
+            << 0
+        }
+        if fi == (1 << 52) {
+            << 1 << 52 // smallest normal: biased=1, mantissa=0
+        }
+        << fi // subnormal: biased=0, mantissa=fi
+    }
+    // Normal: round to a 53-bit mantissa.
+    t := 53 - k
+    if t >= 0 {
+        res := fb_div_shift(n, d, t)
+        has_rem := res.r.len > 0
+        << fb_finish_round(&res.q, has_rem, k)
+    }
+    d2 := fb_shl(d, 0 - t)
+    res := fb_div_shift(n, &d2, 0)
+    has_rem := res.r.len > 0
+    << fb_finish_round(&res.q, has_rem, k)
+}
+
+// Parse an unsigned decimal float literal to IEEE bits; used by lex_number.
+// The lexer has already validated the shape (digits, optional '.', optional
+// e/E exponent), so this never fails.
+fn parse_float_bits(text string) int {
+    mut i := 0
+    mut mant := []int{}
+    mut e10 := 0
+    // integer digits ('_' separators skipped)
+    while i < text.len {
+        c := text[i]
+        if c == 95 {
+            i += 1
+            ->
+        }
+        if c < 48 || c > 57 {
+            <-
+        }
+        mant = fb_append_digit(&mant, c - 48)
+        i += 1
+    }
+    // fractional digits
+    if i < text.len && text[i] == 46 {
+        i += 1
+        while i < text.len {
+            c := text[i]
+            if c == 95 {
+                i += 1
+                ->
+            }
+            if c < 48 || c > 57 {
+                <-
+            }
+            mant = fb_append_digit(&mant, c - 48)
+            e10 -= 1
+            i += 1
+        }
+    }
+    // exponent
+    mut exp10 := 0
+    if i < text.len && (text[i] == 101 || text[i] == 69) {
+        i += 1
+        mut eneg := false
+        if i < text.len && (text[i] == 43 || text[i] == 45) {
+            eneg = text[i] == 45
+            i += 1
+        }
+        while i < text.len {
+            c := text[i]
+            if c == 95 {
+                i += 1
+                ->
+            }
+            if c < 48 || c > 57 {
+                <-
+            }
+            if exp10 < 100000 {
+                exp10 = exp10 * 10 + (c - 48)
+            }
+            i += 1
+        }
+        if eneg {
+            exp10 = 0 - exp10
+        }
+    }
+    e := e10 + exp10
+    if mant.len == 0 {
+        << 0
+    }
+    if e > 400 {
+        << fb_inf
+    }
+    if e < -400 {
+        << 0
+    }
+    if e >= 0 {
+        mut n := fb_trim(&mant)
+        mut j := 0
+        while j < e {
+            n = fb_mul_small(&n, 10)
+            j += 1
+        }
+        one := fb_one()
+        << fb_round_ratio_bits(&n, &one)
+    }
+    mut d := fb_one()
+    mut j := 0
+    while j < 0 - e {
+        d = fb_mul_small(&d, 10)
+        j += 1
+    }
+    << fb_round_ratio_bits(&mant, &d)
+}
+
+fn (l &mut Lexer) lex_number() {
+    start_line := l.line
+    start_col := l.col
+    start := l.i
+    // Hex: 0x... / 0X...; '_' between digits.
+    if l.src[l.i] == 48 && (l.at(1) == 120 || l.at(1) == 88) {
+        l.bump_n(2)
+        hex_start := l.i
+        mut hdone := false
+        while !hdone {
+            while l.i < l.src.len && hex_digit_val(l.src[l.i]) >= 0 {
+                l.bump()
+            }
+            if l.i < l.src.len && l.src[l.i] == 95 && l.i > hex_start && hex_digit_val(l.src[l.i - 1]) >= 0 && l.i + 1 < l.src.len && hex_digit_val(l.src[l.i + 1]) >= 0 {
+                l.bump()
+            } else {
+                hdone = true
+            }
+        }
+        if l.i == hex_start {
+            l.fail_at(start_line, start_col, "hex literal needs at least one digit after 0x")
+        }
+        mut v := 0
+        mut ok := true
+        for k in hex_start:l.i {
+            d := hex_digit_val(l.src[k])
+            if d >= 0 {
+                // i64::MAX = 0x7FFFFFFFFFFFFFFF; MAX/16 = 576460752303423487
+                if v > 576460752303423487 || (v == 576460752303423487 && d > 15) {
+                    ok = false
+                } else {
+                    v = v * 16 + d
+                }
+            }
+        }
+        if !ok {
+            l.fail_at(start_line, start_col, "integer literal '" + l.src[start:l.i] + "' out of range")
+        }
+        l.tokens.push(ast.token(ast.tok_int, start_line, start_col, v, ""))
+        <<
+    }
+    // Binary: 0b... / 0B...; '_' between digits.
+    if l.src[l.i] == 48 && (l.at(1) == 98 || l.at(1) == 66) {
+        l.bump_n(2)
+        bin_start := l.i
+        mut bdone := false
+        while !bdone {
+            while l.i < l.src.len && (l.src[l.i] == 48 || l.src[l.i] == 49) {
+                l.bump()
+            }
+            if l.i < l.src.len && l.src[l.i] == 95 && l.i > bin_start && (l.src[l.i - 1] == 48 || l.src[l.i - 1] == 49) && l.i + 1 < l.src.len && (l.src[l.i + 1] == 48 || l.src[l.i + 1] == 49) {
+                l.bump()
+            } else {
+                bdone = true
+            }
+        }
+        // An alphanumeric (or '_') right after the prefix/digits is an
+        // invalid digit; covers `0b2` and `0b102` alike.
+        if l.i < l.src.len && (is_alnum(l.src[l.i]) || l.src[l.i] == 95) {
+            l.fail_at(start_line, start_col, "invalid binary literal")
+        }
+        if l.i == bin_start {
+            l.fail_at(start_line, start_col, "binary literal needs at least one digit after 0b")
+        }
+        mut v := 0
+        mut ok := true
+        for k in bin_start:l.i {
+            d := l.src[k] - 48
+            if d >= 0 && d <= 1 {
+                // i64::MAX = 2^63-1; MAX/2 = 4611686018427387903
+                if v > 4611686018427387903 || (v == 4611686018427387903 && d > 1) {
+                    ok = false
+                } else {
+                    v = v * 2 + d
+                }
+            }
+        }
+        if !ok {
+            l.fail_at(start_line, start_col, "integer literal '" + l.src[start:l.i] + "' out of range")
+        }
+        l.tokens.push(ast.token(ast.tok_int, start_line, start_col, v, ""))
+        <<
+    }
+    // Decimal digits; may -> as float (1.5, 1e-3). Do not eat `..`.
+    // '_' is accepted between digits.
+    mut ddone := false
+    while !ddone {
+        while l.i < l.src.len && is_digit(l.src[l.i]) {
+            l.bump()
+        }
+        if l.i < l.src.len && l.src[l.i] == 95 && l.i > start && is_digit(l.src[l.i - 1]) && l.i + 1 < l.src.len && is_digit(l.src[l.i + 1]) {
+            l.bump()
+        } else {
+            ddone = true
+        }
+    }
+    mut is_float := false
+    if l.i < l.src.len && l.src[l.i] == 46 && l.at(1) != 46 && l.at(1) >= 48 && l.at(1) <= 57 {
+        is_float = true
+        l.bump() // .
+        mut fdone := false
+        while !fdone {
+            while l.i < l.src.len && is_digit(l.src[l.i]) {
+                l.bump()
+            }
+            if l.i < l.src.len && l.src[l.i] == 95 && is_digit(l.src[l.i - 1]) && l.i + 1 < l.src.len && is_digit(l.src[l.i + 1]) {
+                l.bump()
+            } else {
+                fdone = true
+            }
+        }
+    }
+    if l.i < l.src.len && (l.src[l.i] == 101 || l.src[l.i] == 69) {
+        mut j := l.i + 1
+        if j < l.src.len && (l.src[j] == 43 || l.src[j] == 45) {
+            j = j + 1
+        }
+        if j < l.src.len && is_digit(l.src[j]) {
+            is_float = true
+            l.bump() // e/E
+            if l.i < l.src.len && (l.src[l.i] == 43 || l.src[l.i] == 45) {
+                l.bump()
+            }
+            while l.i < l.src.len && is_digit(l.src[l.i]) {
+                l.bump()
+            }
+        }
+    }
+    // Slice once; branch on float vs int without moving across arms (M2b).
+    if is_float {
+        ftext := l.src[start:l.i]
+        bits := parse_float_bits(ftext)
+        l.tokens.push(ast.token(ast.tok_float, start_line, start_col, bits, ""))
+        <<
+    }
+    mut v := 0
+    mut ok := true
+    for k in start:l.i {
+        if l.src[k] == 95 {
+            ->
+        }
+        d := l.src[k] - 48
+        if v > 922337203685477580 || (v == 922337203685477580 && d > 7) {
+            ok = false
+        } else {
+            v = v * 10 + d
+        }
+    }
+    if !ok {
+        l.fail_at(start_line, start_col, "integer literal '" + l.src[start:l.i] + "' out of range")
+    }
+    l.tokens.push(ast.token(ast.tok_int, start_line, start_col, v, ""))
+}
+
+fn (l &mut Lexer) lex_hash() {
+    start_line := l.line
+    start_col := l.col
+    // Glued `#` after ident/keyword → Pound, unless path-like (`js#a/b`).
+    mut glued := false
+    if l.i > 0 {
+        prev := l.src[l.i - 1]
+        if is_alnum(prev) || prev == 95 {
+            glued = true
+        }
+    }
+    l.bump() // #
+    mut path_like := false
+    if glued {
+        mut j := l.i
+        mut scan := true
+        while scan && j < l.src.len {
+            ch := l.src[j]
+            if is_alnum(ch) || ch == 95 {
+                j += 1
+            } else {
+                if ch == 47 { // /
+                    path_like = true
+                } else if ch == 46 && j + 1 < l.src.len { // .
+                    // Lowercase after `.` → import path (`github.com`).
+                    // Uppercase → type/variant (`Opt#int.Some`).
+                    nxt := l.src[j + 1]
+                    if nxt >= 97 && nxt <= 122 {
+                        path_like = true
+                    }
+                }
+                scan = false
+            }
+        }
+    }
+    if glued && !path_like {
+        l.tokens.push(ast.token(ast.tok_pound, start_line, start_col, 0, ""))
+        <<
+    }
+    path_start := l.i
+    while l.i < l.src.len && l.src[l.i] != 32 && l.src[l.i] != 9 && l.src[l.i] != 13 && l.src[l.i] != 10 {
+        l.bump()
+    }
+    path := l.src[path_start:l.i]
+    l.tokens.push(ast.token(ast.tok_hash, start_line, start_col, 0, path + ""))
+}
+
+fn (l &mut Lexer) lex_ident() {
+    start_line := l.line
+    start_col := l.col
+    start := l.i
+    while l.i < l.src.len && (is_alnum(l.src[l.i]) || l.src[l.i] == 95) {
+        l.bump()
+    }
+    word := l.src[start:l.i]
+    kw := keyword(word + "")
+    if kw != 0 {
+        l.tokens.push(ast.token(kw, start_line, start_col, 0, ""))
+    } else {
+        l.tokens.push(ast.token(ast.tok_ident, start_line, start_col, 0, word + ""))
+    }
+}
+
+fn (l &mut Lexer) lex_string(quote int) {
+    start_line := l.line
+    start_col := l.col
+    l.bump() // opening quote
+    // Raw byte buffer so UTF-8 sequences pass through unchanged.
+    mut value := []int{}
+    mut closed := false
+    while !closed && l.i < l.src.len {
+        ch := l.src[l.i]
+            if ch == quote {
+                l.bump()
+                closed = true
+            } else if ch == 10 {
+                l.fail_at(start_line, start_col, "unterminated string literal")
+            } else if ch == 92 {
+                // Keep `\` + next so parser can treat `\$` and `$ident` together.
+                value.push(92)
+                l.bump()
+                if l.i >= l.src.len {
+                    l.fail_at(start_line, start_col, "unterminated string literal")
+                }
+                value.push(l.src[l.i])
+                l.bump()
+            } else {
+                value.push(ch)
+                l.bump()
+            }
+    }
+    if !closed {
+        l.fail_at(start_line, start_col, "unterminated string literal")
+    }
+    sval := string_from_bytes(value)
+        l.tokens.push(ast.token(ast.tok_str, start_line, start_col, 0, sval))
+}
+
+fn (l &mut Lexer) lex_raw_string() {
+    start_line := l.line
+    start_col := l.col
+    l.bump() // opening `
+    mut value := []int{}
+    mut closed := false
+    while !closed && l.i < l.src.len {
+        ch := l.src[l.i]
+        if ch == 96 {
+            l.bump()
+            closed = true
+        } else {
+            value.push(ch)
+            if ch == 10 {
+                l.line += 1
+                l.col = 1
+            } else {
+                l.col += 1
+            }
+            l.bump()
+        }
+    }
+    if !closed {
+        l.fail_at(start_line, start_col, "unterminated raw string literal")
+    }
+    sval := string_from_bytes(value)
+    l.tokens.push(ast.token(ast.tok_str, start_line, start_col, 1, sval))
+}
+
+// Lex the whole source; `l.tokens` ends with a single EOF token.
+fn (l &mut Lexer) run() {
+    while l.i < l.src.len {
+        l.step()
+    }
+}
+
+// One lexing step: consume at least one byte, maybe emit a token.
+fn (l &mut Lexer) step() {
+    c := l.src[l.i]
+    if c == 32 || c == 9 || c == 13 { // space, tab, CR
+        l.bump()
+    } else if is_digit(c) {
+        l.lex_number()
+    } else if is_alpha(c) || c == 95 {
+        l.lex_ident()
+    } else if c == 39 { // '
+        l.fail("single-quoted strings are removed; use double quotes \"…\"")
+    } else if c == 34 { // "
+        l.lex_string(c)
+    } else if c == 96 { // ` raw string (L1)
+        l.lex_raw_string()
+    } else if c == 10 { // newline
+        l.push_tok(ast.tok_newline)
+        l.i += 1
+        l.line += 1
+        l.col = 1
+    } else if c == 40 { // (
+        l.push_tok(ast.tok_l_paren)
+        l.bump()
+    } else if c == 41 { // )
+        l.push_tok(ast.tok_r_paren)
+        l.bump()
+    } else if c == 123 { // {
+        l.push_tok(ast.tok_l_brace)
+        l.bump()
+    } else if c == 91 { // [
+        l.push_tok(ast.tok_l_bracket)
+        l.bump()
+    } else if c == 93 { // ]
+        l.push_tok(ast.tok_r_bracket)
+        l.bump()
+    } else if c == 125 { // }
+        l.push_tok(ast.tok_r_brace)
+        l.bump()
+    } else if c == 44 { // ,
+        l.push_tok(ast.tok_comma)
+        l.bump()
+    } else if c == 43 { // +
+        if l.at(1) == 61 { // +=
+            l.push_tok(ast.tok_plus_assign)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_plus)
+            l.bump()
+        }
+    } else if c == 45 { // -
+        if l.at(1) == 61 { // -=
+            l.push_tok(ast.tok_minus_assign)
+            l.bump_n(2)
+        } else if l.at(1) == 62 { // ->
+            l.push_tok(ast.tok_right_arrow)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_minus)
+            l.bump()
+        }
+    } else if c == 42 { // *
+        if l.at(1) == 61 { // *=
+            l.push_tok(ast.tok_star_assign)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_star)
+            l.bump()
+        }
+    } else if c == 47 { // /  (also // and /* comments)
+        n1 := l.at(1)
+        if n1 == 47 { // // line comment
+            cline := l.line
+            ccol := l.col
+            l.bump_n(2)
+            start := l.i
+            while l.i < l.src.len && l.src[l.i] != 10 {
+                l.bump()
+            }
+            if l.keep_comments == 1 {
+                mut body := l.src[start:l.i]
+                if body.len > 0 && body[0] == 32 {
+                    body = body[1:body.len]
+                }
+                l.tokens.push(ast.token(ast.tok_comment, cline, ccol, 0, body))
+            }
+        } else if n1 == 42 { // /* block comment
+            cline := l.line
+            ccol := l.col
+            l.bump_n(2)
+            start := l.i
+            mut closed := 0
+            while l.i < l.src.len {
+                if l.src[l.i] == 42 && l.at(1) == 47 {
+                    end := l.i
+                    l.bump()
+                    l.col += 1
+                    l.bump()
+                    l.col += 1
+                    closed = 1
+                    if l.keep_comments == 1 {
+                        mut body := l.src[start:end]
+                        if body.len > 0 && body[0] == 32 {
+                            body = body[1:body.len]
+                        }
+                        if body.len > 0 && body[body.len - 1] == 32 {
+                            body = body[0:(body.len - 1)]
+                        }
+                        l.tokens.push(ast.token(ast.tok_comment, cline, ccol, 0, body))
+                    }
+                    <-
+                }
+                if l.src[l.i] == 10 {
+                    l.line += 1
+                    l.col = 1
+                } else {
+                    l.col += 1
+                }
+                l.bump()
+            }
+            if closed == 0 {
+                l.fail_at(cline, ccol, "unterminated block comment")
+            }
+        } else if n1 == 61 { // /=
+            l.push_tok(ast.tok_slash_assign)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_slash)
+            l.bump()
+        }
+    } else if c == 37 { // %
+        if l.at(1) == 61 { // %=
+            l.push_tok(ast.tok_percent_assign)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_percent)
+            l.bump()
+        }
+    } else if c == 61 { // =
+        if l.at(1) == 61 { // ==
+            l.push_tok(ast.tok_eq_eq)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_assign)
+            l.bump()
+        }
+    } else if c == 33 { // !
+        if l.at(1) == 61 { // !=
+            l.push_tok(ast.tok_not_eq)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_bang)
+            l.bump()
+        }
+    } else if c == 60 { // <
+        if l.at(1) == 61 { // <=
+            l.push_tok(ast.tok_lt_eq)
+            l.bump_n(2)
+        } else if l.at(1) == 60 { // << or <<<
+            if l.at(2) == 60 { // <<<
+                l.push_tok(ast.tok_triple_lt)
+                l.bump_n(3)
+            } else {
+                l.push_tok(ast.tok_shl)
+                l.bump_n(2)
+            }
+        } else if l.at(1) == 45 { // <- or <->
+            if l.at(2) == 62 { // <->
+                l.push_tok(ast.tok_left_right_arrow)
+                l.bump_n(3)
+            } else {
+                l.push_tok(ast.tok_left_arrow)
+                l.bump_n(2)
+            }
+        } else {
+            l.push_tok(ast.tok_lt)
+            l.bump()
+        }
+    } else if c == 62 { // >
+        if l.at(1) == 61 { // >=
+            l.push_tok(ast.tok_gt_eq)
+            l.bump_n(2)
+        } else if l.at(1) == 62 { // >>
+            l.push_tok(ast.tok_shr)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_gt)
+            l.bump()
+        }
+    } else if c == 38 { // &
+        if l.at(1) == 38 { // &&
+            l.push_tok(ast.tok_and_and)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_amp)
+            l.bump()
+        }
+    } else if c == 124 { // |
+        if l.at(1) == 124 { // ||
+            l.push_tok(ast.tok_or_or)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_pipe)
+            l.bump()
+        }
+    } else if c == 94 { // ^
+        l.push_tok(ast.tok_caret)
+        l.bump()
+    } else if c == 58 { // :
+        if l.at(1) == 61 { // :=
+            l.push_tok(ast.tok_colon_assign)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_colon)
+            l.bump()
+        }
+    } else if c == 46 { // .
+        if l.at(1) == 46 && l.at(2) == 46 { // ...
+            l.push_tok(ast.tok_ellipsis)
+            l.bump_n(3)
+        } else if l.at(1) == 46 { // ..
+            l.push_tok(ast.tok_dot_dot)
+            l.bump_n(2)
+        } else {
+            l.push_tok(ast.tok_dot)
+            l.bump()
+        }
+    } else if c == 63 { // ?
+        l.push_tok(ast.tok_question)
+        l.bump()
+    } else if c == 64 { // @
+        l.push_tok(ast.tok_at)
+        l.bump()
+    } else if c == 36 { // $
+        l.push_tok(ast.tok_dollar)
+        l.bump()
+    } else if c == 35 { // #
+        l.lex_hash()
+    } else {
+        l.fail("unexpected character '" + string_from_byte(c) + "'")
+    }
+}
+
+// Lex `src` into `out` (out-param: functions cannot return arrays). Parts of
+// a multi-file compilation omit EOF until the final source file.
+fn lex_part(src string, add_eof bool, out &mut []ast.Token, fname string) {
+    mut l := Lexer{src: src, i: 0, line: 1, col: 1, tokens: []ast.Token{}, keep_comments: 0, file_name: fname}
+    l.run()
+    if add_eof {
+        l.push_tok(ast.tok_eof)
+    }
+    // Copy out field by field: whole elements own strings and cannot move.
+    for i in 0:l.tokens.len {
+        out.push(ast.token(l.tokens[i].kind, l.tokens[i].line, l.tokens[i].col, l.tokens[i].ival, l.tokens[i].sval + ""))
+    }
+}
+
+pub fn lex(src string, out &mut []ast.Token, fname string) {
+    lex_part(src, true, out, fname)
+}
+
+pub fn lex_full(src string, out &mut []ast.Token) {
+    mut l := Lexer{src: src, i: 0, line: 1, col: 1, tokens: []ast.Token{}, keep_comments: 1, file_name: ""}
+    l.run()
+    l.push_tok(ast.tok_eof)
+    for i in 0:l.tokens.len {
+        out.push(ast.token(l.tokens[i].kind, l.tokens[i].line, l.tokens[i].col, l.tokens[i].ival, l.tokens[i].sval + ""))
+    }
+}

@@ -1,0 +1,292 @@
+@xu/types
+
+fn mir_block_skips_unroll(f &MFn, bi int) bool {
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := f.instrs[ii].kind
+        if k == 7 {
+            mut is_pure_math := false
+            if f.instrs[ii].b == 1 {
+                lab := f.instrs[ii].sval
+                if lab == "_xu_math_sqrt" || lab == "_xu_math_clz" || lab == "_xu_math_ctz" || lab == "_xu_math_ones_count" || lab == "_xu_math_reverse_bits" || lab == "_xu_math_byte_swap" {
+                    is_pure_math = true
+                }
+            }
+            if !is_pure_math {
+                << true
+            }
+        } else if k == 8 || k == 12 || k == 33 || k == 37 || k == 39 {
+            << true
+        }
+        if k >= 30 && k <= 36 {
+            << true
+        }
+        if k == 16 && f.instrs[ii].c == 0 {
+            << true
+        }
+        ii = f.instrs[ii].next
+    }
+    << false
+}
+
+fn mir_unroll_map_temp(t int, map_on &[]bool, map_v &[]int) int {
+    if t >= 0 && t < map_on.len {
+        if map_on[t] {
+            << map_v[t]
+        }
+    }
+    << t
+}
+
+fn mir_unroll_bind_dest(f &mut MFn, d int, map_on &mut []bool, map_v &mut []int) {
+    if d >= 0 && d < map_on.len {
+        if !map_on[d] {
+            mut ns := 1
+            if d < f.temps_nslots.len {
+                ns = f.temps_nslots[d]
+            }
+            nt := f.new_temp(f.temps[d], ns)
+            mfn_set_b(map_on, d, true)
+            mfn_set_i(map_v, d, nt)
+        }
+    }
+}
+
+fn mir_unroll_rewrite_dests(f &mut MFn, ii int, map_on &[]bool, map_v &[]int) {
+    mut x := mfn_instr_snap(mut &f.instrs, ii)
+    k := x.kind
+    if k == 36 {
+        x.a = mir_unroll_map_temp(x.a, map_on, map_v)
+        x.b = mir_unroll_map_temp(x.b, map_on, map_v)
+    } else if k == 32 {
+        x.a = mir_unroll_map_temp(x.a, map_on, map_v)
+        x.d = mir_unroll_map_temp(x.d, map_on, map_v)
+    } else if mir_instr_has_dest(k) {
+        if k != 7 || x.a >= 0 {
+            x.a = mir_unroll_map_temp(x.a, map_on, map_v)
+        }
+    }
+    mfn_set_instr(mut &f.instrs, ii, x)
+}
+
+fn mir_unroll_append_copy(f &mut MFn, bi int, ids &[]int, map_on &mut []bool, map_v &mut []int) {
+    for i in 0:map_on.len {
+        mfn_set_b(map_on, i, false)
+        mfn_set_i(map_v, i, 0)
+    }
+    for k in 0:ids.len {
+        oi := ids[k]
+        ik := f.instrs[oi].kind
+        if ik == 36 {
+            mir_unroll_bind_dest(f, f.instrs[oi].a, map_on, map_v)
+            mir_unroll_bind_dest(f, f.instrs[oi].b, map_on, map_v)
+        } else if ik == 32 {
+            mir_unroll_bind_dest(f, f.instrs[oi].a, map_on, map_v)
+            mir_unroll_bind_dest(f, f.instrs[oi].d, map_on, map_v)
+        } else if mir_instr_has_dest(ik) {
+            if ik != 7 || f.instrs[oi].a >= 0 {
+                mir_unroll_bind_dest(f, f.instrs[oi].a, map_on, map_v)
+            }
+        }
+    }
+    mut on_sh := []bool{}
+    mut v_sh := []int{}
+    for i in 0:map_on.len {
+        on_sh.push(map_on[i])
+        v_sh.push(map_v[i])
+    }
+    for k in 0:ids.len {
+        oi := ids[k]
+        mut z := mkinstr(f.instrs[oi].kind)
+        z.a = f.instrs[oi].a
+        z.b = f.instrs[oi].b
+        z.c = f.instrs[oi].c
+        z.d = f.instrs[oi].d
+        z.sval = mfn_sval_clone_owned(&f.instrs, oi)
+        z.line = f.instrs[oi].line
+        z.col = f.instrs[oi].col
+        z.file = f.instrs[oi].file
+        mir_cfg_append(f, bi, z)
+        ni := f.blocks[bi].tail
+        mir_rewrite_instr(f, ni, &on_sh, &v_sh)
+        mir_unroll_rewrite_dests(f, ni, &on_sh, &v_sh)
+    }
+}
+
+// LLVM LoopUnroll analog: duplicate a counted self-loop body in the same
+// latch (keep the pin). Never split into a 2-block cycle. Only when the
+// trip count is a compile-time multiple of the factor (`i := start;
+// while i < bound; i += 1`). Bound instruction and destination-slot cost.
+// Each copy gets fresh dest temps (non-SSA dest reuse + RA pin).
+// Counted self-loop unroll. Calls, growth, drops, pointer stores and
+// FieldRMW stay in place. A pure scalar loop, or one whose only memory
+// op is StoreIndex/IndexRMW, may duplicate the latch.
+fn mir_unroll_self_loop_ok(f &MFn, bi int) bool {
+    z := mir_loop_mem_facts(f, bi)
+    if z.has_call != 0 { << false }
+    if z.has_arr_push != 0 { << false }
+    if z.has_ptr_store != 0 { << false }
+    if z.has_field_rmw != 0 { << false }
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == 8 || k == 21 || k == 22 || k == 24 { << false }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << true
+}
+
+fn mir_unroll_self_loops(f &mut MFn) {
+    mut bi := 0
+    while bi < f.blocks.len {
+        if !f.is_self_loop(bi) || !mir_unroll_self_loop_ok(&*f, bi) {
+            bi += 1
+            ->
+        }
+        mut cost := 0
+        mut slot_cost := 0
+        mut ids := []int{}
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            cost += 1
+            k := f.instrs[ii].kind
+            d := f.instrs[ii].a
+            if mir_instr_has_dest(k) && d >= 0 && d < f.temps_nslots.len {
+                width := f.temps_nslots[d]
+                if width < 1 || width > 32 || slot_cost > 32 - width {
+                    slot_cost = 33
+                } else {
+                    slot_cost += width
+                }
+            }
+            ids.push(ii)
+            ii = f.instrs[ii].next
+        }
+        if mir_block_skips_unroll(&*f, bi) || cost < 1 || cost > 32 {
+            bi += 1
+            ->
+        }
+        u := mir_counted_unroll_factor(&*f, bi, cost, slot_cost)
+        if u < 2 {
+            bi += 1
+            ->
+        }
+        n0 := f.temps.len
+        mut map_on := []bool{}
+        mut map_v := []int{}
+        for _ in 0:n0 {
+            map_on.push(false)
+            map_v.push(0)
+        }
+        mut orig_cond := 0 - 1
+        if f.blocks[bi].tkind == 2 {
+            orig_cond = f.blocks[bi].ta
+        }
+        mut copy := 1
+        while copy < u {
+            mir_unroll_append_copy(f, bi, &ids, mut &map_on, mut &map_v)
+            copy += 1
+        }
+        if orig_cond >= 0 && orig_cond < map_on.len {
+            if map_on[orig_cond] {
+                mut blk := f.blocks[bi]
+                blk.ta = map_v[orig_cond]
+                mfn_set_block(mut &f.blocks, bi, blk)
+            }
+        }
+        bi += 1
+    }
+}
+
+fn mir_counted_unroll_factor(f &MFn, bi int, cost int, slot_cost int) int {
+    if f.blocks[bi].tkind != 2 { << 0 }
+    if f.blocks[bi].tb != bi { << 0 }
+    ct := f.blocks[bi].ta
+    if ct < 0 { << 0 }
+    mut lhs := 0
+    mut bound := 0
+    mut have := false
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if f.instrs[ii].kind == 4 && f.instrs[ii].b == 8 && f.instrs[ii].a == ct {
+            lhs = f.instrs[ii].c
+            if f.val_is_const(f.instrs[ii].d) {
+                bound = f.val_const(f.instrs[ii].d)
+                have = true
+            } else {
+                have = false
+            }
+        }
+        ii = f.instrs[ii].next
+    }
+    if !have { << 0 }
+    if lhs < 0 { << 0 }
+    mut ind := -1
+    ii = f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if f.instrs[ii].kind == 2 && f.instrs[ii].a == lhs {
+            ind = f.instrs[ii].b
+        }
+        ii = f.instrs[ii].next
+    }
+    if ind < 0 {
+        ii = f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            if f.instrs[ii].kind == 3 && f.instrs[ii].b == lhs && lhs >= 0 {
+                ind = f.instrs[ii].a
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+    if ind < 0 { << 0 }
+    mut nstore := 0
+    mut inc_ok := false
+    ii = f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if f.instrs[ii].kind == 3 && f.instrs[ii].a == ind {
+            nstore += 1
+            inc_ok = mir_is_add1_of_local(f, bi, f.instrs[ii].b, ind)
+        }
+        ii = f.instrs[ii].next
+    }
+    if nstore != 1 || !inc_ok { << 0 }
+    pred := f.unique_ext_pred(bi)
+    if pred < 0 { << 0 }
+    mut start := 0
+    if !mir_last_store_const(f, pred, ind, mut &start) { << 0 }
+    trip := bound - start
+    if trip < 2 { << 0 }
+    // Fresh TempIds survive frame layout even when SIMD block selection
+    // replaces their instructions. Instruction count alone expanded Vec3
+    // reductions to 80 scalar homes with unchanged machine code. Bound the
+    // expanded body's homes to 32 words, and try smaller legal factors for
+    // integer loops instead of rejecting every expansion of the body.
+    if trip <= 32 {
+        if cost * trip <= 300 && slot_cost * trip <= 32 {
+            << trip
+        }
+    }
+    if trip % 8 == 0 {
+        if cost * 8 <= 150 && slot_cost <= 32 / 8 {
+            << 8
+        }
+    }
+    if trip % 4 == 0 {
+        if cost * 4 <= 150 && slot_cost <= 32 / 4 {
+            << 4
+        }
+    }
+    if trip % 2 == 0 {
+        if cost * 2 <= 150 && slot_cost <= 32 / 2 {
+            << 2
+        }
+    }
+    << 0
+}

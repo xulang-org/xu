@@ -1,0 +1,334 @@
+@main
+
+#xu/types
+
+fn emit_function_emit_blocks(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ct &CoverTable, w &EmitWalk, generic_vregs bool) {
+    a.rc_fp_inv_t = -1
+    a.rc_fp_inv_idx = -1
+    a.rc_fp_inv_ld = 0
+    a.rc_elem_vr = -1
+    for bi in 0:types.mir_nblocks(m, fi) {
+        a.rc_fp_inv_t = -1
+        a.rc_fp_inv_idx = -1
+        a.rc_elem_vr = -1
+        a.rc_push_fuse = 0
+        a.label(types.mir_fn_label(m, fi) + "_bb" + str(bi))
+        a.rc_cur_bi = bi
+        a.rc_leaf = w.leaf[bi] == 1 || w.straight == 1 || w.scalar_skip == 1
+        // x64 pin homes are V2–V5, the same registers ALU/field/index
+        // scratch use. Skip-store + `_ht` (no stack writeback / no reload)
+        // lets `mid := lo+((hi-lo)>>1)` clobber `lo` (search_ints → 0/OOB).
+        // ARM64 S-pool keeps pins in S0–S3, so V2–V5 stay scratch.
+        a.rc_wb = w.wb[bi] == 1 && a.arch == 0
+        // When the latch is not pin-only ALU, `_ht` must include pin
+        // reloads. Emit it next to `_bbN` so `rc_back_lbl` still resolves
+        // (nbody O1 unknown-label) and `r`/`j` reload from the frame.
+        reload_hot_offset := a.code.len
+        reload_hot := a.arch == 0 && !(a.rc_wb && rc_ht_skip_pin_wb(&*a, m, fi, fr, bi))
+        // m32 coverage: bump the counter for this block's (file,line) slot.
+        // Keep the instrumentation on V0/V1 only: fixed virtual-register
+        // homes own V2+ and may be live at a future CFG block entry.
+        if a.cover && types.mir_bline(m, fi, bi) != 0 {
+            slot := cover_slot(ct, types.mir_fn_file(m, fi), types.mir_bline(m, fi, bi))
+            if slot >= 0 {
+                a.lea(0, "_xu_cover_counts")
+                a.vm_mov_imm(1, slot * 8)
+                a.add(0, 0, 1)
+                a.load(1, 0, 0)
+                a.vm_add_imm(1, 1, 1)
+                a.store(0, 0, 1)
+            }
+        }
+        rc_flush(a)
+        if a.rc_on {
+            // Keep array data-ptr CSE across self-loop re-entry (V6/V7 live).
+            tkind := types.mir_btkind(m, fi, bi)
+            ta := types.mir_bta(m, fi, bi)
+            tb := types.mir_btb(m, fi, bi)
+            tc := types.mir_btc(m, fi, bi)
+            mut self_loop := false
+            if tkind == 1 && ta == bi { self_loop = true }
+            if tkind == 2 && (tb == bi || tc == bi) { self_loop = true }
+            mut keep_arr := self_loop
+            if !keep_arr && a.rc_kernel != 0 {
+                if bi < a.rc_loop_hot.len && a.rc_loop_hot[bi] > 0 {
+                    keep_arr = true
+                }
+            }
+            if !keep_arr {
+                rc_arr_invalidate(a)
+            }
+            if rc_carry_restore(a, bi) {
+                // M192b / O2: parks already live in regs from the unique pred.
+            } else if a.rc_pins.len >= (bi + 1) * 4 {
+                for p in 0:4 {
+                    loc := a.rc_pins[bi * 4 + p]
+                    a.rc_pin[p] = -1
+                    a.rc_pin_dirty[p] = 0
+                    a.rc_pin_alias[p] = -1
+                    a.rc_blk_pin[p] = -1
+                    a.rc_s_cache[p] = -1
+                    if loc >= 0 && loc < fr.local_slot.len && is_frame_slot(fr.local_slot[loc]) {
+                        vr := rc_pin_vr(&*a, p)
+                        a.rc_pin[p] = fr.local_slot[loc]
+                        a.rc_blk_pin[p] = fr.local_slot[loc]
+                        a.rc_s_cache[p] = fr.local_slot[loc]
+                        // Reload: metadata-only left garbage in caller-saved
+                        // V pins when hot_top is off. `_ht` back-edges skip this.
+                        a.load(vr, 15, slot_off(fr.local_slot[loc]))
+                        if vr >= 2 && vr < rc_home_hi(&*a) {
+                            a.rc_slot[vr] = fr.local_slot[loc]
+                            a.rc_dirty[vr] = 0
+                            a.rc_alias[vr] = -1
+                            a.rc_tick += 1
+                            a.rc_used[vr] = a.rc_tick
+                        }
+                    }
+                }
+                if !a.rc_fp_only {
+                    nh := rc_fp_homes()
+                    for p in 0:nh {
+                        a.rc_fp_pin[p] = -1
+                        a.rc_fp_dirty[p] = 0
+                        a.rc_fp_alias[p] = -1
+                        a.rc_fp_alias2[p] = -1
+                        if a.rc_fp_blk.len >= (bi + 1) * nh {
+                            locf := a.rc_fp_blk[bi * nh + p]
+                            if locf >= 0 && locf < fr.local_slot.len {
+                                a.rc_fp_pin[p] = fr.local_slot[locf]
+                                a.rc_fp_alias[p] = fr.local_slot[locf]
+                                if !rc_fp_def_before_use(m, fi, bi, locf) {
+                                    a.be_fload(2 + p, 15, slot_off(fr.local_slot[locf]))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if a.rc_fp_only {
+            // FP-only mode has no GPR block state to restore. Seed the admitted
+            // SIMD layout once at block entry; hot backedges keep the same homes
+            // because rc_flush intentionally preserves them in this mode.
+            nh := rc_fp_homes()
+            for p in 0:nh {
+                if a.rc_fp_blk.len >= (bi + 1) * nh {
+                    locf := a.rc_fp_blk[bi * nh + p]
+                    if locf >= 0 && locf < fr.local_slot.len {
+                        target := fr.local_slot[locf]
+                        // A hot backedge re-enters this block with the same
+                        // physical home. Preserve its value/dirty bit instead
+                        // of reloading the frame copy on every iteration.
+                        if a.rc_fp_pin[p] != target {
+                            a.rc_fp_pin[p] = target
+                            a.rc_fp_dirty[p] = 0
+                            a.rc_fp_alias[p] = target
+                            a.rc_fp_alias2[p] = -1
+                            if !rc_fp_def_before_use(m, fi, bi, locf) {
+                                a.be_fload(2 + p, 15, slot_off(target))
+                            }
+                        }
+                    } else {
+                        a.rc_fp_pin[p] = -1
+                        a.rc_fp_dirty[p] = 0
+                        a.rc_fp_alias[p] = -1
+                        a.rc_fp_alias2[p] = -1
+                    }
+                }
+            }
+        }
+        rc_apply_s_const(a, w.sc_p, w.sc_v)
+        if a.rc_addr_vr >= 0 {
+            a.rc_addr_alias = -1
+            // Occupy addr S home so hold_call_dest / parks do not steal it.
+            ap := a.rc_addr_vr - 8
+            if ap >= 0 && ap < 4 {
+                a.rc_s_hold[ap] = -2
+            }
+        }
+        if bi == 0 && a.rc_on {
+            rc_park_incoming(a, m, fi, fr)
+        }
+        a.rc_fp_rhs = -1
+        if a.rc_alu_fwd_fn != 2 {
+            a.rc_fp_fma_dm = -1
+        }
+        a.rc_fp_ephem = -1
+        a.rc_fp_skip = -1
+        a.rc_fp_skip2 = -1
+        a.rc_fp_skip3 = -1
+        a.rc_fp_skip4 = -1
+        a.rc_fp_skip_n = 0
+        a.pb_recv = -1
+        a.pb_local = -1
+        a.rc_fused_cc = -1
+        a.rc_hot_lbl = ""
+        a.rc_branch_cond = -1
+        a.rc_fold_t0 = -1
+        a.rc_fold_t1 = -1
+        a.rc_row_k0 = -1
+        a.rc_row_k1 = -1
+        a.rc_madd_k0 = -1
+        a.rc_madd_k1 = -1
+        a.rc_aik_loc = -1
+        a.rc_ind_local = -1
+        if types.mir_btkind(m, fi, bi) == 2 && select_pair_at(&fr.select_pairs, bi) < 0 {
+            a.rc_branch_cond = types.mir_bta(m, fi, bi)
+        }
+        // Seed A0 with &local before hot; back-edge skips the mov (Acc.add).
+        // Hot only when leaf or S-pool pins (callee-saved). rc_wb on V2–V5
+        // must re-enter at the block label after `bl`.
+        // Call-bearing wb loops still use `_ht`; StoreLocal must sync S homes
+        // via rc_sync_s_after_store (block pin table) so induction vars stay live.
+        // Array data-ptr CSE also needs `_ht` so seeds are not re-run each iter.
+        mut seed_arr := 0
+        mut seed_madd := 0
+        tkind_ht := types.mir_btkind(m, fi, bi)
+        ta_ht := types.mir_bta(m, fi, bi)
+        tb_ht := types.mir_btb(m, fi, bi)
+        tc_ht := types.mir_btc(m, fi, bi)
+        mut self_loop_ht := false
+        if tkind_ht == 1 && ta_ht == bi { self_loop_ht = true }
+        if tkind_ht == 2 && (tb_ht == bi || tc_ht == bi) { self_loop_ht = true }
+        mut natural_hot := false
+        if bi < a.rc_loop_hot.len && a.rc_loop_hot[bi] > 0 { natural_hot = true }
+        a.rc_ind_local = -1
+        a.rc_and_nocheck = 0
+        if (self_loop_ht || natural_hot) && (a.rc_on || frame_has_vregs(fr)) {
+            a.rc_ind_local = find_induction_local(m, fi, bi)
+            emit_seed_induct_oob(a, m, fi, fr, bi)
+            emit_seed_and_mask_oob(a, m, fi, fr, bi)
+        } else {
+            a.rc_ind_nocheck = 0
+            a.rc_and_nocheck = 0
+        }
+        kernel_hot := natural_hot && a.rc_kernel != 0
+        // Small indexed kernel: ALU temps stay in parks (no per-iter
+        // stur of `hi-lo` / `mid`). Init blocks keep rc_wb off so the
+        // first pin reload still sees stack stores.
+        if kernel_hot && a.rc_kernel == 1 {
+            a.rc_wb = true
+        }
+        // 1-slot search: ALU temps (`hi-lo` / `mid`) stay in V parks.
+        // Pins still store (rc_skip_pin_store is off: nfn counts stubs).
+        if a.arch == 0 && natural_hot && a.rc_fwd_ht && block_has_index(m, fi, bi) {
+            a.rc_wb = true
+        }
+        // V6/V7 data-ptr CSE, madd hoist, and `_ht` skip LoadLocal of the
+        // descriptor. `--no-regcache` must keep slots as truth: seeding
+        // without RA left IndexRMW reading an empty desc (matmul SIGSEGV).
+        if a.rc_on && (self_loop_ht || kernel_hot) && a.arch == 0 && (a.rc_s_pool || block_has_index(m, fi, bi)) {
+            seed_arr = emit_seed_arr_data(a, m, fi, fr, bi)
+        }
+        if seed_arr == 0 && a.rc_on && kernel_hot && a.arch == 0 {
+            seed_arr = emit_seed_kernel_ref_data(a, m, fi, fr, bi)
+        }
+        // Sole-int-ref index (flips_of): seed data* without `_ht`.
+        // 3-block invert is not a self-loop; re-seed each block entry.
+        if seed_arr == 0 && a.rc_on && a.arch == 0 && a.rc_kernel == 0 {
+            if block_has_index(m, fi, bi) {
+                emit_seed_kernel_ref_data(a, m, fi, fr, bi)
+            }
+        }
+        if a.rc_on && self_loop_ht && a.arch == 0 {
+            seed_madd = emit_seed_madd_hoists(a, m, fi, fr, bi)
+        }
+        mut seed_row := 0
+        if seed_arr == 1 && seed_madd == 1 {
+            seed_row = emit_seed_row_walks(a, m, fi, bi)
+        }
+        if seed_row == 1 {
+            emit_seed_aik(a, m, fi, fr, bi)
+        }
+        mut seed_ip0 := 0
+        if a.rc_alu_fwd_fn == 2 && (self_loop_ht || natural_hot) && a.arch == 0 {
+            seed_ip0 = emit_seed_ip0_data(a, m, fi, fr, bi)
+        }
+        mut seed_push := 0
+        mut block_stub := 0
+        if self_loop_ht && a.arch == 0 {
+            seed_push = emit_seed_push_cursor(a, m, fi, fr, bi, &a.rc_pins)
+        }
+        a.rc_nat_wb = natural_hot
+        // `_ht` skip-reload plus pin skip-store is only legal when the
+        // latch is pin-only ALU (match_sum). FieldRMW / StoreIndex
+        // latches write the increment to a scratch (x8/x14) and reload
+        // the local from stack at `_ht` (min_nb `j`, min_fk `r`).
+        if a.rc_wb && !rc_ht_skip_pin_wb(&*a, m, fi, fr, bi) {
+            a.rc_wb = false
+        }
+        // Hoist the loop limit even when the fn later println's (f64_sum).
+        // Only with RA: V7 is not reserved when rc_on is off, and a stale
+        // rc_const_vr turned `sec * 1e9` into `sec * 0x70` (unix_nano).
+        mut entry_const := 0
+        if a.rc_on && a.arch == 0 && w.sc_p < 0 && seed_arr == 0 {
+            if a.rc_leaf || ((self_loop_ht || natural_hot) && types.mir_nfn_live(m) < 256) {
+                hv := rc_hoist_const(m, fi, bi)
+                if hv > 4095 {
+                    if self_loop_ht { a.vm_mov_imm64(7, hv) } else { entry_const = hv }
+                    a.rc_const_vr = 7
+                    a.rc_const_val = hv
+                }
+            }
+        }
+        // `_ht` must still be emitted when `rc_loop_hot` back-edges jump
+        // there (`rc_back_lbl`), even if this fn turned RA off
+        // (`product_rc_mir_safe`). Seeds above already require `rc_on`.
+        hosted_leaf_hot := (a.rc_leaf || natural_hot || self_loop_ht) && a.arch == 0
+        arm64_extra_hot := a.arch == 0 && ((a.rc_wb && a.rc_s_pool) || seed_arr == 1 || seed_madd == 1 || seed_row == 1 || seed_push == 1)
+        if hosted_leaf_hot || arm64_extra_hot {
+            if a.arch == 0 && a.rc_wb {
+                rc_seed_preserved_call_a0(a, m, fi, fr, bi)
+            }
+            a.rc_hot_lbl = types.mir_fn_label(m, fi) + "_bb" + str(bi) + "_ht"
+            if seed_push == 1 && a.rc_push_slow.len > 0 {
+                a.jmp(a.rc_hot_lbl + "")
+                emit_push_grow_stub(a, m, fi, fr)
+                block_stub = 1
+            }
+            a.label(a.rc_hot_lbl + "")
+        } else if reload_hot {
+            a.code_label_at(types.mir_fn_label(m, fi) + "_bb" + str(bi) + "_ht", reload_hot_offset)
+        }
+        // A natural-loop backedge can cross other blocks which also use V7
+        // for a different constant. Re-enter before this reload; only a
+        // single-block loop can safely skip its own reserved constant seed.
+        if entry_const > 4095 { a.vm_mov_imm64(7, entry_const) }
+        mut vecced := 0
+        // SIMD peeps are whole-block MIR replacements. Copy (`dst[i]=src[i]`)
+        // is often a 2-block natural loop after O1 CFG (header Branch + body
+        // Jump), so the matcher must see non-self-loop bodies too. Other
+        // matchers stay fail-closed on self-loop Branch.
+        if a.arch == 0 && !generic_vregs {
+            vecced = emit_vec_block(a, m, fi, fr, bi, &a.rc_pins)
+        }
+        // A whole-block replacement never emits ArrPush, so the grow stub's
+        // `_ap8_done` target would be missing. The stub is unreachable once
+        // the push is replaced; the label only has to exist. Drop the cursor
+        // too: its regs no longer match the descriptor this block wrote.
+        if vecced != 0 && seed_push == 1 {
+            if block_stub == 1 && a.rc_push_done.len > 0 {
+                a.label(a.rc_push_done + "")
+            }
+            a.rc_push_loc = -1
+            a.rc_push_stub = 0
+            a.rc_push_dirty = 0
+            a.rc_push_fuse = 0
+            a.rc_push_done = ""
+            a.rc_push_slow = ""
+        }
+        if vecced == 0 {
+            mut ii := types.mir_bhead(m, fi, bi)
+            for k in 0:types.mir_nins(m, fi) {
+                // The function-wide bound guards malformed cycles; a short
+                // or empty block must stop when its own chain ends.
+                if ii < 0 { <- }
+                emit_instr(a, m, fi, fr, ii)
+                ii = types.mir_inext(m, fi, ii)
+            }
+            // (instr fields are read one by one: whole elements own strings
+            // and cannot move out of the array)
+            emit_term(a, m, fi, fr, bi, &a.rc_pins)
+        }
+    }
+}

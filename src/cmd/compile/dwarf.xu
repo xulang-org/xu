@@ -1,0 +1,291 @@
+@main
+// DWARF v4 debug-info encoding for the hosted ELF64 / Mach-O writers.
+// Ported from bootstrap/crates/xubin/src/dwarf.rs (m33), which is the
+// reference shared with this file. Emits the four sections a debugger needs
+// for source-level line breakpoints and function-name lookups:
+//
+//   .debug_line   - version 4 line-number state machine (address -> line)
+//   .debug_info   - one compile unit + one DW_TAG_subprogram per function
+//   .debug_abbrev - static abbreviation table for the two DIE shapes
+//   .debug_str    - NUL-joined string pool (CU name + function names)
+//
+// Everything is hand-encoded little-endian with ULEB128/SLEB128. Xu has no
+// dynamic byte concat, so every encoder appends to a local []int byte pool
+// with the push idiom (mirrors elf.xu / macho.xu). write16/write32/write64,
+// align_up and the push helpers live in macho.xu (same module main).
+
+// Address -> source-line rows and per-function records collected during
+// emission (see collect_debug_info in emit.xu). Offsets are code-segment
+// relative (i.e. `label_offset` values, which are segment-relative, not
+// already biased by the segment virtual address).
+struct DLineRow {
+    offset int
+    file   int
+    line   int
+}
+
+struct DFuncRow {
+    name  string
+    file  int
+    line  int
+    start int
+    size  int
+}
+
+struct DebugInfo {
+    files []string
+    rows  []DLineRow
+    funcs []DFuncRow
+}
+
+struct DebugSections {
+    line   []int
+    info   []int
+    abbrev []int
+    str    []int
+}
+
+// DWARF v4 standard line-program opcodes.
+//   LNS_COPY = 1, LNS_ADVANCE_LINE = 3, LNS_SET_FILE = 4
+// Extended line-program opcodes (0x00 prefix):
+//   LNE_END_SEQUENCE = 1, LNE_SET_ADDRESS = 2
+// DIE tags / attributes / forms (hex -> decimal, dwarf.rs):
+//   DW_TAG_COMPILE_UNIT = 0x11 = 17, DW_TAG_SUBPROGRAM = 0x2e = 46
+//   DW_AT_NAME = 3, DW_AT_LOW_PC = 17, DW_AT_HIGH_PC = 18,
+//   DW_AT_STMT_LIST = 16, DW_AT_LANGUAGE = 19, DW_AT_DECL_FILE = 58,
+//   DW_AT_DECL_LINE = 59, DW_AT_EXTERNAL = 63
+//   DW_FORM_ADDR = 1, DW_FORM_DATA2 = 5, DW_FORM_DATA4 = 6,
+//   DW_FORM_DATA1 = 11, DW_FORM_FLAG = 12, DW_FORM_STRP = 14,
+//   DW_FORM_SEC_OFFSET = 23
+//   DW_LANG_C = 0x0002 = 2
+
+// ULEB128 (value >= 0). `>>` is arithmetic but the value is never negative.
+fn d_uleb(buf &mut []int, value int) {
+    mut v := value
+    for i in 0:10 {
+        b := v & 127
+        v = v >> 7
+        if v == 0 {
+            buf.push(b)
+            <<
+        }
+        buf.push(b | 128)
+    }
+}
+
+// SLEB128 (signed; line deltas may be negative).
+fn d_sleb(buf &mut []int, value int) {
+    mut v := value
+    for i in 0:10 {
+        b := v & 127
+        v = v >> 7
+        sign_set := (b & 64) != 0
+        done := (v == 0 && !sign_set) || (v == -1 && sign_set)
+        if done {
+            buf.push(b)
+            <<
+        }
+        buf.push(b | 128)
+    }
+}
+
+// .debug_line program (mirror dwarf.rs encode_line). `files` is already the
+// non-empty fallback list (see encode_dwarf).
+fn d_encode_line(di &DebugInfo, files []string, code_vaddr int) []int {
+    mut header := []int{}
+    header.push(1)   // minimum_instruction_length
+    header.push(1)   // maximum_operations_per_instruction (v4)
+    header.push(1)   // default_is_stmt
+    header.push(251) // line_base = -5
+    header.push(14)  // line_range
+    header.push(13)  // opcode_base
+    // standard_opcode_lengths[1..=12] = [0,1,1,1,1,0,0,0,1,0,0,1]
+    header.push(0)
+    header.push(1)
+    header.push(1)
+    header.push(1)
+    header.push(1)
+    header.push(0)
+    header.push(0)
+    header.push(0)
+    header.push(1)
+    header.push(0)
+    header.push(0)
+    header.push(1)
+    header.push(0) // include_directories: empty (single NUL)
+    for f in 0:files.len {
+        for i in 0:files[f].len {
+            header.push(files[f][i])
+        }
+        header.push(0)
+        d_uleb(mut &header, 0) // dir index
+        d_uleb(mut &header, 0) // mtime
+        d_uleb(mut &header, 0) // size
+    }
+    header.push(0) // end of file names
+
+    mut prog := []int{}
+    mut cur_line := 1
+    mut cur_file := 1
+    // Rows are collected in ascending code offset (emission order), so the
+    // reference's stable sort by offset is already satisfied.
+    for r in 0:di.rows.len {
+        // DW_LNE_set_address(code_vaddr + offset)
+        prog.push(0)
+        d_uleb(mut &prog, 9)
+        prog.push(2)
+        write64(mut &prog, code_vaddr + di.rows[r].offset)
+
+        // DW_LNS_set_file (1-based .debug_line file table).
+        file := di.rows[r].file + 1
+        if file != cur_file {
+            prog.push(4)
+            d_uleb(mut &prog, file)
+            cur_file = file
+        }
+
+        // DW_LNS_advance_line — signed delta, full SLEB128.
+        delta := di.rows[r].line - cur_line
+        if delta != 0 {
+            prog.push(3)
+            d_sleb(mut &prog, delta)
+            cur_line = cur_line + delta
+        }
+
+        // DW_LNS_copy registers a row without advancing the address.
+        prog.push(1)
+    }
+
+    // DW_LNE_end_sequence
+    prog.push(0)
+    d_uleb(mut &prog, 1)
+    prog.push(1)
+
+    unit_length := 2 + 4 + header.len + prog.len
+    mut out := []int{}
+    write32(mut &out, unit_length)
+    write16(mut &out, 4) // version
+    write32(mut &out, header.len)
+    for i in 0:header.len {
+        out.push(header[i])
+    }
+    for i in 0:prog.len {
+        out.push(prog[i])
+    }
+    << out
+}
+
+// .debug_info (mirror dwarf.rs encode_info). `str_offs` has 1 + funcs.len
+// entries: str_offs[0] = CU name (files[0]), str_offs[1+i] = func i name.
+fn d_encode_info(di &DebugInfo, code_vaddr int, code_len int, str_offs []int) []int {
+    mut body := []int{}
+    write16(mut &body, 4) // version
+    write32(mut &body, 0) // debug_abbrev_offset
+    body.push(8)          // address_size
+
+    // Compile-unit DIE (abbrev code 1).
+    d_uleb(mut &body, 1)
+    write32(mut &body, str_offs[0])             // DW_AT_name (strp)
+    write64(mut &body, code_vaddr)              // DW_AT_low_pc
+    write64(mut &body, code_vaddr + code_len)   // DW_AT_high_pc
+    write32(mut &body, 0)                       // DW_AT_stmt_list (offset 0)
+    write16(mut &body, 2)                       // DW_AT_language (DW_LANG_C)
+
+    // Subprogram DIEs (abbrev code 2).
+    for i in 0:di.funcs.len {
+        d_uleb(mut &body, 2)
+        write32(mut &body, str_offs[1 + i])     // DW_AT_name
+        write64(mut &body, code_vaddr + di.funcs[i].start)              // low_pc
+        write64(mut &body, code_vaddr + di.funcs[i].start + di.funcs[i].size) // high_pc
+        body.push(di.funcs[i].file + 1)         // DW_AT_decl_file (1-based)
+        write32(mut &body, di.funcs[i].line)    // DW_AT_decl_line
+        body.push(1)                            // DW_AT_external
+    }
+
+    body.push(0) // null DIE terminates the CU's children
+
+    mut out := []int{}
+    write32(mut &out, body.len) // unit_length
+    for i in 0:body.len {
+        out.push(body[i])
+    }
+    << out
+}
+
+// .debug_abbrev (mirror dwarf.rs encode_abbrev): a static two-abbrev table.
+fn d_encode_abbrev() []int {
+    mut out := []int{}
+
+    // Abbrev 1: DW_TAG_compile_unit (has children).
+    d_uleb(mut &out, 1)
+    d_uleb(mut &out, 17) // DW_TAG_COMPILE_UNIT
+    out.push(1)          // DW_CHILDREN_yes
+    d_uleb(mut &out, 3)  // DW_AT_NAME
+    d_uleb(mut &out, 14) // DW_FORM_STRP
+    d_uleb(mut &out, 17) // DW_AT_LOW_PC
+    d_uleb(mut &out, 1)  // DW_FORM_ADDR
+    d_uleb(mut &out, 18) // DW_AT_HIGH_PC
+    d_uleb(mut &out, 1)  // DW_FORM_ADDR
+    d_uleb(mut &out, 16) // DW_AT_STMT_LIST
+    d_uleb(mut &out, 23) // DW_FORM_SEC_OFFSET
+    d_uleb(mut &out, 19) // DW_AT_LANGUAGE
+    d_uleb(mut &out, 5)  // DW_FORM_DATA2
+    out.push(0)
+    out.push(0)
+
+    // Abbrev 2: DW_TAG_subprogram (no children).
+    d_uleb(mut &out, 2)
+    d_uleb(mut &out, 46) // DW_TAG_SUBPROGRAM
+    out.push(0)          // DW_CHILDREN_no
+    d_uleb(mut &out, 3)  // DW_AT_NAME
+    d_uleb(mut &out, 14) // DW_FORM_STRP
+    d_uleb(mut &out, 17) // DW_AT_LOW_PC
+    d_uleb(mut &out, 1)  // DW_FORM_ADDR
+    d_uleb(mut &out, 18) // DW_AT_HIGH_PC
+    d_uleb(mut &out, 1)  // DW_FORM_ADDR
+    d_uleb(mut &out, 58) // DW_AT_DECL_FILE
+    d_uleb(mut &out, 11) // DW_FORM_DATA1
+    d_uleb(mut &out, 59) // DW_AT_DECL_LINE
+    d_uleb(mut &out, 6)  // DW_FORM_DATA4
+    d_uleb(mut &out, 63) // DW_AT_EXTERNAL
+    d_uleb(mut &out, 12) // DW_FORM_FLAG
+    out.push(0)
+    out.push(0)
+
+    out.push(0) // end of abbreviation table
+    << out
+}
+
+// Encode all four debug sections. `di.files` falls back to a single
+// "<input>" entry (mirror dwarf.rs) so the CU name is always valid.
+fn encode_dwarf(di &DebugInfo, code_vaddr int, code_len int) DebugSections {
+    mut files := []string{}
+    if di.files.len == 0 {
+        files.push("<input>")
+    } else {
+        for i in 0:di.files.len {
+            files.push(di.files[i])
+        }
+    }
+
+    // NUL-joined string pool + offsets: [CU name, func0 name, func1 name, ...].
+    mut str_pool := []int{}
+    mut str_offs := []int{}
+    str_offs.push(str_pool.len)
+    for i in 0:files[0].len {
+        str_pool.push(files[0][i])
+    }
+    str_pool.push(0)
+    for fi in 0:di.funcs.len {
+        str_offs.push(str_pool.len)
+        for i in 0:di.funcs[fi].name.len {
+            str_pool.push(di.funcs[fi].name[i])
+        }
+        str_pool.push(0)
+    }
+
+    line := d_encode_line(di, files, code_vaddr)
+    info := d_encode_info(di, code_vaddr, code_len, str_offs)
+    abbrev := d_encode_abbrev()
+    << DebugSections{line: line, info: info, abbrev: abbrev, str: str_pool}
+}

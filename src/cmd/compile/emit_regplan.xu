@@ -1,0 +1,391 @@
+@main
+
+#xu/types
+
+// RegPlan is the shared result format for ARM64 fixed-home and x64 vreg
+// coloring. Home 0 is frame; 2.. are TargetDesc GPR/FP homes. The tail of
+// the plan (after ntemps) is (Call InstrId, TempId) pairs for scalar call
+// save/reload. This file verifies call-clobber and descriptor-spill
+// invariants and selects vreg vs the legacy RegCache adapter.
+//
+// RegCache is not a second planner: it only runs when vreg coloring is
+// skipped or produced an empty plan. Its parks use the same TargetDesc
+// caller-saved GPR window. x64 RC still keeps V2–V5 across calls (those
+// VM homes are treated as surviving in the cache); the vreg planner uses
+// td_home_clobbered_by_call instead.
+
+const rp_home_frame = 0
+const rp_home_gpr_caller = 1
+const rp_home_gpr_callee = 2
+const rp_home_fp = 3
+
+// Reviewed scratch exclusions for instruction paths admitted by vreg_plan.
+// This is a target query, separate from MIR semantic effects and ABI calls;
+// it is not a complete MachineIR clobber model. Bits name VM GPR homes.
+fn regplan_instr_reserved_homes(m &types.Mir, fi int, ii int, arch int) int {
+    k := types.mir_ikind(m, fi, ii)
+    mut mask := 0
+    if arch == 0 && (k == 14 || k == 20 || k == 23 || k == 47) {
+        mask = (1 << 12) | (1 << 13)
+    }
+    // Drop sets S1 even when a non-owning value needs no release helper.
+    // StoreIndex's fixed/generic element paths also prepare their address in
+    // S1. On x64 home9 is outside the current fixed-home pool.
+    if k == 8 || k == 20 || k == 21 || k == 22 || k == 24 {
+        mask = mask | (1 << 9)
+    }
+    if k == 48 && types.mir_id(m, fi, ii) != 4 {
+        mask = mask | (1 << 2)
+    }
+    if k == 10 || k == 17 || k == 26 {
+        d := types.mir_ia(m, fi, ii)
+        if d >= 0 && d < types.mir_ntemps(m, fi) {
+            ty := types.mir_temp_ty(m, fi, d)
+            if ty == 8 || ty == 9 { mask = mask | (1 << 2) }
+        }
+    }
+    << mask
+}
+
+fn regplan_home_reserved(flags int, home int) bool {
+    if home < 2 || home >= 32 { << false }
+    << (flags & (1 << (home + 8))) != 0
+}
+
+fn td_home_clobbered_by_call(arch int, home int) bool {
+    if home < 2 { << false }
+    if home >= 32 {
+        << td_fp_home_in_range(arch, home)
+    }
+    << home >= td_gpr_caller_lo(arch) && home < td_gpr_caller_hi(arch)
+}
+
+fn regplan_home_class(arch int, home int) int {
+    if home < 2 { << rp_home_frame }
+    if home >= 32 {
+        if td_fp_home_in_range(arch, home) {
+            << rp_home_fp
+        }
+        << rp_home_frame
+    }
+    lo := td_gpr_caller_lo(arch)
+    chi := td_gpr_caller_hi(arch)
+    if home >= lo && home < chi {
+        << rp_home_gpr_caller
+    }
+    clo := td_gpr_callee_lo(arch)
+    cahi := td_gpr_callee_hi(arch)
+    if home >= clo && home < cahi {
+        << rp_home_gpr_callee
+    }
+    << rp_home_frame
+}
+
+fn regplan_verify_homes(m &types.Mir, fi int, arch int, plan &[]int, n int) bool {
+    if n < 0 || plan.len < n { << false }
+    if !td_has_vreg(arch) {
+        for t in 0:n {
+            if plan[t] != 0 { << false }
+        }
+        << true
+    }
+    for t in 0:n {
+        h := plan[t]
+        if h == 0 { -> }
+        if h < 0 { << false }
+        if !vreg_temp_eligible(m, fi, t) { << false }
+        ty := types.mir_temp_ty(m, fi, t)
+        if types.mir_temp_nslots(m, fi, t) != 1 { << false }
+        if ty == 3 { << false }
+        if types.is_array_type(ty) { << false }
+        if types.is_map_type(ty) { << false }
+        if m.type_owning(ty) { << false }
+        if ty == 4 {
+            if !td_fp_home_in_range(arch, h) { << false }
+            if !td_home_clobbered_by_call(arch, h) { << false }
+        } else {
+            cls := regplan_home_class(arch, h)
+            if cls != rp_home_gpr_caller && cls != rp_home_gpr_callee {
+                << false
+            }
+            if ty != 1 && ty != 2 && ty != 8 && ty != 9 && ty != 10 {
+                << false
+            }
+        }
+    }
+    << true
+}
+
+fn regplan_verify_fp_split(m &types.Mir, fi int, arch int, plan &[]int, n int) bool {
+    if n < 0 || plan.len < n { << false }
+    extra := plan.len - n
+    if extra < 0 || extra % 2 != 0 { << false }
+    if extra > vreg_max_fp_split_words { << false }
+    nins := types.mir_nins(m, fi)
+    mut p := n
+    while p + 1 < plan.len {
+        ii := plan[p]
+        t := plan[p + 1]
+        if t < 0 || t >= n { << false }
+        h := plan[t]
+        if !td_fp_home_in_range(arch, h) {
+            if arch != 0 || h < td_gpr_caller_lo(arch) || h >= td_gpr_caller_hi(arch) { << false }
+            if !vreg_temp_eligible(m, fi, t) || types.mir_temp_ty(m, fi, t) == 4 { << false }
+        }
+        if !td_home_clobbered_by_call(arch, h) { << false }
+        if ii < 0 || ii >= nins { << false }
+        if types.mir_ikind(m, fi, ii) != 7 || !types.mir_instr_call_live_m(m, fi, ii) { << false }
+        if vreg_sqrt_unop_ok(m, fi, ii, arch) || types.mir_instr_def_m(m, fi, ii) == t { << false }
+        p += 2
+    }
+    << true
+}
+
+fn regplan_verify(m &types.Mir, fi int, arch int, plan &[]int) bool {
+    n := types.mir_ntemps(m, fi)
+    if plan.len == 0 { << true }
+    if n < 0 || plan.len < n { << false }
+    if !regplan_verify_homes(m, fi, arch, plan, n) { << false }
+    if !regplan_verify_fp_split(m, fi, arch, plan, n) { << false }
+    << true
+}
+
+// One admission for fixed homes. Integer ALU and fn-value peep loops stay
+// on RegCache: sharing their pins with vreg homes mis-counted inductions.
+// f64 kernels admitted here keep SIMD pins via rc_fp_hold when the plan
+// took no FP home. Bounded scalar-FP/index loops may exceed 32 blocks;
+// their full planner still verifies widths, liveness and scratch homes.
+// Other oversize memory-writing CFGs stay on the conservative path.
+fn regplan_try_vreg(a &Assembler, m &types.Mir, fi int) bool {
+    if a.ra_level < 1 { << false }
+    if a.arch != 0 && a.arch != 1 { << false }
+    if !td_has_vreg(a.arch) { << false }
+    if fn_is_f64_scalar_loop_kernel(m, fi) { << true }
+    // This scalar shape also includes acyclic, branch-only helpers. Keep
+    // actual loops on RegCache until its pin-based peeps consume fixed
+    // homes; acyclic helpers still benefit from scalar register planning.
+    if fn_is_i64_scalar_loop_kernel(m, fi) {
+        if fn_has_self_loop(m, fi) == 1 || fn_has_natural_loop(m, fi) == 1 { << false }
+        << true
+    }
+    if a.arch == 0 && (fn_is_int_container_leaf(m, fi) || fn_is_int_record_container_leaf(m, fi)) { << true }
+    if types.mir_nblocks(m, fi) > 32 && fn_has_memory_write(m, fi) {
+        << false
+    }
+    if fn_is_f64_field_rmw_kernel(m, fi) { << true }
+    if types.mir_scalar_math_body(m, fi) { << true }
+    if fn_is_int_field_index_kernel(m, fi) { << true }
+    if types.mir_nblocks(m, fi) <= 4 && fn_ncalls(m, fi) == 0 && fn_is_int_index_kernel(m, fi) {
+        // Long straight arithmetic after bounded indexed setup amortizes the
+        // complete plan. Keep short integer loops on their existing cache path.
+        for bi in 0:types.mir_nblocks(m, fi) {
+            mut alu := 0
+            mut ii := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if ii < 0 { <- }
+                if types.mir_ikind(m, fi, ii) == 4 { alu += 1 }
+                ii = types.mir_inext(m, fi, ii)
+            }
+            if alu >= 256 { << true }
+        }
+    }
+    if types.mir_scalar_int_leaf_body(m, fi) { << true }
+    if fn_is_readonly_i64_index(m, fi) { << true }
+    << false
+}
+
+// A bounded opportunity for ordinary integer CFGs. Keep the reviewed
+// profitable cache-only loop replacements, then let the existing planner
+// prove instructions, must-def, liveness, interference and ABI preservation.
+// Non-scalar objects keep frame storage; they do not enter the scalar graph.
+fn regplan_legacy_loop_priority(a &Assembler, m &types.Mir, fi int) bool {
+    nb := types.mir_nblocks(m, fi)
+    if nb <= 0 || nb > 64 || types.mir_ntemps(m, fi) > 512 { << false }
+    if a.rc_on {
+        if fn_keeps_rc_over_vreg(m, fi) { << true }
+        // Calls after the loop (such as formatting its result) do not take
+        // away its existing local pins. Count the loop shape, not all calls.
+        if fn_is_i64_scalar_loop_kernel(m, fi) {
+            if fn_has_self_loop(m, fi) == 1 || fn_has_natural_loop(m, fi) == 1 { << true }
+        }
+        // The cache already hoists a local record's address and carries a
+        // call-free field update in a self-loop. Keep that complete path
+        // until fixed homes also include loop-carried locals and addresses.
+        if a.arch == 0 && fn_loop_addr_local(m, fi) >= 0 {
+            for bi in 0:nb {
+                if types.mir_btkind(m, fi, bi) != 2 || (types.mir_btb(m, fi, bi) != bi && types.mir_btc(m, fi, bi) != bi) { -> }
+                mut field := false
+                mut safe := true
+                mut ii := types.mir_bhead(m, fi, bi)
+                for _ in 0:types.mir_nins(m, fi) {
+                    if ii < 0 { <- }
+                    k := types.mir_ikind(m, fi, ii)
+                    if k == 11 || k == 18 || k == 48 { field = true }
+                    if k != 1 && k != 2 && k != 3 && k != 4 && k != 5 && k != 10 && k != 11 && k != 16 && k != 17 && k != 18 && k != 48 { safe = false }
+                    ii = types.mir_inext(m, fi, ii)
+                }
+                if ii >= 0 { safe = false }
+                if field && safe { << true }
+            }
+        }
+    }
+    if a.arch == 0 {
+        for bi in 0:nb {
+            if match_vec_block(m, fi, bi).kind != 0 { << true }
+        }
+    }
+    << false
+}
+
+fn regplan_try_generic(a &Assembler, m &types.Mir, fi int) bool {
+    if a.ra_level < 1 || !td_has_vreg(a.arch) { << false }
+    nb := types.mir_nblocks(m, fi)
+    nt := types.mir_ntemps(m, fi)
+    if nb <= 0 || nb > 64 || nt <= 0 || nt > 512 || nb * nt > 16384 {
+        << false
+    }
+    if regplan_legacy_loop_priority(a, m, fi) { << false }
+    if !vreg_general_frame_types_ok(m, fi) { << false }
+    mut useful := false
+    for t in 0:nt {
+        if types.mir_temp_ty(m, fi, t) == 4 { << false }
+        if vreg_temp_eligible(m, fi, t) { useful = true }
+    }
+    if !useful { << false }
+    for bi in 0:nb {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if types.mir_instr_use_schema(k, types.mir_ic(m, fi, ii)) < 0 { << false }
+            if types.mir_instr_effects_m(m, fi, ii) < 0 { << false }
+            if k != 1 && k != 2 && k != 3 && k != 4 && k != 5 && k != 7 && k != 8 && k != 10 && k != 11 && k != 14 && k != 16 && k != 17 && k != 18 && k != 20 && k != 23 && k != 25 && k != 26 && k != 47 && k != 48 {
+                << false
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << true
+}
+
+fn regplan_internal_gate() bool {
+    if td_has_vreg(4) { << false }
+    if !td_has_vreg(0) || !td_has_vreg(1) { << false }
+    if regplan_home_class(0, 0) != rp_home_frame { << false }
+    if regplan_home_class(0, 2) != rp_home_gpr_caller { << false }
+    if regplan_home_class(0, 8) != rp_home_gpr_callee { << false }
+    if regplan_home_class(0, 32) != rp_home_fp { << false }
+    if td_home_clobbered_by_call(0, 2) == false { << false }
+    if td_home_clobbered_by_call(0, 8) { << false }
+    if td_home_clobbered_by_call(0, 32) == false { << false }
+    if td_home_clobbered_by_call(1, 2) == false { << false }
+    if td_home_clobbered_by_call(1, 32) == false { << false }
+    if td_home_clobbered_by_call(4, 2) { << false }
+    if td_gpr_caller_hi(0) != 8 { << false }
+    if td_gpr_caller_hi(1) != 6 { << false }
+    if td_gpr_caller_lo(0) != 2 { << false }
+    if td_gpr_callee_lo(0) != 8 { << false }
+    if td_fp_home_hi(0) - td_fp_home_lo() != 22 { << false }
+    << true
+}
+
+fn ra_note_fn(a &mut Assembler, try_vregs bool, has_vreg bool, rc_on bool, spill int) {
+    a.ra_fn += 1
+    if try_vregs {
+        a.ra_try += 1
+    }
+    if has_vreg {
+        a.ra_vreg += 1
+        a.ra_spill += spill
+    } else {
+        if try_vregs {
+            a.ra_empty += 1
+        }
+        if rc_on {
+            a.ra_rc += 1
+        } else {
+            a.ra_frame += 1
+        }
+    }
+    if a.ra_level >= 1 && td_has_vreg(a.arch) && !try_vregs {
+        a.ra_keep_rc += 1
+    }
+}
+
+fn dump_ra_stats(a &Assembler) {
+    eprintln("ra-stats: fn=" + str(a.ra_fn) + " try=" + str(a.ra_try) + " vreg=" + str(a.ra_vreg) + " rc=" + str(a.ra_rc) + " frame=" + str(a.ra_frame) + " keep_rc=" + str(a.ra_keep_rc) + " empty=" + str(a.ra_empty) + " spill=" + str(a.ra_spill))
+}
+
+fn regplan_reason(reason int) string {
+    if reason == 1 { << "budget-or-interface" }
+    if reason == 2 { << "mir-shape" }
+    if reason == 3 { << "target" }
+    if reason == 4 { << "return-contract" }
+    if reason == 5 { << "aggregate-contract" }
+    if reason == 6 { << "instruction-contract" }
+    if reason == 7 { << "dataflow-or-split-proof" }
+    << "no-live-home"
+}
+
+fn regplan_admission_reason(a &Assembler, m &types.Mir, fi int) string {
+    ret := types.mir_fn_ret(m, fi)
+    if ret != 0 && (!vreg_scalar_type(ret) || types.mir_fn_ret_nslots(m, fi) != 1) { << "return-contract" }
+    if !vreg_general_frame_types_ok(m, fi) { << "frame-type-contract" }
+    if types.mir_nblocks(m, fi) > 64 || types.mir_ntemps(m, fi) > 512 { << "general-budget" }
+    if regplan_legacy_loop_priority(a, m, fi) { << "legacy-loop-priority" }
+    if a.rc_on && fn_is_i64_scalar_loop_kernel(m, fi) { << "cache-loop-path" }
+    << "instruction-admission"
+}
+
+fn regplan_report_fn(a &Assembler, m &types.Mir, fi int, fr &Frame, tried bool, has_vreg bool, reason int, instruction int, code_start int) {
+    if !a.ra_report { << }
+    mut mode := "frame"
+    mut why := regplan_admission_reason(a, m, fi)
+    if a.rc_on { mode = "cache" }
+    if a.ra_level < 1 { why = "disabled" }
+    if !td_has_vreg(a.arch) { why = "target" }
+    if tried { why = regplan_reason(reason) }
+    if has_vreg {
+        mode = "vreg"
+        why = "verified"
+    }
+    mut scalar := 0
+    mut gpr := 0
+    mut fp := 0
+    mut spill := 0
+    mut split_gpr := 0
+    mut split_fp := 0
+    for t in 0:fr.temp_slot.len {
+        if !vreg_temp_eligible(m, fi, t) { -> }
+        slot := fr.temp_slot[t]
+        if is_unused_slot(slot) { -> }
+        scalar += 1
+        if t < fr.fp_split.len && fr.fp_split[t] >= 0 {
+            if is_fp_vreg_slot(slot) { split_fp += 1 } else { split_gpr += 1 }
+        }
+        if is_fp_vreg_slot(slot) {
+            fp += 1
+        } else if is_vreg_slot(slot) {
+            gpr += 1
+        } else if is_frame_slot(slot) { spill += 1 }
+    }
+    // Fixed FP homes and the legacy SIMD cache are different residency
+    // mechanisms. Reporting fp=0 alone hid the FieldRMW cache fallback.
+    mut fp_cache := 0
+    mut fp_cache_pins := 0
+    if rc_fp_on(a) {
+        fp_cache = 1
+        for home in 0:a.rc_fp_pin.len {
+            if a.rc_fp_pin[home] >= 0 { fp_cache_pins += 1 }
+        }
+    }
+    mut kind := -1
+    mut sub := -1
+    mut effects := -1
+    if instruction >= 0 && instruction < types.mir_nins(m, fi) {
+        kind = types.mir_ikind(m, fi, instruction)
+        sub = types.mir_ib(m, fi, instruction)
+        effects = types.mir_instr_effects_m(m, fi, instruction)
+    }
+    eprintln("ra-fn: label=" + types.mir_fn_label(m, fi) + " mode=" + mode + " reason=" + why + " blocks=" + str(types.mir_nblocks(m, fi)) + " temps=" + str(types.mir_ntemps(m, fi)) + " scalar=" + str(scalar) + " gpr=" + str(gpr) + " fp=" + str(fp) + " spill=" + str(spill) + " split_gpr=" + str(split_gpr) + " split_fp=" + str(split_fp) + " fp_cache=" + str(fp_cache) + " fp_cache_pins=" + str(fp_cache_pins) + " split_points=" + str((fr.fp_split.len - fr.temp_slot.len) / 2) + " frame=" + str(fr.size) + " code=" + str(a.code.len - code_start) + " instruction=" + str(instruction) + " kind=" + str(kind) + " sub=" + str(sub) + " effects=" + str(effects))
+}

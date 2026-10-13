@@ -1,0 +1,1238 @@
+@main
+
+#xu/types
+
+// Push-fill, stride clear, CRC bit fold, and constant index fill.
+
+
+fn emit_push_fuse(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, pins &[]int) int {
+    if a.rc_push_fuse != 1 { << 0 }
+    lim := push_loop_const_limit(m, fi, bi)
+    if lim <= 16 { << 0 }
+    ind := a.rc_ind_local
+    if ind < 0 { << 0 }
+    if ind >= fr.local_slot.len { << 0 }
+    i_vr := vec_local_vr(&*a, pins, bi, ind, 8)
+    if i_vr == 9 || i_vr == 10 || i_vr == 11 { << 0 }
+    fused := types.mir_fn_label(m, fi) + "_bb" + str(bi) + "_pf"
+    a.vm_mov_imm64(1, lim)
+    a.label(fused + "")
+    a.store_scaled(11, i_vr, i_vr, 8)
+    a.vm_add_imm(i_vr, i_vr, 1)
+    a.cmp(i_vr, 1)
+    a.jlt(fused + "")
+    a.mov(9, i_vr)
+    a.store(15, slot_off(fr.local_slot[ind]), i_vr)
+    emit_push_cursor_writeback(a)
+    a.rc_push_loc = -1
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(types.mir_btc(m, fi, bi)))
+    << 1
+}
+
+fn vec_push_kind_ok(k int) bool {
+    if k == 0 || k == 1 || k == 2 || k == 3 || k == 4 { << true }
+    // 13 ArrPush. 16 Addr: `a.push` materializes &a as the receiver.
+    if k == 13 || k == 16 { << true }
+    << false
+}
+
+fn vec_src_is_zero(m &types.Mir, fi int, src int) bool {
+    mut cur := src
+    for _ in 0:4 {
+        if cur < 0 {
+            ci := -cur - 2
+            if ci >= 0 && ci < types.mir_nconsts(m, fi) {
+                << types.mir_const_at(m, fi, ci) == 0
+            }
+            << false
+        }
+        if vec_has_const(m, fi, cur) {
+            << vec_const(m, fi, cur) == 0
+        }
+        mut found := false
+        mut next := cur
+        for bi in 0:types.mir_nblocks(m, fi) {
+            mut ii := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if ii < 0 { <- }
+                if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == cur {
+                    next = types.mir_ib(m, fi, ii)
+                    found = true
+                    <-
+                }
+                ii = types.mir_inext(m, fi, ii)
+            }
+            if found { <- }
+        }
+        if !found { << false }
+        if next == cur { << false }
+        cur = next
+    }
+    << false
+}
+
+fn vec_const_of(m &types.Mir, fi int, bi int, v int) VecPat {
+    mut r := vec_none()
+    if vec_has_const(m, fi, v) {
+        r.kind = 1
+        r.mask = vec_const(m, fi, v)
+        << r
+    }
+    if v < 0 {
+        ci := -v - 2
+        if ci >= 0 && ci < types.mir_nconsts(m, fi) {
+            r.kind = 1
+            r.mask = types.mir_const_at(m, fi, ci)
+            << r
+        }
+        << r
+    }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == v {
+            src := types.mir_ib(m, fi, ii)
+            if vec_has_const(m, fi, src) {
+                r.kind = 1
+                r.mask = vec_const(m, fi, src)
+                << r
+            }
+            if src < 0 {
+                ci := -src - 2
+                if ci >= 0 && ci < types.mir_nconsts(m, fi) {
+                    r.kind = 1
+                    r.mask = types.mir_const_at(m, fi, ci)
+                    << r
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << r
+}
+
+fn vec_local_zero_init(m &types.Mir, fi int, loc int) bool {
+    if loc < 0 { << false }
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_ikind(m, fi, ii) == 3 && types.mir_ia(m, fi, ii) == loc {
+                if vec_src_is_zero(m, fi, types.mir_ib(m, fi, ii)) { << true }
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << false
+}
+
+// Counted `a.push(i & mask)` / `a.push(i)` / `a.push(c)` from i==0.
+// Grow once, then a pointer bump store. Cuts fill() in copy_bytes / array_ops / sieve.
+fn match_push_fill(m &types.Mir, fi int, bi int) VecPat {
+    mut header := vec_copy_header(m, fi, bi)
+    mut else_bb := -1
+    if header >= 0 {
+        else_bb = vec_copy_else(m, fi, header, bi)
+    }
+    mut npush := 0
+    mut push_ii := -1
+    mut badk := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == 13 {
+            es := types.mir_id(m, fi, ii)
+            if es != 8 && es != 0 - 8 { << vec_none() }
+            npush += 1
+            push_ii = ii
+        } else if !vec_push_kind_ok(k) {
+            badk = k
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if header < 0 || else_bb < 0 { << vec_none() }
+    if badk >= 0 { << vec_none() }
+    if npush != 1 { << vec_none() }
+    ia := types.mir_ia(m, fi, push_ii)
+    ib := types.mir_ib(m, fi, push_ii)
+    loc := arr_push_desc_inline(m, fi, ia)
+    if loc < 0 { << vec_none() }
+    if emit_base_fixed_len(m, fi, 1073741824 + loc) > 0 { << vec_none() }
+    mut ind := vec_find_ind_copy(m, fi, bi)
+    if ind < 0 {
+        ind = vec_find_ind(m, fi, bi)
+    }
+    if ind < 0 { << vec_none() }
+    if !vec_local_zero_init(m, fi, ind) { << vec_none() }
+    mut fac := -1
+    mut mask := 0
+    andp := vec_find_and_of_ind(m, fi, bi, ind)
+    if andp.kind == 1 && vec_same_val(m, fi, bi, ib, andp.acc) {
+        fac = 1
+        mask = andp.mask
+    } else if vec_temp_from_local(m, fi, bi, ib, ind) {
+        fac = 0
+    } else {
+        cv := vec_const_of(m, fi, bi, ib)
+        if cv.kind != 1 { << vec_none() }
+        fac = 2
+        mask = cv.mask
+    }
+    mut lim := vec_copy_limit_in(m, fi, header, 1073741824 + ind)
+    if lim.kind == 0 && header != bi {
+        lim = vec_copy_limit_in(m, fi, bi, 1073741824 + ind)
+    }
+    if lim.kind == 0 {
+        lim = vec_copy_limit_cmp(m, fi, header, 1073741824 + ind, 9)
+        if lim.kind == 0 && header != bi {
+            lim = vec_copy_limit_cmp(m, fi, bi, 1073741824 + ind, 9)
+        }
+    }
+    if lim.kind == 0 { << vec_none() }
+    if lim.limit_t < 0 && lim.limit <= 16 { << vec_none() }
+    << VecPat{kind: 12, ind: 1073741824 + ind, acc: header, mask: mask, limit: lim.limit, limit_t: lim.limit_t, else_bb: else_bb, arr: 1073741824 + loc, fac: fac}
+}
+
+fn vec_crc_and1_local(m &types.Mir, fi int, bi int) int {
+    if types.mir_btkind(m, fi, bi) != 2 { << -1 }
+    mut crc := -1
+    mut nand := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == 4 && types.mir_ib(m, fi, ii) == 14 {
+            lc := types.mir_ic(m, fi, ii)
+            ld := types.mir_id(m, fi, ii)
+            mut other := -1
+            if vec_is_const1(m, fi, ld) {
+                other = lc
+            } else if vec_is_const1(m, fi, lc) {
+                other = ld
+            } else {
+                << -1
+            }
+            loc := vec_local_of_temp(m, fi, bi, other)
+            if loc < 0 { << -1 }
+            crc = loc
+            nand += 1
+        } else if k != 1 && k != 2 && k != 4 {
+            << -1
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if nand != 1 { << -1 }
+    << crc
+}
+
+fn vec_crc_arm(m &types.Mir, fi int, bi int, crc int) VecPat {
+    mut r := vec_none()
+    if types.mir_btkind(m, fi, bi) != 1 { << r }
+    mut nst := 0
+    mut st_src := -1
+    mut xor_d := -1
+    mut xor_a := -1
+    mut xor_b := -1
+    mut and_d := -1
+    mut nshr := 0
+    mut nandm := 0
+    mut nxor := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == 3 {
+            if types.mir_ia(m, fi, ii) != crc { << vec_none() }
+            nst += 1
+            st_src = types.mir_ib(m, fi, ii)
+        } else if k == 4 {
+            op := types.mir_ib(m, fi, ii)
+            lc := types.mir_ic(m, fi, ii)
+            ld := types.mir_id(m, fi, ii)
+            if op == 18 {
+                mut other := -1
+                if vec_operand_is_one(m, fi, bi, ld) {
+                    other = lc
+                } else if vec_operand_is_one(m, fi, bi, lc) {
+                    other = ld
+                } else {
+                    << vec_none()
+                }
+                if !vec_temp_from_local(m, fi, bi, other, crc) { << vec_none() }
+                nshr += 1
+            } else if op == 14 {
+                mut cv := 0
+                mut okc := false
+                if vec_has_const(m, fi, ld) {
+                    cv = vec_const(m, fi, ld)
+                    okc = true
+                } else if vec_has_const(m, fi, lc) {
+                    cv = vec_const(m, fi, lc)
+                    okc = true
+                }
+                if !okc { << vec_none() }
+                if cv != 2147483647 { << vec_none() }
+                nandm += 1
+                and_d = types.mir_ia(m, fi, ii)
+            } else if op == 16 {
+                nxor += 1
+                xor_d = types.mir_ia(m, fi, ii)
+                xor_a = lc
+                xor_b = ld
+            } else {
+                << vec_none()
+            }
+        } else if k != 1 && k != 2 {
+            << vec_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if nst != 1 || nshr != 1 || nandm != 1 { << vec_none() }
+    if nxor > 1 { << vec_none() }
+    if nxor == 1 {
+        if !vec_same_val(m, fi, bi, st_src, xor_d) { << vec_none() }
+        mut poly := xor_a
+        if vec_same_val(m, fi, bi, xor_a, and_d) {
+            poly = xor_b
+        } else if vec_same_val(m, fi, bi, xor_b, and_d) {
+            poly = xor_a
+        } else {
+            << vec_none()
+        }
+        r.kind = 2
+        r.acc = vec_trace(m, fi, bi, poly)
+        << r
+    }
+    if !vec_same_val(m, fi, bi, st_src, and_d) { << vec_none() }
+    r.kind = 1
+    << r
+}
+
+fn vec_crc_latch(m &types.Mir, fi int, latch int, header int) VecPat {
+    mut r := vec_none()
+    if types.mir_btkind(m, fi, latch) != 2 { << r }
+    mut bit := vec_find_ind_copy(m, fi, latch)
+    if bit < 0 {
+        bit = vec_find_ind(m, fi, latch)
+    }
+    if bit < 0 { << r }
+    if !vec_local_zero_init(m, fi, bit) { << r }
+    mut hit8 := false
+    mut ii := types.mir_bhead(m, fi, latch)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 4 {
+            op := types.mir_ib(m, fi, ii)
+            if op == 8 || op == 9 || op == 10 || op == 11 {
+                lc := types.mir_ic(m, fi, ii)
+                ld := types.mir_id(m, fi, ii)
+                mut cv := 0
+                mut side := -1
+                if vec_has_const(m, fi, ld) {
+                    cv = vec_const(m, fi, ld)
+                    side = lc
+                } else if vec_has_const(m, fi, lc) {
+                    cv = vec_const(m, fi, lc)
+                    side = ld
+                }
+                if cv == 8 && side >= 0 {
+                    if vec_temp_from_local(m, fi, latch, side, bit) {
+                        hit8 = true
+                    }
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if !hit8 { << r }
+    tb := types.mir_btb(m, fi, latch)
+    tc := types.mir_btc(m, fi, latch)
+    tb_h := vec_edge_to(m, fi, tb, header)
+    tc_h := vec_edge_to(m, fi, tc, header)
+    if tb_h && !tc_h {
+        r.kind = 1
+        r.ind = 1073741824 + bit
+        r.else_bb = tc
+        << r
+    }
+    if tc_h && !tb_h {
+        r.kind = 1
+        r.ind = 1073741824 + bit
+        r.else_bb = tb
+        << r
+    }
+    << r
+}
+
+fn match_crc_bit8(m &types.Mir, fi int, bi int) VecPat {
+    crc := vec_crc_and1_local(m, fi, bi)
+    if crc < 0 { << vec_none() }
+    tb := vec_skip_empty(m, fi, types.mir_btb(m, fi, bi))
+    tc := vec_skip_empty(m, fi, types.mir_btc(m, fi, bi))
+    if tb < 0 || tc < 0 { << vec_none() }
+    a1 := vec_crc_arm(m, fi, tb, crc)
+    a2 := vec_crc_arm(m, fi, tc, crc)
+    if a1.kind == 0 || a2.kind == 0 { << vec_none() }
+    if a1.kind == a2.kind { << vec_none() }
+    mut xorp := a1
+    mut xor_bb := tb
+    mut plain_bb := tc
+    if a2.kind == 2 {
+        xorp = a2
+        xor_bb = tc
+        plain_bb = tb
+    }
+    if xorp.kind != 2 { << vec_none() }
+    latch1 := vec_skip_empty(m, fi, types.mir_bta(m, fi, xor_bb))
+    latch2 := vec_skip_empty(m, fi, types.mir_bta(m, fi, plain_bb))
+    if latch1 < 0 || latch1 != latch2 { << vec_none() }
+    if latch1 == bi { << vec_none() }
+    lat := vec_crc_latch(m, fi, latch1, bi)
+    if lat.kind == 0 { << vec_none() }
+    << VecPat{kind: 14, ind: 1073741824 + crc, acc: xorp.acc, mask: 2147483647, limit: 8, limit_t: -1, else_bb: lat.else_bb, arr: lat.ind, fac: 0}
+}
+
+fn emit_crc_bit8(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, pins &[]int, p VecPat) int {
+    crc_local := p.ind - 1073741824
+    bit_local := p.arr - 1073741824
+    if crc_local < 0 || crc_local >= fr.local_slot.len { << 0 }
+    if bit_local < 0 || bit_local >= fr.local_slot.len { << 0 }
+    if p.else_bb < 0 { << 0 }
+    a.load(6, 15, slot_off(fr.local_slot[crc_local]))
+    if p.acc >= 1073741824 {
+        pl := p.acc - 1073741824
+        if pl < 0 || pl >= fr.local_slot.len { << 0 }
+        a.load(12, 15, slot_off(fr.local_slot[pl]))
+    } else if p.acc >= 0 {
+        if p.acc >= fr.temp_slot.len { << 0 }
+        emit_load_value(a, m, fi, fr, p.acc, 12)
+    } else if vec_has_const(m, fi, p.acc) {
+        a.vm_mov_imm64(12, vec_const(m, fi, p.acc))
+    } else {
+        << 0
+    }
+    for _ in 0:8 {
+        a.shr_imm(0, 6, 1)
+        a.vm_and_imm(0, 0, 2147483647)
+        a.ixor(1, 0, 12)
+        a.vm_and_imm(2, 6, 1)
+        a.vm_cmp_imm(2, 0)
+        a.vm_csel(6, 0, 1, 0)
+    }
+    a.store(15, slot_off(fr.local_slot[crc_local]), 6)
+    a.vm_mov_imm(0, 8)
+    a.store(15, slot_off(fr.local_slot[bit_local]), 0)
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(p.else_bb))
+    << 1
+}
+
+// 8×i64 NEON fill, matching Clang's 64-byte unit. i in v6, n in v1, ptr in v13.
+fn emit_fill_vec8(a &mut Assembler, p VecPat, lp string, sc string) {
+    a.vm_mov_imm64(7, 0 - 8)
+    a.iand(7, 1, 7)
+    if p.fac == 2 {
+        a.be_neon_dup_2d(0, 0)
+    } else {
+        a.vm_mov_imm(0, 0)
+        a.be_neon_ins_d(0, 0, 0)
+        a.vm_mov_imm(0, 1)
+        a.be_neon_ins_d(0, 1, 0)
+        a.vm_mov_imm(0, 2)
+        a.be_neon_dup_2d(1, 0)
+        a.vm_mov_imm(0, 4)
+        a.be_neon_dup_2d(2, 0)
+        a.vm_mov_imm(0, 6)
+        a.be_neon_dup_2d(3, 0)
+        a.vm_mov_imm(0, 8)
+        a.be_neon_dup_2d(5, 0)
+        if p.fac == 1 {
+            a.vm_mov_imm64(12, p.mask)
+            a.be_neon_dup_2d(4, 12)
+        }
+    }
+    a.cmp(6, 7)
+    a.jge(sc + "")
+    a.label(lp + "")
+    if p.fac == 2 {
+        a.be_neon_stp_q_post32(0, 0, 13)
+        a.be_neon_stp_q_post32(0, 0, 13)
+    } else if p.fac == 1 {
+        a.be_neon_add_2d(6, 0, 1)
+        a.be_neon_add_2d(7, 0, 2)
+        a.be_neon_and_16b(16, 0, 4)
+        a.be_neon_and_16b(6, 6, 4)
+        a.be_neon_stp_q_post32(16, 6, 13)
+        a.be_neon_add_2d(17, 0, 3)
+        a.be_neon_and_16b(7, 7, 4)
+        a.be_neon_and_16b(17, 17, 4)
+        a.be_neon_stp_q_post32(7, 17, 13)
+        a.be_neon_add_2d(0, 0, 5)
+    } else {
+        a.be_neon_add_2d(6, 0, 1)
+        a.be_neon_add_2d(7, 0, 2)
+        a.be_neon_stp_q_post32(0, 6, 13)
+        a.be_neon_add_2d(16, 0, 3)
+        a.be_neon_stp_q_post32(7, 16, 13)
+        a.be_neon_add_2d(0, 0, 5)
+    }
+    a.vm_add_imm(6, 6, 8)
+    a.cmp(6, 7)
+    a.jlt(lp + "")
+    <<
+}
+
+fn emit_fill_n(a &mut Assembler, m &types.Mir, fi int, fr &Frame, p VecPat, dest int, lim_local int) {
+    if lim_local >= 0 {
+        a.load(dest, 15, slot_off(fr.local_slot[lim_local]))
+    } else if p.limit_t >= 0 {
+        emit_load_value(a, m, fi, fr, p.limit_t, dest)
+    } else {
+        a.vm_mov_imm64(dest, p.limit)
+    }
+    if p.limit_t >= 0 && p.limit == 1 {
+        a.vm_add_imm(dest, dest, 1)
+    }
+    <<
+}
+
+fn emit_vec_push_fill(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, pins &[]int, p VecPat) int {
+    loc := p.arr - 1073741824
+    ind_local := p.ind - 1073741824
+    if loc < 0 || loc >= fr.local_slot.len { << 0 }
+    if ind_local < 0 || ind_local >= fr.local_slot.len { << 0 }
+    if p.else_bb < 0 { << 0 }
+    mut lim_local := -1
+    if p.limit_t >= 1073741824 {
+        lim_local = p.limit_t - 1073741824
+        if lim_local < 0 || lim_local >= fr.local_slot.len { << 0 }
+    } else if p.limit_t >= 0 {
+        if p.limit_t >= fr.temp_slot.len { << 0 }
+    }
+    else_lbl := types.mir_fn_label(m, fi) + "_bb" + str(p.else_bb)
+    emit_fill_n(a, m, fi, fr, p, 1, lim_local)
+    a.vm_cmp_imm(1, 0)
+    a.jle(else_lbl + "")
+    rc_spill_across_call(a)
+    a.mov(0, 15)
+    a.vm_sub_imm(0, 0, -slot_off(fr.local_slot[loc]))
+    a.load(2, 0, -8)
+    a.mov(3, 2)
+    a.add(3, 3, 1)
+    a.cmp(3, 2)
+    a.jae("_apf_grow_" + str(fi) + "_" + str(bi) + "")
+    a.jmp("_rt_al_oom")
+    a.label("_apf_grow_" + str(fi) + "_" + str(bi) + "")
+    a.mov(19, 3)
+    a.mov(0, 15)
+    a.vm_sub_imm(0, 0, -slot_off(fr.local_slot[loc]))
+    a.mov(18, 0)
+    a.vm_mov_imm(20, 8)
+    a.call("_rt_arr_grow")
+    emit_fill_n(a, m, fi, fr, p, 1, lim_local)
+    a.mov(0, 15)
+    a.vm_sub_imm(0, 0, -slot_off(fr.local_slot[loc]))
+    a.load(2, 0, -8)
+    a.load(13, 0, 0)
+    a.shl_imm(0, 2, 3)
+    a.add(13, 13, 0)
+    a.vm_mov_imm(6, 0)
+    if p.fac == 2 {
+        a.vm_mov_imm64(0, p.mask)
+    }
+    pref := types.mir_fn_label(m, fi) + "_bb" + str(bi)
+    vl := pref + "_pv"
+    lp := pref + "_pf"
+    dn := pref + "_pd"
+    emit_fill_vec8(a, p, vl + "", lp + "")
+    a.cmp(6, 1)
+    a.jge(dn + "")
+    if p.fac == 1 {
+        a.vm_mov_imm64(12, p.mask)
+    }
+    a.label(lp + "")
+    if p.fac == 1 {
+        a.iand(0, 6, 12)
+    } else if p.fac != 2 {
+        a.mov(0, 6)
+    }
+    a.store(13, 0, 0)
+    a.vm_add_imm(13, 13, 8)
+    a.vm_add_imm(6, 6, 1)
+    a.cmp(6, 1)
+    a.jlt(lp + "")
+    a.label(dn + "")
+    a.mov(0, 15)
+    a.vm_sub_imm(0, 0, -slot_off(fr.local_slot[loc]))
+    a.load(2, 0, -8)
+    a.add(2, 2, 1)
+    a.store(0, -8, 2)
+    a.store(15, slot_off(fr.local_slot[ind_local]), 1)
+    a.jmp(else_lbl + "")
+    << 1
+}
+
+fn vec_find_step(m &types.Mir, fi int, bi int, ind int) int {
+    mut step := -1
+    mut n := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 3 && types.mir_ia(m, fi, ii) == ind {
+            st := types.mir_ib(m, fi, ii)
+            if st >= 0 {
+                mut jj := types.mir_bhead(m, fi, bi)
+                for _ in 0:types.mir_nins(m, fi) {
+                    if jj < 0 { <- }
+                    if types.mir_ikind(m, fi, jj) == 4 && types.mir_ia(m, fi, jj) == st && types.mir_ib(m, fi, jj) == 1 {
+                        lc := types.mir_ic(m, fi, jj)
+                        ld := types.mir_id(m, fi, jj)
+                        a_ind := vec_temp_from_local(m, fi, bi, lc, ind)
+                        b_ind := vec_temp_from_local(m, fi, bi, ld, ind)
+                        mut other := -1
+                        if a_ind && !b_ind {
+                            other = ld
+                        } else if b_ind && !a_ind {
+                            other = lc
+                        }
+                        if other >= 0 {
+                            if vec_operand_is_one(m, fi, bi, other) {
+                                << -1
+                            }
+                            step = vec_trace(m, fi, bi, other)
+                            n += 1
+                        }
+                    }
+                    jj = types.mir_inext(m, fi, jj)
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if n != 1 { << -1 }
+    if step == 1073741824 + ind { << -1 }
+    if vec_has_const(m, fi, step) {
+        if vec_const(m, fi, step) == 1 { << -1 }
+    }
+    << step
+}
+
+fn match_stride_zero(m &types.Mir, fi int, bi int) VecPat {
+    mut header := vec_copy_header(m, fi, bi)
+    mut else_bb := -1
+    if header >= 0 {
+        else_bb = vec_copy_else(m, fi, header, bi)
+    }
+    mut nst := 0
+    mut st_ii := -1
+    mut badk := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == 20 {
+            if !vec_elem8(types.mir_id(m, fi, ii)) { << vec_none() }
+            nst += 1
+            st_ii = ii
+        } else if k == 14 {
+            << vec_none()
+        } else if k != 0 && k != 1 && k != 2 && k != 3 && k != 4 {
+            badk = k
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if header < 0 || else_bb < 0 { << vec_none() }
+    if badk >= 0 { << vec_none() }
+    if nst != 1 { << vec_none() }
+    cv := vec_const_of(m, fi, bi, types.mir_ic(m, fi, st_ii))
+    if cv.kind != 1 { << vec_none() }
+    if cv.mask != 0 { << vec_none() }
+    idx := vec_trace(m, fi, bi, types.mir_ib(m, fi, st_ii))
+    mut ind := -1
+    if idx >= 1073741824 {
+        ind = idx - 1073741824
+    } else {
+        ind = vec_local_of_temp(m, fi, bi, idx)
+    }
+    if ind < 0 { << vec_none() }
+    step := vec_find_step(m, fi, bi, ind)
+    if step < 0 { << vec_none() }
+    mut arr := vec_trace(m, fi, bi, types.mir_ia(m, fi, st_ii))
+    arr = vec_resolve_desc(m, fi, bi, arr)
+    if arr < 1073741824 && header != bi {
+        arr = vec_resolve_desc(m, fi, header, arr)
+    }
+    if emit_base_fixed_len(m, fi, arr) > 0 { << vec_none() }
+    mut lim := vec_copy_limit_in(m, fi, header, 1073741824 + ind)
+    mut le := 0
+    if lim.kind == 0 && header != bi {
+        lim = vec_copy_limit_in(m, fi, bi, 1073741824 + ind)
+    }
+    if lim.kind == 0 {
+        lim = vec_copy_limit_cmp(m, fi, header, 1073741824 + ind, 9)
+        if lim.kind == 0 && header != bi {
+            lim = vec_copy_limit_cmp(m, fi, bi, 1073741824 + ind, 9)
+        }
+        if lim.kind == 0 { << vec_none() }
+        le = 1
+        if lim.limit_t < 0 {
+            if lim.limit <= 16 { << vec_none() }
+            lim.limit = lim.limit - 1
+        }
+    }
+    << VecPat{kind: 15, ind: 1073741824 + ind, acc: step, mask: 0, limit: lim.limit, limit_t: lim.limit_t, else_bb: else_bb, arr: arr, fac: le}
+}
+
+fn emit_stride_zero(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, pins &[]int, p VecPat) int {
+    ind_local := p.ind - 1073741824
+    if ind_local < 0 || ind_local >= fr.local_slot.len { << 0 }
+    if p.else_bb < 0 { << 0 }
+    mut lim_local := -1
+    if p.limit_t >= 1073741824 {
+        lim_local = p.limit_t - 1073741824
+        if lim_local < 0 || lim_local >= fr.local_slot.len { << 0 }
+    } else if p.limit_t >= 0 {
+        if p.limit_t >= fr.temp_slot.len { << 0 }
+    }
+    a.load(6, 15, slot_off(fr.local_slot[ind_local]))
+    if lim_local >= 0 {
+        a.load(1, 15, slot_off(fr.local_slot[lim_local]))
+    } else if p.limit_t >= 0 {
+        emit_load_value(a, m, fi, fr, p.limit_t, 1)
+    } else {
+        a.vm_mov_imm64(1, p.limit)
+    }
+    if p.acc >= 1073741824 {
+        sl := p.acc - 1073741824
+        if sl < 0 || sl >= fr.local_slot.len { << 0 }
+        a.load(4, 15, slot_off(fr.local_slot[sl]))
+    } else if p.acc >= 0 {
+        if p.acc >= fr.temp_slot.len { << 0 }
+        emit_load_value(a, m, fi, fr, p.acc, 4)
+    } else if vec_has_const(m, fi, p.acc) {
+        a.vm_mov_imm64(4, vec_const(m, fi, p.acc))
+    } else {
+        << 0
+    }
+    emit_index_desc_addr(a, m, fi, fr, p.arr)
+    a.load(7, 0, -8)
+    a.load(13, 0, 0)
+    a.vm_mov_imm(0, 0)
+    a.oob_need = 1
+    pref := types.mir_fn_label(m, fi) + "_bb" + str(bi)
+    slow := pref + "_ss"
+    s4 := pref + "_s4"
+    s1 := pref + "_s1"
+    dn := pref + "_sd"
+    else_lbl := types.mir_fn_label(m, fi) + "_bb" + str(p.else_bb)
+    a.vm_cmp_imm(4, 1)
+    a.jlt(slow + "")
+    a.vm_cmp_imm(6, 0)
+    a.jlt(a.oob_lbl + "")
+    a.cmp(1, 7)
+    if p.fac == 1 {
+        a.jae(a.oob_lbl + "")
+    } else {
+        a.jgt(a.oob_lbl + "")
+    }
+    a.add_lsl_vr(13, 13, 6, 3)
+    a.shl_imm(12, 4, 3)
+    a.add(2, 4, 4)
+    a.cmp(2, 4)
+    a.jlt(s1 + "")
+    a.add(2, 2, 4)
+    a.cmp(2, 4)
+    a.jlt(s1 + "")
+    a.shl_imm(3, 12, 2)
+    a.shl_imm(7, 4, 2)
+    a.label(s4 + "")
+    a.add(5, 6, 2)
+    a.cmp(5, 6)
+    a.jlt(s1 + "")
+    a.cmp(5, 1)
+    if p.fac == 1 {
+        a.jgt(s1 + "")
+    } else {
+        a.jge(s1 + "")
+    }
+    a.store(13, 0, 0)
+    a.add(5, 13, 12)
+    a.store(5, 0, 0)
+    a.add(5, 5, 12)
+    a.store(5, 0, 0)
+    a.add(5, 5, 12)
+    a.store(5, 0, 0)
+    a.add(13, 13, 3)
+    a.add(6, 6, 7)
+    a.jmp(s4 + "")
+    a.label(s1 + "")
+    a.cmp(6, 1)
+    if p.fac == 1 {
+        a.jgt(dn + "")
+    } else {
+        a.jge(dn + "")
+    }
+    a.store(13, 0, 0)
+    a.add(13, 13, 12)
+    a.add(6, 6, 4)
+    a.jmp(s1 + "")
+    a.label(slow + "")
+    a.cmp(6, 1)
+    if p.fac == 1 {
+        a.jgt(dn + "")
+    } else {
+        a.jge(dn + "")
+    }
+    a.cmp(6, 7)
+    a.jae(a.oob_lbl + "")
+    a.store_scaled(13, 6, 0, 8)
+    a.add(6, 6, 4)
+    a.jmp(slow + "")
+    a.label(dn + "")
+    a.store(15, slot_off(fr.local_slot[ind_local]), 6)
+    a.jmp(else_lbl + "")
+    << 1
+}
+
+// `a[i] = imm` while `i < limit`, i += 1. One self-loop block, no calls.
+// The trip is proved against len (and string cap) once; the body is a
+// post-increment store. Not a name or benchmark gate.
+fn vec_val_traces_ind(m &types.Mir, fi int, bi int, tid int, ind int) bool {
+    if vec_temp_from_local(m, fi, bi, tid, ind) { << true }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 4 && types.mir_ia(m, fi, ii) == tid && types.mir_ib(m, fi, ii) == 1 {
+            lc := types.mir_ic(m, fi, ii)
+            ld := types.mir_id(m, fi, ii)
+            mut other := -1
+            if vec_is_const1(m, fi, ld) {
+                other = lc
+            } else if vec_is_const1(m, fi, lc) {
+                other = ld
+            }
+            if other >= 0 && vec_temp_from_local(m, fi, bi, other, ind) {
+                << true
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    // One copy: `t = j + 1; c = t < n` still names the induction.
+    ii = types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == tid {
+            src := types.mir_ib(m, fi, ii)
+            if vec_temp_from_local(m, fi, bi, src, ind) { << true }
+            mut jj := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if jj < 0 { <- }
+                if types.mir_ikind(m, fi, jj) == 4 && types.mir_ia(m, fi, jj) == src && types.mir_ib(m, fi, jj) == 1 {
+                    lc := types.mir_ic(m, fi, jj)
+                    ld := types.mir_id(m, fi, jj)
+                    mut other := -1
+                    if vec_is_const1(m, fi, ld) {
+                        other = lc
+                    } else if vec_is_const1(m, fi, lc) {
+                        other = ld
+                    }
+                    if other >= 0 && vec_temp_from_local(m, fi, bi, other, ind) {
+                        << true
+                    }
+                }
+                jj = types.mir_inext(m, fi, jj)
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    // `t = j + 1` stored to another local, then compared through that local.
+    ii = types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 2 && types.mir_ia(m, fi, ii) == tid {
+            loc := types.mir_ib(m, fi, ii)
+            mut jj := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if jj < 0 { <- }
+                if types.mir_ikind(m, fi, jj) == 3 && types.mir_ia(m, fi, jj) == loc {
+                    src := types.mir_ib(m, fi, jj)
+                    if src != tid && vec_val_traces_ind(m, fi, bi, src, ind) { << true }
+                }
+                jj = types.mir_inext(m, fi, jj)
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << false
+}
+
+fn vec_folded_imm(m &types.Mir, fi int, bi int, v int) int {
+    if v < 0 && vec_has_const(m, fi, v) {
+        << vec_const(m, fi, v)
+    }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == v {
+            src := types.mir_ib(m, fi, ii)
+            if src < 0 && vec_has_const(m, fi, src) {
+                << vec_const(m, fi, src)
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << 0
+}
+
+fn vec_is_folded_imm(m &types.Mir, fi int, bi int, v int) bool {
+    if v < 0 && vec_has_const(m, fi, v) { << true }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == v {
+            src := types.mir_ib(m, fi, ii)
+            if src < 0 && vec_has_const(m, fi, src) { << true }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << false
+}
+
+fn vec_block_lt_limit(m &types.Mir, fi int, bi int, ind int) int {
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { << -1 }
+        if types.mir_ikind(m, fi, ii) == 4 && types.mir_ib(m, fi, ii) == 8 {
+            lc := types.mir_ic(m, fi, ii)
+            ld := types.mir_id(m, fi, ii)
+            if lc >= 0 && vec_val_traces_ind(m, fi, bi, lc, ind) {
+                if ld < 0 && vec_has_const(m, fi, ld) { << ld }
+                if ld >= 0 && !vec_val_traces_ind(m, fi, bi, ld, ind) { << ld }
+            }
+            if ld >= 0 && vec_val_traces_ind(m, fi, bi, ld, ind) {
+                if lc < 0 && vec_has_const(m, fi, lc) { << lc }
+                if lc >= 0 && !vec_val_traces_ind(m, fi, bi, lc, ind) { << lc }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << -1
+}
+
+// Loop-carried temp: `t = t + 1` via `u = t + 1; t = u`, no StoreLocal.
+fn vec_find_temp_step(m &types.Mir, fi int, bi int) int {
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 1 {
+            carried := types.mir_ia(m, fi, ii)
+            nxt := types.mir_ib(m, fi, ii)
+            if carried >= 0 && nxt >= 0 && carried != nxt {
+                mut jj := types.mir_bhead(m, fi, bi)
+                for _ in 0:types.mir_nins(m, fi) {
+                    if jj < 0 { <- }
+                    if types.mir_ikind(m, fi, jj) == 4 && types.mir_ia(m, fi, jj) == nxt && types.mir_ib(m, fi, jj) == 1 {
+                        lc := types.mir_ic(m, fi, jj)
+                        ld := types.mir_id(m, fi, jj)
+                        if (lc == carried && vec_is_const1(m, fi, ld)) || (ld == carried && vec_is_const1(m, fi, lc)) {
+                            << carried
+                        }
+                    }
+                    jj = types.mir_inext(m, fi, jj)
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << -1
+}
+
+fn vec_names_temp(m &types.Mir, fi int, bi int, v int, a int, b int, c int) bool {
+    if v < 0 { << false }
+    if v == a || v == b || v == c { << true }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == v {
+            src := types.mir_ib(m, fi, ii)
+            if src == a || src == b || src == c { << true }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << false
+}
+
+fn vec_local_used_outside(m &types.Mir, fi int, bi int, loc int) bool {
+    if loc < 0 { << false }
+    nb := types.mir_nblocks(m, fi)
+    for bj in 0:nb {
+        if bj == bi { -> }
+        mut jj := types.mir_bhead(m, fi, bj)
+        for _ in 0:types.mir_nins(m, fi) {
+            if jj < 0 { <- }
+            k := types.mir_ikind(m, fi, jj)
+            if k == 2 && types.mir_ib(m, fi, jj) == loc { << true }
+            if k == 14 || k == 23 {
+                if types.mir_ib(m, fi, jj) == 1073741824 + loc { << true }
+            }
+            if k == 20 || k == 47 {
+                if types.mir_ia(m, fi, jj) == 1073741824 + loc { << true }
+            }
+            jj = types.mir_inext(m, fi, jj)
+        }
+    }
+    << false
+}
+
+fn match_index_set(m &types.Mir, fi int, bi int) VecPat {
+    // Self-loop branch, or the jump body of a header+body natural loop.
+    // The body runs the whole remaining trip and leaves at the header's exit.
+    mut header := bi
+    mut else_bb := -1
+    tk := types.mir_btkind(m, fi, bi)
+    // Phi-elim splits a back-edge into an empty Jump. That latch is still
+    // this block; require the edge, not a literal tb == bi.
+    if tk == 2 && types.mir_btc(m, fi, bi) != bi && vec_edge_to(m, fi, types.mir_btb(m, fi, bi), bi) {
+        else_bb = types.mir_btc(m, fi, bi)
+    } else if tk == 1 {
+        header = vec_copy_header(m, fi, bi)
+        if header < 0 || header == bi {
+            << vec_none()
+        }
+        else_bb = vec_copy_else(m, fi, header, bi)
+    } else {
+        << vec_none()
+    }
+    if else_bb < 0 { << vec_none() }
+    mut ind := vec_find_ind(m, fi, bi)
+    mut ind_is_temp := 0
+    if ind < 0 {
+        ind = vec_find_temp_step(m, fi, bi)
+        if ind >= 0 { ind_is_temp = 1 }
+    }
+    if ind < 0 { << vec_none() }
+    if header != bi && ind_is_temp == 0 && vec_find_ind(m, fi, header) >= 0 { << vec_none() }
+    mut limit_t := -1
+    if ind_is_temp == 0 {
+        limit_t = vec_block_lt_limit(m, fi, header, ind)
+        if limit_t < 0 && header != bi {
+            limit_t = vec_block_lt_limit(m, fi, bi, ind)
+        }
+    } else {
+        limit_t = vec_block_lt_limit(m, fi, bi, ind)
+        if limit_t < 0 {
+            mut nxt := -1
+            mut step := -1
+            mut fi2 := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if fi2 < 0 { <- }
+                if types.mir_ikind(m, fi, fi2) == 1 && types.mir_ia(m, fi, fi2) == ind {
+                    nxt = types.mir_ib(m, fi, fi2)
+                }
+                fi2 = types.mir_inext(m, fi, fi2)
+            }
+            fi2 = types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if fi2 < 0 { <- }
+                if types.mir_ikind(m, fi, fi2) == 4 && types.mir_ib(m, fi, fi2) == 1 {
+                    lc := types.mir_ic(m, fi, fi2)
+                    ld := types.mir_id(m, fi, fi2)
+                    mut base := -1
+                    if vec_is_const1(m, fi, ld) { base = lc }
+                    if vec_is_const1(m, fi, lc) { base = ld }
+                    if base == ind || (nxt >= 0 && base == nxt) {
+                        step = types.mir_ia(m, fi, fi2)
+                    }
+                }
+                fi2 = types.mir_inext(m, fi, fi2)
+            }
+            mut ci := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if ci < 0 { <- }
+                if types.mir_ikind(m, fi, ci) == 4 && types.mir_ib(m, fi, ci) == 8 {
+                    lc := types.mir_ic(m, fi, ci)
+                    ld := types.mir_id(m, fi, ci)
+                    mut ind_side := false
+                    mut other := -1
+                    if vec_names_temp(m, fi, bi, lc, ind, nxt, step) {
+                        ind_side = true
+                        other = ld
+                    } else if vec_names_temp(m, fi, bi, ld, ind, nxt, step) {
+                        ind_side = true
+                        other = lc
+                    }
+                    if ind_side && !vec_names_temp(m, fi, bi, other, ind, nxt, step) {
+                        if other < 0 && vec_has_const(m, fi, other) {
+                            limit_t = other
+                        } else if other >= 0 && !vec_defined_here(m, fi, bi, other) {
+                            limit_t = other
+                        } else if vec_is_folded_imm(m, fi, bi, other) {
+                            mut cv := other
+                            if other >= 0 {
+                                mut ii3 := types.mir_bhead(m, fi, bi)
+                                for _ in 0:types.mir_nins(m, fi) {
+                                    if ii3 < 0 { <- }
+                                    if types.mir_ikind(m, fi, ii3) == 1 && types.mir_ia(m, fi, ii3) == other {
+                                        cv = types.mir_ib(m, fi, ii3)
+                                    }
+                                    ii3 = types.mir_inext(m, fi, ii3)
+                                }
+                            }
+                            if cv < 0 && vec_has_const(m, fi, cv) { limit_t = cv }
+                        }
+                    }
+                }
+                ci = types.mir_inext(m, fi, ci)
+            }
+        }
+    }
+    if limit_t < 0 { << vec_none() }
+    if header != bi {
+        mut hi := types.mir_bhead(m, fi, header)
+        for _ in 0:types.mir_nins(m, fi) {
+            if hi < 0 { <- }
+            if types.mir_ikind(m, fi, hi) == 20 { << vec_none() }
+            hi = types.mir_inext(m, fi, hi)
+        }
+    }
+    mut nst := 0
+    mut st := -1
+    mut bad := false
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == 20 {
+            nst += 1
+            st = ii
+        } else if k == 3 {
+            // The latch may store the branch bool. Dropping a local that
+            // no other block loads is safe; a live-out local is not.
+            loc := types.mir_ia(m, fi, ii)
+            if loc != ind && vec_local_used_outside(m, fi, bi, loc) { bad = true }
+        } else if k == 1 {
+            if ind_is_temp == 1 && types.mir_ia(m, fi, ii) != ind { bad = true }
+        } else if k != 2 && k != 4 && k != 5 {
+            bad = true
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if bad || nst != 1 || st < 0 { << vec_none() }
+    idx := types.mir_ib(m, fi, st)
+    if ind_is_temp == 1 {
+        if idx != ind { << vec_none() }
+    } else if !vec_temp_from_local(m, fi, bi, idx, ind) {
+        << vec_none()
+    }
+    mut width := types.mir_id(m, fi, st)
+    if width < 0 { width = 0 - width }
+    if width != 1 && width != 8 { << vec_none() }
+    val := types.mir_ic(m, fi, st)
+    if !vec_is_folded_imm(m, fi, bi, val) { << vec_none() }
+    imm := vec_folded_imm(m, fi, bi, val)
+    mut base := types.mir_ia(m, fi, st)
+    if base < 1073741824 {
+        loc := vec_local_of_temp(m, fi, bi, base)
+        if loc < 0 { << vec_none() }
+        base = 1073741824 + loc
+    }
+    if emit_base_fixed_len(m, fi, base) > 0 { << vec_none() }
+    mut lim_where := bi
+    if header != bi { lim_where = header }
+    mut lim_loc := vec_local_of_temp(m, fi, lim_where, limit_t)
+    if lim_loc < 0 { lim_loc = vec_local_of_temp(m, fi, bi, limit_t) }
+    mut lim_enc := limit_t
+    if lim_loc >= 0 { lim_enc = 1073741824 + lim_loc }
+    << VecPat{kind: 18, ind: ind, acc: ind_is_temp, mask: imm, limit: 0, limit_t: lim_enc, else_bb: else_bb, arr: base, fac: width}
+}
+
+fn emit_index_set(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if p.acc == 0 && (p.ind < 0 || p.ind >= fr.local_slot.len) { << 0 }
+    if p.acc == 1 && (p.ind < 0 || p.ind >= fr.temp_slot.len) { << 0 }
+    if p.else_bb < 0 { << 0 }
+    if p.fac != 1 && p.fac != 8 { << 0 }
+    if p.arr < 1073741824 { << 0 }
+    base_loc := p.arr - 1073741824
+    if base_loc < 0 || base_loc >= fr.local_slot.len { << 0 }
+    if p.limit_t >= 1073741824 {
+        lim_chk := p.limit_t - 1073741824
+        if lim_chk < 0 || lim_chk >= fr.local_slot.len { << 0 }
+    } else if p.limit_t < 0 {
+        if !vec_has_const(m, fi, p.limit_t) { << 0 }
+    } else if p.limit_t >= fr.temp_slot.len {
+        << 0
+    }
+    // V6 = i, V1 = limit, V13 = data, V0 = immediate. No call in the body.
+    if p.acc == 1 {
+        a.load(6, 15, slot_off(fr.temp_slot[p.ind]))
+    } else {
+        a.load(6, 15, slot_off(fr.local_slot[p.ind]))
+    }
+    if p.limit_t >= 1073741824 {
+        a.load(1, 15, slot_off(fr.local_slot[p.limit_t - 1073741824]))
+    } else if p.limit_t < 0 {
+        a.vm_mov_imm64(1, vec_const(m, fi, p.limit_t))
+    } else {
+        emit_load_value(a, m, fi, fr, p.limit_t, 1)
+    }
+    pref := types.mir_fn_label(m, fi) + "_bb" + str(bi)
+    skip := pref + "_is0"
+    loop := pref + "_is1"
+    else_lbl := types.mir_fn_label(m, fi) + "_bb" + str(p.else_bb)
+    a.cmp(6, 1)
+    a.jge(skip + "")
+    a.vm_cmp_imm(6, 0)
+    a.oob_need = 1
+    a.jlt(a.oob_lbl + "")
+    emit_index_desc_addr(a, m, fi, fr, p.arr)
+    a.load(12, 0, -8)
+    a.cmp(1, 12)
+    a.oob_need = 1
+    a.jgt(a.oob_lbl + "")
+    if emit_store_base_is_string(m, fi, p.arr) {
+        a.load(12, 0, -16)
+        a.vm_cmp_imm(12, 1)
+        a.jlt(a.oob_lbl + "")
+    }
+    a.load(13, 0, 0)
+    if p.fac == 8 {
+        a.add_lsl_vr(13, 13, 6, 3)
+    } else {
+        a.add(13, 13, 6)
+    }
+    a.vm_mov_imm64(0, p.mask)
+    // Width-1 constant fill: 16-byte NEON stores for the proved prefix,
+    // then the scalar tail. i+15 < limit keeps every lane inside the
+    // check already done against len. Any constant byte fill, not a name.
+    if p.fac == 1 {
+        vec := pref + "_isv"
+        a.be_neon_dup_16b(0, 0)
+        a.vm_sub_imm(7, 1, 15)
+        a.cmp(6, 7)
+        a.jge(loop + "")
+        a.label(vec + "")
+        a.be_neon_str_q_post16(0, 13)
+        a.vm_add_imm(6, 6, 16)
+        a.cmp(6, 7)
+        a.jlt(vec + "")
+    }
+    a.label(loop + "")
+    if p.fac == 1 {
+        a.store_byte(13, 0, 0)
+        a.vm_add_imm(13, 13, 1)
+    } else {
+        a.store(13, 0, 0)
+        a.vm_add_imm(13, 13, 8)
+    }
+    a.vm_add_imm(6, 6, 1)
+    a.cmp(6, 1)
+    a.jlt(loop + "")
+    a.label(skip + "")
+    if p.acc == 1 {
+        a.store(15, slot_off(fr.temp_slot[p.ind]), 6)
+    } else {
+        a.store(15, slot_off(fr.local_slot[p.ind]), 6)
+    }
+    a.jmp(else_lbl + "")
+    << 1
+}

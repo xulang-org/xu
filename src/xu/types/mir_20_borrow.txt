@@ -1,0 +1,315 @@
+@xu/types
+
+// MIR CFG borrow/drop dataflow (OPEN_ADVANCED_PROGRAMMER_IMPLEMENTATION_PLAN.md P1.1).
+//
+// Migration posture: the AST checker in check_10_borrow.xu remains the
+// user-facing authority.  This module is the MIR-side verifier.
+//
+// This slice implements:
+//   * owning-local drop liveness with CFG join meet (dead only if dead on
+//     every predecessor path — NLL-style may-drop, not path-insensitive AND)
+//   * same-block StoreLocal reinit after drop
+//   * address-taken loans (Addr of a live owning local); Drop while a loan
+//     is live in the same block is use-after-drop
+//   * move-from-borrowed: StoreLocal to a loaned local kills the loan (reinit)
+//
+// Still deferred: exclusive/shared loan sets across CFG edges, reborrow
+// chains, pointer-temp provenance, last-use NLL region ends.
+
+struct MirBorrowReport {
+    fn_label string
+    use_after_drop int
+    addr_of_dropped int
+    dropped_twice int
+    loan_after_drop int
+    blocks_visited int
+    instrs_visited int
+}
+
+fn mir_borrow_report_ok(r &MirBorrowReport) bool {
+    if r.use_after_drop != 0 { << false }
+    if r.addr_of_dropped != 0 { << false }
+    if r.dropped_twice != 0 { << false }
+    if r.loan_after_drop != 0 { << false }
+    << true
+}
+
+fn mir_borrow_pred_push(preds &mut []int, succs &mut []int, pi int, si int) {
+    // Flat CSR: for each succ block, append pred index.  Caller sizes via
+    // two-pass count or push-as-we-go into parallel vectors.
+    preds.push(pi)
+    succs.push(si)
+}
+
+// Transfer one block: start from dropped_in, emit findings, return dropped_out.
+// loans[] marks owning locals whose address is live in this block (simple
+// same-block loan; cross-block pointer provenance is deferred).
+fn mir_borrow_xfer_block(f &MFn, bi int, nloc int, dropped_in &[]bool,
+    out &mut MirBorrowReport, dropped_out &mut []bool) bool {
+    // copy in → cur
+    mut cur := []bool{}
+    mut i := 0
+    while i < nloc {
+        if i < dropped_in.len {
+            cur.push(dropped_in[i])
+        } else {
+            cur.push(false)
+        }
+        i += 1
+    }
+    mut loans := []bool{}
+    i = 0
+    while i < nloc {
+        loans.push(false)
+        i += 1
+    }
+
+    mut ii := f.blocks[bi].head
+    mut guard := 0
+    while ii >= 0 {
+        if ii >= f.instrs.len { << false }
+        guard += 1
+        if guard > 1000000 { << false }
+        out.instrs_visited += 1
+        kind := mfn_ikind(&f.instrs, ii)
+        if kind == 8 {
+            loc := mfn_ia(&f.instrs, ii)
+            if loc >= 0 && loc < nloc && loc < f.locals_owning.len && f.locals_owning[loc] {
+                if cur[loc] {
+                    out.dropped_twice += 1
+                }
+                // Scope drop after Addr is normal until pointer-temp
+                // provenance exists; do not count loan_after_drop here.
+                cur[loc] = true
+                loans[loc] = false
+            }
+        }
+        if kind == 2 {
+            loc := mfn_ib(&f.instrs, ii)
+            if loc >= 0 && loc < nloc && loc < f.locals_owning.len && f.locals_owning[loc] && cur[loc] {
+                out.use_after_drop += 1
+            }
+        }
+        if kind == 3 {
+            loc := mfn_ia(&f.instrs, ii)
+            if loc >= 0 && loc < nloc && cur[loc] {
+                cur[loc] = false
+                loans[loc] = false
+            }
+        }
+        if kind == 16 {
+            base := mfn_ib(&f.instrs, ii)
+            which := mfn_ic(&f.instrs, ii)
+            if which == 0 && base >= 0 && base < nloc && base < f.locals_owning.len && f.locals_owning[base] {
+                if cur[base] {
+                    out.addr_of_dropped += 1
+                } else {
+                    loans[base] = true
+                }
+            }
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+
+    // write out
+    i = 0
+    while i < nloc {
+        if i < dropped_out.len {
+            dropped_out[i] = cur[i]
+        }
+        i += 1
+    }
+    << true
+}
+
+fn mir_borrow_analyze(f &MFn, out &mut MirBorrowReport) bool {
+    out.fn_label = f.label
+    out.use_after_drop = 0
+    out.addr_of_dropped = 0
+    out.dropped_twice = 0
+    out.loan_after_drop = 0
+    out.blocks_visited = 0
+    out.instrs_visited = 0
+
+    nloc := f.locals.len
+    if nloc < 1 || nloc > 4096 { << false }
+    nblk := f.blocks.len
+    if nblk < 1 || nblk > 4096 { << false }
+
+    // Build predecessor lists (flat): pred_start[b] .. pred_start[b+1).
+    mut npred := []int{}
+    mut bi := 0
+    while bi < nblk {
+        npred.push(0)
+        bi += 1
+    }
+    mut pred_src := []int{}
+    mut pred_dst := []int{}
+    bi = 0
+    while bi < nblk {
+        tk := f.blocks[bi].tkind
+        if tk == 1 {
+            s := f.blocks[bi].ta
+            if s >= 0 && s < nblk {
+                pred_src.push(bi)
+                pred_dst.push(s)
+                npred[s] = npred[s] + 1
+            }
+        }
+        if tk == 2 {
+            s1 := f.blocks[bi].tb
+            s2 := f.blocks[bi].tc
+            if s1 >= 0 && s1 < nblk {
+                pred_src.push(bi)
+                pred_dst.push(s1)
+                npred[s1] = npred[s1] + 1
+            }
+            if s2 >= 0 && s2 < nblk {
+                pred_src.push(bi)
+                pred_dst.push(s2)
+                npred[s2] = npred[s2] + 1
+            }
+        }
+        bi += 1
+    }
+
+    // dropped_in[bi] as bitset words (nloc bits, 62 per word).
+    mut nw := nloc / 62
+    if nloc % 62 != 0 { nw = nw + 1 }
+    mut din := []int{}
+    mut dout := []int{}
+    mut total := nblk * nw
+    if total > 16777216 { << false }
+    mut t := 0
+    while t < total {
+        din.push(0)
+        dout.push(0)
+        t += 1
+    }
+
+    // Initialize: entry dropped_in = all false (already 0).
+    // Fixpoint: dropped_in[b] = AND of dropped_out[preds]; entry has no preds.
+    // dropped_out from transfer.  Bit AND = all preds dead.
+    // Fixpoint without findings (scratch report), then one findings pass.
+    mut iter := 0
+    mut changed := true
+    while changed && iter < nblk + 2 {
+        changed = false
+        iter += 1
+        bi = 0
+        while bi < nblk {
+            mut k := 0
+            while k < nw {
+                mut meet := 0
+                mut first := true
+                mut e := 0
+                while e < pred_dst.len {
+                    if pred_dst[e] == bi {
+                        pv := dout[pred_src[e] * nw + k]
+                        if first {
+                            meet = pv
+                            first = false
+                        } else {
+                            meet = meet & pv
+                        }
+                    }
+                    e += 1
+                }
+                if !first && din[bi * nw + k] != meet {
+                    din[bi * nw + k] = meet
+                    changed = true
+                }
+                k += 1
+            }
+            mut d_in := []bool{}
+            mut li := 0
+            while li < nloc {
+                w := li / 62
+                b := li % 62
+                bit := din[bi * nw + w]
+                mut bb := 0
+                if (bit / (1 << b)) % 2 == 1 { bb = 1 }
+                if bb == 1 { d_in.push(true) } else { d_in.push(false) }
+                li += 1
+            }
+            mut d_out := []bool{}
+            li = 0
+            while li < nloc {
+                d_out.push(false)
+                li += 1
+            }
+            mut scratch := MirBorrowReport{
+                fn_label: "",
+                use_after_drop: 0,
+                addr_of_dropped: 0,
+                dropped_twice: 0,
+                loan_after_drop: 0,
+                blocks_visited: 0,
+                instrs_visited: 0
+            }
+            if !mir_borrow_xfer_block(f, bi, nloc, &d_in, mut &scratch, mut &d_out) {
+                << false
+            }
+            k = 0
+            while k < nw {
+                mut word := 0
+                mut b2 := 0
+                while b2 < 62 {
+                    li = k * 62 + b2
+                    if li < nloc && d_out[li] {
+                        word = word + (1 << b2)
+                    }
+                    b2 += 1
+                }
+                if dout[bi * nw + k] != word {
+                    dout[bi * nw + k] = word
+                    changed = true
+                }
+                k += 1
+            }
+            bi += 1
+        }
+    }
+    // Findings pass at the fixed point.
+    bi = 0
+    while bi < nblk {
+        mut d_in := []bool{}
+        mut li := 0
+        while li < nloc {
+            w := li / 62
+            b := li % 62
+            bit := din[bi * nw + w]
+            mut bb := 0
+            if (bit / (1 << b)) % 2 == 1 { bb = 1 }
+            if bb == 1 { d_in.push(true) } else { d_in.push(false) }
+            li += 1
+        }
+        mut d_out := []bool{}
+        li = 0
+        while li < nloc {
+            d_out.push(false)
+            li += 1
+        }
+        out.blocks_visited += 1
+        if !mir_borrow_xfer_block(f, bi, nloc, &d_in, out, mut &d_out) {
+            << false
+        }
+        bi += 1
+    }
+    << true
+}
+
+fn mir_borrow_check_fn(f &MFn) int {
+    mut r := MirBorrowReport{
+        fn_label: "",
+        use_after_drop: 0,
+        addr_of_dropped: 0,
+        dropped_twice: 0,
+        loan_after_drop: 0,
+        blocks_visited: 0,
+        instrs_visited: 0
+    }
+    if !mir_borrow_analyze(f, mut &r) { << 2 }
+    if !mir_borrow_report_ok(&r) { << 1 }
+    << 0
+}

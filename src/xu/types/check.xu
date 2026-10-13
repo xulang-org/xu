@@ -1,0 +1,745 @@
+@xu/types
+// Semantic checker for the Gen1 compiler (M6b2-s3a), a subset port of
+// bootstrap/crates/xuhir: name resolution + int/bool/string type checking.
+//
+// s3a language slice: fn (multiple params, recursion), :=/mut/assignment/+=,
+// int/bool arithmetic/comparison/logic, if/else, for i in a -> b, <<,
+// println(int/bool/string-literal). Structs, arrays, match, Result,
+// borrows, string operations and string-typed bindings are rejected with a
+// clear error (later stages).
+//
+// Input is the parser's node pool (shared borrow). Output:
+//   - fns:           function signatures in declaration order
+//   - strings:       string literal intern pool, first-seen order (matches
+//                    xuhir, which interns while checking Str expressions)
+//   - ntype[node]:   resolved type of every expression node (0 = unchecked)
+//   - nlocal[node]:  local id for Ident / Let / For nodes (-1 otherwise)
+//   - ncall[node]:   fn index for user calls; -2 for println; -1 otherwise
+//   - fnlocals[f]:   local type tags of function f (params first, then
+//                    declaration order — the frame layout order)
+//
+// Type tags: 0 = void, 1 = int, 2 = bool, 3 = string; 800 = temp (dynamic data).
+// 802 = error_ty (failed expr; suppresses cascade). fail_at records and
+// prints; check_program exits once after the unit, never lowers MIR.
+
+
+#xu/parser
+
+fn b2i(b bool) int {
+    if b { << 1 }
+    << 0
+}
+
+// Indexed store into a Checker []int field. Direct `c.field[i] = v` on this
+// large struct OOBs under Gen1 (bootstrap host); route through &mut []int.
+fn checker_set_i(a &mut []int, i int, v int) {
+    // A short side table must not take down the compiler. Generic instance
+    // rechecks have indexed past ntype/nclone and printed a bare
+    // "index out of bounds" after the real diagnostic.
+    if i < 0 || i > 2000000 {
+        <<
+    }
+    while a.len <= i {
+        a.push(0)
+    }
+    a[i] = v
+}
+
+
+pub struct CFn {
+pub:
+    name     string
+    label    string
+    ret      int
+    params   []int
+    recv     int
+    recv_mut bool
+    // M9: owning module id ("" = legacy); is_pub for cross-module export.
+    mod_id   string
+    is_pub   bool
+    is_extern bool
+    // M11: generic template (never lowered); recv_name for method lookup key.
+    is_template bool
+    recv_name   string
+    // m37: trailing variadic parameter (last param type is already []T).
+    variadic    bool
+    // M156: lifetime-only names from `<>` (not type params).
+    lt_params   []string
+}
+
+// a struct field: name, type tag, and the byte offset within the struct
+// (C ABI packing). `nslots` on the struct is ceil(size_bytes/8).
+// M165: `life` is the `&a T` lifetime name on the field ("" = bare / non-ref).
+struct CField {
+pub:
+    name    string
+    ty      int
+    slot    int
+    life    string
+    is_pub  bool
+}
+
+// a struct definition: name, ordered field list, total slot count.
+// origin: template name when this is a monomorphized generic instance (else "").
+struct CStruct {
+pub:
+    name        string
+    fields      []CField
+    nslots      int
+    size_bytes  int
+    align_bytes int
+    mod_id      string
+    is_pub      bool
+    origin      string
+    // Reserved non-throwing drop hook: resource ownership independent of fields.
+    drop_label  string
+}
+
+// Array type descriptor.
+// fixed_len == 0 → dynamic `[]T` (3 slots: ptr,len,cap).
+// fixed_len  > 0 → inline `[N]T` (N * elem slots on the frame).
+struct CArray {
+pub:
+    elem_ty    int
+    elem_bytes int
+    fixed_len  int
+}
+
+// Channel element type (M17). Type tag 600+i; handle is 1 slot.
+struct CChan {
+    elem_ty int
+    elem_slots int
+}
+
+// Native map[K]V (MS8b/MS8d). Type tag 50+i; 1-slot owning handle.
+// kkind/vkind: 0 = 8-byte copy, 1 = string, 2 = n-slot blob (vslots words).
+struct CMap {
+pub:
+    key_ty int
+    val_ty int
+    kkind  int
+    vkind  int
+    vslots int
+}
+
+// Interned function signature (params + ret) for fn types (M103/M109).
+// Type tag 700+i. has_env=1 → owning fat ptr with env_struct heap layout.
+struct CFnSig {
+pub:
+    params     []int
+    ret        int
+    has_env    int
+    env_struct int
+}
+
+// Throw-slot descriptor. Flat {tag, payload: max(ok,err)}
+// layout (matches xumir/xurt).
+struct CThrow {
+pub:
+    ok_ty  int
+    err_ty int
+}
+
+// One enum variant (M15): unit or tuple payload field types.
+struct CEnumVariant {
+pub:
+    name        string
+    fields      []int
+    field_slots int
+}
+
+// User enum: layout {tag, payload max} like throw slots (M15). Type tag 500+i.
+struct CEnum {
+pub:
+    name     string
+    variants []CEnumVariant
+    nslots   int
+    owns     bool
+    mod_id   string
+    is_pub   bool
+    // Template name when this is a monomorphized generic instance (else "").
+    origin   string
+    args     []int
+}
+
+pub struct Checker {
+    fns []CFn
+    strings []string
+    ntype []int
+    nlocal []int
+    ncall []int
+    nstr []int
+    // M170: 1 = prepend compile-time file/line before method args (log *at).
+    ncsite []int
+    // Per-node const index when Ident resolves to a package const (-1 = none).
+    nconst []int
+    fnlocals [][]int
+    // Once-assigned int constants / known lengths, restored at MIR lower so
+    // affine `i*n+j` nocheck still sees `n := 250` after check_fn resets.
+    fnlconst [][]int
+    fnlconst_ok [][]int
+    fnllength [][]int
+    fnllength_ok [][]int
+    structs []CStruct
+    arrays []CArray
+    throws []CThrow
+    enums []CEnum
+    chans []CChan
+    maps []CMap
+    fn_sigs []CFnSig
+    // Package-level const Name = literal (M8).
+    cnames []string
+    ctypes []int
+    civals []int
+    cstr_idx []int
+    cmods []string
+    cpubs []int
+    // M9 imports: (imp_file[i], imp_path[i], imp_alias[i]) triples;
+    // import is file-scoped (Go). Alias '' = plain path (M30).
+    imp_owner []string
+    imp_path []string
+    imp_alias []string
+    imp_file []int
+    fn_file []int
+    mod_ids []string
+    // current-function state
+    lname []string
+    ltype []int
+    lmut []int
+    lactive []int
+    lmoved []int
+    // MS9a: for-in owning struct iter var is a read-only borrow view (not dropped).
+    lview []int
+    // M2b deferred moves (mirror bootstrap): locals moved out of an active
+    // barrier scope are recorded per barrier; the scope pop either unmarks
+    // them (body terminated in a <<) or reports M2b at the move.
+    pend_ids []int
+    pend_nodes []int
+    pend_marks []int
+    // M10: for ref-typed locals, origin is Param(local_id) if >=0, else Local (-1).
+    lorigin []int
+    // MS6 C: for `r := mut &e` where e is temp/struct@, laref[r] = e.
+    laref []int
+    // M156: lifetime name on ref params ("" = none / elision).
+    llife []string
+    // M150: struct locals whose embedded refs all flow from the unique ref param.
+    lrefok []int
+    marks []int
+    barriers []int
+    rebind int
+    // Statement node for move_of errors (let/assign span mirror bootstrap).
+    move_err_n int
+    // Diagnostic attribution override: when >= 0, fail_node points at this
+    // node instead of the failing node (bootstrap resolves fn-param types
+    // with the param's span, so param-type errors land on the param name).
+    attr int
+    nclone []int
+    // MS5: expected temp/struct@ after coerce_to (0 = none). Concrete ntype
+    // is kept so MIR can emit BoxTemp/BoxInterface without smashing ncall.
+    nbox []int
+    cur_ret int
+    // M156: expected << lifetime ("" = elision / non-ref).
+    cur_ret_life string
+    cur_mod string
+    cur_file int
+    // Path of cur_file (from parser.file_names), for diagnostics.
+    cur_file_name string
+    loop_depth int
+    // M175/M176: for i in 0 -> a.len induction (parallel stacks; MIR+check).
+    induct_var []int
+    induct_arr []int
+    // Wave 2: while stmt nodes whose body is proven `i < a.len` induction.
+    winduct []int
+    // Int local that holds `arr.len` (or a copy of such a local).
+    int_len_of []int
+    // Current while node while checking its body (-1 none).
+    cur_while int
+    // lo of current while started at 0 (binsearch invariant).
+    bs_ok int
+    // Binary-search while: node, mid local, array local (persist for MIR).
+    wsearch []int
+    wsearch_mid []int
+    wsearch_arr []int
+    // Pass 3 borrow checking. Statement ids are a stable preorder over the
+    // function AST. Each reference local records its owner and remains live
+    // through its last use (NLL at statement granularity).
+    bstmt []int
+    blast []int
+    bdecl []int
+    bowner []int
+    bexcl []int
+    // MS4 Place: 0 = whole local, 1 = Index projection (element hung on root).
+    bproj []int
+    // `mut &*r`: this ref local freezes the source ref until last use.
+    breb []int
+    // M162: field-stored ref borrows (holder local + field index → owner).
+    bf_holder []int
+    bf_field []int
+    bf_owner []int
+    bf_excl []int
+    bf_decl []int
+    bf_proj []int
+    // M166: nested ref pointee types (`&&T` …); tags 3000+i / 4000+i.
+    cnest []int
+    btmp_owner []int
+    btmp_excl []int
+    btmp_proj []int
+    bseq int
+    // M11: active type-param substitution (name -> type tag) for type_of.
+    sub_names []string
+    sub_tys []int
+    // Type-param names/constraints of the function being checked (constraint methods).
+    tp_names []string
+    tp_cons []string
+    // Interfaces: iface_names[i]/iface_mods[i]; methods in parallel im_* arrays.
+    iface_names []string
+    iface_mods []string
+    im_ii []int
+    im_name []string
+    im_ret []int
+    im_poff []int
+    im_plen []int
+    im_ptys []int
+    // Generic struct templates (not yet laid out).
+    stpl_name []string
+    stpl_mod []string
+    stpl_decl []int
+    stpl_pub []int
+    // Generic enum templates (MS7); laid out on instantiation.
+    etpl_name []string
+    etpl_mod []string
+    etpl_decl []int
+    etpl_pub []int
+    etpl_map StrMap
+    // Per-struct type args (empty for non-instances); parallel to structs.
+    sargs [][]int
+    // Per-struct decl node (-1 for generic instances), layout finalized, and
+    // in-progress flags; parallel to structs (recursive/on-demand layout).
+    sdecl []int
+    slaid []int
+    sdoing []int
+    // Per-fn AST decl node (template decl for monomorphized instances).
+    fndecl []int
+    // 0/1 (not []bool): rust ARM64 `[]bool.push` on this large struct SEGV.
+    is_inst []int
+    // Mangle key for instances ("" for non-instances); used for dedup.
+    inst_keys []string
+    // M190: per-instance AST annotation snapshots (shared template bodies).
+    inst_snap_ready []int
+    inst_snap_type [][]int
+    inst_snap_local [][]int
+    inst_snap_call [][]int
+    inst_snap_str [][]int
+    inst_snap_const [][]int
+    inst_snap_clone [][]int
+    inst_snap_box [][]int
+    // Source fn count after pass 1 (instances append after this).
+    n_src_fns int
+    // Instantiation budget (matches bootstrap 512).
+    n_fn_inst int
+    // Scratch bindings for generic call-site inference (Param index → type).
+    uni_bind []int
+    // Scratch type-arg slots (collect_type_list_n / instantiate_fn_n).
+    targs0 int
+    targs1 int
+    targs2 int
+    targs3 int
+    targs_n int
+    // E0: 1 = freestanding (no read_file / write_file / args).
+    freestanding int
+    // m32: 1 = test mode (entry `main` is generated at MIR level, not AST).
+    test_mode int
+    // `-On` MIR tier copied from `Mir.opt_level` before lowering.
+    opt_level int
+    test_failfast int
+    test_count int
+    test_list int
+    // 1 = --lib/--shared: no main required.
+    lib_mode int
+    // Labels of functions provided by a linked .a/.dylib (stubs must be extern).
+    lib_ext_labs []string
+    // MMIO window (volatile_* / raise_irq). allow_mmio=0 on hosted.
+    allow_mmio int
+    mmio_lo int
+    mmio_hi int
+    // 1 while checking fn irq_N.
+    in_irq int
+    // M36 warning channel: file id / line / col / message per warning.
+    warn_file []int
+    warn_line []int
+    warn_col []int
+    warn_msg []string
+    // M36 v1 constant tracking per local: int constant value (single-assignment)
+    // and known length of an array/string literal (for E3/E4 constant checks).
+    lconst []int
+    lconst_ok []int
+    // MS6 A2: proven upper bound (local ≤ lub[i]); independent of exact lconst.
+    lub []int
+    lub_ok []int
+    llength []int
+    llength_ok []int
+    // M36 W2: proven-nonzero locals after guard (if x <= 0 { << }).
+    lnz []int
+    lnz_ok []int
+    // M36 W2: proven-nonzero field paths (receiver_local, field_name).
+    fnz_recv []int
+    fnz_name []string
+    // Wave 2: one-hop copy of a local (`j := i` / `j = i`); -1 = none.
+    calias []int
+    // M36 W1: call-graph edges collected while checking bodies.
+    cur_fn int
+    cg_from []int
+    cg_to []int
+    // M109: closure seq + capture remapping while checking a FnLit body.
+    closure_seq int
+    cap_active int
+    cap_names []string
+    cap_fields []int
+    cap_tys []int
+    // Per-fn: env struct type tag (struct_type(si)) or -1; capture outer local ids.
+    clos_env []int
+    clos_caps [][]int
+    // M154: trampoline fn → real method index (-1 = not a bound trampoline).
+    bound_mfi []int
+    // Per-fn: monomorph type args T0..T3 (concrete tags; -1 if unused).
+    inst_t0 []int
+    inst_t1 []int
+    inst_t2 []int
+    inst_t3 []int
+    // Scratch for M156 lifetime/named-type collection while registering fns.
+    lt_scan []string
+    named_scan []string
+    // M188/M189: intern + open-address maps (fn/struct/string/instance keys).
+    str_map StrMap
+    fn_map StrMap
+    st_map StrMap
+    inst_map StrMap
+    mod_map StrMap
+    alias_map StrMap
+    vis_map StrMap
+    const_map StrMap
+    iface_map StrMap
+    stpl_map StrMap
+    method_map StrMap
+    subst_map StrMap
+    array_map StrMap
+    throw_map StrMap
+    chan_map StrMap
+    map_map StrMap
+    fn_sig_map StrMap
+    iface_glob_map StrMap
+    lname_id []int
+    lhead []int
+    lprev []int
+    // §5.7: throw/or — may_throw fns lower as throw-slot {ret, errors.Error}.
+    fn_may_throw []int
+    fn_throw_ty []int
+    // Safe copies of fn name/mod outside CFn — WoA x64 scrambles string
+    // fields inside c.fns[i] after large struct push.
+    fn_safe_name []string
+    fn_safe_mod []string
+    errors_iface int
+    cur_throw_ty int
+    in_or_catch int
+    or_assign string
+    // MS6 loop CFG: stacked snapshots of lmoved at loop entry, plus consume
+    // unions on break vs back-edge (continue / fall-through).
+    las_off []int
+    las_snap []int
+    las_brk []int
+    las_back []int
+    // MS6 field-level `as`: per-local bitmask of consumed temp/struct@ fields
+    // (bit i = field index i; indices >= 63 fall back to whole-binding).
+    lfcons []int
+    // Nested Field `as` paths (4 packed slots per local; 0 = empty).
+    // Root-first base-64: each digit is field_index+1. Depth>=2 is path>=64.
+    lfpath []int
+    // Stacked lfcons snapshots / unions for if+match+select as-join (parallel
+    // to as_join_snap's lmoved vector so check_11 call sites stay unchanged).
+    aj_off []int
+    aj_fc []int
+    aj_union []int
+    aj_path []int
+    aj_path_u []int
+    // Loop field-consume snap / break / back-edge unions (parallel to las_*).
+    las_fc []int
+    las_fc_brk []int
+    las_fc_back []int
+    las_path []int
+    las_path_brk []int
+    las_path_back []int
+    // Multi-error: printed immediately; process exits after check_program.
+    error_count int
+    fn_err_base int
+    mir_lower_ns int
+    mir_borrow_gate bool
+}
+
+// Typecheck (+ optional lower). Caller must allocate Checker in another
+// module via `Checker{}` (all fields private → MIR zero-fill). Never return
+// Checker by value: windows-x64 large sret leaves map fields as garbage.
+pub fn (c &Checker) mir_time_ns() int { << c.mir_lower_ns }
+
+pub fn (c &mut Checker) set_mir_borrow_gate(enabled bool) { c.mir_borrow_gate = enabled }
+
+pub fn run_checker(c &mut Checker, p &parser.Parser, target_code int, test_mode int, lib_mode int, lib_ext []string, extern_labs []string, do_lower int, m &mut Mir, test_names []string, test_filter string, test_verbose bool, test_failfast bool, test_count int, test_list bool, out_fns &mut []CFn) {
+    c.finish_check(p, target_code, test_mode, lib_mode, lib_ext, extern_labs, do_lower, m, test_names, test_filter, test_verbose, test_failfast, test_count, test_list, out_fns)
+}
+
+
+fn (c &mut Checker) finish_check(p &parser.Parser, target_code int, test_mode int, lib_mode int, lib_ext []string, extern_labs []string, do_lower int, m &mut Mir, test_names []string, test_filter string, test_verbose bool, test_failfast bool, test_count int, test_list bool, out_fns &mut []CFn) {
+    // Cross-module Checker{} zero-fills private fields. Restore sentinels
+    // that are not 0, then unique-empty every map/slice (WoA x64 sret-safe).
+    c.rebind = -1
+    c.move_err_n = -1
+    c.attr = -1
+    c.cur_while = 0 - 1
+    c.errors_iface = -1
+    c.test_count = 1
+    c.opt_level = 1
+    c.seed_strmaps()
+    c.seed_slices()
+    c.opt_level = m.opt_level
+    c.prep_nodes(p.nodes.len)
+    c.apply_target(target_code)
+    if test_mode == 1 {
+        c.apply_test_mode()
+    }
+    if test_failfast {
+        c.test_failfast = 1
+    }
+    if test_count > 0 {
+        c.test_count = test_count
+    }
+    if test_list {
+        c.test_list = 1
+    }
+    c.lib_mode = lib_mode
+    for i in 0:lib_ext.len {
+        c.add_lib_ext(lib_ext[i] + "")
+    }
+    c.check_program(p)
+    for i in 0:c.fns.len {
+        for j in 0:extern_labs.len {
+            if c.fns[i].label == extern_labs[j] {
+                c.fns[i].is_extern = true
+            }
+        }
+    }
+    c.emit_warnings(p)
+    if c.error_count > 0 {
+        <<< 1
+    }
+    c.mir_lower_ns = 0
+    if do_lower == 1 {
+        started := now_ns()
+        c.lower_program(p, m)
+        if test_mode == 1 {
+            mut names_copy := []string{}
+            for i in 0:test_names.len {
+                names_copy.push(mir_test_name_owned(&test_names, i))
+            }
+            mut filter_bytes := []int{}
+            for i in 0:test_filter.len { filter_bytes.push(test_filter[i]) }
+            mut filter_copy := string_from_bytes(filter_bytes)
+            c.inject_test_harness_mir(m, p, names_copy, filter_copy, test_verbose)
+        }
+        c.mir_lower_ns = now_ns() - started
+    }
+    for i in 0:c.fns.len {
+        mut ps := []int{}
+        plen := c.fns[i].params.len
+        for j in 0:plen {
+            ps.push(c.fns[i].params[j])
+        }
+        mut lts := []string{}
+        ltlen := c.fns[i].lt_params.len
+        for j in 0:ltlen {
+            lts.push(c.fns[i].lt_params[j] + "")
+        }
+        out_fns.push(CFn{
+            name: c.fns[i].name + "",
+            label: c.fns[i].label + "",
+            ret: c.fns[i].ret,
+            params: ps,
+            recv: c.fns[i].recv,
+            recv_mut: c.fns[i].recv_mut,
+            mod_id: c.fns[i].mod_id + "",
+            is_pub: c.fns[i].is_pub,
+            is_extern: c.fns[i].is_extern,
+            is_template: c.fns[i].is_template,
+            recv_name: c.fns[i].recv_name + "",
+            variadic: c.fns[i].variadic,
+            lt_params: lts
+        })
+    }
+}
+
+pub fn check_only(p &parser.Parser, target_code int, c &mut Checker) {
+    mut m := empty_mir()
+    mut out_fns := []CFn{}
+    run_checker(c, p, target_code, 0, 0, []string{}, []string{}, 0, mut &m, []string{}, "", false, false, 1, false, mut &out_fns)
+    emit_check_risks(p)
+}
+
+pub fn (c &mut Checker) prep_nodes(nnodes int) {
+    for i in 0:nnodes {
+        c.ntype.push(0)
+        c.nlocal.push(-1)
+        c.ncall.push(-1)
+        c.nstr.push(-1)
+        c.ncsite.push(0)
+        c.nconst.push(-1)
+        c.nclone.push(0)
+        c.nbox.push(0)
+        c.bstmt.push(-1)
+    }
+}
+
+
+pub fn (c &mut Checker) check_program(p &parser.Parser) {
+    // Default attribution: the first CLI file (file 0).
+    c.set_cur_file(p, 0)
+    c.check_names(p)
+    // Copy module table / imports from the merged parser.
+    // Cache `.len` in ints — Gen1→Gen2 emit drops live `.len` across calls
+    // (push / map_put), which skipped module registration and false-failed
+    // `module_exists` (e.g. `xu.ast not found`).
+    n_mods := p.mod_ids.len
+    for i in 0:n_mods {
+        mid := p.mod_ids[i] + ""
+        c.mod_ids.push(mid + "")
+        strmap_put(mut &c.mod_map, mid + "", i)
+    }
+    n_imps := p.imp_path.len
+    for i in 0:n_imps {
+        c.imp_owner.push(p.imp_owner[i] + "")
+        c.imp_path.push(p.imp_path[i] + "")
+        c.imp_alias.push(p.imp_alias[i] + "")
+        c.imp_file.push(p.imp_file[i])
+        strmap_put(mut &c.vis_map, file_key(p.imp_file[i], p.imp_path[i] + ""), i)
+        qual := import_default_qualifier(p.imp_path[i] + "", p.imp_alias[i] + "")
+        qual_key := file_key(p.imp_file[i], qual + "")
+        existing := strmap_get(&c.alias_map, &qual_key)
+        if existing >= 0 {
+            c.fail_at(1, 1, "duplicate import alias '" + qual + "'")
+        }
+        strmap_put(mut &c.alias_map, qual_key, i)
+        if qual.len > 0 && qual != p.imp_path[i] {
+            strmap_put(mut &c.vis_map, file_key(p.imp_file[i], qual + ""), i)
+            strmap_put(mut &c.alias_map, file_key(p.imp_file[i], qual + ""), i)
+        }
+        if p.imp_alias[i].len > 0 {
+            strmap_put(mut &c.alias_map, file_key(p.imp_file[i], p.imp_alias[i] + ""), i)
+        }
+    }
+    // Imports must name a module present in this compilation.
+    n_imps2 := c.imp_path.len
+    for i in 0:n_imps2 {
+        if !c.module_exists(c.imp_path[i]) {
+            c.fail_at(1, 1, "module '" + c.imp_path[i] + "' not found in compilation inputs")
+        }
+    }
+    // Pass 0: register struct names (so cross-package field types like
+    // `[]ast.Token` resolve even if the field's struct is declared later).
+    n_decls := p.decls.len
+    for i in 0:n_decls {
+        d := p.decls[i]
+        if p.nodes[d].kind == 44 {
+            c.register_struct_name(p, d)
+        }
+    }
+    for i in 0:n_decls {
+        d := p.decls[i]
+        if p.nodes[d].kind == 46 {
+            c.register_interface_name(p, d)
+        }
+    }
+    for i in 0:n_decls {
+        d := p.decls[i]
+        if p.nodes[d].kind == 44 {
+            c.layout_struct(p, d)
+        }
+    }
+    for i in 0:n_decls {
+        d := p.decls[i]
+        if p.nodes[d].kind == 49 {
+            c.register_enum(p, d)
+        }
+    }
+    for i in 0:n_decls {
+        d := p.decls[i]
+        if p.nodes[d].kind == 46 {
+            c.resolve_interface_methods(p, d)
+        }
+    }
+    for i in 0:n_decls {
+        d := p.decls[i]
+        if p.nodes[d].kind == 48 {
+            c.register_const(p, d)
+        }
+    }
+    for i in 0:n_decls {
+        d := p.decls[i]
+        k := p.nodes[d].kind
+        if k == 40 {
+            c.register_fn(p, d)
+        }
+    }
+    c.setup_throw_metadata(p)
+    c.validate_resource_drops(p)
+    c.validate_runtime_abi(p)
+    if c.error_count > 0 { << }
+    c.n_src_fns = c.fns.len
+    n_src := c.n_src_fns
+    for i in 0:n_src {
+        err0 := c.error_count
+        c.check_fn(p, c.fndecl[i], i)
+        if c.error_count == err0 {
+            c.borrow_check_fn(p, c.fndecl[i])
+        }
+    }
+    if c.test_mode == 0 {
+        em := c.find_entry_main()
+        if em == -1 {
+            if c.lib_mode == 0 {
+                c.set_cur_file(p, 0)
+                c.fail_at(1, 1, "no main function")
+            }
+        }
+        if em == -2 {
+            c.set_cur_file(p, 0)
+            c.fail_at(1, 1, "multiple main functions")
+        }
+    }
+    if c.error_count > 0 {
+        <<
+    }
+    c.detect_recursion(p)
+    // Preparing a concrete body can discover another generic helper. Keep
+    // processing the worklist until all transitive specializations are ready.
+    mut fi := c.n_src_fns
+    while fi < c.fns.len {
+        if fi < c.is_inst.len && c.is_inst[fi] != 0 {
+            if fi >= c.inst_snap_ready.len || c.inst_snap_ready[fi] == 0 {
+                c.finalize_instance(p, fi)
+                if c.error_count > 0 { << }
+            }
+        }
+        fi += 1
+    }
+    for ai in 0:c.arrays.len {
+        if c.arrays[ai].fixed_len > 0 && c.type_contains_resource(c.arrays[ai].elem_ty) {
+            c.fail_at(1, 1, "fixed arrays containing resource owners are not supported")
+        }
+    }
+    if c.error_count > 0 { << }
+    // A struct field can intern chan T before T's payload layout is complete.
+    // Refresh widths after declarations and generic instances are finalized,
+    // before MIR emits channel allocation/send/receive using this table.
+    for ci in 0:c.chans.len {
+        elem := c.chans[ci].elem_ty
+        slots := c.type_slots(elem)
+        c.chans[ci].elem_slots = slots
+    }
+}

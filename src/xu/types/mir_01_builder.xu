@@ -1,0 +1,1041 @@
+@xu/types
+
+#xu/parser
+
+fn (f &mut MFn) new_temp(ty int, nslots int) int {
+    f.temps.push(ty)
+    f.temps_nslots.push(nslots)
+    << f.temps.len - 1
+}
+
+// Mid-function hold local (e.g. Index/Call results used as by-pointer args).
+// Survives sibling arg evaluation; temps alone do not under Gen1→Gen2 nested
+// path_join(arr[i], Call(...)).
+fn (f &mut MFn) new_local(ty int, nslots int, owning bool) int {
+    f.locals.push(ty)
+    f.locals_nslots.push(nslots)
+    f.locals_owning.push(owning)
+    f.moved.push(false)
+    f.fcons.push(0)
+    << f.locals.len - 1
+}
+
+fn (f &mut MFn) typed_value(v int, ty int) int {
+    if v >= 0 { << v }
+    t := f.new_temp(ty, 1)
+    mut cpy := mkinstr(1)
+    cpy.a = t
+    cpy.b = v
+    f.emit(cpy)
+    << t
+}
+
+fn (f &mut MFn) link_marg(last int, idx int) {
+    mut prev := f.margs[last]
+    prev.next = idx
+    f.margs[last] = prev
+}
+
+fn (f &mut MFn) vconst(x int) int {
+    f.consts.push(x)
+    << -2 - (f.consts.len - 1)
+}
+
+// §4.5: zero-init a field omitted from a cross-module struct literal.
+fn (f &mut MFn) zero_for_type(c &mut Checker, ty int) int {
+    if ty == 1 || ty == 2 || ty == 4 {
+        << f.vconst(0)
+    }
+    if ty == 3 {
+        t := f.new_temp(3, 3)
+        mut ins := mkinstr(6)
+        ins.a = t
+        ins.b = 0
+        f.emit(ins)
+        << t
+    }
+    << f.vconst(0)
+}
+
+fn mkinstr(kind int) MInstr {
+    << MInstr{kind: kind, a: -1, b: -1, c: -1, d: -1, sval: "", next: -1, line: 0, col: 0, file: 0}
+}
+
+fn (f &MFn) get_block(i int) MBlock {
+    << MBlock{
+        head: f.blocks[i].head,
+        tail: f.blocks[i].tail,
+        tkind: f.blocks[i].tkind,
+        ta: f.blocks[i].ta,
+        tb: f.blocks[i].tb,
+        tc: f.blocks[i].tc,
+        line: f.blocks[i].line
+    }
+}
+
+fn (f &mut MFn) set_block(i int, b MBlock) { f.blocks[i] = b }
+
+fn (f &mut MFn) emit(ins MInstr) {
+    idx := f.instrs.len
+    f.instrs.push(ins)
+    mut blk := f.get_block(f.cur)
+    if blk.tail >= 0 {
+        // link previous tail -> this instr
+        mut prev := mkinstr(0)
+        prev.kind = f.instrs[blk.tail].kind
+        prev.a = f.instrs[blk.tail].a
+        prev.b = f.instrs[blk.tail].b
+        prev.c = f.instrs[blk.tail].c
+        prev.d = f.instrs[blk.tail].d
+        // `MInstr.sval` is an owning string.  Copying the descriptor here
+        // and then replacing `f.instrs[blk.tail]` drops the old backing
+        // allocation, leaving the linked-list predecessor dangling.  This
+        // is especially visible for heap-built function-value shims during
+        // Gen1 -> Gen2 self-hosting.  Materialise the value before the whole
+        // element rewrite, as the optimizer clone path already does.
+        prev.sval = mfn_sval_clone_owned(&f.instrs, blk.tail)
+        prev.next = idx
+        prev.line = f.instrs[blk.tail].line
+        prev.col = f.instrs[blk.tail].col
+        prev.file = f.instrs[blk.tail].file
+        f.instrs[blk.tail] = prev
+    } else {
+        blk.head = idx
+    }
+    blk.tail = idx
+    f.set_block(f.cur, blk)
+}
+
+fn (f &mut MFn) terminate(tkind int, ta int, tb int, tc int) {
+    mut blk := f.get_block(f.cur)
+    blk.tkind = tkind
+    blk.ta = ta
+    blk.tb = tb
+    blk.tc = tc
+    f.set_block(f.cur, blk)
+}
+
+fn (f &MFn) block_open() bool { << f.blocks[f.cur].tkind == 0 }
+
+fn (f &MFn) live_and_open() bool { << !f.dead && f.block_open() }
+
+fn (f &mut MFn) new_block() int {
+    ln := f.cur_line
+    f.blocks.push(MBlock{head: -1, tail: -1, tkind: 0, ta: -1, tb: -1, tc: -1, line: ln})
+    << f.blocks.len - 1
+}
+
+fn (f &mut MFn) switch_to(b int) {
+    f.cur = b
+    f.dead = false
+}
+
+// ===== scopes & drops (mirror xumir FnBuilder) =====
+
+// AssignOp 2..6 -> BinOp 1..5 (Add..Mod).
+fn compound_binop(aop int) int {
+    << aop - 1
+}
+
+// M172: encode element size; negative => emit elides bounds check.
+fn elem_d(bytes int, nocheck bool) int {
+    if nocheck { << 0 - bytes }
+    << bytes
+}
+
+fn (f &mut MFn) induct_push(var_lid int, arr_lid int) {
+    f.induct_var.push(var_lid)
+    f.induct_arr.push(arr_lid)
+}
+
+fn (f &mut MFn) induct_pop() {
+    if f.induct_var.len == 0 { << }
+    mut nv := []int{}
+    mut na := []int{}
+    for i in 0:f.induct_var.len - 1 {
+        nv.push(f.induct_var[i])
+        na.push(f.induct_arr[i])
+    }
+    f.induct_var = nv
+    f.induct_arr = na
+}
+
+fn (f &MFn) induction_nocheck(p &parser.Parser, c &mut Checker, arr int, idx int) bool {
+    if arr < 0 || idx < 0 { << false }
+    mut abase := arr
+    if p.nodes[abase].kind == 10 {
+        abase = p.nodes[abase].a
+    }
+    if p.nodes[abase].kind != 4 || p.nodes[idx].kind != 4 { << false }
+    alid := c.nlocal[abase]
+    ilid := c.nlocal[idx]
+    if alid < 0 || ilid < 0 { << false }
+    for i in 0:f.induct_var.len {
+        if f.induct_var[i] == ilid && f.induct_arr[i] == alid {
+            << true
+        }
+    }
+    if ilid < c.calias.len {
+        alid2 := c.calias[ilid]
+        if alid2 >= 0 {
+            for i in 0:f.induct_var.len {
+                if f.induct_var[i] == alid2 && f.induct_arr[i] == alid {
+                    << true
+                }
+            }
+        }
+    }
+    << false
+}
+
+fn (f &MFn) index_nocheck(p &parser.Parser, c &mut Checker, arr int, idx int) bool {
+    if f.induction_nocheck(p, c, arr, idx) { << true }
+    << c.index_bounds_proven(p, arr, idx)
+}
+
+// G3/D1/D2: fail-loud guards for int div/mod. Zero divisor first
+// (`_rt_div_zero`), then signed overflow INT_MIN/-1 (`_rt_div_overflow`).
+// Together these are every x64 idiv #DE case. f64 keeps IEEE.
+fn (f &mut MFn) div_int_guard(lhs int, rhs int, ty int) {
+    if ty == 4 { << }
+    // Literal divisor: 0 and INT_MIN/-1 are compile-time (check_int_div).
+    // Any other constant cannot be zero and cannot be -1, so the runtime
+    // branches are dead. Variable divisors keep both checks.
+    if rhs <= -2 {
+        ci := 0 - rhs - 2
+        if ci >= 0 && ci < f.consts.len {
+            rv := f.consts[ci]
+            if rv != 0 && rv != (0 - 1) {
+                <<
+            }
+        }
+    }
+    after_z := f.new_block()
+    fail_z := f.new_block()
+    f.terminate(2, rhs, after_z, fail_z)
+    f.switch_to(fail_z)
+    mut dz := mkinstr(7)
+    dz.a = -1
+    dz.b = 1
+    dz.c = -1
+    dz.sval = "_rt_div_zero"
+    f.emit(dz)
+    f.terminate(1, after_z, -1, -1)
+    f.switch_to(after_z)
+    is_min := f.new_temp(2, 1)
+    mut eq1 := mkinstr(4)
+    eq1.a = is_min
+    eq1.b = 6
+    eq1.c = lhs
+    eq1.d = f.vconst(0 - 9223372036854775807 - 1)
+    f.emit(eq1)
+    chk_neg := f.new_block()
+    cont := f.new_block()
+    f.terminate(2, is_min, chk_neg, cont)
+    f.switch_to(chk_neg)
+    is_neg := f.new_temp(2, 1)
+    mut eq2 := mkinstr(4)
+    eq2.a = is_neg
+    eq2.b = 6
+    eq2.c = rhs
+    eq2.d = f.vconst(0 - 1)
+    f.emit(eq2)
+    fail_o := f.new_block()
+    f.terminate(2, is_neg, fail_o, cont)
+    f.switch_to(fail_o)
+    mut dov := mkinstr(7)
+    dov.a = -1
+    dov.b = 1
+    dov.c = -1
+    dov.sval = "_rt_div_overflow"
+    f.emit(dov)
+    f.terminate(1, cont, -1, -1)
+    f.switch_to(cont)
+}
+
+// Push a loop target together with the number of lexical scopes that remain
+// live when control transfers to break/continue.  Scope frames at or above
+// this depth belong to the loop body and must be cleaned before the jump.
+fn (f &mut MFn) push_loop(end_bb int, cont_bb int, scope_depth int) {
+    f.loop_break.push(end_bb)
+    f.loop_cont.push(cont_bb)
+    f.loop_scope_depth.push(scope_depth)
+}
+
+fn (f &mut MFn) pop_loop() {
+    mut br := []int{}
+    mut ct := []int{}
+    mut sd := []int{}
+    for i in 0:f.loop_break.len - 1 {
+        br.push(f.loop_break[i])
+        ct.push(f.loop_cont[i])
+        if i < f.loop_scope_depth.len {
+            sd.push(f.loop_scope_depth[i])
+        }
+    }
+    f.loop_break = br
+    f.loop_cont = ct
+    f.loop_scope_depth = sd
+}
+
+// OPT P1: condition cheap enough to duplicate for loop invert.
+// Rejects calls and short-circuit &&/|| (those split the current block).
+// Also rejects Field/Index: Gen1→Gen2 large frames segfault when LoadField
+// (.len) is evaluated on an inverted self-loop latch; keep a separate cond_bb
+// (same shape as `lim := arr.len; while i < lim`).
+fn expr_is_cheap_cond(p &parser.Parser, n int) bool {
+    if n < 0 {
+        << false
+    }
+    k := p.nodes[n].kind
+    if k == 1 || k == 2 || k == 4 || k == 18 {
+        << true
+    }
+    if k == 15 {
+        if !expr_is_cheap_cond(p, p.nodes[n].a) {
+            << false
+        }
+        << expr_is_cheap_cond(p, p.nodes[n].b)
+    }
+    // UnOp / Cast / SField-of-ident only — not NField(7) / NIndex(13).
+    if k == 16 || k == 17 || k == 19 {
+        << expr_is_cheap_cond(p, p.nodes[n].a)
+    }
+    << false
+}
+
+fn stmts_have_own_continue(p &parser.Parser, head int) bool {
+    mut s := head
+    for _g in 0:p.nodes.len {
+        if s < 0 {
+            << false
+        }
+        if node_has_own_continue(p, s) {
+            << true
+        }
+        s = p.nodes[s].next
+    }
+    << false
+}
+
+fn node_has_own_continue(p &parser.Parser, n int) bool {
+    if n < 0 {
+        << false
+    }
+    k := p.nodes[n].kind
+    if k == 34 {
+        << true
+    }
+    if k == 26 || k == 27 || k == 32 {
+        << false
+    }
+    if k == 24 {
+        mut br := p.nodes[n].a
+        for _g in 0:p.nodes.len {
+            if br < 0 {
+                << false
+            }
+            if stmts_have_own_continue(p, p.nodes[br].b) {
+                << true
+            }
+            br = p.nodes[br].next
+        }
+        << false
+    }
+    if k == 28 {
+        mut arm := p.nodes[n].b
+        for _g in 0:p.nodes.len {
+            if arm < 0 {
+                << false
+            }
+            if stmts_have_own_continue(p, p.nodes[arm].c) {
+                << true
+            }
+            arm = p.nodes[arm].next
+        }
+        << false
+    }
+    if k == 60 {
+        mut ar := p.nodes[n].a
+        for _g in 0:p.nodes.len {
+            if ar < 0 {
+                <-
+            } else {
+                if stmts_have_own_continue(p, p.nodes[ar].c) {
+                    << true
+                }
+                ar = p.nodes[ar].next
+            }
+        }
+        << stmts_have_own_continue(p, p.nodes[n].c)
+    }
+    if k == 22 {
+        << node_has_own_continue(p, p.nodes[n].a)
+    }
+    if k == 71 {
+        << stmts_have_own_continue(p, p.nodes[n].c)
+    }
+    << false
+}
+
+fn stmts_have_own_break(p &parser.Parser, head int) bool {
+    mut s := head
+    for _g in 0:p.nodes.len {
+        if s < 0 {
+            << false
+        }
+        if node_has_own_break(p, s) {
+            << true
+        }
+        s = p.nodes[s].next
+    }
+    << false
+}
+
+fn node_has_own_break(p &parser.Parser, n int) bool {
+    if n < 0 {
+        << false
+    }
+    k := p.nodes[n].kind
+    if k == 33 {
+        << true
+    }
+    if k == 26 || k == 27 || k == 32 {
+        << false
+    }
+    if k == 24 {
+        mut br := p.nodes[n].a
+        for _g in 0:p.nodes.len {
+            if br < 0 {
+                << false
+            }
+            if stmts_have_own_break(p, p.nodes[br].b) {
+                << true
+            }
+            br = p.nodes[br].next
+        }
+        << false
+    }
+    if k == 28 {
+        mut arm := p.nodes[n].b
+        for _g in 0:p.nodes.len {
+            if arm < 0 {
+                << false
+            }
+            if stmts_have_own_break(p, p.nodes[arm].c) {
+                << true
+            }
+            arm = p.nodes[arm].next
+        }
+        << false
+    }
+    << false
+}
+
+fn (f &mut MFn) emit_int_lt_local(varid int, limit int) int {
+    iv := f.new_temp(1, 1)
+    mut li := mkinstr(2)
+    li.a = iv
+    li.b = varid
+    f.emit(li)
+    cond := f.new_temp(2, 1)
+    mut bi := mkinstr(4)
+    bi.a = cond
+    bi.b = 8
+    bi.c = iv
+    bi.d = limit
+    f.emit(bi)
+    << cond
+}
+
+fn (f &mut MFn) emit_int_add_imm(v int, imm int) int {
+    if imm == 0 {
+        << v
+    }
+    t := f.new_temp(1, 1)
+    mut bi := mkinstr(4)
+    bi.a = t
+    bi.b = 1
+    bi.c = v
+    bi.d = f.vconst(imm)
+    f.emit(bi)
+    << t
+}
+
+fn (f &mut MFn) emit_int_inc_local(varid int) {
+    iv := f.new_temp(1, 1)
+    mut li := mkinstr(2)
+    li.a = iv
+    li.b = varid
+    f.emit(li)
+    inc := f.new_temp(1, 1)
+    mut bi := mkinstr(4)
+    bi.a = inc
+    bi.b = 1
+    bi.c = iv
+    bi.d = f.vconst(1)
+    f.emit(bi)
+    mut si := mkinstr(3)
+    si.a = varid
+    si.b = inc
+    f.emit(si)
+}
+
+fn (f &mut MFn) push_scope() {
+    // Hoist len: push mutably borrows the receiver.
+    n := f.scope_ids.len
+    f.scopes.push(n)
+    f.scount.push(0)
+}
+
+fn (f &mut MFn) scope_add(local int) {
+    f.scope_ids.push(local)
+    top := f.scount.len - 1
+    n := f.scount[top] + 1
+    f.scount[top] = n
+}
+
+// Drop instructions for locals recorded in one scope frame, reverse order.
+fn (f &mut MFn) emit_drop_scope(si int) {
+    // Scope-exit drop covers owning scalar/string/array locals, plus owning
+    // aggregates whose deep drop is type-directed in emit_drop_value (struct
+    // fields / Result payload / map buckets). Ledger multi-instance showed
+    // `struct U { s string }` field-churn left live_bytes>0 because structs
+    // were still on the conservative skip path.
+    if si < 0 || si >= f.scopes.len {
+        <<
+    }
+    base := f.scopes[si]
+    count := f.scount[si]
+    mut i := base + count
+    while i > base {
+        i -= 1
+        id := f.scope_ids[i]
+        if id >= 0 && id < f.locals.len && id < f.locals_owning.len && id < f.moved.len {
+            if f.locals_owning[id] && !f.moved[id] {
+                ty := f.locals[id]
+                if ty == 3 || is_array_type(ty) || is_struct_type(ty) || is_throw_type(ty) || is_enum_type(ty) || is_map_type(ty) || is_temp_type(ty) || is_any_type(ty) || is_interface_type(ty) || is_fn_type(ty) {
+                    mut di := mkinstr(8)
+                    di.a = id
+                    f.emit(di)
+                }
+            }
+        }
+    }
+}
+
+// Emit cleanup for every scope introduced inside the active loop.  This is
+// used on explicit break/continue edges because those edges bypass the normal
+// lexical `pop_scope_with_drops` at the end of the body.  The helper is kept
+// deliberately in terms of the existing narrow scalar-string drop policy;
+// aggregate/boxed ownership remains on the conservative path.
+fn (f &mut MFn) emit_loop_scope_drops(depth int) {
+    if depth < 0 { << }
+    mut si := f.scopes.len - 1
+    while si >= depth {
+        f.emit_drop_scope(si)
+        si -= 1
+    }
+}
+
+fn (f &mut MFn) pop_scope_with_drops() {
+    top := f.scopes.len - 1
+    if f.live_and_open() {
+        f.emit_drop_scope(top)
+    }
+    // pop scope frame (and truncate the flat id list to the new top base)
+    base := f.scopes[top]
+    mut ss := []int{}
+    mut cc := []int{}
+    for i in 0:top {
+        ss.push(f.scopes[i])
+        cc.push(f.scount[i])
+    }
+    f.scopes = ss
+    f.scount = cc
+    mut ids := []int{}
+    for i in 0:base {
+        ids.push(f.scope_ids[i])
+    }
+    f.scope_ids = ids
+}
+
+// Drops for all alive locals across all scopes (early-<< paths).
+fn (f &mut MFn) emit_drops_all() {
+    for i in 0:f.scopes.len {
+        // Inner scopes first (reverse of declaration order across frames).
+        f.emit_drop_scope(f.scopes.len - 1 - i)
+    }
+}
+
+// Record a move out of an owning local read (mirror xumir mark_move_of).
+fn (f &mut MFn) mark_move_of(p &parser.Parser, c &mut Checker, n int) {
+    // Checker nclone=1 means the read is a heap clone; the source binding
+    // still owns its descriptor. Never whole-move the container on that path
+    // (string field/array-elem args used to mark the struct moved and skip
+    // scope-drop — ledger live_bytes leftover).
+    if n >= 0 && n < c.nclone.len && c.nclone[n] == 1 {
+        <<
+    }
+    k0 := p.nodes[n].kind
+    // Scalar / non-owning field or index reads (`s.len`, `a[i]` int) must not
+    // whole-move the container. `<< s.len` used to mark the string param moved
+    // and skip its return-path Drop (ledger live leftover on take()+return).
+    if k0 == 7 || k0 == 13 {
+        fty := c.ntype[n]
+        if !c.type_owning(fty) && !is_linear_dynamic(fty) && fty != 3 {
+            <<
+        }
+    }
+    if k0 == 7 && is_linear_dynamic(c.ntype[n]) {
+        obj0 := p.nodes[n].a
+        ok := p.nodes[obj0].kind
+        if ok == 7 || ok == 13 {
+            // Nested Field / Field-of-Index: zero the leaf; keep parent owning.
+            <<
+        }
+        id := c.as_top_field_id(p, n)
+        fi := c.as_top_field_fi(p, n)
+        bit := field_bit(fi)
+        if id >= 0 && id < f.fcons.len && bit != 0 {
+            v := f.fcons[id] | bit
+            f.fcons[id] = v
+            <<
+        }
+    }
+    // Owning Field (including string when nclone is unset): record the leaf
+    // only. Whole-moving the struct would skip sibling-field scope-drop.
+    if k0 == 7 && c.type_owning(c.ntype[n]) {
+        obj0 := p.nodes[n].a
+        ok := p.nodes[obj0].kind
+        if ok == 4 {
+            id := c.as_top_field_id(p, n)
+            fi := c.as_top_field_fi(p, n)
+            bit := field_bit(fi)
+            if id >= 0 && id < f.fcons.len && bit != 0 {
+                f.fcons[id] = f.fcons[id] | bit
+                <<
+            }
+            <<
+        }
+        if ok == 7 || ok == 13 {
+            <<
+        }
+    }
+    if k0 == 13 {
+        obj := p.nodes[n].a
+        // Scalar / non-owning element read copies the value. The array stays
+        // owned by its binding — do not mark it moved (if-join drop pads
+        // would free it on the other path; own_scalar_read_keeps_owner).
+        elem_ty := c.ntype[n]
+        // int/f64/bool/ref reads are pure copies; do not mark the array moved.
+        // String/owning elements are handled by the linear-dynamic arms below.
+        if elem_ty == 1 || elem_ty == 2 || elem_ty == 4 || elem_ty == 8 || elem_ty == 9 || elem_ty == 10 || is_ref_type(elem_ty) || is_chan_type(elem_ty) {
+            mut base := obj
+            for _ in 0:p.nodes.len {
+                if p.nodes[base].kind == 7 || p.nodes[base].kind == 13 {
+                    base = p.nodes[base].a
+                } else {
+                    <-
+                }
+            }
+            if p.nodes[base].kind == 4 && c.nconst[base] < 0 {
+                <<
+            }
+        }
+        if p.nodes[obj].kind == 4 && is_linear_dynamic(c.ntype[n]) {
+            id := c.nlocal[obj]
+            ei := c.as_const_index(p, p.nodes[n].b)
+            bit := field_bit(ei)
+            if id >= 0 && id < f.fcons.len && bit != 0 {
+                v := f.fcons[id] | bit
+                f.fcons[id] = v
+                <<
+            }
+            // Runtime index: zero the element, keep the array owning so
+            // remaining elems still drop. Checker still whole-moves (alias).
+            if id >= 0 && !c.is_const_int_expr(p, p.nodes[n].b) {
+                <<
+            }
+        }
+        if is_linear_dynamic(c.ntype[n]) {
+            // Field-then-Index (`h.xs[i] as`): zero the element; keep
+            // the struct owning so remaining elems / sibling fields drop.
+            <<
+        }
+    }
+    mut x := n
+    for _ in 0:p.nodes.len {
+        k := p.nodes[x].kind
+        if k == 7 || k == 13 {
+            x = p.nodes[x].a
+        } else {
+            if k == 4 {
+                if c.nconst[x] >= 0 {
+                    <<
+                }
+                id := c.nlocal[x]
+                if id >= 0 && f.locals_owning[id] {
+                    f.moved[id] = true
+                }
+            }
+            <<
+        }
+    }
+}
+
+// Return true only for an expression whose string value owns a fresh heap
+// descriptor.  Plain locals, fields, and array reads are aliases and must not
+// be reclaimed here.  HIR wraps field/index/deref move reads in Clone, while
+// Gen1's array index lowering clones string elements explicitly; those are the
+// only read forms admitted below.  Builtin str(string) is an identity view and
+// str(bool) points at static storage, so both stay outside the set.
+fn (f &MFn) fresh_string_expr(p &parser.Parser, c &mut Checker, n int) bool {
+    if n < 0 || n >= p.nodes.len || n >= c.ntype.len || c.ntype[n] != 3 {
+        << false
+    }
+    if n < c.nclone.len && c.nclone[n] == 1 {
+        << true
+    }
+    k := p.nodes[n].kind
+    if k == 5 { // Call: user/string-producing builtins return an owner.
+        fi := c.ncall[n]
+        if fi == -19 { // str(string): propagate only a fresh argument owner.
+            arg := p.nodes[n].a
+            if arg >= 0 { << f.fresh_string_expr(p, c, arg) }
+            << false
+        }
+        if fi == -20 { << false }
+        << true
+    }
+    if k == 8 { // Method call returning string (receiver result is owned).
+        << true
+    }
+    if k == 14 || k == 15 || k == 71 { // slice, concat, or-catch payload.
+        << true
+    }
+    if k == 13 { // Gen1 clones an owning array-string element on read.
+        if c.ncall[n] == -77 {
+            // Native map get (m[k]) copies string values with _rt_str_clone
+            // (copy_out_val A3=1). The returned descriptor is a fresh owner
+            // and must drop after println/other borrows — otherwise ledger
+            // shows live_bytes leftover (product vs bootstrap gap).
+            << c.ntype[n] == 3
+        }
+        obj := p.nodes[n].a
+        if obj >= 0 {
+            aty := c.direct_type(c.ntype[obj])
+            if is_array_type(aty) && c.elem_ty_of_array(aty, f.src_fi) == 3 {
+                << true
+            }
+        }
+    }
+    if k == 16 && p.nodes[n].ival == 3 { // unwrapped string deref (rare fallback)
+        << true
+    }
+    << false
+}
+
+// Give a fresh string temporary a short owning lifetime.  The synthetic local
+// is intentionally not entered into a lexical scope: StoreLocal + Drop are
+// adjacent and no later scope walk may drop the slot a second time.  A new
+// local per source expression keeps the helper independent of branch joins and
+// existing MFn layout metadata.
+fn (f &mut MFn) drop_fresh_string_expr(p &parser.Parser, c &mut Checker, n int, v int) {
+    if !f.fresh_string_expr(p, c, n) || v < 0 {
+        <<
+    }
+    lid := f.new_local(3, 3, true)
+    mut st := mkinstr(3) // StoreLocal
+    st.a = lid
+    st.b = v
+    f.emit(st)
+    mut di := mkinstr(8) // Drop
+    di.a = lid
+    f.emit(di)
+}
+
+fn (f &mut MFn) addr_local(id int) int {
+    if (f.receiver && id == 0) || is_ref_type(f.locals[id]) {
+        t := f.new_temp(1, 1)
+        mut li := mkinstr(2)
+        li.a = t
+        li.b = id
+        f.emit(li)
+        << t
+    }
+    t := f.new_temp(1, 1)
+    mut ad := mkinstr(16)
+    ad.a = t
+    ad.b = id
+    ad.c = 0
+    f.emit(ad)
+    << t
+}
+
+fn (f &mut MFn) zero_field_slots(id int, slot int, nslots int) {
+    ptr := f.addr_local(id)
+    z := f.vconst(0)
+    zt := f.typed_value(z, 1)
+    for k in 0:nslots {
+        mut sp := mkinstr(18)
+        sp.a = zt
+        sp.b = ptr
+        sp.c = slot + k * 8
+        sp.d = 1
+        f.emit(sp)
+    }
+}
+
+fn (f &mut MFn) zero_as_place(p &parser.Parser, c &mut Checker, n int) {
+    k := p.nodes[n].kind
+    // A consuming `temp as T` moves the complete fat descriptor out of a
+    // plain local.  Clear all slots before the downcast frees its box; this
+    // keeps merged break/continue/return exits from seeing a stale owner.
+    if k == 4 {
+        id := c.nlocal[n]
+        if id < 0 || id >= f.locals.len {
+            <<
+        }
+        f.zero_field_slots(id, 0, c.type_slots(c.ntype[n]))
+        <<
+    }
+    if k == 7 {
+        ns := c.type_slots(c.ntype[n])
+        if ns < 1 {
+            <<
+        }
+        buf := chain_has_index(p, n)
+        mut ptr := 0
+        if buf {
+            ptr = f.lower_chain_addr(p, c, n, true)
+        } else {
+            ptr = f.lower_addr(p, c, n)
+        }
+        z := f.vconst(0)
+        zt := f.typed_value(z, 1)
+        for i in 0:ns {
+            mut sp := mkinstr(18)
+            if buf {
+                sp.kind = 25
+            }
+            sp.a = zt
+            sp.b = ptr
+            sp.c = i * 8
+            sp.d = 1
+            f.emit(sp)
+        }
+        <<
+    }
+    if k == 13 {
+        obj := p.nodes[n].a
+        ei := c.as_const_index(p, p.nodes[n].b)
+        mut idx := 0
+        if ei >= 0 {
+            idx = f.vconst(ei)
+        } else {
+            if c.is_const_int_expr(p, p.nodes[n].b) {
+                <<
+            }
+            idx = f.lower_expr(p, c, p.nodes[n].b)
+        }
+        ety := c.ntype[n]
+        ns := c.type_slots(ety)
+        mut ptr := -1
+        if p.nodes[obj].kind == 4 {
+            id := c.nlocal[obj]
+            if id < 0 {
+                <<
+            }
+            eb := c.type_size_bytes(ety)
+            afl := c.array_fixed_len_m(c.direct_type(c.ntype[obj]))
+            ptr = f.array_elem_ptr(id, idx, eb, afl)
+        } else {
+            ptr = f.lower_chain_addr(p, c, n, f.chain_index_is_buf(p, &*c, n))
+        }
+        z := f.vconst(0)
+        zt := f.typed_value(z, 1)
+        zfl := c.array_fixed_len_m(c.direct_type(c.ntype[obj]))
+        for k2 in 0:ns {
+            mut sp := mkinstr(18)
+            if zfl <= 0 {
+                sp.kind = 25
+            }
+            sp.a = zt
+            sp.b = ptr
+            sp.c = k2 * 8
+            sp.d = 1
+            f.emit(sp)
+        }
+    }
+}
+
+fn (f &mut MFn) array_elem_ptr(id int, idx int, elem_bytes int, fixed_len int) int {
+    mut base := -1
+    if fixed_len > 0 {
+        base = f.addr_of_local(id)
+    } else {
+        desc := f.new_temp(f.locals[id], 3)
+        mut ld := mkinstr(2)
+        ld.a = desc
+        ld.b = id
+        f.emit(ld)
+        base = desc
+    }
+    ptr := f.new_temp(1, 1)
+    mut ea := mkinstr(23)
+    ea.a = ptr
+    ea.b = base
+    ea.c = idx
+    ea.d = elem_bytes
+    if fixed_len > 0 {
+        ea.col = fixed_len
+    }
+    f.emit(ea)
+    << ptr
+}
+
+fn (f &mut MFn) emit_drop_field_bits(c &mut Checker, id int, bits int) {
+    if bits == 0 {
+        <<
+    }
+    ty := f.locals[id]
+    if !is_struct_type(ty) {
+        <<
+    }
+    si := struct_index(ty)
+    ptr := f.addr_local(id)
+    for fi in 0:c.structs[si].fields.len {
+        bit := field_bit(fi)
+        if bit == 0 || (bits & bit) == 0 {
+            ->
+        }
+        fty := c.structs[si].fields[fi].ty
+        slot := c.structs[si].fields[fi].slot
+        mut df := mkinstr(22)
+        df.a = ptr
+        df.b = slot
+        df.c = fty
+        f.emit(df)
+        ns := c.type_slots(fty)
+        z := f.vconst(0)
+        zt := f.typed_value(z, 1)
+        for k in 0:ns {
+            mut sp := mkinstr(18)
+            sp.a = zt
+            sp.b = ptr
+            sp.c = slot + k * 8
+            sp.d = 1
+            f.emit(sp)
+        }
+    }
+}
+
+fn (f &mut MFn) emit_drop_elem_bits(c &mut Checker, id int, bits int) {
+    if bits == 0 {
+        <<
+    }
+    ty := f.locals[id]
+    if !is_array_type(ty) {
+        <<
+    }
+    ai := ty - 200
+    if ai < 0 || ai >= c.arrays.len {
+        <<
+    }
+    ety := c.arrays[ai].elem_ty
+    ns := c.type_slots(ety)
+    eb := c.type_size_bytes(ety)
+    fl := c.array_fixed_len_m(ty)
+    // MS6 join pad of `if n >= k { xs[k-1] as T }` must not ElemAddr
+    // index k-1 when len < k (1-arg Query packing).
+    alen := f.new_temp(1, 1)
+    if fl > 0 {
+        mut lc := mkinstr(1)
+        lc.a = alen
+        lc.b = f.vconst(fl)
+        f.emit(lc)
+    } else {
+        desc := f.new_temp(ty, 3)
+        mut ld := mkinstr(2)
+        ld.a = desc
+        ld.b = id
+        f.emit(ld)
+        mut lf := mkinstr(10)
+        lf.a = alen
+        lf.b = desc
+        lf.c = 8
+        lf.d = 1
+        f.emit(lf)
+    }
+    for ei in 0:63 {
+        bit := field_bit(ei)
+        if bit == 0 || (bits & bit) == 0 {
+            ->
+        }
+        eit := f.typed_value(f.vconst(ei), 1)
+        cond := f.new_temp(2, 1)
+        mut bi := mkinstr(4)
+        bi.a = cond
+        bi.b = 8
+        bi.c = eit
+        bi.d = alen
+        f.emit(bi)
+        then_bb := f.new_block()
+        skip_bb := f.new_block()
+        f.terminate(2, cond, then_bb, skip_bb)
+        f.switch_to(then_bb)
+        ptr := f.array_elem_ptr(id, f.vconst(ei), eb, fl)
+        mut df := mkinstr(22)
+        if fl <= 0 {
+            df.kind = 24
+        }
+        df.a = ptr
+        df.b = 0
+        df.c = ety
+        f.emit(df)
+        z := f.vconst(0)
+        zt := f.typed_value(z, 1)
+        for k in 0:ns {
+            mut sp := mkinstr(18)
+            if fl <= 0 {
+                sp.kind = 25
+            }
+            sp.a = zt
+            sp.b = ptr
+            sp.c = k * 8
+            sp.d = 1
+            f.emit(sp)
+        }
+        f.terminate(1, skip_bb, -1, -1)
+        f.switch_to(skip_bb)
+    }
+}
+
+// Address of a stable expression. Locals live in the frame; receiver and
+// reference locals already contain pointers. Field addresses descend by the
+// field's slot offset. Other values are first materialized in a temp.
+
+// Discarded fresh owning results still need a cleanup lifetime. Calls and
+// constructors produce owners; identifier/field reads remain borrowed uses.
+fn (f &mut MFn) drop_fresh_owned_expr(p &parser.Parser, c &mut Checker, n int, v int) {
+    if n < 0 || v < 0 { << }
+    ty := c.ntype[n]
+    if ty == 3 || !c.type_owning(ty) { << }
+    k := p.nodes[n].kind
+    // Fixed ArrayLit already has a scoped owning descriptor hold.
+    if k == 11 && is_array_type(ty) && c.array_fixed_len(ty) > 0 { << }
+    if k != 5 && k != 8 && k != 6 && k != 11 && k != 71 { << }
+    if k == 71 {
+        call := p.nodes[n].a
+        if call < 0 || (p.nodes[call].kind != 5 && p.nodes[call].kind != 8) { << }
+    }
+    lid := f.new_local(ty, c.type_slots(ty), true)
+    mut st := mkinstr(3)
+    st.a = lid
+    st.b = v
+    f.emit(st)
+    mut di := mkinstr(8)
+    di.a = lid
+    f.emit(di)
+}

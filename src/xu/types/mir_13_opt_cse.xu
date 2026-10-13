@@ -1,0 +1,418 @@
+@xu/types
+
+fn mir_each_clone_cse(m &mut Mir) {
+    // rustc CopyProp at mir_opt_level>=1. Clone into a local MFn, rewrite,
+    // then append through the owning commit path. Nested field stores into
+    // `m.fns[fi].instrs[i]` miscompile under Gen1.
+    // Do not use a unit-wide nfn cap.  Importing `#math` used to skip CSE
+    // for every user index kernel.  Non-index functions are already skipped
+    // below; compiler helpers without LoadIndex/StoreIndex stay off this pass.
+    n0 := m.fns.len
+    mut fi := 0
+    while fi < n0 {
+        if mir_fn_is_extern(&*m, fi) {
+            fi += 1
+            ->
+        }
+        // Per-fn cap: whole-element store of a large MFn into []MFn
+        // miscompiles under Gen1. User kernels stay under this.
+        if m.fns[fi].instrs.len >= 256 {
+            fi += 1
+            ->
+        }
+        // O1: clone+store-back of a tiny method (unix_nano) in a ~59-fn
+        // unit rewrote `sec * 1e9 + nsec` into `sec * 112 + nsec` (the
+        // 0x70 frame offset). Match SimplifyCFG: only index kernels.
+        // O2 must keep this skip: copy-prop folds match `Copy 19` and the
+        // jump-table peep misses (16ms → 34ms).
+        summary := mir_fn_summary(m, fi)
+        if !mir_summary_has(summary, mir_sum_index) {
+            fi += 1
+            ->
+        }
+        mut f := mir_clone_fn(m, fi, false)
+        if mir_local_cse(mut &f) {
+            mir_copy_prop_fn(mut &f)
+        }
+        mir_copy_prop_fn(mut &f)
+        mir_fn_commit(m, fi, f)
+        fi += 1
+    }
+}
+
+fn mir_temp_cse_ok(f &MFn, t int) bool {
+    << f.temp_cse_ok(t)
+}
+
+fn (f &MFn) temp_cse_ok(t int) bool {
+    if t < 0 || t >= f.temps.len { << false }
+    ty := f.temps[t]
+    if is_integer_type(ty) { << true }
+    if ty == 2 { << true }
+    << false
+}
+
+fn mir_cse_mem_kind(k int) bool {
+    if k == 12 || k == 13 || k == 46 {
+        << true
+    }
+    if k == 11 || k == 18 || k == 20 || k == 25 || k == 47 || k == 48 {
+        << true
+    }
+    if k >= 30 && k <= 37 {
+        << true
+    }
+    << false
+}
+
+fn mir_cse_fill_last(f &mut MFn, bi int, nloc int, last &mut []int) bool {
+    mut scan := f.blocks[bi].head
+    mut clobber := false
+    for _ in 0:f.instrs.len {
+        if scan < 0 { << clobber }
+        k := mfn_ikind(&f.instrs, scan)
+        if k == 2 {
+            loc := mfn_ib(&f.instrs, scan)
+            if loc >= 0 && loc < nloc {
+                mfn_set_i(last, loc, scan)
+            }
+        }
+        if mir_cse_mem_kind(k) {
+            clobber = true
+        }
+        scan = mfn_inext(&f.instrs, scan)
+    }
+    << clobber
+}
+
+fn mir_cse_load_skip(f &mut MFn, bi int, ii int, dest int, src int, from_st bool, latch bool, last_ii int, had bool, mem_clobber bool) bool {
+    mut skip := false
+    if !f.temp_cse_ok(dest) { skip = true }
+    if src >= 0 && !f.temp_cse_ok(src) { skip = true }
+    if latch && ii == last_ii { skip = true }
+    if from_st {
+        mut allow := false
+        blk := f.blocks[bi]
+        if blk.tkind == 3 {
+            allow = true
+            if dest < 0 { allow = false }
+        } else if latch && src >= 0 && had {
+            allow = true
+        }
+        if !allow { skip = true }
+        if !skip {
+            if f.temp_used_outside(dest, bi) { skip = true }
+        }
+        // Store-forward last latch reload so skip-store sees one
+        // LoadLocal; RA pins off add1 StoreLocal.
+        if allow && latch && ii == last_ii {
+            if mem_clobber {
+                skip = true
+            } else if f.temp_cse_ok(dest) {
+                if src < 0 || f.temp_cse_ok(src) {
+                    if !f.temp_used_outside(dest, bi) {
+                        skip = false
+                    }
+                }
+            }
+        }
+    }
+    << skip
+}
+
+fn mir_cse_clear_on(on &mut []bool) {
+    for i in 0:on.len {
+        mfn_set_b(on, i, false)
+    }
+}
+
+fn mir_cse_kill_eq(on &mut []bool, v &mut []int, dest int) {
+    if dest < 0 { << }
+    for i in 0:on.len {
+        if on[i] && v[i] == dest {
+            mfn_set_b(on, i, false)
+        }
+    }
+}
+
+fn mir_cse_step(f &mut MFn, bi int, ii int, latch bool, clobber bool, live_on &mut []bool, live_v &mut []int, live_st &mut []bool, had_load &mut []bool, last_load &mut []int) bool {
+    nloc := live_on.len
+    k := mfn_ikind(&f.instrs, ii)
+    ia2 := mfn_ia(&f.instrs, ii)
+    ib2 := mfn_ib(&f.instrs, ii)
+    ic2 := mfn_ic(&f.instrs, ii)
+    mut changed := false
+    mut pend := false
+    mut pend_loc := 0
+    mut pend_v := 0
+    mut pend_st := false
+    if k == 2 {
+        loc := ib2
+        dest := ia2
+        if loc >= 0 && loc < nloc && live_on[loc] {
+            src := live_v[loc]
+            from_st := live_st[loc]
+            skip := mir_cse_load_skip(f, bi, ii, dest, src, from_st, latch, last_load[loc], had_load[loc], clobber)
+            if skip {
+                pend = true
+                pend_loc = loc
+                pend_v = dest
+                pend_st = false
+                mfn_set_b(had_load, loc, true)
+            } else {
+                mfn_set_copy(mut &f.instrs, ii, src)
+                changed = true
+            }
+        } else if loc >= 0 && loc < nloc {
+            pend = true
+            pend_loc = loc
+            pend_v = dest
+            pend_st = false
+            mfn_set_b(had_load, loc, true)
+        }
+    } else if k == 3 {
+        loc := ia2
+        if loc >= 0 && loc < nloc {
+            pend = true
+            pend_loc = loc
+            pend_v = ib2
+            pend_st = true
+        }
+    } else if k == 8 {
+        loc := ia2
+        if loc >= 0 && loc < nloc {
+            mfn_set_b(live_on, loc, false)
+        }
+    } else if k == 16 && ic2 == 0 {
+        loc := ib2
+        if loc >= 0 && loc < nloc {
+            mfn_set_b(live_on, loc, false)
+        }
+    } else if (k == 7 && ib2 != 95) || mir_cse_mem_kind(k) {
+        mir_cse_clear_on(live_on)
+    }
+    mut da := 0 - 1
+    mut db := 0 - 1
+    if k == 36 {
+        da = ia2
+        db = ib2
+    } else if mir_instr_has_dest(k) {
+        if k != 7 || ia2 >= 0 {
+            da = ia2
+        }
+    }
+    mir_cse_kill_eq(live_on, live_v, da)
+    mir_cse_kill_eq(live_on, live_v, db)
+    if pend && pend_loc >= 0 && pend_loc < nloc {
+        mfn_set_b(live_on, pend_loc, true)
+        mfn_set_i(live_v, pend_loc, pend_v)
+        mfn_set_b(live_st, pend_loc, pend_st)
+    }
+    << changed
+}
+
+// This block has memory effects, so the old all-memory barrier remains the
+// fallback. A frame scalar cannot be changed through indexed heap writes if
+// no instruction in the entire function exposes a frame address. Only reuse
+// integer/bool LoadLocal values; explicit local stores and TempId redefinitions
+// invalidate them, and ABI/hidden-call operations clear the entire table.
+fn mir_cse_memory_scalar_block(f &mut MFn, bi int) bool {
+    if f.locals.len > 48 || f.instrs.len > 256 || f.blocks.len > 32 { << false }
+    if f.blocks[bi].tkind != 3 { << false }
+    for b in 0:f.blocks.len {
+        mut ji := f.blocks[b].head
+        for _ in 0:f.instrs.len {
+            if ji < 0 { <- }
+            if mfn_ikind(&f.instrs, ji) == 16 { << false }
+            ji = mfn_inext(&f.instrs, ji)
+        }
+    }
+    mut last := []int{}
+    for _ in 0:f.locals.len { last.push(-1) }
+    mut changed := false
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { << changed }
+        k := mfn_ikind(&f.instrs, ii)
+        a := mfn_ia(&f.instrs, ii)
+        b := mfn_ib(&f.instrs, ii)
+        if mir_instr_has_dest(k) && a >= 0 {
+            for l in 0:last.len {
+                if last[l] == a { last[l] = -1 }
+            }
+        }
+        if k == 2 && b >= 0 && b < last.len && a >= 0 && a < f.temps.len {
+            ty := f.locals[b]
+            if f.locals_nslots[b] == 1 && f.temps_nslots[a] == 1 && f.temps[a] == ty && mir_temp_cse_ok(&*f, a) {
+                src := last[b]
+                if src >= 0 {
+                    mfn_set_copy(mut &f.instrs, ii, src)
+                    changed = true
+                }
+                last[b] = a
+            }
+        } else if k == 3 && a >= 0 && a < last.len {
+            last[a] = -1
+        } else {
+            mut keep := k == 0 || (k >= 1 && k <= 5) || k == 14 || k == 17
+            if k == 20 {
+                rhs := mfn_ic(&f.instrs, ii)
+                // Typed primitive stores cannot drop an owning old element.
+                // Other stores may hide a real runtime call and stay barriers.
+                if rhs >= 0 && rhs < f.temps.len {
+                    keep = f.temps_nslots[rhs] == 1 && mir_temp_cse_ok(&*f, rhs)
+                }
+            }
+            if !keep {
+                for l in 0:last.len { last[l] = -1 }
+            }
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << changed
+}
+
+fn mir_cse_block_has_memory(f &MFn, bi int) bool {
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if mir_cse_mem_kind(mfn_ikind(&f.instrs, ii)) { << true }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << false
+}
+
+fn mir_cse_block(f &mut MFn, bi int) bool {
+    // Latch CSE fights emit NEON / RA pin (LoadLocal of ind/acc). rustc
+    // keeps the last load that feeds the terminator; Xu's last-load skip
+    // is not that precise yet, and rewriting those loads drops 8-way
+    // `loop_sum`. Straight-line / return blocks still CSE.
+    if f.is_self_loop(bi) { << false }
+    if mir_cse_block_has_memory(&*f, bi) { << mir_cse_memory_scalar_block(f, bi) }
+    nloc := f.locals.len
+    mut live_on := []bool{}
+    mut live_v := []int{}
+    mut live_st := []bool{}
+    mut had_load := []bool{}
+    mut last_load := []int{}
+    for _ in 0:nloc {
+        live_on.push(false)
+        live_v.push(0)
+        live_st.push(false)
+        had_load.push(false)
+        last_load.push(-1)
+    }
+    clobber := mir_cse_fill_last(f, bi, nloc, mut &last_load)
+    if clobber { << false }
+    latch := f.is_self_loop(bi)
+    mut changed := false
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { << changed }
+        nxt := mfn_inext(&f.instrs, ii)
+        if mir_cse_step(f, bi, ii, latch, clobber, mut &live_on, mut &live_v, mut &live_st, mut &had_load, mut &last_load) {
+            changed = true
+        }
+        ii = nxt
+    }
+    << changed
+}
+
+fn mir_local_cse(f &mut MFn) bool {
+    // Split out of one large frame: Gen1-compiled Gen2 clobbered
+    // local []int headers in the combined scan+rewrite function.
+    mut changed := false
+    for bi in 0:f.blocks.len {
+        if mir_cse_block(f, bi) {
+            changed = true
+        }
+    }
+    << changed
+}
+
+fn mir_binop_cse(f &mut MFn) bool {
+    mut changed := false
+    for bi in 0:f.blocks.len {
+        mut top := []int{}
+        mut tlh := []int{}
+        mut trh := []int{}
+        mut tdst := []int{}
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            nxt := f.instrs[ii].next
+            k := f.instrs[ii].kind
+            if k == 7 || k == 33 || k == 37 {
+                for i in 0:top.len {
+                    top[i] = 0 - 1
+                }
+            }
+            mut ins_op := 0
+            mut ins_a := 0
+            mut ins_b := 0
+            mut ins_d := 0
+            mut do_ins := false
+            if k == 4 {
+                dest := f.instrs[ii].a
+                op := f.instrs[ii].b
+                lhs := f.instrs[ii].c
+                rhs := f.instrs[ii].d
+                mut skip := false
+                if dest >= 0 && dest < f.temps.len && f.temps[dest] == 4 {
+                    skip = true
+                }
+                if !skip {
+                    mut a := lhs
+                    mut b := rhs
+                    if mir_bin_commutes(op) && a > b {
+                        tmp := a
+                        a = b
+                        b = tmp
+                    }
+                    mut found := 0 - 1
+                    for ti in 0:top.len {
+                        if found >= 0 { -> }
+                        if top[ti] == op && tlh[ti] == a && trh[ti] == b {
+                            found = tdst[ti]
+                        }
+                    }
+                    if found >= 0 {
+                        mfn_become_copy(mut &f.instrs, ii, found)
+                        changed = true
+                    } else if dest >= 0 && top.len < 64 {
+                        do_ins = true
+                        ins_op = op
+                        ins_a = a
+                        ins_b = b
+                        ins_d = dest
+                    }
+                }
+            }
+            if k == 36 {
+                da := f.instrs[ii].a
+                db := f.instrs[ii].b
+                for i in 0:top.len {
+                    if top[i] < 0 { -> }
+                    if tdst[i] == da || tlh[i] == da || trh[i] == da { top[i] = 0 - 1 }
+                    if tdst[i] == db || tlh[i] == db || trh[i] == db { top[i] = 0 - 1 }
+                }
+            } else if mir_instr_has_dest(k) {
+                if k != 7 || f.instrs[ii].a >= 0 {
+                    da := f.instrs[ii].a
+                    for i in 0:top.len {
+                        if top[i] < 0 { -> }
+                        if tdst[i] == da || tlh[i] == da || trh[i] == da { top[i] = 0 - 1 }
+                    }
+                }
+            }
+            if do_ins {
+                top.push(ins_op)
+                tlh.push(ins_a)
+                trh.push(ins_b)
+                tdst.push(ins_d)
+            }
+            ii = nxt
+        }
+    }
+    << changed
+}

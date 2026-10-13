@@ -1,0 +1,725 @@
+@xu/types
+
+#xu/parser
+
+fn (f &mut MFn) lower_expr_call(p &parser.Parser, c &mut Checker, n int) int {
+    if c.ncall[n] == -83 { // may-throw auto-propagate (§5.7)
+        ok_ty := c.ntype[n]
+        mut res := -1
+        if c.nconst[n] < 0 {
+            throw_ty := c.throw_ok_err_ty(ok_ty, iface_ty(c.errors_iface))
+            if throw_ty < 300 {
+                eprintln("internal: hosted throw type missing")
+                << 0
+            }
+            c.ntype[n] = throw_ty
+            res = f.lower_call(p, c, n, c.nconst[n])
+            c.ntype[n] = ok_ty
+        } else {
+            res = f.lower_call(p, c, n, c.nconst[n])
+        }
+        tag := f.new_temp(1, 1)
+        mut lf := mkinstr(10)
+        lf.a = tag
+        lf.b = res
+        lf.c = 0
+        lf.d = 1
+        f.emit(lf)
+        dest := f.new_temp(ok_ty, c.type_slots(ok_ty))
+        err_bb := f.new_block()
+        ok_bb := f.new_block()
+        f.terminate(2, tag, err_bb, ok_bb)
+        f.switch_to(err_bb)
+        f.emit_drops_all()
+        f.terminate(3, res, 0, 0)
+        f.switch_to(ok_bb)
+        mut lf2 := mkinstr(10)
+        lf2.a = dest
+        lf2.b = res
+        lf2.c = 8
+        lf2.d = c.type_slots(ok_ty)
+        f.emit(lf2)
+        << dest
+    }
+    if c.ncall[n] == -21 {
+        // close(ch) → ChanClose
+        ch := f.lower_expr(p, c, p.nodes[n].a)
+        mut ins := mkinstr(34)
+        ins.a = ch
+        f.emit(ins)
+        << f.vconst(0)
+    }
+    << f.lower_call(p, c, n, -1)
+}
+
+fn (f &mut MFn) lower_expr_try_or(p &parser.Parser, c &mut Checker, n int) int {
+    k := p.nodes[n].kind
+    if k == 71 { // OrCatch: call or (err) { } (§5.7)
+        call := p.nodes[n].a
+        res := f.lower_expr(p, c, call)
+        f.mark_move_of(p, c, call)
+        ok_ty := c.ntype[n]
+        call_ty := c.ntype[call]
+        // Non-throwing calls: `or` is a dead fallback (checker allows it).
+        // Do not index c.throws[call_ty-300] — that was an index OOB.
+        if !is_throw_type(call_ty) {
+            << res
+        }
+        ri := call_ty - 300
+        if ri < 0 || ri >= c.throws.len {
+            << res
+        }
+        tag := f.new_temp(1, 1)
+        mut lf := mkinstr(10)
+        lf.a = tag
+        lf.b = res
+        lf.c = 0
+        lf.d = 1
+        f.emit(lf)
+        dest := f.new_temp(ok_ty, c.type_slots(ok_ty))
+        err_bb := f.new_block()
+        ok_bb := f.new_block()
+        join_bb := f.new_block()
+        f.terminate(2, tag, err_bb, ok_bb)
+        f.switch_to(err_bb)
+        f.push_scope()
+        err_id := c.nlocal[n]
+        err_ty := c.throws[ri].err_ty
+        err_payload := f.new_temp(err_ty, c.type_slots(err_ty))
+        mut lf_err := mkinstr(10)
+        lf_err.a = err_payload
+        lf_err.b = res
+        lf_err.c = 8
+        lf_err.d = c.type_slots(err_ty)
+        f.emit(lf_err)
+        mut st := mkinstr(3)
+        st.a = err_id
+        st.b = err_payload
+        f.emit(st)
+        f.scope_add(err_id)
+        mut s := p.nodes[n].c
+        while s >= 0 {
+            f.lower_stmt(p, c, s)
+            s = p.nodes[s].next
+        }
+        f.pop_scope_with_drops()
+        if f.live_and_open() {
+            f.terminate(1, join_bb, -1, -1)
+        }
+        f.switch_to(ok_bb)
+        mut lf_ok := mkinstr(10)
+        lf_ok.a = dest
+        lf_ok.b = res
+        lf_ok.c = 8
+        lf_ok.d = c.type_slots(ok_ty)
+        f.emit(lf_ok)
+        f.terminate(1, join_bb, -1, -1)
+        f.switch_to(join_bb)
+        << dest
+    }
+    << -1
+}
+
+fn (f &mut MFn) lower_expr_fnlit(p &parser.Parser, c &mut Checker, n int) int {
+    fid := c.ncall[n]
+    env_sty := c.clos_env[fid]
+    if env_sty < 0 {
+        // Zero-capture: fat fn with env=0 via shim (direct ABI body).
+        t := f.new_temp(c.ntype[n], c.type_slots(c.ntype[n]))
+        mut ins := mkinstr(38)
+        ins.a = t
+        // Keep the legacy marker; the emitter resolves the shim label from
+        // `sval`, avoiding checker/MIR index-domain coupling.
+        ins.b = 0
+        // See lower_expr_ident: borrow a local descriptor, never a nested
+        // field of the hosted checker's large function slice.
+        real_label := c.fns[fid].label + ""
+        shim := mir_fnval_real_to_shim(&real_label)
+        ins.sval = shim
+        f.emit(ins)
+        << t
+    }
+    label := c.fns[fid].label + ""
+    // Capturing: build Env struct temp then MakeClosure (real body label).
+    si := struct_index(env_sty)
+    ns := c.structs[si].nslots
+    env_t := f.new_temp(env_sty, ns)
+    for i in 0:c.clos_caps[fid].len {
+        oid := c.clos_caps[fid][i]
+        fty := c.structs[si].fields[i].ty
+        mut count := c.type_slots(fty)
+        mut vt := f.new_temp(fty, count)
+        if oid < 0 {
+            // M111: pack from enclosing closure env.field (-(field+2)).
+            field := 0 - (oid + 2)
+            env_ptr := f.new_temp(1, 1)
+            mut pl := mkinstr(2)
+            pl.a = env_ptr
+            pl.b = 0
+            f.emit(pl)
+            env_ty := f.locals[0]
+            osi := struct_index(c.ref_inner_type(env_ty))
+            slot := c.structs[osi].fields[field].slot
+            mut lf := mkinstr(17)
+            lf.a = vt
+            lf.b = env_ptr
+            lf.c = slot
+            lf.d = count
+            f.emit(lf)
+            if fty == 3 {
+                cloned := f.new_temp(3, 3)
+                mut cp := mkinstr(9)
+                cp.a = cloned
+                cp.b = vt
+                f.emit(cp)
+                vt = cloned
+                count = 3
+            }
+        } else {
+            mut ld := mkinstr(2)
+            ld.a = vt
+            ld.b = oid
+            f.emit(ld)
+            if oid >= 0 && oid < f.locals_owning.len && f.locals_owning[oid] {
+                f.moved[oid] = true
+            }
+        }
+        mut sf := mkinstr(11)
+        sf.a = vt
+        sf.b = env_t
+        sf.c = c.structs[si].fields[i].slot
+        sf.d = count
+        f.emit(sf)
+    }
+    dest := f.new_temp(c.ntype[n], c.type_slots(c.ntype[n]))
+    mut mc := mkinstr(39)
+    mc.a = dest
+    mc.b = env_t
+    mc.c = si
+    mc.sval = label
+    f.emit(mc)
+    << dest
+}
+
+fn (f &mut MFn) lower_expr_box(p &parser.Parser, c &mut Checker, n int, k int) int {
+    is_call := k == 5 || k == 8
+    mut box_any := false
+    mut box_iface := 0
+    if is_temp_type(c.nbox[n]) || is_any_type(c.nbox[n]) {
+        box_any = true
+    }
+    if is_interface_type(c.nbox[n]) {
+        box_iface = c.nbox[n]
+    }
+    if !is_call && c.ncall[n] == -98 {
+        box_any = true
+    }
+    if !is_call && c.ncall[n] == -93 && box_iface == 0 {
+        if is_interface_type(c.ntype[n]) {
+            box_iface = c.ntype[n]
+        } else if n >= 0 && n < c.ntype.len && is_struct_type(c.ntype[n]) {
+            // `>> UserErr{...}` tags the StructInit ncall=-93 but leaves
+            // ntype as the concrete struct. Without this, lower_expr skips
+            // boxing and the throw slot stores a multi-slot struct into the
+            // 2-slot Error fat pointer (product SIGSEGV vs bootstrap).
+            if c.errors_iface >= 0 {
+                box_iface = iface_ty(c.errors_iface)
+            } else if n < c.nstr.len && c.nstr[n] >= 0 {
+                box_iface = iface_ty(c.nstr[n])
+            }
+        }
+    }
+    if !box_any && box_iface == 0 {
+        << -1
+    }
+    saved_call := c.ncall[n]
+    saved_box := c.nbox[n]
+    if !is_call {
+        if c.ncall[n] == -98 || c.ncall[n] == -93 {
+            c.ncall[n] = -1
+        }
+    }
+    c.nbox[n] = 0
+    src := f.lower_expr(p, c, n)
+    c.ncall[n] = saved_call
+    c.nbox[n] = saved_box
+    if box_any {
+        << f.wrap_box_any(p, c, n, src)
+    }
+    << f.wrap_box_interface(p, c, n, src, box_iface)
+}
+
+fn (f &mut MFn) lower_expr(p &parser.Parser, c &mut Checker, n int) int {
+    k := p.nodes[n].kind
+    boxed := f.lower_expr_box(p, c, n, k)
+    if boxed >= 0 {
+        << boxed
+    }
+    if k == 1 { // Int
+        << f.vconst(p.nodes[n].ival)
+    }
+    if k == 18 { // Float: materialize bits as typed f64 temp
+        t := f.new_temp(4, 1)
+        mut cpy := mkinstr(1)
+        cpy.a = t
+        cpy.b = f.vconst(p.nodes[n].ival)
+        f.emit(cpy)
+        << t
+    }
+    if k == 19 { // Cast
+        e := f.lower_expr(p, c, p.nodes[n].a)
+        to := c.ntype[n]
+        t := f.new_temp(to, 1)
+        mut ins := mkinstr(5)
+        ins.a = t
+        if to == 4 { ins.b = 3 } else if to == 1 && c.ntype[p.nodes[n].a] == 4 { ins.b = 4 } else { ins.b = 5 } // 3=scvtf 4=fcvtzs 5=int wrap
+        ins.c = e
+        f.emit(ins)
+        << t
+    }
+    if k == 2 { // Bool
+        << f.vconst(p.nodes[n].ival)
+    }
+    if k == 3 { // Str literal
+        t := f.new_temp(3, 3)
+        mut ins := mkinstr(6)
+        ins.a = t
+        ins.b = c.nstr[n]
+        f.emit(ins)
+        << t
+    }
+    if k == 4 { // Ident
+        << f.lower_expr_ident(p, c, n)
+    }
+    if k == 10 { // Borrow local/field/element: represented by its address.
+        target0 := p.nodes[n].a
+        if p.nodes[target0].kind == 16 && p.nodes[target0].ival == 3 {
+            // `&*r` of a shared ref: copy the pointer.
+            << f.lower_expr(p, c, p.nodes[target0].a)
+        }
+        // A checked direct borrow of a local retains its pointee and
+        // mutability. The addressed object remains in its frame slot;
+        // unrelated scalar Temps can use the general register allocator.
+        borrow_ty := c.ntype[n]
+        if borrow_ty >= 1000 && borrow_ty < 3000 && p.nodes[target0].kind == 4 {
+            lid := c.nlocal[target0]
+            if lid >= 0 && lid < f.locals.len && !(f.receiver && lid == 0) && !is_ref_type(f.locals[lid]) && c.ref_inner_type(borrow_ty) == f.locals[lid] {
+                t := f.new_temp(borrow_ty, 1)
+                mut ad := mkinstr(16)
+                ad.a = t
+                ad.b = lid
+                ad.c = 0
+                f.emit(ad)
+                << t
+            }
+        }
+        // M166: nested `&r` (r already a ref) is AddrOf of the pointer slot.
+        if is_nest_ref_type(c.ntype[n]) {
+            target := p.nodes[n].a
+            if p.nodes[target].kind == 4 {
+                lid := c.nlocal[target]
+                t := f.new_temp(1, 1)
+                mut ad := mkinstr(16)
+                ad.a = t
+                ad.b = lid
+                ad.c = 0
+                f.emit(ad)
+                << t
+            }
+        }
+        target := p.nodes[n].a
+        // MS4 / MS8: `&xs[i]` / `&m[k]` — ElemAddr or `_rt_map_val_ptr` at the borrow site.
+        if chain_has_index(p, target) {
+            if c.borrow_chain_is_map(p, target) {
+                << f.lower_map_elem_addr(p, c, target)
+            }
+            buf := f.chain_index_is_buf(p, &*c, target)
+            << f.lower_chain_addr(p, c, target, buf)
+        }
+        << f.lower_addr(p, c, target)
+    }
+    if k == 11 || k == 12 || k == 13 || k == 14 { // ArrayLit / Index / Slice
+        << f.lower_expr_array(p, c, n)
+    }
+    if k == 74 { // map[K]V{}
+        << f.lower_map_init(p, c, n)
+    }
+    if k == 6 { // StructInit
+        << f.lower_expr_struct_init(p, c, n)
+    }
+    if k == 7 { // Field read — or module.Const (M9) / Color.Red (M15) / method value (M110)
+        << f.lower_expr_field(p, c, n)
+    }
+    if k == 7 { // Field read
+        << f.lower_expr_field(p, c, n)
+    }
+    if k == 5 { // Call
+        << f.lower_expr_call(p, c, n)
+    }
+    if k == 36 { // ChanInit (M17)
+        ci := c.nlocal[n]
+        capv := f.lower_expr(p, c, p.nodes[n].b)
+        dest := f.new_temp(c.ntype[n], 1)
+        mut ins := mkinstr(30)
+        ins.a = dest
+        ins.b = c.chans[ci].elem_slots
+        ins.c = capv
+        f.emit(ins)
+        << dest
+    }
+    if k == 37 { // Recv (M17)
+        ch := f.lower_expr(p, c, p.nodes[n].a)
+        ci := c.nlocal[n]
+        elem := c.chans[ci].elem_ty
+        dest := f.new_temp(elem, c.chans[ci].elem_slots)
+        mut ins := mkinstr(32)
+        ins.a = dest
+        ins.b = ch
+        ins.c = c.chans[ci].elem_slots
+        f.emit(ins)
+        << dest
+    }
+    if k == 8 { // MethodCall
+        if c.ncall[n] == -83 { // may-throw auto-propagate (§5.7)
+            res := f.lower_call(p, c, n, c.nconst[n])
+            ok_ty := c.ntype[n]
+            tag := f.new_temp(1, 1)
+            mut lf := mkinstr(10)
+            lf.a = tag
+            lf.b = res
+            lf.c = 0
+            lf.d = 1
+            f.emit(lf)
+            dest := f.new_temp(ok_ty, c.type_slots(ok_ty))
+            err_bb := f.new_block()
+            ok_bb := f.new_block()
+            f.terminate(2, tag, err_bb, ok_bb)
+            f.switch_to(err_bb)
+            f.emit_drops_all()
+            f.terminate(3, res, 0, 0)
+            f.switch_to(ok_bb)
+            mut lf2 := mkinstr(10)
+            lf2.a = dest
+            lf2.b = res
+            lf2.c = 8
+            lf2.d = c.type_slots(ok_ty)
+            f.emit(lf2)
+            << dest
+        }
+        << f.lower_expr_method(p, c, n)
+    }
+    if k == 15 { // BinOp
+        << f.lower_expr_binop(p, c, n)
+    }
+    if k == 16 { // UnOp
+        if p.nodes[n].ival == 3 { // Deref → LoadPtr (not Instr Un)
+            inner := p.nodes[n].a
+            ptr := f.lower_expr(p, c, inner)
+            ty := c.ntype[n]
+            ns := c.type_slots(ty)
+            dest := f.new_temp(ty, ns)
+            mut lp := mkinstr(17)
+            if f.ref_expr_is_buf(p, &*c, inner, 0) {
+                lp.kind = 26
+            }
+            lp.a = dest
+            lp.b = ptr
+            lp.c = 0
+            lp.d = ns
+            f.emit(lp)
+            if ty == 3 {
+                cloned := f.new_temp(3, 3)
+                mut cp := mkinstr(9)
+                cp.a = cloned
+                cp.b = dest
+                f.emit(cp)
+                << cloned
+            }
+            << dest
+        }
+        e := f.lower_expr(p, c, p.nodes[n].a)
+        t := f.new_temp(c.ntype[n], c.type_slots(c.ntype[n]))
+        mut ins := mkinstr(5)
+        ins.a = t
+        ins.b = p.nodes[n].ival
+        ins.c = e
+        f.emit(ins)
+        << t
+    }
+    if k == 71 { // OrCatch
+        << f.lower_expr_try_or(p, c, n)
+    }
+    if k == 66 { // NTFnLit
+        << f.lower_expr_fnlit(p, c, n)
+    }
+    if k == 67 { // NTypeIs (M147)
+        iface := f.lower_expr(p, c, p.nodes[n].a)
+        dest := f.new_temp(2, 1)
+        mut ins := mkinstr(41)
+        ins.a = dest
+        ins.b = iface
+        ins.c = c.nlocal[n] // concrete struct id
+        f.emit(ins)
+        << dest
+    }
+    if k == 68 { // NTypeAs (M147): dest = concrete T
+        inner := p.nodes[n].a
+        mut iface := -1
+        // Checker.nstr=1: `any` keep, or struct@ Copy keep. Do not zero/move.
+        keep := n >= 0 && n < c.nstr.len && c.nstr[n] == 1
+        if keep {
+            iface = f.lower_expr(p, c, inner)
+        }
+        // MS6 C: `(mut &e) as T` / `r as T` / `(*r) as T` for &mut any.
+        if p.nodes[inner].kind == 10 && p.nodes[inner].ival == 1 {
+            tgt := p.nodes[inner].a
+            if p.nodes[tgt].kind == 4 {
+                oid := c.nlocal[tgt]
+                // Prefer MFn locals (per-fn); Checker.ltype is only the last fn.
+                mut oty := -1
+                if oid >= 0 && oid < f.locals.len {
+                    oty = f.locals[oid]
+                } else if oid >= 0 && oid < c.ltype.len {
+                    oty = c.ltype[oid]
+                }
+                if !keep && oty >= 0 && is_linear_dynamic(oty) {
+                    iface = f.lower_expr(p, c, tgt)
+                    f.zero_field_slots(oid, 0, 2)
+                    if f.locals_owning[oid] {
+                        f.moved[oid] = true
+                    }
+                }
+            }
+        }
+        if iface < 0 && p.nodes[inner].kind == 4 {
+            rid := c.nlocal[inner]
+            mut rty := -1
+            if rid >= 0 && rid < f.locals.len {
+                rty = f.locals[rid]
+            } else if rid >= 0 && rid < c.ltype.len {
+                rty = c.ltype[rid]
+            }
+            if !keep && rty >= 0 && is_mut_ref_type(rty) {
+                pty := c.ref_inner_type(rty)
+                if is_linear_dynamic(pty) {
+                    ptr := f.lower_expr(p, c, inner)
+                    iface = f.new_temp(pty, 2)
+                    mut lp := mkinstr(17)
+                    lp.a = iface
+                    lp.b = ptr
+                    lp.c = 0
+                    lp.d = 2
+                    f.emit(lp)
+                    z := f.vconst(0)
+                    zt := f.typed_value(z, 1)
+                    for i in 0:2 {
+                        mut sp := mkinstr(18)
+                        sp.a = zt
+                        sp.b = ptr
+                        sp.c = i * 8
+                        sp.d = 1
+                        f.emit(sp)
+                    }
+                    if rid < c.laref.len && c.laref[rid] >= 0 {
+                        oid := c.laref[rid]
+                        if oid < f.moved.len && f.locals_owning[oid] {
+                            f.moved[oid] = true
+                        }
+                    }
+                }
+            }
+        }
+        if iface < 0 && p.nodes[inner].kind == 16 && p.nodes[inner].ival == 3 {
+            rnode := p.nodes[inner].a
+            if p.nodes[rnode].kind == 4 {
+                rid := c.nlocal[rnode]
+                mut rty := -1
+                if rid >= 0 && rid < f.locals.len {
+                    rty = f.locals[rid]
+                } else if rid >= 0 && rid < c.ltype.len {
+                    rty = c.ltype[rid]
+                }
+                if !keep && rty >= 0 && is_mut_ref_type(rty) {
+                    pty := c.ref_inner_type(rty)
+                    if is_linear_dynamic(pty) {
+                        ptr := f.lower_expr(p, c, rnode)
+                        iface = f.new_temp(pty, 2)
+                        mut lp := mkinstr(17)
+                        lp.a = iface
+                        lp.b = ptr
+                        lp.c = 0
+                        lp.d = 2
+                        f.emit(lp)
+                        z := f.vconst(0)
+                        zt := f.typed_value(z, 1)
+                        for i in 0:2 {
+                            mut sp := mkinstr(18)
+                            sp.a = zt
+                            sp.b = ptr
+                            sp.c = i * 8
+                            sp.d = 1
+                            f.emit(sp)
+                        }
+                        if rid < c.laref.len && c.laref[rid] >= 0 {
+                            oid := c.laref[rid]
+                            if oid < f.moved.len && f.locals_owning[oid] {
+                                f.moved[oid] = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if iface < 0 {
+            iface = f.lower_expr(p, c, inner)
+            if !keep {
+                f.zero_as_place(p, c, inner)
+                f.mark_move_of(p, c, inner)
+            }
+        }
+        cty := c.ntype[n]
+        dest := f.new_temp(cty, c.type_slots(cty))
+        mut ins := mkinstr(42)
+        ins.a = dest
+        ins.b = iface
+        ins.c = c.nlocal[n] // type_id discriminant
+        ins.d = cty // concrete type tag for nslots / drop
+        if keep {
+            ins.sval = "keep"
+        }
+        f.emit(ins)
+        << dest
+    }
+    << -1 // unreachable: check.xu rejects everything else
+}
+
+// L2c-amp: for `+` string concatenation, a `&string` operand is read
+// through its borrow pointer into an owned string value: the lowered
+// operand is a 1-slot pointer temp, and LoadPtr (instr 17) copies the
+// (ptr,len,cap) descriptor triple out of the referenced slots.
+fn (f &mut MFn) deref_str_operand(p &parser.Parser, c &mut Checker, n int, v int) int {
+    raw_ty := c.ntype[n]
+    if !(is_ref_type(raw_ty) && c.ref_inner_type(raw_ty) == 3) {
+        << v
+    }
+    desc := f.new_temp(3, 3)
+    mut lp := mkinstr(17)
+    lp.a = desc
+    lp.b = v
+    lp.c = 0
+    lp.d = 3
+    f.emit(lp)
+    << desc
+}
+
+// M163/M166: load printable pointee through `&T` / `&&T` for println/eprintln.
+fn (f &mut MFn) deref_print_operand(p &parser.Parser, c &mut Checker, n int, v0 int) int {
+    mut v := v0
+    mut raw_ty := c.ntype[n]
+    for peel in 0:2 {
+        if !is_ref_type(raw_ty) {
+            << v
+        }
+        inner := c.ref_inner_type(raw_ty)
+        mut slots := 1
+        if !is_ref_type(inner) && inner == 3 {
+            slots = 3
+        }
+        if !is_ref_type(inner) && !(inner == 1 || inner == 2 || inner == 3 || inner == 4) {
+            << v
+        }
+        dest := f.new_temp(inner, slots)
+        mut lp := mkinstr(17)
+        lp.a = dest
+        lp.b = v
+        lp.c = 0
+        lp.d = slots
+        f.emit(lp)
+        v = dest
+        raw_ty = inner
+        if !is_ref_type(raw_ty) {
+            << v
+        }
+    }
+    << v
+}
+
+// `&&` / `||`: evaluate lhs; branch. The result is stored into a dedicated
+// local so that SSA promotion can synthesize a proper single-def Phi node
+// rather than leaving a multi-def temporary that violates strict SSA.
+fn (f &mut MFn) lower_short_circuit(p &parser.Parser, c &mut Checker, n int, op int) int {
+    loc := f.new_local(2, 1, false)
+    l := f.lower_expr(p, c, p.nodes[n].a)
+    mut st1 := mkinstr(3)
+    st1.a = loc
+    st1.b = l
+    f.emit(st1)
+    // RHS calls can consume an owner only on the evaluated path. Reconcile
+    // that move with the skipped path before the boolean result rejoins,
+    // just as statement branches do. LHS moves have already happened.
+    mut outer := []int{}
+    for i in 0:f.scope_ids.len { outer.push(f.scope_ids[i]) }
+    mut pre := []bool{}
+    for i in 0:f.moved.len { pre.push(f.moved[i]) }
+    mut pre_fc := []int{}
+    for i in 0:f.fcons.len { pre_fc.push(f.fcons[i]) }
+    mut pads := []int{}
+    mut cons_off := []int{}
+    mut cons_ids := []int{}
+    mut cons_fc := []int{}
+    rhs_bb := f.new_block()
+    skip_bb := f.new_block()
+    join_bb := f.new_block()
+    // For &&: lhs false -> skip rhs. For ||: lhs true -> skip rhs.
+    if op == 12 {
+        f.terminate(2, l, rhs_bb, skip_bb)
+    } else {
+        f.terminate(2, l, skip_bb, rhs_bb)
+    }
+    f.switch_to(rhs_bb)
+    f.push_scope()
+    r := f.lower_expr(p, c, p.nodes[n].b)
+    mut st2 := mkinstr(3)
+    st2.a = loc
+    st2.b = r
+    f.emit(st2)
+    f.pop_scope_with_drops()
+    f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc)
+    f.switch_to(skip_bb)
+    f.as_restore_outer(&outer, &pre, &pre_fc)
+    f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc)
+    f.as_finish_pads(join_bb, &outer, &pre, &pre_fc, pads, cons_off, cons_ids, cons_fc, c)
+    dest := f.new_temp(2, 1)
+    mut ld := mkinstr(2)
+    ld.a = dest
+    ld.b = loc
+    f.emit(ld)
+    << dest
+}
+
+// Compare method name without moving `p.nodes[n].sval` (M2b).
+fn method_is(p &parser.Parser, n int, name string) bool {
+    m := p.nodes[n].sval + ""
+    if m.len != name.len {
+        << false
+    }
+    for i in 0:name.len {
+        if m[i] != name[i] {
+            << false
+        }
+    }
+    << true
+}
+
+fn (c &Checker) throw_ok_err_ty(ok_ty int, err_ty int) int {
+    for i in 0:c.throws.len {
+        if c.throws[i].ok_ty == ok_ty && c.throws[i].err_ty == err_ty {
+            << 300 + i
+        }
+    }
+    << 0
+}
+
+// M200: heap-box a value into dynamic `any` (fat `(data*, itable*)`).
+// `n` is the value expression that check marked with ncall=-98. The restored
+// concrete ntype determines both the dynamic tag and payload width.

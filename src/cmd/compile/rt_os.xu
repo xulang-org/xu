@@ -1,0 +1,1215 @@
+@main
+
+#xu/types
+
+// `_rt_cstr` returns an owning NUL-terminated copy.  OS helpers keep the
+// pointer in a frame slot while crossing a syscall/foreign call; release it
+// on both success and failure before constructing a returned error.  Keeping
+// this tiny emitter centralized makes it harder for a new path to silently
+// retain one temporary per call.
+fn rt_free_cstr_slot(a &mut Assembler, off int) {
+    a.load(18, 15, off)
+    a.call("_rt_free")
+    <<
+}
+
+// Parent-side cleanup for os_exec.  The same frame slot is used for the Unix
+// argv pointer array and the Windows command-line cstr, so one shared helper
+// keeps both backends balanced.  All three slots are initialized to zero;
+// `_rt_free` treats zero as a no-op, making this safe on early failures.
+fn rt_free_os_exec_temps(a &mut Assembler) {
+    rt_free_cstr_slot(a, -72)
+    rt_free_cstr_slot(a, -96)
+    rt_free_cstr_slot(a, -56)
+    <<
+}
+
+// Load 8-byte little-endian integer at [base+off] into r0; clobbers r1.
+fn rt_ox_load_le64(a &mut Assembler, base int, off int) {
+    a.vm_mov_imm(0, 0)
+    mut i := 0
+    while i < 8 {
+        a.load_byte(1, base, off + i)
+        if i != 0 {
+            a.shl_imm(1, 1, i * 8)
+        }
+        a.ior(0, 0, 1)
+        i = i + 1
+    }
+    <<
+}
+
+fn rt_emit_args_clone(a &mut Assembler) {
+    rt_emit_string_array_clone(a, "_rt_args_clone", "_rt_argv_arr", "_rt_ac_")
+}
+
+// Return an independent owning []string from a process-global descriptor.
+// The source storage remains live for later args/environ calls.
+fn rt_emit_string_array_clone(a &mut Assembler, label string, source string, prefix string) {
+    a.label(label)
+    // Each args()/sys_args() result is an owning []string.  Returning the
+    // global descriptor directly aliases both the element buffer and each
+    // string; dropping the first result then poisons every later call.
+    // Keep this in lockstep with bootstrap xurt's emit_args_clone.
+    // Slots: sret -8, ptr -16, len -24, buf -32, i -40, elem -48,
+    // string -56, string length -64.
+    a.prologue(80)
+    a.store(15, -8, 0)
+    a.lea(0, source)
+    a.load(1, 0, 0)
+    a.store(15, -16, 1)
+    a.load(1, 0, 8)
+    a.store(15, -24, 1)
+
+    // buf = alloc(len * sizeof(string)), with an overflow check.
+    a.load(0, 15, -24)
+    a.vm_mov_imm(1, 24)
+    a.mul(0, 0, 1)
+    a.div(2, 0, 1)
+    a.load(3, 15, -24)
+    a.cmp(2, 3)
+    a.jeq(prefix + "bytes_ok")
+    a.jmp("_rt_al_oom")
+    a.label(prefix + "bytes_ok")
+    a.mov(18, 0)
+    a.call("_rt_alloc")
+    a.store(15, -32, 14)
+    a.vm_mov_imm(0, 0)
+    a.store(15, -40, 0)
+
+    a.label(prefix + "loop")
+    a.load(0, 15, -40)
+    a.load(1, 15, -24)
+    a.cmp(0, 1)
+    a.jge(prefix + "done")
+
+    // elem = ptr + i * sizeof(string).
+    a.load(2, 15, -16)
+    a.vm_mov_imm(3, 24)
+    a.mul(3, 0, 3)
+    a.add(2, 2, 3)
+    a.store(15, -48, 2)
+
+    // Clone the element bytes into a fresh owning string.
+    a.load(0, 2, 8)
+    a.store(15, -64, 0)
+    a.mov(18, 0)
+    a.call("_rt_alloc")
+    a.store(15, -56, 14)
+    a.vm_mov_imm(4, 0)
+    a.label(prefix + "copy")
+    a.load(1, 15, -64)
+    a.cmp(4, 1)
+    a.jge(prefix + "cdone")
+    a.load(2, 15, -48)
+    a.load(2, 2, 0)
+    a.add(2, 2, 4)
+    a.load_byte(5, 2, 0)
+    a.load(3, 15, -56)
+    a.add(3, 3, 4)
+    a.store_byte(3, 0, 5)
+    a.vm_add_imm(4, 4, 1)
+    a.jmp(prefix + "copy")
+    a.label(prefix + "cdone")
+
+    // buf[i] = (string, len, len).
+    a.load(2, 15, -32)
+    a.load(3, 15, -40)
+    a.vm_mov_imm(0, 24)
+    a.mul(3, 3, 0)
+    a.add(2, 2, 3)
+    a.load(1, 15, -56)
+    a.store(2, 0, 1)
+    a.load(1, 15, -64)
+    a.store(2, 8, 1)
+    a.store(2, 16, 1)
+    a.load(0, 15, -40)
+    a.vm_add_imm(0, 0, 1)
+    a.store(15, -40, 0)
+    a.jmp(prefix + "loop")
+
+    a.label(prefix + "done")
+    a.load(0, 15, -8)
+    a.load(1, 15, -32)
+    a.store(0, 0, 1)
+    a.load(1, 15, -24)
+    a.store(0, -8, 1)
+    a.store(0, -16, 1)
+    a.epilogue()
+    <<
+}
+
+// mmap(0, len_reg, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
+// or VirtualAlloc on Windows. Result in Ret.
+fn rt_emit_mmap(a &mut Assembler, len_reg int) {
+    if a.os == 2 {
+        a.vm_mov_imm(18, 0)
+        a.mov(19, len_reg)
+        a.vm_mov_imm(20, 12288) // MEM_COMMIT|MEM_RESERVE = 0x3000
+        a.vm_mov_imm(21, 4) // PAGE_READWRITE
+        a.vm_call_iat("_iat_VirtualAlloc")
+    } else {
+        a.mov(19, len_reg)
+        a.vm_mov_imm(18, 0)
+        a.vm_mov_imm(20, 3) // prot
+        a.vm_mov_imm(21, mmap_flags(a.os))
+        a.vm_mov_imm(22, -1)
+        a.vm_mov_imm(23, 0)
+        a.vm_syscall(syscall_number(a.os, a.arch, 2))
+    }
+    <<
+}
+
+// ===== System information (Go os package), hosted only =====
+
+fn rt_emit_getpid(a &mut Assembler) {
+    a.label("_rt_getpid")
+    a.prologue(16)
+    if a.os == 2 {
+        a.vm_call_iat("_iat_GetCurrentProcessId")
+    } else {
+        a.vm_syscall(syscall_number(a.os, a.arch, 12))
+    }
+    a.epilogue()
+    <<
+}
+
+fn rt_emit_getppid(a &mut Assembler) {
+    a.label("_rt_getppid")
+    a.prologue(16)
+    if a.os == 2 {
+        a.vm_mov_imm(14, 0) // documented divergence: Go queries the PEB
+    } else {
+        a.vm_syscall(syscall_number(a.os, a.arch, 13))
+    }
+    a.epilogue()
+    <<
+}
+
+fn rt_emit_getuid(a &mut Assembler) {
+    a.label("_rt_getuid")
+    a.prologue(16)
+    if a.os == 2 {
+        a.vm_mov_imm(14, -1) // Go semantics on Windows
+    } else {
+        a.vm_syscall(syscall_number(a.os, a.arch, 14))
+    }
+    a.epilogue()
+    <<
+}
+
+fn rt_emit_getgid(a &mut Assembler) {
+    a.label("_rt_getgid")
+    a.prologue(16)
+    if a.os == 2 {
+        a.vm_mov_imm(14, -1)
+    } else {
+        a.vm_syscall(syscall_number(a.os, a.arch, 15))
+    }
+    a.epilogue()
+    <<
+}
+
+fn rt_emit_geteuid(a &mut Assembler) {
+    a.label("_rt_geteuid")
+    a.prologue(16)
+    if a.os == 2 {
+        a.vm_mov_imm(14, -1)
+    } else {
+        a.vm_syscall(syscall_number(a.os, a.arch, 16))
+    }
+    a.epilogue()
+    <<
+}
+
+fn rt_emit_getegid(a &mut Assembler) {
+    a.label("_rt_getegid")
+    a.prologue(16)
+    if a.os == 2 {
+        a.vm_mov_imm(14, -1)
+    } else {
+        a.vm_syscall(syscall_number(a.os, a.arch, 17))
+    }
+    a.epilogue()
+    <<
+}
+
+// Page-size data slot: macOS arm64 constant (Apple Silicon 16K), 4K
+// default elsewhere (Linux auxv / Windows GetSystemInfo fill it at entry).
+fn rt_emit_pagesize_slot(a &mut Assembler) {
+    a.align_data(8)
+    a.data_label("_rt_pagesize_slot")
+    if a.os == 0 && a.arch == 0 {
+        a.emit_data([0, 64, 0, 0, 0, 0, 0, 0]) // 16384
+    } else {
+        a.emit_data([0, 16, 0, 0, 0, 0, 0, 0]) // 4096
+    }
+    <<
+}
+
+fn rt_emit_pagesize(a &mut Assembler) {
+    a.label("_rt_pagesize")
+    a.prologue(16)
+    a.lea(0, "_rt_pagesize_slot")
+    a.load(14, 0, 0)
+    a.epilogue()
+    <<
+}
+
+// M35: errno -> static message descriptor (A0 = ptr, A1 = len, cap 0).
+// Messages are Go os.PathError substrings ("no such file or directory", ...).
+fn rt_emit_errno_msg(a &mut Assembler) {
+    a.data_label("_rt_em_noent")
+    rt_emit_bytes(a, "no such file or directory")
+    a.data_label("_rt_em_perm")
+    rt_emit_bytes(a, "permission denied")
+    a.data_label("_rt_em_exist")
+    rt_emit_bytes(a, "file exists")
+    a.data_label("_rt_em_notdir")
+    rt_emit_bytes(a, "not a directory")
+    a.data_label("_rt_em_isdir")
+    rt_emit_bytes(a, "is a directory")
+    a.data_label("_rt_em_notempty")
+    rt_emit_bytes(a, "directory not empty")
+    a.data_label("_rt_em_unknown")
+    rt_emit_bytes(a, "unknown error")
+    a.label("_rt_errno_msg")
+    a.prologue(16)
+    a.vm_cmp_imm(18, 2) // ENOENT
+    a.jeq("_rt_em_hit_noent")
+    a.vm_cmp_imm(18, 13) // EACCES
+    a.jeq("_rt_em_hit_perm")
+    a.vm_cmp_imm(18, 17) // EEXIST
+    a.jeq("_rt_em_hit_exist")
+    a.vm_cmp_imm(18, 20) // ENOTDIR
+    a.jeq("_rt_em_hit_notdir")
+    a.vm_cmp_imm(18, 21) // EISDIR
+    a.jeq("_rt_em_hit_isdir")
+    a.vm_cmp_imm(18, 66) // ENOTEMPTY
+    a.jeq("_rt_em_hit_notempty")
+    a.lea(18, "_rt_em_unknown")
+    a.vm_mov_imm(19, 13)
+    a.epilogue()
+    a.label("_rt_em_hit_noent")
+    a.lea(18, "_rt_em_noent")
+    a.vm_mov_imm(19, 25)
+    a.epilogue()
+    a.label("_rt_em_hit_perm")
+    a.lea(18, "_rt_em_perm")
+    a.vm_mov_imm(19, 17)
+    a.epilogue()
+    a.label("_rt_em_hit_exist")
+    a.lea(18, "_rt_em_exist")
+    a.vm_mov_imm(19, 11)
+    a.epilogue()
+    a.label("_rt_em_hit_notdir")
+    a.lea(18, "_rt_em_notdir")
+    a.vm_mov_imm(19, 15)
+    a.epilogue()
+    a.label("_rt_em_hit_isdir")
+    a.lea(18, "_rt_em_isdir")
+    a.vm_mov_imm(19, 14)
+    a.epilogue()
+    a.label("_rt_em_hit_notempty")
+    a.lea(18, "_rt_em_notempty")
+    a.vm_mov_imm(19, 19)
+    a.epilogue()
+    <<
+}
+
+// M35: stat(path) -> throw<FileInfo, errors.Error> (sret). size/is_dir/mode.
+fn rt_emit_stat(a &mut Assembler) {
+    // sret -8, ptr -16, len -24, pathZ -32, buf base -40; buf [fp-208, fp-49).
+    // macOS struct stat64 is 144 bytes; 160-byte buffer covers all targets.
+    a.label("_rt_stat")
+    a.prologue(208)
+    a.store(15, -8, 0)
+    a.store(15, -16, 18)
+    a.store(15, -24, 19)
+    a.call("_rt_cstr")
+    a.store(15, -32, 14)
+    a.mov(0, 15)
+    a.vm_sub_imm(0, 0, 208)
+    a.store(15, -40, 0)
+    if a.os == 2 {
+        a.load(18, 15, -32)
+        a.vm_mov_imm(19, 0) // GetFileExInfoStandard
+        a.load(20, 15, -40)
+        a.vm_call_iat("_iat_GetFileAttributesExA")
+        a.vm_cbz(14, "_rt_st_fail")
+        a.load(1, 15, -40)
+        a.load(0, 1, 32) // sizeLow
+        a.vm_mov_imm64(2, 4294967295)
+        a.iand(0, 0, 2)
+        a.load_byte(2, 1, 0)
+        a.load_byte(3, 1, 1)
+        a.shl_imm(3, 3, 8)
+        a.ior(2, 2, 3)
+        a.load_byte(3, 1, 2)
+        a.shl_imm(3, 3, 16)
+        a.ior(2, 2, 3)
+        a.load_byte(3, 1, 3)
+        a.shl_imm(3, 3, 24)
+        a.ior(2, 2, 3)
+        a.mov(4, 2)
+        a.vm_mov_imm64(5, 16) // FILE_ATTRIBUTE_DIRECTORY
+        a.iand(4, 4, 5)
+        a.vm_cmp_imm(4, 0)
+        a.vm_cset(4, 1)
+    } else {
+        if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+            a.vm_mov_imm(18, -100) // AT_FDCWD
+            a.load(19, 15, -32)
+            a.load(20, 15, -40)
+            a.vm_mov_imm(21, 0)
+        } else {
+            a.load(18, 15, -32)
+            a.load(19, 15, -40)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 20))
+        a.vm_normalize_syscall("_rt_st_n1")
+        a.vm_cmp_imm(14, 0)
+        a.jlt("_rt_st_fail")
+        a.load(1, 15, -40)
+        if a.os == 0 {
+            a.load(0, 1, 96) // macOS st_size
+            a.load_byte(2, 1, 4) // st_mode (u16)
+            a.load_byte(3, 1, 5)
+            a.shl_imm(3, 3, 8)
+            a.ior(2, 2, 3)
+        } else {
+            a.load(0, 1, 48) // linux st_size
+            mut mo := 16
+            if a.arch == 1 { mo = 24 }
+            a.load_byte(2, 1, mo) // st_mode (u32)
+            a.load_byte(3, 1, mo + 1)
+            a.shl_imm(3, 3, 8)
+            a.ior(2, 2, 3)
+            a.load_byte(3, 1, mo + 2)
+            a.shl_imm(3, 3, 16)
+            a.ior(2, 2, 3)
+            a.load_byte(3, 1, mo + 3)
+            a.shl_imm(3, 3, 24)
+            a.ior(2, 2, 3)
+        }
+        a.mov(4, 2)
+        a.vm_mov_imm64(5, 61440) // S_IFMT 0xF000
+        a.iand(4, 4, 5)
+        a.vm_cmp_imm(4, 16384) // S_IFDIR 0x4000
+        a.vm_cset(4, 0)
+    }
+    a.load(5, 15, -8)
+    a.vm_mov_imm(1, 0)
+    a.store(5, 0, 1)
+    a.store(5, -8, 0) // size
+    a.store(5, -16, 4) // is_dir
+    a.store(5, -24, 2) // mode
+    rt_free_cstr_slot(a, -32)
+    a.epilogue()
+    a.label("_rt_st_fail")
+    if a.os == 2 {
+        a.vm_mov_imm(18, 2)
+    } else {
+        a.neg(18, 14)
+    }
+    // Preserve errno across the cleanup call; `_rt_free` uses the return
+    // register as a scratch value.
+    a.store(15, -48, 18)
+    rt_free_cstr_slot(a, -32)
+    a.load(18, 15, -48)
+    a.call("_rt_errno_msg")
+    rt_call_throw_strerr_args(a, -8)
+    a.epilogue()
+    <<
+}
+
+// M35: mkdir(path) -> throw<int, errors.Error> (sret).
+fn rt_emit_mkdir(a &mut Assembler) {
+    a.label("_rt_mkdir")
+    a.prologue(32)
+    a.store(15, -8, 0)
+    a.store(15, -16, 18)
+    a.store(15, -24, 19)
+    a.call("_rt_cstr")
+    a.store(15, -32, 14)
+    if a.os == 2 {
+        a.load(18, 15, -32)
+        a.vm_mov_imm(19, 0)
+        a.vm_call_iat("_iat_CreateDirectoryA")
+        a.vm_cbz(14, "_rt_mk_fail")
+    } else {
+        if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+            a.vm_mov_imm(18, -100) // AT_FDCWD
+            a.load(19, 15, -32)
+            a.vm_mov_imm(20, 511) // 0777
+        } else {
+            a.load(18, 15, -32)
+            a.vm_mov_imm(19, 511)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 21))
+        a.vm_normalize_syscall("_rt_mk_n1")
+        a.vm_cmp_imm(14, 0)
+        a.jlt("_rt_mk_fail")
+    }
+    a.load(0, 15, -8)
+    a.vm_mov_imm(1, 0)
+    a.store(0, 0, 1)
+    a.vm_mov_imm(1, 0)
+    a.store(0, -8, 1)
+    rt_free_cstr_slot(a, -32)
+    a.epilogue()
+    a.label("_rt_mk_fail")
+    if a.os == 2 {
+        a.vm_mov_imm(18, 17) // EEXIST placeholder
+    } else {
+        a.neg(18, 14)
+    }
+    a.store(15, -24, 18)
+    rt_free_cstr_slot(a, -32)
+    a.load(18, 15, -24)
+    a.call("_rt_errno_msg")
+    rt_call_throw_strerr_args(a, -8)
+    a.epilogue()
+    <<
+}
+
+// M183: os_system(cmd) → int. macOS system(3); Linux fork/exec/wait;
+// Windows CreateProcessA; other targets return 127.
+// Return value matches wait(2) encoding: exit status in bits 15..8 (so
+// system_exit_code can shift). Windows maps GetExitCodeProcess the same way.
+fn rt_emit_os_system(a &mut Assembler) {
+    a.label("_rt_os_system")
+    if a.os == 0 {
+        // Keep the cstr alive across system(3), then release it before
+        // returning the wait status.
+        a.prologue(32)
+        a.call("_rt_cstr")
+        a.store(15, -8, 14)
+        a.mov(18, 14)
+        a.vm_call_iat("_iat_system")
+        a.store(15, -16, 14)
+        rt_free_cstr_slot(a, -8)
+        a.load(14, 15, -16)
+        a.epilogue()
+        <<
+    }
+    if a.os == 2 {
+        // Frame: -8 cstr, -16 exit DWORD, -120 STARTUPINFOA(104), -144 PROCESS_INFORMATION(24)
+        a.prologue(160)
+        a.call("_rt_cstr")
+        a.store(15, -8, 14)
+        a.mov(0, 15)
+        a.vm_sub_imm(0, 0, 144)
+        a.vm_mov_imm(1, 0)
+        a.label("_rt_oss_z")
+        a.vm_cmp_imm(1, 144)
+        a.jge("_rt_oss_zdone")
+        a.mov(14, 0)
+        a.add(14, 14, 1)
+        a.vm_mov_imm(18, 0)
+        a.store(14, 0, 18)
+        a.vm_add_imm(1, 1, 8)
+        a.jmp("_rt_oss_z")
+        a.label("_rt_oss_zdone")
+        a.mov(14, 15)
+        a.vm_sub_imm(14, 14, 120)
+        a.vm_mov_imm(18, 104)
+        a.store(14, 0, 18)
+        a.load(18, 15, -8)
+        a.mov(19, 15)
+        a.vm_sub_imm(19, 19, 120)
+        a.mov(20, 15)
+        a.vm_sub_imm(20, 20, 144)
+        if a.arch == 1 {
+            a.xbe_call_iat_createprocess("_iat_CreateProcessA")
+        } else {
+            a.abe_call_iat_createprocess("_iat_CreateProcessA")
+        }
+        a.vm_cmp_imm(14, 0)
+        a.jeq("_rt_oss_fail")
+        a.load(18, 15, -144)
+        a.vm_mov_imm(19, 4294967295)
+        a.vm_call_iat("_iat_WaitForSingleObject")
+        a.load(18, 15, -144)
+        a.mov(19, 15)
+        a.vm_sub_imm(19, 19, 16)
+        a.vm_call_iat("_iat_GetExitCodeProcess")
+        a.load(18, 15, -136)
+        a.vm_call_iat("_iat_CloseHandle")
+        a.load(18, 15, -144)
+        a.vm_call_iat("_iat_CloseHandle")
+        rt_free_cstr_slot(a, -8)
+        a.load(14, 15, -16)
+        a.shl_imm(14, 14, 8)
+        a.epilogue()
+        a.label("_rt_oss_fail")
+        rt_free_cstr_slot(a, -8)
+        a.vm_mov_imm(14, 32512) // 127 << 8
+        a.epilogue()
+        <<
+    }
+    if a.os == 1 {
+        // linux: fork/clone + execve("/bin/sh", ["sh","-c",cmd], parent envp) + wait4.
+        a.align_data(8)
+        a.data_label("_rt_oss_sh")
+        rt_emit_bytes(a, "/bin/sh")
+        a.emit_data([0])
+        a.data_label("_rt_oss_sharg")
+        rt_emit_bytes(a, "sh")
+        a.emit_data([0])
+        a.data_label("_rt_oss_c")
+        rt_emit_bytes(a, "-c")
+        a.emit_data([0])
+        // The shared function entry above already owns this symbol. Data
+        // emission does not advance the code cursor or require rebinding it.
+        a.prologue(80)
+        a.call("_rt_cstr")
+        a.store(15, -8, 14)
+        if a.arch == 1 {
+            a.vm_syscall(syscall_number(a.os, a.arch, 36))
+        } else {
+            a.vm_mov_imm(18, 17) // SIGCHLD
+            a.vm_mov_imm(19, 0)
+            a.vm_mov_imm(20, 0)
+            a.vm_mov_imm(21, 0)
+            a.vm_mov_imm(22, 0)
+            a.vm_mov_imm(23, 0)
+            a.vm_syscall(syscall_number(a.os, a.arch, 36))
+        }
+        a.vm_cmp_imm(14, 0)
+        a.jeq("_rt_oss_child")
+        a.jlt("_rt_oss_fail")
+        a.vm_mov_imm(1, 0)
+        a.store(15, -16, 1)
+        a.mov(18, 14)
+        a.mov(19, 15)
+        a.vm_sub_imm(19, 19, 16)
+        a.vm_mov_imm(20, 0)
+        a.vm_mov_imm(21, 0)
+        a.vm_syscall(syscall_number(a.os, a.arch, 38))
+        a.vm_cmp_imm(14, 0)
+        a.jlt("_rt_oss_fail")
+        rt_free_cstr_slot(a, -8)
+        a.load(14, 15, -16)
+        a.epilogue()
+        a.label("_rt_oss_child")
+        a.lea(1, "_rt_oss_sharg")
+        a.store(15, -48, 1)
+        a.lea(1, "_rt_oss_c")
+        a.store(15, -40, 1)
+        a.load(1, 15, -8)
+        a.store(15, -32, 1)
+        a.vm_mov_imm(1, 0)
+        a.store(15, -24, 1)
+        a.lea(18, "_rt_oss_sh")
+        a.mov(19, 15)
+        a.vm_sub_imm(19, 19, 48)
+        a.lea(1, "_rt_entry_argc")
+        a.load(1, 1, 0)
+        a.vm_add_imm(1, 1, 1)
+        a.shl_imm(1, 1, 3)
+        a.lea(20, "_rt_entry_argv")
+        a.load(20, 20, 0)
+        a.add(20, 20, 1)
+        a.vm_syscall(syscall_number(a.os, a.arch, 37))
+        a.vm_mov_imm(18, 127)
+        a.vm_exit()
+        a.label("_rt_oss_fail")
+        rt_free_cstr_slot(a, -8)
+        a.vm_mov_imm(14, 32512)
+        a.epilogue()
+        <<
+    }
+    a.prologue(16)
+    a.vm_mov_imm(14, 127)
+    a.epilogue()
+    <<
+}
+
+// os_exec(path, blob, redir) → wait(2) status (blocks until the child exits).
+// blob = dir\0 + argv (unix: arg0\0arg1\0...) or dir\0cmdline (windows).
+// redir:
+//   empty: inherit stdio
+//   [0]==1, rest path: stdout+stderr file (else stdout file if [0]!=2 and !=3)
+//   [0]==2, [1..8] LE stdout fd; if len>=17, [9..16] LE stdin fd
+//   [0]==3, [1..8] LE stdin fd
+// Parent closes the passed fds after fork. Child dup2 then exec.
+fn rt_emit_os_exec(a &mut Assembler) {
+    a.label("_rt_os_exec")
+    a.prologue(256)
+    a.store(15, -8, 18)
+    a.store(15, -16, 19)
+    a.store(15, -24, 20)
+    a.store(15, -32, 21)
+    a.store(15, -40, 22)
+    a.store(15, -48, 23)
+    // Cmd.start may run inline on the calling M. Move its blocking process
+    // wait to a worker before fork so the caller can feed the child's pipes.
+    a.call("_rt_enter_syscall")
+    a.load(18, 15, -8)
+    a.load(19, 15, -16)
+    a.call("_rt_cstr")
+    a.store(15, -56, 14)
+    // Initialize all optional/parent-cleanup slots explicitly to NULL/false.
+    // Keep the source register and stores obvious here: a non-zero sentinel in
+    // -96 makes the no-redirection path call `_rt_free` on an invalid pointer.
+    a.vm_mov_imm(0, 0)
+    a.store(15, -64, 0)  // dir pointer: NULL (use current working directory)
+    a.vm_mov_imm(0, 0)
+    a.store(15, -104, 0) // redirection flag: false
+    a.vm_mov_imm(0, 0)
+    a.store(15, -96, 0)  // optional redirection path cstr: NULL
+    a.vm_mov_imm(0, 0)
+    a.store(15, -160, 0) // stdout-fd redir flag
+    a.vm_mov_imm(0, 0)
+    a.store(15, -168, 0) // stdout-fd value
+    a.vm_mov_imm(0, 0)
+    a.store(15, -176, 0) // stdin-fd redir flag
+    a.vm_mov_imm(0, 0)
+    a.store(15, -184, 0) // stdin-fd value
+    a.load(2, 15, -24)
+    a.load(3, 15, -32)
+    a.vm_mov_imm(4, 0)
+    a.label("_rt_ox_dir")
+    a.cmp(4, 3)
+    a.jge("_rt_ox_dir_done")
+    a.add(5, 2, 4)
+    a.load_byte(1, 5, 0)
+    a.vm_cbz(1, "_rt_ox_dir_hit")
+    a.vm_add_imm(4, 4, 1)
+    a.jmp("_rt_ox_dir")
+    a.label("_rt_ox_dir_hit")
+    a.vm_cmp_imm(4, 0)
+    a.jeq("_rt_ox_dir_skip")
+    a.store(15, -64, 2)
+    a.label("_rt_ox_dir_skip")
+    a.vm_add_imm(4, 4, 1)
+    a.label("_rt_ox_dir_done")
+    a.add(2, 2, 4)
+    a.sub(3, 3, 4)
+    a.store(15, -120, 2)
+    a.store(15, -128, 3)
+    a.load(2, 15, -40)
+    a.load(3, 15, -48)
+    a.vm_cmp_imm(3, 0)
+    a.jeq("_rt_ox_nr")
+    a.load_byte(1, 2, 0)
+    a.vm_cmp_imm(1, 2)
+    a.jeq("_rt_ox_mode2")
+    a.vm_cmp_imm(1, 3)
+    a.jne("_rt_ox_notfd")
+    // redir[0]==3, redir[1..8] little-endian stdin fd.
+    a.vm_cmp_imm(3, 9)
+    a.jlt("_rt_ox_nr")
+    rt_ox_load_le64(a, 2, 1)
+    a.store(15, -184, 0)
+    a.vm_mov_imm(1, 1)
+    a.store(15, -176, 1)
+    a.jmp("_rt_ox_nr")
+    a.label("_rt_ox_mode2")
+    // redir[0]==2, redir[1..8] little-endian stdout fd; if len>=17,
+    // redir[9..16] is the stdin fd.
+    // Parent closes the passed fds after fork so leftover pipe ends
+    // in the parent see EOF / EPIPE when the child exits.
+    a.vm_cmp_imm(3, 9)
+    a.jlt("_rt_ox_nr")
+    rt_ox_load_le64(a, 2, 1)
+    a.store(15, -168, 0)
+    a.vm_mov_imm(1, 1)
+    a.store(15, -160, 1)
+    a.load(3, 15, -48)
+    a.vm_cmp_imm(3, 17)
+    a.jlt("_rt_ox_nr")
+    a.load(2, 15, -40)
+    rt_ox_load_le64(a, 2, 9)
+    a.store(15, -184, 0)
+    a.vm_mov_imm(1, 1)
+    a.store(15, -176, 1)
+    a.jmp("_rt_ox_nr")
+    a.label("_rt_ox_notfd")
+    a.vm_cmp_imm(1, 1)
+    a.jne("_rt_ox_r1")
+    a.vm_mov_imm(1, 1)
+    a.store(15, -104, 1)
+    a.vm_add_imm(2, 2, 1)
+    a.vm_sub_imm(3, 3, 1)
+    a.label("_rt_ox_r1")
+    a.vm_cmp_imm(3, 0)
+    a.jeq("_rt_ox_nr")
+    a.mov(18, 2)
+    a.mov(19, 3)
+    a.call("_rt_cstr")
+    a.store(15, -96, 14)
+    a.label("_rt_ox_nr")
+    if a.os == 2 {
+        rt_emit_os_exec_win(a)
+        <<
+    }
+    rt_emit_os_exec_unix(a)
+    <<
+}
+
+fn rt_emit_os_exec_unix(a &mut Assembler) {
+    a.vm_mov_imm(1, 0)
+    a.store(15, -80, 1)
+    a.load(2, 15, -120)
+    a.load(3, 15, -128)
+    a.vm_mov_imm(4, 0)
+    a.label("_rt_ox_cnt")
+    a.cmp(4, 3)
+    a.jge("_rt_ox_nc")
+    a.load(1, 15, -80)
+    a.vm_add_imm(1, 1, 1)
+    a.store(15, -80, 1)
+    a.label("_rt_ox_sk")
+    a.cmp(4, 3)
+    a.jge("_rt_ox_nc")
+    a.add(5, 2, 4)
+    a.load_byte(1, 5, 0)
+    a.vm_add_imm(4, 4, 1)
+    a.vm_cbnz(1, "_rt_ox_sk")
+    a.jmp("_rt_ox_cnt")
+    a.label("_rt_ox_nc")
+    a.load(1, 15, -80)
+    a.vm_cmp_imm(1, 0)
+    a.jne("_rt_ox_al")
+    a.vm_mov_imm(1, 1)
+    a.store(15, -80, 1)
+    a.vm_mov_imm(1, 1)
+    a.store(15, -112, 1)
+    a.jmp("_rt_ox_al2")
+    a.label("_rt_ox_al")
+    a.vm_mov_imm(1, 0)
+    a.store(15, -112, 1)
+    a.label("_rt_ox_al2")
+    a.load(1, 15, -80)
+    a.vm_add_imm(1, 1, 1)
+    a.shl_imm(18, 1, 3)
+    a.call("_rt_alloc")
+    a.store(15, -72, 14)
+    a.load(1, 15, -112)
+    a.vm_cbz(1, "_rt_ox_fill")
+    a.load(1, 15, -56)
+    a.load(2, 15, -72)
+    a.store(2, 0, 1)
+    a.vm_mov_imm(1, 0)
+    a.store(2, 8, 1)
+    a.jmp("_rt_ox_fork")
+    a.label("_rt_ox_fill")
+    a.load(2, 15, -120)
+    a.load(3, 15, -128)
+    a.load(0, 15, -72)
+    a.vm_mov_imm(4, 0)
+    a.vm_mov_imm(5, 0)
+    a.label("_rt_ox_fp")
+    a.load(1, 15, -80)
+    a.cmp(5, 1)
+    a.jge("_rt_ox_fz")
+    a.add(1, 2, 4)
+    a.store(0, 0, 1)
+    a.vm_add_imm(0, 0, 8)
+    a.vm_add_imm(5, 5, 1)
+    a.label("_rt_ox_fn")
+    a.cmp(4, 3)
+    a.jge("_rt_ox_fz")
+    a.add(1, 2, 4)
+    a.load_byte(1, 1, 0)
+    a.vm_add_imm(4, 4, 1)
+    a.vm_cbnz(1, "_rt_ox_fn")
+    a.jmp("_rt_ox_fp")
+    a.label("_rt_ox_fz")
+    a.vm_mov_imm(1, 0)
+    a.store(0, 0, 1)
+    a.label("_rt_ox_fork")
+    if a.os == 0 {
+        a.vm_call_iat("_iat_fork")
+    } else {
+        if a.os == 1 && a.arch != 1 {
+            a.vm_mov_imm(18, 17)
+            a.vm_mov_imm(19, 0)
+            a.vm_mov_imm(20, 0)
+            a.vm_mov_imm(21, 0)
+            a.vm_mov_imm(22, 0)
+            a.vm_mov_imm(23, 0)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 36))
+    }
+    a.vm_cmp_imm(14, 0)
+    a.jeq("_rt_ox_child")
+    a.jlt("_rt_ox_fail")
+    a.load(1, 15, -160)
+    a.vm_cbz(1, "_rt_ox_pstdin")
+    a.load(18, 15, -168)
+    a.vm_syscall(syscall_number(a.os, a.arch, 6))
+    a.label("_rt_ox_pstdin")
+    a.load(1, 15, -176)
+    a.vm_cbz(1, "_rt_ox_wait")
+    a.load(18, 15, -184)
+    a.vm_syscall(syscall_number(a.os, a.arch, 6))
+    a.label("_rt_ox_wait")
+    a.vm_mov_imm(1, 0)
+    a.store(15, -88, 1)
+    a.mov(18, 14)
+    a.mov(19, 15)
+    a.vm_sub_imm(19, 19, 88)
+    a.vm_mov_imm(20, 0)
+    a.vm_mov_imm(21, 0)
+    if a.os == 0 {
+        a.vm_call_iat("_iat_wait4")
+    } else {
+        a.vm_syscall(syscall_number(a.os, a.arch, 38))
+    }
+    a.vm_cmp_imm(14, 0)
+    a.jlt("_rt_ox_fail")
+    rt_free_os_exec_temps(a)
+    a.load(14, 15, -88)
+    a.epilogue()
+    a.label("_rt_ox_child")
+    a.load(18, 15, -64)
+    a.vm_cbz(18, "_rt_ox_nd")
+    a.vm_syscall(syscall_number(a.os, a.arch, 40))
+    a.label("_rt_ox_nd")
+    a.load(1, 15, -176)
+    a.vm_cbz(1, "_rt_ox_cstdout")
+    a.load(18, 15, -184)
+    a.vm_mov_imm(19, 0)
+    if a.os == 0 {
+        a.vm_call_iat("_iat_dup2")
+    } else {
+        if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+            a.vm_mov_imm(20, 0)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 45))
+    }
+    a.load(18, 15, -184)
+    a.vm_syscall(syscall_number(a.os, a.arch, 6))
+    a.label("_rt_ox_cstdout")
+    a.load(1, 15, -160)
+    a.vm_cbz(1, "_rt_ox_file")
+    a.load(18, 15, -168)
+    a.vm_mov_imm(19, 1)
+    if a.os == 0 {
+        a.vm_call_iat("_iat_dup2")
+    } else {
+        if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+            a.vm_mov_imm(20, 0)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 45))
+    }
+    a.load(18, 15, -168)
+    a.vm_syscall(syscall_number(a.os, a.arch, 6))
+    a.jmp("_rt_ox_exec")
+    a.label("_rt_ox_file")
+    a.load(18, 15, -96)
+    a.vm_cbz(18, "_rt_ox_exec")
+    if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+        a.vm_mov_imm(18, -100)
+        a.load(19, 15, -96)
+        a.vm_mov_imm(20, open_flags_write(a.os))
+        a.vm_mov_imm(21, 438)
+    } else {
+        a.load(18, 15, -96)
+        a.vm_mov_imm(19, open_flags_write(a.os))
+        a.vm_mov_imm(20, 438)
+    }
+    a.vm_syscall(syscall_number(a.os, a.arch, 4))
+    a.vm_normalize_syscall("_rt_ox_opn")
+    a.vm_cmp_imm(14, 0)
+    a.jlt("_rt_ox_xfail")
+    a.store(15, -112, 14)
+    a.mov(18, 14)
+    a.vm_mov_imm(19, 1)
+    if a.os == 0 {
+        a.vm_call_iat("_iat_dup2")
+    } else {
+        if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+            a.vm_mov_imm(20, 0)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 45))
+    }
+    a.load(1, 15, -104)
+    a.vm_cbz(1, "_rt_ox_cl")
+    a.load(18, 15, -112)
+    a.vm_mov_imm(19, 2)
+    if a.os == 0 {
+        a.vm_call_iat("_iat_dup2")
+    } else {
+        if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+            a.vm_mov_imm(20, 0)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 45))
+    }
+    a.label("_rt_ox_cl")
+    a.load(18, 15, -112)
+    a.vm_syscall(syscall_number(a.os, a.arch, 6))
+    a.label("_rt_ox_exec")
+    if a.os == 0 {
+        a.vm_call_iat("_iat__NSGetEnviron")
+        a.load(20, 14, 0)
+        a.store(15, -136, 20)
+        a.load(18, 15, -56)
+        a.load(19, 15, -72)
+        a.load(20, 15, -136)
+        a.vm_call_iat("_iat_execve")
+    } else {
+        a.load(18, 15, -56)
+        a.load(19, 15, -72)
+        a.lea(1, "_rt_entry_argc")
+        a.load(1, 1, 0)
+        a.vm_add_imm(1, 1, 1)
+        a.shl_imm(1, 1, 3)
+        a.lea(20, "_rt_entry_argv")
+        a.load(20, 20, 0)
+        a.add(20, 20, 1)
+        a.vm_syscall(syscall_number(a.os, a.arch, 37))
+    }
+    a.label("_rt_ox_xfail")
+    a.vm_mov_imm(18, 127)
+    a.vm_exit()
+    a.label("_rt_ox_fail")
+    rt_free_os_exec_temps(a)
+    a.vm_mov_imm(14, 32512)
+    a.epilogue()
+    <<
+}
+
+fn rt_emit_os_exec_win(a &mut Assembler) {
+    a.load(18, 15, -120)
+    a.load(19, 15, -128)
+    a.call("_rt_cstr")
+    a.store(15, -72, 14)
+    a.mov(0, 15)
+    a.vm_sub_imm(0, 0, 256)
+    a.vm_mov_imm(1, 0)
+    a.label("_rt_oxw_z")
+    a.vm_cmp_imm(1, 128)
+    a.jge("_rt_oxw_zd")
+    a.mov(14, 0)
+    a.add(14, 14, 1)
+    a.vm_mov_imm(18, 0)
+    a.store(14, 0, 18)
+    a.vm_add_imm(1, 1, 8)
+    a.jmp("_rt_oxw_z")
+    a.label("_rt_oxw_zd")
+    a.mov(2, 15)
+    a.vm_sub_imm(2, 2, 232)
+    a.vm_mov_imm(18, 104)
+    a.store(2, 0, 18)
+    a.vm_mov_imm(1, 0)
+    a.store(15, -112, 1)
+    a.load(18, 15, -96)
+    a.vm_cbz(18, "_rt_oxw_si")
+    a.load(18, 15, -96)
+    a.vm_mov_imm64(19, 1073741824)
+    a.vm_mov_imm(20, 1)
+    a.vm_mov_imm(21, 0)
+    a.vm_mov_imm(22, 2)
+    a.vm_mov_imm(23, 128)
+    a.vm_call_iat7("_iat_CreateFileA")
+    rt_win_cmp_invalid_handle(a)
+    a.jeq("_rt_ox_fail")
+    a.store(15, -112, 14)
+    a.mov(2, 15)
+    a.vm_sub_imm(2, 2, 232)
+    a.vm_mov_imm(18, 256)
+    a.store(2, 60, 18)
+    a.vm_mov_imm(18, -10)
+    a.vm_call_iat("_iat_GetStdHandle")
+    a.mov(2, 15)
+    a.vm_sub_imm(2, 2, 232)
+    a.store(2, 80, 14)
+    a.load(18, 15, -112)
+    a.store(2, 88, 18)
+    a.load(1, 15, -104)
+    a.vm_cbz(1, "_rt_oxw_err")
+    a.store(2, 96, 18)
+    a.jmp("_rt_oxw_si")
+    a.label("_rt_oxw_err")
+    a.vm_mov_imm(18, -12)
+    a.vm_call_iat("_iat_GetStdHandle")
+    a.mov(2, 15)
+    a.vm_sub_imm(2, 2, 232)
+    a.store(2, 96, 14)
+    a.label("_rt_oxw_si")
+    a.load(18, 15, -56)
+    a.load(19, 15, -72)
+    a.load(20, 15, -64)
+    a.mov(21, 15)
+    a.vm_sub_imm(21, 21, 232)
+    a.mov(22, 15)
+    a.vm_sub_imm(22, 22, 256)
+    a.load(1, 15, -96)
+    a.vm_cmp_imm(1, 0)
+    a.jeq("_rt_oxw_inh0")
+    a.vm_mov_imm(23, 1)
+    a.jmp("_rt_oxw_go")
+    a.label("_rt_oxw_inh0")
+    a.vm_mov_imm(23, 0)
+    a.label("_rt_oxw_go")
+    if a.arch == 1 {
+        a.xbe_call_iat_createprocess_exec("_iat_CreateProcessA")
+    } else {
+        a.abe_call_iat_createprocess_exec("_iat_CreateProcessA")
+    }
+    a.vm_cmp_imm(14, 0)
+    a.jeq("_rt_oxw_cln")
+    a.load(18, 15, -256)
+    a.vm_mov_imm(19, 4294967295)
+    a.vm_call_iat("_iat_WaitForSingleObject")
+    a.load(18, 15, -256)
+    a.mov(19, 15)
+    a.vm_sub_imm(19, 19, 88)
+    a.vm_call_iat("_iat_GetExitCodeProcess")
+    a.load(18, 15, -248)
+    a.vm_call_iat("_iat_CloseHandle")
+    a.load(18, 15, -256)
+    a.vm_call_iat("_iat_CloseHandle")
+    a.load(18, 15, -112)
+    a.vm_cbz(18, "_rt_oxw_ok")
+    a.vm_call_iat("_iat_CloseHandle")
+    a.label("_rt_oxw_ok")
+    rt_free_os_exec_temps(a)
+    a.load(14, 15, -88)
+    a.shl_imm(14, 14, 8)
+    a.epilogue()
+    a.label("_rt_oxw_cln")
+    a.load(18, 15, -112)
+    a.vm_cbz(18, "_rt_ox_fail")
+    a.vm_call_iat("_iat_CloseHandle")
+    a.label("_rt_ox_fail")
+    rt_free_os_exec_temps(a)
+    a.vm_mov_imm(14, 32512)
+    a.epilogue()
+    <<
+}
+
+// M35: rename(old, new) -> throw<int, errors.Error> (sret).
+fn rt_emit_rename(a &mut Assembler) {
+    // sret -8, old ptr -16, old len -24, new ptr -32, new len -40,
+    // oldZ -48, newZ -56.
+    a.label("_rt_rename")
+    a.prologue(64)
+    a.store(15, -8, 0)
+    a.store(15, -16, 18)
+    a.store(15, -24, 19)
+    a.store(15, -32, 20)
+    a.store(15, -40, 21)
+    a.load(18, 15, -16)
+    a.load(19, 15, -24)
+    a.call("_rt_cstr")
+    a.store(15, -48, 14)
+    a.load(18, 15, -32)
+    a.load(19, 15, -40)
+    a.call("_rt_cstr")
+    a.store(15, -56, 14)
+    if a.os == 2 {
+        a.load(18, 15, -48)
+        a.load(19, 15, -56)
+        a.vm_mov_imm(20, 1) // MOVEFILE_REPLACE_EXISTING
+        a.vm_call_iat("_iat_MoveFileExA")
+        a.vm_cbz(14, "_rt_rn_fail")
+    } else {
+        if a.os == 1 && (a.arch == 0 || a.arch == 4 || a.arch == 5) {
+            a.vm_mov_imm(18, -100)
+            a.load(19, 15, -48)
+            a.vm_mov_imm(20, -100)
+            a.load(21, 15, -56)
+        } else {
+            a.load(18, 15, -48)
+            a.load(19, 15, -56)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 22))
+        a.vm_normalize_syscall("_rt_rn_n1")
+        a.vm_cmp_imm(14, 0)
+        a.jlt("_rt_rn_fail")
+    }
+    a.load(0, 15, -8)
+    a.vm_mov_imm(1, 0)
+    a.store(0, 0, 1)
+    a.vm_mov_imm(1, 0)
+    a.store(0, -8, 1)
+    rt_free_cstr_slot(a, -48)
+    rt_free_cstr_slot(a, -56)
+    a.epilogue()
+    a.label("_rt_rn_fail")
+    if a.os == 2 {
+        a.vm_mov_imm(18, 2)
+    } else {
+        a.neg(18, 14)
+    }
+    a.store(15, -64, 18)
+    rt_free_cstr_slot(a, -48)
+    rt_free_cstr_slot(a, -56)
+    a.load(18, 15, -64)
+    a.call("_rt_errno_msg")
+    rt_call_throw_strerr_args(a, -8)
+    a.epilogue()
+    <<
+}
+
+// M35: remove(path) -> throw<int, errors.Error> (sret). unlink then rmdir.
+fn rt_emit_remove(a &mut Assembler) {
+    a.label("_rt_remove")
+    a.prologue(32)
+    a.store(15, -8, 0)
+    a.store(15, -16, 18)
+    a.store(15, -24, 19)
+    a.call("_rt_cstr")
+    a.store(15, -32, 14)
+    if a.os == 2 {
+        a.load(18, 15, -32)
+        a.vm_call_iat("_iat_DeleteFileA")
+        a.vm_cbnz(14, "_rt_rm_ok")
+        a.load(18, 15, -32)
+        a.vm_call_iat("_iat_RemoveDirectoryA")
+        a.vm_cbz(14, "_rt_rm_fail")
+        a.jmp("_rt_rm_ok")
+    } else {
+        if a.os == 1 {
+            a.vm_mov_imm(18, -100)
+            a.load(19, 15, -32)
+            a.vm_mov_imm(20, 0)
+        } else {
+            a.load(18, 15, -32)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 23))
+        a.vm_normalize_syscall("_rt_rm_n1")
+        a.vm_cmp_imm(14, 0)
+        a.jge("_rt_rm_ok")
+        if a.os == 1 {
+            a.vm_mov_imm(18, -100)
+            a.load(19, 15, -32)
+            a.vm_mov_imm(20, 512) // AT_REMOVEDIR 0x200
+        } else {
+            a.load(18, 15, -32)
+        }
+        a.vm_syscall(syscall_number(a.os, a.arch, 24))
+        a.vm_normalize_syscall("_rt_rm_n2")
+        a.vm_cmp_imm(14, 0)
+        a.jlt("_rt_rm_fail")
+    }
+    a.label("_rt_rm_ok")
+    a.load(0, 15, -8)
+    a.vm_mov_imm(1, 0)
+    a.store(0, 0, 1)
+    a.vm_mov_imm(1, 0)
+    a.store(0, -8, 1)
+    rt_free_cstr_slot(a, -32)
+    a.epilogue()
+    a.label("_rt_rm_fail")
+    if a.os == 2 {
+        a.vm_mov_imm(18, 2)
+    } else {
+        a.neg(18, 14)
+    }
+    a.store(15, -24, 18)
+    rt_free_cstr_slot(a, -32)
+    a.load(18, 15, -24)
+    a.call("_rt_errno_msg")
+    rt_call_throw_strerr_args(a, -8)
+    a.epilogue()
+    <<
+}
+
+// ===== M-net: TCP IPv4 dial/listen/accept/read/write/close (hosted only) =====
+// Unix: syscalls. Windows: Winsock2 via LoadLibraryA(ws2_32.dll) in rt_net.xu.

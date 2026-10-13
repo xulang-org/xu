@@ -1,0 +1,2124 @@
+@main
+
+#xu/types
+
+// Integer parks, pins, spill, load/store. Split from emit_frame.xu.
+
+fn rc_flush(a &mut Assembler) {
+    a.rc_const_vr = -1
+    a.rc_const_val = 0
+    // Metadata is function/block-local even when code generation has selected
+    // the no-cache or fixed-vreg path.  The Assembler is reused across
+    // functions, so an rc_on early return here can leak a prior ALU ephemeral
+    // or FP alias into a real spill slot with the same numeric offset.
+    a.rc_alu_eph = 0
+    a.rc_int_ephem_t = -1
+    a.rc_int_ephem_vr = -1
+    a.rc_int_ephem_ii = -1
+    hi := rc_home_hi(&*a)
+    for i in 0:hi {
+        a.rc_slot[i] = -1
+        a.rc_dirty[i] = 0
+        a.rc_alias[i] = -1
+    }
+    for p in 0:4 {
+        a.rc_pin_dirty[p] = 0
+        a.rc_pin_alias[p] = -1
+        a.rc_s_hold[p] = -1
+    }
+    a.rc_const_vr = -1
+    // FP-only loop residency is intentionally carried across block labels;
+    // clearing these homes here would turn every natural-loop backedge into a
+    // frame reload. Ordinary regcache mode keeps the historical reset.
+    if !a.rc_fp_only {
+        nh := rc_fp_homes()
+        for p in 0:nh {
+            a.rc_fp_pin[p] = -1
+            a.rc_fp_dirty[p] = 0
+            a.rc_fp_alias[p] = -1
+            a.rc_fp_alias2[p] = -1
+        }
+        a.rc_fp_rhs = -1
+        a.rc_fp_fma_dm = -1
+        a.rc_fp_ephem = -1
+    }
+    for i in 0:6 {
+        a.rc_arg[i] = -1
+        a.rc_arg_alias[i] = -1
+    }
+    rc_reapply_vreg_mask(a)
+    <<
+}
+
+fn rc_vreg_held(a &Assembler, vr int) bool {
+    if vr < 0 || vr >= 31 { << false }
+    << (a.rc_vreg_mask & (1 << vr)) != 0
+}
+
+// Occupy GPR homes the fixed-home plan already owns so a later park
+// cannot pick them. The sentinel is not a frame slot, so spill skips it.
+fn rc_reapply_vreg_mask(a &mut Assembler) {
+    if a.rc_vreg_mask == 0 { << }
+    hi := rc_home_hi(&*a)
+    for i in 2:hi {
+        if rc_vreg_held(&*a, i) {
+            a.rc_slot[i] = synth_slot(0)
+            a.rc_dirty[i] = 0
+        }
+    }
+}
+
+// O2 arm64: pin homes are S0–S3 (8..11); else V2–V5.
+// Same numbers as td_gpr_callee_lo(0)+p / td_gpr_caller_lo+p.
+fn rc_pin_vr(a &Assembler, p int) int {
+    if a.rc_s_pool && a.arch == 0 {
+        << 8 + p
+    }
+    << 2 + p
+}
+
+// M192b: save park metadata for a single-pred successor.
+fn rc_carry_save(a &mut Assembler, bi int) {
+    if !a.rc_on || bi < 0 { << }
+    a.rc_in_ok[bi] = 1
+    for i in 0:8 {
+        a.rc_in_slot[bi * 8 + i] = a.rc_slot[i]
+        a.rc_in_dirty[bi * 8 + i] = a.rc_dirty[i]
+        a.rc_in_alias[bi * 8 + i] = a.rc_alias[i]
+        a.rc_in_used[bi * 8 + i] = a.rc_used[i]
+    }
+    a.rc_in_tick[bi] = a.rc_tick
+    for p in 0:4 {
+        a.rc_in_pin[bi * 4 + p] = a.rc_pin[p]
+    }
+    <<
+}
+
+fn rc_carry_restore(a &mut Assembler, bi int) bool {
+    if !a.rc_on || bi < 0 || a.rc_in_ok[bi] == 0 {
+        << false
+    }
+    a.rc_in_ok[bi] = 0
+    for i in 0:8 {
+        a.rc_slot[i] = a.rc_in_slot[bi * 8 + i]
+        a.rc_dirty[i] = a.rc_in_dirty[bi * 8 + i]
+        a.rc_alias[i] = a.rc_in_alias[bi * 8 + i]
+        a.rc_used[i] = a.rc_in_used[bi * 8 + i]
+    }
+    a.rc_tick = a.rc_in_tick[bi]
+    for p in 0:4 {
+        a.rc_pin[p] = a.rc_in_pin[bi * 4 + p]
+    }
+    << true
+}
+
+fn rc_init_m192b(a &mut Assembler, nblk int) {
+    // Grow as locals then assign: `a.rc_pred.push` on a free-fn `&mut Assembler`
+    // parameter does not write the slice descriptor back (see emit_function pins).
+    mut pred := []int{}
+    mut in_ok := []int{}
+    mut in_slot := []int{}
+    mut in_dirty := []int{}
+    mut in_alias := []int{}
+    mut in_used := []int{}
+    mut in_tick := []int{}
+    mut in_pin := []int{}
+    for i in 0:nblk {
+        pred.push(0)
+        in_ok.push(0)
+        in_tick.push(0)
+        for j in 0:8 {
+            in_slot.push(-1)
+            in_dirty.push(0)
+            in_alias.push(-1)
+            in_used.push(0)
+        }
+        for p in 0:4 {
+            in_pin.push(-1)
+        }
+    }
+    a.rc_pred = pred
+    a.rc_in_ok = in_ok
+    a.rc_in_slot = in_slot
+    a.rc_in_dirty = in_dirty
+    a.rc_in_alias = in_alias
+    a.rc_in_used = in_used
+    a.rc_in_tick = in_tick
+    a.rc_in_pin = in_pin
+    <<
+}
+
+fn rc_count_preds(a &mut Assembler, m &types.Mir, fi int) {
+    nblk := types.mir_nblocks(m, fi)
+    for bi in 0:nblk {
+        tkind := types.mir_btkind(m, fi, bi)
+        ta := types.mir_bta(m, fi, bi)
+        tb := types.mir_btb(m, fi, bi)
+        tc := types.mir_btc(m, fi, bi)
+        if tkind == 1 {
+            if ta >= 0 && ta < nblk {
+                a.rc_pred[ta] = a.rc_pred[ta] + 1
+            }
+        }
+        if tkind == 2 {
+            if tb >= 0 && tb < nblk {
+                a.rc_pred[tb] = a.rc_pred[tb] + 1
+            }
+            if tc >= 0 && tc < nblk {
+                a.rc_pred[tc] = a.rc_pred[tc] + 1
+            }
+        }
+    }
+    <<
+}
+
+fn rc_spill_one(a &mut Assembler, i int) {
+    if a.rc_slot[i] >= 0 && a.rc_dirty[i] == 1 {
+        if is_frame_slot(a.rc_slot[i]) {
+            a.store(15, slot_off(a.rc_slot[i]), i)
+        }
+        a.rc_dirty[i] = 0
+    }
+    <<
+}
+
+// Write LoadLocal skip-store aliases back before parks die (O1 early spill).
+fn rc_materialize_aliases(a &mut Assembler) {
+    if !a.rc_on {
+        <<
+    }
+    hi := rc_home_hi(&*a)
+    for i in 2:hi {
+        al := a.rc_alias[i]
+        if is_frame_slot(al) {
+            a.store(15, slot_off(al), i)
+        }
+    }
+    for p in 0:4 {
+        al := a.rc_pin_alias[p]
+        if is_frame_slot(al) {
+            a.store(15, slot_off(al), rc_pin_vr(&*a, p))
+        }
+    }
+    if is_frame_slot(a.rc_addr_alias) {
+        if a.rc_addr_vr >= 0 {
+            a.store(15, slot_off(a.rc_addr_alias), a.rc_addr_vr)
+        }
+    }
+    for i in 0:6 {
+        al := a.rc_arg_alias[i]
+        if is_frame_slot(al) {
+            a.store(15, slot_off(al), arg_reg(i))
+        }
+    }
+    // !s_pool ephemeral S2/S3: skip-store temps live only in those homes.
+    if !a.rc_s_pool && a.arch == 0 {
+        for p in 2:4 {
+            sl := a.rc_s_hold[p]
+            if is_frame_slot(sl) {
+                a.store(15, slot_off(sl), 8 + p)
+            }
+        }
+    }
+    if rc_fp_on(&*a) {
+        nh := rc_fp_homes()
+        for p in 0:nh {
+            al := a.rc_fp_alias[p]
+            if al >= 0 {
+                a.be_fmov_gpr_from_d(0, rc_fp_d(p))
+                if is_frame_slot(al) {
+                    a.store(15, slot_off(al), 0)
+                }
+                rc_park(a, 0, al)
+            }
+            al2 := a.rc_fp_alias2[p]
+            if al2 >= 0 && al2 != al {
+                a.be_fmov_gpr_from_d(0, rc_fp_d(p))
+                if is_frame_slot(al2) {
+                    a.store(15, slot_off(al2), 0)
+                }
+                rc_park(a, 0, al2)
+            }
+        }
+    }
+    <<
+}
+
+// Write dirty parks back to the frame, then forget them.
+fn rc_spill(a &mut Assembler) {
+    if !a.rc_on { << }
+    emit_push_cursor_clear(a)
+    rc_materialize_aliases(a)
+    hi := rc_home_hi(&*a)
+    for i in 2:hi {
+        rc_spill_one(a, i)
+    }
+    if a.rc_s_pool && a.arch == 0 {
+        for p in 0:4 {
+            if a.rc_pin[p] >= 0 && a.rc_pin_dirty[p] == 1 {
+                a.store(15, slot_off(a.rc_pin[p]), 8 + p)
+                a.rc_pin_dirty[p] = 0
+            }
+        }
+    }
+    rc_spill_fp(a)
+    rc_flush(a)
+    for p in 0:4 {
+        a.rc_pin[p] = -1
+    }
+    <<
+}
+
+// Drop array base-pointer CSE across calls / clobbers.
+fn rc_arr_invalidate(a &mut Assembler) {
+    a.rc_arr_t0 = -1
+    a.rc_arr_t1 = -1
+    a.rc_madd_k0 = -1
+    a.rc_madd_k1 = -1
+    a.rc_row_k0 = -1
+    a.rc_row_k1 = -1
+    a.rc_aik_loc = -1
+    <<
+}
+
+fn rc_arr_held(a &Assembler, i int) bool {
+    // Madd products live in V4/V5 only when S-pool pins own S0–S3.
+    if a.rc_s_pool && i == 4 && a.rc_madd_k0 >= 0 { << true }
+    if a.rc_s_pool && i == 5 && a.rc_madd_k1 >= 0 { << true }
+    if i == 6 && a.rc_arr_t0 >= 0 { << true }
+    if i == 7 && a.rc_arr_t1 != -1 { << true }
+    << false
+}
+
+fn rc_arr_clear_home(a &mut Assembler, vr int) {
+    if a.rc_s_pool && vr == 4 { a.rc_madd_k0 = -1 }
+    if a.rc_s_pool && vr == 5 { a.rc_madd_k1 = -1 }
+    if vr == 6 {
+        a.rc_arr_t0 = -1
+        a.rc_row_k0 = -1
+    }
+    if vr == 7 {
+        a.rc_arr_t1 = -1
+        a.rc_row_k1 = -1
+    }
+    <<
+}
+
+// Before a call: keep callee-saved parks (O2).
+fn rc_spill_across_call(a &mut Assembler) {
+    if !a.rc_on { << }
+    rc_arr_invalidate(a)
+    if !a.rc_s_pool {
+        rc_spill(a)
+        <<
+    }
+    rc_materialize_aliases(a)
+    rc_spill_fp(a)
+    nh := rc_fp_homes()
+    for p in 0:nh {
+        a.rc_fp_pin[p] = -1
+        a.rc_fp_alias[p] = -1
+        a.rc_fp_alias2[p] = -1
+        a.rc_fp_dirty[p] = 0
+    }
+    a.rc_fp_rhs = -1
+    if a.rc_alu_fwd_fn != 2 {
+        a.rc_fp_fma_dm = -1
+    }
+    a.rc_fp_ephem = -1
+    if a.arch == 0 {
+        hi := rc_home_hi(&*a)
+        for i in 2:hi {
+            if !td_home_clobbered_by_call(a.arch, i) {
+                ->
+            }
+            if a.rc_slot[i] < 0 {
+                ->
+            }
+            rc_spill_one(a, i)
+            a.rc_slot[i] = -1
+            a.rc_alias[i] = -1
+            a.rc_dirty[i] = 0
+        }
+        for p in 0:4 {
+            a.rc_pin_alias[p] = -1
+        }
+        a.rc_addr_alias = -1
+        for i in 0:6 {
+            a.rc_arg[i] = -1
+            a.rc_arg_alias[i] = -1
+        }
+        <<
+    }
+    // x64 RC adapter: keep V2–V5 parks across calls. The vreg planner
+    // treats those homes as caller-saved (`td_home_clobbered_by_call`);
+    // this cache does not. A0–A5 still die.
+    for i in 0:6 {
+        a.rc_arg[i] = -1
+        a.rc_arg_alias[i] = -1
+    }
+    <<
+}
+
+// M192c: arm64 parks in V2–V7; x64 keeps V2–V5.
+// Must match td_gpr_caller_hi for arch 0/1.
+fn rc_home_hi(a &Assembler) int {
+    if a.arch == 0 { << 8 }
+    << 6
+}
+
+fn rc_cacheable_slots(n int) bool {
+    << n >= 1 && n <= 3
+}
+
+// GPR pins are integer homes. f64 is 1-slot but must not share those
+// registers with integer add/cset/skip-store in mixed integer/f64 code.
+fn rc_small_mir(a &Assembler) bool {
+    << a.rc_nfn > 0 && a.rc_nfn < 256
+}
+
+// User units, or a read-only indexed diamond kernel in a large unit
+// (`search_ints` inside `#sort`). Both may skip pin→temp frame writes.
+fn rc_skip_pin_store(a &Assembler) bool {
+    << rc_small_mir(a) || a.rc_kernel == 1 || a.rc_alu_fwd_fn == 2
+}
+
+fn rc_pin_ty_ok(ty int) bool {
+    if ty == 4 {
+        << false
+    }
+    // 1-slot structs are still field-addressed via the frame; pinning them
+    // steals an S home from loop counters (method_sum: Acc vs i).
+    if types.is_struct_type(ty) {
+        << false
+    }
+    // `&T` / `&[]T` similarly: pinning `pal` next to induction `i` made
+    // `pal[1].r` do `ldr [x9]` with x9=1 (image_gif encode / nearest).
+    if types.is_ref_type(ty) {
+        << false
+    }
+    << true
+}
+
+fn rc_edge_can_carry(a &Assembler, pins &[]int, from int, to int) bool {
+    if !a.rc_carry || to < 0 || a.rc_pred[to] != 1 {
+        << false
+    }
+    for p in 0:4 {
+        if pins[to * 4 + p] >= 0 {
+            << false
+        }
+    }
+    if a.rc_fp_blk.len >= (to + 1) * rc_fp_homes() {
+        nh := rc_fp_homes()
+        for p in 0:nh {
+            if a.rc_fp_blk[to * nh + p] >= 0 {
+                << false
+            }
+        }
+    }
+    if from >= 0 && a.rc_fp_blk.len >= (from + 1) * rc_fp_homes() {
+        nh := rc_fp_homes()
+        for p in 0:nh {
+            if a.rc_fp_blk[from * nh + p] >= 0 {
+                << false
+            }
+        }
+    }
+    << true
+}
+
+fn rc_park_incoming(a &mut Assembler, m &types.Mir, fi int, fr &Frame) {
+    if !a.rc_on {
+        <<
+    }
+    for i in 0:types.mir_fn_nparams(m, fi) {
+        if i >= 6 {
+            <-
+        }
+        if types.mir_local_nslots(m, fi, i) != 1 {
+            ->
+        }
+        ty := types.mir_local_ty(m, fi, i)
+        if i == 0 && types.mir_fn_receiver(m, fi) {
+            if !m.fns[fi].receiver_mut && !types.is_ref_type(ty) {
+                ->
+            }
+            // mut/ref receiver: local holds the pointer — park A0.
+        } else if !abi_pass_by_value(ty) {
+            // Struct/string: A0 is a hidden pointer; value already copied.
+            ->
+        }
+        slot := fr.local_slot[i]
+        if rc_find(&*a, slot) >= 0 {
+            ->
+        }
+        if a.rc_leaf {
+            a.rc_arg[i] = slot
+            a.rc_arg_alias[i] = -1
+            ->
+        }
+        rc_park(a, arg_reg(i), slot)
+    }
+    <<
+}
+
+fn rc_apply_s_const(a &mut Assembler, p int, val int) {
+    if p < 0 {
+        <<
+    }
+    // Constant pins have no frame alias. The former 1<<30 marker became a
+    // valid frame-domain value after synthetic slots moved above 1<<50, so
+    // materialization treated it as a real slot and emitted an 8 GiB offset.
+    a.rc_pin_alias[p] = -1
+    a.rc_s_hold[p] = -2
+    a.rc_const_vr = 8 + p
+    a.rc_const_val = val
+    <<
+}
+
+fn rc_slot_is_pin(a &Assembler, slot int) bool {
+    if slot < 0 { << false }
+    for p in 0:4 {
+        if a.rc_pin[p] == slot {
+            << true
+        }
+    }
+    << false
+}
+
+// V-park eviction: V2–V5 hold pins only when not using the arm64 S pool.
+fn rc_pin_home(a &Assembler, i int) bool {
+    if a.rc_s_pool && a.arch == 0 {
+        << false
+    }
+    if i < 2 || i > 5 { << false }
+    << a.rc_pin[i - 2] >= 0
+}
+
+// First temp slot index (temps follow locals). Used to skip dead temps.
+fn rc_temp_cutoff(fr &Frame) int {
+    if fr.temp_slot.len > 0 {
+        << fr.temp_slot[0]
+    }
+    << unused_slot()
+}
+
+// Self-loop back-edge: drop dead temps; keep pinned locals in registers.
+fn rc_spill_except_temps_keep_fp(a &mut Assembler, cutoff int) {
+    // FP-only mode has no GPR cache to spill. Do not call rc_flush here:
+    // it would erase the FP pin metadata carried across the hot self-loop.
+    if !a.rc_on {
+        <<
+    }
+    nh := rc_fp_homes()
+    mut fp_pin := []int{}
+    mut fp_dirty := []int{}
+    mut fp_alias := []int{}
+    mut fp_alias2 := []int{}
+    for p in 0:nh {
+        fp_pin.push(a.rc_fp_pin[p])
+        fp_dirty.push(a.rc_fp_dirty[p])
+        fp_alias.push(a.rc_fp_alias[p])
+        fp_alias2.push(a.rc_fp_alias2[p])
+    }
+    hi := rc_home_hi(&*a)
+    for i in 2:hi {
+        sl := a.rc_slot[i]
+        if sl < 0 { -> }
+        if sl >= cutoff {
+            a.rc_dirty[i] = 0
+            a.rc_slot[i] = -1
+            a.rc_alias[i] = -1
+            ->
+        }
+        if rc_slot_is_pin(&*a, sl) { -> }
+        rc_spill_one(a, i)
+    }
+    rc_flush(a)
+    for p in 0:nh {
+        a.rc_fp_pin[p] = fp_pin[p]
+        a.rc_fp_dirty[p] = fp_dirty[p]
+        a.rc_fp_alias[p] = fp_alias[p]
+        a.rc_fp_alias2[p] = fp_alias2[p]
+    }
+    <<
+}
+
+fn rc_spill_except_temps(a &mut Assembler, cutoff int) {
+    if !a.rc_on { << }
+    hi := rc_home_hi(&*a)
+    for i in 2:hi {
+        sl := a.rc_slot[i]
+        if sl < 0 {
+            ->
+        }
+        if sl >= cutoff {
+            a.rc_dirty[i] = 0
+            a.rc_slot[i] = -1
+            a.rc_alias[i] = -1
+            ->
+        }
+        if rc_slot_is_pin(&*a, sl) {
+            ->
+        }
+        rc_spill_one(a, i)
+        a.rc_slot[i] = -1
+        a.rc_alias[i] = -1
+    }
+    <<
+}
+
+fn rc_writeback_all_gpr_pins(a &mut Assembler) {
+    if !a.rc_on { << }
+    for p in 0:4 {
+        if a.rc_pin[p] < 0 {
+            ->
+        }
+        if a.rc_s_pool && a.arch == 0 {
+            a.store(15, slot_off(a.rc_pin[p]), 8 + p)
+            a.rc_pin_dirty[p] = 0
+        } else {
+            vr := 2 + p
+            if vr < rc_home_hi(&*a) {
+                a.store(15, slot_off(a.rc_pin[p]), vr)
+                a.rc_dirty[vr] = 0
+            }
+        }
+    }
+    <<
+}
+
+// Self-loop `_ht` back-edge: skip pin→stack writeback when every StoreLocal
+// in the latch is a 1-slot integer already in an S-pool pin. Callee-saved
+// S0–S3 survive the body (match table peep uses V0/V1). Exit still spills.
+// Call or a store that is not pinned keeps the conservative writeback —
+// LoadLocal at `_ht` would otherwise reload a stale 0. Not a name gate.
+fn rc_ht_skip_pin_wb(a &Assembler, m &types.Mir, fi int, fr &Frame, bi int) bool {
+    if a.arch != 0 { << false }
+    if !a.rc_on { << false }
+    if !a.rc_s_pool { << false }
+    if !rc_skip_pin_store(a) { << false }
+    // Latch-local StoreIndex miss: `r -= 1` sits in its own block while
+    // `count[r-1]=r` is the pred. Function-wide slot writes ⇒ no skip-store.
+    // ArrPush in the entry (iface_sum `xs.push`) is not a latch store.
+    if fn_has_slot_mem_write(m, fi) && !fn_is_f64_index_acc_kernel(m, fi) { << false }
+    mut nstore := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 7 {
+            // Named fn-value that peeps to `x ±/* k` is not a `bl`.
+            // Counting it as a call kept fn_val_sum storing s/i every iter.
+            // Hosted bits peeps (clz/ror/rbit/rev/cnt) are the same: not a `bl`.
+            if emit_call_is_isel_peep(a, m, fi, ii) {
+                ->
+            }
+            << false
+        }
+        // Memory writes clobber index scratch and skip-store pins.
+        // Reads (LoadIndex/ElemAddr/LoadPtr) stay eligible so search_ints
+        // keeps `_ht`. StoreIndex/FieldRMW do not (min_fk `r`, min_nb `j`).
+        if ik == 11 || ik == 13 || ik == 18 || ik == 20 || ik == 25 || ik == 46 || ik == 47 || ik == 48 {
+            << false
+        }
+        if ik == 3 {
+            loc := types.mir_ia(m, fi, ii)
+            if loc < 0 || loc >= fr.local_slot.len {
+                << false
+            }
+            if types.mir_local_nslots(m, fi, loc) != 1 {
+                << false
+            }
+            // f64 acc lives in an FP pin, not S0–S3. Counting it as a
+            // non-pin store forced early `_ht` and a stack reload of `s`
+            // every iter (f64_sum).
+            if types.mir_local_ty(m, fi, loc) == 4 {
+                nstore += 1
+                ->
+            }
+            if !rc_slot_is_pin(a, fr.local_slot[loc]) {
+                << false
+            }
+            nstore += 1
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << nstore > 0
+}
+
+fn rc_writeback_dirty_gpr_pins(a &mut Assembler) {
+    // `_ht` skips block-entry pin reloads. Body LoadLocal that misses a
+    // live park reads the frame. O1 V2–V5 pins (no S pool) used to skip
+    // this store; induction (`for i in 0 -< n`) then reloaded 0 forever.
+    if !a.rc_on { << }
+    for p in 0:4 {
+        if a.rc_pin[p] < 0 {
+            ->
+        }
+        if a.rc_s_pool && a.arch == 0 {
+            if a.rc_pin_dirty[p] == 1 {
+                a.store(15, slot_off(a.rc_pin[p]), 8 + p)
+                a.rc_pin_dirty[p] = 0
+            }
+        } else {
+            vr := 2 + p
+            if vr < rc_home_hi(&*a) && a.rc_dirty[vr] == 1 {
+                a.store(15, slot_off(a.rc_pin[p]), vr)
+                a.rc_dirty[vr] = 0
+            }
+        }
+    }
+    // Non-pin dirty V homes: ALU dest of `m += 1` may sit off the pin VR.
+    hi := rc_home_hi(&*a)
+    for i in 2:hi {
+        sl := a.rc_slot[i]
+        if sl < 0 {
+            ->
+        }
+        if a.rc_dirty[i] == 1 && is_frame_slot(sl) {
+            a.store(15, slot_off(sl), i)
+            a.rc_dirty[i] = 0
+        }
+    }
+}
+
+fn rc_find(a &Assembler, slot int) int {
+    if !a.rc_on { << -1 }
+    for p in 0:4 {
+        if a.rc_pin[p] == slot && slot >= 0 {
+            << rc_pin_vr(a, p)
+        }
+    }
+    if a.rc_s_pool && a.arch == 0 {
+        for p in 0:4 {
+            if a.rc_pin_alias[p] == slot && slot >= 0 {
+                << 8 + p
+            }
+        }
+        for p in 0:4 {
+            if a.rc_s_hold[p] == slot && is_frame_slot(slot) {
+                << 8 + p
+            }
+        }
+    }
+    // !s_pool: S2/S3 hold ephemeral temps when V2–V5 are pins.
+    if !a.rc_s_pool && a.arch == 0 {
+        for p in 2:4 {
+            if a.rc_s_hold[p] == slot && slot >= 0 {
+                << 8 + p
+            }
+        }
+    }
+    hi := rc_home_hi(a)
+    for i in 0:hi {
+        if a.rc_slot[i] == slot {
+            << i
+        }
+        if a.rc_alias[i] == slot {
+            << i
+        }
+    }
+    for i in 0:6 {
+        if a.rc_arg[i] == slot && slot >= 0 {
+            << 18 + i
+        }
+        if a.rc_arg_alias[i] == slot && slot >= 0 {
+            << 18 + i
+        }
+    }
+    if a.rc_addr_vr >= 0 && a.rc_addr_alias == slot && slot >= 0 {
+        << a.rc_addr_vr
+    }
+    << -1
+}
+
+fn rc_pick_dest(a &Assembler, src int, slot int) int {
+    hi := rc_home_hi(a)
+    for p in 0:4 {
+        if a.rc_pin[p] == slot && slot >= 0 {
+            << rc_pin_vr(a, p)
+        }
+    }
+    if a.rc_s_pool && a.arch == 0 && a.cs_pairs >= 1 {
+        mut lim := a.cs_pairs * 2
+        if lim > 4 {
+            lim = 4
+        }
+        for p in 0:lim {
+            if a.rc_pin_alias[p] == slot && slot >= 0 {
+                << 8 + p
+            }
+        }
+        for p in 0:lim {
+            if a.rc_s_hold[p] == slot && is_frame_slot(slot) {
+                << 8 + p
+            }
+        }
+    }
+    if !a.rc_s_pool && a.arch == 0 {
+        for p in 2:4 {
+            if a.rc_s_hold[p] == slot && slot >= 0 {
+                << 8 + p
+            }
+        }
+    }
+    if src >= 2 && src < hi {
+        if !rc_slot_is_pin(a, a.rc_slot[src]) && src != a.rc_const_vr && !rc_arr_held(a, src) {
+            << src
+        }
+    }
+    for i in 2:hi {
+        if a.rc_slot[i] < 0 && i != a.rc_const_vr && !rc_arr_held(a, i) && !rc_vreg_held(a, i) {
+            << i
+        }
+    }
+    mut dest := 2
+    mut bt := a.rc_used[2]
+    mut found := 0
+    for i in 2:hi {
+        if !rc_slot_is_pin(a, a.rc_slot[i]) && i != a.rc_const_vr && !rc_arr_held(a, i) && !rc_vreg_held(a, i) {
+            if found == 0 || a.rc_used[i] < bt {
+                bt = a.rc_used[i]
+                dest = i
+                found = 1
+            }
+        }
+    }
+    if found == 1 {
+        << dest
+    }
+    // Pins fill V2–V5 (!s_pool): use S2/S3 for ephemeral parks (S0/S1
+    // may hold madd row products; index prologues already save S0–S5).
+    if !a.rc_s_pool && a.arch == 0 && a.cs_pairs >= 2 {
+        for p in 2:4 {
+            if a.rc_s_hold[p] == slot && slot >= 0 {
+                << 8 + p
+            }
+        }
+        for p in 2:4 {
+            if a.rc_s_hold[p] < 0 || a.rc_s_hold[p] == slot {
+                << 8 + p
+            }
+        }
+    }
+    << 0
+}
+
+fn rc_forget_slot(a &mut Assembler, slot int) {
+    if !a.rc_on || slot < 0 {
+        <<
+    }
+    hi := rc_home_hi(&*a)
+    for i in 0:hi {
+        if a.rc_slot[i] == slot {
+            a.rc_slot[i] = -1
+            a.rc_dirty[i] = 0
+        }
+        if a.rc_alias[i] == slot {
+            a.rc_alias[i] = -1
+        }
+    }
+    for p in 0:4 {
+        if a.rc_pin_alias[p] == slot {
+            a.rc_pin_alias[p] = -1
+        }
+        if a.rc_s_hold[p] == slot {
+            a.rc_s_hold[p] = -1
+        }
+        if a.rc_pin[p] == slot {
+            a.rc_pin[p] = -1
+            a.rc_pin_dirty[p] = 0
+        }
+    }
+    for i in 0:6 {
+        if a.rc_arg[i] == slot {
+            a.rc_arg[i] = -1
+        }
+        if a.rc_arg_alias[i] == slot {
+            a.rc_arg_alias[i] = -1
+        }
+    }
+    if a.rc_addr_alias == slot {
+        a.rc_addr_alias = -1
+    }
+    if rc_fp_on(&*a) {
+        nh := rc_fp_homes()
+        for p in 0:nh {
+            if a.rc_fp_pin[p] == slot {
+                a.rc_fp_pin[p] = -1
+                a.rc_fp_dirty[p] = 0
+            }
+            if a.rc_fp_alias[p] == slot {
+                a.rc_fp_alias[p] = -1
+            }
+            if a.rc_fp_alias2[p] == slot {
+                a.rc_fp_alias2[p] = -1
+            }
+        }
+    }
+    <<
+}
+
+// Spill dirty park for `slot` then forget — before AddrOf(Local).
+fn rc_evict_slot(a &mut Assembler, slot int) {
+    if !a.rc_on || slot < 0 {
+        <<
+    }
+    hi := rc_home_hi(&*a)
+    for i in 2:hi {
+        if a.rc_slot[i] == slot && a.rc_dirty[i] == 1 {
+            rc_spill_one(a, i)
+        }
+    }
+    p := rc_pin_index(&*a, slot)
+    if p >= 0 {
+        if a.rc_pin_dirty[p] == 1 {
+            a.store(15, slot_off(slot), rc_pin_vr(&*a, p))
+            a.rc_pin_dirty[p] = 0
+        }
+    }
+    pf := rc_fp_index(&*a, slot)
+    if pf >= 0 {
+        if a.rc_fp_dirty[pf] == 1 {
+            a.be_fstore(15, slot_off(slot), rc_fp_d(pf))
+            a.rc_fp_dirty[pf] = 0
+        }
+    }
+    rc_forget_slot(a, slot)
+    <<
+}
+
+fn rc_park(a &mut Assembler, src int, slot int) {
+    if !a.rc_on { << }
+    hi := rc_home_hi(&*a)
+    for i in 0:hi {
+        if a.rc_slot[i] == slot {
+            a.rc_slot[i] = -1
+            a.rc_dirty[i] = 0
+        }
+        if a.rc_alias[i] == slot {
+            a.rc_alias[i] = -1
+        }
+    }
+    for i in 0:6 {
+        if a.rc_arg[i] == slot {
+            a.rc_arg[i] = -1
+        }
+        if a.rc_arg_alias[i] == slot {
+            a.rc_arg_alias[i] = -1
+        }
+    }
+    for p in 0:4 {
+        if a.rc_s_hold[p] == slot {
+            a.rc_s_hold[p] = -1
+        }
+    }
+    dest := rc_pick_dest(&*a, src, slot)
+    if dest == a.rc_const_vr {
+        a.rc_const_vr = -1
+    }
+    if dest < 2 && !rc_slot_is_pin(&*a, slot) {
+        <<
+    }
+    if dest >= 2 && dest < hi {
+        if a.rc_slot[dest] >= 0 && a.rc_dirty[dest] == 1 {
+            rc_spill_one(a, dest)
+        }
+    }
+    if dest != src {
+        a.mov(dest, src)
+    }
+    for p in 0:4 {
+        if a.rc_pin[p] == slot && slot >= 0 {
+            if a.rc_s_pool && a.arch == 0 {
+                a.rc_pin_dirty[p] = 0
+                a.rc_pin_alias[p] = -1
+                <<
+            }
+        }
+    }
+    if dest >= 8 && dest <= 11 && a.rc_s_pool && a.arch == 0 {
+        p := dest - 8
+        a.rc_pin_alias[p] = slot
+        a.rc_s_cache[p] = slot
+        <<
+    }
+    // !s_pool ephemeral: S2/S3 via pick_dest. Do not write rc_slot[10/11]
+    // (V homes are 0..home_hi).
+    if dest >= 10 && dest <= 11 && !a.rc_s_pool && a.arch == 0 {
+        p := dest - 8
+        a.rc_s_hold[p] = slot
+        <<
+    }
+    a.rc_slot[dest] = slot
+    a.rc_dirty[dest] = 0
+    a.rc_alias[dest] = -1
+    a.rc_tick += 1
+    a.rc_used[dest] = a.rc_tick
+    <<
+}
+
+fn rc_clobber(a &mut Assembler, vr int) {
+    if !a.rc_on { << }
+    if vr == a.rc_const_vr {
+        a.rc_const_vr = -1
+    }
+    if vr == a.rc_elem_vr {
+        a.rc_elem_vr = -1
+    }
+    rc_arr_clear_home(a, vr)
+    if vr < 0 || vr >= rc_home_hi(&*a) { << }
+    a.rc_slot[vr] = -1
+    a.rc_dirty[vr] = 0
+    a.rc_alias[vr] = -1
+    <<
+}
+
+// Write a temp's park back to its frame slot (keep the park).
+fn rc_materialize_temp(a &mut Assembler, m &types.Mir, fi int, fr &Frame, v int) {
+    if v < 0 {
+        <<
+    }
+    slot := fr.temp_slot[v]
+    h := rc_find(&*a, slot)
+    if h >= 0 {
+        if !is_synth_slot(slot) {
+            a.store(15, slot_off(slot), h)
+        }
+        if h >= 2 && h < rc_home_hi(&*a) {
+            a.rc_dirty[h] = 0
+        }
+    }
+    <<
+}
+
+// Write back a dirty V park then drop it (safe scratch prep).
+fn rc_evict(a &mut Assembler, vr int) {
+    if !a.rc_on { << }
+    if vr >= 2 && vr < rc_home_hi(&*a) {
+        rc_spill_one(a, vr)
+    }
+    rc_clobber(a, vr)
+    <<
+}
+
+fn rc_park_dirty(a &mut Assembler, src int, slot int) {
+    rc_park(a, src, slot)
+    for p in 0:4 {
+        if a.rc_pin[p] == slot && slot >= 0 {
+            if a.rc_s_pool && a.arch == 0 {
+                a.rc_pin_dirty[p] = 1
+                <<
+            }
+        }
+    }
+    h := rc_find(&*a, slot)
+    if h >= 0 && h < rc_home_hi(&*a) {
+        a.rc_dirty[h] = 1
+    }
+    <<
+}
+
+// Hot back-edges skip pin reloads; keep S homes that cache `slot` in sync
+// after StoreLocal (loop induction: sid = sid + 1). Consult live pin metadata
+// and the block-entry pin table (survives spill_across_call clearing aliases).
+fn rc_sync_s_after_store(a &mut Assembler, slot int, src int) {
+    if !a.rc_on || !a.rc_s_pool || a.arch != 0 || slot < 0 {
+        <<
+    }
+    for p in 0:4 {
+        mut live := 0
+        if a.rc_pin[p] == slot {
+            live = 1
+        }
+        if a.rc_pin_alias[p] == slot {
+            live = 1
+        }
+        if a.rc_s_hold[p] == slot {
+            live = 1
+        }
+        if a.rc_blk_pin[p] == slot {
+            live = 1
+        }
+        if a.rc_s_cache[p] == slot {
+            live = 1
+        }
+        if live == 0 {
+            ->
+        }
+        pv := 8 + p
+        if src != pv {
+            a.mov(pv, src)
+        }
+        // User units skip the StoreLocal frame write (pin stays dirty).
+        // Self-host already wrote the stack — clear dirty to avoid a
+        // second stur on the back-edge (nbody `j += 1`).
+        if a.rc_pin[p] == slot {
+            if rc_skip_pin_store(&*a) {
+                a.rc_pin_dirty[p] = 1
+            } else {
+                a.rc_pin_dirty[p] = 0
+            }
+        }
+        a.rc_s_cache[p] = slot
+    }
+    <<
+}
+
+fn rc_scratch_avoid(avoid int) int {
+    if avoid != 0 {
+        << 0
+    }
+    << 1
+}
+
+fn rc_scratch_avoid2(a int, b int) int {
+    if 0 != a && 0 != b {
+        << 0
+    }
+    if 1 != a && 1 != b {
+        << 1
+    }
+    << 2
+}
+
+// Load a frame local into a GPR. Must not go through a skipped LoadLocal temp.
+fn rc_load_local_reg(a &mut Assembler, fr &Frame, loc int, scratch int) int {
+    lo := fr.local_slot[loc]
+    mut h := rc_find(&*a, lo)
+    if h >= 0 {
+        rc_touch(a, h)
+        << h
+    }
+    rc_clobber(a, scratch)
+    a.load(scratch, 15, slot_off(lo))
+    rc_park(a, scratch, lo)
+    h = rc_find(&*a, lo)
+    if h >= 0 {
+        << h
+    }
+    << scratch
+}
+
+fn rc_touch(a &mut Assembler, vr int) {
+    if !a.rc_on { << }
+    hi := rc_home_hi(&*a)
+    if vr >= 2 && vr < hi {
+        a.rc_tick += 1
+        a.rc_used[vr] = a.rc_tick
+    }
+    <<
+}
+
+fn rc_const_u32(m &types.Mir, fi int, v int) int {
+    if v >= 0 { << -1 }
+    ci := 0 - v - 2
+    if ci < 0 || ci >= types.mir_nconsts(m, fi) { << -1 }
+    c := types.mir_const_at(m, fi, ci)
+    if c < 0 { << -1 }
+    if c > 4095 { << -1 }
+    << c
+}
+
+// Once-assigned scalar local holding a 0..4095 const (`n := 250`).
+fn rc_local_slot_const_u32(m &types.Mir, fi int, loc int) int {
+    if !rc_scalar_local(m, fi, loc) {
+        << -1
+    }
+    mut stores := 0
+    mut src := 0
+    for ii in 0:types.mir_nins(m, fi) {
+        if types.mir_ikind(m, fi, ii) == 3 && types.mir_ia(m, fi, ii) == loc {
+            stores += 1
+            src = types.mir_ib(m, fi, ii)
+        }
+    }
+    if stores != 1 {
+        << -1
+    }
+    c := rc_const_u32(m, fi, src)
+    if c >= 0 {
+        << c
+    }
+    if src < 0 {
+        << -1
+    }
+    mut copies := 0
+    mut from := 0
+    for ii in 0:types.mir_nins(m, fi) {
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 1 && types.mir_ia(m, fi, ii) == src {
+            copies += 1
+            from = types.mir_ib(m, fi, ii)
+        } else if (ik == 2 || ik == 4 || ik == 5 || ik == 14) && types.mir_ia(m, fi, ii) == src {
+            << -1
+        }
+    }
+    if copies != 1 {
+        << -1
+    }
+    << rc_const_u32(m, fi, from)
+}
+
+// Const 0..4095, or a temp that is the unique LoadLocal of such a local.
+fn rc_local_const_u32(m &types.Mir, fi int, v int) int {
+    c := rc_const_u32(m, fi, v)
+    if c >= 0 {
+        << c
+    }
+    if v < 0 {
+        << -1
+    }
+    mut defs := 0
+    mut loc := -1
+    mut copy_from := 0
+    mut is_copy := 0
+    for ii in 0:types.mir_nins(m, fi) {
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 2 && types.mir_ia(m, fi, ii) == v {
+            defs += 1
+            loc = types.mir_ib(m, fi, ii)
+            is_copy = 0
+        } else if ik == 1 && types.mir_ia(m, fi, ii) == v {
+            defs += 1
+            copy_from = types.mir_ib(m, fi, ii)
+            is_copy = 1
+            loc = -1
+        } else if (ik == 4 || ik == 5 || ik == 14) && types.mir_ia(m, fi, ii) == v {
+            << -1
+        }
+    }
+    if defs != 1 {
+        << -1
+    }
+    if is_copy == 1 {
+        << rc_const_u32(m, fi, copy_from)
+    }
+    if loc < 0 {
+        << -1
+    }
+    << rc_local_slot_const_u32(m, fi, loc)
+}
+
+fn rc_lsb_mask(m &types.Mir, fi int, v int) int {
+    if v >= 0 { << -1 }
+    c := types.mir_const_at(m, fi, -v - 2)
+    if c <= 0 { << -1 }
+    if (c & (c + 1)) != 0 { << -1 }
+    << c
+}
+
+fn and_imm_fits_arch(arch int, mask int) bool {
+    if mask < 0 { << false }
+    if arch == 0 { << true }
+    if arch == 1 {
+        if mask <= 2147483647 { << true }
+        << false
+    }
+    if arch == 4 {
+        if mask <= 4095 { << true }
+        << false
+    }
+    if arch == 3 || arch == 5 {
+        if mask <= 2047 { << true }
+        << false
+    }
+    << false
+}
+
+fn rc_pick_alu(a &Assembler) int {
+    if !a.rc_on { << 0 }
+    hi := rc_home_hi(a)
+    for i in 2:hi {
+        if a.rc_slot[i] < 0 && i != a.rc_const_vr && !rc_arr_held(a, i) && !rc_vreg_held(a, i) {
+            << i
+        }
+    }
+    << 0
+}
+
+fn rc_hoist_const(m &types.Mir, fi int, bi int) int {
+    mut found := 0
+    mut ok := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 {
+            <-
+        } else {
+            if types.mir_ikind(m, fi, ii) == 4 {
+                for side in 0:2 {
+                    mut v := types.mir_ic(m, fi, ii)
+                    if side == 1 {
+                        v = types.mir_id(m, fi, ii)
+                    }
+                    if v < 0 {
+                        c := types.mir_const_at(m, fi, -v - 2)
+                        if c > 4095 && ok == 0 {
+                            found = c
+                            ok = 1
+                        }
+                    }
+                }
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    if ok == 0 {
+        << 0
+    }
+    << found
+}
+
+fn bin_cond(op int) int {
+    if op == 6 { << 0 }
+    if op == 7 { << 1 }
+    if op == 8 { << 11 }
+    if op == 9 { << 13 }
+    if op == 10 { << 12 }
+    if op == 11 { << 10 }
+    << -1
+}
+
+fn invert_cc(c int) int {
+    if c == 0 { << 1 }
+    if c == 1 { << 0 }
+    if c == 4 { << 5 }
+    if c == 5 { << 4 }
+    if c == 8 { << 9 }
+    if c == 9 { << 8 }
+    if c == 11 { << 10 }
+    if c == 10 { << 11 }
+    if c == 13 { << 12 }
+    if c == 12 { << 13 }
+    << c
+}
+
+fn emit_jcc(a &mut Assembler, c int, label string) {
+    // Fused ARM64 floating LT/LE and their inverse conditions.
+    if a.arch == 0 && (c == 4 || c == 5 || c == 8 || c == 9) {
+        a.bcond(c, label)
+        <<
+    }
+    if c == 0 {
+        a.jeq(label)
+        <<
+    }
+    if c == 1 {
+        a.jne(label)
+        <<
+    }
+    if c == 11 {
+        a.jlt(label)
+        <<
+    }
+    if c == 13 {
+        a.jle(label)
+        <<
+    }
+    if c == 12 {
+        a.jgt(label)
+        <<
+    }
+    if c == 10 {
+        a.jge(label)
+        <<
+    }
+}
+
+fn rc_back_lbl(a &Assembler, m &types.Mir, fi int, bi int, tb int) string {
+    if a.arch == 0 && tb == bi && a.rc_hot_lbl.len > 0 {
+        << a.rc_hot_lbl + ""
+    }
+    // Cross-block `_ht` is only for proved index kernels (uniform pin
+    // layout). Nested StoreIndex self-loops inside a bigger SCC
+    // (inlined fannkuch `flips_of`) do not share S homes; skipping the
+    // header reload left `r` as 0 and `count[r-1]` OOB.
+    // The fixed-home FP index cache is seeded at each block entry. Its
+    // first edge can be inside the natural loop (including Phi stubs),
+    // so only its same-block backedge may skip that initialization.
+    if a.arch == 0 && (a.rc_kernel == 1 || a.rc_fwd_ht) {
+        if bi >= 0 && tb >= 0 && bi < a.rc_loop_hot.len && tb < a.rc_loop_hot.len {
+            if a.rc_loop_hot[bi] > 0 && a.rc_loop_hot[tb] > 0 {
+                if bi > tb || a.rc_kernel == 1 || a.rc_fwd_ht {
+                    << types.mir_fn_label(m, fi) + "_bb" + str(tb) + "_ht"
+                }
+            }
+        }
+    }
+    << types.mir_fn_label(m, fi) + "_bb" + str(tb)
+}
+
+// Void scalar leaf (Acc.add): A0–a{n-1} unchanged → caller may keep aliases.
+fn rc_seed_preserved_call_a0(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) {
+    if a.rc_addr_vr < 0 || a.rc_addr_local < 0 {
+        <<
+    }
+    mut addr_tmp := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    while ii >= 0 {
+        k := types.mir_ikind(m, fi, ii)
+        if k == 16 && types.mir_ic(m, fi, ii) == 0 && types.mir_ib(m, fi, ii) == a.rc_addr_local {
+            addr_tmp = types.mir_ia(m, fi, ii)
+        }
+        if k == 7 && types.mir_ib(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) < 0 {
+            if addr_tmp < 0 {
+                <<
+            }
+            mask := callee_preserves_arg_mask(&*a, m, types.mir_isval(m, fi, ii) + "")
+            if (mask & 1) == 0 {
+                <<
+            }
+            ah := types.mir_ic(m, fi, ii)
+            if ah < 0 || types.mir_marg_v(m, fi, ah) != addr_tmp {
+                <<
+            }
+            a.mov(arg_reg(0), a.rc_addr_vr)
+            a.rc_arg_alias[0] = fr.temp_slot[addr_tmp]
+            a.rc_arg[0] = -1
+            <<
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    <<
+}
+
+fn rc_pin_index(a &Assembler, slot int) int {
+    for p in 0:4 {
+        if a.rc_pin[p] == slot && slot >= 0 {
+            << p
+        }
+    }
+    << -1
+}
+
+fn rc_load_reg(a &mut Assembler, m &types.Mir, fi int, fr &Frame, v int, scratch int) int {
+    if v < 0 {
+        c := types.mir_const_at(m, fi, -v - 2)
+        // Hoist lives in V7 only while RA is on. Reusing it with rc_on
+        // off kept a stale 0x70 (frame offset) as `1e9` in unix_nano.
+        if a.rc_on && a.rc_const_vr >= 0 && a.rc_const_val == c {
+            << a.rc_const_vr
+        }
+        rc_clobber(a, scratch)
+        a.vm_mov_imm64(scratch, c)
+        << scratch
+    }
+    if v == a.rc_int_ephem_t && a.rc_int_ephem_vr >= 0 {
+        vr := a.rc_int_ephem_vr
+        a.rc_int_ephem_t = -1
+        a.rc_int_ephem_vr = -1
+        a.rc_int_ephem_ii = -1
+        << vr
+    }
+    if v >= 0 && v < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[v]) {
+        << vreg_slot_home(fr.temp_slot[v])
+    }
+    if v >= 0 && v < fr.temp_slot.len && is_fp_vreg_slot(fr.temp_slot[v]) {
+        rc_clobber(a, scratch)
+        a.be_fmov_gpr_from_d(scratch, fp_vreg_slot_d(fr.temp_slot[v]))
+        << scratch
+    }
+    p := rc_fp_index_alias(&*a, fr.temp_slot[v])
+    if p >= 0 {
+        rc_clobber(a, scratch)
+        a.be_fmov_gpr_from_d(scratch, rc_fp_d(p))
+        << scratch
+    }
+    ns := types.mir_temp_nslots(m, fi, v)
+    if a.rc_on && rc_cacheable_slots(ns) {
+        slot := fr.temp_slot[v]
+        mut h := rc_find(&*a, slot)
+        if h >= 0 {
+            rc_touch(a, h)
+            << h
+        }
+        if emit_try_load_ref_alias(a, m, fi, fr, v, scratch) {
+            << scratch
+        }
+        rc_clobber(a, scratch)
+        if is_synth_slot(slot) {
+            << scratch
+        }
+        a.load(scratch, 15, slot_off(slot))
+        rc_park(a, scratch, slot)
+        h = rc_find(&*a, slot)
+        if h >= 0 {
+            << h
+        }
+        << scratch
+    }
+    if emit_try_load_ref_alias(a, m, fi, fr, v, scratch) {
+        << scratch
+    }
+    rc_clobber(a, scratch)
+    if is_synth_slot(fr.temp_slot[v]) {
+        << scratch
+    }
+    a.load(scratch, 15, slot_off(fr.temp_slot[v]))
+    << scratch
+}
+
+fn rc_coalesce_store_pin(a &Assembler, m &types.Mir, fi int, fr &Frame, dest_temp int, next_ii int) int {
+    if !a.rc_on || !a.rc_wb || next_ii < 0 {
+        << -1
+    }
+    mut ni := next_ii
+    mut t := dest_temp
+    // One Copy of dest before StoreLocal: `t = ror; x = t`.
+    if types.mir_ikind(m, fi, ni) == 1 && types.mir_ib(m, fi, ni) == t {
+        t = types.mir_ia(m, fi, ni)
+        ni = types.mir_inext(m, fi, ni)
+        if ni < 0 {
+            << -1
+        }
+    }
+    if types.mir_ikind(m, fi, ni) != 3 {
+        << -1
+    }
+    if types.mir_ib(m, fi, ni) != t {
+        << -1
+    }
+    loc := types.mir_ia(m, fi, ni)
+    if loc < 0 {
+        << -1
+    }
+    if !rc_pin_ty_ok(types.mir_local_ty(m, fi, loc)) {
+        << -1
+    }
+    lo := fr.local_slot[loc]
+    p := rc_pin_index(a, lo)
+    if p < 0 {
+        << -1
+    }
+    << rc_pin_vr(a, p)
+}
+
+// Follow Copy dest=t where t has no later use and the Copy dest is a vreg
+// (loop-carried home). Returns that home, or dest's own vreg, or -1.
+fn emit_copy_chain_dest_home(m &types.Mir, fi int, fr &Frame, dest_temp int, next_ii int) int {
+    mut t := dest_temp
+    mut ni := next_ii
+    mut home := -1
+    if dest_temp >= 0 && dest_temp < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[dest_temp]) {
+        home = vreg_slot_home(fr.temp_slot[dest_temp])
+    }
+    for _ in 0:4 {
+        if ni < 0 {
+            <-
+        }
+        if types.mir_ikind(m, fi, ni) != 1 {
+            <-
+        }
+        if types.mir_ib(m, fi, ni) != t {
+            <-
+        }
+        cd := types.mir_ia(m, fi, ni)
+        if cd < 0 || cd >= fr.temp_slot.len {
+            <-
+        }
+        if !is_vreg_slot(fr.temp_slot[cd]) {
+            <-
+        }
+        // mir_temp_uses_from misses Copy src (ib). A second Copy of t
+        // must keep t's own home (math.sin integer scratch).
+        if temp_used_after_ii(m, fi, -1, ni, t) {
+            <-
+        }
+        t = cd
+        home = vreg_slot_home(fr.temp_slot[cd])
+        ni = types.mir_inext(m, fi, ni)
+    }
+    << home
+}
+
+fn emit_copy_chain_dest_last(m &types.Mir, fi int, fr &Frame, dest_temp int, next_ii int) int {
+    mut t := dest_temp
+    mut ni := next_ii
+    mut last := -1
+    for _ in 0:4 {
+        if ni < 0 {
+            <-
+        }
+        if types.mir_ikind(m, fi, ni) != 1 {
+            <-
+        }
+        if types.mir_ib(m, fi, ni) != t {
+            <-
+        }
+        cd := types.mir_ia(m, fi, ni)
+        if cd < 0 || cd >= fr.temp_slot.len {
+            <-
+        }
+        if !is_vreg_slot(fr.temp_slot[cd]) {
+            <-
+        }
+        if temp_used_after_ii(m, fi, -1, ni, t) {
+            <-
+        }
+        last = ni
+        t = cd
+        ni = types.mir_inext(m, fi, ni)
+    }
+    << last
+}
+
+fn emit_skip_copy_dest_chain(a &mut Assembler, m &types.Mir, fi int, fr &Frame, dest_temp int, next_ii int) {
+    last := emit_copy_chain_dest_last(m, fi, fr, dest_temp, next_ii)
+    if last >= 0 && next_ii >= 0 {
+        a.rc_fp_skip_n = isel_skip_count(m, fi, next_ii, last)
+    }
+}
+
+fn vreg_home_is_callee(home int) bool {
+    << home >= 8 && home <= 13
+}
+
+// Walk Copy defs of `v` before `before` toward a loop-carried vreg home.
+// Stop at S0–S5: dest-coalesce of `x = ror(t)` skips `mov x19, x11`, so
+// walking through that Copy would read the stale caller-saved `t` (i/sum).
+fn emit_copy_chain_src_home(m &types.Mir, fi int, fr &Frame, bi int, before int, v int) int {
+    mut cur := v
+    mut home := -1
+    if v >= 0 && v < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[v]) {
+        home = vreg_slot_home(fr.temp_slot[v])
+        if vreg_home_is_callee(home) {
+            << home
+        }
+    }
+    if bi < 0 {
+        << home
+    }
+    for _ in 0:8 {
+        mut found_copy := -1
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 || ii == before {
+                <-
+            }
+            if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == cur {
+                found_copy = types.mir_ib(m, fi, ii)
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        if found_copy < 0 {
+            <-
+        }
+        cur = found_copy
+        if cur >= 0 && cur < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[cur]) {
+            sh := vreg_slot_home(fr.temp_slot[cur])
+            home = sh
+            if vreg_home_is_callee(sh) {
+                << home
+            }
+        } else {
+            <-
+        }
+    }
+    << home
+}
+
+fn rc_coalesce_alu_lhs(a &Assembler, m &types.Mir, fi int, fr &Frame, lhs int, dest_temp int, next_ii int) int {
+    if !a.rc_on || next_ii < 0 || lhs < 0 {
+        << -1
+    }
+    nk := types.mir_ikind(m, fi, next_ii)
+    // StoreField (11) / StorePtr (18) only — never StoreLocal (3): in-place ALU
+    // onto a live lhs breaks patterns like write_uleb128 (`b:=x&127; x=x>>7`).
+    if nk != 18 && nk != 11 {
+        << -1
+    }
+    if types.mir_ia(m, fi, next_ii) != dest_temp {
+        << -1
+    }
+    if types.mir_ib(m, fi, next_ii) == lhs {
+        << -1
+    }
+    // Refuse if lhs is read again later in this block.
+    mut scan := types.mir_inext(m, fi, next_ii)
+    while scan >= 0 {
+        if rc_instr_reads_temp(m, fi, scan, lhs) {
+            << -1
+        }
+        scan = types.mir_inext(m, fi, scan)
+    }
+    h := rc_find(a, fr.temp_slot[lhs])
+    if h >= 2 && h < rc_home_hi(a) {
+        << h
+    }
+    if h >= 8 && h < 12 && a.rc_s_pool && a.arch == 0 {
+        << h
+    }
+    << -1
+}
+
+// Conservative: true if instr may read temp `t` as a source (not dest).
+fn rc_instr_reads_temp(m &types.Mir, fi int, ii int, t int) bool {
+    k := types.mir_ikind(m, fi, ii)
+    a := types.mir_ia(m, fi, ii)
+    b := types.mir_ib(m, fi, ii)
+    c := types.mir_ic(m, fi, ii)
+    d := types.mir_id(m, fi, ii)
+    if k == 1 { // Copy src=b
+        << b == t
+    }
+    if k == 3 { // StoreLocal src=b
+        << b == t
+    }
+    if k == 4 { // Bin lhs=c rhs=d
+        << c == t || d == t
+    }
+    if k == 5 { // Un src=c
+        << c == t
+    }
+    if k == 7 || k == 33 { // Call / Xu args chain in c
+        mut ai := c
+        while ai >= 0 {
+            if types.mir_marg_v(m, fi, ai) == t {
+                << true
+            }
+            ai = types.mir_marg_next(m, fi, ai)
+        }
+        << false
+    }
+    if k == 10 || k == 16 || k == 17 || k == 21 || k == 22 || k == 24 || k == 26 {
+        << b == t
+    }
+    if k == 11 || k == 18 || k == 25 { // StoreField/StorePtr: src=a base=b
+        << a == t || b == t
+    }
+    if k == 14 || k == 23 { // LoadIndex / ElemAddr: base=b index=c
+        << b == t || c == t
+    }
+    if k == 20 { // StoreIndex: base=a? check mir — a=array b=index c=value
+        << a == t || b == t || c == t
+    }
+    if k == 47 { // IndexRMW: a=array b=index c=rhs
+        << a == t || b == t || c == t
+    }
+    if k == 31 || k == 35 { // ChanSend / TrySend
+        << a == t || b == t
+    }
+    if k == 32 || k == 34 || k == 36 {
+        << b == t || c == t
+    }
+    << false
+}
+
+/// Next is direct Call (kind 7, b=1) and dest is args[i] once → ALU into Ai.
+fn rc_coalesce_call_arg(a &Assembler, m &types.Mir, fi int, fr &Frame, dest_temp int, next_ii int) int {
+    if !a.rc_on || next_ii < 0 {
+        << -1
+    }
+    if types.mir_ikind(m, fi, next_ii) != 7 {
+        << -1
+    }
+    if types.mir_ib(m, fi, next_ii) != 1 {
+        << -1
+    }
+    mut ai := types.mir_ic(m, fi, next_ii)
+    mut i := 0
+    mut hit := -1
+    while ai >= 0 && i < 6 {
+        v := types.mir_marg_v(m, fi, ai)
+        if v == dest_temp {
+            if hit >= 0 {
+                << -1
+            }
+            hit = i
+        }
+        i += 1
+        ai = types.mir_marg_next(m, fi, ai)
+    }
+    if hit < 0 {
+        << -1
+    }
+    << arg_reg(hit)
+}
+
+// `(x>>n)|(x<<(32-n))` xor-tree isel is live in this fn (sha256 Sigma).
+fn rc_commit_alu(a &mut Assembler, m &types.Mir, fi int, fr &Frame, dest_temp int, dest_r int, coalesced int, next_ii int) {
+    a.rc_int_ephem_t = -1
+    a.rc_int_ephem_vr = -1
+    a.rc_int_ephem_ii = -1
+    a.rc_alu_eph = mir_alu_feeds_index(m, fi, dest_temp, next_ii)
+    if coalesced == 1 {
+        slot := fr.temp_slot[dest_temp]
+        mut pi := -1
+        if a.rc_s_pool && a.arch == 0 {
+            if dest_r >= 8 && dest_r < 12 {
+                pi = dest_r - 8
+            }
+        } else {
+            if dest_r >= 2 && dest_r <= 5 {
+                pi = dest_r - 2
+            }
+        }
+        if pi >= 0 {
+            a.rc_pin_dirty[pi] = 1
+            if a.rc_s_pool && a.arch == 0 {
+                a.rc_pin_alias[pi] = slot
+            } else {
+                a.rc_dirty[dest_r] = 1
+                a.rc_alias[dest_r] = slot
+            }
+        }
+        if !a.rc_leaf && !a.rc_wb {
+            a.store(15, slot_off(slot), dest_r)
+        }
+        a.rc_alu_eph = 0
+        <<
+    }
+    // Call-arg coalesce: value already in Ai (18..23).
+    if dest_r >= 18 && dest_r < 24 {
+        slot := fr.temp_slot[dest_temp]
+        ai := dest_r - 18
+        rc_forget_slot(a, slot)
+        a.rc_arg[ai] = -1
+        a.rc_arg_alias[ai] = slot
+        a.rc_alu_eph = 0
+        <<
+    }
+    // Dest dies at the next StoreLocal: write that local and skip the store.
+    if rc_alu_fwd(&*a, m, fi) && next_ii >= 0 && rc_scalar_temp(m, fi, dest_temp) {
+        if types.mir_ikind(m, fi, next_ii) == 3 && types.mir_ib(m, fi, next_ii) == dest_temp {
+            loc := types.mir_ia(m, fi, next_ii)
+            if rc_scalar_local(m, fi, loc) && rc_temp_use_count(m, fi, dest_temp) == 1 {
+                a.store(15, slot_off(fr.local_slot[loc]), dest_r)
+                a.rc_fp_skip = next_ii
+                a.rc_alu_eph = 0
+                <<
+            }
+        }
+    }
+    // SelectionDAG-style one-edge forwarding for the X64 two-operand tier.
+    // The proof is intentionally narrow: a one-slot integer result, consumed
+    // exactly once as the lhs of the immediately following Bin in a proved
+    // natural-loop block. Arm64's S-pool/V-home split has separate aliasing.
+    if a.arch == 1 && a.rc_nat_wb && next_ii >= 0 && types.mir_temp_nslots(m, fi, dest_temp) == 1 && types.mir_temp_ty(m, fi, dest_temp) != 4 {
+        if types.mir_ikind(m, fi, next_ii) == 4 && types.mir_ic(m, fi, next_ii) == dest_temp {
+            if mir_temp_uses_from(m, fi, dest_temp, next_ii) == 1 {
+                a.rc_int_ephem_t = dest_temp
+                a.rc_int_ephem_vr = dest_r
+                a.rc_int_ephem_ii = next_ii
+                a.rc_alu_eph = 0
+                <<
+            }
+        }
+    }
+    // Same one-edge forward without RA (compress: ror/add trees).
+    if rc_alu_fwd(&*a, m, fi) && next_ii >= 0 && rc_scalar_temp(m, fi, dest_temp) {
+        if types.mir_ikind(m, fi, next_ii) == 4 && types.mir_ic(m, fi, next_ii) == dest_temp {
+            if rc_temp_use_count(m, fi, dest_temp) == 1 {
+                a.rc_int_ephem_t = dest_temp
+                a.rc_int_ephem_vr = dest_r
+                a.rc_int_ephem_ii = next_ii
+                a.rc_alu_eph = 0
+                <<
+            }
+        }
+    }
+    emit_store_scalar_temp(a, m, fi, fr, dest_temp, dest_r)
+    <<
+}
+
+// Park-miss path for `&T` temps: skip-store of a Copy left the temp slot
+// empty, then Call x0 loaded 0 (gen2 check_stmt → fn_failed: ldr [x0-0x16f0]).
+fn emit_try_load_ref_alias(a &mut Assembler, m &types.Mir, fi int, fr &Frame, v int, dest int) bool {
+    loc := temp_ref_alias_local(m, fi, fr, v)
+    if loc < 0 { << false }
+    rc_clobber(a, dest)
+    a.load(dest, 15, slot_off(fr.local_slot[loc]))
+    slot := fr.temp_slot[v]
+    if is_frame_slot(slot) || is_synth_slot(slot) {
+        rc_park(a, dest, slot)
+    }
+    << true
+}
+
+/// Narrow: dest only consumed by index ops (14/20/23/47). Skips p4_for mul→add.
+fn emit_load_value(a &mut Assembler, m &types.Mir, fi int, fr &Frame, v int, dest int) {
+    if v < 0 {
+        rc_clobber(a, dest)
+        a.vm_mov_imm64(dest, types.mir_const_at(m, fi, -v - 2))
+        <<
+    }
+    if v == a.rc_int_ephem_t && a.rc_int_ephem_vr >= 0 {
+        vr := a.rc_int_ephem_vr
+        a.rc_int_ephem_t = -1
+        a.rc_int_ephem_vr = -1
+        a.rc_int_ephem_ii = -1
+        if dest != vr {
+            a.mov(dest, vr)
+        }
+        <<
+    }
+    if v >= 0 && v < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[v]) {
+        home := vreg_slot_home(fr.temp_slot[v])
+        if dest != home {
+            a.mov(dest, home)
+        }
+        <<
+    }
+    if v >= 0 && v < fr.temp_slot.len && is_fp_vreg_slot(fr.temp_slot[v]) {
+        a.be_fmov_gpr_from_d(dest, fp_vreg_slot_d(fr.temp_slot[v]))
+        <<
+    }
+    p := rc_fp_index_alias(&*a, fr.temp_slot[v])
+    if p >= 0 {
+        a.be_fmov_gpr_from_d(dest, rc_fp_d(p))
+        <<
+    }
+    ns := types.mir_temp_nslots(m, fi, v)
+    slot := fr.temp_slot[v]
+    if !is_frame_slot(slot) && !is_synth_slot(slot) {
+        eprintln("internal compiler error: emit_load_value non-frame temp slot")
+        <<< 1
+    }
+    if a.rc_on && rc_cacheable_slots(ns) {
+        h := rc_find(&*a, slot)
+        if h >= 0 {
+            if h != dest {
+                rc_clobber(a, dest)
+                a.mov(dest, h)
+            }
+            <<
+        }
+        if emit_try_load_ref_alias(a, m, fi, fr, v, dest) {
+            <<
+        }
+        rc_clobber(a, dest)
+        a.load(dest, 15, slot_off(slot))
+        rc_park(a, dest, slot)
+        <<
+    }
+    if emit_try_load_ref_alias(a, m, fi, fr, v, dest) {
+        <<
+    }
+    rc_clobber(a, dest)
+    a.load(dest, 15, slot_off(slot))
+    <<
+}
+
+fn emit_load_value_reg(a &mut Assembler, m &types.Mir, fi int, fr &Frame, v int, scratch int) int {
+    if v < 0 {
+        rc_clobber(a, scratch)
+        a.vm_mov_imm64(scratch, types.mir_const_at(m, fi, -v - 2))
+        << scratch
+    }
+    if a.arch == 0 && a.rc_elem_vr >= 0 {
+        if v == a.rc_fp_inv_t {
+            << a.rc_elem_vr
+        }
+        if v == a.rc_fp_inv_idx {
+            << a.rc_elem_vr
+        }
+        bi := a.rc_cur_bi
+        if bi >= 0 && v >= 0 {
+            mut pv := v
+            mut jj := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if jj < 0 { <- }
+                if types.mir_ikind(m, fi, jj) == 1 {
+                    if types.mir_ia(m, fi, jj) == pv {
+                        pv = types.mir_ib(m, fi, jj)
+                    }
+                }
+                jj = types.mir_inext(m, fi, jj)
+            }
+            if pv == a.rc_fp_inv_t {
+                << a.rc_elem_vr
+            }
+            if pv == a.rc_fp_inv_idx {
+                << a.rc_elem_vr
+            }
+        }
+    }
+    if v >= 0 && v < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[v]) {
+        << vreg_slot_home(fr.temp_slot[v])
+    }
+    if v >= 0 && v < fr.temp_slot.len && is_fp_vreg_slot(fr.temp_slot[v]) {
+        rc_clobber(a, scratch)
+        a.be_fmov_gpr_from_d(scratch, fp_vreg_slot_d(fr.temp_slot[v]))
+        << scratch
+    }
+    p := rc_fp_index_alias(&*a, fr.temp_slot[v])
+    if p >= 0 {
+        rc_clobber(a, scratch)
+        a.be_fmov_gpr_from_d(scratch, rc_fp_d(p))
+        << scratch
+    }
+    ns := types.mir_temp_nslots(m, fi, v)
+    if a.rc_on && rc_cacheable_slots(ns) {
+        slot := fr.temp_slot[v]
+        h := rc_find(&*a, slot)
+        if h >= 0 {
+            << h
+        }
+        if emit_try_load_ref_alias(a, m, fi, fr, v, scratch) {
+            << scratch
+        }
+        rc_clobber(a, scratch)
+        a.load(scratch, 15, slot_off(slot))
+        rc_park(a, scratch, slot)
+        h2 := rc_find(&*a, slot)
+        if h2 >= 0 {
+            << h2
+        }
+    }
+    if emit_try_load_ref_alias(a, m, fi, fr, v, scratch) {
+        << scratch
+    }
+    rc_clobber(a, scratch)
+    a.load(scratch, 15, slot_off(fr.temp_slot[v]))
+    << scratch
+}
+
+fn emit_load_value_word(a &mut Assembler, m &types.Mir, fi int, fr &Frame, v int, word int, dest int) {
+    if word == 0 {
+        emit_load_value(a, m, fi, fr, v, dest)
+        <<
+    }
+    ns := types.mir_temp_nslots(m, fi, v)
+    slot := fr.temp_slot[v] + word
+    if a.rc_on && rc_cacheable_slots(ns) {
+        h := rc_find(&*a, slot)
+        if h >= 0 {
+            if h != dest {
+                rc_clobber(a, dest)
+                a.mov(dest, h)
+            }
+            <<
+        }
+        rc_clobber(a, dest)
+        a.load(dest, 15, slot_off(slot))
+        rc_park(a, dest, slot)
+        <<
+    }
+    rc_clobber(a, dest)
+    a.load(dest, 15, slot_off(fr.temp_slot[v]) - word * 8)
+    <<
+}
+
+fn emit_store_temp(a &mut Assembler, fr &Frame, t int, src int) {
+    slot := fr.temp_slot[t]
+    if is_vreg_slot(slot) {
+        home := vreg_slot_home(slot)
+        if home != src {
+            a.mov(home, src)
+        }
+        <<
+    }
+    if is_fp_vreg_slot(slot) {
+        a.be_fmov_d_from_gpr(fp_vreg_slot_d(slot), src)
+        <<
+    }
+    if a.rc_on && a.rc_wb {
+        rc_park_dirty(a, src, slot)
+        if rc_find(&*a, slot) >= 0 {
+            <<
+        }
+    }
+    if is_synth_slot(slot) {
+        if a.rc_on {
+            rc_park(a, src, slot)
+        }
+        <<
+    }
+    a.store(15, slot_off(slot), src)
+    if a.rc_on {
+        // Always refresh park — iface arms share dest across calls.
+        rc_park(a, src, slot)
+    }
+    <<
+}
+
+fn emit_store_vreg_or_parked(a &mut Assembler, fr &Frame, t int, src int) bool {
+    slot := fr.temp_slot[t]
+    if is_vreg_slot(slot) {
+        home := vreg_slot_home(slot)
+        if home != src {
+            a.mov(home, src)
+        }
+        << true
+    }
+    << false
+}
+
+fn emit_store_scalar_temp(a &mut Assembler, m &types.Mir, fi int, fr &Frame, t int, src int) {
+    slot := fr.temp_slot[t]
+    if emit_store_vreg_or_parked(a, fr, t, src) {
+        <<
+    }
+    if is_fp_vreg_slot(slot) {
+        a.be_fmov_d_from_gpr(fp_vreg_slot_d(slot), src)
+        <<
+    }
+    // f64 already in a SIMD home: sync the frame slot and keep the alias.
+    // Never steal GPR parks (nbody: sys[i]/sys[j] element pointers in x10/x11).
+    if t >= 0 && t < types.mir_ntemps(m, fi) && types.mir_temp_ty(m, fi, t) == 4 && rc_fp_on(&*a) {
+        p := rc_fp_index_alias(&*a, slot)
+        if p >= 0 {
+            if !is_synth_slot(slot) {
+                a.be_fstore(15, slot_off(slot), rc_fp_d(p))
+            }
+            <<
+        }
+    }
+    rc_kill_fp_alias(a, slot)
+    if a.rc_on && rc_cacheable_slots(types.mir_temp_nslots(m, fi, t)) {
+        // f64: write the stack from the GPR bits only — do not rc_park into
+        // integer homes (those hold live pointers in field-heavy loops).
+        if t >= 0 && t < types.mir_ntemps(m, fi) && types.mir_temp_ty(m, fi, t) == 4 && rc_fp_on(&*a) {
+            if !is_synth_slot(slot) {
+                a.store(15, slot_off(slot), src)
+            }
+            <<
+        }
+        // `&T` Copy that only parks is spilled across later calls; check_stmt
+        // then loaded x0=0 into fn_failed (error_count at Checker+0x16f0).
+        if t >= 0 && t < types.mir_ntemps(m, fi) && types.is_ref_type(types.mir_temp_ty(m, fi, t)) {
+            if !is_synth_slot(slot) {
+                a.store(15, slot_off(slot), src)
+            }
+            rc_park(a, src, slot)
+            <<
+        }
+        if a.rc_wb {
+            rc_park_dirty(a, src, slot)
+            if rc_find(&*a, slot) >= 0 {
+                <<
+            }
+        }
+        eph := a.rc_alu_eph
+        a.rc_alu_eph = 0
+        if eph == 1 && types.mir_temp_nslots(m, fi, t) == 1 {
+            rc_park_dirty(a, src, slot)
+            if rc_find(&*a, slot) >= 0 {
+                <<
+            }
+        }
+        // 1-block no-call (Acc.add): 1-slot temps stay in parks.
+        if a.rc_leaf && types.mir_temp_nslots(m, fi, t) == 1 {
+            rc_park(a, src, slot)
+            if rc_find(&*a, slot) >= 0 {
+                <<
+            }
+        }
+        if is_synth_slot(slot) {
+            rc_park(a, src, slot)
+            <<
+        }
+        a.store(15, slot_off(slot), src)
+        rc_park(a, src, slot)
+        <<
+    }
+    if is_synth_slot(slot) {
+        <<
+    }
+    a.store(15, slot_off(slot), src)
+    <<
+}
+
+// ===== top level =====

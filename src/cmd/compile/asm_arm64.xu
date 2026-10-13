@@ -1,0 +1,2587 @@
+@main
+// ARM64 assembler, ported from bootstrap/crates/xuasm/src/lib.rs (which was
+// ported from asm.js `asm/arm64.js`). Emit the whole program into one code
+// buffer; references to not-yet-addressed labels are recorded as pending
+// fixups and patched by `fixup_all()` once `code_vaddr`/`data_vaddr` have
+// been assigned by the binary writer (two-pass addressing protocol).
+//
+// Authoring-subset notes:
+// - No hex literals in Xu: every opcode constant is decimal, with the
+//   reference hex value in a comment.
+// - No HashMap: labels are a []Label scanned linearly.
+// - All integers are i64; 32-bit instruction words are kept as non-negative
+//   i64 values and masked on emission.
+// - `>>` is an arithmetic shift; the fixup math below only ever divides
+//   values that are exact multiples of the shift amount, so it matches the
+//   reference's truncating `/`.
+
+// register numbers (encoding shared with XZR where context dependent)
+// SP = 31, XZR = 31, FP = 29, LR = 30, X16 = 16 (scratch)
+
+// condition codes
+// EQ = 0, NE = 1, HS = 2, LO = 3, VS = 6, HI = 8, LS = 9,
+// GE = 10, LT = 11, GT = 12, LE = 13
+
+// fixup kinds
+// FK_B = 0, FK_BL = 1, FK_CBZ = 2, FK_CBNZ = 3, FK_ADRP_ADD = 4
+
+struct Label {
+    name    string
+    offset  int
+    is_data bool
+}
+
+// Free-fn field reads on `&[]Label` / `&[]Fixup`. `a.labels[i].name`
+// through a large Assembler is a Gen1 3-level string-field miscompile
+// (gen2 hello copies a garbage ptr). Same workaround as mfn_isval.
+fn lab_name(ls &[]Label, i int) string { << ls[i].name + "" }
+fn lab_name_len(ls &[]Label, i int) int { << ls[i].name.len }
+fn lab_name_byte(ls &[]Label, i int, j int) int { << ls[i].name[j] }
+fn lab_off(ls &[]Label, i int) int { << ls[i].offset }
+fn lab_is_data(ls &[]Label, i int) bool { << ls[i].is_data }
+
+struct Fixup {
+    kind   int
+    offset int
+    label  string
+    rd     int
+}
+
+fn fix_kind(fs &[]Fixup, i int) int { << fs[i].kind }
+fn fix_off(fs &[]Fixup, i int) int { << fs[i].offset }
+fn fix_label(fs &[]Fixup, i int) string { << asm_string_copy(&fs[i].label) }
+fn fix_label_len(fs &[]Fixup, i int) int { << fs[i].label.len }
+fn fix_rd(fs &[]Fixup, i int) int { << fs[i].rd }
+
+// `s + ""` is only a descriptor alias under the hosted Gen1 ABI.  Fixup
+// labels outlive the call that records them (they are resolved after all code
+// emission), so retaining that alias can leave a dangling pointer when the
+// producer returns a temporary label.  Materialise an independent string at
+// this boundary instead.  Keep this helper local to the assembler so every
+// backend can continue passing ordinary string values without an ownership
+// convention hidden in Fixup.
+fn asm_string_copy(s &string) string {
+    if s.len == 0 {
+        << ""
+    }
+    mut bytes := []int{}
+    for i in 0:s.len {
+        bytes.push(s[i])
+    }
+    << string_from_bytes(bytes)
+}
+
+// Target OS / arch on the assembler (M12). Compile-time only; selects
+// encoder, syscall ABI, and binary writer. Defaults = host gen1 path.
+//   OS:   0 = macos, 1 = linux, 2 = windows, 3 = none
+//   ARCH: 0 = arm64, 1 = x64, 2 = thumb, 3 = riscv32
+
+struct Assembler {
+    // Not field 0: Gen1-compiled Gen2 misreads/miswrites the first
+    // field of this large struct (emit32 saw ncode=0; `mut &a.code`
+    // copied a garbage string header).
+    pad0       int
+    code       []int
+    data       []int
+    labels     []Label
+    label_keys []string
+    label_vals []int
+    label_used []int
+    label_n    int
+    label_cap  int
+    fixups     []Fixup
+    code_vaddr int
+    data_vaddr int
+    drop_seq   int
+    os         int
+    arch       int
+    // loong64 (M39): compare state recorded by be_cmp/be_cmp_imm/be_fcmp and
+    // consumed by the immediately-following be_cset/be_jcc (LoongArch has no
+    // condition flags). cmp_fp: 0 = integer regs in cmp_a/cmp_b, 1 = float
+    // (operands already moved to F0/F1).
+    cmp_fp     int
+    cmp_a      int
+    cmp_b      int
+    // m32: emit-mode flags set by the driver before emit_program.
+    cover      bool
+    test       bool
+    test_short bool
+    // OPT P2/P3: block-local scalar register cache (hosted arm64/x64).
+    rc_on      bool
+    /// 0=off, 1=block cache, 2=carry+S-pool, 3=linear-scan pins.
+    ra_level   int
+    rc_carry   bool
+    rc_s_pool  bool
+    rc_ls      bool
+    /// MIR function count for this unit. CopyProp/skip-store cost gate:
+    /// self-host (~2841 fns) keeps the conservative frame writeback so
+    /// gen2==gen3; user programs (<64) can skip pin stores like bootstrap.
+    rc_nfn     int
+    /// Labels of `fn_is_small_indexed_kernel` callees. Filled once per unit
+    /// so rc_alu_fwd does not rescan all ~2800 fns on every ALU instr.
+    rc_kern_labs []string
+    /// 1 if the fn currently being emitted may ALU-forward (rc_off path).
+    rc_alu_fwd_fn int
+    /// Void scalar leaves whose A0..A{n-1} survive the call (Acc.add).
+    rc_preserve_labs []string
+    rc_preserve_mask []int
+    /// Arm64: S0–S5 pairs saved in prologue (0..=3). Helpers keep 3.
+    cs_pairs   int
+    rc_wb      bool
+    rc_leaf    bool
+    /// Current block belongs to a proved uniform-pin natural loop.  Enables
+    /// read-only pointer forwarding and the guarded conditional-update tier.
+    rc_nat_wb  bool
+    /// Next emit_store_scalar_temp may park_dirty+skip (ALU→index only).
+    rc_alu_eph int
+    /// One-use integer ALU result forwarded to the immediately following Bin.
+    rc_int_ephem_t int
+    rc_int_ephem_vr int
+    rc_int_ephem_ii int
+    rc_fused_cc int
+    rc_branch_cond int
+    rc_const_vr int
+    rc_const_val int
+    rc_hot_lbl string
+    rc_slot    []int
+    rc_used    []int
+    rc_dirty   []int
+    rc_alias   []int
+    rc_tick    int
+    rc_pin     []int
+    rc_pin_dirty []int
+    /// LoadLocal temp aliased onto an S-pool pin (arm64 O2); -1 = unused.
+    rc_pin_alias []int
+    /// Call-dest / reserved S home (arm64 O1): frame slot, -1 free, -2 reserved
+    /// (AddrOf/const). Survives spill_across_call; not written back as pin_alias.
+    rc_s_hold []int
+    /// Block-entry S pin slots (arm64); not cleared by spill — StoreLocal sync.
+    rc_blk_pin []int
+    /// Sticky last slot parked in each S home (survives spill alias clear).
+    rc_s_cache []int
+    // M192b: per-block pred counts + pending cache restore (emit_function).
+    rc_pred    []int
+    rc_in_ok   []int
+    rc_in_slot []int
+    rc_in_dirty []int
+    rc_in_alias []int
+    rc_in_used []int
+    rc_in_tick []int
+    rc_in_pin  []int
+    oob_lbl    string
+    oob_need   int
+    // SIMD/XMM f64 homes (hosted arm64/x64). ARM64: d2–d7 + d16–d31.
+    // x64: xmm2–xmm7. d0/d1 stay operand scratch in rc_fp_operand_d.
+    rc_fp_pin   []int
+    rc_fp_dirty []int
+    rc_fp_alias []int
+    rc_fp_alias2 []int
+    rc_fp_rhs   int
+    /// When >= 0: FieldRMW should `fmadd`/`fmsub` d0 with (d1 * rc_fp_fma_dm)
+    /// instead of add/sub of a fully-multiplied rhs (nbody `dx*mj*mag`).
+    rc_fp_fma_dm int
+    /// Ephemeral f64 temp in d0 (single next FP consumer); -1 = empty.
+    /// Keeps d2–d7 free for pinned locals / masses (nbody mj/mi).
+    rc_fp_ephem int
+    rc_fp_skip  int
+    /// Second instr to skip after rc_fp_skip (mul*mul→RMW peeks LoadLocal).
+    rc_fp_skip2 int
+    /// Third skip (nbody mag: LoadLocal dt fuses LoadLocal+mul+div).
+    rc_fp_skip3 int
+    rc_fp_skip4 int
+    /// Skip the next N instrs along the block chain (Clang isel windows).
+    rc_fp_skip_n int
+    /// push_byte header cache. pb_local >= 0 means S1–S4 hold &string,
+    /// ptr, len and cap for that local. Invalid across blocks and calls.
+    pb_recv int
+    pb_local int
+    /// Block currently being emitted (for def-before-use store elision).
+    rc_cur_bi   int
+    rc_fp_blk   []int
+    /// FP-only loop residency; intentionally independent from the GPR regcache.
+    rc_fp_only   bool
+    /// Set when a GPR vreg plan left the SIMD pool free. setup_walk turns
+    /// this into rc_fp_only and runs the full f64 pin collector (nbody).
+    rc_fp_hold   bool
+    /// Bit i set: vreg owns physical GPR i. RC must not park or pick it.
+    rc_vreg_mask int
+    /// Blocks in a proved multi-block natural loop.  Intra-loop edges may
+    /// jump to the block's hot entry and keep the common pin layout live.
+    rc_loop_hot []int
+    /// Leaf: 1-slot incoming args still in A0–A5 (no park mov). -1 = empty.
+    rc_arg      []int
+    rc_arg_alias []int
+    /// Emit-hoisted AddrOf(Local): S reg holds &local across bl.
+    rc_addr_local int
+    rc_addr_vr    int
+    rc_addr_alias int
+    /// Block-local array data-pointer cache (arm64): keys in rc_arr_t0/t1,
+    /// sticky values in V6/V7. Survives element RMW; invalidated on calls.
+    rc_arr_t0     int
+    rc_arr_t1     int
+    /// Dest temp of the first ElemAddr in this function (nbody `sys[i]`).
+    /// Same-index re-emits update the dest and clear `rc_fp_inv_ld`.
+    /// A later ElemAddr with a different index (`sys[j]`) does not overwrite.
+    /// -1 = empty. Not cleared by rc_flush (cross-block emit).
+    rc_fp_inv_t   int
+    rc_fp_inv_idx int
+    /// 1 after vx/vy/vz were filled into d28–d30 for the current inv pointer.
+    rc_fp_inv_ld  int
+    /// GPR holding the last ElemAddr pointer (nbody sys[j] in x24 / S5).
+    /// -1 = empty. S5 is outside rc_slot[0..7], so rc_park cannot record it.
+    rc_elem_vr    int
+    /// Clang-style row walk: V6/V7 hold data+hoist*8 (keys = arr temps).
+    rc_row_k0     int
+    rc_row_k1     int
+    /// Arm64 self-loop: hoisted loc_a*loc_b for a*b+j (keys; -1 = empty).
+    /// Homes: V4/V5 when s_pool, else S0/S1.
+    rc_madd_k0    int
+    rc_madd_k1    int
+    /// Self-loop induction local id (-1 = none).
+    rc_ind_local  int
+    /// 1 = small read-only indexed diamond (skip-store + `_ht`).
+    /// 2 = assign-diamond only (nocheck / seed, no forward `_ht`).
+    rc_kernel     int
+    /// Forward hot-edge `_ht` without kernel skip-store / V6 seed.
+    /// 1-slot `&[]T` search: skip pin reload on header→body.
+    rc_fwd_ht     bool
+    /// 1 after seeding a self-loop `i < L` with arr.len >= L (skip per-iter OOB).
+    rc_ind_nocheck int
+    /// Proven descriptors for rc_ind_nocheck (at most two; -1 = unset).
+    /// The consumer must match the current access descriptor against these:
+    /// a third array in the loop never gets a length proof.
+    rc_ind_desc0 int
+    rc_ind_desc1 int
+    /// 0 = off; M+1 = header proved arr.len > M for `x & M` indexes (0≤M≤255).
+    rc_and_nocheck int
+    /// Proven descriptors for rc_and_nocheck (at most two; -1 = unset).
+    /// The consumer must match the current access descriptor against these:
+    /// a third array in the loop never gets a mask proof.
+    rc_and_desc0 int
+    rc_and_desc1 int
+    /// Row-walk madd: local of the invariant operand parked in S4 (-1 = none).
+    rc_aik_loc    int
+    /// Word-ArrPush cursor: local id (-1 none). S1=len, S2=cap, S3=ptr.
+    rc_push_loc     int
+    rc_push_ptr_off int
+    rc_push_len_off int
+    rc_push_cap_off int
+    rc_push_dirty   int
+    rc_push_ii      int
+    rc_push_elem    int
+    rc_push_val_loc int
+    rc_push_stub    int
+    rc_push_slow    string
+    rc_push_done    string
+    rc_push_fuse    int
+    /// Deferred home+ind for index-only temps (matmul). Empty: temp < 0.
+    rc_fold_t0    int
+    rc_fold_t1    int
+    rc_fold_h0    int
+    rc_fold_h1    int
+    rc_fold_i0    int
+    rc_fold_i1    int
+    rc_fold_u0    int
+    rc_fold_u1    int
+    /// Per-fn GPR pin table (nblk*4). Lives on Assembler (heap) so Gen2
+    /// cannot corrupt a frame-local []int header in large emit_function.
+    rc_pins       []int
+    // --lib / --shared / link .dylib (driver fills before emit_program)
+    lib           int
+    dylib_paths   []string
+    dylib_labs    []string
+    dylib_ords    []int
+    lib_exp_name  []string
+    lib_exp_off   []int
+    // Stage 0 OptStats: RA admission observation only. Never changes coloring.
+    ra_fn      int
+    ra_try     int
+    ra_vreg    int
+    ra_rc      int
+    ra_frame   int
+    ra_keep_rc int
+    ra_empty   int
+    ra_spill   int
+    ra_report  bool // per-function diagnostics, enabled only by --timings
+    // Data-segment offset of `_xus_{i}` string literals (fixup kind 5).
+    xus_off       []int
+    // Immutable per-function rotate proof, invalidated before every function.
+    rc_ror32_facts []int
+}
+
+// Fill a zeroed Assembler in place. Do not return Assembler by value:
+// Gen1 sret of this large struct is garbage in gen2 (hello copies a
+// wild string header at 0x16fe00000). Mirror Checker{}.
+fn init_assembler(a &mut Assembler, os int, arch int) {
+    a.os = os
+    a.arch = arch
+    a.label_cap = 256
+    a.rc_on = os != 3 && arch == 0
+    a.rc_fp_hold = false
+    a.rc_vreg_mask = 0
+    a.ra_level = 1
+    a.cs_pairs = 3
+    a.rc_int_ephem_t = -1
+    a.rc_int_ephem_vr = -1
+    a.rc_int_ephem_ii = -1
+    a.rc_fused_cc = -1
+    a.rc_branch_cond = -1
+    a.rc_const_vr = -1
+    a.rc_fp_rhs = -1
+    a.rc_fp_fma_dm = -1
+    a.rc_fp_ephem = -1
+    a.rc_fp_skip = -1
+    a.rc_fp_skip2 = -1
+    a.rc_fp_skip3 = -1
+    a.rc_fp_skip4 = -1
+    a.pb_recv = -1
+    a.pb_local = -1
+    a.rc_cur_bi = -1
+    a.rc_addr_local = -1
+    a.rc_addr_vr = -1
+    a.rc_addr_alias = -1
+    a.rc_arr_t0 = -1
+    a.rc_arr_t1 = -1
+    a.rc_fp_inv_t = -1
+    a.rc_fp_inv_idx = -1
+    a.rc_fp_inv_ld = 0
+    a.rc_elem_vr = -1
+    a.rc_row_k0 = -1
+    a.rc_row_k1 = -1
+    a.rc_madd_k0 = -1
+    a.rc_madd_k1 = -1
+    a.rc_ind_local = -1
+    a.rc_and_nocheck = 0
+    a.rc_aik_loc = -1
+    a.rc_push_loc = -1
+    a.rc_push_ii = -1
+    a.rc_push_elem = -1
+    a.rc_push_val_loc = -1
+    a.rc_fold_t0 = -1
+    a.rc_fold_t1 = -1
+    for i in 0:a.label_cap {
+        a.label_keys.push("")
+        a.label_vals.push(0)
+        a.label_used.push(0)
+    }
+    a.xus_off = []int{}
+    for i in 0:8 {
+        a.rc_slot.push(-1)
+        a.rc_used.push(0)
+        a.rc_dirty.push(0)
+        a.rc_alias.push(-1)
+    }
+    for i in 0:4 {
+        a.rc_pin.push(-1)
+        a.rc_pin_dirty.push(0)
+        a.rc_pin_alias.push(-1)
+        a.rc_s_hold.push(-1)
+        a.rc_blk_pin.push(-1)
+        a.rc_s_cache.push(-1)
+    }
+    nhf := rc_fp_homes()
+    for i in 0:nhf {
+        a.rc_fp_pin.push(-1)
+        a.rc_fp_dirty.push(0)
+        a.rc_fp_alias.push(-1)
+        a.rc_fp_alias2.push(-1)
+    }
+    for i in 0:6 {
+        a.rc_arg.push(-1)
+        a.rc_arg_alias.push(-1)
+    }
+}
+
+// Parse hosted five-target plus E0 freestanding, plus M39 loong64.
+// Returns os*10+arch, or -1 if unknown.
+// os: 0 macos, 1 linux, 2 windows, 3 none
+// arch: 0 arm64, 1 x64, 2 thumb, 3 riscv32, 4 loong64
+fn parse_target(s string) int {
+    if s == "macos-arm64" { << 0 }
+    if s == "macos-x64" { << 1 }
+    if s == "linux-arm64" { << 10 }
+    if s == "linux-x64" { << 11 }
+    if s == "linux-loongarch64" { << 14 }
+    if s == "linux-riscv64" { << 15 }
+    if s == "linux-arm32" { << 12 }
+    if s == "linux-arm" { << 12 }
+    if s == "linux-armv7" { << 12 }
+    if s == "windows-x64" { << 21 }
+    if s == "windows-arm64" { << 20 }
+    if s == "thumbv7em-none" { << 32 }
+    if s == "thumb-none" { << 32 }
+    if s == "riscv32imac-none" { << 33 }
+    if s == "riscv32-none" { << 33 }
+    << -1
+}
+
+// XUOS + XUARCH (host OS/arch env names). Both must be set and valid.
+// --target on the CLI wins; callers apply this only when --target is omitted.
+fn target_from_env() int {
+    osn := env_get("XUOS")
+    archn := env_get("XUARCH")
+    if osn.len == 0 {
+        << -1
+    }
+    if archn.len == 0 {
+        << -1
+    }
+    mut name := ""
+    if osn == "none" {
+        if archn == "thumb" || archn == "thumbv7em" || archn == "arm32" || archn == "armv7" || archn == "arm" {
+            name = "thumbv7em-none"
+        }
+        if archn == "riscv32" || archn == "riscv32imac" {
+            name = "riscv32imac-none"
+        }
+    } else {
+        mut os_part := ""
+        if osn == "macos" { os_part = "macos" }
+        if osn == "linux" { os_part = "linux" }
+        if osn == "windows" { os_part = "windows" }
+        mut arch_part := ""
+        if archn == "arm64" || archn == "aarch64" { arch_part = "arm64" }
+        if archn == "x64" || archn == "x86_64" || archn == "amd64" { arch_part = "x64" }
+        if archn == "loong64" || archn == "loongarch64" { arch_part = "loongarch64" }
+        if archn == "riscv64" || archn == "rv64" { arch_part = "riscv64" }
+        if archn == "arm32" || archn == "armv7" || archn == "arm" || archn == "thumb" || archn == "thumbv7em" {
+            arch_part = "arm32"
+        }
+        if os_part.len > 0 && arch_part.len > 0 {
+            name = os_part + "-" + arch_part
+        }
+    }
+    if name.len == 0 {
+        << -1
+    }
+    << parse_target(name)
+}
+
+fn apply_env_target(target_set bool, target_code int) int {
+    if target_set {
+        << target_code
+    }
+    te := target_from_env()
+    if te >= 0 {
+        << te
+    }
+    << host_target_code()
+}
+
+// Bootstrap bridge for callers that already own argv.  Old hosted runtimes
+// returned a shallow sys_args descriptor, so asking for argv again after CLI
+// parsing could observe freed elements before the new deep-clone runtime had
+// bootstrapped itself.
+fn apply_env_target_host(target_set bool, target_code int, host_code int) int {
+    if target_set {
+        << target_code
+    }
+    te := target_from_env()
+    if te >= 0 {
+        << te
+    }
+    << host_code
+}
+
+fn target_os(t int) int { << t / 10 }
+fn target_arch(t int) int { << t % 10 }
+
+// Thumb / RV32 are ILP32. Hosted linux-arm32 reuses the Thumb ISA.
+fn ptr_shift(arch int) int {
+    if arch == 2 { << 2 }
+    if arch == 3 { << 2 }
+    << 3
+}
+
+fn ptr_bytes(arch int) int {
+    if arch == 2 { << 4 }
+    if arch == 3 { << 4 }
+    << 8
+}
+
+fn target_os_name(t int) string {
+    o := target_os(t)
+    if o == 0 { << "macos" }
+    if o == 1 { << "linux" }
+    if o == 2 { << "windows" }
+    if o == 3 { << "none" }
+    << ""
+}
+
+fn target_arch_name(t int) string {
+    a := target_arch(t)
+    if a == 0 { << "arm64" }
+    if a == 1 { << "x64" }
+    if a == 2 { << "thumb" }
+    if a == 3 { << "riscv32" }
+    if a == 4 { << "loong64" }
+    if a == 5 { << "riscv64" }
+    << ""
+}
+
+fn target_name(t int) string {
+    if t == 0 { << "macos-arm64" }
+    if t == 1 { << "macos-x64" }
+    if t == 10 { << "linux-arm64" }
+    if t == 11 { << "linux-x64" }
+    if t == 14 { << "linux-loongarch64" }
+    if t == 15 { << "linux-riscv64" }
+    if t == 12 { << "linux-arm32" }
+    if t == 20 { << "windows-arm64" }
+    if t == 21 { << "windows-x64" }
+    if t == 32 { << "thumbv7em-none" }
+    if t == 33 { << "riscv32imac-none" }
+    << "unknown"
+}
+
+// Syscall numbers (Sys enum: 0=Exit 1=Write 2=Mmap 3=Munmap 4=Open 5=Read
+// 6=Close 7=Clone 8=Futex 9=Getdents 10=ClockGettime 11=Nanosleep
+// 12..17 uid/gid/pid family 18=Uname 19=Getcwd 20=Stat 21=Mkdir 22=Rename
+// 23=Unlink 24=Rmdir 25=Socket 26=Connect 27=Bind 28=Listen 29=Accept
+// 30=Setsockopt 31=Sendto 32=Recvfrom 33=UlockWait 34=UlockWake).
+fn syscall_number(os int, arch int, sys int) int {
+    if os == 0 { // macos BSD class 0x2000000
+        if sys == 0 { << 33554433 } // exit
+        if sys == 1 { << 33554436 } // write
+        if sys == 2 { << 33554629 } // mmap
+        if sys == 3 { << 33554505 } // munmap
+        if sys == 4 { << 33554437 } // open
+        if sys == 5 { << 33554435 } // read
+        if sys == 6 { << 33554438 } // close
+        if sys == 9 { << 33554776 } // getdirentries64
+        if sys == 10 { << 0 } // clock_gettime: libSystem IAT
+        if sys == 11 { << 0 } // nanosleep: libSystem IAT
+        if sys == 12 { << 33554452 } // getpid
+        if sys == 13 { << 33554471 } // getppid
+        if sys == 14 { << 33554456 } // getuid
+        if sys == 15 { << 33554479 } // getgid
+        if sys == 16 { << 33554457 } // geteuid
+        if sys == 17 { << 33554475 } // getegid
+        if sys == 18 { << 0 } // uname: libSystem gethostname IAT
+        if sys == 19 { << 0 } // getcwd: libSystem IAT
+        if sys == 20 { << 33554770 } // stat64 = 0x2000000+338
+        if sys == 21 { << 33554568 } // mkdir = 0x2000000+136
+        if sys == 22 { << 33554560 } // rename = 0x2000000+128
+        if sys == 23 { << 33554442 } // unlink = 0x2000000+10
+        if sys == 24 { << 33554569 } // rmdir = 0x2000000+137
+        if sys == 25 { << 33554529 } // socket = 0x2000000+97
+        if sys == 26 { << 33554530 } // connect = 0x2000000+98
+        if sys == 27 { << 33554536 } // bind = 0x2000000+104
+        if sys == 28 { << 33554538 } // listen = 0x2000000+106
+        if sys == 29 { << 33554462 } // accept = 0x2000000+30
+        if sys == 30 { << 33554537 } // setsockopt = 0x2000000+105
+        if sys == 31 { << 33554565 } // sendto = 0x2000000+133
+        if sys == 32 { << 33554461 } // recvfrom = 0x2000000+29
+        if sys == 33 { << 33554947 } // ulock_wait = 0x2000000+515
+        if sys == 34 { << 33554948 } // ulock_wake = 0x2000000+516
+        if sys == 39 { << 33554447 } // chmod = 0x2000000+15
+        if sys == 40 { << 33554444 } // chdir = 0x2000000+12
+        if sys == 41 { << 33554489 } // symlink = 0x2000000+57
+        if sys == 42 { << 33554490 } // readlink = 0x2000000+58
+        if sys == 43 { << 33554631 } // lseek = 0x2000000+199
+        if sys == 44 { << 33554474 } // pipe = 0x2000000+42
+        if sys == 36 { << 33554434 } // fork = 0x2000000+2
+        if sys == 37 { << 33554491 } // execve = 0x2000000+59
+        if sys == 38 { << 33554439 } // wait4 = 0x2000000+7
+        if sys == 45 { << 33554522 } // dup2 = 0x2000000+90
+        if sys == 46 { << 33554486 } // ioctl = 0x2000000+54
+        << 0
+    }
+    if os == 1 && arch == 2 { // linux ARM EABI (not the generic aarch64 table)
+        if sys == 0 { << 248 } // exit_group
+        if sys == 1 { << 4 } // write
+        if sys == 2 { << 192 } // mmap2
+        if sys == 3 { << 91 } // munmap
+        if sys == 4 { << 322 } // openat
+        if sys == 5 { << 3 } // read
+        if sys == 6 { << 6 } // close
+        if sys == 7 { << 120 } // clone
+        if sys == 8 { << 240 } // futex
+        if sys == 9 { << 217 } // getdents64
+        if sys == 10 { << 263 } // clock_gettime
+        if sys == 11 { << 162 } // nanosleep
+        if sys == 12 { << 20 } // getpid
+        if sys == 13 { << 64 } // getppid
+        if sys == 14 { << 24 } // getuid
+        if sys == 15 { << 47 } // getgid
+        if sys == 16 { << 49 } // geteuid
+        if sys == 17 { << 50 } // getegid
+        if sys == 18 { << 122 } // uname
+        if sys == 19 { << 183 } // getcwd
+        if sys == 20 { << 327 } // newfstatat
+        if sys == 21 { << 323 } // mkdirat
+        if sys == 22 { << 329 } // renameat
+        if sys == 23 { << 328 } // unlinkat
+        if sys == 24 { << 328 } // unlinkat (AT_REMOVEDIR)
+        if sys == 25 { << 281 } // socket
+        if sys == 26 { << 283 } // connect
+        if sys == 27 { << 282 } // bind
+        if sys == 28 { << 284 } // listen
+        if sys == 29 { << 285 } // accept
+        if sys == 30 { << 294 } // setsockopt
+        if sys == 31 { << 290 } // sendto
+        if sys == 32 { << 292 } // recvfrom
+        if sys == 36 { << 120 } // clone
+        if sys == 37 { << 11 } // execve
+        if sys == 38 { << 114 } // wait4
+        if sys == 39 { << 333 } // fchmodat
+        if sys == 40 { << 12 } // chdir
+        if sys == 41 { << 331 } // symlinkat
+        if sys == 42 { << 332 } // readlinkat
+        if sys == 43 { << 19 } // lseek
+        if sys == 44 { << 359 } // pipe2
+        if sys == 45 { << 358 } // dup3
+        if sys == 46 { << 54 } // ioctl
+        if sys == 47 { << 143 } // flock
+        << 0
+    }
+    if os == 1 && (arch == 0 || arch == 4 || arch == 5) { // linux arm64 / loong64 / riscv64 (generic table)
+        if sys == 0 { << 94 } // exit_group
+        if sys == 1 { << 64 }
+        if sys == 2 { << 222 }
+        if sys == 3 { << 215 }
+        if sys == 4 { << 56 } // openat
+        if sys == 5 { << 63 }
+        if sys == 6 { << 57 }
+        if sys == 7 { << 220 } // clone
+        if sys == 8 { << 98 } // futex
+        if sys == 9 { << 61 } // getdents64
+        if sys == 10 { << 113 } // clock_gettime
+        if sys == 11 { << 101 } // nanosleep
+        if sys == 12 { << 172 } // getpid
+        if sys == 13 { << 173 } // getppid
+        if sys == 14 { << 174 } // getuid
+        if sys == 15 { << 176 } // getgid
+        if sys == 16 { << 175 } // geteuid
+        if sys == 17 { << 177 } // getegid
+        if sys == 18 { << 160 } // uname
+        if sys == 19 { << 17 } // getcwd
+        if sys == 20 { << 79 } // newfstatat
+        if sys == 21 { << 34 } // mkdirat
+        if sys == 22 { << 38 } // renameat
+        if sys == 23 { << 35 } // unlinkat
+        if sys == 24 { << 35 } // unlinkat (AT_REMOVEDIR)
+        if sys == 25 { << 198 } // socket
+        if sys == 26 { << 203 } // connect
+        if sys == 27 { << 200 } // bind
+        if sys == 28 { << 201 } // listen
+        if sys == 29 { << 202 } // accept
+        if sys == 30 { << 208 } // setsockopt
+        if sys == 31 { << 206 } // sendto
+        if sys == 32 { << 207 } // recvfrom
+        if sys == 36 { << 220 } // clone (fork-like)
+        if sys == 37 { << 221 } // execve
+        if sys == 38 { << 260 } // wait4
+        if sys == 39 { << 53 } // fchmodat
+        if sys == 40 { << 49 } // chdir
+        if sys == 41 { << 36 } // symlinkat
+        if sys == 42 { << 78 } // readlinkat
+        if sys == 43 { << 62 } // lseek
+        if sys == 44 { << 59 } // pipe2
+        if sys == 45 { << 24 } // dup3
+        if sys == 46 { << 29 } // ioctl
+        if sys == 47 { << 32 } // flock
+        << 0
+    }
+    if os == 1 && arch == 1 { // linux x64
+        if sys == 0 { << 231 } // exit_group
+        if sys == 1 { << 1 }
+        if sys == 2 { << 9 }
+        if sys == 3 { << 11 }
+        if sys == 4 { << 2 }
+        if sys == 5 { << 0 }
+        if sys == 6 { << 3 }
+        if sys == 7 { << 56 } // clone
+        if sys == 8 { << 202 } // futex
+        if sys == 9 { << 217 } // getdents64
+        if sys == 10 { << 228 } // clock_gettime
+        if sys == 11 { << 35 } // nanosleep
+        if sys == 12 { << 39 } // getpid
+        if sys == 13 { << 110 } // getppid
+        if sys == 14 { << 102 } // getuid
+        if sys == 15 { << 104 } // getgid
+        if sys == 16 { << 107 } // geteuid
+        if sys == 17 { << 108 } // getegid
+        if sys == 18 { << 63 } // uname
+        if sys == 19 { << 79 } // getcwd
+        if sys == 20 { << 4 } // stat
+        if sys == 21 { << 83 } // mkdir
+        if sys == 22 { << 82 } // rename
+        if sys == 23 { << 263 } // unlinkat
+        if sys == 24 { << 263 } // unlinkat (AT_REMOVEDIR)
+        if sys == 25 { << 41 } // socket
+        if sys == 26 { << 42 } // connect
+        if sys == 27 { << 49 } // bind
+        if sys == 28 { << 50 } // listen
+        if sys == 29 { << 43 } // accept
+        if sys == 30 { << 54 } // setsockopt
+        if sys == 31 { << 44 } // sendto
+        if sys == 32 { << 45 } // recvfrom
+        if sys == 36 { << 57 } // fork
+        if sys == 37 { << 59 } // execve
+        if sys == 38 { << 61 } // wait4
+        if sys == 39 { << 90 } // chmod
+        if sys == 40 { << 80 } // chdir
+        if sys == 41 { << 88 } // symlink
+        if sys == 42 { << 89 } // readlink
+        if sys == 43 { << 8 } // lseek
+        if sys == 44 { << 22 } // pipe
+        if sys == 45 { << 33 } // dup2
+        if sys == 46 { << 16 } // ioctl
+        if sys == 47 { << 73 } // flock
+        << 0
+    }
+    << 0 // windows: not used
+}
+
+fn linux_exit_thread(arch int) int {
+    if arch == 0 { << 93 }
+    if arch == 4 { << 93 } // loong64 uses the generic table, same as arm64
+    if arch == 5 { << 93 } // riscv64 uses the generic table, same as arm64
+    << 60
+}
+
+fn mmap_flags(os int) int {
+    if os == 0 { << 4098 } // MAP_PRIVATE|MAP_ANON
+    if os == 1 { << 34 } // MAP_PRIVATE|MAP_ANONYMOUS
+    << 0
+}
+
+fn open_flags_write(os int) int {
+    if os == 0 { << 1537 } // 0x601
+    if os == 1 { << 577 } // 0x241
+    << 0
+}
+
+fn open_flags_excl(os int) int {
+    if os == 0 { << 2561 } // O_WRONLY|O_CREAT|O_EXCL
+    if os == 1 { << 193 } // O_WRONLY|O_CREAT|O_EXCL
+    << 0
+}
+
+fn open_flags_mode(os int, mode int) int {
+    if mode == 1 {
+        << open_flags_write(os)
+    }
+    if mode == 2 {
+        if os == 0 { << 521 } // O_WRONLY|O_CREAT|O_APPEND
+        if os == 1 { << 1089 } // 1|64|1024
+        << 0
+    }
+    if mode == 3 {
+        << open_flags_excl(os)
+    }
+    << 0
+}
+
+// Unique label for drop sequences (program-wide counter on the assembler).
+fn (a &mut Assembler) drop_label(kind string) string {
+    a.drop_seq = a.drop_seq + 1
+    << "_xudrop_" + str(a.drop_seq) + "_" + kind
+}
+
+// Append one 32-bit instruction word, little-endian.
+// Gen2 cannot `mut &a.code` + push4 (wrong field / SEGV). Four `a.code.push`
+// writes persist.
+fn (a &mut Assembler) emit32(word int) {
+    a.code.push(word & 255)
+    a.code.push((word >> 8) & 255)
+    a.code.push((word >> 16) & 255)
+    a.code.push((word >> 24) & 255)
+}
+
+fn (a &mut Assembler) emit64(val int) {
+    a.emit32(val & 4294967295)
+    a.emit32((val >> 32) & 4294967295)
+}
+
+// Current byte offset in the code buffer.
+fn (a Assembler) current_offset() int { << a.code.len }
+
+fn label_hash(s &string) int {
+    mut h := 5381
+    for i in 0:s.len {
+        h = ((h << 5) + h) + (s[i] & 255)
+        h = h & 2147483647
+    }
+    << h
+}
+
+// Block labels share numeric/_ht suffixes. Raw djb2 low bits cluster badly
+// in this power-of-two table. Mix only the bucket selector: label hashes,
+// stable symbol IDs, full-name equality and relocation formats stay intact.
+// Mask after each multiply so this uses the same low 31 bits on every target.
+fn label_bucket(h int, cap int) int {
+    if cap <= 0 { << 0 }
+    mut mixed := ((h ^ (h >> 16)) * 73244475) & 2147483647
+    mixed = ((mixed ^ (mixed >> 16)) * 73244475) & 2147483647
+    << (mixed ^ (mixed >> 16)) % cap
+}
+
+fn (a &mut Assembler) label_index_grow() {
+    old_cap := a.label_cap
+    mut ncap := old_cap * 2
+    if ncap < 256 {
+        ncap = 256
+    }
+    if ncap <= 0 {
+        <<
+    }
+    mut new_keys := []string{}
+    mut new_vals := []int{}
+    mut new_used := []int{}
+    for i in 0:ncap {
+        new_keys.push("")
+        new_vals.push(0)
+        new_used.push(0)
+    }
+    for i in 0:old_cap {
+        if a.label_used[i] == 1 {
+            // Rehashing is an ownership boundary: the old table is released
+            // immediately after these arrays are swapped, so a descriptor
+            // alias would leave every moved key dangling.  Copy bytes into a
+            // fresh string before installing the key in the new table.
+            key0 := a.label_keys[i] + ""
+            key := asm_string_copy(&key0)
+            h := label_hash(&key)
+            mut j := label_bucket(h, ncap)
+            while true {
+                if new_used[j] == 0 {
+                    new_used[j] = 1
+                    new_keys[j] = key
+                    new_vals[j] = a.label_vals[i]
+                    <-
+                }
+                j = (j + 1) % ncap
+            }
+        }
+    }
+    a.label_keys = new_keys
+    a.label_vals = new_vals
+    a.label_used = new_used
+    a.label_cap = ncap
+}
+
+fn (a &mut Assembler) label_index_put(name string, idx int) {
+    if a.label_cap <= 0 {
+        a.label_cap = 256
+        for i in 0:a.label_cap {
+            a.label_keys.push("")
+            a.label_vals.push(0)
+            a.label_used.push(0)
+        }
+    }
+    if (a.label_n + 1) * 4 >= a.label_cap * 3 {
+        a.label_index_grow()
+    }
+    cap := a.label_cap
+    if cap <= 0 {
+        <<
+    }
+    h := label_hash(&name)
+    mut i := label_bucket(h, cap)
+    while true {
+        if a.label_used[i] == 0 {
+            a.label_used[i] = 1
+            owned := asm_string_copy(&name)
+            a.label_keys[i] = owned
+            a.label_vals[i] = idx
+            a.label_n += 1
+            <<
+        }
+        if a.label_keys[i] == name {
+            eprintln("duplicate assembly label: " + name)
+            <<< 1
+        }
+        i = (i + 1) % cap
+    }
+}
+
+fn (a Assembler) label_index(name string) int {
+    cap := a.label_cap
+    if cap <= 0 {
+        << -1
+    }
+    h := label_hash(&name)
+    mut i := label_bucket(h, cap)
+    start := i
+    while true {
+        if a.label_used[i] == 0 {
+            << -1
+        }
+        if a.label_keys[i] == name {
+            << a.label_vals[i]
+        }
+        i = (i + 1) % cap
+        if i == start {
+            << -1
+        }
+    }
+    << -1
+}
+
+// Full-name interning yields a stable Label index even before definition.
+// Hashes choose a probe bucket; they never identify a relocation target.
+fn (a &Assembler) label_index_ref(name &string) int {
+    if a.label_cap <= 0 { << -1 }
+    mut i := label_bucket(label_hash(name), a.label_cap)
+    start := i
+    while a.label_used[i] != 0 {
+        mut same := a.label_keys[i].len == name.len
+        if same {
+            for j in 0:name.len {
+                if a.label_keys[i][j] != name[j] { same = false
+                    <- }
+            }
+        }
+        if same { << a.label_vals[i] }
+        i = (i + 1) % a.label_cap
+        if i == start { << -1 }
+    }
+    << -1
+}
+
+fn (a &mut Assembler) label_symbol(name &string) int {
+    existing := a.label_index_ref(name)
+    if existing >= 0 { << existing }
+    owned := asm_string_copy(name)
+    key := asm_string_copy(name)
+    a.labels.push(Label{name: owned, offset: -1, is_data: false})
+    idx := a.labels.len - 1
+    a.label_index_put(key, idx)
+    << idx
+}
+
+fn lab_define(ls &mut []Label, idx int, off int, data bool) {
+    ls[idx].offset = off
+    ls[idx].is_data = data
+}
+
+fn (a &mut Assembler) define_label(name &string, off int, data bool) {
+    idx := a.label_symbol(name)
+    if lab_off(&a.labels, idx) >= 0 {
+        eprintln("duplicate assembly label: " + name)
+        <<< 1
+    }
+    lab_define(mut &a.labels, idx, off, data)
+}
+
+// Pad the code buffer so `code.len` is a multiple of `n`.
+fn (a &mut Assembler) align_code(n int) {
+    if n <= 1 {
+        <<
+    }
+    if n <= 0 {
+        <<
+    }
+    rem := a.code.len % n
+    if rem == 0 {
+        <<
+    }
+    pad := n - rem
+    for i in 0:pad {
+        if a.arch == 1 {
+            a.x64_nop()
+        } else {
+            a.code.push(144)
+        }
+    }
+}
+
+// Define a code-segment label at the current code offset.
+fn (a &mut Assembler) label(name string) {
+    // x64: 16-byte-align every code label. WoA's x64 emulator has been
+    // observed to drop a tiny PE whose `call` targets (e.g. collect_args)
+    // land on an odd address, while the same glue at an even RVA in the
+    // large compiler image runs.
+    if a.arch == 1 {
+        a.align_code(16)
+    }
+    // Hoisted: the push mutably borrows `a`, so `a.code.len` cannot be
+    // read inside the same call expression.
+    a.code_label_at(name, a.code.len)
+}
+
+// Register a decided block-entry alias at its captured code offset.
+fn (a &mut Assembler) code_label_at(name string, off int) {
+    a.define_label(&name, off, false)
+}
+
+// Define a data-segment label at the current data offset.
+fn (a &mut Assembler) data_label(name string) {
+    a.define_label(&name, a.data.len, true)
+}
+
+// Append raw bytes to the data buffer.
+fn (a &mut Assembler) emit_data(bytes []int) {
+    for b in bytes {
+        a.data.push(b & 255)
+    }
+}
+
+// Offset of a label within its segment, 0 if undefined (mirrors the
+// reference's `unwrap_or(0)` used for the `_start` lookup).
+fn (a Assembler) label_offset(name string) int {
+    idx := a.label_index(name)
+    if idx >= 0 && idx < a.labels.len {
+        << lab_off(&a.labels, idx)
+    }
+    << 0
+}
+
+fn (a Assembler) label_is_data(name string) bool {
+    idx := a.label_index(name)
+    if idx >= 0 && idx < a.labels.len {
+        << lab_is_data(&a.labels, idx)
+    }
+    << false
+}
+
+fn (a Assembler) is_dylib_lab(lab string) bool {
+    for i in 0:a.dylib_labs.len {
+        if a.dylib_labs[i] == lab {
+            << true
+        }
+    }
+    << false
+}
+
+fn iat_from_xu_label(lab string) string {
+    s := lab + ""
+    if s.len > 0 {
+        c := s[0]
+        if c == 95 {
+            << "_iat_" + s[1:s.len]
+        }
+    }
+    << "_iat_" + s
+}
+
+fn (a &mut Assembler) call_user(lab string) {
+    name := lab + ""
+    if a.is_dylib_lab(name + "") {
+        a.vm_call_iat(iat_from_xu_label(name + ""))
+        <<
+    }
+    a.call(name)
+}
+
+fn (a &mut Assembler) align_data(n int) {
+    if n <= 0 {
+        <<
+    }
+    rem := a.data.len % n
+    if rem == 0 {
+        <<
+    }
+    pad := n - rem
+    for i in 0:pad {
+        a.data.push(0)
+    }
+}
+
+fn (a Assembler) label_addr(name string) int {
+    // `label_index` takes ownership of its argument under the hosted ABI;
+    // passing `name + ""` can therefore consume/poison the caller's
+    // descriptor before the diagnostic below.  Keep independent copies for
+    // lookup and reporting.
+    idx := a.label_index(name + "")
+    if idx >= 0 && idx < a.labels.len {
+        data_flag := lab_is_data(&a.labels, idx)
+        label_off := lab_off(&a.labels, idx)
+        if data_flag {
+            result := a.data_vaddr + label_off
+            << result
+        }
+        result := a.code_vaddr + label_off
+        << result
+    }
+    eprintln("ERROR: Unknown label: " + name)
+    <<< 1
+    << 0
+}
+
+fn label_hash_at(ls &[]Label, i int) int {
+    mut h := 5381
+    n := lab_name_len(ls, i)
+    for j in 0:n {
+        h = ((h << 5) + h) + (lab_name_byte(ls, i, j) & 255)
+        h = h & 2147483647
+    }
+    << h
+}
+
+// Resolve a hash-only ARM64 fixup.  We deliberately scan the compact label
+// table (rather than the full label vector) instead of retaining a string in
+// Fixup; this keeps correctness independent of the hosted Gen1
+// aggregate-copy/drop implementation while preserving near-O(1) fixup time
+// for the compiler's tens of thousands of branches.
+fn (a Assembler) label_addr_hash(h int) int {
+    cap := a.label_cap
+    mut idx := -1
+    // Keep the nonzero proof separate from the table-shape guards.
+    if cap > 0 {
+        if cap <= 1048576 && a.label_used.len >= cap {
+            mut i := h % cap
+            start := i
+            while true {
+                if a.label_used[i] == 0 {
+                    <-
+                }
+                mut kh := 5381
+                for j in 0:a.label_keys[i].len {
+                    kh = ((kh << 5) + kh) + (a.label_keys[i][j] & 255)
+                    kh = kh & 2147483647
+                }
+                if kh == h {
+                    if idx >= 0 && idx != a.label_vals[i] {
+                        kname := a.label_keys[i] + ""
+                        lname := lab_name(&a.labels, idx)
+                        eprintln("ambiguous assembly label hash: " + lname + " / " + kname)
+                        <<< 1
+                    }
+                    idx = a.label_vals[i]
+                }
+                i = (i + 1) % cap
+                if i == start {
+                    <-
+                }
+            }
+        }
+    }
+    if idx >= 0 && idx < a.labels.len {
+        if lab_is_data(&a.labels, idx) {
+            << a.data_vaddr + lab_off(&a.labels, idx)
+        }
+        << a.code_vaddr + lab_off(&a.labels, idx)
+    }
+    eprintln("ERROR: unknown label hash " + str(h))
+    // Surface the candidate label name(s) that produced this hash, so the
+    // host-side fixup emitter can identify which call site is asking for a
+    // label that was never registered via a.label(...). Cap the scan to keep
+    // this fail-loud path bounded on huge label tables.
+    mut scanned := 0
+    for i in 0:a.labels.len {
+        if scanned >= 256 { <- }
+        if label_hash_at(&a.labels, i) == h {
+            eprintln("  candidate: " + lab_name(&a.labels, i))
+        }
+        scanned += 1
+    }
+    // Fail-closed: emitting a BL with target=0 lands in __PAGEZERO and
+    // crashes the produced binary at runtime (observed as Gen2 SIGBUS when
+    // an indirect call's fnval real did not match any in-unit MIR fn).
+    // Surface the missing label as a build error so the self-host chain
+    // aborts with a clear root cause instead of producing a broken image.
+    <<< 1
+    << 0
+}
+
+fn (a Assembler) label_name_hash(h int) string {
+    for i in 0:a.labels.len {
+        if label_hash_at(&a.labels, i) == h {
+            nm := lab_name(&a.labels, i)
+            << asm_string_copy(&nm)
+        }
+    }
+    << ""
+}
+
+// Resolve a stable Label index without touching a Fixup owning string.
+// Forward references remain offset=-1 until their full-name definition.
+fn (a Assembler) label_addr_symbol(sym int) int {
+    if sym >= 0 && sym < a.labels.len && lab_off(&a.labels, sym) >= 0 {
+        if lab_is_data(&a.labels, sym) { << a.data_vaddr + lab_off(&a.labels, sym) }
+        << a.code_vaddr + lab_off(&a.labels, sym)
+    }
+    if sym >= 0 && sym < a.labels.len {
+        eprintln("ERROR: Unknown label: " + lab_name(&a.labels, sym))
+    } else {
+        eprintln("ERROR: Unknown label symbol")
+    }
+    <<< 1
+    << 0
+}
+
+// ==================== Data movement ====================
+
+// MOV with a full 64-bit immediate: MOVZ for the low 16 bits, then MOVK
+// for each non-zero higher 16-bit field (LSL #16/#32/#48).
+fn (a &mut Assembler) mov_imm64(rd int, imm int) {
+    // MOVZ rd, #imm16, LSL #0  (0xD2800000)
+    a.emit32(3531603968 | ((imm & 65535) << 5) | rd)
+    high16 := (imm >> 16) & 65535
+    if high16 != 0 {
+        a.emit32(4070572032 | (high16 << 5) | rd) // MOVK lsl #16 (0xF2A00000)
+    }
+    high32 := (imm >> 32) & 65535
+    if high32 != 0 {
+        a.emit32(4072669184 | (high32 << 5) | rd) // MOVK lsl #32 (0xF2C00000)
+    }
+    high48 := (imm >> 48) & 65535
+    if high48 != 0 {
+        a.emit32(4074766336 | (high48 << 5) | rd) // MOVK lsl #48 (0xF2E00000)
+    }
+}
+
+// MOV with a signed immediate. MOVN only encodes 0xFFFFFFFFFFFF0000|~imm16,
+// i.e. values in -65536..=-1. GENERIC_READ (0x80000000) and other large
+// negatives must use the 64-bit MOVZ/MOVK path — otherwise ARM64 Windows
+// CreateFileA gets 0xFFFF0000 instead of 0x80000000.
+fn (a &mut Assembler) mov_imm(rd int, imm int) {
+    if imm < 0 {
+        if imm >= -65536 {
+            inverted := (-imm - 1) & 65535
+            a.emit32(2457862144 | (inverted << 5) | rd) // MOVN (0x92800000)
+            <<
+        }
+    }
+    a.mov_imm64(rd, imm)
+}
+
+// MOV register. Uses ADD rd, rn, #0 when SP(31) is involved, otherwise
+// ORR rd, XZR, rn (asm.js `movReg`).
+fn (a &mut Assembler) mov_reg(rd int, rn int) {
+    if rd == 31 || rn == 31 {
+        a.emit32(2432696320 | (rn << 5) | rd) // 0x91000000
+    } else {
+        a.emit32(2852127712 | (rn << 16) | rd) // 0xAA0003E0
+    }
+}
+
+// ==================== Floating point (D regs; M13) ====================
+
+// FMOV Dd, Xn  0x9E670000
+fn (a &mut Assembler) fmov_d_from_x(dd int, xn int) {
+    a.emit32(2657550336 | (xn << 5) | dd)
+}
+
+// FMOV Xd, Dn  0x9E660000
+fn (a &mut Assembler) fmov_x_from_d(xd int, dn int) {
+    a.emit32(2657484800 | (dn << 5) | xd)
+}
+
+fn (a &mut Assembler) fmov_w_from_s(wd int, sn int) {
+    a.emit32(505806848 | (sn << 5) | wd)
+}
+
+fn (a &mut Assembler) rev64(rd int, rn int) {
+    a.emit32(3670019072 | (rn << 5) | rd)
+}
+
+fn (a &mut Assembler) cnt_8b(vd int, vn int) {
+    a.emit32(237000704 | (vn << 5) | vd)
+}
+
+fn (a &mut Assembler) addv_8b(bd int, vn int) {
+    a.emit32(238139392 | (vn << 5) | bd)
+}
+
+// ADDV Bd, Vn.16B 0x4E31B800. The count kernel shifts equality
+// masks to 0/1 first, so the 16-byte sum is at most 16 and cannot wrap.
+fn (a &mut Assembler) addv_16b(bd int, vn int) {
+    a.emit32(0x4E31B800 | (vn << 5) | bd)
+}
+
+// UMAXV Bd, Vn.16B  0x6E30A800
+fn (a &mut Assembler) umaxv_16b(bd int, vn int) {
+    a.emit32(1848682496 | (vn << 5) | bd)
+}
+
+// UMOV Xd, Vn.D[idx]  0x4E083C00 | (idx << 20) | (vn << 5) | rd
+fn (a &mut Assembler) umov_64(rd int, vn int, idx int) {
+    a.emit32(1309162496 | (idx << 20) | (vn << 5) | rd)
+}
+
+// FADD Dd, Dn, Dm  0x1E602800
+fn (a &mut Assembler) fadd_d(dd int, dn int, dm int) {
+    a.emit32(509618176 | (dm << 16) | (dn << 5) | dd)
+}
+
+// ==================== Integer NEON (Q regs; wrapping i64×2) ====================
+// GPR `xn` arguments are physical X numbers (same as fmov_d_from_x).
+
+// DUP Vd.2D, Xn  0x4E080C00
+fn (a &mut Assembler) dup_2d_from_x(vd int, xn int) {
+    a.emit32(1309150208 | (xn << 5) | vd)
+}
+
+// DUP Vd.16B, Wn  0x4E010C00. Low 8 bits fill every byte lane.
+fn (a &mut Assembler) dup_16b_from_w(vd int, wn int) {
+    a.emit32(1308691456 | (wn << 5) | vd)
+}
+
+// STR Qt, [Xn], #16  0x3C810400. Post-index 16, 128-bit store.
+fn (a &mut Assembler) str_q_post16(qt int, rn int) {
+    a.emit32(1015088128 | (rn << 5) | qt)
+}
+
+// INS Vd.D[lane], Xn  0x4E001C00 | imm5<<16; lane 0 → imm5=8, lane 1 → 24
+fn (a &mut Assembler) ins_d_from_x(vd int, lane int, xn int) {
+    mut imm5 := 8
+    if lane != 0 {
+        imm5 = 24
+    }
+    a.emit32(1308630016 | (imm5 << 16) | (xn << 5) | vd)
+}
+
+// ADD Vd.2D, Vn.2D, Vm.2D  0x4EE08400  (integer)
+fn (a &mut Assembler) add_2d(vd int, vn int, vm int) {
+    a.emit32(1323336704 | (vm << 16) | (vn << 5) | vd)
+}
+
+// FMUL Vd.2D, Vn.2D, Vm.2D  0x6E60DC00
+fn (a &mut Assembler) mul_2d(vd int, vn int, vm int) {
+    a.emit32(1851841536 | (vm << 16) | (vn << 5) | vd)
+}
+
+// FADD Vd.2D, Vn.2D, Vm.2D  0x4E60D400
+fn (a &mut Assembler) fadd_2d(vd int, vn int, vm int) {
+    a.emit32(1314968576 | (vm << 16) | (vn << 5) | vd)
+}
+
+// LDR Qt, [Xn], #16  0x3CC00000 | (imm9=16)<<12 | 01<<10
+fn (a &mut Assembler) ldr_q_post16(qt int, rn int) {
+    a.emit32(1019215872 | (16 << 12) | (1 << 10) | (rn << 5) | qt)
+}
+
+// AND Vd.16B, Vn.16B, Vm.16B  0x4E201C00
+fn (a &mut Assembler) and_16b(vd int, vn int, vm int) {
+    a.emit32(1310727168 | (vm << 16) | (vn << 5) | vd)
+}
+
+// ADD Vd.16B, Vn.16B, Vm.16B  0x4E208400
+fn (a &mut Assembler) add_16b(vd int, vn int, vm int) {
+    a.emit32(1310753792 | (vm << 16) | (vn << 5) | vd)
+}
+
+// MUL Vd.16B, Vn.16B, Vm.16B  0x4E209C00
+fn (a &mut Assembler) mul_16b(vd int, vn int, vm int) {
+    a.emit32(1310759936 | (vm << 16) | (vn << 5) | vd)
+}
+
+// TBL Vd.16B, {Vn.16B, Vn+1.16B, Vn+2.16B, Vn+3.16B}, Vm.16B  0x4E006000
+fn (a &mut Assembler) tbl4_16b(vd int, vn int, vm int) {
+    a.emit32(1308647424 | (vm << 16) | (vn << 5) | vd)
+}
+
+// LD3 {Vt.16B, Vt+1.16B, Vt+2.16B}, [Xn], #48  0x4CDF4000
+fn (a &mut Assembler) ld3_16b_post(vt int, xn int) {
+    a.emit32(1289699328 | (xn << 5) | vt)
+}
+
+// ST4 {Vt.16B, Vt+1.16B, Vt+2.16B, Vt+3.16B}, [Xn], #64  0x4C9F0000
+fn (a &mut Assembler) st4_16b_post(vt int, xn int) {
+    a.emit32(1285488640 | (xn << 5) | vt)
+}
+
+// SLI Vd.16B, Vn.16B, #shift  0x6F085400
+fn (a &mut Assembler) sli_16b(vd int, vn int, shift int) {
+    a.emit32(1862816768 | (shift << 16) | (vn << 5) | vd)
+}
+
+// ZIP1 Vd.16B, Vn.16B, Vm.16B  0x4E003800
+fn (a &mut Assembler) zip1_16b(vd int, vn int, vm int) {
+    a.emit32(1308637184 | (vm << 16) | (vn << 5) | vd)
+}
+
+// ZIP2 Vd.16B, Vn.16B, Vm.16B  0x4E007800
+fn (a &mut Assembler) zip2_16b(vd int, vn int, vm int) {
+    a.emit32(1308653568 | (vm << 16) | (vn << 5) | vd)
+}
+
+// USHR Vd.16B, Vn.16B, #shift. shift is 1..8.
+// 0x6F080400 | ((8 - shift + 8) << 16). Checked with clang:
+// ushr.16b v0, v1, #4 → 0x6F0C0420.
+fn (a &mut Assembler) ushr_16b(vd int, vn int, shift int) {
+    if shift < 1 || shift > 8 { << }
+    imm := 16 - shift
+    a.emit32(1862796288 | (imm << 16) | (vn << 5) | vd)
+}
+
+// CMEQ Vd.16B, Vn.16B, Vm.16B  0x6E208C00. Q=1; the 8B form is 0x2E208C00.
+fn (a &mut Assembler) cmeq_16b(vd int, vn int, vm int) {
+    a.emit32(1847626752 | (vm << 16) | (vn << 5) | vd)
+}
+
+// BIT Vd.16B, Vn.16B, Vm.16B  0x6EA01C00
+// Vd = Vn where Vm is set, else the old Vd.
+fn (a &mut Assembler) bit_16b(vd int, vn int, vm int) {
+    a.emit32(1855986688 | (vm << 16) | (vn << 5) | vd)
+}
+
+// EOR Vd.16B, Vn.16B, Vm.16B  0x6E201C00
+fn (a &mut Assembler) eor_16b(vd int, vn int, vm int) {
+    a.emit32(1847598080 | (vm << 16) | (vn << 5) | vd)
+}
+
+// AESE Vd.16B, Vn.16B  0x4E284800
+fn (a &mut Assembler) aese_16b(vd int, vn int) {
+    a.emit32(1311262720 | (vn << 5) | vd)
+}
+
+// AESMC Vd.16B, Vn.16B  0x4E286800
+fn (a &mut Assembler) aesmc_16b(vd int, vn int) {
+    a.emit32(1311270912 | (vn << 5) | vd)
+}
+
+// AESD Vd.16B, Vn.16B  0x4E285800
+fn (a &mut Assembler) aesd_16b(vd int, vn int) {
+    a.emit32(1311266816 | (vn << 5) | vd)
+}
+
+// AESIMC Vd.16B, Vn.16B  0x4E287800
+fn (a &mut Assembler) aesimc_16b(vd int, vn int) {
+    a.emit32(1311275008 | (vn << 5) | vd)
+}
+
+// LDR Qt, [Xn, #imm]. imm must be multiple of 16 (0..65520).
+// 0x3DC00000 | ((imm / 16) << 10) | (rn << 5) | qt
+fn (a &mut Assembler) ldr_q_uoff(qt int, rn int, imm int) {
+    scale := imm / 16
+    a.emit32(1035993088 | (scale << 10) | (rn << 5) | qt)
+}
+
+// STR Qt, [Xn, #imm]. imm must be multiple of 16 (0..65520).
+// 0x3D800000 | ((imm / 16) << 10) | (rn << 5) | qt
+fn (a &mut Assembler) str_q_uoff(qt int, rn int, imm int) {
+    scale := imm / 16
+    a.emit32(1031798784 | (scale << 10) | (rn << 5) | qt)
+}
+
+// CMEQ Vd.2D, Vn.2D, Vm.2D  0x6EE08C00
+fn (a &mut Assembler) cmeq_2d(vd int, vn int, vm int) {
+    a.emit32(1860209664 | (vm << 16) | (vn << 5) | vd)
+}
+
+// SUB Vd.2D, Vn.2D, Vm.2D  0x6EE08400
+fn (a &mut Assembler) sub_2d(vd int, vn int, vm int) {
+    a.emit32(1860207616 | (vm << 16) | (vn << 5) | vd)
+}
+
+// MOVI Vd.2D, #0  0x6F00E400
+fn (a &mut Assembler) movi_2d_zero(vd int) {
+    a.emit32(1862329344 | vd)
+}
+
+// ADDP Dd, Vn.2D  0x5EF1B800  (integer pairwise)
+fn (a &mut Assembler) addp_2d_to_d(dd int, vn int) {
+    a.emit32(1592899584 | (vn << 5) | dd)
+}
+
+// FADDP Dd, Vn.2D  0x7E70D800
+fn (a &mut Assembler) faddp_2d_to_d(dd int, vn int) {
+    a.emit32(2121324544 | (vn << 5) | dd)
+}
+
+// LDP Qt1, Qt2, [Xn], #32  0xACC00000 | (imm7=2)<<15
+fn (a &mut Assembler) ldp_q_post32(qt1 int, qt2 int, rn int) {
+    a.emit32(2898264064 | (2 << 15) | (qt2 << 10) | (rn << 5) | qt1)
+}
+
+// STP Qt1, Qt2, [Xn], #32  0xAC800000 | (imm7=2)<<15  (LDP with L=0)
+fn (a &mut Assembler) stp_q_post32(qt1 int, qt2 int, rn int) {
+    a.emit32(2894069760 | (2 << 15) | (qt2 << 10) | (rn << 5) | qt1)
+}
+
+// CRC32B Wd, Wn, Wm  0x1AC04000
+fn (a &mut Assembler) crc32b(wd int, wn int, wm int) {
+    a.emit32(448806912 | (wm << 16) | (wn << 5) | wd)
+}
+
+// CRC32W Wd, Wn, Wm  0x1AC04800
+fn (a &mut Assembler) crc32w(wd int, wn int, wm int) {
+    a.emit32(448808960 | (wm << 16) | (wn << 5) | wd)
+}
+
+// CRC32X Wd, Wn, Xm  0x9AC04C00
+fn (a &mut Assembler) crc32x(wd int, wn int, xm int) {
+    a.emit32(2596293632 | (xm << 16) | (wn << 5) | wd)
+}
+
+// CRC32CB Wd, Wn, Wm  0x1AC05000
+fn (a &mut Assembler) crc32cb(wd int, wn int, wm int) {
+    a.emit32(448811008 | (wm << 16) | (wn << 5) | wd)
+}
+
+// CRC32CW Wd, Wn, Wm  0x1AC05800
+fn (a &mut Assembler) crc32cw(wd int, wn int, wm int) {
+    a.emit32(448813056 | (wm << 16) | (wn << 5) | wd)
+}
+
+// CRC32CX Wd, Wn, Xm  0x9AC05C00
+fn (a &mut Assembler) crc32cx(wd int, wn int, xm int) {
+    a.emit32(2596297728 | (xm << 16) | (wn << 5) | wd)
+}
+
+// SHA256H Qd, Qn, Vm.4S  0x5E004000
+fn (a &mut Assembler) sha256h(qd int, qn int, vm int) {
+    a.emit32(1577074688 | (vm << 16) | (qn << 5) | qd)
+}
+
+// SHA256H2 Qd, Qn, Vm.4S  0x5E005000
+fn (a &mut Assembler) sha256h2(qd int, qn int, vm int) {
+    a.emit32(1577078784 | (vm << 16) | (qn << 5) | qd)
+}
+
+// SHA256SU0 Vd.4S, Vn.4S  0x5E282800
+fn (a &mut Assembler) sha256su0(vd int, vn int) {
+    a.emit32(1579689984 | (vn << 5) | vd)
+}
+
+// SHA256SU1 Vd.4S, Vn.4S, Vm.4S  0x5E006000
+fn (a &mut Assembler) sha256su1(vd int, vn int, vm int) {
+    a.emit32(1577082880 | (vm << 16) | (vn << 5) | vd)
+}
+
+// SHA1C Qd, Sn, Vm.4S  0x5E000000
+// 0x5E000000 = 1577058304
+fn (a &mut Assembler) sha1c(qd int, sn int, vm int) {
+    a.emit32(1577058304 | (vm << 16) | (sn << 5) | qd)
+}
+
+// SHA1P Qd, Sn, Vm.4S  0x5E001000
+// 0x5E001000 = 1577062400
+fn (a &mut Assembler) sha1p(qd int, sn int, vm int) {
+    a.emit32(1577062400 | (vm << 16) | (sn << 5) | qd)
+}
+
+// SHA1M Qd, Sn, Vm.4S  0x5E002000
+// 0x5E002000 = 1577066496
+fn (a &mut Assembler) sha1m(qd int, sn int, vm int) {
+    a.emit32(1577066496 | (vm << 16) | (sn << 5) | qd)
+}
+
+// SHA1H Sd, Sn  0x5E280800
+// 0x5E280800 = 1579681792
+fn (a &mut Assembler) sha1h(sd int, sn int) {
+    a.emit32(1579681792 | (sn << 5) | sd)
+}
+
+// SHA1SU0 Vd.4S, Vn.4S, Vm.4S  0x5E003000
+// 0x5E003000 = 1577070592
+fn (a &mut Assembler) sha1su0(vd int, vn int, vm int) {
+    a.emit32(1577070592 | (vm << 16) | (vn << 5) | vd)
+}
+
+// SHA1SU1 Vd.4S, Vn.4S  0x5E281800
+// 0x5E281800 = 1579685888
+fn (a &mut Assembler) sha1su1(vd int, vn int) {
+    a.emit32(1579685888 | (vn << 5) | vd)
+}
+
+// PMULL Vd.1Q, Vn.1D, Vm.1D  0x0EE0E000
+fn (a &mut Assembler) pmull_1q(vd int, vn int, vm int) {
+    a.emit32(249626624 | (vm << 16) | (vn << 5) | vd)
+}
+
+// PMULL2 Vd.1Q, Vn.2D, Vm.2D  0x4EE0E000
+fn (a &mut Assembler) pmull2_1q(vd int, vn int, vm int) {
+    a.emit32(1323360256 | (vm << 16) | (vn << 5) | vd)
+}
+
+// SHA512H Qd, Qn, Vm.2D  0xCE608000
+fn (a &mut Assembler) sha512h_q(qd int, qn int, vm int) {
+    a.emit32(3462430720 | (vm << 16) | (qn << 5) | qd)
+}
+
+// SHA512H2 Qd, Qn, Vm.2D  0xCE608400
+fn (a &mut Assembler) sha512h2_q(qd int, qn int, vm int) {
+    a.emit32(3462431744 | (vm << 16) | (qn << 5) | qd)
+}
+
+// SHA512SU0 Vd.2D, Vn.2D  0xCEC08000
+fn (a &mut Assembler) sha512su0_2d(vd int, vn int) {
+    a.emit32(3468722176 | (vn << 5) | vd)
+}
+
+// SHA512SU1 Vd.2D, Vn.2D, Vm.2D  0xCE608800
+fn (a &mut Assembler) sha512su1_2d(vd int, vn int, vm int) {
+    a.emit32(3462432768 | (vm << 16) | (vn << 5) | vd)
+}
+
+// EOR3 Vd.16B, Vn.16B, Vm.16B, Va.16B  0xCE000000
+fn (a &mut Assembler) eor3_16b(vd int, vn int, vm int, va int) {
+    a.emit32(3456122880 | (vm << 16) | (va << 10) | (vn << 5) | vd)
+}
+
+// RAX1 Vd.2D, Vn.2D, Vm.2D  0xCE608C00
+fn (a &mut Assembler) rax1_2d(vd int, vn int, vm int) {
+    a.emit32(3462433792 | (vm << 16) | (vn << 5) | vd)
+}
+
+// XAR Vd.2D, Vn.2D, Vm.2D, #imm6  0xCE800000
+fn (a &mut Assembler) xar_2d(vd int, vn int, vm int, imm6 int) {
+    a.emit32(3464495104 | (vm << 16) | ((imm6 & 63) << 10) | (vn << 5) | vd)
+}
+
+// BCAX Vd.16B, Vn.16B, Vm.16B, Va.16B  0xCE200000
+fn (a &mut Assembler) bcax_16b(vd int, vn int, vm int, va int) {
+    a.emit32(3458220032 | (vm << 16) | (va << 10) | (vn << 5) | vd)
+}
+
+// FMOV Sd, Wn  0x1E270000
+// 0x1E270000 = 505872384
+fn (a &mut Assembler) fmov_s_from_w(sd int, wn int) {
+    a.emit32(505872384 | (wn << 5) | sd)
+}
+
+// DUP Vd.4S, Vn.S[idx]  0x4E040400 | (idx << 19) | (vn << 5) | vd
+// 0x4E040400 = 1308886016
+fn (a &mut Assembler) dup_4s_from_s(vd int, vn int, idx int) {
+    a.emit32(1308886016 | (idx << 19) | (vn << 5) | vd)
+}
+
+// SM4E Vd.4S, Vn.4S  0xCEC08400
+// 0xCEC08400 = 3468788736
+fn (a &mut Assembler) sm4e_4s(vd int, vn int) {
+    a.emit32(3468788736 | (vn << 5) | vd)
+}
+
+// REV32 Vd.16B, Vn.16B  0x6E200800
+// 0x6E200800 = 1847592960
+fn (a &mut Assembler) rev32_16b(vd int, vn int) {
+    a.emit32(1847592960 | (vn << 5) | vd)
+}
+
+// REV64 Vd.16B, Vn.16B  0x4E200800
+// 0x4E200800 = 1310722048
+fn (a &mut Assembler) rev64_16b(vd int, vn int) {
+    a.emit32(1310722048 | (vn << 5) | vd)
+}
+
+// INS Vd.S[idx], Wn  0x4E041C00 | (idx << 19) | (rn << 5) | vd
+// 0x4E041C00 = 1308892160
+fn (a &mut Assembler) ins_element_32(vd int, idx int, rn int) {
+    a.emit32(1308892160 | (idx << 19) | (rn << 5) | vd)
+}
+
+// INS Vd.D[idx], Xn  0x4E081C00 | (idx << 20) | (rn << 5) | vd
+// 0x4E081C00 = 1309154304
+fn (a &mut Assembler) ins_element_64(vd int, idx int, rn int) {
+    a.emit32(1309154304 | (idx << 20) | (rn << 5) | vd)
+}
+
+// EXT Vd.16B, Vn.16B, Vm.16B, #imm  0x6E000000 | (vm << 16) | (imm << 11) | (vn << 5) | vd
+// 0x6E000000 = 1845493760
+fn (a &mut Assembler) ext_16b(vd int, vn int, vm int, imm int) {
+    a.emit32(1845493760 | (vm << 16) | ((imm & 15) << 11) | (vn << 5) | vd)
+}
+
+// UMULH Xd, Xn, Xm  0x9BC07C00
+// 0x9BC07C00 = 2613083136
+fn (a &mut Assembler) umulh(rd int, rn int, rm int) {
+    a.emit32(2613083136 | (rm << 16) | (rn << 5) | rd)
+}
+
+// TBL Vd.16B, {Vn.16B}, Vm.16B  0x4E000000
+// 0x4E000000 = 1308622848
+fn (a &mut Assembler) tbl_16b(vd int, vn int, vm int) {
+    a.emit32(1308622848 | (vm << 16) | (vn << 5) | vd)
+}
+
+// MOVI Vd.16B, #imm8  0x4F00E400
+// ARM64 vector immediate: imm8 is split into abc (bits 18:16) and defgh (bits 9:5).
+fn (a &mut Assembler) movi_16b_imm(vd int, imm int) {
+    abc := ((imm & 255) >> 5) & 7
+    defgh := imm & 31
+    a.emit32(1325458432 | (abc << 16) | (defgh << 5) | vd)
+}
+
+// UMOV Wd, Vn.S[idx]  0x0E043C00 | (idx << 19) | (vn << 5) | rd
+// 0x0E043C00 = 235158528
+fn (a &mut Assembler) umov_32(rd int, vn int, idx int) {
+    a.emit32(235158528 | (idx << 19) | (vn << 5) | rd)
+}
+
+// ADD Vd.4S, Vn.4S, Vm.4S  0x4EA08400
+// 0x4EA08400 = 1319142400
+fn (a &mut Assembler) add_4s(vd int, vn int, vm int) {
+    a.emit32(1319142400 | (vm << 16) | (vn << 5) | vd)
+}
+
+// MOV Vd.16B, Vn.16B  (ORR Vd.16B, Vn.16B, Vn.16B) 0x4EA01C00
+// 0x4EA01C00 = 1319115776
+fn (a &mut Assembler) mov_16b(vd int, vn int) {
+    a.emit32(1319115776 | (vn << 16) | (vn << 5) | vd)
+}
+
+// FSUB Dd, Dn, Dm  0x1E603800
+fn (a &mut Assembler) fsub_d(dd int, dn int, dm int) {
+    a.emit32(509622272 | (dm << 16) | (dn << 5) | dd)
+}
+
+// FMUL Dd, Dn, Dm  0x1E600800
+fn (a &mut Assembler) fmul_d(dd int, dn int, dm int) {
+    a.emit32(509609984 | (dm << 16) | (dn << 5) | dd)
+}
+
+// FMADD Dd, Dn, Dm, Da  (Dd = Da + Dn*Dm). 0x1F400000
+fn (a &mut Assembler) fmadd_d(dd int, dn int, dm int, da int) {
+    a.emit32(524288000 | (dm << 16) | (da << 10) | (dn << 5) | dd)
+}
+
+// FMSUB Dd, Dn, Dm, Da  (Dd = Da - Dn*Dm). 0x1F408000
+fn (a &mut Assembler) fmsub_d(dd int, dn int, dm int, da int) {
+    a.emit32(524320768 | (dm << 16) | (da << 10) | (dn << 5) | dd)
+}
+
+// FNMSUB Dd, Dn, Dm, Da  (Dd = Dn*Dm - Da). 0x1F608000
+fn (a &mut Assembler) fnmsub_d(dd int, dn int, dm int, da int) {
+    a.emit32(526336000 | (dm << 16) | (da << 10) | (dn << 5) | dd)
+}
+
+// FDIV Dd, Dn, Dm  0x1E601800
+fn (a &mut Assembler) fdiv_d(dd int, dn int, dm int) {
+    a.emit32(509614080 | (dm << 16) | (dn << 5) | dd)
+}
+
+// FNEG Dd, Dn  0x1E614000
+fn (a &mut Assembler) fneg_d(dd int, dn int) {
+    a.emit32(509689856 | (dn << 5) | dd)
+}
+
+// FSQRT Dd, Dn  0x1E61C000
+fn (a &mut Assembler) fsqrt_d(dd int, dn int) {
+    a.emit32(509722624 | (dn << 5) | dd)
+}
+
+// FRINTM Dd, Dn (Floor)  0x1E654000
+// 0x1E654000 = 509952000
+fn (a &mut Assembler) frintm_d(dd int, dn int) {
+    a.emit32(509952000 | (dn << 5) | dd)
+}
+
+// FRINTP Dd, Dn (Ceil)  0x1E64C000
+// 0x1E64C000 = 509919232
+fn (a &mut Assembler) frintp_d(dd int, dn int) {
+    a.emit32(509919232 | (dn << 5) | dd)
+}
+
+// FRINTZ Dd, Dn (Trunc)  0x1E65C000
+// 0x1E65C000 = 509984768
+fn (a &mut Assembler) frintz_d(dd int, dn int) {
+    a.emit32(509984768 | (dn << 5) | dd)
+}
+
+// FRINTN Dd, Dn (Round to even)  0x1E644000
+// 0x1E644000 = 509886464
+fn (a &mut Assembler) frintn_d(dd int, dn int) {
+    a.emit32(509886464 | (dn << 5) | dd)
+}
+
+// CLZ Xd, Xn  0xDAC01000.  The opcode does not fit in a signed 32-bit
+// immediate, so emit the four little-endian bytes directly.
+fn (a &mut Assembler) clz_x(rd int, rn int) {
+    a.code.push((rd & 31) | ((rn & 7) << 5))
+    a.code.push(16 | ((rn >> 3) & 3))
+    a.code.push(192)
+    a.code.push(218)
+}
+
+// RBIT Xd, Xn  0xDAC00000
+fn (a &mut Assembler) rbit_x(rd int, rn int) {
+    a.code.push((rd & 31) | ((rn & 7) << 5))
+    a.code.push((rn >> 3) & 3)
+    a.code.push(192)
+    a.code.push(218)
+}
+
+// FCMP Dn, Dm  0x1E602000
+fn (a &mut Assembler) fcmp_d(dn int, dm int) {
+    a.emit32(509616128 | (dm << 16) | (dn << 5))
+}
+
+// SCVTF Dd, Xn  0x9E620000 (0x9E630000 would be UCVTF — unsigned!)
+fn (a &mut Assembler) scvtf_d_from_x(dd int, xn int) {
+    a.emit32(2657222656 | (xn << 5) | dd) // SCVTF 0x9E620000 (signed)
+}
+
+// FCVTZS Xd, Dn  0x9E780000
+fn (a &mut Assembler) fcvtzs_x_from_d(xd int, dn int) {
+    a.emit32(2658664448 | (dn << 5) | xd)
+}
+
+// STUR Dt, [Xn, #imm] (unscaled signed 9-bit). 0xFC000000
+fn (a &mut Assembler) stur_d(dt int, rn int, offset int) {
+    imm9 := offset & 511
+    a.emit32(4227858432 | (imm9 << 12) | (rn << 5) | dt)
+}
+
+// LDUR Dt, [Xn, #imm] (unscaled signed 9-bit). 0xFC400000
+fn (a &mut Assembler) ldur_d(dt int, rn int, offset int) {
+    imm9 := offset & 511
+    a.emit32(4232052736 | (imm9 << 12) | (rn << 5) | dt)
+}
+
+// STR Dt, [Xn, #imm] (scaled unsigned, 8-byte units). 0xFD000000
+fn (a &mut Assembler) str_d(dt int, rn int, offset int) {
+    imm12 := (offset >> 3) & 4095
+    a.emit32(4244635648 | (imm12 << 10) | (rn << 5) | dt)
+}
+
+// LDR Dt, [Xn, #imm] (scaled unsigned, 8-byte units). 0xFD400000
+fn (a &mut Assembler) ldr_d(dt int, rn int, offset int) {
+    imm12 := (offset >> 3) & 4095
+    a.emit32(4248829952 | (imm12 << 10) | (rn << 5) | dt)
+}
+
+fn (a &mut Assembler) load_d_offset(dt int, rn int, offset int) {
+    if offset >= 0 && offset % 8 == 0 {
+        a.ldr_d(dt, rn, offset)
+    } else {
+        a.ldur_d(dt, rn, offset)
+    }
+}
+
+fn (a &mut Assembler) store_d_offset(dt int, rn int, offset int) {
+    if offset >= 0 && offset % 8 == 0 {
+        a.str_d(dt, rn, offset)
+    } else {
+        a.stur_d(dt, rn, offset)
+    }
+}
+
+// FMOV Dd, Dn (register). 0x1E604000
+fn (a &mut Assembler) fmov_d_from_d(dd int, dn int) {
+    a.emit32(509624320 | (dn << 5) | dd)
+}
+
+// ==================== Arithmetic ====================
+
+// ADD register (shifted register, LSL #0). 0x8B000000
+fn (a &mut Assembler) add_reg(rd int, rn int, rm int) {
+    a.emit32(2332033024 | (rm << 16) | (rn << 5) | rd)
+}
+
+// SUB register (shifted register, LSL #0). 0xCB000000
+fn (a &mut Assembler) sub_reg(rd int, rn int, rm int) {
+    a.emit32(3405774848 | (rm << 16) | (rn << 5) | rd)
+}
+
+// SUB immediate. Same 12-bit / hi+lo split as `add_imm` (asm.js `subImm`).
+fn (a &mut Assembler) sub_imm(rd int, rn int, imm int) {
+    if imm > 4095 {
+        if imm > 16777215 {
+            eprintln("sub_imm: immediate too large: imm=" + str(imm) + " rd=" + str(rd) + " rn=" + str(rn))
+            <<< 1
+        }
+        // Compute hi12 before lo12: O1 may AND in-place on imm's park reg;
+        // doing & 4095 first would make (imm >> 12) see only the low 12 bits
+        // (heap chunk end became add #0 instead of #0x10,LSL#12).
+        hi12 := (imm >> 12) & 4095
+        lo12 := imm & 4095
+        mut rsrc := rn
+        if hi12 != 0 {
+            // SUB rd, rsrc, #hi12, LSL #12 (sh bit = bit 22)  0xD1000000
+            a.emit32(3506438144 | (1 << 22) | (hi12 << 10) | (rsrc << 5) | rd)
+            rsrc = rd
+        }
+        if lo12 != 0 || hi12 == 0 {
+            a.emit32(3506438144 | (lo12 << 10) | (rsrc << 5) | rd)
+        }
+    } else {
+        a.emit32(3506438144 | (imm << 10) | (rn << 5) | rd)
+    }
+}
+
+// MUL rd = rn * rm (MADD rd, rn, rm, XZR). 0x9B007C00
+// (named mul_reg for consistency and to leave `mul` free for the vm layer)
+fn (a &mut Assembler) mul_reg(rd int, rn int, rm int) {
+    a.emit32(2600500224 | (rm << 16) | (rn << 5) | rd)
+}
+
+// MADD rd = ra + rn * rm. 0x9B000000
+fn (a &mut Assembler) madd_reg(rd int, rn int, rm int, ra int) {
+    a.emit32(2600468480 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+}
+
+// ADD rd = rn + (rm << sh). 0x8B000000 | (rm<<16) | (sh<<10) | (rn<<5) | rd
+fn (a &mut Assembler) add_lsl(rd int, rn int, rm int, sh int) {
+    a.emit32(2332033024 | (rm << 16) | ((sh & 63) << 10) | (rn << 5) | rd)
+}
+
+// SUB rd = rn - (rm << sh). 0xCB000000
+fn (a &mut Assembler) sub_lsl(rd int, rn int, rm int, sh int) {
+    a.emit32(3405774848 | (rm << 16) | ((sh & 63) << 10) | (rn << 5) | rd)
+}
+
+// LDR Dt, [Xn, Xm, LSL #3]  SIMD&FP register offset. 0xFC607800
+fn (a &mut Assembler) ldr_d_reg_lsl(dt int, rn int, rm int) {
+    a.emit32(4234180608 | (rm << 16) | (rn << 5) | dt)
+}
+
+// STR Dt, [Xn, Xm, LSL #3]. 0xFC207800
+fn (a &mut Assembler) str_d_reg_lsl(dt int, rn int, rm int) {
+    a.emit32(4229986304 | (rm << 16) | (rn << 5) | dt)
+}
+
+// LDR Dt, [Xn], #imm9  post-index. 0xFC400400
+fn (a &mut Assembler) ldr_d_post(dt int, rn int, imm int) {
+    a.emit32(4232053760 | ((imm & 511) << 12) | (rn << 5) | dt)
+}
+
+// LDR Xt, [Xn, Xm, LSL #3] / W LSL#2 / H LSL#1 / B. elem_sz in {1,2,4,8}.
+fn (a &mut Assembler) ldr_reg_lsl(rt int, rn int, rm int, elem_sz int) {
+    if elem_sz == 8 {
+        a.emit32(4167071744 | (rm << 16) | (rn << 5) | rt) // 0xF8607800
+        <<
+    }
+    if elem_sz == 4 {
+        a.emit32(3093329920 | (rm << 16) | (rn << 5) | rt) // 0xB8607800
+        <<
+    }
+    if elem_sz == 2 {
+        a.emit32(2019588096 | (rm << 16) | (rn << 5) | rt) // 0x78607800
+        <<
+    }
+    // byte: no shift amount
+    a.emit32(945842176 | (rm << 16) | (rn << 5) | rt) // 0x38606800
+    <<
+}
+
+// STR Xt/W/H/B, [Xn, Xm, LSL #…] — same elem_sz set as ldr_reg_lsl.
+fn (a &mut Assembler) str_reg_lsl(rt int, rn int, rm int, elem_sz int) {
+    if elem_sz == 8 {
+        a.emit32(4162877440 | (rm << 16) | (rn << 5) | rt) // 0xF8207800
+        <<
+    }
+    if elem_sz == 4 {
+        a.emit32(3089135616 | (rm << 16) | (rn << 5) | rt) // 0xB8207800
+        <<
+    }
+    if elem_sz == 2 {
+        a.emit32(2015393792 | (rm << 16) | (rn << 5) | rt) // 0x78207800
+        <<
+    }
+    a.emit32(941647872 | (rm << 16) | (rn << 5) | rt) // 0x38206800
+    <<
+}
+
+// SDIV: signed division. 0x9AC00C00
+fn (a &mut Assembler) sdiv(rd int, rn int, rm int) {
+    a.emit32(2596277248 | (rm << 16) | (rn << 5) | rd)
+}
+
+// SMULH rd = (rn * rm) >> 64 (signed high 64-bit product). 0x9B407C00
+fn (a &mut Assembler) smulh(rd int, rn int, rm int) {
+    a.emit32(2604694528 | (rm << 16) | (rn << 5) | rd)
+}
+
+// MSUB rd = ra - rn * rm (used for `rem` after SDIV). 0x9B008000
+fn (a &mut Assembler) msub(rd int, rn int, rm int, ra int) {
+    a.emit32(2600501248 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+}
+
+// NEG rd = -rm (SUB rd, XZR, rm). 0xCB0003E0
+fn (a &mut Assembler) neg_reg(rd int, rm int) {
+    a.emit32(3405775840 | (rm << 16) | rd)
+}
+
+// AND rd = rn & rm (shifted register, LSL #0). 0x8A000000
+fn (a &mut Assembler) and_reg(rd int, rn int, rm int) {
+    a.emit32(2315255808 | (rm << 16) | (rn << 5) | rd)
+}
+
+// AND rd = rn & (2^k-1). N=1, immr=0, imms=k-1. 0x92400000 | imms<<10
+fn (a &mut Assembler) and_imm(rd int, rn int, imm int) {
+    mut n := 0
+    mut x := imm
+    while x > 0 {
+        n = n + 1
+        x = x / 2
+    }
+    imms := n - 1
+    a.emit32(2453667840 | (imms << 10) | (rn << 5) | rd)
+}
+
+// ORR rd = rn | rm. 0xAA000000
+fn (a &mut Assembler) orr_reg(rd int, rn int, rm int) {
+    a.emit32(2852126720 | (rm << 16) | (rn << 5) | rd)
+}
+
+// EOR rd = rn ^ rm. 0xCA000000
+fn (a &mut Assembler) eor_reg(rd int, rn int, rm int) {
+    a.emit32(3388997632 | (rm << 16) | (rn << 5) | rd)
+}
+
+// LSLV rd = rn << rm (register shift). 0x9AC02000
+fn (a &mut Assembler) lsl_reg(rd int, rn int, rm int) {
+    a.emit32(2596282368 | (rm << 16) | (rn << 5) | rd)
+}
+
+// LSRV rd = rn >> rm (register shift, logical). 0x9AC02400
+fn (a &mut Assembler) lsr_reg(rd int, rn int, rm int) {
+    a.emit32(2596283392 | (rm << 16) | (rn << 5) | rd)
+}
+
+// ASRV rd = rn >> rm (register shift, arithmetic). 0x9AC02800
+fn (a &mut Assembler) asr_reg(rd int, rn int, rm int) {
+    a.emit32(2596284416 | (rm << 16) | (rn << 5) | rd)
+}
+
+// ASR immediate: SBFM Xd, Xn, #shift, #63. 0x93400000
+fn (a &mut Assembler) asr_imm(rd int, rn int, shift int) {
+    immr := shift & 63
+    a.emit32(2470445056 | (immr << 16) | (63 << 10) | (rn << 5) | rd)
+}
+
+// ROR Xd, Xn, #imm — EXTR Xd, Xn, Xn, #imm. 0x93C00000
+fn (a &mut Assembler) ror_imm(rd int, rn int, imm int) {
+    immr := imm & 63
+    a.emit32(2478833664 | (rn << 16) | (immr << 10) | (rn << 5) | rd)
+}
+
+// ROR Wd, Wn, #imm — 32-bit EXTR; writing Wd zeros the high half. 0x13800000
+fn (a &mut Assembler) ror_imm32(rd int, rn int, imm int) {
+    immr := imm & 31
+    a.emit32(327155712 | (rn << 16) | (immr << 10) | (rn << 5) | rd)
+}
+
+// LSR immediate (logical shift right): UBFM Xd, Xn, #shift, #63. 0xD3400000
+// LSR Wd, Wn, #imm — UBFM 32-bit. 0x53000000
+fn (a &mut Assembler) lsr_imm32(rd int, rn int, imm int) {
+    immr := imm & 31
+    a.emit32(1392508928 | (immr << 16) | (31 << 10) | (rn << 5) | rd)
+}
+
+// 32-bit logical shifted-register. opc 0=AND 1=ORR 2=EOR; shift 0=LSL 1=LSR 2=ASR 3=ROR.
+fn (a &mut Assembler) logical32(opc int, rd int, rn int, rm int, shift int, imm int, invert int) {
+    mut base := 167772160
+    if opc == 1 {
+        base = 704643072
+    }
+    if opc == 2 {
+        base = 1241513984
+    }
+    mut nbit := 0
+    if invert != 0 {
+        nbit = 2097152
+    }
+    a.emit32(base | nbit | ((shift & 3) << 22) | (rm << 16) | ((imm & 31) << 10) | (rn << 5) | rd)
+}
+
+fn (a &mut Assembler) eor_ror32(rd int, rn int, rm int, imm int) {
+    a.logical32(2, rd, rn, rm, 3, imm, 0)
+}
+
+fn (a &mut Assembler) eor_lsr32(rd int, rn int, rm int, imm int) {
+    a.logical32(2, rd, rn, rm, 1, imm, 0)
+}
+
+fn (a &mut Assembler) bic32(rd int, rn int, rm int) {
+    a.logical32(0, rd, rn, rm, 0, 0, 1)
+}
+
+fn (a &mut Assembler) mvn32(rd int, rm int) {
+    a.logical32(1, rd, 31, rm, 0, 0, 1)
+}
+
+// LSR immediate (logical shift right): UBFM Xd, Xn, #shift, #63. 0xD3400000
+fn (a &mut Assembler) lsr_imm(rd int, rn int, shift int) {
+    immr := shift & 63
+    a.emit32(3544186880 | (immr << 16) | (63 << 10) | (rn << 5) | rd)
+}
+
+// LSL immediate (logical shift left): UBFM Xd, Xn, #(-shift mod 64), #(63-shift).
+fn (a &mut Assembler) lsl_imm(rd int, rn int, shift int) {
+    immr := (64 - shift) & 63
+    imms := (63 - shift) & 63
+    a.emit32(3544186880 | (immr << 16) | (imms << 10) | (rn << 5) | rd)
+}
+
+// ==================== Compare ====================
+
+// CMP rn, rm (SUBS XZR, rn, rm). 0xEB00001F
+fn (a &mut Assembler) cmp_reg(rn int, rm int) {
+    a.emit32(3942645791 | (rm << 16) | (rn << 5))
+}
+
+// CMP rn, #imm (SUBS XZR, rn, #imm). 12-bit immediates encode directly;
+// anything else is materialized in X16 and compared as a register.
+fn (a &mut Assembler) cmp_imm(rn int, imm int) {
+    if rn == 16 {
+        eprintln("cmp_imm: rn must not be X16 (scratch)")
+        <<< 1
+    }
+    if imm >= 0 && imm <= 4095 {
+        a.emit32(4043309087 | (imm << 10) | (rn << 5)) // 0xF100001F
+    } else {
+        a.mov_imm(16, imm)
+        a.cmp_reg(rn, 16)
+    }
+}
+
+// CSET rd, cond (CSINC rd, XZR, XZR, !cond). 0x9A9F07E0
+fn (a &mut Assembler) cset(rd int, cond int) {
+    a.emit32(2594113504 | ((cond ^ 1) << 12) | rd)
+}
+
+// CSEL rd, rn, rm, cond. 0x9A800000
+fn (a &mut Assembler) csel(rd int, rn int, rm int, cond int) {
+    a.emit32(2592079872 | (rm << 16) | (cond << 12) | (rn << 5) | rd)
+}
+
+// CSINC rd, rn, rm, cond. 0x9A800400
+fn (a &mut Assembler) csinc(rd int, rn int, rm int, cond int) {
+    a.emit32(2592080896 | (rm << 16) | (cond << 12) | (rn << 5) | rd)
+}
+
+// ==================== Memory access ====================
+
+// STP Xt1, Xt2, [Xn, #imm]! (pre-indexed; imm must be a multiple of 8).
+// 0xA9800000. Offset is a multiple of 8, so /8 == >>3 here.
+fn (a &mut Assembler) stp_pre(rt1 int, rt2 int, rn int, offset int) {
+    imm7 := (offset >> 3) & 127
+    a.emit32(2843738112 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+// LDP Xt1, Xt2, [Xn], #imm (post-indexed; imm must be a multiple of 8).
+// 0xA8C00000
+fn (a &mut Assembler) ldp_post(rt1 int, rt2 int, rn int, offset int) {
+    imm7 := (offset >> 3) & 127
+    a.emit32(2831155200 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+// STP Xt1, Xt2, [Xn], #imm (post-indexed; imm must be a multiple of 8).
+// 0xA8800000
+fn (a &mut Assembler) stp_post(rt1 int, rt2 int, rn int, offset int) {
+    imm7 := (offset >> 3) & 127
+    a.emit32(2826960896 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+// STR Xt, [Xn, #imm] (scaled unsigned offset, 8-byte units). 0xF9000000
+fn (a &mut Assembler) str(rt int, rn int, offset int) {
+    imm12 := (offset >> 3) & 4095
+    a.emit32(4177526784 | (imm12 << 10) | (rn << 5) | rt)
+}
+
+// LDR Xt, [Xn, #imm] (scaled unsigned offset, 8-byte units). 0xF9400000
+fn (a &mut Assembler) ldr(rt int, rn int, offset int) {
+    imm12 := (offset >> 3) & 4095
+    a.emit32(4181721088 | (imm12 << 10) | (rn << 5) | rt)
+}
+
+// STUR Xt, [Xn, #imm] (unscaled signed 9-bit offset). 0xF8000000
+fn (a &mut Assembler) stur(rt int, rn int, offset int) {
+    imm9 := offset & 511
+    a.emit32(4160749568 | (imm9 << 12) | (rn << 5) | rt)
+}
+
+// LDUR Xt, [Xn, #imm] (unscaled signed 9-bit offset). 0xF8400000
+fn (a &mut Assembler) ldur(rt int, rn int, offset int) {
+    imm9 := offset & 511
+    a.emit32(4164943872 | (imm9 << 12) | (rn << 5) | rt)
+}
+
+// STRB Wt, [Xn, #imm] (unsigned 12-bit offset). 0x39000000
+fn (a &mut Assembler) strb(rt int, rn int, offset int) {
+    a.emit32(956301312 | ((offset & 4095) << 10) | (rn << 5) | rt)
+}
+
+// STURB Wt, [Xn, #imm] (unscaled signed 9-bit offset). 0x38000000
+fn (a &mut Assembler) sturb(rt int, rn int, offset int) {
+    imm9 := offset & 511
+    a.emit32(939524096 | (imm9 << 12) | (rn << 5) | rt)
+}
+
+// LDRB Wt, [Xn, #imm] (unsigned 12-bit offset, zero-extended byte load).
+// 0x39400000
+fn (a &mut Assembler) ldrb(rt int, rn int, offset int) {
+    a.emit32(960495616 | ((offset & 4095) << 10) | (rn << 5) | rt)
+}
+
+// LDURB Wt, [Xn, #imm] (unscaled signed 9-bit offset). 0x38400000
+fn (a &mut Assembler) ldurb(rt int, rn int, offset int) {
+    imm9 := offset & 511
+    a.emit32(943718400 | (imm9 << 12) | (rn << 5) | rt)
+}
+
+// Byte load with base + signed byte offset.
+fn (a &mut Assembler) load_byte_offset(rt int, rn int, offset int) {
+    if offset >= 0 {
+        a.ldrb(rt, rn, offset)
+    } else {
+        a.ldurb(rt, rn, offset)
+    }
+}
+
+// Load with base + signed byte offset (asm.js `movLoadOffset`): LDR for
+// non-negative multiples of 8, LDUR otherwise.
+fn (a &mut Assembler) load_offset(rt int, rn int, offset int) {
+    if offset >= 0 && offset % 8 == 0 {
+        a.ldr(rt, rn, offset)
+    } else {
+        a.ldur(rt, rn, offset)
+    }
+}
+
+// Store with base + signed byte offset (asm.js `movStoreOffset`).
+fn (a &mut Assembler) store_offset(rt int, rn int, offset int) {
+    if offset >= 0 && offset % 8 == 0 {
+        a.str(rt, rn, offset)
+    } else {
+        a.stur(rt, rn, offset)
+    }
+}
+
+// Byte store with base + signed byte offset.
+fn (a &mut Assembler) store_byte_offset(rt int, rn int, offset int) {
+    if offset >= 0 {
+        a.strb(rt, rn, offset)
+    } else {
+        a.sturb(rt, rn, offset)
+    }
+}
+
+// ADD immediate. Encodes directly for 12-bit immediates; larger values up
+// to 0xFFFFFF are split into `imm12 << 12` + `imm12` (asm.js `addImm`).
+fn (a &mut Assembler) add_imm(rd int, rn int, imm int) {
+    if imm > 4095 {
+        if imm > 16777215 {
+            eprintln("add_imm: immediate too large")
+            <<< 1
+        }
+        // hi12 before lo12 — see add_imm (O1 in-place AND on imm park).
+        hi12 := (imm >> 12) & 4095
+        lo12 := imm & 4095
+        mut rsrc := rn
+        if hi12 != 0 {
+            // ADD rd, rsrc, #hi12, LSL #12 (sh bit = bit 22)  0x91000000
+            a.emit32(2432696320 | (1 << 22) | (hi12 << 10) | (rsrc << 5) | rd)
+            rsrc = rd
+        }
+        if lo12 != 0 || hi12 == 0 {
+            a.emit32(2432696320 | (lo12 << 10) | (rsrc << 5) | rd)
+        }
+    } else {
+        a.emit32(2432696320 | (imm << 10) | (rn << 5) | rd)
+    }
+}
+
+// ==================== Branches ====================
+
+fn (a &mut Assembler) push_fixup(kind int, label string, rd int) {
+    a.push_fixup_at(kind, a.code.len, &label, rd)
+}
+
+fn (a &mut Assembler) push_fixup_ref(kind int, label &string, rd int) {
+    a.push_fixup_at(kind, a.code.len, label, rd)
+}
+
+fn (a &mut Assembler) push_fixup_at(kind int, off int, label &string, rd int) {
+    mut lab := ""
+    mut out_rd := rd
+    mut out_kind := kind
+    if a.arch == 0 {
+        if kind < 0 || kind > 4 {
+            eprintln("ERROR: unsupported symbolic relocation kind " + str(kind))
+            <<< 1
+        }
+        sym := a.label_symbol(label)
+        out_rd = ((sym + 1) << 5) | (rd & 31)
+        // Kinds 6..10 distinguish full-name symbols from legacy hash tokens.
+        out_kind = kind + 6
+    } else {
+        lab = asm_string_copy(label)
+    }
+    a.fixups.push(Fixup{kind: out_kind, offset: off, label: lab, rd: out_rd})
+}
+
+// Unconditional branch to a label (patched by `fixup_all`). 0x14000000
+fn (a &mut Assembler) b(label string) {
+    a.push_fixup(0, label, 0)
+    a.emit32(335544320)
+}
+
+// Branch with link to a label (patched by `fixup_all`). 0x94000000
+fn (a &mut Assembler) bl(label string) {
+    a.push_fixup(1, label, 0)
+    a.emit32(2483027968)
+}
+
+fn (a &mut Assembler) bl_ref(label &string) {
+    a.push_fixup_ref(1, label, 0)
+    a.emit32(2483027968)
+}
+
+// Scalar-hash relocation forms for labels that originate in nested MIR
+// aggregates.  The caller computes the hash from byte accessors and passes no
+// string descriptor through the backend forwarding chain.
+// Emit an ARM64 BL whose target is a MIR function index.  The target offset
+// is bound by emit_function_entry and resolved in fixup_all after the code
+// virtual address is known.  Encoding the index in Fixup.rd keeps this path
+// entirely numeric and avoids carrying a temporary string through the large
+// Assembler receiver.  rd is otherwise non-negative for BL fixups, so
+// -(fi+1) is an unambiguous sentinel.
+fn (a &mut Assembler) call_fn_index(fi int) {
+    off := a.code.len
+    marker := 0 - fi - 1
+    a.fixups.push(Fixup{kind: 1, offset: off, label: "", rd: marker})
+    a.emit32(2483027968)
+}
+
+// Branch with link to register (indirect call): BLR rn. 0xD63F0000
+fn (a &mut Assembler) blr(rn int) {
+    a.emit32(3594452992 | (rn << 5))
+}
+
+// LDAXR Xt, [Xn]  0xC85FFC00
+fn (a &mut Assembler) ldaxr(rt int, rn int) {
+    a.emit32(3361733632 | (rn << 5) | rt)
+}
+
+// STLXR Ws, Xt, [Xn]  0xC800FC00
+fn (a &mut Assembler) stlxr(rs int, rt int, rn int) {
+    a.emit32(3355507712 | (rs << 16) | (rn << 5) | rt)
+}
+
+// LDAR Xt, [Xn] — load-acquire (64-bit, sequential consistency). 0xC8DFFC00
+fn (a &mut Assembler) ldar(rt int, rn int) {
+    a.emit32(3370122240 | (rn << 5) | rt)
+}
+
+// STLR Xt, [Xn] — store-release (64-bit, sequential consistency). 0xC89FFC00
+fn (a &mut Assembler) stlr(rt int, rn int) {
+    a.emit32(3365927936 | (rn << 5) | rt)
+}
+
+// Compare and branch if zero (patched by `fixup_all`). 0xB4000000
+// Compute the placeholder before `push_fixup`: under -O1 the call can
+// clobber the caller-saved home of `rt` (rd is not passed for CBZ).
+// Stash `rt` in Fixup.rd so `fixup_all` need not re-read the low bits.
+fn (a &mut Assembler) cbz(rt int, label string) {
+    r := rt & 31
+    word := 3019898880 | r
+    a.push_fixup(2, label, r)
+    a.emit32(word)
+}
+
+// Compare and branch if non-zero (patched by `fixup_all`). 0xB5000000
+fn (a &mut Assembler) cbnz(rt int, label string) {
+    r := rt & 31
+    word := 3036676096 | r
+    a.push_fixup(3, label, r)
+    a.emit32(word)
+}
+
+// Conditional branch. Already-defined nearby labels (loop back-edges) use
+// a real B.cond (imm19). Forward/far targets keep `b.<inv> .+8` + `b`.
+// 0x54000000
+fn (a &mut Assembler) bcond(cond int, label string) {
+    idx := a.label_index_ref(&label)
+    if idx >= 0 && idx < a.labels.len {
+        is_data := lab_is_data(&a.labels, idx)
+        if !is_data {
+            off := lab_off(&a.labels, idx)
+            if off >= 0 {
+                here := a.code.len
+                delta := (off - here) / 4
+                if delta >= -262144 && delta < 262144 {
+                    imm19 := delta & 524287
+                    a.emit32(1409286144 | (imm19 << 5) | cond)
+                    <<
+                }
+            }
+        }
+    }
+    inv := cond ^ 1
+    a.emit32(1409286144 | (2 << 5) | inv) // b.<inv> .+8
+    a.b(label)
+}
+
+fn (a &mut Assembler) beq(label string) { a.bcond(0, label) }
+fn (a &mut Assembler) bne(label string) { a.bcond(1, label) }
+fn (a &mut Assembler) blt(label string) { a.bcond(11, label) }
+fn (a &mut Assembler) bge(label string) { a.bcond(10, label) }
+fn (a &mut Assembler) bgt(label string) { a.bcond(12, label) }
+fn (a &mut Assembler) ble(label string) { a.bcond(13, label) }
+
+// ==================== Address loading ====================
+
+// Load the address of a label into `rd` via ADRP + ADD (asm.js
+// `leaRipRel`). Both instructions are patched by `fixup_all`.
+fn (a &mut Assembler) lea_rip_rel(rd int, label string) {
+    a.push_fixup(4, label, rd)
+    a.emit32(2415919104 | rd) // ADRP rd, <page> placeholder (0x90000000)
+    a.emit32(2432696320 | (rd << 5) | rd) // ADD rd, rd, #0 (0x91000000)
+}
+
+// LEA of `_xus_{ib}` string literal via data-offset table (avoids label-hash collisions).
+fn (a &mut Assembler) lea_xus(rd int, ib int) {
+    off := a.code.len
+    a.fixups.push(Fixup{kind: 5, offset: off, label: "", rd: (ib << 5) | (rd & 31)})
+    a.emit32(2415919104 | (rd & 31))
+    a.emit32(2432696320 | ((rd & 31) << 5) | (rd & 31))
+}
+
+// Numeric variant used by LoadFnAddr on ARM64.  Fixup kind 4 normally stores
+// the destination register in rd; encode both the MIR function index and that
+// register in one negative sentinel so the Fixup/Assembler layouts remain
+// unchanged: token = (fi+1)*32 + rd + 1, rd_field = -token.
+fn (a &mut Assembler) lea_fn_index(rd int, fi int) {
+    off := a.code.len
+    token := (fi + 1) * 32 + (rd & 31) + 1
+    marker := 0 - token
+    a.fixups.push(Fixup{kind: 4, offset: off, label: "", rd: marker})
+    a.emit32(2415919104 | (rd & 31))
+    a.emit32(2432696320 | ((rd & 31) << 5) | (rd & 31))
+}
+
+// ==================== System calls ====================
+
+// SVC with a 16-bit immediate. 0xD4000001
+fn (a &mut Assembler) svc(imm int) {
+    a.emit32(3556769793 | (imm << 5))
+}
+
+// macOS raw syscall trap: SVC #0x80.
+fn (a &mut Assembler) syscall() { a.svc(128) }
+
+// ==================== Misc ====================
+
+fn (a &mut Assembler) ret() { a.emit32(3596551104) } // 0xD65F03C0
+fn (a &mut Assembler) nop() { a.emit32(3573751839) } // 0xD503201F
+fn (a &mut Assembler) mrs_tpidr_el0(rt int) {
+    // MRS Xt, TPIDR_EL0 = D53BD040 | Rt. Bytes keep immediates in 0..255.
+    a.code.push((64 | (rt & 31)) & 255)
+    a.code.push(208)
+    a.code.push(59)
+    a.code.push(213)
+}
+
+// ==================== Fixups ====================
+
+fn (a &mut Assembler) patch32(offset int, word int) {
+    a.code[offset] = word & 255
+    a.code[offset + 1] = (word >> 8) & 255
+    a.code[offset + 2] = (word >> 16) & 255
+    a.code[offset + 3] = (word >> 24) & 255
+}
+
+// Patch all pending fixups. Must be called after `code_vaddr` and
+// `data_vaddr` have been assigned by the binary writer, and after all
+// code/data emission is complete (two-pass addressing protocol).
+fn (a &mut Assembler) fixup_all() {
+    if a.arch == 1 {
+        a.x64_fixup_all()
+        <<
+    }
+    if a.arch == 2 {
+        a.t_fixup_all()
+        <<
+    }
+    if a.arch == 3 {
+        a.r_fixup_all()
+        <<
+    }
+    if a.arch == 4 {
+        a.l_fixup_all()
+        <<
+    }
+    if a.arch == 5 {
+        a.v_fixup_all()
+        <<
+    }
+    for i in 0:a.fixups.len {
+        mut kind := fix_kind(&a.fixups, i)
+        offset := fix_off(&a.fixups, i)
+        // BL fixups emitted by call_fn_index carry a negative rd sentinel
+        // instead of a string label. Resolve those directly from the
+        // MIR-index -> code-offset table; all ordinary fixups retain the
+        // existing string-label path.
+        mut target_addr := 0
+        mut numeric_fn := false
+        fix_rd0 := fix_rd(&a.fixups, i)
+        mut patch_rd := fix_rd0
+        if kind >= 6 && kind <= 10 {
+            kind -= 6
+            target_addr = a.label_addr_symbol((fix_rd0 >> 5) - 1)
+            patch_rd = fix_rd0 & 31
+            numeric_fn = true
+        }
+        if !numeric_fn && kind == 1 && fix_rd0 < 0 {
+            fi := 0 - fix_rd0 - 1
+            if a.lib == 0 && fi >= 0 && fi < a.lib_exp_off.len {
+                fn_off := a.lib_exp_off[fi]
+                if fn_off >= 0 {
+                    target_addr = a.code_vaddr + fn_off
+                    numeric_fn = true
+                }
+            }
+        } else if !numeric_fn && kind == 4 && fix_rd0 < 0 {
+            // ADRP+ADD numeric token also carries the destination register.
+            tok := 0 - fix_rd0 - 1
+            pr := tok % 32
+            fi := tok / 32 - 1
+            if a.lib == 0 && fi >= 0 && fi < a.lib_exp_off.len {
+                fn_off := a.lib_exp_off[fi]
+                if fn_off >= 0 {
+                    target_addr = a.code_vaddr + fn_off
+                    patch_rd = pr
+                    numeric_fn = true
+                }
+            }
+        }
+        mut encoded_label := false
+        if kind == 5 {
+            // String-literal LEA: rd packs (intern_index << 5) | dest_reg.
+            ib := fix_rd0 >> 5
+            patch_rd = fix_rd0 & 31
+            if ib >= 0 && ib < a.xus_off.len && a.xus_off[ib] >= 0 {
+                target_addr = a.data_vaddr + a.xus_off[ib]
+            } else {
+                target_addr = a.data_vaddr
+            }
+            numeric_fn = true
+        }
+        // ARM64 hash-token fixups use rd>=32; ordinary register operands are
+        // limited to 0..31.  Trust the numeric marker even when a stale
+        // string descriptor carries a non-zero length, otherwise malformed
+        // metadata can route a valid token through the dangling-label path.
+        if !numeric_fn && fix_rd0 >= 32 {
+            hash := (fix_rd0 >> 5) - 1
+            patch_rd = fix_rd0 & 31
+            target_addr = a.label_addr_hash(hash)
+            encoded_label = true
+        }
+        if !numeric_fn && !encoded_label {
+            // Object files produced by older compilers still carry a string
+            // label; retain this compatibility path.
+            lbl := fix_label(&a.fixups, i)
+            target_addr = a.label_addr(lbl)
+        }
+        current_addr := a.code_vaddr + offset
+        if kind == 0 || kind == 1 {
+            // B / BL, imm26. target and current are both 4-byte aligned,
+            // so >>2 equals the reference's truncating /4.
+            imm26 := ((target_addr - current_addr) >> 2) & 67108863
+            mut opcode := 335544320
+            if kind == 1 {
+                opcode = 2483027968
+            }
+            a.patch32(offset, opcode | imm26)
+        } else if kind == 2 || kind == 3 {
+            // CBZ / CBNZ, imm19; encoded fixups use patch_rd, while legacy
+            // object fixups keep the raw register in rd.
+            imm19 := ((target_addr - current_addr) >> 2) & 524287
+            rt := patch_rd & 31
+            mut opcode := 3019898880
+            if kind == 3 {
+                opcode = 3036676096
+            }
+            a.patch32(offset, opcode | (imm19 << 5) | rt)
+        } else {
+            // ADRP + ADD: ADRP computes the 4KB page, ADD the page offset.
+            current_page := current_addr & -4096
+            target_page := target_addr & -4096
+            page_offset := (target_page - current_page) >> 12
+            immlo := page_offset & 3
+            immhi := (page_offset >> 2) & 524287
+            rd := patch_rd
+            a.patch32(offset, 2415919104 | (immlo << 29) | (immhi << 5) | rd)
+            offset_in_page := target_addr & 4095
+            a.patch32(offset + 4, 2432696320 | (offset_in_page << 10) | (rd << 5) | rd)
+        }
+    }
+}

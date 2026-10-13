@@ -1,0 +1,951 @@
+@encoding/json
+
+// encoding.json — strict JSON, same slot as Go `encoding/json`.
+// Xu has no pointers-to-heap, so the parse tree is a POOL of flat nodes
+// (the xu.ast / encoding.xun idiom): every node is an index into Doc's
+// parallel arrays, children linked through firsts/nexts (-1 = none).
+// Handles are plain ints (copyable); the Doc owns all storage.
+// Strict by design: UTF-8 validated, control bytes rejected, surrogate
+// pairs combined, duplicate keys rejected, depth and size capped, and
+// every failure is an Err — never a partial document.
+// Numbers keep their raw text (Go's json.Number shape); number_int()
+// and number_f64() convert through strconv.
+
+#errors
+#unicode/utf8
+#strconv
+#strings
+#io
+
+const kind_dict = 0
+const kind_list = 1
+const kind_str = 2
+const kind_num = 3
+const kind_bool = 4
+const kind_null = 5
+const max_bytes = 1048576
+const max_depth = 64
+const hex = "0123456789abcdef"
+
+pub struct Doc {
+    pub kinds []int
+    pub texts []string
+    pub keys []string
+    pub firsts []int
+    pub nexts []int
+    pub lasts []int
+    pub root_idx int
+    pub err string
+    pub line int
+    // Parse state (kept here: arrays cannot move between structs).
+    pub raw string
+    pub i int
+}
+
+fn new_doc() Doc {
+    << Doc{
+        kinds: []int{},
+        texts: []string{},
+        keys: []string{},
+        firsts: []int{},
+        nexts: []int{},
+        lasts: []int{},
+        root_idx: -1,
+        err: "",
+        line: 1,
+        raw: "",
+        i: 0
+    }
+}
+
+// ===== public API =====
+
+pub fn (d Doc) ok() bool {
+    << d.err.len == 0
+}
+
+pub fn (d Doc) error() string {
+    << d.err + ""
+}
+
+pub fn (d Doc) error_line() int {
+    << d.line
+}
+
+pub fn (d Doc) root() int {
+    << d.root_idx
+}
+
+pub fn (d Doc) kind(n int) int {
+    << d.kinds[n]
+}
+
+pub fn (d Doc) is_dict(n int) bool {
+    << d.kinds[n] == kind_dict
+}
+
+pub fn (d Doc) is_list(n int) bool {
+    << d.kinds[n] == kind_list
+}
+
+pub fn (d Doc) is_string(n int) bool {
+    << d.kinds[n] == kind_str
+}
+
+pub fn (d Doc) is_number(n int) bool {
+    << d.kinds[n] == kind_num
+}
+
+pub fn (d Doc) is_bool(n int) bool {
+    << d.kinds[n] == kind_bool
+}
+
+pub fn (d Doc) as_bool(n int) bool {
+    if d.kinds[n] != kind_bool {
+        >> errors.new("json: not a bool")
+    }
+    << d.texts[n] == "true"
+}
+
+pub fn (d Doc) as_string(n int) string {
+    if d.kinds[n] != kind_str {
+        >> errors.new("json: not a string")
+    }
+    << d.texts[n] + ""
+}
+
+pub fn (d Doc) as_null(n int) int {
+    if d.kinds[n] != kind_null {
+        >> errors.new("json: not null")
+    }
+    << 0
+}
+
+pub fn (d Doc) as_int(n int) int {
+    if d.kinds[n] != kind_num {
+        >> errors.new("json: not a number")
+    }
+    << d.number_int(n)
+}
+
+pub fn (d Doc) as_f64(n int) f64 {
+    if d.kinds[n] != kind_num {
+        >> errors.new("json: not a number")
+    }
+    << d.number_f64(n)
+}
+
+pub fn (d Doc) is_null(n int) bool {
+    << d.kinds[n] == kind_null
+}
+
+pub fn (d Doc) text(n int) string {
+    << d.texts[n] + ""
+}
+
+pub fn (d Doc) key(n int) string {
+    << d.keys[n] + ""
+}
+
+pub fn (d Doc) count(n int) int {
+    mut c := 0
+    mut cur := d.firsts[n]
+    for guard in 0:d.nexts.len + 1 {
+        if cur < 0 {
+            << c
+        }
+        c += 1
+        cur = d.nexts[cur]
+    }
+    << c
+}
+
+pub fn (d Doc) at(n int, i int) int {
+    mut cur := d.firsts[n]
+    mut k := 0
+    for guard in 0:d.nexts.len + 1 {
+        if cur < 0 {
+            << -1
+        }
+        if k == i {
+            << cur
+        }
+        k += 1
+        cur = d.nexts[cur]
+    }
+    << -1
+}
+
+pub fn (d Doc) has(n int, key string) bool {
+    << d.get(n, key) >= 0
+}
+
+pub fn (d Doc) dict_keys(n int) []string {
+    mut out := []string{}
+    mut cur := d.firsts[n]
+    for guard in 0:d.nexts.len + 1 {
+        if cur < 0 {
+            << out
+        }
+        out.push(d.keys[cur] + "")
+        cur = d.nexts[cur]
+    }
+    << out
+}
+
+pub fn (d Doc) get(n int, key string) int {
+    mut cur := d.firsts[n]
+    for guard in 0:d.nexts.len + 1 {
+        if cur < 0 {
+            << -1
+        }
+        if d.keys[cur] == key {
+            << cur
+        }
+        cur = d.nexts[cur]
+    }
+    << -1
+}
+
+fn json_int_throw(msg string) int {
+    >> errors.new(msg)
+    << 0
+}
+
+fn parse_json_int(t &string) int {
+    << strconv.parse(t, 10) or (err) {
+        << json_int_throw(err.msg())
+    }
+}
+
+fn json_f64_throw(msg string) f64 {
+    >> errors.new(msg)
+    << 0.0
+}
+
+fn parse_json_f64(t &string) f64 {
+    << strconv.parse_float(t) or (err) {
+        << json_f64_throw(err.msg())
+    }
+}
+
+// number_int converts a number node whose raw text is a plain integer.
+pub fn (d Doc) number_int(n int) int {
+    t := d.texts[n] + ""
+    << parse_json_int(&t) or (err) {
+        << 0
+    }
+}
+
+// number_f64 converts a number node through strconv.parse_float.
+pub fn (d Doc) number_f64(n int) f64 {
+    t := d.texts[n] + ""
+    << parse_json_f64(&t) or (err) {
+        << 0.0
+    }
+}
+
+// ===== node construction / linkage =====
+
+fn (d &mut Doc) new_node(kind int, text string, key string) int {
+    d.kinds.push(kind)
+    d.texts.push(text)
+    d.keys.push(key)
+    d.firsts.push(-1)
+    d.nexts.push(-1)
+    d.lasts.push(-1)
+    << d.kinds.len - 1
+}
+
+fn (d &mut Doc) attach(parent int, child int) {
+    if parent < 0 {
+        <<
+    }
+    if d.firsts[parent] == -1 {
+        d.firsts[parent] = child
+    } else {
+        d.nexts[d.lasts[parent]] = child
+    }
+    d.lasts[parent] = child
+}
+
+fn (d &mut Doc) fail(msg string) {
+    if d.err.len > 0 {
+        <<
+    }
+    d.err = msg
+    mut l := 1
+    for j in 0:d.i {
+        if d.raw[j] == 10 {
+            l += 1
+        }
+    }
+    d.line = l
+}
+
+fn (d Doc) peek() int {
+    if d.i >= d.raw.len {
+        << -1
+    }
+    << d.raw[d.i]
+}
+
+fn (d &mut Doc) skip_ws() {
+    while d.i < d.raw.len {
+        c := d.raw[d.i]
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            d.i += 1
+        } else {
+            <<
+        }
+    }
+}
+
+fn is_delim(c int) bool {
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+        << true
+    }
+    if c == 44 || c == 93 || c == 125 {
+        << true
+    }
+    << false
+}
+
+fn hex_val(c int) int {
+    if c >= 48 && c <= 57 {
+        << c - 48
+    }
+    if c >= 97 && c <= 102 {
+        << c - 87
+    }
+    if c >= 65 && c <= 70 {
+        << c - 55
+    }
+    << -1
+}
+
+// ===== parse =====
+
+pub fn parse(src &string) Doc {
+    mut d := new_doc()
+    d.raw = src + ""
+    if d.raw.len > max_bytes {
+        d.fail("json: document larger than 1048576 bytes")
+        << d
+    }
+    raw2 := d.raw + ""
+    if !utf8.valid(&raw2) {
+        d.fail("json: invalid UTF-8")
+        << d
+    }
+    d.skip_ws()
+    if d.i >= d.raw.len {
+        d.fail("json: unexpected end of input")
+        << d
+    }
+    root := d.parse_value(0)
+    if d.err.len > 0 {
+        << d
+    }
+    d.skip_ws()
+    if d.i < d.raw.len {
+        d.fail("json: trailing characters after value")
+        << d
+    }
+    d.root_idx = root
+    << d
+}
+
+fn (d &mut Doc) parse_value(depth int) int {
+    if depth > max_depth {
+        d.fail("json: too much nesting")
+        << -1
+    }
+    d.skip_ws()
+    c := d.peek()
+    if c < 0 {
+        d.fail("json: unexpected end of input")
+        << -1
+    }
+    if c == 123 { // {
+        << d.parse_dict(depth)
+    }
+    if c == 91 { // [
+        << d.parse_list(depth)
+    }
+    if c == 34 { // "
+        s := d.parse_string()
+        if d.err.len > 0 {
+            << -1
+        }
+        << d.new_node(kind_str, s, "")
+    }
+    if c == 45 || (c >= 48 && c <= 57) {
+        num := d.parse_number()
+        if d.err.len > 0 {
+            << -1
+        }
+        << d.new_node(kind_num, num, "")
+    }
+    if c == 116 { // true
+        if d.raw.len - d.i >= 4 && d.raw[d.i:d.i + 4] == "true" {
+            d.i += 4
+            << d.new_node(kind_bool, "true", "")
+        }
+        d.fail("json: invalid literal")
+        << -1
+    }
+    if c == 102 { // false
+        if d.raw.len - d.i >= 5 && d.raw[d.i:d.i + 5] == "false" {
+            d.i += 5
+            << d.new_node(kind_bool, "false", "")
+        }
+        d.fail("json: invalid literal")
+        << -1
+    }
+    if c == 110 { // null
+        if d.raw.len - d.i >= 4 && d.raw[d.i:d.i + 4] == "null" {
+            d.i += 4
+            << d.new_node(kind_null, "null", "")
+        }
+        d.fail("json: invalid literal")
+        << -1
+    }
+    d.fail("json: unexpected character")
+    << -1
+}
+
+fn (d &mut Doc) parse_dict(depth int) int {
+    me := d.new_node(kind_dict, "", "")
+    d.i += 1 // {
+    mut first := true
+    while true {
+        d.skip_ws()
+        mut c := d.peek()
+        if c == 125 { // }
+            d.i += 1
+            << me
+        }
+        if c < 0 {
+            d.fail("json: unterminated object")
+            << -1
+        }
+        if !first {
+            if c == 44 { // ,
+                d.i += 1
+                d.skip_ws()
+                c = d.peek()
+            } else {
+                d.fail("json: expected ',' or '}' in object")
+                << -1
+            }
+        }
+        if c != 34 {
+            d.fail("json: expected string key in object")
+            << -1
+        }
+        k := d.parse_string()
+        if d.err.len > 0 {
+            << -1
+        }
+        if d.get(me, k + "") >= 0 {
+            d.fail("json: duplicate key '" + k + "'")
+            << -1
+        }
+        d.skip_ws()
+        if d.peek() != 58 { // :
+            d.fail("json: expected ':' after object key")
+            << -1
+        }
+        d.i += 1
+        child := d.parse_value(depth + 1)
+        if d.err.len > 0 {
+            << -1
+        }
+        d.keys[child] = k
+        d.attach(me, child)
+        first = false
+    }
+    << me
+}
+
+fn (d &mut Doc) parse_list(depth int) int {
+    me := d.new_node(kind_list, "", "")
+    d.i += 1 // [
+    mut first := true
+    while true {
+        d.skip_ws()
+        mut c := d.peek()
+        if c == 93 { // ]
+            d.i += 1
+            << me
+        }
+        if c < 0 {
+            d.fail("json: unterminated array")
+            << -1
+        }
+        if !first {
+            if c == 44 { // ,
+                d.i += 1
+                d.skip_ws()
+                c = d.peek()
+            } else {
+                d.fail("json: expected ',' or ']' in array")
+                << -1
+            }
+        }
+        child := d.parse_value(depth + 1)
+        if d.err.len > 0 {
+            << -1
+        }
+        d.attach(me, child)
+        first = false
+    }
+    << me
+}
+
+// Reads a JSON string starting at the opening quote; returns the decoded
+// text. Handles \\uXXXX with surrogate pairs; lone surrogates are Err.
+fn (d &mut Doc) parse_string() string {
+    d.i += 1 // opening "
+    mut out := []int{}
+    while true {
+        if d.i >= d.raw.len {
+            d.fail("json: unterminated string")
+            << ""
+        }
+        c := d.raw[d.i]
+        if c == 34 { // closing "
+            d.i += 1
+            << string_from_bytes(out)
+        }
+        if c < 32 {
+            d.fail("json: control character in string")
+            << ""
+        }
+        if c == 92 { // backslash
+            d.i += 1
+            if d.i >= d.raw.len {
+                d.fail("json: unterminated string escape")
+                << ""
+            }
+            e := d.raw[d.i]
+            d.i += 1
+            if e == 34 { out.push(34) }
+            else if e == 92 { out.push(92) }
+            else if e == 47 { out.push(47) }
+            else if e == 98 { out.push(8) }
+            else if e == 102 { out.push(12) }
+            else if e == 110 { out.push(10) }
+            else if e == 114 { out.push(13) }
+            else if e == 116 { out.push(9) }
+            else if e == 117 { // \uXXXX
+                mut cp := d.read_hex4()
+                if d.err.len > 0 {
+                    << ""
+                }
+                if cp >= 55296 && cp <= 56319 {
+                    // High surrogate: must be followed by \uDC00-\uDFFF.
+                    if d.raw.len - d.i >= 6 && d.raw[d.i] == 92 && d.raw[d.i + 1] == 117 {
+                        d.i += 2
+                        lo := d.read_hex4()
+                        if d.err.len > 0 {
+                            << ""
+                        }
+                        if lo >= 56320 && lo <= 57343 {
+                            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                        } else {
+                            d.fail("json: invalid surrogate pair in \\u escape")
+                            << ""
+                        }
+                    } else {
+                        d.fail("json: invalid surrogate pair in \\u escape")
+                        << ""
+                    }
+                } else if cp >= 56320 && cp <= 57343 {
+                    d.fail("json: invalid surrogate pair in \\u escape")
+                    << ""
+                }
+                enc := utf8.encode(cp) or (err) {
+                    d.fail("json: invalid code point in \\u escape")
+                    << ""
+                }
+                for j in 0:enc.len {
+                    out.push(enc[j])
+                }
+            } else {
+                d.fail("json: invalid escape character")
+                << ""
+            }
+        } else {
+            out.push(c)
+            d.i += 1
+        }
+    }
+    << ""
+}
+
+fn (d &mut Doc) read_hex4() int {
+    if d.raw.len - d.i < 4 {
+        d.fail("json: invalid \\u escape")
+        << 0
+    }
+    mut v := 0
+    for j in 0:4 {
+        h := hex_val(d.raw[d.i + j])
+        if h < 0 {
+            d.fail("json: invalid \\u escape")
+            << 0
+        }
+        v = v * 16 + h
+    }
+    d.i += 4
+    << v
+}
+
+fn (d &mut Doc) parse_number() string {
+    start := d.i
+    mut state := 0
+    // RFC 8259: int [frac] [exp]. 0 start, 6 after '-', 1 after 0, 2 digits,
+    // 8 after '.', 3 frac digits, 4 after e/E, 9 after e-sign, 5 exp digits.
+    while d.i < d.raw.len {
+        c := d.raw[d.i]
+        if is_delim(c) {
+            <-
+        }
+        if state == 0 {
+            if c == 45 {
+                state = 6
+            } else if c == 48 {
+                state = 1
+            } else if c >= 49 && c <= 57 {
+                state = 2
+            } else {
+                d.fail("json: invalid number")
+                << ""
+            }
+        } else if state == 6 {
+            if c == 48 {
+                state = 1
+            } else if c >= 49 && c <= 57 {
+                state = 2
+            } else {
+                d.fail("json: invalid number")
+                << ""
+            }
+        } else if state == 1 {
+            if c >= 48 && c <= 57 {
+                d.fail("json: leading zero in number")
+                << ""
+            } else if c == 46 {
+                state = 8
+            } else if c == 101 || c == 69 {
+                state = 4
+            } else {
+                d.fail("json: invalid number")
+                << ""
+            }
+        } else if state == 2 {
+            if c >= 48 && c <= 57 {
+                state = 2
+            } else if c == 46 {
+                state = 8
+            } else if c == 101 || c == 69 {
+                state = 4
+            } else {
+                d.fail("json: invalid number")
+                << ""
+            }
+        } else if state == 8 {
+            if c >= 48 && c <= 57 {
+                state = 3
+            } else {
+                d.fail("json: invalid number")
+                << ""
+            }
+        } else if state == 3 {
+            if c >= 48 && c <= 57 {
+                state = 3
+            } else if c == 101 || c == 69 {
+                state = 4
+            } else {
+                d.fail("json: invalid number")
+                << ""
+            }
+        } else if state == 4 {
+            if c == 43 || c == 45 {
+                state = 9
+            } else if c >= 48 && c <= 57 {
+                state = 5
+            } else {
+                d.fail("json: invalid exponent")
+                << ""
+            }
+        } else if state == 9 {
+            if c >= 48 && c <= 57 {
+                state = 5
+            } else {
+                d.fail("json: invalid exponent")
+                << ""
+            }
+        } else if state == 5 {
+            if c >= 48 && c <= 57 {
+                state = 5
+            } else {
+                d.fail("json: invalid exponent")
+                << ""
+            }
+        }
+        d.i += 1
+    }
+    if state == 1 || state == 2 || state == 3 || state == 5 {
+        << d.raw[start:d.i] + ""
+    }
+    d.fail("json: invalid number")
+    << ""
+}
+
+// ===== emission =====
+
+// escape: JSON string body escaping (no surrounding quotes).
+pub fn escape(s &string) string {
+    mut out := []int{}
+    for i in 0:s.len {
+        c := s[i]
+        if c == 34 {
+            out.push(92)
+            out.push(34)
+        } else if c == 92 {
+            out.push(92)
+            out.push(92)
+        } else if c == 10 {
+            out.push(92)
+            out.push(110)
+        } else if c == 13 {
+            out.push(92)
+            out.push(114)
+        } else if c == 9 {
+            out.push(92)
+            out.push(116)
+        } else if c == 8 {
+            out.push(92)
+            out.push(98)
+        } else if c == 12 {
+            out.push(92)
+            out.push(102)
+        } else if c < 32 {
+            out.push(92)
+            out.push(117)
+            out.push(48)
+            out.push(48)
+            out.push(hex[c >> 4])
+            out.push(hex[c & 15])
+        } else {
+            out.push(c)
+        }
+    }
+    << string_from_bytes(out)
+}
+
+// quote: JSON string literal, surrounding quotes included.
+pub fn quote(s &string) string {
+    << "\"" + escape(s) + "\""
+}
+
+// unquote parses exactly one JSON string literal (quotes included).
+pub fn unquote(s &string) string {
+    mut d := new_doc()
+    d.raw = s + ""
+    if d.raw.len == 0 || d.raw[0] != 34 {
+        >> errors.new("json: invalid quoted string")
+    }
+    v := d.parse_string()
+    if d.err.len > 0 {
+        >> errors.new(d.err + "")
+    }
+    if d.i != d.raw.len {
+        >> errors.new("json: trailing characters after quoted string")
+    }
+    << v
+}
+
+// to_json: canonical re-emission of the document (keys in parse order,
+// strings re-escaped, numbers verbatim).
+pub fn (d Doc) to_json() string {
+    if d.root_idx < 0 {
+        << "null"
+    }
+    << d.emit_node(d.root_idx)
+}
+
+fn (d Doc) emit_node(n int) string {
+    k := d.kinds[n]
+    if k == kind_dict {
+        mut out := io.buffer()
+        out.write_str("{")
+        for i in 0:d.count(n) {
+            if i > 0 {
+                out.write_str(",")
+            }
+            c := d.at(n, i)
+            kk := d.keys[c] + ""
+            out.write_str(quote(&kk))
+            out.write_str(":")
+            child := d.emit_node(c)
+            out.write(&child)
+        }
+        out.write_str("}")
+        << out.bytes()
+    }
+    if k == kind_list {
+        mut out := io.buffer()
+        out.write_str("[")
+        for i in 0:d.count(n) {
+            if i > 0 {
+                out.write_str(",")
+            }
+            child := d.emit_node(d.at(n, i))
+            out.write(&child)
+        }
+        out.write_str("]")
+        << out.bytes()
+    }
+    if k == kind_str {
+        t := d.texts[n] + ""
+        << quote(&t)
+    }
+    if k == kind_bool {
+        << d.texts[n] + ""
+    }
+    if k == kind_null {
+        << "null"
+    }
+    << d.texts[n] + ""
+}
+
+pub fn valid(src &string) bool {
+    d := parse(src)
+    << d.ok()
+}
+
+pub fn compact(src &string) string {
+    d := parse(src)
+    if d.err.len > 0 {
+        >> errors.new(d.err + "")
+    }
+    << d.to_json()
+}
+
+fn pad_line(prefix &string, indent &string, depth int) string {
+    << prefix + strings.repeat(indent, depth)
+}
+
+fn (d Doc) emit_pretty(n int, prefix &string, indent &string, depth int) string {
+    k := d.kinds[n]
+    nl := string_from_byte(10)
+    if k == kind_dict {
+        cnt := d.count(n)
+        if cnt == 0 {
+            << "{}"
+        }
+        mut out := io.buffer()
+        out.write_str("{")
+        out.write(&nl)
+        for i in 0:cnt {
+            if i > 0 {
+                out.write_str(",")
+                out.write(&nl)
+            }
+            c := d.at(n, i)
+            kk := d.keys[c] + ""
+            child := d.emit_pretty(c, prefix, indent, depth + 1)
+            out.write_str(pad_line(prefix, indent, depth + 1))
+            out.write_str(quote(&kk))
+            out.write_str(": ")
+            out.write(&child)
+        }
+        out.write(&nl)
+        out.write_str(pad_line(prefix, indent, depth))
+        out.write_str("}")
+        << out.bytes()
+    }
+    if k == kind_list {
+        cnt := d.count(n)
+        if cnt == 0 {
+            << "[]"
+        }
+        mut out := io.buffer()
+        out.write_str("[")
+        out.write(&nl)
+        for i in 0:cnt {
+            if i > 0 {
+                out.write_str(",")
+                out.write(&nl)
+            }
+            child := d.emit_pretty(d.at(n, i), prefix, indent, depth + 1)
+            out.write_str(pad_line(prefix, indent, depth + 1))
+            out.write(&child)
+        }
+        out.write(&nl)
+        out.write_str(pad_line(prefix, indent, depth))
+        out.write_str("]")
+        << out.bytes()
+    }
+    if k == kind_str {
+        t := d.texts[n] + ""
+        << quote(&t)
+    }
+    if k == kind_bool {
+        << d.texts[n] + ""
+    }
+    if k == kind_null {
+        << "null"
+    }
+    << d.texts[n] + ""
+}
+
+pub fn indent(src &string, prefix &string, gap &string) string {
+    d := parse(src)
+    if d.err.len > 0 {
+        >> errors.new(d.err + "")
+    }
+    if d.root_idx < 0 {
+        << "null"
+    }
+    << d.emit_pretty(d.root_idx, prefix, gap, 0)
+}
+
+pub fn html_escape(src &string) string {
+    mut out := []int{}
+    mut i := 0
+    while i < src.len {
+        c := src[i] & 255
+        if c == 60 || c == 62 || c == 38 {
+            out.push(92)
+            out.push(117)
+            out.push(48)
+            out.push(48)
+            out.push(hex[(c >> 4) & 15])
+            out.push(hex[c & 15])
+            i = i + 1
+            ->
+        }
+        if c == 226 && i + 2 < src.len {
+            b1 := src[i + 1] & 255
+            b2 := src[i + 2] & 255
+            if b1 == 128 && (b2 == 168 || b2 == 169) {
+                out.push(92)
+                out.push(117)
+                out.push(50)
+                out.push(48)
+                out.push(50)
+                out.push(hex[b2 & 15])
+                i = i + 3
+                ->
+            }
+        }
+        out.push(c)
+        i = i + 1
+    }
+    << string_from_bytes(out)
+}

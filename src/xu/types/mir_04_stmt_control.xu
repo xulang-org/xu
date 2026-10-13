@@ -1,0 +1,860 @@
+@xu/types
+
+#xu/parser
+
+fn (f &mut MFn) lower_stmt_xu(p &parser.Parser, c &mut Checker, n int) {
+ // Xu (M17)
+        fi := c.ncall[n]
+        call := p.nodes[n].a
+        mut args := -1
+        mut last := -1
+        mut arg := p.nodes[call].a
+        mut pi := 0 // target param index (xu args are positional)
+        while arg >= 0 {
+                // Hidden-pointer ABI: scalars/refs/chan/map in registers;
+                // string/struct (including 1-slot Point)/fn/array via &slot0.
+                mut v := 0
+                if mir_abi_by_pointer(c.fns[fi].params[pi]) {
+                    v = f.lower_pointer_arg(p, c, arg)
+                } else {
+                    v = f.lower_expr(p, c, arg)
+                }
+                f.mark_move_of(p, c, arg)
+                pi = pi + 1
+                ma := MArg{v: v, next: -1}
+                idx := f.margs.len
+                f.margs.push(ma)
+                if args < 0 { args = idx } else {
+                    f.link_marg(last, idx)
+                }
+                last = idx
+                arg = p.nodes[arg].next
+        }
+        mut gi := mkinstr(33)
+        gi.sval = c.fns[fi].label
+        gi.c = args
+        f.emit(gi)
+        <<
+}
+
+// Wave C: send stmt — split from lower_stmt_match_select_xu (W3).
+fn (f &mut MFn) lower_stmt_send(p &parser.Parser, c &mut Checker, n int) {
+ // Send (M17)
+        ch := f.lower_expr(p, c, p.nodes[n].a)
+        mut sv := f.lower_expr(p, c, p.nodes[n].b)
+        f.mark_move_of(p, c, p.nodes[n].b)
+        // Materialize const into temp
+        if sv < 0 {
+            t := f.new_temp(c.ntype[p.nodes[n].b], c.type_slots(c.ntype[p.nodes[n].b]))
+            mut cp := mkinstr(1)
+            cp.a = t
+            cp.b = sv
+            f.emit(cp)
+            sv = t
+        }
+        ci := c.nlocal[n]
+        mut si := mkinstr(31)
+        si.a = ch
+        si.b = sv
+        si.c = c.chans[ci].elem_slots
+        f.emit(si)
+        <<
+}
+
+// Internal select adapter calls use the ordinary Call operand/effect model.
+// 151=new, 152=watch, 153=park, 154=drop; handles never escape this statement.
+fn (f &mut MFn) select_call(kind int, dest int, first int, second int) {
+    mut args := -1
+    if first != -1 {
+        args = f.margs.len
+        f.margs.push(MArg{v: first, next: -1})
+        if second != -1 {
+            next := f.margs.len
+            f.margs.push(MArg{v: second, next: -1})
+            f.link_marg(args, next)
+        }
+    }
+    mut call := mkinstr(7)
+    call.a = dest
+    call.b = kind
+    call.c = args
+    f.emit(call)
+}
+
+// Wave C: select stmt — split from lower_stmt_match_select_xu (W3).
+fn (f &mut MFn) lower_stmt_select(p &parser.Parser, c &mut Checker, n int) {
+ // Select
+        loop_bb := f.new_block()
+        end_bb := f.new_block()
+        // Evaluate channel/send operands once, before acquiring a wait group.
+        // An implicit throw here must not leave subscriptions pointing at a
+        // G that can later return and be reaped. Retrying only retries I/O.
+        mut channels := []int{}
+        mut values := []int{}
+        mut prep := p.nodes[n].a
+        while prep >= 0 {
+            channels.push(f.lower_expr(p, c, p.nodes[prep].a))
+            if p.nodes[prep].kind == 61 {
+                values.push(f.lower_expr(p, c, p.nodes[prep].b))
+            } else { values.push(-1) }
+            prep = p.nodes[prep].next
+        }
+        mut outer := []int{}
+        for i in 0:f.scope_ids.len {
+            outer.push(f.scope_ids[i])
+        }
+        mut pre := []bool{}
+        for i in 0:f.moved.len {
+            pre.push(f.moved[i])
+        }
+        mut pre_fc := []int{}
+        for i in 0:f.fcons.len {
+            pre_fc.push(f.fcons[i])
+        }
+        mut pads := []int{}
+        mut cons_off := []int{}
+        mut cons_ids := []int{}
+        mut cons_fc := []int{}
+        f.terminate(1, loop_bb, -1, -1)
+        f.switch_to(loop_bb)
+        mut wait := -1
+        if p.nodes[n].ival != 1 && p.nodes[n].c < 0 && c.freestanding != 1 {
+            wait = f.new_temp(1, 1)
+            f.select_call(151, wait, -1, -1)
+        }
+        mut ar := p.nodes[n].a
+        mut arm_index := 0
+        while ar >= 0 {
+            ak := p.nodes[ar].kind
+            if ak == 61 { // SelSend
+                    ch := channels[arm_index]
+                    if wait >= 0 { f.select_call(152, -1, wait, ch) }
+                    vn := p.nodes[ar].b
+                    mut sv := values[arm_index]
+                    if c.nclone[vn] == 1 && c.ntype[vn] == 3 {
+                        t := f.new_temp(3, 3)
+                        mut cl := mkinstr(9)
+                        cl.a = t
+                        cl.b = sv
+                        f.emit(cl)
+                        sv = t
+                    }
+                    if sv < 0 {
+                        t := f.new_temp(c.ntype[vn], c.type_slots(c.ntype[vn]))
+                        mut cp := mkinstr(1)
+                        cp.a = t
+                        cp.b = sv
+                        f.emit(cp)
+                        sv = t
+                    }
+                    ci := c.nlocal[ar]
+                    status := f.new_temp(1, 1)
+                    mut ts := mkinstr(35)
+                    ts.a = status
+                    ts.b = ch
+                    ts.c = sv
+                    ts.d = c.chans[ci].elem_slots
+                    f.emit(ts)
+                    ok := f.new_temp(2, 1)
+                    mut eq := mkinstr(4)
+                    eq.a = ok
+                    eq.b = 6
+                    eq.c = status
+                    eq.d = f.vconst(1)
+                    f.emit(eq)
+                    body_bb := f.new_block()
+                    next_bb := f.new_block()
+                    f.terminate(2, ok, body_bb, next_bb)
+                    f.switch_to(body_bb)
+                    if wait >= 0 { f.select_call(154, -1, wait, -1) }
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                    f.switch_to(next_bb)
+                } else if ak == 62 { // SelRecv
+                    ch := channels[arm_index]
+                    if wait >= 0 { f.select_call(152, -1, wait, ch) }
+                    cty := c.ntype[p.nodes[ar].a]
+                    ci := cty - 600
+                    elem := c.chans[ci].elem_ty
+                    slots := c.chans[ci].elem_slots
+                    val := f.new_temp(elem, slots)
+                    status := f.new_temp(1, 1)
+                    mut tr := mkinstr(36)
+                    tr.a = status
+                    tr.b = val
+                    tr.c = ch
+                    tr.d = slots
+                    f.emit(tr)
+                    ok := f.new_temp(2, 1)
+                    mut ne := mkinstr(4)
+                    ne.a = ok
+                    ne.b = 7 // Ne
+                    ne.c = status
+                    ne.d = f.vconst(0)
+                    f.emit(ne)
+                    body_bb := f.new_block()
+                    next_bb := f.new_block()
+                    f.terminate(2, ok, body_bb, next_bb)
+                    f.switch_to(body_bb)
+                    if wait >= 0 { f.select_call(154, -1, wait, -1) }
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    lid := c.nlocal[ar]
+                    mut st := mkinstr(3)
+                    st.a = lid
+                    st.b = val
+                    f.emit(st)
+                    f.scope_add(lid)
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                    f.switch_to(next_bb)
+                }
+                ar = p.nodes[ar].next
+                arm_index = arm_index + 1
+        }
+        if p.nodes[n].ival == 1 || p.nodes[n].c >= 0 {
+            f.as_restore_outer(&outer, &pre, &pre_fc)
+            f.push_scope()
+            mut s := p.nodes[n].c
+            while s >= 0 {
+                f.lower_stmt(p, c, s)
+                s = p.nodes[s].next
+            }
+            f.pop_scope_with_drops()
+            if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+        } else {
+            f.as_restore_outer(&outer, &pre, &pre_fc)
+            if wait >= 0 {
+                f.select_call(153, -1, wait, -1)
+                f.select_call(154, -1, wait, -1)
+            } else {
+                mut gp := mkinstr(37)
+                f.emit(gp)
+            }
+            if f.live_and_open() { f.terminate(1, loop_bb, -1, -1) }
+        }
+        if f.live_and_open() && pads.len == 0 {
+            f.terminate(1, end_bb, -1, -1)
+        }
+        f.as_finish_pads(end_bb, &outer, &pre, &pre_fc, pads, cons_off, cons_ids, cons_fc, c)
+        <<
+}
+
+// `ident += intconst` as the sole statement of a match arm.
+// out[0] = local id, out[1] = addend. false if the arm is anything else.
+fn (c &Checker) match_arm_addend(p &parser.Parser, body int, out &mut []int) bool {
+    if body < 0 {
+        << false
+    }
+    if p.nodes[body].next >= 0 {
+        << false
+    }
+    if p.nodes[body].kind != 21 {
+        << false
+    }
+    if p.nodes[body].ival != 2 {
+        << false
+    }
+    t := p.nodes[body].a
+    rhs := p.nodes[body].b
+    if t < 0 || p.nodes[t].kind != 4 {
+        << false
+    }
+    if rhs < 0 || p.nodes[rhs].kind != 1 {
+        << false
+    }
+    lid := c.nlocal[t]
+    if lid < 0 {
+        << false
+    }
+    out[0] = lid
+    out[1] = p.nodes[rhs].ival
+    << true
+}
+
+// Dense `ident += intconst` match → one block of `acc + (k==key)*(c-else)`.
+// Keeps the counted while a self-loop so RA can pin i/s; emit may then
+// turn the Eq+Mul+Add latch into a jump table (emit_match_table_peep).
+fn (f &mut MFn) try_lower_match_add_select(p &parser.Parser, c &mut Checker, n int) bool {
+    sty := c.ntype[p.nodes[n].a]
+    if is_throw_type(sty) || is_enum_type(sty) {
+        << false
+    }
+    mut keys := []int{}
+    mut addends := []int{}
+    mut lid := -1
+    mut else_val := 0
+    mut has_else := 0
+    mut narms := 0
+    mut box := []int{}
+    box.push(0)
+    box.push(0)
+    mut ar := p.nodes[n].b
+    while ar >= 0 {
+        narms += 1
+        if narms > 17 {
+            << false
+        }
+        ak := p.nodes[ar].kind
+        if ak == 29 {
+            if !c.match_arm_addend(p, p.nodes[ar].c, mut &box) {
+                << false
+            }
+            id := box[0]
+            v := box[1]
+            if lid < 0 {
+                lid = id
+            } else if lid != id {
+                << false
+            }
+            key := p.nodes[ar].ival
+            mut k := 0
+            while k < keys.len {
+                if keys[k] == key {
+                    << false
+                }
+                k += 1
+            }
+            keys.push(key)
+            addends.push(v)
+        } else if ak == 31 {
+            if !c.match_arm_addend(p, p.nodes[ar].c, mut &box) {
+                << false
+            }
+            id := box[0]
+            v := box[1]
+            if lid < 0 {
+                lid = id
+            } else if lid != id {
+                << false
+            }
+            has_else = 1
+            else_val = v
+        } else {
+            << false
+        }
+        ar = p.nodes[ar].next
+    }
+    if lid < 0 || keys.len == 0 {
+        << false
+    }
+    if has_else == 0 {
+        else_val = 0
+    }
+    if lid >= f.locals.len || f.locals[lid] != 1 {
+        << false
+    }
+    sv := f.lower_expr(p, c, p.nodes[n].a)
+    eqt := f.new_temp(2, 1)
+    pr := f.new_temp(1, 1)
+    acc := f.new_temp(1, 1)
+    mut cp := mkinstr(1)
+    cp.a = acc
+    cp.b = f.vconst(else_val)
+    f.emit(cp)
+    mut i := 0
+    while i < keys.len {
+        mut eq := mkinstr(4)
+        eq.a = eqt
+        eq.b = 6
+        eq.c = sv
+        eq.d = f.vconst(keys[i])
+        f.emit(eq)
+        dt := addends[i] - else_val
+        if dt == 0 {
+            i += 1
+            ->
+        }
+        mut mag := dt
+        mut op := 1
+        if dt < 0 {
+            mag = 0 - dt
+            op = 2
+        }
+        mut term := eqt
+        if mag != 1 {
+            mut mu := mkinstr(4)
+            mu.a = pr
+            mu.b = 3
+            mu.c = eqt
+            mu.d = f.vconst(mag)
+            f.emit(mu)
+            term = pr
+        }
+        mut bn := mkinstr(4)
+        bn.a = acc
+        bn.b = op
+        bn.c = acc
+        bn.d = term
+        f.emit(bn)
+        i += 1
+    }
+    cur := f.new_temp(1, 1)
+    mut li := mkinstr(2)
+    li.a = cur
+    li.b = lid
+    f.emit(li)
+    sum := f.new_temp(1, 1)
+    mut ad := mkinstr(4)
+    ad.a = sum
+    ad.b = 1
+    ad.c = cur
+    ad.d = acc
+    f.emit(ad)
+    mut st := mkinstr(3)
+    st.a = lid
+    st.b = sum
+    f.emit(st)
+    << true
+}
+
+// Wave C: match stmt — split from lower_stmt_match_select_xu (W3).
+fn (f &mut MFn) lower_stmt_match(p &parser.Parser, c &mut Checker, n int) {
+ // Match
+        if f.try_lower_match_add_select(p, c, n) {
+            <<
+        }
+        subject := f.lower_expr(p, c, p.nodes[n].a)
+        // M158 / MS-enum: Result and enum match consume the subject
+        // (payload moved into arm bindings; skip outer drop of those fields).
+        if is_throw_type(c.ntype[p.nodes[n].a]) || is_enum_type(c.ntype[p.nodes[n].a]) {
+            f.mark_move_of(p, c, p.nodes[n].a)
+        }
+        join := f.new_block()
+        mut outer := []int{}
+        for i in 0:f.scope_ids.len {
+            outer.push(f.scope_ids[i])
+        }
+        mut pre := []bool{}
+        for i in 0:f.moved.len {
+            pre.push(f.moved[i])
+        }
+        mut pre_fc := []int{}
+        for i in 0:f.fcons.len {
+            pre_fc.push(f.fcons[i])
+        }
+        mut pads := []int{}
+        mut cons_off := []int{}
+        mut cons_ids := []int{}
+        mut cons_fc := []int{}
+        mut ar := p.nodes[n].b
+        while ar >= 0 {
+            ak := p.nodes[ar].kind
+                if ak == 29 { // integer arm
+                    test := f.new_temp(2, 1)
+                    mut eq := mkinstr(4)
+                    eq.a = test
+                    eq.b = 6 // Eq
+                    eq.c = subject
+                    eq.d = f.vconst(p.nodes[ar].ival)
+                    f.emit(eq)
+                    body_bb := f.new_block()
+                    next_bb := f.new_block()
+                    f.terminate(2, test, body_bb, next_bb)
+                    f.switch_to(body_bb)
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                    f.switch_to(next_bb)
+                } else if ak == 75 { // string literal arm (MS9c): subject == lit
+                    lit := f.new_temp(3, 3)
+                    mut sc := mkinstr(6) // StrConst
+                    sc.a = lit
+                    sc.b = c.nstr[ar]
+                    f.emit(sc)
+                    test := f.new_temp(2, 1)
+                    mut eq := mkinstr(4)
+                    eq.a = test
+                    eq.b = 6 // Eq
+                    eq.c = subject
+                    eq.d = lit
+                    eq.sval = "str_cmp"
+                    f.emit(eq)
+                    body_bb := f.new_block()
+                    next_bb := f.new_block()
+                    f.terminate(2, test, body_bb, next_bb)
+                    f.switch_to(body_bb)
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                    f.switch_to(next_bb)
+                } else if ak == 30 { // range arm: `-<` / `>-` / `>-<` / `--`
+                    rk := range_ival_from_str(p.nodes[ar].sval2)
+                    mut lo_op := 11 // Ge
+                    if range_start_excl(rk) {
+                        lo_op = 10 // Gt
+                    }
+                    mut hi_op := 9 // Le
+                    if range_end_excl(rk) {
+                        hi_op = 8 // Lt
+                    }
+                    lo_test := f.new_temp(2, 1)
+                    mut ge := mkinstr(4)
+                    ge.a = lo_test
+                    ge.b = lo_op
+                    ge.c = subject
+                    ge.d = f.vconst(p.nodes[ar].ival)
+                    f.emit(ge)
+                    in_bb := f.new_block()
+                    next_bb := f.new_block()
+                    f.terminate(2, lo_test, in_bb, next_bb)
+                    f.switch_to(in_bb)
+                    hi_test := f.new_temp(2, 1)
+                    mut le := mkinstr(4)
+                    le.a = hi_test
+                    le.b = hi_op
+                    le.c = subject
+                    le.d = f.vconst(p.nodes[ar].d)
+                    f.emit(le)
+                    body_bb := f.new_block()
+                    f.terminate(2, hi_test, body_bb, next_bb)
+                    f.switch_to(body_bb)
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                    f.switch_to(next_bb)
+                } else if ak == 35 { // enum variant arm (M15)
+                    vidx := c.nlocal[ar]
+                    ety := c.ntype[ar]
+                    ei := ety - 500
+                    tagt := f.new_temp(1, 1)
+                    mut lf := mkinstr(10) // LoadField
+                    lf.a = tagt
+                    lf.b = subject
+                    lf.c = 0
+                    lf.d = 1
+                    f.emit(lf)
+                    test := f.new_temp(2, 1)
+                    mut eq := mkinstr(4)
+                    eq.a = test
+                    eq.b = 6 // Eq
+                    eq.c = tagt
+                    eq.d = f.vconst(vidx)
+                    f.emit(eq)
+                    body_bb := f.new_block()
+                    next_bb := f.new_block()
+                    f.terminate(2, test, body_bb, next_bb)
+                    f.switch_to(body_bb)
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    // Bind payload fields into arm locals.
+                    mut off := 8
+                    mut b := p.nodes[ar].a
+                    mut fi := 0
+                    while b >= 0 {
+                        fty := c.enums[ei].variants[vidx].fields[fi]
+                        ns := c.type_slots(fty)
+                        tmp := f.new_temp(fty, ns)
+                        mut load := mkinstr(10)
+                        load.a = tmp
+                        load.b = subject
+                        load.c = off
+                        load.d = ns
+                        f.emit(load)
+                        lid := c.nlocal[b]
+                        mut st := mkinstr(3) // StoreLocal
+                        st.a = lid
+                        st.b = tmp
+                        f.emit(st)
+                        f.scope_add(lid)
+                        off += ns * 8
+                        fi += 1
+                        b = p.nodes[b].next
+                    }
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                    f.switch_to(next_bb)
+                } else if ak == 69 { // Result Ok/Err arm (M158)
+                    want := c.nlocal[ar] // 0=Ok, 1=Err
+                    tagt := f.new_temp(1, 1)
+                    mut lf := mkinstr(10)
+                    lf.a = tagt
+                    lf.b = subject
+                    lf.c = 0
+                    lf.d = 1
+                    f.emit(lf)
+                    test := f.new_temp(2, 1)
+                    mut eq := mkinstr(4)
+                    eq.a = test
+                    eq.b = 6 // Eq
+                    eq.c = tagt
+                    eq.d = f.vconst(want)
+                    f.emit(eq)
+                    body_bb := f.new_block()
+                    next_bb := f.new_block()
+                    f.terminate(2, test, body_bb, next_bb)
+                    f.switch_to(body_bb)
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    b := p.nodes[ar].a
+                    fty := c.ntype[b]
+                    ns := c.type_slots(fty)
+                    tmp := f.new_temp(fty, ns)
+                    mut load := mkinstr(10)
+                    load.a = tmp
+                    load.b = subject
+                    load.c = 8
+                    load.d = ns
+                    f.emit(load)
+                    lid := c.nlocal[b]
+                    mut st := mkinstr(3)
+                    st.a = lid
+                    st.b = tmp
+                    f.emit(st)
+                    f.scope_add(lid)
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                    f.switch_to(next_bb)
+                } else { // else arm
+                    f.as_restore_outer(&outer, &pre, &pre_fc)
+                    f.push_scope()
+                    // The match consumed the subject. An unexpanded payload
+                    // still needs an owner on every exit from this arm.
+                    sty := c.ntype[p.nodes[n].a]
+                    if (is_enum_type(sty) || is_throw_type(sty)) && c.type_owning(sty) {
+                        lid := f.new_local(sty, c.type_slots(sty), true)
+                        mut st := mkinstr(3)
+                        st.a = lid
+                        st.b = subject
+                        f.emit(st)
+                        f.scope_add(lid)
+                    }
+                    mut s := p.nodes[ar].c
+                    while s >= 0 {
+                        f.lower_stmt(p, c, s)
+                        s = p.nodes[s].next
+                    }
+                    f.pop_scope_with_drops()
+                    if f.live_and_open() { f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc) }
+                }
+                ar = p.nodes[ar].next
+        }
+        if f.live_and_open() {
+            f.as_restore_outer(&outer, &pre, &pre_fc)
+            f.as_push_pad(&outer, &pre, &pre_fc, mut &pads, mut &cons_off, mut &cons_ids, mut &cons_fc)
+        }
+        f.as_finish_pads(join, &outer, &pre, &pre_fc, pads, cons_off, cons_ids, cons_fc, c)
+        <<
+}
+
+// Wave C: thin dispatcher over xu/send/select/match — split lower_stmt_match_select_xu (W3).
+fn (f &mut MFn) lower_stmt_match_select_xu(p &parser.Parser, c &mut Checker, n int) {
+    k := p.nodes[n].kind
+    if k == 38 { // Xu (M17)
+        f.lower_stmt_xu(p, c, n)
+        <<
+    }
+    if k == 39 { // Send (M17)
+        f.lower_stmt_send(p, c, n)
+        <<
+    }
+    if k == 60 { // Select
+        f.lower_stmt_select(p, c, n)
+        <<
+    }
+    if k == 28 { // Match
+        f.lower_stmt_match(p, c, n)
+        <<
+    }
+}
+
+fn alias_node_lid(c &mut Checker, n int) int {
+    if n < 0 || n >= c.nlocal.len { << -1 }
+    << c.nlocal[n]
+}
+
+fn alias_ident(p &parser.Parser, c &mut Checker, n int, lid int) bool {
+    if n < 0 || lid < 0 { << false }
+    if p.nodes[n].kind != 4 { << false }
+    << alias_node_lid(c, n) == lid
+}
+
+fn alias_target(p &parser.Parser, c &mut Checker, n int, lid int) bool {
+    if n < 0 || lid < 0 { << false }
+    if alias_ident(p, c, n, lid) { << true }
+    k := p.nodes[n].kind
+    if k == 7 || k == 8 || k == 13 || k == 14 {
+        << alias_ident(p, c, p.nodes[n].a, lid)
+    }
+    << false
+}
+
+fn alias_walk_node(p &parser.Parser, c &mut Checker, n int, lid int, arr int) bool {
+    if n < 0 { << true }
+    k := p.nodes[n].kind
+    if k == 4 {
+        id := alias_node_lid(c, n)
+        if id == lid || id == arr { << false }
+        << true
+    }
+    if k == 21 {
+        if alias_target(p, c, p.nodes[n].a, lid) || alias_target(p, c, p.nodes[n].a, arr) {
+            << false
+        }
+        << alias_walk_list(p, c, p.nodes[n].b, lid, arr)
+    }
+    if k == 7 || k == 10 {
+        if alias_ident(p, c, p.nodes[n].a, lid) { << true }
+        << alias_walk_list(p, c, p.nodes[n].a, lid, arr)
+    }
+    if k == 13 || k == 14 {
+        base := p.nodes[n].a
+        if alias_ident(p, c, base, lid) || alias_ident(p, c, base, arr) {
+            if !alias_walk_list(p, c, p.nodes[n].b, lid, arr) { << false }
+            << alias_walk_list(p, c, p.nodes[n].c, lid, arr)
+        }
+    }
+    if !alias_walk_list(p, c, p.nodes[n].a, lid, arr) { << false }
+    if !alias_walk_list(p, c, p.nodes[n].b, lid, arr) { << false }
+    if !alias_walk_list(p, c, p.nodes[n].c, lid, arr) { << false }
+    if !alias_walk_list(p, c, p.nodes[n].d, lid, arr) { << false }
+    << alias_walk_list(p, c, p.nodes[n].e, lid, arr)
+}
+
+fn alias_walk_list(p &parser.Parser, c &mut Checker, start int, lid int, arr int) bool {
+    mut n := start
+    mut guard := 0
+    while n >= 0 && guard < 100000 {
+        if !alias_walk_node(p, c, n, lid, arr) { << false }
+        n = p.nodes[n].next
+        guard = guard + 1
+    }
+    << true
+}
+
+// `p := arr[i]` may borrow the element when every later use in this block
+// only reads p, and arr itself is not moved or overwritten here.
+fn string_index_alias_ok(p &parser.Parser, c &mut Checker, let_n int, init int, lid int) bool {
+    if init < 0 || lid < 0 { << false }
+    if p.nodes[init].kind != 13 { << false }
+    if init >= c.ntype.len || c.ntype[init] != 3 { << false }
+    base := p.nodes[init].a
+    if !alias_ident(p, c, base, alias_node_lid(c, base)) { << false }
+    arr := alias_node_lid(c, base)
+    if arr < 0 || arr == lid { << false }
+    << alias_walk_list(p, c, p.nodes[let_n].next, lid, arr)
+}
+
+fn (f &mut MFn) lower_stmt(p &parser.Parser, c &mut Checker, n int) {
+    // M32: attribute the current statement's line to the block being lowered
+    // into (first statement wins), and to any block created below.
+    f.cur_line = p.nodes[n].line
+    if f.blocks[f.cur].line == 0 {
+        mut blk := f.get_block(f.cur)
+        blk.line = p.nodes[n].line
+        f.set_block(f.cur, blk)
+    }
+    k := p.nodes[n].kind
+    if k == 20 { // Let
+        init := p.nodes[n].a
+        lid := c.nlocal[n]
+        alias := string_index_alias_ok(p, c, n, init, lid)
+        if alias {
+            f.alias_on = true
+            f.alias_node = init
+            f.alias_hit = false
+        }
+        v := f.lower_expr(p, c, init)
+        f.alias_on = false
+        f.mark_move_of(p, c, init)
+        mut ins := mkinstr(3)
+        ins.a = lid
+        ins.b = v
+        f.emit(ins)
+        if alias && f.alias_hit && lid >= 0 && lid < f.locals_owning.len {
+            f.locals_owning[lid] = false
+        }
+        f.scope_add(c.nlocal[n])
+        // Fixed ArrayLit: synthetic []T hold owns the heap buffer; do not
+        // also drop the `[N]T` local as if it were inline element storage.
+        if f.lit_hold >= 0 && init >= 0 && p.nodes[init].kind == 11 {
+            sty := c.ntype[init]
+            if is_array_type(sty) && c.array_fixed_len(sty) > 0 {
+                lid := c.nlocal[n]
+                if lid >= 0 && lid < f.locals_owning.len {
+                    f.locals_owning[lid] = false
+                }
+            }
+        }
+        f.lit_hold = -1
+        <<
+    }
+    if k == 21 { // Assign
+        f.lower_stmt_assign(p, c, n)
+        <<
+    }
+    if k == 22 { // ExprStmt: result discarded
+        expr := p.nodes[n].a
+        v := f.lower_expr(p, c, expr)
+        // Calls and concat still execute for side effects, but a fresh string
+        // result has no lexical owner in an expression statement.  Reclaim
+        // only proven fresh values; aliases remain owned by their source.
+        f.drop_fresh_string_expr(p, c, expr, v)
+        f.drop_fresh_owned_expr(p, c, expr, v)
+        <<
+    }
+    if k == 72 { // Exit <<<
+        f.lower_call(p, c, n, -1)
+        <<
+    }
+    if k == 70 || k == 23 { // Throw / Return
+        f.lower_stmt_throw_return(p, c, n)
+        <<
+    }
+    if k == 24 { // If
+        f.lower_stmt_if(p, c, n)
+        <<
+    }
+    if k == 26 || k == 27 || k == 32 || k == 33 || k == 34 { // For / While / break
+        f.lower_stmt_loops(p, c, n)
+        <<
+    }
+    if k == 28 || k == 38 || k == 39 || k == 60 { // Match / Xu / Send / Select
+        f.lower_stmt_match_select_xu(p, c, n)
+        <<
+    }
+    // check.xu rejects everything else
+}
+
+
+// M178: Ident arm of lower_expr

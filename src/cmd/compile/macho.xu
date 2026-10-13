@@ -1,0 +1,1671 @@
+@main
+// Mach-O 64-bit executable generator for ARM64, dynamically linked against
+// libSystem (macOS arm64 requires dyld; fully static executables do not run).
+//
+// Ported from bootstrap/crates/xubin/src/lib.rs (itself ported from asm.js
+// `binary/macho_arm64.js`). MH_EXECUTE and MH_DYLIB share the same layout
+// math; `--shared` swaps LC_MAIN for LC_ID_DYLIB and writes nlist exports.
+//
+// External symbols / classic GOT are not ported. M17c multi-core binds
+// `_iat_*` data slots via LC_DYLD_INFO (same as bootstrap xubin data-IAT).
+//
+// two-pass addressing protocol (half of it lives here):
+// 1. `code_vaddr()` / `data_vaddr(code_size)` compute the segment addresses
+//    from the (already final) load-command layout;
+// 2. the caller assigns them to the assembler, runs `fixup_all()`, then calls
+//    `generate(&asm, start_offset)` to produce the final file bytes.
+//
+// Like the reference, the output carries no LC_CODE_SIGNATURE; unsigned
+// executables run fine on macOS arm64.
+
+// Mach-O constants (decimal; Xu has no hex literals):
+//   MH_MAGIC_64   = 4277009103  (0xFEEDFACF)
+//   MH_EXECUTE    = 2
+//   MH_DYLDLINK|MH_PIE = 2097156 (0x200004)
+//   CPU_TYPE_ARM64 = 16777228   (0x0100000C), subtype ALL = 0
+//   LC_SEGMENT_64 = 25, LC_SYMTAB = 2, LC_DYSYMTAB = 11,
+//   LC_LOAD_DYLINKER = 14, LC_LOAD_DYLIB = 12,
+//   LC_MAIN = 2147483688 (0x80000028), LC_DYLD_INFO_ONLY = 2147483682
+//   VM_PROT_NONE=0 READ=1 WRITE=2 EXECUTE=4
+//   S_ATTR_PURE_INSTRUCTIONS|S_ATTR_SOME_INSTRUCTIONS = 2147484672
+// Load command sizes: segment 72, section 80, LC_MAIN 24, dyld_info 48,
+// symtab 24, dysymtab 80.
+
+struct MachO {
+    base_addr   int
+    page_size   int
+    cpu_type    int
+    cpu_subtype int
+    // m33: append a non-loaded __DWARF segment (LC_SEGMENT_64 + 4
+    // LC_SECTION_64) after __LINKEDIT. 0 keeps the historical byte stream.
+    has_debug   int
+    // --shared: LC_ID_DYLIB install name (empty → MH_EXECUTE + LC_MAIN).
+    dylib_id    string
+    ext_dylibs  []string
+    exp_name    []string
+    exp_off     []int
+    iat_bind_name []string
+    iat_bind_ord  []int
+}
+
+struct MachoSymtab {
+    nlist  []int
+    strtab []int
+}
+
+struct MachoLinkedit {
+    nlist_off  int
+    strtab_off int
+    size       int
+}
+
+fn empty_macho_slices() MachO {
+    << MachO{base_addr: 4294967296, page_size: 16384, cpu_type: 16777228, cpu_subtype: 0, has_debug: 0, dylib_id: "", ext_dylibs: []string{}, exp_name: []string{}, exp_off: []int{}, iat_bind_name: []string{}, iat_bind_ord: []int{}}
+}
+
+fn new_macho() MachO {
+    // base 0x100000000, page 0x4000, CPU_TYPE_ARM64
+    << empty_macho_slices()
+}
+
+// x86_64 Mach-O (identical layout; only CPU type differs).
+fn new_macho_x64() MachO {
+    // CPU_TYPE_X86_64 = 0x01000007, subtype ALL = 3
+    mut m := empty_macho_slices()
+    m.cpu_type = 16777223
+    m.cpu_subtype = 3
+    << m
+}
+
+// --shared: MH_DYLIB + LC_ID_DYLIB + nlist exports (from assembler lib_exp_*).
+fn macho_set_dylib(m MachO, a &Assembler, install string) MachO {
+    mut o := m
+    o.dylib_id = install + ""
+    for i in 0:a.lib_exp_name.len {
+        o.exp_name.push(a.lib_exp_name[i] + "")
+        o.exp_off.push(a.lib_exp_off[i])
+    }
+    << o
+}
+
+// Chain .dylib: extra LC_LOAD_DYLIB + bind `_iat_xu_*` to ordinal 2+.
+fn macho_apply_dylibs(m MachO, a &Assembler) MachO {
+    mut o := m
+    for i in 0:a.dylib_paths.len {
+        o.ext_dylibs.push(a.dylib_paths[i] + "")
+    }
+    for i in 0:a.dylib_labs.len {
+        o.iat_bind_name.push(a.dylib_labs[i] + "")
+        if i < a.dylib_ords.len {
+            o.iat_bind_ord.push(a.dylib_ords[i])
+        } else {
+            o.iat_bind_ord.push(2)
+        }
+    }
+    << o
+}
+
+// m33: copy with the __DWARF segment enabled (set before code_vaddr/data_vaddr
+// and generate_debug so both passes agree on the load-command layout).
+fn (m MachO) with_debug() MachO {
+    mut o := m
+    o.has_debug = 1
+    << o
+}
+
+fn align_up(v int, a int) int {
+    if a <= 1 { << v }
+    if a <= 0 { << v }
+    << ((v + a - 1) / a) * a
+}
+
+fn macho_find_data_off(a &Assembler, name string) int {
+    idx := a.label_index(name)
+    if idx >= 0 && idx < a.labels.len && lab_is_data(&a.labels, idx) {
+        << lab_off(&a.labels, idx)
+    }
+    << -1
+}
+
+fn write_uleb128(buf &mut []int, v int) {
+    mut x := v
+    for k in 0:8 {
+        b := x & 127
+        x = x >> 7
+        if x == 0 {
+            buf.push(b)
+            <<
+        }
+        buf.push(b | 128)
+    }
+}
+
+fn (m MachO) extra_dylib_cmds() int {
+    mut n := 0
+    for i in 0:m.ext_dylibs.len {
+        n = n + align_up(24 + m.ext_dylibs[i].len + 1, 8)
+    }
+    << n
+}
+
+// LC_MAIN is 24; LC_ID_DYLIB is 8-aligned dylib_command + install name.
+fn (m MachO) entry_or_id_cmd_size() int {
+    if m.dylib_id.len > 0 {
+        << align_up(24 + m.dylib_id.len + 1, 8)
+    }
+    << 24
+}
+
+fn (m MachO) ncmds() int {
+    if m.has_debug == 1 {
+        << 11 + m.ext_dylibs.len
+    }
+    << 10 + m.ext_dylibs.len
+}
+
+fn (m MachO) filetype() int {
+    if m.dylib_id.len > 0 {
+        << 6 // MH_DYLIB
+    }
+    << 2 // MH_EXECUTE
+}
+
+fn (m MachO) export_symtab(text_vmaddr int) MachoSymtab {
+    mut strtab := []int{}
+    strtab.push(0)
+    mut nlist := []int{}
+    for i in 0:m.exp_name.len {
+        strx := strtab.len
+        nm := m.exp_name[i] + ""
+        for j in 0:nm.len {
+            strtab.push(nm[j])
+        }
+        strtab.push(0)
+        write32(mut &nlist, strx)
+        nlist.push(15) // N_EXT | N_SECT
+        nlist.push(1)  // section 1 = __text
+        write16(mut &nlist, 0)
+        write64(mut &nlist, text_vmaddr + m.exp_off[i])
+    }
+    << MachoSymtab{nlist: nlist, strtab: strtab}
+}
+
+fn (m MachO) linkedit_layout(link_off int, bind_len int, nlist_len int, strtab_len int) MachoLinkedit {
+    if m.exp_name.len > 0 {
+        mut pad := bind_len
+        if pad < 1 {
+            pad = 1
+        }
+        noff := align_up(link_off + pad, 8)
+        soff := noff + nlist_len
+        end := soff + strtab_len
+        mut sz := align_up(end - link_off, 8)
+        if sz < 16 {
+            sz = 16
+        }
+        << MachoLinkedit{nlist_off: noff, strtab_off: soff, size: sz}
+    }
+    mut sz := 16
+    if bind_len > 0 {
+        sz = align_up(bind_len, 8)
+    }
+    << MachoLinkedit{nlist_off: 0, strtab_off: 0, size: sz}
+}
+
+fn (m MachO) xu_iat_bind_bytes(a &Assembler) []int {
+    mut names := []string{}
+    mut offs := []int{}
+    a.collect_iat_xu(mut &names, mut &offs)
+    mut b := []int{}
+    for i in 0:names.len {
+        mut ord := 1
+        for j in 0:m.iat_bind_name.len {
+            if m.iat_bind_name[j] == names[i] {
+                ord = m.iat_bind_ord[j]
+            }
+        }
+        b.push(16 | ord)
+        b.push(81)
+        b.push(64)
+        write_cstr(mut &b, names[i])
+        b.push(114)
+        write_uleb128(mut &b, offs[i])
+        b.push(144)
+    }
+    << b
+}
+
+// Total size of all load commands (no trailing alignment). One __data
+// section, no __got (no external symbols). Extra LC_LOAD_DYLIB + LC_ID_DYLIB
+// (vs LC_MAIN) are included when chaining / --shared. m33 adds the
+// __DWARF segment (LC_SEGMENT_64 + 4 LC_SECTION_64 = 72 + 4*80 = 392) when
+// has_debug is set.
+fn (m MachO) load_commands_size() int {
+    dylinker_cmd := align_up(12 + 13 + 1, 8) // '/usr/lib/dyld' + NUL
+    dylib_cmd := align_up(24 + 25 + 1, 8) // '/usr/lib/libSystem.B.dylib' + NUL
+    extra := m.extra_dylib_cmds()
+    entry := m.entry_or_id_cmd_size()
+    n := 72 + (72 + 80) + (72 + 80) + 72 + 48 + 24 + 80 + dylinker_cmd + dylib_cmd + extra + entry
+    if m.has_debug == 1 {
+        << n + 392
+    }
+    << n
+}
+
+// File offset of the first code byte, derived from the load-command layout.
+// Must stay in sync with `generate` — both use this helper so the two passes
+// cannot disagree.
+// ≥32 bytes between load commands and __text so `codesign -s -` does not
+// clobber the first instructions (that overflow used to SIGILL).
+fn (m MachO) code_offset() int { << align_up(32 + m.load_commands_size() + 32, 16) }
+
+// Virtual address of the first code byte (= base + code file offset).
+fn (m MachO) code_vaddr() int { << m.base_addr + m.code_offset() }
+
+// Virtual address of the __DATA segment start.
+fn (m MachO) data_vaddr(code_size int) int {
+    text_seg_file_size := align_up(m.code_offset() + code_size, m.page_size)
+    << m.base_addr + text_seg_file_size
+}
+
+// ===== Little-endian write helpers (buf is a local, borrowed mutably) =====
+
+fn write16(buf &mut []int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+}
+
+fn write32(buf &mut []int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 24) & 255)
+}
+
+fn write64(buf &mut []int, v int) {
+    // Inlined rather than delegating to write32: re-borrowing a &mut
+    // parameter (`mut &out`) is not in the subset.
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 24) & 255)
+    buf.push((v >> 32) & 255)
+    buf.push((v >> 40) & 255)
+    buf.push((v >> 48) & 255)
+    buf.push((v >> 56) & 255)
+}
+
+// Fixed-length string, zero-padded (truncates like the reference).
+fn write_str(buf &mut []int, s string, len int) {
+    for i in 0:len {
+        if i < s.len {
+            buf.push(s[i])
+        } else {
+            buf.push(0)
+        }
+    }
+}
+
+// NUL-terminated string.
+fn write_cstr(buf &mut []int, s string) {
+    for i in 0:s.len {
+        buf.push(s[i])
+    }
+    buf.push(0)
+}
+
+fn pad_to(buf &mut []int, offset int) {
+    for i in buf.len:offset {
+        buf.push(0)
+    }
+}
+
+fn align_buf_to(buf &mut []int, a int) {
+    padded := align_up(buf.len, a)
+    for i in buf.len:padded {
+        buf.push(0)
+    }
+}
+
+// ===== Second pass: file generation =====
+
+// Return the final executable bytes. `start_offset` is the start
+// entry as a code-segment offset (0 = first code byte). The assembler is
+// borrowed; its code/data are copied out byte by byte.
+fn (m MachO) generate(a &Assembler, start_offset int) []int {
+    // Local buffer: helpers take `&mut []int`, and a &mut parameter
+    // itself moves when passed on, so only a true local can be re-borrowed.
+    mut out := []int{}
+
+    dylinker_cmd_size := align_up(12 + 13 + 1, 8)
+    dylib_cmd_size := align_up(24 + 25 + 1, 8)
+
+    code_offset := m.code_offset()
+    text_size := a.code.len
+    text_seg_file_size := align_up(code_offset + text_size, m.page_size)
+    text_seg_vm_size := text_seg_file_size
+
+    // __DATA segment (no GOT follows the data: no external symbols). The
+    // 8-byte GOT alignment still feeds total_data_size, exactly like the
+    // reference (got_offset_in_segment + got_size with got_size = 0).
+    data_file_offset := text_seg_file_size
+    data_vaddr := m.base_addr + text_seg_file_size
+    data_size := a.data.len
+    total_data_size := align_up(data_size, 8)
+    mut data_seg_file_size := m.page_size
+    if total_data_size > 0 {
+        data_seg_file_size = align_up(total_data_size, m.page_size)
+    }
+    data_seg_vm_size := data_seg_file_size
+
+    // Data-section IAT slots (`_iat_*`) → LC_DYLD_INFO bind to libSystem.
+    mut bind := []int{}
+    off0 := macho_find_data_off(a, "_iat_pthread_create")
+    if off0 >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_create")
+        bind.push(114)
+        write_uleb128(mut &bind, off0)
+        bind.push(144)
+        off1 := macho_find_data_off(a, "_iat_pthread_detach")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_detach")
+        bind.push(114)
+        write_uleb128(mut &bind, off1)
+        bind.push(144)
+        off2 := macho_find_data_off(a, "_iat_pthread_mutex_lock")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_mutex_lock")
+        bind.push(114)
+        write_uleb128(mut &bind, off2)
+        bind.push(144)
+        off3 := macho_find_data_off(a, "_iat_pthread_mutex_unlock")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_mutex_unlock")
+        bind.push(114)
+        write_uleb128(mut &bind, off3)
+        bind.push(144)
+        off4 := macho_find_data_off(a, "_iat_pthread_cond_wait")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_cond_wait")
+        bind.push(114)
+        write_uleb128(mut &bind, off4)
+        bind.push(144)
+        off5 := macho_find_data_off(a, "_iat_pthread_cond_signal")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_cond_signal")
+        bind.push(114)
+        write_uleb128(mut &bind, off5)
+        bind.push(144)
+        off6 := macho_find_data_off(a, "_iat_pthread_cond_broadcast")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_cond_broadcast")
+        bind.push(114)
+        write_uleb128(mut &bind, off6)
+        bind.push(144)
+        off7 := macho_find_data_off(a, "_iat_pthread_mutex_init")
+        if off7 >= 0 {
+            bind.push(17)
+            bind.push(81)
+            bind.push(64)
+            write_cstr(mut &bind, "_pthread_mutex_init")
+            bind.push(114)
+            write_uleb128(mut &bind, off7)
+            bind.push(144)
+        }
+        off8 := macho_find_data_off(a, "_iat_pthread_cond_init")
+        if off8 >= 0 {
+            bind.push(17)
+            bind.push(81)
+            bind.push(64)
+            write_cstr(mut &bind, "_pthread_cond_init")
+            bind.push(114)
+            write_uleb128(mut &bind, off8)
+            bind.push(144)
+        }
+    }
+    off_clk := macho_find_data_off(a, "_iat_clock_gettime")
+    if off_clk >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_clock_gettime")
+        bind.push(114)
+        write_uleb128(mut &bind, off_clk)
+        bind.push(144)
+    }
+    off_ns := macho_find_data_off(a, "_iat_nanosleep")
+    if off_ns >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_nanosleep")
+        bind.push(114)
+        write_uleb128(mut &bind, off_ns)
+        bind.push(144)
+    }
+    off_nsg := macho_find_data_off(a, "_iat__NSGetEnviron")
+    if off_nsg >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "__NSGetEnviron")
+        bind.push(114)
+        write_uleb128(mut &bind, off_nsg)
+        bind.push(144)
+    }
+    off_ghn := macho_find_data_off(a, "_iat_gethostname")
+    if off_ghn >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_gethostname")
+        bind.push(114)
+        write_uleb128(mut &bind, off_ghn)
+        bind.push(144)
+    }
+    off_gcw := macho_find_data_off(a, "_iat_getcwd")
+    if off_gcw >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_getcwd")
+        bind.push(114)
+        write_uleb128(mut &bind, off_gcw)
+        bind.push(144)
+    }
+    off_pipe := macho_find_data_off(a, "_iat_pipe")
+    if off_pipe >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pipe")
+        bind.push(114)
+        write_uleb128(mut &bind, off_pipe)
+        bind.push(144)
+    }
+    off_gifa := macho_find_data_off(a, "_iat_getifaddrs")
+    if off_gifa >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_getifaddrs")
+        bind.push(114)
+        write_uleb128(mut &bind, off_gifa)
+        bind.push(144)
+    }
+    off_fifa := macho_find_data_off(a, "_iat_freeifaddrs")
+    if off_fifa >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_freeifaddrs")
+        bind.push(114)
+        write_uleb128(mut &bind, off_fifa)
+        bind.push(144)
+    }
+    off_sys := macho_find_data_off(a, "_iat_system")
+    if off_sys >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_system")
+        bind.push(114)
+        write_uleb128(mut &bind, off_sys)
+        bind.push(144)
+    }
+    // os/exec uses the POSIX process primitives directly on macOS.  These
+    // slots are emitted by rt_emit_os_exec, so they must receive the same
+    // dyld bind opcodes as the other libSystem imports; leaving one at zero
+    // turns the indirect call into a null-PC SIGSEGV.
+    off_fork := macho_find_data_off(a, "_iat_fork")
+    if off_fork >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_fork")
+        bind.push(114)
+        write_uleb128(mut &bind, off_fork)
+        bind.push(144)
+    }
+    off_execve := macho_find_data_off(a, "_iat_execve")
+    if off_execve >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_execve")
+        bind.push(114)
+        write_uleb128(mut &bind, off_execve)
+        bind.push(144)
+    }
+    off_wait4 := macho_find_data_off(a, "_iat_wait4")
+    if off_wait4 >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_wait4")
+        bind.push(114)
+        write_uleb128(mut &bind, off_wait4)
+        bind.push(144)
+    }
+    off_dup2 := macho_find_data_off(a, "_iat_dup2")
+    if off_dup2 >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_dup2")
+        bind.push(114)
+        write_uleb128(mut &bind, off_dup2)
+        bind.push(144)
+    }
+    off_dlo := macho_find_data_off(a, "_iat_dlopen")
+    if off_dlo >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_dlopen")
+        bind.push(114)
+        write_uleb128(mut &bind, off_dlo)
+        bind.push(144)
+    }
+    off_dls := macho_find_data_off(a, "_iat_dlsym")
+    if off_dls >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_dlsym")
+        bind.push(114)
+        write_uleb128(mut &bind, off_dls)
+        bind.push(144)
+    }
+    xub := m.xu_iat_bind_bytes(a)
+    for i in 0:xub.len {
+        bind.push(xub[i])
+    }
+    if bind.len > 0 {
+        bind.push(0) // DONE
+    }
+
+    // __LINKEDIT: bind info, or 16 zero bytes when no IAT (hello identity).
+    // MH_DYLIB also appends nlist + strtab after bind.
+    linkedit_file_offset := data_file_offset + data_seg_file_size
+    linkedit_vaddr := data_vaddr + data_seg_vm_size
+    text_vmaddr := m.base_addr + code_offset
+    st := m.export_symtab(text_vmaddr)
+    nsyms := m.exp_name.len
+    le := m.linkedit_layout(linkedit_file_offset, bind.len, st.nlist.len, st.strtab.len)
+    linkedit_size := le.size
+
+    entry_offset := code_offset + start_offset // relative to __TEXT start
+
+    // ===== Mach-O header =====
+    write32(mut &out, 4277009103) // MH_MAGIC_64
+    write32(mut &out, m.cpu_type)
+    write32(mut &out, m.cpu_subtype)
+    write32(mut &out, m.filetype())
+    write32(mut &out, m.ncmds())
+    write32(mut &out, m.load_commands_size())
+    write32(mut &out, 2097156) // MH_DYLDLINK | MH_PIE
+    write32(mut &out, 0) // reserved
+
+    // ===== LC_SEGMENT_64: __PAGEZERO =====
+    write32(mut &out, 25)
+    write32(mut &out, 72)
+    write_str(mut &out, "__PAGEZERO", 16)
+    write64(mut &out, 0)
+    write64(mut &out, m.base_addr)
+    write64(mut &out, 0)
+    write64(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __TEXT =====
+    write32(mut &out, 25)
+    write32(mut &out, 72 + 80)
+    write_str(mut &out, "__TEXT", 16)
+    write64(mut &out, m.base_addr)
+    write64(mut &out, text_seg_vm_size)
+    write64(mut &out, 0)
+    write64(mut &out, text_seg_file_size)
+    write32(mut &out, 5) // VM_PROT_READ | VM_PROT_EXECUTE
+    write32(mut &out, 5)
+    write32(mut &out, 1) // nsects
+    write32(mut &out, 0)
+
+    // __text section
+    write_str(mut &out, "__text", 16)
+    write_str(mut &out, "__TEXT", 16)
+    write64(mut &out, m.base_addr + code_offset)
+    write64(mut &out, text_size)
+    write32(mut &out, code_offset)
+    write32(mut &out, 4) // align 2^4 = 16
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 2147484672) // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __DATA =====
+    write32(mut &out, 25)
+    write32(mut &out, 72 + 80)
+    write_str(mut &out, "__DATA", 16)
+    write64(mut &out, data_vaddr)
+    write64(mut &out, data_seg_vm_size)
+    write64(mut &out, data_file_offset)
+    write64(mut &out, total_data_size)
+    write32(mut &out, 3) // VM_PROT_READ | VM_PROT_WRITE
+    write32(mut &out, 3)
+    write32(mut &out, 1) // nsects
+    write32(mut &out, 0)
+
+    // __data section
+    write_str(mut &out, "__data", 16)
+    write_str(mut &out, "__DATA", 16)
+    write64(mut &out, data_vaddr)
+    write64(mut &out, data_size)
+    write32(mut &out, data_file_offset)
+    write32(mut &out, 4)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __LINKEDIT =====
+    write32(mut &out, 25)
+    write32(mut &out, 72)
+    write_str(mut &out, "__LINKEDIT", 16)
+    write64(mut &out, linkedit_vaddr)
+    write64(mut &out, align_up(linkedit_size, m.page_size))
+    write64(mut &out, linkedit_file_offset)
+    write64(mut &out, linkedit_size)
+    write32(mut &out, 1) // VM_PROT_READ
+    write32(mut &out, 1)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_DYLD_INFO_ONLY =====
+    write32(mut &out, 2147483682)
+    write32(mut &out, 48)
+    write32(mut &out, 0) // rebase_off
+    write32(mut &out, 0) // rebase_size
+    mut bind_off := 0
+    mut bind_size := 0
+    if bind.len > 0 {
+        bind_off = linkedit_file_offset
+        bind_size = bind.len
+    }
+    write32(mut &out, bind_off)
+    write32(mut &out, bind_size)
+    write32(mut &out, 0) // weak_bind
+    write32(mut &out, 0)
+    write32(mut &out, 0) // lazy_bind
+    write32(mut &out, 0)
+    write32(mut &out, 0) // export
+    write32(mut &out, 0)
+
+    // ===== LC_SYMTAB =====
+    write32(mut &out, 2)
+    write32(mut &out, 24)
+    write32(mut &out, le.nlist_off)
+    write32(mut &out, nsyms)
+    if nsyms > 0 {
+        write32(mut &out, le.strtab_off)
+        write32(mut &out, st.strtab.len)
+    } else {
+        write32(mut &out, 0)
+        write32(mut &out, 0)
+    }
+
+    // ===== LC_DYSYMTAB =====
+    write32(mut &out, 11)
+    write32(mut &out, 80)
+    write32(mut &out, 0) // ilocalsym
+    write32(mut &out, 0) // nlocalsym
+    write32(mut &out, 0) // iextdefsym
+    write32(mut &out, nsyms) // nextdefsym
+    write32(mut &out, nsyms) // iundefsym
+    write32(mut &out, 0) // nundefsym
+    for i in 0:12 {
+        write32(mut &out, 0)
+    }
+
+    // ===== LC_LOAD_DYLINKER =====
+    write32(mut &out, 14)
+    write32(mut &out, dylinker_cmd_size)
+    write32(mut &out, 12) // name offset
+    write_cstr(mut &out, "/usr/lib/dyld")
+    align_buf_to(mut &out, 8)
+
+    // ===== LC_LOAD_DYLIB (libSystem) =====
+    write32(mut &out, 12)
+    write32(mut &out, dylib_cmd_size)
+    write32(mut &out, 24) // name offset
+    write32(mut &out, 2) // timestamp
+    write32(mut &out, 65536) // current_version
+    write32(mut &out, 65536) // compatibility_version
+    write_cstr(mut &out, "/usr/lib/libSystem.B.dylib")
+    align_buf_to(mut &out, 8)
+
+    for i in 0:m.ext_dylibs.len {
+        p := m.ext_dylibs[i] + ""
+        sz := align_up(24 + p.len + 1, 8)
+        write32(mut &out, 12)
+        write32(mut &out, sz)
+        write32(mut &out, 24)
+        write32(mut &out, 2)
+        write32(mut &out, 65536)
+        write32(mut &out, 65536)
+        write_cstr(mut &out, p)
+        align_buf_to(mut &out, 8)
+    }
+
+    if m.dylib_id.len > 0 {
+        // ===== LC_ID_DYLIB =====
+        write32(mut &out, 13)
+        write32(mut &out, m.entry_or_id_cmd_size())
+        write32(mut &out, 24)
+        write32(mut &out, 1)
+        write32(mut &out, 65536)
+        write32(mut &out, 65536)
+        write_cstr(mut &out, m.dylib_id)
+        align_buf_to(mut &out, 8)
+    } else {
+        // ===== LC_MAIN =====
+        write32(mut &out, 2147483688)
+        write32(mut &out, 24)
+        write64(mut &out, entry_offset)
+        write64(mut &out, 0) // stacksize (gen1_ref / hello byte-identical)
+    }
+
+    // ===== Code =====
+    pad_to(mut &out, code_offset)
+    // Index loop: read the struct's code field directly. (`mut code_ref :=
+    // &a.code` triggers a bootstrap xumir bug where the borrow's .len
+    // becomes garbage; the direct field access compiles correctly.)
+    for i in 0:a.code.len {
+        out.push(a.code[i])
+    }
+
+    // ===== Data =====
+    pad_to(mut &out, data_file_offset)
+    for i in 0:a.data.len {
+        out.push(a.data[i])
+    }
+
+    // ===== __LINKEDIT: bind info (or 16 zero bytes) + optional nlist =====
+    pad_to(mut &out, linkedit_file_offset)
+    if bind.len > 0 {
+        for i in 0:bind.len {
+            out.push(bind[i])
+        }
+    }
+    if nsyms > 0 {
+        pad_to(mut &out, le.nlist_off)
+        for i in 0:st.nlist.len {
+            out.push(st.nlist[i])
+        }
+        pad_to(mut &out, le.strtab_off)
+        for i in 0:st.strtab.len {
+            out.push(st.strtab[i])
+        }
+    }
+    pad_to(mut &out, linkedit_file_offset + linkedit_size)
+
+    << out
+}
+
+fn (m MachO) generate_from(code &[]int, data &[]int, start_offset int) []int {
+    // Local buffer: helpers take `&mut []int`, and a &mut parameter
+    // itself moves when passed on, so only a true local can be re-borrowed.
+    mut out := []int{}
+
+    dylinker_cmd_size := align_up(12 + 13 + 1, 8)
+    dylib_cmd_size := align_up(24 + 25 + 1, 8)
+
+    code_offset := m.code_offset()
+    text_size := code.len
+    text_seg_file_size := align_up(code_offset + text_size, m.page_size)
+    text_seg_vm_size := text_seg_file_size
+
+    // __DATA segment (no GOT follows the data: no external symbols). The
+    // 8-byte GOT alignment still feeds total_data_size, exactly like the
+    // reference (got_offset_in_segment + got_size with got_size = 0).
+    data_file_offset := text_seg_file_size
+    data_vaddr := m.base_addr + text_seg_file_size
+    data_size := data.len
+    total_data_size := align_up(data_size, 8)
+    mut data_seg_file_size := m.page_size
+    if total_data_size > 0 {
+        data_seg_file_size = align_up(total_data_size, m.page_size)
+    }
+    data_seg_vm_size := data_seg_file_size
+
+    mut bind := []int{}
+
+    // __LINKEDIT: bind info, or 16 zero bytes when no IAT (hello identity).
+    // MH_DYLIB also appends nlist + strtab after bind.
+    linkedit_file_offset := data_file_offset + data_seg_file_size
+    linkedit_vaddr := data_vaddr + data_seg_vm_size
+    text_vmaddr := m.base_addr + code_offset
+    st := m.export_symtab(text_vmaddr)
+    nsyms := m.exp_name.len
+    le := m.linkedit_layout(linkedit_file_offset, bind.len, st.nlist.len, st.strtab.len)
+    linkedit_size := le.size
+
+    entry_offset := code_offset + start_offset // relative to __TEXT start
+
+    // ===== Mach-O header =====
+    write32(mut &out, 4277009103) // MH_MAGIC_64
+    write32(mut &out, m.cpu_type)
+    write32(mut &out, m.cpu_subtype)
+    write32(mut &out, m.filetype())
+    write32(mut &out, m.ncmds())
+    write32(mut &out, m.load_commands_size())
+    write32(mut &out, 2097156) // MH_DYLDLINK | MH_PIE
+    write32(mut &out, 0) // reserved
+
+    // ===== LC_SEGMENT_64: __PAGEZERO =====
+    write32(mut &out, 25)
+    write32(mut &out, 72)
+    write_str(mut &out, "__PAGEZERO", 16)
+    write64(mut &out, 0)
+    write64(mut &out, m.base_addr)
+    write64(mut &out, 0)
+    write64(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __TEXT =====
+    write32(mut &out, 25)
+    write32(mut &out, 72 + 80)
+    write_str(mut &out, "__TEXT", 16)
+    write64(mut &out, m.base_addr)
+    write64(mut &out, text_seg_vm_size)
+    write64(mut &out, 0)
+    write64(mut &out, text_seg_file_size)
+    write32(mut &out, 5) // VM_PROT_READ | VM_PROT_EXECUTE
+    write32(mut &out, 5)
+    write32(mut &out, 1) // nsects
+    write32(mut &out, 0)
+
+    // __text section
+    write_str(mut &out, "__text", 16)
+    write_str(mut &out, "__TEXT", 16)
+    write64(mut &out, m.base_addr + code_offset)
+    write64(mut &out, text_size)
+    write32(mut &out, code_offset)
+    write32(mut &out, 4) // align 2^4 = 16
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 2147484672) // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __DATA =====
+    write32(mut &out, 25)
+    write32(mut &out, 72 + 80)
+    write_str(mut &out, "__DATA", 16)
+    write64(mut &out, data_vaddr)
+    write64(mut &out, data_seg_vm_size)
+    write64(mut &out, data_file_offset)
+    write64(mut &out, total_data_size)
+    write32(mut &out, 3) // VM_PROT_READ | VM_PROT_WRITE
+    write32(mut &out, 3)
+    write32(mut &out, 1) // nsects
+    write32(mut &out, 0)
+
+    // __data section
+    write_str(mut &out, "__data", 16)
+    write_str(mut &out, "__DATA", 16)
+    write64(mut &out, data_vaddr)
+    write64(mut &out, data_size)
+    write32(mut &out, data_file_offset)
+    write32(mut &out, 4)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __LINKEDIT =====
+    write32(mut &out, 25)
+    write32(mut &out, 72)
+    write_str(mut &out, "__LINKEDIT", 16)
+    write64(mut &out, linkedit_vaddr)
+    write64(mut &out, align_up(linkedit_size, m.page_size))
+    write64(mut &out, linkedit_file_offset)
+    write64(mut &out, linkedit_size)
+    write32(mut &out, 1) // VM_PROT_READ
+    write32(mut &out, 1)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_DYLD_INFO_ONLY =====
+    write32(mut &out, 2147483682)
+    write32(mut &out, 48)
+    write32(mut &out, 0) // rebase_off
+    write32(mut &out, 0) // rebase_size
+    mut bind_off := 0
+    mut bind_size := 0
+    if bind.len > 0 {
+        bind_off = linkedit_file_offset
+        bind_size = bind.len
+    }
+    write32(mut &out, bind_off)
+    write32(mut &out, bind_size)
+    write32(mut &out, 0) // weak_bind
+    write32(mut &out, 0)
+    write32(mut &out, 0) // lazy_bind
+    write32(mut &out, 0)
+    write32(mut &out, 0) // export
+    write32(mut &out, 0)
+
+    // ===== LC_SYMTAB =====
+    write32(mut &out, 2)
+    write32(mut &out, 24)
+    write32(mut &out, le.nlist_off)
+    write32(mut &out, nsyms)
+    if nsyms > 0 {
+        write32(mut &out, le.strtab_off)
+        write32(mut &out, st.strtab.len)
+    } else {
+        write32(mut &out, 0)
+        write32(mut &out, 0)
+    }
+
+    // ===== LC_DYSYMTAB =====
+    write32(mut &out, 11)
+    write32(mut &out, 80)
+    write32(mut &out, 0) // ilocalsym
+    write32(mut &out, 0) // nlocalsym
+    write32(mut &out, 0) // iextdefsym
+    write32(mut &out, nsyms) // nextdefsym
+    write32(mut &out, nsyms) // iundefsym
+    write32(mut &out, 0) // nundefsym
+    for i in 0:12 {
+        write32(mut &out, 0)
+    }
+
+    // ===== LC_LOAD_DYLINKER =====
+    write32(mut &out, 14)
+    write32(mut &out, dylinker_cmd_size)
+    write32(mut &out, 12) // name offset
+    write_cstr(mut &out, "/usr/lib/dyld")
+    align_buf_to(mut &out, 8)
+
+    // ===== LC_LOAD_DYLIB (libSystem) =====
+    write32(mut &out, 12)
+    write32(mut &out, dylib_cmd_size)
+    write32(mut &out, 24) // name offset
+    write32(mut &out, 2) // timestamp
+    write32(mut &out, 65536) // current_version
+    write32(mut &out, 65536) // compatibility_version
+    write_cstr(mut &out, "/usr/lib/libSystem.B.dylib")
+    align_buf_to(mut &out, 8)
+
+    for i in 0:m.ext_dylibs.len {
+        p := m.ext_dylibs[i] + ""
+        sz := align_up(24 + p.len + 1, 8)
+        write32(mut &out, 12)
+        write32(mut &out, sz)
+        write32(mut &out, 24)
+        write32(mut &out, 2)
+        write32(mut &out, 65536)
+        write32(mut &out, 65536)
+        write_cstr(mut &out, p)
+        align_buf_to(mut &out, 8)
+    }
+
+    if m.dylib_id.len > 0 {
+        // ===== LC_ID_DYLIB =====
+        write32(mut &out, 13)
+        write32(mut &out, m.entry_or_id_cmd_size())
+        write32(mut &out, 24)
+        write32(mut &out, 1)
+        write32(mut &out, 65536)
+        write32(mut &out, 65536)
+        write_cstr(mut &out, m.dylib_id)
+        align_buf_to(mut &out, 8)
+    } else {
+        // ===== LC_MAIN =====
+        write32(mut &out, 2147483688)
+        write32(mut &out, 24)
+        write64(mut &out, entry_offset)
+        write64(mut &out, 0) // stacksize (gen1_ref / hello byte-identical)
+    }
+
+    // ===== Code =====
+    pad_to(mut &out, code_offset)
+    // Index loop: read the struct's code field directly. (`mut code_ref :=
+    // &a.code` triggers a bootstrap xumir bug where the borrow's .len
+    // becomes garbage; the direct field access compiles correctly.)
+    for i in 0:code.len {
+        out.push(code[i])
+    }
+
+    // ===== Data =====
+    pad_to(mut &out, data_file_offset)
+    for i in 0:data.len {
+        out.push(data[i])
+    }
+
+    // ===== __LINKEDIT: bind info (or 16 zero bytes) + optional nlist =====
+    pad_to(mut &out, linkedit_file_offset)
+    if bind.len > 0 {
+        for i in 0:bind.len {
+            out.push(bind[i])
+        }
+    }
+    if nsyms > 0 {
+        pad_to(mut &out, le.nlist_off)
+        for i in 0:st.nlist.len {
+            out.push(st.nlist[i])
+        }
+        pad_to(mut &out, le.strtab_off)
+        for i in 0:st.strtab.len {
+            out.push(st.strtab[i])
+        }
+    }
+    pad_to(mut &out, linkedit_file_offset + linkedit_size)
+
+    << out
+}
+
+// One LC_SECTION_64 (80 bytes) for a non-loaded __DWARF section. Built in a
+// local and returned by value (a &mut []int parameter cannot be re-borrowed).
+
+// One LC_SECTION_64 (80 bytes) for a non-loaded __DWARF section. Built in a
+// local and returned by value (a &mut []int parameter cannot be re-borrowed).
+fn dwarf_section_hdr(name string, size int, fileoff int, addr int) []int {
+    mut b := []int{}
+    write_str(mut &b, name, 16)    // sectname
+    write_str(mut &b, "__DWARF", 16) // segname
+    write64(mut &b, addr)          // addr
+    write64(mut &b, size)          // size
+    write32(mut &b, fileoff)       // offset
+    write32(mut &b, 0)             // align
+    write32(mut &b, 0)             // reloff
+    write32(mut &b, 0)             // nreloc
+    write32(mut &b, 0)             // flags
+    write32(mut &b, 0)             // reserved1
+    write32(mut &b, 0)             // reserved2
+    write32(mut &b, 0)             // reserved3
+    << b
+}
+
+// m33: produce the final executable bytes with a non-loaded __DWARF segment
+// (LC_SEGMENT_64 + 4 LC_SECTION_64) appended after __LINKEDIT. Mirrors
+// xubin lib.rs generate_with_debug with `debug = Some(..)`. Requires
+// has_debug == 1 (set via with_debug before the first pass).
+fn (m MachO) generate_debug(a &Assembler, start_offset int, d &DebugSections) []int {
+    mut out := []int{}
+
+    dylinker_cmd_size := align_up(12 + 13 + 1, 8)
+    dylib_cmd_size := align_up(24 + 25 + 1, 8)
+
+    code_offset := m.code_offset()
+    text_size := a.code.len
+    text_seg_file_size := align_up(code_offset + text_size, m.page_size)
+    text_seg_vm_size := text_seg_file_size
+
+    data_file_offset := text_seg_file_size
+    data_vaddr := m.base_addr + text_seg_file_size
+    data_size := a.data.len
+    total_data_size := align_up(data_size, 8)
+    mut data_seg_file_size := m.page_size
+    if total_data_size > 0 {
+        data_seg_file_size = align_up(total_data_size, m.page_size)
+    }
+    data_seg_vm_size := data_seg_file_size
+
+    // Data-section IAT slots (`_iat_*`) -> LC_DYLD_INFO bind to libSystem
+    // (same block as `generate`).
+    mut bind := []int{}
+    off0 := macho_find_data_off(a, "_iat_pthread_create")
+    if off0 >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_create")
+        bind.push(114)
+        write_uleb128(mut &bind, off0)
+        bind.push(144)
+        off1 := macho_find_data_off(a, "_iat_pthread_detach")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_detach")
+        bind.push(114)
+        write_uleb128(mut &bind, off1)
+        bind.push(144)
+        off2 := macho_find_data_off(a, "_iat_pthread_mutex_lock")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_mutex_lock")
+        bind.push(114)
+        write_uleb128(mut &bind, off2)
+        bind.push(144)
+        off3 := macho_find_data_off(a, "_iat_pthread_mutex_unlock")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_mutex_unlock")
+        bind.push(114)
+        write_uleb128(mut &bind, off3)
+        bind.push(144)
+        off4 := macho_find_data_off(a, "_iat_pthread_cond_wait")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_cond_wait")
+        bind.push(114)
+        write_uleb128(mut &bind, off4)
+        bind.push(144)
+        off5 := macho_find_data_off(a, "_iat_pthread_cond_signal")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_cond_signal")
+        bind.push(114)
+        write_uleb128(mut &bind, off5)
+        bind.push(144)
+        off6 := macho_find_data_off(a, "_iat_pthread_cond_broadcast")
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pthread_cond_broadcast")
+        bind.push(114)
+        write_uleb128(mut &bind, off6)
+        bind.push(144)
+        off7 := macho_find_data_off(a, "_iat_pthread_mutex_init")
+        if off7 >= 0 {
+            bind.push(17)
+            bind.push(81)
+            bind.push(64)
+            write_cstr(mut &bind, "_pthread_mutex_init")
+            bind.push(114)
+            write_uleb128(mut &bind, off7)
+            bind.push(144)
+        }
+        off8 := macho_find_data_off(a, "_iat_pthread_cond_init")
+        if off8 >= 0 {
+            bind.push(17)
+            bind.push(81)
+            bind.push(64)
+            write_cstr(mut &bind, "_pthread_cond_init")
+            bind.push(114)
+            write_uleb128(mut &bind, off8)
+            bind.push(144)
+        }
+    }
+    off_clk := macho_find_data_off(a, "_iat_clock_gettime")
+    if off_clk >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_clock_gettime")
+        bind.push(114)
+        write_uleb128(mut &bind, off_clk)
+        bind.push(144)
+    }
+    off_ns := macho_find_data_off(a, "_iat_nanosleep")
+    if off_ns >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_nanosleep")
+        bind.push(114)
+        write_uleb128(mut &bind, off_ns)
+        bind.push(144)
+    }
+    off_nsg := macho_find_data_off(a, "_iat__NSGetEnviron")
+    if off_nsg >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "__NSGetEnviron")
+        bind.push(114)
+        write_uleb128(mut &bind, off_nsg)
+        bind.push(144)
+    }
+    off_ghn := macho_find_data_off(a, "_iat_gethostname")
+    if off_ghn >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_gethostname")
+        bind.push(114)
+        write_uleb128(mut &bind, off_ghn)
+        bind.push(144)
+    }
+    off_gcw := macho_find_data_off(a, "_iat_getcwd")
+    if off_gcw >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_getcwd")
+        bind.push(114)
+        write_uleb128(mut &bind, off_gcw)
+        bind.push(144)
+    }
+    off_pipe := macho_find_data_off(a, "_iat_pipe")
+    if off_pipe >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_pipe")
+        bind.push(114)
+        write_uleb128(mut &bind, off_pipe)
+        bind.push(144)
+    }
+    off_gifa := macho_find_data_off(a, "_iat_getifaddrs")
+    if off_gifa >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_getifaddrs")
+        bind.push(114)
+        write_uleb128(mut &bind, off_gifa)
+        bind.push(144)
+    }
+    off_fifa := macho_find_data_off(a, "_iat_freeifaddrs")
+    if off_fifa >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_freeifaddrs")
+        bind.push(114)
+        write_uleb128(mut &bind, off_fifa)
+        bind.push(144)
+    }
+    off_sys := macho_find_data_off(a, "_iat_system")
+    if off_sys >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_system")
+        bind.push(114)
+        write_uleb128(mut &bind, off_sys)
+        bind.push(144)
+    }
+    off_fork := macho_find_data_off(a, "_iat_fork")
+    if off_fork >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_fork")
+        bind.push(114)
+        write_uleb128(mut &bind, off_fork)
+        bind.push(144)
+    }
+    off_execve := macho_find_data_off(a, "_iat_execve")
+    if off_execve >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_execve")
+        bind.push(114)
+        write_uleb128(mut &bind, off_execve)
+        bind.push(144)
+    }
+    off_wait4 := macho_find_data_off(a, "_iat_wait4")
+    if off_wait4 >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_wait4")
+        bind.push(114)
+        write_uleb128(mut &bind, off_wait4)
+        bind.push(144)
+    }
+    off_dup2 := macho_find_data_off(a, "_iat_dup2")
+    if off_dup2 >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_dup2")
+        bind.push(114)
+        write_uleb128(mut &bind, off_dup2)
+        bind.push(144)
+    }
+    off_dlo := macho_find_data_off(a, "_iat_dlopen")
+    if off_dlo >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_dlopen")
+        bind.push(114)
+        write_uleb128(mut &bind, off_dlo)
+        bind.push(144)
+    }
+    off_dls := macho_find_data_off(a, "_iat_dlsym")
+    if off_dls >= 0 {
+        bind.push(17)
+        bind.push(81)
+        bind.push(64)
+        write_cstr(mut &bind, "_dlsym")
+        bind.push(114)
+        write_uleb128(mut &bind, off_dls)
+        bind.push(144)
+    }
+    xub := m.xu_iat_bind_bytes(a)
+    for i in 0:xub.len {
+        bind.push(xub[i])
+    }
+    if bind.len > 0 {
+        bind.push(0) // DONE
+    }
+
+    linkedit_file_offset := data_file_offset + data_seg_file_size
+    linkedit_vaddr := data_vaddr + data_seg_vm_size
+    text_vmaddr := m.base_addr + code_offset
+    st := m.export_symtab(text_vmaddr)
+    nsyms := m.exp_name.len
+    le := m.linkedit_layout(linkedit_file_offset, bind.len, st.nlist.len, st.strtab.len)
+    linkedit_size := le.size
+    linkedit_file_size := align_up(linkedit_size, m.page_size)
+
+    entry_offset := code_offset + start_offset
+
+    // m33: __DWARF section file offsets live right after __LINKEDIT's
+    // content, each 8-byte aligned. The segment is PROT_NONE (not mapped),
+    // but dyld still validates every section's addr falls inside its
+    // segment's vmaddr..vmaddr+vmsize, so the segment gets a real
+    // (page-aligned) VM range right after __LINKEDIT.
+    dwarf_base := align_up(linkedit_file_offset + linkedit_size, m.page_size)
+    line_off := dwarf_base
+    info_off := align_up(line_off + d.line.len, 8)
+    abbrev_off := align_up(info_off + d.info.len, 8)
+    str_off := align_up(abbrev_off + d.abbrev.len, 8)
+    dwarf_size := str_off + d.str.len - dwarf_base
+    dwarf_vmaddr := linkedit_vaddr + linkedit_file_size
+    dwarf_vmsize := align_up(dwarf_size, m.page_size)
+
+    // ===== Mach-O header =====
+    write32(mut &out, 4277009103) // MH_MAGIC_64
+    write32(mut &out, m.cpu_type)
+    write32(mut &out, m.cpu_subtype)
+    write32(mut &out, m.filetype())
+    write32(mut &out, m.ncmds())
+    write32(mut &out, m.load_commands_size())
+    write32(mut &out, 2097156) // MH_DYLDLINK | MH_PIE
+    write32(mut &out, 0) // reserved
+
+    // ===== LC_SEGMENT_64: __PAGEZERO =====
+    write32(mut &out, 25)
+    write32(mut &out, 72)
+    write_str(mut &out, "__PAGEZERO", 16)
+    write64(mut &out, 0)
+    write64(mut &out, m.base_addr)
+    write64(mut &out, 0)
+    write64(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __TEXT =====
+    write32(mut &out, 25)
+    write32(mut &out, 72 + 80)
+    write_str(mut &out, "__TEXT", 16)
+    write64(mut &out, m.base_addr)
+    write64(mut &out, text_seg_vm_size)
+    write64(mut &out, 0)
+    write64(mut &out, text_seg_file_size)
+    write32(mut &out, 5)
+    write32(mut &out, 5)
+    write32(mut &out, 1)
+    write32(mut &out, 0)
+
+    // __text section
+    write_str(mut &out, "__text", 16)
+    write_str(mut &out, "__TEXT", 16)
+    write64(mut &out, m.base_addr + code_offset)
+    write64(mut &out, text_size)
+    write32(mut &out, code_offset)
+    write32(mut &out, 4)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 2147484672)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __DATA =====
+    write32(mut &out, 25)
+    write32(mut &out, 72 + 80)
+    write_str(mut &out, "__DATA", 16)
+    write64(mut &out, data_vaddr)
+    write64(mut &out, data_seg_vm_size)
+    write64(mut &out, data_file_offset)
+    write64(mut &out, total_data_size)
+    write32(mut &out, 3)
+    write32(mut &out, 3)
+    write32(mut &out, 1)
+    write32(mut &out, 0)
+
+    // __data section
+    write_str(mut &out, "__data", 16)
+    write_str(mut &out, "__DATA", 16)
+    write64(mut &out, data_vaddr)
+    write64(mut &out, data_size)
+    write32(mut &out, data_file_offset)
+    write32(mut &out, 4)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SEGMENT_64: __LINKEDIT =====
+    write32(mut &out, 25)
+    write32(mut &out, 72)
+    write_str(mut &out, "__LINKEDIT", 16)
+    write64(mut &out, linkedit_vaddr)
+    write64(mut &out, linkedit_file_size)
+    write64(mut &out, linkedit_file_offset)
+    write64(mut &out, linkedit_size)
+    write32(mut &out, 1)
+    write32(mut &out, 1)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_DYLD_INFO_ONLY =====
+    write32(mut &out, 2147483682)
+    write32(mut &out, 48)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    mut bind_off := 0
+    mut bind_size := 0
+    if bind.len > 0 {
+        bind_off = linkedit_file_offset
+        bind_size = bind.len
+    }
+    write32(mut &out, bind_off)
+    write32(mut &out, bind_size)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+
+    // ===== LC_SYMTAB =====
+    write32(mut &out, 2)
+    write32(mut &out, 24)
+    write32(mut &out, le.nlist_off)
+    write32(mut &out, nsyms)
+    if nsyms > 0 {
+        write32(mut &out, le.strtab_off)
+        write32(mut &out, st.strtab.len)
+    } else {
+        write32(mut &out, 0)
+        write32(mut &out, 0)
+    }
+
+    // ===== LC_DYSYMTAB =====
+    write32(mut &out, 11)
+    write32(mut &out, 80)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, nsyms)
+    write32(mut &out, nsyms)
+    write32(mut &out, 0)
+    for i in 0:12 {
+        write32(mut &out, 0)
+    }
+
+    // ===== LC_LOAD_DYLINKER =====
+    write32(mut &out, 14)
+    write32(mut &out, dylinker_cmd_size)
+    write32(mut &out, 12)
+    write_cstr(mut &out, "/usr/lib/dyld")
+    align_buf_to(mut &out, 8)
+
+    // ===== LC_LOAD_DYLIB (libSystem) =====
+    write32(mut &out, 12)
+    write32(mut &out, dylib_cmd_size)
+    write32(mut &out, 24)
+    write32(mut &out, 2)
+    write32(mut &out, 65536)
+    write32(mut &out, 65536)
+    write_cstr(mut &out, "/usr/lib/libSystem.B.dylib")
+    align_buf_to(mut &out, 8)
+
+    for i in 0:m.ext_dylibs.len {
+        p := m.ext_dylibs[i] + ""
+        sz := align_up(24 + p.len + 1, 8)
+        write32(mut &out, 12)
+        write32(mut &out, sz)
+        write32(mut &out, 24)
+        write32(mut &out, 2)
+        write32(mut &out, 65536)
+        write32(mut &out, 65536)
+        write_cstr(mut &out, p)
+        align_buf_to(mut &out, 8)
+    }
+
+    if m.dylib_id.len > 0 {
+        write32(mut &out, 13)
+        write32(mut &out, m.entry_or_id_cmd_size())
+        write32(mut &out, 24)
+        write32(mut &out, 1)
+        write32(mut &out, 65536)
+        write32(mut &out, 65536)
+        write_cstr(mut &out, m.dylib_id)
+        align_buf_to(mut &out, 8)
+    } else {
+        // ===== LC_MAIN =====
+        write32(mut &out, 2147483688)
+        write32(mut &out, 24)
+        write64(mut &out, entry_offset)
+        write64(mut &out, 0)
+    }
+
+    // ===== LC_SEGMENT_64: __DWARF (m33, non-loaded) =====
+    write32(mut &out, 25)
+    write32(mut &out, 72 + 80 * 4)
+    write_str(mut &out, "__DWARF", 16)
+    write64(mut &out, dwarf_vmaddr)
+    write64(mut &out, dwarf_vmsize)
+    write64(mut &out, dwarf_base)
+    write64(mut &out, dwarf_size)
+    write32(mut &out, 0)
+    write32(mut &out, 0)
+    write32(mut &out, 4)
+    write32(mut &out, 0)
+
+    sl := dwarf_section_hdr("__debug_line", d.line.len, line_off, dwarf_vmaddr + (line_off - dwarf_base))
+    for i in 0:sl.len {
+        out.push(sl[i])
+    }
+    si := dwarf_section_hdr("__debug_info", d.info.len, info_off, dwarf_vmaddr + (info_off - dwarf_base))
+    for i in 0:si.len {
+        out.push(si[i])
+    }
+    sa := dwarf_section_hdr("__debug_abbrev", d.abbrev.len, abbrev_off, dwarf_vmaddr + (abbrev_off - dwarf_base))
+    for i in 0:sa.len {
+        out.push(sa[i])
+    }
+    ss := dwarf_section_hdr("__debug_str", d.str.len, str_off, dwarf_vmaddr + (str_off - dwarf_base))
+    for i in 0:ss.len {
+        out.push(ss[i])
+    }
+
+    // ===== Code =====
+    pad_to(mut &out, code_offset)
+    for i in 0:a.code.len {
+        out.push(a.code[i])
+    }
+
+    // ===== Data =====
+    pad_to(mut &out, data_file_offset)
+    for i in 0:a.data.len {
+        out.push(a.data[i])
+    }
+
+    // ===== __LINKEDIT: bind info (or 16 zero bytes) =====
+    pad_to(mut &out, linkedit_file_offset)
+    if bind.len > 0 {
+        for i in 0:bind.len {
+            out.push(bind[i])
+        }
+    }
+    if nsyms > 0 {
+        pad_to(mut &out, le.nlist_off)
+        for i in 0:st.nlist.len {
+            out.push(st.nlist[i])
+        }
+        pad_to(mut &out, le.strtab_off)
+        for i in 0:st.strtab.len {
+            out.push(st.strtab[i])
+        }
+    }
+    pad_to(mut &out, linkedit_file_offset + linkedit_size)
+
+    // ===== __DWARF section payloads (m33) =====
+    pad_to(mut &out, line_off)
+    for i in 0:d.line.len {
+        out.push(d.line[i])
+    }
+    pad_to(mut &out, info_off)
+    for i in 0:d.info.len {
+        out.push(d.info[i])
+    }
+    pad_to(mut &out, abbrev_off)
+    for i in 0:d.abbrev.len {
+        out.push(d.abbrev[i])
+    }
+    pad_to(mut &out, str_off)
+    for i in 0:d.str.len {
+        out.push(d.str[i])
+    }
+
+    << out
+}

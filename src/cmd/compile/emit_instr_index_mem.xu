@@ -1,0 +1,4640 @@
+@main
+
+#xu/types
+
+// ===== Index emit register contract =====
+//   V0     = &descriptor / data scratch
+//   V1     = index (unmapped after load; kept for scaled ldr/str)
+//   S4(12) = len
+//   S5(13) = data pointer → element address
+//   S1(9)  = call-safe address for emit_drop_value only
+//
+// Why S4/S5: O1 pin homes are V2–V5 (!s_pool) or S0–S3 (s_pool).
+// V6/V7 are hot parks. S4/S5 are never pin homes.
+// Index ops already force fn_uses_s_scratch → cs_pairs=3 (S0–S5 saved).
+// Flow: sync array nslots → evict V0/V1 → load_value index → store_scalar dest.
+
+fn emit_index_base_ty(m &types.Mir, fi int, base int) int {
+    if base >= 1073741824 {
+        << types.mir_local_ty(m, fi, base - 1073741824)
+    }
+    << types.mir_temp_ty(m, fi, base)
+}
+
+// A string byte store reuses StoreIndex with width 1. The base is the
+// string descriptor (ptr/len/cap), not an array record, so the owning
+// element drop does not apply. Literals keep cap 0 and must not be written.
+fn emit_store_base_is_string(m &types.Mir, fi int, base int) bool {
+    << emit_index_base_ty(m, fi, base) == 3
+}
+
+// `[N]T` / `&[N]T` index base: length lives on the type, not MInstr.col
+// (col is also source-column / RMW op). 0 = dynamic `[]T` descriptor.
+fn emit_base_fixed_len(m &types.Mir, fi int, base int) int {
+    ty := emit_index_base_ty(m, fi, base)
+    mut arr_ty := ty
+    inner := vreg_direct_ref_inner(ty)
+    if inner >= 0 {
+        arr_ty = inner
+    }
+    if !types.is_array_type(arr_ty) {
+        << 0
+    }
+    ai := arr_ty - 200
+    if ai < 0 || ai >= m.arrays.len {
+        << 0
+    }
+    fl := m.arrays[ai].fixed_len
+    if fl < 0 {
+        << 0
+    }
+    << fl
+}
+
+// StoreIndex has no explicit `drop_old` bit in the Gen1 MInstr ABI: the
+// checker emits a drop for every simple assignment whose element type owns a
+// resource (compound assignment is restricted to scalar int/f64).  Keep the
+// type-directed decision in one place so the fixed-array and dynamic-array
+// paths cannot drift apart.  Unknown/future type tags are deliberately not
+// treated as owning; callers run the shape gate below and reject them before
+// emission instead of silently leaking the old element.
+const emit_store_index_max_depth = 64
+
+// Fast, non-recursive tag/index check.  The recursive validator below handles
+// by-value children; pointer-like edges (dynamic arrays, maps and boxed
+// values) only need their immediate descriptor to be known here.
+fn emit_store_index_type_tag_known(m &types.Mir, ty int) bool {
+    if ty == 1 || ty == 2 || ty == 3 || ty == 4 || ty == 8 || ty == 9 || ty == 10 {
+        << true
+    }
+    // Generic Param(k) monomorph residue: treat as a known opaque tag so
+    // StoreIndex shape checks do not abort the whole compilation unit.
+    if ty >= 400 && ty < 500 { << true }
+    if types.is_ref_type(ty) { << true }
+    if ty == 800 || ty == 801 || types.is_interface_type(ty) { << true }
+    if types.is_struct_type(ty) {
+        si := types.struct_index(ty)
+        << si >= 0 && si < m.structs.len
+    }
+    if types.is_array_type(ty) {
+        ai := ty - 200
+        << ai >= 0 && ai < m.arrays.len
+    }
+    if types.is_throw_type(ty) {
+        ri := ty - 300
+        << ri >= 0 && ri < m.throws.len
+    }
+    if types.is_enum_type(ty) {
+        ei := ty - 500
+        << ei >= 0 && ei < m.enums.len
+    }
+    if types.is_chan_type(ty) {
+        ci := ty - 600
+        << ci >= 0 && ci < m.chans.len
+    }
+    if types.is_map_type(ty) {
+        mi := ty - 50
+        << mi >= 0 && mi < m.maps.len
+    }
+    if types.is_fn_type(ty) {
+        si := ty - 700
+        << si >= 0 && si < m.fn_sigs.len
+    }
+    << false
+}
+
+// Struct fields are addressed by byte offset, while boxes and frame sizing
+// use the materialized word count.  Keep the two declarations tied together
+// before any drop walk can trust either one.  Layout is ceil(bytes / 8), with
+// an explicit zero/zero exception for empty structs.  Bounds are checked
+// before multiplication so forged MIR cannot wrap the relation arithmetic.
+fn emit_store_index_struct_layout_ok(nslots int, size_bytes int) bool {
+    if nslots < 0 || nslots > types.mir_max_layout_words { << false }
+    if size_bytes < 0 || size_bytes > types.mir_max_layout_bytes { << false }
+    if nslots == 0 { << size_bytes == 0 }
+    if nslots > types.mir_max_layout_bytes / 8 { << false }
+    upper := nslots * 8
+    lower := upper - 8
+    << size_bytes > lower && size_bytes <= upper
+}
+
+// Enum payloads are laid out as one tag word plus the largest variant.  The
+// variant field_slots records are consumed directly by emit_drop_value, so a
+// forged smaller nslots would make a boxed enum drop walk past its allocation.
+fn emit_store_index_enum_layout_ok(nslots int, max_payload int) bool {
+    if nslots <= 0 || nslots > types.mir_max_layout_words { << false }
+    if max_payload < 0 || max_payload >= types.mir_max_layout_words { << false }
+    << nslots == max_payload + 1
+}
+
+// Validate the type graph consumed by emit_drop_value and return its ownership
+// state: 0 = known non-owning, 1 = known owning, -1 = malformed/unsupported.
+// Only by-value edges participate in the recursion.  A dynamic slice points
+// at separately allocated elements, so a recursive slice (`[]Node` where
+// Node contains a slice) remains legal while a direct by-value cycle is
+// rejected before type_owning/emit_drop_value can recurse indefinitely.
+fn emit_store_index_type_state(m &types.Mir, ty int, depth int) int {
+    if depth > emit_store_index_max_depth { << -1 }
+    if !emit_store_index_type_tag_known(m, ty) { << -1 }
+    // Param residue: assume non-owning so drop is skipped (compile survives;
+    // owning monomorphs must substitute concrete tags for correct drops).
+    if ty >= 400 && ty < 500 { << 0 }
+    if ty == 1 || ty == 2 || ty == 4 || ty == 8 || ty == 9 || ty == 10 {
+        << 0
+    }
+    if types.is_param_type(ty) { << 0 }
+    if ty == 3 { << 1 }
+    if types.is_ref_type(ty) || types.is_chan_type(ty) { << 0 }
+    if ty == 800 || ty == 801 || types.is_interface_type(ty) { << 1 }
+    if types.is_map_type(ty) { << 1 }
+    if types.is_fn_type(ty) {
+        si := ty - 700
+        has_env := m.fn_sigs[si].has_env
+        if has_env != 0 && has_env != 1 { << -1 }
+        if has_env == 0 { << 0 }
+        env_si := m.fn_sigs[si].env_struct
+        if env_si < 0 || env_si >= m.structs.len { << -1 }
+        // The environment is heap-indirected at runtime, but its fields are
+        // emitted inline by the Fn drop path; validate that by-value layout.
+        env_state := emit_store_index_type_state(m, types.struct_type(env_si), depth + 1)
+        if env_state < 0 { << -1 }
+        << 1
+    }
+    if types.is_array_type(ty) {
+        ai := ty - 200
+        fixed_len := m.arrays[ai].fixed_len
+        elem_bytes := m.arrays[ai].elem_bytes
+        elem_ty := m.arrays[ai].elem_ty
+        if fixed_len < 0 || fixed_len > types.mir_max_layout_words { << -1 }
+        if elem_bytes < 0 || elem_bytes > types.mir_max_layout_bytes { << -1 }
+        if !emit_store_index_type_tag_known(m, elem_ty) { << -1 }
+        // Dynamic arrays are pointer edges.  Keep the ownership result
+        // terminal here (recursive slices are valid); the shape gate runs the
+        // separate graph walk below so nested metadata is still validated
+        // before the array drop helper is emitted.
+        if fixed_len == 0 { << 1 }
+        elem_state := emit_store_index_type_state(m, elem_ty, depth + 1)
+        if elem_state < 0 { << -1 }
+        << elem_state
+    }
+    if types.is_struct_type(ty) {
+        si := types.struct_index(ty)
+        nslots := m.structs[si].nslots
+        size_bytes := m.structs[si].size_bytes
+        align_bytes := m.structs[si].align_bytes
+        if !emit_store_index_struct_layout_ok(nslots, size_bytes) { << -1 }
+        if align_bytes <= 0 || align_bytes > types.mir_max_layout_bytes { << -1 }
+        mut own := 0
+        if m.structs[si].drop_label.len > 0 { own = 1 }
+        for i in 0:m.structs[si].fields.len {
+            fty := m.structs[si].fields[i].ty
+            fs := emit_store_index_type_state(m, fty, depth + 1)
+            if fs < 0 { << -1 }
+            if fs > 0 { own = 1 }
+            slots := m.type_slots(fty)
+            if slots < 0 || slots > types.mir_max_layout_words { << -1 }
+            off := m.structs[si].fields[i].slot
+            // CStruct.field.slot is a byte offset; comparing it directly
+            // with the struct's word count rejects valid fields after word 0
+            // (and can otherwise hide a real overrun).  Validate both the
+            // byte span and the bounded slot count against the materialized
+            // struct size.
+            fbytes := m.type_size_bytes(fty)
+            if fbytes < 0 || fbytes > types.mir_max_layout_bytes { << -1 }
+            if off < 0 || off > size_bytes || fbytes > size_bytes - off { << -1 }
+        }
+        << own
+    }
+    if types.is_throw_type(ty) {
+        ri := ty - 300
+        ok := emit_store_index_type_state(m, m.throws[ri].ok_ty, depth + 1)
+        er := emit_store_index_type_state(m, m.throws[ri].err_ty, depth + 1)
+        if ok < 0 || er < 0 { << -1 }
+        if ok > 0 || er > 0 { << 1 }
+        << 0
+    }
+    if types.is_enum_type(ty) {
+        ei := ty - 500
+        nslots := m.enums[ei].nslots
+        owns := m.enums[ei].owns
+        mut max_payload := 0
+        mut own := 0
+        for vi in 0:m.enums[ei].variants.len {
+            vslots := m.enums[ei].variants[vi].field_slots
+            if vslots < 0 || vslots >= types.mir_max_layout_words { << -1 }
+            if vslots > max_payload { max_payload = vslots }
+            for fj in 0:m.enums[ei].variants[vi].fields.len {
+                fs := emit_store_index_type_state(m, m.enums[ei].variants[vi].fields[fj], depth + 1)
+                if fs < 0 { << -1 }
+                if fs > 0 { own = 1 }
+            }
+        }
+        if !emit_store_index_enum_layout_ok(nslots, max_payload) { << -1 }
+        if owns && own == 0 { << -1 }
+        if !owns && own != 0 { << -1 }
+        << own
+    }
+    << -1
+}
+
+// Return whether an edge to `ty` is represented by a separately allocated
+// object.  Dynamic arrays are the only aggregate edge that the drop emitter
+// can recurse through safely: their helper is a call boundary.  Fixed arrays,
+// structs, throws and enum payloads are inline and therefore remain
+// by-value edges for cycle checking.
+fn emit_store_index_type_ptr_edge(m &types.Mir, ty int) int {
+    if !types.is_array_type(ty) { << 0 }
+    ai := ty - 200
+    if ai < 0 || ai >= m.arrays.len { << 0 }
+    if m.arrays[ai].fixed_len == 0 { << 1 }
+    << 0
+}
+
+// Validate every metadata record reachable from a StoreIndex element.  The
+// older ownership oracle intentionally stopped at dynamic arrays because it
+// only needed a 0/1 answer; that left a malformed nested descriptor (bad
+// elem_bytes, map shape, or an invalid child tag) able to reach a generated
+// drop helper.  This bounded DFS checks the complete graph while preserving
+// legal recursive slices (`[]Node` where Node contains a `[]Node`): a cycle is
+// accepted only when entered through a dynamic-array pointer edge.  Any
+// by-value cycle is rejected before emission.
+fn emit_store_index_type_graph_ok(m &types.Mir, ty int, depth int, path &mut []int, path_len int, ptr_edge int) bool {
+    if depth > emit_store_index_max_depth { << false }
+    if path_len < 0 || path_len >= path.len { << false }
+    if !emit_store_index_type_tag_known(m, ty) { << false }
+    if ty >= 400 && ty < 500 { << true }
+    for i in 0:path_len {
+        if path[i] == ty {
+            if ptr_edge != 0 { << true }
+            << false
+        }
+    }
+    path[path_len] = ty
+    next_len := path_len + 1
+
+    // Scalars, references, channels and boxed/interface values have no
+    // statically traversed child metadata in emit_drop_value.
+    if ty == 1 || ty == 2 || ty == 3 || ty == 4 || ty == 8 || ty == 9 || ty == 10 {
+        << true
+    }
+    if types.is_param_type(ty) { << true }
+    if types.is_ref_type(ty) || types.is_chan_type(ty) { << true }
+    if ty == 800 || ty == 801 || types.is_interface_type(ty) { << true }
+
+    if types.is_fn_type(ty) {
+        si := ty - 700
+        if si < 0 || si >= m.fn_sigs.len { << false }
+        has_env := m.fn_sigs[si].has_env
+        if has_env != 0 && has_env != 1 { << false }
+        if has_env == 0 { << true }
+        env_si := m.fn_sigs[si].env_struct
+        if env_si < 0 || env_si >= m.structs.len { << false }
+        // The environment allocation is a pointer, but its fields are
+        // emitted inline by the Fn drop path.  Keep cycles fail-closed here
+        // instead of allowing recursive code generation.
+        << emit_store_index_type_graph_ok(m, types.struct_type(env_si), depth + 1, path, next_len, 0)
+    }
+
+    if types.is_array_type(ty) {
+        ai := ty - 200
+        if ai < 0 || ai >= m.arrays.len { << false }
+        fixed_len := m.arrays[ai].fixed_len
+        elem_bytes := m.arrays[ai].elem_bytes
+        elem_ty := m.arrays[ai].elem_ty
+        if fixed_len < 0 || fixed_len > types.mir_max_layout_words { << false }
+        if elem_bytes < 0 || elem_bytes > types.mir_max_layout_bytes { << false }
+        if fixed_len > 0 {
+            if elem_bytes <= 0 || fixed_len > types.mir_max_layout_bytes { << false }
+            if fixed_len * elem_bytes > types.mir_max_layout_bytes { << false }
+        } else {
+            // A dynamic descriptor with a zero stride cannot be walked by
+            // the runtime helper (it clamps to one byte), so reject it here.
+            if elem_bytes <= 0 { << false }
+        }
+        if !emit_store_index_type_tag_known(m, elem_ty) { << false }
+        expected := m.type_size_bytes(elem_ty)
+        if expected <= 0 || expected != elem_bytes {
+            << false
+        }
+        mut child_edge := 0
+        if fixed_len == 0 { child_edge = 1 }
+        << emit_store_index_type_graph_ok(m, elem_ty, depth + 1, path, next_len, child_edge)
+    }
+
+    if types.is_map_type(ty) {
+        mi := ty - 50
+        if mi < 0 || mi >= m.maps.len { << false }
+        kty := m.maps[mi].key_ty
+        vty := m.maps[mi].val_ty
+        kkind := m.maps[mi].kkind
+        vkind := m.maps[mi].vkind
+        vslots := m.maps[mi].vslots
+        if !emit_store_index_type_tag_known(m, kty) || !emit_store_index_type_tag_known(m, vty) { << false }
+        if kkind < 0 || kkind > 1 || vkind < 0 || vkind > 2 { << false }
+        if vslots <= 0 || vslots > 255 { << false }
+        if kkind == 0 && kty != 1 { << false }
+        if kkind == 1 && kty != 3 { << false }
+        if vkind == 1 && (vty != 3 || vslots != 3) { << false }
+        if vkind == 0 {
+            // Reuse the bounded ownership oracle instead of calling the
+            // unconstrained Mir helper on hostile by-value metadata.
+            vstate := emit_store_index_type_state(m, vty, 0)
+            if vty != 1 && vty != 2 && vty != 4 && vty != 8 && vty != 9 && vty != 10 { << false }
+            if vslots != 1 || vstate != 0 { << false }
+        }
+        if vkind == 2 {
+            if vslots != m.type_slots(vty) { << false }
+            // Map values live in separately allocated entries; callbacks use
+            // a helper boundary, so recursive map/array value graphs are
+            // pointer edges just like dynamic slices.
+            if !emit_store_index_type_graph_ok(m, vty, depth + 1, path, next_len, 1) { << false }
+        }
+        << true
+    }
+
+    if types.is_struct_type(ty) {
+        si := types.struct_index(ty)
+        if si < 0 || si >= m.structs.len { << false }
+        nslots := m.structs[si].nslots
+        size_bytes := m.structs[si].size_bytes
+        align_bytes := m.structs[si].align_bytes
+        if !emit_store_index_struct_layout_ok(nslots, size_bytes) { << false }
+        if align_bytes <= 0 || align_bytes > types.mir_max_layout_bytes { << false }
+        for i in 0:m.structs[si].fields.len {
+            fty := m.structs[si].fields[i].ty
+            if !emit_store_index_type_tag_known(m, fty) { << false }
+            fslots := m.type_slots(fty)
+            if fslots < 0 || fslots > types.mir_max_layout_words { << false }
+            fbytes := m.type_size_bytes(fty)
+            off := m.structs[si].fields[i].slot
+            if fbytes < 0 || fbytes > types.mir_max_layout_bytes { << false }
+            // CStruct.field.slot is a byte offset (not a slot index).
+            if off < 0 || off > size_bytes || fbytes > size_bytes - off { << false }
+            child_edge := emit_store_index_type_ptr_edge(m, fty)
+            if !emit_store_index_type_graph_ok(m, fty, depth + 1, path, next_len, child_edge) { << false }
+        }
+        << true
+    }
+
+    if types.is_throw_type(ty) {
+        ri := ty - 300
+        if ri < 0 || ri >= m.throws.len { << false }
+        if m.type_slots(ty) <= 0 || m.type_slots(ty) > types.mir_max_layout_words { << false }
+        ok_ty := m.throws[ri].ok_ty
+        err_ty := m.throws[ri].err_ty
+        if !emit_store_index_type_tag_known(m, ok_ty) || !emit_store_index_type_tag_known(m, err_ty) { << false }
+        ok_edge := emit_store_index_type_ptr_edge(m, ok_ty)
+        err_edge := emit_store_index_type_ptr_edge(m, err_ty)
+        if !emit_store_index_type_graph_ok(m, ok_ty, depth + 1, path, next_len, ok_edge) { << false }
+        if !emit_store_index_type_graph_ok(m, err_ty, depth + 1, path, next_len, err_edge) { << false }
+        << true
+    }
+
+    if types.is_enum_type(ty) {
+        ei := ty - 500
+        if ei < 0 || ei >= m.enums.len { << false }
+        nslots := m.enums[ei].nslots
+        mut max_payload := 0
+        for vi in 0:m.enums[ei].variants.len {
+            vslots := m.enums[ei].variants[vi].field_slots
+            if vslots < 0 || vslots >= types.mir_max_layout_words { << false }
+            if vslots > max_payload { max_payload = vslots }
+            mut calc := 0
+            for fi in 0:m.enums[ei].variants[vi].fields.len {
+                fty := m.enums[ei].variants[vi].fields[fi]
+                if !emit_store_index_type_tag_known(m, fty) { << false }
+                fs := m.type_slots(fty)
+                if fs < 0 || fs > types.mir_max_layout_words || calc > types.mir_max_layout_words - fs { << false }
+                calc += fs
+                child_edge := emit_store_index_type_ptr_edge(m, fty)
+                if !emit_store_index_type_graph_ok(m, fty, depth + 1, path, next_len, child_edge) { << false }
+            }
+            if vslots != calc { << false }
+        }
+        if !emit_store_index_enum_layout_ok(nslots, max_payload) { << false }
+        << true
+    }
+    << false
+}
+
+fn emit_store_index_type_graph_root_ok(m &types.Mir, ty int) bool {
+    mut path := []int{}
+    // The path is fixed-size and reused across recursive calls; this avoids
+    // allocating or mutating a slice length while the hosted compiler walks
+    // user-provided metadata.
+    for _ in 0:emit_store_index_max_depth + 2 { path.push(-1) }
+    << emit_store_index_type_graph_ok(m, ty, 0, mut &path, 0, 0)
+}
+
+fn emit_store_index_unwrap_ref(ty int) int {
+    // Concrete shared/mut refs: 1000+k / 2000+k encode the inner type id.
+    // Nested refs (3000+) need Checker.cnest and are rejected here.
+    if ty >= 2000 && ty < 3000 { << ty - 2000 }
+    if ty >= 1000 && ty < 2000 { << ty - 1000 }
+    << ty
+}
+
+fn emit_store_index_array_id(m &types.Mir, fi int, base int) int {
+    if fi < 0 || fi >= m.fns.len { << -1 }
+    mut aty := -1
+    if base >= 1073741824 {
+        lid := base - 1073741824
+        if lid < 0 || lid >= types.mir_nlocals(m, fi) { << -1 }
+        aty = types.mir_local_ty(m, fi, lid)
+    } else {
+        if base < 0 || base >= types.mir_ntemps(m, fi) { << -1 }
+        aty = types.mir_temp_ty(m, fi, base)
+    }
+    // `&mut []T` / `&[]T` params are the common StoreIndex base. Unwrap the
+    // reference edge so the array id is the element-array, not a rejection.
+    if types.is_ref_type(aty) {
+        aty = emit_store_index_unwrap_ref(aty)
+    }
+    if !types.is_array_type(aty) { << -1 }
+    ai := aty - 200
+    if ai < 0 || ai >= m.arrays.len { << -1 }
+    << ai
+}
+
+// Allocation-free preflight for every StoreIndex in a function.  The caller
+// runs the generic MIR shape/ABI gates first, so linked-list accessors below
+// are bounded; this pass adds the type/layout contract needed by the drop
+// sequence and rejects malformed metadata before Frame.layout or emission.
+fn emit_store_index_shape_ok(m &types.Mir, fi int) bool {
+    if fi < 0 || fi >= m.fns.len { << false }
+    nins := types.mir_nins(m, fi)
+    nblk := types.mir_nblocks(m, fi)
+    if nins < 0 || nins > 1000000 || nblk <= 0 || nblk > 1000000 { << false }
+    for bi in 0:nblk {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:nins + 1 {
+            if ii < 0 { <- }
+            if ii >= nins { << false }
+            if types.mir_ikind(m, fi, ii) == 20 {
+                base := types.mir_ia(m, fi, ii)
+                if emit_store_base_is_string(m, fi, base) {
+                    mut sw := types.mir_id(m, fi, ii)
+                    if sw < 0 {
+                        sw = 0 - sw
+                    }
+                    if sw != 1 { << false }
+                } else {
+                ai := emit_store_index_array_id(m, fi, base)
+                if ai < 0 || ai >= m.arrays.len { << false }
+                fixed_len := m.arrays[ai].fixed_len
+                elem_bytes := m.arrays[ai].elem_bytes
+                elem_ty := m.arrays[ai].elem_ty
+                if fixed_len < 0 || fixed_len > types.mir_max_layout_words { << false }
+                if elem_bytes < 0 || elem_bytes > types.mir_max_layout_bytes { << false }
+                mut width := types.mir_id(m, fi, ii)
+                if width < 0 {
+                    if width < 0 - types.mir_max_layout_bytes { << false }
+                    width = 0 - width
+                }
+                if width <= 0 || width > types.mir_max_layout_bytes { << false }
+                if elem_bytes != width { << false }
+                // Param(k) left by incomplete monomorph: stride must still match.
+                if elem_ty >= 400 && elem_ty < 500 {
+                    if elem_bytes <= 0 { << false }
+                } else {
+                    if m.type_size_bytes(elem_ty) != width { << false }
+                    state := emit_store_index_type_state(m, elem_ty, 0)
+                    if state < 0 { << false }
+                    if !emit_store_index_type_graph_root_ok(m, elem_ty) { << false }
+                }
+                }
+            }
+            nxt := types.mir_inext(m, fi, ii)
+            if nxt < -1 || nxt >= nins { << false }
+            ii = nxt
+        }
+        if ii >= 0 { << false }
+    }
+    << true
+}
+
+// Drop the element currently resident at S1 before a StoreIndex overwrite.
+// `dir` selects the physical layout: fixed arrays are frame-backed and walk
+// down from the element base, while dynamic-array buffers walk up.  Keeping
+// this call type-directed (rather than inferring string from byte width) is
+// essential for 8/16-byte owning values such as Map/Fn/Temp/Any and for
+// tagged Enum/Throw payloads.
+fn emit_store_index_drop_old(a &mut Assembler, m &types.Mir, fi int, base int, dir int) {
+    if emit_store_base_is_string(m, fi, base) {
+        <<
+    }
+    ai := emit_store_index_array_id(m, fi, base)
+    if ai < 0 || ai >= m.arrays.len {
+        eprintln("internal compiler error: StoreIndex base is not a valid array")
+        <<< 1
+    }
+    ety := m.arrays[ai].elem_ty
+    state := emit_store_index_type_state(m, ety, 0)
+    if state < 0 {
+        eprintln("internal compiler error: StoreIndex element type is not droppable")
+        <<< 1
+    }
+    if state > 0 {
+        emit_drop_value(a, m, ety, 0, dir)
+    }
+    <<
+}
+
+// The one-word ARM64/x64 fast path can store directly through the scaled
+// descriptor pointer, but an owning one-word element still needs its old
+// value dropped first.  Route those values through the generic pointer path;
+// scalar stores retain the inexpensive scaled instruction.
+fn emit_store_index_elem_owning(m &types.Mir, fi int, base int) bool {
+    ai := emit_store_index_array_id(m, fi, base)
+    if ai < 0 || ai >= m.arrays.len { << true }
+    state := emit_store_index_type_state(m, m.arrays[ai].elem_ty, 0)
+    if state < 0 { << true }
+    << state > 0
+}
+
+fn emit_index_len_vr() int { << 12 }
+fn emit_index_ptr_vr() int { << 13 }
+fn emit_ip0_phys() int { << 24 }
+
+fn self_loop_lt_const(m &types.Mir, fi int, bi int) int {
+    if types.mir_btkind(m, fi, bi) != 2 { << 0 }
+    if types.mir_btb(m, fi, bi) != bi && types.mir_btc(m, fi, bi) != bi { << 0 }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 4 && types.mir_ib(m, fi, ii) == 8 {
+            d := types.mir_id(m, fi, ii)
+            if d < 0 {
+                ci := -d - 2
+                if ci >= 0 && ci < types.mir_nconsts(m, fi) {
+                    c := types.mir_const_at(m, fi, ci)
+                    if c > 0 { << c }
+                }
+            }
+            c2 := types.mir_ic(m, fi, ii)
+            if c2 < 0 {
+                ci2 := -c2 - 2
+                if ci2 >= 0 && ci2 < types.mir_nconsts(m, fi) {
+                    c := types.mir_const_at(m, fi, ci2)
+                    if c > 0 { << c }
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << 0
+}
+
+// `i < n` in a self-loop: n is a 1-slot local, not a constant and not `.len`.
+fn self_loop_lt_bound_local(m &types.Mir, fi int, bi int, ind int) int {
+    if ind < 0 { << -1 }
+    if types.mir_btkind(m, fi, bi) != 2 { << -1 }
+    if types.mir_btb(m, fi, bi) != bi && types.mir_btc(m, fi, bi) != bi { << -1 }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 4 && types.mir_ib(m, fi, ii) == 8 {
+            l0 := temp_local_before(m, fi, bi, ii, types.mir_ic(m, fi, ii))
+            l1 := temp_local_before(m, fi, bi, ii, types.mir_id(m, fi, ii))
+            if l0 == ind && l1 >= 0 && l1 != ind { << l1 }
+            if l1 == ind && l0 >= 0 && l0 != ind { << l0 }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << -1
+}
+
+// A header guard runs before this block's instructions. A descriptor copied
+// by LoadPtr inside the body has no frame value yet, even if every index use
+// is dominated by that copy. Keep checks at the access unless the descriptor
+// is available at entry and is not overwritten by this block.
+fn index_desc_available_at_header(m &types.Mir, fi int, bi int, desc int) bool {
+    if desc < 0 { << false }
+    mut local := -1
+    if desc >= 1073741824 {
+        local = desc - 1073741824
+        if local >= types.mir_nlocals(m, fi) { << false }
+    } else if desc >= types.mir_ntemps(m, fi) { << false }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if local >= 0 {
+            if types.mir_ikind(m, fi, ii) == 3 && types.mir_ia(m, fi, ii) == local { << false }
+        } else if types.mir_instr_def_m(m, fi, ii) == desc { << false }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if ii >= 0 { << false }
+    if local >= 0 { << true }
+    // A unique external-predecessor chain gives a bounded dominance proof.
+    // Multiple incoming paths need the general must-def analysis instead;
+    // this optional emitter shortcut simply keeps per-access checks there.
+    mut pred := emit_unique_ext_pred(m, fi, bi)
+    for _ in 0:types.mir_nblocks(m, fi) {
+        if pred < 0 || pred == bi { << false }
+        mut pi := types.mir_bhead(m, fi, pred)
+        for _ in 0:types.mir_nins(m, fi) {
+            if pi < 0 { <- }
+            if types.mir_instr_def_m(m, fi, pi) == desc { << true }
+            pi = types.mir_inext(m, fi, pi)
+        }
+        if pi >= 0 { << false }
+        pred = emit_unique_ext_pred(m, fi, pred)
+    }
+    << false
+}
+
+// Before `_ht`: prove arr.len >= L for every array indexed by induction i
+// in this self-loop (`i < L` or `i < n`). Body loads of `a[i]` then skip rt_oob.
+// Vreg homes own V2+; this seed uses V0/V1 only when rc_on is off.
+fn emit_seed_induct_oob(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) {
+    a.rc_ind_nocheck = 0
+    a.rc_ind_desc0 = -1
+    a.rc_ind_desc1 = -1
+    if a.arch != 0 { << }
+    if a.rc_ind_local < 0 { << }
+    lim := self_loop_lt_const(m, fi, bi)
+    mut nloc := -1
+    mut ntmp := -1
+    if lim <= 0 {
+        nloc = self_loop_lt_bound_local(m, fi, bi, a.rc_ind_local)
+    }
+    if lim <= 0 && nloc < 0 {
+        ntmp = vec_find_lt_temp(m, fi, a.rc_cur_bi, a.rc_ind_local)
+        if ntmp < 0 {
+            ntmp = vec_find_lt_temp(m, fi, bi, a.rc_ind_local)
+        }
+    }
+    if lim <= 0 && nloc < 0 && ntmp < 0 { << }
+    if nloc >= 0 {
+        if nloc >= fr.local_slot.len { << }
+        if types.mir_local_nslots(m, fi, nloc) != 1 { << }
+        if !vreg_scalar_type(types.mir_local_ty(m, fi, nloc)) { << }
+    }
+    if ntmp >= 0 {
+        if ntmp >= types.mir_ntemps(m, fi) { << }
+        if !vreg_temp_eligible(m, fi, ntmp) { << }
+    }
+    // Header guards are valid only while the descriptor and bound are
+    // unchanged. Calls, growth, pointer writes, drops and descriptor stores
+    // start a new memory epoch; keep per-access checks in those loops.
+    if ntmp >= 0 { << }
+    mut guard_ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if guard_ii < 0 { <- }
+        k := types.mir_ikind(m, fi, guard_ii)
+        if k == 7 || k == 8 || k == 13 || k == 18 || k == 25 || k == 33 || k == 46 { << }
+        if k == 3 {
+            lid := types.mir_ia(m, fi, guard_ii)
+            if lid == nloc { << }
+            if lid >= 0 && types.mir_local_nslots(m, fi, lid) != 1 { << }
+        }
+        guard_ii = types.mir_inext(m, fi, guard_ii)
+    }
+    mut nchk := 0
+    mut b0 := -1
+    mut b1 := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        mut base := -1
+        mut idx := -1
+        if ik == 14 || ik == 23 {
+            base = types.mir_ib(m, fi, ii)
+            idx = types.mir_ic(m, fi, ii)
+        } else if ik == 20 || ik == 47 {
+            base = types.mir_ia(m, fi, ii)
+            idx = types.mir_ib(m, fi, ii)
+        }
+        if base >= 0 && idx >= 0 {
+            if temp_local_before(m, fi, bi, ii, idx) == a.rc_ind_local {
+                mut desc := base
+                if base < 1073741824 {
+                    loc := temp_local_before(m, fi, bi, ii, base)
+                    if loc >= 0 { desc = 1073741824 + loc }
+                }
+                if !index_desc_available_at_header(m, fi, bi, desc) {
+                    ii = types.mir_inext(m, fi, ii)
+                    ->
+                }
+                if desc != b0 && desc != b1 {
+                    if nchk == 0 { b0 = desc }
+                    if nchk == 1 { b1 = desc }
+                    if nchk < 2 {
+                        mut tfl := emit_base_fixed_len(m, fi, base)
+                        if tfl <= 0 {
+                            tfl = emit_base_fixed_len(m, fi, desc)
+                        }
+                        if tfl > 0 {
+                            if lim > 0 {
+                                if tfl < lim {
+                                    a.oob_need = 1
+                                    a.jmp(a.oob_lbl + "")
+                                }
+                            } else {
+                                if nloc >= 0 {
+                                    a.load(1, 15, slot_off(fr.local_slot[nloc]))
+                                } else {
+                                    emit_load_value(a, m, fi, fr, ntmp, 1)
+                                }
+                                a.vm_mov_imm(0, tfl)
+                                a.cmp(0, 1)
+                                a.oob_need = 1
+                                a.jlt(a.oob_lbl + "")
+                            }
+                        } else {
+                            emit_index_desc_addr(a, m, fi, fr, desc)
+                            mut len_d := emit_index_len_vr()
+                            mut bound_d := 1
+                            if !a.rc_on {
+                                len_d = 1
+                                bound_d = 0
+                            }
+                            a.load(len_d, 0, -8)
+                            if lim > 0 {
+                                a.vm_mov_imm(bound_d, lim)
+                            } else if nloc >= 0 {
+                                a.load(bound_d, 15, slot_off(fr.local_slot[nloc]))
+                            } else {
+                                emit_load_value(a, m, fi, fr, ntmp, bound_d)
+                            }
+                            a.cmp(len_d, bound_d)
+                            a.oob_need = 1
+                            a.jlt(a.oob_lbl + "")
+                        }
+                        nchk += 1
+                    }
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if nchk > 0 {
+        a.rc_ind_nocheck = 1
+        a.rc_ind_desc0 = b0
+        a.rc_ind_desc1 = b1
+    }
+    <<
+}
+
+// Self-loop header: `x & M` is in [0, M]. Prove arr.len > M once, then
+// body LoadIndex/StoreIndex/ElemAddr/IndexRMW of that mask skip rt_oob.
+// Same M for every masked index; at most two arrays. Call / ArrPush /
+// StorePtr / multi-slot StoreLocal refuse (len or descriptor may change).
+fn emit_seed_and_mask_oob(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) {
+    a.rc_and_nocheck = 0
+    a.rc_and_desc0 = -1
+    a.rc_and_desc1 = -1
+    if a.arch != 0 { << }
+    mut mask := -1
+    mut d0 := -1
+    mut d1 := -1
+    mut n := 0
+    mut bad := false
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 7 || ik == 13 || ik == 18 || ik == 46 {
+            bad = true
+            <-
+        }
+        if ik == 3 {
+            loc := types.mir_ia(m, fi, ii)
+            if loc >= 0 && loc < types.mir_nlocals(m, fi) {
+                if types.mir_local_nslots(m, fi, loc) != 1 {
+                    bad = true
+                    <-
+                }
+            }
+        }
+        mut base := -1
+        mut idx := -1
+        if ik == 14 || ik == 23 {
+            base = types.mir_ib(m, fi, ii)
+            idx = types.mir_ic(m, fi, ii)
+        } else if ik == 20 || ik == 47 {
+            base = types.mir_ia(m, fi, ii)
+            idx = types.mir_ib(m, fi, ii)
+        }
+        if base >= 0 && idx >= 0 {
+            msk := temp_and_imm(m, fi, bi, ii, idx)
+            if msk >= 0 {
+                if mask < 0 {
+                    mask = msk
+                } else if msk != mask {
+                    bad = true
+                    <-
+                }
+                mut desc := base
+                if base < 1073741824 {
+                    loc := temp_local_before(m, fi, bi, ii, base)
+                    if loc >= 0 { desc = 1073741824 + loc }
+                }
+                if !index_desc_available_at_header(m, fi, bi, desc) { << }
+                if desc != d0 && desc != d1 {
+                    if n == 0 { d0 = desc }
+                    if n == 1 { d1 = desc }
+                    if n >= 2 {
+                        bad = true
+                        <-
+                    }
+                    n += 1
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if bad || n <= 0 || mask < 0 { << }
+    mut di := 0
+    for _ in 0:n {
+        mut desc := d0
+        if di == 1 { desc = d1 }
+        tfl := emit_base_fixed_len(m, fi, desc)
+        bound := mask + 1
+        if tfl > 0 {
+            if tfl < bound {
+                a.oob_need = 1
+                a.jmp(a.oob_lbl + "")
+            }
+        } else {
+            emit_index_desc_addr(a, m, fi, fr, desc)
+            mut len_d := emit_index_len_vr()
+            mut bound_d := 1
+            if !a.rc_on {
+                len_d = 1
+                bound_d = 0
+            }
+            a.load(len_d, 0, -8)
+            a.vm_mov_imm(bound_d, bound)
+            a.cmp(len_d, bound_d)
+            a.oob_need = 1
+            a.jlt(a.oob_lbl + "")
+        }
+        di += 1
+    }
+    a.rc_and_nocheck = mask + 1
+    a.rc_and_desc0 = d0
+    a.rc_and_desc1 = d1
+    <<
+}
+
+/// Seed V6/V7 with array data ptrs for self-loop CSE. Returns 1 if seeded.
+/// Temp bases (Gen1 copies a local descriptor into the loop) are only
+/// used when the block has IndexRMW — fill-only StoreIndex loops keep
+/// V6/V7 as data bases for scaled stores.
+fn emit_seed_arr_data(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) int {
+    if !a.rc_on { << 0 }
+    if a.arch != 0 { << 0 }
+    mut has_rmw := false
+    mut ri := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ri < 0 { <- }
+        if types.mir_ikind(m, fi, ri) == 47 {
+            has_rmw = true
+            <-
+        }
+        ri = types.mir_inext(m, fi, ri)
+    }
+    mut k0 := -1
+    mut b0 := -1
+    mut k1 := -1
+    mut b1 := -1
+    mut n := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        mut base := -1
+        mut nocheck := false
+        if ik == 14 || ik == 23 {
+            base = types.mir_ib(m, fi, ii)
+            d := types.mir_id(m, fi, ii)
+            if d < 0 { nocheck = true }
+        } else if ik == 20 || ik == 47 {
+            base = types.mir_ia(m, fi, ii)
+            d := types.mir_id(m, fi, ii)
+            if d < 0 { nocheck = true }
+            // Data pointer is loop-invariant even when the index is checked.
+            nocheck = true
+        }
+        if nocheck && base >= 0 {
+            mut desc := base
+            mut key := base
+            if base < 1073741824 {
+                if !has_rmw && a.rc_kernel == 0 {
+                    ii = types.mir_inext(m, fi, ii)
+                    ->
+                }
+                loc := temp_local_before(m, fi, bi, ii, base)
+                if loc < 0 {
+                    ii = types.mir_inext(m, fi, ii)
+                    ->
+                }
+                // 1-slot `&[]T` is a pointer to the live descriptor, not a
+                // frame copy. Treating [fp+slot] as data (V6) SIGSEGV'd
+                // Call-free inlined search_ints. Kernel-ref seed loads
+                // through the pointer; skip this path.
+                if loc < m.fns[fi].locals_nslots.len && types.mir_local_nslots(m, fi, loc) == 1 {
+                    ii = types.mir_inext(m, fi, ii)
+                    ->
+                }
+                desc = 1073741824 + loc
+            }
+            if n == 0 {
+                k0 = key
+                b0 = desc
+                n = 1
+            } else if n == 1 && desc != b0 {
+                k1 = key
+                b1 = desc
+                n = 2
+                <-
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if n == 0 { << 0 }
+    a.rc_arr_t0 = -1
+    a.rc_arr_t1 = -1
+    ptr_vr := emit_index_ptr_vr()
+    emit_index_desc_addr(a, m, fi, fr, b0)
+    a.load(ptr_vr, 0, 0)
+    rc_evict(a, 6)
+    a.mov(6, ptr_vr)
+    a.rc_arr_t0 = k0
+    if n == 2 {
+        emit_index_desc_addr(a, m, fi, fr, b1)
+        a.load(ptr_vr, 0, 0)
+        rc_evict(a, 7)
+        a.mov(7, ptr_vr)
+        a.rc_arr_t1 = k1
+    }
+    << 1
+}
+
+fn pack_madd_pair(a int, b int) int {
+    mut lo := a
+    mut hi := b
+    if a > b {
+        lo = b
+        hi = a
+    }
+    << lo | (hi << 16)
+}
+
+fn madd_hoist_vr(a &Assembler, slot int) int {
+    if a.rc_s_pool {
+        if slot == 0 { << 4 }
+        << 5
+    }
+    if slot == 0 { << 8 }
+    << 9
+}
+
+fn find_induction_local(m &types.Mir, fi int, bi int) int {
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { << -1 }
+        if types.mir_ikind(m, fi, ii) == 3 {
+            loc := types.mir_ia(m, fi, ii)
+            st := types.mir_ib(m, fi, ii)
+            if st >= 0 {
+                mut jj := types.mir_bhead(m, fi, bi)
+                for _ in 0:types.mir_nins(m, fi) {
+                    if jj < 0 || jj == ii { <- }
+                    if types.mir_ikind(m, fi, jj) == 4 && types.mir_ia(m, fi, jj) == st && types.mir_ib(m, fi, jj) == 1 {
+                        lc := types.mir_ic(m, fi, jj)
+                        ld := types.mir_id(m, fi, jj)
+                        mut other := -1
+                        if ld < 0 && rc_const_u32(m, fi, ld) == 1 {
+                            other = lc
+                        } else if lc < 0 && rc_const_u32(m, fi, lc) == 1 {
+                            other = ld
+                        }
+                        if other >= 0 {
+                            mut kk := types.mir_bhead(m, fi, bi)
+                            for _ in 0:types.mir_nins(m, fi) {
+                                if kk < 0 || kk == jj { <- }
+                                if types.mir_ikind(m, fi, kk) == 2 && types.mir_ia(m, fi, kk) == other && types.mir_ib(m, fi, kk) == loc {
+                                    << loc
+                                }
+                                kk = types.mir_inext(m, fi, kk)
+                            }
+                        }
+                        <-
+                    }
+                    jj = types.mir_inext(m, fi, jj)
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << -1
+}
+
+/// True when the mul at `mul_ii` is `loc_a * loc_b` followed by `+ induction`
+/// (the pattern seeded into S0/S1 before `_ht`). Those operand locals should
+/// not occupy pin homes — the seed loads them once.
+fn mul_feeds_ind_add(m &types.Mir, fi int, bi int, mul_ii int, ind int) bool {
+    if ind < 0 || mul_ii < 0 { << false }
+    if types.mir_ikind(m, fi, mul_ii) != 4 || types.mir_ib(m, fi, mul_ii) != 3 {
+        << false
+    }
+    md := types.mir_ia(m, fi, mul_ii)
+    mut mid := skip_copy_instrs(m, fi, types.mir_inext(m, fi, mul_ii))
+    if mid >= 0 && types.mir_ikind(m, fi, mid) == 2 && types.mir_ib(m, fi, mid) == ind {
+        mid = skip_copy_instrs(m, fi, types.mir_inext(m, fi, mid))
+    }
+    if mid < 0 { << false }
+    if types.mir_ikind(m, fi, mid) != 4 || types.mir_ib(m, fi, mid) != 1 {
+        << false
+    }
+    ac := types.mir_ic(m, fi, mid)
+    ad := types.mir_id(m, fi, mid)
+    mut other := -1
+    if ac == md {
+        other = ad
+    } else if ad == md {
+        other = ac
+    } else {
+        << false
+    }
+    << temp_local_before(m, fi, bi, mid, other) == ind
+}
+
+/// Dest of LoadLocal `loc` is only consumed by a hoisted `a*b+j` mul.
+fn temp_only_feeds_hoist_mul(m &types.Mir, fi int, bi int, dest int, start_ii int, ind int) bool {
+    if dest < 0 || start_ii < 0 || ind < 0 { << false }
+    mut cur := start_ii
+    for _ in 0:types.mir_nins(m, fi) {
+        if cur < 0 { << false }
+        ik := types.mir_ikind(m, fi, cur)
+        if ik == 1 {
+            cur = types.mir_inext(m, fi, cur)
+            ->
+        }
+        if ik == 4 && types.mir_ib(m, fi, cur) == 3 {
+            ml := types.mir_ic(m, fi, cur)
+            mr := types.mir_id(m, fi, cur)
+            if ml != dest && mr != dest {
+                if mir_instr_uses_temp(m, fi, cur, dest) { << false }
+                cur = types.mir_inext(m, fi, cur)
+                ->
+            }
+            if !mul_feeds_ind_add(m, fi, bi, cur, ind) { << false }
+            << mir_temp_uses_from(m, fi, dest, types.mir_inext(m, fi, cur)) == 0
+        }
+        if mir_instr_uses_temp(m, fi, cur, dest) { << false }
+        cur = types.mir_inext(m, fi, cur)
+    }
+    << false
+}
+
+fn local_is_hoist_only(m &types.Mir, fi int, bi int, loc int, ind int) bool {
+    if loc < 0 || ind < 0 || loc == ind { << false }
+    mut nload := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 3 && types.mir_ia(m, fi, ii) == loc {
+            << false
+        }
+        if ik == 2 && types.mir_ib(m, fi, ii) == loc {
+            nload += 1
+            dest := types.mir_ia(m, fi, ii)
+            if !temp_only_feeds_hoist_mul(m, fi, bi, dest, types.mir_inext(m, fi, ii), ind) {
+                << false
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << nload > 0
+}
+
+/// Self-loop pin homes: induction first, then locals the hot body actually
+/// reloads (aik), then hoist-only `i*n`/`k*n` operands if slots remain.
+/// Once-assigned small consts (`n := 250`) are cmp_imm / hoist, not pins.
+fn self_loop_write_pins(m &types.Mir, fi int, bi int, pins &mut []int, base int) {
+    if pins.len < base + 4 { << }
+    ind := find_induction_local(m, fi, bi)
+    mut cands := []int{}
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        mut loc := -1
+        if ik == 2 { loc = types.mir_ib(m, fi, ii) }
+        if ik == 3 { loc = types.mir_ia(m, fi, ii) }
+        if loc >= 0 && loc < types.mir_nlocals(m, fi) {
+            if types.mir_local_nslots(m, fi, loc) == 1 && rc_pin_ty_ok(types.mir_local_ty(m, fi, loc)) {
+                if loc != ind && rc_local_slot_const_u32(m, fi, loc) >= 0 {
+                    ->
+                }
+                mut seen := false
+                for p in 0:cands.len {
+                    if cands[p] == loc { seen = true }
+                }
+                if !seen { cands.push(loc) }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    mut n := 0
+    if ind >= 0 {
+        for p in 0:cands.len {
+            if cands[p] == ind && n < 4 {
+                pins[base + n] = ind
+                n += 1
+            }
+        }
+    }
+    for ci in 0:cands.len {
+        loc := cands[ci]
+        if n >= 4 { <- }
+        if loc == ind { -> }
+        if local_is_hoist_only(m, fi, bi, loc, ind) { -> }
+        pins[base + n] = loc
+        n += 1
+    }
+    for ci in 0:cands.len {
+        loc := cands[ci]
+        if n >= 4 { <- }
+        mut seen := false
+        for p in 0:n {
+            if pins[base + p] == loc { seen = true }
+        }
+        if seen { -> }
+        pins[base + n] = loc
+        n += 1
+    }
+    <<
+}
+
+fn skip_copy_instrs(m &types.Mir, fi int, from int) int {
+    mut cur := from
+    for _ in 0:types.mir_nins(m, fi) {
+        if cur < 0 { << cur }
+        if types.mir_ikind(m, fi, cur) == 1 {
+            cur = types.mir_inext(m, fi, cur)
+            ->
+        }
+        << cur
+    }
+    << cur
+}
+
+fn emit_unique_ext_pred(m &types.Mir, fi int, bi int) int {
+    mut pred := -1
+    for pi in 0:types.mir_nblocks(m, fi) {
+        if pi == bi { -> }
+        mut hits := false
+        tk := types.mir_btkind(m, fi, pi)
+        if tk == 1 && types.mir_bta(m, fi, pi) == bi { hits = true }
+        if tk == 2 && (types.mir_btb(m, fi, pi) == bi || types.mir_btc(m, fi, pi) == bi) { hits = true }
+        if hits {
+            if pred >= 0 { << -1 }
+            pred = pi
+        }
+    }
+    << pred
+}
+
+fn temp_local_before(m &types.Mir, fi int, bi int, before int, tid int) int {
+    mut cur := tid
+    pred := emit_unique_ext_pred(m, fi, bi)
+    for _ in 0:8 {
+        mut found_local := -1
+        mut found_copy := -1
+        if pred >= 0 {
+            mut ii := types.mir_bhead(m, fi, pred)
+            for _ in 0:types.mir_nins(m, fi) {
+                if ii < 0 { <- }
+                if types.mir_ikind(m, fi, ii) == 2 && types.mir_ia(m, fi, ii) == cur {
+                    found_local = types.mir_ib(m, fi, ii)
+                    found_copy = -1
+                }
+                if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == cur {
+                    found_copy = types.mir_ib(m, fi, ii)
+                    found_local = -1
+                }
+                ii = types.mir_inext(m, fi, ii)
+            }
+        }
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 || ii == before { <- }
+            if types.mir_ikind(m, fi, ii) == 2 && types.mir_ia(m, fi, ii) == cur {
+                found_local = types.mir_ib(m, fi, ii)
+                found_copy = -1
+            }
+            if types.mir_ikind(m, fi, ii) == 1 && types.mir_ia(m, fi, ii) == cur {
+                found_copy = types.mir_ib(m, fi, ii)
+                found_local = -1
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        if found_local >= 0 { << found_local }
+        if found_copy >= 0 {
+            cur = found_copy
+            ->
+        }
+        << -1
+    }
+    << -1
+}
+
+// `t` and Copy-chain aliases are only the fat pointer of a named fn-value
+// Call that peeps to x±/*k. The peep does not load the pointer. Walk every
+// block: a block-local `inext` walk missed the Call when Addr sat in a
+// predecessor and left `&f` in the fn_val_sum latch. Fail-closed unless a
+// peeped Call 80 actually uses the chain.
+fn temp_chain_has(c0 int, c1 int, c2 int, c3 int, v int) bool {
+    if v < 0 { << false }
+    if v == c0 { << true }
+    if c1 >= 0 && v == c1 { << true }
+    if c2 >= 0 && v == c2 { << true }
+    if c3 >= 0 && v == c3 { << true }
+    << false
+}
+
+fn temp_only_feeds_peeped_fnval(m &types.Mir, fi int, def_ii int, t int) bool {
+    if t < 0 { << false }
+    mut c0 := t
+    mut c1 := -1
+    mut c2 := -1
+    mut c3 := -1
+    nblk := types.mir_nblocks(m, fi)
+    for _ in 0:8 {
+        mut grew := 0
+        for bi in 0:nblk {
+            mut cur := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if cur < 0 { <- }
+                if cur != def_ii && types.mir_ikind(m, fi, cur) == 1 {
+                    src := types.mir_ib(m, fi, cur)
+                    if temp_chain_has(c0, c1, c2, c3, src) {
+                        dst := types.mir_ia(m, fi, cur)
+                        if dst >= 0 && !temp_chain_has(c0, c1, c2, c3, dst) {
+                            if c1 < 0 {
+                                c1 = dst
+                                grew = 1
+                            } else if c2 < 0 {
+                                c2 = dst
+                                grew = 1
+                            } else if c3 < 0 {
+                                c3 = dst
+                                grew = 1
+                            }
+                        }
+                    }
+                }
+                cur = types.mir_inext(m, fi, cur)
+            }
+        }
+        if grew == 0 { <- }
+    }
+    for bi in 0:nblk {
+        mut cur := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if cur < 0 { <- }
+            if cur == def_ii {
+                cur = types.mir_inext(m, fi, cur)
+                ->
+            }
+            ik := types.mir_ikind(m, fi, cur)
+            if ik == 1 {
+                src := types.mir_ib(m, fi, cur)
+                if temp_chain_has(c0, c1, c2, c3, src) {
+                    cur = types.mir_inext(m, fi, cur)
+                    ->
+                }
+            }
+            if ik == 7 && types.mir_ib(m, fi, cur) == 80 {
+                ap := types.mir_ic(m, fi, cur)
+                mut v0 := -1
+                if ap >= 0 {
+                    v0 = types.mir_marg_v(m, fi, ap)
+                }
+                if temp_chain_has(c0, c1, c2, c3, v0) {
+                    if !mir_fnval_call_is_binop_peep(m, fi, cur) {
+                        << false
+                    }
+                    cur = types.mir_inext(m, fi, cur)
+                    ->
+                }
+            }
+            if mir_instr_uses_temp(m, fi, cur, c0) {
+                << false
+            }
+            if c1 >= 0 && mir_instr_uses_temp(m, fi, cur, c1) {
+                << false
+            }
+            if c2 >= 0 && mir_instr_uses_temp(m, fi, cur, c2) {
+                << false
+            }
+            if c3 >= 0 && mir_instr_uses_temp(m, fi, cur, c3) {
+                << false
+            }
+            cur = types.mir_inext(m, fi, cur)
+        }
+        tk := types.mir_btkind(m, fi, bi)
+        ta := types.mir_bta(m, fi, bi)
+        if tk == 2 || tk == 3 {
+            if temp_chain_has(c0, c1, c2, c3, ta) {
+                << false
+            }
+        }
+    }
+    // No non-peep use: dead Addr (fn_val residual `&f`) or peeped Call 80
+    // only. uses_temp must cover FieldRMW/ArrPush or nbody/fannkuch skip.
+    << true
+}
+
+fn addr_only_feeds_peeped_fnval(a &mut Assembler, m &types.Mir, fi int, ii int) bool {
+    // STUBBED for S1 bisect: fail closed, disable optimization.
+    // TODO: restore reaching-def logic after seed segfault isolated.
+    << false
+}
+
+fn copy_only_feeds_peeped_fnval(a &mut Assembler, m &types.Mir, fi int, ii int) bool {
+    // STUBBED for S1 bisect: fail closed, disable optimization.
+    // TODO: restore reaching-def logic after seed segfault isolated.
+    << false
+}
+
+// Source-home forwarding can inspect Copy definitions only in the consumer
+// block. A de-SSA Phi has several edge definitions; dropping those copies
+// loses the loop-carried value even when every read is a bit intrinsic.
+fn copy_unique_def_block(m &types.Mir, fi int, t int, def_ii int) int {
+    if t < 0 || types.mir_nins(m, fi) > 4096 || types.mir_nblocks(m, fi) > 64 { << -1 }
+    mut block := -1
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_instr_def_m(m, fi, ii) == t {
+                if ii != def_ii || block >= 0 { << -1 }
+                block = bi
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << block
+}
+
+// Copy dest is only an argument of a hosted bits peep (clz/ror/rbit/rev/cnt).
+// Every forwarded definition and use must be after the original Copy in its
+// block. Whole-function single-use checks do not prove a reaching definition.
+fn temp_only_feeds_peeped_bits(m &types.Mir, fi int, def_ii int, t int) bool {
+    def_block := copy_unique_def_block(m, fi, t, def_ii)
+    if def_block < 0 { << false }
+    mut c0 := t
+    mut c1 := -1
+    mut c2 := -1
+    mut c3 := -1
+    nblk := types.mir_nblocks(m, fi)
+    for _ in 0:8 {
+        mut grew := 0
+        for bi in 0:nblk {
+            mut cur := types.mir_bhead(m, fi, bi)
+            for _ in 0:types.mir_nins(m, fi) {
+                if cur < 0 { <- }
+                if cur != def_ii && types.mir_ikind(m, fi, cur) == 1 {
+                    src := types.mir_ib(m, fi, cur)
+                    if temp_chain_has(c0, c1, c2, c3, src) {
+                        dst := types.mir_ia(m, fi, cur)
+                        if bi != def_block || copy_unique_def_block(m, fi, dst, cur) != def_block { << false }
+                        if dst >= 0 && !temp_chain_has(c0, c1, c2, c3, dst) {
+                            if c1 < 0 {
+                                c1 = dst
+                                grew = 1
+                            } else if c2 < 0 {
+                                c2 = dst
+                                grew = 1
+                            } else if c3 < 0 {
+                                c3 = dst
+                                grew = 1
+                            }
+                        }
+                    }
+                }
+                cur = types.mir_inext(m, fi, cur)
+            }
+        }
+        if grew == 0 { <- }
+    }
+    mut saw := 0
+    for bi in 0:nblk {
+        mut past_def := false
+        mut cur := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if cur < 0 { <- }
+            if cur == def_ii {
+                past_def = true
+                cur = types.mir_inext(m, fi, cur)
+                ->
+            }
+            ik := types.mir_ikind(m, fi, cur)
+            if ik == 1 {
+                src := types.mir_ib(m, fi, cur)
+                if temp_chain_has(c0, c1, c2, c3, src) {
+                    if bi != def_block || !past_def { << false }
+                    cur = types.mir_inext(m, fi, cur)
+                    ->
+                }
+            }
+            if ik == 7 && bits_call_is_peep_label(m, fi, cur) {
+                mut ai := types.mir_ic(m, fi, cur)
+                mut hit := false
+                while ai >= 0 {
+                    if temp_chain_has(c0, c1, c2, c3, types.mir_marg_v(m, fi, ai)) {
+                        hit = true
+                    }
+                    ai = types.mir_marg_next(m, fi, ai)
+                }
+                if hit {
+                    if bi != def_block || !past_def { << false }
+                    saw += 1
+                    cur = types.mir_inext(m, fi, cur)
+                    ->
+                }
+            }
+            if mir_instr_uses_temp(m, fi, cur, c0) {
+                << false
+            }
+            if c1 >= 0 && mir_instr_uses_temp(m, fi, cur, c1) {
+                << false
+            }
+            if c2 >= 0 && mir_instr_uses_temp(m, fi, cur, c2) {
+                << false
+            }
+            if c3 >= 0 && mir_instr_uses_temp(m, fi, cur, c3) {
+                << false
+            }
+            cur = types.mir_inext(m, fi, cur)
+        }
+        tk := types.mir_btkind(m, fi, bi)
+        ta := types.mir_bta(m, fi, bi)
+        if tk == 2 || tk == 3 {
+            if temp_chain_has(c0, c1, c2, c3, ta) {
+                << false
+            }
+        }
+    }
+    << saw >= 1
+}
+
+fn copy_only_feeds_peeped_bits(m &types.Mir, fi int, fr &Frame, ii int) bool {
+    if types.mir_ikind(m, fi, ii) != 1 { << false }
+    src := types.mir_ib(m, fi, ii)
+    // nrc / frame: the Call src-walk needs a vreg home. Skipping a
+    // frame Copy leaves the arg slot unwritten (math_bits nrc = 5e6*81).
+    if src < 0 || src >= fr.temp_slot.len { << false }
+    if !is_vreg_slot(fr.temp_slot[src]) { << false }
+    << temp_only_feeds_peeped_bits(m, fi, ii, types.mir_ia(m, fi, ii))
+}
+
+// Last def of `tid` before `before` is `x & M` with const M in 0..255.
+// One Copy hop. -1 = not an and-imm index.
+fn temp_and_imm(m &types.Mir, fi int, bi int, before int, tid int) int {
+    if tid < 0 { << -1 }
+    mut cur := tid
+    for _ in 0:4 {
+        mut found_mask := -1
+        mut found_copy := -1
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 || ii == before { <- }
+            ik := types.mir_ikind(m, fi, ii)
+            if types.mir_ia(m, fi, ii) == cur {
+                if ik == 4 && types.mir_ib(m, fi, ii) == 14 {
+                    lc := types.mir_ic(m, fi, ii)
+                    ld := types.mir_id(m, fi, ii)
+                    mut c := -1
+                    if ld < 0 {
+                        c = types.mir_const_at(m, fi, 0 - ld - 2)
+                    } else if lc < 0 {
+                        c = types.mir_const_at(m, fi, 0 - lc - 2)
+                    }
+                    if c >= 0 && c <= 1073741823 {
+                        found_mask = c
+                    } else {
+                        found_mask = -1
+                    }
+                    found_copy = -1
+                } else if ik == 1 {
+                    found_copy = types.mir_ib(m, fi, ii)
+                    found_mask = -1
+                }
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        if found_mask >= 0 { << found_mask }
+        if found_copy >= 0 {
+            cur = found_copy
+            ->
+        }
+        << -1
+    }
+    << -1
+}
+
+fn emit_index_try_nocheck(a &mut Assembler, m &types.Mir, fi int, ii int, base int, idx int) bool {
+    if a.rc_ind_nocheck == 1 {
+        if temp_local_before(m, fi, a.rc_cur_bi, ii, idx) == a.rc_ind_local {
+            // The seed proves arr.len >= L for at most two descriptors
+            // (rc_ind_desc0/1). A third array in the loop gets no proof, so
+            // its accesses must keep the bounds check. Recompute the
+            // descriptor exactly like the seed.
+            mut desc := base
+            if base < 1073741824 {
+                loc := temp_local_before(m, fi, a.rc_cur_bi, ii, base)
+                if loc >= 0 { desc = 1073741824 + loc }
+            }
+            if desc >= 0 && (desc == a.rc_ind_desc0 || desc == a.rc_ind_desc1) {
+                << true
+            }
+        }
+    }
+    if a.rc_and_nocheck > 0 {
+        msk := temp_and_imm(m, fi, a.rc_cur_bi, ii, idx)
+        if msk >= 0 && msk + 1 == a.rc_and_nocheck {
+            // The seed proves arr.len > mask for at most two descriptors
+            // (rc_and_desc0/1). A third array in the loop gets no proof, so
+            // its accesses must keep the bounds check. Recompute the
+            // descriptor exactly like the seed.
+            mut desc := base
+            if base < 1073741824 {
+                loc := temp_local_before(m, fi, a.rc_cur_bi, ii, base)
+                if loc >= 0 { desc = 1073741824 + loc }
+            }
+            if desc >= 0 && (desc == a.rc_and_desc0 || desc == a.rc_and_desc1) {
+                << true
+            }
+        }
+    }
+    if a.ra_level >= 1 && intfield_prior_index_check(m, fi, a.rc_cur_bi, ii, base, idx) { << true }
+    << false
+}
+
+fn block_has_index(m &types.Mir, fi int, bi int) bool {
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { << false }
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 14 || ik == 20 || ik == 23 || ik == 47 {
+            << true
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << false
+}
+
+// a multi-slot LoadPtr of a descriptor can feed an index operation directly:
+// the original pointer already is `&descriptor`, so copying three words to a
+// temporary frame object and immediately reading them back is unnecessary.
+fn loadptr_defining(m &types.Mir, fi int, bi int, dest int) int {
+    if dest < 0 { << -1 }
+    mut ii := types.mir_bhead(m, fi, bi)
+    mut found := -1
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 17 && types.mir_ia(m, fi, ii) == dest {
+            if types.mir_ic(m, fi, ii) == 0 && types.mir_id(m, fi, ii) >= 2 {
+                found = ii
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << found
+}
+
+fn forwarded_index_ptr_temp(m &types.Mir, fi int, bi int, before int, arr_temp int) int {
+    if arr_temp < 0 { << -1 }
+    mut ii := types.mir_bhead(m, fi, bi)
+    mut ptr := -1
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 || ii == before { <- }
+        if types.mir_ikind(m, fi, ii) == 17 && types.mir_ia(m, fi, ii) == arr_temp {
+            if types.mir_ic(m, fi, ii) == 0 && types.mir_id(m, fi, ii) >= 2 {
+                ptr = types.mir_ib(m, fi, ii)
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << ptr
+}
+
+// Sole 1-slot integer `&[]T` (fannkuch flips_of). f64 or a second ref
+// stays out — times/nbody SIGSEGV'd or zeroed spectralnorm.
+fn fn_sole_int_ref_loc(m &types.Mir, fi int) int {
+    // Compiler self-host has thousands of helpers; V6/V7 len CSE there
+    // trapped rt_oob while emitting gen3.
+    if types.mir_nfn_live(m) >= 64 {
+        << -1
+    }
+    mut nref := 0
+    mut rloc := -1
+    for li in 0:types.mir_nlocals(m, fi) {
+        if types.mir_local_ty(m, fi, li) == 4 {
+            << -1
+        }
+        if types.mir_local_nslots(m, fi, li) == 1 {
+            if types.is_ref_type(types.mir_local_ty(m, fi, li)) {
+                nref += 1
+                rloc = li
+            }
+        }
+    }
+    for ti in 0:types.mir_ntemps(m, fi) {
+        if types.mir_temp_ty(m, fi, ti) == 4 {
+            << -1
+        }
+    }
+    if nref != 1 {
+        << -1
+    }
+    << rloc
+}
+
+// `&[]T` index: seed V6/V7 with the descriptor's data pointer so the
+// forwarded load path does not ldur the fat pointer every iteration.
+fn emit_seed_kernel_ref_data(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) int {
+    if !a.rc_on { << 0 }
+    if a.arch != 0 { << 0 }
+    if a.rc_kernel == 0 {
+        rloc := fn_sole_int_ref_loc(m, fi)
+        if rloc < 0 || rloc >= fr.local_slot.len {
+            << 0
+        }
+        // This seed executes before this block's StoreLocal instructions.
+        // Inlining can introduce a reference initialized inside the block;
+        // retain per-access descriptor reads unless it is available at entry.
+        if !vreg_index_base_temp(m, fi, 1073741824 + rloc) || !index_desc_available_at_header(m, fi, bi, 1073741824 + rloc) { << 0 }
+        a.load(0, 15, slot_off(fr.local_slot[rloc]))
+        rc_evict(a, 6)
+        a.load(6, 0, 0)
+        rc_evict(a, 7)
+        a.load(7, 0, -8)
+        a.rc_arr_t0 = 1073741824 + rloc
+        a.rc_arr_t1 = -2
+        << 1
+    }
+    mut k0 := -1
+    mut loc0 := -1
+    mut k1 := -1
+    mut loc1 := -1
+    mut n := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 14 {
+            base := types.mir_ib(m, fi, ii)
+            if base >= 0 && base < 1073741824 {
+                refp := forwarded_index_ptr_temp(m, fi, bi, ii, base)
+                if refp >= 0 {
+                    loc := temp_local_before(m, fi, bi, ii, refp)
+                    if loc >= 0 && loc < m.fns[fi].locals_nslots.len {
+                        if types.mir_local_nslots(m, fi, loc) == 1 {
+                            if n == 0 {
+                                k0 = base
+                                loc0 = loc
+                                n = 1
+                            } else if n == 1 && loc != loc0 {
+                                k1 = base
+                                loc1 = loc
+                                n = 2
+                                <-
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if n == 0 { << 0 }
+    a.load(0, 15, slot_off(fr.local_slot[loc0]))
+    rc_evict(a, 6)
+    a.load(6, 0, 0)
+    a.rc_arr_t0 = k0
+    if n == 2 {
+        a.load(0, 15, slot_off(fr.local_slot[loc1]))
+        rc_evict(a, 7)
+        a.load(7, 0, 0)
+        a.rc_arr_t1 = k1
+    }
+    << 1
+}
+
+// Temps used as object pointers must occupy a frame slot. Skip-store of a
+// `&mut T` LoadLocal, then FieldRMW `rc_clobber`, left Lexer.col's StorePtr
+// reading an empty slot (gen2 parse: str [x9] with x9=-40).
+fn temp_alias_local(m &types.Mir, fi int, t0 int) int {
+    mut t := t0
+    nins := types.mir_nins(m, fi)
+    for _ in 0:8 {
+        if t < 0 { << -1 }
+        mut next := -2
+        mut loc := -1
+        for ii in 0:nins {
+            k := types.mir_ikind(m, fi, ii)
+            if k == 2 && types.mir_ia(m, fi, ii) == t {
+                loc = types.mir_ib(m, fi, ii)
+                next = -1
+            }
+            if k == 1 && types.mir_ia(m, fi, ii) == t {
+                src := types.mir_ib(m, fi, ii)
+                if src >= 0 {
+                    next = src
+                }
+            }
+        }
+        if next == -1 { << loc }
+        if next < 0 { << -1 }
+        t = next
+    }
+    << -1
+}
+
+// LoadLocal/Copy chain of a `&T` temp that still lives in a frame local.
+fn temp_ref_alias_local(m &types.Mir, fi int, fr &Frame, t0 int) int {
+    if t0 < 0 { << -1 }
+    if !types.is_ref_type(types.mir_temp_ty(m, fi, t0)) { << -1 }
+    loc := temp_alias_local(m, fi, t0)
+    if loc >= 0 && loc < fr.local_slot.len && is_frame_slot(fr.local_slot[loc]) {
+        << loc
+    }
+    << -1
+}
+
+fn temp_used_as_mem_ptr(m &types.Mir, fi int, dest int, ii int) bool {
+    if dest < 0 { << false }
+    mut ji := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ji < 0 { <- }
+        k := types.mir_ikind(m, fi, ji)
+        a := types.mir_ia(m, fi, ji)
+        b := types.mir_ib(m, fi, ji)
+        if k == 17 && b == dest { << true }
+        if k == 18 && b == dest { << true }
+        if k == 48 && a == dest { << true }
+        if k == 22 && a == dest { << true }
+        if k == 25 && b == dest { << true }
+        if k == 26 && b == dest { << true }
+        if k == 23 && b == dest { << true }
+        if k == 7 || k == 33 {
+            mut ai := types.mir_ic(m, fi, ji)
+            while ai >= 0 {
+                if types.mir_marg_v(m, fi, ai) == dest { << true }
+                ai = types.mir_marg_next(m, fi, ai)
+            }
+        }
+        ji = types.mir_inext(m, fi, ji)
+    }
+    << false
+}
+
+// LoadLocal of `&[]T` that only feeds a forwarded LoadPtr whose dest is
+// the seeded index base — the data pointer already lives in V6/V7.
+fn loadlocal_only_feeds_fwd_index(a &Assembler, m &types.Mir, fi int, dest int, ii int) bool {
+    if !a.rc_on { << false }
+    if dest < 0 { << false }
+    if a.rc_arr_t0 < 0 && a.rc_arr_t1 < 0 { << false }
+    mut uses := 0
+    mut ok := 0
+    mut ji := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ji < 0 { <- }
+        k := types.mir_ikind(m, fi, ji)
+        if k == 17 && types.mir_ib(m, fi, ji) == dest {
+            if types.mir_ic(m, fi, ji) == 0 && types.mir_id(m, fi, ji) >= 2 {
+                uses += 1
+                lp := types.mir_ia(m, fi, ji)
+                if a.rc_arr_t0 == lp || a.rc_arr_t1 == lp {
+                    ok += 1
+                }
+            } else if mir_instr_uses_temp(m, fi, ji, dest) {
+                uses += 1
+            }
+        } else if mir_instr_uses_temp(m, fi, ji, dest) {
+            uses += 1
+        }
+        ji = types.mir_inext(m, fi, ji)
+    }
+    << uses == 1 && ok == 1
+}
+
+fn loadptr_only_feeds_index(m &types.Mir, fi int, ii int, dest int) bool {
+    mut uses := 0
+    mut index_use := 0
+    mut ji := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ji < 0 { <- }
+        k := types.mir_ikind(m, fi, ji)
+        if k == 14 && types.mir_ib(m, fi, ji) == dest {
+            uses += 1
+            index_use += 1
+        } else if k == 23 && types.mir_ib(m, fi, ji) == dest {
+            // ElemAddr has no forwarded live-pointer path. Skipping
+            // LoadPtr leaves the 3-slot dest unfilled (`a[i].field`).
+            uses += 1
+        } else if (k == 20 || k == 47) && types.mir_ia(m, fi, ji) == dest {
+            // Store must see a materialized 3-slot desc. Skipping LoadPtr
+            // left ptr=0 after field ArrPush and desynced heapify stores.
+            uses += 1
+        } else if mir_instr_uses_temp(m, fi, ji, dest) {
+            uses += 1
+        }
+        ji = types.mir_inext(m, fi, ji)
+    }
+    << uses == 1 && index_use == 1
+}
+
+/// LoadLocal of an array descriptor that only feeds seeded index ops — the
+/// data pointer already lives in V6/V7 (row walk / arr CSE).
+fn loadlocal_only_feeds_seeded_arr(a &Assembler, m &types.Mir, fi int, dest int, ii int) bool {
+    if !a.rc_on { << false }
+    if dest < 0 { << false }
+    if a.rc_arr_t0 != dest && a.rc_arr_t1 != dest { << false }
+    mut uses := 0
+    mut index_use := 0
+    mut ji := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ji < 0 { <- }
+        k := types.mir_ikind(m, fi, ji)
+        if (k == 14 || k == 23) && types.mir_ib(m, fi, ji) == dest {
+            uses += 1
+            index_use += 1
+            es := types.mir_id(m, fi, ji)
+            if es > 0 {
+                << false
+            }
+        } else if (k == 20 || k == 47) && types.mir_ia(m, fi, ji) == dest {
+            uses += 1
+            index_use += 1
+            es := types.mir_id(m, fi, ji)
+            if es > 0 {
+                << false
+            }
+        } else if mir_instr_uses_temp(m, fi, ji, dest) {
+            uses += 1
+        }
+        ji = types.mir_inext(m, fi, ji)
+    }
+    << uses > 0 && uses == index_use
+}
+
+fn emit_madd_load_local(a &mut Assembler, fr &Frame, loc int, scratch int) int {
+    lo := fr.local_slot[loc]
+    h := rc_find(&*a, lo)
+    if h >= 0 {
+        rc_touch(a, h)
+        << h
+    }
+    p := rc_pin_index(&*a, lo)
+    if p >= 0 {
+        << rc_pin_vr(&*a, p)
+    }
+    rc_clobber(a, scratch)
+    a.load(scratch, 15, slot_off(lo))
+    << scratch
+}
+
+/// Seed S0/S1 or V4/V5 with i*n / k*n for self-loop strength reduce. Returns 1 if seeded.
+fn emit_seed_madd_hoists(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) int {
+    if !a.rc_on { << 0 }
+    if a.arch != 0 { << 0 }
+    ind := a.rc_ind_local
+    if ind < 0 { << 0 }
+    if !a.rc_s_pool && !block_has_index(m, fi, bi) { << 0 }
+    mut k0 := -1
+    mut k1 := -1
+    mut la0 := -1
+    mut lb0 := -1
+    mut la1 := -1
+    mut lb1 := -1
+    mut n := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 4 && types.mir_ib(m, fi, ii) == 3 {
+            md := types.mir_ia(m, fi, ii)
+            ml := types.mir_ic(m, fi, ii)
+            mr := types.mir_id(m, fi, ii)
+            mut mid := skip_copy_instrs(m, fi, types.mir_inext(m, fi, ii))
+            if mid >= 0 && types.mir_ikind(m, fi, mid) == 2 && types.mir_ib(m, fi, mid) == ind {
+                mid = skip_copy_instrs(m, fi, types.mir_inext(m, fi, mid))
+            }
+            if mid >= 0 && types.mir_ikind(m, fi, mid) == 4 && types.mir_ib(m, fi, mid) == 1 {
+                ac := types.mir_ic(m, fi, mid)
+                ad := types.mir_id(m, fi, mid)
+                mut other := -1
+                if ac == md {
+                    other = ad
+                } else if ad == md {
+                    other = ac
+                }
+                if other >= 0 && temp_local_before(m, fi, bi, mid, other) == ind {
+                    pla := temp_local_before(m, fi, bi, ii, ml)
+                    plb := temp_local_before(m, fi, bi, ii, mr)
+                    if pla >= 0 && plb >= 0 && pla != ind && plb != ind {
+                            key := pack_madd_pair(pla, plb)
+                            mut dup := false
+                            if n >= 1 && k0 == key { dup = true }
+                            if n >= 2 && k1 == key { dup = true }
+                            if !dup {
+                                if n == 0 {
+                                    k0 = key
+                                    la0 = pla
+                                    lb0 = plb
+                                    n = 1
+                                } else if n == 1 {
+                                    k1 = key
+                                    la1 = pla
+                                    lb1 = plb
+                                    n = 2
+                                    <-
+                                }
+                            }
+                    }
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if n == 0 { << 0 }
+    a.rc_madd_k0 = -1
+    a.rc_madd_k1 = -1
+    home0 := madd_hoist_vr(&*a, 0)
+    rc_evict(a, home0)
+    ra := emit_madd_load_local(a, fr, la0, 0)
+    rb := emit_madd_load_local(a, fr, lb0, rc_scratch_avoid(ra))
+    if home0 != ra && home0 != rb {
+        a.mul(home0, ra, rb)
+    } else {
+        mut tmp := 1
+        if tmp == ra || tmp == rb { tmp = 0 }
+        if tmp == ra || tmp == rb { tmp = 7 }
+        rc_clobber(a, tmp)
+        a.mul(tmp, ra, rb)
+        a.mov(home0, tmp)
+    }
+    a.rc_madd_k0 = k0
+    if n == 2 {
+        home1 := madd_hoist_vr(&*a, 1)
+        rc_evict(a, home1)
+        ra2 := emit_madd_load_local(a, fr, la1, 0)
+        rb2 := emit_madd_load_local(a, fr, lb1, rc_scratch_avoid(ra2))
+        if home1 != ra2 && home1 != rb2 {
+            a.mul(home1, ra2, rb2)
+        } else {
+            mut tmp2 := 1
+            if tmp2 == ra2 || tmp2 == rb2 { tmp2 = 0 }
+            if tmp2 == ra2 || tmp2 == rb2 { tmp2 = 7 }
+            rc_clobber(a, tmp2)
+            a.mul(tmp2, ra2, rb2)
+            a.mov(home1, tmp2)
+        }
+        a.rc_madd_k1 = k1
+    }
+    << 1
+}
+
+fn row_walk_base_after(m &types.Mir, fi int, add_ii int, add_dest int) int {
+    mut jj := types.mir_inext(m, fi, add_ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if jj < 0 { << -1 }
+        ik := types.mir_ikind(m, fi, jj)
+        if (ik == 1 || ik == 2 || ik == 4 || ik == 5) && types.mir_ia(m, fi, jj) == add_dest {
+            << -1
+        }
+        if ik == 14 {
+            es := types.mir_id(m, fi, jj)
+            if es < 0 && 0 - es == 8 && types.mir_ic(m, fi, jj) == add_dest {
+                << types.mir_ib(m, fi, jj)
+            }
+        }
+        if ik == 20 || ik == 47 {
+            es := types.mir_id(m, fi, jj)
+            if es < 0 && 0 - es == 8 && types.mir_ib(m, fi, jj) == add_dest {
+                << types.mir_ia(m, fi, jj)
+            }
+        }
+        jj = types.mir_inext(m, fi, jj)
+    }
+    << -1
+}
+
+/// Rewrite V6/V7 from data ptrs into data+hoist*8. Body uses [ptr]+=8.
+fn emit_seed_row_walks(a &mut Assembler, m &types.Mir, fi int, bi int) int {
+    if !a.rc_on { << 0 }
+    if a.arch != 0 { << 0 }
+    if a.rc_madd_k0 < 0 || a.rc_arr_t0 < 0 { << 0 }
+    mut has_rmw := false
+    mut ri := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ri < 0 { <- }
+        if types.mir_ikind(m, fi, ri) == 47 {
+            has_rmw = true
+            <-
+        }
+        ri = types.mir_inext(m, fi, ri)
+    }
+    if !has_rmw { << 0 }
+    ind := a.rc_ind_local
+    if ind < 0 { << 0 }
+    a.rc_row_k0 = -1
+    a.rc_row_k1 = -1
+    mut n := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if n >= 2 { <- }
+        if types.mir_ikind(m, fi, ii) == 4 && types.mir_ib(m, fi, ii) == 3 {
+            md := types.mir_ia(m, fi, ii)
+            ml := types.mir_ic(m, fi, ii)
+            mr := types.mir_id(m, fi, ii)
+            mut mid := skip_copy_instrs(m, fi, types.mir_inext(m, fi, ii))
+            if mid >= 0 && types.mir_ikind(m, fi, mid) == 2 && types.mir_ib(m, fi, mid) == ind {
+                mid = skip_copy_instrs(m, fi, types.mir_inext(m, fi, mid))
+            }
+            if mid >= 0 && types.mir_ikind(m, fi, mid) == 4 && types.mir_ib(m, fi, mid) == 1 {
+                ac := types.mir_ic(m, fi, mid)
+                ad := types.mir_id(m, fi, mid)
+                mut other := -1
+                if ac == md {
+                    other = ad
+                } else if ad == md {
+                    other = ac
+                }
+                if other >= 0 && temp_local_before(m, fi, bi, mid, other) == ind {
+                    pla := temp_local_before(m, fi, bi, ii, ml)
+                    plb := temp_local_before(m, fi, bi, ii, mr)
+                    if pla < 0 || plb < 0 || pla == ind || plb == ind {
+                        ii = types.mir_inext(m, fi, ii)
+                        ->
+                    }
+                    home := madd_hoist_home(&*a, pla, plb)
+                    base := row_walk_base_after(m, fi, mid, types.mir_ia(m, fi, mid))
+                    if home >= 0 && base >= 0 {
+                        mut data := -1
+                        if a.rc_arr_t0 == base { data = 6 }
+                        if a.rc_arr_t1 == base { data = 7 }
+                        mut dup := false
+                        if data == 6 && a.rc_row_k0 == base { dup = true }
+                        if data == 7 && a.rc_row_k1 == base { dup = true }
+                        if data >= 0 && !dup {
+                            a.shl_imm(0, home, 3)
+                            a.add(data, data, 0)
+                            if data == 6 {
+                                a.rc_row_k0 = base
+                            } else {
+                                a.rc_row_k1 = base
+                            }
+                            n += 1
+                        }
+                    }
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if n > 0 { << 1 }
+    << 0
+}
+
+/// Park the row-walk madd's invariant operand (aik) in S4 before `_ht`
+/// when it did not get a V2–V5 pin.
+fn emit_seed_aik(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) {
+    a.rc_aik_loc = -1
+    if !a.rc_on { << }
+    if a.arch != 0 { << }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == 14 {
+            n1 := types.mir_inext(m, fi, ii)
+            if n1 >= 0 && types.mir_ikind(m, fi, n1) == 4 && types.mir_ib(m, fi, n1) == 3 {
+                load_dest := types.mir_ia(m, fi, ii)
+                ml := types.mir_ic(m, fi, n1)
+                mr := types.mir_id(m, fi, n1)
+                mut aik := -1
+                if ml == load_dest {
+                    aik = mr
+                } else if mr == load_dest {
+                    aik = ml
+                }
+                if aik >= 0 {
+                    n2 := skip_copy_instrs(m, fi, types.mir_inext(m, fi, n1))
+                    if n2 >= 0 && types.mir_ikind(m, fi, n2) == 47 {
+                        if types.mir_icol(m, fi, n2) == 1 && types.mir_ic(m, fi, n2) == types.mir_ia(m, fi, n1) {
+                            if types.mir_id(m, fi, n2) == 0 - 8 {
+                                loc := value_as_local(m, fi, bi, aik)
+                                if loc >= 0 && loc != a.rc_ind_local && loc < fr.local_slot.len {
+                                    lo := fr.local_slot[loc]
+                                    if rc_pin_index(&*a, lo) >= 0 {
+                                        <<
+                                    }
+                                    a.load(12, 15, slot_off(lo))
+                                    a.rc_aik_loc = loc
+                                    <<
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    <<
+}
+
+fn emit_try_row_ptr(a &Assembler, arr_temp int) int {
+    if a.rc_row_k0 == arr_temp { << 6 }
+    if a.rc_row_k1 == arr_temp { << 7 }
+    << -1
+}
+
+fn emit_index_fold_active(a &Assembler, tid int) bool {
+    if a.rc_fold_t0 == tid { << true }
+    if a.rc_fold_t1 == tid { << true }
+    << false
+}
+
+fn emit_index_fold_consume(a &mut Assembler, tid int) {
+    if a.rc_fold_t0 == tid {
+        if a.rc_fold_u0 <= 1 {
+            a.rc_fold_t0 = -1
+        } else {
+            a.rc_fold_u0 = a.rc_fold_u0 - 1
+        }
+        <<
+    }
+    if a.rc_fold_t1 == tid {
+        if a.rc_fold_u1 <= 1 {
+            a.rc_fold_t1 = -1
+        } else {
+            a.rc_fold_u1 = a.rc_fold_u1 - 1
+        }
+    }
+    <<
+}
+
+/// `LoadIndex b` → `Mul(aik, b)` → `IndexRMW c +=` with row walks on both.
+fn emit_try_walk_mul_rmw(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int, load_dest int, ptr_b int) bool {
+    n1 := types.mir_inext(m, fi, ii)
+    if n1 < 0 { << false }
+    n2 := types.mir_inext(m, fi, n1)
+    if n2 < 0 { << false }
+    if types.mir_ikind(m, fi, n1) != 4 || types.mir_ib(m, fi, n1) != 3 { << false }
+    md := types.mir_ia(m, fi, n1)
+    ml := types.mir_ic(m, fi, n1)
+    mr := types.mir_id(m, fi, n1)
+    mut aik := 0
+    mut has_aik := false
+    if ml == load_dest {
+        aik = mr
+        has_aik = true
+    } else if mr == load_dest {
+        aik = ml
+        has_aik = true
+    }
+    if !has_aik { << false }
+    if types.mir_ikind(m, fi, n2) != 47 { << false }
+    if types.mir_icol(m, fi, n2) != 1 { << false }
+    es := types.mir_id(m, fi, n2)
+    if es != 0 - 8 { << false }
+    if types.mir_ic(m, fi, n2) != md { << false }
+    ci := types.mir_ib(m, fi, n2)
+    if ci < 0 || !emit_index_fold_active(&*a, ci) { << false }
+    ptr_c := emit_try_row_ptr(&*a, types.mir_ia(m, fi, n2))
+    if ptr_c < 0 { << false }
+    mut aik_r := 12
+    if aik >= 0 {
+        loc := value_as_local(m, fi, a.rc_cur_bi, aik)
+        if loc >= 0 {
+            if loc == a.rc_aik_loc {
+                aik_r = 12
+            } else {
+                aik_r = emit_madd_load_local(a, fr, loc, 12)
+            }
+        } else {
+            emit_load_value(a, m, fi, fr, aik, 12)
+            aik_r = 12
+        }
+    } else {
+        a.vm_mov_imm(12, types.mir_const_at(m, fi, -aik - 2))
+        aik_r = 12
+    }
+    if aik_r == 0 || aik_r == 1 || aik_r == 6 || aik_r == 7 {
+        a.mov(12, aik_r)
+        aik_r = 12
+    }
+    rc_clobber(a, 0)
+    rc_clobber(a, 1)
+    if aik_r == 12 && a.rc_aik_loc < 0 {
+        rc_clobber(a, 12)
+    }
+    a.load(0, ptr_b, 0)
+    a.vm_add_imm(ptr_b, ptr_b, 8)
+    emit_index_fold_consume(a, types.mir_ic(m, fi, ii))
+    a.load(1, ptr_c, 0)
+    a.madd(1, 0, aik_r, 1)
+    a.store(ptr_c, 0, 1)
+    a.vm_add_imm(ptr_c, ptr_c, 8)
+    emit_index_fold_consume(a, ci)
+    a.rc_fp_skip = n1
+    a.rc_fp_skip2 = n2
+    << true
+}
+
+fn ip0_matches(a &Assembler, m &types.Mir, fi int, arr int) bool {
+    if a.rc_alu_fwd_fn != 2 { << false }
+    if a.rc_aik_loc < 0 { << false }
+    << arr == a.rc_aik_loc
+}
+
+fn ip0_instr_defines(m &types.Mir, fi int, ii int, tid int) bool {
+    ik := types.mir_ikind(m, fi, ii)
+    if ik == 20 || ik == 18 || ik == 25 || ik == 11 || ik == 13 || ik == 3 || ik == 23 || ik == 47 || ik == 48 {
+        << false
+    }
+    << types.mir_ia(m, fi, ii) == tid
+}
+
+fn block_ip0_arr_key(m &types.Mir, fi int, bi int) int {
+    mut key := -1
+    mut n := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 14 {
+            d := types.mir_id(m, fi, ii)
+            dest := types.mir_ia(m, fi, ii)
+            mut es := d
+            if es < 0 {
+                es = 0 - es
+            }
+            if es != 8 { << -1 }
+            if dest < 0 || dest >= types.mir_ntemps(m, fi) { << -1 }
+            if types.mir_temp_ty(m, fi, dest) != 4 { << -1 }
+            base := types.mir_ib(m, fi, ii)
+            if base < 0 { << -1 }
+            if key < 0 {
+                key = base
+            } else if key != base {
+                << -1
+            }
+            n += 1
+        } else if ik == 23 || ik == 47 {
+            << -1
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if n < 1 || key < 0 { << -1 }
+    mut jj := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if jj < 0 { <- }
+        if ip0_instr_defines(m, fi, jj, key) {
+            << -1
+        }
+        jj = types.mir_inext(m, fi, jj)
+    }
+    << key
+}
+
+fn block_ip0_walk_ok(m &types.Mir, fi int, bi int, key int) bool {
+    ind := find_induction_local(m, fi, bi)
+    if ind < 0 { << false }
+    mut nld := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 14 {
+            if types.mir_ib(m, fi, ii) != key { << false }
+            idx := types.mir_ic(m, fi, ii)
+            if idx < 0 { << false }
+            if temp_local_before(m, fi, bi, ii, idx) != ind { << false }
+            nld += 1
+        }
+        if ik == 20 {
+            if types.mir_ia(m, fi, ii) == key { << false }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << nld == 1
+}
+
+/// After vreg turned rc_off: mark index-acc kernels so the inner self-loop
+/// can seed x24. Kept out of emit_function's frame (Assembler is large).
+/// Reuses rc_alu_fwd_fn==2 / rc_aik_loc / rc_push_fuse; those are idle here.
+fn emit_ip0_prepare(a &mut Assembler, m &types.Mir, fi int, fr &Frame) {
+    if a.arch != 0 { << }
+    if !frame_has_vregs(fr) { << }
+    if types.mir_fn_nparams(m, fi) > 6 { << }
+    if !fn_is_f64_index_acc_kernel(m, fi) { << }
+    for t in 0:fr.temp_slot.len {
+        slot := fr.temp_slot[t]
+        if is_vreg_slot(slot) {
+            h := vreg_slot_home(slot)
+            if h == 12 || h == 13 {
+                <<
+            }
+        }
+    }
+    if a.cs_pairs < 3 {
+        a.cs_pairs = 3
+    }
+    a.rc_alu_fwd_fn = 2
+}
+
+fn block_fp_acc_local(m &types.Mir, fi int, bi int) int {
+    mut loc := -1
+    mut nld := 0
+    mut nst := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        ik := types.mir_ikind(m, fi, ii)
+        if ik == 2 {
+            l := types.mir_ib(m, fi, ii)
+            if l >= 0 && l < types.mir_nlocals(m, fi) {
+                if types.mir_local_ty(m, fi, l) == 4 && types.mir_local_nslots(m, fi, l) == 1 {
+                    if loc < 0 {
+                        loc = l
+                    } else if loc != l {
+                        << -1
+                    }
+                    nld += 1
+                }
+            }
+        }
+        if ik == 3 {
+            l := types.mir_ia(m, fi, ii)
+            if l >= 0 && l < types.mir_nlocals(m, fi) {
+                if types.mir_local_ty(m, fi, l) == 4 && types.mir_local_nslots(m, fi, l) == 1 {
+                    if loc < 0 {
+                        loc = l
+                    } else if loc != l {
+                        << -1
+                    }
+                    nst += 1
+                }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if loc < 0 || nld < 1 || nst < 1 { << -1 }
+    << loc
+}
+
+fn ip0_d_used(fr &Frame, d int) bool {
+    for t in 0:fr.temp_slot.len {
+        if is_fp_vreg_slot(fr.temp_slot[t]) {
+            if fp_vreg_slot_d(fr.temp_slot[t]) == d {
+                << true
+            }
+        }
+    }
+    << false
+}
+
+fn ip0_free_acc_d(fr &Frame) int {
+    for d in 2:8 {
+        if !ip0_d_used(fr, d) { << d }
+    }
+    for d in 16:32 {
+        if !ip0_d_used(fr, d) { << d }
+    }
+    << -1
+}
+
+fn emit_seed_ip0_acc(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) {
+    if a.rc_addr_local >= 0 && a.rc_fp_fma_dm >= 2 {
+        <<
+    }
+    loc := block_fp_acc_local(m, fi, bi)
+    if loc < 0 || loc >= fr.local_slot.len { << }
+    if !is_frame_slot(fr.local_slot[loc]) { << }
+    fd := ip0_free_acc_d(fr)
+    if fd < 2 { << }
+    a.be_fload(fd, 15, slot_off(fr.local_slot[loc]))
+    a.rc_addr_local = loc
+    a.rc_fp_fma_dm = fd
+}
+
+/// Seed x24 with the loop-invariant array data pointer. Back-edge `_ht`
+/// keeps x24 live; body uses post-index walk or scaled `[x24, idx]`.
+fn emit_seed_ip0_data(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int) int {
+    if a.arch != 0 { << 0 }
+    loc := block_ip0_arr_key(m, fi, bi)
+    if loc < 0 { << 0 }
+    if loc >= 1073741824 {
+        lid := loc - 1073741824
+        if lid < 0 || lid >= fr.local_slot.len { << 0 }
+        if !is_frame_slot(fr.local_slot[lid]) { << 0 }
+    } else {
+        if loc >= fr.temp_slot.len { << 0 }
+        if !is_frame_slot(fr.temp_slot[loc]) { << 0 }
+    }
+    emit_index_desc_addr(a, m, fi, fr, loc)
+    a.load(12, 0, -8)
+    a.load(0, 0, 0)
+    a.mov_reg(emit_ip0_phys(), map_reg(0))
+    a.rc_aik_loc = loc
+    a.rc_push_fuse = 0
+    // A +1 induction alone proves neither a zero starting offset nor
+    // an in-bounds access. Cache the descriptor data, but retain the
+    // actual index and the access's own bounds proof.
+    if !frame_has_vregs(fr) {
+        emit_seed_ip0_acc(a, m, fi, fr, bi)
+    }
+    << 1
+}
+
+fn emit_try_ip0_load(a &mut Assembler, m &types.Mir, fi int, fr &Frame, dest int, arr int, idx int, nocheck bool, elem_sz int) bool {
+    if a.arch != 0 || elem_sz != 8 { << false }
+    if !ip0_matches(&*a, m, fi, arr) { << false }
+    mut fd := fixed_fp_temp_d(fr, dest)
+    mut frame_st := false
+    if fd < 0 {
+        if dest >= 0 && dest < types.mir_ntemps(m, fi) && types.mir_temp_ty(m, fi, dest) == 4 {
+            fd = 0
+            frame_st = true
+        } else {
+            << false
+        }
+    }
+    emit_index_load_idx(a, m, fi, fr, idx)
+    if !nocheck {
+        a.cmp(1, 12)
+        a.oob_need = 1
+        a.jae(a.oob_lbl + "")
+    }
+    a.ldr_d_reg_lsl(fd, emit_ip0_phys(), map_reg(1))
+    if frame_st {
+        a.rc_fp_ephem = dest
+    }
+    << true
+}
+
+/// Clang-style `[ptr]` + `ptr+=8` for nocheck i64 LoadIndex.
+fn emit_try_row_walk_load(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int, dest int, arr int, idx int, nocheck bool, elem_sz int) bool {
+    if a.arch != 0 || !nocheck || elem_sz != 8 || idx < 0 { << false }
+    if !emit_index_fold_active(&*a, idx) { << false }
+    ptr := emit_try_row_ptr(&*a, arr)
+    if ptr < 0 { << false }
+    if emit_try_walk_mul_rmw(a, m, fi, fr, ii, dest, ptr) {
+        << true
+    }
+    rc_clobber(a, 0)
+    a.load(0, ptr, 0)
+    a.vm_add_imm(ptr, ptr, 8)
+    emit_index_fold_consume(a, idx)
+    emit_store_scalar_temp(a, m, fi, fr, dest, 0)
+    << true
+}
+
+/// Clang-style `[ptr]+=rhs; ptr+=8` for nocheck i64 IndexRMW add.
+fn emit_try_row_walk_rmw(a &mut Assembler, m &types.Mir, fi int, fr &Frame, arr int, idx int, rhs int, op int, nocheck bool, elem_sz int) bool {
+    if a.arch != 0 || !nocheck || elem_sz != 8 || op != 1 || idx < 0 { << false }
+    if !emit_index_fold_active(&*a, idx) { << false }
+    ptr := emit_try_row_ptr(&*a, arr)
+    if ptr < 0 { << false }
+    if rhs >= 0 {
+        emit_load_value(a, m, fi, fr, rhs, 12)
+    } else {
+        a.vm_mov_imm(12, types.mir_const_at(m, fi, -rhs - 2))
+    }
+    rc_clobber(a, 12)
+    rc_clobber(a, 0)
+    a.load(0, ptr, 0)
+    a.add(0, 0, 12)
+    a.store(ptr, 0, 0)
+    a.vm_add_imm(ptr, ptr, 8)
+    emit_index_fold_consume(a, idx)
+    << true
+}
+
+fn madd_hoist_home(a &Assembler, la int, lb int) int {
+    key := pack_madd_pair(la, lb)
+    if a.rc_madd_k0 == key {
+        << madd_hoist_vr(a, 0)
+    }
+    if a.rc_madd_k1 == key {
+        << madd_hoist_vr(a, 1)
+    }
+    << -1
+}
+
+fn install_index_fold(a &mut Assembler, tid int, home int, ind int, uses int) bool {
+    if a.rc_fold_t0 < 0 {
+        a.rc_fold_t0 = tid
+        a.rc_fold_h0 = home
+        a.rc_fold_i0 = ind
+        a.rc_fold_u0 = uses
+        << true
+    }
+    if a.rc_fold_t1 < 0 {
+        a.rc_fold_t1 = tid
+        a.rc_fold_h1 = home
+        a.rc_fold_i1 = ind
+        a.rc_fold_u1 = uses
+        << true
+    }
+    << false
+}
+
+fn emit_index_fold_into(a &mut Assembler, fr &Frame, tid int, dest int) bool {
+    mut home := -1
+    mut ind := -1
+    mut slot := -1
+    if a.rc_fold_t0 == tid {
+        home = a.rc_fold_h0
+        ind = a.rc_fold_i0
+        slot = 0
+    } else if a.rc_fold_t1 == tid {
+        home = a.rc_fold_h1
+        ind = a.rc_fold_i1
+        slot = 1
+    } else {
+        << false
+    }
+    j := emit_madd_load_local(a, fr, ind, rc_scratch_avoid(home))
+    if dest != home && dest != j {
+        a.add(dest, home, j)
+    } else {
+        mut tmp := 1
+        if tmp == home || tmp == j { tmp = 0 }
+        if tmp == home || tmp == j { tmp = 7 }
+        rc_clobber(a, tmp)
+        a.add(tmp, home, j)
+        a.mov(dest, tmp)
+    }
+    if slot == 0 {
+        if a.rc_fold_u0 <= 1 {
+            a.rc_fold_t0 = -1
+        } else {
+            a.rc_fold_u0 = a.rc_fold_u0 - 1
+        }
+    } else {
+        if a.rc_fold_u1 <= 1 {
+            a.rc_fold_t1 = -1
+        } else {
+            a.rc_fold_u1 = a.rc_fold_u1 - 1
+        }
+    }
+    << true
+}
+
+fn value_as_local(m &types.Mir, fi int, bi int, v int) int {
+    << temp_local_before(m, fi, bi, -1, v)
+}
+
+/// LoadLocal of a mul operand whose product is already hoisted — emit nothing.
+fn loadlocal_only_feeds_hoisted_mul(a &Assembler, m &types.Mir, fi int, dest int, loc int, ii int) bool {
+    if !a.rc_on { << false }
+    if a.rc_madd_k0 < 0 && a.rc_madd_k1 < 0 { << false }
+    mut cur := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if cur < 0 { << false }
+        ik := types.mir_ikind(m, fi, cur)
+        if ik == 2 || ik == 1 {
+            if types.mir_ia(m, fi, cur) == dest { << false }
+            cur = types.mir_inext(m, fi, cur)
+            ->
+        }
+        if ik == 4 && types.mir_ib(m, fi, cur) == 3 {
+            ml := types.mir_ic(m, fi, cur)
+            mr := types.mir_id(m, fi, cur)
+            mut other := -1
+            if ml == dest {
+                other = mr
+            } else if mr == dest {
+                other = ml
+            } else if mir_instr_uses_temp(m, fi, cur, dest) {
+                << false
+            } else {
+                cur = types.mir_inext(m, fi, cur)
+                ->
+            }
+            if mir_temp_uses_from(m, fi, dest, types.mir_inext(m, fi, cur)) != 0 {
+                << false
+            }
+            other_l := value_as_local(m, fi, a.rc_cur_bi, other)
+            if other_l < 0 { << false }
+            << madd_hoist_home(a, loc, other_l) >= 0
+        }
+        if mir_instr_uses_temp(m, fi, cur, dest) {
+            << false
+        }
+        cur = types.mir_inext(m, fi, cur)
+    }
+    << false
+}
+
+/// LoadLocal of j that only feeds `hoist+j` used as a row-walked index.
+fn loadlocal_only_feeds_walked_index(a &Assembler, m &types.Mir, fi int, dest int, ii int) bool {
+    if !a.rc_on { << false }
+    if dest < 0 { << false }
+    if a.rc_row_k0 < 0 && a.rc_row_k1 < 0 { << false }
+    mut uses := 0
+    mut add0 := -1
+    mut add1 := -1
+    mut ji := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ji < 0 { <- }
+        ik := types.mir_ikind(m, fi, ji)
+        if ik == 4 && types.mir_ib(m, fi, ji) == 1 {
+            if types.mir_ic(m, fi, ji) == dest || types.mir_id(m, fi, ji) == dest {
+                uses += 1
+                ad := types.mir_ia(m, fi, ji)
+                if add0 < 0 {
+                    add0 = ad
+                } else {
+                    add1 = ad
+                }
+            } else if mir_instr_uses_temp(m, fi, ji, dest) {
+                uses += 1
+            }
+        } else if mir_instr_uses_temp(m, fi, ji, dest) {
+            uses += 1
+        }
+        ji = types.mir_inext(m, fi, ji)
+    }
+    if uses < 1 || uses > 2 || add0 < 0 { << false }
+    if uses == 2 && add1 < 0 { << false }
+    if !add_only_feeds_row_index(a, m, fi, ii, add0) { << false }
+    if add1 >= 0 && !add_only_feeds_row_index(a, m, fi, ii, add1) { << false }
+    << true
+}
+
+fn add_only_feeds_row_index(a &Assembler, m &types.Mir, fi int, ii int, add_dest int) bool {
+    mut au := 0
+    mut row_u := 0
+    mut ji := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ji < 0 { <- }
+        ik := types.mir_ikind(m, fi, ji)
+        if (ik == 14 || ik == 23) && types.mir_ic(m, fi, ji) == add_dest {
+            au += 1
+            b := types.mir_ib(m, fi, ji)
+            if a.rc_row_k0 == b || a.rc_row_k1 == b { row_u += 1 }
+        } else if (ik == 20 || ik == 47) && types.mir_ib(m, fi, ji) == add_dest {
+            au += 1
+            aa := types.mir_ia(m, fi, ji)
+            if a.rc_row_k0 == aa || a.rc_row_k1 == aa { row_u += 1 }
+        } else if mir_instr_uses_temp(m, fi, ji, add_dest) {
+            au += 1
+        }
+        ji = types.mir_inext(m, fi, ji)
+    }
+    << au > 0 && au == row_u
+}
+
+/// LoadLocal of aik that only feeds fused `LoadIndex → Mul → IndexRMW` row walk.
+fn loadlocal_only_feeds_walk_mul(a &Assembler, m &types.Mir, fi int, dest int, ii int) bool {
+    if !a.rc_on { << false }
+    if dest < 0 { << false }
+    if a.rc_row_k0 < 0 && a.rc_row_k1 < 0 { << false }
+    mut uses := 0
+    mut mul_ii := -1
+    mut ji := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ji < 0 { <- }
+        ik := types.mir_ikind(m, fi, ji)
+        if ik == 4 && types.mir_ib(m, fi, ji) == 3 {
+            ml := types.mir_ic(m, fi, ji)
+            mr := types.mir_id(m, fi, ji)
+            if ml == dest || mr == dest {
+                uses += 1
+                mul_ii = ji
+            } else if mir_instr_uses_temp(m, fi, ji, dest) {
+                uses += 1
+            }
+        } else if mir_instr_uses_temp(m, fi, ji, dest) {
+            uses += 1
+        }
+        ji = types.mir_inext(m, fi, ji)
+    }
+    if uses != 1 || mul_ii < 0 { << false }
+    md := types.mir_ia(m, fi, mul_ii)
+    ml := types.mir_ic(m, fi, mul_ii)
+    mr := types.mir_id(m, fi, mul_ii)
+    mut other := ml
+    if ml == dest { other = mr }
+    n2 := skip_copy_instrs(m, fi, types.mir_inext(m, fi, mul_ii))
+    if n2 < 0 { << false }
+    if types.mir_ikind(m, fi, n2) != 47 { << false }
+    if types.mir_icol(m, fi, n2) != 1 { << false }
+    if types.mir_ic(m, fi, n2) != md { << false }
+    es := types.mir_id(m, fi, n2)
+    if es != 0 - 8 { << false }
+    arr := types.mir_ia(m, fi, n2)
+    if a.rc_row_k0 != arr && a.rc_row_k1 != arr { << false }
+    if other < 0 { << false }
+    mut saw := false
+    mut pi := types.mir_inext(m, fi, ii)
+    for _ in 0:types.mir_nins(m, fi) {
+        if pi < 0 { <- }
+        if pi == mul_ii { <- }
+        if types.mir_ikind(m, fi, pi) == 14 && types.mir_ia(m, fi, pi) == other {
+            b := types.mir_ib(m, fi, pi)
+            if a.rc_row_k0 == b || a.rc_row_k1 == b { saw = true }
+        }
+        pi = types.mir_inext(m, fi, pi)
+    }
+    << saw
+}
+
+fn emit_index_scratch_evict(a &mut Assembler) {
+    rc_evict(a, 0)
+    rc_evict(a, 1)
+    <<
+}
+
+fn emit_index_sync_arr(a &mut Assembler, m &types.Mir, fi int, fr &Frame, arr_temp int) {
+    mut base := 0
+    mut ns := 1
+    if arr_temp >= 1073741824 {
+        lid := arr_temp - 1073741824
+        base = fr.local_slot[lid]
+        ns = types.mir_local_nslots(m, fi, lid)
+    } else {
+        base = fr.temp_slot[arr_temp]
+        ns = types.mir_temp_nslots(m, fi, arr_temp)
+    }
+    for i in 0:ns {
+        rc_evict_slot(a, base + i)
+    }
+    <<
+}
+
+fn emit_index_prepare(a &mut Assembler, m &types.Mir, fi int, fr &Frame, arr_temp int) {
+    emit_index_sync_arr(a, m, fi, fr, arr_temp)
+    emit_index_scratch_evict(a)
+    <<
+}
+
+fn emit_index_base_nslots(m &types.Mir, fi int, t int) int {
+    if t < 0 || t >= types.mir_ntemps(m, fi) { << 0 }
+    << types.mir_temp_nslots(m, fi, t)
+}
+
+/// 1-slot base is already a data pointer (`&[N]T` thin-ref LoadPtr desc[0]).
+/// Form ptr = data + idx*scale without touching descriptor words.
+fn emit_index_raw_ptr_addr(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ib int, ic int, elem_sz int, nocheck bool, fixed_len int) bool {
+    if emit_index_base_nslots(m, fi, ib) != 1 {
+        << false
+    }
+    if !nocheck && fixed_len <= 0 {
+        << false
+    }
+    ptr_vr := emit_index_ptr_vr()
+    emit_load_value(a, m, fi, fr, ib, ptr_vr)
+    rc_clobber(a, ptr_vr)
+    emit_index_load_idx(a, m, fi, fr, ic)
+    if !nocheck && fixed_len > 0 {
+        len_vr := emit_index_len_vr()
+        a.vm_mov_imm(len_vr, fixed_len)
+        a.cmp(1, len_vr)
+        a.oob_need = 1
+        a.jae(a.oob_lbl + "")
+    }
+    emit_index_scale(a, elem_sz)
+    << true
+}
+
+fn emit_index_desc_addr(a &mut Assembler, m &types.Mir, fi int, fr &Frame, arr_temp int) {
+    // 1-slot base is a pointer to the live descriptor (field / ArrPush
+    // ic==1). 3-slot base is a frame copy. Always form &ptr-word in V0.
+    mut ns := 3
+    mut slot := 0
+    if arr_temp >= 1073741824 {
+        lid := arr_temp - 1073741824
+        slot = fr.local_slot[lid]
+        ns = types.mir_local_nslots(m, fi, lid)
+    } else {
+        slot = fr.temp_slot[arr_temp]
+        ns = types.mir_temp_nslots(m, fi, arr_temp)
+    }
+    if !is_frame_slot(slot) {
+        eprintln("internal compiler error: index descriptor is not a frame slot")
+        <<< 1
+    }
+    if ns == 1 {
+        a.load(0, 15, slot_off(slot))
+        <<
+    }
+    a.mov(0, 15)
+    a.vm_sub_imm(0, 0, -slot_off(slot))
+    <<
+}
+
+/// Arm64: CSE array data ptr into S5 via sticky V6/V7 (seed installs only).
+/// Row-walked V6/V7 are data+hoist*8, not the original data pointer.
+fn emit_index_load_data(a &mut Assembler, m &types.Mir, fi int, fr &Frame, arr_temp int) {
+    ptr_vr := emit_index_ptr_vr()
+    // Thin-ref 1-slot: the slot already holds the array data pointer.
+    if emit_index_base_nslots(m, fi, arr_temp) == 1 && arr_temp >= 0 && arr_temp < fr.temp_slot.len {
+        emit_load_value(a, m, fi, fr, arr_temp, ptr_vr)
+        <<
+    }
+    if a.arch == 0 && a.rc_on {
+        key := arr_temp
+        if a.rc_arr_t0 == key && a.rc_row_k0 != key {
+            a.mov(ptr_vr, 6)
+            <<
+        }
+        if a.rc_arr_t1 == key && a.rc_row_k1 != key {
+            a.mov(ptr_vr, 7)
+            <<
+        }
+        // Tagged 1<<30+local from sole-int-ref seed. Reverse bodies cannot
+        // name the local (two preds). Re-check this function so a stale
+        // key cannot apply to times/nbody.
+        if a.rc_arr_t0 >= 1073741824 && a.rc_arr_t1 < 0 && a.rc_row_k0 < 0 {
+            sl := fn_sole_int_ref_loc(m, fi)
+            if sl >= 0 {
+                if a.rc_arr_t0 == 1073741824 + sl {
+                    a.mov(ptr_vr, 6)
+                    <<
+                }
+            }
+        }
+    }
+    emit_index_desc_addr(a, m, fi, fr, arr_temp)
+    a.load(ptr_vr, 0, 0)
+    <<
+}
+
+fn rc_sole_ref_cached(a &Assembler, m &types.Mir, fi int) bool {
+    if a.arch != 0 {
+        << false
+    }
+    if a.rc_arr_t0 < 1073741824 {
+        << false
+    }
+    if a.rc_row_k0 >= 0 {
+        << false
+    }
+    sl := fn_sole_int_ref_loc(m, fi)
+    if sl < 0 {
+        << false
+    }
+    << a.rc_arr_t0 == 1073741824 + sl
+}
+
+// Index in V1. Cached sole-ref: len in V7. Else load desc+len.
+fn emit_index_cached_oob(a &mut Assembler, m &types.Mir, fi int, fr &Frame, arr_temp int, nocheck bool) {
+    if nocheck {
+        <<
+    }
+    if rc_sole_ref_cached(&*a, m, fi) {
+        if a.rc_arr_t1 == -2 {
+            a.cmp(1, 7)
+            a.oob_need = 1
+            a.jae(a.oob_lbl + "")
+            <<
+        }
+    }
+    len_vr := emit_index_len_vr()
+    emit_index_desc_addr(a, m, fi, fr, arr_temp)
+    a.load(len_vr, 0, -8)
+    a.cmp(1, len_vr)
+    a.oob_need = 1
+    a.jae(a.oob_lbl + "")
+    <<
+}
+
+fn emit_index_idx_reg(a &mut Assembler, m &types.Mir, fi int, fr &Frame, idx int) int {
+    if idx >= 0 && idx < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[idx]) {
+        << vreg_slot_home(fr.temp_slot[idx])
+    }
+    emit_index_load_idx(a, m, fi, fr, idx)
+    << 1
+}
+
+fn emit_index_load_idx(a &mut Assembler, m &types.Mir, fi int, fr &Frame, idx int) {
+    if idx >= 0 {
+        if emit_index_fold_into(a, fr, idx, 1) {
+            rc_clobber(a, 1)
+            <<
+        }
+        emit_load_value(a, m, fi, fr, idx, 1)
+    } else {
+        a.vm_mov_imm(1, types.mir_const_at(m, fi, -idx - 2))
+    }
+    rc_clobber(a, 1)
+    <<
+}
+
+fn emit_index_take_s1(a &mut Assembler) {
+    if a.rc_on && a.rc_s_pool && a.arch == 0 {
+        if a.rc_pin[1] >= 0 {
+            if a.rc_pin_dirty[1] == 1 {
+                a.store(15, slot_off(a.rc_pin[1]), 9)
+                a.rc_pin_dirty[1] = 0
+            }
+            a.rc_pin[1] = -1
+            a.rc_pin_alias[1] = -1
+        }
+    }
+    <<
+}
+
+fn loadindex_only_feeds_iface(m &types.Mir, fi int, def_ii int, dest int) bool {
+    if dest < 0 { << false }
+    mut saw := 0
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut cur := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if cur < 0 { <- }
+            if cur == def_ii {
+                cur = types.mir_inext(m, fi, cur)
+                ->
+            }
+            if types.mir_ikind(m, fi, cur) == 43 && types.mir_ib(m, fi, cur) == dest {
+                saw += 1
+                cur = types.mir_inext(m, fi, cur)
+                ->
+            }
+            if mir_instr_uses_temp(m, fi, cur, dest) {
+                << false
+            }
+            cur = types.mir_inext(m, fi, cur)
+        }
+    }
+    << saw >= 1
+}
+
+fn emit_index_scale(a &mut Assembler, elem_sz int) {
+    ptr := emit_index_ptr_vr()
+    if a.arch == 0 {
+        if elem_sz == 1 {
+            a.add(ptr, ptr, 1)
+            <<
+        }
+        if elem_sz == 2 {
+            a.add_lsl_vr(ptr, ptr, 1, 1)
+            <<
+        }
+        if elem_sz == 4 {
+            a.add_lsl_vr(ptr, ptr, 1, 2)
+            <<
+        }
+        if elem_sz == 8 {
+            a.add_lsl_vr(ptr, ptr, 1, 3)
+            <<
+        }
+        if elem_sz == 16 {
+            a.add_lsl_vr(ptr, ptr, 1, 4)
+            <<
+        }
+    }
+    a.vm_mov_imm(0, elem_sz)
+    a.mul(1, 1, 0)
+    a.add(ptr, ptr, 1)
+    <<
+}
+
+// Fixed `[N]T` frame layout: words descend from &blob, so elem_i = base - i*sz.
+// cidx >= 0 is a constant index (fold to sub_imm). cidx < 0 uses r1.
+fn emit_index_scale_sub(a &mut Assembler, elem_sz int, cidx int) {
+    emit_index_scale_sub_r(a, elem_sz, cidx, 1)
+    <<
+}
+
+fn emit_index_scale_sub_r(a &mut Assembler, elem_sz int, cidx int, idx_r int) {
+    ptr := emit_index_ptr_vr()
+    if a.arch == 0 && cidx >= 0 {
+        off := cidx * elem_sz
+        if off == 0 {
+            <<
+        }
+        if off > 0 && off <= 4095 {
+            a.vm_sub_imm(ptr, ptr, off)
+            <<
+        }
+    }
+    if a.arch == 0 {
+        if elem_sz == 1 {
+            a.sub(ptr, ptr, idx_r)
+            <<
+        }
+        if elem_sz == 2 {
+            a.sub_lsl_vr(ptr, ptr, idx_r, 1)
+            <<
+        }
+        if elem_sz == 4 {
+            a.sub_lsl_vr(ptr, ptr, idx_r, 2)
+            <<
+        }
+        if elem_sz == 8 {
+            a.sub_lsl_vr(ptr, ptr, idx_r, 3)
+            <<
+        }
+        if elem_sz == 16 {
+            a.sub_lsl_vr(ptr, ptr, idx_r, 4)
+            <<
+        }
+        // General: ptr = ptr - idx * elem_sz
+        a.vm_mov_imm(0, elem_sz)
+        a.be_msub(ptr, idx_r, 0, ptr)
+        <<
+    }
+    a.vm_mov_imm(0, elem_sz)
+    a.mul(idx_r, idx_r, 0)
+    a.sub(ptr, ptr, idx_r)
+    <<
+}
+
+fn emit_index_fixed_prepare(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ptr_temp int) {
+    emit_index_sync_arr(a, m, fi, fr, ptr_temp)
+    emit_index_scratch_evict(a)
+    emit_load_value(a, m, fi, fr, ptr_temp, emit_index_ptr_vr())
+    rc_clobber(a, emit_index_ptr_vr())
+    <<
+}
+
+fn emit_index_fixed_check(a &mut Assembler, fixed_len int, nocheck bool) {
+    emit_index_fixed_check_r(a, fixed_len, nocheck, 1)
+    <<
+}
+
+fn emit_index_fixed_check_r(a &mut Assembler, fixed_len int, nocheck bool, idx_r int) {
+    if nocheck { << }
+    a.vm_mov_imm(emit_index_len_vr(), fixed_len)
+    a.cmp(idx_r, emit_index_len_vr())
+    a.oob_need = 1
+    a.jae(a.oob_lbl + "")
+    <<
+}
+
+fn emit_index_fixed_addr(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ptr_temp int, idx int, elem_sz int, cidx int, fixed_len int, nocheck bool) {
+    emit_index_fixed_prepare(a, m, fi, fr, ptr_temp)
+    idx_r := emit_index_idx_reg(a, m, fi, fr, idx)
+    emit_index_fixed_check_r(a, fixed_len, nocheck, idx_r)
+    emit_index_scale_sub_r(a, elem_sz, cidx, idx_r)
+    <<
+}
+
+// Origin of an ElemAddr array/index: local tag or the temp itself.
+// Follows LoadLocal/Copy (temp_local_before) and Addr-of-local.
+fn emit_elemaddr_origin(m &types.Mir, fi int, bi int, before int, v int) int {
+    if v >= 1073741824 { << v }
+    loc := temp_local_before(m, fi, bi, before, v)
+    if loc >= 0 { << 1073741824 + loc }
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if ii == before { <- }
+        if types.mir_ikind(m, fi, ii) == 16 && types.mir_ia(m, fi, ii) == v {
+            if types.mir_ic(m, fi, ii) == 0 {
+                << 1073741824 + types.mir_ib(m, fi, ii)
+            }
+            if types.mir_ic(m, fi, ii) == 1 {
+                loc2 := temp_local_before(m, fi, bi, ii, types.mir_ib(m, fi, ii))
+                if loc2 >= 0 { << 1073741824 + loc2 }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    mut found_loc := -1
+    mut found_copy := -1
+    nblk := types.mir_nblocks(m, fi)
+    mut b := 0
+    while b < nblk {
+        if b == bi {
+            b += 1
+            ->
+        }
+        mut jj := types.mir_bhead(m, fi, b)
+        for _ in 0:types.mir_nins(m, fi) {
+            if jj < 0 { <- }
+            jk := types.mir_ikind(m, fi, jj)
+            if jk == 2 && types.mir_ia(m, fi, jj) == v {
+                found_loc = types.mir_ib(m, fi, jj)
+                found_copy = -1
+            }
+            if jk == 1 && types.mir_ia(m, fi, jj) == v {
+                found_copy = types.mir_ib(m, fi, jj)
+                found_loc = -1
+            }
+            if jk == 16 && types.mir_ia(m, fi, jj) == v && types.mir_ic(m, fi, jj) == 0 {
+                found_loc = types.mir_ib(m, fi, jj)
+                found_copy = -1
+            }
+            jj = types.mir_inext(m, fi, jj)
+        }
+        b += 1
+    }
+    if found_loc >= 0 {
+        << 1073741824 + found_loc
+    }
+    if found_copy >= 0 {
+        loc3 := temp_local_before(m, fi, bi, before, found_copy)
+        if loc3 >= 0 {
+            << 1073741824 + loc3
+        }
+        << found_copy
+    }
+    << v
+}
+
+fn emit_elemaddr_abs_sz(w int) int {
+    if w < 0 { << 0 - w }
+    << w
+}
+
+// Same-block ElemAddr CSE: `sys[j].x` / `.y` / `.vx` share one `base - j*elem`.
+// Not a function-name kernel. First access keeps its bounds check.
+fn emit_try_reuse_elemaddr(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) bool {
+    bi := a.rc_cur_bi
+    if bi < 0 { << false }
+    arr := types.mir_ib(m, fi, ii)
+    idx := types.mir_ic(m, fi, ii)
+    es := emit_elemaddr_abs_sz(types.mir_id(m, fi, ii))
+    if es <= 0 { << false }
+    arr_k := emit_elemaddr_origin(m, fi, bi, ii, arr)
+    idx_k := emit_elemaddr_origin(m, fi, bi, ii, idx)
+    mut hit_dest := -1
+    mut hit_ii := -1
+    mut jj := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if jj < 0 { <- }
+        if jj == ii { <- }
+        k := types.mir_ikind(m, fi, jj)
+        if k == 3 {
+            loc := types.mir_ia(m, fi, jj)
+            if arr_k >= 1073741824 && loc == arr_k - 1073741824 {
+                hit_dest = -1
+                hit_ii = -1
+            }
+            if idx_k >= 1073741824 && loc == idx_k - 1073741824 {
+                hit_dest = -1
+                hit_ii = -1
+            }
+        }
+        if k == 1 || k == 2 || k == 4 || k == 5 || k == 10 || k == 14 || k == 16 || k == 17 || k == 23 || k == 26 {
+            if hit_dest >= 0 && types.mir_ia(m, fi, jj) == hit_dest && jj != hit_ii {
+                hit_dest = -1
+                hit_ii = -1
+            }
+        }
+        if k == 23 {
+            if emit_elemaddr_abs_sz(types.mir_id(m, fi, jj)) == es {
+                a0 := emit_elemaddr_origin(m, fi, bi, jj, types.mir_ib(m, fi, jj))
+                i0 := emit_elemaddr_origin(m, fi, bi, jj, types.mir_ic(m, fi, jj))
+                if a0 == arr_k && i0 == idx_k {
+                    hit_dest = types.mir_ia(m, fi, jj)
+                    hit_ii = jj
+                }
+            }
+        }
+        jj = types.mir_inext(m, fi, jj)
+    }
+    if hit_dest < 0 { << false }
+    ptr := emit_index_ptr_vr()
+    br := emit_load_value_reg(a, m, fi, fr, hit_dest, ptr)
+    if br != ptr {
+        a.mov(ptr, br)
+    }
+    nd := types.mir_ia(m, fi, ii)
+    if a.arch == 0 {
+        a.rc_elem_vr = ptr
+        if a.rc_fp_inv_idx < 0 {
+            a.rc_fp_inv_idx = a.rc_fp_inv_t
+        }
+        if a.rc_fp_inv_idx < 0 {
+            a.rc_fp_inv_idx = hit_dest
+        }
+        a.rc_fp_inv_t = nd
+    }
+    emit_elemaddr_commit_slot(a, m, fi, fr, nd, ptr)
+    << true
+}
+
+fn emit_instr_index(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    if rc_fp_consume_skip(a, ii) {
+        <<
+    }
+    ik := types.mir_ikind(m, fi, ii)
+    ia := types.mir_ia(m, fi, ii)
+    ib := types.mir_ib(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    id := types.mir_id(m, fi, ii)
+    mut fixed_len := types.mir_icol(m, fi, ii)
+    if ik == 47 {
+        // IndexRMW: col is the binop. line is source-line if stamped and
+        // must not be read as [N]T length (that path clobbers V1 with rhs).
+        fixed_len = 0
+    } else {
+        mut base_v := ib
+        if ik == 20 {
+            base_v = ia
+        }
+        mut tfl := emit_base_fixed_len(m, fi, base_v)
+        if tfl <= 0 && base_v < 1073741824 {
+            loc := temp_local_before(m, fi, a.rc_cur_bi, ii, base_v)
+            if loc >= 0 {
+                tfl = emit_base_fixed_len(m, fi, 1073741824 + loc)
+            }
+        }
+        if tfl > 0 {
+            fixed_len = tfl
+        }
+    }
+    len_vr := emit_index_len_vr()
+    ptr_vr := emit_index_ptr_vr()
+    if ik == 14 {
+        mut elem_sz := id
+        mut nocheck := false
+        if elem_sz < 0 {
+            nocheck = true
+            elem_sz = 0 - elem_sz
+        }
+        if !nocheck && emit_index_try_nocheck(a, m, fi, ii, ib, ic) {
+            nocheck = true
+        }
+        if fixed_len > 0 {
+            emit_index_fixed_addr(a, m, fi, fr, ib, ic, elem_sz, -1, fixed_len, nocheck)
+            if elem_sz == 1 {
+                a.load_byte(0, ptr_vr, 0)
+                emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+            } else if elem_sz == 8 {
+                a.load(0, ptr_vr, 0)
+                emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+            } else {
+                chunks := elem_sz / 8
+                for j in 0:chunks {
+                    a.load(0, ptr_vr, 0 - j * 8)
+                    a.store(15, slot_off(fr.temp_slot[ia]) - j * 8, 0)
+                }
+                rc_forget_slot(a, fr.temp_slot[ia])
+            }
+            <<
+        }
+        if emit_try_ip0_load(a, m, fi, fr, ia, ib, ic, nocheck, elem_sz) {
+            <<
+        }
+        if emit_try_row_walk_load(a, m, fi, fr, ii, ia, ib, ic, nocheck, elem_sz) {
+            <<
+        }
+        mut data_r := ptr_vr
+        ref_ptr := forwarded_index_ptr_temp(m, fi, a.rc_cur_bi, ii, ib)
+        mut load_fwd := false
+        if ref_ptr >= 0 && ((a.rc_on && a.rc_nat_wb) || frame_has_vregs(fr)) {
+            lp := loadptr_defining(m, fi, a.rc_cur_bi, ib)
+            if lp >= 0 && loadptr_only_feeds_index(m, fi, lp, ib) {
+                load_fwd = true
+            }
+        }
+        if emit_index_try_live_field(a, m, fi, fr, ib, ic, nocheck) {
+            data_r = ptr_vr
+        } else if load_fwd {
+            emit_index_scratch_evict(a)
+            emit_index_load_idx(a, m, fi, fr, ic)
+            if a.arch == 0 && a.rc_arr_t0 == ib {
+                data_r = 6
+            } else if a.arch == 0 && a.rc_arr_t1 == ib {
+                data_r = 7
+            } else {
+                emit_load_value(a, m, fi, fr, ref_ptr, 0)
+                rc_clobber(a, 0)
+                if !nocheck {
+                    a.load(len_vr, 0, -8)
+                    a.cmp(1, len_vr)
+                    a.oob_need = 1
+                    a.jae(a.oob_lbl + "")
+                }
+                if a.arch == 0 && a.rc_kernel != 0 {
+                    a.load(6, 0, 0)
+                    data_r = 6
+                } else {
+                    a.load(ptr_vr, 0, 0)
+                }
+            }
+        } else {
+            emit_index_prepare(a, m, fi, fr, ib)
+            emit_index_load_idx(a, m, fi, fr, ic)
+            emit_index_cached_oob(a, m, fi, fr, ib, nocheck)
+            if a.arch == 0 && a.rc_kernel != 0 {
+                emit_index_desc_addr(a, m, fi, fr, ib)
+                a.load(6, 0, 0)
+                data_r = 6
+            } else {
+                emit_index_load_data(a, m, fi, fr, ib)
+            }
+        }
+        if (a.arch == 0 || a.arch == 1) && elem_sz == 8 {
+            if types.mir_temp_ty(m, fi, ia) == 4 {
+                fd := fixed_fp_temp_d(fr, ia)
+                if fd >= 0 {
+                    if a.arch == 0 {
+                        a.be_fload_scaled(fd, data_r, 1)
+                        <<
+                    }
+                    a.load_scaled(0, data_r, 1, 8)
+                    a.be_fmov_d_from_gpr(fd, 0)
+                    <<
+                }
+            }
+            a.load_scaled(0, data_r, 1, 8)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+            <<
+        }
+        if (a.arch == 0 || a.arch == 1) && elem_sz == 1 {
+            a.load_scaled(0, data_r, 1, 1)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+            <<
+        }
+        emit_index_scale(a, elem_sz)
+        if a.arch == 0 && elem_sz == 16 {
+            a.rc_elem_vr = ptr_vr
+            a.rc_fp_inv_t = ia
+            if loadindex_only_feeds_iface(m, fi, ii, ia) {
+                <<
+            }
+        }
+        if elem_sz == 1 {
+            a.load_byte(0, ptr_vr, 0)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if elem_sz == 4 {
+            a.load_byte(1, ptr_vr, 0)
+            a.load_byte(0, ptr_vr, 1)
+            a.shl_imm(0, 0, 8)
+            a.ior(1, 1, 0)
+            a.load_byte(0, ptr_vr, 2)
+            a.shl_imm(0, 0, 16)
+            a.ior(1, 1, 0)
+            a.load_byte(0, ptr_vr, 3)
+            a.shl_imm(0, 0, 24)
+            a.ior(0, 1, 0)
+            emit_wrap_int(a, types.mir_temp_ty(m, fi, ia))
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if elem_sz == 8 {
+            a.load(0, ptr_vr, 0)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else {
+            chunks := elem_sz / 8
+            for j in 0:chunks {
+                a.load(0, ptr_vr, j * 8)
+                a.store(15, slot_off(fr.temp_slot[ia]) - j * 8, 0)
+            }
+            rc_forget_slot(a, fr.temp_slot[ia])
+        }
+        <<
+    }
+    if ik == 20 {
+        mut elem_sz := id
+        mut nocheck := false
+        if elem_sz < 0 {
+            nocheck = true
+            elem_sz = 0 - elem_sz
+        }
+        if !nocheck && emit_index_try_nocheck(a, m, fi, ii, ia, ib) {
+            nocheck = true
+        }
+        if fixed_len > 0 {
+            emit_index_fixed_addr(a, m, fi, fr, ia, ib, elem_sz, -1, fixed_len, nocheck)
+            emit_index_take_s1(a)
+            a.mov(9, ptr_vr)
+            // Fixed-array elements use frame layout (word k at -8*k).
+            // Drop the old owning value before writing the replacement.
+            emit_store_index_drop_old(a, m, fi, ia, -1)
+            chunks := elem_sz / 8
+            if elem_sz == 1 {
+                emit_load_value(a, m, fi, fr, ic, 0)
+                a.store_byte(9, 0, 0)
+            } else if elem_sz == 8 {
+                emit_load_value(a, m, fi, fr, ic, 0)
+                a.store(9, 0, 0)
+            } else {
+                for j in 0:chunks {
+                    if ic >= 0 {
+                        emit_load_value_word(a, m, fi, fr, ic, j, 0)
+                    } else {
+                        emit_load_value(a, m, fi, fr, ic, 0)
+                    }
+                    a.store(9, 0 - j * 8, 0)
+                }
+            }
+            <<
+        }
+        mut data_r := ptr_vr
+        ref_ptr := forwarded_index_ptr_temp(m, fi, a.rc_cur_bi, ii, ia)
+        // Only when LoadPtr of this dest was skipped (index-only use).
+        // init() loads+stores the same desc temp; forwarding stores while
+        // the 3-slot copy is live desyncs heapify.
+        mut fwd := false
+        // Same predicate as the LoadPtr skip. At -O0 the 3-slot copy is
+        // materialized; forwarding anyway made gen1 emit of the compiler
+        // disagree with bootstrap (gen2 SIGSEGV on time).
+        if ref_ptr >= 0 && ((a.rc_on && a.rc_nat_wb) || frame_has_vregs(fr)) {
+            lp := loadptr_defining(m, fi, a.rc_cur_bi, ia)
+            if lp >= 0 && loadptr_only_feeds_index(m, fi, lp, ia) {
+                fwd = true
+            }
+        }
+        if emit_index_try_live_field(a, m, fi, fr, ia, ib, nocheck) {
+            data_r = ptr_vr
+        } else if fwd {
+            // LoadPtr of this desc was skipped (nat_wb). Use the live
+            // object pointer; a 3-slot copy would still hold ptr=0 after
+            // field ArrPush (StrHeap.push).
+            emit_index_scratch_evict(a)
+            emit_index_load_idx(a, m, fi, fr, ib)
+            if a.arch == 0 && a.rc_on && a.rc_arr_t0 == ia {
+                data_r = 6
+            } else if a.arch == 0 && a.rc_on && a.rc_arr_t1 == ia {
+                data_r = 7
+            } else {
+                emit_load_value(a, m, fi, fr, ref_ptr, 0)
+                rc_clobber(a, 0)
+                if !nocheck {
+                    a.load(len_vr, 0, -8)
+                    a.cmp(1, len_vr)
+                    a.oob_need = 1
+                    a.jae(a.oob_lbl + "")
+                }
+                a.load(ptr_vr, 0, 0)
+                data_r = ptr_vr
+            }
+        } else {
+            emit_index_prepare(a, m, fi, fr, ia)
+            emit_index_load_idx(a, m, fi, fr, ib)
+            emit_index_cached_oob(a, m, fi, fr, ia, nocheck)
+            emit_index_load_data(a, m, fi, fr, ia)
+            data_r = ptr_vr
+        }
+        if data_r != ptr_vr {
+            a.mov(ptr_vr, data_r)
+        }
+        if (a.arch == 0 || a.arch == 1) && elem_sz == 8 && !emit_store_index_elem_owning(m, fi, ia) {
+            if ic >= 0 && types.mir_temp_ty(m, fi, ic) == 4 {
+                fd := fixed_fp_temp_d(fr, ic)
+                if fd >= 0 {
+                    if a.arch == 0 {
+                        a.be_fstore_scaled(data_r, 1, fd)
+                        <<
+                    }
+                    a.be_fmov_gpr_from_d(0, fd)
+                    rc_clobber(a, 0)
+                    a.store_scaled(data_r, 1, 0, 8)
+                    <<
+                }
+            }
+            emit_load_value(a, m, fi, fr, ic, 0)
+            rc_clobber(a, 0)
+            a.store_scaled(data_r, 1, 0, 8)
+            <<
+        }
+        if emit_store_base_is_string(m, fi, ia) {
+            // cap <= 0 is a literal or a non-owning descriptor. Refuse
+            // the store instead of writing static bytes.
+            emit_index_desc_addr(a, m, fi, fr, ia)
+            a.load(0, 0, -16)
+            a.vm_cmp_imm(0, 1)
+            a.oob_need = 1
+            a.jlt(a.oob_lbl + "")
+        }
+        emit_index_scale(a, elem_sz)
+        emit_index_take_s1(a)
+        a.mov(9, ptr_vr)
+        // Dynamic-array buffers use ascending layout (word k at +8*k).
+        // Resolve the actual element type so Map/Fn/Temp/Any/Enum/Throw all
+        // receive the same generic drop treatment as fields and locals.
+        emit_store_index_drop_old(a, m, fi, ia, 1)
+        chunks := elem_sz / 8
+        if elem_sz == 1 {
+            emit_load_value(a, m, fi, fr, ic, 0)
+            a.store_byte(9, 0, 0)
+        } else if elem_sz == 4 {
+            emit_load_value(a, m, fi, fr, ic, 0)
+            a.store_byte(9, 0, 0)
+            a.shr_imm(1, 0, 8)
+            a.store_byte(9, 1, 1)
+            a.shr_imm(1, 0, 16)
+            a.store_byte(9, 2, 1)
+            a.shr_imm(1, 0, 24)
+            a.store_byte(9, 3, 1)
+        } else {
+            for j in 0:chunks {
+                if ic >= 0 {
+                    emit_load_value_word(a, m, fi, fr, ic, j, 0)
+                } else {
+                    emit_load_value(a, m, fi, fr, ic, 0)
+                }
+                a.store(9, j * 8, 0)
+            }
+        }
+        <<
+    }
+    if ik == 23 {
+        if emit_elemaddr_forward_enabled(&*a, fr) {
+            fp := elemaddr_forward_ptr(m, fi, a.rc_cur_bi, ib)
+            if fp >= 0 {
+                mut size := id
+                mut nocheck := false
+                if size < 0 { size = 0 - size
+                    nocheck = true }
+                emit_elemaddr_forward(a, m, fi, fr, ii, ia, ic, size, nocheck, fp)
+                <<
+            }
+        }
+        if emit_try_reuse_elemaddr(a, m, fi, fr, ii) {
+            emit_elemaddr_park(a, ia, emit_index_ptr_vr())
+            <<
+        }
+        a.rc_elem_vr = -1
+        mut elem_sz := id
+        mut nocheck := false
+        if elem_sz < 0 {
+            nocheck = true
+            elem_sz = 0 - elem_sz
+        }
+        // Fixed arrays use descending frame layout, including thin refs.
+        // Their length still guards the access; slot count is not a proof.
+        if fixed_len > 0 {
+            mut cidx := -1
+            if ic < 0 {
+                cidx = types.mir_const_at(m, fi, 0 - ic - 2)
+            }
+            emit_index_fixed_addr(a, m, fi, fr, ib, ic, elem_sz, cidx, fixed_len, nocheck)
+            emit_elemaddr_park(a, ia, ptr_vr)
+            emit_elemaddr_commit_slot(a, m, fi, fr, ia, ptr_vr)
+            <<
+        }
+        if emit_index_raw_ptr_addr(a, m, fi, fr, ib, ic, elem_sz, nocheck, fixed_len) {
+            emit_store_scalar_temp(a, m, fi, fr, ia, emit_index_ptr_vr())
+            <<
+        }
+        emit_index_prepare(a, m, fi, fr, ib)
+        emit_index_load_idx(a, m, fi, fr, ic)
+        if !nocheck {
+            emit_index_desc_addr(a, m, fi, fr, ib)
+            a.load(len_vr, 0, -8)
+            a.cmp(1, len_vr)
+            a.oob_need = 1
+            a.jae(a.oob_lbl + "")
+        }
+        emit_index_load_data(a, m, fi, fr, ib)
+        emit_index_scale(a, elem_sz)
+        emit_elemaddr_park(a, ia, ptr_vr)
+        emit_elemaddr_commit_slot(a, m, fi, fr, ia, ptr_vr)
+        <<
+    }
+    if ik == 47 {
+        mut elem_sz := id
+        mut nocheck := false
+        if elem_sz < 0 {
+            nocheck = true
+            elem_sz = 0 - elem_sz
+        }
+        if !nocheck && emit_index_try_nocheck(a, m, fi, ii, ia, ib) {
+            nocheck = true
+        }
+        op := types.mir_icol(m, fi, ii)
+        if emit_try_row_walk_rmw(a, m, fi, fr, ia, ib, ic, op, nocheck, elem_sz) {
+            <<
+        }
+        emit_index_prepare(a, m, fi, fr, ia)
+        emit_index_load_idx(a, m, fi, fr, ib)
+        emit_index_cached_oob(a, m, fi, fr, ia, nocheck)
+        emit_index_load_data(a, m, fi, fr, ia)
+        if (a.arch == 0 || a.arch == 1) && elem_sz == 8 {
+            // Keep the index in V1. rhs goes to S4 (12); do not reload
+            // rhs into V1 (the [N]T path did, and O1 RA then rt_oob'd).
+            idx_r := 1
+            if ic >= 0 {
+                emit_load_value(a, m, fi, fr, ic, len_vr)
+            } else {
+                a.vm_mov_imm(len_vr, types.mir_const_at(m, fi, -ic - 2))
+            }
+            rc_clobber(a, len_vr)
+            a.load_scaled(0, ptr_vr, idx_r, 8)
+            if op == 1 { a.add(0, 0, len_vr) }
+            if op == 2 { a.sub(0, 0, len_vr) }
+            if op == 3 { a.mul(0, 0, len_vr) }
+            if op == 14 { a.iand(0, 0, len_vr) }
+            if op == 15 { a.ior(0, 0, len_vr) }
+            if op == 16 { a.ixor(0, 0, len_vr) }
+            a.store_scaled(ptr_vr, idx_r, 0, 8)
+            <<
+        }
+        emit_index_scale(a, elem_sz)
+        a.load(0, ptr_vr, 0)
+        if ic >= 0 {
+            emit_load_value(a, m, fi, fr, ic, 1)
+        } else {
+            a.vm_mov_imm(1, types.mir_const_at(m, fi, -ic - 2))
+        }
+        rc_clobber(a, 1)
+        if op == 1 { a.add(0, 0, 1) }
+        if op == 2 { a.sub(0, 0, 1) }
+        if op == 3 { a.mul(0, 0, 1) }
+        if op == 14 { a.iand(0, 0, 1) }
+        if op == 15 { a.ior(0, 0, 1) }
+        if op == 16 { a.ixor(0, 0, 1) }
+        a.store(ptr_vr, 0, 0)
+        <<
+    }
+    <<
+}
+
+
+// Mem-path register contract (O1 leaf skip-store safe):
+//   Pointer / scalar RHS → emit_load_value (honours rc_alias / rc_arg).
+//   Scalar dest → emit_store_scalar_temp.
+//   Scratch: V0/V1; i32 byte assemble may borrow V2 after rc_evict.
+// Never raw-load a temp slot: LoadLocal/Bin may leave it park-only.
+
+fn emit_mem_load_ptr(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ptr_temp int) {
+    rc_materialize_temp(a, m, fi, fr, ptr_temp)
+    // Lexer.step `l.col = 1` after `push_tok`: FieldRMW of i/line uses a
+    // LoadLocal copy stored to a temp, but StorePtr's pointer temp is a
+    // different SSA id whose frame slot was never written (gen2 parse
+    // SIGSEGV: str [x9] with x9=-40). The receiver local still holds &l.
+    loc := temp_alias_local(m, fi, ptr_temp)
+    if loc >= 0 && loc < fr.local_slot.len && is_frame_slot(fr.local_slot[loc]) {
+        a.load(1, 15, slot_off(fr.local_slot[loc]))
+        rc_clobber(a, 1)
+        <<
+    }
+    if a.arch == 0 && a.rc_elem_vr >= 0 {
+        if ptr_temp == a.rc_fp_inv_t {
+            a.mov(1, a.rc_elem_vr)
+            rc_clobber(a, 1)
+            <<
+        }
+        if ptr_temp == a.rc_fp_inv_idx {
+            a.mov(1, a.rc_elem_vr)
+            rc_clobber(a, 1)
+            <<
+        }
+        br := emit_load_value_reg(a, m, fi, fr, ptr_temp, 1)
+        if br == a.rc_elem_vr {
+            if br != 1 {
+                a.mov(1, br)
+            }
+            rc_clobber(a, 1)
+            <<
+        }
+        if br != 1 {
+            a.mov(1, br)
+        }
+        rc_clobber(a, 1)
+        <<
+    }
+    emit_load_value(a, m, fi, fr, ptr_temp, 1)
+    rc_clobber(a, 1)
+    <<
+}
+
+fn emit_mem_i32_from_bytes(a &mut Assembler, base_vr int, byte_off int) {
+    rc_evict(a, 2)
+    a.load_byte(0, base_vr, byte_off)
+    a.load_byte(2, base_vr, byte_off + 1)
+    a.shl_imm(2, 2, 8)
+    a.ior(0, 0, 2)
+    a.load_byte(2, base_vr, byte_off + 2)
+    a.shl_imm(2, 2, 16)
+    a.ior(0, 0, 2)
+    a.load_byte(2, base_vr, byte_off + 3)
+    a.shl_imm(2, 2, 24)
+    a.ior(0, 0, 2)
+    <<
+}
+
+fn emit_mem_store_i32_bytes(a &mut Assembler, base_vr int, byte_off int) {
+    // Destructive shifts on V0 — avoid V2 (O1 pin home).
+    a.store_byte(base_vr, byte_off, 0)
+    a.shr_imm(0, 0, 8)
+    a.store_byte(base_vr, byte_off + 1, 0)
+    a.shr_imm(0, 0, 8)
+    a.store_byte(base_vr, byte_off + 2, 0)
+    a.shr_imm(0, 0, 8)
+    a.store_byte(base_vr, byte_off + 3, 0)
+    <<
+}
+
+fn emit_frmw_load_rhs(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ic int, fma_dm int) int {
+    if fma_dm >= 2 { << 1 }
+    if rc_fp_on(&*a) || fixed_fp_temp_d(fr, ic) >= 0 {
+        dm := rc_fp_operand_d(a, m, fi, fr, ic, 1)
+        if dm == 0 {
+            a.be_fmov_dd(1, 0)
+            << 1
+        }
+        << dm
+    }
+    emit_load_value(a, m, fi, fr, ic, 0)
+    a.be_fmov_d_from_gpr(1, 0)
+    << 1
+}
+
+fn emit_elemaddr_park(a &mut Assembler, dest int, ptr int) {
+    a.rc_fp_inv_t = dest
+    a.rc_fp_inv_idx = dest
+    if a.arch == 0 {
+        a.rc_elem_vr = ptr
+    }
+}
+
+// Park plus a real frame write. Leaf/wb skip-store of the dest temp is
+// what turned the next LoadPtr into `ldr x24, [fp, #empty]`.
+fn emit_elemaddr_commit_slot(a &mut Assembler, m &types.Mir, fi int, fr &Frame, dest int, ptr int) {
+    emit_store_scalar_temp(a, m, fi, fr, dest, ptr)
+    <<
+}
+
+// Fill sys[i].vx/vy/vz into d28–d30 and keep &sys[i] in x23 (S4).
+// Emitted in the i-header LoadPtr of .x, so it re-runs each i.
+// Later LoadPtr of sys[j].x (ptr==inv_t) fills d25–d27 for j-body skip_ld.
+fn emit_frmw_fill_vel(a &mut Assembler, br int, ptr_temp int) {
+    // Disabled: this path keeps i's vx/vy/vz in d28–d30 and writebacks
+    // through x23, assuming ElemAddr dests are park-only. Committing
+    // those dests to the frame (needed so O0 LoadPtr is not `ldur [x24]`
+    // with x24=0) desyncs the SIMD copies; N=1 after-energy became
+    // -0.16960 instead of -0.16907. Memory FieldRMW is the source of
+    // truth again.
+    <<
+    if a.rc_fp_inv_ld == 0 {
+        // This sequence lives in the i-header .x load and runs each i.
+        // Write back the previous i's vx/vy/vz; x23 is 0 on the first i.
+        a.vm_cbz(12, a.oob_lbl + "_iwb")
+        a.be_fstore(12, 0 - 24, rc_fp_d(18))
+        a.be_fstore(12, 0 - 32, rc_fp_d(19))
+        a.be_fstore(12, 0 - 40, rc_fp_d(20))
+        a.label(a.oob_lbl + "_iwb")
+        mut wo := 24
+        while wo <= 40 {
+            a.be_fload(rc_fp_d(15 + wo / 8), br, 0 - wo)
+            wo += 8
+        }
+        a.mov(12, br)
+        <<
+    }
+    if ptr_temp != a.rc_fp_inv_t {
+        <<
+    }
+    mut wj := 24
+    while wj <= 40 {
+        a.be_fload(rc_fp_d(12 + wj / 8), br, 0 - wj)
+        wj += 8
+    }
+}
+
+fn emit_frmw_maybe_store(a &mut Assembler, br int, mem_off int, acc int, ia int, off int) {
+    a.be_fstore(br, mem_off, acc)
+}
+
+fn emit_frmw_acc_d(a &Assembler, ia int, off int) int {
+    if ia == a.rc_fp_inv_t {
+        << rc_fp_d(12 + off / 8)
+    }
+    << rc_fp_d(15 + off / 8)
+}
+
+fn emit_frmw_br(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ia int, off int) int {
+    if a.arch == 0 && a.rc_elem_vr >= 0 && ia == a.rc_fp_inv_t {
+        << a.rc_elem_vr
+    }
+    // Same predicate as skip_ld (nbody i-body vx/vy/vz). pair vx is off==16
+    // so it stays on the stack path. inv_ld means fill+x23 was emitted.
+    if a.arch == 0 && off > 16 && a.rc_fp_inv_t >= 0 && ia != a.rc_fp_inv_t && a.rc_fp_inv_ld == 1 {
+        << 12
+    }
+    << emit_load_value_reg(a, m, fi, fr, ia, 1)
+}
+
+fn emit_instr_mem(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
+    if rc_fp_consume_skip(a, ii) {
+        <<
+    }
+    ik := types.mir_ikind(m, fi, ii)
+    ia := types.mir_ia(m, fi, ii)
+    ib := types.mir_ib(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    id := types.mir_id(m, fi, ii)
+    if ik == 48 { // FieldRMW: [ptr+off] = [ptr+off] op rhs
+        op := types.mir_icol(m, fi, ii)
+        off := types.mir_iline(m, fi, ii)
+        buf := ib == 1
+        fty := id
+        // Fail-soft: skip FieldRMW when operands are outside the frame layout
+        // (fold/CSE can leave stale high temp ids). Avoid compiler index-OOB.
+        if ia >= 0 && ia >= types.mir_ntemps(m, fi) {
+            <<
+        }
+        if ic >= 0 && ic >= types.mir_ntemps(m, fi) {
+            <<
+        }
+        if ia >= 0 && ia < fr.temp_slot.len && fr.temp_slot[ia] < 0 && !is_vreg_slot(fr.temp_slot[ia]) && !is_fp_vreg_slot(fr.temp_slot[ia]) {
+            // unused_slot / synth: no real pointer home
+            <<
+        }
+        if fty == 4 && (a.arch == 0 || a.arch == 1) {
+            // f64 RMW must use FP ops even when regcache is off (rc_fp_on
+            // false): falling through to int add corrupts the bits.
+            mut dm := 1
+            mut fma_dm := -1
+            if a.rc_fp_fma_dm >= 2 {
+                fma_dm = a.rc_fp_fma_dm
+                a.rc_fp_fma_dm = -1
+            }
+            if ic >= 0 {
+                dm = emit_frmw_load_rhs(a, m, fi, fr, ic, fma_dm)
+            } else {
+                a.vm_mov_imm64(0, types.mir_const_at(m, fi, -ic - 2))
+                a.be_fmov_d_from_gpr(1, 0)
+            }
+            // Parked pointer home + offset. nbody FieldRMW is buf=true
+            // (non-negative body-field offsets) — must take the FMA path too.
+            mut used_home := false
+            if off >= 0 && off <= 255 && off % 8 == 0 {
+                br := emit_load_value_reg(a, m, fi, fr, ia, 1)
+                if buf {
+                    a.be_fload(0, br, off)
+                } else {
+                    a.be_fload(0, br, 0 - off)
+                }
+                if fma_dm >= 2 && dm == 1 {
+                    if op == 1 { a.be_fmadd_dddd(0, 1, fma_dm, 0) }
+                    if op == 2 { a.be_fmsub_dddd(0, 1, fma_dm, 0) }
+                    if op == 3 { a.be_fmul_dd(0, 0, dm) }
+                } else if fma_dm >= 2 && dm >= 2 && dm != fma_dm {
+                    if op == 1 { a.be_fmadd_dddd(0, dm, fma_dm, 0) }
+                    if op == 2 { a.be_fmsub_dddd(0, dm, fma_dm, 0) }
+                    if op == 3 { a.be_fmul_dd(0, 0, dm) }
+                } else {
+                    if op == 1 { a.be_fadd_dd(0, 0, dm) }
+                    if op == 2 { a.be_fsub_dd(0, 0, dm) }
+                    if op == 3 { a.be_fmul_dd(0, 0, dm) }
+                }
+                if buf {
+                    a.be_fstore(br, off, 0)
+                } else {
+                    a.be_fstore(br, 0 - off, 0)
+                }
+                used_home = true
+            }
+            if !used_home {
+                emit_mem_load_ptr(a, m, fi, fr, ia)
+                mut imm := off
+                if !buf {
+                    w := off / 8
+                    imm = off % 8
+                    if w > 0 { a.vm_sub_imm(1, 1, w * 8) }
+                }
+                a.be_fload(0, 1, imm)
+                if fma_dm >= 2 && dm == 1 {
+                    if op == 1 { a.be_fmadd_dddd(0, 1, fma_dm, 0) }
+                    if op == 2 { a.be_fmsub_dddd(0, 1, fma_dm, 0) }
+                    if op == 3 { a.be_fmul_dd(0, 0, dm) }
+                } else {
+                    if op == 1 { a.be_fadd_dd(0, 0, dm) }
+                    if op == 2 { a.be_fsub_dd(0, 0, dm) }
+                    if op == 3 { a.be_fmul_dd(0, 0, dm) }
+                }
+                a.be_fstore(1, imm, 0)
+            }
+            <<
+        }
+        emit_mem_load_ptr(a, m, fi, fr, ia)
+        mut imm2 := off
+        if !buf {
+            w2 := off / 8
+            imm2 = off % 8
+            if w2 > 0 { a.vm_sub_imm(1, 1, w2 * 8) }
+        }
+        // int scalar RMW
+        a.load(0, 1, imm2)
+        if ic >= 0 {
+            emit_load_value(a, m, fi, fr, ic, 2)
+        } else {
+            a.vm_mov_imm(2, types.mir_const_at(m, fi, -ic - 2))
+        }
+        rc_clobber(a, 2)
+        if op == 1 { a.add(0, 0, 2) }
+        if op == 2 { a.sub(0, 0, 2) }
+        if op == 3 { a.mul(0, 0, 2) }
+        if op == 14 { a.iand(0, 0, 2) }
+        if op == 15 { a.ior(0, 0, 2) }
+        if op == 16 { a.ixor(0, 0, 2) }
+        a.store(1, imm2, 0)
+        <<
+    }
+    if ik == 10 { // LoadField: dest <- src[byte_off] (C packed)
+        if ia < 0 || ia >= types.mir_ntemps(m, fi) || ib < 0 || ib >= types.mir_ntemps(m, fi) {
+            eprintln("internal compiler error: malformed LoadField operands")
+            <<< 1
+        }
+        if ia >= fr.temp_slot.len || ib >= fr.temp_slot.len {
+            eprintln("internal compiler error: missing LoadField frame slots")
+            <<< 1
+        }
+        ty := types.mir_temp_ty(m, fi, ia)
+        // Struct words live in frame slots; sync before FP-relative reads.
+        rc_materialize_temp(a, m, fi, fr, ib)
+        bo := frame_byte_off(fr.temp_slot[ib], ic)
+        if ty == 10 {
+            rc_evict(a, 0)
+            a.load_byte(0, 15, bo)
+            emit_wrap_int(a, 10)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if ty == 8 || ty == 9 {
+            emit_mem_i32_from_bytes(a, 15, bo)
+            emit_wrap_int(a, ty)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if ty == 4 && id == 1 {
+            fd := fixed_fp_temp_d(fr, ia)
+            if fd >= 0 {
+                a.be_fload(fd, 15, bo)
+            } else {
+                a.be_fload(0, 15, bo)
+                if !emit_f64_from_home_to_temp(a, fr, ia, 0) {
+                    a.be_fmov_gpr_from_d(0, 0)
+                    emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+                }
+            }
+        } else if id == 1 {
+            a.load(0, 15, bo)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else {
+            for i in 0:id {
+                a.load(0, 15, frame_byte_off(fr.temp_slot[ib], ic + i * 8))
+                a.store(15, slot_off(fr.temp_slot[ia]) - i * 8, 0)
+            }
+            rc_forget_slot(a, fr.temp_slot[ia])
+        }
+        <<
+    }
+    if ik == 11 { // StoreField
+        mut ty := 1
+        if ia >= 0 { ty = types.mir_temp_ty(m, fi, ia) }
+        rc_materialize_temp(a, m, fi, fr, ib)
+        bo := frame_byte_off(fr.temp_slot[ib], ic)
+        if ty == 10 {
+            emit_load_value(a, m, fi, fr, ia, 0)
+            a.store_byte(15, bo, 0)
+        } else if ty == 8 || ty == 9 {
+            emit_load_value(a, m, fi, fr, ia, 0)
+            emit_mem_store_i32_bytes(a, 15, bo)
+        } else {
+            for i in 0:id {
+                if ia >= 0 {
+                    emit_load_value_word(a, m, fi, fr, ia, i, 0)
+                } else {
+                    emit_load_value(a, m, fi, fr, ia, 0)
+                }
+                a.store(15, frame_byte_off(fr.temp_slot[ib], ic + i * 8), 0)
+            }
+        }
+        <<
+    }
+    if ik == 16 { // Addr of local/temp frame slots
+        if a.rc_push_loc >= 0 && ic == 0 && ib == a.rc_push_loc {
+            <<
+        }
+        // Named fn-value Call peeps to x±k without reading the fat pointer.
+        if addr_only_feeds_peeped_fnval(a, m, fi, ii) {
+            <<
+        }
+        // Skip-store temps must hit the stack before &slot is taken.
+        if ic == 0 {
+            rc_evict_slot(a, fr.local_slot[ib])
+        } else {
+            rc_materialize_temp(a, m, fi, fr, ib)
+            rc_evict_slot(a, fr.temp_slot[ib])
+        }
+        rc_evict(a, 0)
+        a.mov(0, 15)
+        if ic == 0 {
+            a.vm_sub_imm(0, 0, -slot_off(fr.local_slot[ib]))
+        } else {
+            a.vm_sub_imm(0, 0, -slot_off(fr.temp_slot[ib]))
+        }
+        emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        <<
+    }
+    if ik == 17 { // LoadPtr: dest <- [ptr + packed byte offset]
+        ty := types.mir_temp_ty(m, fi, ia)
+        if emit_elemaddr_forward_enabled(&*a, fr) && elemaddr_forward_ptr(m, fi, a.rc_cur_bi, ia) >= 0 { << }
+        if intfield_forward_enabled(m, fi, fr) && intfield_elided_descriptor_field(m, fi, ia) >= 0 { << }
+        if id >= 2 && ic == 0 && ((a.rc_on && a.rc_nat_wb) || frame_has_vregs(fr)) && loadptr_only_feeds_index(m, fi, ii, ia) {
+            // The consuming index is emitted from the original pointer.
+            <<
+        }
+        // f64 + parked ptr: ldur [Xn, #-off] (nbody sys[i].y / .mass).
+        // Drop rc_fp_on: nbody advance colors i/j in vregs and clears rc_on.
+        // Parked f64 LoadPtr must still ldur [x24, #-off] without mov x9,x24.
+        if ty == 4 && id == 1 && ic >= 0 && ic <= 255 && ic % 8 == 0 && a.arch == 0 && a.rc_elem_vr >= 0 {
+            mut br := emit_load_value_reg(a, m, fi, fr, ib, 1)
+            if a.arch == 0 && a.rc_elem_vr >= 0 && ib == a.rc_fp_inv_t {
+                br = a.rc_elem_vr
+            }
+            p := rc_fp_dest_or_scratch(&*a, fr, ia)
+            if p >= 0 {
+                if a.rc_fp_alias[p] >= 0 {
+                    rc_fp_flush_scratch(a, p)
+                }
+                a.be_fload(rc_fp_d(p), br, 0 - ic)
+                // First parked f64 LoadPtr at offset 0 in this function is
+                // nbody `sys[i].x` in the i-header (emitted before the j-body).
+                // Fill d28–d30 once; the j back-edge skips this block.
+                if a.arch == 0 && ic == 0 {
+                    emit_frmw_fill_vel(a, br, ib)
+                }
+                ni := types.mir_inext(m, fi, ii)
+                if f64_can_skip_materialize(m, fi, ia, ni) {
+                    a.rc_fp_dirty[p] = 1
+                    a.rc_fp_alias2[p] = -1
+                    a.rc_fp_alias[p] = fr.temp_slot[ia]
+                    <<
+                }
+                a.be_fmov_gpr_from_d(0, rc_fp_d(p))
+                emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+                a.rc_fp_dirty[p] = 1
+                a.rc_fp_alias2[p] = -1
+                a.rc_fp_alias[p] = fr.temp_slot[ia]
+                <<
+            }
+        }
+        emit_mem_load_ptr(a, m, fi, fr, ib)
+        w := ic / 8
+        r := ic % 8
+        // f64 LoadPtr: signed [Xn,#-off] (FieldRMW already does this).
+        // Do not add a new if-block here: p47d drops them in this function.
+        if w > 0 {
+            if ty != 4 {
+                a.vm_sub_imm(1, 1, w * 8)
+            }
+        }
+        if ty == 10 {
+            a.load_byte(0, 1, r)
+            emit_wrap_int(a, 10)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if ty == 8 || ty == 9 {
+            emit_mem_i32_from_bytes(a, 1, r)
+            emit_wrap_int(a, ty)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if id == 1 {
+            if ty == 4 {
+                fd := fixed_fp_temp_d(fr, ia)
+                if fd >= 0 {
+                    a.be_fload(fd, 1, 0 - ic)
+                    if a.arch == 0 && ic == 0 && r == 0 {
+                        emit_frmw_fill_vel(a, 1, ib)
+                    }
+                    <<
+                }
+            }
+            // f64: load into a SIMD home. Skip stack materialize when the sole
+            // next use is an FP binop / StorePtr (nbody field RMW).
+            if ty == 4 && rc_fp_on(&*a) {
+                p := rc_fp_pick_scratch(&*a)
+                if p >= 0 {
+                    if a.rc_fp_alias[p] >= 0 {
+                        rc_fp_flush_scratch(a, p)
+                    }
+                    mut br := 1
+                    if a.arch == 0 && a.rc_elem_vr >= 0 {
+                        br = a.rc_elem_vr
+                    }
+                    a.be_fload(rc_fp_d(p), br, 0 - ic)
+                    if a.arch == 0 && ic == 0 && r == 0 {
+                        emit_frmw_fill_vel(a, br, ib)
+                    }
+                    ni := types.mir_inext(m, fi, ii)
+                    if f64_can_skip_materialize(m, fi, ia, ni) {
+                        a.rc_fp_dirty[p] = 1
+                        a.rc_fp_alias2[p] = -1
+                        a.rc_fp_alias[p] = fr.temp_slot[ia]
+                        <<
+                    }
+                    a.be_fmov_gpr_from_d(0, rc_fp_d(p))
+                    emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+                    a.rc_fp_dirty[p] = 1
+                    a.rc_fp_alias2[p] = -1
+                    a.rc_fp_alias[p] = fr.temp_slot[ia]
+                    <<
+                }
+            }
+            mut loff := r
+            if ty == 4 {
+                loff = 0 - ic
+            }
+            a.load(0, 1, loff)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else {
+            for i in 0:id {
+                a.load(0, 1, r - i * 8)
+                a.store(15, slot_off(fr.temp_slot[ia]) - i * 8, 0)
+            }
+            rc_forget_slot(a, fr.temp_slot[ia])
+        }
+        <<
+    }
+    if ik == 18 { // StorePtr
+        mut ty := 1
+        if ia >= 0 { ty = types.mir_temp_ty(m, fi, ia) }
+        emit_mem_load_ptr(a, m, fi, fr, ib)
+        w := ic / 8
+        r := ic % 8
+        if w > 0 { a.vm_sub_imm(1, 1, w * 8) }
+        if ty == 10 {
+            emit_load_value(a, m, fi, fr, ia, 0)
+            a.store_byte(1, r, 0)
+        } else if ty == 8 || ty == 9 {
+            emit_load_value(a, m, fi, fr, ia, 0)
+            emit_mem_store_i32_bytes(a, 1, r)
+        } else if id == 1 {
+            if ty == 4 && ia >= 0 {
+                fd := fixed_fp_temp_d(fr, ia)
+                if fd >= 0 {
+                    a.be_fstore(1, r, fd)
+                    <<
+                }
+                if rc_fp_on(&*a) {
+                    fp := rc_fp_index_alias(&*a, fr.temp_slot[ia])
+                    if fp >= 0 {
+                        a.be_fstore(1, r, rc_fp_d(fp))
+                        <<
+                    }
+                }
+            }
+            emit_load_value(a, m, fi, fr, ia, 0)
+            a.store(1, r, 0)
+        } else {
+            for i in 0:id {
+                if ia >= 0 {
+                    emit_load_value_word(a, m, fi, fr, ia, i, 0)
+                } else {
+                    emit_load_value(a, m, fi, fr, ia, 0)
+                }
+                a.store(1, r - i * 8, 0)
+            }
+        }
+        <<
+    }
+    if ik == 25 { // StoreBufPtr: buffer + byte offset
+        mut ty := 1
+        if ia >= 0 { ty = types.mir_temp_ty(m, fi, ia) }
+        emit_mem_load_ptr(a, m, fi, fr, ib)
+        if ty == 10 {
+            emit_load_value(a, m, fi, fr, ia, 0)
+            a.store_byte(1, ic, 0)
+        } else if ty == 8 || ty == 9 {
+            emit_load_value(a, m, fi, fr, ia, 0)
+            emit_mem_store_i32_bytes(a, 1, ic)
+        } else if id == 1 {
+            if ty == 4 && ia >= 0 {
+                fd := fixed_fp_temp_d(fr, ia)
+                if fd >= 0 {
+                    a.be_fstore(1, ic, fd)
+                    <<
+                }
+                if rc_fp_on(&*a) {
+                    fp := rc_fp_index_alias(&*a, fr.temp_slot[ia])
+                    if fp >= 0 {
+                        a.be_fstore(1, ic, rc_fp_d(fp))
+                        <<
+                    }
+                }
+            }
+            emit_load_value(a, m, fi, fr, ia, 0)
+            a.store(1, ic, 0)
+        } else {
+            for i in 0:id {
+                if ia >= 0 {
+                    emit_load_value_word(a, m, fi, fr, ia, i, 0)
+                } else {
+                    emit_load_value(a, m, fi, fr, ia, 0)
+                }
+                a.store(1, ic + i * 8, 0)
+            }
+        }
+        <<
+    }
+    if ik == 26 { // LoadBufPtr
+        ty := types.mir_temp_ty(m, fi, ia)
+        emit_mem_load_ptr(a, m, fi, fr, ib)
+        if ty == 10 {
+            a.load_byte(0, 1, ic)
+            emit_wrap_int(a, 10)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if ty == 8 || ty == 9 {
+            emit_mem_i32_from_bytes(a, 1, ic)
+            emit_wrap_int(a, ty)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+        } else if id == 1 {
+            if ty == 4 {
+                fd := fixed_fp_temp_d(fr, ia)
+                if fd >= 0 {
+                    a.be_fload(fd, 1, ic)
+                    <<
+                }
+            }
+            if ty == 4 && rc_fp_on(&*a) {
+                p := rc_fp_pick_scratch(&*a)
+                if p >= 0 {
+                    // Must clear/flush before overwrite — stale alias reads wrong bits.
+                    if a.rc_fp_alias[p] >= 0 {
+                        rc_fp_flush_scratch(a, p)
+                    }
+                    a.be_fload(rc_fp_d(p), 1, ic)
+                    ni := types.mir_inext(m, fi, ii)
+                    if f64_can_skip_materialize(m, fi, ia, ni) {
+                        a.rc_fp_dirty[p] = 1
+                        a.rc_fp_alias2[p] = -1
+                        a.rc_fp_alias[p] = fr.temp_slot[ia]
+                        <<
+                    }
+                    a.be_fmov_gpr_from_d(0, rc_fp_d(p))
+                    emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+                    a.rc_fp_dirty[p] = 1
+                    a.rc_fp_alias2[p] = -1
+                    a.rc_fp_alias[p] = fr.temp_slot[ia]
+                    <<
+                }
+            }
+            a.load(0, 1, ic)
+            emit_store_scalar_temp(a, m, fi, fr, ia, 0)
+            if ty == 4 && rc_fp_on(&*a) {
+                p2 := rc_fp_pick_scratch(&*a)
+                if p2 >= 0 {
+                    if a.rc_fp_alias[p2] >= 0 {
+                        rc_fp_flush_scratch(a, p2)
+                    }
+                    a.be_fmov_d_from_gpr(rc_fp_d(p2), 0)
+                    a.rc_fp_dirty[p2] = 1
+                    a.rc_fp_alias2[p2] = -1
+                    a.rc_fp_alias[p2] = fr.temp_slot[ia]
+                }
+            }
+        } else {
+            for i in 0:id {
+                a.load(0, 1, ic + i * 8)
+                a.store(15, slot_off(fr.temp_slot[ia]) - i * 8, 0)
+            }
+            rc_forget_slot(a, fr.temp_slot[ia])
+        }
+        <<
+    }
+    <<
+}
+
+// The omitted producer and every consumer use the same whole-body and
+// unique-definition/use proof. The receiver Local remains a real frame slot.
+fn emit_index_try_live_field(a &mut Assembler, m &types.Mir, fi int, fr &Frame, base int, idx int, nocheck bool) bool {
+    if !intfield_forward_enabled(m, fi, fr) { << false }
+    field := intfield_elided_descriptor_field(m, fi, base)
+    if field < 0 { << false }
+    emit_index_scratch_evict(a)
+    emit_index_load_idx(a, m, fi, fr, idx)
+    a.load(0, 15, slot_off(fr.local_slot[0]))
+    rc_clobber(a, 0)
+    if !nocheck {
+        len_vr := emit_index_len_vr()
+        a.load(len_vr, 0, 0 - field - 8)
+        a.cmp(1, len_vr)
+        a.oob_need = 1
+        a.jae(a.oob_lbl + "")
+    }
+    a.load(emit_index_ptr_vr(), 0, 0 - field)
+    << true
+}
+
+// A reference-array descriptor snapshot can feed a single same-block
+// ElemAddr directly. Keep frame slots and all other consumers unchanged.
+fn elemaddr_forward_ptr(m &types.Mir, fi int, bi int, desc int) int {
+    if fi < 0 || fi >= m.fns.len || bi < 0 || bi >= types.mir_nblocks(m, fi) { << -1 }
+    ni := types.mir_nins(m, fi)
+    nt := types.mir_ntemps(m, fi)
+    if ni > 1024 || nt > 512 || types.mir_nblocks(m, fi) > 128 || m.fns[fi].margs.len > 64 { << -1 }
+    if desc < 0 || desc >= nt || types.mir_temp_nslots(m, fi, desc) != 3 { << -1 }
+    ty := types.mir_temp_ty(m, fi, desc)
+    if !types.is_array_type(ty) { << -1 }
+    ai := ty - 200
+    if ai < 0 || ai >= m.arrays.len || m.arrays[ai].fixed_len != 0 { << -1 }
+    mut def := -1
+    mut consumer := -1
+    mut ptr := -1
+    mut ptrdef := -1
+    mut ndef := 0
+    mut nuse := 0
+    for b in 0:types.mir_nblocks(m, fi) {
+        if types.mir_btkind(m, fi, b) == 2 && types.mir_bta(m, fi, b) == desc { << -1 }
+        if types.mir_btkind(m, fi, b) == 3 && types.mir_bta(m, fi, b) == desc { << -1 }
+        mut ii := types.mir_bhead(m, fi, b)
+        for _ in 0:ni {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            // The backend use query models this closed set, including all
+            // memory consumers. Wider argument packing/unknown kinds stay
+            // materialized until their complete use contracts are shared.
+            if k < 0 || k > 5 && k != 7 && k != 10 && k != 11 && k != 13 && k != 14 && k != 16 && k != 17 && k != 18 && k != 20 && k != 23 && k != 25 && k != 26 && k != 47 && k != 48 { << -1 }
+            if types.mir_instr_has_dest(k) && types.mir_ia(m, fi, ii) == desc {
+                ndef += 1
+                if b != bi || k != 17 || types.mir_ic(m, fi, ii) != 0 || types.mir_id(m, fi, ii) != 3 { << -1 }
+                def = ii
+                ptr = types.mir_ib(m, fi, ii)
+            }
+            if mir_instr_uses_temp(m, fi, ii, desc) {
+                nuse += 1
+                if b != bi || k != 23 || types.mir_ib(m, fi, ii) != desc { << -1 }
+                consumer = ii
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    if ndef != 1 || nuse != 1 || def < 0 || consumer < 0 || ptr < 0 || ptr >= nt { << -1 }
+    if types.mir_temp_nslots(m, fi, ptr) != 1 || vreg_direct_ref_inner(types.mir_temp_ty(m, fi, ptr)) != ty { << -1 }
+    idx := types.mir_ic(m, fi, consumer)
+    if idx >= 0 {
+        if idx >= nt || types.mir_temp_ty(m, fi, idx) != 1 || types.mir_temp_nslots(m, fi, idx) != 1 { << -1 }
+    } else if idx > -2 || 0 - idx - 2 >= types.mir_nconsts(m, fi) { << -1 }
+    size := types.mir_id(m, fi, consumer)
+    mut abs_size := size
+    if abs_size < 0 { abs_size = 0 - abs_size }
+    if m.arrays[ai].elem_bytes <= 0 || abs_size != m.arrays[ai].elem_bytes { << -1 }
+    // A single immutable formal LoadLocal also makes emit_load_value's
+    // reference-local alias shortcut preserve the pointer snapshot.
+    mut pdefs := 0
+    mut local := -1
+    for b in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, b)
+        for _ in 0:ni {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if types.mir_instr_has_dest(k) && types.mir_ia(m, fi, ii) == ptr {
+                pdefs += 1
+                if b != bi || k != 2 { << -1 }
+                ptrdef = ii
+                local = types.mir_ib(m, fi, ii)
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    if pdefs != 1 || local < 0 || local >= types.mir_fn_nparams(m, fi) { << -1 }
+    if types.mir_local_ty(m, fi, local) != types.mir_temp_ty(m, fi, ptr) || types.mir_local_nslots(m, fi, local) != 1 { << -1 }
+    for b in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, b)
+        for _ in 0:ni {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if k == 3 && types.mir_ia(m, fi, ii) == local { << -1 }
+            if k == 16 && types.mir_ic(m, fi, ii) == 0 && types.mir_ib(m, fi, ii) == local { << -1 }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    mut seen_ptr := false
+    mut active := false
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:ni {
+        if ii < 0 { <- }
+        if ii == ptrdef { seen_ptr = true }
+        if ii == def {
+            if !seen_ptr { << -1 }
+            active = true
+        } else if active {
+            if ii == consumer { << ptr }
+            k := types.mir_ikind(m, fi, ii)
+            if k != 0 && (k < 1 || k > 5) { << -1 }
+            if k != 0 && k != 3 {
+                d := types.mir_ia(m, fi, ii)
+                if d < 0 || d >= nt || types.mir_temp_nslots(m, fi, d) != 1 || !vreg_scalar_type(types.mir_temp_ty(m, fi, d)) { << -1 }
+            }
+            // StoreLocal of an owning/wide/ref value may drop memory.
+            if k == 3 {
+                loc := types.mir_ia(m, fi, ii)
+                lt := types.mir_local_ty(m, fi, loc)
+                if types.mir_local_nslots(m, fi, loc) != 1 || (lt != 1 && lt != 2 && lt != 4 && lt != 8 && lt != 9 && lt != 10) { << -1 }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << -1
+}
+
+fn emit_elemaddr_forward_enabled(a &Assembler, fr &Frame) bool {
+    << a.ra_level >= 1 && frame_has_vregs(fr)
+}
+
+fn emit_elemaddr_forward(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int, dest int, idx int, size int, nocheck bool, ptr int) {
+    a.rc_elem_vr = -1
+    emit_index_scratch_evict(a)
+    prior := elemaddr_prior_address(m, fi, a.rc_cur_bi, ii)
+    if prior >= 0 && prior < fr.temp_slot.len && is_frame_slot(fr.temp_slot[prior]) {
+        a.load(emit_index_ptr_vr(), 15, slot_off(fr.temp_slot[prior]))
+        emit_elemaddr_park(a, dest, emit_index_ptr_vr())
+        emit_elemaddr_commit_slot(a, m, fi, fr, dest, emit_index_ptr_vr())
+        <<
+    }
+    emit_index_load_idx(a, m, fi, fr, idx)
+    local := elemaddr_forward_local(m, fi, ptr)
+    if local < 0 {
+        eprintln("internal compiler error: forwarded array reference lacks proven local")
+        <<< 1
+    }
+    rc_clobber(a, 0)
+    a.load(0, 15, slot_off(fr.local_slot[local]))
+    if !nocheck {
+        a.load(emit_index_len_vr(), 0, -8)
+        a.cmp(1, emit_index_len_vr())
+        a.oob_need = 1
+        a.jae(a.oob_lbl + "")
+    }
+    a.load(emit_index_ptr_vr(), 0, 0)
+    emit_index_scale(a, size)
+    emit_elemaddr_park(a, dest, emit_index_ptr_vr())
+    emit_elemaddr_commit_slot(a, m, fi, fr, dest, emit_index_ptr_vr())
+}
+
+// Same complete forwarding proof drives frame omission and emission.
+fn elemaddr_elided_descriptor(m &types.Mir, fi int, t int) bool {
+    if fi < 0 || fi >= m.fns.len || t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+    if types.mir_nins(m, fi) > 1024 || types.mir_ntemps(m, fi) > 512 || types.mir_nblocks(m, fi) > 128 { << false }
+    if types.mir_temp_nslots(m, fi, t) != 3 || !types.is_array_type(types.mir_temp_ty(m, fi, t)) { << false }
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_ikind(m, fi, ii) == 17 && types.mir_ia(m, fi, ii) == t {
+                << elemaddr_forward_ptr(m, fi, bi, t) >= 0
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << false
+}
+
+// Receiver LoadLocal may disappear only when its sole whole-function use
+// is the descriptor producer whose complete forwarding proof succeeds.
+fn elemaddr_elided_receiver(m &types.Mir, fi int, t int) bool {
+    if fi < 0 || fi >= m.fns.len || t < 0 || t >= types.mir_ntemps(m, fi) { << false }
+    if types.mir_nins(m, fi) > 1024 || types.mir_ntemps(m, fi) > 512 || types.mir_nblocks(m, fi) > 128 { << false }
+    if types.mir_temp_nslots(m, fi, t) != 1 || vreg_direct_ref_inner(types.mir_temp_ty(m, fi, t)) < 0 { << false }
+    mut uses := 0
+    for bi in 0:types.mir_nblocks(m, fi) {
+        if types.mir_btkind(m, fi, bi) == 2 && types.mir_bta(m, fi, bi) == t { << false }
+        if types.mir_btkind(m, fi, bi) == 3 && types.mir_bta(m, fi, bi) == t { << false }
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if mir_instr_uses_temp(m, fi, ii, t) {
+                if types.mir_ikind(m, fi, ii) != 17 || types.mir_ib(m, fi, ii) != t { << false }
+                if elemaddr_forward_ptr(m, fi, bi, types.mir_ia(m, fi, ii)) != t { << false }
+                uses += 1
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << uses == 1
+}
+
+// Read the active producer proved by elemaddr_forward_ptr. Pool records
+// outside block lists must not override a reaching LoadLocal.
+fn elemaddr_forward_local(m &types.Mir, fi int, t int) int {
+    if fi < 0 || fi >= m.fns.len || t < 0 || t >= types.mir_ntemps(m, fi) { << -1 }
+    if types.mir_nins(m, fi) > 1024 || types.mir_ntemps(m, fi) > 512 || types.mir_nblocks(m, fi) > 128 { << -1 }
+    mut local := -1
+    mut defs := 0
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if types.mir_instr_has_dest(k) && types.mir_ia(m, fi, ii) == t {
+                if k != 2 { << -1 }
+                local = types.mir_ib(m, fi, ii)
+                defs += 1
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    if defs != 1 || local < 0 || local >= types.mir_fn_nparams(m, fi) { << -1 }
+    << local
+}
+
+// Only active definitions participate; a reused address stays in a real
+// frame slot so its MIR register lifetime never extends implicitly.
+fn elemaddr_def_before(m &types.Mir, fi int, bi int, before int, t int) int {
+    mut last := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii == before { << last }
+        if ii < 0 { << -1 }
+        if types.mir_instr_has_dest(types.mir_ikind(m, fi, ii)) && types.mir_ia(m, fi, ii) == t { last = ii }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << -1
+}
+
+// Constants or a current scalar Local snapshot, with its exact defining
+// Copy/LoadLocal chain. Address-exposed locals and intervening rebinds fail.
+fn elemaddr_index_key(m &types.Mir, fi int, bi int, before int, value int) int {
+    mut t := value
+    mut stop := before
+    for _ in 0:16 {
+        if t <= -2 {
+            if 0 - t - 2 >= types.mir_nconsts(m, fi) { << -1 }
+            << t
+        }
+        if t < 0 || t >= types.mir_ntemps(m, fi) || types.mir_temp_ty(m, fi, t) != 1 || types.mir_temp_nslots(m, fi, t) != 1 { << -1 }
+        def := elemaddr_def_before(m, fi, bi, stop, t)
+        if def < 0 { << -1 }
+        k := types.mir_ikind(m, fi, def)
+        if k == 1 {
+            t = types.mir_ib(m, fi, def)
+            stop = def
+            ->
+        }
+        if k != 2 { << -1 }
+        local := types.mir_ib(m, fi, def)
+        if local < 0 || local >= types.mir_nlocals(m, fi) || types.mir_local_ty(m, fi, local) != 1 || types.mir_local_nslots(m, fi, local) != 1 { << -1 }
+        for b in 0:types.mir_nblocks(m, fi) {
+            mut ii := types.mir_bhead(m, fi, b)
+            for _ in 0:types.mir_nins(m, fi) {
+                if ii < 0 { <- }
+                if types.mir_ikind(m, fi, ii) == 16 && types.mir_ic(m, fi, ii) == 0 && types.mir_ib(m, fi, ii) == local { << -1 }
+                ii = types.mir_inext(m, fi, ii)
+            }
+        }
+        mut ii := types.mir_inext(m, fi, def)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii == before { << 1073741824 + local }
+            if ii < 0 { << -1 }
+            if types.mir_ikind(m, fi, ii) == 3 && types.mir_ia(m, fi, ii) == local { << -1 }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        << -1
+    }
+    << -1
+}
+
+fn elemaddr_same_index_key(m &types.Mir, fi int, left int, right int) bool {
+    if left >= 1073741824 && right >= 1073741824 { << left == right }
+    if left <= -2 && right <= -2 {
+        << types.mir_const_at(m, fi, 0 - left - 2) == types.mir_const_at(m, fi, 0 - right - 2)
+    }
+    << false
+}
+
+// Reuse an already checked same-block address for the same immutable array
+// reference and reaching scalar index. Calls and all memory writes reset
+// the candidate; the first checked access remains in its original position.
+fn elemaddr_prior_address(m &types.Mir, fi int, bi int, before int) int {
+    if fi < 0 || fi >= m.fns.len || bi < 0 || bi >= types.mir_nblocks(m, fi) { << -1 }
+    if before < 0 || before >= types.mir_nins(m, fi) || types.mir_ikind(m, fi, before) != 23 { << -1 }
+    base := types.mir_ib(m, fi, before)
+    ptr := elemaddr_forward_ptr(m, fi, bi, base)
+    if ptr < 0 { << -1 }
+    local := elemaddr_forward_local(m, fi, ptr)
+    key := elemaddr_index_key(m, fi, bi, before, types.mir_ic(m, fi, before))
+    if local < 0 || key == -1 { << -1 }
+    mut size := types.mir_id(m, fi, before)
+    if size < 0 { size = 0 - size }
+    mut hit := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii == before { << hit }
+        if ii < 0 { << -1 }
+        k := types.mir_ikind(m, fi, ii)
+        if k != 0 && k != 17 && k != 23 && k != 26 && (k < 1 || k > 5) { hit = -1 }
+        if k == 1 || k == 2 || k == 4 || k == 5 || k == 17 || k == 26 {
+            d := types.mir_ia(m, fi, ii)
+            ty := types.mir_temp_ty(m, fi, d)
+            ns := types.mir_temp_nslots(m, fi, d)
+            mut plain := ns == 1 && vreg_scalar_type(ty)
+            if (k == 1 || k == 2) && ns == 1 && types.is_ref_type(ty) { plain = true }
+            if k == 17 && ns == 3 && types.is_array_type(ty) { plain = true }
+            if !plain { hit = -1 }
+        }
+        if k == 3 {
+            loc := types.mir_ia(m, fi, ii)
+            ty := types.mir_local_ty(m, fi, loc)
+            if types.mir_local_nslots(m, fi, loc) != 1 || !vreg_scalar_type(ty) { hit = -1 }
+            if loc < 0 || loc >= m.fns[fi].locals_owning.len { hit = -1 } else if m.fns[fi].locals_owning[loc] { hit = -1 }
+            if loc == local || key >= 1073741824 && loc == key - 1073741824 { hit = -1 }
+        }
+        if hit >= 0 && types.mir_instr_has_dest(k) && types.mir_ia(m, fi, ii) == hit { hit = -1 }
+        if k == 23 && types.mir_id(m, fi, ii) == size {
+            old_ptr := elemaddr_forward_ptr(m, fi, bi, types.mir_ib(m, fi, ii))
+            if old_ptr >= 0 && elemaddr_forward_local(m, fi, old_ptr) == local {
+                old_key := elemaddr_index_key(m, fi, bi, ii, types.mir_ic(m, fi, ii))
+                if elemaddr_same_index_key(m, fi, old_key, key) { hit = types.mir_ia(m, fi, ii) }
+            }
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << -1
+}
