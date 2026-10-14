@@ -434,6 +434,13 @@ fn mir_promote_canonical_empty_tails(f &mut MFn) bool {
 }
 
 fn mir_promote_scalar_locals_ssa_f(f &mut MFn) int {
+    << mir_promote_scalar_locals_ssa_terminal_f(f, false)
+}
+
+// The extra terminal-call admission is used only after the bounded scalar
+// x64 loop proof below. Other targets retain their existing slot-shaped
+// cache/SIMD pipeline, including its intrinsic-call witness.
+fn mir_promote_scalar_locals_ssa_terminal_f(f &mut MFn, terminal_calls bool) int {
     nloc := f.locals.len
     // Keep each denominator proof in its own early-return guard.  The Gen1
     // checker intentionally does not infer non-zero facts through a compound
@@ -593,7 +600,7 @@ fn mir_promote_scalar_locals_ssa_f(f &mut MFn) int {
                 if mixed {
                     if !mir_promote_body_kind_ok(k) { << 0 }
                 } else if !mir_promote_kind_scalar_only(k) {
-                    if !(has_math_call && mir_promote_scalar_call_f(&*f, ii)) { << 0 }
+                    if !((has_math_call || terminal_calls) && mir_promote_scalar_call_f(&*f, ii)) { << 0 }
                 }
                 ii = mfn_inext(&f.instrs, ii)
             }
@@ -1597,6 +1604,103 @@ fn mir_each_promote_scalar_locals(m &mut Mir, small_unit bool) {
         }
         fi += 1
     }
+}
+
+// A scalar output call in a returning block cannot be on a backedge. Prove
+// that complete shape before allowing it through the SSA promotion gate;
+// calls inside loops, addresses, memory, owning values and unknown opcodes
+// retain their established storage and ABI behavior.
+pub fn mir_terminal_scalar_loop_m(m &Mir, fi int) bool {
+    if fi < 0 || fi >= m.fns.len || mir_fn_is_extern(m, fi) { << false }
+    nb := mir_nblocks(m, fi)
+    nl := mir_nlocals(m, fi)
+    nt := mir_ntemps(m, fi)
+    ni := mir_nins(m, fi)
+    if nb <= 1 || nb > 64 || nl <= 0 || nl > 48 || nt > 512 || ni > 1024 { << false }
+    if m.fns[fi].locals_nslots.len != nl || m.fns[fi].temps_nslots.len != nt { << false }
+    rt := mir_fn_ret(m, fi)
+    if rt != 0 && (!mir_local_promotion_scalar(rt) || mir_fn_ret_nslots(m, fi) != 1) { << false }
+    for l in 0:nl {
+        if !mir_local_promotion_scalar(mir_local_ty(m, fi, l)) || mir_local_nslots(m, fi, l) != 1 { << false }
+        if l < m.fns[fi].locals_owning.len && m.fns[fi].locals_owning[l] { << false }
+    }
+    for t in 0:nt {
+        if !mir_local_promotion_scalar(mir_temp_ty(m, fi, t)) || mir_temp_nslots(m, fi, t) != 1 { << false }
+    }
+    mut loop := false
+    mut output := false
+    for bi in 0:nb {
+        tk := mir_btkind(m, fi, bi)
+        if tk == 0 {
+            if mir_bhead(m, fi, bi) >= 0 { << false }
+        } else if tk == 1 {
+            to := mir_bta(m, fi, bi)
+            if to < 0 || to >= nb { << false }
+            if to <= bi { loop = true }
+        } else if tk == 2 {
+            yes := mir_btb(m, fi, bi)
+            no := mir_btc(m, fi, bi)
+            if yes < 0 || yes >= nb || no < 0 || no >= nb { << false }
+            if yes <= bi || no <= bi { loop = true }
+        } else if tk != 3 { << false }
+        mut ii := mir_bhead(m, fi, bi)
+        for _ in 0:ni + 1 {
+            if ii < 0 { <- }
+            if ii >= ni { << false }
+            k := mir_ikind(m, fi, ii)
+            if k == 7 {
+                ck := mir_ib(m, fi, ii)
+                if tk != 3 || ii != mir_btail(m, fi, bi) { << false }
+                if ck != 2 && ck != 3 && ck != 4 && ck != 5 && ck != 22 { << false }
+                output = true
+            } else if k != 0 && (k < 1 || k > 5) { << false }
+            ii = mir_inext(m, fi, ii)
+        }
+        if ii >= 0 { << false }
+    }
+    << loop && output && mir_verify_emission_calls(m, fi)
+}
+
+fn mir_simplify_scalar_loop_commit(m &mut Mir, fi int) {
+    if !mir_terminal_scalar_loop_m(&*m, fi) { << }
+    mut f := mir_clone_fn(m, fi, true)
+    mir_simplify_cfg(mut &f)
+    if mir_verify_mfn_f(&f, false) != 0 { << }
+    mir_fn_commit(m, fi, f)
+}
+
+pub fn mir_promote_x64_scalar_loops(m &mut Mir) {
+    if m.opt_level < 1 { << }
+    n0 := m.fns.len
+    mut changed := false
+    for fi in 0:n0 {
+        if !mir_terminal_scalar_loop_m(&*m, fi) { -> }
+        mut f := mir_clone_fn(m, fi, true)
+        if mir_promote_scalar_locals_ssa_terminal_f(mut &f, true) == 0 { -> }
+        if mir_ssa_has_value_work_verified_f(&f) {
+            simplified := mir_ssa_simplify_verified_f(mut &f)
+            if simplified >= 0 && mir_verify_mfn_f(&f, true) != 0 { -> }
+        }
+        moved := mir_ssa_licm_verified_f(mut &f)
+        if moved > 0 && mir_verify_mfn_f(&f, true) != 0 { -> }
+        mir_fn_commit(m, fi, f)
+        changed = true
+    }
+    if !changed { << }
+    mir_each_phi_elim(m)
+    // Phi destruction introduces edge blocks after the ordinary CFG pass.
+    // Reuse its checked copy/jump cleanup only for these scalar x64 loops.
+    n1 := m.fns.len
+    for fi in 0:n1 {
+        mir_simplify_scalar_loop_commit(m, fi)
+    }
+    mir_each_late_const(m)
+    m.opt_nfn = mir_nfn_live(&*m)
+    mut nins := 0
+    for fi in 0:m.fns.len {
+        if !mir_fn_is_extern(&*m, fi) { nins += mir_nins(&*m, fi) }
+    }
+    m.opt_nins_out = nins
 }
 
 fn mir_fn_has_fieldrmw(m &Mir, fi int) bool {
