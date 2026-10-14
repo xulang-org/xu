@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LOCAL_ROOTS = {
     "docs", "tests", "tmp", "temp", "notes", "reports", "artifacts", "bin", "build",
     ".codex", ".claude", ".codex-tmp", ".cache", ".idea", ".vscode", "htmlcov",
+    ".agents", ".cursor", "dist",
 }
 LOCAL_FILES = {
     "PROGRESS.md", "TODO.md", "TASKS.md", "PLAN.md", "test_main", "test_order",
