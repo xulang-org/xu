@@ -10,12 +10,13 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_ROOTS = {
-    "docs", "tmp", "temp", "notes", "reports", "artifacts", "bin", "build",
+    "docs", "tests", "tmp", "temp", "notes", "reports", "artifacts", "bin", "build",
     ".codex", ".claude", ".codex-tmp", ".cache", ".idea", ".vscode", "htmlcov",
 }
 LOCAL_FILES = {
     "PROGRESS.md", "TODO.md", "TASKS.md", "PLAN.md", "test_main", "test_order",
-    "bootstrap/SYNC_DIFF.md",
+    "bootstrap/SYNC_DIFF.md", "CLAUDE.md", "AGENTS.md", "REPOSITORIES.md",
+    ".impeccable.md", "server.example.md", "server.md", "pytest.ini",
 }
 CACHE_DIRS = {"target", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 OUTPUT_SUFFIXES = {
@@ -38,14 +39,20 @@ def git(root: Path, *args: str, input: bytes | None = None) -> bytes:
     ).stdout
 
 
+def local_only_path(name: str) -> bool:
+    return (name.split("/", 1)[0] in {"docs", "tests"} or name in LOCAL_FILES
+            or name == "xu-site/xu-api-extract.md" or name.lower() == "readme.txt")
+
+
 def local_reason(name: str) -> str | None:
     path = PurePosixPath(name)
     if path.parts[0] in LOCAL_ROOTS or name in LOCAL_FILES or name == "xu-site/xu-api-extract.md":
         return "本机文档或研发材料"
+    if name.lower() == "readme.txt":
+        return "根目录使用 README.md"
     if any(part in CACHE_DIRS or part.endswith((".app", ".curves")) for part in path.parts):
         return "缓存或生成目录"
-    golden = path.parts[0] == "tests" and path.name in {"expected.stdout", "expected.stderr"}
-    if (path.suffix.lower() in OUTPUT_SUFFIXES and not golden) or path.name.endswith("~"):
+    if path.suffix.lower() in OUTPUT_SUFFIXES or path.name.endswith("~"):
         return "日志、临时文件或编译产物"
     if path.name in {".DS_Store", "Thumbs.db", "Desktop.ini", ".coverage"}:
         return "本机工具文件"
@@ -76,12 +83,12 @@ def check(root: Path) -> tuple[list[str], int]:
     ).split(b"\0") if name]
     errors = []
     blocked = set()
-    # docs and the identified process records must be completely untracked.
+    # Local-only paths must remain untracked, including unchanged index entries.
     for name in sorted(entries):
         if entries[name][2] != "0":
             errors.append(f"{name!r}: 未解决的合并冲突")
             blocked.add(name)
-        if name.startswith("docs/") or name in LOCAL_FILES or name == "xu-site/xu-api-extract.md":
+        if local_only_path(name):
             errors.append(f"{name!r}: 本机材料仍在 Git 跟踪中；使用 git rm --cached 移除跟踪")
             blocked.add(name)
     if changed:
@@ -122,21 +129,53 @@ def check(root: Path) -> tuple[list[str], int]:
     return errors, len(changed)
 
 
+def check_tree(root: Path, revision: str) -> list[str]:
+    """Inspect the exact outgoing tree; staged deletions cannot hide HEAD files."""
+    errors = []
+    names = git(root, "ls-tree", "-r", "--name-only", "-z", revision).split(b"\0")
+    for raw in names:
+        if not raw:
+            continue
+        name = raw.decode("utf-8", "surrogateescape")
+        if local_only_path(name):
+            errors.append(f"{revision}:{name!r}: 待推送版本仍包含禁止上传的本机文件")
+    return errors
+
+
+def check_push(root: Path, lines: list[str]) -> tuple[list[str], int]:
+    errors = []
+    revisions = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 4:
+            raise ValueError("invalid pre-push input")
+        local_oid = fields[1]
+        if local_oid and set(local_oid) != {"0"}:
+            revisions.add(local_oid)
+    for revision in sorted(revisions):
+        errors.extend(check_tree(root, revision))
+    return errors, len(revisions)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--staged", action="store_true", help="check staged changes (default)")
-    parser.parse_args()
+    parser.add_argument("--pre-push", action="store_true", help="check outgoing ref trees from hook stdin")
+    args = parser.parse_args()
     try:
-        errors, count = check(ROOT)
+        if args.pre_push:
+            errors, count = check_push(ROOT, sys.stdin.read().splitlines())
+        else:
+            errors, count = check(ROOT)
     except (subprocess.CalledProcessError, OSError, ValueError) as error:
         print(f"Git 提交检查无法完成：{error}", file=sys.stderr)
         return 1
     if errors:
-        print("Git 提交检查失败：", file=sys.stderr)
+        print("Git 上传范围检查失败：", file=sys.stderr)
         for error in errors:
             print(f"  {error}", file=sys.stderr)
         return 1
-    print(f"Git 提交检查通过（{count} 个新增或修改文件；本机文档未跟踪）。")
+    print(f"Git 上传范围检查通过（{count} 个检查对象；本机文件与 tests/ 未进入提交范围）。")
     return 0
 
 

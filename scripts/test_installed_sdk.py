@@ -97,6 +97,12 @@ fn main() int {
     assert child.returncode == 7, (child.returncode, child.stderr)
     (project / "args.xu").write_text('@main\n#os\nfn main() int {\n    args := os.argv()\n    println(args[1])\n    println(args[2])\n    << 0\n}\n')
     assert run([xu, "run", "args.xu", "--", "argument with spaces", 'quote"value\\'], cwd=project, env=active).splitlines() == ["argument with spaces", 'quote"value\\']
+    # Exercise optimized compilation and child execution in the installed CLI.
+    # All input is created in the user's temporary project, independent of tests/.
+    (project / "loop.xu").write_text('@main\nfn main() int {\n    mut total := 0\n    mut i := 0\n    while i < 32768 {\n        total = total + i\n        i = i + 1\n    }\n    println(total)\n    << 0\n}\n')
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
+        assert run([str(program)], cwd=project, env=active).strip() == "536854528"
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
         (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  "github.com/xulang-org/packages": file:' + (prefix / "packages").as_posix() + '\n')

@@ -17,6 +17,7 @@
 #   scripts/run_fixtures.sh                       # Rust bootstrap (Gen0)
 #   scripts/run_fixtures.sh --xu=/path/to/gen1 --sub=build \
 #       --label=gen1 --known-fail=docs/audit/GEN1_FIXTURE_KNOWN_FAIL.txt
+#   scripts/run_fixtures.sh --skip-require  # cold Gen1; replay with --only-require after fixed point
 #   scripts/run_fixtures.sh --skip-net   # omit net_* / http_* (language gate)
 #   scripts/run_fixtures.sh --only='^(parse_int|starts_with)'  # name regex
 #
@@ -42,7 +43,11 @@ SUB=""
 LABEL="bootstrap"
 KNOWN_FAIL_LIST=""
 SKIP_NET=0
+SKIP_REQUIRE=0
+ONLY_REQUIRE=0
 ONLY=""
+TARGET=""
+RUNNER=""
 FIXTURE_TIMEOUT=${FIXTURE_TIMEOUT:-30}
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -51,7 +56,11 @@ while [ "$#" -gt 0 ]; do
         --label=*) LABEL="${1#*=}" ;;
         --known-fail=*) KNOWN_FAIL_LIST="${1#*=}" ;;
         --only=*) ONLY="${1#*=}" ;;
+        --target=*) TARGET="${1#*=}" ;;
+        --runner=*) RUNNER="${1#*=}" ;;
         --skip-net) SKIP_NET=1 ;;
+        --skip-require) SKIP_REQUIRE=1 ;;
+        --only-require) ONLY_REQUIRE=1 ;;
         *) echo "run_fixtures: unknown arg $1"; exit 1 ;;
     esac
     shift
@@ -189,6 +198,7 @@ compile_source() {
     # Intentionally unquoted so multiple flags split; empty is a no-op.
     # shellcheck disable=SC2086
     local extra=(${XU_FIXTURE_EXTRA_ARGS-})
+    if [ -n "$TARGET" ]; then extra+=(--target "$TARGET"); fi
     if [ "$LANE" = "product" ]; then
         # Product Xu uses the hosted `build` subcommand.  Keep the legacy
         # direct path for oracle/dual diagnostics only.
@@ -198,6 +208,9 @@ compile_source() {
         "$BIN" $SUB ${extra[@]+"${extra[@]}"} "$@"
     fi
 }
+
+runner_args=()
+if [ -n "$RUNNER" ]; then runner_args+=("$RUNNER"); fi
 
 # M177: safety fixtures requiring exact first-line stderr.
 SAFETY_EXACT_LIST="$ROOT/docs/audit/SAFETY_DIAG_EXACT.txt"
@@ -257,6 +270,21 @@ for dir in tests/fixtures/*/; do
     fi
     if [ ! -f "$dir/main.xu" ] && [ ! -f "$dir/error.txt" ]; then
         echo "SKIP $name (no main.xu; library source)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    requires=0
+    if [ -f "$dir/xu.xun" ] && grep -q '^require:' "$dir/xu.xun"; then requires=1; fi
+    if [ "$ONLY_REQUIRE" = 1 ] && [ "$requires" = 0 ]; then continue; fi
+    if [ "$SKIP_REQUIRE" = 1 ] && [ "$requires" = 1 ]; then
+        echo "SKIP $name (dependency features are checked after the hosted fixed point)"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    external_packages=0
+    if [ "$requires" = 1 ] && grep -q 'github.com/xulang-org/packages' "$dir/xu.xun"; then external_packages=1; fi
+    if [ "$LANE" = oracle ] && [ "$external_packages" = 1 ]; then
+        echo "SKIP $name (external import syntax is outside the frozen primer; hosted dependency gate required)"
         skipped=$((skipped + 1))
         continue
     fi
@@ -337,7 +365,7 @@ actual stderr:      $(cat "$tmp/stderr")"
         fi
         chmod +x "$tmp/a.out" 2>/dev/null
         set +e
-        (cd "$tmp" && run_with_timeout "$FIXTURE_TIMEOUT" ./a.out) >"$tmp/stdout" 2>/dev/null
+        (cd "$tmp" && run_with_timeout "$FIXTURE_TIMEOUT" ${runner_args[@]+"${runner_args[@]}"} ./a.out) >"$tmp/stdout" 2>/dev/null
         code=$?
         set -e
         if [ "$code" -eq 124 ]; then
@@ -350,6 +378,15 @@ actual stderr:      $(cat "$tmp/stderr")"
         fi
         rm -rf "$tmp"
         continue
+    fi
+
+    if [ "$external_packages" = 1 ]; then
+        if ! python3 scripts/prepare_packages_fixture.py "$dir" "$tmp/external_fixture" 2>"$tmp/stderr"; then
+            record_fail "$name" "external package fixture unavailable" "$(cat "$tmp/stderr")"
+            rm -rf "$tmp"
+            continue
+        fi
+        dir="$tmp/external_fixture"
     fi
 
     # M183: local HTTP server for require: http:// locators.
@@ -365,7 +402,7 @@ actual stderr:      $(cat "$tmp/stderr")"
         HTTP_PORT=$(cut -d: -f1 < "$tmp/http.port")
         http_pid=$(cut -d: -f2 < "$tmp/http.port")
         sed -i.bak "s/19883/$HTTP_PORT/g" "$dir/xu.xun"
-        if [ "$LANE" = product ]; then
+        if [ "$LANE" = product ] || [ "$SUB" = build ]; then
             python3 scripts/prepare_require_http_fixture.py "$dir"
         fi
         export XU_CACHE="$tmp/xu_cache"
@@ -424,7 +461,7 @@ actual stderr:      $(cat "$tmp/stderr")"
     fi
     # SIGSEGV is 139; with set -e the script would abort mid-corpus.
     set +e
-    (cd "$tmp" && run_with_timeout "$FIXTURE_TIMEOUT" ./a.out $extra_args) >"$tmp/stdout" 2>"$tmp/stderr"
+    (cd "$tmp" && run_with_timeout "$FIXTURE_TIMEOUT" ${runner_args[@]+"${runner_args[@]}"} ./a.out $extra_args) >"$tmp/stdout" 2>"$tmp/stderr"
     code=$?
     set -e
 

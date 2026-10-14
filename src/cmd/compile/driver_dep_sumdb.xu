@@ -1,0 +1,270 @@
+@main
+
+#internal/sumdb
+#internal/modulepath
+#os
+#path/filepath
+#errors
+
+struct RequireSumProof {
+    base string
+    root string
+    size int
+    tile_paths []string
+    tile_bodies []string
+    node_paths []string
+    node_hashes []string
+}
+
+fn require_sumdb_private(key &string) bool {
+    config := os.lookup_env("XUNOSUMDB")
+    mut patterns := config.value + ""
+    if !config.found { patterns = env_get("XUPRIVATE") }
+    << require_module_patterns(&patterns, key)
+}
+
+fn require_sumdb_configuration(key &string) []string {
+    mut out := []string{}
+    raw := xun_trim(env_get("XUSUMDB"))
+    if raw.len == 0 || raw == "off" || require_sumdb_private(key) { << out }
+    fields := require_lock_fields(raw + "")
+    if fields.len < 1 || fields.len > 2 { >> errors.new("sumdb: XUSUMDB expects verifier-key [URL]") }
+    encoded := fields[0]
+    verifier := sumdb.verifier(&encoded) or >>
+    mut base := "https://" + verifier.name
+    if fields.len == 2 { base = fields[1] + "" }
+    if !val_has_prefix(&base, "https://") && !val_has_prefix(&base, "http://") && !val_has_prefix(&base, "file://") { >> errors.new("sumdb: URL must use http(s) or absolute file://") }
+    if val_has_prefix(&base, "file://") {
+        file := base[7:base.len]
+        if !filepath.is_abs(&file) { >> errors.new("sumdb: file URL must be absolute") }
+    }
+    mut floor := 0
+    if val_has_prefix(&base, "file://") { floor = 7 }
+    while base.len > floor && base[base.len - 1] == 47 { base = base[0:base.len - 1] }
+    out.push(encoded + "")
+    out.push(base)
+    << out
+}
+
+fn require_sumdb_read_file(p &string, limit int) string {
+    require_no_link(p)
+    info := os.stat(p + "") or >>
+    if info.is_dir || info.size > limit { >> errors.new("sumdb: cache response exceeds size limit") }
+    body := read_file(p + "") or >>
+    if body.len > limit { >> errors.new("sumdb: response exceeds size limit") }
+    << body
+}
+
+fn require_sumdb_request(base &string, relative &string, root &string, missing bool) string {
+    if require_offline() || require_frozen() { >> errors.new("sumdb: offline/frozen build needs cached proof: " + relative) }
+    url := base + "/" + relative
+    dest := root + "/response." + str(os.getpid()) + "." + str(now_ns())
+    status := require_proxy_read(&url, &dest, 65536)
+    if status != 200 {
+        os.remove(dest + "") or (err) {
+            if missing && (status == 404 || status == 410) { << "" }
+            >> errors.new("sumdb: request failed (status " + str(status) + "): " + relative)
+        }
+        if missing && (status == 404 || status == 410) { << "" }
+        >> errors.new("sumdb: request failed (status " + str(status) + "): " + relative)
+    }
+    body := require_sumdb_read_file(&dest, 65536) or (err) {
+        os.remove(dest + "") or (remove_err) { >> err }
+        >> err
+    }
+    os.remove(dest + "") or >>
+    << body
+}
+
+fn require_sumdb_tile_name(level int, offset int, width int) string {
+    mut n := offset
+    mut piece := str(n % 1000)
+    while piece.len < 3 { piece = "0" + piece }
+    mut path := piece + ""
+    while n >= 1000 {
+        n = n / 1000
+        piece = str(n % 1000)
+        while piece.len < 3 { piece = "0" + piece }
+        path = "x" + piece + "/" + path
+    }
+    path = "tile/8/" + str(level) + "/" + path
+    if width != 256 { path = path + ".p/" + str(width) }
+    << path
+}
+
+fn require_sumdb_node(proof &mut RequireSumProof, level int, index int) string {
+    if level < 0 || level > 40 || index < 0 { >> errors.new("sumdb: invalid proof coordinate") }
+    node_name := str(level) + "-" + str(index)
+    for i in 0:proof.node_paths.len {
+        if proof.node_paths[i] == node_name { << proof.node_hashes[i] + "" }
+    }
+    node_path := proof.root + "/nodes/" + node_name
+    if path_exists(&node_path) {
+        hash := require_sumdb_read_file(&node_path, 32) or >>
+        if hash.len != 32 { >> errors.new("sumdb: malformed cached node") }
+        proof.node_paths.push(node_name)
+        proof.node_hashes.push(hash + "")
+        << hash
+    }
+    tile_level := level / 8
+    relative_level := level % 8
+    leaves := 1 << relative_level
+    first := index * leaves
+    tile_offset := first / 256
+    mut width := (proof.size >> (tile_level * 8)) - tile_offset * 256
+    if width > 256 { width = 256 }
+    start := first % 256
+    if width <= 0 || start + leaves > width { >> errors.new("sumdb: node outside checkpoint") }
+    path := require_sumdb_tile_name(tile_level, tile_offset, width)
+    mut body := ""
+    mut found := false
+    for i in 0:proof.tile_paths.len {
+        if proof.tile_paths[i] == path { body = proof.tile_bodies[i] + ""
+            found = true
+            <- }
+    }
+    if !found {
+        body = require_sumdb_request(&proof.base, &path, &proof.root, width != 256) or >>
+        if body.len == 0 && width != 256 {
+            full := require_sumdb_tile_name(tile_level, tile_offset, 256)
+            body = require_sumdb_request(&proof.base, &full, &proof.root, false) or >>
+            if body.len != 8192 { >> errors.new("sumdb: missing or malformed full tile") }
+        } else if body.len != width * 32 { >> errors.new("sumdb: missing or malformed tile") }
+        proof.tile_paths.push(path + "")
+        proof.tile_bodies.push(body + "")
+    }
+    hashes := body[start * 32:(start + leaves) * 32]
+    hash := sumdb.fold(&hashes) or >>
+    proof.node_paths.push(node_name)
+    proof.node_hashes.push(hash + "")
+    << hash
+}
+
+// Jointly reconstruct the new root and its old prefix. Every node used in
+// the prefix also contributes to the new root: an inclusion-only proof must
+// never authenticate an unrelated old prefix. At most O(log N) branches are
+// expanded around the record and prefix boundaries.
+fn require_sumdb_roots(proof &mut RequireSumProof, start int, count int, record int, leaf &string, prefix int) sumdb.Roots {
+    inside := record >= start && record < start + count
+    mut whole := false
+    mut level := 0
+    mut size := 1
+    while size < count { size = size * 2
+        level += 1 }
+    if size == count { whole = true }
+    crosses := start < prefix && start + count > prefix
+    if count == 1 && inside {
+        mut old := ""
+        if start < prefix { old = leaf + "" }
+        << sumdb.Roots{full: leaf + "", prefix: old}
+    }
+    if whole && !inside && !crosses {
+        hash := require_sumdb_node(proof, level, start / count) or >>
+        mut old := ""
+        if start + count <= prefix { old = hash + "" }
+        << sumdb.Roots{full: hash + "", prefix: old}
+    }
+    if count <= 1 { >> errors.new("sumdb: invalid proof range") }
+    k := sumdb.split(count)
+    left := require_sumdb_roots(proof, start, k, record, leaf, prefix) or >>
+    right := require_sumdb_roots(proof, start + k, count - k, record, leaf, prefix) or >>
+    root := sumdb.combine(&left.full, &right.full)
+    mut old := left.prefix + ""
+    if right.prefix.len > 0 {
+        if left.prefix.len == 0 { >> errors.new("sumdb: noncontiguous prefix") }
+        old = sumdb.combine(&left.prefix, &right.prefix)
+    }
+    << sumdb.Roots{full: root, prefix: old}
+}
+
+fn require_sumdb_save(path &string, body &string) int {
+    parent := path_dirname(path)
+    mkdir_all(parent)
+    require_no_link(path)
+    pending_path := path + ".partial." + str(os.getpid()) + "." + str(now_ns())
+    os.write(pending_path + "", body + "") or >>
+    os.rename(pending_path, path + "") or >>
+    << 0
+}
+
+fn require_sumdb_verify(config &[]string, key &string, version &string, digest &string) int {
+    encoded := config[0]
+    verifier := sumdb.verifier(&encoded) or >>
+    base := config[1]
+    identity := sumdb.cache_identity(&encoded)
+    root := xu_pkg_cache_dir() + "/sumdb/" + identity
+    source := require_source_key(key, version)
+    record_path := root + "/records/" + source
+    read_only := require_offline() || require_frozen()
+    if read_only && !path_exists(&record_path) { >> errors.new("sumdb: offline/frozen build needs cached checksum record") }
+    if !read_only { mkdir_all(root + "") }
+    require_no_link(&root)
+    lock_path := root + "/.lck"
+    mut guard := os.closed_file()
+    if !read_only || path_exists(&lock_path) { guard = require_guard(&lock_path, read_only) }
+    latest_path := root + "/latest"
+    mut prior := sumdb.Tree{size: 0, hash: "", note: ""}
+    if path_exists(&latest_path) {
+        note := require_sumdb_read_file(&latest_path, 16384) or >>
+        prior = sumdb.checkpoint(&note, &verifier) or >>
+    }
+    mut response := ""
+    mut cached := false
+    if path_exists(&record_path) {
+        response = require_sumdb_read_file(&record_path, 65536) or >>
+        cached = true
+    } else {
+        relative := "lookup/" + modulepath.storage_path(key) + "@" + modulepath.storage_path(version)
+        response = require_sumdb_request(&base, &relative, &root, false) or >>
+    }
+    record := sumdb.record(&response) or >>
+    head := sumdb.checkpoint(&record.note, &verifier) or >>
+    if record.id >= head.size { >> errors.new("sumdb: record outside signed checkpoint") }
+    expected := sumdb.checksum(&record.text, key, version) or >>
+    if !str_eq(&expected, digest) { >> errors.new("sumdb: authenticated module checksum mismatch: " + key + "@" + version) }
+    mut effective := sumdb.Tree{size: head.size, hash: head.hash + "", note: head.note + ""}
+    mut old := sumdb.Tree{size: prior.size, hash: prior.hash + "", note: prior.note + ""}
+    witness_path := root + "/heads/" + str(head.size)
+    if head.size == prior.size && head.hash != prior.hash { >> errors.new("sumdb: conflicting checkpoint at the same size") }
+    if head.size < prior.size {
+        mut witnessed := false
+        if path_exists(&witness_path) {
+            note := require_sumdb_read_file(&witness_path, 16384) or >>
+            witness := sumdb.checkpoint(&note, &verifier) or >>
+            if witness.size != head.size || witness.hash != head.hash { >> errors.new("sumdb: conflicting historical checkpoint") }
+            witnessed = true
+        }
+        if witnessed {
+            old = sumdb.Tree{size: 0, hash: "", note: ""}
+        } else { effective = sumdb.Tree{size: prior.size, hash: prior.hash + "", note: prior.note + ""}
+            old = sumdb.Tree{size: head.size, hash: head.hash + "", note: head.note + ""} }
+    }
+    mut proof := RequireSumProof{base: base + "", root: root + "", size: effective.size, tile_paths: []string{}, tile_bodies: []string{}, node_paths: []string{}, node_hashes: []string{}}
+    leaf := sumdb.leaf(&record.text)
+    roots := require_sumdb_roots(mut &proof, 0, effective.size, record.id, &leaf, old.size) or >>
+    if roots.full != effective.hash { >> errors.new("sumdb: record inclusion proof failed") }
+    if old.size > 0 && roots.prefix != old.hash { >> errors.new("sumdb: append-only consistency proof failed") }
+    if !read_only {
+        for i in 0:proof.node_paths.len {
+            path := root + "/nodes/" + proof.node_paths[i]
+            hash := proof.node_hashes[i]
+            require_sumdb_save(&path, &hash) or >>
+        }
+        // Persist only reconstructed nodes, never unused bytes in tiles.
+        require_sumdb_save(&witness_path, &head.note) or >>
+        if head.size >= prior.size { require_sumdb_save(&latest_path, &head.note) or >> }
+        if !cached { require_sumdb_save(&record_path, &response) or >> }
+    }
+    guard.close() or >>
+    << 0
+}
+
+fn require_authenticate_version(key &string, locator &string, digest &string) {
+    version := require_version(locator)
+    if version.len == 0 { << }
+    config := require_sumdb_configuration(key) or (err) { eprintln(err.msg())
+        <<< 1 }
+    if config.len == 0 { << }
+    require_sumdb_verify(&config, key, &version, digest) or (err) { eprintln(err.msg())
+        <<< 1 }
+}

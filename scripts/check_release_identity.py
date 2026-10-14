@@ -20,10 +20,10 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from .module_versions import read_version as read_module_version, read_xu_version
+    from .module_versions import read_version as read_module_version, read_xu_version, Version
     from .companion_repos import project_root
 else:
-    from module_versions import read_version as read_module_version, read_xu_version
+    from module_versions import read_version as read_module_version, read_xu_version, Version
     from companion_repos import project_root
 
 try:
@@ -50,11 +50,11 @@ def read_version_file() -> str | None:
     return text or None
 
 
-def parse_semver(value: str) -> tuple[int, ...] | None:
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", value.strip())
-    if not m:
+def parse_semver(value: str):
+    try:
+        return Version.parse(value.strip().removeprefix("v"))
+    except ValueError:
         return None
-    return tuple(int(x) for x in m.groups())
 
 
 def xu_cli_version(xu: Path) -> str | None:
@@ -71,10 +71,10 @@ def xu_cli_version(xu: Path) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    m = re.search(r"v(\d+\.\d+\.\d+)", blob)
+    m = re.search(r"v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?=\s|$)", blob)
     if m:
         return m.group(1)
-    m = re.search(r"(\d+\.\d+\.\d+)", blob)
+    m = re.search(r"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?=\s|$)", blob)
     return m.group(1) if m else None
 
 

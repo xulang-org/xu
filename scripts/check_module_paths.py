@@ -45,7 +45,7 @@ def main() -> int:
         if not path.is_file() or (path.suffix != ".xu" and path.name != "xu.xun"):
             continue
         count += 1
-        failures.extend(errors(path, path.read_text()))
+        failures.extend(errors(path, path.read_text(encoding="utf-8")))
     for failure in failures:
         print(failure)
     print(f"Module paths: {count} files checked; {len(failures)} violations")

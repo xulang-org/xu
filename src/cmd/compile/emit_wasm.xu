@@ -1,0 +1,755 @@
+@main
+
+#xu/types
+#os
+
+// Xu MIR -> WebAssembly. No foreign code generator or compiler is involved.
+// Values use Xu's 64-bit slots; frame descriptors descend, heap arrays ascend.
+// Every internal function has (argument-frame i32, return-frame i32) -> void.
+// Per-evaluation arena allocation lets the worker discard an entire execution.
+struct WModule{
+    data []int
+    strings []int
+    functions []int
+    labels []string
+}
+
+struct WFrame{
+    locals []int
+    temps []int
+    size int
+    scratch int
+}
+
+fn w_u(b &mut []int, v int) {
+    mut n := v
+    while n >= 128 {b.push((n &127) | 128)
+        n = n >> 7}
+    b.push(n)
+}
+
+fn w_s(b &mut []int, v int) {
+    mut n := v
+    mut done := false
+    while !done{
+        x := n &127
+        n = n >> 7
+        done =(n == 0 &&(x &64) == 0) ||(n == - 1 &&(x &64) != 0)
+        if done{b.push(x)} else {b.push(x | 128)}
+    }
+}
+
+fn w_bytes(b &mut []int, v &[]int) {for i in 0:v.len{b.push(v[i])}}
+fn w_name(b &mut []int, v string) {w_u(b, v.len)
+    for i in 0:v.len{b.push(v[i])}}
+fn w_section(b &mut []int, id int, v &[]int) {b.push(id)
+    w_u(b, v.len)
+    w_bytes(b, v)}
+fn w_i32(b &mut []int, v int) {b.push(65)
+    w_s(b, v)}
+fn w_i64(b &mut []int, v int) {b.push(66)
+    w_s(b, v)}
+fn w_get(b &mut []int, i int) {b.push(32)
+    w_u(b, i)}
+fn w_set(b &mut []int, i int) {b.push(33)
+    w_u(b, i)}
+fn w_load(b &mut []int, off int) {b.push(41)
+    w_u(b, 3)
+    w_u(b, off)}
+fn w_store(b &mut []int, off int) {b.push(55)
+    w_u(b, 3)
+    w_u(b, off)}
+fn w_addr(b &mut []int, off int) {w_get(b, 2)
+    w_i32(b, off)
+    b.push(107)}
+fn w_value(b &mut []int, m &types.Mir, fi int, fr &WFrame, v int, slot int) {
+    if v >= 0 {w_addr(b, fr.temps[v] + slot * 8)
+        w_load(b, 0)}
+    else if slot == 0 && v <= - 2 {w_i64(b, types.mir_const_at(m, fi, - v - 2))}
+    else {w_i64(b, 0)}
+}
+fn w_dest(b &mut []int, fr &WFrame, v int, slot int) {w_addr(b, fr.temps[v] + slot * 8)}
+fn w_slots(m &types.Mir, fi int, v int) int {
+    if v < 0 { << 1}
+    << types.mir_temp_nslots(m, fi, v)
+}
+fn w_frame(m &types.Mir, fi int) WFrame{
+    mut f := WFrame{locals:[]int {}, temps:[]int {}, size: 0, scratch: 0}
+    for i in 0:types.mir_nlocals(m, fi) {
+        offset := f.size
+        f.locals.push(offset)
+        f.size += types.mir_local_nslots(m, fi, i) * 8
+    }
+    for i in 0:types.mir_ntemps(m, fi) {
+        offset := f.size
+        f.temps.push(offset)
+        f.size += types.mir_temp_nslots(m, fi, i) * 8
+    }
+    f.scratch = f.size
+    f.size += 16384
+    << f
+}
+fn w_copy(b &mut []int, m &types.Mir, fi int, fr &WFrame, off int, src int, n int) {
+    for s in 0:n{w_addr(b, off + s * 8)
+        w_value(b, m, fi, fr, src, s)
+        w_store(b, 0)}
+}
+fn w_named(m &types.Mir, fi int, name string) bool {
+    if types.mir_fn_name_len(m, fi) != name.len { << false }
+    for i in 0:name.len { if types.mir_fn_name_byte(m, fi, i) != name[i] { << false } }
+    << true
+}
+fn w_find(m &types.Mir, label string) int {
+    for i in 0:m.fns.len{if types.mir_fn_label(m, i) == label{ << i}}
+    if label.len > 4 && label[0:4] == "_xu_" {
+        name := label[4:label.len]
+        for i in 0:m.fns.len { if w_named(m, i, name + "") { << i } }
+    }
+    << -1
+}
+fn w_index(w &WModule, fi int) int {
+    for i in 0:w.functions.len{if w.functions[i] == fi{ << i}}
+    eprintln("wasm: missing function " + str(fi))
+    <<< 1
+}
+fn w_fail(m &types.Mir, fi int, ii int, message string) {
+    eprintln("wasm: " + types.mir_fn_label(m, fi) + ":" + str(types.mir_iline(m, fi, ii)) + ": " + message)
+    <<< 1
+}
+fn w_call(b &mut []int, w &WModule, m &types.Mir, fi int, fr &WFrame, dest int, callee int, args &[]int, pointer_args bool) {
+    mut off := fr.scratch
+    for j in 0:args.len{
+        n := types.mir_local_nslots(m, callee, j)
+        mut indirect := pointer_args && types.mir_type_abi_class(types.mir_local_ty(m, callee, j)) == types.ty_abi_pointer
+        if j == 0 && types.mir_fn_receiver(m, callee) { indirect = false }
+        if indirect {
+            for slot in 0:n {
+                w_addr(b, off + slot * 8)
+                w_value(b, m, fi, fr, args[j], 0)
+                b.push(167)
+                w_i32(b, slot * 8)
+                b.push(107)
+                w_load(b, 0)
+                w_store(b, 0)
+            }
+        } else { w_copy(b, m, fi, fr, off, args[j], n) }
+        off += n * 8
+    }
+    w_addr(b, fr.scratch)
+    if dest >= 0 {w_dest(b, fr, dest, 0)} else {w_addr(b, fr.scratch + 8192)}
+    b.push(16)
+    w_u(b, w_index(w, callee))
+}
+fn w_helper(b &mut []int, w &WModule, m &types.Mir, fi int, fr &WFrame, dest int, name string, args &[]int) {
+    f := w_find(m, "_xu_" + name)
+    if f < 0 {eprintln("wasm: missing Xu helper " + name)
+        <<< 1}
+    w_call(b, w, m, fi, fr, dest, f, args, false)
+}
+// Append an immediate scalar to a helper argument frame.
+fn w_arg_int(b &mut []int, fr &WFrame, slot int, n int) {
+    w_addr(b, fr.scratch + slot * 8)
+    w_i64(b, n)
+    w_store(b, 0)
+}
+fn w_helper_raw(b &mut []int, w &WModule, m &types.Mir, fr &WFrame, dest int, name string) {
+    f := w_find(m, "_xu_" + name)
+    if f < 0 {eprintln("wasm: missing Xu helper " + name)
+        <<< 1}
+    w_addr(b, fr.scratch)
+    if dest >= 0 {w_dest(b, fr, dest, 0)} else {w_addr(b, fr.scratch + 8192)}
+    b.push(16)
+    w_u(b, w_index(w, f))
+}
+
+fn w_builtin(b &mut []int, w &WModule, m &types.Mir, fi int, fr &WFrame, ii int) {
+    a := types.mir_ia(m, fi, ii)
+    mut k := types.mir_ib(m, fi, ii)
+    mut at := types.mir_ic(m, fi, ii)
+    mut args :=[]int {}
+    while at >= 0 {args.push(types.mir_marg_v(m, fi, at))
+        at = types.mir_marg_next(m, fi, at)}
+    if k == 1 {
+        label := types.mir_isval(m, fi, ii)
+        if label == "_rt_div_zero" || label == "_rt_div_overflow" { b.push(0)
+            << }
+        to := w_find(m, types.mir_isval(m, fi, ii))
+        if w_named(m, to, "wasm_mem_load") { k = 43 }
+        else if w_named(m, to, "wasm_mem_load8") { k = 44 }
+        else if w_named(m, to, "wasm_mem_store") { k = 41 }
+        else if w_named(m, to, "wasm_mem_store8") { k = 42 }
+        else { w_call(b, w, m, fi, fr, a, to, &args, true)
+            << }
+    }
+    if k == 41 || k == 42 {
+        w_value(b, m, fi, fr, args[0], 0)
+        b.push(167)
+        w_value(b, m, fi, fr, args[1], 0)
+        if k == 41 {w_store(b, 0)} else {b.push(167)
+            b.push(58)
+            w_u(b, 0)
+            w_u(b, 0)}
+        <<
+    }
+    if k == 43 || k == 44 {
+        w_dest(b, fr, a, 0)
+        w_value(b, m, fi, fr, args[0], 0)
+        b.push(167)
+        if k == 43 {w_load(b, 0)} else {b.push(45)
+            w_u(b, 0)
+            w_u(b, 0)
+            b.push(173)}
+        w_store(b, 0)
+        <<
+    }
+    if k == 160 || k == 161 {
+        w_copy(b, m, fi, fr, fr.scratch, args[0], 1)
+        if k == 160 {
+            w_addr(b, fr.scratch)
+            w_value(b, m, fi, fr, args[0], 0)
+            w_i64(b, 8)
+            b.push(126)
+            w_store(b, 0)
+        }
+        w_helper_raw(b, w, m, fr, a, "wasm_rt_alloc")
+        w_dest(b, fr, a, 1)
+        w_value(b, m, fi, fr, args[0], 0)
+        w_store(b, 0)
+        w_dest(b, fr, a, 2)
+        w_value(b, m, fi, fr, args[0], 0)
+        w_store(b, 0)
+        <<
+    }
+    if k == 15 {b.push(0)
+        << }
+    if k == 28 || k == 99 || k == 100 {
+        w_dest(b, fr, a, 0)
+        w_i64(b, 0)
+        w_store(b, 0)
+        <<
+    }
+    mut helper := ""
+    if k == 6 {helper = "wasm_rt_str"}
+    if k == 10 {helper = "wasm_rt_byte"}
+    if k == 11 {helper = "wasm_rt_from_bytes"}
+    if k == 20 {helper = "wasm_rt_slice"}
+    if k == 21 {helper = "wasm_rt_bool"}
+    if k == 160 {helper = "wasm_rt_ints"}
+    if k == 161 {helper = "wasm_rt_string"}
+    if k == 81 {helper = "wasm_rt_bytes"}
+    if k == 24 {helper = "wasm_rt_assert"}
+    if k == 5 {helper = "wasm_rt_push_str"}
+    if k == 122 {helper = "wasm_rt_push_byte"}
+    if k >= 16 && k <= 19 {helper = "wasm_rt_class_" + str(k)}
+    if helper.len > 0 {w_helper(b, w, m, fi, fr, a, helper, &args)
+        << }
+    if k == 2 || k == 3 || k == 4 || k == 7 || k == 8 || k == 9 || k == 22 || k == 23 {
+        helper = "wasm_rt_print_int"
+        if k == 3 || k == 8 {helper = "wasm_rt_print_bool"}
+        if k == 4 || k == 9 || k == 23 {helper = "wasm_rt_print_str"}
+        n := w_slots(m, fi, args[0])
+        w_copy(b, m, fi, fr, fr.scratch, args[0], n)
+        mut err := 0
+        if k == 7 || k == 8 || k == 9 {err = 1}
+        w_arg_int(b, fr, n, err)
+        mut nl := 1
+        if k == 22 || k == 23 {nl = 0}
+        w_arg_int(b, fr, n + 1, nl)
+        w_helper_raw(b, w, m, fr, - 1, helper)
+        <<
+    }
+    w_fail(m, fi, ii, "unsupported builtin " + str(k))
+}
+
+fn w_binary(b &mut []int, op int) {
+    mut code := 0
+    if op == 1 {code = 124}
+    if op == 2 {code = 125}
+    if op == 3 {code = 126}
+    if op == 4 {code = 127}
+    if op == 5 {code = 129}
+    if op == 6 {code = 81}
+    if op == 7 {code = 82}
+    if op == 8 {code = 83}
+    if op == 9 {code = 87}
+    if op == 10 {code = 85}
+    if op == 11 {code = 89}
+    if op == 12 || op == 14 {code = 131}
+    if op == 13 || op == 15 {code = 132}
+    if op == 16 {code = 133}
+    if op == 17 {code = 134}
+    if op == 18 {code = 135}
+    if code == 0 {eprintln("wasm: unsupported binary op " + str(op))
+        <<< 1}
+    b.push(code)
+    if op >= 6 && op <= 11 {b.push(173)}
+}
+
+fn w_instr(b &mut []int, w &WModule, m &types.Mir, fi int, fr &WFrame, ii int) {
+    k := types.mir_ikind(m, fi, ii)
+    a := types.mir_ia(m, fi, ii)
+    v := types.mir_ib(m, fi, ii)
+    c := types.mir_ic(m, fi, ii)
+    d := types.mir_id(m, fi, ii)
+    if k == 0 || k == 8 || k == 21 || k == 22 || k == 24 { << }
+    if k == 1 || k == 9 {w_copy(b, m, fi, fr, fr.temps[a], v, types.mir_temp_nslots(m, fi, a))
+        << }
+    if k == 2 {
+        for s in 0:types.mir_temp_nslots(m, fi, a) {
+            w_dest(b, fr, a, s)
+            w_addr(b, fr.locals[v] + s * 8)
+            w_load(b, 0)
+            w_store(b, 0)
+        }
+        <<
+    }
+    if k == 3 {w_copy(b, m, fi, fr, fr.locals[a], v, types.mir_local_nslots(m, fi, a))
+        << }
+    if k == 4 {
+        if (a >= 0 && types.mir_temp_ty(m, fi, a) == 4) || (c >= 0 && types.mir_temp_ty(m, fi, c) == 4) || (d >= 0 && types.mir_temp_ty(m, fi, d) == 4) {
+            w_fail(m, fi, ii, "f64 arithmetic and comparison are not implemented")
+        }
+        if c >= 0 && types.mir_temp_ty(m, fi, c) == 3 {
+            if v == 1 {w_helper(b, w, m, fi, fr, a, "wasm_rt_concat", &[c, d])
+                << }
+            if v == 6 || v == 7 {
+                w_helper(b, w, m, fi, fr, a, "wasm_rt_eq", &[c, d])
+                if v == 7 {w_dest(b, fr, a, 0)
+                    w_value(b, m, fi, fr, a, 0)
+                    b.push(80)
+                    b.push(173)
+                    w_store(b, 0)}
+                <<
+            }
+        }
+        w_dest(b, fr, a, 0)
+        w_value(b, m, fi, fr, c, 0)
+        w_value(b, m, fi, fr, d, 0)
+        w_binary(b, v)
+        w_store(b, 0)
+        <<
+    }
+    if k == 5 {
+        if a >= 0 && types.mir_temp_ty(m, fi, a) == 4 { w_fail(m, fi, ii, "f64 unary arithmetic is not implemented") }
+        w_dest(b, fr, a, 0)
+        if v == 1 {w_i64(b, 0)
+            w_value(b, m, fi, fr, c, 0)
+            b.push(125)}
+        else {w_value(b, m, fi, fr, c, 0)
+            b.push(80)
+            b.push(173)}
+        w_store(b, 0)
+        <<
+    }
+    if k == 6 {
+        w_dest(b, fr, a, 0)
+        w_i64(b, w.strings[v])
+        w_store(b, 0)
+        w_dest(b, fr, a, 1)
+        w_i64(b, m.strings[v].len)
+        w_store(b, 0)
+        w_dest(b, fr, a, 2)
+        w_i64(b, 0)
+        w_store(b, 0)
+        <<
+    }
+    if k == 7 {w_builtin(b, w, m, fi, fr, ii)
+        << }
+    if k == 10 || k == 11 {
+        for s in 0:d{
+            if k == 10 {
+                w_dest(b, fr, a, s)
+                w_addr(b, fr.temps[v] + c + s * 8)
+                w_load(b, 0)
+                w_store(b, 0)
+            } else {
+                w_addr(b, fr.temps[v] + c + s * 8)
+                w_value(b, m, fi, fr, a, s)
+                w_store(b, 0)
+            }
+        }
+        <<
+    }
+    if k == 16 {
+        w_dest(b, fr, a, 0)
+        if c == 0 {w_addr(b, fr.locals[v])} else {w_addr(b, fr.temps[v])}
+        b.push(173)
+        w_store(b, 0)
+        <<
+    }
+    if k == 17 || k == 18 || k == 25 || k == 26 {
+        for s in 0:d{
+            mut off := c + s * 8
+            if k == 17 || k == 18 {off = - off}
+            if k == 17 || k == 26 {w_dest(b, fr, a, s)}
+            w_value(b, m, fi, fr, v, 0)
+            b.push(167)
+            w_i32(b, off)
+            b.push(106)
+            if k == 17 || k == 26 {w_load(b, 0)
+                w_store(b, 0)}
+            else {w_value(b, m, fi, fr, a, s)
+                w_store(b, 0)}
+        }
+        <<
+    }
+    if k == 12 {
+        // Array literal: argument chain elements copied into ascending heap.
+        w_arg_int(b, fr, 0, v * d)
+        w_helper_raw(b, w, m, fr, a, "wasm_rt_alloc")
+        w_dest(b, fr, a, 1)
+        w_i64(b, v)
+        w_store(b, 0)
+        w_dest(b, fr, a, 2)
+        w_i64(b, v)
+        w_store(b, 0)
+        mut arg := c
+        for j in 0:v{
+            elem := types.mir_marg_v(m, fi, arg)
+            for s in 0:d / 8 {
+                w_value(b, m, fi, fr, a, 0)
+                b.push(167)
+                w_value(b, m, fi, fr, elem, s)
+                w_store(b, j * d + s * 8)
+            }
+            arg = types.mir_marg_next(m, fi, arg)
+        }
+        <<
+    }
+    if k == 13 {
+        w_addr(b, fr.scratch)
+        if c == 1 {w_value(b, m, fi, fr, a, 0)
+            b.push(167)} else if a >= 1073741824 {w_addr(b, fr.locals[a - 1073741824])} else {w_addr(b, fr.temps[a])}
+        b.push(173)
+        w_store(b, 0)
+        w_addr(b, fr.scratch + 8)
+        w_dest(b, fr, v, 0)
+        b.push(173)
+        w_store(b, 0)
+        w_arg_int(b, fr, 2, d)
+        w_helper_raw(b, w, m, fr, - 1, "wasm_rt_push")
+        <<
+    }
+    if k == 48 {
+        w_value(b, m, fi, fr, a, 0)
+        b.push(167)
+        offset := types.mir_iline(m, fi, ii)
+        w_i32(b, offset)
+        if v == 0 { b.push(107) } else { b.push(106) }
+        w_set(b, 4)
+        w_get(b, 4)
+        w_get(b, 4)
+        w_load(b, 0)
+        w_value(b, m, fi, fr, c, 0)
+        w_binary(b, types.mir_icol(m, fi, ii))
+        w_store(b, 0)
+        <<
+    }
+    if k == 14 || k == 20 || k == 23 || k == 47 {
+        mut base := v
+        mut idx := c
+        if k == 20 || k == 47 {base = a
+            idx = v}
+        mut off := 0
+        mut ty := 0
+        if base >= 1073741824 {off = fr.locals[base - 1073741824]
+            ty = types.mir_local_ty(m, fi, base - 1073741824)}
+        else {off = fr.temps[base]
+            ty = types.mir_temp_ty(m, fi, base)}
+        mut width := d
+        if width < 0 {width = - width}
+        if ty == 3 {width = 1}
+        // Bounds checks remain active even when the native MIR proved them.
+        w_value(b, m, fi, fr, idx, 0)
+        w_i64(b, 0)
+        b.push(83)
+        w_value(b, m, fi, fr, idx, 0)
+        w_addr(b, off + 8)
+        w_load(b, 0)
+        b.push(89)
+        b.push(114)
+        b.push(4)
+        b.push(64)
+        b.push(0)
+        b.push(11)
+        w_addr(b, off)
+        w_load(b, 0)
+        w_value(b, m, fi, fr, idx, 0)
+        w_i64(b, width)
+        b.push(126)
+        b.push(124)
+        b.push(167)
+        w_set(b, 4)
+        if k == 23 {w_dest(b, fr, a, 0)
+            w_get(b, 4)
+            b.push(173)
+            w_store(b, 0)
+            << }
+        if k == 47 {
+            w_get(b, 4)
+            w_get(b, 4)
+            w_load(b, 0)
+            w_value(b, m, fi, fr, c, 0)
+            w_binary(b, types.mir_icol(m, fi, ii))
+            w_store(b, 0)
+            <<
+        }
+        mut n := width / 8
+        if width == 1 {n = 1}
+        for s in 0:n{
+            if k == 14 {w_dest(b, fr, a, s)
+                w_get(b, 4)}
+            else {w_get(b, 4)
+                w_value(b, m, fi, fr, c, s)}
+            if k == 14 {
+                if width == 1 {b.push(45)
+                    w_u(b, 0)
+                    w_u(b, 0)
+                    b.push(173)} else {w_load(b, s * 8)}
+                w_store(b, 0)
+            } else if width == 1 {b.push(167)
+                b.push(58)
+                w_u(b, 0)
+                w_u(b, 0)}
+            else {w_store(b, s * 8)}
+        }
+        <<
+    }
+    if k == 15 {
+        w_dest(b, fr, a, 0)
+        w_value(b, m, fi, fr, v, 0)
+        w_i64(b, c)
+        b.push(81)
+        b.push(173)
+        w_store(b, 0)
+        <<
+    }
+    if k == 19 || k == 45 {
+        w_value(b, m, fi, fr, v, 0)
+        w_i64(b, 0)
+        b.push(82)
+        b.push(4)
+        b.push(64)
+        b.push(0)
+        b.push(11)
+        for s in 0:d{w_dest(b, fr, a, s)
+            w_value(b, m, fi, fr, v, s + 1)
+            w_store(b, 0)}
+        <<
+    }
+    w_fail(m, fi, ii, "unsupported MIR instruction " + str(k))
+}
+
+fn w_body(w &WModule, m &types.Mir, fi int)[]int {
+    fr := w_frame(m, fi)
+    mut b :=[]int {}
+    w_u(mut &b, 1)
+    w_u(mut &b, 3)
+    b.push(127)  // fp, pc, scratch i32
+    b.push(35)
+    w_u(mut &b, 0)
+    w_set(mut &b, 2)
+    w_get(mut &b, 2)
+    w_i32(mut &b, fr.size)
+    b.push(107)
+    b.push(36)
+    w_u(mut &b, 0)
+    w_addr(mut &b, fr.size - 8)
+    w_i32(mut &b, 0)
+    w_i32(mut &b, fr.size)
+    b.push(252)
+    b.push(11)
+    b.push(0)
+    mut argslot := 0
+    for j in 0:types.mir_fn_nparams(m, fi) {
+        for s in 0:types.mir_local_nslots(m, fi, j) {
+            w_addr(mut &b, fr.locals[j] + s * 8)
+            w_get(mut &b, 0)
+            w_i32(mut &b, argslot * 8)
+            b.push(107)
+            w_load(mut &b, 0)
+            w_store(mut &b, 0)
+            argslot += 1
+        }
+    }
+    w_i32(mut &b, 0)
+    w_set(mut &b, 3)
+    b.push(3)
+    b.push(64)  // dispatch loop
+    for bi in 0:types.mir_nblocks(m, fi) {
+        w_get(mut &b, 3)
+        w_i32(mut &b, bi)
+        b.push(70)
+        b.push(4)
+        b.push(64)
+        mut ii := types.mir_bhead(m, fi, bi)
+        while ii >= 0 {w_instr(mut &b, w, m, fi, &fr, ii)
+            ii = types.mir_inext(m, fi, ii)}
+        tk := types.mir_btkind(m, fi, bi)
+        if tk == 3 {
+            v := types.mir_bta(m, fi, bi)
+            for s in 0:types.mir_fn_ret_nslots(m, fi) {
+                w_get(mut &b, 1)
+                w_i32(mut &b, s * 8)
+                b.push(107)
+                w_value(mut &b, m, fi, &fr, v, s)
+                w_store(mut &b, 0)
+            }
+            w_get(mut &b, 2)
+            b.push(36)
+            w_u(mut &b, 0)
+            b.push(15)
+        } else if tk == 1 || tk == 2 {
+            if tk == 1 {w_i32(mut &b, types.mir_bta(m, fi, bi))}
+            else {
+                w_i32(mut &b, types.mir_btb(m, fi, bi))
+                w_i32(mut &b, types.mir_btc(m, fi, bi))
+                w_value(mut &b, m, fi, &fr, types.mir_bta(m, fi, bi), 0)
+                b.push(167)
+                b.push(27)
+            }
+            w_set(mut &b, 3)
+            b.push(12)
+            w_u(mut &b, 1)
+        } else {b.push(0)}
+        b.push(11)
+    }
+    b.push(0)
+    b.push(11)
+    b.push(11)
+    << b
+}
+
+fn wasm_emit(m &types.Mir, c_fns &[]types.CFn, path string) int {
+    mut w := WModule{data:[]int {}, strings:[]int {}, functions:[]int {}, labels:[]string {}}
+    // Public free functions in @main are host entry points; main is exported
+    // even without pub. All use the documented frame ABI, not native registers.
+    mut exports := []int{}
+    mut export_names := []string{}
+    for i in 0:c_fns.len {
+        if c_fns[i].mod_id == "main" && c_fns[i].recv < 0 && !c_fns[i].is_extern && !c_fns[i].is_template {
+            if c_fns[i].is_pub || c_fns[i].name == "main" {
+                fi := w_find(m, c_fns[i].label + "")
+                if fi >= 0 {
+                    exports.push(fi)
+                    export_names.push(c_fns[i].name + "_frame")
+                    w.functions.push(fi)
+                }
+            }
+        }
+    }
+    // Xu-provided runtime helpers implement allocation, strings and output.
+    // Applications own the arena; the compiler has no browser or site dependency.
+    for i in 0:m.fns.len {
+        lab := types.mir_fn_label(m, i)
+        if lab.len >= 17 && lab[0:17] == "_xu_main_wasm_rt_" {
+            w.functions.push(i)
+        }
+    }
+    if exports.len == 0 { eprintln("wasm: no main or public @main entry point")
+        << 1 }
+    mut pos := 0
+    while pos < w.functions.len{
+        fi := w.functions[pos]
+        for ii in 0:types.mir_nins(m, fi) {
+            if types.mir_ikind(m, fi, ii) == 7 && types.mir_ib(m, fi, ii) == 1 {
+                lab := types.mir_isval(m, fi, ii)
+                to := w_find(m, lab + "")
+                if to < 0 {
+                    if lab == "_rt_div_zero" || lab == "_rt_div_overflow" { -> }
+                    w_fail(m, fi, ii, "unknown callee " + lab)
+                }
+                mut found := false
+                for j in 0:w.functions.len{if w.functions[j] == to{found = true}}
+                if !found{w.functions.push(to)}
+            }
+        }
+        pos += 1
+    }
+    mut missing := []int{}
+    for j in 0:w.functions.len {
+        fi := w.functions[j]
+        for ii in 0:types.mir_nins(m, fi) {
+            kind := types.mir_ikind(m, fi, ii)
+            mut tag := 0
+            if kind == 7 {
+                bk := types.mir_ib(m, fi, ii)
+                if !(bk >= 1 && bk <= 11 || bk >= 15 && bk <= 21 || bk == 24 || bk == 28 || bk >= 41 && bk <= 44 || bk == 81 || bk == 99 || bk == 100 || bk == 122 || bk == 160 || bk == 161) { tag = 1000 + bk }
+            } else if !(kind >= 0 && kind <= 26 || kind == 47 || kind == 48) { tag = kind }
+            if tag > 0 {
+                mut seen := false
+                for n in 0:missing.len { if missing[n] == tag { seen = true } }
+                if !seen { missing.push(tag)
+                    eprintln("wasm requirement " + str(tag) + " in " + types.mir_fn_label(m, fi)) }
+            }
+        }
+    }
+    if missing.len > 0 { << 1 }
+    for i in 0:m.strings.len{
+        address := 1048576 + w.data.len
+        w.strings.push(address)
+        for j in 0:m.strings[i].len{w.data.push(m.strings[i][j])}
+    }
+    if w.data.len > 2097152 {eprintln("wasm: constant pool exceeds 2 MiB")
+        << 1}
+    mut out :=[0, 97, 115, 109, 1, 0, 0, 0]
+    mut section :=[1, 96, 2, 127, 127, 0]
+    w_section(mut &out, 1, &section)
+    section =[]int {}
+    w_u(mut &section, w.functions.len)
+    for _ in 0:w.functions.len{w_u(mut &section, 0)}
+    w_section(mut &out, 3, &section)
+    section =[1, 1, 128, 8, 128, 8]  // memory 1024 pages, max 1024
+    w_section(mut &out, 5, &section)
+    section =[1, 127, 1, 65]
+    w_s(mut &section, 8388600)
+    section.push(11)
+    w_section(mut &out, 6, &section)
+    section =[]int {}
+    w_u(mut &section, 1 + exports.len)
+    w_name(mut &section, "memory")
+    section.push(2)
+    w_u(mut &section, 0)
+    for i in 0:exports.len {
+        w_name(mut &section, export_names[i] + "")
+        section.push(0)
+        w_u(mut &section, w_index(&w, exports[i]))
+    }
+    w_section(mut &out, 7, &section)
+    section =[]int {}
+    w_u(mut &section, w.functions.len)
+    for j in 0:w.functions.len{
+        body := w_body(&w, m, w.functions[j])
+        w_u(mut &section, body.len)
+        w_bytes(mut &section, &body)
+    }
+    w_section(mut &out, 10, &section)
+    section =[1, 0, 65]
+    w_s(mut &section, 1048576)
+    section.push(11)
+    w_u(mut &section, w.data.len)
+    w_bytes(mut &section, &w.data)
+    w_section(mut &out, 11, &section)
+    // Provenance is embedded in the binary rather than inferred from its name.
+    section =[]int {}
+    w_name(mut &section, "xu.source")
+    w_name(mut &section, "Xu compiler wasm32 backend; Xu MIR; frame ABI v1; no foreign code generator")
+    w_section(mut &out, 0, &section)
+    section = []int{}
+    w_name(mut &section, "name")
+    mut names := []int{}
+    w_u(mut &names, w.functions.len)
+    for j in 0:w.functions.len {
+        w_u(mut &names, j)
+        w_name(mut &names, types.mir_fn_label(m, w.functions[j]))
+    }
+    section.push(1)
+    w_u(mut &section, names.len)
+    w_bytes(mut &section, &names)
+    w_section(mut &out, 0, &section)
+    bytes := string_from_bytes(out)
+    os.write(path + "", bytes + "") or(err) {eprintln("wasm: cannot write " + path)
+        << 1}
+    println("Xu -> WASM: " + str(w.functions.len) + " functions, " + str(bytes.len) + " bytes")
+    << 0
+}

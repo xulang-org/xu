@@ -1,0 +1,447 @@
+@main
+
+#os/exec
+
+fn update_look_path(name string) string {
+    << exec.look_path(name) or (err) { << "" }
+}
+
+fn run_update(argv &[]string) int {
+    for i in 2:argv.len {
+        if argv[i] == "--help" || argv[i] == "-h" {
+            println("Usage: xu up | xu update [options]")
+            println("  --check          check for a new version without installing")
+            println("  --version VER    build a specific GitHub release (e.g. 0.8.7-dev.1; default updates use final releases)")
+            println("  --ref REF        build a GitHub branch, tag or commit (e.g. main)")
+            println("  --prefix DIR     install an SDK into DIR/bin instead of replacing this xu")
+            println("  --source DIR     build from a local source tree instead of downloading")
+            println("  --force          rebuild the same version or allow a downgrade")
+            println("Default: latest GitHub release; main if no release exists. Requires Python 3.9+.")
+            << 0
+        }
+    }
+    exe := cli_arg_owned(argv, 0)
+    resolved := exec.look_path(exe) or (err) {
+        eprintln("xu update: " + err.msg())
+        << 1
+    }
+    actual := require_real_path(&resolved)
+    mut python := update_look_path("python3")
+    mut args := []string{}
+    if python.len == 0 {
+        python = update_look_path("py")
+        if python.len > 0 { args.push("-3") }
+    }
+    if python.len == 0 {
+        python = update_look_path("python")
+    }
+    if python.len == 0 {
+        eprintln("xu update: Python 3.9+ is required; install Python and retry")
+        << 1
+    }
+    args.push("-c")
+    args.push(update_python_source())
+    args.push(actual)
+    for i in 2:argv.len { args.push(cli_arg_owned(argv, i)) }
+    << cli_exec(python, args)
+}
+
+// Keep the updater inside the executable: standalone downloads need no
+// helper scripts. Raw strings preserve Python's quoting and Windows paths.
+fn update_python_source() string {
+    << `
+# BEGIN XU UPDATE PYTHON
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+REPO = "xulang-org/xu"
+TOOLS = ("doctor", "fmt", "map", "doc", "desktop")
+
+
+def log(message):
+    print("xu update: " + message, flush=True)
+
+
+def version(value):
+    match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?", value)
+    if not match:
+        raise ValueError("invalid Xu version: " + value)
+    pre = match[4].split(".") if match[4] else []
+    if any(part.isdigit() and len(part) > 1 and part[0] == "0" for part in pre):
+        raise ValueError("invalid numeric prerelease identifier: " + value)
+    tokens = tuple((0, int(part)) if part.isdigit() else (1, part) for part in pre)
+    return tuple(int(match[i]) for i in (1, 2, 3)), not pre, tokens
+
+
+def fetch(url, limit=1024 * 1024):
+    request = urllib.request.Request(url, headers={"User-Agent": "Xu-self-update"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("download exceeds size limit: " + url)
+    return data
+
+
+def remote_source(ref=None, requested=None):
+    if requested:
+        requested = requested.removeprefix("v")
+        version(requested)
+        ref = "v" + requested
+    if ref is None:
+        try:
+            release = json.loads(fetch("https://api.github.com/repos/" + REPO + "/releases/latest"))
+            ref = release["tag_name"]
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            ref = "main"
+    commit = json.loads(fetch("https://api.github.com/repos/" + REPO + "/commits/" + urllib.parse.quote(ref, safe="")))["sha"]
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("GitHub returned an invalid source commit")
+    target = fetch("https://raw.githubusercontent.com/" + REPO + "/" + commit + "/VERSION").decode().strip()
+    version(target)
+    if requested and target != requested:
+        raise ValueError("release VERSION does not match --version " + requested)
+    return target, commit
+
+
+def extract_source(archive, destination):
+    # GitHub tarballs contain one root directory. Reject links, devices and
+    # paths escaping that root before extracting any archive member.
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = bundle.getmembers()
+        roots = set()
+        for member in members:
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts or "\\" in member.name or not path.parts:
+                raise ValueError("unsafe source archive path: " + member.name)
+            if not (member.isdir() or member.isfile()):
+                raise ValueError("unsupported source archive entry: " + member.name)
+            roots.add(path.parts[0])
+        if len(roots) != 1:
+            raise ValueError("source archive must contain one repository root")
+        if sum(member.size for member in members) > 512 * 1024 * 1024:
+            raise ValueError("source archive is too large")
+        for member in members:
+            path = destination.joinpath(*PurePosixPath(member.name).parts[1:])
+            if member.isdir():
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.extractfile(member) as reader, path.open("wb") as writer:
+                    shutil.copyfileobj(reader, writer)
+                path.chmod(member.mode & 0o777)
+
+
+def compiler_version(compiler):
+    result = subprocess.run([str(compiler), "--version"], capture_output=True, text=True, timeout=30, check=True)
+    match = re.search(r"Xu Compiler Toolchain v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?) \(self-hosted\)", result.stdout)
+    if not match:
+        raise ValueError("update requires a self-hosted Xu product compiler: " + str(compiler))
+    version(match[1])
+    return match[1]
+
+
+def layout(seed, prefix=None):
+    if prefix:
+        root = Path(prefix).expanduser().resolve()
+        return root, root / "bin", root / "bin" / ("xu.exe" if os.name == "nt" else "xu")
+    bindir = seed.parent
+    if bindir.name == "bin":
+        root = bindir.parent
+    elif bindir.parent.name == "platform" and bindir.parent.parent.name == "bin":
+        root = bindir.parent.parent.parent
+    else:
+        root = bindir
+    return root, bindir, seed
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def build_source(source, seed, work, target):
+    main = source / "src/cmd/compile/main.xu"
+    if not main.is_file() or not (source / "src/os").is_dir():
+        raise ValueError("source tree is missing compiler or standard library")
+    sources = [main, *sorted(path for path in main.parent.glob("*.xu") if path != main)]
+    env = dict(os.environ)
+    for key in ("XUOS", "XUARCH", "XU_BOOT_EXTRA", "XU_HEAP_STATS", "XU_SEED", "XU_ALLOW_ORACLE_SEED", "XU_PRODUCT_XUPATH"):
+        env.pop(key, None)
+    env.update(LC_ALL="C", XUPATH="", XU_STDLIB_ROOT=(source / "src").as_posix(), XU_CACHE=(work / "cache").as_posix())
+    (work / "cache").mkdir()
+
+    def compile_with(compiler, inputs, output):
+        log("building " + output.name)
+        subprocess.run([str(compiler), "build", *map(str, inputs), "--output", str(output)], cwd=source, env=env, check=True)
+        if not output.is_file():
+            raise ValueError("compiler did not produce " + str(output))
+
+    # Old seeds can reject the new module version before compiling it.
+    # Omit only that identity from the first hop; later hops use real sources.
+    first = work / "seed-input"
+    first.mkdir()
+    for path in sources:
+        shutil.copy2(path, first / path.name)
+    manifest = (main.parent / "xu.xun").read_text()
+    (first / "xu.xun").write_text("".join(line for line in manifest.splitlines(keepends=True) if not line.startswith("version:")))
+    first_sources = [first / path.name for path in sources]
+    suffix = ".exe" if os.name == "nt" else ""
+    generations = []
+    previous = seed
+    for number in range(1, 4):
+        output = work / ("gen" + str(number) + suffix)
+        compile_with(previous, first_sources if number == 1 else sources, output)
+        generations.append(output)
+        previous = output
+    hashes = [digest(path) for path in generations]
+    if hashes[1] != hashes[2]:
+        output = work / ("gen4" + suffix)
+        compile_with(previous, sources, output)
+        generations.append(output)
+        hashes.append(digest(output))
+        if hashes[2] != hashes[3]:
+            raise ValueError("self-host verification failed: Gen3 differs from Gen4")
+    compiler = generations[-1]
+    if compiler_version(compiler) != target:
+        raise ValueError("built compiler version does not match source VERSION")
+    binaries = {"xu": compiler}
+    for name in TOOLS:
+        output = work / ("xu-" + name + suffix)
+        compile_with(compiler, [source / "src/cmd" / name], output)
+        binaries["xu-" + name] = output
+    smoke = work / "smoke.xu"
+    smoke.write_text('@main\n#os\nfn main() int {\n    println("xu-update-ok")\n    << 0\n}\n')
+    output = work / ("smoke" + suffix)
+    compile_with(compiler, [smoke], output)
+    result = subprocess.run([str(output)], capture_output=True, text=True, timeout=30, check=True)
+    if result.stdout.strip() != "xu-update-ok":
+        raise ValueError("new compiler failed its runtime smoke test")
+    count = len(generations)
+    provenance = dict(schema=2, status="PASS", lane="product", hosted_profile="product", fixed_point_cmp="PASS",
+                      fixed_point_pair="gen2_gen3" if count == 3 else "gen3_gen4", confirmed_generation=count,
+                      confirmed_sha256=hashes[-1], confirmed_size=compiler.stat().st_size,
+                      gen2_gen3_cmp="PASS" if count == 3 else "DIFFERENT", gen3_gen4_cmp="SKIPPED" if count == 3 else "PASS",
+                      gen4_sha256="SKIPPED", gen4_size="SKIPPED", seed_sha256=digest(seed), update_source_version=target)
+    for number, (path, value) in enumerate(zip(generations, hashes), 1):
+        provenance["gen" + str(number) + "_sha256"] = value
+        provenance["gen" + str(number) + "_size"] = path.stat().st_size
+    return binaries, provenance
+
+
+# The same transaction runs here on Unix and in a deferred worker on Windows,
+# where the invoking xu.exe must exit before its image can be replaced.
+INSTALL_CODE = r'''
+import json, os, re, shutil, subprocess, sys
+from pathlib import Path
+
+def commit_install(stage):
+    plan = json.loads((stage / "plan.json").read_text())
+    completed = []
+    try:
+        for index, entry in enumerate(plan["entries"]):
+            source, target = map(Path, entry)
+            backup = stage / ("old-" + str(index))
+            existed = target.exists() or target.is_symlink()
+            completed.append((target, backup, existed, False))
+            if existed:
+                os.replace(target, backup)
+                completed[-1] = (target, backup, existed, True)
+            os.replace(source, target)
+            if not existed:
+                completed[-1] = (target, backup, existed, True)
+        result = subprocess.run([plan["compiler"], "--version"], capture_output=True, text=True, timeout=30, check=True)
+        if "Xu Compiler Toolchain v" + plan["version"] + " (self-hosted)" not in result.stdout:
+            raise ValueError("installed compiler has an unexpected version")
+    except BaseException as failure:
+        rollback_errors = []
+        for target, backup, existed, moved in reversed(completed):
+            if not moved:
+                continue
+            try:
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                elif target.exists() or target.is_symlink():
+                    target.unlink()
+                if existed:
+                    os.replace(backup, target)
+            except OSError as error:
+                rollback_errors.append(str(error))
+        if rollback_errors:
+            raise OSError("rollback incomplete; backups retained at " + str(stage) + ": " + "; ".join(rollback_errors)) from failure
+        raise
+'''
+exec(INSTALL_CODE)
+
+
+def stage_install(source, binaries, provenance, root, bindir, compiler, target, commit):
+    stage = Path(tempfile.mkdtemp(prefix=".xu-update-stage-", dir=root))
+    try:
+        entries = []
+        bindir.mkdir(parents=True, exist_ok=True)
+        for directory in ("src", "include"):
+            if (source / directory).is_dir():
+                shutil.copytree(source / directory, stage / directory)
+                entries.append([str(stage / directory), str(root / directory)])
+        for name, binary in binaries.items():
+            dest = compiler if name == "xu" else bindir / (name + (".exe" if os.name == "nt" else ""))
+            staged = stage / dest.name
+            shutil.copy2(binary, staged)
+            staged.chmod(0o755)
+            entries.append([str(staged), str(dest)])
+        (stage / "VERSION").write_text(target + "\n")
+        entries.append([str(stage / "VERSION"), str(root / "VERSION")])
+        provenance["update_source_commit"] = commit or "local"
+        (stage / "provenance").write_text("".join(str(key) + "=" + str(value) + "\n" for key, value in provenance.items()))
+        entries.append([str(stage / "provenance"), str(compiler) + ".provenance"])
+        if (root / "bundle.json").is_file():
+            metadata = json.loads((root / "bundle.json").read_text())
+            metadata["version"] = target
+            (stage / "bundle.json").write_text(json.dumps(metadata, indent=2) + "\n")
+            entries.append([str(stage / "bundle.json"), str(root / "bundle.json")])
+        (stage / "plan.json").write_text(json.dumps(dict(entries=entries, compiler=str(compiler), version=target)))
+        return stage
+    except BaseException:
+        shutil.rmtree(stage)
+        raise
+
+
+def install(stage, root, target):
+    if os.name == "nt":
+        worker = stage / "worker.py"
+        worker.write_text(INSTALL_CODE + '''
+import ctypes
+stage = Path(sys.argv[1])
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel.OpenProcess.restype = ctypes.c_void_p
+kernel.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+handle = kernel.OpenProcess(0x00100000, False, int(sys.argv[2]))
+try:
+    if not handle and ctypes.get_last_error() != 87:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if handle and kernel.WaitForSingleObject(handle, 120000) != 0:
+        raise RuntimeError("invoking xu.exe did not exit; update remains staged at " + str(stage))
+    commit_install(stage)
+    print("xu update: installed " + sys.argv[3], flush=True)
+    shutil.rmtree(stage)
+finally:
+    if handle:
+        kernel.CloseHandle(handle)
+    (stage.parent / ".xu-update.lock").unlink(missing_ok=True)
+''')
+        with (root / ".xu-update.log").open("w") as output:
+            subprocess.Popen([sys.executable, str(worker), str(stage), str(os.getppid()), target],
+                             stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        log("build verified; installation completes when xu exits. Log: " + str(root / ".xu-update.log"))
+        return True
+    commit_install(stage)
+    shutil.rmtree(stage)
+    log("installed " + target + "; compiler, tools and standard library updated")
+    return False
+
+
+def main(seed, arguments):
+    parser = argparse.ArgumentParser(prog="xu update", description="Build and install Xu from official GitHub sources (Python 3.9+).")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--version")
+    selection.add_argument("--ref")
+    selection.add_argument("--source", type=Path)
+    parser.add_argument("--prefix")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args(arguments)
+    seed = Path(seed).resolve(strict=True)
+    current = compiler_version(seed)
+    commit = None
+    if args.source:
+        source = args.source.expanduser().resolve(strict=True)
+        target = (source / "VERSION").read_text().strip()
+    else:
+        target, commit = remote_source(args.ref, args.version)
+    log("current " + current + "; source " + target + (" (" + commit[:12] + ")" if commit else " (local)"))
+    comparison = version(target) > version(current)
+    if args.check:
+        log("update available" if comparison else "already up to date")
+        return 0
+    if not args.force and not comparison and not args.prefix:
+        log("already up to date; use --force to rebuild or downgrade")
+        return 0
+    root, bindir, compiler = layout(seed, args.prefix)
+    if (root / ".git").exists():
+        raise ValueError("refusing to overwrite a development checkout; use --prefix DIR to install a separate SDK")
+    if (root / "src").exists() and not ((root / "src/cmd/compile/xu.xun").is_file() and (root / "VERSION").is_file()):
+        raise ValueError("destination src/ is not a Xu SDK; use --prefix DIR with a separate installation directory")
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / ".xu-update.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise ValueError("another update is running; lock: " + str(lock))
+    os.close(fd)
+    deferred = False
+    stage = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="xu-update-build-") as directory:
+            work = Path(directory)
+            if not args.source:
+                archive = work / "source.tar.gz"
+                log("downloading source commit " + commit)
+                archive.write_bytes(fetch("https://codeload.github.com/" + REPO + "/tar.gz/" + commit, 128 * 1024 * 1024))
+                source = work / "source"
+                extract_source(archive, source)
+                if (source / "VERSION").read_text().strip() != target:
+                    raise ValueError("downloaded source VERSION changed")
+            else:
+                # Compile and install the same snapshot even if a developer
+                # edits the local tree while the self-host chain is running.
+                snapshot = work / "source"
+                snapshot.mkdir()
+                for name in ("src", "include"):
+                    if (source / name).is_dir():
+                        shutil.copytree(source / name, snapshot / name)
+                shutil.copy2(source / "VERSION", snapshot / "VERSION")
+                source = snapshot
+                if (source / "VERSION").read_text().strip() != target:
+                    raise ValueError("local source VERSION changed during snapshot")
+            binaries, provenance = build_source(source, seed, work, target)
+            stage = stage_install(source, binaries, provenance, root, bindir, compiler, target, commit)
+            deferred = install(stage, root, target)
+    finally:
+        if not deferred:
+            lock.unlink(missing_ok=True)
+            if stage and stage.exists():
+                if list(stage.glob("old-*")):
+                    log("recovery files retained at " + str(stage))
+                else:
+                    shutil.rmtree(stage)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        if sys.version_info < (3, 9):
+            raise ValueError("Python 3.9+ is required")
+        sys.exit(main(sys.argv[1], sys.argv[2:]))
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, tarfile.TarError) as error:
+        print("xu update: " + str(error), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("xu update: interrupted; current installation retained", file=sys.stderr)
+        sys.exit(130)
+# END XU UPDATE PYTHON
+`
+}

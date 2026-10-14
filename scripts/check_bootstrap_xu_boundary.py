@@ -266,7 +266,7 @@ class BoundaryCheck:
                 self.error(f"required_paths[{index}] must be a string")
                 continue
             # Development docs and the sync ledger intentionally stay local.
-            if self.ci and (value.startswith("docs/") or value == "bootstrap/SYNC_DIFF.md"):
+            if self.ci and (value.startswith(("docs/", "tests/")) or value == "bootstrap/SYNC_DIFF.md"):
                 continue
             path = self.path(value, f"required_paths[{index}]")
             if path is not None and not path.exists():
@@ -695,6 +695,8 @@ class BoundaryCheck:
         if not isinstance(strict_paths, list):
             strict_paths = []
         for index, value in enumerate(strict_paths):
+            if self.ci and isinstance(value, str) and value.startswith("tests/"):
+                continue  # The complete Xu test corpus stays on the development machine.
             label = f"invariants.oracle_strict_resolver_scripts[{index}]"
             if not isinstance(value, str):
                 self.error(f"{label} must be a string")
@@ -1996,6 +1998,12 @@ class BoundaryCheck:
                         f"{section} must be disjoint from product/oracle consumers: {value}"
                     )
                 path = self.path(value, label)
+                if self.ci and value.startswith("tests/"):
+                    # Keep lane/disjointness checks above; local test bodies
+                    # are intentionally absent from a public checkout.
+                    if path is not None:
+                        self.info.setdefault("local_test_consumers_excluded", []).append(value)
+                    continue
                 if path is None or not self.regular_file(path, label):
                     continue
                 try:
@@ -2307,8 +2315,8 @@ class BoundaryCheck:
                 # it into an unlabeled product build.
                 if not re.search(r"(?im)^\s*name:\s*oracle\b", text):
                     self.error("oracle workflow must identify itself as oracle")
-                if not re.search(r"\bmake\s+oracle\b", active):
-                    self.error("oracle workflow must invoke the explicit `make oracle` target")
+                if not re.search(r"\bmake\s+oracle\b|(?:\./)?scripts/oracle_platform_chain\.sh(?=\s|$)", active):
+                    self.error("oracle workflow must invoke `make oracle` or `scripts/oracle_platform_chain.sh`")
                 if not re.search(r"XU_CI_LANE\s*=\s*oracle|lane\s*[:=]\s*oracle", active, re.IGNORECASE):
                     self.error("oracle workflow must carry an active lane=oracle marker")
                 if re.search(r"\bmake\s+(?:xu|product-selfhost|selfhost)\b", active):

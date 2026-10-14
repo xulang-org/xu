@@ -261,7 +261,7 @@ done
 # are deterministic. Divergences still being worked through are
 # listed in docs/audit/GEN1_FIXTURE_KNOWN_FAIL.txt; that list can only shrink.
 scripts/run_fixtures.sh --xu="$tmp/gen1.xin" --sub=build --label=gen1 \
-    --known-fail=docs/audit/GEN1_FIXTURE_KNOWN_FAIL.txt --skip-net > "$tmp/gen1_fixtures.log" 2>&1 \
+    --known-fail=docs/audit/GEN1_FIXTURE_KNOWN_FAIL.txt --skip-net --skip-require > "$tmp/gen1_fixtures.log" 2>&1 \
     || { grep -E '^(FAIL|FIXED) ' -A3 "$tmp/gen1_fixtures.log" | head -40; fail "gen1 fixture corpus"; }
 gen1_fx_line=$(grep '^fixtures\[gen1\]' "$tmp/gen1_fixtures.log" || echo "fixtures[gen1]: ?")
 echo "gen1_test: $gen1_fx_line"
@@ -411,36 +411,6 @@ chmod +x "$tmp/wz_boot.xin" "$tmp/wz_gen1.xin"
 cmp -s "$tmp/wz_boot.err" "$tmp/wz_gen1.err" \
     || { diff -u "$tmp/wz_boot.err" "$tmp/wz_gen1.err" | head -20; fail "warn_div_zero_var stderr boot/gen1 differ"; }
 
-# ===== 6f. Gen1 require: http:// download (M183) =====
-python3 -m http.server 19883 --bind 127.0.0.1 --directory tests/fixtures/require_http/www >/dev/null 2>&1 &
-http_pid=$!
-ready=0
-i=0
-while [ "$i" -lt 40 ]; do
-    if curl -fsS "http://127.0.0.1:19883/rempkg.xu" >/dev/null 2>&1; then
-        ready=1
-        break
-    fi
-    i=$((i + 1))
-    sleep 0.05
-done
-[ "$ready" = "1" ] || { kill "$http_pid" 2>/dev/null || true; fail "M183 http.server did not start"; }
-export XU_CACHE="$tmp/xu_cache_m183"
-"$XU" tests/fixtures/require_http/main.xu -o "$tmp/req_http_boot.xin" \
-    || { kill "$http_pid" 2>/dev/null || true; fail "bootstrap require_http"; }
-cp -R tests/fixtures/require_http "$tmp/require_http_product"
-python3 scripts/prepare_require_http_fixture.py "$tmp/require_http_product"
-"$tmp/gen1.xin" build "$tmp/require_http_product/main.xu" -o "$tmp/req_http_gen1.xin" \
-    || { kill "$http_pid" 2>/dev/null || true; fail "gen1 require_http"; }
-chmod +x "$tmp/req_http_boot.xin" "$tmp/req_http_gen1.xin"
-"$tmp/req_http_boot.xin" > "$tmp/req_http_ob"
-"$tmp/req_http_gen1.xin" > "$tmp/req_http_og"
-kill "$http_pid" 2>/dev/null || true
-wait "$http_pid" 2>/dev/null || true
-unset XU_CACHE
-cmp -s "$tmp/req_http_ob" "$tmp/req_http_og" || fail "require_http stdout boot/gen1 differ"
-[ "$(cat "$tmp/req_http_ob")" = "42" ] || fail "require_http stdout want 42"
-
 # ===== 7. self-hosting fixed point (M6c) =====
 echo "gen1_test: building Gen2, Gen3 and Gen4 fixed point (this is the slow stage)"
 gen2_t0=$(date +%s)
@@ -450,7 +420,9 @@ gen2_wall=$(( $(date +%s) - gen2_t0 ))
 grep '^timings:' "$tmp/gen2.timings" | tail -1 > "$tmp/gen2.line" 2>/dev/null || true
 echo "gen1_test: Gen2 build wall=${gen2_wall}s $(cat "$tmp/gen2.line" 2>/dev/null || true)"
 perf_failed=0
-if [[ -f docs/audit/bench_compile.baseline.txt ]]; then
+if [ "${XU_BOUNDARY_CI:-0}" = 1 ]; then
+  echo "gen1_test: compile timing recorded; pinned-host performance baseline remains local"
+elif [[ -f docs/audit/bench_compile.baseline.txt ]]; then
   if ! python3 scripts/compile_baseline_identity.py docs/audit/bench_compile.baseline.txt; then
     perf_failed=1
   else
@@ -498,6 +470,43 @@ chmod +x "$tmp/xu"
     || fail "xu (gen4) sanity parse failed"
 scripts/build_product_tools.sh "$tmp/xu" "$tmp" \
     || fail "gen4 could not build xu-fmt/xu-desktop/xu-doctor/xu-map/xu-doc"
+
+# ===== 8. Confirmed hosted require: http:// download (M183) =====
+python3 -m http.server 19883 --bind 127.0.0.1 --directory tests/fixtures/require_http/www >/dev/null 2>&1 &
+http_pid=$!
+ready=0
+i=0
+while [ "$i" -lt 40 ]; do
+    if curl -fsS "http://127.0.0.1:19883/rempkg.xu" >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.05
+done
+[ "$ready" = "1" ] || { kill "$http_pid" 2>/dev/null || true; fail "M183 http.server did not start"; }
+export XU_CACHE="$tmp/xu_cache_m183"
+"$XU" tests/fixtures/require_http/main.xu -o "$tmp/req_http_boot.xin" \
+    || { kill "$http_pid" 2>/dev/null || true; fail "bootstrap require_http"; }
+cp -R tests/fixtures/require_http "$tmp/require_http_product"
+python3 scripts/prepare_require_http_fixture.py "$tmp/require_http_product"
+"$tmp/gen4.xin" build "$tmp/require_http_product/main.xu" -o "$tmp/req_http_gen1.xin" \
+    || { kill "$http_pid" 2>/dev/null || true; fail "gen4 require_http"; }
+chmod +x "$tmp/req_http_boot.xin" "$tmp/req_http_gen1.xin"
+"$tmp/req_http_boot.xin" > "$tmp/req_http_ob"
+"$tmp/req_http_gen1.xin" > "$tmp/req_http_og"
+kill "$http_pid" 2>/dev/null || true
+wait "$http_pid" 2>/dev/null || true
+unset XU_CACHE
+cmp -s "$tmp/req_http_ob" "$tmp/req_http_og" || fail "require_http stdout boot/gen1 differ"
+[ "$(cat "$tmp/req_http_ob")" = "42" ] || fail "require_http stdout want 42"
+
+# New dependency acquisition belongs to Xu. Cold Gen1 uses the frozen
+# primer's older file ABI; replay every require fixture with confirmed Gen4.
+scripts/run_fixtures.sh --xu="$tmp/gen4.xin" --sub=build --label=oracle-gen4 \
+    --only-require > "$tmp/gen4_dependencies.log" 2>&1 \
+    || { cat "$tmp/gen4_dependencies.log"; fail "confirmed hosted dependency fixtures"; }
+echo "gen1_test: $(grep '^fixtures\[' "$tmp/gen4_dependencies.log")"
 
 # A performance failure must not suppress the independent fixed-point and
 # sibling-tool checks. Keep the same baseline/threshold and final failure.

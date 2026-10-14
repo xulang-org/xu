@@ -9,6 +9,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__:
+    from .release_version import Version
+else:
+    from release_version import Version
+
 ROOT = Path(__file__).resolve().parents[1]
 DOMAINS = ("src", "packages", "developer")
 COMPILER_MANIFEST = "src/cmd/compile/xu.xun"
@@ -32,14 +37,14 @@ def read_version(text: str) -> tuple[int, int, int] | None:
         value = value[5:].strip()
     if value.startswith('"') and value.endswith('"'):
         value = value[1:-1]
-    match = SEMVER.fullmatch(value)
-    if not match:
-        raise ValueError("version: must be a major.minor.patch version")
-    return tuple(int(x) for x in match.groups())
+    try:
+        return Version.parse(value)
+    except ValueError as error:
+        raise ValueError("version: " + str(error)) from error
 
 
 def format_version(version: tuple[int, int, int]) -> str:
-    return ".".join(map(str, version))
+    return str(version if isinstance(version, Version) else Version(version))
 
 
 def bump_version(version: tuple[int, int, int], kind: str) -> tuple[int, int, int]:
@@ -148,11 +153,30 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
     return errors
 
 
-def release(root: Path, kind: str | None = None, check: bool = False, *, allow_stable: bool = False) -> list[str]:
+def release(root: Path, kind: str | None = None, check: bool = False, *, allow_stable: bool = False,
+            channel: str | None = None, set_version: str | None = None,
+            next_prerelease: bool = False, promote: str | None = None, allow_unpublished: bool = False) -> list[str]:
     """Align xu: and compiler version: to VERSION; other modules stay independent."""
     raw = (root / "VERSION").read_text(encoding="utf-8").strip()
     previous = read_version(f"version: {raw}\n")
-    target = bump_version(previous, kind) if kind else previous
+    target = Version(bump_version(previous, kind)) if kind else previous
+    if kind == "patch" and channel is None and previous.prerelease:
+        target = previous.next_prerelease()
+    elif kind and channel is None and previous.prerelease:
+        target = Version(tuple(target), (previous.prerelease[0], "1"))
+    if channel and kind:
+        target = Version(tuple(target), () if channel == "stable" else (channel, "1"))
+    if set_version is not None:
+        target = Version.parse(set_version)
+    if next_prerelease:
+        target = previous.next_prerelease()
+    if promote is not None:
+        target = previous.promote(promote)
+    converting_unpublished = (allow_unpublished and set_version is not None
+                             and not previous.prerelease and bool(target.prerelease)
+                             and tuple(previous) == tuple(target))
+    if target < previous and not converting_unpublished:
+        return [f"release version would regress from {previous} to {target}"]
     if kind and previous[0] == 0 and target[0] >= 1 and not allow_stable:
         return ["Xu stays in 0.x until an explicit stable release decision; use a minor/patch bump. --allow-stable is reserved for that approved release."]
     value = format_version(target)
@@ -168,7 +192,7 @@ def release(root: Path, kind: str | None = None, check: bool = False, *, allow_s
             if read_version(text) is None:
                 raise ValueError("missing module version:")
             current = read_xu_version(text)
-            if current is not None and current > target:
+            if current is not None and current > target and not (converting_unpublished and current == previous):
                 raise ValueError(f"release {value} would regress xu: {format_version(current)}; choose a newer release")
             if check and current != target:
                 raise ValueError(f"xu: must match release VERSION={value}")
@@ -184,21 +208,23 @@ def release(root: Path, kind: str | None = None, check: bool = False, *, allow_s
             errors.append(f"{name}: {error}")
     # Update only the product version fields, not arbitrary version strings.
     fields = (
-        ("src/cmd/compile/driver_entry.xu", r"(Xu Compiler Toolchain v)([0-9]+\.[0-9]+\.[0-9]+)"),
+        ("src/cmd/compile/driver_entry.xu", r"(Xu Compiler Toolchain v)([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)"),
         ("src/cmd/desktop/pack_macos.xu", r"(CFBundleShortVersionString</key>[^\n]*?<string>)([0-9]+\.[0-9]+\.[0-9]+)"),
+        ("src/cmd/desktop/pack_macos.xu", r"(XuToolchainVersion</key>[^\n]*?<string>)([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)"),
     )
     for name, pattern in fields:
-        text = (root / name).read_text(encoding="utf-8")
+        text = updates.get(name, (root / name).read_text(encoding="utf-8"))
         matches = list(re.finditer(pattern, text))
         if len(matches) != 1:
             errors.append(f"{name}: expected exactly one product version field")
             continue
-        if check and matches[0].group(2) != value:
+        field_value = ".".join(map(str, tuple(target))) if "CFBundleShortVersionString" in pattern else value
+        if check and matches[0].group(2) != field_value:
             errors.append(f"{name}: product version must match VERSION={value}")
-        rewritten = re.sub(pattern, lambda m: m.group(1) + value, text)
+        rewritten = re.sub(pattern, lambda m: m.group(1) + field_value, text)
         if rewritten != text:
             updates[name] = rewritten
-    if kind:
+    if kind or set_version is not None or next_prerelease or promote is not None:
         updates["VERSION"] = value + "\n"
     if not errors and not check:
         for name, text in updates.items():
@@ -216,14 +242,26 @@ def main() -> int:
     mode.add_argument("--sync-release", action="store_true", help="align every manifest's xu: and product source version to VERSION")
     mode.add_argument("--check-release", action="store_true", help="check every manifest's xu: and product source version equals VERSION")
     mode.add_argument("--release-bump", choices=("patch", "minor", "major"), help="bump VERSION and align every release manifest")
+    mode.add_argument("--set-release", metavar="VERSION", help="set a complete release identity and synchronize manifests")
+    mode.add_argument("--next-prerelease", action="store_true", help="increment dev.N or rc.N without changing the target final version")
+    mode.add_argument("--promote", choices=("rc", "stable"), help="advance dev to rc.1, or a prerelease to the final version")
+    parser.add_argument("--channel", choices=("dev", "rc", "stable"), help="channel for --release-bump (default: stable)")
+    parser.add_argument("--allow-unpublished", action="store_true", help="only with --set-release: correct an unpublished numeric version into its prerelease")
     parser.add_argument("--kind", choices=("patch", "minor", "major"), default="patch")
     parser.add_argument("--allow-stable", action="store_true", help="explicitly opt in to a decided stable Xu release (only with --release-bump)")
     args = parser.parse_args()
     if args.allow_stable and not args.release_bump:
         parser.error("--allow-stable requires --release-bump")
+    if args.channel and not args.release_bump:
+        parser.error("--channel requires --release-bump")
+    if args.allow_unpublished and not args.set_release:
+        parser.error("--allow-unpublished requires --set-release")
     try:
-        if args.sync_release or args.check_release or args.release_bump:
-            errors = release(ROOT, args.release_bump, args.check_release, allow_stable=args.allow_stable)
+        if args.sync_release or args.check_release or args.release_bump or args.set_release or args.next_prerelease or args.promote:
+            errors = release(ROOT, args.release_bump, args.check_release, allow_stable=args.allow_stable,
+                             channel=args.channel, set_version=args.set_release,
+                             next_prerelease=args.next_prerelease, promote=args.promote,
+                             allow_unpublished=args.allow_unpublished)
         else:
             errors = process(ROOT, args.base, args.bump, args.kind)
     except (subprocess.CalledProcessError, ValueError, OSError) as error:

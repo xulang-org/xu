@@ -302,10 +302,12 @@ compile_target() {
             run_compiler "$compiler" "$SOURCE" --target "$target" -o "$output"
         fi
     fi
-    # Accept Windows .exe if the bare path was requested and the target
-    # emitted a suffix. Never invent a .xin.
+    # The legacy primer appends .xin on Unix. Normalize its actual output
+    # only in the explicit oracle lane, preserving the requested server path.
     if [ ! -f "$output" ] && [ -f "$output.exe" ]; then
         mv -- "$output.exe" "$output"
+    elif [ "$LANE" = oracle ] && [ ! -f "$output" ] && [ -f "$output.xin" ]; then
+        mv -- "$output.xin" "$output"
     fi
     [ -f "$output" ] || die "compiler did not produce $output"
     chmod +x "$output" 2>/dev/null || true
@@ -393,7 +395,10 @@ local_smoke() (
         fi
         sleep 0.1
     done
-    [ "$ready" -eq 1 ] || die "local smoke server failed to become healthy"
+    if [ "$ready" -ne 1 ]; then
+        cat "$tmp_dir/server.log" >&2
+        die "local smoke server failed to become healthy"
+    fi
 
     local i health hello echo_body missing
     i=1

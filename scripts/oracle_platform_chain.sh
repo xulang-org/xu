@@ -52,7 +52,7 @@ esac
 mkdir -p "$DEST_DIR"
 DEST_DIR=$(cd "$DEST_DIR" && pwd -P)
 
-HOP_EXT=""
+HOP_EXT=".xin"
 PRIMER_NAME="xu"
 host_os=""
 host_arch=""
