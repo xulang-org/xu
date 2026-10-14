@@ -39,10 +39,12 @@ build_one() {
     if [ "${OS:-}" = Windows_NT ]; then name="$name.exe"; fi
     echo "build_product_tools: $name"
     if [ "$name" = xu-setup.exe ] && [ "$("$XU" env HOST_ARCH)" = x64 ]; then
-        python3 scripts/pack_windows_ui_oneexe.py --src "$src/main.xu" \
-            --no-webview --no-publish --xu "$XU" -o "$tools_staged/$name"
-        install_one "$tools_staged/$name" "$OUT/$name"
-        return
+        if python3 scripts/pack_windows_ui_oneexe.py --src "$src/main.xu" \
+            --no-webview --no-publish --xu "$XU" -o "$tools_staged/$name" 2>/dev/null; then
+            install_one "$tools_staged/$name" "$OUT/$name"
+            return
+        fi
+        echo "build_product_tools: Windows UI setup unavailable; falling back to standard setup" >&2
     fi
     # After gen1/gen2/gen3 the compiler hop can sit near 6GiB RSS. The next
     # `xu build` is a new process; macOS may still SIGKILL it (137). Retry once.

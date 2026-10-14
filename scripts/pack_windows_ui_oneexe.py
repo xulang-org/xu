@@ -195,11 +195,17 @@ APPS = {
 }
 
 
+def _sh_exec(script: pathlib.Path, args: list[str] | None = None) -> list[str]:
+    cmd_args = args or []
+    if os.name == "nt" or sys.platform == "win32":
+        bash = shutil.which("bash") or shutil.which("sh") or "bash"
+        return [bash, str(script), *cmd_args]
+    return [str(script), *cmd_args]
+
+
 def resolve_product_xu(requested: pathlib.Path | None) -> pathlib.Path:
     """Resolve a hosted product compiler; never select/build the Rust primer."""
-    if not HOST_SEED_RESOLVER.is_file() or not os.access(
-        HOST_SEED_RESOLVER, os.X_OK
-    ):
+    if not HOST_SEED_RESOLVER.is_file():
         raise SystemExit(
             f"pack_windows: missing executable seed resolver: {HOST_SEED_RESOLVER}"
         )
@@ -218,7 +224,7 @@ def resolve_product_xu(requested: pathlib.Path | None) -> pathlib.Path:
         env.pop("XU_SEED", None)
 
     proc = subprocess.run(
-        [str(HOST_SEED_RESOLVER)],
+        _sh_exec(HOST_SEED_RESOLVER),
         cwd=str(ROOT),
         env=env,
         text=True,
@@ -239,7 +245,8 @@ def resolve_product_xu(requested: pathlib.Path | None) -> pathlib.Path:
         raise SystemExit(
             f"pack_windows: cannot canonicalize resolved compiler: {exc}"
         ) from exc
-    if not compiler.is_file() or not os.access(compiler, os.X_OK):
+    is_win = os.name == "nt" or sys.platform == "win32"
+    if not compiler.is_file() or (not is_win and not os.access(compiler, os.X_OK)):
         raise SystemExit(f"pack_windows: resolved compiler is not executable: {compiler}")
     try:
         compiler.relative_to(project_root("bootstrap", core_root=ROOT))
@@ -250,14 +257,12 @@ def resolve_product_xu(requested: pathlib.Path | None) -> pathlib.Path:
 
 def run_product_compiler(xu: pathlib.Path, args: list[str]) -> None:
     """Compile through the hermetic product wrapper (clears ambient XUPATH/cache)."""
-    if not PRODUCT_COMPILER_RUNNER.is_file() or not os.access(
-        PRODUCT_COMPILER_RUNNER, os.X_OK
-    ):
+    if not PRODUCT_COMPILER_RUNNER.is_file():
         raise SystemExit(
             f"pack_windows: missing product compiler wrapper: {PRODUCT_COMPILER_RUNNER}"
         )
     subprocess.check_call(
-        [str(PRODUCT_COMPILER_RUNNER), str(xu), *args],
+        _sh_exec(PRODUCT_COMPILER_RUNNER, [str(xu), *args]),
         cwd=str(ROOT),
     )
 
