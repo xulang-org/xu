@@ -301,14 +301,30 @@ fi
 EXAMPLES_CHECKOUT="${XU_EXAMPLES_ROOT:-$SOURCE_DIR/../examples}"
 if [[ -z "${XU_EXAMPLES_ROOT:-}" && ! -d "$EXAMPLES_CHECKOUT" ]]; then EXAMPLES_CHECKOUT="$SOURCE_DIR/../xu-examples"; fi
 EXAMPLES_SOURCE="$EXAMPLES_CHECKOUT/examples"
-if [[ -d "$EXAMPLES_SOURCE" ]]; then
-    log_info "Copying official examples..."
-    mkdir -p "$INSTALL_DIR/examples"
-    cp -Rf "$EXAMPLES_SOURCE/." "$INSTALL_DIR/examples/"
-elif [[ -d "$SOURCE_DIR/examples" ]]; then
+if [[ -d "$SOURCE_DIR/examples" ]]; then
     log_info "Copying official examples..."
     mkdir -p "$INSTALL_DIR/examples"
     cp -Rf "$SOURCE_DIR/examples/." "$INSTALL_DIR/examples/"
+elif [[ -d "$EXAMPLES_SOURCE" ]]; then
+    log_info "Copying official examples..."
+    mkdir -p "$INSTALL_DIR/examples"
+    cp -Rf "$EXAMPLES_SOURCE/." "$INSTALL_DIR/examples/"
+fi
+if [[ -d "$INSTALL_DIR/examples" ]]; then
+    # Source checkouts and SDKs have different layouts. Each copied example
+    # must resolve the official module from the installed packages directory.
+    while IFS= read -r -d '' manifest; do
+        nested="${manifest#"$INSTALL_DIR/examples/"}"
+        package_path="../packages"
+        while [[ "$nested" == */* ]]; do
+            package_path="../$package_path"
+            nested="${nested#*/}"
+        done
+        rewritten=$(mktemp "$manifest.XXXXXX")
+        cp -p "$manifest" "$rewritten"
+        sed -E "s@^([[:space:]]*\"?github\\.com/xulang-org/packages\"?[[:space:]]*:[[:space:]]*)file:.*@\\1file:$package_path@" "$manifest" > "$rewritten"
+        mv -f "$rewritten" "$manifest"
+    done < <(find "$INSTALL_DIR/examples" -type f -name xu.xun -print0)
 fi
 
 # Copy metadata

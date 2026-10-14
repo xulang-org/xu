@@ -178,13 +178,24 @@ if ($VscodeSource) {
 }
 
 # 6. Examples
-$ExSrc = "$SourceDir\developer\examples"
-if (-not (Test-Path $ExSrc)) { $ExSrc = "$SourceDir\examples" }
+$ExSrc = "$SourceDir\examples"
+if (-not (Test-Path $ExSrc)) { $ExSrc = "$SourceDir\developer\examples" }
+if (-not (Test-Path $ExSrc) -and $env:XU_EXAMPLES_ROOT) { $ExSrc = "$env:XU_EXAMPLES_ROOT\examples" }
 if (Test-Path $ExSrc) {
     Write-Color "[INFO] Copying official examples..." -Color Blue
     $ExDest = "$Prefix\examples"
     if (Test-Path $ExDest) { Remove-Item -Path $ExDest -Recurse -Force }
     Copy-Item -Path $ExSrc -Destination $ExDest -Recurse -Force
+    # Rebase only the official package locator; example assets remain relative.
+    $Base = [System.IO.Path]::GetFullPath($ExDest).TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+    $Utf8 = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+    Get-ChildItem -Path $ExDest -Filter xu.xun -File -Recurse | ForEach-Object {
+        $Depth = ($_.FullName.Substring($Base.Length) -split '[\\/]').Length
+        $PackagePath = ('../' * $Depth) + 'packages'
+        $Text = [System.IO.File]::ReadAllText($_.FullName)
+        $Text = [regex]::Replace($Text, '(?m)^(\s*"?github\.com/xulang-org/packages"?\s*:\s*)file:[^\r\n]+', [System.Text.RegularExpressions.MatchEvaluator]{ param($Match) $Match.Groups[1].Value + 'file:' + $PackagePath })
+        [System.IO.File]::WriteAllText($_.FullName, $Text, $Utf8)
+    }
 }
 
 # Metadata

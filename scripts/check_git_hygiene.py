@@ -88,7 +88,7 @@ def check(root: Path) -> tuple[list[str], int]:
         if entries[name][2] != "0":
             errors.append(f"{name!r}: 未解决的合并冲突")
             blocked.add(name)
-        if local_only_path(name):
+        if local_reason(name):
             errors.append(f"{name!r}: 本机材料仍在 Git 跟踪中；使用 git rm --cached 移除跟踪")
             blocked.add(name)
     if changed:
@@ -132,13 +132,21 @@ def check(root: Path) -> tuple[list[str], int]:
 def check_tree(root: Path, revision: str) -> list[str]:
     """Inspect the exact outgoing tree; staged deletions cannot hide HEAD files."""
     errors = []
-    names = git(root, "ls-tree", "-r", "--name-only", "-z", revision).split(b"\0")
-    for raw in names:
+    entries = git(root, "ls-tree", "-r", "-z", revision).split(b"\0")
+    for raw in entries:
         if not raw:
             continue
-        name = raw.decode("utf-8", "surrogateescape")
-        if local_only_path(name):
+        metadata, raw_name = raw.split(b"\t", 1)
+        mode, kind, oid = metadata.decode("ascii").split()
+        name = raw_name.decode("utf-8", "surrogateescape")
+        if local_reason(name):
             errors.append(f"{revision}:{name!r}: 待推送版本仍包含禁止上传的本机文件")
+        elif kind == "blob":
+            size = int(git(root, "cat-file", "-s", oid))
+            if size > MAX_BYTES:
+                errors.append(f"{revision}:{name!r}: 超过 10 MiB；产物应保存在本机")
+            elif mode != "120000" and compiled_binary(git(root, "cat-file", "blob", oid)[:64]):
+                errors.append(f"{revision}:{name!r}: ELF、Mach-O 或 PE 编译二进制")
     return errors
 
 
