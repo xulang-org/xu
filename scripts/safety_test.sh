@@ -82,6 +82,12 @@ for bad in tests/gen1/safety/*.xu; do
     [ "$gen1_rc" != "0" ] || fail "gen1 accepted unsafe program $bad"
     a=$(head -1 "$tmp/safety_${n}_be" | tr -d '\r' | sed 's/[[:space:]]*$//')
     b=$(head -1 "$tmp/safety_${n}_ge" | tr -d '\r' | sed 's/[[:space:]]*$//')
+    if [ "${XU_BOUNDARY_CI:-0}" = 1 ]; then
+        # The local column-drift ledger stays out of CI. Require the same
+        # file, line and diagnostic while allowing parser column offsets.
+        a=$(printf '%s\n' "$a" | sed -E 's/:([0-9]+):[0-9]+: error:/:\1: error:/')
+        b=$(printf '%s\n' "$b" | sed -E 's/:([0-9]+):[0-9]+: error:/:\1: error:/')
+    fi
     if is_safety_drift "$n"; then
         # Drift list: both must reject the same file; line/col/message may differ.
         apre=${a%: error:*}; apre=${apre%:*}; apre=${apre%:*}
