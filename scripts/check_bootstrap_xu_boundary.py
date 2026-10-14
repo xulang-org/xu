@@ -2815,7 +2815,8 @@ def main(argv: list[str]) -> int:
         help="boundary manifest (default: bootstrap/BOUNDARY.json)",
     )
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
-    parser.add_argument("--ci", action="store_true", default=os.environ.get("XU_BOUNDARY_CI") == "1",
+    is_ci = os.environ.get("XU_BOUNDARY_CI") == "1" or os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
+    parser.add_argument("--ci", action="store_true", default=is_ci,
                         help="check published sources without local docs or SYNC_DIFF.md")
     parser.add_argument(
         "--strict-freeze",
