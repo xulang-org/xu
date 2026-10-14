@@ -21,7 +21,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help memsafe all xu xu-desktop xu-fmt xu-doctor xu-map xu-doc xu-platform tools \
+.PHONY: help memsafe all xu xu-desktop xu-fmt xu-doctor xu-map xu-doc xu-setup xu-platform tools \
 	server-build-local server-build-linux server-check-linux server-start server-health server-smoke-local server-unit \
 	server-remote-check server-remote-deploy server-remote-status server-remote-health server-remote-smoke \
 	server-remote-restart server-remote-stop server-remote-rollback \
@@ -50,7 +50,8 @@ help:
 	@echo "  make xu-fmt          formatter → $(BIN)/xu-fmt"
 	@echo "  make xu-map          source path map → $(BIN)/xu-map"
 	@echo "  make xu-doc          declaration docs → $(BIN)/xu-doc"
-	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc (needs $(XU))"
+	@echo "  make xu-setup        standalone installer → $(BIN)/xu-setup"
+	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup (needs $(XU))"
 	@echo "  make server-build-local  build xu-examples/examples/11_http_server for this host"
 	@echo "  make server-build-linux  cross-build Xu HTTP server for linux-x64"
 	@echo "  make server-check-linux  build + verify linux-x64 ELF"
@@ -113,6 +114,7 @@ DOCTOR_XU  := $(wildcard src/cmd/doctor/*.xu)
 FMT_XU     := $(wildcard src/cmd/fmt/*.xu)
 MAP_XU     := $(wildcard src/cmd/map/*.xu)
 DOC_XU     := $(wildcard src/cmd/doc/*.xu)
+SETUP_XU   := $(wildcard src/cmd/setup/*.xu)
 XU_PKG_XU  := $(wildcard src/xu/*/*.xu)
 # The complete product source tree is a dependency of the hosted compiler.
 # The boundary checker still defines the exact Gen1 input closure; this wider
@@ -132,6 +134,7 @@ XU_DOCTOR  := $(BIN)/xu-doctor$(EXE_SUFFIX)
 XU_FMT     := $(BIN)/xu-fmt$(EXE_SUFFIX)
 XU_MAP     := $(BIN)/xu-map$(EXE_SUFFIX)
 XU_DOC     := $(BIN)/xu-doc$(EXE_SUFFIX)
+XU_SETUP   := $(BIN)/xu-setup$(EXE_SUFFIX)
 
 xu: $(XU) tools
 ifneq ($(strip $(BUMP)),)
@@ -169,13 +172,14 @@ product-selfhost: $(XU)
 xu-platform: $(XU)
 	./scripts/build_platform_xu.sh $(XU) $(BIN)/platform
 
-tools: xu-doctor xu-desktop xu-fmt xu-map xu-doc
+tools: xu-doctor xu-desktop xu-fmt xu-map xu-doc xu-setup
 
 xu-desktop: $(XU_DESKTOP)
 xu-doctor: $(XU_DOCTOR)
 xu-fmt: $(XU_FMT)
 xu-map: $(XU_MAP)
 xu-doc: $(XU_DOC)
+xu-setup: $(XU_SETUP)
 
 $(BIN):
 	mkdir -p $(BIN)
@@ -207,6 +211,9 @@ $(XU_MAP): $(XU) src/cmd/map/xu.xun $(MAP_XU) $(XU_PKG_XU) | $(BIN)
 
 $(XU_DOC): $(XU) src/cmd/doc/xu.xun $(DOC_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-doc)
+
+$(XU_SETUP): $(XU) src/cmd/setup/xu.xun $(SETUP_XU) $(XU_PKG_XU) | $(BIN)
+	$(call build_product_tool,xu-setup)
 
 # Milestone / oracle: frozen primer compiles Gen1 and diffs behavior.
 # Not on the product `make xu` path. CI runs this weekly (see oracle.yml).

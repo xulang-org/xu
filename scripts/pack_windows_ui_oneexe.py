@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import shutil
 import struct
 import subprocess
 import sys
@@ -32,8 +33,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXAMPLES_ROOT = pathlib.Path(os.environ.get("XU_EXAMPLES_ROOT", ROOT.parent / "xu-examples")).expanduser().resolve()
 OUT_DIR = ROOT / "dist" / "windows-x64-ui"
 ZIP = ROOT / "dist" / "windows-x64-ui.zip"
-CXX = "x86_64-w64-mingw32-g++"
-AR = "x86_64-w64-mingw32-ar"
+def mingw_tool(name: str) -> str:
+    cross = "x86_64-w64-mingw32-" + name
+    return shutil.which(cross) or (shutil.which(name) if os.name == "nt" else None) or cross
+
+
+CXX = mingw_tool("g++")
+AR = mingw_tool("ar")
+GCC = mingw_tool("gcc")
+WINDRES = mingw_tool("windres")
 HOST_SEED_RESOLVER = ROOT / "scripts" / "xu_host_seed.sh"
 PRODUCT_COMPILER_RUNNER = ROOT / "scripts" / "run_product_compiler.sh"
 XUOBJ_TO_O = ROOT / "scripts" / "xuobj_to_coff_o.py"
@@ -314,7 +322,7 @@ def build_host_objects(*, with_webview: bool, td: pathlib.Path) -> list[pathlib.
     ):
         subprocess.check_call(
             [
-                "x86_64-w64-mingw32-gcc",
+                GCC,
                 "-O2",
                 "-c",
                 "-Isrc/ui/host",
@@ -325,6 +333,11 @@ def build_host_objects(*, with_webview: bool, td: pathlib.Path) -> list[pathlib.
             cwd=str(ROOT),
         )
     objs = [host_o, assets_o, assets_weak_o]
+    draw_o = td / "windows_draw.o"
+    subprocess.check_call(
+        [*common, "src/ui/host/windows_draw.cc", "-o", str(draw_o)], cwd=str(ROOT)
+    )
+    objs.append(draw_o)
     mem_o = td / "xu_ui_mem.o"
     subprocess.check_call(
         [
@@ -391,13 +404,13 @@ def link_static(
         write_icon_blob_c(icon, icon_c)
         icon_o = td / "icon_blob.o"
         subprocess.check_call(
-            ["x86_64-w64-mingw32-gcc", "-O2", "-c", str(icon_c), "-o", str(icon_o)],
+            [GCC, "-O2", "-c", str(icon_c), "-o", str(icon_o)],
         )
         icon_ico_c = td / "icon_ico_blob.c"
         write_icon_ico_blob_c(icon, icon_ico_c, td)
         icon_ico_o = td / "icon_ico_blob.o"
         subprocess.check_call(
-            ["x86_64-w64-mingw32-gcc", "-O2", "-c", str(icon_ico_c), "-o", str(icon_ico_o)],
+            [GCC, "-O2", "-c", str(icon_ico_c), "-o", str(icon_ico_o)],
         )
         ico_path = td / "xu_app_icon.ico"
         print(f"embed tray .ico ({ico_path.stat().st_size} bytes)")
@@ -412,7 +425,7 @@ def link_static(
         icon_res_o = td / "xu_app_res.o"
         subprocess.check_call(
             [
-                "x86_64-w64-mingw32-windres",
+                WINDRES,
                 "-i",
                 str(rc_path),
                 "-o",
@@ -433,7 +446,7 @@ def link_static(
             write_loader_blob_c(loader, loader_c)
             loader_o = td / "loader_blob.o"
             subprocess.check_call(
-                ["x86_64-w64-mingw32-gcc", "-O2", "-c", str(loader_c), "-o", str(loader_o)],
+                [GCC, "-O2", "-c", str(loader_c), "-o", str(loader_o)],
             )
             print(f"embed WebView2Loader.dll ({loader.stat().st_size} bytes) → beside exe only")
             loader_extern = (
@@ -479,7 +492,7 @@ def link_static(
             n = write_www_blob_c(www, www_c, extra=extra)
             www_o = td / "www_blob.o"
             subprocess.check_call(
-                ["x86_64-w64-mingw32-gcc", "-O2", "-c", str(www_c), "-o", str(www_o)],
+                [GCC, "-O2", "-c", str(www_c), "-o", str(www_o)],
             )
             print(f"www: embed {n} files from {www} (in-memory xu://; no TEMP extract)")
         else:
@@ -493,7 +506,7 @@ def link_static(
             )
             www_o = td / "www_blob_empty.o"
             subprocess.check_call(
-                ["x86_64-w64-mingw32-gcc", "-O2", "-c", str(www_c), "-o", str(www_o)],
+                [GCC, "-O2", "-c", str(www_c), "-o", str(www_o)],
             )
 
         host_a = td / "libxu_ui_host.a"
@@ -918,7 +931,7 @@ def link_static(
         )
         shim_o = td / "winmain_shim.o"
         subprocess.check_call(
-            ["x86_64-w64-mingw32-gcc", "-O2", "-c", str(shim), "-o", str(shim_o)],
+            [GCC, "-O2", "-c", str(shim), "-o", str(shim_o)],
         )
 
         libs = [
@@ -1010,6 +1023,7 @@ def main() -> None:
     )
     ap.add_argument("--webview", action="store_true", help="force WebView2 host plugin")
     ap.add_argument("--no-webview", action="store_true", help="force shell-only host")
+    ap.add_argument("--no-publish", action="store_true", help="build only the requested executable")
     ap.add_argument(
         "--xu",
         dest="xu_compiler",
@@ -1125,6 +1139,9 @@ def main() -> None:
             icon_png=resolve_project_icon(pathlib.Path(xu_src)),
             xu_src=pathlib.Path(xu_src),
         )
+
+    if args.no_publish:
+        return
 
     keep = {cfg["out_name"], "README.txt", "XuShaped.exe", "XuOpenWindow.exe"}
     clean_public_dir(keep=keep)

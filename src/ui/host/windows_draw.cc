@@ -60,6 +60,7 @@ struct XuContentPlugin {
   int last_y;
   double cam_x;
   double cam_y;
+  int pan_enabled;
 };
 
 static XuContentPlugin *g_self = NULL;
@@ -317,10 +318,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       p->dragging = 1;
       p->last_x = x;
       p->last_y = y;
-      p->cam_x -= (double)dx;
-      p->cam_y -= (double)dy;
-      report_drag(p, dx, dy);
-      InvalidateRect(hwnd, NULL, FALSE);
+      if (p->pan_enabled) {
+        p->cam_x -= (double)dx;
+        p->cam_y -= (double)dy;
+        report_drag(p, dx, dy);
+        InvalidateRect(hwnd, NULL, FALSE);
+      }
     }
     return 0;
   }
@@ -334,6 +337,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return 0;
   }
   if (msg == WM_MOUSEWHEEL && p) {
+    if (!p->pan_enabled) return 0;
     int d = GET_WHEEL_DELTA_WPARAM(wp);
     int dy = -(d / 6);
     if (dy == 0) dy = d > 0 ? -8 : 8;
@@ -343,6 +347,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return 0;
   }
   if (msg == WM_MOUSEHWHEEL && p) {
+    if (!p->pan_enabled) return 0;
     int d = GET_WHEEL_DELTA_WPARAM(wp);
     int dx = d / 6;
     if (dx == 0) dx = d > 0 ? 8 : -8;
@@ -390,6 +395,7 @@ static XuContentPlugin *draw_create(XuContentHost *host) {
   p->bg.on = 1;
   p->bg.r = p->bg.g = p->bg.b = 26;
   p->bg.a = 255;
+  p->pan_enabled = 1;
   reset_pen(p);
   g_self = p;
   return p;
@@ -429,6 +435,15 @@ static Op blank_op(void) {
 
 static int draw_handle(XuContentPlugin *p, const char *cmd) {
   if (!cmd) return 0;
+  if (strncmp(cmd, "pan_enabled\t", 12) == 0) {
+    p->pan_enabled = cmd[12] != '0';
+    if (!p->pan_enabled) {
+      p->cam_x = 0;
+      p->cam_y = 0;
+    }
+    if (p->hwnd) InvalidateRect(p->hwnd, NULL, FALSE);
+    return 1;
+  }
   if (strcmp(cmd, "begin") == 0) {
     p->ops.clear();
     reset_pen(p);

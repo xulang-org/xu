@@ -29,20 +29,22 @@ python3 scripts/module_versions.py --promote stable
 
 这些命令同步 `VERSION`、编译器 `version:` / `xu:`、所有当前模块的 Xu 要求与产品横幅；其他模块自身的 `version:` 保持独立。改动后仍需重建并验证实际二进制与安装包。
 
-## 下载 SDK
+## 下载 SDK 与 Setup 安装包
 
-在 Releases 下载对应平台的压缩包和 `SHA256SUMS`。也可以打开 Installed SDK 工作流，选择安装验收已通过的平台，从 Artifacts 下载 `xu-sdk-product-<平台>`。失败运行中的诊断产物不能作为已通过验收的安装包。
+在 [Releases](https://github.com/xulang-org/xu/releases) 下载对应平台的 Setup 安装程序、SDK 归档包和 `SHA256SUMS`。后续所有版本均默认发布单文件离线 Setup 安装包，内嵌完整编译器、工具链与标准库源码，自动配置系统全局环境变量。
 
-| 操作系统 / CPU | 平台 | SDK 文件名 |
-| --- | --- | --- |
-| macOS / Apple Silicon | `macos-arm64` | `xu-v<版本>-macos-arm64.tar.gz` |
-| macOS / Intel | `macos-x64` | `xu-v<版本>-macos-x64.tar.gz` |
-| Linux / ARM64 | `linux-arm64` | `xu-v<版本>-linux-arm64.tar.gz` |
-| Linux / x86-64 | `linux-x64` | `xu-v<版本>-linux-x64.tar.gz` |
-| Linux / LoongArch64 | `linux-loongarch64` | `xu-v<版本>-linux-loongarch64.tar.gz` |
-| Linux / RISC-V 64 | `linux-riscv64` | `xu-v<版本>-linux-riscv64.tar.gz` |
-| Windows / ARM64 | `windows-arm64` | `xu-v<版本>-windows-arm64.zip` |
-| Windows / x86-64 | `windows-x64` | `xu-v<版本>-windows-x64.zip` |
+| 操作系统 / CPU | 平台 | 推荐 Setup 安装程序 (单文件离线包) | SDK 完整源码归档 |
+| --- | --- | --- | --- |
+| Windows / x86-64 | `windows-x64` | `xu-v<版本>-windows-x64-setup.exe` (双击运行图形向导) | `xu-v<版本>-windows-x64.zip` |
+| Windows / ARM64 | `windows-arm64` | `xu-v<版本>-windows-arm64-setup.exe` | `xu-v<版本>-windows-arm64.zip` |
+| macOS / Apple Silicon | `macos-arm64` | `xu-v<版本>-macos-arm64.pkg` (双击安装) 或 `xu-setup-macos-arm64` | `xu-v<版本>-macos-arm64.tar.gz` |
+| macOS / Intel | `macos-x64` | `xu-setup-macos-x64` | `xu-v<版本>-macos-x64.tar.gz` |
+| Linux / x86-64 | `linux-x64` | `xu-setup-linux-x64` (赋权后直接 `./xu-setup-linux-x64 -y`) | `xu-v<版本>-linux-x64.tar.gz` |
+| Linux / ARM64 | `linux-arm64` | `xu-setup-linux-arm64` | `xu-v<版本>-linux-arm64.tar.gz` |
+| Linux / LoongArch64 | `linux-loongarch64` | `xu-setup-linux-loongarch64` | `xu-v<版本>-linux-loongarch64.tar.gz` |
+| Linux / RISC-V 64 | `linux-riscv64` | `xu-setup-linux-riscv64` | `xu-v<版本>-linux-riscv64.tar.gz` |
+
+Releases 中同时提供带版本号文件（如 `xu-v<版本>-windows-x64-setup.exe`）及标准别名（如 `xu-setup-windows-x64.exe`）。也可以打开 Installed SDK 工作流，选择安装验收已通过的平台，从 Artifacts 下载 `xu-sdk-product-<平台>`。
 
 Actions Artifact 是外层 ZIP，解压后在 `dist/sdk-ci/` 找到 SDK 压缩包、`SHA256SUMS` 与 `RELEASE_MANIFEST.md`，再解压 SDK 压缩包。SDK 顶层目录为 `xu-v<版本>/`；不同平台使用各自的解压目录。
 
@@ -87,8 +89,9 @@ Windows 的 Hash 应与 `SHA256SUMS` 中同名文件的完整哈希一致。
 | `packages/` | 可选外部包，来自独立的 [packages 仓库](https://github.com/xulang-org/packages) |
 | `examples/` | 官方教程与示例，来自独立的 [examples 仓库](https://github.com/xulang-org/examples) |
 | `include/` | C 原生接口头文件 `xu_native.h` |
+| `xu-setup` / `xu-setup.exe` | 原生安装程序（零依赖、自动注册全局环境变量） |
 | `editors/` | 编辑器资源，内容取决于打包输入 |
-| `install.sh` / `install.ps1` | 安装脚本 |
+| `install.sh` / `install.ps1` | 兼容安装脚本 |
 | `env.sh` / `env.ps1` | 当前终端环境激活脚本 |
 | `uninstall.sh` / `uninstall.ps1` | 卸载脚本 |
 | `README.md`、`VERSION`、`TARGET`、`bundle.json` | 安装说明、版本、平台与校验元数据 |
@@ -117,35 +120,57 @@ xu run "$env:XU_ROOT\examples\01_hello\main.xu"
 
 激活脚本设置 `PATH`、`XU_ROOT`、`XU_STDLIB_ROOT` 和 `XUPATH`，保留已有包搜索路径；重开终端后再次激活。
 
-## 安装到用户目录
+## 原生 Setup 安装程序（推荐全局安装）
 
-macOS / Linux：
+Xu 提供纯原生安装程序（无需安装 Python、解压工具或调整 PowerShell 脚本策略），单文件离线安装，自动持久化注册操作系统全局环境变量。在 Releases 中可直接下载独立安装包，也可在下载解压后的 SDK 目录中执行 `xu-setup`。
+
+### Windows
+
+下载 `xu-v<版本>-windows-x64-setup.exe` 或 `xu-setup-windows-x64.exe`：
+- **图形向导**：直接双击运行，启动零依赖原生自绘界面，一键完成安装。
+- **命令行静默安装**：
+  ```cmd
+  xu-v<版本>-windows-x64-setup.exe -y
+  ```
+
+安装程序会自动将 `bin` 路径注册到用户注册表 `HKCU\Environment\Path` 并配置 `XU_ROOT`。重新打开任意终端（CMD / PowerShell / Terminal / VS Code）即可全局直接使用 `xu`。
+
+### macOS
+
+- **官方 PKG 安装包**：下载 `xu-v<版本>-macos-arm64.pkg`，双击启动图形安装向导，自动配置 `/etc/paths.d/xu`，全局立即可用。
+- **免提权原生程序**：下载 `xu-setup-macos-arm64`（或在解压的 SDK 目录下执行 `./xu-setup`）：
+  ```bash
+  chmod +x xu-setup-macos-arm64
+  ./xu-setup-macos-arm64 -y
+  ```
+
+### Linux
+
+下载对应架构的 `xu-setup-linux-x64`（或 `xu-setup-linux-arm64`），赋予权限后执行：
 
 ```bash
-bash ./install.sh
-source "$HOME/.xu/env.sh"
-xu --version
+chmod +x xu-setup-linux-x64
+./xu-setup-linux-x64 -y
 ```
 
-Windows（PowerShell）：
+自动解压并写入用户 Shell 环境配置（`~/.bashrc` / `~/.zshrc`），全局生效。
 
-```powershell
-.\install.ps1
-. "$HOME\.xu\env.ps1"
-xu --version
-```
+### 自定义选项
 
-默认安装位置为用户目录下的 `.xu`。自定义安装目录且自行管理终端环境：
+所有平台的原生 Setup 安装程序均支持以下参数：
 
 ```bash
-bash ./install.sh --prefix "$HOME/xu-sdk" --no-modify-path
-source "$HOME/xu-sdk/env.sh"
+# 指定安装目录 (默认 ~/.xu 或 %USERPROFILE%\.xu)
+./xu-setup --prefix "$HOME/my-xu" -y
+
+# 强制控制台命令行交互 (Windows 下跳过自绘图形向导)
+.\xu-setup.exe --cli
+
+# 查看帮助
+./xu-setup --help
 ```
 
-```powershell
-.\install.ps1 -Prefix "$HOME\xu-sdk" -NoModifyPath
-. "$HOME\xu-sdk\env.ps1"
-```
+自动化 CI 脚本中亦可继续使用 `bash ./install.sh` 或 `.\install.ps1`。
 
 原生 FFI 和桌面 UI 打包需要平台 C 工具链、链接器与 UI SDK。执行 `xu doctor` 检查依赖。
 

@@ -37,17 +37,7 @@ def activate(prefix, cwd, env):
     return env | values
 
 
-def smoke(archive: Path, work: Path):
-    extract = work / "unpacked SDK"
-    extract.mkdir()
-    if archive.suffix == ".zip":
-        with zipfile.ZipFile(archive) as source:
-            source.extractall(extract)
-    else:
-        with tarfile.open(archive) as source:
-            source.extractall(extract, filter="data")
-    bundle, = (p for p in extract.iterdir() if p.is_dir())
-    manifest = json.loads((bundle / "bundle.json").read_text())
+def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
     prefix = work / "installed Xu SDK"
     project = work / "user project with spaces"
     project.mkdir()
@@ -58,10 +48,30 @@ def smoke(archive: Path, work: Path):
     for key in ("XU_ROOT", "XU_STDLIB_ROOT", "XUOS", "XUARCH", "XU_PACKAGES_ROOT", "XU_VSCODE_ROOT", "XU_BOOT_EXTRA"):
         env.pop(key, None)
     env.update(XU_SKIP_EDITOR_INSTALL="1", XUPATH=str(extra), XU_CACHE=str(work / "package cache"))
-    if os.name == "nt":
-        run(["pwsh", "-NoProfile", "-File", str(bundle / "install.ps1"), "-Prefix", str(prefix), "-NoModifyPath"], cwd=project, env=env)
+
+    if installer:
+        run([str(installer), "--prefix", str(prefix), "--yes"], cwd=project, env=env)
+        manifest_file = prefix / "bundle.json"
+        manifest = json.loads(manifest_file.read_text()) if manifest_file.is_file() else {"version": "", "target": "host", "lane": "product"}
     else:
-        run(["bash", str(bundle / "install.sh"), "--prefix", str(prefix), "--no-modify-path", "--yes"], cwd=project, env=env)
+        assert archive is not None, "archive must be provided when installer is None"
+        extract = work / "unpacked SDK"
+        extract.mkdir()
+        if archive.suffix == ".zip":
+            with zipfile.ZipFile(archive) as source:
+                source.extractall(extract)
+        else:
+            with tarfile.open(archive) as source:
+                source.extractall(extract, filter="data")
+        bundle, = (p for p in extract.iterdir() if p.is_dir())
+        manifest = json.loads((bundle / "bundle.json").read_text())
+        if native_setup:
+            setup = bundle / ("xu-setup.exe" if os.name == "nt" else "xu-setup")
+            run([str(setup), "--prefix", str(prefix), "--yes"], cwd=project, env=env)
+        elif os.name == "nt":
+            run(["pwsh", "-NoProfile", "-File", str(bundle / "install.ps1"), "-Prefix", str(prefix), "-NoModifyPath"], cwd=project, env=env)
+        else:
+            run(["bash", str(bundle / "install.sh"), "--prefix", str(prefix), "--no-modify-path", "--yes"], cwd=project, env=env)
     active = activate(prefix, project, env)
     entries = active["XUPATH"].split(os.pathsep)
     assert entries.count(str(extra)) == 1, entries
@@ -118,10 +128,19 @@ fn main() int {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, help="path to SDK archive (.tar.gz or .zip)")
+    parser.add_argument("--installer", type=Path, help="path to standalone setup installer executable")
+    parser.add_argument("--native-setup", action="store_true", help="verify the native installer instead of the shell script")
     args = parser.parse_args()
+    if not args.archive and not args.installer:
+        parser.error("either --archive or --installer is required")
     with tempfile.TemporaryDirectory(prefix="xu-sdk-smoke-") as directory:
-        smoke(args.archive.resolve(), Path(directory).resolve())
+        smoke(
+            args.archive.resolve() if args.archive else None,
+            Path(directory).resolve(),
+            args.native_setup,
+            installer=args.installer.resolve() if args.installer else None,
+        )
 
 
 if __name__ == "__main__":

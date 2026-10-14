@@ -16,7 +16,7 @@ XU=$1
 OUT=${2:-bin}
 tool_only=${3:-}
 case "$tool_only" in
-    ""|xu-doctor|xu-fmt|xu-map|xu-doc|xu-desktop) ;;
+    ""|xu-doctor|xu-fmt|xu-map|xu-doc|xu-desktop|xu-setup) ;;
     *) echo "build_product_tools: unknown tool: $tool_only" >&2; exit 1 ;;
 esac
 PRODUCT_RUN="$PWD/scripts/run_product_compiler.sh"
@@ -38,6 +38,12 @@ build_one() {
     if [ -n "$tool_only" ] && [ "$name" != "$tool_only" ]; then return; fi
     if [ "${OS:-}" = Windows_NT ]; then name="$name.exe"; fi
     echo "build_product_tools: $name"
+    if [ "$name" = xu-setup.exe ] && [ "$("$XU" env HOST_ARCH)" = x64 ]; then
+        python3 scripts/pack_windows_ui_oneexe.py --src "$src/main.xu" \
+            --no-webview --no-publish --xu "$XU" -o "$tools_staged/$name"
+        install_one "$tools_staged/$name" "$OUT/$name"
+        return
+    fi
     # After gen1/gen2/gen3 the compiler hop can sit near 6GiB RSS. The next
     # `xu build` is a new process; macOS may still SIGKILL it (137). Retry once.
     if ! "$PRODUCT_RUN" "$XU" build "$src" -o "$tools_staged/$name"; then
@@ -52,3 +58,4 @@ build_one src/cmd/fmt xu-fmt
 build_one src/cmd/map xu-map
 build_one src/cmd/doc xu-doc
 build_one src/cmd/desktop xu-desktop
+build_one src/cmd/setup xu-setup

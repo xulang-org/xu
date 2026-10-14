@@ -35,6 +35,7 @@ import zipfile
 from pathlib import Path
 
 from companion_repos import project_root, package_directories, vscode_package_files
+from inject_offline_payload import create_offline_installer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -55,6 +56,7 @@ SIBLING_TOOLS = [
     ("xu-doc", "src/cmd/doc"),
     ("xu-map", "src/cmd/map"),
     ("xu-desktop", "src/cmd/desktop"),
+    ("xu-setup", "src/cmd/setup"),
 ]
 
 
@@ -170,6 +172,14 @@ def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, c
         "-o",
         str(cached_tool),
     ]
+    if tool_name == "xu-setup" and target == "windows-x64":
+        cross_cxx = shutil.which("x86_64-w64-mingw32-g++") or (shutil.which("g++") if os.name == "nt" else None)
+        if cross_cxx:
+            cmd = [sys.executable, str(REPO_ROOT / "scripts/pack_windows_ui_oneexe.py"),
+                   "--src", str(REPO_ROOT / src_dir / "main.xu"), "--no-webview", "--no-publish",
+                   "--xu", str(xu_bin), "-o", str(cached_tool)]
+        else:
+            print("    [note] mingw cross-compiler unavailable; using direct native PE compiler for xu-setup")
     run_res = subprocess.run(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=build_environment())
     if run_res.returncode != 0:
         cached_tool.unlink(missing_ok=True)
@@ -217,6 +227,14 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
         dest_name = f"{tool_name}.exe" if is_windows else tool_name
         shutil.copy2(built_tool, bin_dir / dest_name)
         (bin_dir / dest_name).chmod(0o755)
+
+    # 2.1 Copy xu-setup to bundle root for direct execution
+    exe_suffix = ".exe" if is_windows else ""
+    setup_name = f"xu-setup{exe_suffix}"
+    if (bin_dir / setup_name).exists():
+        shutil.copy2(bin_dir / setup_name, stage_dir / setup_name)
+        (stage_dir / setup_name).chmod(0o755)
+
 
     # 3. Standard Library (src/)
     dest_src = stage_dir / "src"
@@ -325,19 +343,18 @@ Xu is a fast, safe, GC-free systems programming language combining Go-style tool
 
 ## Quick Installation
 
-### Unix (macOS / Linux):
+### Windows:
+直接双击运行本目录下的 `xu-setup.exe`（或在控制台执行 `xu-setup.exe`），无需运行 PowerShell 脚本，自动完成安装与系统环境变量配置。
+
+### macOS / Linux:
+在终端中直接运行本目录下的原生安装程序：
 ```bash
-./install.sh
-```
-Or specify a custom install directory:
-```bash
-./install.sh --prefix /opt/xu
+./xu-setup
 ```
 
-### Windows (PowerShell):
-```powershell
-.\\install.ps1
-```
+### 独立使用（不修改系统环境）：
+- Unix: `source env.sh`
+- Windows: `. .\\env.ps1` 或调用已安装目录的 `env.cmd`
 
 ### Instant Try (No System Modification):
 - Unix: `source env.sh`
@@ -426,6 +443,8 @@ def main():
         if source.is_file() and source.suffix in (".xu", ".xun", ".h", ".c", ".cc"):
             source_hash.update(source.relative_to(REPO_ROOT).as_posix().encode())
             source_hash.update(source.read_bytes())
+    for name in ("pack_windows_ui_oneexe.py", "xuobj_to_coff_o.py", "ar_xu_host.py"):
+        source_hash.update((REPO_ROOT / "scripts" / name).read_bytes())
     cache_dir = REPO_ROOT / "dist" / "tool_cache" / version / compute_sha256(xu_bin) / source_hash.hexdigest()
 
     targets_to_build = []
@@ -476,6 +495,37 @@ def main():
         sha256 = compute_sha256(archive_file)
         print(f"  [ok] {archive_file.name} ({size_mb:.2f} MB) - SHA256: {sha256[:12]}...")
         generated_archives.append((archive_file, target, size_mb, sha256))
+
+        # Emit standalone installer program (e.g. xu-v0.8.8-windows-x64-setup.exe and xu-setup-windows-x64.exe)
+        exe_suffix = ".exe" if target.startswith("windows") else ""
+        setup_bin_name = f"xu-setup{exe_suffix}"
+        stage_setup = stage_dir / "bin" / setup_bin_name
+        if stage_setup.exists():
+            versioned_installer = out_dir / f"xu-v{version}-{target}-setup{exe_suffix}"
+            create_offline_installer(stage_setup, archive_file, versioned_installer)
+            inst_size = versioned_installer.stat().st_size / (1024 * 1024)
+            inst_sha = compute_sha256(versioned_installer)
+            print(f"  [installer] {versioned_installer.name} ({inst_size:.2f} MB) - SHA256: {inst_sha[:12]}...")
+            generated_archives.append((versioned_installer, f"{target}-setup", inst_size, inst_sha))
+
+            canonical_installer = out_dir / f"xu-setup-{target}{exe_suffix}"
+            shutil.copy2(versioned_installer, canonical_installer)
+            can_size = canonical_installer.stat().st_size / (1024 * 1024)
+            can_sha = compute_sha256(canonical_installer)
+            generated_archives.append((canonical_installer, f"{target}-setup-alias", can_size, can_sha))
+
+        # On macOS host packaging for macos target, also generate authentic .pkg installer
+        if target.startswith("macos") and platform.system().lower() == "darwin":
+            pkg_file = out_dir / f"{archive_stem}.pkg"
+            pkg_script = REPO_ROOT / "scripts" / "build_macos_pkg.sh"
+            if pkg_script.exists():
+                print(f"  [pkg] Creating macOS installer package: {pkg_file.name}...")
+                subprocess.run(["bash", str(pkg_script), str(stage_dir), str(pkg_file), version],
+                               cwd=REPO_ROOT, check=True)
+                pkg_size = pkg_file.stat().st_size / (1024 * 1024)
+                pkg_sha = compute_sha256(pkg_file)
+                print(f"  [ok] {pkg_file.name} ({pkg_size:.2f} MB) - SHA256: {pkg_sha[:12]}...")
+                generated_archives.append((pkg_file, f"{target}-pkg", pkg_size, pkg_sha))
 
     # Also build universal devkit if requested or if --all is specified
     if args.bundle_devkit or args.all:
@@ -529,16 +579,32 @@ def main():
         for archive, target, size_mb, sha in generated_archives:
             f.write(f"| `{archive.name}` | `{target}` | {size_mb:.2f} MB | `{sha[:16]}...` |\n")
         f.write("\n## 🚀 包含核心组件\n\n")
-        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`\n")
+        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-setup`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`\n")
         f.write("- **官方标准库源码 (`src/`)**: 包含 `os`, `io`, `net`, `sync`, `crypto`, `database/sql`, `ui` 等完整源码\n")
         f.write("- **独立 packages 仓库的扩展模块（选装） (`packages/`)**: `redis`, `mysql`, `postgres`, `sqlite`, `clickhouse`, `mongodb`, `nats`, `mqtt`, `etcd`, `elasticsearch`, `influxdb`, `memcached`, `s3`\n")
         f.write("- **C/C++ 原生交互头文件 (`include/`)**: `xu_native.h`\n")
         f.write("- **官方 IDE 插件 (`editors/`)**: VS Code 语法高亮与语言服务扩展 (`xu-language-*.vsix`)\n")
         f.write("- **开箱即用上手示例 (`examples/`)**: 官方示例集合\n")
-        f.write("- **跨平台安装与卸载脚本**: `install.sh`, `install.ps1`, `uninstall.sh`, `uninstall.ps1`, `env.sh`, `env.ps1`\n\n")
-        f.write("## 💡 一键安装指南\n\n")
-        f.write(f"### macOS / Linux 离线安装\n```bash\ntar -xzf xu-v{version}-<target>.tar.gz\ncd xu-v{version}\n./install.sh\n```\n\n")
-        f.write(f"### Windows 离线安装 (PowerShell)\n```powershell\nExpand-Archive xu-v{version}-windows-x64.zip\ncd xu-v{version}\n.\\install.ps1\n```\n\n")
+        f.write("- **单文件离线安装程序 (`setup`)**: 内嵌完整 SDK，自动持久化注册系统全局环境变量（Windows 注册表 Path/XU_ROOT，Unix 用户 Shell 配置）\n")
+        f.write("- **跨平台脚本与兼容组件**: `install.sh`, `install.ps1`, `uninstall.sh`, `uninstall.ps1`, `env.sh`, `env.ps1`\n\n")
+        f.write("## 💡 一键安装指南 (推荐使用 Setup 安装程序)\n\n")
+        f.write(f"### Windows 快速安装 (推荐)\n")
+        f.write(f"- **图形向导 / 命令行安装**:\n")
+        f.write(f"  下载 `xu-v{version}-windows-x64-setup.exe`（或 `xu-setup-windows-x64.exe`）。\n")
+        f.write(f"  - 双击运行：直接弹出自绘图形安装向导，一键完成安装并配置全局注册表 Path 与 XU_ROOT。\n")
+        f.write(f"  - 控制台静默安装：\n")
+        f.write(f"    ```cmd\n    xu-v{version}-windows-x64-setup.exe -y\n    ```\n\n")
+        f.write(f"### macOS 快速安装 (推荐)\n")
+        f.write(f"- **官方 PKG 安装包**: 下载 `xu-v{version}-macos-arm64.pkg`，双击启动 macOS 标准图形安装器。\n")
+        f.write(f"- **独立免提权安装程序**: 下载 `xu-setup-macos-arm64`（或 `xu-v{version}-macos-arm64-setup`）：\n")
+        f.write(f"  ```bash\n  chmod +x xu-setup-macos-arm64\n  ./xu-setup-macos-arm64 -y\n  ```\n\n")
+        f.write(f"### Linux 快速安装 (推荐)\n")
+        f.write(f"- **独立原生安装程序**: 下载对应架构的 `xu-setup-linux-x64`（或 `xu-setup-linux-arm64`）：\n")
+        f.write(f"  ```bash\n  chmod +x xu-setup-linux-x64\n  ./xu-setup-linux-x64 -y\n  ```\n")
+        f.write(f"  零依赖自动解压标准库与工具链，自动注册用户环境。\n\n")
+        f.write(f"### 传统压缩包归档（手动解压与兼容模式）\n\n")
+        f.write(f"#### macOS / Linux 离线解压安装\n```bash\ntar -xzf xu-v{version}-<target>.tar.gz\ncd xu-v{version}\n./xu-setup -y\n```\n\n")
+        f.write(f"#### Windows 离线解压安装 (PowerShell)\n```powershell\nExpand-Archive xu-v{version}-windows-x64.zip\ncd xu-v{version}\n.\\xu-setup.exe -y\n```\n\n")
         f.write("### 在线一键安装\n- **macOS / Linux**:\n  ```bash\n  curl -fsSL https://xulang.org/install.sh | bash\n  ```\n- **Windows (PowerShell)**:\n  ```powershell\n  irm https://xulang.org/install.ps1 | iex\n  ```\n")
 
     print(f"[OK] Release manifest saved to: {manifest_file}")

@@ -789,8 +789,39 @@ static void menu_on_command(const char *id) {
   post_menu_invoke(id);
 }
 
+static SIZE outer_size_for_client(int width, int height, DWORD style, DWORD ex,
+                                  BOOL has_menu) {
+  RECT frame = {0, 0, width, height};
+  AdjustWindowRectEx(&frame, style, has_menu, ex);
+  SIZE size = {frame.right - frame.left, frame.bottom - frame.top};
+  return size;
+}
+
+static void resize_to_client(int width, int height, UINT flags = 0) {
+  if (!g_hwnd) return;
+  SIZE size = outer_size_for_client(width, height,
+      (DWORD)GetWindowLongPtr(g_hwnd, GWL_STYLE),
+      (DWORD)GetWindowLongPtr(g_hwnd, GWL_EXSTYLE), GetMenu(g_hwnd) != NULL);
+  SetWindowPos(g_hwnd, NULL, 0, 0, size.cx, size.cy,
+               SWP_NOMOVE | SWP_NOZORDER | flags);
+}
+
 static void menu_install_or_update(void) {
   if (!g_hwnd) return;
+  char visible[16];
+  read_trim_file("xu_ui_menu_visible.txt", visible, sizeof(visible));
+  if (visible[0] == '0') {
+    if (g_app_menu) {
+      SetMenu(g_hwnd, NULL);
+      DestroyMenu(g_app_menu);
+      g_app_menu = NULL;
+      g_menu_n = 0;
+      g_menu_sig[0] = 0;
+      DrawMenuBar(g_hwnd);
+      resize_to_client(g_width, g_height);
+    }
+    return;
+  }
   char items[4096];
   read_file_raw("xu_ui_menu.txt", items, sizeof(items));
   char sig[512];
@@ -852,6 +883,7 @@ static void menu_install_or_update(void) {
   }
   SetMenu(g_hwnd, menubar);
   DrawMenuBar(g_hwnd);
+  resize_to_client(g_width, g_height);
   g_app_menu = menubar;
   snprintf(g_menu_sig, sizeof(g_menu_sig), "%s", sig);
 }
@@ -1520,7 +1552,7 @@ static void drain_title_size(void) {
       snprintf(g_last_size, sizeof(g_last_size), "%s", size_raw);
       g_width = w;
       g_height = h;
-      SetWindowPos(g_hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+      resize_to_client(w, h);
       if (g_mask_active) paint_mask_layered();
     }
   }
@@ -1755,11 +1787,10 @@ static void handle_shell_cmd(const char *s) {
   }
   if (strncmp(s, "resizable\t", 10) == 0) {
     LONG_PTR style = GetWindowLongPtr(g_hwnd, GWL_STYLE);
-    if (s[10] != '0') style |= WS_THICKFRAME;
-    else style &= ~WS_THICKFRAME;
+    if (s[10] != '0') style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+    else style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
     SetWindowLongPtr(g_hwnd, GWL_STYLE, style);
-    SetWindowPos(g_hwnd, NULL, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    resize_to_client(g_width, g_height, SWP_FRAMECHANGED);
     return;
   }
   if (strncmp(s, "position\t", 9) == 0) {
@@ -2062,14 +2093,15 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
 
   int sw = GetSystemMetrics(SM_CXSCREEN);
   int sh = GetSystemMetrics(SM_CYSCREEN);
-  int px = (sw > g_width) ? (sw - g_width) / 2 : 0;
-  int py = (sh > g_height) ? (sh - g_height) / 2 : 0;
+  SIZE outer = outer_size_for_client(g_width, g_height, style, ex, FALSE);
+  int px = (sw > outer.cx) ? (sw - outer.cx) / 2 : 0;
+  int py = (sh > outer.cy) ? (sh - outer.cy) / 2 : 0;
 
   wchar_t wtitle[512];
   utf8_to_wide(title, wtitle, 512);
   host_trace("CreateWindowExW...");
   g_hwnd = CreateWindowExW(ex, L"XuUiHost", wtitle, style,
-                           px, py, g_width, g_height,
+                           px, py, outer.cx, outer.cy,
                            NULL, NULL, hi, NULL);
   if (!g_hwnd) {
     append_shell_event("create_window_failed");

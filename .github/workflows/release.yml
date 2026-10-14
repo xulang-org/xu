@@ -1,0 +1,202 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.8.9). Default: v + VERSION"
+        required: false
+        type: string
+      custom_notes:
+        description: "Optional custom notes or announcement highlights (Markdown)"
+        required: false
+        type: string
+      prerelease:
+        description: "Mark as pre-release (auto: true if tag contains -dev/-rc/-alpha/-beta)"
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - true
+          - false
+      draft:
+        description: "Create as draft"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  XU_CI_LANE: product
+
+jobs:
+  publish-release:
+    name: Build & publish release
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout companion examples
+        uses: actions/checkout@v4
+        with:
+          repository: xulang-org/examples
+          path: .ci/examples
+          persist-credentials: false
+
+      - name: Checkout companion packages
+        uses: actions/checkout@v4
+        with:
+          repository: xulang-org/packages
+          path: .ci/packages
+          persist-credentials: false
+
+      - name: Checkout companion vscode
+        uses: actions/checkout@v4
+        with:
+          repository: xulang-org/vscode
+          path: .ci/vscode
+          persist-credentials: false
+
+      - name: Set companion environment
+        run: |
+          echo "XU_EXAMPLES_ROOT=$GITHUB_WORKSPACE/.ci/examples" >> "$GITHUB_ENV"
+          echo "XU_PACKAGES_ROOT=$GITHUB_WORKSPACE/.ci/packages" >> "$GITHUB_ENV"
+          echo "XU_VSCODE_ROOT=$GITHUB_WORKSPACE/.ci/vscode" >> "$GITHUB_ENV"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install native Windows draw packaging dependencies
+        run: |
+          brew install mingw-w64
+          python3 -m pip install Pillow
+
+      - name: Restore hosted seed cache
+        id: seed-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bin/xu
+          key: hosted-seed-macos-arm64-${{ hashFiles('VERSION') }}
+          restore-keys: |
+            hosted-seed-macos-arm64-
+
+      - name: Restore seed from a published product SDK
+        if: steps.seed-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          XU_SDK_SEED_VERSION: ${{ vars.XU_SDK_SEED_VERSION }}
+        run: python3 scripts/restore_product_seed.py --target macos-arm64 --destination bin/xu
+
+      - name: Build hosted compiler chain
+        run: |
+          chmod +x bin/xu
+          echo "XU_CI_LANE=product seed present: $(./bin/xu --version | head -n 2 | tail -n 1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          XU_SKIP_CROSS=1 ./scripts/build_hosted_chain.sh bin/xu bin/xu
+          python3 scripts/check_release_identity.py --require-cli
+          make tools
+
+      - name: Verify source & boundary contract
+        run: python3 scripts/check_bootstrap_xu_boundary.py --strict-freeze
+
+      - name: Package all platform release SDKs
+        run: |
+          mkdir -p dist/release
+          python3 scripts/pack_release_bundle.py --all --out-dir dist/release
+
+      - name: Test installed host SDK and native setup installer
+        run: |
+          VERSION=$(cat VERSION)
+          python3 scripts/test_installed_sdk.py --archive "dist/release/xu-v$VERSION-macos-arm64.tar.gz" --native-setup
+          if [ -f "dist/release/xu-setup-macos-arm64" ]; then
+            python3 scripts/test_installed_sdk.py --installer "dist/release/xu-setup-macos-arm64"
+          fi
+
+      - name: Generate structured release notes
+        id: notes
+        env:
+          CUSTOM_NOTES: ${{ inputs.custom_notes }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [[ "$TAG" != v* ]]; then
+            TAG="v$(cat VERSION)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$CUSTOM_NOTES" ]; then
+            python3 scripts/generate_release_notes.py \
+              --tag "$TAG" \
+              --manifest dist/release/RELEASE_MANIFEST.md \
+              --custom-notes "$CUSTOM_NOTES" \
+              --output dist/release/RELEASE_NOTES.md
+          else
+            python3 scripts/generate_release_notes.py \
+              --tag "$TAG" \
+              --manifest dist/release/RELEASE_MANIFEST.md \
+              --output dist/release/RELEASE_NOTES.md
+          fi
+
+          echo "=== RELEASE NOTES PREVIEW ==="
+          head -n 50 dist/release/RELEASE_NOTES.md
+          cat dist/release/RELEASE_NOTES.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Determine release flags
+        id: flags
+        run: |
+          TAG="${{ steps.notes.outputs.tag }}"
+          FLAGS=()
+          PRERELEASE="${{ inputs.prerelease || 'auto' }}"
+          if [ "$PRERELEASE" = "true" ] || ([ "$PRERELEASE" = "auto" ] && [[ "$TAG" =~ -(dev|rc|alpha|beta) ]]); then
+            FLAGS+=(--prerelease)
+          fi
+          if [ "${{ inputs.draft }}" = "true" ]; then
+            FLAGS+=(--draft)
+          fi
+          echo "flags=${FLAGS[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.notes.outputs.tag }}"
+          FLAGS=(${{ steps.flags.outputs.flags }})
+
+          echo "Publishing Release: $TAG (flags: ${FLAGS[*]})"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, updating assets..."
+            gh release upload "$TAG" dist/release/* --clobber
+            gh release edit "$TAG" --notes-file dist/release/RELEASE_NOTES.md "${FLAGS[@]}"
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" dist/release/* \
+              --title "Xu $TAG" \
+              --notes-file dist/release/RELEASE_NOTES.md \
+              "${FLAGS[@]}"
+          fi
+
+          echo "Release successfully published: $(gh release view "$TAG" --json url -q .url)"
+
+      - name: Upload release assets to workflow artifacts (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xu-published-release-${{ steps.notes.outputs.tag }}
+          path: dist/release/
+          if-no-files-found: warn

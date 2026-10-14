@@ -18,7 +18,14 @@ ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
 BOOTSTRAP_ROOT=$("$ROOT_DIR/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT_DIR"
 
-SOURCE_DEFAULT="${XU_EXAMPLES_ROOT:-$ROOT_DIR/../xu-examples}/examples/11_http_server/main.xu"
+if [ -n "${XU_EXAMPLES_ROOT:-}" ]; then
+    EXAMPLES_DIR="$XU_EXAMPLES_ROOT"
+elif [ -d "$ROOT_DIR/../examples" ]; then
+    EXAMPLES_DIR="$ROOT_DIR/../examples"
+else
+    EXAMPLES_DIR="$ROOT_DIR/../xu-examples"
+fi
+SOURCE_DEFAULT="$EXAMPLES_DIR/examples/11_http_server/main.xu"
 OUT_DIR_DEFAULT="$ROOT_DIR/dist/xu-server"
 HEALTH_URL_DEFAULT="http://127.0.0.1:18080/health"
 

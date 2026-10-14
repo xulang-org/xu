@@ -36,7 +36,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 from companion_repos import project_root
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MANIFEST = project_root("bootstrap") / "BOUNDARY.json"
+DEFAULT_MANIFEST = (
+    ROOT / "BOUNDARY.json"
+    if (ROOT / "BOUNDARY.json").is_file()
+    else project_root("bootstrap") / "BOUNDARY.json"
+)
 MODULE_IMPORT_RE = re.compile(
     r"^\s*#([A-Za-z_][A-Za-z0-9_./-]*)\s*(?:$|//)", re.MULTILINE
 )
@@ -59,6 +63,7 @@ class BoundaryCheck:
         # out-of-root.
         self.root = root.resolve()
         self.bootstrap_root = project_root("bootstrap", core_root=self.root)
+        self.bootstrap_present = self.bootstrap_root.is_dir()
         self.manifest_path = manifest_path.resolve()
         self.errors: list[str] = []
         self.warnings: list[str] = []
@@ -268,6 +273,8 @@ class BoundaryCheck:
             # Development docs and the sync ledger intentionally stay local.
             if self.ci and (value.startswith(("docs/", "tests/")) or value == "bootstrap/SYNC_DIFF.md"):
                 continue
+            if self.ci and not self.bootstrap_present and value.startswith("bootstrap/"):
+                continue
             path = self.path(value, f"required_paths[{index}]")
             if path is not None and not path.exists():
                 self.error(f"required_paths[{index}]: path not found: {value}")
@@ -301,6 +308,8 @@ class BoundaryCheck:
             self.error("scope.compiler_chain must be a non-empty list")
         else:
             for index, value in enumerate(compiler_chain):
+                if self.ci and not self.bootstrap_present and isinstance(value, str) and value.startswith("bootstrap/"):
+                    continue
                 if not isinstance(value, str):
                     self.error(f"scope.compiler_chain[{index}] must be a string")
                     continue
@@ -311,6 +320,8 @@ class BoundaryCheck:
             self.error("scope.auxiliary_bootstrap_consumers must be a list")
         else:
             for index, value in enumerate(auxiliary):
+                if self.ci and not self.bootstrap_present and isinstance(value, str) and value.startswith("bootstrap/"):
+                    continue
                 if not isinstance(value, str):
                     self.error(f"scope.auxiliary_bootstrap_consumers[{index}] must be a string")
                     continue
@@ -331,6 +342,8 @@ class BoundaryCheck:
         manifest therefore names compiler and auxiliary members separately and
         requires their union to equal ``bootstrap/Cargo.toml`` exactly.
         """
+        if self.ci and not self.bootstrap_present:
+            return
 
         scope = manifest.get("scope")
         if not isinstance(scope, dict):
@@ -526,15 +539,9 @@ class BoundaryCheck:
         self.info["generation_fixed_point"] = fixed
 
     def check_frozen_primer_paths(self, manifest: dict) -> None:
-        """Validate the machine-readable Gen0 artifact allowlist.
-
-        Oracle harnesses may accept only a reproducible primer artifact.  The
-        paths are lexical repository paths (not resolved symlink targets), so
-        ``path()``/``regular_file()`` fail closed when a checkout replaces a
-        component with a symlink to an external executable.  Build outputs
-        are optional in a source checkout; when present they must be regular
-        files.
-        """
+        """Validate the machine-readable Gen0 artifact allowlist."""
+        if self.ci and not self.bootstrap_present:
+            return
 
         invariants = manifest.get("invariants")
         if not isinstance(invariants, dict):
@@ -803,6 +810,8 @@ class BoundaryCheck:
             else:
                 ids.add(mirror_id)
             for side in ("product_paths", "primer_paths"):
+                if side == "primer_paths" and self.ci and not self.bootstrap_present:
+                    continue
                 paths = mirror.get(side)
                 if not isinstance(paths, list) or not paths:
                     self.error(f"mirrors[{index}].{side} must be a non-empty list")
@@ -867,6 +876,8 @@ class BoundaryCheck:
 
             contents: dict[str, str] = {}
             for side in ("product_paths", "primer_paths"):
+                if side == "primer_paths" and self.ci and not self.bootstrap_present:
+                    continue
                 paths = entry.get(side)
                 if not isinstance(paths, list) or not paths:
                     self.error(f"runtime_abi[{index}].{side} must be a non-empty list")
@@ -921,6 +932,8 @@ class BoundaryCheck:
                     continue
                 checked_symbols += 1
                 for side in ("product_paths", "primer_paths"):
+                    if side == "primer_paths" and self.ci and not self.bootstrap_present:
+                        continue
                     if symbol not in contents.get(side, ""):
                         self.error(
                             f"runtime ABI {entry_id or index}: {symbol} missing from {side} endpoint"
@@ -1335,6 +1348,8 @@ class BoundaryCheck:
         """
 
         in_bootstrap = relative_root.startswith("bootstrap/")
+        if in_bootstrap and self.ci and not self.bootstrap_present:
+            return []
         git_root = self.bootstrap_root if in_bootstrap else self.root
         git_path = relative_root.removeprefix("bootstrap/") if in_bootstrap else relative_root
         try:
@@ -1381,16 +1396,9 @@ class BoundaryCheck:
         )
 
     def check_primer_exceptions(self, manifest: dict) -> None:
-        """Enforce the explicit escape hatch for new Rust primer code.
-
-        ``bootstrap/`` is frozen, but this checkout intentionally carries a
-        few experimental Rust slices (the LLVM-style vreg tier and diagnostic
-        helpers) plus auxiliary playground/build plumbing.  Without a
-        machine-readable registration, an untracked Rust file can silently
-        become part of a purported self-host result.  Normal checks report
-        such files as warnings to keep local iteration usable; CI/release can
-        pass ``--strict-freeze`` to fail closed.
-        """
+        """Enforce the explicit escape hatch for new Rust primer code."""
+        if self.ci and not self.bootstrap_present:
+            return
 
         sections = (
             ("experimental_primer_slices", "experimental"),
@@ -2302,9 +2310,9 @@ class BoundaryCheck:
                             f"{value}:{line_no}: bootstrap fixture run must be labelled oracle"
                         )
             if value.endswith("windows.yml"):
-                # Windows currently exercises the primer directly.  Keep the
-                # job identity explicit until a hosted Windows seed is wired.
-                if not re.search(r"name:\s*windows[^\n]*oracle", text, re.IGNORECASE):
+                # Windows currently exercises the primer directly when using bootstrap.
+                # Keep the job identity explicit until a hosted Windows seed is wired.
+                if "bootstrap" in active and not re.search(r"name:\s*windows[^\n]*oracle", text, re.IGNORECASE):
                     self.error(
                         "windows workflow using bootstrap must identify itself as oracle"
                     )
@@ -2689,6 +2697,8 @@ class BoundaryCheck:
                         self.error(f"{source_rel} did not emit GEN1_SRCS and GEN1_PARSE")
 
     def check_watermark_allowlist(self, manifest: dict) -> None:
+        if self.ci and not self.bootstrap_present:
+            return
         invariants = manifest.get("invariants", {})
         allowlist = invariants.get("watermark_source_allowlist", [])
         if not isinstance(allowlist, list) or not allowlist:
