@@ -50,14 +50,24 @@ def download(target: str, version: str, archives: Path) -> None:
                     '--pattern', f'xu-{tag}-{target}.{extension}', '--dir', str(archives)], check=True)
 
 
-def restore(target: str, archives: Path, destination: Path) -> None:
-    if destination.exists():
+def restore(target: str, archives: Path, destination: Path, *, replace_existing: bool = False) -> None:
+    if destination.exists() and not replace_existing:
         raise ValueError('Refusing to overwrite an existing hosted seed')
     with tempfile.TemporaryDirectory(prefix='xu-product-seed-') as temporary:
         compiler = extract_seed(archives, target, Path(temporary) / 'sdk')
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(compiler, destination)
-        destination.chmod(0o755)
+        # Complete SDK identity verification and copying before replacing a
+        # partially restored cache. A failed download/extraction/install keeps
+        # the previous bytes, and Mach-O installation receives a fresh inode.
+        fd, staged_name = tempfile.mkstemp(prefix='.xu-product-seed-', dir=destination.parent)
+        os.close(fd)
+        staged = Path(staged_name)
+        try:
+            shutil.copy2(compiler, staged)
+            staged.chmod(0o755)
+            os.replace(staged, destination)
+        finally:
+            staged.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -66,6 +76,8 @@ def main() -> int:
     parser.add_argument('--version', default=os.environ.get('XU_SDK_SEED_VERSION', ''))
     parser.add_argument('--archives', type=Path)
     parser.add_argument('--destination', type=Path)
+    parser.add_argument('--replace-existing', action='store_true',
+                        help='atomically replace a cached seed after validating the downloaded SDK')
     args = parser.parse_args()
     if not args.archives and not args.destination:
         parser.error('Provide --archives or --destination')
@@ -74,7 +86,7 @@ def main() -> int:
             archives = args.archives or Path(temporary)
             download(args.target, args.version, archives)
             if args.destination:
-                restore(args.target, archives, args.destination)
+                restore(args.target, archives, args.destination, replace_existing=args.replace_existing)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print('Product seed BLOCKED: no valid published SDK seed. Publish the initial verified SDK '
               'or configure a successful artifact run; oracle binaries are not product seeds.', file=sys.stderr)
