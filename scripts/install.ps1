@@ -179,7 +179,6 @@ if ($VscodeSource) {
 
 # 6. Examples
 $ExSrc = "$SourceDir\examples"
-if (-not (Test-Path $ExSrc)) { $ExSrc = "$SourceDir\developer\examples" }
 if (-not (Test-Path $ExSrc) -and $env:XU_EXAMPLES_ROOT) { $ExSrc = "$env:XU_EXAMPLES_ROOT\examples" }
 if (Test-Path $ExSrc) {
     Write-Color "[INFO] Copying official examples..." -Color Blue

@@ -15,7 +15,7 @@ else:
     from release_version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
-DOMAINS = ("src", "packages", "developer")
+DOMAINS = ("src", "packages")
 COMPILER_MANIFEST = "src/cmd/compile/xu.xun"
 VERSION_LINE = re.compile(r"^version:[^\n]*(?:\n|$)", re.MULTILINE)
 XU_LINE = re.compile(r"^xu:[^\n]*(?:\n|$)", re.MULTILINE)

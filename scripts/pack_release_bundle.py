@@ -206,13 +206,8 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
     target_xu = xu_bin if target == get_host_target() else cached_xu
     if not target_xu.exists():
         target_xu = REPO_ROOT / "bin" / "platform" / target / xu_target_name
-    if not target_xu.exists():
-        # Fallback to bin/xu or developer/bin
-        dev_xu = REPO_ROOT / "developer" / "bin" / f"xu.{target.replace('-', '.')}{'.exe' if is_windows else ''}"
-        if dev_xu.exists():
-            target_xu = dev_xu
-        elif target == get_host_target():
-            target_xu = xu_bin
+    if not target_xu.exists() and target == get_host_target():
+        target_xu = xu_bin
 
     if not target_xu.exists():
         raise FileNotFoundError(f"Missing compiler binary for target {target}: {target_xu}")

@@ -8,7 +8,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-DOMAINS = ("src", "packages", "developer", "tests")
+DOMAINS = ("src", "packages", "tests")
 
 
 def errors(path: Path, text: str) -> list[str]:
