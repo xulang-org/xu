@@ -1,108 +1,116 @@
-# Xu 编程语言
+<p align="center">
+  <a href="https://xulang.org"><img src="brand/xu_classic.svg" alt="Xu Logo" width="100" height="100"></a>
+</p>
 
-Xu 是一门静态类型、原生 AOT 编译、无 GC 的编程语言，通过所有权和借用管理内存。SDK 提供编译器、配套工具、标准库和官方示例，解压即可使用，也可以安装到用户目录。
+<h1 align="center">The Xu Programming Language</h1>
 
-当前源码版本见 [VERSION](VERSION)。下载版本以 [Releases](https://github.com/xulang-org/xu/releases) 和包内 `VERSION` 为准；包内 `TARGET` 记录平台，`bundle.json` 记录产品来源与二进制 SHA-256。
+<p align="center">
+  <b>English</b> | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-- [官网与文档](https://xulang.org)
-- [Installed SDK 工作流](https://github.com/xulang-org/xu/actions/workflows/sdk.yml)
-- [问题反馈](https://github.com/xulang-org/xu/issues)
+<p align="center">
+  <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?include_prereleases&label=release" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <a href="https://xulang.org"><img src="https://img.shields.io/badge/docs-xulang.org-rose" alt="Docs"></a>
+</p>
 
-## 开发版与正式版
+Xu is a statically-typed, native AOT-compiled, GC-free modern systems programming language that manages memory through compile-time ownership and borrow checking. The SDK provides the compiler, developer toolchain, standard library, and official examples. You can extract and run immediately or install globally via standalone native Setup installers.
 
-Xu 与编译器使用同一个完整版本号：开发调试版为 `0.8.8-dev.1`、`0.8.8-dev.2`；发布候选版为 `0.8.8-rc.1`；验收后的正式版为 `0.8.8`。持续调试递增后缀计数，进入下一个正式版本周期时再递增三段数字。
+For current source version, see [VERSION](VERSION). Published releases are determined by [GitHub Releases](https://github.com/xulang-org/xu/releases) and the in-bundle `VERSION`; `TARGET` records the target platform, and `bundle.json` records provenance and SHA-256 binary digests.
 
-GitHub 的开发版和候选版标记为 **Pre-release**。默认 `xu update` 获取正式发布；需要调试版时显式执行 `xu update --version 0.8.8-dev.1`。已发布的标签和安装包不覆盖，修复后使用新的开发版序号。这里的“正式发布”仍属于 `0.8.x`，不代表语言已经进入 `1.0` 稳定阶段。
+- [Official Website & WebAssembly Playground](https://xulang.org)
+- [47 Cross-Language Benchmarks Across Dual Architectures](https://xulang.org/benchmarks)
+- [Installed SDK CI Workflows](https://github.com/xulang-org/xu/actions/workflows/sdk.yml)
+- [Issues & Discussions](https://github.com/xulang-org/xu/issues)
 
-版本维护命令：
+## Releases and Channels
+
+Xu and its compiler share a unified semantic version number: debug development builds use `0.8.8-dev.1`, `0.8.8-dev.2`; release candidates use `0.8.8-rc.1`; and verified general-availability releases use `0.8.8`. Pre-release versions advance the suffix counter until the next stable release cycle.
+
+On GitHub, dev and rc builds are marked as **Pre-release**. By default, `xu update` tracks stable releases; pass `--version 0.8.8-dev.1` to install a specific development build. Existing tags and releases are immutable. Note that current stable releases belong to the `0.8.x` series and do not imply language `1.0` stability.
+
+Version maintenance scripts:
 
 ```bash
-# 从上一正式版本开始新一轮开发，例如 0.8.8 → 0.8.8-dev.1
+# Start a new dev cycle from stable, e.g. 0.8.8 → 0.8.8-dev.1
 python3 scripts/module_versions.py --release-bump patch --channel dev
-# 同一轮开发：dev.1 → dev.2，或 rc.1 → rc.2
+# Advance counter within the same channel: dev.1 → dev.2, or rc.1 → rc.2
 python3 scripts/module_versions.py --next-prerelease
 # dev.N → rc.1
 python3 scripts/module_versions.py --promote rc
-# rc.N → 同号正式版，仅在验收通过并决定发布后执行
+# rc.N → matching stable release, executed only after full validation
 python3 scripts/module_versions.py --promote stable
 ```
 
-这些命令同步 `VERSION`、编译器 `version:` / `xu:`、所有当前模块的 Xu 要求与产品横幅；其他模块自身的 `version:` 保持独立。改动后仍需重建并验证实际二进制与安装包。
+## Download SDK & Setup Installers
 
-## 下载 SDK 与 Setup 安装包
+Download native Setup installers, SDK archives, and `SHA256SUMS` from [GitHub Releases](https://github.com/xulang-org/xu/releases). All releases provide standalone offline Setup packages with embedded compiler, tools, and standard library sources that automatically register persistent system environment variables.
 
-在 [Releases](https://github.com/xulang-org/xu/releases) 下载对应平台的 Setup 安装程序、SDK 归档包和 `SHA256SUMS`。后续所有版本均默认发布单文件离线 Setup 安装包，内嵌完整编译器、工具链与标准库源码，自动配置系统全局环境变量。
-
-| 操作系统 / CPU | 平台 | 推荐 Setup 安装程序 (单文件离线包) | SDK 完整源码归档 |
+| Operating System / CPU | Platform Target | Recommended Setup Installer (Self-contained) | Full SDK Source Archive |
 | --- | --- | --- | --- |
-| Windows / x86-64 | `windows-x64` | `xu-v<版本>-windows-x64-setup.exe` (双击运行图形向导) | `xu-v<版本>-windows-x64.zip` |
-| Windows / ARM64 | `windows-arm64` | `xu-v<版本>-windows-arm64-setup.exe` | `xu-v<版本>-windows-arm64.zip` |
-| macOS / Apple Silicon | `macos-arm64` | `xu-v<版本>-macos-arm64.pkg` (双击安装) 或 `xu-setup-macos-arm64` | `xu-v<版本>-macos-arm64.tar.gz` |
-| macOS / Intel | `macos-x64` | `xu-setup-macos-x64` | `xu-v<版本>-macos-x64.tar.gz` |
-| Linux / x86-64 | `linux-x64` | `xu-setup-linux-x64` (赋权后直接 `./xu-setup-linux-x64 -y`) | `xu-v<版本>-linux-x64.tar.gz` |
-| Linux / ARM64 | `linux-arm64` | `xu-setup-linux-arm64` | `xu-v<版本>-linux-arm64.tar.gz` |
-| Linux / LoongArch64 | `linux-loongarch64` | `xu-setup-linux-loongarch64` | `xu-v<版本>-linux-loongarch64.tar.gz` |
-| Linux / RISC-V 64 | `linux-riscv64` | `xu-setup-linux-riscv64` | `xu-v<版本>-linux-riscv64.tar.gz` |
+| Windows / x86-64 | `windows-x64` | `xu-v<version>-windows-x64-setup.exe` (Double-click GUI wizard) | `xu-v<version>-windows-x64.zip` |
+| Windows / ARM64 | `windows-arm64` | `xu-v<version>-windows-arm64-setup.exe` | `xu-v<version>-windows-arm64.zip` |
+| macOS / Apple Silicon | `macos-arm64` | `xu-v<version>-macos-arm64.pkg` (Double-click GUI wizard) or `xu-setup-macos-arm64` | `xu-v<version>-macos-arm64.tar.gz` |
+| macOS / Intel | `macos-x64` | `xu-setup-macos-x64` | `xu-v<version>-macos-x64.tar.gz` |
+| Linux / x86-64 | `linux-x64` | `xu-setup-linux-x64` (Run `chmod +x xu-setup-linux-x64 && ./xu-setup-linux-x64 -y`) | `xu-v<version>-linux-x64.tar.gz` |
+| Linux / ARM64 | `linux-arm64` | `xu-setup-linux-arm64` | `xu-v<version>-linux-arm64.tar.gz` |
+| Linux / LoongArch64 | `linux-loongarch64` | `xu-setup-linux-loongarch64` | `xu-v<version>-linux-loongarch64.tar.gz` |
+| Linux / RISC-V 64 | `linux-riscv64` | `xu-setup-linux-riscv64` | `xu-v<version>-linux-riscv64.tar.gz` |
+| WebAssembly | `wasm32` | Built-in AOT target (`xu build --target wasm32 app.xu`) | No external packages required |
 
-Releases 中同时提供带版本号文件（如 `xu-v<版本>-windows-x64-setup.exe`）及标准别名（如 `xu-setup-windows-x64.exe`）。也可以打开 Installed SDK 工作流，选择安装验收已通过的平台，从 Artifacts 下载 `xu-sdk-product-<平台>`。
+Releases also provide canonical alias binaries (e.g. `xu-setup-windows-x64.exe`).
 
-Actions Artifact 是外层 ZIP，解压后在 `dist/sdk-ci/` 找到 SDK 压缩包、`SHA256SUMS` 与 `RELEASE_MANIFEST.md`，再解压 SDK 压缩包。SDK 顶层目录为 `xu-v<版本>/`；不同平台使用各自的解压目录。
+## Verification & Extraction
 
-以下解压示例使用已发布的 `0.8.3`，下载其他版本时替换文件名和目录中的版本号。
+Run in the directory containing the download archive and `SHA256SUMS`.
 
-## 校验与解压
-
-在压缩包与 `SHA256SUMS` 所在目录执行。
-
-macOS：
+macOS:
 
 ```bash
 shasum -a 256 -c SHA256SUMS
-tar -xzf xu-v0.8.3-macos-arm64.tar.gz
-cd xu-v0.8.3
+tar -xzf xu-v0.8.8-macos-arm64.tar.gz
+cd xu-v0.8.8
 ```
 
-Linux（x86-64）：
+Linux (x86-64):
 
 ```bash
 sha256sum -c SHA256SUMS
-tar -xzf xu-v0.8.3-linux-x64.tar.gz
-cd xu-v0.8.3
+tar -xzf xu-v0.8.8-linux-x64.tar.gz
+cd xu-v0.8.8
 ```
 
-Windows（PowerShell，x64）：
+Windows (PowerShell, x64):
 
 ```powershell
-Get-FileHash .\xu-v0.8.3-windows-x64.zip -Algorithm SHA256
-Expand-Archive .\xu-v0.8.3-windows-x64.zip -DestinationPath .
-Set-Location .\xu-v0.8.3
+Get-FileHash .\xu-v0.8.8-windows-x64.zip -Algorithm SHA256
+Expand-Archive .\xu-v0.8.8-windows-x64.zip -DestinationPath .
+Set-Location .\xu-v0.8.8
 ```
 
-Windows 的 Hash 应与 `SHA256SUMS` 中同名文件的完整哈希一致。
+## SDK Structure
 
-## SDK 内容
-
-| 路径 | 内容 |
+| Path | Description |
 | --- | --- |
-| `bin/` | `xu`、`xu-doctor`、`xu-fmt`、`xu-doc`、`xu-map`、`xu-desktop`；Windows 使用 `.exe` 扩展名 |
-| `src/` | 标准库与运行时支撑源码 |
-| `packages/` | 可选外部包，来自独立的 [packages 仓库](https://github.com/xulang-org/packages) |
-| `examples/` | 官方教程与示例，来自独立的 [examples 仓库](https://github.com/xulang-org/examples) |
-| `include/` | C 原生接口头文件 `xu_native.h` |
-| `xu-setup` / `xu-setup.exe` | 原生安装程序（零依赖、自动注册全局环境变量） |
-| `editors/` | 编辑器资源，内容取决于打包输入 |
-| `install.sh` / `install.ps1` | 兼容安装脚本 |
-| `env.sh` / `env.ps1` | 当前终端环境激活脚本 |
-| `uninstall.sh` / `uninstall.ps1` | 卸载脚本 |
-| `README.md`、`VERSION`、`TARGET`、`bundle.json` | 安装说明、版本、平台与校验元数据 |
+| `bin/` | `xu`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop` (`.exe` on Windows) |
+| `src/` | Standard library and runtime sources (required input for compilation) |
+| `packages/` | Optional external packages from the [packages repository](https://github.com/xulang-org/packages) |
+| `examples/` | Official tutorials and examples from the [examples repository](https://github.com/xulang-org/examples) |
+| `include/` | Native C interface header `xu_native.h` |
+| `xu-setup` / `xu-setup.exe` | Native standalone installer (zero-dependency, auto environment config) |
+| `editors/` | Editor syntax highlighting and configuration assets |
+| `install.sh` / `install.ps1` | Compatibility CI installation scripts |
+| `env.sh` / `env.ps1` | Temporary shell environment activation scripts |
+| `uninstall.sh` / `uninstall.ps1` | Uninstallation scripts |
+| `LICENSE`, `README.md`, `VERSION`, `TARGET`, `bundle.json` | License, documentation, version, target, and checksum metadata |
 
-VS Code 扩展独立发布，见 [vscode 仓库](https://github.com/xulang-org/vscode)。
+VS Code extension is published separately at [vscode repository](https://github.com/xulang-org/vscode).
 
-## 解压后直接使用
+## Instant Evaluation (Without Global Install)
 
-在 SDK 目录中激活当前终端。
+Activate the current shell within the extracted SDK directory:
 
-macOS / Linux（Bash）：
+macOS / Linux (Bash):
 
 ```bash
 source ./env.sh
@@ -110,7 +118,7 @@ xu --version
 xu run "$XU_ROOT/examples/01_hello/main.xu"
 ```
 
-Windows（PowerShell）：
+Windows (PowerShell):
 
 ```powershell
 . .\env.ps1
@@ -118,27 +126,27 @@ xu --version
 xu run "$env:XU_ROOT\examples\01_hello\main.xu"
 ```
 
-激活脚本设置 `PATH`、`XU_ROOT`、`XU_STDLIB_ROOT` 和 `XUPATH`，保留已有包搜索路径；重开终端后再次激活。
+The activation script configures `PATH`, `XU_ROOT`, `XU_STDLIB_ROOT`, and `XUPATH`.
 
-## 原生 Setup 安装程序（推荐全局安装）
+## Native Setup Installers (Recommended for Global Use)
 
-Xu 提供纯原生安装程序（无需安装 Python、解压工具或调整 PowerShell 脚本策略），单文件离线安装，自动持久化注册操作系统全局环境变量。在 Releases 中可直接下载独立安装包，也可在下载解压后的 SDK 目录中执行 `xu-setup`。
+Xu provides standalone native Setup installers requiring zero Python, bash, or PowerShell execution policy changes.
 
 ### Windows
 
-下载 `xu-v<版本>-windows-x64-setup.exe` 或 `xu-setup-windows-x64.exe`：
-- **图形向导**：直接双击运行，启动零依赖原生自绘界面，一键完成安装。
-- **命令行静默安装**：
+Download `xu-v<version>-windows-x64-setup.exe` or `xu-setup-windows-x64.exe`:
+- **GUI Wizard**: Double-click to launch the native self-rendered wizard and complete setup with one click.
+- **Silent CLI Install**:
   ```cmd
-  xu-v<版本>-windows-x64-setup.exe -y
+  xu-setup-windows-x64.exe -y
   ```
 
-安装程序会自动将 `bin` 路径注册到用户注册表 `HKCU\Environment\Path` 并配置 `XU_ROOT`。重新打开任意终端（CMD / PowerShell / Terminal / VS Code）即可全局直接使用 `xu`。
+Automatically registers `bin` to `HKCU\Environment\Path` and sets `XU_ROOT`. Open a new terminal (CMD, PowerShell, or VS Code) to use `xu` globally.
 
 ### macOS
 
-- **官方 PKG 安装包**：下载 `xu-v<版本>-macos-arm64.pkg`，双击启动图形安装向导，自动配置 `/etc/paths.d/xu`，全局立即可用。
-- **免提权原生程序**：下载 `xu-setup-macos-arm64`（或在解压的 SDK 目录下执行 `./xu-setup`）：
+- **Official PKG**: Download `xu-v<version>-macos-arm64.pkg` and double-click to install into `/usr/local/xu` with `/etc/paths.d/xu` configured.
+- **Unprivileged CLI**: Download `xu-setup-macos-arm64` (or run `./xu-setup` in SDK folder):
   ```bash
   chmod +x xu-setup-macos-arm64
   ./xu-setup-macos-arm64 -y
@@ -146,37 +154,33 @@ Xu 提供纯原生安装程序（无需安装 Python、解压工具或调整 Pow
 
 ### Linux
 
-下载对应架构的 `xu-setup-linux-x64`（或 `xu-setup-linux-arm64`），赋予权限后执行：
+Download matching binary `xu-setup-linux-x64` (or `xu-setup-linux-arm64`) and run:
 
 ```bash
 chmod +x xu-setup-linux-x64
 ./xu-setup-linux-x64 -y
 ```
 
-自动解压并写入用户 Shell 环境配置（`~/.bashrc` / `~/.zshrc`），全局生效。
+Automatically unpacks and updates user shell profiles (`~/.bashrc` / `~/.zshrc`).
 
-### 自定义选项
+### Common Options
 
-所有平台的原生 Setup 安装程序均支持以下参数：
+All native Setup installers support these flags:
 
 ```bash
-# 指定安装目录 (默认 ~/.xu 或 %USERPROFILE%\.xu)
+# Custom prefix (default: ~/.xu or %USERPROFILE%\.xu)
 ./xu-setup --prefix "$HOME/my-xu" -y
 
-# 强制控制台命令行交互 (Windows 下跳过自绘图形向导)
+# Force terminal CLI interactive mode (skips GUI wizard on Windows)
 .\xu-setup.exe --cli
 
-# 查看帮助
+# Help
 ./xu-setup --help
 ```
 
-自动化 CI 脚本中亦可继续使用 `bash ./install.sh` 或 `.\install.ps1`。
+## First Program
 
-原生 FFI 和桌面 UI 打包需要平台 C 工具链、链接器与 UI SDK。执行 `xu doctor` 检查依赖。
-
-## 第一个程序
-
-在项目目录新建 UTF-8 编码的 `main.xu`：
+Create a UTF-8 encoded `main.xu` in your workspace:
 
 ```xu
 @main
@@ -193,31 +197,20 @@ xu run main.xu
 xu build main.xu -o hello
 ```
 
-编译后，macOS / Linux 执行 `./hello`，Windows 执行 `.\hello.exe`。其他常用命令：
+On macOS / Linux run `./hello`; on Windows run `.\hello.exe`. Other commands:
 
 ```bash
 xu fmt main.xu -w
 xu test test_main.xu
 xu doc . --public
 xu map .
+xu build --target wasm32 main.xu -o hello.wasm
 xu build --debug-build main.xu
 xu --help
 ```
 
-保留完整 SDK 目录结构，编译器即可从 `bin/` 旁的 `src/` 查找标准库。外部包必须在项目的 `xu.xun` 中声明依赖；packages 使用统一根模块 `github.com/xulang-org/packages`，内部包路径如 `github.com/xulang-org/packages/mysql`。`XUPATH` 不能替代依赖声明。
+Keep the full SDK folder structure intact so the compiler resolves standard library imports from `src/` beside `bin/`. Declare external packages in `xu.xun` under `github.com/xulang-org/packages`.
 
-## 卸载与反馈
+## License
 
-默认安装目录的卸载方式：
-
-```bash
-bash "$HOME/.xu/uninstall.sh"
-```
-
-```powershell
-& "$HOME\.xu\uninstall.ps1"
-```
-
-自定义目录使用 Unix 的 `XU_INSTALL_DIR` 或 PowerShell 的 `-Prefix` 指定卸载位置。仅解压使用时，关闭已激活的终端后删除解压目录。
-
-Xu 仍处于 `0.x` 阶段。反馈问题时请提供安装包文件名、`xu --version` 输出、操作系统与 CPU 架构、最小复现源码、执行命令及完整错误信息。
+The Xu project is open-source under the [MIT License](LICENSE).
