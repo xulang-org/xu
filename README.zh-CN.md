@@ -27,12 +27,25 @@ Xu 是一门静态类型、原生 AOT 编译、无 GC 的现代系统编程语�
 
 Xu 与编译器使用同一个完整版本号：开发调试版为 `0.8.8-dev.1`、`0.8.8-dev.2`；发布候选版为 `0.8.8-rc.1`；验收后的正式版为 `0.8.8`。持续调试递增后缀计数，进入下一个正式版本周期时再递增三段数字。
 
-GitHub 的开发版和候选版标记为 **Pre-release**。默认 `xu update` 获取正式发布；需要调试版时显式执行 `xu update --version 0.8.8-dev.1`。已发布的标签和安装包不覆盖，修复后使用新的开发版序号。这里的“正式发布”仍属于 `0.8.x`，不代表语言已经进入 `1.0` 稳定阶段。
+GitHub 上的正式发布（如 `v0.8.8`）标记为 **Latest Release**，开发版和候选版标记为 **Pre-release**。默认 `xu update` 获取最新正式发布；需要调试版时显式执行 `xu update --version <版本号>`。已发布的标签和安装包不覆盖，修复后使用新的序号。这里的“正式发布”仍属于 `0.8.x`，不代表语言已经进入 `1.0` 稳定阶段。
+
+### v0.8.8 核心亮点与优化
+
+- **后端指令与循环发射优化**：
+  - x86-64 架构下 32 位有符号立即数比较优化，彻底消除循环体内大于 4095 常数的 10 字节 `movabs` 冗余加载，密集循环吞吐大幅提升（`loop_sum` 性能逼近 C 语言基准）。
+  - 条件跳转空跳板块（Nop/DCE）自动穿透，消除二重无条件跳转，降低分支预测与流水线开销。
+  - 函数入口只读入参直接转发（Entry Param Forwarding），减少叶子函数多余的栈内存读写。
+- **全平台多架构矩阵与单文件 Setup**：
+  - 支持 Windows（x64 / ARM64 双架构自绘原生向导）、macOS（Apple Silicon arm64 PKG / Intel x64）、Linux（x64 / ARM64 / LoongArch64 / RISC-V 64）以及 WebAssembly（wasm32）。
+  - 双架构（ARM64 + x86_64）47 项跨语言性能横测持续验证。
+- **工具链稳定性与规范性**：
+  - 编译器完全自举闭环，确认不动点 `Gen2 == Gen3`；
+  - 修复终端 banner 在特定编码环境下的显示兼容性。
 
 版本维护命令：
 
 ```bash
-# 从上一正式版本开始新一轮开发，例如 0.8.8 → 0.8.8-dev.1
+# 从上一正式版本开始新一轮开发，例如 0.8.8 → 0.8.9-dev.1
 python3 scripts/module_versions.py --release-bump patch --channel dev
 # 同一轮开发：dev.1 → dev.2，或 rc.1 → rc.2
 python3 scripts/module_versions.py --next-prerelease

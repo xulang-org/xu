@@ -27,12 +27,25 @@ For current source version, see [VERSION](VERSION). Published releases are deter
 
 Xu and its compiler share a unified semantic version number: debug development builds use `0.8.8-dev.1`, `0.8.8-dev.2`; release candidates use `0.8.8-rc.1`; and verified general-availability releases use `0.8.8`. Pre-release versions advance the suffix counter until the next stable release cycle.
 
-On GitHub, dev and rc builds are marked as **Pre-release**. By default, `xu update` tracks stable releases; pass `--version 0.8.8-dev.1` to install a specific development build. Existing tags and releases are immutable. Note that current stable releases belong to the `0.8.x` series and do not imply language `1.0` stability.
+On GitHub, releases without pre-release suffixes (such as `v0.8.8`) are marked as official **Latest Release**, while dev and rc builds are marked as **Pre-release**. By default, `xu update` tracks stable releases; pass `--version <version>` to install a specific development build. Existing tags and releases are immutable. Note that current stable releases belong to the `0.8.x` series and do not imply language `1.0` stability.
+
+### Highlights in v0.8.8
+
+- **Backend Codegen & Instruction Optimizations**:
+  - Immediate comparison optimization for x86-64 (supports 32-bit signed constants up to 2147483647), eliminating 10-byte redundant `movabs` loads inside loops and significantly boosting tight loop throughput (bringing `loop_sum` close to C performance).
+  - Empty jump block passthrough for conditional branches, collapsing redundant hops through Nop/DCE blocks to reduce branch target overhead and pipeline bubbles.
+  - Entry parameter forwarding for read-only scalar parameters, reducing superfluous stack spilling and reloading on leaf routines.
+- **Multi-Architecture Matrix & Standalone Setup**:
+  - Full native support across Windows (x64 / ARM64 GUI wizards), macOS (Apple Silicon arm64 PKG / Intel x64), Linux (x64 / ARM64 / LoongArch64 / RISC-V 64), and WebAssembly (wasm32).
+  - Dual-architecture (ARM64 + x86_64) cross-language benchmarks continuously validated across 47 tasks.
+- **Toolchain Integrity**:
+  - Full self-hosted bootstrap cycle verified with fixed-point `Gen2 == Gen3`.
+  - Terminal banner ASCII compatibility fix for cross-platform shells.
 
 Version maintenance scripts:
 
 ```bash
-# Start a new dev cycle from stable, e.g. 0.8.8 → 0.8.8-dev.1
+# Start a new dev cycle from stable, e.g. 0.8.8 → 0.8.9-dev.1
 python3 scripts/module_versions.py --release-bump patch --channel dev
 # Advance counter within the same channel: dev.1 → dev.2, or rc.1 → rc.2
 python3 scripts/module_versions.py --next-prerelease
