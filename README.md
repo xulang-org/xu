@@ -5,225 +5,194 @@
 <h1 align="center">The Xu Programming Language</h1>
 
 <p align="center">
+  <b>Go-like Concurrency Meets C/Rust Zero-GC Performance</b><br>
+  <sub>A compile-time memory-safe systems language engineered for high-throughput, low-latency, and modern applications.</sub>
+</p>
+
+<p align="center">
   <b>English</b> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?include_prereleases&label=release" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <a href="https://xulang.org"><img src="https://img.shields.io/badge/docs-xulang.org-rose" alt="Docs"></a>
+  <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?include_prereleases&label=Release&color=0284c7" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
+  <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
-Xu is a statically-typed, native AOT-compiled, GC-free modern systems programming language that manages memory through compile-time ownership and borrow checking. The SDK provides the compiler, developer toolchain, standard library, and official examples. You can extract and run immediately or install globally via standalone native Setup installers.
+<p align="center">
+  <a href="https://xulang.org">🌐 <b>Online Playground (No Install)</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>47-Task Benchmark Dashboard</b></a> &nbsp;•&nbsp;
+  <a href="#-zero-friction-quick-start">🚀 <b>30s Quick Start</b></a> &nbsp;•&nbsp;
+  <a href="https://github.com/xulang-org/xu/releases">📦 <b>Download Installers</b></a>
+</p>
 
-For current source version, see [VERSION](VERSION). Published releases are determined by [GitHub Releases](https://github.com/xulang-org/xu/releases) and the in-bundle `VERSION`; `TARGET` records the target platform, and `bundle.json` records provenance and SHA-256 binary digests.
+---
 
-- [Official Website & WebAssembly Playground](https://xulang.org)
-- [47 Cross-Language Benchmarks Across Dual Architectures](https://xulang.org/benchmarks)
-- [Installed SDK CI Workflows](https://github.com/xulang-org/xu/actions/workflows/sdk.yml)
-- [Issues & Discussions](https://github.com/xulang-org/xu/issues)
+## ⚡ Xu at a Glance (Show, Don't Tell)
 
-## Releases and Channels
-
-Xu and its compiler share a unified semantic version number: debug development builds use `0.8.8-dev.1`, `0.8.8-dev.2`; release candidates use `0.8.8-rc.1`; and verified general-availability releases use `0.8.8`. Pre-release versions advance the suffix counter until the next stable release cycle.
-
-On GitHub, releases without pre-release suffixes (such as `v0.8.8`) are marked as official **Latest Release**, while dev and rc builds are marked as **Pre-release**. By default, `xu update` tracks stable releases; pass `--version <version>` to install a specific development build. Existing tags and releases are immutable. Note that current stable releases belong to the `0.8.x` series and do not imply language `1.0` stability.
-
-### Highlights in v0.8.8
-
-- **Backend Codegen & Instruction Optimizations**:
-  - Immediate comparison optimization for x86-64 (supports 32-bit signed constants up to 2147483647), eliminating 10-byte redundant `movabs` loads inside loops and significantly boosting tight loop throughput (bringing `loop_sum` close to C performance).
-  - Empty jump block passthrough for conditional branches, collapsing redundant hops through Nop/DCE blocks to reduce branch target overhead and pipeline bubbles.
-  - Entry parameter forwarding for read-only scalar parameters, reducing superfluous stack spilling and reloading on leaf routines.
-- **Multi-Architecture Matrix & Standalone Setup**:
-  - Full native support across Windows (x64 / ARM64 GUI wizards), macOS (Apple Silicon arm64 PKG / Intel x64), Linux (x64 / ARM64 / LoongArch64 / RISC-V 64), and WebAssembly (wasm32).
-  - Dual-architecture (ARM64 + x86_64) cross-language benchmarks continuously validated across 47 tasks.
-- **Toolchain Integrity**:
-  - Full self-hosted bootstrap cycle verified with fixed-point `Gen2 == Gen3`.
-  - Terminal banner ASCII compatibility fix for cross-platform shells.
-
-Version maintenance scripts:
-
-```bash
-# Start a new dev cycle from stable, e.g. 0.8.8 → 0.8.9-dev.1
-python3 scripts/module_versions.py --release-bump patch --channel dev
-# Advance counter within the same channel: dev.1 → dev.2, or rc.1 → rc.2
-python3 scripts/module_versions.py --next-prerelease
-# dev.N → rc.1
-python3 scripts/module_versions.py --promote rc
-# rc.N → matching stable release, executed only after full validation
-python3 scripts/module_versions.py --promote stable
-```
-
-## Download SDK & Setup Installers
-
-Download native Setup installers, SDK archives, and `SHA256SUMS` from [GitHub Releases](https://github.com/xulang-org/xu/releases). All releases provide standalone offline Setup packages with embedded compiler, tools, and standard library sources that automatically register persistent system environment variables.
-
-| Operating System / CPU | Platform Target | Recommended Setup Installer (Self-contained) | Full SDK Source Archive |
-| --- | --- | --- | --- |
-| Windows / x86-64 | `windows-x64` | `xu-v<version>-windows-x64-setup.exe` (Double-click GUI wizard) | `xu-v<version>-windows-x64.zip` |
-| Windows / ARM64 | `windows-arm64` | `xu-v<version>-windows-arm64-setup.exe` | `xu-v<version>-windows-arm64.zip` |
-| macOS / Apple Silicon | `macos-arm64` | `xu-v<version>-macos-arm64.pkg` (Double-click GUI wizard) or `xu-setup-macos-arm64` | `xu-v<version>-macos-arm64.tar.gz` |
-| macOS / Intel | `macos-x64` | `xu-setup-macos-x64` | `xu-v<version>-macos-x64.tar.gz` |
-| Linux / x86-64 | `linux-x64` | `xu-setup-linux-x64` (Run `chmod +x xu-setup-linux-x64 && ./xu-setup-linux-x64 -y`) | `xu-v<version>-linux-x64.tar.gz` |
-| Linux / ARM64 | `linux-arm64` | `xu-setup-linux-arm64` | `xu-v<version>-linux-arm64.tar.gz` |
-| Linux / LoongArch64 | `linux-loongarch64` | `xu-setup-linux-loongarch64` | `xu-v<version>-linux-loongarch64.tar.gz` |
-| Linux / RISC-V 64 | `linux-riscv64` | `xu-setup-linux-riscv64` | `xu-v<version>-linux-riscv64.tar.gz` |
-| WebAssembly | `wasm32` | Built-in AOT target (`xu build --target wasm32 app.xu`) | No external packages required |
-
-Releases also provide canonical alias binaries (e.g. `xu-setup-windows-x64.exe`).
-
-## Verification & Extraction
-
-Run in the directory containing the download archive and `SHA256SUMS`.
-
-macOS:
-
-```bash
-shasum -a 256 -c SHA256SUMS
-tar -xzf xu-v0.8.8-macos-arm64.tar.gz
-cd xu-v0.8.8
-```
-
-Linux (x86-64):
-
-```bash
-sha256sum -c SHA256SUMS
-tar -xzf xu-v0.8.8-linux-x64.tar.gz
-cd xu-v0.8.8
-```
-
-Windows (PowerShell, x64):
-
-```powershell
-Get-FileHash .\xu-v0.8.8-windows-x64.zip -Algorithm SHA256
-Expand-Archive .\xu-v0.8.8-windows-x64.zip -DestinationPath .
-Set-Location .\xu-v0.8.8
-```
-
-## SDK Structure
-
-| Path | Description |
-| --- | --- |
-| `bin/` | `xu`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop` (`.exe` on Windows) |
-| `src/` | Standard library and runtime sources (required input for compilation) |
-| `packages/` | Optional external packages from the [packages repository](https://github.com/xulang-org/packages) |
-| `examples/` | Official tutorials and examples from the [examples repository](https://github.com/xulang-org/examples) |
-| `include/` | Native C interface header `xu_native.h` |
-| `xu-setup` / `xu-setup.exe` | Native standalone installer (zero-dependency, auto environment config) |
-| `editors/` | Editor syntax highlighting and configuration assets |
-| `install.sh` / `install.ps1` | Compatibility CI installation scripts |
-| `env.sh` / `env.ps1` | Temporary shell environment activation scripts |
-| `uninstall.sh` / `uninstall.ps1` | Uninstallation scripts |
-| `LICENSE`, `README.md`, `VERSION`, `TARGET`, `bundle.json` | License, documentation, version, target, and checksum metadata |
-
-VS Code extension is published separately at [vscode repository](https://github.com/xulang-org/vscode).
-
-## Instant Evaluation (Without Global Install)
-
-Activate the current shell within the extracted SDK directory:
-
-macOS / Linux (Bash):
-
-```bash
-source ./env.sh
-xu --version
-xu run "$XU_ROOT/examples/01_hello/main.xu"
-```
-
-Windows (PowerShell):
-
-```powershell
-. .\env.ps1
-xu --version
-xu run "$env:XU_ROOT\examples\01_hello\main.xu"
-```
-
-The activation script configures `PATH`, `XU_ROOT`, `XU_STDLIB_ROOT`, and `XUPATH`.
-
-## Native Setup Installers (Recommended for Global Use)
-
-Xu provides standalone native Setup installers requiring zero Python, bash, or PowerShell execution policy changes.
-
-### Windows
-
-Download `xu-v<version>-windows-x64-setup.exe` or `xu-setup-windows-x64.exe`:
-- **GUI Wizard**: Double-click to launch the native self-rendered wizard and complete setup with one click.
-- **Silent CLI Install**:
-  ```cmd
-  xu-setup-windows-x64.exe -y
-  ```
-
-Automatically registers `bin` to `HKCU\Environment\Path` and sets `XU_ROOT`. Open a new terminal (CMD, PowerShell, or VS Code) to use `xu` globally.
-
-### macOS
-
-- **Official PKG**: Download `xu-v<version>-macos-arm64.pkg` and double-click to install into `/usr/local/xu` with `/etc/paths.d/xu` configured.
-- **Unprivileged CLI**: Download `xu-setup-macos-arm64` (or run `./xu-setup` in SDK folder):
-  ```bash
-  chmod +x xu-setup-macos-arm64
-  ./xu-setup-macos-arm64 -y
-  ```
-
-### Linux
-
-Download matching binary `xu-setup-linux-x64` (or `xu-setup-linux-arm64`) and run:
-
-```bash
-chmod +x xu-setup-linux-x64
-./xu-setup-linux-x64 -y
-```
-
-Automatically unpacks and updates user shell profiles (`~/.bashrc` / `~/.zshrc`).
-
-### Common Options
-
-All native Setup installers support these flags:
-
-```bash
-# Custom prefix (default: ~/.xu or %USERPROFILE%\.xu)
-./xu-setup --prefix "$HOME/my-xu" -y
-
-# Force terminal CLI interactive mode (skips GUI wizard on Windows)
-.\xu-setup.exe --cli
-
-# Help
-./xu-setup --help
-```
-
-## First Program
-
-Create a UTF-8 encoded `main.xu` in your workspace:
+No complex boilerplate. No convoluted lifetime annotation gymnastics. Experience Xu's clean modern syntax in 15 lines of code:
 
 ```xu
 @main
+#errors
+
+// Symbolic flow control: `<<` returns, `>>` throws; no nested Result/unwrap boilerplate
+fn fetch_metric(task string) int {
+    if task.len == 0 { >> errors.new("empty task name") }
+    << task.len * 42
+}
+
+fn worker(task string, ch chan int) {
+    val := fetch_metric(task) or (err) { << } // Mandatory safe local handling without `if err != nil`
+    ch <- val                                 // Type-safe channel messaging
+}
 
 fn main() int {
-    println("Hello, Xu!")
-    << 0
+    ch := chan int{cap: 2}
+    xu worker("latency", ch) // Native `xu` keyword spawns lightweight coroutine
+    xu worker("memory", ch)
+    println(<-ch + <-ch)     // Fan-in channel aggregation
+    << 0                     // Deterministic teardown, zero GC pauses, static AOT native build
 }
 ```
 
+> **Why Developers Love It**:
+> 1. **Symbolic Flow Control**: `<<` returns, `>>` throws, `<<<` exits. Goodbye verbose legacy keywords.
+> 2. **Ergonomic Error Flow**: Handled at the call site with `or (err) { ... }`. Eliminates screen-cluttering `if err != nil` and catastrophic runtime `unwrap()` panics.
+> 3. **Native Lightweight Concurrency**: `xu worker()` coroutines + `chan` channels provide effortless Go-like concurrency.
+> 4. **Compile-time Static Safety**: Tracked via ownership & borrow inference. **Zero garbage collection (Zero-GC)**, zero pauses, and ultra-lean deterministic memory consumption.
+
+---
+
+## 🎯 Pain Points & "Why Xu?"
+
+As software engineers building high-performance systems and services, we are constantly forced to choose between flawed trade-offs:
+
+### 1. The Dilemmas We Solve
+
+- **Pain Point 1: Garbage Collection Latency Spikes & Memory Bloat**
+  - *Status Quo*: Go and Java are productive, but GC pauses (STW) and unpredictable latency jitter are deal-breakers in low-latency gateways, trading engines, and embedded targets.
+  - *The Xu Fix*: **Zero GC Runtime**. Pure AOT compilation. Ownership tracks memory at compile time and frees it deterministically on scope exit. Zero pauses, zero GC spikes.
+- **Pain Point 2: The Battle with "Explicit Lifetime Annotation Hell"**
+  - *Status Quo*: C/C++ leaves you vulnerable to dangling pointers, memory corruption, and UAF bugs. Rust is safe, but explicit lifetime parameters (`'a`, `'b`) and complex type gymnastics drastically slow down development speed.
+  - *The Xu Fix*: **Implicit Ownership Inference & Borrow Checking**. No explicit lifetime annotations in application code. Natural value semantics for slices give you both safety and velocity.
+- **Pain Point 3: Screen-Filling Boilerplate & Nested Error Wrappers**
+  - *Status Quo*: Go codebases are flooded with repetitive `if err != nil`. Rust wraps types inside multiple `Result<T, E>` / `Option` layers.
+  - *The Xu Fix*: **Symbolic `>>` combined with mandatory `or (err) { ... }`**, providing lightweight, clean, and safe error propagation.
+- **Pain Point 4: Fragmented Toolchains & Setup Friction**
+  - *Status Quo*: Stitching together CMake, Make, package managers, and platform linkers is notoriously fragile.
+  - *The Xu Fix*: **Single-Binary Closed Loop**. Everything—compiler, test runner, formatter (`xu fmt`), documentation generator (`xu doc`), and self-rendered GUI setup wizards—is built right in.
+
+### 2. Hardcore Technical Comparison
+
+| Key Dimension | C / C++ | Go | Rust | **Xu** |
+| :--- | :--- | :--- | :--- | :--- |
+| **Memory Management** | Manual malloc/free<br>*(Leaks & dangling pointers)* | Runtime GC<br>*(STW latency pauses & memory bloat)* | Compile-time ownership<br>*(Explicit lifetime `'a` annotations)* | **Compile-time ownership<br>(Zero-GC / Deterministic drops)** |
+| **Runtime Overhead** | Zero-cost abstractions | Heavy (GC engine + scheduler runtime) | Zero-cost abstractions | **Zero-cost (No GC engine / Pure native machine code)** |
+| **Cognitive Load** | Vulnerable to UB & race conditions | Simple, but `nil` panics persist | Steep learning curve (Borrow checker fights) | **Minimal (No lifetime annotations / Clean symbolic flow)** |
+| **Concurrency Model** | OS threads / External libraries | CSP coroutines (`go`) + channels (`chan`) | Threads / Async runtimes (Function coloring) | **Native lightweight coroutines (`xu`) + typed `chan`** |
+| **Error Handling** | Error codes / Exceptions *(Implicit)* | `if err != nil` *(Cluttered boilerplate)* | `Result<T, E>` + `?` operator | **Symbolic flow: `>>` throw + `or` mandatory handling** |
+| **Flow Control** | `return` / `break` / `continue` | `return` / `break` / `continue` | `return` / Tail expressions | **Symbolic flow: `<<` return / `>>` throw / `<-` break** |
+| **Toolchain Cohesion**| Fragmented (CMake/Make/Conan) | Integrated out-of-the-box | Integrated (Cargo) | **Single-binary loop (Built-in build/test/fmt/doc)** |
+| **Cross-Platform Setup**| Complex toolchain & linker dependencies | Official installer / manual PATH config | Requires rustup & external network scripts | **Standalone GUI Setup wizards / One-click setup** |
+
+---
+
+## 🚀 Zero-Friction Quick Start
+
+### Option 1: Instant Browser Sandbox (Zero Install)
+
+Jump directly into the **[xulang.org Online Playground](https://xulang.org)**. Powered by a client-side WebAssembly build of Xu, you can test and experiment with full language features instantly.
+
+### Option 2: One-Liner Fast Install (Recommended)
+
+Xu provides standalone installers with embedded compilers and standard library sources that automatically register persistent system environment variables:
+
+- **macOS / Linux** (One command in terminal):
+  ```bash
+  # Detects architecture, downloads, and configures environment automatically
+  curl -fsSL https://xulang.org/install.sh | bash
+  ```
+  *Or download standalone binaries from [Releases](https://github.com/xulang-org/xu/releases):*
+  ```bash
+  chmod +x xu-setup-linux-x64 && ./xu-setup-linux-x64 -y
+  ```
+
+- **Windows** (GUI Wizard or PowerShell):
+  - **GUI Wizard**: Download `xu-setup-windows-x64.exe` from [Releases](https://github.com/xulang-org/xu/releases) and double-click to run the zero-dependency self-rendered wizard.
+  - **PowerShell One-Liner**:
+    ```powershell
+    irm https://xulang.org/install.ps1 | iex
+    ```
+
+> Open a new terminal and type `xu --version` to run from anywhere.
+
+### Option 3: 30-Second Hello World
+
 ```bash
-xu check main.xu
+# 1. Create source file
+cat << 'EOF' > main.xu
+@main
+
+fn main() int {
+    println("Hello, World! Welcome to Xu.")
+    << 0
+}
+EOF
+
+# 2. Run immediately
 xu run main.xu
-xu build main.xu -o hello
+
+# 3. Compile ahead-of-time to an optimized native binary
+xu build main.xu -o myapp
+./myapp
 ```
 
-On macOS / Linux run `./hello`; on Windows run `.\hello.exe`. Other commands:
+### CLI Command Quick Reference
 
-```bash
-xu fmt main.xu -w
-xu test test_main.xu
-xu doc . --public
-xu map .
-xu build --target wasm32 main.xu -o hello.wasm
-xu build --debug-build main.xu
-xu --help
-```
+| Command | Description |
+| :--- | :--- |
+| `xu run <file.xu>` | Rapid compilation and in-memory execution |
+| `xu build <file.xu> -o <bin>` | AOT compile to an optimized, standalone native binary |
+| `xu build --target wasm32 <file.xu>` | Cross-compile directly to WebAssembly |
+| `xu test <file.xu>` | Execute integrated unit tests and assertion suites |
+| `xu fmt <file.xu> -w` | Automatically format code according to official guidelines |
+| `xu doc <dir> --public` | Extract doc comments and generate clean API references |
+| `xu doctor` | Diagnostics tool checking native C linkers and SDK health |
 
-Keep the full SDK folder structure intact so the compiler resolves standard library imports from `src/` beside `bin/`. Declare external packages in `xu.xun` under `github.com/xulang-org/packages`.
+---
+
+## 🗺️ Project Roadmap
+
+Driven by continuous active iteration, Xu is rapidly evolving. Here is our current status and roadmap:
+
+- [x] **Static Native AOT Compilation**: Direct emission of optimized machine code with fixed-point bootstrap verification (`Gen2 == Gen3`)
+- [x] **Compile-Time Ownership & Borrow Inference**: Zero-GC runtime, deterministic deallocation, eliminating dangling pointers
+- [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication
+- [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
+- [x] **Universal Architecture Support**: Windows / macOS / Linux / LoongArch64 / RISC-V 64 / WebAssembly
+- [x] **Standalone Native Setup Wizards**: Zero-dependency self-rendered GUI wizards for Windows / macOS PKG / Linux installers
+- [x] **Production Infrastructure Packages**: Native drivers for MySQL, Postgres, Redis, ClickHouse, Kafka, SQLite, etc.
+- [ ] **Language Server Protocol (LSP)**: Deep VS Code & Neovim integration with real-time diagnostics and autocompletion
+- [ ] **Interactive Source Debugger**: Native breakpoint debugging, stack unwinding, and variable inspection
+- [ ] **Deep Monomorphization & Inlining Optimizations**: Cross-module automatic inlining and enhanced escape analysis
+- [ ] **Central Package Registry**: Cryptographically verified package distribution and automated dependency resolution
+
+---
+
+## 🌟 Join the Community & Support Xu
+
+Xu is an open-source, forward-looking systems programming language. If you believe in **Zero-GC extreme performance combined with ergonomic modern syntax**, we invite you to join us!
+
+- ⭐ **Star the Repo**: If Xu resonates with your engineering philosophy, give us a **Star** on [GitHub](https://github.com/xulang-org/xu)—it fuels our development!
+- 💬 **Feedback & Discussions**: Have feature requests or suggestions? Open a discussion or ticket on [GitHub Issues](https://github.com/xulang-org/xu/issues).
+- 📊 **Benchmark Insights**: Explore deep CPU and memory benchmarks across 47 tasks at [xulang.org/benchmarks](https://xulang.org/benchmarks).
+- 📚 **Comprehensive Documentation**: Read guides, syntax specifications, and tutorials at [xulang.org](https://xulang.org).
+
+---
 
 ## License
 
-The Xu project is open-source under the [MIT License](LICENSE).
+The Xu programming language is open source under the [MIT License](LICENSE).
