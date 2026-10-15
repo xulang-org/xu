@@ -100,30 +100,40 @@ def write_icon_blob_c(png: pathlib.Path, out_c: pathlib.Path) -> None:
 
 def build_tray_ico_bytes(png: pathlib.Path, work: pathlib.Path) -> bytes:
     """Build a multi-size .ico (16/32/48/256) for Windows tray + exe/window chrome."""
-    from PIL import Image
+    ico_candidate = png.with_suffix(".ico")
+    if ico_candidate.is_file():
+        return ico_candidate.read_bytes()
 
-    sizes = [16, 32, 48, 256]
-    imgs: list[tuple[int, bytes]] = []
-    src = Image.open(png).convert("RGBA")
-    for s in sizes:
-        im = src.resize((s, s), Image.Resampling.LANCZOS)
-        buf = pathlib.Path(work) / f"tray_{s}.png"
-        im.save(buf, format="PNG")
-        imgs.append((s, buf.read_bytes()))
+    try:
+        from PIL import Image
+        sizes = [16, 32, 48, 256]
+        imgs: list[tuple[int, bytes]] = []
+        src = Image.open(png).convert("RGBA")
+        for s in sizes:
+            im = src.resize((s, s), Image.Resampling.LANCZOS)
+            buf = pathlib.Path(work) / f"tray_{s}.png"
+            im.save(buf, format="PNG")
+            imgs.append((s, buf.read_bytes()))
 
-    # ICONDIR + ICONDIRENTRY[n] + PNG payloads (Vista+ PNG-in-ICO).
-    count = len(imgs)
-    header = struct.pack("<HHH", 0, 1, count)
-    entries = bytearray()
-    payload = bytearray()
-    offset = 6 + 16 * count
-    for s, data in imgs:
-        w = 0 if s >= 256 else s
-        h = 0 if s >= 256 else s
-        entries += struct.pack("<BBBBHHII", w, h, 0, 0, 1, 32, len(data), offset)
-        payload += data
-        offset += len(data)
-    return bytes(header) + bytes(entries) + bytes(payload)
+        # ICONDIR + ICONDIRENTRY[n] + PNG payloads (Vista+ PNG-in-ICO).
+        count = len(imgs)
+        header = struct.pack("<HHH", 0, 1, count)
+        entries = bytearray()
+        payload = bytearray()
+        offset = 6 + 16 * count
+        for s, data in imgs:
+            w = 0 if s >= 256 else s
+            h = 0 if s >= 256 else s
+            entries += struct.pack("<BBBBHHII", w, h, 0, 0, 1, 32, len(data), offset)
+            payload += data
+            offset += len(data)
+        return bytes(header) + bytes(entries) + bytes(payload)
+    except Exception:
+        # Fallback without Pillow: wrap raw PNG into standard Vista+ PNG-in-ICO
+        png_bytes = png.read_bytes()
+        header = struct.pack("<HHH", 0, 1, 1)
+        entry = struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png_bytes), 22)
+        return bytes(header) + bytes(entry) + png_bytes
 
 
 def write_icon_ico_blob_c(png: pathlib.Path, out_c: pathlib.Path, work: pathlib.Path) -> None:
