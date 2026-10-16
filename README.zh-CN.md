@@ -14,21 +14,27 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?include_prereleases&label=Release&color=0284c7" alt="Release"></a>
+  <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?label=Release&color=0284c7" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
   <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
-  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-13%20Tasks-amber" alt="Benchmarks"></a>
   <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
 <p align="center">
   <a href="https://xulang.org">🌐 <b>在线 Playground（免安装试玩）</b></a> &nbsp;•&nbsp;
-  <a href="https://xulang.org/benchmarks">⚡ <b>47 项跨语言横测看板</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>13 项跨语言横测看板</b></a> &nbsp;•&nbsp;
   <a href="#-零阻力快速上手-quick-start">🚀 <b>30 秒上手</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/xulang-org/xu/releases">📦 <b>下载安装包</b></a>
 </p>
 
 ---
+
+## Xu 0.8.11
+
+本版优化了 x64 整数归约和 SHA-256 软件计算，减少了符合条件的整数内核中的寄存器溢出，并简化 ARM64 基线条件返回。Windows 自举、SDK 打包及跨平台确定性检查已修复。
+
+下载 [0.8.11 SDK 与安装包](https://github.com/xulang-org/xu/releases/tag/v0.8.11)。[基准页面](https://xulang.org/zh/benchmarks)提供实测负载、编译器身份及各平台结果。SHA-256 在支持的 ARM64 系统上可使用硬件指令；x64 当前使用软件实现。不同机器的绝对耗时不能作为优化加速比。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 
