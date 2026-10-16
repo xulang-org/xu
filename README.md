@@ -32,6 +32,8 @@
 
 ## Xu 0.8.11
 
+Main development continues at `0.8.12-dev.1`; default downloads remain on the stable `0.8.11` SDK.
+
 This release improves x64 integer reductions and SHA-256 software hashing, reduces register spills in eligible integer kernels, and streamlines ARM64 base-case returns. Windows bootstrap, SDK packaging, and cross-platform determinism checks are repaired.
 
 Download the [0.8.11 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.8.11). See the [benchmark dashboard](https://xulang.org/benchmarks) for measured workloads, compiler identities, and platform-specific results. SHA-256 can use hardware instructions on supported ARM64 systems; x64 currently uses the software path. Timings from different machines are not speedup measurements.
