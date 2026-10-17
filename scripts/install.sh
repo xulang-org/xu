@@ -264,7 +264,8 @@ fi
 
 VSCODE_SOURCE="${XU_VSCODE_ROOT:-$SOURCE_DIR/editors/vscode}"
 if [[ -z "${XU_VSCODE_ROOT:-}" && ! -d "$VSCODE_SOURCE" ]]; then
-    VSCODE_SOURCE="$SOURCE_DIR/../vscode"
+    VSCODE_SOURCE="$SOURCE_DIR/../vscode-xu"
+    if [[ ! -d "$VSCODE_SOURCE" ]]; then VSCODE_SOURCE="$SOURCE_DIR/../vscode"; fi
     if [[ ! -d "$VSCODE_SOURCE" ]]; then VSCODE_SOURCE="$SOURCE_DIR/../xu-vscode"; fi
 fi
 if [[ -n "${XU_VSCODE_ROOT:-}" && ! -d "$VSCODE_SOURCE" ]]; then

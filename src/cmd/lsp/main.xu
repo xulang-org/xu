@@ -1,0 +1,1672 @@
+@main
+// xu-lsp — Language Server Protocol daemon for the Xu programming language.
+// Speaks JSON-RPC 2.0 over stdin/stdout.
+
+#encoding/json
+#xu/format
+#os
+#os/exec
+#io
+#strconv
+#strings
+#errors
+
+struct DocCache {
+    uris []string
+    texts []string
+    vers []int
+}
+
+fn (c &mut DocCache) set(uri string, text string, ver int) {
+    for i in 0:c.uris.len {
+        if c.uris[i] == uri {
+            c.texts[i] = text
+            c.vers[i] = ver
+            <<
+        }
+    }
+    c.uris.push(uri)
+    c.texts.push(text)
+    c.vers.push(ver)
+}
+
+fn (c &DocCache) get(uri string) string {
+    for i in 0:c.uris.len {
+        if c.uris[i] == uri {
+            << c.texts[i]
+        }
+    }
+    path := uri_to_path(uri)
+    data := read_file(path) or (err) {
+        << ""
+    }
+    << data
+}
+
+fn (c &mut DocCache) remove(uri string) {
+    mut new_uris := []string{}
+    mut new_texts := []string{}
+    mut new_vers := []int{}
+    for i in 0:c.uris.len {
+        if c.uris[i] != uri {
+            new_uris.push(c.uris[i])
+            new_texts.push(c.texts[i])
+            new_vers.push(c.vers[i])
+        }
+    }
+    c.uris = new_uris
+    c.texts = new_texts
+    c.vers = new_vers
+}
+
+fn uri_to_path(uri string) string {
+    mut p := uri
+    if strings.has_prefix(&p, "file://") {
+        p = p[7:p.len]
+    }
+    if xu_target_os() == 2 && p.len >= 3 && p[0] == 47 && p[2] == 58 {
+        p = p[1:p.len]
+    }
+    << p
+}
+
+fn path_to_uri(path string) string {
+    if strings.has_prefix(&path, "file://") {
+        << path
+    }
+    mut p := path
+    if xu_target_os() == 2 {
+        mut norm := io.buffer()
+        for i in 0:p.len {
+            if p[i] == 92 {
+                norm.write_byte(47)
+            } else {
+                norm.write_byte(p[i])
+            }
+        }
+        n_str := norm.bytes()
+        if n_str.len > 0 && n_str[0] != 47 {
+            << "file:///" + n_str
+        }
+        << "file://" + n_str
+    }
+    if !strings.has_prefix(&p, "/") {
+        p = "/" + p
+    }
+    << "file://" + p
+}
+
+fn dir_of(path string) string {
+    mut cut := 0 - 1
+    for i in 0:path.len {
+        if path[i] == 47 || path[i] == 92 {
+            cut = i
+        }
+    }
+    if cut >= 0 {
+        << path[0:cut]
+    }
+    << "."
+}
+
+fn find_stdlib_root(xu_bin string) string {
+    env_std := os.getenv("XU_STDLIB_ROOT")
+    if env_std.len > 0 && file_exists(env_std + "") {
+        << env_std
+    }
+    env_root := os.getenv("XU_ROOT")
+    if env_root.len > 0 {
+        cand := env_root + "/src"
+        if file_exists(cand + "") {
+            << cand
+        }
+    }
+    if xu_bin.len > 0 {
+        bin_dir := dir_of(xu_bin + "")
+        root_dir := dir_of(bin_dir + "")
+        cand := root_dir + "/src"
+        if file_exists(cand + "") {
+            << cand
+        }
+    }
+    if file_exists("./src") {
+        << "./src"
+    }
+    << ""
+}
+
+fn list_xu_files(dir string) []string {
+    raw := os.read_dir(dir + "") or (err) {
+        << []string{}
+    }
+    lines := strings.split(&raw, "\n")
+    mut res := []string{}
+    for i in 0:lines.len {
+        item := strings.trim_space(&lines[i])
+        if strings.has_suffix(&item, ".xu") {
+            res.push(item)
+        }
+    }
+    << res
+}
+
+fn resolve_module_file(mod_path string, cur_dir string, stdlib_root string) string {
+    if stdlib_root.len > 0 {
+        c1 := stdlib_root + "/" + mod_path + "/mod.xu"
+        if file_exists(c1 + "") { << c1 }
+        c2 := stdlib_root + "/" + mod_path + ".xu"
+        if file_exists(c2 + "") { << c2 }
+    }
+    if cur_dir.len > 0 {
+        c3 := cur_dir + "/" + mod_path + "/mod.xu"
+        if file_exists(c3 + "") { << c3 }
+        c4 := cur_dir + "/" + mod_path + ".xu"
+        if file_exists(c4 + "") { << c4 }
+    }
+    << ""
+}
+
+struct ImportItem {
+    alias string
+    pkg_path string
+}
+
+fn parse_file_imports(src string) []ImportItem {
+    lines := strings.split(&src, "\n")
+    mut items := []ImportItem{}
+    for i in 0:lines.len {
+        line := strings.trim_space(&lines[i])
+        if strings.has_prefix(&line, "#") {
+            mut raw := line[1:line.len]
+            as_idx := strings.index_of(&raw, " as ")
+            mut alias := ""
+            mut pkg_path := ""
+            if as_idx >= 0 {
+                pkg_path = strings.trim_space(&raw[0:as_idx])
+                alias_part := raw[as_idx + 4:raw.len]
+                alias = strings.trim_space(&alias_part)
+            } else {
+                pkg_path = strings.trim_space(&raw)
+                last_slash := strings.last_index(&pkg_path, "/")
+                if last_slash >= 0 {
+                    alias = pkg_path[last_slash + 1:pkg_path.len]
+                } else {
+                    alias = pkg_path + ""
+                }
+            }
+            if alias.len > 0 && pkg_path.len > 0 {
+                items.push(ImportItem{alias: alias, pkg_path: pkg_path})
+            }
+        }
+    }
+    << items
+}
+
+struct MemberAccess {
+    has_member bool
+    pkg string
+    member string
+}
+
+struct SymbolLoc {
+    found bool
+    line int
+    col int
+    hover_md string
+}
+
+fn json_quote_str(s string) string {
+    mut out := io.buffer()
+    out.write_str("\"")
+    for i in 0:s.len {
+        c := s[i]
+        if c == 34 {
+            out.write_str("\\\"")
+        } else if c == 92 {
+            out.write_str("\\\\")
+        } else if c == 10 {
+            out.write_str("\\n")
+        } else if c == 13 {
+            out.write_str("\\r")
+        } else if c == 9 {
+            out.write_str("\\t")
+        } else if c < 32 {
+            // skip unprintable control characters
+        } else {
+            out.write_byte(c)
+        }
+    }
+    out.write_str("\"")
+    << out.bytes()
+}
+
+fn send_raw(payload string) {
+    hdr := "Content-Length: " + str(payload.len) + "\r\n\r\n"
+    full := hdr + payload
+    os_fd_write(1, full) or (err) {
+        <<
+    }
+}
+
+fn reply_result(id string, result_json string) {
+    msg := "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result_json + "}"
+    send_raw(msg)
+}
+
+fn reply_error(id string, code int, message string) {
+    esc_msg := json_quote_str(message)
+    msg := "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + str(code) + ",\"message\":" + esc_msg + "}}"
+    send_raw(msg)
+}
+
+fn send_notification(method string, params_json string) {
+    msg := "{\"jsonrpc\":\"2.0\",\"method\":\"" + method + "\",\"params\":" + params_json + "}"
+    send_raw(msg)
+}
+
+fn parse_int_digits(s string) int {
+    mut n := 0
+    for i in 0:s.len {
+        c := s[i]
+        if c >= 48 && c <= 57 {
+            n = n * 10 + (c - 48)
+        }
+    }
+    << n
+}
+
+struct LspReader {
+    buf string
+}
+
+fn (r &mut LspReader) read_message() string {
+    while true {
+        b_str := r.buf + ""
+        mut hdr_end := strings.index_of(&b_str, "\r\n\r\n")
+        mut sep_len := 4
+        if hdr_end < 0 {
+            hdr_end = strings.index_of(&b_str, "\n\n")
+            sep_len = 2
+        }
+        if hdr_end >= 0 {
+            hdr := b_str[0:hdr_end]
+            mut content_len := -1
+            mut cl_idx := strings.index_of(&hdr, "Content-Length:")
+            if cl_idx < 0 {
+                cl_idx = strings.index_of(&hdr, "content-length:")
+            }
+            if cl_idx >= 0 {
+                raw_rest := hdr[cl_idx + 15:hdr.len]
+                rest := strings.trim_space(&raw_rest)
+                mut end_num := 0
+                while end_num < rest.len {
+                    c := rest[end_num]
+                    if c >= 48 && c <= 57 {
+                        end_num = end_num + 1
+                    } else {
+                        <-
+                    }
+                }
+                if end_num > 0 {
+                    content_len = parse_int_digits(rest[0:end_num])
+                }
+            }
+            if content_len >= 0 {
+                body_start := hdr_end + sep_len
+                need_total := body_start + content_len
+                while r.buf.len < need_total {
+                    chunk := os_fd_read(0, 4096) or (err) {
+                        << ""
+                    }
+                    if chunk.len == 0 {
+                        << ""
+                    }
+                    r.buf = r.buf + chunk
+                }
+                cur_str := r.buf + ""
+                body := cur_str[body_start:body_start + content_len]
+                r.buf = cur_str[body_start + content_len:cur_str.len]
+                << body
+            }
+        }
+        chunk := os_fd_read(0, 4096) or (err) {
+            << ""
+        }
+        if chunk.len == 0 {
+            << ""
+        }
+        r.buf = r.buf + chunk
+    }
+    << ""
+}
+
+fn file_exists(path string) bool {
+    os_stat(path + "") or (err) {
+        << false
+    }
+    << true
+}
+
+fn find_xu_compiler() string {
+    // 1. Explicit environment variable XU
+    env_xu := os.getenv("XU")
+    if env_xu.len > 0 && file_exists(env_xu + "") {
+        << env_xu
+    }
+    // 2. Look beside current executable
+    argv := args()
+    if argv.len > 0 {
+        self_path := argv[0]
+        mut cut := 0 - 1
+        for i in 0:self_path.len {
+            if self_path[i] == 47 || self_path[i] == 92 {
+                cut = i
+            }
+        }
+        if cut >= 0 {
+            dir := self_path[0:cut]
+            mut cand := dir + "/xu"
+            if xu_target_os() == 2 {
+                cand = dir + "\\xu.exe"
+            }
+            if cand.len > 0 && file_exists(cand + "") {
+                << cand
+            }
+        }
+    }
+    // 3. Fallback to ./bin/xu in current working directory
+    mut local_bin := "./bin/xu"
+    if xu_target_os() == 2 {
+        local_bin = ".\\bin\\xu.exe"
+    }
+    if file_exists(local_bin + "") {
+        << local_bin
+    }
+    // 4. Look in PATH
+    found := exec.look_path("xu") or (err) {
+        << "xu"
+    }
+    << found
+}
+
+fn drop_temp_file(p string) {
+    os.remove(p + "") or (err) {
+        <<
+    }
+}
+
+fn write_temp_file(path string, data string) bool {
+    write_file(path + "", data + "") or (err) {
+        << false
+    }
+    << true
+}
+
+fn execute_xu_check(xu_bin string, target_file string) string {
+    tmp_out := os.temp_dir() + "/xu-lsp-diag-" + str(os.getpid()) + "-" + str(now_ns()) + ".txt"
+    redir := string_from_byte(1) + tmp_out
+
+    mut blob := io.buffer()
+    if xu_target_os() == 2 {
+        blob.write_str("")
+        blob.write_byte(0)
+        blob.write_str("\"" + xu_bin + "\" check \"" + target_file + "\"")
+    } else {
+        blob.write_str("")
+        blob.write_byte(0)
+        blob.write_str(xu_bin)
+        blob.write_byte(0)
+        blob.write_str("check")
+        blob.write_byte(0)
+        blob.write_str(target_file)
+        blob.write_byte(0)
+    }
+
+    _ := os_exec(xu_bin, blob.bytes(), redir)
+    output := read_file(tmp_out) or (err) {
+        << ""
+    }
+    drop_temp_file(tmp_out)
+    << output
+}
+
+fn parse_diagnostics_json(raw_output string) string {
+    if raw_output.len == 0 {
+        << "[]"
+    }
+    raw_lines := strings.split(&raw_output, "\n")
+    mut items := []string{}
+    for i in 0:raw_lines.len {
+        line := strings.trim_space(&raw_lines[i])
+        if line.len == 0 {
+            ->
+        }
+        idx := strings.index_of(&line, ": error:")
+        if idx >= 0 {
+            head := line[0:idx]
+            raw_msg := line[idx + 8:line.len]
+            msg := strings.trim_space(&raw_msg)
+            // Parse line and column from head: ...:line:col
+            last_colon := strings.last_index(&head, ":")
+            mut line_num := 0
+            mut col_num := 0
+            if last_colon >= 0 {
+                col_str := head[last_colon + 1:head.len]
+                col_num = parse_int_digits(col_str)
+                rest_head := head[0:last_colon]
+                second_colon := strings.last_index(&rest_head, ":")
+                if second_colon >= 0 {
+                    line_str := rest_head[second_colon + 1:rest_head.len]
+                    line_num = parse_int_digits(line_str)
+                } else {
+                    line_num = col_num
+                    col_num = 1
+                }
+            }
+            if line_num > 0 {
+                line_num = line_num - 1
+            }
+            if col_num > 0 {
+                col_num = col_num - 1
+            }
+            end_col := col_num + 1
+            item := "{\"range\":{\"start\":{\"line\":" + str(line_num) + ",\"character\":" + str(col_num) + "},\"end\":{\"line\":" + str(line_num) + ",\"character\":" + str(end_col) + "}},\"severity\":1,\"source\":\"xu\",\"message\":" + json_quote_str(msg) + "}"
+            items.push(item)
+        }
+    }
+    if items.len == 0 {
+        << "[]"
+    }
+    mut out := "["
+    for j in 0:items.len {
+        if j > 0 {
+            out = out + ","
+        }
+        out = out + items[j]
+    }
+    out = out + "]"
+    << out
+}
+
+fn publish_diags_for(uri string, cache &DocCache, xu_bin string) {
+    u_str := uri + ""
+    path := uri_to_path(u_str)
+    cached_text := cache.get(uri + "")
+    mut check_file := path
+    mut is_temp := false
+    if cached_text.len > 0 {
+        // Write to temporary file for live in-memory check
+        tmp_src := os.temp_dir() + "/xu-live-" + str(os.getpid()) + "-" + str(now_ns()) + ".xu"
+        if write_temp_file(tmp_src + "", cached_text) {
+            check_file = tmp_src
+            is_temp = true
+        }
+    }
+    raw_out := execute_xu_check(xu_bin, check_file + "")
+    if is_temp {
+        drop_temp_file(check_file)
+    }
+    diags_json := parse_diagnostics_json(raw_out)
+    params := "{\"uri\":\"" + uri + "\",\"diagnostics\":" + diags_json + "}"
+    send_notification("textDocument/publishDiagnostics", params)
+}
+
+fn handle_formatting(uri string, cache &DocCache) string {
+    src := cache.get(uri)
+    if src.len == 0 {
+        << "[]"
+    }
+    src_clone := src + ""
+    formatted := format.source(src_clone)
+    if formatted.len == 0 || formatted == src {
+        << "[]"
+    }
+    esc_formatted := json_quote_str(formatted)
+    // Replace whole document (from line 0 col 0 to line 1000000 col 0)
+    << "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":1000000,\"character\":0}},\"newText\":" + esc_formatted + "}]"
+}
+
+fn is_ident_char(c int) bool {
+    if c >= 97 && c <= 122 { << true } // a-z
+    if c >= 65 && c <= 90 { << true }  // A-Z
+    if c >= 48 && c <= 57 { << true }  // 0-9
+    if c == 95 { << true }             // _
+    << false
+}
+
+fn extract_word_at(line string, col int) string {
+    if line.len == 0 || col < 0 || col >= line.len {
+        << ""
+    }
+    if !is_ident_char(line[col]) {
+        if col > 0 && is_ident_char(line[col - 1]) {
+            // Cursor might be right after the word
+            mut s := col - 1
+            while s > 0 && is_ident_char(line[s - 1]) {
+                s = s - 1
+            }
+            << line[s:col]
+        }
+        << ""
+    }
+    mut start := col
+    while start > 0 && is_ident_char(line[start - 1]) {
+        start = start - 1
+    }
+    mut end := col
+    while end < line.len && is_ident_char(line[end]) {
+        end = end + 1
+    }
+    << line[start:end]
+}
+
+fn extract_member_access_at(line string, col int) MemberAccess {
+    if line.len == 0 || col < 0 || col >= line.len {
+        << MemberAccess{has_member: false, pkg: "", member: ""}
+    }
+    word := extract_word_at(line + "", col)
+    if word.len == 0 {
+        << MemberAccess{has_member: false, pkg: "", member: ""}
+    }
+    mut start_col := col
+    if start_col >= line.len || !is_ident_char(line[start_col]) {
+        if start_col > 0 && is_ident_char(line[start_col - 1]) {
+            start_col = start_col - 1
+        }
+    }
+    while start_col > 0 && is_ident_char(line[start_col - 1]) {
+        start_col = start_col - 1
+    }
+    end_col := start_col + word.len
+
+    // Case 1: Cursor is on member (e.g. `split` in `strings.split`)
+    if start_col > 0 && line[start_col - 1] == 46 { // '.'
+        pkg := extract_word_at(line + "", start_col - 2)
+        if pkg.len > 0 {
+            << MemberAccess{has_member: true, pkg: pkg, member: word}
+        }
+    }
+
+    // Case 2: Cursor is on package (e.g. `strings` in `strings.split`)
+    if end_col < line.len && line[end_col] == 46 { // '.'
+        mem := extract_word_at(line + "", end_col + 1)
+        if mem.len > 0 {
+            << MemberAccess{has_member: true, pkg: word, member: mem}
+        }
+    }
+
+    << MemberAccess{has_member: false, pkg: "", member: ""}
+}
+
+fn find_symbol_in_lines(lines []string, word string) SymbolLoc {
+    fn_target1 := "fn " + word + "("
+    fn_target2 := "fn " + word + "#"
+    pub_fn_target := "pub fn " + word + "("
+    struct_target := "struct " + word
+    pub_struct_target := "pub struct " + word
+    enum_target := "enum " + word
+    pub_enum_target := "pub enum " + word
+    const_target := "const " + word
+    pub_const_target := "pub const " + word
+    fn_method_target := " " + word + "("
+
+    for i in 0:lines.len {
+        l := lines[i]
+        mut def_col := -1
+        idx1 := strings.index_of(&l, fn_target1)
+        if idx1 >= 0 {
+            def_col = idx1 + 3
+        } else {
+            idx_pfn := strings.index_of(&l, pub_fn_target)
+            if idx_pfn >= 0 {
+                def_col = idx_pfn + 7
+            } else {
+                idx_pst := strings.index_of(&l, pub_struct_target)
+                if idx_pst >= 0 {
+                    def_col = idx_pst + 11
+                } else {
+                    idx_st := strings.index_of(&l, struct_target)
+                    if idx_st >= 0 {
+                        def_col = idx_st + 7
+                    } else {
+                        idx_pen := strings.index_of(&l, pub_enum_target)
+                        if idx_pen >= 0 {
+                            def_col = idx_pen + 9
+                        } else {
+                            idx_en := strings.index_of(&l, enum_target)
+                            if idx_en >= 0 {
+                                def_col = idx_en + 5
+                            } else {
+                                idx_pco := strings.index_of(&l, pub_const_target)
+                                if idx_pco >= 0 {
+                                    def_col = idx_pco + 10
+                                } else {
+                                    idx_co := strings.index_of(&l, const_target)
+                                    if idx_co >= 0 {
+                                        def_col = idx_co + 6
+                                    } else if strings.has_prefix(&l, "fn ") || strings.has_prefix(&l, "pub fn ") {
+                                        if strings.contains(&l, fn_method_target) {
+                                            idx_m := strings.index_of(&l, fn_method_target)
+                                            def_col = idx_m + 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if def_col >= 0 {
+            mut doc_lines := []string{}
+            mut k := i - 1
+            while k >= 0 {
+                prev := strings.trim_space(&lines[k])
+                if strings.has_prefix(&prev, "//") {
+                    doc_lines.push(prev)
+                    k = k - 1
+                } else {
+                    <-
+                }
+            }
+            decl_line := strings.trim_space(&l)
+            mut md := "```xu\n" + decl_line + "\n```"
+            if doc_lines.len > 0 {
+                md = md + "\n"
+                mut idx := doc_lines.len - 1
+                while idx >= 0 {
+                    c_line := doc_lines[idx]
+                    mut stripped := ""
+                    if strings.has_prefix(&c_line, "// ") {
+                        stripped = c_line[3:c_line.len]
+                    } else if strings.has_prefix(&c_line, "//") {
+                        stripped = c_line[2:c_line.len]
+                    } else {
+                        stripped = c_line
+                    }
+                    md = md + "\n" + stripped
+                    idx = idx - 1
+                }
+            }
+            << SymbolLoc{found: true, line: i, col: def_col, hover_md: md}
+        }
+    }
+    << SymbolLoc{found: false, line: 0, col: 0, hover_md: ""}
+}
+
+fn is_keyword(w string) bool {
+    raw := "fn struct enum mut pub const let if else for in while match xu select or as is int string bool f64 byte i32 u32 chan map return throw break continue"
+    kws := strings.split(&raw, " ")
+    for i in 0:kws.len {
+        if kws[i] == w {
+            << true
+        }
+    }
+    << false
+}
+
+fn is_valid_ident(w string) bool {
+    if w.len == 0 {
+        << false
+    }
+    c0 := w[0]
+    if c0 >= 48 && c0 <= 57 {
+        << false
+    }
+    for i in 0:w.len {
+        if !is_ident_char(w[i]) {
+            << false
+        }
+    }
+    if is_keyword(w + "") {
+        << false
+    }
+    << true
+}
+
+fn strip_line_comment(line string) string {
+    trimmed := strings.trim_space(&line)
+    if strings.has_prefix(&trimmed, "//") {
+        << ""
+    }
+    mut in_str := false
+    mut cut := line.len
+    for i in 0:line.len {
+        c := line[i]
+        if c == 34 { // '"'
+            in_str = !in_str
+        } else if !in_str && c == 47 && i + 1 < line.len && line[i + 1] == 47 {
+            cut = i
+            <-
+        }
+    }
+    << line[0:cut]
+}
+
+fn find_ident_occurrences_in_line(raw_line string, word string) []int {
+    mut cols := []int{}
+    line := strip_line_comment(raw_line + "")
+    w_len := word.len
+    if w_len == 0 || line.len < w_len {
+        << cols
+    }
+    mut i := 0
+    while i <= line.len - w_len {
+        if line[i] == word[0] {
+            mut matched := true
+            for j in 0:w_len {
+                if line[i + j] != word[j] {
+                    matched = false
+                    <-
+                }
+            }
+            if matched {
+                left_ok := (i == 0) || !is_ident_char(line[i - 1])
+                right_idx := i + w_len
+                right_ok := (right_idx >= line.len) || !is_ident_char(line[right_idx])
+                if left_ok && right_ok {
+                    cols.push(i)
+                    i = i + w_len
+                    ->
+                }
+            }
+        }
+        i = i + 1
+    }
+    << cols
+}
+
+fn handle_definition(uri string, cache &DocCache, xu_bin string, line int, col int) string {
+    src := cache.get(uri + "")
+    if src.len == 0 {
+        << "null"
+    }
+    lines := strings.split(&src, "\n")
+    if line < 0 || line >= lines.len {
+        << "null"
+    }
+    current_line := lines[line]
+    cur_path := uri_to_path(uri + "")
+    cur_dir := dir_of(cur_path + "")
+    stdlib_root := find_stdlib_root(xu_bin + "")
+
+    // Case 1: Import statement `#module/path`
+    trimmed_line := strings.trim_space(&current_line)
+    if strings.has_prefix(&trimmed_line, "#") {
+        mut mod_spec := trimmed_line[1:trimmed_line.len]
+        as_idx := strings.index_of(&mod_spec, " as ")
+        if as_idx >= 0 {
+            mod_spec = mod_spec[0:as_idx]
+        }
+        mod_path := strings.trim_space(&mod_spec)
+        if mod_path.len > 0 {
+            target_f := resolve_module_file(mod_path + "", cur_dir + "", stdlib_root + "")
+            if target_f.len > 0 {
+                target_uri := path_to_uri(target_f)
+                << "{\"uri\":\"" + target_uri + "\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}}"
+            }
+        }
+    }
+
+    // Case 2: Member access `pkg.member`
+    ma := extract_member_access_at(current_line + "", col)
+    if ma.has_member {
+        imports := parse_file_imports(src + "")
+        mut pkg_path := ma.pkg + ""
+        for ii in 0:imports.len {
+            if imports[ii].alias == ma.pkg {
+                pkg_path = imports[ii].pkg_path + ""
+            }
+        }
+        mut pkg_dir := ""
+        if stdlib_root.len > 0 && file_exists(stdlib_root + "/" + pkg_path) {
+            pkg_dir = stdlib_root + "/" + pkg_path
+        } else if file_exists(cur_dir + "/" + pkg_path) {
+            pkg_dir = cur_dir + "/" + pkg_path
+        }
+        if pkg_dir.len > 0 {
+            pkg_files := list_xu_files(pkg_dir + "")
+            for pfi in 0:pkg_files.len {
+                f_path := pkg_dir + "/" + pkg_files[pfi]
+                f_content := read_file(f_path + "") or (err) {
+                    ->
+                }
+                f_lines := strings.split(&f_content, "\n")
+                loc := find_symbol_in_lines(f_lines, ma.member + "")
+                if loc.found {
+                    target_uri := path_to_uri(f_path)
+                    end_col := loc.col + ma.member.len
+                    << "{\"uri\":\"" + target_uri + "\",\"range\":{\"start\":{\"line\":" + str(loc.line) + ",\"character\":" + str(loc.col) + "},\"end\":{\"line\":" + str(loc.line) + ",\"character\":" + str(end_col) + "}}}"
+                }
+            }
+        }
+    }
+
+    word := extract_word_at(current_line, col)
+    if word.len == 0 {
+        << "null"
+    }
+
+    // Case 3: Current file
+    loc_cur := find_symbol_in_lines(lines, word + "")
+    if loc_cur.found {
+        target_uri := uri + ""
+        end_col := loc_cur.col + word.len
+        << "{\"uri\":\"" + target_uri + "\",\"range\":{\"start\":{\"line\":" + str(loc_cur.line) + ",\"character\":" + str(loc_cur.col) + "},\"end\":{\"line\":" + str(loc_cur.line) + ",\"character\":" + str(end_col) + "}}}"
+    }
+
+    // Case 4: Sibling files in same package directory
+    sib_files := list_xu_files(cur_dir + "")
+    for sfi in 0:sib_files.len {
+        sf := sib_files[sfi]
+        full_sf := cur_dir + "/" + sf
+        if full_sf != cur_path {
+            sf_content := read_file(full_sf + "") or (err) {
+                ->
+            }
+            sf_lines := strings.split(&sf_content, "\n")
+            loc_sib := find_symbol_in_lines(sf_lines, word + "")
+            if loc_sib.found {
+                target_uri := path_to_uri(full_sf)
+                end_col := loc_sib.col + word.len
+                << "{\"uri\":\"" + target_uri + "\",\"range\":{\"start\":{\"line\":" + str(loc_sib.line) + ",\"character\":" + str(loc_sib.col) + "},\"end\":{\"line\":" + str(loc_sib.line) + ",\"character\":" + str(end_col) + "}}}"
+            }
+        }
+    }
+
+    << "null"
+}
+
+fn builtin_hover(word string) string {
+    if word == "println" {
+        << "```xu\nfn println(s ...string)\n```\nPrints string representation to stdout followed by a newline."
+    }
+    if word == "eprintln" {
+        << "```xu\nfn eprintln(s ...string)\n```\nPrints string representation to stderr followed by a newline."
+    }
+    if word == "print" {
+        << "```xu\nfn print(s string)\n```\nPrints string to stdout without a newline."
+    }
+    if word == "assert" {
+        << "```xu\nfn assert(cond bool, msg ...string)\n```\nPanics if condition evaluates to false."
+    }
+    if word == "str" {
+        << "```xu\nfn str(val any) string\n```\nConverts integer, float, bool, or byte to string."
+    }
+    if word == "now_ns" {
+        << "```xu\nfn now_ns() int\n```\nReturns current monotonic wall-clock timestamp in nanoseconds."
+    }
+    if word == "args" {
+        << "```xu\nfn args() []string\n```\nReturns command-line arguments slice."
+    }
+    if word == "read_file" {
+        << "```xu\nfn read_file(path string) throw<string>\n```\nReads file contents into string, throws on I/O error."
+    }
+    if word == "write_file" {
+        << "```xu\nfn write_file(path string, data string) throw<int>\n```\nWrites data to path, throws on I/O error."
+    }
+    if word == "read_dir" {
+        << "```xu\nfn read_dir(path string) throw<[]string>\n```\nReturns directory entries as string slice."
+    }
+    if word == "parse_int" {
+        << "```xu\nfn parse_int(s string) throw<int>\n```\nParses decimal integer string into int."
+    }
+    if word == "parse_float" {
+        << "```xu\nfn parse_float(s string) throw<f64>\n```\nParses floating point string into f64."
+    }
+    if word == "int" {
+        << "```xu\nprimitive type int\n```\n64-bit signed integer."
+    }
+    if word == "string" {
+        << "```xu\nprimitive type string\n```\nImmutable UTF-8 byte sequence with O(1) length."
+    }
+    if word == "bool" {
+        << "```xu\nprimitive type bool\n```\nBoolean type (`true` or `false`)."
+    }
+    if word == "f64" {
+        << "```xu\nprimitive type f64\n```\n64-bit IEEE 754 double precision floating point."
+    }
+    if word == "byte" || word == "u8" {
+        << "```xu\nprimitive type byte\n```\n8-bit unsigned integer."
+    }
+    if word == "i32" {
+        << "```xu\nprimitive type i32\n```\n32-bit signed integer."
+    }
+    if word == "u32" {
+        << "```xu\nprimitive type u32\n```\n32-bit unsigned integer."
+    }
+    if word == "fn" {
+        << "```xu\nfn name(params...) RetType { ... }\n```\nDeclares a function or method."
+    }
+    if word == "struct" {
+        << "```xu\nstruct Name { fields... }\n```\nDeclares a composite struct type (value semantics, zero-GC)."
+    }
+    if word == "enum" {
+        << "```xu\nenum Name { Variants... }\n```\nDeclares an algebraic enumeration type."
+    }
+    if word == "mut" {
+        << "```xu\nmut name := val\n```\nDeclares a mutable variable or reference."
+    }
+    if word == "pub" {
+        << "```xu\npub ...\n```\nExports a declaration outside of the current module."
+    }
+    if word == "const" {
+        << "```xu\nconst Name = val\n```\nDeclares a compile-time constant."
+    }
+    if word == "xu" {
+        << "```xu\nxu fn_call()\n```\nSpawns an asynchronous concurrent goroutine."
+    }
+    if word == "select" {
+        << "```xu\nselect { ch <- v { ... } x := <-ch { ... } else { ... } }\n```\nMultiplexes asynchronous channel operations."
+    }
+    if word == "match" {
+        << "```xu\nmatch expr { pat => { ... } }\n```\nPattern matching control flow."
+    }
+    << ""
+}
+
+fn handle_hover(uri string, cache &DocCache, xu_bin string, line int, col int) string {
+    src := cache.get(uri + "")
+    if src.len == 0 {
+        << "null"
+    }
+    lines := strings.split(&src, "\n")
+    if line < 0 || line >= lines.len {
+        << "null"
+    }
+    current_line := lines[line]
+    cur_path := uri_to_path(uri + "")
+    cur_dir := dir_of(cur_path + "")
+    stdlib_root := find_stdlib_root(xu_bin + "")
+
+    word := extract_word_at(current_line + "", col)
+
+    // 1. Built-in keywords, primitives and functions
+    if word.len > 0 {
+        b_hover := builtin_hover(word + "")
+        if b_hover.len > 0 {
+            esc := json_quote_str(b_hover)
+            << "{\"contents\":{\"kind\":\"markdown\",\"value\":" + esc + "}}"
+        }
+    }
+
+    // 2. Member access hover (e.g. strings.split)
+    ma := extract_member_access_at(current_line + "", col)
+    if ma.has_member {
+        imports := parse_file_imports(src + "")
+        mut pkg_path := ma.pkg + ""
+        for ii in 0:imports.len {
+            if imports[ii].alias == ma.pkg {
+                pkg_path = imports[ii].pkg_path + ""
+            }
+        }
+        mut pkg_dir := ""
+        if stdlib_root.len > 0 && file_exists(stdlib_root + "/" + pkg_path) {
+            pkg_dir = stdlib_root + "/" + pkg_path
+        } else if file_exists(cur_dir + "/" + pkg_path) {
+            pkg_dir = cur_dir + "/" + pkg_path
+        }
+        if pkg_dir.len > 0 {
+            pkg_files := list_xu_files(pkg_dir + "")
+            for pfi in 0:pkg_files.len {
+                f_path := pkg_dir + "/" + pkg_files[pfi]
+                f_content := read_file(f_path + "") or (err) {
+                    ->
+                }
+                f_lines := strings.split(&f_content, "\n")
+                loc := find_symbol_in_lines(f_lines, ma.member + "")
+                if loc.found && loc.hover_md.len > 0 {
+                    esc := json_quote_str(loc.hover_md)
+                    << "{\"contents\":{\"kind\":\"markdown\",\"value\":" + esc + "}}"
+                }
+            }
+        }
+    }
+
+    if word.len == 0 {
+        << "null"
+    }
+
+    // 3. User-defined symbol in current file
+    loc_cur := find_symbol_in_lines(lines, word + "")
+    if loc_cur.found && loc_cur.hover_md.len > 0 {
+        esc := json_quote_str(loc_cur.hover_md)
+        << "{\"contents\":{\"kind\":\"markdown\",\"value\":" + esc + "}}"
+    }
+
+    // 4. Sibling files in the same directory
+    sib_files := list_xu_files(cur_dir + "")
+    for sfi in 0:sib_files.len {
+        sf := sib_files[sfi]
+        full_sf := cur_dir + "/" + sf
+        if full_sf != cur_path {
+            sf_content := read_file(full_sf + "") or (err) {
+                ->
+            }
+            sf_lines := strings.split(&sf_content, "\n")
+            loc_sib := find_symbol_in_lines(sf_lines, word + "")
+            if loc_sib.found && loc_sib.hover_md.len > 0 {
+                esc := json_quote_str(loc_sib.hover_md)
+                << "{\"contents\":{\"kind\":\"markdown\",\"value\":" + esc + "}}"
+            }
+        }
+    }
+
+    << "null"
+}
+
+fn handle_references(uri string, cache &DocCache, line int, col int) string {
+    src := cache.get(uri + "")
+    if src.len == 0 {
+        << "[]"
+    }
+    lines := strings.split(&src, "\n")
+    if line < 0 || line >= lines.len {
+        << "[]"
+    }
+    word := extract_word_at(lines[line], col)
+    if word.len == 0 || is_keyword(word + "") {
+        << "[]"
+    }
+
+    mut items := []string{}
+    target_uri := uri + ""
+
+    // 1. Scan current file
+    for i in 0:lines.len {
+        l := lines[i]
+        cols := find_ident_occurrences_in_line(l + "", word + "")
+        for j in 0:cols.len {
+            c := cols[j]
+            end_c := c + word.len
+            item := "{\"uri\":\"" + target_uri + "\",\"range\":{\"start\":{\"line\":" + str(i) + ",\"character\":" + str(c) + "},\"end\":{\"line\":" + str(i) + ",\"character\":" + str(end_c) + "}}}"
+            items.push(item)
+        }
+    }
+
+    // 2. Scan sibling .xu files in same directory
+    cur_path := uri_to_path(uri + "")
+    cur_dir := dir_of(cur_path + "")
+    sib_files := list_xu_files(cur_dir + "")
+    for si in 0:sib_files.len {
+        sf := sib_files[si]
+        full_sf := cur_dir + "/" + sf
+        if full_sf != cur_path {
+            sf_content := read_file(full_sf + "") or (err) {
+                ->
+            }
+            sf_uri := path_to_uri(full_sf)
+            sf_lines := strings.split(&sf_content, "\n")
+            for i2 in 0:sf_lines.len {
+                l2 := sf_lines[i2]
+                cols2 := find_ident_occurrences_in_line(l2 + "", word + "")
+                for j2 in 0:cols2.len {
+                    c2 := cols2[j2]
+                    end_c2 := c2 + word.len
+                    item2 := "{\"uri\":\"" + sf_uri + "\",\"range\":{\"start\":{\"line\":" + str(i2) + ",\"character\":" + str(c2) + "},\"end\":{\"line\":" + str(i2) + ",\"character\":" + str(end_c2) + "}}}"
+                    items.push(item2)
+                }
+            }
+        }
+    }
+
+    if items.len == 0 {
+        << "[]"
+    }
+    mut out := "["
+    for k in 0:items.len {
+        if k > 0 {
+            out = out + ","
+        }
+        out = out + items[k]
+    }
+    out = out + "]"
+    << out
+}
+
+fn handle_prepare_rename(uri string, cache &DocCache, line int, col int) string {
+    src := cache.get(uri + "")
+    if src.len == 0 {
+        << "null"
+    }
+    lines := strings.split(&src, "\n")
+    if line < 0 || line >= lines.len {
+        << "null"
+    }
+    current_line := lines[line]
+    word := extract_word_at(current_line + "", col)
+    if word.len == 0 || is_keyword(word + "") {
+        << "null"
+    }
+
+    mut start_col := col
+    if start_col >= current_line.len || !is_ident_char(current_line[start_col]) {
+        if start_col > 0 && is_ident_char(current_line[start_col - 1]) {
+            start_col = start_col - 1
+        }
+    }
+    while start_col > 0 && is_ident_char(current_line[start_col - 1]) {
+        start_col = start_col - 1
+    }
+    end_col := start_col + word.len
+    esc_ph := json_quote_str(word)
+    << "{\"range\":{\"start\":{\"line\":" + str(line) + ",\"character\":" + str(start_col) + "},\"end\":{\"line\":" + str(line) + ",\"character\":" + str(end_col) + "}},\"placeholder\":" + esc_ph + "}"
+}
+
+fn handle_rename(uri string, cache &DocCache, line int, col int, new_name string) string {
+    if !is_valid_ident(new_name + "") {
+        << "null"
+    }
+    src := cache.get(uri + "")
+    if src.len == 0 {
+        << "null"
+    }
+    lines := strings.split(&src, "\n")
+    if line < 0 || line >= lines.len {
+        << "null"
+    }
+    word := extract_word_at(lines[line], col)
+    if word.len == 0 || is_keyword(word + "") {
+        << "null"
+    }
+
+    mut edits := []string{}
+    esc_new := json_quote_str(new_name)
+    for i in 0:lines.len {
+        l := lines[i]
+        cols := find_ident_occurrences_in_line(l + "", word + "")
+        for j in 0:cols.len {
+            c := cols[j]
+            end_c := c + word.len
+            edit := "{\"range\":{\"start\":{\"line\":" + str(i) + ",\"character\":" + str(c) + "},\"end\":{\"line\":" + str(i) + ",\"character\":" + str(end_c) + "}},\"newText\":" + esc_new + "}"
+            edits.push(edit)
+        }
+    }
+
+    if edits.len == 0 {
+        << "null"
+    }
+    mut edits_json := "["
+    for k in 0:edits.len {
+        if k > 0 {
+            edits_json = edits_json + ","
+        }
+        edits_json = edits_json + edits[k]
+    }
+    edits_json = edits_json + "]"
+
+    uri_key := json_quote_str(uri)
+    << "{\"changes\":{" + uri_key + ":" + edits_json + "}}"
+}
+
+fn extract_ident_after(s string, prefix string) string {
+    pre_len := prefix.len
+    idx := strings.index_of(&s, prefix)
+    if idx < 0 {
+        << ""
+    }
+    mut start := idx + pre_len
+    while start < s.len && s[start] == 32 {
+        start = start + 1
+    }
+    mut end := start
+    while end < s.len && is_ident_char(s[end]) {
+        end = end + 1
+    }
+    if end > start {
+        << s[start:end]
+    }
+    << ""
+}
+
+fn handle_document_symbol(uri string, cache &DocCache) string {
+    src := cache.get(uri + "")
+    if src.len == 0 {
+        << "[]"
+    }
+    lines := strings.split(&src, "\n")
+    mut items := []string{}
+
+    for i in 0:lines.len {
+        line := lines[i]
+        trimmed := strings.trim_space(&line)
+        if strings.has_prefix(&trimmed, "//") {
+            ->
+        }
+        mut name := ""
+        mut kind := 0
+        if strings.has_prefix(&trimmed, "fn ") || strings.has_prefix(&trimmed, "pub fn ") {
+            if strings.has_prefix(&trimmed, "fn (") || strings.has_prefix(&trimmed, "pub fn (") {
+                idx_paren := strings.index_of(&trimmed, ") ")
+                if idx_paren >= 0 {
+                    rest := trimmed[idx_paren + 2:trimmed.len]
+                    mut end_id := 0
+                    while end_id < rest.len && is_ident_char(rest[end_id]) {
+                        end_id = end_id + 1
+                    }
+                    if end_id > 0 {
+                        name = rest[0:end_id]
+                        kind = 12 // Method
+                    }
+                }
+            } else {
+                name = extract_ident_after(trimmed + "", "fn ")
+                kind = 12 // Function
+            }
+        } else if strings.has_prefix(&trimmed, "struct ") || strings.has_prefix(&trimmed, "pub struct ") {
+            name = extract_ident_after(trimmed + "", "struct ")
+            kind = 23 // Struct
+        } else if strings.has_prefix(&trimmed, "enum ") || strings.has_prefix(&trimmed, "pub enum ") {
+            name = extract_ident_after(trimmed + "", "enum ")
+            kind = 10 // Enum
+        } else if strings.has_prefix(&trimmed, "const ") || strings.has_prefix(&trimmed, "pub const ") {
+            name = extract_ident_after(trimmed + "", "const ")
+            kind = 14 // Constant
+        }
+
+        if name.len > 0 && kind > 0 {
+            name_esc := json_quote_str(name)
+            item := "{\"name\":" + name_esc + ",\"kind\":" + str(kind) + ",\"range\":{\"start\":{\"line\":" + str(i) + ",\"character\":0},\"end\":{\"line\":" + str(i) + ",\"character\":" + str(line.len) + "}},\"selectionRange\":{\"start\":{\"line\":" + str(i) + ",\"character\":0},\"end\":{\"line\":" + str(i) + ",\"character\":" + str(line.len) + "}}}"
+            items.push(item)
+        }
+    }
+
+    if items.len == 0 {
+        << "[]"
+    }
+    mut out := "["
+    for j in 0:items.len {
+        if j > 0 {
+            out = out + ","
+        }
+        out = out + items[j]
+    }
+    out = out + "]"
+    << out
+}
+
+fn handle_completion(uri string, cache &DocCache, line int, col int) string {
+    src := cache.get(uri + "")
+    mut prefix := ""
+    if src.len > 0 {
+        lines := strings.split(&src, "\n")
+        if line >= 0 && line < lines.len {
+            prefix = extract_word_at(lines[line], col)
+        }
+    }
+
+    raw_kws := "fn struct enum mut pub const let if else for in while match xu select or as is int string bool f64 byte i32 u32 chan map"
+    kw_names := strings.split(&raw_kws, " ")
+    raw_builtins := "println eprintln print assert str now_ns args read_file write_file read_dir parse_int parse_float"
+    builtin_fns := strings.split(&raw_builtins, " ")
+
+    mut items := []string{}
+
+    // Add keywords
+    for i in 0:kw_names.len {
+        kw := kw_names[i]
+        if prefix.len == 0 || strings.has_prefix(&kw, prefix + "") {
+            item := "{\"label\":\"" + kw + "\",\"kind\":14,\"detail\":\"keyword\"}"
+            items.push(item)
+        }
+    }
+
+    // Add builtin functions
+    for j in 0:builtin_fns.len {
+        bf := builtin_fns[j]
+        if prefix.len == 0 || strings.has_prefix(&bf, prefix + "") {
+            item := "{\"label\":\"" + bf + "\",\"kind\":3,\"detail\":\"builtin function\"}"
+            items.push(item)
+        }
+    }
+
+    // Add symbols from current file
+    if src.len > 0 {
+        src_lines := strings.split(&src, "\n")
+        for k in 0:src_lines.len {
+            tl := strings.trim_space(&src_lines[k])
+            mut sym := ""
+            mut sym_kind := 0
+            if strings.has_prefix(&tl, "fn ") || strings.has_prefix(&tl, "pub fn ") {
+                if strings.has_prefix(&tl, "fn (") || strings.has_prefix(&tl, "pub fn (") {
+                    idx_p := strings.index_of(&tl, ") ")
+                    if idx_p >= 0 {
+                        rest := tl[idx_p + 2:tl.len]
+                        mut eid := 0
+                        while eid < rest.len && is_ident_char(rest[eid]) {
+                            eid = eid + 1
+                        }
+                        if eid > 0 { sym = rest[0:eid] }
+                    }
+                } else {
+                    sym = extract_ident_after(tl + "", "fn ")
+                }
+                sym_kind = 3
+            } else if strings.has_prefix(&tl, "struct ") || strings.has_prefix(&tl, "pub struct ") {
+                sym = extract_ident_after(tl + "", "struct ")
+                sym_kind = 22
+            } else if strings.has_prefix(&tl, "const ") || strings.has_prefix(&tl, "pub const ") {
+                sym = extract_ident_after(tl + "", "const ")
+                sym_kind = 21
+            }
+            if sym.len > 0 && (prefix.len == 0 || strings.has_prefix(&sym, prefix + "")) {
+                mut is_kw := false
+                for ki in 0:kw_names.len {
+                    if kw_names[ki] == sym { is_kw = true }
+                }
+                if !is_kw {
+                    sym_esc := json_quote_str(sym)
+                    item := "{\"label\":" + sym_esc + ",\"kind\":" + str(sym_kind) + ",\"detail\":\"local declaration\"}"
+                    items.push(item)
+                }
+            }
+        }
+    }
+
+    mut out := "{\"isIncomplete\":false,\"items\":["
+    for idx in 0:items.len {
+        if idx > 0 {
+            out = out + ","
+        }
+        out = out + items[idx]
+    }
+    out = out + "]}"
+    << out
+}
+
+fn main() int {
+    xu_bin := find_xu_compiler()
+    mut cache := DocCache{
+        uris: []string{},
+        texts: []string{},
+        vers: []int{}
+    }
+    mut reader := LspReader{buf: ""}
+
+    while true {
+        msg := reader.read_message()
+        if msg.len == 0 {
+            <- // stdin closed / EOF
+        }
+        doc := json.parse(&msg)
+        if !doc.ok() {
+            reply_error("null", -32700, "Parse error: " + doc.error())
+            ->
+        }
+        root := doc.root()
+        method_node := doc.get(root, "method")
+        mut method := ""
+        if method_node >= 0 && doc.is_string(method_node) {
+            method = doc.text(method_node)
+        }
+
+        id_node := doc.get(root, "id")
+        mut has_id := false
+        mut id_str := "null"
+        if id_node >= 0 {
+            has_id = true
+            if doc.is_number(id_node) {
+                id_str = strconv.itoa(doc.number_int(id_node))
+            } else if doc.is_string(id_node) {
+                id_str = json_quote_str(doc.text(id_node))
+            }
+        }
+        params_node := doc.get(root, "params")
+
+        if method == "initialize" {
+            caps := "{\"capabilities\":{\"textDocumentSync\":1,\"definitionProvider\":true,\"documentFormattingProvider\":true,\"hoverProvider\":true,\"documentSymbolProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\",\":\"]},\"diagnosticProvider\":{\"interFileDependencies\":false,\"workspaceDiagnostics\":false}},\"serverInfo\":{\"name\":\"xu-lsp\",\"version\":\"0.3.0\"}}"
+            if has_id {
+                reply_result(id_str, caps)
+            }
+        } else if method == "initialized" {
+            // no-op
+        } else if method == "shutdown" {
+            if has_id {
+                reply_result(id_str, "null")
+            }
+        } else if method == "exit" {
+            <<< 0
+        } else if method == "textDocument/didOpen" {
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                if td_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    text_node := doc.get(td_node, "text")
+                    ver_node := doc.get(td_node, "version")
+                    if uri_node >= 0 {
+                        uri := doc.text(uri_node)
+                        mut text := ""
+                        if text_node >= 0 { text = doc.text(text_node) }
+                        mut ver := 0
+                        if ver_node >= 0 && doc.is_number(ver_node) { ver = doc.number_int(ver_node) }
+                        cache.set(uri + "", text, ver)
+                        publish_diags_for(uri, &cache, xu_bin)
+                    }
+                }
+            }
+        } else if method == "textDocument/didChange" {
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                cc_node := doc.get(params_node, "contentChanges")
+                if td_node >= 0 && cc_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    ver_node := doc.get(td_node, "version")
+                    if uri_node >= 0 {
+                        uri := doc.text(uri_node)
+                        mut ver := 0
+                        if ver_node >= 0 && doc.is_number(ver_node) { ver = doc.number_int(ver_node) }
+                        if doc.count(cc_node) > 0 {
+                            first_change := doc.at(cc_node, 0)
+                            text_field := doc.get(first_change, "text")
+                            if text_field >= 0 {
+                                text := doc.text(text_field)
+                                cache.set(uri + "", text, ver)
+                                publish_diags_for(uri, &cache, xu_bin)
+                            }
+                        }
+                    }
+                }
+            }
+        } else if method == "textDocument/didSave" {
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                if td_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    if uri_node >= 0 {
+                        uri := doc.text(uri_node)
+                        publish_diags_for(uri, &cache, xu_bin)
+                    }
+                }
+            }
+        } else if method == "textDocument/didClose" {
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                if td_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    if uri_node >= 0 {
+                        uri := doc.text(uri_node)
+                        cache.remove(uri + "")
+                        // Clear diagnostics on close
+                        send_notification("textDocument/publishDiagnostics", "{\"uri\":\"" + uri + "\",\"diagnostics\":[]}")
+                    }
+                }
+            }
+        } else if method == "textDocument/diagnostic" {
+            mut diags_json := "[]"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                if td_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    if uri_node >= 0 {
+                        uri := doc.text(uri_node)
+                        path := uri_to_path(uri)
+                        raw_out := execute_xu_check(xu_bin, path)
+                        diags_json = parse_diagnostics_json(raw_out)
+                    }
+                }
+            }
+            if has_id {
+                res := "{\"kind\":\"full\",\"items\":" + diags_json + "}"
+                reply_result(id_str, res)
+            }
+        } else if method == "textDocument/formatting" {
+            mut result_edits := "[]"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                if td_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    if uri_node >= 0 {
+                        uri := doc.text(uri_node)
+                        result_edits = handle_formatting(uri, &cache)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, result_edits)
+            }
+        } else if method == "textDocument/definition" {
+            mut def_res := "null"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                pos_node := doc.get(params_node, "position")
+                if td_node >= 0 && pos_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    line_node := doc.get(pos_node, "line")
+                    char_node := doc.get(pos_node, "character")
+                    if uri_node >= 0 && line_node >= 0 && char_node >= 0 {
+                        uri := doc.text(uri_node)
+                        line := doc.number_int(line_node)
+                        col := doc.number_int(char_node)
+                        def_res = handle_definition(uri, &cache, xu_bin, line, col)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, def_res)
+            }
+        } else if method == "textDocument/hover" {
+            mut hover_res := "null"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                pos_node := doc.get(params_node, "position")
+                if td_node >= 0 && pos_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    line_node := doc.get(pos_node, "line")
+                    char_node := doc.get(pos_node, "character")
+                    if uri_node >= 0 && line_node >= 0 && char_node >= 0 {
+                        uri := doc.text(uri_node)
+                        line := doc.number_int(line_node)
+                        col := doc.number_int(char_node)
+                        hover_res = handle_hover(uri, &cache, xu_bin, line, col)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, hover_res)
+            }
+        } else if method == "textDocument/documentSymbol" {
+            mut sym_res := "[]"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                if td_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    if uri_node >= 0 {
+                        uri := doc.text(uri_node)
+                        sym_res = handle_document_symbol(uri, &cache)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, sym_res)
+            }
+        } else if method == "textDocument/completion" {
+            mut comp_res := "{\"isIncomplete\":false,\"items\":[]}"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                pos_node := doc.get(params_node, "position")
+                if td_node >= 0 && pos_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    line_node := doc.get(pos_node, "line")
+                    char_node := doc.get(pos_node, "character")
+                    if uri_node >= 0 && line_node >= 0 && char_node >= 0 {
+                        uri := doc.text(uri_node)
+                        line := doc.number_int(line_node)
+                        col := doc.number_int(char_node)
+                        comp_res = handle_completion(uri, &cache, line, col)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, comp_res)
+            }
+        } else if method == "textDocument/references" {
+            mut refs_res := "[]"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                pos_node := doc.get(params_node, "position")
+                if td_node >= 0 && pos_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    line_node := doc.get(pos_node, "line")
+                    char_node := doc.get(pos_node, "character")
+                    if uri_node >= 0 && line_node >= 0 && char_node >= 0 {
+                        uri := doc.text(uri_node)
+                        line := doc.number_int(line_node)
+                        col := doc.number_int(char_node)
+                        refs_res = handle_references(uri, &cache, line, col)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, refs_res)
+            }
+        } else if method == "textDocument/prepareRename" {
+            mut prep_res := "null"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                pos_node := doc.get(params_node, "position")
+                if td_node >= 0 && pos_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    line_node := doc.get(pos_node, "line")
+                    char_node := doc.get(pos_node, "character")
+                    if uri_node >= 0 && line_node >= 0 && char_node >= 0 {
+                        uri := doc.text(uri_node)
+                        line := doc.number_int(line_node)
+                        col := doc.number_int(char_node)
+                        prep_res = handle_prepare_rename(uri, &cache, line, col)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, prep_res)
+            }
+        } else if method == "textDocument/rename" {
+            mut rename_res := "null"
+            if params_node >= 0 {
+                td_node := doc.get(params_node, "textDocument")
+                pos_node := doc.get(params_node, "position")
+                new_name_node := doc.get(params_node, "newName")
+                if td_node >= 0 && pos_node >= 0 && new_name_node >= 0 {
+                    uri_node := doc.get(td_node, "uri")
+                    line_node := doc.get(pos_node, "line")
+                    char_node := doc.get(pos_node, "character")
+                    if uri_node >= 0 && line_node >= 0 && char_node >= 0 {
+                        uri := doc.text(uri_node)
+                        line := doc.number_int(line_node)
+                        col := doc.number_int(char_node)
+                        new_name := doc.text(new_name_node)
+                        rename_res = handle_rename(uri, &cache, line, col, new_name)
+                    }
+                }
+            }
+            if has_id {
+                reply_result(id_str, rename_res)
+            }
+        } else {
+            if has_id {
+                reply_error(id_str, -32601, "Method not found: " + method)
+            }
+        }
+    }
+    << 0
+}

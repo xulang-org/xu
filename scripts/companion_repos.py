@@ -28,8 +28,11 @@ def project_root(project: str, *, core_root: Path | None = None) -> Path:
         return current
     if project == "site" and (root.parent / "xulanguage").is_dir():
         return root.parent / "xulanguage"
-    if project == "vscode" and not legacy.is_dir() and (root / "editors/vscode").is_dir():
-        return root / "editors/vscode"
+    if project == "vscode":
+        if (root.parent / "vscode-xu").is_dir():
+            return root.parent / "vscode-xu"
+        if not legacy.is_dir() and (root / "editors/vscode").is_dir():
+            return root / "editors/vscode"
     return legacy if legacy.is_dir() else current
 
 

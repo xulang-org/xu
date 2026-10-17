@@ -148,7 +148,7 @@ if (Test-Path "$SourceDir\include") {
 # 5. Editors
 $VscodeSource = $env:XU_VSCODE_ROOT
 if (-not $VscodeSource) {
-    foreach ($Candidate in @("$SourceDir\editors\vscode", "$SourceDir\..\vscode", "$SourceDir\..\xu-vscode")) {
+    foreach ($Candidate in @("$SourceDir\..\vscode-xu", "$SourceDir\editors\vscode", "$SourceDir\..\vscode", "$SourceDir\..\xu-vscode")) {
         if (Test-Path $Candidate -PathType Container) { $VscodeSource = $Candidate; break }
     }
 }
