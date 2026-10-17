@@ -166,9 +166,18 @@ xu build main.xu -o myapp
 | `xu build <file.xu> -o <bin>` | AOT compile to an optimized, standalone native binary |
 | `xu build --target wasm32 <file.xu>` | Cross-compile directly to WebAssembly |
 | `xu test <file.xu>` | Execute integrated unit tests and assertion suites |
+| `xu get <module>@<version>` | Add or update a dependency, install it, and update `xu.lock` |
+| `xu install [dir]` | Install the dependencies already declared in `xu.xun` |
 | `xu fmt <file.xu> -w` | Automatically format code according to official guidelines |
 | `xu doc <dir> --public` | Extract doc comments and generate clean API references |
 | `xu doctor` | Diagnostics tool checking native C linkers and SDK health |
+
+In a project with `xu.xun`, run `xu get github.com/xulang-org/packages@v0.1.1`
+to add or update the root module under `require:` and install its dependency
+graph into `vendor/`. An explicit version is required; `@latest`, version ranges,
+and package subpath discovery are not supported. `--offline` uses verified local
+cache/vendor data. Failed resolution or installation preserves the project's
+manifest, lock file, and vendor directory. `--frozen` rejects dependency changes.
 
 ---
 

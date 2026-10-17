@@ -1,0 +1,259 @@
+@main
+
+#internal/modulepath
+#os
+#os/exec
+
+// The install worker writes only to a staging directory. Relative file:
+// locators and their lock identities still refer to the original project.
+fn require_project_base(project &string) string {
+    args := os.argv()
+    if args.len >= 4 && args[1] == "_get-install" {
+        staged := args[3]
+        if str_eq(&staged, project) { << cli_arg_owned(&args, 2) }
+    }
+    << str_clone(project)
+}
+
+fn get_help() {
+    println("usage: xu get <module>@<version> [--offline]")
+    println("  Add or update a root module in the current directory's xu.xun,")
+    println("  then install dependencies into vendor/ and update xu.lock.")
+    println("  An explicit version is required, for example:")
+    println("    xu get github.com/xulang-org/packages@v0.1.1")
+}
+
+// Edit byte ranges so comments, unrelated sections, indentation and line
+// endings survive. The caller validates the existing manifest first.
+fn get_manifest(body &string, key &string, version &string) string {
+    mut eol := "\n"
+    for i in 0:body.len {
+        if body[i] == 10 {
+            if i > 0 && body[i - 1] == 13 { eol = "\r\n" }
+            <-
+        }
+    }
+    mut start := 0
+    mut in_req := false
+    mut saw_req := false
+    mut insert := body.len
+    mut indent := "  "
+    mut replacement_start := -1
+    mut replacement_end := -1
+    while start < body.len {
+        mut end := start
+        while end < body.len && body[end] != 10 { end += 1 }
+        mut next := end
+        if next < body.len { next += 1 }
+        row := body[start:end]
+        trimmed := xun_trim(row + "")
+        if trimmed.len > 0 && trimmed[0] != 35 {
+            mut spaces := 0
+            while spaces < row.len && row[spaces] == 32 { spaces += 1 }
+            if spaces == 0 {
+                if in_req { insert = start }
+                in_req = false
+                if val_has_prefix(&trimmed, "require:") {
+                    if saw_req || trimmed != "require:" {
+                        eprintln("xu get: require: must be a single dictionary")
+                        <<< 1
+                    }
+                    saw_req = true
+                    in_req = true
+                }
+            } else if in_req {
+                indent = row[0:spaces] + ""
+                mut colon := spaces
+                while colon < row.len && row[colon] != 58 { colon += 1 }
+                if colon < row.len {
+                    entry := xun_module_identity(xun_trim(row[spaces:colon]))
+                    if str_eq(&entry, key) {
+                        replacement_start = start + colon + 1
+                        while replacement_start < end && body[replacement_start] == 32 { replacement_start += 1 }
+                        if replacement_start < end && body[replacement_start] == 33 {
+                            while replacement_start < end && body[replacement_start] != 32 { replacement_start += 1 }
+                            while replacement_start < end && body[replacement_start] == 32 { replacement_start += 1 }
+                        }
+                        replacement_end = end
+                        while replacement_end > replacement_start && (body[replacement_end - 1] == 32 || body[replacement_end - 1] == 13) { replacement_end -= 1 }
+                    }
+                }
+            }
+        }
+        start = next
+    }
+    if replacement_start >= 0 {
+        previous := xun_scalar_text(body[replacement_start:replacement_end])
+        pinned := require_version(&previous)
+        if str_eq(&pinned, version) { << str_clone(body) }
+        << body[0:replacement_start] + version + body[replacement_end:body.len]
+    }
+    mut addition := ""
+    if insert > 0 && body[insert - 1] != 10 { addition = eol + "" }
+    if !saw_req { addition = addition + "require:" + eol }
+    addition = addition + indent + "\"" + key + "\": " + version + eol
+    << body[0:insert] + addition + body[insert:body.len]
+}
+
+// Copy the existing authenticated state as well as version snapshots. Reject
+// links before reading so the worker cannot follow a vendor escape.
+fn get_copy(src string, dst string) {
+    require_no_link(&src)
+    if dir_readable(&src) == 1 {
+        os.mkdir(dst + "") or (err) { eprintln(err.msg())
+            <<< 1 }
+        listing := os.listdir(src + "") or (err) { eprintln(err.msg())
+            <<< 1 }
+        names := split_lines(listing)
+        for i in 0:names.len {
+            name := names[i]
+            if name.len == 0 || name == "." || name == ".." { -> }
+            get_copy(src + "/" + name, dst + "/" + name)
+        }
+    } else {
+        vendor_copy_file(src, dst)
+    }
+}
+
+fn run_get_install(argv &[]string) int {
+    if argv.len != 4 && !(argv.len == 5 && argv[4] == "--offline") { << 1 }
+    origin := cli_arg_owned(argv, 2)
+    stage := cli_arg_owned(argv, 3)
+    mut names := []string{}
+    names.push("xu.lock")
+    names.push("vendor")
+    for i in 0:names.len {
+        src := origin + "/" + names[i]
+        if path_exists(&src) { get_copy(src, stage + "/" + names[i]) }
+    }
+    << run_install_project(stage, true)
+}
+
+fn get_restore(project &string, stage &string, names &[]string, originals &[]int) int {
+    mut i := originals.len
+    while i > 0 {
+        i -= 1
+        dest := project + "/" + names[i]
+        staged := stage + "/" + names[i]
+        if path_exists(&dest) { os.rename(dest + "", staged) or >> }
+        if originals[i] == 1 { os.rename(stage + "/previous-" + names[i], dest) or >> }
+    }
+    << 0
+}
+
+fn get_publish(project &string, stage &string) int {
+    // Publish the manifest last, while holding the project transaction lock.
+    mut names := []string{}
+    names.push("vendor")
+    names.push("xu.lock")
+    names.push("xu.xun")
+    mut originals := []int{}
+    for i in 0:names.len {
+        dest := project + "/" + names[i]
+        mut had_original := 0
+        if path_exists(&dest) {
+            os.rename(dest + "", stage + "/previous-" + names[i]) or (err) {
+                get_restore(project, stage, &names, &originals) or >>
+                >> err
+            }
+            had_original = 1
+        }
+        originals.push(had_original)
+        os.rename(stage + "/" + names[i], dest) or (err) {
+            get_restore(project, stage, &names, &originals) or >>
+            >> err
+        }
+    }
+    << 0
+}
+
+fn get_cleanup(stage &string) {
+    os.remove_all(str_clone(stage)) or (err) { eprintln("xu get: cannot clean staging directory " + stage + ": " + err.msg()) }
+}
+
+fn run_get(argv &[]string) int {
+    mut spec := ""
+    mut offline := false
+    for i in 2:argv.len {
+        arg := argv[i]
+        if argv.len == 3 && (arg == "--help" || arg == "-h") { get_help()
+            << 0 }
+        if arg == "--offline" { offline = true
+            -> }
+        if arg == "--frozen" {
+            eprintln("xu get: --frozen forbids dependency writes")
+            << 1
+        }
+        if spec.len > 0 || arg.len == 0 || arg[0] == 45 {
+            eprintln("xu get: unexpected argument " + arg)
+            << 1
+        }
+        spec = cli_arg_owned(argv, i)
+    }
+    mut at := -1
+    for i in 0:spec.len { if spec[i] == 64 { at = i } }
+    if at <= 0 || at + 1 >= spec.len {
+        eprintln("xu get: expected <module>@<version>; an explicit version is required")
+        << 1
+    }
+    key := spec[0:at]
+    raw_version := spec[at + 1:spec.len]
+    version := require_version(&raw_version)
+    if !modulepath.is_external(&key) || !modulepath.valid_module(&key) {
+        eprintln("xu get: invalid external module path " + key)
+        << 1
+    }
+    if version.len == 0 {
+        eprintln("xu get: an explicit major.minor.patch version is required (for example @v1.2.3)")
+        << 1
+    }
+    require_validate_locator(&key, &version)
+    project := cwd()
+    manifest := project + "/xu.xun"
+    require_no_link(&manifest)
+    lock_path := project + "/xu.lock"
+    vendor_path := project + "/vendor"
+    require_no_link(&lock_path)
+    require_no_link(&vendor_path)
+    if !path_exists(&manifest) { eprintln("xu get: no xu.xun in " + project)
+        << 1 }
+    // Unlike an install, the first get also needs a guard with no requires.
+    lock := project + "/.xu-deps.lck"
+    mut guard := require_guard(&lock, false)
+    before := read_file(manifest + "") or (err) { eprintln(err.msg())
+        << 1 }
+    xun_manifest_module(manifest + "", before + "")
+    mut keys := []string{}
+    mut vals := []string{}
+    collect_direct_require_entries(&project, mut &keys, mut &vals)
+    candidate := get_manifest(&before, &key, &version)
+    stage := os.mkdir_temp(project + "", ".xu-get-*") or (err) { eprintln(err.msg())
+        << 1 }
+    write_file(stage + "/xu.xun", candidate + "") or (err) { get_cleanup(&stage)
+        eprintln(err.msg())
+        << 1 }
+    exe_arg := cli_arg_owned(argv, 0)
+    exe := exec.look_path(exe_arg) or (err) { get_cleanup(&stage)
+        eprintln(err.msg())
+        << 1 }
+    mut worker := exec.command(exe, "_get-install", project + "", stage + "")
+    if offline { worker.args.push("--offline") }
+    worker.run() or (err) { get_cleanup(&stage)
+        eprintln("xu get: installation failed; project dependencies unchanged")
+        << 1 }
+    current := read_file(manifest + "") or (err) { get_cleanup(&stage)
+        eprintln(err.msg())
+        << 1 }
+    if current != before { get_cleanup(&stage)
+        eprintln("xu get: xu.xun changed during installation; retry with the current manifest")
+        << 1 }
+    get_publish(&project, &stage) or (err) {
+        eprintln("xu get: cannot publish dependencies: " + err.msg() + "; recovery files retained in " + stage)
+        << 1
+    }
+    get_cleanup(&stage)
+    guard.close() or (err) { eprintln(err.msg())
+        << 1 }
+    println("xu get: " + key + "@" + version)
+    << 0
+}
