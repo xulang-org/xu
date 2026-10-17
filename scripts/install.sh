@@ -1,33 +1,9 @@
 #!/usr/bin/env bash
 # Xu Programming Language — Cross-platform Development Environment Installer
-# Supports offline installation (from unpacked bundle) and online installation.
+# Supports offline installation (from unpacked bundle) and online installation (curl | bash).
 set -euo pipefail
 
-SCRIPT_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
-fi
-
-XU_VERSION_DEFAULT="0.8.12"
-if [[ -n "$SCRIPT_DIR" ]]; then
-    for version_file in "$SCRIPT_DIR/VERSION" "$SCRIPT_DIR/../VERSION"; do
-        if [[ -f "$version_file" ]]; then XU_VERSION_DEFAULT="$(cat "$version_file")"; break; fi
-    done
-fi
-
-# Try resolving latest official release from GitHub if not specified
-if [[ -z "$SCRIPT_DIR" || (! -f "$SCRIPT_DIR/VERSION" && ! -f "$SCRIPT_DIR/../VERSION") ]]; then
-    LATEST_TAG=$(curl -sSL --connect-timeout 3 -m 5 -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/xulang-org/xu/releases/latest 2>/dev/null | grep '"tag_name":' | head -n 1 | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
-    if [[ -n "$LATEST_TAG" && "$LATEST_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        XU_VERSION_DEFAULT="$LATEST_TAG"
-    fi
-fi
-
-DEFAULT_INSTALL_DIR="$HOME/.xu"
-INSTALL_DIR="${XU_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
-DOWNLOAD_BASE_URL="${XU_DOWNLOAD_URL:-https://github.com/xulang-org/xu/releases/download}"
-
-# Color output helpers (ANSI-C quoting for reliable escape interpretation)
+# ANSI color codes
 BOLD=$'\033[1m'
 GREEN=$'\033[0;32m'
 BLUE=$'\033[0;34m'
@@ -48,21 +24,10 @@ EOF
     printf "%b\n" "${NC}"
 }
 
-log_info() {
-    printf "${BLUE}[INFO]${NC} %b\n" "$1"
-}
-
-log_ok() {
-    printf "${GREEN}[OK]${NC} %b\n" "$1"
-}
-
-log_warn() {
-    printf "${YELLOW}[WARN]${NC} %b\n" "$1"
-}
-
-log_err() {
-    printf "${RED}[ERROR]${NC} %b\n" "$1" >&2
-}
+log_info() { printf "${BLUE}[INFO]${NC} %b\n" "$1"; }
+log_ok()   { printf "${GREEN}[OK]${NC} %b\n" "$1"; }
+log_warn() { printf "${YELLOW}[WARN]${NC} %b\n" "$1"; }
+log_err()  { printf "${RED}[ERROR]${NC} %b\n" "$1" >&2; }
 
 # Detect operating system and architecture
 detect_platform() {
@@ -99,20 +64,28 @@ usage() {
 Xu Development Environment Installer
 
 Usage:
-  ./install.sh [options]
+  install.sh [options]
+  curl -fsSL https://xulang.org/install.sh | bash -s -- [options]
 
 Options:
-  --prefix <DIR>       Install directory (default: ~/.xu)
-  --version <VER>      Version to install when downloading (default: $XU_VERSION_DEFAULT)
+  --prefix <DIR>       Install directory (default: ~/.xu or \$XU_INSTALL_DIR)
+  --version <VER>      Version to install when downloading (default: latest stable or \$XU_VERSION)
+  --online             Force downloading release archive even if executed from local bundle
   --no-modify-path     Do not append environment variables to shell config files
   -y, --yes            Assume yes to all prompts
   -h, --help           Show this help message
 EOF
 }
 
+# Configuration defaults
+DEFAULT_INSTALL_DIR="$HOME/.xu"
+INSTALL_DIR="${XU_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+DOWNLOAD_BASE_URL="${XU_DOWNLOAD_URL:-https://github.com/xulang-org/xu/releases/download}"
+FALLBACK_VERSION="0.8.12"
+TARGET_VERSION="${XU_VERSION:-}"
 MODIFY_PATH=1
 AUTO_YES=0
-TARGET_VERSION="$XU_VERSION_DEFAULT"
+FORCE_ONLINE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -123,6 +96,10 @@ while [[ $# -gt 0 ]]; do
         --version)
             TARGET_VERSION="$2"
             shift 2
+            ;;
+        --online)
+            FORCE_ONLINE=1
+            shift
             ;;
         --no-modify-path)
             MODIFY_PATH=0
@@ -148,30 +125,62 @@ print_banner
 
 PLATFORM=$(detect_platform)
 if [[ "$PLATFORM" == windows-* ]]; then
-    log_err "Use install.ps1 from native PowerShell on Windows."
+    log_err "Windows detected. Please use install.ps1 from PowerShell:"
+    echo "  irm https://xulang.org/install.ps1 | iex"
     exit 1
 fi
 log_info "Detected host platform: ${BOLD}${PLATFORM}${NC}"
 log_info "Target install directory: ${BOLD}${INSTALL_DIR}${NC}"
 
+IS_LOCAL_SCRIPT=0
 SCRIPT_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+# A legitimate local script invocation requires a real, readable regular file on disk.
+# When invoked via pipe (e.g. curl ... | bash), BASH_SOURCE[0] is empty or /dev/fd/*
+if [[ "$FORCE_ONLINE" -eq 0 && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" && -r "${BASH_SOURCE[0]}" ]]; then
+    case "${BASH_SOURCE[0]}" in
+        /dev/*|/proc/*)
+            IS_LOCAL_SCRIPT=0
+            ;;
+        *)
+            SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+            if [[ -n "$SCRIPT_DIR" && -d "$SCRIPT_DIR" ]]; then
+                IS_LOCAL_SCRIPT=1
+            fi
+            ;;
+    esac
 fi
-SOURCE_DIR=""
 
-# Check if we are running from inside an unpacked distribution bundle (only when invoked from a script file)
-if [[ -n "$SCRIPT_DIR" ]]; then
-    if [[ -d "$SCRIPT_DIR/bin" && -d "$SCRIPT_DIR/src" ]]; then
-        SOURCE_DIR="$SCRIPT_DIR"
-        log_info "Found local offline distribution files in: $SOURCE_DIR"
-    elif [[ -d "$SCRIPT_DIR/../bin" && -d "$SCRIPT_DIR/../src" ]]; then
-        SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-        log_info "Found repository root distribution files in: $SOURCE_DIR"
+SOURCE_DIR=""
+# Check if SCRIPT_DIR is inside an unpacked distribution bundle
+if [[ "$IS_LOCAL_SCRIPT" -eq 1 && -n "$SCRIPT_DIR" ]]; then
+    for candidate in "$SCRIPT_DIR" "$SCRIPT_DIR/.."; do
+        candidate="$(cd "$candidate" 2>/dev/null && pwd || true)"
+        if [[ -n "$candidate" && -d "$candidate/src" ]]; then
+            if [[ -f "$candidate/VERSION" || -f "$candidate/TARGET" || -d "$candidate/bin" ]]; then
+                SOURCE_DIR="$candidate"
+                log_info "Found local offline distribution files in: $SOURCE_DIR"
+                break
+            fi
+        fi
+    done
+fi
+
+# Resolve version
+if [[ -z "$TARGET_VERSION" ]]; then
+    if [[ -n "$SOURCE_DIR" && -f "$SOURCE_DIR/VERSION" ]]; then
+        TARGET_VERSION="$(cat "$SOURCE_DIR/VERSION" | tr -d '[:space:]')"
+    else
+        # Try resolving latest official release from GitHub with a fast 2s timeout
+        LATEST_TAG=$(curl -sSL --connect-timeout 2 -m 3 -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/xulang-org/xu/releases/latest 2>/dev/null | grep '"tag_name":' | head -n 1 | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
+        if [[ -n "$LATEST_TAG" && "$LATEST_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            TARGET_VERSION="$LATEST_TAG"
+            log_info "Resolved latest release version: ${BOLD}v${TARGET_VERSION}${NC}"
+        else
+            TARGET_VERSION="$FALLBACK_VERSION"
+        fi
     fi
 fi
 
-# If no local files found, download release archive
 TMP_DIR=""
 cleanup() {
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
@@ -181,18 +190,18 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ -z "$SOURCE_DIR" ]]; then
-    log_info "Preparing to download online release for ${PLATFORM}..."
+    log_info "Preparing to download online release v${TARGET_VERSION} for ${PLATFORM}..."
     ARCHIVE_NAME="xu-v${TARGET_VERSION}-${PLATFORM}.tar.gz"
     ARCHIVE_URL="${DOWNLOAD_BASE_URL}/v${TARGET_VERSION}/${ARCHIVE_NAME}"
 
-    TMP_DIR="$(mktemp -d /tmp/xu_install_XXXXXX)"
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/xu_install_XXXXXX")"
     ARCHIVE_DEST="$TMP_DIR/$ARCHIVE_NAME"
 
     log_info "Downloading ${ARCHIVE_URL}..."
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$ARCHIVE_URL" -o "$ARCHIVE_DEST"
+        curl -fsSL --connect-timeout 15 --retry 2 "$ARCHIVE_URL" -o "$ARCHIVE_DEST"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$ARCHIVE_DEST" "$ARCHIVE_URL"
+        wget -q --tries=2 --timeout=15 -O "$ARCHIVE_DEST" "$ARCHIVE_URL"
     else
         log_err "Neither curl nor wget found. Please install curl or wget."
         exit 1
@@ -200,60 +209,83 @@ if [[ -z "$SOURCE_DIR" ]]; then
 
     log_info "Extracting bundle..."
     tar -xzf "$ARCHIVE_DEST" -C "$TMP_DIR"
-    SOURCE_DIR="$TMP_DIR/xu-v$TARGET_VERSION"
-    if [[ ! -d "$SOURCE_DIR" ]]; then
-        SOURCE_DIR="$TMP_DIR/xu"
-        if [[ ! -d "$SOURCE_DIR" ]]; then SOURCE_DIR="$TMP_DIR"; fi
-    fi
-fi
 
-# Validate before touching an existing installation.
-if [[ ! -d "$SOURCE_DIR/src" || ! -f "$SOURCE_DIR/VERSION" ]]; then
-    log_err "Invalid Xu distribution: src/ or VERSION is missing."
-    exit 1
-fi
-if [[ -f "$SOURCE_DIR/TARGET" ]]; then
-    BUNDLE_TARGET="$(cat "$SOURCE_DIR/TARGET")"
-    if [[ "$BUNDLE_TARGET" != "$PLATFORM" && "$BUNDLE_TARGET" != devkit-all ]]; then
-        log_err "Bundle target $BUNDLE_TARGET does not match host $PLATFORM."
+    # Intelligent root discovery: find directory containing src/ and VERSION
+    if [[ -d "$TMP_DIR/src" && -f "$TMP_DIR/VERSION" ]]; then
+        SOURCE_DIR="$TMP_DIR"
+    else
+        for sub in "$TMP_DIR"/*; do
+            if [[ -d "$sub" && -d "$sub/src" && -f "$sub/VERSION" ]]; then
+                SOURCE_DIR="$sub"
+                break
+            fi
+        done
+        if [[ -z "$SOURCE_DIR" ]]; then
+            found_src=$(find "$TMP_DIR" -maxdepth 2 -type d -name "src" 2>/dev/null | head -n 1 || true)
+            if [[ -n "$found_src" ]]; then
+                SOURCE_DIR="$(dirname "$found_src")"
+            fi
+        fi
+    fi
+
+    if [[ -z "$SOURCE_DIR" || ! -d "$SOURCE_DIR" ]]; then
+        log_err "Failed to locate extracted distribution files in $TMP_DIR."
         exit 1
     fi
 fi
+
+# Pre-flight validation
+if [[ ! -d "$SOURCE_DIR/src" || ! -f "$SOURCE_DIR/VERSION" ]]; then
+    log_err "Invalid Xu distribution: src/ or VERSION is missing in $SOURCE_DIR."
+    exit 1
+fi
+
+if [[ -f "$SOURCE_DIR/TARGET" ]]; then
+    BUNDLE_TARGET="$(cat "$SOURCE_DIR/TARGET" | tr -d '[:space:]')"
+    if [[ "$BUNDLE_TARGET" != "$PLATFORM" && "$BUNDLE_TARGET" != devkit-all ]]; then
+        log_err "Bundle target '$BUNDLE_TARGET' does not match host '$PLATFORM'."
+        exit 1
+    fi
+fi
+
 BINARY_SOURCE="$SOURCE_DIR/bin"
-if [[ -d "$BINARY_SOURCE/platform/$PLATFORM" ]]; then BINARY_SOURCE="$BINARY_SOURCE/platform/$PLATFORM"; fi
-if [[ ! -x "$BINARY_SOURCE/xu" ]] || ! "$BINARY_SOURCE/xu" --version >/dev/null; then
+if [[ -d "$BINARY_SOURCE/platform/$PLATFORM" ]]; then
+    BINARY_SOURCE="$BINARY_SOURCE/platform/$PLATFORM"
+fi
+
+if [[ ! -x "$BINARY_SOURCE/xu" ]] || ! "$BINARY_SOURCE/xu" --version >/dev/null 2>&1; then
     log_err "Distribution compiler cannot run on $PLATFORM: $BINARY_SOURCE/xu"
     exit 1
 fi
 
-# Prepare target directory
+# Prepare target install directory
 mkdir -p "$INSTALL_DIR"
 INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
 if [[ "$INSTALL_DIR" == "$SOURCE_DIR" ]]; then
-    log_err "Install directory must differ from the source distribution. Use source env.sh to activate in place."
+    log_err "Install directory must differ from source distribution. Use 'source env.sh' to activate in place."
     exit 1
 fi
 
+# 1. Binaries
 log_info "Copying toolchain binaries..."
 mkdir -p "$INSTALL_DIR/bin"
 if [[ -d "$SOURCE_DIR/bin/platform/$PLATFORM" ]]; then
     cp -Rf "$SOURCE_DIR/bin/platform/$PLATFORM/." "$INSTALL_DIR/bin/"
 elif [[ -d "$SOURCE_DIR/bin" ]]; then
-    # Copy host binaries or platform matching
-    for b in xu xu-doctor xu-fmt xu-doc xu-map xu-desktop xu-native; do
+    for b in xu xu-doctor xu-fmt xu-doc xu-map xu-desktop xu-native xu-setup; do
         if [[ -f "$SOURCE_DIR/bin/$b" ]]; then
             cp -f "$SOURCE_DIR/bin/$b" "$INSTALL_DIR/bin/"
-        elif [[ -f "$SOURCE_DIR/bin/$b.exe" ]]; then
-            cp -f "$SOURCE_DIR/bin/$b.exe" "$INSTALL_DIR/bin/"
         fi
     done
 fi
 chmod +x "$INSTALL_DIR/bin/"* 2>/dev/null || true
 
+# 2. Standard library (src/)
 log_info "Copying standard library (src/)..."
 mkdir -p "$INSTALL_DIR/src"
 cp -Rf "$SOURCE_DIR/src/." "$INSTALL_DIR/src/"
 
+# 3. External modules (packages/)
 PACKAGES_SOURCE="${XU_PACKAGES_ROOT:-$SOURCE_DIR/packages}"
 if [[ -z "${XU_PACKAGES_ROOT:-}" && ! -d "$PACKAGES_SOURCE" ]]; then
     PACKAGES_SOURCE="$SOURCE_DIR/../packages"
@@ -276,12 +308,14 @@ else
     log_info "External driver repository absent; core toolchain installed."
 fi
 
+# 4. Native C headers (include/)
 if [[ -d "$SOURCE_DIR/include" ]]; then
     log_info "Copying native headers (include/)..."
     mkdir -p "$INSTALL_DIR/include"
     cp -Rf "$SOURCE_DIR/include/." "$INSTALL_DIR/include/"
 fi
 
+# 5. VS Code extension (editors/vscode)
 VSCODE_SOURCE="${XU_VSCODE_ROOT:-$SOURCE_DIR/editors/vscode}"
 if [[ -z "${XU_VSCODE_ROOT:-}" && ! -d "$VSCODE_SOURCE" ]]; then
     VSCODE_SOURCE="$SOURCE_DIR/../vscode-xu"
@@ -293,32 +327,27 @@ if [[ -n "${XU_VSCODE_ROOT:-}" && ! -d "$VSCODE_SOURCE" ]]; then
     exit 1
 fi
 VSIX_FILE=""
-if [[ -d "$VSCODE_SOURCE" ]]; then
-    if [[ ! -f "$VSCODE_SOURCE/package.json" ]]; then
-        log_err "VS Code extension package.json missing: $VSCODE_SOURCE"
-        exit 1
-    fi
+if [[ -d "$VSCODE_SOURCE" && -f "$VSCODE_SOURCE/package.json" ]]; then
     EXTENSION_NAME=$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$VSCODE_SOURCE/package.json" | head -n 1)
     EXTENSION_VERSION=$(sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$VSCODE_SOURCE/package.json" | head -n 1)
-    if [[ ! "$EXTENSION_NAME" =~ ^[A-Za-z0-9_-]+$ || ! "$EXTENSION_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$ ]]; then
-        log_err "Invalid VS Code extension name/version: $VSCODE_SOURCE/package.json"
-        exit 1
-    fi
-    CURRENT_VSIX="$EXTENSION_NAME-$EXTENSION_VERSION.vsix"
-    log_info "Copying VS Code extension from: $VSCODE_SOURCE"
-    mkdir -p "$INSTALL_DIR/editors/vscode"
-    for resource in package.json language-configuration.json README.md "$CURRENT_VSIX"; do
-        if [[ -f "$VSCODE_SOURCE/$resource" ]]; then
-            cp -f "$VSCODE_SOURCE/$resource" "$INSTALL_DIR/editors/vscode/$resource"
+    if [[ "$EXTENSION_NAME" =~ ^[A-Za-z0-9_-]+$ && "$EXTENSION_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        CURRENT_VSIX="$EXTENSION_NAME-$EXTENSION_VERSION.vsix"
+        log_info "Copying VS Code extension from: $VSCODE_SOURCE"
+        mkdir -p "$INSTALL_DIR/editors/vscode"
+        for resource in package.json language-configuration.json README.md "$CURRENT_VSIX"; do
+            if [[ -f "$VSCODE_SOURCE/$resource" ]]; then
+                cp -f "$VSCODE_SOURCE/$resource" "$INSTALL_DIR/editors/vscode/$resource"
+            fi
+        done
+        if [[ -f "$VSCODE_SOURCE/$CURRENT_VSIX" ]]; then
+            VSIX_FILE="$INSTALL_DIR/editors/vscode/$CURRENT_VSIX"
         fi
-    done
-    if [[ -f "$VSCODE_SOURCE/$CURRENT_VSIX" ]]; then
-        VSIX_FILE="$INSTALL_DIR/editors/vscode/$CURRENT_VSIX"
     fi
 else
     log_info "VS Code extension repository absent; core toolchain installed."
 fi
 
+# 6. Official examples (examples/)
 EXAMPLES_CHECKOUT="${XU_EXAMPLES_ROOT:-$SOURCE_DIR/../examples}"
 if [[ -z "${XU_EXAMPLES_ROOT:-}" && ! -d "$EXAMPLES_CHECKOUT" ]]; then EXAMPLES_CHECKOUT="$SOURCE_DIR/../xu-examples"; fi
 EXAMPLES_SOURCE="$EXAMPLES_CHECKOUT/examples"
@@ -346,7 +375,7 @@ if [[ -d "$INSTALL_DIR/examples" ]]; then
     done < <(find "$INSTALL_DIR/examples" -type f -name xu.xun -print0)
 fi
 
-# Copy metadata
+# 7. Metadata
 for meta in README.md LICENSE VERSION TARGET bundle.json env.sh uninstall.sh; do
     if [[ -f "$SOURCE_DIR/$meta" ]]; then
         cp -f "$SOURCE_DIR/$meta" "$INSTALL_DIR/"
@@ -359,66 +388,66 @@ for meta in README.md LICENSE VERSION TARGET bundle.json env.sh uninstall.sh; do
     fi
 done
 
-# Safety fallback: ensure env.sh ALWAYS exists in $INSTALL_DIR
-if [[ ! -f "$INSTALL_DIR/env.sh" ]]; then
-    cat << 'EOF' > "$INSTALL_DIR/env.sh"
-if [ -n "${ZSH_VERSION:-}" ]; then
-    XU_ENV_SRC="${(%):-%x}"
-elif [ -n "${BASH_SOURCE[0]:-}" ]; then
-    XU_ENV_SRC="${BASH_SOURCE[0]}"
+# Ensure env.sh ALWAYS exists and is robust across zsh, bash, sh
+cat << EOF > "$INSTALL_DIR/env.sh"
+# Xu Development Environment Activation Script
+if [ -n "\${ZSH_VERSION:-}" ]; then
+    XU_ENV_SRC="\${(%):-%x}"
+elif [ -n "\${BASH_SOURCE[0]:-}" ]; then
+    XU_ENV_SRC="\${BASH_SOURCE[0]}"
 else
-    XU_ENV_SRC="$0"
+    XU_ENV_SRC="\$0"
 fi
-XU_ENV_DIR="$(cd "$(dirname "$XU_ENV_SRC")" && pwd)"
-if [[ ! -d "$XU_ENV_DIR/src" && -d "$XU_ENV_DIR/../src" ]]; then XU_ENV_DIR="$(cd "$XU_ENV_DIR/.." && pwd)"; fi
-export XU_ROOT="$XU_ENV_DIR"
-export XU_STDLIB_ROOT="$XU_ROOT/src"
-XU_ENV_BIN="$XU_ROOT/bin"
-XU_ENV_OS="$(uname -s)"
-XU_ENV_ARCH="$(uname -m)"
-case "$XU_ENV_OS" in Darwin) XU_ENV_OS=macos ;; Linux) XU_ENV_OS=linux ;; esac
-case "$XU_ENV_ARCH" in arm64|aarch64) XU_ENV_ARCH=arm64 ;; x86_64|amd64) XU_ENV_ARCH=x64 ;; esac
-if [[ -d "$XU_ENV_BIN/platform/$XU_ENV_OS-$XU_ENV_ARCH" ]]; then
-    XU_ENV_BIN="$XU_ENV_BIN/platform/$XU_ENV_OS-$XU_ENV_ARCH"
+XU_ENV_DIR="\$(cd "\$(dirname "\$XU_ENV_SRC")" 2>/dev/null && pwd || true)"
+if [ -z "\$XU_ENV_DIR" ] || [ ! -d "\$XU_ENV_DIR/src" ]; then
+    XU_ENV_DIR=$(printf '%q' "$INSTALL_DIR")
 fi
-for XU_ENV_PATH in "$XU_ROOT/packages" "$XU_ROOT/src"; do
-    [[ -d "$XU_ENV_PATH" ]] || continue
-    case ":${XUPATH:-}:" in
-        *":$XU_ENV_PATH:"*) ;;
-        *) export XUPATH="$XU_ENV_PATH${XUPATH:+:$XUPATH}" ;;
+export XU_ROOT="\$XU_ENV_DIR"
+export XU_STDLIB_ROOT="\$XU_ROOT/src"
+XU_ENV_BIN="\$XU_ROOT/bin"
+XU_ENV_OS="\$(uname -s)"
+XU_ENV_ARCH="\$(uname -m)"
+case "\$XU_ENV_OS" in Darwin) XU_ENV_OS=macos ;; Linux) XU_ENV_OS=linux ;; esac
+case "\$XU_ENV_ARCH" in arm64|aarch64) XU_ENV_ARCH=arm64 ;; x86_64|amd64) XU_ENV_ARCH=x64 ;; esac
+if [ -d "\$XU_ENV_BIN/platform/\$XU_ENV_OS-\$XU_ENV_ARCH" ]; then
+    XU_ENV_BIN="\$XU_ENV_BIN/platform/\$XU_ENV_OS-\$XU_ENV_ARCH"
+fi
+for XU_ENV_PATH in "\$XU_ROOT/packages" "\$XU_ROOT/src"; do
+    [ -d "\$XU_ENV_PATH" ] || continue
+    case ":\${XUPATH:-}:" in
+        *":\$XU_ENV_PATH:"*) ;;
+        *) export XUPATH="\$XU_ENV_PATH\${XUPATH:+:\$XUPATH}" ;;
     esac
 done
-case ":$PATH:" in
-    *":$XU_ENV_BIN:"*) ;;
-    *) export PATH="$XU_ENV_BIN:$PATH" ;;
+case ":\$PATH:" in
+    *":\$XU_ENV_BIN:"*) ;;
+    *) export PATH="\$XU_ENV_BIN:\$PATH" ;;
 esac
 unset XU_ENV_PATH XU_ENV_DIR XU_ENV_BIN XU_ENV_OS XU_ENV_ARCH XU_ENV_SRC
-echo "Xu environment activated: $XU_ROOT"
+echo "Xu environment activated: \$XU_ROOT"
 EOF
-    chmod +x "$INSTALL_DIR/env.sh"
-fi
+chmod +x "$INSTALL_DIR/env.sh"
 
-if [[ ! -f "$INSTALL_DIR/uninstall.sh" ]]; then
-    cat << 'EOF' > "$INSTALL_DIR/uninstall.sh"
+# Ensure uninstall.sh ALWAYS exists
+cat << EOF > "$INSTALL_DIR/uninstall.sh"
 #!/usr/bin/env bash
 set -euo pipefail
-PREFIX="${1:-$HOME/.xu}"
-echo "Removing Xu development environment from: $PREFIX"
-if [[ -d "$PREFIX" ]]; then
-    rm -rf "$PREFIX"
-    echo "[OK] Removed $PREFIX"
+PREFIX="\${1:-$INSTALL_DIR}"
+echo "Removing Xu development environment from: \$PREFIX"
+if [ -d "\$PREFIX" ]; then
+    rm -rf "\$PREFIX"
+    echo "[OK] Removed \$PREFIX"
 fi
-for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
-    if [[ -f "$rc" ]] && grep -q "# >>> xu development environment >>>" "$rc"; then
-        sed -i.bak '/# >>> xu development environment >>>/,/# <<< xu development environment <<</d' "$rc" 2>/dev/null || true
-        rm -f "${rc}.bak"
-        echo "[OK] Cleaned $rc"
+for rc in "\$HOME/.zshrc" "\$HOME/.bashrc" "\$HOME/.bash_profile" "\$HOME/.profile" "\$HOME/.config/fish/config.fish"; do
+    if [ -f "\$rc" ] && grep -q "# >>> xu development environment >>>" "\$rc"; then
+        sed -i.bak '/# >>> xu development environment >>>/,/# <<< xu development environment <<</d' "\$rc" 2>/dev/null || true
+        rm -f "\${rc}.bak"
+        echo "[OK] Cleaned \$rc"
     fi
 done
 echo "Xu has been uninstalled successfully."
 EOF
-    chmod +x "$INSTALL_DIR/uninstall.sh"
-fi
+chmod +x "$INSTALL_DIR/uninstall.sh"
 
 log_ok "Core development files installed to: $INSTALL_DIR"
 
@@ -438,32 +467,44 @@ if [[ "$MODIFY_PATH" -eq 1 ]]; then
     ENV_SNIPPET_END="# <<< xu development environment <<<"
 
     TARGET_RC_FILES=()
-    SHELL_NAME="$(basename "${SHELL:-bash}")"
 
-    case "$SHELL_NAME" in
-        zsh)
-            TARGET_RC_FILES+=("$HOME/.zshrc")
-            ;;
-        bash)
-            if [[ -f "$HOME/.bashrc" ]]; then
-                TARGET_RC_FILES+=("$HOME/.bashrc")
-            fi
-            if [[ -f "$HOME/.bash_profile" ]]; then
-                TARGET_RC_FILES+=("$HOME/.bash_profile")
-            fi
-            if [[ ${#TARGET_RC_FILES[@]} -eq 0 ]]; then
-                TARGET_RC_FILES+=("$HOME/.bashrc")
-            fi
-            ;;
-        fish)
-            TARGET_RC_FILES+=("$HOME/.config/fish/config.fish")
-            ;;
-        *)
-            TARGET_RC_FILES+=("$HOME/.profile")
-            ;;
-    esac
+    # Detect all shells present in user home
+    if [[ -f "$HOME/.zshrc" ]] || [[ "${SHELL:-}" == *"zsh"* ]]; then
+        TARGET_RC_FILES+=("$HOME/.zshrc")
+    fi
+    if [[ -f "$HOME/.bashrc" ]]; then
+        TARGET_RC_FILES+=("$HOME/.bashrc")
+    fi
+    if [[ -f "$HOME/.bash_profile" ]]; then
+        TARGET_RC_FILES+=("$HOME/.bash_profile")
+    fi
+    if [[ -f "$HOME/.profile" ]]; then
+        TARGET_RC_FILES+=("$HOME/.profile")
+    fi
+    if [[ -f "$HOME/.config/fish/config.fish" ]] || [[ "${SHELL:-}" == *"fish"* ]]; then
+        TARGET_RC_FILES+=("$HOME/.config/fish/config.fish")
+    fi
 
+    # Fallback if no known rc file exists
+    if [[ ${#TARGET_RC_FILES[@]} -eq 0 ]]; then
+        case "$(basename "${SHELL:-bash}")" in
+            zsh)  TARGET_RC_FILES+=("$HOME/.zshrc") ;;
+            fish) TARGET_RC_FILES+=("$HOME/.config/fish/config.fish") ;;
+            *)    TARGET_RC_FILES+=("$HOME/.bashrc") ;;
+        esac
+    fi
+
+    # Deduplicate files
+    UNIQUE_RC_FILES=()
     for rc in "${TARGET_RC_FILES[@]}"; do
+        already=0
+        for u in "${UNIQUE_RC_FILES[@]:-}"; do
+            if [[ "$rc" == "$u" ]]; then already=1; break; fi
+        done
+        if [[ $already -eq 0 ]]; then UNIQUE_RC_FILES+=("$rc"); fi
+    done
+
+    for rc in "${UNIQUE_RC_FILES[@]}"; do
         mkdir -p "$(dirname "$rc")"
         touch "$rc"
 
@@ -473,7 +514,7 @@ if [[ "$MODIFY_PATH" -eq 1 ]]; then
             rm -f "${rc}.bak"
         fi
 
-        if [[ "$SHELL_NAME" == "fish" ]]; then
+        if [[ "$rc" == *"/config.fish" ]]; then
             cat << EOF >> "$rc"
 $ENV_SNIPPET_START
 set -gx XU_ROOT "$INSTALL_DIR"
@@ -485,13 +526,13 @@ EOF
         else
             cat << EOF >> "$rc"
 $ENV_SNIPPET_START
-if [ -f $(printf '%q' "$INSTALL_DIR/env.sh") ]; then
-    source $(printf '%q' "$INSTALL_DIR/env.sh")
+if [ -f "$INSTALL_DIR/env.sh" ]; then
+    source "$INSTALL_DIR/env.sh"
 else
-    export XU_ROOT=$(printf '%q' "$INSTALL_DIR")
-    export XU_STDLIB_ROOT=$(printf '%q' "$INSTALL_DIR/src")
-    export XUPATH=$(printf '%q' "$INSTALL_DIR/src:$INSTALL_DIR/packages")\${XUPATH:+:\$XUPATH}
-    export PATH=$(printf '%q' "$INSTALL_DIR/bin"):\$PATH
+    export XU_ROOT="$INSTALL_DIR"
+    export XU_STDLIB_ROOT="$INSTALL_DIR/src"
+    export XUPATH="$INSTALL_DIR/src:$INSTALL_DIR/packages\${XUPATH:+:\$XUPATH}"
+    export PATH="$INSTALL_DIR/bin:\$PATH"
 fi
 $ENV_SNIPPET_END
 EOF
@@ -500,7 +541,7 @@ EOF
     done
 fi
 
-# Verification / Doctor self-check
+# Self-check compiler
 log_info "Running Xu toolchain self-check..."
 export XU_ROOT="$INSTALL_DIR"
 export XU_STDLIB_ROOT="$INSTALL_DIR/src"
@@ -521,27 +562,27 @@ if [[ -x "$INSTALL_DIR/bin/xu-doctor" ]]; then
     echo
 fi
 
-printf "\n${GREEN}${BOLD}🎉 Xu 跨平台开发环境安装完成！${NC}\n\n"
+printf "\n${GREEN}${BOLD}🎉 Xu development environment installed successfully!${NC}\n\n"
 cat << EOF
-已包含核心组件：
-  • 核心编译器与工具链: $INSTALL_DIR/bin (xu, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop, xu-native)
-  • 标准库源码 (src):   $INSTALL_DIR/src
-  • 外部驱动模块（选装）:    $INSTALL_DIR/packages (redis, mysql, postgres, sqlite, etcd, etc.)
-  • 原生 C 接口头文件:  $INSTALL_DIR/include
-  • VS Code 扩展:       $INSTALL_DIR/editors/vscode
-  • 官方实战示例:       $INSTALL_DIR/examples
+Installed components:
+  • Core compiler & toolchain: $INSTALL_DIR/bin (xu, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop, xu-native)
+  • Standard library (src):    $INSTALL_DIR/src
+  • External driver modules:   $INSTALL_DIR/packages (redis, mysql, postgres, sqlite, etcd, etc.)
+  • Native C headers:          $INSTALL_DIR/include
+  • VS Code extension:         $INSTALL_DIR/editors/vscode
+  • Official examples:         $INSTALL_DIR/examples
 
-立即开始使用：
-  1. 重载 Shell 环境变量：
-     source ~/.zshrc   # 或 source ~/.bashrc
+To get started:
+  1. Reload your shell environment:
+     source ~/.zshrc   # or source ~/.bashrc
 
-  2. 也可以临时在当前终端激活环境：
+  2. Or activate in your current terminal session:
      source $INSTALL_DIR/env.sh
 
-  3. 编译并运行官方示例：
+  3. Compile and run an official example:
      xu run $INSTALL_DIR/examples/01_hello/main.xu
 
-  4. 检查环境与工具链诊断：
+  4. Check toolchain diagnosis:
      xu doctor
 
 EOF
