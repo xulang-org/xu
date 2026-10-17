@@ -220,7 +220,7 @@ if [[ -d "$SOURCE_DIR/bin/platform/$PLATFORM" ]]; then
     cp -Rf "$SOURCE_DIR/bin/platform/$PLATFORM/." "$INSTALL_DIR/bin/"
 elif [[ -d "$SOURCE_DIR/bin" ]]; then
     # Copy host binaries or platform matching
-    for b in xu xu-doctor xu-fmt xu-doc xu-map xu-desktop; do
+    for b in xu xu-doctor xu-fmt xu-doc xu-map xu-desktop xu-native; do
         if [[ -f "$SOURCE_DIR/bin/$b" ]]; then
             cp -f "$SOURCE_DIR/bin/$b" "$INSTALL_DIR/bin/"
         elif [[ -f "$SOURCE_DIR/bin/$b.exe" ]]; then
@@ -434,7 +434,7 @@ fi
 printf "\n${GREEN}${BOLD}🎉 Xu 跨平台开发环境安装完成！${NC}\n\n"
 cat << EOF
 已包含核心组件：
-  • 核心编译器与工具链: $INSTALL_DIR/bin (xu, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop)
+  • 核心编译器与工具链: $INSTALL_DIR/bin (xu, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop, xu-native)
   • 标准库源码 (src):   $INSTALL_DIR/src
   • 外部驱动模块（选装）:    $INSTALL_DIR/packages (redis, mysql, postgres, sqlite, etcd, etc.)
   • 原生 C 接口头文件:  $INSTALL_DIR/include

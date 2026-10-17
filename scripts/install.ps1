@@ -10,6 +10,11 @@ param (
 
 $ErrorActionPreference = "Stop"
 
+# Enable TLS 1.2 (required for downloading from GitHub on Windows PowerShell 5.1)
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+} catch {}
+
 function Write-Color([string]$Text, [ConsoleColor]$Color) {
     Write-Host $Text -ForegroundColor $Color
 }
@@ -22,8 +27,29 @@ Write-Color @"
   /_/\_\   \__,_|   Windows Development Environment Installer
 "@ -Color Cyan
 
-$Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-if ($Arch -notin @("x64", "arm64")) { throw "Unsupported Windows architecture: $Arch" }
+# Detect Windows architecture safely across PowerShell 5.1 (.NET Framework) and PowerShell 7+ (.NET Core)
+$Arch = $null
+try {
+    $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    if ($null -ne $osArch) {
+        $Arch = $osArch.ToString().ToLowerInvariant()
+    }
+} catch {}
+
+if (-not $Arch) {
+    $rawArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    if ($rawArch -match "ARM64") {
+        $Arch = "arm64"
+    } elseif ($rawArch -match "AMD64|x86_64|x64") {
+        $Arch = "x64"
+    } elseif ([System.Environment]::Is64BitOperatingSystem) {
+        $Arch = "x64"
+    } else {
+        $Arch = if ($rawArch) { $rawArch.ToLowerInvariant() } else { "x64" }
+    }
+}
+
+if ($Arch -notin @("x64", "arm64")) { throw "Unsupported Windows architecture: $Arch (Xu currently supports x64 and arm64 on Windows)" }
 $Platform = "windows-$Arch"
 $Prefix = [System.IO.Path]::GetFullPath($Prefix)
 
@@ -36,9 +62,19 @@ $TempExtract = $null
 try {
 $SourceDir = $null
 if (-not $Version) {
-    $Version = "0.8.2"
+    $Version = "0.8.12"
     foreach ($VersionFile in @("$ScriptDir\VERSION", "$ScriptDir\..\VERSION")) {
         if (Test-Path $VersionFile) { $Version = (Get-Content $VersionFile -Raw).Trim(); break }
+    }
+    # If downloading online and VERSION file absent, try querying latest official release
+    if (-not (Test-Path "$ScriptDir\VERSION") -and -not (Test-Path "$ScriptDir\..\VERSION")) {
+        try {
+            $headers = @{ "User-Agent" = "xu-installer" }
+            $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/xulang-org/xu/releases/latest" -Headers $headers -TimeoutSec 3 -ErrorAction SilentlyContinue -UseBasicParsing
+            if ($latest.tag_name -match '^v?(\d+\.\d+\.\d+)$') {
+                $Version = $Matches[1]
+            }
+        } catch {}
     }
 }
 
@@ -57,7 +93,7 @@ if (-not $SourceDir) {
     $TempExtract = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "xu_install_" + [System.Guid]::NewGuid().ToString())
 
     Write-Color "[INFO] Downloading $DownloadUrl..." -Color Blue
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip -UseBasicParsing
 
     Write-Color "[INFO] Extracting bundle..." -Color Blue
     Expand-Archive -Path $TempZip -DestinationPath $TempExtract -Force
@@ -96,7 +132,7 @@ if (-not (Test-Path $BinDest)) { New-Item -ItemType Directory -Path $BinDest -Fo
 if (Test-Path "$SourceDir\bin\platform\$Platform") {
     Copy-Item -Path "$SourceDir\bin\platform\$Platform\*" -Destination $BinDest -Recurse -Force
 } elseif (Test-Path "$SourceDir\bin") {
-    $Tools = @("xu", "xu-doctor", "xu-fmt", "xu-doc", "xu-map", "xu-desktop")
+    $Tools = @("xu", "xu-doctor", "xu-fmt", "xu-doc", "xu-map", "xu-desktop", "xu-native")
     foreach ($tool in $Tools) {
         if (Test-Path "$SourceDir\bin\$tool.exe") {
             Copy-Item -Path "$SourceDir\bin\$tool.exe" -Destination $BinDest -Force
@@ -228,8 +264,9 @@ if (-not $NoModifyPath) {
     [System.Environment]::SetEnvironmentVariable("XUPATH", $XuPathVal, [System.EnvironmentVariableTarget]::User)
 
     $UserPath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
-    if (($UserPath -split ';') -notcontains "$Prefix\bin") {
-        $NewPath = "$Prefix\bin;" + $UserPath
+    $PathParts = if ($UserPath) { $UserPath -split ';' | Where-Object { $_ } } else { @() }
+    if ($PathParts -notcontains "$Prefix\bin") {
+        $NewPath = if ($UserPath) { "$Prefix\bin;$UserPath" } else { "$Prefix\bin" }
         [System.Environment]::SetEnvironmentVariable("Path", $NewPath, [System.EnvironmentVariableTarget]::User)
     }
 

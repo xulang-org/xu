@@ -1,0 +1,959 @@
+@main
+// xu-native — native module compiler, archiver, and .xulib pack tool.
+// User: `xu native <compile|archive|pack|inspect|extract>` or `xu-native`.
+
+#os
+#os/exec
+#path/filepath
+#strings
+#crypto/sha256
+#encoding/hex
+#encoding/json
+#errors
+
+fn print_usage() {
+    println("usage: xu native <command> [options]")
+    println("")
+    println("Commands:")
+    println("  compile   compile C sources with metadata wrapper into a native .a archive")
+    println("            xu native compile --manifest native.json --target <target> [-o lib.a] <files.c...>")
+    println("  archive   wrap precompiled objects with metadata into a native .a archive")
+    println("            xu native archive --manifest native.json --target <target> [-o lib.a] --native <objs...>")
+    println("  pack      bundle target slices into a portable .xulib library")
+    println("            xu native pack --manifest native.json --slice <target>=<path.a>... [-o lib.xulib]")
+    println("  inspect   inspect a .xulib container and its slices")
+    println("            xu native inspect <lib.xulib>")
+    println("  extract   extract a target slice from a .xulib container")
+    println("            xu native extract <lib.xulib> --target <target> -o <out.a>")
+    println("")
+    println("Options:")
+    println("  --manifest PATH   path to native.json manifest")
+    println("  --target TARGET   target platform (e.g. macos-arm64, linux-x64, windows-x64)")
+    println("  --slice T=PATH    add a target slice mapping for pack")
+    println("  --cc PATH         custom C compiler path (default: auto clang)")
+    println("  --ar PATH         custom archive tool path (default: auto llvm-ar / ar)")
+    println("  -o PATH           output file path")
+}
+
+fn str_clone(s &string) string {
+    << s + ""
+}
+
+fn byte_to_hex(b int) string {
+    h := "0123456789abcdef"
+    hi := (b >> 4) & 15
+    lo := b & 15
+    mut res := ""
+    res = res + h[hi:hi + 1] + h[lo:lo + 1]
+    << res
+}
+
+fn write_u16(buf &mut []int, val int) {
+    buf.push(val & 255)
+    buf.push((val >> 8) & 255)
+}
+
+fn write_u32(buf &mut []int, val int) {
+    buf.push(val & 255)
+    buf.push((val >> 8) & 255)
+    buf.push((val >> 16) & 255)
+    buf.push((val >> 24) & 255)
+}
+
+fn write_u64(buf &mut []int, val int) {
+    buf.push(val & 255)
+    buf.push((val >> 8) & 255)
+    buf.push((val >> 16) & 255)
+    buf.push((val >> 24) & 255)
+    buf.push((val >> 32) & 255)
+    buf.push((val >> 40) & 255)
+    buf.push((val >> 48) & 255)
+    buf.push((val >> 56) & 255)
+}
+
+fn write_bytes(buf &mut []int, s &string) {
+    for i in 0:s.len {
+        buf.push(s[i] & 255)
+    }
+}
+
+fn write_xu_string(buf &mut []int, s &string) {
+    write_u16(buf, s.len)
+    write_bytes(buf, s)
+}
+
+fn target_to_triple(target string) string {
+    if target == "macos-arm64" { << "arm64-apple-macos11" }
+    if target == "macos-x64" { << "x86_64-apple-macos11" }
+    if target == "linux-arm64" { << "aarch64-linux-gnu" }
+    if target == "linux-x64" { << "x86_64-linux-gnu" }
+    if target == "linux-loongarch64" { << "loongarch64-linux-gnu" }
+    if target == "linux-riscv64" { << "riscv64-linux-gnu" }
+    if target == "windows-arm64" { << "aarch64-pc-windows-msvc" }
+    if target == "windows-x64" { << "x86_64-pc-windows-msvc" }
+    << ""
+}
+
+fn target_codes(target string) []int {
+    if target == "macos-arm64" { << [1, 1] }
+    if target == "macos-x64" { << [1, 2] }
+    if target == "linux-arm64" { << [2, 1] }
+    if target == "linux-x64" { << [2, 2] }
+    if target == "linux-loongarch64" { << [2, 5] }
+    if target == "linux-riscv64" { << [2, 6] }
+    if target == "windows-arm64" { << [3, 1] }
+    if target == "windows-x64" { << [3, 2] }
+    << [0, 0]
+}
+
+fn type_to_code(name &string) int {
+    s := strings.to_lower(name)
+    if s == "void" { << 0 }
+    if s == "int" { << 1 }
+    if s == "bool" { << 2 }
+    if s == "f64" { << 4 }
+    if s == "i32" { << 8 }
+    if s == "u32" { << 9 }
+    if s == "u8" { << 10 }
+    << -1
+}
+
+fn default_export_label(module &string, name &string) string {
+    mut m := ""
+    for i in 0:module.len {
+        c := module[i]
+        if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 {
+            m = m + module[i:i + 1]
+        } else {
+            m = m + "_"
+        }
+    }
+    mut n := ""
+    for j in 0:name.len {
+        c := name[j]
+        if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 {
+            n = n + name[j:j + 1]
+        } else {
+            n = n + "_"
+        }
+    }
+    << "_xu_" + m + "_" + n
+}
+
+fn path_exists(p &string) bool {
+    os.stat(str_clone(p)) or (err) { << false }
+    << true
+}
+
+fn safe_rm(path &string) {
+    os.remove(str_clone(path)) or (err) {
+        <<
+    }
+    <<
+}
+
+fn safe_rmdir(path &string) {
+    os.remove_all(str_clone(path)) or (err) {
+        <<
+    }
+    <<
+}
+
+fn make_temp_dir() string {
+    mut td := os.temp_dir()
+    if td.len == 0 { td = "/tmp" }
+    p := td + "/xunative_" + str(os.getpid()) + "_" + str(now_ns() & 2147483647)
+    os.mkdir_all(str_clone(&p)) or (err) { << "/tmp" }
+    << p
+}
+
+fn find_include_dir() string {
+    root := os.getenv("XU_ROOT")
+    if root.len > 0 {
+        mut p := []string{}
+        p.push(root)
+        p.push("include")
+        inc := filepath.join(p)
+        if path_exists(&inc) { << inc }
+    }
+    exe := os.argv()[0]
+    exe_dir := filepath.dir(&exe)
+    parent := filepath.dir(&exe_dir)
+    mut p2 := []string{}
+    p2.push(parent)
+    p2.push("include")
+    inc2 := filepath.join(p2)
+    if path_exists(&inc2) { << inc2 }
+    cur_inc := "include"
+    if path_exists(&cur_inc) { << cur_inc }
+    << ""
+}
+
+fn probe_tool(name string) string {
+    << exec.look_path(name) or (err) { << "" }
+}
+
+fn find_cc(custom &string) string {
+    if custom.len > 0 { << str_clone(custom) }
+    p := probe_tool("clang")
+    if p.len > 0 { << p }
+    h1 := "/opt/homebrew/opt/llvm/bin/clang"
+    if path_exists(&h1) { << h1 }
+    h2 := "/usr/local/opt/llvm/bin/clang"
+    if path_exists(&h2) { << h2 }
+    h3 := "/usr/bin/clang"
+    if path_exists(&h3) { << h3 }
+    p2 := probe_tool("gcc")
+    if p2.len > 0 { << p2 }
+    << "clang"
+}
+
+fn find_ar(custom &string) string {
+    if custom.len > 0 { << str_clone(custom) }
+    p := probe_tool("llvm-ar")
+    if p.len > 0 { << p }
+    p2 := probe_tool("ar")
+    if p2.len > 0 { << p2 }
+    h1 := "/opt/homebrew/opt/llvm/bin/llvm-ar"
+    if path_exists(&h1) { << h1 }
+    h2 := "/usr/bin/ar"
+    if path_exists(&h2) { << h2 }
+    << "ar"
+}
+
+fn encode_xuobj(manifest_json &string, target string) []int {
+    mut out := []int{}
+    // "XUOBJ\x01\x00\x00" (8 bytes)
+    out.push(88) // X
+    out.push(85) // U
+    out.push(79) // O
+    out.push(66) // B
+    out.push(74) // J
+    out.push(1)
+    out.push(0)
+    out.push(0)
+
+    codes := target_codes(target)
+    out.push(codes[0])
+    out.push(codes[1])
+    write_u16(mut &out, 0)
+
+    doc := json.parse(manifest_json) or (err) {
+        eprintln("xu native: manifest is invalid json: " + err.msg())
+        << []int{}
+    }
+    root := doc.root()
+    mod_idx := doc.get(root, "module")
+    mut mod_name := ""
+    if mod_idx >= 0 {
+        mod_name = doc.text(mod_idx)
+    }
+    if mod_name.len == 0 {
+        eprintln("xu native: manifest missing 'module'")
+        << []int{}
+    }
+    write_xu_string(mut &out, &mod_name)
+
+    exp_idx := doc.get(root, "exports")
+    mut exp_count := 0
+    if exp_idx >= 0 {
+        exp_count = doc.count(exp_idx)
+    }
+    write_u32(mut &out, exp_count)
+
+    for i in 0:exp_count {
+        item := doc.at(exp_idx, i)
+        name_idx := doc.get(item, "name")
+        mut fn_name := ""
+        if name_idx >= 0 { fn_name = doc.text(name_idx) }
+
+        label_idx := doc.get(item, "label")
+        mut label := ""
+        if label_idx >= 0 {
+            label = doc.text(label_idx)
+        } else {
+            label = default_export_label(&mod_name, &fn_name)
+        }
+
+        ret_idx := doc.get(item, "ret")
+        mut ret_name := "void"
+        if ret_idx >= 0 { ret_name = doc.text(ret_idx) }
+        ret_code := type_to_code(&ret_name)
+
+        params_idx := doc.get(item, "params")
+        mut param_count := 0
+        if params_idx >= 0 { param_count = doc.count(params_idx) }
+
+        write_xu_string(mut &out, &fn_name)
+        write_xu_string(mut &out, &label)
+        out.push(ret_code)
+        out.push(param_count)
+        for p in 0:param_count {
+            p_item := doc.at(params_idx, p)
+            p_name := doc.text(p_item)
+            out.push(type_to_code(&p_name))
+        }
+    }
+
+    // 4 x u32 0 (labels, relocations, code, data)
+    write_u32(mut &out, 0)
+    write_u32(mut &out, 0)
+    write_u32(mut &out, 0)
+    write_u32(mut &out, 0)
+    << out
+}
+
+fn metadata_c_source(meta_bytes &[]int, target string) string {
+    mut sec := ".xumeta"
+    if strings.has_prefix(&target, "macos-") {
+        sec = "__DATA,__xumeta"
+    }
+    mut s := "/* Generated XUNATIVE metadata wrapper. */\n"
+    s = s + "__attribute__((used, aligned(1), section(\"" + sec + "\")))\n"
+    s = s + "static const unsigned char xu_native_metadata_v1[] = {\n"
+    for i in 0:meta_bytes.len {
+        b := meta_bytes[i] & 255
+        s = s + "0x" + byte_to_hex(b) + ","
+        if (i + 1) % 12 == 0 { s = s + "\n" }
+        else { s = s + " " }
+    }
+    s = s + "\n};\n"
+    << s
+}
+
+fn run_command_simple(bin &string, args &[]string) int {
+    mut cmd := exec.command(str_clone(bin))
+    for i in 0:args.len {
+        cmd.args.push(str_clone(&args[i]))
+    }
+    cmd.run() or (err) {
+        << 1
+    }
+    << 0
+}
+
+fn run_compile(argv &[]string) int {
+    mut manifest_path := ""
+    mut target := ""
+    mut out_path := ""
+    mut cc_path := ""
+    mut ar_path := ""
+    mut sources := []string{}
+    mut cflags := []string{}
+
+    mut i := 2
+    while i < argv.len {
+        arg := argv[i]
+        if arg == "--manifest" && i + 1 < argv.len {
+            manifest_path = argv[i + 1]
+            i += 2
+        } else if arg == "--target" && i + 1 < argv.len {
+            target = argv[i + 1]
+            i += 2
+        } else if (arg == "-o" || arg == "--output") && i + 1 < argv.len {
+            out_path = argv[i + 1]
+            i += 2
+        } else if arg == "--cc" && i + 1 < argv.len {
+            cc_path = argv[i + 1]
+            i += 2
+        } else if arg == "--ar" && i + 1 < argv.len {
+            ar_path = argv[i + 1]
+            i += 2
+        } else if strings.has_prefix(&arg, "-") {
+            cflags.push(arg)
+            i += 1
+        } else {
+            sources.push(arg)
+            i += 1
+        }
+    }
+
+    if manifest_path.len == 0 {
+        eprintln("xu native compile: missing --manifest")
+        << 1
+    }
+    if target.len == 0 {
+        eprintln("xu native compile: missing --target")
+        << 1
+    }
+    if sources.len == 0 {
+        eprintln("xu native compile: no C source files specified")
+        << 1
+    }
+    triple := target_to_triple(str_clone(&target))
+    if triple.len == 0 {
+        eprintln("xu native compile: unsupported target: " + target)
+        << 1
+    }
+    if out_path.len == 0 {
+        out_path = "libnative-" + target + ".a"
+    }
+
+    manifest_bytes := read_file(str_clone(&manifest_path)) or (err) {
+        eprintln("xu native compile: cannot read manifest " + manifest_path + ": " + err.msg())
+        << 1
+    }
+    xuobj := encode_xuobj(&manifest_bytes, str_clone(&target))
+    if xuobj.len == 0 {
+        << 1
+    }
+
+    cc := find_cc(&cc_path)
+    ar := find_ar(&ar_path)
+    inc := find_include_dir()
+
+    // 1. Write metadata C wrapper into temp dir as xu.c / xu.o
+    temp_dir := make_temp_dir()
+    meta_c := temp_dir + "/xu.c"
+    meta_o := temp_dir + "/xu.o"
+    meta_code := metadata_c_source(&xuobj, str_clone(&target))
+    write_file(str_clone(&meta_c), meta_code) or (err) {
+        eprintln("xu native compile: failed to write " + meta_c + ": " + err.msg())
+        safe_rmdir(&temp_dir)
+        << 1
+    }
+
+    // Compile metadata wrapper
+    mut meta_args := []string{}
+    meta_args.push("--target=" + triple)
+    meta_args.push("-c")
+    meta_args.push("-x")
+    meta_args.push("c")
+    meta_args.push(str_clone(&meta_c))
+    meta_args.push("-o")
+    meta_args.push(str_clone(&meta_o))
+
+    rc_m := run_command_simple(&cc, &meta_args)
+    safe_rm(&meta_c)
+    if rc_m != 0 {
+        eprintln("xu native compile: failed to compile metadata object with " + cc)
+        safe_rmdir(&temp_dir)
+        << rc_m
+    }
+
+    // 2. Compile user C sources
+    mut obj_files := []string{}
+    obj_files.push(str_clone(&meta_o))
+    for s_idx in 0:sources.len {
+        src := sources[s_idx]
+        obj := temp_dir + "/native_" + str(s_idx) + ".o"
+        mut c_args := []string{}
+        c_args.push("--target=" + triple)
+        if inc.len > 0 {
+            c_args.push("-I" + inc)
+        }
+        for f in 0:cflags.len { c_args.push(cflags[f]) }
+        c_args.push("-c")
+        c_args.push(str_clone(&src))
+        c_args.push("-o")
+        c_args.push(str_clone(&obj))
+
+        rc_c := run_command_simple(&cc, &c_args)
+        if rc_c != 0 {
+            eprintln("xu native compile: compilation failed for " + src)
+            for clean_idx in 0:obj_files.len { safe_rm(&obj_files[clean_idx]) }
+            safe_rm(&obj)
+            safe_rmdir(&temp_dir)
+            << rc_c
+        }
+        obj_files.push(obj)
+    }
+
+    // 3. Build .a
+    safe_rm(&out_path)
+
+    mut ar_args := []string{}
+    ar_args.push("rcs")
+    ar_args.push(str_clone(&out_path))
+    for o_idx in 0:obj_files.len {
+        ar_args.push(obj_files[o_idx])
+    }
+
+    rc_ar := run_command_simple(&ar, &ar_args)
+
+    // Cleanup temporary objects
+    for clean_idx in 0:obj_files.len {
+        safe_rm(&obj_files[clean_idx])
+    }
+    safe_rmdir(&temp_dir)
+
+    if rc_ar != 0 {
+        eprintln("xu native compile: archive creation failed with " + ar)
+        << rc_ar
+    }
+
+    println("Compiled native archive: " + out_path + " (" + target + ")")
+    << 0
+}
+
+fn run_archive(argv &[]string) int {
+    mut manifest_path := ""
+    mut target := ""
+    mut out_path := ""
+    mut cc_path := ""
+    mut ar_path := ""
+    mut native_objs := []string{}
+
+    mut i := 2
+    while i < argv.len {
+        arg := argv[i]
+        if arg == "--manifest" && i + 1 < argv.len {
+            manifest_path = argv[i + 1]
+            i += 2
+        } else if arg == "--target" && i + 1 < argv.len {
+            target = argv[i + 1]
+            i += 2
+        } else if (arg == "-o" || arg == "--output") && i + 1 < argv.len {
+            out_path = argv[i + 1]
+            i += 2
+        } else if arg == "--cc" && i + 1 < argv.len {
+            cc_path = argv[i + 1]
+            i += 2
+        } else if arg == "--ar" && i + 1 < argv.len {
+            ar_path = argv[i + 1]
+            i += 2
+        } else if arg == "--native" && i + 1 < argv.len {
+            native_objs.push(argv[i + 1])
+            i += 2
+        } else if !strings.has_prefix(&arg, "-") {
+            native_objs.push(arg)
+            i += 1
+        } else {
+            i += 1
+        }
+    }
+
+    if manifest_path.len == 0 {
+        eprintln("xu native archive: missing --manifest")
+        << 1
+    }
+    if target.len == 0 {
+        eprintln("xu native archive: missing --target")
+        << 1
+    }
+    if native_objs.len == 0 {
+        eprintln("xu native archive: no native objects specified (--native)")
+        << 1
+    }
+    triple := target_to_triple(str_clone(&target))
+    if triple.len == 0 {
+        eprintln("xu native archive: unsupported target: " + target)
+        << 1
+    }
+    if out_path.len == 0 {
+        out_path = "libnative-" + target + ".a"
+    }
+
+    manifest_bytes := read_file(str_clone(&manifest_path)) or (err) {
+        eprintln("xu native archive: cannot read manifest " + manifest_path + ": " + err.msg())
+        << 1
+    }
+    xuobj := encode_xuobj(&manifest_bytes, str_clone(&target))
+    if xuobj.len == 0 {
+        << 1
+    }
+
+    cc := find_cc(&cc_path)
+    ar := find_ar(&ar_path)
+
+    // 1. Write metadata C wrapper into temp dir as xu.c / xu.o
+    temp_dir := make_temp_dir()
+    meta_c := temp_dir + "/xu.c"
+    meta_o := temp_dir + "/xu.o"
+    meta_code := metadata_c_source(&xuobj, str_clone(&target))
+    write_file(str_clone(&meta_c), meta_code) or (err) {
+        eprintln("xu native archive: failed to write " + meta_c + ": " + err.msg())
+        safe_rmdir(&temp_dir)
+        << 1
+    }
+
+    mut meta_args := []string{}
+    meta_args.push("--target=" + triple)
+    meta_args.push("-c")
+    meta_args.push("-x")
+    meta_args.push("c")
+    meta_args.push(str_clone(&meta_c))
+    meta_args.push("-o")
+    meta_args.push(str_clone(&meta_o))
+
+    rc_m := run_command_simple(&cc, &meta_args)
+    safe_rm(&meta_c)
+    if rc_m != 0 {
+        eprintln("xu native archive: failed to compile metadata object")
+        safe_rmdir(&temp_dir)
+        << rc_m
+    }
+
+    safe_rm(&out_path)
+    mut ar_args := []string{}
+    ar_args.push("rcs")
+    ar_args.push(str_clone(&out_path))
+    ar_args.push(str_clone(&meta_o))
+    for o_idx in 0:native_objs.len {
+        ar_args.push(native_objs[o_idx])
+    }
+
+    rc_ar := run_command_simple(&ar, &ar_args)
+    safe_rm(&meta_o)
+    safe_rmdir(&temp_dir)
+
+    if rc_ar != 0 {
+        eprintln("xu native archive: archive creation failed")
+        << rc_ar
+    }
+
+    println("Created native archive: " + out_path + " (" + target + ")")
+    << 0
+}
+
+struct SliceEntry {
+    target string
+    path string
+    kind string
+    size int
+    digest_raw string
+    digest_hex string
+}
+
+fn run_pack(argv &[]string) int {
+    mut manifest_path := ""
+    mut out_path := ""
+    mut slices := []SliceEntry{}
+
+    mut i := 2
+    while i < argv.len {
+        arg := argv[i]
+        if arg == "--manifest" && i + 1 < argv.len {
+            manifest_path = argv[i + 1]
+            i += 2
+        } else if (arg == "-o" || arg == "--output") && i + 1 < argv.len {
+            out_path = argv[i + 1]
+            i += 2
+        } else if arg == "--slice" && i + 1 < argv.len {
+            slice_spec := argv[i + 1]
+            eq_idx := strings.index_of(&slice_spec, "=")
+            if eq_idx > 0 {
+                t_name := slice_spec[0:eq_idx]
+                p_name := slice_spec[eq_idx + 1:slice_spec.len]
+                mut k_name := "archive"
+                if strings.has_suffix(&p_name, ".o") || strings.has_suffix(&p_name, ".obj") {
+                    k_name = "object"
+                }
+                slices.push(SliceEntry{
+                    target: t_name,
+                    path: p_name,
+                    kind: k_name,
+                    size: 0,
+                    digest_raw: "",
+                    digest_hex: ""
+                })
+            } else {
+                eprintln("xu native pack: invalid --slice format (want TARGET=PATH): " + slice_spec)
+                << 1
+            }
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+
+    if manifest_path.len == 0 {
+        eprintln("xu native pack: missing --manifest")
+        << 1
+    }
+    if slices.len == 0 {
+        eprintln("xu native pack: requires at least one --slice TARGET=PATH")
+        << 1
+    }
+    if out_path.len == 0 {
+        out_path = "libnative.xulib"
+    }
+
+    manifest_raw := read_file(str_clone(&manifest_path)) or (err) {
+        eprintln("xu native pack: cannot read manifest " + manifest_path + ": " + err.msg())
+        << 1
+    }
+
+    // Read each slice and calculate sha256
+    mut payloads := []string{}
+    for s_idx in 0:slices.len {
+        p := slices[s_idx].path
+        data := read_file(str_clone(&p)) or (err) {
+            eprintln("xu native pack: cannot read slice " + p + ": " + err.msg())
+            << 1
+        }
+        slices[s_idx].size = data.len
+        slices[s_idx].digest_raw = sha256.sum256_bytes(str_clone(&data))
+        slices[s_idx].digest_hex = sha256.sum256(str_clone(&data))
+        payloads.push(data)
+    }
+
+    // Build JSON manifest string with format and slices
+    doc := json.parse(&manifest_raw) or (err) {
+        eprintln("xu native pack: manifest is not valid json")
+        << 1
+    }
+    root := doc.root()
+    mod_idx := doc.get(root, "module")
+    mut mod_name := ""
+    if mod_idx >= 0 { mod_name = doc.text(mod_idx) }
+    abi_idx := doc.get(root, "abi")
+    mut abi_name := "xu-c-1"
+    if abi_idx >= 0 { abi_name = doc.text(abi_idx) }
+
+    mut manifest_json := "{\"abi\":\"" + abi_name + "\",\"format\":\"xulib-1\",\"module\":\"" + mod_name + "\",\"slices\":["
+    for s_idx in 0:slices.len {
+        if s_idx > 0 { manifest_json = manifest_json + "," }
+        manifest_json = manifest_json + "{\"kind\":\"" + slices[s_idx].kind + "\",\"sha256\":\"" + slices[s_idx].digest_hex + "\",\"size\":" + str(slices[s_idx].size) + ",\"target\":\"" + slices[s_idx].target + "\"}"
+    }
+    manifest_json = manifest_json + "]}"
+
+    // Build binary XULIB container
+    mut out_bin := []int{}
+    // 1. Magic "XULIB\x01\x00" (7 bytes)
+    out_bin.push(88) // X
+    out_bin.push(85) // U
+    out_bin.push(76) // L
+    out_bin.push(73) // I
+    out_bin.push(66) // B
+    out_bin.push(1)
+    out_bin.push(0)
+
+    // 2. Version = 1 (u16), Flags = 0 (u16), Manifest Len (u32)
+    write_u16(mut &out_bin, 1)
+    write_u16(mut &out_bin, 0)
+    write_u32(mut &out_bin, manifest_json.len)
+    write_bytes(mut &out_bin, &manifest_json)
+
+    // 3. Slice count (u32)
+    write_u32(mut &out_bin, slices.len)
+
+    // 4. Calculate table size to determine payload offsets
+    mut table_size := 0
+    for s_idx in 0:slices.len {
+        target_len := slices[s_idx].target.len
+        kind_len := slices[s_idx].kind.len
+        table_size = table_size + 2 + target_len + 1 + kind_len + 8 + 8 + 32
+    }
+    payload_start := out_bin.len + table_size
+
+    mut cur_offset := payload_start
+    for s_idx in 0:slices.len {
+        target_str := slices[s_idx].target
+        kind_str := slices[s_idx].kind
+        write_u16(mut &out_bin, target_str.len)
+        write_bytes(mut &out_bin, &target_str)
+        out_bin.push(kind_str.len & 255)
+        write_bytes(mut &out_bin, &kind_str)
+        write_u64(mut &out_bin, cur_offset)
+        write_u64(mut &out_bin, slices[s_idx].size)
+        // 32 bytes raw digest
+        raw_dig := slices[s_idx].digest_raw
+        for d in 0:32 {
+            if d < raw_dig.len {
+                out_bin.push(raw_dig[d] & 255)
+            } else {
+                out_bin.push(0)
+            }
+        }
+        cur_offset = cur_offset + slices[s_idx].size
+    }
+
+    // 5. Append slice payloads
+    for s_idx in 0:payloads.len {
+        p_data := payloads[s_idx]
+        write_bytes(mut &out_bin, &p_data)
+    }
+
+    // Write output .xulib
+    bytes_str := string_from_bytes(out_bin)
+    write_file(str_clone(&out_path), bytes_str) or (err) {
+        eprintln("xu native pack: cannot write " + out_path + ": " + err.msg())
+        << 1
+    }
+
+    println("Packed " + str(slices.len) + " slice(s) into " + out_path)
+    << 0
+}
+
+fn get_u16_at(b &string, pos int) int {
+    if pos + 1 >= b.len { << 0 }
+    << (b[pos] & 255) | ((b[pos + 1] & 255) << 8)
+}
+
+fn get_u32_at(b &string, pos int) int {
+    if pos + 3 >= b.len { << 0 }
+    << (b[pos] & 255) | ((b[pos + 1] & 255) << 8) | ((b[pos + 2] & 255) << 16) | ((b[pos + 3] & 255) << 24)
+}
+
+fn get_u64_at(b &string, pos int) int {
+    if pos + 7 >= b.len { << 0 }
+    lo := (b[pos] & 255) | ((b[pos + 1] & 255) << 8) | ((b[pos + 2] & 255) << 16) | ((b[pos + 3] & 255) << 24)
+    hi := (b[pos + 4] & 255) | ((b[pos + 5] & 255) << 8) | ((b[pos + 6] & 255) << 16) | ((b[pos + 7] & 255) << 24)
+    << lo | (hi << 32)
+}
+
+fn run_inspect(argv &[]string) int {
+    if argv.len < 3 {
+        eprintln("usage: xu native inspect <lib.xulib>")
+        << 1
+    }
+    lib_path := argv[2]
+    data := read_file(str_clone(&lib_path)) or (err) {
+        eprintln("xu native inspect: cannot read file " + lib_path + ": " + err.msg())
+        << 1
+    }
+    if data.len < 19 {
+        eprintln("xu native inspect: file is too small to be a valid .xulib")
+        << 1
+    }
+    if data[0] != 88 || data[1] != 85 || data[2] != 76 || data[3] != 73 || data[4] != 66 || data[5] != 1 || data[6] != 0 {
+        eprintln("xu native inspect: not a valid XULIB container (bad magic)")
+        << 1
+    }
+    ver := get_u16_at(&data, 7)
+    manifest_len := get_u32_at(&data, 11)
+    mut pos := 15
+    if pos + manifest_len > data.len {
+        eprintln("xu native inspect: corrupted manifest length")
+        << 1
+    }
+    manifest_str := data[pos:pos + manifest_len]
+    pos = pos + manifest_len
+
+    println("XULIB Container: " + lib_path)
+    println("  Format Version: " + str(ver))
+    println("  Manifest: " + manifest_str)
+
+    slice_count := get_u32_at(&data, pos)
+    pos = pos + 4
+    println("  Slices (" + str(slice_count) + "):")
+
+    for s in 0:slice_count {
+        target_len := get_u16_at(&data, pos)
+        pos = pos + 2
+        t_name := data[pos:pos + target_len]
+        pos = pos + target_len
+        kind_len := data[pos] & 255
+        pos = pos + 1
+        k_name := data[pos:pos + kind_len]
+        pos = pos + kind_len
+        offset := get_u64_at(&data, pos)
+        size := get_u64_at(&data, pos + 8)
+        pos = pos + 16
+        mut hex_digest := ""
+        for h in 0:32 {
+            hex_digest = hex_digest + byte_to_hex(data[pos + h] & 255)
+        }
+        pos = pos + 32
+        println("    - target: " + t_name + " [" + k_name + "], size: " + str(size) + " bytes, sha256: " + hex_digest + ", offset: " + str(offset))
+    }
+    << 0
+}
+
+fn run_extract(argv &[]string) int {
+    if argv.len < 3 {
+        eprintln("usage: xu native extract <lib.xulib> --target <target> -o <out.a>")
+        << 1
+    }
+    lib_path := argv[2]
+    mut target := ""
+    mut out_path := ""
+
+    mut i := 3
+    while i < argv.len {
+        arg := argv[i]
+        if arg == "--target" && i + 1 < argv.len {
+            target = argv[i + 1]
+            i += 2
+        } else if (arg == "-o" || arg == "--output") && i + 1 < argv.len {
+            out_path = argv[i + 1]
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+
+    if target.len == 0 {
+        eprintln("xu native extract: missing --target")
+        << 1
+    }
+    if out_path.len == 0 {
+        out_path = target + ".a"
+    }
+
+    data := read_file(str_clone(&lib_path)) or (err) {
+        eprintln("xu native extract: cannot read file " + lib_path + ": " + err.msg())
+        << 1
+    }
+    if data.len < 19 {
+        eprintln("xu native extract: file is too small")
+        << 1
+    }
+    manifest_len := get_u32_at(&data, 11)
+    mut pos := 15 + manifest_len
+    if pos + 4 > data.len {
+        eprintln("xu native extract: truncated xulib")
+        << 1
+    }
+    count := get_u32_at(&data, pos)
+    pos = pos + 4
+
+    mut found := false
+    for s in 0:count {
+        target_len := get_u16_at(&data, pos)
+        pos = pos + 2
+        t_name := data[pos:pos + target_len]
+        pos = pos + target_len
+        kind_len := data[pos] & 255
+        pos = pos + 1 + kind_len
+        offset := get_u64_at(&data, pos)
+        size := get_u64_at(&data, pos + 8)
+        pos = pos + 48
+        if t_name == target {
+            if offset + size <= data.len {
+                slice_data := data[offset:offset + size]
+                write_file(str_clone(&out_path), slice_data) or (err) {
+                    eprintln("xu native extract: cannot write " + out_path + ": " + err.msg())
+                    << 1
+                }
+                println("Extracted slice " + target + " to " + out_path)
+                found = true
+                <-
+            }
+        }
+    }
+
+    if !found {
+        eprintln("xu native extract: target slice not found: " + target)
+        << 1
+    }
+    << 0
+}
+
+fn main() int {
+    args := os.argv()
+    if args.len < 2 || args[1] == "-h" || args[1] == "--help" {
+        print_usage()
+        << 0
+    }
+    sub := args[1]
+    if sub == "compile" {
+        << run_compile(&args)
+    }
+    if sub == "archive" {
+        << run_archive(&args)
+    }
+    if sub == "pack" {
+        << run_pack(&args)
+    }
+    if sub == "inspect" {
+        << run_inspect(&args)
+    }
+    if sub == "extract" {
+        << run_extract(&args)
+    }
+
+    eprintln("xu native: unknown command '" + sub + "' (want compile|archive|pack|inspect|extract)")
+    << 1
+}
