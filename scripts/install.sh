@@ -3,26 +3,41 @@
 # Supports offline installation (from unpacked bundle) and online installation.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-XU_VERSION_DEFAULT="0.8.2"
-for version_file in "$SCRIPT_DIR/VERSION" "$SCRIPT_DIR/../VERSION"; do
-    if [[ -f "$version_file" ]]; then XU_VERSION_DEFAULT="$(cat "$version_file")"; break; fi
-done
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+fi
+
+XU_VERSION_DEFAULT="0.8.12"
+if [[ -n "$SCRIPT_DIR" ]]; then
+    for version_file in "$SCRIPT_DIR/VERSION" "$SCRIPT_DIR/../VERSION"; do
+        if [[ -f "$version_file" ]]; then XU_VERSION_DEFAULT="$(cat "$version_file")"; break; fi
+    done
+fi
+
+# Try resolving latest official release from GitHub if not specified
+if [[ -z "$SCRIPT_DIR" || (! -f "$SCRIPT_DIR/VERSION" && ! -f "$SCRIPT_DIR/../VERSION") ]]; then
+    LATEST_TAG=$(curl -sSL --connect-timeout 3 -m 5 -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/xulang-org/xu/releases/latest 2>/dev/null | grep '"tag_name":' | head -n 1 | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
+    if [[ -n "$LATEST_TAG" && "$LATEST_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        XU_VERSION_DEFAULT="$LATEST_TAG"
+    fi
+fi
+
 DEFAULT_INSTALL_DIR="$HOME/.xu"
 INSTALL_DIR="${XU_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 DOWNLOAD_BASE_URL="${XU_DOWNLOAD_URL:-https://github.com/xulang-org/xu/releases/download}"
 
-# Color output helpers
-BOLD='\033[1m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+# Color output helpers (ANSI-C quoting for reliable escape interpretation)
+BOLD=$'\033[1m'
+GREEN=$'\033[0;32m'
+BLUE=$'\033[0;34m'
+YELLOW=$'\033[0;33m'
+CYAN=$'\033[0;36m'
+RED=$'\033[0;31m'
+NC=$'\033[0m' # No Color
 
 print_banner() {
-    printf "${CYAN}${BOLD}"
+    printf "%b" "${CYAN}${BOLD}"
     cat << 'EOF'
   __  __
   \ \/ /   _   _
@@ -30,23 +45,23 @@ print_banner() {
    /  \   | |_| |   Fast, Safe, GC-Free Systems Language
   /_/\_\   \__,_|   Development Environment Installer
 EOF
-    printf "${NC}\n"
+    printf "%b\n" "${NC}"
 }
 
 log_info() {
-    printf "${BLUE}[INFO]${NC} %s\n" "$1"
+    printf "${BLUE}[INFO]${NC} %b\n" "$1"
 }
 
 log_ok() {
-    printf "${GREEN}[OK]${NC} %s\n" "$1"
+    printf "${GREEN}[OK]${NC} %b\n" "$1"
 }
 
 log_warn() {
-    printf "${YELLOW}[WARN]${NC} %s\n" "$1"
+    printf "${YELLOW}[WARN]${NC} %b\n" "$1"
 }
 
 log_err() {
-    printf "${RED}[ERROR]${NC} %s\n" "$1" >&2
+    printf "${RED}[ERROR]${NC} %b\n" "$1" >&2
 }
 
 # Detect operating system and architecture
@@ -139,16 +154,21 @@ fi
 log_info "Detected host platform: ${BOLD}${PLATFORM}${NC}"
 log_info "Target install directory: ${BOLD}${INSTALL_DIR}${NC}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+fi
 SOURCE_DIR=""
 
-# Check if we are running from inside an unpacked distribution bundle
-if [[ -d "$SCRIPT_DIR/bin" && -d "$SCRIPT_DIR/src" ]]; then
-    SOURCE_DIR="$SCRIPT_DIR"
-    log_info "Found local offline distribution files in: $SOURCE_DIR"
-elif [[ -d "$SCRIPT_DIR/../bin" && -d "$SCRIPT_DIR/../src" ]]; then
-    SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-    log_info "Found repository root distribution files in: $SOURCE_DIR"
+# Check if we are running from inside an unpacked distribution bundle (only when invoked from a script file)
+if [[ -n "$SCRIPT_DIR" ]]; then
+    if [[ -d "$SCRIPT_DIR/bin" && -d "$SCRIPT_DIR/src" ]]; then
+        SOURCE_DIR="$SCRIPT_DIR"
+        log_info "Found local offline distribution files in: $SOURCE_DIR"
+    elif [[ -d "$SCRIPT_DIR/../bin" && -d "$SCRIPT_DIR/../src" ]]; then
+        SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+        log_info "Found repository root distribution files in: $SOURCE_DIR"
+    fi
 fi
 
 # If no local files found, download release archive
@@ -312,8 +332,6 @@ elif [[ -d "$EXAMPLES_SOURCE" ]]; then
     cp -Rf "$EXAMPLES_SOURCE/." "$INSTALL_DIR/examples/"
 fi
 if [[ -d "$INSTALL_DIR/examples" ]]; then
-    # Source checkouts and SDKs have different layouts. Each copied example
-    # must resolve the official module from the installed packages directory.
     while IFS= read -r -d '' manifest; do
         nested="${manifest#"$INSTALL_DIR/examples/"}"
         package_path="../packages"
@@ -332,10 +350,75 @@ fi
 for meta in README.md LICENSE VERSION TARGET bundle.json env.sh uninstall.sh; do
     if [[ -f "$SOURCE_DIR/$meta" ]]; then
         cp -f "$SOURCE_DIR/$meta" "$INSTALL_DIR/"
-    elif [[ -f "$SCRIPT_DIR/$meta" ]]; then
+    elif [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$meta" ]]; then
         cp -f "$SCRIPT_DIR/$meta" "$INSTALL_DIR/"
+    elif [[ -f "$SOURCE_DIR/scripts/$meta" ]]; then
+        cp -f "$SOURCE_DIR/scripts/$meta" "$INSTALL_DIR/"
+    elif [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/scripts/$meta" ]]; then
+        cp -f "$SCRIPT_DIR/scripts/$meta" "$INSTALL_DIR/"
     fi
 done
+
+# Safety fallback: ensure env.sh ALWAYS exists in $INSTALL_DIR
+if [[ ! -f "$INSTALL_DIR/env.sh" ]]; then
+    cat << 'EOF' > "$INSTALL_DIR/env.sh"
+if [ -n "${ZSH_VERSION:-}" ]; then
+    XU_ENV_SRC="${(%):-%x}"
+elif [ -n "${BASH_SOURCE[0]:-}" ]; then
+    XU_ENV_SRC="${BASH_SOURCE[0]}"
+else
+    XU_ENV_SRC="$0"
+fi
+XU_ENV_DIR="$(cd "$(dirname "$XU_ENV_SRC")" && pwd)"
+if [[ ! -d "$XU_ENV_DIR/src" && -d "$XU_ENV_DIR/../src" ]]; then XU_ENV_DIR="$(cd "$XU_ENV_DIR/.." && pwd)"; fi
+export XU_ROOT="$XU_ENV_DIR"
+export XU_STDLIB_ROOT="$XU_ROOT/src"
+XU_ENV_BIN="$XU_ROOT/bin"
+XU_ENV_OS="$(uname -s)"
+XU_ENV_ARCH="$(uname -m)"
+case "$XU_ENV_OS" in Darwin) XU_ENV_OS=macos ;; Linux) XU_ENV_OS=linux ;; esac
+case "$XU_ENV_ARCH" in arm64|aarch64) XU_ENV_ARCH=arm64 ;; x86_64|amd64) XU_ENV_ARCH=x64 ;; esac
+if [[ -d "$XU_ENV_BIN/platform/$XU_ENV_OS-$XU_ENV_ARCH" ]]; then
+    XU_ENV_BIN="$XU_ENV_BIN/platform/$XU_ENV_OS-$XU_ENV_ARCH"
+fi
+for XU_ENV_PATH in "$XU_ROOT/packages" "$XU_ROOT/src"; do
+    [[ -d "$XU_ENV_PATH" ]] || continue
+    case ":${XUPATH:-}:" in
+        *":$XU_ENV_PATH:"*) ;;
+        *) export XUPATH="$XU_ENV_PATH${XUPATH:+:$XUPATH}" ;;
+    esac
+done
+case ":$PATH:" in
+    *":$XU_ENV_BIN:"*) ;;
+    *) export PATH="$XU_ENV_BIN:$PATH" ;;
+esac
+unset XU_ENV_PATH XU_ENV_DIR XU_ENV_BIN XU_ENV_OS XU_ENV_ARCH XU_ENV_SRC
+echo "Xu environment activated: $XU_ROOT"
+EOF
+    chmod +x "$INSTALL_DIR/env.sh"
+fi
+
+if [[ ! -f "$INSTALL_DIR/uninstall.sh" ]]; then
+    cat << 'EOF' > "$INSTALL_DIR/uninstall.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+PREFIX="${1:-$HOME/.xu}"
+echo "Removing Xu development environment from: $PREFIX"
+if [[ -d "$PREFIX" ]]; then
+    rm -rf "$PREFIX"
+    echo "[OK] Removed $PREFIX"
+fi
+for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    if [[ -f "$rc" ]] && grep -q "# >>> xu development environment >>>" "$rc"; then
+        sed -i.bak '/# >>> xu development environment >>>/,/# <<< xu development environment <<</d' "$rc" 2>/dev/null || true
+        rm -f "${rc}.bak"
+        echo "[OK] Cleaned $rc"
+    fi
+done
+echo "Xu has been uninstalled successfully."
+EOF
+    chmod +x "$INSTALL_DIR/uninstall.sh"
+fi
 
 log_ok "Core development files installed to: $INSTALL_DIR"
 
@@ -402,7 +485,14 @@ EOF
         else
             cat << EOF >> "$rc"
 $ENV_SNIPPET_START
-source $(printf '%q' "$INSTALL_DIR/env.sh")
+if [ -f $(printf '%q' "$INSTALL_DIR/env.sh") ]; then
+    source $(printf '%q' "$INSTALL_DIR/env.sh")
+else
+    export XU_ROOT=$(printf '%q' "$INSTALL_DIR")
+    export XU_STDLIB_ROOT=$(printf '%q' "$INSTALL_DIR/src")
+    export XUPATH=$(printf '%q' "$INSTALL_DIR/src:$INSTALL_DIR/packages")\${XUPATH:+:\$XUPATH}
+    export PATH=$(printf '%q' "$INSTALL_DIR/bin"):\$PATH
+fi
 $ENV_SNIPPET_END
 EOF
         fi

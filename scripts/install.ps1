@@ -240,6 +240,10 @@ foreach ($meta in $MetaFiles) {
         Copy-Item -Path "$SourceDir\$meta" -Destination "$Prefix\$meta" -Force
     } elseif (Test-Path "$ScriptDir\$meta") {
         Copy-Item -Path "$ScriptDir\$meta" -Destination "$Prefix\$meta" -Force
+    } elseif (Test-Path "$SourceDir\scripts\$meta") {
+        Copy-Item -Path "$SourceDir\scripts\$meta" -Destination "$Prefix\$meta" -Force
+    } elseif (Test-Path "$ScriptDir\scripts\$meta") {
+        Copy-Item -Path "$ScriptDir\scripts\$meta" -Destination "$Prefix\$meta" -Force
     }
 }
 

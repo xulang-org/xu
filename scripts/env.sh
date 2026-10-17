@@ -1,6 +1,11 @@
-#!/usr/bin/env bash
-# Source from a compiler checkout or unpacked toolchain bundle.
-XU_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${ZSH_VERSION:-}" ]; then
+    XU_ENV_SRC="${(%):-%x}"
+elif [ -n "${BASH_SOURCE[0]:-}" ]; then
+    XU_ENV_SRC="${BASH_SOURCE[0]}"
+else
+    XU_ENV_SRC="$0"
+fi
+XU_ENV_DIR="$(cd "$(dirname "$XU_ENV_SRC")" && pwd)"
 if [[ ! -d "$XU_ENV_DIR/src" && -d "$XU_ENV_DIR/../src" ]]; then XU_ENV_DIR="$(cd "$XU_ENV_DIR/.." && pwd)"; fi
 export XU_ROOT="$XU_ENV_DIR"
 export XU_STDLIB_ROOT="$XU_ROOT/src"
@@ -23,5 +28,5 @@ case ":$PATH:" in
     *":$XU_ENV_BIN:"*) ;;
     *) export PATH="$XU_ENV_BIN:$PATH" ;;
 esac
-unset XU_ENV_PATH XU_ENV_DIR XU_ENV_BIN XU_ENV_OS XU_ENV_ARCH
+unset XU_ENV_PATH XU_ENV_DIR XU_ENV_BIN XU_ENV_OS XU_ENV_ARCH XU_ENV_SRC
 echo "Xu environment activated: $XU_ROOT"
