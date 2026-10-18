@@ -27,8 +27,6 @@ import sys
 import tempfile
 import zipfile
 
-from companion_repos import project_root
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXAMPLES_ROOT = pathlib.Path(os.environ.get("XU_EXAMPLES_ROOT", ROOT.parent / "xu-examples")).expanduser().resolve()
 OUT_DIR = ROOT / "dist" / "windows-x64-ui"
@@ -225,7 +223,6 @@ def resolve_product_xu(requested: pathlib.Path | None) -> pathlib.Path:
         raw = pathlib.Path(env_value).expanduser() if env_value else None
 
     env = os.environ.copy()
-    env["XU_ALLOW_ORACLE_SEED"] = "0"
     if raw is not None:
         if not raw.is_absolute():
             raw = pathlib.Path.cwd() / raw
@@ -258,11 +255,7 @@ def resolve_product_xu(requested: pathlib.Path | None) -> pathlib.Path:
     is_win = os.name == "nt" or sys.platform == "win32"
     if not compiler.is_file() or (not is_win and not os.access(compiler, os.X_OK)):
         raise SystemExit(f"pack_windows: resolved compiler is not executable: {compiler}")
-    try:
-        compiler.relative_to(project_root("bootstrap", core_root=ROOT))
-    except ValueError:
-        return compiler
-    raise SystemExit("pack_windows: bootstrap primer is outside the product packaging lane")
+    return compiler
 
 
 def run_product_compiler(xu: pathlib.Path, args: list[str]) -> None:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Desktop toolchain doctor — implementation detail for product `xu doctor`.
 
-User entry is self-hosted xu. Rust bootstrap only compiles Xu.
+User entry is the self-hosted Xu product.
 """
 from __future__ import annotations
 
@@ -12,21 +12,8 @@ import shutil
 import subprocess
 import sys
 
-from companion_repos import project_root
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HOST_SEED_RESOLVER = ROOT / "scripts" / "xu_host_seed.sh"
-# The doctor has an explicit oracle mode, but that mode is still evidence
-# about Gen0 only.  Restrict it to the canonical debug/release primer outputs
-# rather than accepting an arbitrary executable supplied via XU_COMPILER.
-FROZEN_PRIMER_PATHS = frozenset(
-    {
-        (project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu.exe").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu.exe").absolute(),
-    }
-)
 
 HOSTED = {
     "macos-arm64",
@@ -120,79 +107,10 @@ def _configured_compiler() -> str:
     return ""
 
 
-def _under_bootstrap(path: pathlib.Path) -> bool:
-    try:
-        path.relative_to(project_root("bootstrap", core_root=ROOT))
-    except ValueError:
-        return False
-    return True
-
-
-def _lexical_path(path: pathlib.Path) -> pathlib.Path:
-    """Make an absolute path without following symlink components."""
-
-    candidate = pathlib.Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = pathlib.Path.cwd() / candidate
-    return candidate.absolute()
-
-
-def _has_symlink_component(path: pathlib.Path) -> bool:
-    candidate = _lexical_path(path)
-    owner = project_root("bootstrap", core_root=ROOT)
-    if not candidate.is_relative_to(owner):
-        owner = ROOT
-    try:
-        relative = candidate.relative_to(owner)
-    except ValueError:
-        return False
-    if owner.is_symlink():
-        return True
-    current = owner
-    for part in relative.parts:
-        current /= part
-        try:
-            if current.is_symlink():
-                return True
-        except OSError:
-            return True
-    return False
-
-
-def _is_frozen_primer(path: pathlib.Path) -> bool:
-    """Return whether *path* is a declared, reproducible Gen0 artifact.
-
-    The lexical path must be an exact allowlist entry and contain no symlink
-    components.  Resolving first would let an external executable masquerade
-    as the frozen primer (or let a symlink alias redefine its provenance).
-    """
-
-    lexical = _lexical_path(path)
-    if (
-        lexical not in FROZEN_PRIMER_PATHS
-        or _has_symlink_component(lexical)
-        or not lexical.is_file()
-        or not os.access(lexical, os.X_OK)
-    ):
-        return False
-    try:
-        return lexical.resolve() == lexical
-    except (OSError, RuntimeError):
-        return False
-
-
 def _resolve_xu_seed(lane: str) -> str | None:
-    """Resolve the compiler for an explicitly named product/oracle lane.
-
-    Product is intentionally the default and delegates to the canonical
-    hosted-seed resolver.  Oracle keeps the old diagnostic convenience of
-    using ``bootstrap/target/{release,debug}/xu[.exe]`` when (and only when) the
-    caller explicitly passes ``--oracle``/``--lane oracle``.  This function
-    never invokes cargo or silently falls through from product to primer.
-    """
-
-    if lane not in {"product", "oracle"}:
-        raise ValueError(f"unknown compiler lane: {lane}")
+    """Resolve the hosted product compiler through the shared policy."""
+    if lane != "product":
+        raise ValueError(f"unsupported compiler lane: {lane}")
     if not HOST_SEED_RESOLVER.is_file():
         return None
     resolver_cmd = [str(HOST_SEED_RESOLVER)]
@@ -205,18 +123,7 @@ def _resolve_xu_seed(lane: str) -> str | None:
         resolver_cmd = [bash, str(HOST_SEED_RESOLVER)]
 
     env = os.environ.copy()
-    env["XU_ALLOW_ORACLE_SEED"] = "1" if lane == "oracle" else "0"
     candidate = _configured_compiler()
-    if lane == "oracle" and not candidate:
-        for fallback in (
-            project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu",
-            project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu.exe",
-            project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu",
-            project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu.exe",
-        ):
-            if fallback.is_file() and os.access(fallback, os.X_OK):
-                candidate = str(fallback)
-                break
 
     # Preserve the caller's lexical path for the boundary check.  Resolving
     # it before classification would turn a bootstrap symlink to an external
@@ -253,20 +160,6 @@ def _resolve_xu_seed(lane: str) -> str | None:
     except (OSError, RuntimeError):
         return None
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        return None
-    if lane == "product" and (
-        (candidate_path is not None and _under_bootstrap(candidate_path))
-        or _under_bootstrap(resolved)
-    ):
-        # Defensive duplicate of the resolver contract.  It keeps this
-        # Python diagnostic safe if the shell resolver is replaced or wrapped.
-        return None
-    if lane == "oracle" and (
-        candidate_path is None or not _is_frozen_primer(candidate_path)
-    ):
-        # Keep oracle reports tied to the frozen Gen0 artifact.  In
-        # particular, an arbitrary XU_COMPILER must not be relabelled as a
-        # primer merely because the caller selected --oracle.
         return None
     return str(resolved)
 
@@ -387,15 +280,7 @@ def run_doctor(target: str, need_webview: bool, lane: str = "product") -> bool:
     if xu_bin:
         checks.append(("ok", "xu binary (--emit-obj)", xu_bin))
     else:
-        if lane == "oracle":
-            missing_detail = (
-                "build bootstrap xu or set XU_COMPILER; oracle lane is explicit only"
-            )
-        else:
-            missing_detail = (
-                "need hosted bin/xu or developer/bin snapshot; "
-                "set XU_COMPILER/XU_SEED (bootstrap is not a product fallback)"
-            )
+        missing_detail = "need hosted bin/xu or developer/bin snapshot; set XU_COMPILER/XU_SEED"
         checks.append(
             (
                 "missing",
@@ -449,20 +334,9 @@ def main() -> None:
         action="store_true",
         help="also require WebView deps (Linux webkitgtk)",
     )
-    lane_group = ap.add_mutually_exclusive_group()
-    lane_group.add_argument(
-        "--lane",
-        choices=("product", "oracle"),
-        default="product",
-        help="compiler lane (default: product; oracle is diagnostic-only)",
-    )
-    lane_group.add_argument(
-        "--oracle",
-        action="store_true",
-        help="explicitly use the frozen bootstrap compiler for diagnostics",
-    )
+    ap.add_argument("--lane", choices=("product",), default="product")
     args = ap.parse_args()
-    lane = "oracle" if args.oracle else args.lane
+    lane = args.lane
     target = args.target or default_target()
     if target not in HOSTED and not target.startswith(("macos-", "linux-", "windows-")):
         print(f"xu doctor: unknown or freestanding target {target}", file=sys.stderr)

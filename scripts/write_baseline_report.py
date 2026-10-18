@@ -65,7 +65,7 @@ def main() -> int:
     gates["boundary"] = {
         "rc": rc,
         "ok": rc == 0,
-        "summary": last_line(out, "bootstrap/Xu boundary"),
+        "summary": last_line(out, "Xu product contract"),
         "seed_files": next(
             (ln.split(":", 1)[1].strip() for ln in out.splitlines() if "Gen1 seed files" in ln),
             "",

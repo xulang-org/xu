@@ -42,35 +42,11 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 
-from companion_repos import project_root
-
 ROOT = Path(__file__).resolve().parents[1]
 
-# This harness can exercise either side of the compiler seam, but it is not a
-# fixed-point proof on its own.  Keep the mixed nature explicit in reports and
-# in the boundary manifest; callers select the actual compiler lane with
-# ``--lane``.
-LANE = "dual"
+LANE = "product"
 HOST_SEED_RESOLVER = ROOT / "scripts" / "xu_host_seed.sh"
 PRODUCT_COMPILER_RUNNER = ROOT / "scripts" / "run_product_compiler.sh"
-_BOOT_CANDIDATES = (
-    project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu",
-    project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu.exe",
-    project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu",
-    project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu.exe",
-)
-BOOT_XU = next((candidate for candidate in _BOOT_CANDIDATES if candidate.is_file()), _BOOT_CANDIDATES[0])
-# Oracle runs must be tied to a declared Gen0 artifact.  Keep this list
-# explicit so an arbitrary executable passed with ``--lane oracle`` cannot
-# silently become the frozen reference implementation.
-FROZEN_PRIMER_PATHS = frozenset(
-    {
-        (project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu.exe").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu.exe").absolute(),
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -315,75 +291,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _lexical_path(path: Path) -> Path:
-    """Return an absolute path without following symlinks."""
-
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
-    return candidate.absolute()
-
-
-def _has_symlink_component(path: Path) -> bool:
-    candidate = _lexical_path(path)
-    owner = project_root("bootstrap", core_root=ROOT)
-    if not candidate.is_relative_to(owner):
-        owner = ROOT
-    try:
-        relative = candidate.relative_to(owner)
-    except ValueError:
-        return False
-    if owner.is_symlink():
-        return True
-    current = owner
-    for part in relative.parts:
-        current /= part
-        try:
-            if current.is_symlink():
-                return True
-        except OSError:
-            return True
-    return False
-
-
-def _is_primer(path: Path, resolved: Path | None = None) -> bool:
-    """Classify both lexical and resolved bootstrap provenance."""
-
-    lexical = _lexical_path(path)
-    if resolved is None:
-        try:
-            target = lexical.resolve()
-        except (OSError, RuntimeError):
-            target = lexical
-    else:
-        target = _lexical_path(resolved)
-    bootstrap = project_root("bootstrap", core_root=ROOT)
-    for candidate in (lexical, target):
-        try:
-            candidate.relative_to(bootstrap)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        return True
-    return False
-
-
-def _is_frozen_primer(path: Path) -> bool:
-    """Return whether *path* is an allowed, canonical Gen0 artifact."""
-
-    lexical = _lexical_path(path)
-    if (
-        lexical not in FROZEN_PRIMER_PATHS
-        or _has_symlink_component(lexical)
-        or not lexical.is_file()
-        or not os.access(lexical, os.X_OK)
-    ):
-        return False
-    try:
-        return lexical.resolve() == lexical
-    except (OSError, RuntimeError):
-        return False
-
-
 def _resolve_product_compiler(explicit: str | None) -> Path:
     """Resolve a hosted product seed and reject primer fallback."""
 
@@ -398,7 +305,6 @@ def _resolve_product_compiler(explicit: str | None) -> Path:
         if not HOST_SEED_RESOLVER.is_file():
             raise ValueError(f"missing hosted seed resolver: {HOST_SEED_RESOLVER}")
         env = os.environ.copy()
-        env["XU_ALLOW_ORACLE_SEED"] = "0"
         env.pop("XU_SEED", None)
         probe = subprocess.run(
             [str(HOST_SEED_RESOLVER)],
@@ -418,30 +324,8 @@ def _resolve_product_compiler(explicit: str | None) -> Path:
         if len(lines) != 1:
             raise ValueError("hosted seed resolver returned invalid output")
         compiler = Path(lines[0]).expanduser().resolve()
-    if _is_primer(raw if explicit else compiler, compiler):
-        raise ValueError(
-            "bootstrap primer is oracle-only; pass --lane oracle for primer diagnostics"
-        )
     if not compiler.is_file() or not os.access(compiler, os.X_OK):
         raise ValueError(f"compiler is not an executable file: {compiler}")
-    return compiler
-
-
-def _resolve_oracle_compiler(explicit: str | None) -> Path:
-    """Resolve an explicitly requested oracle compiler without product fallback."""
-
-    raw = Path(explicit).expanduser() if explicit else BOOT_XU
-    compiler = raw.resolve()
-    if not compiler.is_file() or not os.access(compiler, os.X_OK):
-        raise ValueError(
-            f"oracle compiler is not executable: {compiler}; build bootstrap explicitly"
-        )
-    if not _is_frozen_primer(raw):
-        raise ValueError(
-            "oracle lane requires the frozen bootstrap primer "
-            "(bootstrap/target/{debug,release}/xu[.exe]); use --lane product for "
-            "a hosted compiler"
-        )
     return compiler
 
 
@@ -568,70 +452,12 @@ def _resolve_profiles(value: str) -> list[str]:
     return selected
 
 
-def _detect_compile_mode(compiler: Path, requested: str) -> str:
-    """Resolve the product and bootstrap Xu command-line dialects.
-
-    The hosted product exposes ``xu build ...`` while the Rust bootstrap
-    accepts source files directly (``xu file.xu -o out``).  Keeping the
-    distinction in the harness prevents a clean checkout from being reported
-    as a scheduler runtime failure merely because the wrong CLI form was
-    sent.  Explicit modes remain available for CI and post-mortem runs.
-    """
-
-    if requested in {"product", "direct"}:
-        return requested
-    try:
-        probe = subprocess.run(
-            [str(compiler), "--help"],
-            cwd=str(ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=5.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        # Let the actual build produce the useful diagnostic if a wrapper does
-        # not implement --help (for example a cross-target launcher).
-        return "product"
-    help_text = probe.stdout.decode("utf-8", errors="replace")
-    # Product help has a dedicated `build input.xu...` section.  Bootstrap
-    # mentions compiling Xu but does not implement this subcommand.
-    if "build input.xu" in help_text or "build input" in help_text:
-        return "product"
-    return "direct"
-
-
-def _build_command(
-    compiler: Path,
-    mode: str,
-    profile: str,
-    source: Path,
-    binary: Path,
-    *,
-    lane: str = "oracle",
-) -> list[str]:
-    if mode == "product":
-        command = [
-            str(compiler),
-            "build",
-            *PROFILE_FLAGS[profile],
-            str(source),
-            "-o",
-            str(binary),
-        ]
-        if lane == "product":
-            return [
-                str(PRODUCT_COMPILER_RUNNER),
-                *command,
-            ]
-        return command
-    return [
-        str(compiler),
-        *PROFILE_FLAGS[profile],
-        str(source),
-        "-o",
-        str(binary),
-    ]
+def _build_command(compiler: Path, mode: str, profile: str, source: Path,
+                   binary: Path, *, lane: str = "product") -> list[str]:
+    if mode != "product" or lane != "product":
+        raise ValueError("scheduler stress requires the hosted product compiler")
+    return [str(PRODUCT_COMPILER_RUNNER), str(compiler), "build",
+            *PROFILE_FLAGS[profile], str(source), "-o", str(binary)]
 
 
 def _known_build_skip(
@@ -856,27 +682,22 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("XU_COMPILER"),
         help=(
             "compiler executable; product lane resolves hosted bin/xu when omitted, "
-            "oracle lane resolves bootstrap debug xu"
+            "the product compiler runs through the isolated wrapper"
         ),
     )
     parser.add_argument(
         "--lane",
-        choices=("product", "oracle"),
+        choices=("product",),
         default=os.environ.get("XU_SCHED_LANE", "product"),
-        help="compiler lane (default: product; oracle explicitly permits bootstrap)",
-    )
-    parser.add_argument(
-        "--oracle",
-        action="store_true",
-        help="alias for --lane oracle",
+        help="compiler lane (default: product; only product is supported)",
     )
     parser.add_argument(
         "--compile-mode",
-        choices=("auto", "product", "direct"),
+        choices=("auto", "product"),
         default=os.environ.get("XU_SCHED_COMPILE_MODE", "auto"),
         help=(
             "compiler CLI dialect: product uses `xu build`, direct uses "
-            "bootstrap's file-first form (default: auto)"
+            "the hosted build command (default: auto)"
         ),
     )
     parser.add_argument(
@@ -943,9 +764,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    lane = "oracle" if args.oracle else args.lane
-    if args.oracle and args.lane != "product":
-        parser.error("use either --oracle or --lane oracle, not both")
+    lane = args.lane
     try:
         cases = _resolve_cases(args)
         profiles = _resolve_profiles(args.profiles)
@@ -962,11 +781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--kill-grace must be between 0 and 60 seconds")
 
     try:
-        compiler = (
-            _resolve_product_compiler(args.xu)
-            if lane == "product"
-            else _resolve_oracle_compiler(args.xu)
-        )
+        compiler = _resolve_product_compiler(args.xu)
     except ValueError as exc:
         parser.error(str(exc))
     for case in cases:
@@ -975,12 +790,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not case.expected.is_file():
             parser.error(f"case expectation does not exist: {case.expected}")
 
-    if lane == "product":
-        if args.compile_mode == "direct":
-            parser.error("product lane requires --compile-mode product or auto")
-        compile_mode = "product"
-    else:
-        compile_mode = _detect_compile_mode(compiler, args.compile_mode)
+    compile_mode = "product"
 
     # Keep the child environment stable and prevent an inherited package cache
     # or scheduler-specific debug setting from changing the stress signal.

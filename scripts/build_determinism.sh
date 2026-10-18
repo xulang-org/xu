@@ -15,28 +15,26 @@
 #   scripts/build_determinism.sh --xu=bin/xu --unit=tests/fixtures/matmul_tiny/main.xu
 #   scripts/build_determinism.sh --xu=bin/xu --pads=0,1500,3000 # more environment sizes
 #
-# Lane: dual (hosted compiler; primer only with --allow-oracle-seed).  Not a
+# Lane: hosted product compiler. This probe is not a
 # fixed-point proof; a PASS says the build did not depend on environment size
 # for the tried sizes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
 cd "$ROOT"
-LANE=dual
+LANE=product
 source scripts/test_lib.sh
 . ./scripts/gen1_sources.sh
 
 XU_INPUT=""
 UNIT="compiler"
 PADS="0,2000"
-ALLOW_ORACLE=0
 HOP_TIMEOUT=${XU_DETERMINISM_HOP_TIMEOUT:-1800}
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --xu=*) XU_INPUT="${1#*=}" ;;
         --unit=*) UNIT="${1#*=}" ;;
         --pads=*) PADS="${1#*=}" ;;
-        --allow-oracle-seed) ALLOW_ORACLE=1 ;;
         -h|--help)
             sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -49,8 +47,8 @@ if [ -z "$XU_INPUT" ]; then
     echo "build_determinism: --xu=<hosted compiler> is required" >&2
     exit 1
 fi
-if ! XU=$(XU_ALLOW_ORACLE_SEED="$ALLOW_ORACLE" XU_SEED="$XU_INPUT" ./scripts/xu_host_seed.sh); then
-    echo "build_determinism: compiler rejected by hosted/oracle boundary: $XU_INPUT" >&2
+if ! XU=$(XU_SEED="$XU_INPUT" ./scripts/xu_host_seed.sh); then
+    echo "build_determinism: compiler rejected by hosted product policy: $XU_INPUT" >&2
     exit 1
 fi
 
@@ -80,7 +78,7 @@ export XU_CACHE="$WORK/cache"
 export HOME="$WORK/home"
 export USERPROFILE="$HOME"
 mkdir -p "$XU_CACHE" "$HOME"
-unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED XU_ALLOW_ORACLE_SEED
+unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED
 
 sha256_file() {
     if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'; else sha256sum "$1" | awk '{print $1}'; fi

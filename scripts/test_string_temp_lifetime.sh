@@ -7,16 +7,15 @@
 # covers the optimizer's StoreLocal/Drop rewrites as well as the raw lowering.
 set -euo pipefail
 
-# Machine-readable boundary role: temporary-string oracle evidence.
-BOUNDARY_LANE=oracle
+# Machine-readable boundary role: temporary-string product evidence.
+BOUNDARY_LANE=product
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
 source "$ROOT/scripts/test_lib.sh"
 
-XU=${XU:-"$BOOTSTRAP_ROOT/target/debug/xu"}
+XU=${XU:-}
 GEN1=${XU_GEN1:-}
 BUILD_TIMEOUT=${XU_STRING_TEMP_BUILD_TIMEOUT:-60}
 RUN_TIMEOUT=${XU_STRING_TEMP_RUN_TIMEOUT:-15}
@@ -36,8 +35,8 @@ while [ "$#" -gt 0 ]; do
             ;;
         -h|--help)
             echo "usage: test_string_temp_lifetime.sh [--gen1=PATH|--gen1 PATH]"
-            echo "  XU (or bootstrap xu) runs strict heap-ledger checks."
-            echo "  --gen1 or XU_GEN1 optionally runs Gen1 O0/O1 parity (ledger stays off)."
+            echo "  XU runs strict heap-ledger checks."
+            echo "  --gen1 or XU_GEN1 optionally runs Gen1 O0/O1 parity."
             exit 0
             ;;
         *)
@@ -48,33 +47,15 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-if [ ! -x "$XU" ]; then
-    cargo build --quiet --manifest-path "$BOOTSTRAP_ROOT/Cargo.toml" -p xu --bin xu
+if [ -n "$XU" ]; then
+    XU=$(XU_SEED="$XU" "$ROOT/scripts/xu_host_seed.sh")
+else
+    XU=$("$ROOT/scripts/xu_host_seed.sh")
 fi
-if [ ! -x "$XU" ]; then
+[ -x "$XU" ] || {
     echo "string temporary lifetime: compiler is not executable: $XU" >&2
     exit 1
-fi
-if ! XU=$(XU_ALLOW_ORACLE_SEED=1 XU_REQUIRE_FROZEN_PRIMER=1 XU_SEED="$XU" \
-    "$ROOT/scripts/xu_host_seed.sh"); then
-    echo "string temporary lifetime: compiler is not the canonical frozen primer" >&2
-    exit 1
-fi
-if [ -n "$GEN1" ]; then
-    echo "string temporary lifetime: lane=oracle; gen1_lane=parity (explicit --gen1/XU_GEN1; not product evidence)" >&2
-else
-    echo "string temporary lifetime: lane=oracle (frozen bootstrap); generated Gen1 parity is not product evidence" >&2
-fi
-
-HELP_TEXT=""
-HELP_RC=0
-HELP_TEXT=$(run_with_timeout 5 "$XU" --help 2>&1) || HELP_RC=$?
-CLI_MODE=direct
-if [[ "$HELP_TEXT" == *"build input.xu"* || "$HELP_TEXT" == *"build input"* ]]; then
-    CLI_MODE=product
-elif [ "$HELP_RC" -ne 0 ] && [[ "$HELP_TEXT" == *"Usage:"* ]]; then
-    CLI_MODE=direct
-fi
+}
 
 resolve_binary() {
     local base="$1"
@@ -95,13 +76,9 @@ compile_fixture() {
     local base="$TMP/${name}_${opt}"
     local stderr_file="$TMP/${name}_${opt}.compile.stderr"
     local stdout_file="$TMP/${name}_${opt}.compile.stdout"
-    if [ "$CLI_MODE" = product ]; then
-        run_with_timeout "$BUILD_TIMEOUT" "$XU" build "$source" "-$opt" -o "$base" \
-            >"$stdout_file" 2>"$stderr_file"
-    else
-        run_with_timeout "$BUILD_TIMEOUT" "$XU" "-$opt" "$source" -o "$base" \
-            >"$stdout_file" 2>"$stderr_file"
-    fi
+    XU_GEN1_HEAP_LEDGER=1 run_with_timeout "$BUILD_TIMEOUT" "$ROOT/scripts/run_product_compiler.sh" "$XU" build "$source" "-$opt" -o "$base" \
+        >"$stdout_file" 2>"$stderr_file"
+
     local binary
     if ! binary=$(resolve_binary "$base"); then
         echo "string temporary lifetime: $name/$opt produced no executable" >&2
@@ -197,11 +174,11 @@ for opt in O0 O1; do
     done
 done
 
-echo "string temporary lifetime: PASS (bootstrap O0/O1 strict ledger)"
+echo "string temporary lifetime: PASS (product O0/O1 strict ledger)"
 
 # Gen1 keeps the heap-ledger capability disabled by default.  When a caller
 # supplies a product/Gen1 compiler, still exercise both optimization levels
-# and compare observable output; strict accounting remains the bootstrap-only
+# and compare observable output; strict accounting remains the product
 # contract above and is never enabled by mutating the shared source tree.
 if [ -n "$GEN1" ]; then
     if [ ! -x "$GEN1" ]; then
@@ -213,7 +190,7 @@ if [ -n "$GEN1" ]; then
             source="$ROOT/tests/fixtures/$name/main.xu"
             base="$TMP/gen1_${name}_${opt}"
             compile_err="$TMP/gen1_${name}_${opt}.compile.stderr"
-            if ! run_with_timeout "$BUILD_TIMEOUT" "$GEN1" build "-$opt" "$source" -o "$base" \
+            if ! run_with_timeout "$BUILD_TIMEOUT" "$ROOT/scripts/run_product_compiler.sh" "$GEN1" build "-$opt" "$source" -o "$base" \
                 >"$TMP/gen1_${name}_${opt}.compile.stdout" 2>"$compile_err"; then
                 echo "string temporary lifetime: Gen1 $name/$opt compile failed" >&2
                 sed -n '1,120p' "$compile_err" >&2 || true

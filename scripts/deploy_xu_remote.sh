@@ -62,9 +62,7 @@ Options:
 
 Remote commands are never selected implicitly by the local deployment script.
 The local artifact build is always the hosted product lane; `--compiler` is
-resolved by `deploy_xu_server.sh` and a bootstrap primer is rejected. Use the
-local adapter's explicit `--oracle` mode for recovery smoke only; this remote
-adapter never turns that lane on implicitly.
+resolved by `deploy_xu_server.sh` through the hosted seed policy.
 EOF
 }
 

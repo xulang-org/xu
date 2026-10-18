@@ -21,16 +21,15 @@
 #   scripts/product_gate.sh --quick             # skip perturb + determinism
 #   scripts/product_gate.sh --skip-build        # reuse existing bin/xu
 #   scripts/product_gate.sh --out=DIR           # report directory override
-#   scripts/product_gate.sh --allow-oracle-seed # recovery only; report is
-#                                               # labelled non-product
 #
 # Lane: product.  The seed is resolved by xu_host_seed.sh (bin/xu or
-# developer/bin snapshot).  Oracle primer requires --allow-oracle-seed and is
-# recorded as lane=oracle, never as product evidence.
+# developer/bin snapshot).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
+export XU_ROOT="$ROOT"
 cd "$ROOT"
+export XU_STDLIB_ROOT="$("${PYTHON:-python3}" -c 'from pathlib import Path; print(Path("src").resolve().as_posix())')"
 source scripts/test_lib.sh
 
 sha256_file() {
@@ -50,7 +49,6 @@ PYTHON="${PYTHON:-python3}"
 QUICK=0
 SKIP_BUILD=0
 SKIP_FIXTURE_MATRIX=0
-ALLOW_ORACLE=0
 OUT=""
 LABEL="product-gate"
 
@@ -63,7 +61,6 @@ while [ "$#" -gt 0 ]; do
         --quick) QUICK=1 ;;
         --skip-build) SKIP_BUILD=1 ;;
         --skip-fixture-matrix) SKIP_FIXTURE_MATRIX=1 ;;
-        --allow-oracle-seed) ALLOW_ORACLE=1 ;;
         --out=*) OUT="${1#*=}" ;;
         --label=*) LABEL="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
@@ -73,9 +70,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 LANE=product
-if [ "$ALLOW_ORACLE" = 1 ]; then
-    LANE=oracle
-fi
 
 if [ -z "$OUT" ]; then
     OUT="docs/audit"
@@ -282,7 +276,7 @@ if [ "$SKIP_BUILD" = 1 ]; then
     fi
 else
     set +e
-    XU_SKIP_CROSS=1 XU_ALLOW_ORACLE_SEED="$ALLOW_ORACLE" make xu \
+    XU_SKIP_CROSS=1 make xu \
         >"$LOG_DIR/make-xu.log" 2>&1
     m_rc=$?
     set -e

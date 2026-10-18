@@ -66,6 +66,9 @@ def restore(target: str, archives: Path, destination: Path, *, replace_existing:
             shutil.copy2(compiler, staged)
             staged.chmod(0o755)
             os.replace(staged, destination)
+            # The replaced binary's fixed-point identity cannot describe the
+            # restored SDK seed. A fresh chain will write new provenance.
+            Path(str(destination) + '.provenance').unlink(missing_ok=True)
         finally:
             staged.unlink(missing_ok=True)
 

@@ -5,9 +5,8 @@
 #   scripts/run_product_compiler.sh [--cwd ABSOLUTE_DIRECTORY] <hosted-xu> <xu-arguments...>
 #
 # This wrapper is for the product lane (sibling tools and cross-target
-# compiler copies). It deliberately does not build anything with cargo. A
-# primer path is always rejected here; oracle/recovery scripts must invoke the
-# primer directly and are never product evidence.
+# compiler copies). Compiler selection follows xu_host_seed.sh; existing
+# provenance must identify the product lane.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,14 +33,12 @@ fi
 COMPILER_INPUT=$1
 shift
 
-# Reuse the canonical seed resolver so direct wrapper calls cannot hide the
-# primer behind a symlink or a relative path. Product wrappers force the
-# oracle opt-in off even when a developer has it set globally; recovery runs
-# must call the primer explicitly, outside this product-only wrapper.
+# Reuse the canonical resolver for executable paths, Windows suffixes,
+# symlinks and any available product provenance.
 # The resolver's stdout is only the canonical executable path; diagnostics
 # stay on stderr.
-if ! COMPILER=$(XU_ALLOW_ORACLE_SEED=0 XU_SEED="$COMPILER_INPUT" ./scripts/xu_host_seed.sh); then
-    echo "run_product_compiler: compiler rejected by hosted/oracle boundary: $COMPILER_INPUT" >&2
+if ! COMPILER=$(XU_SEED="$COMPILER_INPUT" ./scripts/xu_host_seed.sh); then
+    echo "run_product_compiler: compiler rejected by hosted product policy: $COMPILER_INPUT" >&2
     exit 1
 fi
 
@@ -63,7 +60,6 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
-bootstrap = root / "bootstrap"
 raw = sys.argv[2]
 if not raw:
     sys.stdout.write("")
@@ -94,16 +90,6 @@ for item in raw.split(sep):
         resolved.relative_to(root)
     except ValueError:
         raise SystemExit(f"XU_PRODUCT_XUPATH resolves outside repository: {item}")
-    try:
-        resolved.relative_to(bootstrap)
-    except ValueError:
-        pass
-    else:
-        # Product compiles must never import the frozen Rust workspace through
-        # the opt-in search-root seam.  A path such as ``src/../bootstrap``
-        # is caught after resolution even when its lexical spelling looked
-        # like an ordinary in-repo directory.
-        raise SystemExit(f"XU_PRODUCT_XUPATH points into frozen bootstrap: {item}")
     if not resolved.is_dir():
         raise SystemExit(f"XU_PRODUCT_XUPATH is not a directory: {item}")
     values.append(str(resolved))
@@ -130,7 +116,7 @@ export XU_STDLIB_ROOT="$(native_path "$PWD/src")"
 export XU_CACHE="$(native_path "$cache")"
 export HOME="$(native_path "$home")"
 export USERPROFILE="$HOME"
-unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED XU_ALLOW_ORACLE_SEED XU_PRODUCT_XUPATH
+unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED XU_PRODUCT_XUPATH
 
 # Resolve compiler and opt-in import roots against the repository first. Only
 # the explicitly selected invocation directory changes; cache/home isolation

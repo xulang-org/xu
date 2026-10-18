@@ -11,17 +11,16 @@
 #   scripts/safety_embedded.sh --gen1=/path/to/gen1
 set -euo pipefail
 # Machine-readable boundary role: embedded safety oracle evidence.
-BOUNDARY_LANE=oracle
+BOUNDARY_LANE=product
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
 
 GEN1=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --gen1=*) GEN1="${1#*=}" ;;
+        --xu=*|--gen1=*) GEN1="${1#*=}" ;;
         *) echo "safety_embedded: unknown arg $1"; exit 1 ;;
     esac
     shift
@@ -32,23 +31,16 @@ trap 'rm -rf "$tmp"' EXIT
 
 fail() { echo "safety_embedded: FAIL ($1)"; exit 1; }
 
-if [ -z "$GEN1" ]; then
-    cargo build --quiet --manifest-path "$BOOTSTRAP_ROOT/Cargo.toml" -p xu --bin xu \
-        || fail "bootstrap xu build failed"
-    XU="$BOOTSTRAP_ROOT/target/debug/xu"
-    XU=$(XU_ALLOW_ORACLE_SEED=1 XU_REQUIRE_FROZEN_PRIMER=1 XU_SEED="$XU" \
-        "$ROOT/scripts/xu_host_seed.sh") || fail "bootstrap compiler is not the canonical frozen primer"
-    . ./scripts/gen1_sources.sh || fail "could not load scripts/gen1_sources.sh"
-    # Primer -O0: bootstrap auto/O1 still miscompiles the full compiler.
-    "$XU" -O0 $GEN1_SRCS -o "$tmp/gen1.xin" || fail "bootstrap could not compile Gen1"
-    GEN1="$tmp/gen1.xin"
-    echo "safety_embedded: lane=oracle (frozen bootstrap); generated Gen1 is parity-only, not product evidence" >&2
-else
-    # An explicit Gen1 is a comparison input only; do not let its embedded
-    # results be read as hosted product evidence.
-    echo "safety_embedded: lane=parity (explicit --gen1; not product evidence)" >&2
-fi
-chmod +x "$GEN1"
+HOST_SEED_RESOLVER="$ROOT/scripts/xu_host_seed.sh"
+PRODUCT_COMPILER_RUNNER="$ROOT/scripts/run_product_compiler.sh"
+GEN1=$(XU_SEED="$GEN1" "$HOST_SEED_RESOLVER")
+compile_product() {
+    "$PRODUCT_COMPILER_RUNNER" "$GEN1" build "$@"
+}
+echo "safety_embedded: lane=product compiler=$GEN1" >&2
+
+# Compiler permissions are validated by the resolver.
+
 
 pass=0
 skip=0
@@ -61,7 +53,7 @@ for n in $EMBED_NEG; do
     prog="tests/gen1/safety/embedded/${n}.xu"
     [ -f "$prog" ] || fail "missing embedded negative $prog"
     for target in thumbv7em-none riscv32imac-none; do
-        if "$GEN1" build "$prog" --target "$target" -o "$tmp/${n}_${target}.elf" \
+        if compile_product "$prog" --target "$target" -o "$tmp/${n}_${target}.elf" \
             >"$tmp/${n}_${target}.out" 2>"$tmp/${n}_${target}.err"; then
             echo "FAIL $n/$target (expected compile error)"
             fail_n=$((fail_n + 1))
@@ -78,7 +70,7 @@ EMBED_HOSTED_MIRROR="volatile_hosted raise_irq_hosted"
 for n in $EMBED_HOSTED_MIRROR; do
     prog="tests/gen1/safety/${n}.xu"
     [ -f "$prog" ] || fail "missing hosted mirror $prog"
-    if "$GEN1" build "$prog" --target thumbv7em-none -o "$tmp/${n}_thumb.elf" \
+    if compile_product "$prog" --target thumbv7em-none -o "$tmp/${n}_thumb.elf" \
         >"$tmp/${n}_thumb.out" 2>"$tmp/${n}_thumb.err"; then
         echo "PASS $n/thumb (hosted-only API allowed on embedded)"
         pass=$((pass + 1))
@@ -123,10 +115,10 @@ PY
 }
 
 if command -v qemu-system-arm >/dev/null 2>&1; then
-    "$GEN1" build tests/embedded/chan_xu_basic.xu --target thumbv7em-none -o "$tmp/chan_thumb.elf" \
+    compile_product tests/embedded/chan_xu_basic.xu --target thumbv7em-none -o "$tmp/chan_thumb.elf" \
         || fail "gen1 thumb chan_xu_basic build"
     run_qemu_arm "$tmp/chan_thumb.elf" "10" "chan_xu_basic"
-    "$GEN1" build tests/embedded/irq_xu.xu --target thumbv7em-none -o "$tmp/irq_thumb.elf" \
+    compile_product tests/embedded/irq_xu.xu --target thumbv7em-none -o "$tmp/irq_thumb.elf" \
         || fail "gen1 thumb irq_xu build"
     run_qemu_arm "$tmp/irq_thumb.elf" "7" "irq_xu"
 else
@@ -135,10 +127,10 @@ else
 fi
 
 if command -v qemu-system-riscv32 >/dev/null 2>&1; then
-    "$GEN1" build tests/embedded/chan_xu_basic.xu --target riscv32imac-none -o "$tmp/chan_rv32.elf" \
+    compile_product tests/embedded/chan_xu_basic.xu --target riscv32imac-none -o "$tmp/chan_rv32.elf" \
         || fail "gen1 rv32 chan_xu_basic build"
     run_qemu_rv32 "$tmp/chan_rv32.elf" "10" "chan_xu_basic"
-    "$GEN1" build tests/embedded/irq_xu.xu --target riscv32imac-none -o "$tmp/irq_rv32.elf" \
+    compile_product tests/embedded/irq_xu.xu --target riscv32imac-none -o "$tmp/irq_rv32.elf" \
         || fail "gen1 rv32 irq_xu build"
     run_qemu_rv32 "$tmp/irq_rv32.elf" "7" "irq_xu"
 else

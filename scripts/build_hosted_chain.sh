@@ -7,16 +7,10 @@
 #
 # Usage: scripts/build_hosted_chain.sh [--candidate-only] <seed-xu> [dest-xu]
 #
-# The seed is checked by xu_host_seed.sh even when this script is called
-# directly (rather than through Makefile).  Thus passing the Rust primer by
-# accident cannot turn an oracle build into a product build.  For an explicit
-# oracle/recovery run, name the primer and set XU_ALLOW_ORACLE_SEED=1; the
-# script prints a warning and the resulting artifact must not be release
-# evidence.
+# The seed is resolved through the shared hosted product policy.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 python3 scripts/check_module_paths.py
 
@@ -40,18 +34,8 @@ SEED_LANE=product
 # Reuse the single seed policy implementation.  XU_SEED is scoped to this
 # child invocation; the caller's environment remains untouched after exit.
 if ! SEED=$(XU_SEED="$SEED_INPUT" ./scripts/xu_host_seed.sh); then
-    echo "build_hosted_chain: seed rejected by hosted/oracle boundary: $SEED_INPUT" >&2
+    echo "build_hosted_chain: seed rejected by hosted boundary: $SEED_INPUT" >&2
     exit 1
-fi
-case "$SEED" in
-    "$BOOTSTRAP_ROOT"|"$BOOTSTRAP_ROOT"/*)
-        SEED_LANE=oracle
-        ;;
-esac
-
-# Recovery provenance follows hosted descendants as well as primer paths.
-if [ -f "${SEED}.provenance" ] && [ "$(awk -F= '/^lane=/{print $2; exit}' "${SEED}.provenance")" = oracle ]; then
-    SEED_LANE=oracle
 fi
 
 . ./scripts/gen1_sources.sh
@@ -99,13 +83,13 @@ mkdir -p "$XU_CACHE" "$HOME"
 export XU_CACHE="$(native_path "$XU_CACHE")"
 export HOME="$(native_path "$HOME")"
 export USERPROFILE="$HOME"
-unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED XU_ALLOW_ORACLE_SEED
+unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED
 
 # Keep the product chain on the compiler's versioned defaults.  The explicit
 # acceptance profile is available for deterministic vreg/SSA gates and must
 # be selected by the caller; every hosted hop uses exactly the same arguments
 # so a fixed-point comparison cannot mix profiles.  Gen2 is a deliberate
-# warm-up: the O0 primer can expose a one-time lowering/optimization
+# warm-up: an older seed can expose a one-time lowering/optimization
 # transition.  Confirm Gen2→Gen3 first; a transition needs Gen3→Gen4 confirmation.
 HOSTED_PROFILE=${HOSTED_PROFILE:-product}
 case "$HOSTED_PROFILE" in
@@ -138,9 +122,7 @@ sha256_file() {
     return 1
 }
 
-# Never install a product binary inside the frozen primer tree.  Resolve the
-# destination's existing path (or its parent when it does not exist) without
-# relying on lexical spelling, so `bootstrap/../bin` and symlinks are covered.
+# Canonicalize the destination before enforcing candidate isolation.
 canonical_path() {
     if command -v realpath >/dev/null 2>&1; then
         # BSD realpath may require the final component to exist.  Try it
@@ -164,12 +146,6 @@ PY
 }
 
 dest_abs=$(canonical_path "$DEST") || exit 1
-case "$dest_abs" in
-    "$BOOTSTRAP_ROOT"|"$BOOTSTRAP_ROOT"/*)
-        echo "build_hosted_chain: refusing to install product into frozen bootstrap tree: $DEST" >&2
-        exit 1
-        ;;
-esac
 
 if [ "$CANDIDATE_ONLY" = 1 ]; then
     case "$dest_abs" in
@@ -188,14 +164,6 @@ is_product_destination() {
             return 1 ;;
     esac
 }
-if [ "$SEED_LANE" = "oracle" ] && is_product_destination "$dest_abs"; then
-    if [ "${XU_ALLOW_ORACLE_INSTALL:-0}" != 1 ]; then
-        echo "build_hosted_chain: refusing to install oracle-derived artifact as product: $DEST" >&2
-        echo "build_hosted_chain: use a temporary destination, or explicitly set XU_ALLOW_ORACLE_INSTALL=1 for recovery" >&2
-        exit 1
-    fi
-    echo "build_hosted_chain: WARNING oracle-derived product destination explicitly enabled; non-release evidence" >&2
-fi
 
 pick_bin() {
     if [ -x "$1" ]; then
@@ -211,11 +179,7 @@ pick_bin() {
     exit 1
 }
 
-if [ "$SEED_LANE" = "oracle" ]; then
-    echo "build_hosted_chain: lane=oracle/recovery (non-product evidence)" >&2
-else
-    echo "build_hosted_chain: lane=product (hosted seed)"
-fi
+echo "build_hosted_chain: lane=product (hosted seed)"
 echo "build_hosted_chain: seed=$SEED"
 echo "build_hosted_chain: hosted_profile=$HOSTED_PROFILE"
 cat >"$tmp/provenance.env" <<EOF
@@ -264,43 +228,12 @@ if [ "$SOURCE_MANIFEST_STATUS" != "PASS" ]; then
     exit 1
 fi
 
+FAILED_STAGE="seed_to_gen1"
+# Every hop builds the original source and manifest with the same profile.
 # shellcheck disable=SC2086
-FAILED_STAGE="gen0_to_gen1"
-# Older seeds need an isolated declaration bridge for the first hop only.
-# Gen1/Gen2/Gen3 read real slash sources; source provenance remains bound to
-# the repository, and the bridge never rewrites function bodies or imports.
-SEED_SRCS=($GEN1_SRCS)
-SEED_SYNTAX_BRIDGE=none
-mkdir -p "$tmp/syntax-probe/seed_probe/slash"
-printf '@seed_probe/slash\npub fn value() int { << 0 }\n' >"$tmp/syntax-probe/seed_probe/slash/mod.xu"
-printf '@main\n#seed_probe/slash\nfn main() int { << slash.value() }\n' >"$tmp/syntax-probe/main.xu"
-if ! "$SEED" check "$tmp/syntax-probe/main.xu" >"$tmp/syntax-probe.log" 2>&1; then
-    SEED_SYNTAX_BRIDGE=slash-declarations-to-dots
-    python3 scripts/stage_seed_syntax.py --source-root src --dest-root "$tmp/seed-input/src"
-    export XU_STDLIB_ROOT="$(native_path "$tmp/seed-input/src")"
-    for i in "${!SEED_SRCS[@]}"; do
-        SEED_SRCS[$i]="$tmp/seed-input/${SEED_SRCS[$i]}"
-    done
-fi
-if [ -f src/cmd/compile/xu.xun ] && grep -q '^version:' src/cmd/compile/xu.xun; then
-    SEED_INPUT_DIR="$tmp/seed-input/compile"
-    mkdir -p "$SEED_INPUT_DIR"
-    python3 - "$SEED_INPUT_DIR" "${SEED_SRCS[@]}" <<'PY'
-import shutil, sys
-from pathlib import Path
-dest = Path(sys.argv[1])
-for source in sys.argv[2:]:
-    shutil.copyfile(source, dest / Path(source).name)
-manifest = Path("src/cmd/compile/xu.xun").read_text(encoding="utf-8")
-(dest / "xu.xun").write_text(
-    "".join(line for line in manifest.splitlines(keepends=True)
-            if not line.startswith("version:")), encoding="utf-8")
-PY
-    for i in "${!SEED_SRCS[@]}"; do
-        SEED_SRCS[$i]="$SEED_INPUT_DIR/$(basename "${SEED_SRCS[$i]}")"
-    done
-fi
-"$SEED" build "${SEED_SRCS[@]}" -o "$tmp/gen1.xin"
+set +u
+"$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin"
+set -u
 export XU_STDLIB_ROOT="$(native_path "$ROOT/src")"
 G1=$(pick_bin "$tmp/gen1.xin")
 echo "build_hosted_chain: gen1=$G1"
@@ -374,25 +307,9 @@ for key in ('seed_sha256', 'closure_sha256'):
         raise SystemExit('build_hosted_chain: source changed during chain: ' + key)
 PY_CHECK
 
-if [ "$SEED_LANE" = "oracle" ] && [ "${XU_ALLOW_ORACLE_INSTALL:-0}" != 1 ] && [ "$CANDIDATE_ONLY" != 1 ]; then
-    # An oracle/recovery chain may be useful for diagnosing a hosted hop, but
-    # it must not leak a primer-derived compiler, sibling tool, or platform
-    # copy into a product directory.  In particular, DEST may be a temporary
-    # path while the historical helpers would still write bin/platform.
-    FAILED_STAGE="oracle_artifact"
-    mkdir -p "$(dirname "$DEST")"
-    bash ./scripts/install_product_executable.sh "$CONFIRMED" "$DEST"
-    echo "build_hosted_chain: oracle artifact kept at $DEST (Gen$CONFIRMED_GENERATION; not installed as product)" >&2
-    FAILED_STAGE=""
-    echo "build_hosted_chain: chain PASS lane=oracle/recovery (non-product evidence)"
-    exit 0
-fi
 
-# Product/tool/platform installation is reachable only from the hosted
-# product lane, or from an explicitly authorised recovery override above.
-# Keep the existing order and backup semantics for compatibility; the
-# destination guard plus the oracle branch ensure that no implicit primer run
-# can write sibling tools or cross-target product copies.
+# Candidate builds write only their explicit destination. Product builds
+# also install sibling tools and cross-target compiler copies.
 FAILED_STAGE="artifact"
 mkdir -p "$(dirname "$DEST")"
 if [ -f "$DEST" ]; then
@@ -426,7 +343,7 @@ target_arch=$(uname -m)
 repo_head=$REPO_HEAD
 seed_path=$SEED
 seed_sha256=$SEED_SHA256
-seed_syntax_bridge=$SEED_SYNTAX_BRIDGE
+seed_manifest_bridge=none
 source_seed_files=$SOURCE_SEED_FILES
 source_seed_sha256=$SOURCE_SEED_SHA256
 source_closure_files=$SOURCE_CLOSURE_FILES

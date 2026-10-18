@@ -4,7 +4,7 @@
 One entry point for every release-grade check we already have: cross-language
 performance, Benchmarks Game, optimizer gates, stdlib/fixtures, safety (host,
 cross-target, embedded, escape), portability, CLI, self-host, and product
-vs bootstrap runtime/compile. Individual scripts stay independent so a speed
+optimized/unoptimized runtime and hosted compilation. Individual scripts stay independent so a speed
 regression cannot hide a semantic or safety result. This driver runs them,
 keeps native reports/logs, and writes one index.
 
@@ -32,121 +32,9 @@ from companion_repos import project_root
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCT_XU = ROOT / "bin" / "xu"
-_BOOT_CANDIDATES = (
-    project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu",
-    project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu.exe",
-    project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu",
-    project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu.exe",
-)
-BOOT_XU = next(
-    (candidate for candidate in _BOOT_CANDIDATES if candidate.is_file()),
-    _BOOT_CANDIDATES[0],
-)
-
-# Oracle-side suites are intentionally available from this dual orchestrator,
-# but only the repository's physical Gen0 artifacts may be passed to them.
-# Keep the lexical spelling until this check completes: resolving first would
-# let ``bootstrap/.../xu`` (or a parent-component alias) become an arbitrary
-# external executable and blur the product/oracle evidence boundary.
-FROZEN_PRIMER_PATHS = frozenset(
-    {
-        (project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "debug" / "xu.exe").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu").absolute(),
-        (project_root("bootstrap", core_root=ROOT) / "target" / "release" / "xu.exe").absolute(),
-    }
-)
-
-# This driver intentionally orchestrates product, oracle, and comparison
-# suites in one report.  It is therefore a dual/mixed lane, not product
-# compiler evidence by itself.  The marker is checked by the boundary
-# manifest so a future refactor cannot silently make the mixed report look
-# like a hosted fixed-point result.
-LANE = "dual"
 
 
-def _lexical_path(path: Path) -> Path:
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
-    return candidate.absolute()
-
-
-def _has_symlink_component(path: Path) -> bool:
-    """Return whether a repository-relative candidate contains a symlink."""
-
-    candidate = _lexical_path(path)
-    owner = project_root("bootstrap", core_root=ROOT)
-    if not candidate.is_relative_to(owner):
-        owner = ROOT
-    try:
-        relative = candidate.relative_to(owner)
-    except ValueError:
-        return False
-    if owner.is_symlink():
-        return True
-    current = owner
-    for part in relative.parts:
-        current /= part
-        try:
-            if current.is_symlink():
-                return True
-        except OSError:
-            # A path we cannot inspect is unsafe for reproducible oracle data.
-            return True
-    return False
-
-
-def is_primer(path: Path, resolved: Path | None = None) -> bool:
-    """Classify lexical and resolved bootstrap provenance."""
-
-    lexical = _lexical_path(path)
-    if resolved is None:
-        # Resolve only the comparison copy.  Keep ``lexical`` untouched so a
-        # symlink/parent alias remains visible to the provenance check.
-        try:
-            target = lexical.resolve()
-        except (OSError, RuntimeError):
-            target = lexical
-    else:
-        target = _lexical_path(resolved)
-    bootstrap = project_root("bootstrap", core_root=ROOT)
-    for candidate in (lexical, target):
-        try:
-            candidate.relative_to(bootstrap)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        return True
-    return False
-
-
-def is_frozen_primer(path: Path) -> bool:
-    """Return true only for an exact, non-symlink Gen0 artifact."""
-
-    lexical = _lexical_path(path)
-    if (
-        lexical not in FROZEN_PRIMER_PATHS
-        or _has_symlink_component(lexical)
-        or not lexical.is_file()
-        or not os.access(lexical, os.X_OK)
-    ):
-        return False
-    try:
-        return lexical.resolve() == lexical
-    except (OSError, RuntimeError):
-        return False
-
-
-def primer_flag() -> list[str]:
-    """safety/platform scripts take --xu= as the Rust primer, not the product."""
-    for candidate in _BOOT_CANDIDATES:
-        if (
-            candidate.is_file()
-            and os.access(candidate, os.X_OK)
-            and is_frozen_primer(candidate)
-        ):
-            return [f"--xu={candidate}"]
-    return []
+LANE = "product"
 
 
 @dataclass(frozen=True)
@@ -184,13 +72,13 @@ SUITES: tuple[Suite, ...] = (
     ),
     Suite(
         "runtime",
-        "运行时 boot vs gen3",
-        "xu-bench/tests/bench/*.xu 由 bootstrap 与产品 bin/xu 各编各跑，stdout 必须一致。scripts/bench_runtime.sh",
+        "运行时 O0 与默认优化对拍",
+        "xu-bench/tests/bench/*.xu 由产品 bin/xu 使用 O0 与默认优化各编各跑，stdout 必须一致。scripts/bench_runtime.sh",
     ),
     Suite(
         "compile",
         "自编译时间",
-        "bootstrap 编 Gen1、Gen1 自编译；对照 bench_compile baseline。scripts/bench_compile.sh",
+        "产品种子编 Gen1、Gen1 自编译；对照 bench_compile baseline。scripts/bench_compile.sh",
     ),
     Suite(
         "stdlib",
@@ -200,7 +88,7 @@ SUITES: tuple[Suite, ...] = (
     Suite(
         "programs",
         "程序行为对照",
-        "tests/gen1/programs 在 bootstrap 与产品 xu 上 stdout/退出码一致。scripts/programs_cross_check.sh",
+        "tests/gen1/programs 在产品 xu 的 O0 与默认优化下 stdout/退出码一致。scripts/programs_cross_check.sh",
     ),
     Suite(
         "safety",
@@ -234,13 +122,13 @@ SUITES: tuple[Suite, ...] = (
     ),
     Suite(
         "gen1_platform",
-        "Gen1 多目标矩阵",
-        "Primer 生成 Gen1 的多目标矩阵；仅 oracle/parity 证据。scripts/gen1_platform_test.sh",
+        "平台目标矩阵",
+        "产品编译器在各架构平台的矩阵验证。scripts/platform_test.sh",
     ),
     Suite(
         "selfhost",
         "自举与可复现",
-        "oracle Gen1→Gen2（预热）→Gen3→Gen4 固定点、行为对照和自举编译性能基线。scripts/gen1_test.sh",
+        "纯自举 Seed→Gen1→Gen2→Gen3 固定点与可复现验证。scripts/build_hosted_chain.sh",
     ),
 )
 BY_NAME = {suite.name: suite for suite in SUITES}
@@ -394,7 +282,7 @@ def command_for(
         cmd = [sys.executable, str(ROOT / "scripts/run_companion.py"), "bench", "scripts/bench_runtime.sh"]
         if not quick:
             cmd.append("--check")
-        return cmd, "bootstrap vs gen3 runtime"
+        return cmd, "product O0 vs default runtime"
 
     if suite.name == "compile":
         return [sys.executable, str(ROOT / "scripts/run_companion.py"), "bench", "scripts/bench_compile.sh"], "self-compile wall"
@@ -414,10 +302,10 @@ def command_for(
         return [
             "./scripts/programs_cross_check.sh",
             f"--xu={xu}",
-        ], "programs bootstrap vs product"
+        ], "programs product O0 vs default"
 
     if suite.name == "safety":
-        cmd = ["./scripts/safety_test.sh", *primer_flag(), f"--gen1={xu}"]
+        cmd = ["./scripts/safety_test.sh", f"--xu={xu}"]
         return cmd, "safety gate"
 
     if suite.name == "safety_cross":
@@ -429,8 +317,7 @@ def command_for(
     if suite.name == "safety_escape":
         return [
             "./scripts/safety_escape_test.sh",
-            *primer_flag(),
-            f"--gen1={xu}",
+            f"--xu={xu}",
         ], "escape check"
 
     if suite.name == "portability":
@@ -440,10 +327,10 @@ def command_for(
         return ["./scripts/cli_platform_test.sh"], "CLI contract"
 
     if suite.name == "gen1_platform":
-        return ["./scripts/gen1_platform_test.sh"], "Gen1 target matrix"
+        return ["./scripts/platform_test.sh", f"--xu={xu}", "--lane=product"], "product target matrix"
 
     if suite.name == "selfhost":
-        return ["./scripts/gen1_test.sh"], "Gen1→Gen2(warm-up)→Gen3→Gen4 fixed point"
+        return ["./scripts/build_hosted_chain.sh", str(xu)], "hosted fixed point"
 
     raise AssertionError(f"unhandled suite {suite.name}")
 
@@ -496,7 +383,7 @@ def write_index(
         f"- Date: {time.strftime('%Y-%m-%d %H:%M %z')}",
         f"- Host: {os.uname().sysname} {os.uname().release} {os.uname().machine}",
         f"- Product compiler: `{xu}`",
-        f"- Driver lane: `{LANE}` (bootstrap/oracle suites use the canonical frozen primer; parity inputs are not product evidence)",
+        f"- Driver lane: `{LANE}` (self-host product evidence)",
         f"- Mode: {'quick' if quick else 'complete'}{' (dry run)' if dry_run else ''}",
         "",
         "| Dimension | Suite | Status | Time | Evidence |",
@@ -584,17 +471,6 @@ def main() -> int:
 
     raw_xu = Path(args.xu).expanduser()
     xu = raw_xu.resolve()
-    # Keep the product input boundary active even for ``--dry-run``.  A dry
-    # run may intentionally name a not-yet-built ``bin/xu``, but an explicitly
-    # named bootstrap path must never be rendered as the product compiler in
-    # the generated plan/report.  Classify the lexical spelling together with
-    # its resolved target so a symlink/parent alias cannot hide primer
-    # provenance.
-    if is_primer(raw_xu, xu):
-        raise SystemExit(
-            "language_eval: bootstrap primer is oracle-only; pass a hosted "
-            "product compiler with --xu (oracle suites are invoked explicitly)"
-        )
     if not args.dry_run:
         if not xu.is_file():
             raise SystemExit(f"missing product compiler {xu}; run `make xu` first")

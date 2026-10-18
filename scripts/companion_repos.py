@@ -5,25 +5,17 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PROJECTS = {"examples": "examples", "bench": "bench", "site": "xulang-org", "packages": "packages", "bootstrap": "bootstrap", "vscode": "vscode"}
-LEGACY_NAMES = {"examples": "xu-examples", "bench": "xu-bench", "site": "xu-site", "packages": "xu-packages", "bootstrap": "xu-bootstrap", "vscode": "xu-vscode"}
+PROJECTS = {"examples": "examples", "bench": "bench", "site": "xulang-org", "packages": "packages", "vscode": "vscode"}
+LEGACY_NAMES = {"examples": "xu-examples", "bench": "xu-bench", "site": "xu-site", "packages": "xu-packages", "vscode": "xu-vscode"}
 
 def project_root(project: str, *, core_root: Path | None = None) -> Path:
     root = ROOT if core_root is None else core_root
     name = PROJECTS[project]
     value = os.environ.get(f"XU_{project.upper()}_ROOT")
     if value:
-        if project == "bootstrap":
-            return Path(os.path.abspath(os.path.expanduser(value)))
         return Path(value).expanduser().resolve()
     current = root.parent / name
     legacy = root.parent / LEGACY_NAMES[project]
-    # Old source archives and focused boundary fixtures can still use the
-    # former nested layout. A sibling checkout always takes precedence.
-    if project == "bootstrap" and not current.is_dir() and not legacy.is_dir():
-        nested = root / "bootstrap"
-        if nested.exists() or nested.is_symlink():
-            return nested.absolute()
     if current.is_dir():
         return current
     if project == "site" and (root.parent / "xulanguage").is_dir():

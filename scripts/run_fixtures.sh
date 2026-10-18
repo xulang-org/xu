@@ -14,7 +14,7 @@
 #                   err_pkg_xun_mismatch keeps substring (absolute path).
 #
 # Usage:
-#   scripts/run_fixtures.sh                       # Rust bootstrap (Gen0)
+#   scripts/run_fixtures.sh                       # hosted product compiler
 #   scripts/run_fixtures.sh --xu=/path/to/gen1 --sub=build \
 #       --label=gen1 --known-fail=docs/audit/GEN1_FIXTURE_KNOWN_FAIL.txt
 #   scripts/run_fixtures.sh --skip-require  # cold Gen1; replay with --only-require after fixed point
@@ -33,14 +33,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
 source scripts/test_lib.sh
 
 XU=""
-SUB=""
-LABEL="bootstrap"
+SUB="build"
+LABEL="product"
 KNOWN_FAIL_LIST=""
 SKIP_NET=0
 SKIP_REQUIRE=0
@@ -66,147 +65,21 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-# BOUNDARY: fixture execution is explicitly labelled by --label.  The
-# historical default remains the bootstrap oracle; product callers pass a
-# product label (gen1/gen2/gen3/product) and an explicit --xu path.  Oracle
-# compilation is direct; product compilation is resolved canonically and
-# routed through the hermetic product wrapper.
-LANE="dual"
-case "$LABEL" in
-    oracle|bootstrap|primer|gen0) LANE="oracle" ;;
-    product|gen1|gen2|gen3) LANE="product" ;;
-esac
-if [ -n "$XU" ] && [ "$LABEL" = "bootstrap" ]; then
-    case "$XU" in
-        bootstrap/*|*/bootstrap/*) LANE="oracle" ;;
-        *) LANE="product" ;;
-    esac
-fi
-if [ "$LANE" = "product" ] && [ -z "$XU" ]; then
-    echo "run_fixtures: lane=product requires an explicit --xu hosted compiler" >&2
-    exit 1
-fi
-
 HOST_SEED_RESOLVER="$ROOT/scripts/xu_host_seed.sh"
 PRODUCT_COMPILER_RUNNER="$ROOT/scripts/run_product_compiler.sh"
-
-canonical_path() {
-    if command -v realpath >/dev/null 2>&1; then
-        realpath "$1"
-        return
-    fi
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$1" <<'PY'
-import os
-import sys
-print(os.path.realpath(sys.argv[1]))
-PY
-        return
-    fi
-    echo "run_fixtures: cannot canonicalize compiler path (need realpath or python3)" >&2
-    return 1
-}
-
-has_symlink_component() {
-    local candidate=$1 root=$2 rel current part
-    case "$candidate" in
-        "$root"/*) rel=${candidate#"$root/"} ;;
-        *) return 1 ;;
-    esac
-    [ -L "$root" ] && return 0
-    current=$root
-    local components=()
-    IFS='/' read -r -a components <<< "$rel"
-    for part in "${components[@]}"; do
-        [ -n "$part" ] || continue
-        current="$current/$part"
-        [ -L "$current" ] && return 0
-    done
-    return 1
-}
-
-is_frozen_primer_path() {
-    # Keep both the lexical candidate and canonical target.  Checking only
-    # the resolved path would let an external symlink alias (or a symlinked
-    # checkout component) masquerade as this repository's Gen0 artifact.
-    local candidate=$1 resolved=${2:-$1} expected root lexical
-    root=$(pwd -P)
-    case "$candidate" in
-        /*) lexical=$candidate ;;
-        *) lexical="$root/$candidate" ;;
-    esac
-    for expected in \
-        "$BOOTSTRAP_ROOT/target/debug/xu" \
-        "$BOOTSTRAP_ROOT/target/debug/xu.exe" \
-        "$BOOTSTRAP_ROOT/target/release/xu" \
-        "$BOOTSTRAP_ROOT/target/release/xu.exe"; do
-        [ "$lexical" = "$expected" ] || continue
-        [ -f "$expected" ] || continue
-        [ -x "$expected" ] || continue
-        has_symlink_component "$expected" "$BOOTSTRAP_ROOT" && continue
-        if [ "$resolved" = "$expected" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-python3 scripts/check_ncall_registry.py || { echo "ncall registry check failed"; exit 1; }
-python3 scripts/check_crypto_constant_time.py || { echo "crypto constant-time contract check failed"; exit 1; }
-
-if [ -z "$XU" ]; then
-    cargo build --quiet --manifest-path "$BOOTSTRAP_ROOT/Cargo.toml" -p xu || { echo "xu build failed"; exit 1; }
-    XU=""
-    for primer in \
-        "$BOOTSTRAP_ROOT/target/debug/xu" \
-        "$BOOTSTRAP_ROOT/target/debug/xu.exe" \
-        "$BOOTSTRAP_ROOT/target/release/xu" \
-        "$BOOTSTRAP_ROOT/target/release/xu.exe"; do
-        if [ -x "$primer" ]; then
-            XU="$primer"
-            break
-        fi
-    done
-    [ -n "$XU" ] || { echo "run_fixtures: bootstrap compiler missing after build" >&2; exit 1; }
-elif [ "$LANE" = "product" ]; then
-    # Do not let a product-labelled fixture run use a primer through a
-    # symlink or a stale relative path.  The resolver also canonicalises the
-    # hosted seed for reproducible diagnostics.
-    if ! XU=$(XU_ALLOW_ORACLE_SEED=0 XU_SEED="$XU" "$HOST_SEED_RESOLVER"); then
-        echo "run_fixtures: product lane requires a hosted compiler; bootstrap is oracle-only" >&2
-        exit 1
-    fi
-fi
+XU=$(XU_SEED="$XU" "$HOST_SEED_RESOLVER")
 BIN="$XU"
-if [ "$LANE" = "oracle" ]; then
-    ORACLE_CANDIDATE="$BIN"
-    BIN=$(canonical_path "$BIN") || exit 1
-    is_frozen_primer_path "$ORACLE_CANDIDATE" "$BIN" || {
-        echo "run_fixtures: oracle lane requires the frozen bootstrap primer (bootstrap/target/{debug,release}/xu[.exe])" >&2
-        exit 1
-    }
-fi
-case "$LANE" in
-    oracle) echo "run_fixtures: lane=oracle (bootstrap primer; non-product evidence)" >&2 ;;
-    product) echo "run_fixtures: lane=product (explicit compiler/label)" >&2 ;;
-    *) echo "run_fixtures: lane=dual (custom compiler label; compare explicitly)" >&2 ;;
-esac
+LANE=product
+python3 scripts/check_ncall_registry.py
+python3 scripts/check_crypto_constant_time.py
+echo "run_fixtures: lane=product compiler=$BIN" >&2
 
 compile_source() {
-    # XU_FIXTURE_EXTRA_ARGS is the matrix/optimization seam: one space-separated
-    # flag list prepended to every compile (e.g. "-O0", "--no-regcache").
-    # Intentionally unquoted so multiple flags split; empty is a no-op.
-    # shellcheck disable=SC2086
+    # The matrix supplies a space-separated list of optimization flags.
     local extra=(${XU_FIXTURE_EXTRA_ARGS-})
     if [ -n "$TARGET" ]; then extra+=(--target "$TARGET"); fi
-    if [ "$LANE" = "product" ]; then
-        # Product Xu uses the hosted `build` subcommand.  Keep the legacy
-        # direct path for oracle/dual diagnostics only.
-        XU_PRODUCT_XUPATH="${XUPATH-}" \
-            "$PRODUCT_COMPILER_RUNNER" "$BIN" build ${extra[@]+"${extra[@]}"} "$@"
-    else
-        "$BIN" $SUB ${extra[@]+"${extra[@]}"} "$@"
-    fi
+    XU_PRODUCT_XUPATH="${XUPATH-}" \
+        "$PRODUCT_COMPILER_RUNNER" "$BIN" "$SUB" ${extra[@]+"${extra[@]}"} "$@"
 }
 
 runner_args=()
@@ -283,11 +156,7 @@ for dir in tests/fixtures/*/; do
     fi
     external_packages=0
     if [ "$requires" = 1 ] && grep -q 'github.com/xulang-org/packages' "$dir/xu.xun"; then external_packages=1; fi
-    if [ "$LANE" = oracle ] && [ "$external_packages" = 1 ]; then
-        echo "SKIP $name (external import syntax is outside the frozen primer; hosted dependency gate required)"
-        skipped=$((skipped + 1))
-        continue
-    fi
+
     if [ "$SKIP_NET" = "1" ] && lang_gate_skip_fixture "$name"; then
         echo "SKIP $name (net package; not language-compiler gate)"
         skipped=$((skipped + 1))

@@ -19,13 +19,13 @@ if [ -n "$COMPILER_INPUT" ]; then
         /*) ;;
         *) COMPILER_INPUT="$PWD/$COMPILER_INPUT" ;;
     esac
-    xu_bin=$(XU_ALLOW_ORACLE_SEED=0 XU_SEED="$COMPILER_INPUT" \
+    xu_bin=$(XU_SEED="$COMPILER_INPUT" \
         "$HOST_SEED_RESOLVER") || {
         echo "x509_revocation_test: compiler rejected by product boundary: $COMPILER_INPUT" >&2
         exit 1
     }
 else
-    xu_bin=$(XU_ALLOW_ORACLE_SEED=0 "$HOST_SEED_RESOLVER") || {
+    xu_bin=$("$HOST_SEED_RESOLVER") || {
         echo "x509_revocation_test: hosted product compiler missing (run make xu)" >&2
         exit 1
     }

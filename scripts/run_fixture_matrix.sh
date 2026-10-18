@@ -21,16 +21,14 @@
 #   scripts/run_fixture_matrix.sh --xu=bin/xu --only='^(matmul|nbody|copy_)' --skip-net
 #   scripts/run_fixture_matrix.sh --xu=bin/xu --out=/tmp/matrix   # keep per-mode logs
 #
-# Lane: dual.  --xu must be a hosted compiler (xu_host_seed.sh policy); the
-# frozen primer is accepted only with --allow-oracle-seed and is then oracle
-# evidence, not product evidence.  No result here is a fixed-point proof.
+# --xu selects the hosted compiler through xu_host_seed.sh. Each mode
+# compares against fixture expectations; this is separate from the fixed point.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
-LANE=dual
+LANE=product
 
 XU_INPUT=""
 MODES="-O0,-O1,-O2,-O3,--no-regcache"
@@ -39,7 +37,6 @@ QUICK=0
 SKIP_NET=0
 OUT=""
 LABEL="matrix"
-ALLOW_ORACLE=0
 QUICK_ONLY='^(emission_|matmul|nbody|copy_|vreg_|sroa_|lism_|mir_lism_|mir_fnval_|mir_cse_|mir_late_const_|mir_scalar_int_|scalar_int_|scalar_call_|scalar_inline_|mir_empty_tail_|mir_effect_|array_|bounds_|loop_|while_|for_|map_|iface_|interface_|generic_|enum_|struct_|chan_|select_|compound_|div_|sdiv_|math_|string_|str_|slice|index_|err_index|err_bounds|err_f64_|err_intfield_|image_|search|sort|heap|bits_|f64_|float|bool_|compare_logic$|short_circuit_|optimizer_name_|match_|closure|fn_val|fnval_|method_|recursion|fib)'
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -50,7 +47,6 @@ while [ "$#" -gt 0 ]; do
         --skip-net) SKIP_NET=1 ;;
         --out=*) OUT="${1#*=}" ;;
         --label=*) LABEL="${1#*=}" ;;
-        --allow-oracle-seed) ALLOW_ORACLE=1 ;;
         -h|--help)
             sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -64,18 +60,11 @@ if [ -z "$XU_INPUT" ]; then
     echo "run_fixture_matrix: --xu=<hosted compiler> is required (no primer/cargo fallback)" >&2
     exit 1
 fi
-if ! XU=$(XU_ALLOW_ORACLE_SEED="$ALLOW_ORACLE" XU_SEED="$XU_INPUT" ./scripts/xu_host_seed.sh); then
-    echo "run_fixture_matrix: compiler rejected by hosted/oracle boundary: $XU_INPUT" >&2
+if ! XU=$(XU_SEED="$XU_INPUT" ./scripts/xu_host_seed.sh); then
+    echo "run_fixture_matrix: compiler rejected by hosted product policy: $XU_INPUT" >&2
     exit 1
 fi
 SEED_LANE=hosted
-case "$XU" in
-    "$BOOTSTRAP_ROOT"|"$BOOTSTRAP_ROOT"/*) SEED_LANE=oracle ;;
-esac
-# Recovery descendants keep their origin even when stored outside bootstrap/.
-if [ -f "$XU.provenance" ] && grep -qx 'lane=oracle' "$XU.provenance"; then
-    SEED_LANE=oracle
-fi
 if [ "$QUICK" = 1 ] && [ -z "$ONLY" ]; then
     ONLY="$QUICK_ONLY"
 fi
@@ -111,9 +100,6 @@ sha256_file() {
 echo "run_fixture_matrix: lane=$LANE seed_lane=$SEED_LANE"
 echo "run_fixture_matrix: xu=$XU sha256=$(sha256_file "$XU")"
 echo "run_fixture_matrix: modes=$MODES only=${ONLY:-<all>} skip_net=$SKIP_NET"
-if [ "$SEED_LANE" = oracle ]; then
-    echo "run_fixture_matrix: WARNING oracle lineage; results are not product evidence" >&2
-fi
 
 IFS=',' read -r -a MODE_LIST <<< "$MODES"
 mode_files=()
@@ -121,11 +107,7 @@ for mode in "${MODE_LIST[@]}"; do
     [ -n "$mode" ] || continue
     tag=$(printf '%s' "$mode" | tr -c 'A-Za-z0-9' '_')
     log="$OUT/mode$tag.log"
-    if [ "$SEED_LANE" = oracle ] && [[ "$XU" = "$BOOTSTRAP_ROOT/"* ]]; then
-        args=(--xu="$XU" --sub= --label=oracle)
-    else
-        args=(--xu="$XU" --sub=build --label="$LABEL")
-    fi
+    args=(--xu="$XU" --sub=build --label="$LABEL")
     [ -n "$ONLY" ] && args+=(--only="$ONLY")
     [ "$SKIP_NET" = 1 ] && args+=(--skip-net)
     echo "run_fixture_matrix: mode [$mode] ..."

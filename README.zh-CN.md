@@ -30,13 +30,13 @@
 
 ---
 
-## Xu 0.8.11
+## Xu 0.8.13
 
-主分支开发从 `0.8.12-dev.1` 继续，默认下载保持正式版 `0.8.11` SDK。
+Xu 0.8.13 正式发布纯 Xu 自举工具链。使用已发布的 Xu SDK 作为种子，各代直接编译原始源码与清单并确认固定点；构建不再依赖 Rust/Cargo 或历史 bootstrap 仓库。
 
-本版优化了 x64 整数归约和 SHA-256 软件计算，减少了符合条件的整数内核中的寄存器溢出，并简化 ARM64 基线条件返回。Windows 自举、SDK 打包及跨平台确定性检查已修复。
+本版修复浮点调用保存、元素地址复制、x64 Map 适配器及汇编符号解析，精简 MIR 字段更新与后端标签转发，并统一 SDK 安装元数据和包发现行为。
 
-下载 [0.8.11 SDK 与安装包](https://github.com/xulang-org/xu/releases/tag/v0.8.11)。[基准页面](https://xulang.org/zh/benchmarks)提供实测负载、编译器身份及各平台结果。SHA-256 在支持的 ARM64 系统上可使用硬件指令；x64 当前使用软件实现。不同机器的绝对耗时不能作为优化加速比。
+下载 [0.8.13 SDK 与安装包](https://github.com/xulang-org/xu/releases/tag/v0.8.13)。[基准页面](https://xulang.org/zh/benchmarks)保留每次实测的编译器版本与来源；现有 0.8.12 数据不作为 0.8.13 的成绩。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 

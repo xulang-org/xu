@@ -33,7 +33,7 @@ if [ ! -x "$HOST_SEED_RESOLVER" ]; then
     echo "build_platform_xu: missing hosted seed resolver: $HOST_SEED_RESOLVER" >&2
     exit 1
 fi
-if ! XU=$(XU_ALLOW_ORACLE_SEED=0 XU_SEED="$XU_INPUT" "$HOST_SEED_RESOLVER"); then
+if ! XU=$(XU_SEED="$XU_INPUT" "$HOST_SEED_RESOLVER"); then
     echo "build_platform_xu: compiler must be a hosted product seed (bootstrap is oracle-only): $XU_INPUT" >&2
     exit 1
 fi

@@ -13,49 +13,33 @@
 # XU_HEAP_STATS ABI and never attempts to free a live G stack.
 set -euo pipefail
 
-# Machine-readable boundary role: hosted lifetime-policy oracle evidence.
-BOUNDARY_LANE=oracle
+# Machine-readable boundary role: hosted lifetime-policy product evidence.
+BOUNDARY_LANE=product
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
 source "$ROOT/scripts/test_lib.sh"
 
-XU=${XU:-"$BOOTSTRAP_ROOT/target/debug/xu"}
+XU=${XU:-}
 BUILD_TIMEOUT=${XU_LIFETIME_BUILD_TIMEOUT:-60}
 RUN_TIMEOUT=${XU_LIFETIME_RUN_TIMEOUT:-15}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/xu-lifetime-policy.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
-if [ ! -x "$XU" ]; then
-    cargo build --quiet --manifest-path "$BOOTSTRAP_ROOT/Cargo.toml" -p xu --bin xu
+if [ -n "$XU" ]; then
+    XU=$(XU_SEED="$XU" "$ROOT/scripts/xu_host_seed.sh")
+else
+    XU=$("$ROOT/scripts/xu_host_seed.sh")
 fi
-if [ ! -x "$XU" ]; then
+[ -x "$XU" ] || {
     echo "runtime lifetime policy: compiler is not executable: $XU" >&2
     exit 1
-fi
-if ! XU=$(XU_ALLOW_ORACLE_SEED=1 XU_REQUIRE_FROZEN_PRIMER=1 XU_SEED="$XU" \
-    "$ROOT/scripts/xu_host_seed.sh"); then
-    echo "runtime lifetime policy: compiler is not the canonical frozen primer" >&2
-    exit 1
-fi
+}
 
 # Bootstrap accepts `xu input.xu -o out`; the product CLI accepts
 # `xu build input.xu -o out`.  Detect the advertised form, retaining the
 # direct form as the default for old wrappers.
-HELP_TEXT=""
-HELP_RC=0
-HELP_TEXT=$(run_with_timeout 5 "$XU" --help 2>&1) || HELP_RC=$?
-CLI_MODE=direct
-if [[ "$HELP_TEXT" == *"build input.xu"* || "$HELP_TEXT" == *"build input"* ]]; then
-    CLI_MODE=product
-elif [ "$HELP_RC" -ne 0 ] && [[ "$HELP_TEXT" == *"Usage:"* ]]; then
-    # A wrapper that failed help is still more likely to expose the historical
-    # direct form; leave the conservative default in place.
-    CLI_MODE=direct
-fi
-
 resolve_binary() {
     local base="$1"
     local candidate
@@ -75,13 +59,9 @@ compile_fixture() {
     local stdout_file="$TMP/$name.compile.stdout"
     local stderr_file="$TMP/$name.compile.stderr"
 
-    if [ "$CLI_MODE" = product ]; then
-        run_with_timeout "$BUILD_TIMEOUT" "$XU" build "$source" -o "$base" \
-            >"$stdout_file" 2>"$stderr_file"
-    else
-        run_with_timeout "$BUILD_TIMEOUT" "$XU" "$source" -o "$base" \
-            >"$stdout_file" 2>"$stderr_file"
-    fi
+    XU_GEN1_HEAP_LEDGER=1 run_with_timeout "$BUILD_TIMEOUT" "$ROOT/scripts/run_product_compiler.sh" "$XU" build "$source" -o "$base" \
+        >"$stdout_file" 2>"$stderr_file"
+
     local binary
     if ! binary=$(resolve_binary "$base"); then
         echo "runtime lifetime policy: $name produced no executable" >&2
@@ -262,16 +242,12 @@ if heap["live_bytes"] != 0 or heap["allocs"] != heap["frees"]:
         f"live={heap['live_bytes']} allocs={heap['allocs']} frees={heap['frees']}"
     )
 
-# These constants mirror xurt's hosted M:N layout.  chan_xu_basic creates one
-# G and one cap=1 MC channel; the lower bound intentionally excludes allocator
-# class padding and transient runtime values, so harmless implementation
-# additions cannot make the policy flaky.  If the G stack/header/channel ABI
-# changes, update this bound with the corresponding xurt constants.
-g_stack = 131072
-g_header = 256
+# Hosted M:N layout: chan_xu_basic creates one cap=1 MC channel.
+# G stacks use dedicated/mmap memory in the hosted product runtime, so heap
+# metadata holds channel header (232) + slot (8).
 mc_chan_header = 232
 one_int_slot = 8
-persistent_min = g_stack + g_header + mc_chan_header + one_int_slot
+persistent_min = mc_chan_header + one_int_slot
 if chan["live_bytes"] < persistent_min:
     raise SystemExit(
         "chan_xu_basic: process-scoped metadata below policy floor "

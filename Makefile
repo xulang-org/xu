@@ -1,20 +1,11 @@
 # Xu — hosted compiler is the product. Self-host: previous bin/xu (or
 # developer/bin snapshot) compiles gen1 → gen2 → gen3, then gen4 only if needed;
 # cmp gen2 gen3 confirms Gen3; a transition requires cmp gen3 gen4.
-# Rust bootstrap/ is frozen (bootstrap/FROZEN.md): oracle only.
-
-CARGO    ?= cargo
 
 # Publishing with BUMP updates versions as a prerequisite, never while parsing
 # the Makefile (so make -n and make help cannot accidentally bump a version).
 PYTHON   ?= python3
-BOOTSTRAP_ROOT := $(shell ./scripts/xu_host_seed.sh --bootstrap-root)
-export XU_BOOTSTRAP_ROOT := $(BOOTSTRAP_ROOT)
 export XU_ROOT := $(CURDIR)
-MANIFEST := $(BOOTSTRAP_ROOT)/Cargo.toml
-empty :=
-space := $(empty) $(empty)
-BOOTSTRAP_BOUNDARY := $(if $(wildcard $(BOOTSTRAP_ROOT)/BOUNDARY.json),$(subst $(space),\$(space),$(BOOTSTRAP_ROOT)/BOUNDARY.json),$(if $(wildcard BOUNDARY.json),BOUNDARY.json,))
 BIN      := bin
 EXE_SUFFIX := $(if $(filter Windows_NT,$(OS)),.exe,)
 XU       := $(BIN)/xu$(EXE_SUFFIX)
@@ -25,7 +16,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 	server-build-local server-build-linux server-check-linux server-start server-health server-smoke-local server-unit \
 	server-remote-check server-remote-deploy server-remote-status server-remote-health server-remote-smoke \
 	server-remote-restart server-remote-stop server-remote-rollback \
-	gate check test selfhost gen1-test oracle product-selfhost \
+	check test selfhost product-selfhost \
 	ncall fixtures fixtures-gen3 programs-gen3 verify-gen3 \
 	safety safety-cross safety-embedded safety-escape hardening-gate \
 	platform gen1-platform cli-platform bench bench-runtime bench-stdlib bench-opt-levels bench-nbody-residency bench-opt-full bench-crosslang bench-language bench-game \
@@ -33,7 +24,6 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 	verify-product-math-x64 verify-product-algorithm-x64 \
 	ci ci-fast doc-test packages-test \
 	boundary module-path-check release-version-prepare release-version-sync release-version-check \
-	bootstrap bootstrap-release bootstrap-e2e bootstrap-warn \
 	clean
 
 help:
@@ -64,23 +54,20 @@ help:
 	@echo "  make server-remote-check  inspect server.md target (read-only)"
 	@echo "  make server-remote-deploy build, upload, verify, atomically switch and health-check"
 	@echo "  make server-remote-status/health/smoke/restart/stop/rollback  manage remote unit"
-	@echo "  make gate            定点成果: primer oracle (gen1_test.sh)"
-	@echo "  make oracle          same as gate with --oracle=bootstrap banner (weekly CI)"
 	@echo "  make product-selfhost hosted Gen1→Gen2→Gen3; build Gen4 only if Gen2 differs from Gen3"
 	@echo "  make selfhost        alias for product-selfhost (blocked if hosted chain is not green)"
 	@echo
 	@echo "Confirmed product binary verification — 调试 bin/xu 本身用"
 	@echo "  make verify-gen3     fixtures + programs 全量跑在 confirmed bin/xu 上"
 	@echo "  make fixtures-gen3   438 fixtures 用 confirmed bin/xu 编译运行比对"
-	@echo "  make programs-gen3   tests/gen1/programs bootstrap vs bin/xu 行为对照"
+	@echo "  make programs-gen3   tests/gen1/programs 行为验证"
 	@echo
 	@echo "Also"
 	@echo "  make platform         multi-target compile matrix"
 	@echo "  make cli-platform     product CLI flags/env smoke (see CLI_CROSS_PLATFORM.md)"
 	@echo "  make doc-test         xu doc Markdown golden + CLI smoke"
 	@echo "  make packages-test    package regressions using product xu and local protocol peers"
-	@echo "  make gen1-platform    hosted multi-target matrix"
-	@echo "  make bench-runtime    运行时基准(xu-bench,bootstrap vs confirmed product,--save/--check 见脚本)"
+	@echo "  make bench-runtime    运行时基准(xu-bench, confirmed product,--save/--check 见脚本)"
 	@echo "  make bench-stdlib     标准库热路径（os/io/fs/path/time/strings）基准（xu-bench/scripts/bench_stdlib.sh）"
 	@echo "  make stdlib-matrix    生成标准库包/API/fixture/平台矩阵"
 	@echo "  make stdlib-matrix-check  检查矩阵是否与当前源码一致"
@@ -92,14 +79,10 @@ help:
 	@echo "  make verify-product-math-x64  bin/xu 生成并运行 X64 math/f64 回归"
 	@echo "  make verify-product-algorithm-x64  bin/xu 生成并运行 X64 sort/search/slices/heap 回归"
 	@echo "  make bench-game       Benchmarks Game 尺子(Xu/C/C++/Rust/Go → docs/audit/)"
-	@echo "  make ci               ncall+fixtures+safety+verify-gen3（oracle 不在每次 PR）"
+	@echo "  make ci               ncall+fixtures+safety+verify-gen3"
 	@echo "  make hardening-gate   统一安全/泄漏/协程/vreg 门禁（HARDENING_GATE_ARGS=…）"
-	@echo "  make boundary          strict bootstrap↔Xu source-of-truth / ABI seam 门禁"
+	@echo "  make boundary          strict Xu source-of-truth / ABI seam 门禁"
 	@echo "  make clean"
-	@echo
-	@echo "Bootstrap (FROZEN primer — bootstrap/FROZEN.md)"
-	@echo "  make bootstrap        cargo xu/gen1_ref; freeze banner; not on the product build path"
-	@echo "  make oracle           primer gen1_test (hello / safety / gen3==gen4 after warm-up)"
 
 all: xu
 
@@ -126,9 +109,9 @@ XU_PKG_XU  := $(wildcard src/xu/*/*.xu)
 # package edit cannot leave bin/xu looking newer than its product source.
 XU_SOURCE_XU := $(shell find -P src -type f -name '*.xu' -print 2>/dev/null | LC_ALL=C sort)
 SELFHOST_POLICY := scripts/gen1_sources.sh scripts/xu_host_seed.sh scripts/build_hosted_chain.sh \
-	scripts/stage_seed_syntax.py scripts/check_module_paths.py \
+	scripts/check_module_paths.py \
 	scripts/install_product_executable.sh \
-	$(BOOTSTRAP_BOUNDARY) scripts/check_bootstrap_xu_boundary.py scripts/run_product_compiler.sh \
+	BOUNDARY.json scripts/check_bootstrap_xu_boundary.py scripts/run_product_compiler.sh \
 	scripts/build_platform_xu.sh scripts/build_product_tools.sh scripts/cli_platform_test.sh \
 	scripts/pack_developer_xu.sh scripts/deploy_xu_server.sh scripts/deploy_xu_remote.sh scripts/pack_macos_ui_app.py \
 	scripts/pack_macos_ui_oneexe.py scripts/pack_linux_ui_oneexe.py scripts/pack_windows_ui_oneexe.py \
@@ -169,7 +152,7 @@ $(XU): release-version-prepare
 endif
 
 # Explicit product-lane name.  This target is intentionally separate from
-# `oracle`: it resolves only a hosted seed and never invokes cargo/primer.
+# other checks: it resolves a hosted product seed.
 product-selfhost: $(XU)
 	@echo "product-selfhost: hosted product lane (Gen2==Gen3, or Gen3==Gen4 after a warm-up transition)"
 
@@ -196,8 +179,8 @@ $(BIN):
 # next Gen1. Primer is not on this path.
 $(XU): VERSION src/cmd/compile/xu.xun scripts/module_versions.py $(COMPILE_XU) $(XU_PKG_XU) $(XU_SOURCE_XU) $(SELFHOST_POLICY) | $(BIN)
 	@set -e; $(PYTHON) scripts/check_bootstrap_xu_boundary.py --strict-freeze; \
-	seed="$$(XU_ALLOW_ORACLE_SEED=0 ./scripts/xu_host_seed.sh)"; \
-	XU_ALLOW_ORACLE_SEED=0 ./scripts/build_hosted_chain.sh "$$seed" "$(XU)"
+	seed="$$(./scripts/xu_host_seed.sh)"; \
+	./scripts/build_hosted_chain.sh "$$seed" "$(XU)"
 
 # Product sibling tools (compiled by product xu; not in GEN1 selfhost list).
 # Product tools: default name has no extension (Windows .exe).
@@ -229,11 +212,7 @@ $(XU_LSP): $(XU) src/cmd/lsp/xu.xun $(LSP_XU) $(XU_PKG_XU) | $(BIN)
 $(XU_NATIVE): $(XU) src/cmd/native/xu.xun $(NATIVE_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-native)
 
-# Milestone / oracle: frozen primer compiles Gen1 and diffs behavior.
-# Not on the product `make xu` path. CI runs this weekly (see oracle.yml).
-gate check test gen1-test oracle:
-	$(PYTHON) scripts/check_bootstrap_xu_boundary.py --strict-freeze
-	./scripts/gen1_test.sh --oracle=bootstrap
+check test: verify-gen3
 
 # Historical callers used `make selfhost`; keep that spelling but make its
 # product-only semantics explicit instead of silently routing to the primer.
@@ -248,10 +227,7 @@ stdlib-matrix:
 stdlib-matrix-check:
 	$(PYTHON) scripts/generate_stdlib_matrix.py --check
 
-# Oracle-only corpus target; product corpus verification is fixtures-gen3
-# (the target name is retained for compatibility; bin/xu is the confirmed product).
-fixtures: bootstrap
-	./scripts/run_fixtures.sh --xu="$(BOOTSTRAP_ROOT)/target/debug/xu" --label=oracle
+fixtures: fixtures-gen3
 
 # Confirmed bin/xu behavior verification: run everything on the product
 # binary itself, not on the gen1 intermediate. Depends on `xu` so the
@@ -268,9 +244,8 @@ doc-test: xu-doc
 verify-gen3: fixtures-gen3 programs-gen3 doc-test
 	@echo "verify-gen3: PASS"
 
-# Oracle safety parity; product safety is supplied through verify-gen3/hardening args.
-safety: bootstrap
-	./scripts/safety_test.sh --xu="$(BOOTSTRAP_ROOT)/target/debug/xu"
+safety: xu
+	./scripts/safety_test.sh --xu=$(CURDIR)/bin/xu
 
 # Product-lane multi-instance memory-safety batteries.
 # Override compiler: make memsafe XU=/path/to/xu
@@ -285,29 +260,25 @@ memsafe:
 	XU="$(XU_PRODUCT)" python3 scripts/memsafe_heap_ledger_test.py
 
 .PHONY: memsafe
-safety-cross:
+safety-cross: xu
 	./scripts/safety_cross_target.sh
 
-safety-embedded:
+safety-embedded: xu
 	./scripts/safety_embedded.sh
 
-safety-escape:
+safety-escape: xu
 	./scripts/safety_escape_test.sh
 
-hardening-gate:
+hardening-gate: xu
 	./scripts/hardening_gate.sh $(HARDENING_GATE_ARGS)
 
 boundary:
 	$(PYTHON) scripts/check_bootstrap_xu_boundary.py --strict-freeze
 
-# Oracle cross-target matrix; hosted product matrix is gen1-platform/product tools.
-platform: bootstrap
-	./scripts/platform_test.sh --xu="$(BOOTSTRAP_ROOT)/target/debug/xu"
+platform gen1-platform: xu
+	./scripts/platform_test.sh --xu=$(CURDIR)/bin/xu --lane=product
 
-gen1-platform:
-	./scripts/gen1_platform_test.sh
-
-cli-platform:
+cli-platform: xu
 	./scripts/cli_platform_test.sh
 
 bench:
@@ -394,30 +365,11 @@ server-remote-stop:
 server-remote-rollback:
 	./scripts/deploy_xu_remote.sh rollback
 
-# Run the executable bootstrap↔Xu policy gate on every CI bundle, even when
+# Run the executable policy gate on every CI bundle, even when
 # bin/xu is already up to date and the self-host recipe is not re-evaluated.
 ci-fast: boundary ncall fixtures
 ci: ci-fast safety safety-cross safety-embedded verify-gen3
 
-# --- independent primer (FROZEN 2026-08-28; bootstrap/FROZEN.md) ---------------
-# Frozen. Product `make xu` does not call this. `make oracle` still does.
-
-.PHONY: bootstrap-warn
-bootstrap-warn:
-	@echo "=== bootstrap primer is FROZEN (2026-08-28) ==="
-	@echo "Only P0 correctness fixes. New features go in src/xu and src/cmd/compile."
-	@echo "See $(BOOTSTRAP_ROOT)/FROZEN.md and $(BOOTSTRAP_ROOT)/SYNC_DIFF.md."
-
-bootstrap: bootstrap-warn
-	$(CARGO) build --manifest-path "$(MANIFEST)" -p xu --bin xu --bin gen1_ref
-
-bootstrap-release: bootstrap-warn
-	$(CARGO) build --release --manifest-path "$(MANIFEST)" -p xu --bin xu
-
-bootstrap-e2e: bootstrap-warn
-	$(CARGO) test -p xu --test e2e --manifest-path "$(MANIFEST)"
-
 clean:
-	if [ -f "$(MANIFEST)" ]; then $(CARGO) clean --manifest-path "$(MANIFEST)"; fi
 	rm -rf $(BIN)
 	rm -f hello a.out hello.exe

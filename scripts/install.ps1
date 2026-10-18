@@ -87,7 +87,7 @@ if ($IsLocalScript -and $ScriptDir) {
 }
 
 # Resolve version
-$FallbackVersion = "0.8.12"
+$FallbackVersion = "0.8.13"
 if (-not $Version) {
     if ($SourceDir -and (Test-Path "$SourceDir\VERSION")) {
         $Version = (Get-Content "$SourceDir\VERSION" -Raw).Trim()

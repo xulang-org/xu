@@ -13,7 +13,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
 
@@ -35,132 +34,20 @@ done
 HOST_SEED_RESOLVER="$ROOT/scripts/xu_host_seed.sh"
 PRODUCT_COMPILER_RUNNER="$ROOT/scripts/run_product_compiler.sh"
 
-canonical_path() {
-    if command -v realpath >/dev/null 2>&1; then
-        realpath "$1"
-        return
-    fi
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$1" <<'PY'
-import os
-import sys
-print(os.path.realpath(sys.argv[1]))
-PY
-        return
-    fi
-    echo "platform_test: cannot canonicalize compiler path (need realpath or python3)" >&2
-    return 1
-}
-
-has_symlink_component() {
-    local candidate=$1 root=$2 rel current part
-    case "$candidate" in
-        "$root"/*) rel=${candidate#"$root/"} ;;
-        *) return 1 ;;
-    esac
-    [ -L "$root" ] && return 0
-    current=$root
-    local components=()
-    IFS='/' read -r -a components <<< "$rel"
-    for part in "${components[@]}"; do
-        [ -n "$part" ] || continue
-        current="$current/$part"
-        [ -L "$current" ] && return 0
-    done
-    return 1
-}
-
-is_frozen_primer_path() {
-    local candidate=$1 resolved=${2:-$1} expected root lexical
-    root=$(pwd -P)
-    case "$candidate" in
-        /*) lexical=$candidate ;;
-        *) lexical="$root/$candidate" ;;
-    esac
-    for expected in \
-        "$BOOTSTRAP_ROOT/target/debug/xu" \
-        "$BOOTSTRAP_ROOT/target/debug/xu.exe" \
-        "$BOOTSTRAP_ROOT/target/release/xu" \
-        "$BOOTSTRAP_ROOT/target/release/xu.exe"; do
-        [ "$lexical" = "$expected" ] || continue
-        [ -f "$expected" ] || continue
-        [ -x "$expected" ] || continue
-        has_symlink_component "$expected" "$BOOTSTRAP_ROOT" && continue
-        if [ "$resolved" = "$expected" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-if [ -n "$XU" ]; then
-    BIN_INPUT="$XU"
-    if [ -n "$REQUESTED_LANE" ]; then
-        LANE="$REQUESTED_LANE"
-    else
-        case "$XU" in
-            bootstrap/*|*/bootstrap/*) LANE="oracle" ;;
-            *) LANE="product" ;;
-        esac
-    fi
-    if [ "$LANE" = "product" ]; then
-        if ! BIN=$(XU_ALLOW_ORACLE_SEED=0 XU_SEED="$BIN_INPUT" "$HOST_SEED_RESOLVER"); then
-            echo "platform_test: product lane requires a hosted compiler (bootstrap is oracle-only)" >&2
-            exit 1
-        fi
-    else
-        BIN=$(canonical_path "$BIN_INPUT") || exit 1
-    fi
-    [ -x "$BIN" ] || { echo "platform_test: compiler is not executable: $BIN" >&2; exit 1; }
-else
-    LANE="${REQUESTED_LANE:-oracle}"
-    if [ "$LANE" = "product" ]; then
-        echo "platform_test: lane=product requires an explicit --xu hosted compiler" >&2
-        exit 1
-    fi
-    cargo build --quiet --manifest-path "$BOOTSTRAP_ROOT/Cargo.toml" -p xu || { echo "xu build failed"; exit 1; }
-    BIN=""
-    for primer in \
-        "$BOOTSTRAP_ROOT/target/debug/xu" \
-        "$BOOTSTRAP_ROOT/target/debug/xu.exe" \
-        "$BOOTSTRAP_ROOT/target/release/xu" \
-        "$BOOTSTRAP_ROOT/target/release/xu.exe"; do
-        if [ -x "$primer" ]; then
-            BIN=$(canonical_path "$primer") || exit 1
-            break
-        fi
-    done
-    [ -n "$BIN" ] || { echo "platform_test: bootstrap compiler missing after build" >&2; exit 1; }
-fi
-case "$LANE" in
-    oracle) echo "platform_test: lane=oracle (bootstrap primer; non-product evidence)" >&2 ;;
-    product) echo "platform_test: lane=product (explicit --xu compiler)" >&2 ;;
-    dual) echo "platform_test: lane=dual (explicit comparison harness)" >&2 ;;
-    *) echo "platform_test: invalid lane '$LANE' (want oracle, product, or dual)" >&2; exit 1 ;;
-esac
-
-if [ "$LANE" = "oracle" ]; then
-    ORACLE_CANDIDATE=${BIN_INPUT:-$BIN}
-    is_frozen_primer_path "$ORACLE_CANDIDATE" "$BIN" || {
-        echo "platform_test: oracle lane requires the frozen bootstrap primer (bootstrap/target/{debug,release}/xu[.exe])" >&2
-        exit 1
-    }
-fi
-
+[ "${REQUESTED_LANE:-product}" = product ] || { echo "platform_test: only lane=product is supported" >&2; exit 2; }
+BIN=$(XU_SEED="$XU" "$HOST_SEED_RESOLVER")
+LANE=product
+echo "platform_test: lane=product compiler=$BIN" >&2
 compile_source() {
-    if [ "$LANE" = "product" ]; then
-        local subcommand=build
-        local arguments=()
-        local arg
-        for arg in "$@"; do
-            if [ "$arg" = "--test" ]; then subcommand=test
-            else arguments+=("$arg")
-            fi
-        done
-        "$PRODUCT_COMPILER_RUNNER" "$BIN" "$subcommand" "${arguments[@]}"
-    else
-        "$BIN" "$@"
-    fi
+    local subcommand=build
+    local arguments=()
+    local arg
+    for arg in "$@"; do
+        if [ "$arg" = "--test" ]; then subcommand=test
+        else arguments+=("$arg")
+        fi
+    done
+    "$PRODUCT_COMPILER_RUNNER" "$BIN" "$subcommand" "${arguments[@]}"
 }
 
 FIXTURES="arith_precedence f64_loop_regcache string_concat struct_sample generic_struct fib_recursive alloc_stress drop_loop_stress borrow_mut_param result_propagate match_int array_basic array_push_stress array_string_owning str_convert string_bytes file_roundtrip atomic_basic args_basic exit_builtin slice_basic char_builtins parse_int_ok starts_with eprintln_fd multifile chan_xu_basic chan_parallel channel_blocking_string std_os path_os_extra os_b1c time_wall crypto_rand crypto_ecdsa crypto_x509_ecdsa crypto_x509_chain crypto_x509_pool crypto_tls_pipe crypto_tls_ecdhe_interop net_platform_files net_udp_echo net_udp_connected net_ipv6_loopback net_unix_loopback net_interfaces net_unsupported_contract"

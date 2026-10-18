@@ -30,13 +30,13 @@
 
 ---
 
-## Xu 0.8.11
+## Xu 0.8.13
 
-Main development continues at `0.8.12-dev.1`; default downloads remain on the stable `0.8.11` SDK.
+Xu 0.8.13 is the stable release of the pure Xu self-hosted toolchain. Build with a published Xu SDK seed; every generation compiles the original source and manifest and confirms a fixed point. Rust/Cargo and the historical bootstrap checkout are no longer required.
 
-This release improves x64 integer reductions and SHA-256 software hashing, reduces register spills in eligible integer kernels, and streamlines ARM64 base-case returns. Windows bootstrap, SDK packaging, and cross-platform determinism checks are repaired.
+This release fixes floating-point call preservation and element-address copies, repairs x64 map adapters and assembly symbol resolution, and simplifies MIR field updates and backend label forwarding. SDK installation keeps metadata and package discovery consistent across supported platforms.
 
-Download the [0.8.11 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.8.11). See the [benchmark dashboard](https://xulang.org/benchmarks) for measured workloads, compiler identities, and platform-specific results. SHA-256 can use hardware instructions on supported ARM64 systems; x64 currently uses the software path. Timings from different machines are not speedup measurements.
+Download the [0.8.13 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.8.13). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance; existing 0.8.12 measurements are not 0.8.13 results.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 

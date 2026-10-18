@@ -7,8 +7,6 @@ import os
 import sys
 from pathlib import Path
 
-from companion_repos import project_root
-
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "audit" / "CRYPTO_CONSTANT_TIME.md"
 
@@ -211,14 +209,6 @@ def check_consumers() -> None:
 
 def check_core_boundary() -> None:
     roots = [ROOT / "src" / "xu", ROOT / "src" / "cmd" / "compile"]
-    # Tests/examples may legitimately mention crypto fixture names. The
-    # boundary applies to bootstrap implementation code, not its test corpus.
-    bootstrap_root = project_root("bootstrap", core_root=ROOT)
-    roots.extend(sorted((bootstrap_root / "crates").glob("*/src")))
-    def logical(path: Path) -> str:
-        if path.is_relative_to(ROOT):
-            return path.relative_to(ROOT).as_posix()
-        return (Path("bootstrap") / path.relative_to(bootstrap_root)).as_posix()
     forbidden = re.compile(
         r"@crypto(?:/|\.)|#crypto(?:/|\.)|_xu_crypto_|"
         r"\bcrypto_(?:aes|rsa|ecdsa|ecdh|ed25519|tls|x509|sha[0-9_]*)\b|"
@@ -228,17 +218,17 @@ def check_core_boundary() -> None:
     )
     for root in roots:
         if not root.is_dir():
-            fail(f"missing boundary root {logical(root)}")
+            fail(f"missing boundary root {root.relative_to(ROOT).as_posix()}")
         for path in sorted(root.rglob("*")):
-            if path.suffix not in {".xu", ".rs"}:
+            if path.suffix != ".xu":
                 continue
-            relative = logical(path)
+            relative = path.relative_to(ROOT).as_posix()
             text = mask_hardware_references(relative, path.read_text(errors="replace"))
             match = forbidden.search(text)
             if match:
                 fail(
                     f"stdlib crypto implementation marker '{match.group(0)}' entered "
-                    f"{logical(path)}"
+                    f"{relative}"
                 )
 
 

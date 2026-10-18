@@ -26,16 +26,14 @@
 #   scripts/selfhost_perturb.sh --files=src/cmd/compile/emit_ra_fp.xu,src/cmd/compile/emit_vec.xu
 #   scripts/selfhost_perturb.sh --self-test          # prove the harness compiles the perturbed tree
 #
-# Lane: dual.  The seed is a hosted compiler resolved by xu_host_seed.sh; the
-# primer is accepted only with --allow-oracle-seed and an explicit --seed, and
-# that run is never product evidence.  Nothing here installs bin/xu.
+# The seed is a hosted compiler resolved by xu_host_seed.sh.
+# Perturbed candidates are isolated from the installed bin/xu.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
-LANE=dual
+LANE=product
 source scripts/test_lib.sh
 . ./scripts/gen1_sources.sh
 
@@ -50,7 +48,6 @@ REORDER=1
 FULL_CHAIN=0
 KEEP=0
 SELF_TEST=0
-ALLOW_ORACLE=0
 HOP_TIMEOUT=${XU_PERTURB_HOP_TIMEOUT:-1800}
 SMOKE='^(hello_string|struct_fields|struct_methods|struct_tag_overflow|struct_init_move|closure_basic|crypto_aes|field_arr_while_off|while_countdown|bounds_while_len|generic_nested|iface_box_user|enum_owning_match|matmul_tiny|nbody_pair_rmw|copy_index_loop|map_lang_basic|chan_xu_basic|err_index_kernel_oob|err_bounds_while_n)$'
 while [ "$#" -gt 0 ]; do
@@ -68,7 +65,6 @@ while [ "$#" -gt 0 ]; do
         --self-test) SELF_TEST=1 ;;
         --smoke=*) SMOKE="${1#*=}" ;;
         --hop-timeout=*) HOP_TIMEOUT="${1#*=}" ;;
-        --allow-oracle-seed) ALLOW_ORACLE=1 ;;
         -h|--help)
             sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -78,18 +74,11 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-if [ "$ALLOW_ORACLE" = 1 ] && [ -z "$SEED_INPUT" ]; then
-    echo "selfhost_perturb: --allow-oracle-seed requires an explicit --seed=bootstrap/target/{debug,release}/xu" >&2
-    exit 1
-fi
-if ! SEED=$(XU_ALLOW_ORACLE_SEED="$ALLOW_ORACLE" XU_SEED="$SEED_INPUT" ./scripts/xu_host_seed.sh); then
-    echo "selfhost_perturb: seed rejected by hosted/oracle boundary: ${SEED_INPUT:-<auto>}" >&2
+if ! SEED=$(XU_SEED="$SEED_INPUT" ./scripts/xu_host_seed.sh); then
+    echo "selfhost_perturb: seed rejected by hosted product policy: ${SEED_INPUT:-<auto>}" >&2
     exit 1
 fi
 SEED_LANE=hosted
-case "$SEED" in
-    "$BOOTSTRAP_ROOT"|"$BOOTSTRAP_ROOT"/*) SEED_LANE=oracle ;;
-esac
 
 sha256_file() {
     if command -v shasum >/dev/null 2>&1; then
@@ -137,14 +126,17 @@ export XU_CACHE="$WORK/cache"
 export HOME="$WORK/home"
 export USERPROFILE="$HOME"
 mkdir -p "$XU_CACHE" "$HOME"
-unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED XU_ALLOW_ORACLE_SEED
+unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED
 
 # hop <cwd> <compiler> <out> : compile the Gen1 source list found below <cwd>.
 hop() {
     local cwd="$1" xu="$2" out="$3" rc
     set +e
     # shellcheck disable=SC2086
-    (cd "$cwd" && run_with_timeout "$HOP_TIMEOUT" "$xu" build $GEN1_SRCS -o "$out") >"$out.log" 2>&1
+    (cd "$cwd" &&
+        export XU_ROOT="$(python3 -c 'from pathlib import Path; print(Path.cwd().resolve().as_posix())')" &&
+        export XU_STDLIB_ROOT="$XU_ROOT/src" &&
+        run_with_timeout "$HOP_TIMEOUT" "$xu" build $GEN1_SRCS -o "$out") >"$out.log" 2>&1
     rc=$?
     set -e
     if [ "$rc" -eq 124 ]; then
@@ -164,15 +156,14 @@ echo "selfhost_perturb: lane=$LANE seed_lane=$SEED_LANE"
 echo "selfhost_perturb: seed=$SEED"
 echo "selfhost_perturb: seed_sha256=$(sha256_file "$SEED")"
 echo "selfhost_perturb: rounds=$ROUNDS random_seed=$RSEED files=${FILES:-<random $NFILES>} fns=$FNS structs=$STRUCTS reorder=$REORDER full_chain=$FULL_CHAIN"
-if [ "$SEED_LANE" = oracle ]; then
-    echo "selfhost_perturb: WARNING oracle primer seed explicitly enabled; results are not product evidence" >&2
-fi
 
 # ---- self-test: the harness must be compiling the perturbed tree -----------
 if [ "$SELF_TEST" = 1 ]; then
-    python3 scripts/selfhost_perturb.py --src-root "$ROOT" --out-root "$WORK/selftest" \
-        --random-seed "$RSEED" --nfiles 1 --fns 1 --structs 1 --no-reorder --self-test \
-        --manifest "$WORK/selftest/manifest.json" >/dev/null
+    selftest_args=(--src-root "$ROOT" --out-root "$WORK/selftest"
+        --random-seed "$RSEED" --nfiles 1 --fns 1 --structs 1 --no-reorder --self-test
+        --manifest "$WORK/selftest/manifest.json")
+    [ -z "$FILES" ] || selftest_args+=(--files "$FILES")
+    python3 scripts/selfhost_perturb.py "${selftest_args[@]}" >/dev/null
     if hop "$WORK/selftest" "$SEED" "$WORK/selftest/p1$HOP_EXT" 2>/dev/null; then
         echo "selfhost_perturb: SELF-TEST FAILED: an injected syntax error compiled; the harness is not compiling the perturbed tree" >&2
         exit 1

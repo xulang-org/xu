@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""Check the static part of the bootstrap/Xu self-host boundary.
+"""Validate the hosted product source closure, runtime ABI and build contract.
 
-This is deliberately a schema/source check, not a substitute for compiling
-the chain.  It verifies that the two implementations remain in their
-declared roles, that the small ABI seam has both endpoints, and that the
-product source does not acquire a runtime dependency on the Rust primer.
-Semantic parity is covered by the oracle and self-host gates.  Ordinary mode
-warns about untracked bootstrap implementation files; ``--strict-freeze``
-requires every such file to be registered as an oracle/auxiliary exception.
+All checks are local to this checkout. The historical filename and
+--strict-freeze/--ci options remain compatible with existing build callers.
 """
 
 from __future__ import annotations
@@ -27,32 +22,11 @@ from collections import deque
 from pathlib import Path
 from typing import Iterable
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
-    tomllib = None  # type: ignore[assignment]
-
-
-from companion_repos import project_root
-
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MANIFEST = (
-    ROOT / "BOUNDARY.json"
-    if (ROOT / "BOUNDARY.json").is_file()
-    else project_root("bootstrap") / "BOUNDARY.json"
-)
+DEFAULT_MANIFEST = ROOT / "BOUNDARY.json"
 MODULE_IMPORT_RE = re.compile(
     r"^\s*#([A-Za-z_][A-Za-z0-9_./-]*)\s*(?:$|//)", re.MULTILINE
 )
-STATUS_VALUES = {
-    "open",
-    "cleared",
-    "accepted",
-    "deferred-1.0",
-    "deferred-2.0",
-}
-
-
 class BoundaryCheck:
     def __init__(
         self, root: Path, manifest_path: Path, *, strict_freeze: bool = False, ci: bool = False
@@ -62,8 +36,6 @@ class BoundaryCheck:
         # resolved children would otherwise report legitimate paths as
         # out-of-root.
         self.root = root.resolve()
-        self.bootstrap_root = project_root("bootstrap", core_root=self.root)
-        self.bootstrap_present = self.bootstrap_root.is_dir()
         self.manifest_path = manifest_path.resolve()
         self.errors: list[str] = []
         self.warnings: list[str] = []
@@ -85,15 +57,10 @@ class BoundaryCheck:
         self.error(message)
 
     def repository_root(self, path: Path) -> Path:
-        """Identify the owner using lexical paths, before resolving symlinks."""
-        if path.is_relative_to(self.bootstrap_root):
-            return self.bootstrap_root
+        """All contract paths belong to the product checkout."""
         return self.root
 
     def relative(self, path: Path) -> Path:
-        """Keep manifest identities stable across the two independent repos."""
-        if path.is_relative_to(self.bootstrap_root):
-            return Path("bootstrap") / path.relative_to(self.bootstrap_root)
         return path.relative_to(self.root)
 
     def _reject_symlink_components(self, candidate: Path, label: str) -> bool:
@@ -106,8 +73,8 @@ class BoundaryCheck:
         checkout.  Out-of-root targets are reported separately by ``path``.
         """
 
-        owner = self.bootstrap_root if candidate.parts[:1] == ("bootstrap",) else self.root
-        parts = candidate.parts[1:] if owner == self.bootstrap_root else candidate.parts
+        owner = self.root
+        parts = candidate.parts
         current = owner
         unsafe = current.is_symlink()
         if unsafe:
@@ -139,8 +106,8 @@ class BoundaryCheck:
         if self._reject_symlink_components(candidate, label):
             return None
         try:
-            owner = self.bootstrap_root if candidate.parts[:1] == ("bootstrap",) else self.root
-            relative = Path(*candidate.parts[1:]) if owner == self.bootstrap_root else candidate
+            owner = self.root
+            relative = candidate
             resolved = (owner / relative).resolve()
         except RuntimeError as exc:
             self.error(f"{label}: cannot resolve path {value}: {exc}")
@@ -271,9 +238,7 @@ class BoundaryCheck:
                 self.error(f"required_paths[{index}] must be a string")
                 continue
             # Development docs and the sync ledger intentionally stay local.
-            if self.ci and (value.startswith(("docs/", "tests/")) or value == "bootstrap/SYNC_DIFF.md"):
-                continue
-            if self.ci and not self.bootstrap_present and value.startswith("bootstrap/"):
+            if self.ci and (value.startswith(("docs/", "tests/"))):
                 continue
             path = self.path(value, f"required_paths[{index}]")
             if path is not None and not path.exists():
@@ -284,453 +249,59 @@ class BoundaryCheck:
         if not isinstance(roles, dict):
             self.error("roles must be an object")
             return
-        bootstrap = roles.get("bootstrap")
         product = roles.get("xu")
-        if not isinstance(bootstrap, dict) or not isinstance(product, dict):
-            self.error("roles must contain bootstrap and xu objects")
+        if not isinstance(product, dict):
+            self.error("roles must contain xu object")
             return
-        if bootstrap.get("root") != "bootstrap" or bootstrap.get("stage") != "Gen0":
-            self.error("bootstrap role must be root=bootstrap, stage=Gen0")
         if product.get("root") != "src" or not product.get("product_artifact"):
             self.error("xu role must be the src product authority")
-        if bootstrap.get("product_artifact") is not False:
-            self.error("bootstrap role must not be marked as a product artifact")
-        self.info["bootstrap_role"] = bootstrap.get("authority", [])
         self.info["product_role"] = product.get("authority", [])
 
-        scope = manifest.get("scope")
-        if not isinstance(scope, dict):
-            self.error("scope must be an object")
-            return
-        compiler_chain = scope.get("compiler_chain")
-        auxiliary = scope.get("auxiliary_bootstrap_consumers")
-        if not isinstance(compiler_chain, list) or not compiler_chain:
+        scope = manifest.get("scope", {})
+        paths = scope.get("compiler_chain") if isinstance(scope, dict) else None
+        if not isinstance(paths, list) or not paths:
             self.error("scope.compiler_chain must be a non-empty list")
-        else:
-            for index, value in enumerate(compiler_chain):
-                if self.ci and not self.bootstrap_present and isinstance(value, str) and value.startswith("bootstrap/"):
-                    continue
-                if not isinstance(value, str):
-                    self.error(f"scope.compiler_chain[{index}] must be a string")
-                    continue
-                path = self.path(value, f"scope.compiler_chain[{index}]")
-                if path is not None and not path.exists():
-                    self.error(f"scope.compiler_chain[{index}]: path not found: {value}")
-        if not isinstance(auxiliary, list):
-            self.error("scope.auxiliary_bootstrap_consumers must be a list")
-        else:
-            for index, value in enumerate(auxiliary):
-                if self.ci and not self.bootstrap_present and isinstance(value, str) and value.startswith("bootstrap/"):
-                    continue
-                if not isinstance(value, str):
-                    self.error(f"scope.auxiliary_bootstrap_consumers[{index}] must be a string")
-                    continue
-                path = self.path(value, f"scope.auxiliary_bootstrap_consumers[{index}]")
-                if path is not None and not path.exists():
-                    self.error(
-                        f"scope.auxiliary_bootstrap_consumers[{index}]: path not found: {value}"
-                    )
-            self.info["auxiliary_consumers"] = auxiliary
-        self.check_workspace_scope(manifest)
-
-    def check_workspace_scope(self, manifest: dict) -> None:
-        """Keep the declared compiler crate scope closed over Cargo members.
-
-        A partial list (for example only ``xu``/``xuhir``/``xumir``) can make
-        a Rust-only test look like a complete primer check while transitive
-        crates such as ``xuparse`` or ``xuvm`` change underneath it.  The
-        manifest therefore names compiler and auxiliary members separately and
-        requires their union to equal ``bootstrap/Cargo.toml`` exactly.
-        """
-        if self.ci and not self.bootstrap_present:
             return
-
-        scope = manifest.get("scope")
-        if not isinstance(scope, dict):
-            return
-        config = scope.get("bootstrap_workspace")
-        if not isinstance(config, dict):
-            self.error("scope.bootstrap_workspace must be an object")
-            return
-        cargo_rel = config.get("manifest")
-        if not isinstance(cargo_rel, str):
-            self.error("scope.bootstrap_workspace.manifest must be a string")
-            return
-        cargo_path = self.path(cargo_rel, "scope.bootstrap_workspace.manifest")
-        if cargo_path is None or not self.regular_file(
-            cargo_path, "scope.bootstrap_workspace.manifest"
-        ):
-            return
-        try:
-            cargo_text = cargo_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            self.error(f"cannot read workspace manifest: {exc}")
-            return
-
-        members: list[str] = []
-        if tomllib is not None:
-            try:
-                cargo = tomllib.loads(cargo_text)
-                raw_members = cargo.get("workspace", {}).get("members", [])
-                if isinstance(raw_members, list):
-                    members = [str(item) for item in raw_members if isinstance(item, str)]
-            except (tomllib.TOMLDecodeError, AttributeError) as exc:
-                self.error(f"cannot parse bootstrap/Cargo.toml: {exc}")
-                return
-        else:  # pragma: no cover - only Python 3.10 without tomllib
-            match = re.search(r"(?ms)^\s*members\s*=\s*\[(.*?)\]", cargo_text)
-            if match:
-                members = re.findall(r'"([^"]+)"', match.group(1))
-            else:
-                self.error("cannot locate workspace members in bootstrap/Cargo.toml")
-                return
-
-        if not members:
-            self.error("bootstrap/Cargo.toml workspace.members is empty")
-            return
-        if any(Path(member).is_absolute() or ".." in Path(member).parts for member in members):
-            self.error("bootstrap/Cargo.toml contains an unsafe workspace member path")
-            return
-
-        compiler_members = config.get("compiler_members")
-        auxiliary_members = config.get("auxiliary_members")
-        if not isinstance(compiler_members, list) or not compiler_members:
-            self.error("scope.bootstrap_workspace.compiler_members must be non-empty")
-            return
-        if not isinstance(auxiliary_members, list):
-            self.error("scope.bootstrap_workspace.auxiliary_members must be a list")
-            return
-        compiler_names = [item for item in compiler_members if isinstance(item, str)]
-        auxiliary_names = [item for item in auxiliary_members if isinstance(item, str)]
-        if len(compiler_names) != len(compiler_members):
-            self.error("scope.bootstrap_workspace.compiler_members entries must be strings")
-        if len(auxiliary_names) != len(auxiliary_members):
-            self.error("scope.bootstrap_workspace.auxiliary_members entries must be strings")
-        declared_names = compiler_names + auxiliary_names
-        if len(declared_names) != len(set(declared_names)):
-            self.error("scope.bootstrap_workspace has duplicate crate names")
-
-        # Cargo members are paths; turn each into its package name so the
-        # manifest remains stable if a member path is ever relocated.
-        cargo_names: list[str] = []
-        for member in members:
-            member_path = self.path(
-                str((Path(cargo_rel).parent / member).as_posix()),
-                f"bootstrap workspace member {member}",
-            )
-            if member_path is None or not member_path.is_dir():
-                self.error(f"workspace member directory missing: {member}")
+        for index, value in enumerate(paths):
+            if not isinstance(value, str):
+                self.error(f"scope.compiler_chain[{index}] must be a string")
                 continue
-            package_toml = member_path / "Cargo.toml"
-            if not self.regular_file(package_toml, f"workspace member {member}"):
-                continue
-            try:
-                package_text = package_toml.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                self.error(f"cannot read workspace member {member}: {exc}")
-                continue
-            package_name: str | None = None
-            if tomllib is not None:
-                try:
-                    package = tomllib.loads(package_text).get("package", {})
-                    if isinstance(package, dict) and isinstance(package.get("name"), str):
-                        package_name = package["name"]
-                except (tomllib.TOMLDecodeError, AttributeError) as exc:
-                    self.error(f"cannot parse {member}/Cargo.toml: {exc}")
-            if package_name is None:
-                match = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', package_text)
-                package_name = match.group(1) if match else None
-            if package_name is None:
-                self.error(f"workspace member {member} has no package.name")
-            else:
-                cargo_names.append(package_name)
-
-        expected = set(cargo_names)
-        declared = set(declared_names)
-        exact = config.get("exact") is True
-        if exact and declared != expected:
-            self.error(
-                "bootstrap workspace scope must equal Cargo members: "
-                f"missing={sorted(expected - declared)!r}, "
-                f"extra={sorted(declared - expected)!r}"
-            )
-        elif not exact and not expected.issubset(declared):
-            self.error(
-                "bootstrap workspace scope omits Cargo members: "
-                f"{sorted(expected - declared)!r}"
-            )
-
-        chain = scope.get("compiler_chain", [])
-        chain_set = set(chain) if isinstance(chain, list) else set()
-        for name in compiler_names:
-            crate_path = f"bootstrap/crates/{name}"
-            if crate_path not in chain_set:
-                self.error(
-                    f"compiler workspace member {name} is missing from scope.compiler_chain"
-                )
-        for name in auxiliary_names:
-            crate_path = f"bootstrap/crates/{name}"
-            if crate_path not in set(scope.get("auxiliary_bootstrap_consumers", [])):
-                self.error(
-                    f"auxiliary workspace member {name} must be listed in "
-                    "scope.auxiliary_bootstrap_consumers"
-                )
-        self.info["workspace_scope"] = {
-            "cargo_members": sorted(expected),
-            "compiler_members": sorted(set(compiler_names)),
-            "auxiliary_members": sorted(set(auxiliary_names)),
-        }
+            path = self.path(value, f"scope.compiler_chain[{index}]")
+            if path is not None and not path.is_dir():
+                self.error(f"scope.compiler_chain[{index}]: directory not found: {value}")
+        self.info["workspace_scope"] = not self.errors
 
     def check_generation(self, manifest: dict) -> None:
         generation = manifest.get("generation")
         if not isinstance(generation, dict):
             self.error("generation must be an object")
             return
-        required = {
-            "gen0": ("Gen1", "-O0"),
-            "gen1": ("Gen2", "hosted"),
-            "gen2": ("Gen3", "hosted"),
-            "gen3": ("Gen4", "hosted"),
-        }
-        # Keep the generation graph executable, rather than treating the
-        # producer/input fields as documentation-only labels.  In particular,
-        # a typo that changes Gen0 to a release/hosted binary or skips the
-        # declared source-manifest script would otherwise leave the checker
-        # green while the chain script follows a different graph.
-        expected_producers = {
-            "gen0": "bootstrap/target/debug/xu",
-            "gen1": "Gen0",
-            "gen2": "Gen1",
-            "gen3": "Gen2",
-        }
-        expected_input = "scripts/gen1_sources.sh"
-        for stage, (output, mode_hint) in required.items():
+        for stage, producer in (("gen1", "Seed"), ("gen2", "Gen1"),
+                                ("gen3", "Gen2"), ("gen4", "Gen3")):
             item = generation.get(stage)
             if not isinstance(item, dict):
                 self.error(f"generation.{stage} must be an object")
                 continue
-            if item.get("producer") != expected_producers[stage]:
-                self.error(
-                    f"generation.{stage}.producer must be "
-                    f"{expected_producers[stage]!r}"
-                )
-            if item.get("input") != expected_input:
-                self.error(
-                    f"generation.{stage}.input must be {expected_input!r}"
-                )
-            if item.get("output") != output:
-                self.error(f"generation.{stage}.output must be {output}")
-            mode = str(item.get("mode", ""))
-            if mode_hint not in mode:
-                self.error(f"generation.{stage}.mode must mention {mode_hint}")
+            for key, expected in (("producer", producer), ("output", stage.title()),
+                                  ("input", "scripts/gen1_sources.sh")):
+                if item.get(key) != expected:
+                    self.error(f"generation.{stage}.{key} must be {expected!r}")
         self.check_profiles(manifest, generation)
         warmup = generation.get("warmup")
-        if not isinstance(warmup, dict):
-            self.error("generation.warmup must be an object")
-        else:
-            if warmup.get("artifact") != "Gen2":
-                self.error("generation.warmup.artifact must be Gen2")
-            hops = warmup.get("max_transient_hops")
-            if not isinstance(hops, int) or isinstance(hops, bool) or hops < 0:
-                self.error("generation.warmup.max_transient_hops must be a non-negative integer")
+        if warmup is not None:
+            if not isinstance(warmup, dict):
+                self.error("generation.warmup must be an object")
+            else:
+                if warmup.get("artifact") != "Gen2":
+                    self.error("generation.warmup.artifact must be Gen2")
+                hops = warmup.get("max_transient_hops")
+                if not isinstance(hops, int) or isinstance(hops, bool) or hops < 0:
+                    self.error("generation.warmup.max_transient_hops must be a non-negative integer")
         fixed = str(generation.get("fixed_point", ""))
-        if not all(marker in fixed for marker in ("byte-identical", "Gen2", "Gen3", "Gen4", "skip")):
-            self.error("generation.fixed_point must confirm Gen2/Gen3 byte identity or fall back to Gen3/Gen4")
+        if not all(marker in fixed for marker in ("byte-identical", "Gen2", "Gen3")):
+            self.error("generation.fixed_point must confirm Gen2/Gen3 byte identity")
         self.info["generation_fixed_point"] = fixed
 
-    def check_frozen_primer_paths(self, manifest: dict) -> None:
-        """Validate the machine-readable Gen0 artifact allowlist."""
-        if self.ci and not self.bootstrap_present:
-            return
-
-        invariants = manifest.get("invariants")
-        if not isinstance(invariants, dict):
-            self.error("invariants must be an object")
-            return
-        if invariants.get("oracle_requires_frozen_primer") is not True:
-            self.error("oracle_requires_frozen_primer must be true")
-        expected = [
-            "bootstrap/target/debug/xu",
-            "bootstrap/target/debug/xu.exe",
-            "bootstrap/target/release/xu",
-            "bootstrap/target/release/xu.exe",
-        ]
-        paths = invariants.get("frozen_primer_paths")
-        if paths != expected:
-            self.error(
-                "frozen_primer_paths must list the canonical debug/release primer "
-                f"paths exactly (got {paths!r})"
-            )
-            paths = expected if not isinstance(paths, list) else paths
-        seen: set[str] = set()
-        valid: list[str] = []
-        for index, value in enumerate(paths):
-            label = f"invariants.frozen_primer_paths[{index}]"
-            if not isinstance(value, str):
-                self.error(f"{label} must be a string")
-                continue
-            if value in seen:
-                self.error(f"{label} is duplicated: {value}")
-            seen.add(value)
-            path = self.path(value, label)
-            if path is None:
-                continue
-            valid.append(value)
-            # A clean clone does not contain target artifacts yet.  If an
-            # artifact exists, however, require a non-symlink regular file.
-            if path.exists() and not self.regular_file(path, label):
-                continue
-        self.info["frozen_primer_paths"] = valid
-
-    def check_oracle_path_guards(self, manifest: dict) -> None:
-        """Ensure every lane entrypoint enforces the frozen-primer seam.
-
-        The runtime checks live in small Python/shell consumers, so a schema
-        check alone is insufficient: a later refactor could leave the
-        manifest unchanged while dropping the path/symlink guard.  Keep the
-        required marker set deliberately narrow and inspect executable source
-        with comments removed.
-        """
-
-        invariants = manifest.get("invariants")
-        if not isinstance(invariants, dict):
-            self.error("invariants must be an object")
-            return
-        expected = [
-            "scripts/cli_platform_test.sh",
-            "scripts/check_crypto_constant_time_codegen.py",
-            "scripts/deploy_xu_server.sh",
-            "scripts/hardening_gate.sh",
-            "scripts/language_eval.py",
-            "scripts/platform_test.sh",
-            "scripts/run_fixtures.sh",
-            "scripts/scheduler_stress.py",
-            "scripts/xu_doctor.py",
-        ]
-        paths = invariants.get("oracle_path_guard_scripts")
-        if paths != expected:
-            self.error(
-                "oracle_path_guard_scripts must list every lane entrypoint "
-                f"exactly (got {paths!r})"
-            )
-            paths = expected if not isinstance(paths, list) else paths
-
-        python_markers = {
-            "scripts/check_crypto_constant_time_codegen.py": (
-                "FROZEN_PRIMER_PATHS",
-                "is_frozen_primer",
-            ),
-            "scripts/scheduler_stress.py": ("FROZEN_PRIMER_PATHS", "_is_frozen_primer"),
-            "scripts/xu_doctor.py": ("FROZEN_PRIMER_PATHS", "_is_frozen_primer"),
-            "scripts/language_eval.py": ("FROZEN_PRIMER_PATHS", "is_frozen_primer"),
-        }
-        shell_markers = {
-            "scripts/cli_platform_test.sh": ("is_frozen_primer_path", "has_symlink_component"),
-            "scripts/deploy_xu_server.sh": ("is_frozen_primer_path", "has_symlink_component"),
-            "scripts/platform_test.sh": ("is_frozen_primer_path", "has_symlink_component"),
-            "scripts/run_fixtures.sh": ("is_frozen_primer_path", "has_symlink_component"),
-            # hardening_gate selects scheduler's lane from a canonical path;
-            # it accepts an explicitly hosted compiler but fail-closes any
-            # non-canonical path below bootstrap.
-            "scripts/hardening_gate.sh": (
-                "is_primer_path",
-                "is_frozen_primer_path",
-                "SCHEDULER_LANE",
-            ),
-        }
-        seen: list[str] = []
-        if not isinstance(paths, list):
-            paths = []
-        for index, value in enumerate(paths):
-            label = f"invariants.oracle_path_guard_scripts[{index}]"
-            if not isinstance(value, str):
-                self.error(f"{label} must be a string")
-                continue
-            path = self.path(value, label)
-            if path is None or not self.regular_file(path, label):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                self.error(f"cannot read oracle path-guard script {value}: {exc}")
-                continue
-            active = "\n".join(
-                line for line in text.splitlines() if not line.lstrip().startswith("#")
-            )
-            markers = python_markers.get(value) or shell_markers.get(value)
-            if markers is None:
-                self.error(f"oracle path-guard script is not classified: {value}")
-                continue
-            for marker in markers:
-                if marker not in active:
-                    self.error(
-                        f"oracle path-guard script {value} is missing active marker {marker}"
-                    )
-            seen.append(value)
-        self.info["oracle_path_guard_scripts"] = sorted(seen)
-
-        # Direct oracle harnesses that build/use a fixed bootstrap path must
-        # delegate validation to xu_host_seed's strict mode.  This catches a
-        # refactor that leaves the BOUNDARY_LANE=oracle banner intact while
-        # accepting an external primer or a symlinked target.
-        strict_expected = [
-            "scripts/e2_qemu_hello.sh",
-            "scripts/gen1_platform_test.sh",
-            "scripts/gen1_test.sh",
-            "scripts/programs_cross_check.sh",
-            "scripts/safety_cross_target.sh",
-            "scripts/safety_embedded.sh",
-            "scripts/safety_escape_test.sh",
-            "scripts/safety_test.sh",
-            "scripts/test_runtime_data_alignment.sh",
-            "scripts/test_runtime_lifetime_policy.sh",
-            "scripts/test_string_temp_lifetime.sh",
-            "scripts/test_vreg_matrix.sh",
-            "scripts/test_vreg_selfhost.sh",
-            "tests/platform_contract.sh",
-        ]
-        strict_paths = invariants.get("oracle_strict_resolver_scripts")
-        if strict_paths != strict_expected:
-            self.error(
-                "oracle_strict_resolver_scripts must list every direct oracle "
-                f"consumer exactly (got {strict_paths!r})"
-            )
-            strict_paths = (
-                strict_expected if not isinstance(strict_paths, list) else strict_paths
-            )
-        strict_seen: list[str] = []
-        if not isinstance(strict_paths, list):
-            strict_paths = []
-        for index, value in enumerate(strict_paths):
-            if self.ci and isinstance(value, str) and value.startswith("tests/"):
-                continue  # The complete Xu test corpus stays on the development machine.
-            label = f"invariants.oracle_strict_resolver_scripts[{index}]"
-            if not isinstance(value, str):
-                self.error(f"{label} must be a string")
-                continue
-            path = self.path(value, label)
-            if path is None or not self.regular_file(path, label):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                self.error(f"cannot read strict oracle consumer {value}: {exc}")
-                continue
-            active = "\n".join(
-                line for line in text.splitlines() if not line.lstrip().startswith("#")
-            )
-            for marker, description in (
-                ("XU_REQUIRE_FROZEN_PRIMER=1", "strict frozen-primer resolver mode"),
-                ("XU_ALLOW_ORACLE_SEED=1", "explicit oracle opt-in"),
-                ("xu_host_seed.sh", "canonical seed resolver"),
-            ):
-                if marker not in active:
-                    self.error(
-                        f"strict oracle consumer {value} is missing {description} "
-                        f"({marker})"
-                    )
-            strict_seen.append(value)
-        self.info["oracle_strict_resolver_scripts"] = sorted(strict_seen)
 
     def check_profiles(self, manifest: dict, generation: dict) -> None:
         """Validate the named optimization profiles and their generation use.
@@ -746,12 +317,10 @@ class BoundaryCheck:
         if not isinstance(profiles, dict):
             self.error("profiles must be an object")
             return
-        required_profiles = {
-            "primer_oracle": ["-O0"],
-            "hosted_product": [],
-            "hosted_acceptance": ["-O1", "--ra=1"],
-        }
-        for name, expected_args in required_profiles.items():
+        if "hosted_product" not in profiles:
+            self.error("profiles.hosted_product must be present")
+            return
+        for name in profiles:
             item = profiles.get(name)
             if not isinstance(item, dict):
                 self.error(f"profiles.{name} must be an object")
@@ -760,69 +329,26 @@ class BoundaryCheck:
             if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
                 self.error(f"profiles.{name}.args must be a string list")
                 continue
-            if list(args) != expected_args:
-                self.error(
-                    f"profiles.{name}.args must be {expected_args!r}, got {args!r}"
-                )
             lane = item.get("lane")
             if not isinstance(lane, str) or not lane:
                 self.error(f"profiles.{name}.lane must be non-empty")
 
-        gen0 = generation.get("gen0")
-        if isinstance(gen0, dict):
-            if gen0.get("profile") not in (None, "primer_oracle"):
-                self.error("generation.gen0.profile must be primer_oracle")
-            # Keep the old compact manifest valid while requiring the profile
-            # to be explicit for new manifests.
-            if gen0.get("profile") is None:
-                self.warnings.append("generation.gen0.profile is implicit; add primer_oracle")
-        for stage in ("gen1", "gen2", "gen3"):
+        for stage in ("gen1", "gen2", "gen3", "gen4"):
             item = generation.get(stage)
             if not isinstance(item, dict):
                 continue
             if item.get("profile") != "hosted_product":
                 self.error(f"generation.{stage}.profile must be hosted_product")
-            if item.get("acceptance_profile") != "hosted_acceptance":
+            if item.get("acceptance_profile") and item.get("acceptance_profile") != "hosted_acceptance":
                 self.error(
                     f"generation.{stage}.acceptance_profile must be hosted_acceptance"
                 )
         self.info["profiles"] = {
             name: profiles.get(name, {}).get("args", [])
-            for name in required_profiles
+            for name in profiles
             if isinstance(profiles.get(name), dict)
         }
 
-    def check_mirrors(self, manifest: dict) -> None:
-        mirrors = manifest.get("mirrors")
-        if not isinstance(mirrors, list) or not mirrors:
-            self.error("mirrors must be a non-empty list")
-            return
-        ids: set[str] = set()
-        for index, mirror in enumerate(mirrors):
-            if not isinstance(mirror, dict):
-                self.error(f"mirrors[{index}] must be an object")
-                continue
-            mirror_id = mirror.get("id")
-            if not isinstance(mirror_id, str) or not mirror_id:
-                self.error(f"mirrors[{index}].id must be non-empty")
-            elif mirror_id in ids:
-                self.error(f"duplicate mirror id: {mirror_id}")
-            else:
-                ids.add(mirror_id)
-            for side in ("product_paths", "primer_paths"):
-                if side == "primer_paths" and self.ci and not self.bootstrap_present:
-                    continue
-                paths = mirror.get(side)
-                if not isinstance(paths, list) or not paths:
-                    self.error(f"mirrors[{index}].{side} must be a non-empty list")
-                    continue
-                for pindex, value in enumerate(paths):
-                    if not isinstance(value, str):
-                        self.error(f"mirrors[{index}].{side}[{pindex}] must be a string")
-                        continue
-                    path = self.path(value, f"mirrors[{index}].{side}[{pindex}]")
-                    if path is not None and not path.exists():
-                        self.error(f"mirrors[{index}].{side}[{pindex}]: path not found: {value}")
 
     def check_runtime_contract_registry(self, manifest: dict) -> None:
         config = manifest.get("runtime_contract_registry")
@@ -875,9 +401,7 @@ class BoundaryCheck:
                 ids.add(entry_id)
 
             contents: dict[str, str] = {}
-            for side in ("product_paths", "primer_paths"):
-                if side == "primer_paths" and self.ci and not self.bootstrap_present:
-                    continue
+            for side in ("product_paths",):
                 paths = entry.get(side)
                 if not isinstance(paths, list) or not paths:
                     self.error(f"runtime_abi[{index}].{side} must be a non-empty list")
@@ -902,7 +426,7 @@ class BoundaryCheck:
                     else:
                         files = self.source_files_under(
                             path,
-                            (".xu", ".rs"),
+                            (".xu",),
                             f"runtime_abi[{index}].{side}[{pindex}]",
                             recursive=True,
                         )
@@ -931,9 +455,7 @@ class BoundaryCheck:
                     self.error(f"runtime_abi[{index}] contains an invalid symbol")
                     continue
                 checked_symbols += 1
-                for side in ("product_paths", "primer_paths"):
-                    if side == "primer_paths" and self.ci and not self.bootstrap_present:
-                        continue
+                for side in ("product_paths",):
                     if symbol not in contents.get(side, ""):
                         self.error(
                             f"runtime ABI {entry_id or index}: {symbol} missing from {side} endpoint"
@@ -1107,19 +629,8 @@ class BoundaryCheck:
         )
         if "bin/xu" not in seed_active or "developer/bin/xu." not in seed_active:
             self.error("xu_host_seed.sh must select a hosted bin/xu or developer/bin snapshot")
-        # The resolver is allowed to mention the frozen primer in its
-        # *guard*: an explicit XU_SEED pointing there may be used for oracle
-        # recovery only.  What is forbidden is an unconditional primer/cargo
-        # fallback.  Keep these checks semantic and narrow instead of banning
-        # the word `bootstrap` everywhere (which would reject the guard and
-        # its diagnostic).
+        # Seed selection never builds a compiler or invokes a Rust toolchain.
         for marker, label in (
-            ("XU_ALLOW_ORACLE_SEED", "explicit oracle opt-in"),
-            ("XU_REQUIRE_FROZEN_PRIMER", "strict frozen-primer mode"),
-            ("is_primer", "primer path classification"),
-            ("is_frozen_primer", "canonical frozen-primer classification"),
-            ("has_symlink_component", "primer symlink-component guard"),
-            ("has_any_symlink_component", "external oracle alias guard"),
             ("select_explicit", "explicit seed path"),
             ("select_auto", "hosted auto-discovery"),
         ):
@@ -1127,10 +638,6 @@ class BoundaryCheck:
                 self.error(f"xu_host_seed.sh is missing {label} guard ({marker})")
         if re.search(r"(?:^|[;&|]\s*)cargo(?:\s|$)", seed_active, re.IGNORECASE):
             self.error("xu_host_seed.sh must not invoke cargo")
-        # The resolver may name the canonical paths inside its *classifier*;
-        # what is forbidden is assigning one directly as an automatic seed or
-        # fallback.  Keep the check assignment-oriented so the allowlist and
-        # the no-fallback invariant can coexist.
         if re.search(
             r"(?im)^\s*(?:candidate|seed|compiler|xu)\s*=.*"
             r"bootstrap/target/(?:debug|release)/xu(?:\.exe)?",
@@ -1138,7 +645,7 @@ class BoundaryCheck:
         ):
             self.error("xu_host_seed.sh must not hard-code a primer binary fallback")
         if not re.search(r"select_explicit\s+\"\$XU_SEED\"", seed_active):
-            self.error("xu_host_seed.sh must require an explicit XU_SEED for oracle override")
+            self.error("xu_host_seed.sh must require an explicit XU_SEED for override")
 
         chain_active = "\n".join(
             line for line in chain.splitlines() if not line.lstrip().startswith("#")
@@ -1175,51 +682,17 @@ class BoundaryCheck:
             )
         if "product-selfhost" not in makefile:
             self.error("Makefile must expose an explicit product-selfhost lane")
-        if "XU_ALLOW_ORACLE_SEED=0" not in makefile:
-            self.error(
-                "Makefile product lane must force XU_ALLOW_ORACLE_SEED=0 "
-                "(oracle recovery is explicit only)"
-            )
         for marker, label in (
-            ("XU_SEED=\"$SEED_INPUT\"", "seed policy delegation"),
-            ("XUPATH=\"\"", "clean XUPATH"),
+            ('XU_SEED="$SEED_INPUT"', "seed policy delegation"),
+            ('XUPATH=""', "clean XUPATH"),
             ("XU_CACHE=", "isolated XU_CACHE"),
             ("unset XUOS XUARCH", "fixed host target"),
-            ("XU_ALLOW_ORACLE_INSTALL", "oracle install guard"),
-            ("is_product_destination", "product destination classification"),
         ):
             if marker not in chain_active:
                 self.error(f"build_hosted_chain.sh is missing {label} ({marker})")
-        if re.search(r"bootstrap/target/(?:debug|release)/xu(?:\.exe)?", chain_active):
-            self.error("build_hosted_chain.sh must not hard-code a primer seed")
         # An explicitly enabled oracle recovery chain may write a temporary
         # Gen4 for diagnosis, but it must stop before the product install
-        # helpers.  Otherwise a primer run with DEST=/tmp/foo could still
-        # mutate bin/platform or sibling tools and contaminate the next
-        # product seed.
-        oracle_guard = re.search(
-            r'\[\s*"\$SEED_LANE"\s*=\s*"oracle"\s*\].*?XU_ALLOW_ORACLE_INSTALL',
-            chain_active,
-            re.DOTALL,
-        )
-        if oracle_guard is None:
-            self.error(
-                "build_hosted_chain.sh must guard oracle artifact installation "
-                "with XU_ALLOW_ORACLE_INSTALL"
-            )
-        else:
-            tools_pos = chain_active.find("./scripts/build_product_tools.sh")
-            guard_pos = oracle_guard.start()
-            if tools_pos >= 0 and guard_pos > tools_pos:
-                self.error(
-                    "build_hosted_chain.sh must evaluate the oracle install guard "
-                    "before product_tools"
-                )
-        if "oracle artifact kept" not in chain_active:
-            self.error(
-                "build_hosted_chain.sh must report and isolate a non-installed "
-                "oracle artifact"
-            )
+
         if "warmup transition recorded" not in chain_active:
             self.error(
                 "build_hosted_chain.sh must report the Gen2 warm-up transition"
@@ -1287,253 +760,12 @@ class BoundaryCheck:
                 f"all three hosted hops (found {len(hop_uses)})"
             )
 
-        selfhost_path = self.path(
-            "scripts/test_vreg_selfhost.sh", "vreg acceptance profile script"
-        )
-        if selfhost_path is not None and self.regular_file(
-            selfhost_path, "vreg acceptance profile script"
-        ):
-            try:
-                selfhost = selfhost_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                self.error(f"cannot read vreg acceptance profile script: {exc}")
-            else:
-                selfhost_active = "\n".join(
-                    line
-                    for line in selfhost.splitlines()
-                    if not line.lstrip().startswith("#")
-                )
-                if not re.search(r"hosted_args=\(\s*-O1\s+--ra=1\s*\)", selfhost_active):
-                    self.error(
-                        "test_vreg_selfhost.sh must pin the hosted_acceptance profile "
-                        "(-O1 --ra=1)"
-                    )
-
         self.info["profile_contract"] = {
             "product": product_args,
             "acceptance": acceptance_args,
             "chain_hops_pinned": len(hop_uses) == 3,
         }
 
-    def _sync_ids(self) -> set[str]:
-        """Read the synchronization ledger IDs without interpreting prose.
-
-        Exception entries are deliberately tied to a ledger row.  Keeping the
-        lookup here small and table-oriented means a paragraph mentioning an
-        ID cannot accidentally authorize a new primer implementation.
-        """
-
-        if self.ci:
-            return set()
-        path = self.bootstrap_root / "SYNC_DIFF.md"
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            self.error(f"cannot read SYNC_DIFF.md for exception registration: {exc}")
-            return set()
-        return {
-            match.group(1)
-            for match in re.finditer(
-                r"^\|\s*(SYNC-[A-Z][0-9]+)\s*\|", text, re.MULTILINE
-            )
-        }
-
-    def _git_untracked_paths(self, relative_root: str) -> list[str]:
-        """Return untracked paths below ``relative_root`` deterministically.
-
-        The checker is also useful in source archives where Git is absent, so
-        an unavailable Git command is a warning in ordinary mode and a hard
-        failure only for ``--strict-freeze``.  We never invoke a shell here;
-        path names are data, not commands.
-        """
-
-        in_bootstrap = relative_root.startswith("bootstrap/")
-        if in_bootstrap and self.ci and not self.bootstrap_present:
-            return []
-        git_root = self.bootstrap_root if in_bootstrap else self.root
-        git_path = relative_root.removeprefix("bootstrap/") if in_bootstrap else relative_root
-        try:
-            proc = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(git_root),
-                    "ls-files",
-                    "--others",
-                    "--exclude-standard",
-                    "--",
-                    git_path,
-                ],
-                text=True,
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            message = f"cannot inspect untracked bootstrap files: {exc}"
-            if self.strict_freeze:
-                self.error(message)
-            else:
-                self.warnings.append(message)
-            return []
-        if proc.returncode != 0:
-            message = (
-                "git ls-files failed while checking untracked bootstrap files: "
-                + (proc.stderr.strip() or f"exit {proc.returncode}")
-            )
-            if self.strict_freeze:
-                self.error(message)
-            else:
-                self.warnings.append(message)
-            return []
-        return sorted(
-            {
-                ("bootstrap/" if in_bootstrap else "") + line.strip()
-                for line in proc.stdout.splitlines()
-                if line.strip()
-            },
-            key=lambda value: value.encode("utf-8"),
-        )
-
-    def check_primer_exceptions(self, manifest: dict) -> None:
-        """Enforce the explicit escape hatch for new Rust primer code."""
-        if self.ci and not self.bootstrap_present:
-            return
-
-        sections = (
-            ("experimental_primer_slices", "experimental"),
-            ("auxiliary_bootstrap_slices", "auxiliary"),
-        )
-        sync_ids = self._sync_ids()
-        registered: set[str] = set()
-        entry_ids: set[str] = set()
-        entry_count = 0
-
-        for section_name, section_kind in sections:
-            entries = manifest.get(section_name)
-            if not isinstance(entries, list):
-                self.error(f"{section_name} must be a list")
-                continue
-            for index, entry in enumerate(entries):
-                entry_count += 1
-                prefix = f"{section_name}[{index}]"
-                if not isinstance(entry, dict):
-                    self.error(f"{prefix} must be an object")
-                    continue
-                entry_id = entry.get("id")
-                if not isinstance(entry_id, str) or not entry_id:
-                    self.error(f"{prefix}.id must be a non-empty string")
-                elif entry_id in entry_ids:
-                    self.error(f"duplicate primer exception id: {entry_id}")
-                else:
-                    entry_ids.add(entry_id)
-
-                paths = entry.get("paths")
-                if not isinstance(paths, list) or not paths:
-                    self.error(f"{prefix}.paths must be a non-empty list")
-                    paths = []
-                for pindex, value in enumerate(paths):
-                    if not isinstance(value, str):
-                        self.error(f"{prefix}.paths[{pindex}] must be a string")
-                        continue
-                    path = self.path(value, f"{prefix}.paths[{pindex}]")
-                    if path is None or not self.regular_file(
-                        path, f"{prefix}.paths[{pindex}]"
-                    ):
-                        continue
-                    relative = self.relative(path).as_posix()
-                    registered.add(relative)
-                    # All exception paths must stay in the Rust workspace;
-                    # product Xu files belong in mirror_paths instead.
-                    if not relative.startswith("bootstrap/crates/"):
-                        self.error(
-                            f"{prefix}.paths[{pindex}] must be below bootstrap/crates: {value}"
-                        )
-
-                kind = entry.get("kind")
-                lane = entry.get("lane")
-                status = entry.get("status")
-                sync_id = entry.get("sync_id")
-                if not isinstance(kind, str) or not kind:
-                    self.error(f"{prefix}.kind must be a non-empty string")
-                if not isinstance(lane, str) or not lane:
-                    self.error(f"{prefix}.lane must be a non-empty string")
-                if status not in STATUS_VALUES:
-                    self.error(
-                        f"{prefix}.status must be one of {sorted(STATUS_VALUES)!r}"
-                    )
-                if not isinstance(sync_id, str) or not sync_id:
-                    self.error(f"{prefix}.sync_id must be a non-empty string")
-                elif not re.fullmatch(r"SYNC-[A-Z][0-9]+", sync_id):
-                    self.error(f"{prefix}.sync_id must be a structured SYNC identifier")
-                elif not self.ci and sync_id not in sync_ids:
-                    self.error(f"{prefix}.sync_id is not present in SYNC_DIFF.md: {sync_id}")
-                if entry.get("product_evidence") is not False:
-                    self.error(f"{prefix}.product_evidence must be false")
-
-                mirrors = entry.get("mirror_paths")
-                if not isinstance(mirrors, list) or any(
-                    not isinstance(item, str) for item in mirrors
-                ):
-                    self.error(f"{prefix}.mirror_paths must be a string list")
-                    mirrors = []
-                if section_kind == "experimental" and not mirrors:
-                    self.error(
-                        f"{prefix}.mirror_paths must name the Xu product counterpart"
-                    )
-                for mindex, value in enumerate(mirrors):
-                    path = self.path(value, f"{prefix}.mirror_paths[{mindex}]")
-                    if path is None or not path.exists():
-                        self.error(
-                            f"{prefix}.mirror_paths[{mindex}]: path not found: {value}"
-                        )
-
-                promotion = entry.get("promotion")
-                if not isinstance(promotion, str) or not promotion.strip():
-                    self.error(f"{prefix}.promotion must state a promotion condition")
-
-        policy = manifest.get("untracked_policy")
-        if not isinstance(policy, dict):
-            self.error("untracked_policy must be an object")
-            policy = {}
-        suffixes = policy.get("implementation_suffixes")
-        if not isinstance(suffixes, list) or any(
-            not isinstance(item, str) or not item for item in suffixes
-        ):
-            self.error("untracked_policy.implementation_suffixes must be a string list")
-            suffixes = []
-        if policy.get("strict_requires_registration") is not True:
-            self.error("untracked_policy.strict_requires_registration must be true")
-        if policy.get("normal_mode") != "warn" or policy.get("strict_mode") != "fail":
-            self.error("untracked_policy must use normal_mode=warn and strict_mode=fail")
-
-        candidates: list[str] = []
-        for value in self._git_untracked_paths("bootstrap/crates"):
-            path = self.path(value, "untracked bootstrap implementation")
-            if path is None:
-                continue
-            if path.name == "Cargo.toml" or any(
-                path.name.endswith(suffix) for suffix in suffixes
-            ):
-                candidates.append(value)
-        unregistered = sorted(set(candidates) - registered, key=lambda v: v.encode("utf-8"))
-        for value in unregistered:
-            message = (
-                "untracked bootstrap implementation is not registered in "
-                f"BOUNDARY.json: {value}"
-            )
-            if self.strict_freeze:
-                self.error(message)
-            else:
-                self.warnings.append(message)
-
-        self.info["primer_exceptions"] = {
-            "entries": entry_count,
-            "registered_paths": len(registered),
-            "untracked_candidates": len(candidates),
-            "unregistered_untracked": unregistered,
-            "strict_freeze": self.strict_freeze,
-        }
 
     def check_product_compiler_wrapper(self, manifest: dict) -> None:
         """Guard sibling/cross-target invocations against ambient imports.
@@ -1587,7 +819,6 @@ class BoundaryCheck:
             ("XU_BOOT_EXTRA", "no bootstrap extra injection"),
             ("XU_HEAP_STATS", "no heap debug injection"),
             ("XU_SEED", "no recursive seed override"),
-            ("XU_ALLOW_ORACLE_SEED", "no recursive oracle override"),
         ):
             if not re.search(rf"\bunset\s+[^\n]*\b{re.escape(variable)}\b", active):
                 self.error(
@@ -1621,7 +852,6 @@ class BoundaryCheck:
                 for marker, description in (
                     ("HOST_SEED_RESOLVER", "hosted seed resolver"),
                     ("xu_host_seed.sh", "canonical seed resolver call"),
-                    ("XU_ALLOW_ORACLE_SEED=0", "oracle opt-in disabled"),
                 ):
                     if marker not in active_text:
                         self.error(
@@ -1726,42 +956,12 @@ class BoundaryCheck:
                 ("xu_host_seed.sh", "canonical seed resolver call"),
                 ("PRODUCT_COMPILER_RUNNER", "product compiler runner variable"),
                 ("run_product_compiler.sh", "hermetic product runner call"),
-                ("XU_ALLOW_ORACLE_SEED=0", "oracle opt-in disabled"),
             ):
                 if marker not in active:
                     self.error(f"product seed consumer {value} is missing {label_text} ({marker})")
             if re.search(r"\bcargo\s+(?:build|run|test)\b", active):
                 self.error(f"product seed consumer {value} must not invoke cargo")
-            primer_ref = bool(
-                re.search(
-                    r"bootstrap\s*/\s*target|ROOT\s*/\s*[\"']bootstrap[\"']|"
-                    r"BOOT(?:STRAP)?[_-]XU|ROOT_DIR\s*/\s*[\"']bootstrap[\"']",
-                    active,
-                    re.IGNORECASE,
-                )
-            )
-            if primer_ref:
-                explicit_oracle = bool(
-                    re.search(
-                        r"--oracle|lane\s*(?:==|in|=)\s*[\"']oracle[\"']|"
-                        r"XU_ALLOW_ORACLE_SEED\s*[:=]",
-                        active,
-                        re.IGNORECASE,
-                    )
-                )
-                rejection_guard = bool(
-                    re.search(
-                        r"is_primer|primer_path|refusing .*primer|primer.*oracle-only|"
-                        r"not.*product.*fallback",
-                        active,
-                        re.IGNORECASE,
-                    )
-                )
-                if not explicit_oracle and not rejection_guard:
-                    self.error(
-                        f"product seed consumer {value} references bootstrap without "
-                        "an explicit oracle branch or rejection guard"
-                    )
+            self.check_product_bootstrap_reference(value, active)
         self.info["product_seed_consumers"] = sorted(seed_ids)
 
         # Some product-facing tools are orchestration layers rather than
@@ -1831,280 +1031,16 @@ class BoundaryCheck:
                 )
         self.info["product_orchestrators"] = sorted(orchestrator_ids)
 
-        # Keep the recovery/oracle side explicit as well.  We validate the
-        # declared paths and disjointness here; each script owns its detailed
-        # diagnostic policy, but none may silently become a product consumer.
-        oracle_cfg = manifest.get("oracle_consumers")
-        oracle_ids: set[str] = set()
-        if not isinstance(oracle_cfg, dict):
-            self.error("oracle_consumers must be an object")
-        else:
-            oracle_paths = oracle_cfg.get("paths")
-            if not isinstance(oracle_paths, list) or not oracle_paths:
-                self.error("oracle_consumers.paths must be a non-empty list")
-                oracle_paths = []
-            oracle_lane_annotations: list[str] = []
-            for index, value in enumerate(oracle_paths):
-                if not isinstance(value, str):
-                    self.error(f"oracle_consumers.paths[{index}] must be a string")
-                    continue
-                if value in oracle_ids:
-                    self.error(f"oracle_consumers.paths contains duplicate path: {value}")
-                oracle_ids.add(value)
-                path = self.path(value, f"oracle_consumers.paths[{index}]")
-                if path is not None and not self.regular_file(
-                    path, f"oracle_consumers.paths[{index}]"
-                ):
-                    continue
-                if path is None:
-                    continue
-                try:
-                    text = path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError) as exc:
-                    self.error(f"cannot read oracle consumer {value}: {exc}")
-                    continue
-                active = "\n".join(
-                    line
-                    for line in text.splitlines()
-                    if not line.lstrip().startswith("#")
-                )
-                # A filename/comment is not a sufficient lane declaration:
-                # require an executable assignment so a refactor cannot make
-                # the frozen primer an implicit product dependency.
-                if not re.search(
-                    r"(?:^|\n)[ \t]*BOUNDARY_LANE[ \t]*=[ \t]*(?:['\"]oracle['\"]|oracle)[ \t]*(?=\n|$|#)",
-                    active,
-                    re.IGNORECASE,
-                ):
-                    self.error(
-                        f"oracle consumer {value} is missing active "
-                        "BOUNDARY_LANE=oracle marker"
-                    )
-                else:
-                    oracle_lane_annotations.append(value)
-            overlap = sorted(oracle_ids & (consumer_ids | orchestrator_ids))
-            if overlap:
-                self.error(
-                    "oracle_consumers must be disjoint from product consumers/orchestrators: "
-                    + ", ".join(overlap)
-                )
-            if oracle_cfg.get("explicit_only") is not True:
-                self.error("oracle_consumers.explicit_only must be true")
-        self.info["oracle_consumers"] = sorted(oracle_ids)
-        self.info["oracle_lane_annotations"] = sorted(oracle_lane_annotations)
-
     def check_product_bootstrap_reference(self, value: str, active_text: str) -> None:
-        """Require every product-side primer mention to be guarded.
+        """Retired compiler paths cannot re-enter a product consumer."""
+        if re.search(r"bootstrap[/\\]target|BOOTSTRAP_ROOT|--oracle", active_text):
+            self.error(f"product consumer {value} references the retired compiler")
+        if re.search(r"\bcargo\s+(?:build|run|test)\b", active_text):
+            self.error(f"product consumer {value} must not invoke cargo")
 
-        Product wrappers may need to *recognise* a primer in order to reject
-        it, and a few mixed tools expose an explicit oracle diagnostic mode.
-        What is forbidden is an unguarded ``bootstrap/target`` candidate that
-        can become the product compiler by accident.  This check deliberately
-        accepts either a rejection guard (``is_primer``/``primer_path``) or an
-        explicit oracle branch; the resolver and wrapper checks above still
-        enforce the actual product path.
-        """
-
-        primer_reference = bool(
-            re.search(
-                r"bootstrap\s*/\s*target|ROOT\s*/\s*[\"']bootstrap[\"']|"
-                r"BOOT(?:STRAP)?[_-]XU|ROOT_DIR\s*/\s*[\"']bootstrap[\"']",
-                active_text,
-                re.IGNORECASE,
-            )
-        )
-        if not primer_reference:
-            return
-        explicit_oracle = bool(
-            re.search(
-                r"--oracle|lane\s*(?:==|in|=)\s*[\"']oracle[\"']|"
-                r"XU_ALLOW_ORACLE_SEED\s*[:=]",
-                active_text,
-                re.IGNORECASE,
-            )
-        )
-        rejection_guard = bool(
-            re.search(
-                r"is_primer|primer_path|refusing .*primer|primer.*oracle-only|"
-                r"not.*product.*fallback",
-                active_text,
-                re.IGNORECASE,
-            )
-        )
-        if not explicit_oracle and not rejection_guard:
-            self.error(
-                f"product consumer {value} references bootstrap without an explicit "
-                "oracle branch or primer rejection guard"
-            )
-
-    def check_lane_consumers(self, manifest: dict) -> None:
-        """Validate explicitly labelled diagnostic and dual-lane harnesses.
-
-        These scripts are intentionally outside the direct product-consumer
-        seam: some run the frozen Rust primer, while others compare primer and
-        hosted outputs. Keeping them in separate manifest sections prevents a
-        benchmark/contract probe from being mistaken for a product build, and
-        requires an active (non-comment) lane marker in each script.
-        """
-
-        sections = (
-            ("diagnostic_consumers", "oracle"),
-            ("dual_consumers", "dual"),
-        )
-        product_ids = {
-            value
-            for value in manifest.get("product_consumers", [])
-            if isinstance(value, str)
-        }
-        orchestrator_ids = {
-            entry.get("path")
-            for entry in manifest.get("product_orchestrators", [])
-            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
-        }
-        oracle_cfg = manifest.get("oracle_consumers")
-        oracle_ids = {
-            value
-            for value in (
-                oracle_cfg.get("paths", []) if isinstance(oracle_cfg, dict) else []
-            )
-            if isinstance(value, str)
-        }
-        claimed: set[str] = set()
-        report: dict[str, list[str]] = {}
-
-        for section, expected_lane in sections:
-            cfg = manifest.get(section)
-            if not isinstance(cfg, dict):
-                self.error(f"{section} must be an object")
-                report[section] = []
-                continue
-            if cfg.get("lane") != expected_lane:
-                self.error(
-                    f"{section}.lane must be {expected_lane!r} "
-                    f"(got {cfg.get('lane')!r})"
-                )
-            if cfg.get("explicit_only") is not True:
-                self.error(f"{section}.explicit_only must be true")
-            paths = cfg.get("paths")
-            if not isinstance(paths, list) or not paths:
-                self.error(f"{section}.paths must be a non-empty list")
-                paths = []
-            ids: set[str] = set()
-            for index, value in enumerate(paths):
-                label = f"{section}.paths[{index}]"
-                if not isinstance(value, str):
-                    self.error(f"{label} must be a string")
-                    continue
-                if value in ids:
-                    self.error(f"{section}.paths contains duplicate path: {value}")
-                ids.add(value)
-                if value in claimed:
-                    self.error(f"lane consumer path appears in multiple sections: {value}")
-                claimed.add(value)
-                if value in product_ids or value in orchestrator_ids or value in oracle_ids:
-                    self.error(
-                        f"{section} must be disjoint from product/oracle consumers: {value}"
-                    )
-                path = self.path(value, label)
-                if self.ci and value.startswith("tests/"):
-                    # Keep lane/disjointness checks above; local test bodies
-                    # are intentionally absent from a public checkout.
-                    if path is not None:
-                        self.info.setdefault("local_test_consumers_excluded", []).append(value)
-                    continue
-                if path is None or not self.regular_file(path, label):
-                    continue
-                try:
-                    text = path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError) as exc:
-                    self.error(f"cannot read {section} consumer {value}: {exc}")
-                    continue
-                active = "\n".join(
-                    line
-                    for line in text.splitlines()
-                    if not line.lstrip().startswith("#")
-                )
-                # Require an executable marker, not only a documentation
-                # comment, so a future refactor cannot silently change lanes.
-                marker = re.search(
-                    rf"\bLANE\s*=\s*['\"]?{re.escape(expected_lane)}\b|"
-                    rf"\blane\s*=\s*['\"]?{re.escape(expected_lane)}\b",
-                    active,
-                    re.IGNORECASE,
-                )
-                if marker is None:
-                    self.error(
-                        f"{section} consumer {value} is missing active lane={expected_lane} marker"
-                    )
-            report[section] = sorted(ids)
-
-        self.info["diagnostic_consumers"] = report.get("diagnostic_consumers", [])
-        self.info["dual_consumers"] = report.get("dual_consumers", [])
-        self.info["lane_consumers"] = report
-
-        # Dual harnesses are allowed to call the frozen primer directly for
-        # the oracle side, but every path that also compiles the hosted side
-        # must cross the same product resolver/wrapper seam as a normal
-        # product consumer.  Keep this subset explicit: mixed report drivers
-        # (for example language_eval.py) delegate to these paths and do not
-        # need to duplicate the wrapper implementation.
-        dual_cfg = manifest.get("dual_consumers")
-        compile_paths = (
-            dual_cfg.get("product_compile_paths", [])
-            if isinstance(dual_cfg, dict)
-            else []
-        )
-        if not isinstance(compile_paths, list) or not compile_paths:
-            self.error("dual_consumers.product_compile_paths must be a non-empty list")
-            compile_paths = []
-        dual_ids = set(report.get("dual_consumers", []))
-        compile_ids: set[str] = set()
-        for index, value in enumerate(compile_paths):
-            label = f"dual_consumers.product_compile_paths[{index}]"
-            if not isinstance(value, str):
-                self.error(f"{label} must be a string")
-                continue
-            if value in compile_ids:
-                self.error(f"dual_consumers.product_compile_paths contains duplicate path: {value}")
-            compile_ids.add(value)
-            if value not in dual_ids:
-                self.error(f"dual product compile path is not a dual consumer: {value}")
-                continue
-            path = self.path(value, label)
-            if path is None or not self.regular_file(path, label):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                self.error(f"cannot read dual product compile consumer {value}: {exc}")
-                continue
-            active = "\n".join(
-                line for line in text.splitlines() if not line.lstrip().startswith("#")
-            )
-            for marker, description in (
-                ("HOST_SEED_RESOLVER", "hosted seed resolver"),
-                ("PRODUCT_COMPILER_RUNNER", "hermetic product compiler runner"),
-                ("run_product_compiler.sh", "product wrapper invocation"),
-            ):
-                if marker not in active:
-                    self.error(
-                        f"dual product compile consumer {value} is missing "
-                        f"{description} ({marker})"
-                    )
-            self.check_product_bootstrap_reference(value, active)
-        self.info["dual_product_compile_paths"] = sorted(compile_ids)
 
     def check_product_probes(self, manifest: dict) -> None:
-        """Check lane-aware product diagnostics that do not compile sources.
-
-        A few compatibility tools (currently ``xu_doctor.py``) inspect the
-        compiler/toolchain without going through the compiler invocation
-        wrapper.  They still sit on the product-facing boundary: the default
-        probe must resolve a hosted seed, while primer inspection is an
-        explicit oracle mode.  Keeping this category separate prevents the
-        direct-consumer rule from requiring a pointless compile wrapper while
-        still catching the old ``bootstrap/target`` silent fallback.
-        """
+        """Check hosted diagnostics that inspect the toolchain without compiling."""
 
         cfg = manifest.get("product_probes")
         if not isinstance(cfg, dict):
@@ -2130,24 +1066,6 @@ class BoundaryCheck:
             for entry in manifest.get("product_orchestrators", [])
             if isinstance(entry, dict) and isinstance(entry.get("path"), str)
         }
-        oracle_cfg = manifest.get("oracle_consumers")
-        oracle_ids = {
-            value
-            for value in (
-                oracle_cfg.get("paths", []) if isinstance(oracle_cfg, dict) else []
-            )
-            if isinstance(value, str)
-        }
-        lane_cfg = {
-            value
-            for section in ("diagnostic_consumers", "dual_consumers")
-            for value in (
-                manifest.get(section, {}).get("paths", [])
-                if isinstance(manifest.get(section), dict)
-                else []
-            )
-            if isinstance(value, str)
-        }
         seen: set[str] = set()
         for index, value in enumerate(paths):
             label = f"product_probes.paths[{index}]"
@@ -2157,7 +1075,7 @@ class BoundaryCheck:
             if value in seen:
                 self.error(f"product_probes.paths contains duplicate path: {value}")
             seen.add(value)
-            if value in product_ids | orchestrator_ids | oracle_ids | lane_cfg:
+            if value in product_ids | orchestrator_ids:
                 self.error(f"product_probes path overlaps another consumer section: {value}")
             path = self.path(value, label)
             if path is None or not self.regular_file(path, label):
@@ -2172,24 +1090,11 @@ class BoundaryCheck:
             )
             for marker, description in (
                 ("HOST_SEED_RESOLVER", "hosted seed resolver"),
-                ("XU_ALLOW_ORACLE_SEED", "explicit oracle switch"),
-                ("--oracle", "oracle command-line mode"),
-                ("lane", "lane selection"),
             ):
                 if marker not in active:
                     self.error(f"product probe {value} is missing {description} ({marker})")
             if re.search(r"\bcargo\s+(?:build|run|test)\b", active):
                 self.error(f"product probe {value} must not invoke cargo")
-            # A probe may mention bootstrap only inside its explicit oracle
-            # fallback.  Require both a lane branch and the resolver guard so
-            # a future unconditional candidate list cannot pass by accident.
-            if "bootstrap/target" in active and not re.search(
-                r"lane\s*==\s*[\"']oracle[\"']|lane\s*in\s*\{[^}]*oracle",
-                active,
-            ):
-                self.error(
-                    f"product probe {value} mentions bootstrap without an explicit oracle branch"
-                )
         self.info["product_probes"] = sorted(seen)
 
     def check_boundary_infrastructure(self, manifest: dict) -> None:
@@ -2212,10 +1117,9 @@ class BoundaryCheck:
             self.error("boundary_infrastructure.paths must be a non-empty list")
             entries = []
         required_markers: dict[str, tuple[str, ...]] = {
-            "seed-resolver": ("XU_ALLOW_ORACLE_SEED", "select_auto", "select_explicit"),
+            "seed-resolver": ("select_auto", "select_explicit"),
             "generation-orchestrator": (
                 "HOSTED_PROFILE",
-                "XU_ALLOW_ORACLE_INSTALL",
                 "gen2_to_gen3",
                 "gen3_to_gen4",
             ),
@@ -2226,7 +1130,7 @@ class BoundaryCheck:
             ),
             "policy-checker": ("strict-freeze", "BOUNDARY.json"),
             "source-manifest": ("GEN1_SRCS", "GEN1_PARSE", "LC_ALL=C sort"),
-            "top-level-entrypoints": ("product-selfhost", "oracle", "build_hosted_chain.sh"),
+            "top-level-entrypoints": ("product-selfhost", "build_hosted_chain.sh"),
         }
         seen: set[str] = set()
         for index, entry in enumerate(entries):
@@ -2274,64 +1178,15 @@ class BoundaryCheck:
         self.info["boundary_infrastructure"] = sorted(seen)
 
     def check_ci_lane_annotations(self) -> None:
-        """Prevent CI primer probes from masquerading as product builds."""
-
-        workflow_paths = (
-            (".github/workflows/ci.yml", "ci workflow"),
-            (".github/workflows/windows.yml", "windows workflow"),
-            (".github/workflows/oracle.yml", "oracle workflow"),
-        )
-        checked: list[str] = []
-        for value, label in workflow_paths:
-            path = self.path(value, label)
-            if path is None or not self.regular_file(path, label):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                self.error(f"cannot read {label}: {exc}")
-                continue
-            active = "\n".join(
-                line for line in text.splitlines() if not line.lstrip().startswith("#")
-            )
-            # The fast CI job intentionally uses the Rust primer for a cheap
-            # server smoke before a hosted seed exists.  It must say --oracle
-            # on the same command; otherwise a future product-only parser
-            # change could silently turn this into an ambiguous invocation.
-            for line_no, line in enumerate(active.splitlines(), 1):
-                if "bootstrap/target" in line and "deploy_xu_server.sh" in line:
-                    if "--oracle" not in line:
-                        self.error(
-                            f"{value}:{line_no}: bootstrap deploy must be explicit --oracle"
-                        )
-                if "bootstrap/target" in line and "run_fixtures.sh" in line:
-                    if "--label=oracle" not in line:
-                        self.error(
-                            f"{value}:{line_no}: bootstrap fixture run must be labelled oracle"
-                        )
-            if value.endswith("windows.yml"):
-                # Windows currently exercises the primer directly when using bootstrap.
-                # Keep the job identity explicit until a hosted Windows seed is wired.
-                if "bootstrap" in active and not re.search(r"name:\s*windows[^\n]*oracle", text, re.IGNORECASE):
-                    self.error(
-                        "windows workflow using bootstrap must identify itself as oracle"
-                    )
-            if value.endswith("oracle.yml"):
-                # The scheduled/manual workflow is intentionally a primer
-                # oracle lane.  Require both the workflow identity and the
-                # explicit oracle target so a future copy/paste cannot turn
-                # it into an unlabeled product build.
-                if not re.search(r"(?im)^\s*name:\s*oracle\b", text):
-                    self.error("oracle workflow must identify itself as oracle")
-                if not re.search(r"\bmake\s+oracle\b|(?:\./)?scripts/oracle_platform_chain\.sh(?=\s|$)", active):
-                    self.error("oracle workflow must invoke `make oracle` or `scripts/oracle_platform_chain.sh`")
-                if not re.search(r"XU_CI_LANE\s*=\s*oracle|lane\s*[:=]\s*oracle", active, re.IGNORECASE):
-                    self.error("oracle workflow must carry an active lane=oracle marker")
-                if re.search(r"\bmake\s+(?:xu|product-selfhost|selfhost)\b", active):
-                    self.error("oracle workflow must not invoke a product self-host target")
-                if "bootstrap" not in text.lower() and "primer" not in text.lower():
-                    self.error("oracle workflow must state its bootstrap/primer role")
-            checked.append(value)
+        """All compiler workflows use the hosted product chain."""
+        checked = []
+        for path in sorted((self.root / ".github/workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            active = "\n".join(line for line in text.splitlines()
+                               if not line.lstrip().startswith("#"))
+            if re.search(r"bootstrap-checkout|rust-toolchain|rust-cache|\bcargo\s+(?:build|test|run)|XU_CI_LANE:\s*oracle", active):
+                self.error(f"{self.relative(path)} references the retired compiler lane")
+            checked.append(self.relative(path).as_posix())
         self.info["ci_lane_annotations"] = checked
 
     @staticmethod
@@ -2696,89 +1551,11 @@ class BoundaryCheck:
                     else:
                         self.error(f"{source_rel} did not emit GEN1_SRCS and GEN1_PARSE")
 
-    def check_watermark_allowlist(self, manifest: dict) -> None:
-        if self.ci and not self.bootstrap_present:
-            return
-        invariants = manifest.get("invariants", {})
-        allowlist = invariants.get("watermark_source_allowlist", [])
-        if not isinstance(allowlist, list) or not allowlist:
-            self.error("watermark_source_allowlist must be a non-empty list")
-            return
-        allowed: set[str] = set()
-        for item in allowlist:
-            if not isinstance(item, str):
-                self.error("watermark_source_allowlist entries must be strings")
-                continue
-            path = self.path(item, "watermark_source_allowlist")
-            if path is None:
-                continue
-            allowed.add(self.relative(path).as_posix())
-        literal = "xu830103"
-        scan_roots = [self.bootstrap_root / "crates"]
-        scan_paths: set[Path] = set()
-        for root in scan_roots:
-            # Walk without following symlinks so a primer watermark cannot be
-            # smuggled through an aliased crate source tree.
-            scan_paths.update(self.source_files_under(root, (".rs",), "watermark scan"))
-        for allowed_path in allowlist:
-            path = self.path(str(allowed_path), "watermark_source_allowlist")
-            if path is not None:
-                scan_paths.add(path)
-        for path in sorted(scan_paths):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                self.error(f"cannot read bootstrap source {path}: {exc}")
-                continue
-            if literal in text and self.relative(path).as_posix() not in allowed:
-                self.error(
-                    f"watermark literal {literal} is outside the allowlist: "
-                    f"{self.relative(path)}"
-                )
-
-    def check_sync_diff_schema(self) -> None:
-        if self.ci:
-            self.info["local_ledger"] = "excluded from CI; source and exception checks remain enforced"
-            return
-        path = self.bootstrap_root / "SYNC_DIFF.md"
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            self.error(f"cannot read SYNC_DIFF.md: {exc}")
-            return
-        ids: set[str] = set()
-        counts = {status: 0 for status in STATUS_VALUES}
-        for line_no, line in enumerate(text.splitlines(), 1):
-            if not re.match(r"^\|\s*SYNC-[A-Z][0-9]+\s*\|", line):
-                continue
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-            if len(cells) < 4:
-                self.error(f"SYNC_DIFF.md:{line_no}: malformed ledger row")
-                continue
-            entry_id = cells[0]
-            # Section tables have either five or six columns.  Locate the
-            # status cell by value instead of relying on one column index.
-            status_cells = [cell.strip("`* ") for cell in cells if cell.strip("`* ") in STATUS_VALUES]
-            status = status_cells[0] if len(status_cells) == 1 else ""
-            if entry_id in ids:
-                self.error(f"SYNC_DIFF.md:{line_no}: duplicate id {entry_id}")
-            ids.add(entry_id)
-            if status not in STATUS_VALUES:
-                self.error(f"SYNC_DIFF.md:{line_no}: invalid status {status!r}")
-            else:
-                counts[status] += 1
-        if not ids:
-            self.error("SYNC_DIFF.md contains no SYNC-* ledger rows")
-        self.info["sync_diff"] = {"entries": len(ids), "statuses": counts}
 
     def run(self, manifest: dict) -> None:
         self.check_required_paths(manifest)
         self.check_roles(manifest)
         self.check_generation(manifest)
-        self.check_frozen_primer_paths(manifest)
-        self.check_oracle_path_guards(manifest)
-        self.check_primer_exceptions(manifest)
-        self.check_mirrors(manifest)
         self.check_runtime_abi(manifest)
         self.check_runtime_contract_registry(manifest)
         self.check_product_source_purity(manifest)
@@ -2787,11 +1564,8 @@ class BoundaryCheck:
         self.check_product_compiler_wrapper(manifest)
         self.check_product_probes(manifest)
         self.check_boundary_infrastructure(manifest)
-        self.check_lane_consumers(manifest)
         self.check_ci_lane_annotations()
         self.check_source_manifest(manifest)
-        self.check_watermark_allowlist(manifest)
-        self.check_sync_diff_schema()
 
 
 def load_manifest(path: Path) -> dict:
@@ -2812,16 +1586,16 @@ def main(argv: list[str]) -> int:
         "--manifest",
         type=Path,
         default=DEFAULT_MANIFEST,
-        help="boundary manifest (default: bootstrap/BOUNDARY.json)",
+        help="product contract manifest (default: BOUNDARY.json)",
     )
     parser.add_argument("--json", action="store_true", help="emit a machine-readable report")
     is_ci = os.environ.get("XU_BOUNDARY_CI") == "1" or os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
     parser.add_argument("--ci", action="store_true", default=is_ci,
-                        help="check published sources without local docs or SYNC_DIFF.md")
+                        help="compatibility option; all checks use published product sources")
     parser.add_argument(
         "--strict-freeze",
         action="store_true",
-        help="fail when an untracked bootstrap implementation is not registered",
+        help="compatibility option; product contract checks are always strict",
     )
     args = parser.parse_args(argv)
     manifest_path = args.manifest if args.manifest.is_absolute() else ROOT / args.manifest
@@ -2861,14 +1635,10 @@ def main(argv: list[str]) -> int:
         "product_seed_seam": "chain_script" in check.info
         and "product_compiler_wrapper" in check.info,
         "product_consumer_seam": "product_orchestrators" in check.info
-        and "oracle_consumers" in check.info,
+        and "product_consumers" in check.info,
         "product_seed_consumer_seam": "product_seed_consumers" in check.info,
-        "lane_consumer_seam": "diagnostic_consumers" in check.info
-        and "dual_consumers" in check.info,
         "product_probe_seam": "product_probes" in check.info,
         "ci_lane_annotations": "ci_lane_annotations" in check.info,
-        "primer_exception_registration": "primer_exceptions" in check.info,
-        "sync_diff": "sync_diff" in check.info,
     }
     report = {
         "status": "PASS" if not check.errors else "FAIL",
@@ -2890,9 +1660,9 @@ def main(argv: list[str]) -> int:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     else:
         if check.errors:
-            print("bootstrap/Xu boundary: FAIL")
+            print("Xu product contract: FAIL")
         else:
-            print("bootstrap/Xu boundary: PASS")
+            print("Xu product contract: PASS")
         print(f"  manifest: {report['manifest']}")
         if "source_manifest" in report:
             source = report["source_manifest"]
@@ -2904,18 +1674,6 @@ def main(argv: list[str]) -> int:
             print(f"  closure sha256: {source['closure_sha256']}")
         if "runtime_symbols_checked" in report:
             print(f"  runtime ABI symbols checked: {report['runtime_symbols_checked']}")
-        if "primer_exceptions" in report:
-            exceptions = report["primer_exceptions"]
-            assert isinstance(exceptions, dict)
-            print(
-                "  primer exception paths: "
-                f"{exceptions['registered_paths']} "
-                f"(untracked candidates={exceptions['untracked_candidates']})"
-            )
-        sync = report.get("sync_diff")
-        if isinstance(sync, dict):
-            print(f"  SYNC_DIFF entries: {sync['entries']}")
-            print(f"  SYNC_DIFF status counts: {sync['statuses']}")
     for warning in check.warnings:
         print(f"boundary: warning: {warning}", file=sys.stderr)
     for error in check.errors:

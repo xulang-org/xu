@@ -1,21 +1,9 @@
 #!/usr/bin/env bash
-# Build, run, and health-check the Xu HTTP server example.
-#
-# This script is intentionally local-only: it never SSHes, copies files to a
-# remote host, edits system directories, or reads server.md. Remote operations
-# are isolated in deploy_xu_remote.sh so a local build can never deploy by
-# accident.
-#
-# The default compiler lane is hosted product (`bin/xu` or a developer/bin
-# snapshot). Product invocations go through run_product_compiler.sh, which
-# isolates package/cache/target environment and rejects the Rust primer. An
-# explicit `--oracle` lane is retained for recovery and primer smoke only; it
-# uses an existing executable and never invokes cargo implicitly.
+# Build and exercise the Xu server using the hosted product compiler.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT_DIR/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT_DIR"
 
 if [ -n "${XU_EXAMPLES_ROOT:-}" ]; then
@@ -33,7 +21,6 @@ SOURCE=${XU_SERVER_SOURCE:-$SOURCE_DEFAULT}
 OUT_DIR=${XU_SERVER_OUT_DIR:-$OUT_DIR_DEFAULT}
 LANE=${XU_SERVER_LANE:-product}
 COMPILER_INPUT=${XU_COMPILER:-${XU_SEED:-${XU:-}}}
-ORACLE_INPUT=${XU_BOOT:-}
 TARGET=${XU_SERVER_TARGET:-}
 HEALTH_URL=${XU_SERVER_HEALTH_URL:-$HEALTH_URL_DEFAULT}
 HEALTH_TIMEOUT=${XU_SERVER_HEALTH_TIMEOUT:-5}
@@ -57,8 +44,7 @@ Options:
   --source PATH           Xu source (default xu-examples/examples/11_http_server/main.xu)
   --output PATH           Output path (default .../<target>; Windows uses .exe)
   --compiler PATH         Hosted Xu compiler (or set XU_COMPILER/XU_SEED/XU)
-  --lane product|oracle   Select compiler lane (default product)
-  --oracle                Explicit primer/recovery lane (same as --lane oracle)
+  --lane product   Select compiler lane (default product)
   --target TARGET         Build target (default host for build-local, linux-x64 for build-linux)
   --opt O0|O1|O2|O3      Select optimization level (default compiler setting)
   --no-regcache          Disable register caching (diagnostic/safe-codegen mode)
@@ -71,7 +57,6 @@ Examples:
   scripts/deploy_xu_server.sh health
   scripts/deploy_xu_server.sh smoke-local
   scripts/deploy_xu_server.sh build-linux --output dist/xu-server/xu-server-linux-x64
-  scripts/deploy_xu_server.sh build-local --oracle --compiler bootstrap/target/debug/xu
 EOF
 }
 
@@ -108,131 +93,14 @@ validate_target() {
     esac
 }
 
-canonical_compiler_path() {
-    local candidate=$1
-    if command -v realpath >/dev/null 2>&1; then
-        realpath "$candidate"
-        return
-    fi
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$candidate" <<'PY'
-import os
-import sys
-print(os.path.realpath(sys.argv[1]))
-PY
-        return
-    fi
-    die "cannot canonicalize compiler path (need realpath or python3)"
-}
-
-has_symlink_component() {
-    local candidate=$1 root=$2 rel current part
-    case "$candidate" in
-        "$root"/*) rel=${candidate#"$root/"} ;;
-        *) return 1 ;;
-    esac
-    [ -L "$root" ] && return 0
-    current=$root
-    local components=()
-    IFS='/' read -r -a components <<< "$rel"
-    for part in "${components[@]}"; do
-        [ -n "$part" ] || continue
-        current="$current/$part"
-        [ -L "$current" ] && return 0
-    done
-    return 1
-}
-
-is_frozen_primer_path() {
-    # Oracle evidence is tied to the reproducible Gen0 build outputs.  Do not
-    # accept an arbitrary executable (including a copied hosted binary) just
-    # because --oracle was selected.
-    local candidate=$1 resolved=${2:-$1} expected lexical
-    case "$candidate" in
-        /*) lexical=$candidate ;;
-        *) lexical="$ROOT_DIR/$candidate" ;;
-    esac
-    for expected in \
-        "$BOOTSTRAP_ROOT/target/debug/xu" \
-        "$BOOTSTRAP_ROOT/target/debug/xu.exe" \
-        "$BOOTSTRAP_ROOT/target/release/xu" \
-        "$BOOTSTRAP_ROOT/target/release/xu.exe"; do
-        # Compare against the physical, lexical path.  If the declared
-        # artifact itself (or one of its components) is a symlink, fail
-        # closed instead of treating an external target as frozen Gen0.
-        [ "$lexical" = "$expected" ] || continue
-        [ -f "$expected" ] || continue
-        [ -x "$expected" ] || continue
-        has_symlink_component "$expected" "$BOOTSTRAP_ROOT" && continue
-        if [ "$resolved" = "$expected" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
 find_compiler() {
-    local candidate resolved host
-    if [ "$LANE" = product ]; then
-        # A product build may use an explicit external path, but all paths go
-        # through the shared resolver so a bootstrap symlink cannot masquerade
-        # as bin/xu. The resolver is deliberately run with oracle opt-in off.
-        if [ -n "$COMPILER_INPUT" ]; then
-            candidate=$COMPILER_INPUT
-            case "$candidate" in
-                /*) ;;
-                *) candidate="$ROOT_DIR/$candidate" ;;
-            esac
-            XU_ALLOW_ORACLE_SEED=0 XU_SEED="$candidate" \
-                "$ROOT_DIR/scripts/xu_host_seed.sh" \
-                || die "hosted product compiler rejected: $COMPILER_INPUT"
-        else
-            XU_ALLOW_ORACLE_SEED=0 "$ROOT_DIR/scripts/xu_host_seed.sh" \
-                || die "hosted product compiler not found (set XU_COMPILER/XU_SEED)"
-        fi
-        return 0
-    fi
-
-    # Oracle/recovery is opt-in and only consumes an existing executable. Do
-    # not invoke cargo here: building the primer belongs to an explicit
-    # bootstrap/oracle workflow, never to a deployment smoke script.
-    candidate=${COMPILER_INPUT:-$ORACLE_INPUT}
-    if [ -n "$candidate" ]; then
-        case "$candidate" in
-            /*) ;;
-            *) candidate="$ROOT_DIR/$candidate" ;;
-        esac
-    else
-        for primer in \
-            "$BOOTSTRAP_ROOT/target/debug/xu" \
-            "$BOOTSTRAP_ROOT/target/debug/xu.exe" \
-            "$BOOTSTRAP_ROOT/target/release/xu" \
-            "$BOOTSTRAP_ROOT/target/release/xu.exe"; do
-            if [ -x "$primer" ]; then
-                candidate="$primer"
-                break
-            fi
-        done
-    fi
-    [ -n "$candidate" ] || die "oracle compiler missing (build bootstrap explicitly, then pass --oracle)"
-    [ -x "$candidate" ] || die "oracle compiler is not executable: $candidate"
-    resolved=$(canonical_compiler_path "$candidate") || die "cannot resolve oracle compiler: $candidate"
-    [ -x "$resolved" ] || die "resolved oracle compiler is not executable: $resolved"
-    is_frozen_primer_path "$candidate" "$resolved" || die \
-        "oracle compiler must be the frozen bootstrap primer (bootstrap/target/{debug,release}/xu[.exe])"
-    printf '%s\n' "$resolved"
+    XU_SEED="$COMPILER_INPUT" "$ROOT_DIR/scripts/xu_host_seed.sh"
 }
 
 run_compiler() {
     local compiler=$1
     shift
-    if [ "$LANE" = product ]; then
-        # Product consumers always use the hermetic wrapper. It rejects primer
-        # paths again and clears ambient XUPATH/XU_CACHE/HOME/target overrides.
-        "$ROOT_DIR/scripts/run_product_compiler.sh" "$compiler" "$@"
-    else
-        "$compiler" "$@"
-    fi
+    "$ROOT_DIR/scripts/run_product_compiler.sh" "$compiler" "$@"
 }
 
 default_output() {
@@ -267,11 +135,7 @@ compile_target() {
     # Default outputs are unsuffixed except Windows .exe. An explicit --output
     # path is preserved as supplied.
     echo "Building $SOURCE"
-    if [ "$LANE" = oracle ]; then
-        echo "  lane: oracle/recovery (non-product evidence)" >&2
-    else
-        echo "  lane: product (hosted compiler)"
-    fi
+    echo "  lane: product (hosted compiler)"
     echo "  compiler: $compiler"
     echo "  target: $target"
     echo "  output: $output"
@@ -281,40 +145,13 @@ compile_target() {
     if [ "$NO_REGCACHE" = 1 ]; then
         build_opts+=("--no-regcache")
     fi
-    # Product Xu uses `xu build FILE`; the frozen Rust primer intentionally
-    # keeps the older direct form `xu FILE`. Supporting the latter is limited
-    # to the explicit oracle lane and cannot silently downgrade a product run.
-    # Capture help before matching. With pipefail, `xu --help | grep -q` can
-    # report failure when grep closes early and xu receives SIGPIPE, causing a
-    # product compiler to be mistaken for the primer.
-    local compiler_help has_build
-    compiler_help=$(run_compiler "$compiler" --help 2>&1 || true)
-    has_build=0
-    if printf '%s\n' "$compiler_help" | grep -E '^[[:space:]]*build[[:space:]]' >/dev/null; then
-        has_build=1
-    fi
-    if [ "$LANE" = product ] && [ "$has_build" -ne 1 ]; then
-        die "hosted product compiler does not expose the product 'build' command"
-    fi
-    if [ "$has_build" -eq 1 ]; then
-        if [ "${#build_opts[@]}" -gt 0 ]; then
-            run_compiler "$compiler" build "$SOURCE" --target "$target" "${build_opts[@]}" -o "$output"
-        else
-            run_compiler "$compiler" build "$SOURCE" --target "$target" -o "$output"
-        fi
+    if [ "${#build_opts[@]}" -gt 0 ]; then
+        run_compiler "$compiler" build "$SOURCE" --target "$target" "${build_opts[@]}" -o "$output"
     else
-        if [ "${#build_opts[@]}" -gt 0 ]; then
-            run_compiler "$compiler" "$SOURCE" --target "$target" "${build_opts[@]}" -o "$output"
-        else
-            run_compiler "$compiler" "$SOURCE" --target "$target" -o "$output"
-        fi
+        run_compiler "$compiler" build "$SOURCE" --target "$target" -o "$output"
     fi
-    # The legacy primer appends .xin on Unix. Normalize its actual output
-    # only in the explicit oracle lane, preserving the requested server path.
     if [ ! -f "$output" ] && [ -f "$output.exe" ]; then
         mv -- "$output.exe" "$output"
-    elif [ "$LANE" = oracle ] && [ ! -f "$output" ] && [ -f "$output.xin" ]; then
-        mv -- "$output.xin" "$output"
     fi
     [ -f "$output" ] || die "compiler did not produce $output"
     chmod +x "$output" 2>/dev/null || true
@@ -470,10 +307,8 @@ parse_options() {
             --compiler)
                 [ "$#" -ge 2 ] || die "--compiler needs a path"
                 COMPILER_INPUT=$2; shift 2 ;;
-            --oracle)
-                LANE=oracle; shift ;;
             --lane)
-                [ "$#" -ge 2 ] || die "--lane needs product or oracle"
+                [ "$#" -ge 2 ] || die "--lane needs product"
                 LANE=$2; shift 2 ;;
             --target)
                 [ "$#" -ge 2 ] || die "--target needs a value"
@@ -510,8 +345,8 @@ main() {
     parse_options "$@"
 
     case "$LANE" in
-        product|oracle) ;;
-        *) die "lane must be product or oracle (got $LANE)" ;;
+        product) ;;
+        *) die "lane must be product (got $LANE)" ;;
     esac
     case "$OPT_LEVEL" in
         ""|O0|O1|O2|O3) ;;

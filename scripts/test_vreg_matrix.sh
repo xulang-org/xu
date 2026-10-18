@@ -1,48 +1,35 @@
 #!/bin/sh
-# Focused virtual-register regression matrix.  This intentionally avoids the
-# full fixture/cross-target benchmark suites so allocator work can iterate
-# quickly and deterministically.
+# Focused virtual-register regression matrix on the product compiler.
+# Tests targeted fixtures across RA0..RA3 and no-regcache modes under O0/O1/O2/O3.
 set -eu
 
-# Machine-readable boundary role: allocator/SSA oracle evidence.
-BOUNDARY_LANE=oracle
-
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-BOOTSTRAP_ROOT=$("$repo_root/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$repo_root"
-cargo_bin=${CARGO:-cargo}
 
-cd "$BOOTSTRAP_ROOT"
-"$cargo_bin" test -p xuemit --test vreg_matrix -- "$@"
+HOST_SEED_RESOLVER="$repo_root/scripts/xu_host_seed.sh"
+PRODUCT_COMPILER_RUNNER="$repo_root/scripts/run_product_compiler.sh"
 
-# A tiny hosted execution check complements the plan/assembly assertions: the
-# branch-value fixture exercises a comparison result that remains live on both
-# CFG successors.  Run both disabled and fixed-home tiers and require exactly
-# the same observable output.
-if [ "${VREG_MATRIX_SKIP_RUNTIME:-0}" = 1 ]; then
-    exit 0
+compiler_input=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --xu=*) compiler_input="${1#*=}" ;;
+        *) echo "test_vreg_matrix: unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+if [ -n "$compiler_input" ]; then
+    compiler=$(XU_SEED="$compiler_input" "$HOST_SEED_RESOLVER")
+else
+    compiler=$("$HOST_SEED_RESOLVER")
 fi
+[ -x "$compiler" ] || {
+    echo "test_vreg_matrix: product compiler not found or not executable" >&2
+    exit 1
+}
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/xu-vreg-matrix.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
-
-"$cargo_bin" build -q -p xu --bin xu
-compiler="$BOOTSTRAP_ROOT/target/debug/xu"
-for candidate in \
-    "$BOOTSTRAP_ROOT/target/debug/xu" \
-    "$BOOTSTRAP_ROOT/target/debug/xu.exe" \
-    "$BOOTSTRAP_ROOT/target/release/xu" \
-    "$BOOTSTRAP_ROOT/target/release/xu.exe"; do
-    if [ -x "$candidate" ]; then
-        compiler="$candidate"
-        break
-    fi
-done
-compiler=$(XU_ALLOW_ORACLE_SEED=1 XU_REQUIRE_FROZEN_PRIMER=1 XU_SEED="$compiler" \
-    "$repo_root/scripts/xu_host_seed.sh") || {
-    echo "vreg matrix: bootstrap compiler is not the canonical frozen primer" >&2
-    exit 1
-}
 
 for fixture_name in vreg_branch_value vreg_call_live vreg_local_cfg vreg_search_loop vreg_fwd_exit vreg_f64_temp vreg_f64_call_split; do
     fixture_dir="$repo_root/tests/fixtures/$fixture_name"
@@ -63,9 +50,10 @@ for fixture_name in vreg_branch_value vreg_call_live vreg_local_cfg vreg_search_
                 ra3) ra_arg=--ra=3 ;;
                 nrc) ra_arg=--no-regcache ;;
             esac
-            "$compiler" "$fixture_dir/main.xu" "-$opt" "$ra_arg" \
+            "$PRODUCT_COMPILER_RUNNER" "$compiler" build "$fixture_dir/main.xu" "-$opt" "$ra_arg" \
                 -o "$tmp_dir/${fixture_name}.${opt}.${mode}.xin" \
                 >"$tmp_dir/${fixture_name}.${opt}.${mode}.compile.log" 2>&1
+            chmod +x "$tmp_dir/${fixture_name}.${opt}.${mode}.xin"
             actual=$("$tmp_dir/${fixture_name}.${opt}.${mode}.xin")
             if [ "$actual" != "$expected" ]; then
                 printf '%s\n' "$fixture_name $opt $mode output mismatch:" >&2

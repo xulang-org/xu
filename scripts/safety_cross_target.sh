@@ -13,17 +13,16 @@
 #   scripts/safety_cross_target.sh --gen1=/path/to/gen1
 set -euo pipefail
 # Machine-readable boundary role: cross-target safety oracle evidence.
-BOUNDARY_LANE=oracle
+BOUNDARY_LANE=product
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
-BOOTSTRAP_ROOT=$("$ROOT/scripts/xu_host_seed.sh" --bootstrap-root)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
 
 GEN1=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --gen1=*) GEN1="${1#*=}" ;;
+        --xu=*|--gen1=*) GEN1="${1#*=}" ;;
         *) echo "safety_cross_target: unknown arg $1"; exit 1 ;;
     esac
     shift
@@ -34,24 +33,16 @@ trap 'rm -rf "$tmp"' EXIT
 
 fail() { echo "safety_cross_target: FAIL ($1)"; exit 1; }
 
-if [ -z "$GEN1" ]; then
-    cargo build --quiet --manifest-path "$BOOTSTRAP_ROOT/Cargo.toml" -p xu --bin xu \
-        || fail "bootstrap xu build failed"
-    XU="$BOOTSTRAP_ROOT/target/debug/xu"
-    XU=$(XU_ALLOW_ORACLE_SEED=1 XU_REQUIRE_FROZEN_PRIMER=1 XU_SEED="$XU" \
-        "$ROOT/scripts/xu_host_seed.sh") || fail "bootstrap compiler is not the canonical frozen primer"
-    . ./scripts/gen1_sources.sh || fail "could not load scripts/gen1_sources.sh"
-    # Primer -O0: bootstrap auto/O1 still miscompiles the full compiler.
-    "$XU" -O0 $GEN1_SRCS -o "$tmp/gen1.xin" || fail "bootstrap could not compile Gen1"
-    GEN1="$tmp/gen1.xin"
-    echo "safety_cross_target: lane=oracle (frozen bootstrap); generated Gen1 is parity-only, not product evidence" >&2
-else
-    # An explicitly supplied Gen1 is allowed for parity, but it is not an
-    # oracle or product fixed-point artifact.  Keep this distinction visible
-    # when the script is used outside the default bootstrap path.
-    echo "safety_cross_target: lane=parity (explicit --gen1; not product evidence)" >&2
-fi
-chmod +x "$GEN1"
+HOST_SEED_RESOLVER="$ROOT/scripts/xu_host_seed.sh"
+PRODUCT_COMPILER_RUNNER="$ROOT/scripts/run_product_compiler.sh"
+GEN1=$(XU_SEED="$GEN1" "$HOST_SEED_RESOLVER")
+compile_product() {
+    "$PRODUCT_COMPILER_RUNNER" "$GEN1" build "$@"
+}
+echo "safety_cross_target: lane=product compiler=$GEN1" >&2
+
+# Compiler permissions are validated by the resolver.
+
 
 ARM64_IMG="${XU_LINUX_ARM64_IMAGE:-postgres:15}"
 X64_IMG="${XU_LINUX_X64_IMAGE:-jsbin-wine}"
@@ -209,7 +200,7 @@ do
         work=$(mktemp -d)
         out="$work/a.out"
         [ "$target" = "windows-x64" ] && out="$work/a.exe"
-        if ! "$GEN1" build "$prog" --target "$target" -o "$out" 2>"$work/compile.err"; then
+        if ! compile_product "$prog" --target "$target" -o "$out" 2>"$work/compile.err"; then
             echo "FAIL $probe/$target (compile)"
             sed 's/^/  /' "$work/compile.err"
             fail_n=$((fail_n + 1))
