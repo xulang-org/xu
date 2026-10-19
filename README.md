@@ -30,16 +30,16 @@
 
 ---
 
-## Xu 0.9.1
+## Xu 0.9.2
 
-Xu 0.9.1 is the formal release featuring major binary size optimizations and streamlined toolchain distribution:
+Xu 0.9.2 is a critical maintenance release delivering key compiler and runtime stability fixes:
 
-- **Call Graph Tree-Shaking**: Global analysis of reachable functions and symbols, stripping unreferenced code and drastically reducing output binary footprint.
-- **Static Constant Lowering**: Large immutable arrays and slices are placed directly into `.rodata` read-only sections, eliminating runtime stack setup and bloat.
-- **Zero Bootstrap Warnings**: Cleared all self-hosting compiler warnings including division-by-zero detection, AST terminating branch exits, and raised large stack frame thresholds.
-- **Dynamic Toolchain Discovery & Updates**: `xu up` dynamically unpacks and manages all sibling toolchain binaries (such as `xu-lsp`, `xu-native`), and the root CLI automatically delegates to installed sibling tools.
+- **x64 Coroutine Callee-Saved Register Preservation**: Resolved an issue where register save frame configurations (`cs_pairs`) leaked into runtime glue emitters, omitting nonvolatile register preservation (R15) in coroutine trampoline callers and triggering segmentation faults (SIGSEGV) upon completion on `linux-x64`.
+- **Recursive Call Operand Preservation**: Fixed a silent miscompilation issue where self-recursive functions evaluating a recursive call as a right-hand side binary operand (e.g. `n * fact(n - 1)`) reloaded uninitialized stack memory instead of preserved parameter values.
+- **Loop Control in Error Handlers**: Repaired loop unrolling analysis (`node_has_own_break` / `node_has_own_continue`) to traverse variable declarations and error-catch (`or`) blocks, preventing internal compiler bounds crashes when `break` or `continue` appears inside an `or` block within a constant range loop.
+- **Full Parity Across Native Targets**: Ensures identical coroutine scheduling, error handling, and channel communication behavior across `macos-arm64`, `linux-x64`, and all supported tier-1 targets.
 
-Download the [0.9.1 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.1). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
+Download the [0.9.2 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.2). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
