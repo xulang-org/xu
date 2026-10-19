@@ -1,14 +1,20 @@
 @crypto/gmtls
 
+// XU-CT-USE: fixed-shape-only
+// CBC padding and MAC comparison avoid early padding-error exits.
+
 #errors
 #net
 #crypto/rand
 #crypto/sm4
+#crypto/subtle
 
 const rec_ccs = 20
 const rec_alert = 21
 const rec_hs = 22
 const rec_app = 23
+const max_plaintext_len = 16384
+const max_ciphertext_len = 18432
 
 fn push_s(b &mut []int, s &string) {
     mut i := 0
@@ -78,6 +84,9 @@ fn hs_wrap(typ int, body &string) string {
 
 fn rec_wrap(typ int, ver int, frag &string) string {
     n := frag.len
+    if n > max_ciphertext_len {
+        >> errors.new("crypto/gmtls: record overflow")
+    }
     mut b := []int{}
     b.push(typ & 255)
     b.push((ver >> 8) & 255)
@@ -103,7 +112,7 @@ fn parse_rec(raw0 &string) int {
     }
     typ := raw[0] & 255
     ln := u16_at(&raw, 3) or >>
-    if raw.len != 5 + ln {
+    if ln > max_ciphertext_len || raw.len != 5 + ln {
         >> errors.new("crypto/gmtls: record length")
     }
     << typ
@@ -156,6 +165,9 @@ fn gcm_aad(seq int, typ int, ver int, pt_len int) string {
 }
 
 fn gcm_seal_rec(key &string, iv &string, seq int, typ int, ver int, pt &string) string {
+    if pt.len > max_plaintext_len {
+        >> errors.new("crypto/gmtls: record overflow")
+    }
     c := sm4.new_cipher(key) or >>
     nn := gcm_nonce(iv, seq)
     expl := be64(seq)
@@ -170,7 +182,7 @@ fn gcm_open_rec(key &string, iv &string, seq int, raw0 string) string {
     typ := raw[0] & 255
     ver := rec_ver(&raw) or >>
     frag := rec_frag(&raw) or >>
-    if frag.len < 8 + 16 {
+    if frag.len < 8 + 16 || frag.len > max_ciphertext_len {
         >> errors.new("crypto/gmtls: short gcm record")
     }
     expl := slice_copy(&frag, 0, 8) or >>
@@ -215,29 +227,43 @@ fn tls_pad(raw0 &string) string {
     << string_from_bytes(b)
 }
 
+// Constant-time padding check for standalone callers.
 fn tls_unpad(inner0 &string) string {
     raw := inner0 + ""
     if raw.len < 1 || (raw.len % 16) != 0 {
         >> errors.new("crypto/gmtls: bad cbc padding")
     }
     padn := raw[raw.len - 1] & 255
+    mut bad := 0
     if padn + 1 > raw.len {
-        >> errors.new("crypto/gmtls: bad cbc padding")
+        bad = 1
     }
-    start := raw.len - 1 - padn
-    mut i := start
-    while i < raw.len {
-        if (raw[i] & 255) != padn {
-            >> errors.new("crypto/gmtls: bad cbc padding")
+    mut check_len := 256
+    if raw.len < check_len {
+        check_len = raw.len
+    }
+    mut i := 0
+    while i < check_len {
+        idx := raw.len - 1 - i
+        b := raw[idx] & 255
+        if i <= padn {
+            bad = bad | (b ^ padn)
         }
         i = i + 1
     }
+    if bad != 0 {
+        >> errors.new("crypto/gmtls: bad cbc padding")
+    }
+    start := raw.len - 1 - padn
     << slice_copy(&raw, 0, start) or (err) {
         << ""
     }
 }
 
 fn cbc_seal_rec(key &string, mac_key &string, seq int, typ int, ver int, pt &string) string {
+    if pt.len > max_plaintext_len {
+        >> errors.new("crypto/gmtls: record overflow")
+    }
     mac := rec_mac(mac_key, seq, typ, ver, pt)
     mut inner := []int{}
     push_s(mut &inner, pt)
@@ -256,30 +282,55 @@ fn cbc_open_rec(key &string, mac_key &string, seq int, raw0 string) string {
     typ := raw[0] & 255
     ver := rec_ver(&raw) or >>
     frag := rec_frag(&raw) or >>
-    if frag.len < 32 || (frag.len % 16) != 0 {
+    // 16-byte IV + at least 48 bytes of ciphertext (32-byte SM3 MAC + >=1 byte pad).
+    if frag.len < 64 || frag.len > max_ciphertext_len || (frag.len % 16) != 0 {
         >> errors.new("crypto/gmtls: short cbc record")
     }
     iv := slice_copy(&frag, 0, 16) or >>
     ct := slice_copy(&frag, 16, frag.len) or >>
     c := sm4.new_cipher(key) or >>
     dec := sm4.decrypt_cbc(&c, &iv, &ct) or >>
-    body := tls_unpad(&dec) or >>
-    if body.len < 32 {
-        >> errors.new("crypto/gmtls: short cbc mac")
+
+    // Mitigate Lucky13 / CBC padding oracle: validate padding across a bounded
+    // window without early exit, clamp indices so HMAC-SM3 is ALWAYS computed,
+    // and return a single unified error message on either padding or MAC failure.
+    padn := dec[dec.len - 1] & 255
+    mut pad_ok := 1
+    if padn + 33 > dec.len {
+        pad_ok = 0
     }
-    pt := slice_copy(&body, 0, body.len - 32) or >>
-    got := slice_copy(&body, body.len - 32, body.len) or >>
-    want := rec_mac(mac_key, seq, typ, ver, &pt)
-    mut x := 0
+    mut scan_max := 256
+    if dec.len < scan_max {
+        scan_max = dec.len
+    }
+    mut diff := 0
     mut i := 0
-    while i < 32 {
-        x = x | ((got[i] & 255) ^ (want[i] & 255))
+    while i < scan_max {
+        b := dec[dec.len - 1 - i] & 255
+        // Apply mask when i <= padn
+        in_pad := subtle.constant_time_select(b2i(i <= padn), 1, 0)
+        diff = diff | (in_pad & (b ^ padn))
         i = i + 1
     }
-    if x != 0 {
+    pad_ok = pad_ok & subtle.constant_time_byte_eq(diff, 0)
+    safe_padn := subtle.constant_time_select(pad_ok, padn, 0)
+    body_len := dec.len - 1 - safe_padn
+    pt_len := body_len - 32
+    pt := slice_copy(&dec, 0, pt_len) or >>
+    got := slice_copy(&dec, pt_len, body_len) or >>
+    want := rec_mac(mac_key, seq, typ, ver, &pt)
+    mac_ok := subtle.constant_time_compare(&got, &want)
+    if (pad_ok & mac_ok) != 1 {
         >> errors.new("crypto/gmtls: cbc mac")
     }
     << pt
+}
+
+fn b2i(cond bool) int {
+    if cond {
+        << 1
+    }
+    << 0
 }
 
 fn rec_seal(suite int, key &string, iv &string, mac &string, seq int, typ int, ver int, pt &string) string {
