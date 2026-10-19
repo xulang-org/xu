@@ -10,11 +10,12 @@
 // EncryptPKCS1v15 / DecryptPKCS1v15, SignPKCS1v15 / VerifyPKCS1v15,
 // EncryptOAEP / DecryptOAEP, SignPSS / VerifyPSS (RFC 8017; hash SHA-1/256/512).
 // Hash IDs match Go `crypto.Hash` (SHA-1=3, SHA-256=5, SHA-384=6, SHA-512=7).
-// No CRT/blinding. v1 GenerateKey allows bits>=64 (tests);
-// production keys should be >=2048.
+// Includes CRT (Chinese Remainder Theorem) acceleration, RSA blinding when
+// prime factors p/q and public exponent e are present, and branchless PKCS#1 v1.5
+// padding checks. v1 GenerateKey allows bits>=64 (tests); production keys >=2048.
 // XU-CT-CLASS: variable-time
-// math/big exponentiation and padding paths have no constant-time contract;
-// crypto/subtle is used only for final fixed-shape equality checks.
+// math/big exponentiation has no constant-time contract; crypto/subtle is used
+// for fixed-shape equality and padding checks.
 
 pub const sha1 = 3
 pub const sha256 = 5
@@ -93,6 +94,94 @@ fn rsa_crypt(x &big.Int, exp &big.Int, mod &big.Int) big.Int {
     << z
 }
 
+// Private-key operation with Chinese Remainder Theorem (CRT) and RSA blinding
+// when p, q are populated; falls back to c^d mod n for bare {n, d} keys.
+fn rsa_priv_op(priv &PrivateKey, c &big.Int) big.Int {
+    mut nn := big.new_int(0)
+    nn.set(&priv.public.n)
+    mut dd := big.new_int(0)
+    dd.set(&priv.d)
+    if priv.p.sign() <= 0 || priv.q.sign() <= 0 || priv.public.e <= 0 {
+        << rsa_crypt(c, &dd, &nn)
+    }
+    mut p := big.new_int(0)
+    p.set(&priv.p)
+    mut q := big.new_int(0)
+    q.set(&priv.q)
+    if p.cmp(&q) == 0 {
+        << rsa_crypt(c, &dd, &nn)
+    }
+
+    // RSA Blinding: choose random r in [1, n-1] with gcd(r, n) == 1
+    mut one := big.new_int(1)
+    mut ee := big.new_int(priv.public.e)
+    mut c_blind := big.new_int(0)
+    c_blind.set(c)
+    mut rinv := big.new_int(1)
+    mut blinded := false
+    k := n_size(&nn)
+    if k > 1 {
+        rbuf := rand.read(k - 1) or (err) { << rsa_crypt(c, &dd, &nn) }
+        mut r := big.new_int(0)
+        r.set_bytes(rbuf)
+        if r.sign() <= 0 {
+            r.set(&one)
+        }
+        mut g := big.new_int(0)
+        g.gcd(&r, &nn)
+        if g.cmp(&one) == 0 {
+            if rinv.mod_inverse(&r, &nn) {
+                re := rsa_crypt(&r, &ee, &nn) or >>
+                c_blind.mul(&c_blind, &re)
+                c_blind.mod(&c_blind, &nn) or >>
+                blinded = true
+            }
+        }
+    }
+
+    // CRT: dp = d mod (p-1), dq = d mod (q-1), qinv = q^-1 mod p
+    mut pm1 := big.new_int(0)
+    pm1.sub(&p, &one)
+    mut qm1 := big.new_int(0)
+    qm1.sub(&q, &one)
+    mut dp := big.new_int(0)
+    dp.mod(&dd, &pm1) or >>
+    mut dq := big.new_int(0)
+    dq.mod(&dd, &qm1) or >>
+    mut qinv := big.new_int(0)
+    if !qinv.mod_inverse(&q, &p) {
+        << rsa_crypt(c, &dd, &nn)
+    }
+
+    mut cp := big.new_int(0)
+    cp.mod(&c_blind, &p) or >>
+    mut cq := big.new_int(0)
+    cq.mod(&c_blind, &q) or >>
+    m1 := rsa_crypt(&cp, &dp, &p) or >>
+    m2 := rsa_crypt(&cq, &dq, &q) or >>
+
+    mut diff := big.new_int(0)
+    diff.sub(&m1, &m2)
+    while diff.sign() < 0 {
+        diff.add(&diff, &p)
+    }
+    mut h := big.new_int(0)
+    h.mul(&qinv, &diff)
+    h.mod(&h, &p) or >>
+
+    mut hq := big.new_int(0)
+    hq.mul(&h, &q)
+    mut m := big.new_int(0)
+    m.add(&m2, &hq)
+    m.mod(&m, &nn) or >>
+
+    if blinded {
+        m.mul(&m, &rinv)
+        m.mod(&m, &nn) or >>
+    }
+    << m
+}
+
 fn non_zero_ps(n int) string {
     mut out := []int{}
     mut guard := 0
@@ -151,10 +240,17 @@ pub fn encrypt_pkcs1v15(pk &PublicKey, msg &string) string {
     << i2osp(&c, k)
 }
 
+fn b2i_ct(cond bool) int {
+    if cond {
+        << 1
+    }
+    << 0
+}
+
 pub fn decrypt_pkcs1v15(priv &PrivateKey, ciphertext &string) string {
     pk := &priv.public
     k := pk.size()
-    if ciphertext.len != k {
+    if ciphertext.len != k || k < 11 {
         >> errors.new("crypto/rsa: decryption error")
     }
     mut c := big.new_int(0)
@@ -164,29 +260,29 @@ pub fn decrypt_pkcs1v15(priv &PrivateKey, ciphertext &string) string {
     if c.cmp(&nn) >= 0 {
         >> errors.new("crypto/rsa: decryption error")
     }
-    mut dd := big.new_int(0)
-    dd.set(&priv.d)
-    m := rsa_crypt(&c, &dd, &nn) or >>
+    m := rsa_priv_op(priv, &c) or >>
     em := i2osp(&m, k) or >>
-    if (em[0] & 255) != 0 || (em[1] & 255) != 2 {
-        >> errors.new("crypto/rsa: decryption error")
-    }
-    mut i := 2
-    mut ps := 0
+
+    // Constant-time scan of PKCS#1 v1.5 header (0x00 0x02 <PS >= 8 bytes> 0x00)
+    // to mitigate Bleichenbacher padding oracle side channels.
+    b0_ok := subtle.constant_time_byte_eq(em[0] & 255, 0)
+    b1_ok := subtle.constant_time_byte_eq(em[1] & 255, 2)
     mut found := 0
+    mut sep_idx := 0
+    mut i := 2
     while i < em.len {
-        b := em[i] & 255
-        if b == 0 {
-            found = 1
-            <-
-        }
-        ps = ps + 1
+        is_zero := subtle.constant_time_byte_eq(em[i] & 255, 0)
+        first_zero := (1 - found) & is_zero
+        sep_idx = subtle.constant_time_select(first_zero, i, sep_idx)
+        found = found | is_zero
         i = i + 1
     }
-    if found == 0 || ps < 8 {
+    ps_ok := b2i_ct(sep_idx >= 10)
+    valid := b0_ok & b1_ok & found & ps_ok
+    if valid != 1 {
         >> errors.new("crypto/rsa: decryption error")
     }
-    << em[(i + 1):em.len]
+    << em[(sep_idx + 1):em.len]
 }
 
 fn emsa_pkcs1v15(k int, hash int, hashed &string) string {
@@ -218,11 +314,7 @@ pub fn sign_pkcs1v15(priv &PrivateKey, hash int, hashed &string) string {
     ems := emsa_pkcs1v15(k, hash, hashed) or >>
     mut m := big.new_int(0)
     m.set_bytes(ems)
-    mut nn := big.new_int(0)
-    nn.set(&pk.n)
-    mut dd := big.new_int(0)
-    dd.set(&priv.d)
-    s := rsa_crypt(&m, &dd, &nn) or >>
+    s := rsa_priv_op(priv, &m) or >>
     << i2osp(&s, k)
 }
 
