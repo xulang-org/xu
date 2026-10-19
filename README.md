@@ -30,13 +30,16 @@
 
 ---
 
-## Xu 0.8.13
+## Xu 0.9.1
 
-Xu 0.8.13 is the stable release of the pure Xu self-hosted toolchain. Build with a published Xu SDK seed; every generation compiles the original source and manifest and confirms a fixed point. Rust/Cargo and the historical bootstrap checkout are no longer required.
+Xu 0.9.1 is the formal release featuring major binary size optimizations and streamlined toolchain distribution:
 
-This release fixes floating-point call preservation and element-address copies, repairs x64 map adapters and assembly symbol resolution, and simplifies MIR field updates and backend label forwarding. SDK installation keeps metadata and package discovery consistent across supported platforms.
+- **Call Graph Tree-Shaking**: Global analysis of reachable functions and symbols, stripping unreferenced code and drastically reducing output binary footprint.
+- **Static Constant Lowering**: Large immutable arrays and slices are placed directly into `.rodata` read-only sections, eliminating runtime stack setup and bloat.
+- **Zero Bootstrap Warnings**: Cleared all self-hosting compiler warnings including division-by-zero detection, AST terminating branch exits, and raised large stack frame thresholds.
+- **Dynamic Toolchain Discovery & Updates**: `xu up` dynamically unpacks and manages all sibling toolchain binaries (such as `xu-lsp`, `xu-native`), and the root CLI automatically delegates to installed sibling tools.
 
-Download the [0.8.13 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.8.13). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance; existing 0.8.12 measurements are not 0.8.13 results.
+Download the [0.9.1 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.1). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 

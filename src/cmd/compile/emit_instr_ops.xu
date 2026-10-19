@@ -593,6 +593,26 @@ fn emit_compare_fuses_branch(a &Assembler, m &types.Mir, fi int, ii int) bool {
     << rc_temp_use_count(m, fi, dest) == 1
 }
 
+// A LoadLocal of an immutable recursive parameter can feed a terminal
+// compare directly from its callee-saved home.  Keep this proof tied to the
+// exact producer/consumer pair so unrelated fixed-home values still use the
+// ordinary materialization path.
+fn vreg_compare_param_home(a &Assembler, m &types.Mir, fi int, fr &Frame, cmp_ii int, temp_id int) int {
+    if !emit_compare_fuses_branch(a, m, fi, cmp_ii) { << -1 }
+    if temp_id < 0 || temp_id >= fr.temp_slot.len || !is_vreg_slot(fr.temp_slot[temp_id]) { << -1 }
+    for bi in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_ikind(m, fi, ii) == 2 && types.mir_ia(m, fi, ii) == temp_id && types.mir_inext(m, fi, ii) == cmp_ii {
+                << vreg_self_param_home(m, fi, fr, a.arch, types.mir_ib(m, fi, ii))
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << -1
+}
+
 fn emit_instr_bin(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
     if rc_fp_consume_skip(a, ii) {
         <<
@@ -637,7 +657,13 @@ fn emit_instr_bin(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
     // In particular, a trailing StoreLocal may feed the skipped-RHS edge
     // of &&/||. Keep that value and store for every allocation mode.
     if emit_compare_fuses_branch(&*a, m, fi, ii) {
-        lhs_r := rc_load_reg(a, m, fi, fr, ic, 0)
+        mut lhs_r := -1
+        if ic >= 0 {
+            lhs_r = vreg_compare_param_home(&*a, m, fi, fr, ii, ic)
+        }
+        if lhs_r < 0 {
+            lhs_r = rc_load_reg(a, m, fi, fr, ic, 0)
+        }
         mut imm := rc_local_const_u32(m, fi, id)
         if imm < 0 && a.arch == 1 {
             raw_c := rc_const_val(m, fi, id)
@@ -1008,7 +1034,7 @@ fn vreg_entry_param_forward_ok(m &types.Mir, fi int, loc int, ii int) bool {
         for _ in 0:nins {
             if cur < 0 { <- }
             k := types.mir_ikind(m, fi, cur)
-            if (k == 2 || k == 4) && types.mir_ia(m, fi, cur) == loc { << false }
+            if k == 3 && types.mir_ia(m, fi, cur) == loc { << false }
             cur = types.mir_inext(m, fi, cur)
         }
     }
@@ -1020,6 +1046,54 @@ fn vreg_entry_param_forward_ok(m &types.Mir, fi int, loc int, ii int) bool {
         k := types.mir_ikind(m, fi, cur0)
         if k == 7 || types.mir_instr_has_dest(k) { << false }
         cur0 = types.mir_inext(m, fi, cur0)
+    }
+    << true
+}
+
+// A frameless entry guard can branch directly from block 0 into a body block
+// while the ABI argument is still in A0..A5. Forward a parameter LoadLocal on
+// that edge when the body has no other predecessor and no prior call. This is
+// a CFG proof for any direct-call function; it does not depend on a benchmark
+// or function name. Backedges and joins remain frame-backed.
+fn vreg_entry_edge_param_forward_ok(m &types.Mir, fi int, bi int, loc int, ii int) bool {
+    if bi <= 0 || bi >= types.mir_nblocks(m, fi) || loc < 0 || loc >= types.mir_fn_nparams(m, fi) || loc >= 6 { << false }
+    if types.mir_local_nslots(m, fi, loc) != 1 || !abi_pass_by_value(types.mir_local_ty(m, fi, loc)) { << false }
+    // The parameter must remain an immutable scalar local.
+    for bj in 0:types.mir_nblocks(m, fi) {
+        mut xi := types.mir_bhead(m, fi, bj)
+        for _ in 0:types.mir_nins(m, fi) {
+            if xi < 0 { <- }
+            k := types.mir_ikind(m, fi, xi)
+            if k == 3 && types.mir_ia(m, fi, xi) == loc { << false }
+            xi = types.mir_inext(m, fi, xi)
+        }
+    }
+    // Block 0 must branch directly to this body block.
+    if types.mir_btkind(m, fi, 0) != 2 || (types.mir_btb(m, fi, 0) != bi && types.mir_btc(m, fi, 0) != bi) { << false }
+    mut preds := 0
+    for bj in 0:types.mir_nblocks(m, fi) {
+        tk := types.mir_btkind(m, fi, bj)
+        if tk == 1 {
+            if types.mir_bta(m, fi, bj) == bi { preds += 1 }
+        } else if tk == 2 {
+            if types.mir_btb(m, fi, bj) == bi { preds += 1 }
+            if types.mir_btc(m, fi, bj) == bi { preds += 1 }
+        }
+    }
+    if preds != 1 { << false }
+    // The argument register survives the entry block and all instructions
+    // before this LoadLocal. A call is the only relevant clobber here.
+    mut xi := types.mir_bhead(m, fi, 0)
+    for _ in 0:types.mir_nins(m, fi) {
+        if xi < 0 { <- }
+        if types.mir_ikind(m, fi, xi) == 7 { << false }
+        xi = types.mir_inext(m, fi, xi)
+    }
+    xi = types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if xi < 0 || xi == ii { <- }
+        if types.mir_ikind(m, fi, xi) == 7 { << false }
+        xi = types.mir_inext(m, fi, xi)
     }
     << true
 }
@@ -1039,7 +1113,20 @@ fn emit_instr_loadlocal(a &mut Assembler, m &types.Mir, fi int, fr &Frame, ii in
     if ia >= 0 && ia < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[ia]) {
         if ib >= 0 && ib < fr.local_slot.len && is_frame_slot(fr.local_slot[ib]) {
             home := vreg_slot_home(fr.temp_slot[ia])
-            if a.rc_cur_bi == 0 && vreg_entry_param_forward_ok(m, fi, ib, ii) {
+            if a.rc_branch_cond >= 0 {
+                mut next := types.mir_inext(m, fi, ii)
+                if next >= 0 && vreg_compare_param_home(&*a, m, fi, fr, next, ia) >= 0 {
+                    <<
+                }
+            }
+            param_home := vreg_self_param_home(m, fi, fr, a.arch, ib)
+            if param_home >= 0 {
+                if home != param_home {
+                    a.mov(home, param_home)
+                }
+                <<
+            }
+            if (a.rc_cur_bi == 0 && vreg_entry_param_forward_ok(m, fi, ib, ii)) || vreg_entry_edge_param_forward_ok(m, fi, a.rc_cur_bi, ib, ii) {
                 preg := arg_reg(ib)
                 if home != preg {
                     a.mov(home, preg)

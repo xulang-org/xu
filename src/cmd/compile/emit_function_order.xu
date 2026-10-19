@@ -8,10 +8,199 @@
 // without changing Mir ownership, labels, numeric function IDs or fixups.
 // Debug ranges use this same sequence so their next-function boundary agrees
 // with actual emission. Equal source IDs retain their relative order.
-fn emit_function_order(m &types.Mir) []int {
+struct MirLabelIndex {
+    buckets []int
+    next    []int
+}
+
+fn mir_label_hash_fast(m &types.Mir, fi int) int {
+    mut h := 5381
+    n := types.mir_fn_label_len(m, fi)
+    for j in 0:n {
+        h = (((h << 5) + h) + (types.mir_fn_label_byte(m, fi, j) & 255)) & 2147483647
+    }
+    << h
+}
+
+fn mir_str_hash_fast(s &string) int {
+    mut h := 5381
+    for j in 0:s.len {
+        h = (((h << 5) + h) + (s[j] & 255)) & 2147483647
+    }
+    << h
+}
+
+fn mir_build_label_index(m &types.Mir) MirLabelIndex {
+    nf := m.fns.len
+    mut nb := 1
+    while nb < nf * 2 { nb *= 2 }
+    mut buckets := []int{}
+    for _ in 0:nb { buckets.push(-1) }
+    mut next := []int{}
+    for _ in 0:nf { next.push(-1) }
+    for j in 0:nf {
+        if types.mir_fn_is_extern(m, j) { -> }
+        h := mir_label_hash_fast(m, j)
+        b := h & (nb - 1)
+        next[j] = buckets[b]
+        buckets[b] = j
+    }
+    << MirLabelIndex{buckets: buckets, next: next}
+}
+
+fn mir_label_index_find(idx &MirLabelIndex, m &types.Mir, lab string) int {
+    if lab == "" || idx.buckets.len == 0 { << -1 }
+    h := mir_str_hash_fast(&lab)
+    b := h & (idx.buckets.len - 1)
+    mut at := idx.buckets[b]
+    n := lab.len
+    while at >= 0 {
+        if !types.mir_fn_is_extern(m, at) && types.mir_fn_label_len(m, at) == n {
+            if types.mir_fn_label(m, at) == lab {
+                << at
+            }
+        }
+        at = idx.next[at]
+    }
+    << -1
+}
+
+fn mir_collect_reachable(m &types.Mir, keep_all bool) []bool {
+    mut reachable := []bool{}
+    nf := m.fns.len
+    for _ in 0:nf {
+        reachable.push(false)
+    }
+    if keep_all || nf <= 1 {
+        for i in 0:nf {
+            reachable[i] = true
+        }
+        << reachable
+    }
+
+    idx := mir_build_label_index(m)
+    main_fi := mir_label_index_find(&idx, m, "_xu_main")
+    if main_fi < 0 {
+        for i in 0:nf {
+            reachable[i] = true
+        }
+        << reachable
+    }
+
+    mut work := []int{}
+    reachable[main_fi] = true
+    work.push(main_fi)
+
+    isr_fi := mir_label_index_find(&idx, m, "_xu_isr")
+    if isr_fi >= 0 && !reachable[isr_fi] {
+        reachable[isr_fi] = true
+        work.push(isr_fi)
+    }
+    app_fi := mir_label_index_find(&idx, m, "_xu_app_start")
+    if app_fi >= 0 && !reachable[app_fi] {
+        reachable[app_fi] = true
+        work.push(app_fi)
+    }
+    host_fi := mir_label_index_find(&idx, m, "_xu_ui_host_run")
+    if host_fi >= 0 && !reachable[host_fi] {
+        reachable[host_fi] = true
+        work.push(host_fi)
+    }
+
+    // Retain resource drop methods (called by emit_resource_drop / emit_drop_value)
+    for si in 0:m.structs.len {
+        if m.structs[si].drop_label.len > 0 {
+            dfi := mir_label_index_find(&idx, m, m.structs[si].drop_label + "")
+            if dfi >= 0 && !reachable[dfi] {
+                reachable[dfi] = true
+                work.push(dfi)
+            }
+        }
+    }
+
+    // Retain runtime-injected hooks if present
+    for j in 0:nf {
+        if !types.mir_fn_is_extern(m, j) && !reachable[j] {
+            lab := types.mir_fn_label(m, j)
+            if lab.len >= 12 && lab[0:12] == "_xu_runtime_" {
+                reachable[j] = true
+                work.push(j)
+            } else if lab.len >= 7 && lab[0:7] == "_xu_ui_" {
+                reachable[j] = true
+                work.push(j)
+            } else if irq_slot(m.fns[j].name + "") >= 0 {
+                reachable[j] = true
+                work.push(j)
+            }
+        }
+    }
+
+    mut head := 0
+    while head < work.len {
+        cur := work[head]
+        head += 1
+
+        nins := types.mir_nins(m, cur)
+        for ii in 0:nins {
+            ik := types.mir_ikind(m, cur, ii)
+            if ik == 7 { // Call
+                if types.mir_ib(m, cur, ii) != 80 {
+                    lab := types.mir_isval(m, cur, ii)
+                    cfi := mir_label_index_find(&idx, m, lab)
+                    if cfi >= 0 && !reachable[cfi] {
+                        reachable[cfi] = true
+                        work.push(cfi)
+                    }
+                }
+            } else if ik == 33 || ik == 39 { // Xu, MakeClosure
+                lab := types.mir_isval(m, cur, ii)
+                cfi := mir_label_index_find(&idx, m, lab)
+                if cfi >= 0 && !reachable[cfi] {
+                    reachable[cfi] = true
+                    work.push(cfi)
+                }
+            } else if ik == 38 { // LoadFnAddr: sval may be shim or real
+                lab := types.mir_isval(m, cur, ii)
+                real := types.mir_fnval_shim_to_real(&lab)
+                mut cfi := mir_label_index_find(&idx, m, lab)
+                if cfi < 0 && real != "" {
+                    cfi = mir_label_index_find(&idx, m, real)
+                }
+                if cfi >= 0 && !reachable[cfi] {
+                    reachable[cfi] = true
+                    work.push(cfi)
+                }
+            } else if ik == 43 { // InterfaceMethod: sval = method name
+                mname := types.mir_isval(m, cur, ii)
+                if mname != "" {
+                    for j in 0:nf {
+                        if !types.mir_fn_is_extern(m, j) && !reachable[j] {
+                            if types.mir_fn_receiver(m, j) && m.fns[j].name == mname {
+                                reachable[j] = true
+                                work.push(j)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    << reachable
+}
+
+// Optimizer commits append replacements and leave old owners in the pool.
+// Their allocation order must not move unchanged functions whenever an
+// unrelated helper is rewritten. Preserve concrete Checker declaration order
+// without changing Mir ownership, labels, numeric function IDs or fixups.
+// Debug ranges use this same sequence so their next-function boundary agrees
+// with actual emission. Equal source IDs retain their relative order.
+fn emit_function_order(m &types.Mir, keep_all bool) []int {
+    reachable := mir_collect_reachable(m, keep_all)
     mut order := []int{}
     for fi in 0:m.fns.len {
-        if !types.mir_fn_is_extern(m, fi) { order.push(fi) }
+        if !types.mir_fn_is_extern(m, fi) && reachable[fi] {
+            order.push(fi)
+        }
     }
     if order.len < 2 { << order }
     mut scratch := []int{}
