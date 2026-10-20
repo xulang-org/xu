@@ -55,7 +55,21 @@ fn hs_body(frag0 &string) string {
     << slice_copy(&frag, 4, frag.len) or >>
 }
 
-fn make_client_hello(random &string, name &string, key_share &string) string {
+fn ecdhe_public_size(group int) int {
+    if group == 23 { << ecdsa.public_key_size_p256 }
+    if group == 24 { << ecdsa.public_key_size_p384 }
+    if group == 25 { << ecdsa.public_key_size_p521 }
+    >> errors.new("tls: unsupported ECDHE group")
+}
+
+fn ecdhe_curve_for_size(size int) int {
+    if size == ecdsa.public_key_size_p256 { << ecdsa.p256 }
+    if size == ecdsa.public_key_size_p384 { << ecdsa.p384 }
+    if size == ecdsa.public_key_size_p521 { << ecdsa.p521 }
+    >> errors.new("tls: invalid ECDHE point")
+}
+
+fn make_client_hello(random &string, name &string, key_shares &[]string) string {
     mut b := []int{}
     b.push(3)
     b.push(3)
@@ -102,15 +116,18 @@ fn make_client_hello(random &string, name &string, key_share &string) string {
             ni = ni + 1
         }
     }
-    // supported_groups: secp256r1 (23).
+    // TLS 1.2 also uses supported_groups to select ECDSA certificates.
+    // Offer every supported NIST curve, with matching TLS 1.3 key shares.
     ext.push(0)
     ext.push(10)
     ext.push(0)
-    ext.push(4)
+    ext.push(8)
     ext.push(0)
-    ext.push(2)
-    ext.push(0)
-    ext.push(23)
+    ext.push(6)
+    for group in [23, 24, 25] {
+        ext.push(0)
+        ext.push(group)
+    }
     // ec_point_formats: uncompressed.
     ext.push(0)
     ext.push(11)
@@ -148,25 +165,33 @@ fn make_client_hello(random &string, name &string, key_share &string) string {
     ext.push(4)
     ext.push(3)
     ext.push(3)
-    // key_share: one secp256r1 share.
-    if key_share.len != ecdsa.public_key_size_p256 {
+    // Supply a share for each advertised group, so a peer can select any
+    // of them without requiring an unsupported HelloRetryRequest path.
+    if key_shares.len != 3 {
         >> errors.new("tls: invalid TLS 1.3 key share")
     }
+    mut shares := []int{}
+    for i in 0:3 {
+        group := 23 + i
+        key_share := &key_shares[i]
+        size := ecdhe_public_size(group) or >>
+        if key_share.len != size {
+            >> errors.new("tls: invalid TLS 1.3 key share")
+        }
+        shares.push(0)
+        shares.push(group)
+        shares.push((size >> 8) & 255)
+        shares.push(size & 255)
+        push_s(mut &shares, key_share)
+    }
+    share_bytes := string_from_bytes(shares)
+    share_len := be16(share_bytes.len)
+    ext_len := be16(share_bytes.len + 2)
     ext.push(0)
     ext.push(51)
-    ext.push(0)
-    ext.push(71)
-    ext.push(0)
-    ext.push(69)
-    ext.push(0)
-    ext.push(23)
-    ext.push(0)
-    ext.push(65)
-    mut ki := 0
-    while ki < key_share.len {
-        ext.push(key_share[ki] & 255)
-        ki = ki + 1
-    }
+    push_s(mut &ext, &ext_len)
+    push_s(mut &ext, &share_len)
+    push_s(mut &ext, &share_bytes)
     b.push((ext.len >> 8) & 255)
     b.push(ext.len & 255)
     mut ei := 0
@@ -268,9 +293,7 @@ fn make_cke(enc &string) string {
 }
 
 fn make_cke_point(point &string) string {
-    if point.len != ecdsa.public_key_size_p256 {
-        >> errors.new("tls: invalid ECDHE point")
-    }
+    ecdhe_curve_for_size(point.len) or >>
     mut b := []int{}
     b.push(point.len)
     push_s(mut &b, point)
@@ -386,12 +409,14 @@ fn parse_cke_point(body0 &string) string {
 
 fn verify_ske_cert(body0 &string, cr &string, sr &string, cert &x509.Certificate) string {
     body := body0 + ""
-    if body.len < 4 || (body[0] & 255) != 3 || u16_at(&body, 1) != 23 {
+    if body.len < 4 || (body[0] & 255) != 3 {
         >> errors.new("tls: unsupported ECDHE parameters")
     }
+    group := u16_at(&body, 1) or >>
+    size := ecdhe_public_size(group) or >>
     n := body[3] & 255
     params_end := 4 + n
-    if n != ecdsa.public_key_size_p256 || params_end + 4 > body.len {
+    if n != size || params_end + 4 > body.len {
         >> errors.new("tls: invalid ECDHE parameters")
     }
     sig_alg := u16_at(&body, params_end) or >>
@@ -424,11 +449,14 @@ fn verify_ske_cert(body0 &string, cr &string, sr &string, cert &x509.Certificate
     if cert.public_key_algorithm == x509.ecdsa {
         pub_key := cert.public_key + ""
         mut digest := ""
-        if sig_alg == 0x0403 && pub_key.len == ecdsa.public_key_size_p256 {
+        // TLS 1.2 negotiates hash/signature pairs without binding the hash
+        // to the certificate curve (RFC 8446 section 4.2.3 compatibility).
+        // TLS 1.3 keeps its curve-specific rules in tls13.xu.
+        if sig_alg == 0x0403 {
             digest = sha256.sum256_bytes(signed_s)
-        } else if sig_alg == 0x0503 && pub_key.len == ecdsa.public_key_size_p384 {
+        } else if sig_alg == 0x0503 {
             digest = sha512.sum384(signed_s)
-        } else if sig_alg == 0x0603 && pub_key.len == ecdsa.public_key_size_p521 {
+        } else if sig_alg == 0x0603 {
             digest = sha512.sum512(signed_s)
         } else {
             >> errors.new("tls: unsupported ECDHE ECDSA signature")
@@ -597,11 +625,17 @@ fn expect_hs(c &mut Conn, want int) string {
 fn handshake_client(c &mut Conn, cfg &Config) int {
     cr := make_random()
     sn := cfg.server_name
-    // The same ephemeral share is used if the server selects TLS 1.3; TLS 1.2
-    // ECDHE uses a fresh scalar after the signed ServerKeyExchange.
-    hello_priv := ecdsa.generate_key(ecdsa.p256) or >>
-    hello_share := ecdsa.public(&hello_priv) or >>
-    ch := make_client_hello(&cr, &sn, &hello_share)
+    // Each advertised group has its own ephemeral scalar and TLS 1.3 share.
+    // TLS 1.2 generates a fresh scalar after the signed ServerKeyExchange.
+    mut hello_privates := []string{}
+    mut hello_shares := []string{}
+    for curve in [ecdsa.p256, ecdsa.p384, ecdsa.p521] {
+        private_key := ecdsa.generate_key(curve) or >>
+        public_key := ecdsa.public(&private_key) or >>
+        hello_privates.push(private_key)
+        hello_shares.push(public_key)
+    }
+    ch := make_client_hello(&cr, &sn, &hello_shares) or >>
     mut log := io.buffer()
     log.write(&ch)
     rec_write(c, rec_hs, &ch) or >>
@@ -612,7 +646,7 @@ fn handshake_client(c &mut Conn, cfg &Config) int {
     suite := parse_sh_suite(&shb) or >>
     if suite == tls_aes_128_gcm_sha256 {
         log_s0 := log.bytes()
-        << handshake_client13(c, cfg, &cr, &sr, &log_s0, &hello_priv, &shb)
+        << handshake_client13(c, cfg, &cr, &sr, &log_s0, &hello_privates, &shb)
     }
     if suite != tls_rsa_with_aes_128_gcm_sha256 && suite != tls_ecdhe_rsa_with_aes_128_gcm_sha256 && suite != tls_ecdhe_ecdsa_with_aes_128_gcm_sha256 {
         >> errors.new("tls: cipher suite")
@@ -637,7 +671,8 @@ fn handshake_client(c &mut Conn, cfg &Config) int {
     mut pms := ""
     mut cke := ""
     if is_ecdhe {
-        eph_priv := ecdsa.generate_key(ecdsa.p256) or >>
+        curve := ecdhe_curve_for_size(peer_point.len) or >>
+        eph_priv := ecdsa.generate_key(curve) or >>
         eph_pub := ecdsa.public(&eph_priv) or >>
         pms = ecdsa.ecdh(&eph_priv, &peer_point) or >>
         cke = make_cke_point(&eph_pub) or >>
