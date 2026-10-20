@@ -30,15 +30,17 @@
 
 ---
 
-## Xu 0.9.3
+## Xu 0.9.4
 
-Xu 0.9.3 is a critical stability release delivering key compiler code generation and diagnostic fixes:
+Xu 0.9.4 is a compiler consistency and optimizer release:
 
-- **Self-Recursive Multi-Parameter Register Allocation**: Resolved a compiler register allocation defect where self-recursive functions with multiple scalar parameters (e.g. Ackermann `ack(m, n)`) assigned the same callee-saved virtual register (`x19` on ARM64, RBX on x64) to all parameters, causing later parameters to overwrite earlier ones and resulting in infinite recursion or segmentation faults.
-- **Compiler Diagnostic Robustness**: Fixed an internal compiler bounds crash (`index out of bounds`) when referencing undefined function names, ensuring clean error reporting without compiler panic.
-- **Comprehensive Syntax & Concurrency Validation**: Validated complex recursion, coroutine rendezvous channels (`cap: 0`), channel drain with `close()`, curried closures, custom RAII destructors (`drop()`), multi-parameter generics (`#A, B`), and nested loop control inside error handlers across both `macos-arm64` and `linux-x64`.
+- **Borrow Checking Soundness**: The borrow checker now walks every expression kind (with a conservative fallback for unknown kinds), so aliasing such as `f(mut &v, &v)` is reported even when nested inside casts or arithmetic; borrows taken inside a loop now stay live across the back edge. Programs that previously compiled only because of these gaps now receive a diagnostic.
+- **Generics and Type Table Limits**: Generic declarations are no longer limited to four type parameters, type-id range overflow is asserted instead of silently wrapping, and backends that do not support a requested target fail explicitly.
+- **MIR Verification**: `XU_VERIFY=1` runs the full MIR verifier after every optimization pass; mismatches between the verifier, lowering and the backend were fixed. `XU_DUMP_MIR=<fn>` dumps a function's MIR.
+- **SSA Loop Optimization**: Scalar SSA promotion no longer depends on a per-shape whitelist, and the ARM64 loop kernels (scan, saxpy, CRC, binary search, fill, stride, predicated scan) have SSA-based matchers. Loops bounded by an `[]int` length are rotated so they qualify. Measured speedups versus 0.9.3 include `bloom_filter` ~12%, `chase_index` 9-11%, `f64_sum` ~8% and `algorithm_search` ~9% at `-O3`, with no regressions and slightly faster self-compilation.
+- **Pattern Diagnostics**: `--timings` reports `pattern-hits:` and per-function register-allocation mode; `XU_PATTERNS_OFF` disables named backend patterns for differential testing (`scripts/pattern_diff.sh`).
 
-Download the [0.9.3 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.3). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
+Download the [0.9.4 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.4). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
