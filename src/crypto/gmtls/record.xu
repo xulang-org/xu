@@ -98,11 +98,11 @@ fn rec_wrap(typ int, ver int, frag &string) string {
 }
 
 fn pipe_write(p net.PipeConn, rec string) int {
-    << p.write(rec)
+    << p.write(rec) or >>
 }
 
 fn pipe_read(p net.PipeConn) string {
-    << p.read()
+    << p.read() or >>
 }
 
 fn parse_rec(raw0 &string) int {
@@ -194,18 +194,21 @@ fn gcm_open_rec(key &string, iv &string, seq int, raw0 string) string {
     << sm4.open_gcm(&c, &nn, &sealed, &aad)
 }
 
-fn rec_mac(mac_key &string, seq int, typ int, ver int, content &string) string {
+fn rec_mac_header(seq int, typ int, ver int, n int) string {
     mut b := []int{}
     s := be64(seq)
     push_s(mut &b, &s)
     b.push(typ & 255)
     b.push((ver >> 8) & 255)
     b.push(ver & 255)
-    n := content.len
     b.push((n >> 8) & 255)
     b.push(n & 255)
-    push_s(mut &b, content)
-    data := string_from_bytes(b)
+    << string_from_bytes(b)
+}
+
+fn rec_mac(mac_key &string, seq int, typ int, ver int, content &string) string {
+    header := rec_mac_header(seq, typ, ver, content.len)
+    data := header + (content + "")
     << hmac_sm3_raw(mac_key, &data)
 }
 
@@ -234,10 +237,7 @@ fn tls_unpad(inner0 &string) string {
         >> errors.new("crypto/gmtls: bad cbc padding")
     }
     padn := raw[raw.len - 1] & 255
-    mut bad := 0
-    if padn + 1 > raw.len {
-        bad = 1
-    }
+    mut bad := ((raw.len - 1 - padn) >> 63) & 1
     mut check_len := 256
     if raw.len < check_len {
         check_len = raw.len
@@ -246,9 +246,8 @@ fn tls_unpad(inner0 &string) string {
     while i < check_len {
         idx := raw.len - 1 - i
         b := raw[idx] & 255
-        if i <= padn {
-            bad = bad | (b ^ padn)
-        }
+        in_pad := 1 - (((padn - i) >> 63) & 1)
+        bad = bad | ((0 - in_pad) & (b ^ padn))
         i = i + 1
     }
     if bad != 0 {
@@ -291,14 +290,17 @@ fn cbc_open_rec(key &string, mac_key &string, seq int, raw0 string) string {
     c := sm4.new_cipher(key) or >>
     dec := sm4.decrypt_cbc(&c, &iv, &ct) or >>
 
-    // Mitigate Lucky13 / CBC padding oracle: validate padding across a bounded
-    // window without early exit, clamp indices so HMAC-SM3 is ALWAYS computed,
-    // and return a single unified error message on either padding or MAC failure.
-    padn := dec[dec.len - 1] & 255
-    mut pad_ok := 1
-    if padn + 33 > dec.len {
-        pad_ok = 0
+    << cbc_check_inner(mac_key, seq, typ, ver, &dec) or >>
+}
+
+// Before authentication, padding controls only masks, never loop bounds,
+// memory indices, allocations or the number of SM3 compression blocks.
+fn cbc_check_inner(mac_key &string, seq int, typ int, ver int, dec &string) string {
+    if dec.len < 48 || (dec.len % 16) != 0 {
+        >> errors.new("crypto/gmtls: cbc mac")
     }
+    padn := dec[dec.len - 1] & 255
+    mut pad_ok := 1 - (((dec.len - 33 - padn) >> 63) & 1)
     mut scan_max := 256
     if dec.len < scan_max {
         scan_max = dec.len
@@ -307,30 +309,40 @@ fn cbc_open_rec(key &string, mac_key &string, seq int, raw0 string) string {
     mut i := 0
     while i < scan_max {
         b := dec[dec.len - 1 - i] & 255
-        // Apply mask when i <= padn
-        in_pad := subtle.constant_time_select(b2i(i <= padn), 1, 0)
-        diff = diff | (in_pad & (b ^ padn))
+        in_pad := 1 - (((padn - i) >> 63) & 1)
+        diff = diff | ((0 - in_pad) & (b ^ padn))
         i = i + 1
     }
     pad_ok = pad_ok & subtle.constant_time_byte_eq(diff, 0)
     safe_padn := subtle.constant_time_select(pad_ok, padn, 0)
     body_len := dec.len - 1 - safe_padn
     pt_len := body_len - 32
-    pt := slice_copy(&dec, 0, pt_len) or >>
-    got := slice_copy(&dec, pt_len, body_len) or >>
-    want := rec_mac(mac_key, seq, typ, ver, &pt)
+    // Gather the MAC using a public trailing window. Its start can be at
+    // most 256 padding bytes plus 32 MAC bytes from the end of the record.
+    mut start := dec.len - 288
+    if start < 0 {
+        start = 0
+    }
+    mut got_bytes := []int{}
+    for j in 0:32 {
+        mut v := 0
+        for idx in start:dec.len {
+            at_mac := subtle.constant_time_eq(idx, pt_len + j)
+            v = v | ((dec[idx] & 255) & (0 - at_mac))
+        }
+        got_bytes.push(v)
+    }
+    got := string_from_bytes(got_bytes)
+    header := rec_mac_header(seq, typ, ver, pt_len)
+    input := header + (dec + "")
+    want := hmac_sm3_prefix(mac_key, &input, 13 + pt_len) or >>
     mac_ok := subtle.constant_time_compare(&got, &want)
-    if (pad_ok & mac_ok) != 1 {
+    len_ok := 1 - (((max_plaintext_len - pt_len) >> 63) & 1)
+    if (pad_ok & mac_ok & len_ok) != 1 {
         >> errors.new("crypto/gmtls: cbc mac")
     }
-    << pt
-}
-
-fn b2i(cond bool) int {
-    if cond {
-        << 1
-    }
-    << 0
+    // Secret-dependent slicing is safe only after successful authentication.
+    << slice_copy(dec, 0, pt_len) or >>
 }
 
 fn rec_seal(suite int, key &string, iv &string, mac &string, seq int, typ int, ver int, pt &string) string {
