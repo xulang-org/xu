@@ -4,6 +4,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <windows.h>
+#include "xu_ui_mem.h"
+#include "xu_pack_assets.h"
+#include "xu_ui_text.h"
 
 typedef void (WINAPI *ExitProcessFn)(UINT);
 
@@ -248,6 +251,8 @@ static void maybe_alloc_console(void) {
 }
 
 static int xu_pack_setup(void) {
+  xu_ui_set_asset_reader(xu_pack_asset_ptr);
+  xu_draw_text_init();
   char exe_dir[MAX_PATH];
   char *slash;
   DWORD n;

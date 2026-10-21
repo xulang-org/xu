@@ -1,6 +1,7 @@
 // Xu UI Windows shell host (Win32 + GDI+) — shell.* aligned with macOS TMP protocol.
 
 #include <windows.h>
+#include "xu_ui_dpi.h"
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -13,6 +14,11 @@
 #include "xu_content_abi.h"
 #include "xu_pack_assets.h"
 #include "xu_ui_mem.h"
+#include "xu_ui_commands.h"
+#include "xu_ui_windows.h"
+#include "xu_ui_requests.h"
+#include "xu_draw_frame.h"
+#include "windows_files.inc"
 
 using namespace Gdiplus;
 
@@ -22,6 +28,8 @@ const XuContentVTable *xu_draw_plugin_vtable(void) __attribute__((weak));
 }
 
 static char g_tmp[1024];
+static unsigned g_root_generation=0;
+static bool g_root_closed=false;
 static HWND g_hwnd = NULL;
 static BOOL g_frameless = FALSE;
 static BOOL g_transparent = FALSE;
@@ -77,6 +85,7 @@ static char g_last_shot_path[1200];
 static HICON g_badge_icon = NULL;
 
 static void request_close(void);
+static void drain_title_size(void);
 static void append_shell_event(const char *payload);
 static void read_trim_file(const char *name, char *out, size_t n);
 static void read_file_raw(const char *name, char *out, size_t n);
@@ -142,7 +151,7 @@ static void write_tmp(const char *name, const char *body) {
 }
 
 static void append_shell_event(const char *payload) {
-  xu_ui_mem_append("xu_ui_shell_event.txt", payload ? payload : "", 1);
+  xu_ui_window_event(1,(payload && strcmp(payload,"ready") && strcmp(payload,"exit"))?g_root_generation:0,payload?payload:"");
   if (!g_tmp[0]) return;
   char path[1200];
   path_join(path, sizeof(path), "xu_ui_shell_event.txt");
@@ -789,19 +798,15 @@ static void menu_on_command(const char *id) {
   post_menu_invoke(id);
 }
 
-static SIZE outer_size_for_client(int width, int height, DWORD style, DWORD ex,
-                                  BOOL has_menu) {
-  RECT frame = {0, 0, width, height};
-  AdjustWindowRectEx(&frame, style, has_menu, ex);
-  SIZE size = {frame.right - frame.left, frame.bottom - frame.top};
-  return size;
+static SIZE outer_size_for_client(int width,int height,DWORD style,DWORD ex,BOOL has_menu,HWND window=NULL) {
+  return xu_ui_outer_for_client(window,width,height,style,ex,has_menu);
 }
 
 static void resize_to_client(int width, int height, UINT flags = 0) {
   if (!g_hwnd) return;
   SIZE size = outer_size_for_client(width, height,
       (DWORD)GetWindowLongPtr(g_hwnd, GWL_STYLE),
-      (DWORD)GetWindowLongPtr(g_hwnd, GWL_EXSTYLE), GetMenu(g_hwnd) != NULL);
+      (DWORD)GetWindowLongPtr(g_hwnd, GWL_EXSTYLE), GetMenu(g_hwnd) != NULL,g_hwnd);
   SetWindowPos(g_hwnd, NULL, 0, 0, size.cx, size.cy,
                SWP_NOMOVE | SWP_NOZORDER | flags);
 }
@@ -1220,20 +1225,20 @@ static void tray_install_or_update(void) {
 }
 
 static void do_quit(void) {
-  if (g_quitting) return;
-  g_quitting = TRUE;
-  append_shell_event("closed");
-  append_shell_event("exit");
-  if (g_hwnd && g_timer) {
-    KillTimer(g_hwnd, g_timer);
-    g_timer = 0;
+  if(g_quitting)return;
+  if(!g_root_closed){
+    g_root_closed=true;
+    desktop_files_close_owner(1,g_root_generation);
+    if(g_content && g_content_vt && g_content_vt->destroy)g_content_vt->destroy(g_content);
+    g_content=NULL;xu_ui_window_closed(1,g_root_generation);append_shell_event("closed");
+    if(g_hwnd)ShowWindow(g_hwnd,SW_HIDE);
   }
-  tray_remove();
-  if (g_content && g_content_vt && g_content_vt->destroy) {
-    g_content_vt->destroy(g_content);
-    g_content = NULL;
-  }
-  PostQuitMessage(0);
+  if(xu_ui_window_count() || !desktop_files_idle())return;
+  g_quitting=TRUE;xu_ui_windows_shutdown();xu_ui_emit_close();
+  if(g_hwnd && g_timer){KillTimer(g_hwnd,g_timer);g_timer=0;}
+  tray_remove();xu_ui_host_set_kick(NULL);
+  if(g_hwnd){HWND window=g_hwnd;g_hwnd=NULL;DestroyWindow(window);}
+  append_shell_event("exit");PostQuitMessage(0);
 }
 
 static void request_close(void) {
@@ -1559,6 +1564,11 @@ static void drain_title_size(void) {
 }
 
 static void handle_shell_cmd(const char *s) {
+  if(g_root_closed)return;
+  if(!strcmp(s,"close")){request_close();return;}
+  if(!strncmp(s,"title\t",6)){write_tmp("xu_ui_title.txt",s+6);drain_title_size();return;}
+  if(!strncmp(s,"size\t",5)){int width=0,height=0;char tail=0;if(sscanf(s+5,"%d\t%d%c",&width,&height,&tail)==2 && width>=40 && height>=40 && width<=16384 && height<=16384){char size[40];snprintf(size,sizeof(size),"%d %d",width,height);write_tmp("xu_ui_size.txt",size);drain_title_size();}return;}
+
   if (strcmp(s, "show") == 0) {
     g_hidden = FALSE;
     ShowWindow(g_hwnd, SW_SHOW);
@@ -1802,42 +1812,31 @@ static void handle_shell_cmd(const char *s) {
   }
 }
 
-static void strip_prefix(const char *raw, char *out, size_t n) {
-  const char *s = raw;
-  if (strncmp(s, "shell.", 6) == 0) s += 6;
-  else if (strncmp(s, "content.", 8) == 0) s += 8;
-  else if (strncmp(s, "wv.", 3) == 0) s += 3;
-  snprintf(out, n, "%s", s);
+static const char *strip_prefix(const char *raw) {
+  if (strncmp(raw, "shell.", 6) == 0) return raw + 6;
+  if (strncmp(raw, "content.", 8) == 0) return raw + 8;
+  if (strncmp(raw, "wv.", 3) == 0) return raw + 3;
+  return raw;
 }
 
+static void maybe_install_content_plugin(void);
+#include "windows_clipboard.inc"
+#include "windows_windows.inc"
+
 static void drain_cmds(void) {
-  drain_title_size();
+  xu_ui_request_poll();
+  desktop_files_poll();
+  if(!g_root_closed)drain_title_size();
+  extra_poll();
+  if(g_root_closed && !xu_ui_window_count()){do_quit();if(g_quitting)return;}
   apply_app_icon();
   tray_install_or_update();
   menu_install_or_update();
   if (g_content && g_content_vt && g_content_vt->on_poll) {
     g_content_vt->on_poll(g_content);
   }
-  char buf[8192];
-  buf[0] = 0;
-  if (xu_ui_mem_get("xu_ui_cmd.txt", buf, sizeof(buf)) < 0) {
-    if (!g_tmp[0]) return;
-    char path[1200];
-    path_join(path, sizeof(path), "xu_ui_cmd.txt");
-    FILE *f = fopen(path, "r");
-    if (!f) {
-      snprintf(path, sizeof(path), "%s\\xu_ui_cmd.txt", g_tmp);
-      f = fopen(path, "r");
-    }
-    if (!f) return;
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    buf[n] = 0;
-    f = fopen(path, "w");
-    if (f) fclose(f);
-  } else {
-    xu_ui_mem_clear("xu_ui_cmd.txt");
-  }
+  std::string commands = xu_ui_take_commands(g_tmp);
+  char *buf = commands.data();
   if (!buf[0]) return;
   char *p = buf;
   while (*p) {
@@ -1849,13 +1848,17 @@ static void drain_cmds(void) {
     }
     while (*line == ' ') line++;
     if (*line) {
-      char cmd[4096];
-      strip_prefix(line, cmd, sizeof(cmd));
-      int to_content = (strncmp(line, "wv.", 3) == 0 || strncmp(line, "content.", 8) == 0);
+      if(!strcmp(line,"shell.quit_app")){for(auto &window:g_extra_windows)extra_close(window,true);xu_ui_windows_shutdown();do_quit();return;}
+      if(extra_dispatch(line))continue;
+      unsigned identity[2];const char *unscoped=line;xu_ui_scoped_command(line,identity,&unscoped);
+      const char *cmd = strip_prefix(unscoped);
+      int to_content = (strncmp(unscoped, "wv.", 3) == 0 || strncmp(unscoped, "content.", 8) == 0);
       if (to_content) {
-        if (g_content && g_content_vt && g_content_vt->handle_cmd) {
+        if (!desktop_files(cmd,1,g_root_generation,g_hwnd) && !desktop_clipboard(cmd,1,g_root_generation) && g_content && g_content_vt && g_content_vt->handle_cmd) {
           g_content_vt->handle_cmd(g_content, cmd);
         }
+        xu_ui_draw_discard_marker(cmd);
+        xu_ui_request_discard_marker(cmd);
       } else {
         handle_shell_cmd(cmd);
       }
@@ -1899,11 +1902,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return 0;
   }
   case WM_SIZE:
+    if(!g_root_closed && g_root_generation){RECT client={};GetClientRect(hwnd,&client);double scale=xu_ui_window_scale(hwnd);char event[80];snprintf(event,sizeof(event),"resized\t%d\t%d",(int)((client.right-client.left)/scale),(int)((client.bottom-client.top)/scale));append_shell_event(event);}
     if (g_mask_active) paint_mask_layered();
     if (g_content && g_content_vt && g_content_vt->sync_frame) {
       g_content_vt->sync_frame(g_content);
     }
     return 0;
+  case WM_DPICHANGED: {
+    const RECT *suggested = (const RECT *)lParam;
+    if (suggested) SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+        suggested->right - suggested->left, suggested->bottom - suggested->top,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_content && g_content_vt && g_content_vt->sync_frame) g_content_vt->sync_frame(g_content);
+    return 0;
+  }
   case WM_GETMINMAXINFO: {
     if (g_min_w > 0 || g_min_h > 0) {
       MINMAXINFO *mmi = (MINMAXINFO *)lParam;
@@ -1984,6 +1996,9 @@ static void host_read_raw(const char *name, char *out, unsigned n) {
 }
 
 static const XuContentVTable *resolve_content_vtable(void) {
+  unsigned meta[6];if(xu_ui_window_info(1,0,meta,NULL,0))return content_kind_vtable(meta[4]);
+  char kind[16];read_trim_file("xu_ui_content_kind.txt",kind,sizeof(kind));
+  if(kind[0])return content_kind_vtable((unsigned)atoi(kind));
   char boot[256];
   read_trim_file("xu_ui_plugin_bootstrap.txt", boot, sizeof(boot));
   if (strcmp(boot, "XuWebViewPluginBootstrap") == 0) {
@@ -2002,6 +2017,9 @@ static void maybe_install_content_plugin(void) {
   if (!g_content_vt || !g_content_vt->create || !g_content_vt->install) return;
   ZeroMemory(&g_content_host, sizeof(g_content_host));
   g_content_host.tmp = g_tmp;
+  g_content_host.window_id = 1;
+  g_content_host.canvas_id = 1;
+  unsigned meta[6];if(xu_ui_window_info(1,0,meta,NULL,0))g_content_host.canvas_generation=meta[1];
   g_content_host.native_window = (void *)g_hwnd;
   g_content_host.content_parent = (void *)g_hwnd;
   g_content_host.append_shell_event = host_append_event;
@@ -2014,6 +2032,8 @@ static void maybe_install_content_plugin(void) {
 
 // Real body. Keep separate so xu_ui_host_run can realign RSP first (Win64 + SSE).
 static int xu_ui_host_run_impl(const char *tmp_dir) {
+  xu_ui_emit_start();
+  xu_ui_enable_dpi_awareness();
   host_trace("enter");
   HRESULT co = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
   host_trace(SUCCEEDED(co) || co == S_FALSE || co == RPC_E_CHANGED_MODE ? "coinit ok" : "coinit fail");
@@ -2113,6 +2133,7 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
     CoUninitialize();
     return 1;
   }
+  resize_to_client(g_width,g_height,SWP_NOACTIVATE);
   host_trace("hwnd ok");
   apply_app_icon();
   fprintf(stderr,
@@ -2130,7 +2151,9 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
   }
 
   host_trace("content plugin...");
+  unsigned identity[6];if(xu_ui_window_info(1,0,identity,NULL,0)){g_root_generation=identity[1];xu_ui_window_claim(1,identity[1]);}
   maybe_install_content_plugin();
+  if(identity[1])xu_ui_window_ready(1,identity[1]);
   host_trace("ShowWindow...");
 
   ShowWindow(g_hwnd, SW_SHOW);
@@ -2142,6 +2165,7 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
   xu_ui_host_set_kick([]() {
     if (g_hwnd) PostMessageW(g_hwnd, WM_XU_KICK_HOST, 0, 0);
   });
+  append_shell_event("window_ready");
   append_shell_event("ready");
   host_trace("ready; msgloop");
   fprintf(stderr, "xu_ui_host: ready mask_active=%d\n", (int)g_mask_active);
@@ -2166,6 +2190,7 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
 
   MSG msg;
   while (GetMessageW(&msg, NULL, 0, 0)) {
+    if (xu_ui_dialog_message(&msg)) continue;
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }

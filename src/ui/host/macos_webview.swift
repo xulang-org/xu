@@ -98,7 +98,7 @@ final class XuInvokeScriptHandler: NSObject, WKScriptMessageHandlerWithReply {
     didReceive message: WKScriptMessage,
     replyHandler: @escaping (Any?, String?) -> Void
   ) {
-    guard message.name == "xuInvoke", let shell = shell else {
+    guard message.name == "xuInvoke", let shell = shell,!shell.notifiedClose else {
       replyHandler(nil, "no host")
       return
     }
@@ -112,7 +112,8 @@ final class XuInvokeScriptHandler: NSObject, WKScriptMessageHandlerWithReply {
     }
     let req = XuXun.encode(name: name, payload: payload)
     let t0 = CFAbsoluteTimeGetCurrent()
-    shell.xuIpcInvokeAsync(req) { resp in
+    shell.xuIpcInvokeAsync(req) { [weak shell] resp in
+      guard let shell,!shell.notifiedClose else { replyHandler(nil,"window closed");return }
       let o = XuXun.decode(resp)
       let ok = (o["ok"] != "false" && o["ok"] != "0")
       let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
@@ -141,7 +142,7 @@ final class XuSchemeHandler: NSObject, WKURLSchemeHandler {
   private var stopped = Set<ObjectIdentifier>()
 
   func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
-    guard let shell = shell, let url = urlSchemeTask.request.url else {
+    guard let shell = shell,!shell.notifiedClose, let url = urlSchemeTask.request.url else {
       urlSchemeTask.didFailWithError(NSError(domain: "xu", code: 1))
       return
     }
@@ -291,7 +292,7 @@ final class XuSchemeHandler: NSObject, WKURLSchemeHandler {
   }
 
   private func finish(_ task: WKURLSchemeTask, id: ObjectIdentifier, data: Data, mime: String, status: Int = 200) {
-    if stopped.contains(id) { return }
+    if stopped.contains(id) || shell == nil || shell?.notifiedClose == true { return }
     let headers = [
       "Content-Type": mime,
       "Content-Length": "\(data.count)",
@@ -329,6 +330,18 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
     super.init()
   }
 
+  func shutdown() {
+    progressObs?.invalidate();progressObs = nil
+    invokeHandler?.shell = nil;schemeHandler?.shell = nil
+    if let web {
+      web.navigationDelegate = nil;web.uiDelegate = nil
+      web.configuration.userContentController.removeScriptMessageHandler(forName: "xuInvoke",contentWorld: .page)
+      web.stopLoading();web.removeFromSuperview()
+    }
+    dropOverlay?.onFileDrop = nil;dropOverlay?.removeFromSuperview();dropOverlay = nil
+    web = nil;invokeHandler = nil;schemeHandler = nil
+  }
+
   func install(into root: NSView, host: AppDelegate) {
     self.shell = host
     let config = WKWebViewConfiguration()
@@ -363,33 +376,13 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
     lastWwwRoot = shell.readTrimmed("xu_ui_www_root.txt")
     lastUrlKey = shell.readTrimmed("xu_ui_page.url")
     lastHtmlKey = shell.readTrimmed("xu_ui_page.html")
-    let urlPath = (shell.tmp as NSString).appendingPathComponent("xu_ui_page.url")
-    let htmlPath = (shell.tmp as NSString).appendingPathComponent("xu_ui_page.html")
     let scheme = shell.readTrimmed("xu_ui_scheme.txt")
-    if let u = try? String(contentsOfFile: urlPath, encoding: .utf8) {
-      let trimmed = u.trimmingCharacters(in: .whitespacesAndNewlines)
-      // Local xu:// mode only when URL is app scheme or scheme flag is xu without remote http(s).
-      if isAppXuURL(trimmed) || (scheme == "xu" && !isRemoteHTTP(trimmed)) {
-        loadXuDocument(trimmed.isEmpty ? "xu://app/" : trimmed)
-        return
-      }
-      if let url = URL(string: trimmed), !trimmed.isEmpty {
-        ensureBridgeUserScript()
-        lastUrlKey = trimmed
-        web.load(URLRequest(url: url))
-        syncWebFrame()
-        return
-      }
-    }
-    if let html = try? String(contentsOfFile: htmlPath, encoding: .utf8), html.count > 0 {
-      if scheme == "xu" {
-        loadXuDocument("xu://app/")
-      } else {
-        ensureBridgeUserScript()
-        web.loadHTMLString(html, baseURL: nil)
-      }
-    } else if scheme == "xu" {
-      loadXuDocument("xu://app/")
+    if isAppXuURL(lastUrlKey) || (scheme == "xu" && !isRemoteHTTP(lastUrlKey)) {
+      loadXuDocument(lastUrlKey.isEmpty ? "xu://app/" : lastUrlKey)
+    } else if !lastUrlKey.isEmpty,let url = URL(string: lastUrlKey) {
+      ensureBridgeUserScript();web.load(URLRequest(url: url));syncWebFrame()
+    } else if !lastHtmlKey.isEmpty {
+      ensureBridgeUserScript();web.loadHTMLString(shell.readSlotRaw("xu_ui_page.html"),baseURL: nil)
     }
   }
 
@@ -1122,5 +1115,6 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
 public class XuWebViewPluginBootstrap: NSObject {
   @objc public static func registerPlugin() {
     XuContentRegistry.make = { host in XuWebViewPlugin(shell: host) }
+    XuContentRegistry.factories[1] = XuContentRegistry.make
   }
 }
