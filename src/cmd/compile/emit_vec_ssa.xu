@@ -1,0 +1,1462 @@
+@main
+
+#xu/types
+
+// Whole-loop patterns over promoted SSA counted loops (types.mir_ssa_loop).
+// Each matcher proves the complete header body; the emitter reads the phis,
+// runs the slot pattern's core, writes the header temps the latch and exit
+// read, and spills because the exit block starts from a flushed cache.
+
+fn vec_ssa_src(m &types.Mir, fi int, bi int, v0 int) int {
+    << vec_ssa_src_upto(m, fi, bi, v0, -1)
+}
+
+// vec_ssa_src that stops at stop: a self-loop's closing phi copy must not
+// make the phi read as its next value.
+fn vec_ssa_src_upto(m &types.Mir, fi int, bi int, v0 int, stop int) int {
+    mut v := v0
+    for _ in 0:4 {
+        if v < 0 || v == stop { << v }
+        mut next := -1
+        mut ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_ikind(m, fi, ii) == types.mi_copy && types.mir_ia(m, fi, ii) == v { next = types.mir_ib(m, fi, ii) }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        if next == -1 { << v }
+        v = next
+    }
+    << v
+}
+
+fn vec_ssa_def(m &types.Mir, fi int, bi int, t int) int {
+    mut found := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k != types.mi_nop && types.mir_instr_has_dest(k) && types.mir_ia(m, fi, ii) == t { found = ii }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    << found
+}
+
+// A loop-invariant descriptor: one LoadLocal outside the loop, in a frame
+// slot the loop never writes.
+fn vec_ssa_hoisted_desc(m &types.Mir, fi int, t int) bool {
+    mut n := 0
+    for bj in 0:types.mir_nblocks(m, fi) {
+        mut ii := types.mir_bhead(m, fi, bj)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if k == types.mi_chan_try_recv && (types.mir_ia(m, fi, ii) == t || types.mir_ib(m, fi, ii) == t) { << false }
+            if k != types.mi_nop && types.mir_instr_has_dest(k) && types.mir_ia(m, fi, ii) == t {
+                if k != types.mi_load_local { << false }
+                n += 1
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << n == 1
+}
+
+// `a.push(i)`, `a.push(i & mask)` or `a.push(c)` counted from 0.
+// ind = i_next, which leaves the loop holding the trip count.
+fn match_push_fill_ssa(m &types.Mir, fi int, bi int) VecPat {
+    if types.mir_btkind(m, fi, bi) != 2 { << vec_none() }
+    mut npush := 0
+    mut push_ii := -1
+    mut naddr := 0
+    mut nbin := 0
+    mut and_ii := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_arr_push {
+            es := types.mir_id(m, fi, ii)
+            if es != 8 && es != 0 - 8 { << vec_none() }
+            npush += 1
+            push_ii = ii
+        } else if k == types.mi_addr {
+            naddr += 1
+        } else if k == types.mi_bin {
+            nbin += 1
+            if types.mir_ib(m, fi, ii) == 14 {
+                if and_ii >= 0 { << vec_none() }
+                and_ii = ii
+            }
+        } else if k != types.mi_copy && k != types.mi_nop {
+            << vec_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if npush != 1 || naddr > 1 { << vec_none() }
+    lp := types.mir_ssa_loop(m, fi, bi)
+    if !lp.ok || lp.ncopy != 1 || lp.init != 0 || lp.len_local >= 0 { << vec_none() }
+    loc := arr_push_desc_inline(m, fi, types.mir_ia(m, fi, push_ii))
+    if loc < 0 { << vec_none() }
+    if emit_base_fixed_len(m, fi, types.mir_local_operand_base + loc) > 0 { << vec_none() }
+    val := vec_ssa_src(m, fi, bi, types.mir_ib(m, fi, push_ii))
+    mut fac := -1
+    mut mask := 0
+    if val == lp.i_phi && and_ii < 0 && nbin == 2 {
+        fac = 0
+    } else if and_ii >= 0 && types.mir_ia(m, fi, and_ii) == val && nbin == 3 {
+        lc := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, and_ii))
+        ld := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, and_ii))
+        if lc == lp.i_phi && vec_has_const(m, fi, ld) {
+            mask = vec_const(m, fi, ld)
+            fac = 1
+        } else if ld == lp.i_phi && vec_has_const(m, fi, lc) {
+            mask = vec_const(m, fi, lc)
+            fac = 1
+        }
+    } else if and_ii < 0 && nbin == 2 && vec_has_const(m, fi, val) {
+        mask = vec_const(m, fi, val)
+        fac = 2
+    }
+    if fac < 0 { << vec_none() }
+    if !types.mir_ssa_loop_closed(m, fi, bi, &lp, lp.i_next, -1) { << vec_none() }
+    mut limit := 0
+    mut limit_t := -1
+    if lp.limit >= 0 {
+        limit_t = lp.limit
+        if lp.le { limit = 1 }
+    } else {
+        limit = vec_const(m, fi, lp.limit)
+        if lp.le { limit += 1 }
+        if limit <= 16 { << vec_none() }
+    }
+    << VecPat{kind: vp_push_fill_ssa, ind: lp.i_next, acc: bi, mask: mask, limit: limit, limit_t: limit_t, else_bb: lp.exit, arr: types.mir_local_operand_base + loc, fac: fac}
+}
+
+fn emit_push_fill_ssa(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if a.arch != 0 || frame_has_vregs(fr) { << 0 }
+    loc := p.arr - types.mir_local_operand_base
+    if loc < 0 || loc >= fr.local_slot.len { << 0 }
+    if p.ind < 0 || p.ind >= fr.temp_slot.len || p.limit_t >= fr.temp_slot.len { << 0 }
+    else_lbl := types.mir_fn_label(m, fi) + "_bb" + str(p.else_bb)
+    emit_push_fill_core(a, m, fi, fr, bi, p, loc, -1, else_lbl + "")
+    emit_store_temp(a, fr, p.ind, 1)
+    rc_spill(a)
+    a.jmp(else_lbl + "")
+    << 1
+}
+
+// `s += a[i] & mask` over a bounds-proved index (negative element size),
+// i from 0 while i < limit. ind/acc = i/s phis, limit = i_next,
+// fac = s_next, arr = the descriptor temp loaded in the header.
+fn match_scan_ssa(m &types.Mir, fi int, bi int) VecPat {
+    if types.mir_btkind(m, fi, bi) != 2 { << vec_none() }
+    mut li := -1
+    mut nbin := 0
+    mut lf := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_load_index {
+            if li >= 0 || types.mir_id(m, fi, ii) != 0 - 8 { << vec_none() }
+            li = ii
+        } else if k == types.mi_bin {
+            nbin += 1
+        } else if k == types.mi_load_field {
+            if lf >= 0 { << vec_none() }
+            lf = ii
+        } else if k != types.mi_load_local && k != types.mi_copy && k != types.mi_nop {
+            << vec_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if li < 0 || nbin != 4 { << vec_none() }
+    lp := types.mir_ssa_loop(m, fi, bi)
+    if !lp.ok || lp.ncopy != 2 || lp.init != 0 || lp.le { << vec_none() }
+    if lf >= 0 && (lp.len_local < 0 || types.mir_ia(m, fi, lf) != lp.limit) { << vec_none() }
+    mut s_phi := -1
+    mut s_next := -1
+    ii = types.mir_bhead(m, fi, lp.latch)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        if types.mir_ikind(m, fi, ii) == types.mi_copy && types.mir_ia(m, fi, ii) != lp.i_phi {
+            s_phi = types.mir_ia(m, fi, ii)
+            s_next = types.mir_ib(m, fi, ii)
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if s_phi < 0 || s_next < 0 || s_phi == lp.limit { << vec_none() }
+    if types.mir_temp_ty(m, fi, s_phi) != 1 || types.mir_temp_nslots(m, fi, s_phi) != 1 { << vec_none() }
+    if vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, li)) != lp.i_phi { << vec_none() }
+    arr := types.mir_ib(m, fi, li)
+    if arr < 0 || vec_ssa_def(m, fi, lp.latch, arr) >= 0 { << vec_none() }
+    ad := vec_ssa_def(m, fi, bi, arr)
+    if ad >= 0 && types.mir_ikind(m, fi, ad) != types.mi_load_local { << vec_none() }
+    if ad < 0 && !vec_ssa_hoisted_desc(m, fi, arr) { << vec_none() }
+    elem := types.mir_ia(m, fi, li)
+    sd := vec_ssa_def(m, fi, bi, s_next)
+    if sd < 0 || types.mir_ikind(m, fi, sd) != types.mi_bin || types.mir_ib(m, fi, sd) != 1 { << vec_none() }
+    mut and_t := -1
+    sc := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, sd))
+    sdd := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, sd))
+    if sc == s_phi { and_t = sdd }
+    if sdd == s_phi { and_t = sc }
+    if and_t < 0 { << vec_none() }
+    nd := vec_ssa_def(m, fi, bi, and_t)
+    if nd < 0 || types.mir_ikind(m, fi, nd) != types.mi_bin || types.mir_ib(m, fi, nd) != 14 { << vec_none() }
+    nc := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, nd))
+    ndd := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, nd))
+    mut mask := 0
+    if nc == elem && vec_has_const(m, fi, ndd) {
+        mask = vec_const(m, fi, ndd)
+    } else if ndd == elem && vec_has_const(m, fi, nc) {
+        mask = vec_const(m, fi, nc)
+    } else {
+        << vec_none()
+    }
+    if types.mir_ssa_temp_used_beyond(m, fi, s_phi, bi, lp.latch) { << vec_none() }
+    if !types.mir_ssa_loop_closed(m, fi, bi, &lp, lp.i_next, s_next) { << vec_none() }
+    mut limit_t := lp.limit
+    if lp.len_local >= 0 {
+        if ad < 0 || types.mir_ib(m, fi, ad) != lp.len_local { << vec_none() }
+        limit_t = -1
+    }
+    << VecPat{kind: vp_scan_ssa, ind: lp.i_phi, acc: s_phi, mask: mask, limit: lp.i_next, limit_t: limit_t, else_bb: lp.exit, arr: arr, fac: s_next}
+}
+
+fn emit_scan_ssa(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if a.arch != 0 || frame_has_vregs(fr) || !vec_ssa_fp_free(&*a, fr) { << 0 }
+    iv := 20
+    sv := 21
+    emit_load_value(a, m, fi, fr, p.ind, iv)
+    emit_load_value(a, m, fi, fr, p.acc, sv)
+    emit_scan_core(a, m, fi, fr, bi, p, iv, sv)
+    rc_clobber(a, 12)
+    rc_clobber(a, 13)
+    emit_store_temp(a, fr, p.fac, sv)
+    emit_store_temp(a, fr, p.limit, iv)
+    rc_spill(a)
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(p.else_bb))
+    << 1
+}
+
+struct SaxpySsa {
+    ok bool
+    i_phi int
+    i_next int
+    limit int
+    limit_t int
+    aik int
+    base_c int
+    base_b int
+    arr_c int
+    arr_b int
+    exit int
+}
+
+fn saxpy_ssa_none() SaxpySsa {
+    << SaxpySsa{ok: false, i_phi: -1, i_next: -1, limit: 0, limit_t: -1, aik: -1, base_c: -1, base_b: -1, arr_c: -1, arr_b: -1, exit: -1}
+}
+
+// A constant or a temp the loop never defines.
+fn vec_ssa_inv_leaf(m &types.Mir, fi int, bi int, lp &types.MirSsaLoop, v int) bool {
+    if v < 0 { << vec_has_const(m, fi, v) }
+    if v == lp.i_phi { << false }
+    << vec_ssa_def(m, fi, bi, v) < 0 && vec_ssa_def(m, fi, lp.latch, v) < 0
+}
+
+// 0: varies, 1: leaf, 2: one header add/mul of two leaves.
+fn vec_ssa_inv_kind(m &types.Mir, fi int, bi int, lp &types.MirSsaLoop, v int) int {
+    if vec_ssa_inv_leaf(m, fi, bi, lp, v) { << 1 }
+    if v < 0 { << 0 }
+    d := vec_ssa_def(m, fi, bi, v)
+    if d < 0 || types.mir_ikind(m, fi, d) != types.mi_bin { << 0 }
+    op := types.mir_ib(m, fi, d)
+    if op != 1 && op != 3 { << 0 }
+    if !vec_ssa_inv_leaf(m, fi, bi, lp, vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, d))) { << 0 }
+    if !vec_ssa_inv_leaf(m, fi, bi, lp, vec_ssa_src(m, fi, bi, types.mir_id(m, fi, d))) { << 0 }
+    << 2
+}
+
+// idx = i_phi + base; returns base or -1 (constants are rejected).
+fn vec_ssa_affine_base(m &types.Mir, fi int, bi int, lp &types.MirSsaLoop, idx int) int {
+    if idx < 0 { << -1 }
+    d := vec_ssa_def(m, fi, bi, idx)
+    if d < 0 || types.mir_ikind(m, fi, d) != types.mi_bin || types.mir_ib(m, fi, d) != 1 { << -1 }
+    x := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, d))
+    y := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, d))
+    mut base := -1
+    if x == lp.i_phi { base = y }
+    if y == lp.i_phi { base = x }
+    if base < 0 || base == lp.i_phi { << -1 }
+    if vec_ssa_inv_kind(m, fi, bi, lp, base) == 0 { << -1 }
+    << base
+}
+
+// The frame local behind a descriptor temp: header LoadLocal resolves to the
+// local operand, a hoisted LoadLocal stays a temp. -1 otherwise.
+fn vec_ssa_desc(m &types.Mir, fi int, bi int, lp &types.MirSsaLoop, v int) int {
+    t := vec_ssa_src(m, fi, bi, v)
+    if t < 0 || vec_ssa_def(m, fi, lp.latch, t) >= 0 { << -1 }
+    d := vec_ssa_def(m, fi, bi, t)
+    if d >= 0 {
+        if types.mir_ikind(m, fi, d) != types.mi_load_local { << -1 }
+        << types.mir_local_operand_base + types.mir_ib(m, fi, d)
+    }
+    if !vec_ssa_hoisted_desc(m, fi, t) { << -1 }
+    << t
+}
+
+fn vec_ssa_desc_local(m &types.Mir, fi int, desc int) int {
+    if desc >= types.mir_local_operand_base { << desc - types.mir_local_operand_base }
+    for bj in 0:types.mir_nblocks(m, fi) {
+        d := vec_ssa_def(m, fi, bj, desc)
+        if d >= 0 && types.mir_ikind(m, fi, d) == types.mi_load_local { << types.mir_ib(m, fi, d) }
+    }
+    << -1
+}
+
+// `c[base_c + j] += aik * b[base_b + j]` for j from 0 while j < n, with
+// aik and both bases loop-invariant and c, b distinct locals.
+fn saxpy_ssa_info(m &types.Mir, fi int, bi int) SaxpySsa {
+    if types.mir_btkind(m, fi, bi) != 2 { << saxpy_ssa_none() }
+    mut ld := -1
+    mut rmw := -1
+    mut nbin := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_load_index {
+            if ld >= 0 || !vec_elem8(types.mir_id(m, fi, ii)) { << saxpy_ssa_none() }
+            ld = ii
+        } else if k == types.mi_index_rmw {
+            if rmw >= 0 || !vec_elem8(types.mir_id(m, fi, ii)) || types.mir_icol(m, fi, ii) != 1 { << saxpy_ssa_none() }
+            rmw = ii
+        } else if k == types.mi_bin {
+            nbin += 1
+        } else if k != types.mi_load_local && k != types.mi_copy && k != types.mi_nop {
+            << saxpy_ssa_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if ld < 0 || rmw < 0 { << saxpy_ssa_none() }
+    lp := types.mir_ssa_loop(m, fi, bi)
+    if !lp.ok || lp.ncopy != 1 || lp.init != 0 || lp.len_local >= 0 { << saxpy_ssa_none() }
+    md := vec_ssa_def(m, fi, bi, vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, rmw)))
+    if md < 0 || types.mir_ikind(m, fi, md) != types.mi_bin || types.mir_ib(m, fi, md) != 3 { << saxpy_ssa_none() }
+    bval := types.mir_ia(m, fi, ld)
+    x := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, md))
+    y := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, md))
+    mut aik := -2
+    if x == bval && y != bval { aik = y }
+    if y == bval && x != bval { aik = x }
+    if aik == -2 || !vec_ssa_inv_leaf(m, fi, bi, &lp, aik) { << saxpy_ssa_none() }
+    base_c := vec_ssa_affine_base(m, fi, bi, &lp, vec_ssa_src(m, fi, bi, types.mir_ib(m, fi, rmw)))
+    base_b := vec_ssa_affine_base(m, fi, bi, &lp, vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, ld)))
+    if base_c < 0 || base_b < 0 { << saxpy_ssa_none() }
+    mut want := 5
+    if vec_ssa_inv_kind(m, fi, bi, &lp, base_c) == 2 { want += 1 }
+    if base_b != base_c && vec_ssa_inv_kind(m, fi, bi, &lp, base_b) == 2 { want += 1 }
+    if nbin != want { << saxpy_ssa_none() }
+    arr_c := vec_ssa_desc(m, fi, bi, &lp, types.mir_ia(m, fi, rmw))
+    arr_b := vec_ssa_desc(m, fi, bi, &lp, types.mir_ib(m, fi, ld))
+    if arr_c < 0 || arr_b < 0 { << saxpy_ssa_none() }
+    lc := vec_ssa_desc_local(m, fi, arr_c)
+    lb := vec_ssa_desc_local(m, fi, arr_b)
+    if lc < 0 || lb < 0 || lc == lb { << saxpy_ssa_none() }
+    if !types.mir_ssa_loop_closed(m, fi, bi, &lp, lp.i_next, -1) { << saxpy_ssa_none() }
+    mut r := saxpy_ssa_none()
+    if lp.limit >= 0 {
+        if lp.le { << saxpy_ssa_none() }
+        r.limit_t = lp.limit
+    } else {
+        r.limit = vec_const(m, fi, lp.limit)
+        if lp.le { r.limit += 1 }
+        if r.limit <= 0 { << saxpy_ssa_none() }
+    }
+    r.ok = true
+    r.i_phi = lp.i_phi
+    r.i_next = lp.i_next
+    r.aik = aik
+    r.base_c = base_c
+    r.base_b = base_b
+    r.arr_c = arr_c
+    r.arr_b = arr_b
+    r.exit = lp.exit
+    << r
+}
+
+fn match_saxpy_ssa(m &types.Mir, fi int, bi int) VecPat {
+    s := saxpy_ssa_info(m, fi, bi)
+    if !s.ok { << vec_none() }
+    << VecPat{kind: vp_saxpy_ssa, ind: s.i_phi, acc: s.aik, mask: 0, limit: s.limit, limit_t: s.limit_t, else_bb: s.exit, arr: s.arr_c, fac: s.arr_b}
+}
+
+fn emit_ssa_inv(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, v int, dst int) {
+    mut d := -1
+    if v >= 0 { d = vec_ssa_def(m, fi, bi, v) }
+    if d < 0 {
+        emit_load_value(a, m, fi, fr, v, dst)
+        <<
+    }
+    emit_load_value(a, m, fi, fr, vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, d)), 0)
+    emit_load_value(a, m, fi, fr, vec_ssa_src(m, fi, bi, types.mir_id(m, fi, d)), 14)
+    if types.mir_ib(m, fi, d) == 3 {
+        a.mul(dst, 0, 14)
+    } else {
+        a.add(dst, 0, 14)
+    }
+}
+
+fn emit_saxpy_ssa(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if a.arch != 0 { << 0 }
+    s := saxpy_ssa_info(m, fi, bi)
+    if !s.ok { << 0 }
+    if s.i_next < 0 || s.i_next >= fr.temp_slot.len || s.limit_t >= fr.temp_slot.len { << 0 }
+    if !vec_ssa_desc_in_frame(m, fi, fr, s.arr_c) || !vec_ssa_desc_in_frame(m, fi, fr, s.arr_b) { << 0 }
+    // R0 R1 R14 and A19-A23, none of them a scalar home.
+    if !vec_ssa_homes_safe(&*a, m, fi, fr, s.exit, 16387, s.i_next, -1) { << 0 }
+    emit_ssa_inv(a, m, fi, fr, bi, s.base_b, 1)
+    emit_ssa_inv(a, m, fi, fr, bi, s.base_c, 21)
+    emit_load_value(a, m, fi, fr, s.aik, 23)
+    emit_load_value(a, m, fi, fr, s.i_phi, 20)
+    if s.limit_t >= 0 {
+        emit_load_value(a, m, fi, fr, s.limit_t, 19)
+    } else {
+        a.vm_mov_imm64(19, s.limit)
+    }
+    emit_saxpy47_core(a, m, fi, fr, bi, s.arr_c, s.arr_b)
+    if s.limit_t >= 0 {
+        emit_load_value(a, m, fi, fr, s.limit_t, 20)
+    } else {
+        a.vm_mov_imm64(20, s.limit)
+    }
+    emit_store_temp(a, fr, s.i_next, 20)
+    rc_spill(a)
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(s.exit))
+    << 1
+}
+
+fn vec_ssa_preds(m &types.Mir, fi int, b int) []int {
+    mut r := []int{}
+    for bj in 0:types.mir_nblocks(m, fi) {
+        k := types.mir_btkind(m, fi, bj)
+        if k == 1 && types.mir_bta(m, fi, bj) == b {
+            r.push(bj)
+        } else if k == 2 && (types.mir_btb(m, fi, bj) == b || types.mir_btc(m, fi, bj) == b) {
+            r.push(bj)
+        }
+    }
+    << r
+}
+
+fn vec_ssa_in(bs &[]int, b int) bool {
+    for i in 0:bs.len {
+        if bs[i] == b { << true }
+    }
+    << false
+}
+
+// A constant operand reached through single-definition copies, or -1.
+fn vec_ssa_const_src(m &types.Mir, fi int, v0 int) int {
+    mut v := v0
+    for _ in 0:6 {
+        if v < 0 {
+            if vec_has_const(m, fi, v) { << v }
+            << -1
+        }
+        mut nd := 0
+        mut src := -1
+        for bj in 0:types.mir_nblocks(m, fi) {
+            mut ii := types.mir_bhead(m, fi, bj)
+            for _ in 0:types.mir_nins(m, fi) {
+                if ii < 0 { <- }
+                k := types.mir_ikind(m, fi, ii)
+                if k != types.mi_nop && types.mir_instr_has_dest(k) && types.mir_ia(m, fi, ii) == v {
+                    nd += 1
+                    if k == types.mi_copy { src = types.mir_ib(m, fi, ii) }
+                }
+                ii = types.mir_inext(m, fi, ii)
+            }
+        }
+        if nd != 1 || src == -1 { << -1 }
+        v = src
+    }
+    << -1
+}
+
+fn vec_ssa_defined_in(m &types.Mir, fi int, bs &[]int, t int) bool {
+    if t < 0 { << false }
+    for i in 0:bs.len {
+        if vec_ssa_def(m, fi, bs[i], t) >= 0 { << true }
+    }
+    << false
+}
+
+// Every outside entry to h is a copy-only jump block setting phi = init,
+// and init op limit holds there (both constant, or the single predecessor
+// branches to it on exactly that compare). A rotated body then runs at
+// least once exactly when the source loop does.
+fn vec_ssa_entry_ok(m &types.Mir, fi int, h int, loop &[]int, phi int, op int, limit int) bool {
+    preds := vec_ssa_preds(m, fi, h)
+    mut n := 0
+    for pi in 0:preds.len {
+        p := preds[pi]
+        if vec_ssa_in(loop, p) { -> }
+        if types.mir_btkind(m, fi, p) != 1 { << false }
+        mut init := -1
+        mut seen := false
+        mut ii := types.mir_bhead(m, fi, p)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if k == types.mi_copy {
+                if types.mir_ia(m, fi, ii) == phi {
+                    init = types.mir_ib(m, fi, ii)
+                    seen = true
+                }
+            } else if k != types.mi_nop {
+                << false
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        if !seen { << false }
+        ci := vec_ssa_const_src(m, fi, init)
+        cl := vec_ssa_const_src(m, fi, limit)
+        if ci != -1 && cl != -1 {
+            a := vec_const(m, fi, ci)
+            b := vec_const(m, fi, cl)
+            if op == 8 && !(a < b) { << false }
+            if op == 9 && !(a <= b) { << false }
+        } else {
+            qs := vec_ssa_preds(m, fi, p)
+            if qs.len != 1 { << false }
+            q := qs[0]
+            if types.mir_btkind(m, fi, q) != 2 || types.mir_btb(m, fi, q) != p || types.mir_btc(m, fi, q) == p { << false }
+            cd := vec_ssa_def(m, fi, q, types.mir_bta(m, fi, q))
+            if cd < 0 || types.mir_ikind(m, fi, cd) != types.mi_bin || types.mir_ib(m, fi, cd) != op { << false }
+            if vec_ssa_src(m, fi, q, types.mir_ic(m, fi, cd)) != init { << false }
+            gl := vec_ssa_src(m, fi, q, types.mir_id(m, fi, cd))
+            if gl != limit {
+                gc := vec_ssa_const_src(m, fi, gl)
+                if gc == -1 || cl == -1 || vec_const(m, fi, gc) != vec_const(m, fi, cl) { << false }
+            }
+        }
+        n += 1
+    }
+    << n > 0
+}
+
+// Header LoadLocal resolves to the local operand; a hoisted LoadLocal stays a
+// temp. Fixed-length bases are rejected.
+fn vec_ssa_arr(m &types.Mir, fi int, bs &[]int, bi int, v int) int {
+    t := vec_ssa_src(m, fi, bi, v)
+    if t < 0 { << -1 }
+    d := vec_ssa_def(m, fi, bi, t)
+    mut r := -1
+    if d >= 0 {
+        if types.mir_ikind(m, fi, d) != types.mi_load_local { << -1 }
+        r = types.mir_local_operand_base + types.mir_ib(m, fi, d)
+    } else {
+        if vec_ssa_defined_in(m, fi, bs, t) || !vec_ssa_hoisted_desc(m, fi, t) { << -1 }
+        r = t
+    }
+    loc := vec_ssa_desc_local(m, fi, r)
+    if loc < 0 || emit_base_fixed_len(m, fi, types.mir_local_operand_base + loc) > 0 { << -1 }
+    << r
+}
+
+fn vec_ssa_dests(m &types.Mir, fi int, bs &[]int, skip &[]int) []int {
+    mut r := []int{}
+    for i in 0:bs.len {
+        mut ii := types.mir_bhead(m, fi, bs[i])
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if k != types.mi_nop && types.mir_instr_has_dest(k) {
+                d := types.mir_ia(m, fi, ii)
+                if d >= 0 && !vec_ssa_in(skip, d) { r.push(d) }
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << r
+}
+
+// Self-loop `a[j] = 0; j += step` while j < limit (j <= limit: fac 1);
+// the j phi copy closes the block. ind = j, acc = step.
+fn match_stride_zero_ssa(m &types.Mir, fi int, bi int) VecPat {
+    if types.mir_btkind(m, fi, bi) != 2 || types.mir_btb(m, fi, bi) != bi || types.mir_btc(m, fi, bi) == bi { << vec_none() }
+    mut st := -1
+    mut cp := -1
+    mut nbin := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_store_index {
+            if st >= 0 || cp >= 0 || !vec_elem8(types.mir_id(m, fi, ii)) { << vec_none() }
+            st = ii
+        } else if k == types.mi_copy {
+            if cp >= 0 { << vec_none() }
+            cp = ii
+        } else if k == types.mi_bin {
+            if cp >= 0 { << vec_none() }
+            nbin += 1
+        } else if k == types.mi_load_local {
+            if cp >= 0 { << vec_none() }
+        } else if k != types.mi_nop {
+            << vec_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if st < 0 || cp < 0 || nbin != 2 { << vec_none() }
+    phi := types.mir_ia(m, fi, cp)
+    nxt := types.mir_ib(m, fi, cp)
+    if phi < 0 || nxt < 0 || phi == nxt { << vec_none() }
+    nd := vec_ssa_def(m, fi, bi, nxt)
+    if nd < 0 || types.mir_ikind(m, fi, nd) != types.mi_bin || types.mir_ib(m, fi, nd) != 1 { << vec_none() }
+    x := vec_ssa_src_upto(m, fi, bi, types.mir_ic(m, fi, nd), phi)
+    y := vec_ssa_src_upto(m, fi, bi, types.mir_id(m, fi, nd), phi)
+    mut step := -1
+    if x == phi && y != phi { step = y }
+    if y == phi && x != phi { step = x }
+    if step == -1 { << vec_none() }
+    if step >= 0 && vec_ssa_def(m, fi, bi, step) >= 0 { << vec_none() }
+    if step < 0 && !vec_has_const(m, fi, step) { << vec_none() }
+    cd := vec_ssa_def(m, fi, bi, types.mir_bta(m, fi, bi))
+    if cd < 0 || types.mir_ikind(m, fi, cd) != types.mi_bin { << vec_none() }
+    op := types.mir_ib(m, fi, cd)
+    if op != 8 && op != 9 { << vec_none() }
+    if vec_ssa_src_upto(m, fi, bi, types.mir_ic(m, fi, cd), phi) != nxt { << vec_none() }
+    limit := vec_ssa_src_upto(m, fi, bi, types.mir_id(m, fi, cd), phi)
+    if limit == phi || limit == nxt { << vec_none() }
+    if limit >= 0 && vec_ssa_def(m, fi, bi, limit) >= 0 { << vec_none() }
+    if limit < 0 && !vec_has_const(m, fi, limit) { << vec_none() }
+    if vec_ssa_src_upto(m, fi, bi, types.mir_ib(m, fi, st), phi) != phi { << vec_none() }
+    zv := vec_ssa_const_src(m, fi, vec_ssa_src_upto(m, fi, bi, types.mir_ic(m, fi, st), phi))
+    if zv == -1 || vec_const(m, fi, zv) != 0 { << vec_none() }
+    mut blocks := []int{}
+    blocks.push(bi)
+    arr := vec_ssa_arr(m, fi, &blocks, bi, types.mir_ia(m, fi, st))
+    if arr == -1 { << vec_none() }
+    if !vec_ssa_entry_ok(m, fi, bi, &blocks, phi, op, limit) { << vec_none() }
+    none := []int{}
+    temps := vec_ssa_dests(m, fi, &blocks, &none)
+    if !types.mir_ssa_temps_confined(m, fi, &temps, &blocks) { << vec_none() }
+    mut lim := 0
+    mut lim_t := -1
+    if limit >= 0 {
+        lim_t = limit
+    } else {
+        lim = vec_const(m, fi, limit)
+    }
+    mut le := 0
+    if op == 9 { le = 1 }
+    << VecPat{kind: vp_stride_zero_ssa, ind: phi, acc: step, mask: 0, limit: lim, limit_t: lim_t, else_bb: types.mir_btc(m, fi, bi), arr: arr, fac: le}
+}
+
+fn vec_ssa_clobber_gprs(a &mut Assembler) {
+    for r in 0:14 { rc_clobber(a, r) }
+}
+
+// A core that writes the registers in clob (bit r = register r) may run
+// only when the prologue saved every callee-saved one among them and no
+// other temp homed in one of them is live on entry to exit. Temps k1/k2
+// are written by the replacement itself.
+fn vec_ssa_homes_safe(a &Assembler, m &types.Mir, fi int, fr &Frame, exit int, clob int, k1 int, k2 int) bool {
+    for h in 8:14 {
+        if (clob & (1 << h)) != 0 && a.cs_pairs < (h - 8) / 2 + 1 { << false }
+    }
+    if !frame_has_vregs(fr) { << true }
+    mut homed := []int{}
+    for t in 0:fr.temp_slot.len {
+        if t == k1 || t == k2 { -> }
+        slot := fr.temp_slot[t]
+        if is_vreg_slot(slot) && (clob & (1 << vreg_slot_home(slot))) != 0 { homed.push(t) }
+    }
+    << types.mir_ssa_temps_dead_at(m, fi, &homed, exit)
+}
+
+// emit_index_desc_addr addresses the descriptor through its frame slot.
+fn vec_ssa_desc_in_frame(m &types.Mir, fi int, fr &Frame, arr int) bool {
+    if arr >= types.mir_local_operand_base {
+        l := arr - types.mir_local_operand_base
+        << l < fr.local_slot.len && is_frame_slot(fr.local_slot[l])
+    }
+    << arr >= 0 && arr < fr.temp_slot.len && is_frame_slot(fr.temp_slot[arr])
+}
+
+fn emit_stride_zero_ssa(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if a.arch != 0 || frame_has_vregs(fr) { << 0 }
+    if p.ind < 0 || p.ind >= fr.temp_slot.len || p.limit_t >= fr.temp_slot.len || p.acc >= fr.temp_slot.len { << 0 }
+    emit_load_value(a, m, fi, fr, p.ind, 20)
+    if p.limit_t >= 0 {
+        emit_load_value(a, m, fi, fr, p.limit_t, 21)
+    } else {
+        a.vm_mov_imm64(21, p.limit)
+    }
+    emit_load_value(a, m, fi, fr, p.acc, 22)
+    vec_ssa_clobber_gprs(a)
+    a.mov(6, 20)
+    a.mov(1, 21)
+    a.mov(4, 22)
+    emit_stride_zero_core(a, m, fi, fr, bi, p.arr, p.fac == 1)
+    vec_ssa_clobber_gprs(a)
+    rc_spill(a)
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(p.else_bb))
+    << 1
+}
+
+struct PredScanSsa {
+    ok bool
+    k_phi int
+    k_next int
+    c_phi int
+    t_phi int
+    c_join int
+    t_join int
+    limit int
+    limit_t int
+    le bool
+    arr int
+    exit int
+}
+
+fn pred_scan_ssa_none() PredScanSsa {
+    << PredScanSsa{ok: false, k_phi: -1, k_next: -1, c_phi: -1, t_phi: -1, c_join: -1, t_join: -1, limit: 0, limit_t: -1, le: false, arr: -1, exit: -1}
+}
+
+// Jump blocks from s up to the first branch block; [-1] when a block on the
+// way has another predecessor or the walk is too long.
+fn vec_ssa_path(m &types.Mir, fi int, s int) []int {
+    mut r := []int{}
+    mut b := s
+    for _ in 0:5 {
+        if b < 0 { <- }
+        if types.mir_btkind(m, fi, b) == 2 { << r }
+        if types.mir_btkind(m, fi, b) != 1 || vec_ssa_preds(m, fi, b).len != 1 { <- }
+        r.push(b)
+        b = types.mir_bta(m, fi, b)
+    }
+    mut bad := []int{}
+    bad.push(-1)
+    << bad
+}
+
+fn vec_ssa_path_end(m &types.Mir, fi int, s int, path &[]int) int {
+    if path.len == 0 { << s }
+    << types.mir_bta(m, fi, path[path.len - 1])
+}
+
+fn vec_ssa_def_on(m &types.Mir, fi int, bs &[]int, t int) int {
+    for i in 0:bs.len {
+        d := vec_ssa_def(m, fi, bs[i], t)
+        if d >= 0 { << d }
+    }
+    << -1
+}
+
+fn vec_ssa_path_nbin(m &types.Mir, fi int, bs &[]int) int {
+    mut n := 0
+    for i in 0:bs.len {
+        mut ii := types.mir_bhead(m, fi, bs[i])
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_ikind(m, fi, ii) == types.mi_bin { n += 1 }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << n
+}
+
+// Copies on the path blocks as (dest, src) pairs; [-1] on anything but
+// copy, bin or nop.
+fn vec_ssa_path_copies(m &types.Mir, fi int, bs &[]int) []int {
+    mut r := []int{}
+    for i in 0:bs.len {
+        mut ii := types.mir_bhead(m, fi, bs[i])
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            k := types.mir_ikind(m, fi, ii)
+            if k == types.mi_copy {
+                r.push(types.mir_ia(m, fi, ii))
+                r.push(types.mir_ib(m, fi, ii))
+            } else if k != types.mi_bin && k != types.mi_nop {
+                r = []int{}
+                r.push(-1)
+                << r
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << r
+}
+
+fn vec_ssa_pair_src(pairs &[]int, d int) int {
+    mut n := 0
+    mut s := -1
+    mut i := 0
+    for _ in 0:pairs.len {
+        if i + 1 >= pairs.len { <- }
+        if pairs[i] == d {
+            n += 1
+            s = pairs[i + 1]
+        }
+        i += 2
+    }
+    if n != 1 { << -1 }
+    << s
+}
+
+// `if a[k] == 1 { count += 1; total += k }` for k from init while
+// k < limit (or <=), over the promoted diamond H -> paths -> J -> L.
+fn pred_scan_ssa_info(m &types.Mir, fi int, bi int) PredScanSsa {
+    if types.mir_btkind(m, fi, bi) != 2 { << pred_scan_ssa_none() }
+    mut li := -1
+    mut nbin := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_load_index {
+            if li >= 0 || !vec_elem8(types.mir_id(m, fi, ii)) { << pred_scan_ssa_none() }
+            li = ii
+        } else if k == types.mi_bin {
+            nbin += 1
+        } else if k != types.mi_load_local && k != types.mi_copy && k != types.mi_nop {
+            << pred_scan_ssa_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if li < 0 || nbin != 1 { << pred_scan_ssa_none() }
+    elem := types.mir_ia(m, fi, li)
+    if types.mir_temp_ty(m, fi, elem) != 1 { << pred_scan_ssa_none() }
+    k_phi := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, li))
+    if k_phi < 0 { << pred_scan_ssa_none() }
+    cd := vec_ssa_def(m, fi, bi, types.mir_bta(m, fi, bi))
+    if cd < 0 || types.mir_ikind(m, fi, cd) != types.mi_bin { << pred_scan_ssa_none() }
+    cop := types.mir_ib(m, fi, cd)
+    if cop != 6 && cop != 7 { << pred_scan_ssa_none() }
+    cx := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, cd))
+    cy := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, cd))
+    mut one := -1
+    if cx == elem { one = cy }
+    if cy == elem { one = cx }
+    if one == -1 || one == elem { << pred_scan_ssa_none() }
+    oc := vec_ssa_const_src(m, fi, one)
+    if oc == -1 || vec_const(m, fi, oc) != 1 { << pred_scan_ssa_none() }
+    mut hit := types.mir_btb(m, fi, bi)
+    mut miss := types.mir_btc(m, fi, bi)
+    if cop == 7 {
+        hit = types.mir_btc(m, fi, bi)
+        miss = types.mir_btb(m, fi, bi)
+    }
+    if hit == miss || hit == bi || miss == bi { << pred_scan_ssa_none() }
+    hp := vec_ssa_path(m, fi, hit)
+    mp := vec_ssa_path(m, fi, miss)
+    if hp.len == 0 || mp.len == 0 || hp[0] == -1 || mp[0] == -1 { << pred_scan_ssa_none() }
+    j := vec_ssa_path_end(m, fi, hit, &hp)
+    if j != vec_ssa_path_end(m, fi, miss, &mp) || j == bi || types.mir_btkind(m, fi, j) != 2 { << pred_scan_ssa_none() }
+    if vec_ssa_preds(m, fi, j).len != 2 { << pred_scan_ssa_none() }
+    mut jbin := 0
+    ii = types.mir_bhead(m, fi, j)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_bin {
+            jbin += 1
+        } else if k != types.mi_copy && k != types.mi_nop {
+            << pred_scan_ssa_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if jbin != 2 { << pred_scan_ssa_none() }
+    jd := vec_ssa_def(m, fi, j, types.mir_bta(m, fi, j))
+    if jd < 0 || types.mir_ikind(m, fi, jd) != types.mi_bin { << pred_scan_ssa_none() }
+    op := types.mir_ib(m, fi, jd)
+    if op != 8 && op != 9 { << pred_scan_ssa_none() }
+    k_next := vec_ssa_src(m, fi, j, types.mir_ic(m, fi, jd))
+    limit := vec_ssa_src(m, fi, j, types.mir_id(m, fi, jd))
+    kd := vec_ssa_def(m, fi, j, k_next)
+    if kd < 0 || types.mir_ikind(m, fi, kd) != types.mi_bin || types.mir_ib(m, fi, kd) != 1 { << pred_scan_ssa_none() }
+    kx := vec_ssa_src(m, fi, j, types.mir_ic(m, fi, kd))
+    ky := vec_ssa_src(m, fi, j, types.mir_id(m, fi, kd))
+    mut kinc := -1
+    if kx == k_phi { kinc = ky }
+    if ky == k_phi { kinc = kx }
+    kc := vec_ssa_const_src(m, fi, kinc)
+    if kinc == -1 || kc == -1 || vec_const(m, fi, kc) != 1 { << pred_scan_ssa_none() }
+    l := types.mir_btb(m, fi, j)
+    exit := types.mir_btc(m, fi, j)
+    if l == exit || types.mir_btkind(m, fi, l) != 1 || types.mir_bta(m, fi, l) != bi || vec_ssa_preds(m, fi, l).len != 1 { << pred_scan_ssa_none() }
+    mut lbs := []int{}
+    lbs.push(l)
+    lpairs := vec_ssa_path_copies(m, fi, &lbs)
+    if vec_ssa_path_nbin(m, fi, &lbs) != 0 || lpairs.len != 6 { << pred_scan_ssa_none() }
+    if vec_ssa_pair_src(&lpairs, k_phi) != k_next { << pred_scan_ssa_none() }
+    mut pa := -1
+    mut pb := -1
+    mut i := 0
+    for _ in 0:3 {
+        if lpairs[i] != k_phi {
+            if pa == -1 { pa = lpairs[i] } else { pb = lpairs[i] }
+        }
+        i += 2
+    }
+    if pa < 0 || pb < 0 || pa == pb { << pred_scan_ssa_none() }
+    ja := vec_ssa_pair_src(&lpairs, pa)
+    jb := vec_ssa_pair_src(&lpairs, pb)
+    if ja < 0 || jb < 0 || ja == jb || ja == k_next || jb == k_next { << pred_scan_ssa_none() }
+    if types.mir_temp_ty(m, fi, pa) != 1 || types.mir_temp_nslots(m, fi, pa) != 1 { << pred_scan_ssa_none() }
+    if types.mir_temp_ty(m, fi, pb) != 1 || types.mir_temp_nslots(m, fi, pb) != 1 { << pred_scan_ssa_none() }
+    mpairs := vec_ssa_path_copies(m, fi, &mp)
+    if vec_ssa_path_nbin(m, fi, &mp) != 0 || mpairs.len != 4 { << pred_scan_ssa_none() }
+    if vec_ssa_pair_src(&mpairs, ja) != pa || vec_ssa_pair_src(&mpairs, jb) != pb { << pred_scan_ssa_none() }
+    hpairs := vec_ssa_path_copies(m, fi, &hp)
+    if vec_ssa_path_nbin(m, fi, &hp) != 2 || hpairs.len != 4 { << pred_scan_ssa_none() }
+    mut c_phi := -1
+    mut t_phi := -1
+    mut c_join := -1
+    mut t_join := -1
+    for side in 0:2 {
+        mut ph := pa
+        mut jn := ja
+        if side == 1 {
+            ph = pb
+            jn = jb
+        }
+        hd := vec_ssa_def_on(m, fi, &hp, vec_ssa_pair_src(&hpairs, jn))
+        if hd < 0 || types.mir_ikind(m, fi, hd) != types.mi_bin || types.mir_ib(m, fi, hd) != 1 { << pred_scan_ssa_none() }
+        hx := types.mir_ic(m, fi, hd)
+        hy := types.mir_id(m, fi, hd)
+        mut other := -1
+        if hx == ph { other = hy }
+        if hy == ph { other = hx }
+        if other == -1 { << pred_scan_ssa_none() }
+        if other == k_phi {
+            t_phi = ph
+            t_join = jn
+        } else {
+            uc := vec_ssa_const_src(m, fi, other)
+            if uc == -1 || vec_const(m, fi, uc) != 1 { << pred_scan_ssa_none() }
+            c_phi = ph
+            c_join = jn
+        }
+    }
+    if c_phi < 0 || t_phi < 0 { << pred_scan_ssa_none() }
+    mut blocks := []int{}
+    blocks.push(bi)
+    for x in 0:hp.len { blocks.push(hp[x]) }
+    for x in 0:mp.len { blocks.push(mp[x]) }
+    blocks.push(j)
+    blocks.push(l)
+    if vec_ssa_in(&blocks, exit) { << pred_scan_ssa_none() }
+    if limit == k_phi || vec_ssa_defined_in(m, fi, &blocks, limit) { << pred_scan_ssa_none() }
+    if limit < 0 && !vec_has_const(m, fi, limit) { << pred_scan_ssa_none() }
+    arr := vec_ssa_arr(m, fi, &blocks, bi, types.mir_ib(m, fi, li))
+    if arr == -1 { << pred_scan_ssa_none() }
+    if !vec_ssa_entry_ok(m, fi, bi, &blocks, k_phi, op, limit) { << pred_scan_ssa_none() }
+    mut keep := []int{}
+    keep.push(c_join)
+    keep.push(t_join)
+    keep.push(k_next)
+    temps := vec_ssa_dests(m, fi, &blocks, &keep)
+    if !types.mir_ssa_temps_confined(m, fi, &temps, &blocks) { << pred_scan_ssa_none() }
+    mut r := pred_scan_ssa_none()
+    if limit >= 0 {
+        r.limit_t = limit
+    } else {
+        r.limit = vec_const(m, fi, limit)
+    }
+    r.ok = true
+    r.k_phi = k_phi
+    r.k_next = k_next
+    r.c_phi = c_phi
+    r.t_phi = t_phi
+    r.c_join = c_join
+    r.t_join = t_join
+    r.le = op == 9
+    r.arr = arr
+    r.exit = exit
+    << r
+}
+
+fn match_pred_scan_ssa(m &types.Mir, fi int, bi int) VecPat {
+    s := pred_scan_ssa_info(m, fi, bi)
+    if !s.ok { << vec_none() }
+    << VecPat{kind: vp_pred_scan_ssa, ind: s.k_phi, acc: s.c_phi, mask: 0, limit: s.limit, limit_t: s.limit_t, else_bb: s.exit, arr: s.arr, fac: s.t_phi}
+}
+
+fn emit_pred_scan_ssa(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if a.arch != 0 || frame_has_vregs(fr) || !vec_ssa_fp_free(&*a, fr) { << 0 }
+    s := pred_scan_ssa_info(m, fi, bi)
+    if !s.ok { << 0 }
+    nt := fr.temp_slot.len
+    if s.k_next >= nt || s.c_join >= nt || s.t_join >= nt || s.k_phi >= nt || s.c_phi >= nt || s.t_phi >= nt || s.limit_t >= nt { << 0 }
+    emit_load_value(a, m, fi, fr, s.k_phi, 20)
+    if s.limit_t >= 0 {
+        emit_load_value(a, m, fi, fr, s.limit_t, 21)
+    } else {
+        a.vm_mov_imm64(21, s.limit)
+    }
+    emit_load_value(a, m, fi, fr, s.c_phi, 22)
+    emit_load_value(a, m, fi, fr, s.t_phi, 23)
+    vec_ssa_clobber_gprs(a)
+    a.mov(6, 20)
+    a.mov(1, 21)
+    a.mov(4, 22)
+    a.mov(11, 23)
+    emit_pred_scan_core(a, m, fi, fr, bi, s.arr, s.le)
+    vec_ssa_clobber_gprs(a)
+    emit_store_temp(a, fr, s.k_next, 6)
+    emit_store_temp(a, fr, s.c_join, 4)
+    emit_store_temp(a, fr, s.t_join, 11)
+    rc_spill(a)
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(s.exit))
+    << 1
+}
+
+struct CrcSsa {
+    ok bool
+    crc_phi int
+    crc_join int
+    b_next int
+    poly int
+    exit int
+}
+
+fn crc_ssa_none() CrcSsa {
+    << CrcSsa{ok: false, crc_phi: -1, crc_join: -1, b_next: -1, poly: -1, exit: -1}
+}
+
+fn vec_ssa_is_const(m &types.Mir, fi int, v int, c int) bool {
+    cv := vec_ssa_const_src(m, fi, v)
+    << cv != -1 && vec_const(m, fi, cv) == c
+}
+
+// `(crc >> 1) & 0x7fffffff` on the path, then optionally `^ poly`.
+// Returns the result temp or -1; poly is written through when present.
+fn vec_crc_ssa_arm(m &types.Mir, fi int, bs &[]int, crc int, src int, with_poly bool, loop &[]int) int {
+    mut v := src
+    mut poly := -1
+    if with_poly {
+        d := vec_ssa_def_on(m, fi, bs, v)
+        if d < 0 || types.mir_ikind(m, fi, d) != types.mi_bin || types.mir_ib(m, fi, d) != 16 { << -1 }
+        x := types.mir_ic(m, fi, d)
+        y := types.mir_id(m, fi, d)
+        mut inner := -1
+        if vec_ssa_def_on(m, fi, bs, x) >= 0 && vec_ssa_def_on(m, fi, bs, y) < 0 {
+            inner = x
+            poly = y
+        } else if vec_ssa_def_on(m, fi, bs, y) >= 0 && vec_ssa_def_on(m, fi, bs, x) < 0 {
+            inner = y
+            poly = x
+        } else {
+            << -1
+        }
+        if poly >= 0 && vec_ssa_defined_in(m, fi, loop, poly) { << -1 }
+        if poly < 0 && !vec_has_const(m, fi, poly) { << -1 }
+        v = inner
+    }
+    ad := vec_ssa_def_on(m, fi, bs, v)
+    if ad < 0 || types.mir_ikind(m, fi, ad) != types.mi_bin || types.mir_ib(m, fi, ad) != 14 { << -1 }
+    mut sh := -1
+    if vec_ssa_is_const(m, fi, types.mir_id(m, fi, ad), 2147483647) { sh = types.mir_ic(m, fi, ad) }
+    if sh < 0 && vec_ssa_is_const(m, fi, types.mir_ic(m, fi, ad), 2147483647) { sh = types.mir_id(m, fi, ad) }
+    if sh < 0 { << -1 }
+    sd := vec_ssa_def_on(m, fi, bs, sh)
+    if sd < 0 || types.mir_ikind(m, fi, sd) != types.mi_bin || types.mir_ib(m, fi, sd) != 18 { << -1 }
+    if types.mir_ic(m, fi, sd) != crc || !vec_ssa_is_const(m, fi, types.mir_id(m, fi, sd), 1) { << -1 }
+    if with_poly { << poly }
+    << v
+}
+
+// Eight unrolled CRC-32 bit steps over the promoted diamond:
+// `if crc & 1 != 0 { crc = ((crc >> 1) & M) ^ poly } else { crc = (crc >> 1) & M }`
+// for bit from 0 while bit < 8.
+fn crc_ssa_info(m &types.Mir, fi int, bi int) CrcSsa {
+    if types.mir_btkind(m, fi, bi) != 2 { << crc_ssa_none() }
+    mut nbin := 0
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_bin {
+            nbin += 1
+        } else if k != types.mi_copy && k != types.mi_nop {
+            << crc_ssa_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if nbin != 2 { << crc_ssa_none() }
+    cd := vec_ssa_def(m, fi, bi, types.mir_bta(m, fi, bi))
+    if cd < 0 || types.mir_ikind(m, fi, cd) != types.mi_bin { << crc_ssa_none() }
+    cop := types.mir_ib(m, fi, cd)
+    if cop != 6 && cop != 7 { << crc_ssa_none() }
+    mut low := -1
+    if vec_ssa_is_const(m, fi, types.mir_id(m, fi, cd), 0) { low = vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, cd)) }
+    if low < 0 && vec_ssa_is_const(m, fi, types.mir_ic(m, fi, cd), 0) { low = vec_ssa_src(m, fi, bi, types.mir_id(m, fi, cd)) }
+    if low < 0 { << crc_ssa_none() }
+    ld := vec_ssa_def(m, fi, bi, low)
+    if ld < 0 || types.mir_ikind(m, fi, ld) != types.mi_bin || types.mir_ib(m, fi, ld) != 14 { << crc_ssa_none() }
+    mut crc := -1
+    if vec_ssa_is_const(m, fi, types.mir_id(m, fi, ld), 1) { crc = vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, ld)) }
+    if crc < 0 && vec_ssa_is_const(m, fi, types.mir_ic(m, fi, ld), 1) { crc = vec_ssa_src(m, fi, bi, types.mir_id(m, fi, ld)) }
+    if crc < 0 || vec_ssa_def(m, fi, bi, crc) >= 0 { << crc_ssa_none() }
+    if types.mir_temp_ty(m, fi, crc) != 1 || types.mir_temp_nslots(m, fi, crc) != 1 { << crc_ssa_none() }
+    mut odd := types.mir_btb(m, fi, bi)
+    mut even := types.mir_btc(m, fi, bi)
+    if cop == 6 {
+        odd = types.mir_btc(m, fi, bi)
+        even = types.mir_btb(m, fi, bi)
+    }
+    if odd == even || odd == bi || even == bi { << crc_ssa_none() }
+    odp := vec_ssa_path(m, fi, odd)
+    ep := vec_ssa_path(m, fi, even)
+    if odp.len == 0 || ep.len == 0 || odp[0] == -1 || ep[0] == -1 { << crc_ssa_none() }
+    j := vec_ssa_path_end(m, fi, odd, &odp)
+    if j != vec_ssa_path_end(m, fi, even, &ep) || j == bi || types.mir_btkind(m, fi, j) != 2 { << crc_ssa_none() }
+    if vec_ssa_preds(m, fi, j).len != 2 { << crc_ssa_none() }
+    mut jbin := 0
+    ii = types.mir_bhead(m, fi, j)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_bin {
+            jbin += 1
+        } else if k != types.mi_copy && k != types.mi_nop {
+            << crc_ssa_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if jbin != 2 { << crc_ssa_none() }
+    jd := vec_ssa_def(m, fi, j, types.mir_bta(m, fi, j))
+    if jd < 0 || types.mir_ikind(m, fi, jd) != types.mi_bin { << crc_ssa_none() }
+    op := types.mir_ib(m, fi, jd)
+    b_next := vec_ssa_src(m, fi, j, types.mir_ic(m, fi, jd))
+    lim := types.mir_id(m, fi, jd)
+    if !((op == 8 && vec_ssa_is_const(m, fi, lim, 8)) || (op == 9 && vec_ssa_is_const(m, fi, lim, 7))) { << crc_ssa_none() }
+    bd := vec_ssa_def(m, fi, j, b_next)
+    if bd < 0 || types.mir_ikind(m, fi, bd) != types.mi_bin || types.mir_ib(m, fi, bd) != 1 { << crc_ssa_none() }
+    mut b_phi := -1
+    if vec_ssa_is_const(m, fi, types.mir_id(m, fi, bd), 1) { b_phi = vec_ssa_src(m, fi, j, types.mir_ic(m, fi, bd)) }
+    if b_phi < 0 && vec_ssa_is_const(m, fi, types.mir_ic(m, fi, bd), 1) { b_phi = vec_ssa_src(m, fi, j, types.mir_id(m, fi, bd)) }
+    if b_phi < 0 || b_phi == crc { << crc_ssa_none() }
+    l := types.mir_btb(m, fi, j)
+    exit := types.mir_btc(m, fi, j)
+    if l == exit || types.mir_btkind(m, fi, l) != 1 || types.mir_bta(m, fi, l) != bi || vec_ssa_preds(m, fi, l).len != 1 { << crc_ssa_none() }
+    mut lbs := []int{}
+    lbs.push(l)
+    lpairs := vec_ssa_path_copies(m, fi, &lbs)
+    if vec_ssa_path_nbin(m, fi, &lbs) != 0 || lpairs.len != 4 { << crc_ssa_none() }
+    if vec_ssa_pair_src(&lpairs, b_phi) != b_next { << crc_ssa_none() }
+    cj := vec_ssa_pair_src(&lpairs, crc)
+    if cj < 0 || cj == b_next { << crc_ssa_none() }
+    mut blocks := []int{}
+    blocks.push(bi)
+    for x in 0:odp.len { blocks.push(odp[x]) }
+    for x in 0:ep.len { blocks.push(ep[x]) }
+    blocks.push(j)
+    blocks.push(l)
+    if vec_ssa_in(&blocks, exit) { << crc_ssa_none() }
+    opairs := vec_ssa_path_copies(m, fi, &odp)
+    epairs := vec_ssa_path_copies(m, fi, &ep)
+    if opairs.len != 2 || epairs.len != 2 || opairs[0] != cj || epairs[0] != cj { << crc_ssa_none() }
+    if vec_ssa_path_nbin(m, fi, &odp) != 3 || vec_ssa_path_nbin(m, fi, &ep) != 2 { << crc_ssa_none() }
+    poly := vec_crc_ssa_arm(m, fi, &odp, crc, opairs[1], true, &blocks)
+    if poly == -1 { << crc_ssa_none() }
+    if vec_crc_ssa_arm(m, fi, &ep, crc, epairs[1], false, &blocks) < 0 { << crc_ssa_none() }
+    preds := vec_ssa_preds(m, fi, bi)
+    for pi in 0:preds.len {
+        p := preds[pi]
+        if p == l { -> }
+        mut init := -2
+        ii = types.mir_bhead(m, fi, p)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            if types.mir_ikind(m, fi, ii) == types.mi_copy && types.mir_ia(m, fi, ii) == b_phi { init = types.mir_ib(m, fi, ii) }
+            ii = types.mir_inext(m, fi, ii)
+        }
+        if init == -2 || !vec_ssa_is_const(m, fi, init, 0) { << crc_ssa_none() }
+    }
+    if !vec_ssa_entry_ok(m, fi, bi, &blocks, b_phi, op, lim) { << crc_ssa_none() }
+    mut keep := []int{}
+    keep.push(cj)
+    keep.push(b_next)
+    temps := vec_ssa_dests(m, fi, &blocks, &keep)
+    if !types.mir_ssa_temps_confined(m, fi, &temps, &blocks) { << crc_ssa_none() }
+    mut r := crc_ssa_none()
+    r.ok = true
+    r.crc_phi = crc
+    r.crc_join = cj
+    r.b_next = b_next
+    r.poly = poly
+    r.exit = exit
+    << r
+}
+
+fn match_crc_bit8_ssa(m &types.Mir, fi int, bi int) VecPat {
+    s := crc_ssa_info(m, fi, bi)
+    if !s.ok { << vec_none() }
+    << VecPat{kind: vp_crc_bit8_ssa, ind: s.crc_phi, acc: s.poly, mask: 2147483647, limit: 8, limit_t: -1, else_bb: s.exit, arr: s.crc_join, fac: s.b_next}
+}
+
+fn emit_crc_bit8_ssa(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if a.arch != 0 { << 0 }
+    s := crc_ssa_info(m, fi, bi)
+    if !s.ok { << 0 }
+    nt := fr.temp_slot.len
+    if s.crc_phi >= nt || s.crc_join >= nt || s.b_next >= nt || s.poly >= nt { << 0 }
+    // R0 R1 R12 R13 R14.
+    if !vec_ssa_homes_safe(&*a, m, fi, fr, s.exit, 28675, s.crc_join, s.b_next) { << 0 }
+    emit_load_value(a, m, fi, fr, s.crc_phi, 20)
+    emit_load_value(a, m, fi, fr, s.poly, 21)
+    vec_ssa_clobber_gprs(a)
+    a.mov(0, 20)
+    a.mov(1, 21)
+    emit_crc_bit8_core(a)
+    vec_ssa_clobber_gprs(a)
+    emit_store_temp(a, fr, s.crc_join, 0)
+    a.vm_mov_imm(20, 8)
+    emit_store_temp(a, fr, s.b_next, 20)
+    rc_spill(a)
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(s.exit))
+    << 1
+}
+
+struct BsearchSsa {
+    ok bool
+    lo_phi int
+    hi_phi int
+    lo_join int
+    hi_join int
+    v int
+    v_local int
+    arr int
+    exit int
+}
+
+fn bsearch_ssa_none() BsearchSsa {
+    << BsearchSsa{ok: false, lo_phi: -1, hi_phi: -1, lo_join: -1, hi_join: -1, v: -1, v_local: -1, arr: -1, exit: -1}
+}
+
+fn vec_ssa_same_val(m &types.Mir, fi int, x int, y int) bool {
+    if x == y { << true }
+    cx := vec_ssa_const_src(m, fi, x)
+    cy := vec_ssa_const_src(m, fi, y)
+    << cx != -1 && cy != -1 && vec_const(m, fi, cx) == vec_const(m, fi, cy)
+}
+
+fn vec_ssa_is_bin(m &types.Mir, fi int, d int, op int) bool {
+    << d >= 0 && types.mir_ikind(m, fi, d) == types.mi_bin && types.mir_ib(m, fi, d) == op
+}
+
+// Lower-bound search over the promoted diamond:
+// `mid := lo + ((hi - lo) >> 1); if a[mid] < v { lo = mid + 1 } else { hi = mid }`
+// while lo < hi, entered only after lo < hi was tested on the same values.
+fn bsearch_ssa_info(m &types.Mir, fi int, bi int) BsearchSsa {
+    if types.mir_btkind(m, fi, bi) != 2 { << bsearch_ssa_none() }
+    mut li := -1
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        k := types.mir_ikind(m, fi, ii)
+        if k == types.mi_load_index {
+            if li >= 0 || !vec_elem8(types.mir_id(m, fi, ii)) { << bsearch_ssa_none() }
+            li = ii
+        } else if k != types.mi_bin && k != types.mi_load_local && k != types.mi_load_ptr && k != types.mi_copy && k != types.mi_nop {
+            << bsearch_ssa_none()
+        }
+        ii = types.mir_inext(m, fi, ii)
+    }
+    if li < 0 { << bsearch_ssa_none() }
+    mut hb := []int{}
+    hb.push(bi)
+    if vec_ssa_path_nbin(m, fi, &hb) != 4 { << bsearch_ssa_none() }
+    elem := types.mir_ia(m, fi, li)
+    if types.mir_temp_ty(m, fi, elem) != 1 { << bsearch_ssa_none() }
+    cd := vec_ssa_def(m, fi, bi, types.mir_bta(m, fi, bi))
+    if !vec_ssa_is_bin(m, fi, cd, 8) || vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, cd)) != elem { << bsearch_ssa_none() }
+    v := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, cd))
+    if v == elem { << bsearch_ssa_none() }
+    mid := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, li))
+    md := vec_ssa_def(m, fi, bi, mid)
+    if !vec_ssa_is_bin(m, fi, md, 1) { << bsearch_ssa_none() }
+    mx := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, md))
+    my := vec_ssa_src(m, fi, bi, types.mir_id(m, fi, md))
+    mut lo := -1
+    mut half := -1
+    if vec_ssa_is_bin(m, fi, vec_ssa_def(m, fi, bi, my), 18) {
+        lo = mx
+        half = my
+    } else if vec_ssa_is_bin(m, fi, vec_ssa_def(m, fi, bi, mx), 18) {
+        lo = my
+        half = mx
+    } else {
+        << bsearch_ssa_none()
+    }
+    sd := vec_ssa_def(m, fi, bi, half)
+    if !vec_ssa_is_const(m, fi, types.mir_id(m, fi, sd), 1) { << bsearch_ssa_none() }
+    dd := vec_ssa_def(m, fi, bi, vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, sd)))
+    if !vec_ssa_is_bin(m, fi, dd, 2) || vec_ssa_src(m, fi, bi, types.mir_id(m, fi, dd)) != lo { << bsearch_ssa_none() }
+    hi := vec_ssa_src(m, fi, bi, types.mir_ic(m, fi, dd))
+    if lo < 0 || hi < 0 || lo == hi || vec_ssa_def(m, fi, bi, lo) >= 0 || vec_ssa_def(m, fi, bi, hi) >= 0 { << bsearch_ssa_none() }
+    for t in 0:2 {
+        mut x := lo
+        if t == 1 { x = hi }
+        if types.mir_temp_ty(m, fi, x) != 1 || types.mir_temp_nslots(m, fi, x) != 1 { << bsearch_ssa_none() }
+    }
+    // a[mid] < v: lo = mid + 1 on the true edge, hi = mid on the false edge.
+    up := types.mir_btb(m, fi, bi)
+    down := types.mir_btc(m, fi, bi)
+    if up == down || up == bi || down == bi { << bsearch_ssa_none() }
+    upp := vec_ssa_path(m, fi, up)
+    dnp := vec_ssa_path(m, fi, down)
+    if upp.len == 0 || dnp.len == 0 || upp[0] == -1 || dnp[0] == -1 { << bsearch_ssa_none() }
+    j := vec_ssa_path_end(m, fi, up, &upp)
+    if j != vec_ssa_path_end(m, fi, down, &dnp) || j == bi || types.mir_btkind(m, fi, j) != 2 { << bsearch_ssa_none() }
+    if vec_ssa_preds(m, fi, j).len != 2 { << bsearch_ssa_none() }
+    mut jb := []int{}
+    jb.push(j)
+    jpairs := vec_ssa_path_copies(m, fi, &jb)
+    if jpairs.len != 0 || vec_ssa_path_nbin(m, fi, &jb) != 1 { << bsearch_ssa_none() }
+    jd := vec_ssa_def(m, fi, j, types.mir_bta(m, fi, j))
+    if !vec_ssa_is_bin(m, fi, jd, 8) { << bsearch_ssa_none() }
+    lj := types.mir_ic(m, fi, jd)
+    hj := types.mir_id(m, fi, jd)
+    l := types.mir_btb(m, fi, j)
+    exit := types.mir_btc(m, fi, j)
+    if l == exit || types.mir_btkind(m, fi, l) != 1 || types.mir_bta(m, fi, l) != bi || vec_ssa_preds(m, fi, l).len != 1 { << bsearch_ssa_none() }
+    mut lbs := []int{}
+    lbs.push(l)
+    lpairs := vec_ssa_path_copies(m, fi, &lbs)
+    if vec_ssa_path_nbin(m, fi, &lbs) != 0 || lpairs.len != 4 { << bsearch_ssa_none() }
+    if vec_ssa_pair_src(&lpairs, lo) != lj || vec_ssa_pair_src(&lpairs, hi) != hj { << bsearch_ssa_none() }
+    upairs := vec_ssa_path_copies(m, fi, &upp)
+    dpairs := vec_ssa_path_copies(m, fi, &dnp)
+    if upairs.len != 4 || dpairs.len != 4 || vec_ssa_path_nbin(m, fi, &upp) != 1 || vec_ssa_path_nbin(m, fi, &dnp) != 0 { << bsearch_ssa_none() }
+    if vec_ssa_pair_src(&upairs, hj) != hi || vec_ssa_pair_src(&dpairs, lj) != lo || vec_ssa_pair_src(&dpairs, hj) != mid { << bsearch_ssa_none() }
+    ud := vec_ssa_def_on(m, fi, &upp, vec_ssa_pair_src(&upairs, lj))
+    if !vec_ssa_is_bin(m, fi, ud, 1) { << bsearch_ssa_none() }
+    if !((types.mir_ic(m, fi, ud) == mid && vec_ssa_is_const(m, fi, types.mir_id(m, fi, ud), 1)) || (types.mir_id(m, fi, ud) == mid && vec_ssa_is_const(m, fi, types.mir_ic(m, fi, ud), 1))) { << bsearch_ssa_none() }
+    mut blocks := []int{}
+    blocks.push(bi)
+    for x in 0:upp.len { blocks.push(upp[x]) }
+    for x in 0:dnp.len { blocks.push(dnp[x]) }
+    blocks.push(j)
+    blocks.push(l)
+    if vec_ssa_in(&blocks, exit) { << bsearch_ssa_none() }
+    // The array: a header LoadLocal of a slice local, or LoadPtr(LoadLocal p,
+    // 0, 3) through a pointer local; the loop stores nothing.
+    at := vec_ssa_src(m, fi, bi, types.mir_ib(m, fi, li))
+    ad := vec_ssa_def(m, fi, bi, at)
+    if ad < 0 { << bsearch_ssa_none() }
+    mut arr := -1
+    if types.mir_ikind(m, fi, ad) == types.mi_load_local {
+        arr = types.mir_local_operand_base + types.mir_ib(m, fi, ad)
+    } else if types.mir_ikind(m, fi, ad) == types.mi_load_ptr && types.mir_ic(m, fi, ad) == 0 && types.mir_id(m, fi, ad) == 3 {
+        pd := vec_ssa_def(m, fi, bi, vec_ssa_src(m, fi, bi, types.mir_ib(m, fi, ad)))
+        if pd < 0 || types.mir_ikind(m, fi, pd) != types.mi_load_local { << bsearch_ssa_none() }
+        pl := types.mir_ib(m, fi, pd)
+        if types.mir_local_nslots(m, fi, pl) != 1 { << bsearch_ssa_none() }
+        arr = types.mir_local_operand_base + pl
+    } else {
+        << bsearch_ssa_none()
+    }
+    if emit_base_fixed_len(m, fi, arr) > 0 { << bsearch_ssa_none() }
+    mut v_local := -1
+    if v < 0 { << bsearch_ssa_none() }
+    vd := vec_ssa_def(m, fi, bi, v)
+    if vd >= 0 {
+        if types.mir_ikind(m, fi, vd) != types.mi_load_local { << bsearch_ssa_none() }
+        v_local = types.mir_ib(m, fi, vd)
+        if types.mir_local_ty(m, fi, v_local) != 1 { << bsearch_ssa_none() }
+    } else if vec_ssa_defined_in(m, fi, &blocks, v) || types.mir_temp_ty(m, fi, v) != 1 {
+        << bsearch_ssa_none()
+    }
+    // Every outside entry copies (lo, hi) = (x, y) after its only
+    // predecessor branched to it on x < y.
+    preds := vec_ssa_preds(m, fi, bi)
+    mut n := 0
+    for pi in 0:preds.len {
+        p := preds[pi]
+        if p == l { -> }
+        if types.mir_btkind(m, fi, p) != 1 { << bsearch_ssa_none() }
+        mut pbs := []int{}
+        pbs.push(p)
+        pp := vec_ssa_path_copies(m, fi, &pbs)
+        if vec_ssa_path_nbin(m, fi, &pbs) != 0 || pp.len == 1 { << bsearch_ssa_none() }
+        x := vec_ssa_pair_src(&pp, lo)
+        y := vec_ssa_pair_src(&pp, hi)
+        if x == -1 || y == -1 { << bsearch_ssa_none() }
+        qs := vec_ssa_preds(m, fi, p)
+        if qs.len != 1 { << bsearch_ssa_none() }
+        q := qs[0]
+        if types.mir_btkind(m, fi, q) != 2 || types.mir_btb(m, fi, q) != p || types.mir_btc(m, fi, q) == p { << bsearch_ssa_none() }
+        gd := vec_ssa_def(m, fi, q, types.mir_bta(m, fi, q))
+        if !vec_ssa_is_bin(m, fi, gd, 8) { << bsearch_ssa_none() }
+        if !vec_ssa_same_val(m, fi, vec_ssa_src(m, fi, q, types.mir_ic(m, fi, gd)), x) { << bsearch_ssa_none() }
+        if !vec_ssa_same_val(m, fi, vec_ssa_src(m, fi, q, types.mir_id(m, fi, gd)), y) { << bsearch_ssa_none() }
+        n += 1
+    }
+    if n == 0 { << bsearch_ssa_none() }
+    mut keep := []int{}
+    keep.push(lj)
+    keep.push(hj)
+    temps := vec_ssa_dests(m, fi, &blocks, &keep)
+    if !types.mir_ssa_temps_confined(m, fi, &temps, &blocks) { << bsearch_ssa_none() }
+    mut r := bsearch_ssa_none()
+    r.ok = true
+    r.lo_phi = lo
+    r.hi_phi = hi
+    r.lo_join = lj
+    r.hi_join = hj
+    r.v = v
+    r.v_local = v_local
+    r.arr = arr
+    r.exit = exit
+    << r
+}
+
+fn match_bsearch_ssa(m &types.Mir, fi int, bi int) VecPat {
+    s := bsearch_ssa_info(m, fi, bi)
+    if !s.ok { << vec_none() }
+    << VecPat{kind: vp_bsearch_ssa, ind: s.lo_phi, acc: s.hi_phi, mask: 0, limit: 0, limit_t: -1, else_bb: s.exit, arr: s.arr, fac: s.v}
+}
+
+fn emit_bsearch_ssa(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, p VecPat) int {
+    if a.arch != 0 || a.cover { << 0 }
+    s := bsearch_ssa_info(m, fi, bi)
+    if !s.ok { << 0 }
+    nt := fr.temp_slot.len
+    if s.lo_phi >= nt || s.hi_phi >= nt || s.lo_join >= nt || s.hi_join >= nt || s.v >= nt { << 0 }
+    al := s.arr - types.mir_local_operand_base
+    if al < 0 || al >= fr.local_slot.len || !is_frame_slot(fr.local_slot[al]) { << 0 }
+    if s.v_local >= 0 && (s.v_local >= fr.local_slot.len || !is_frame_slot(fr.local_slot[s.v_local])) { << 0 }
+    if !select_pair_frame_cells_ok(fr, m, fi) { << 0 }
+    // R0 R1 R2 R6 R7 R12 R13.
+    if !vec_ssa_homes_safe(&*a, m, fi, fr, s.exit, 12487, s.lo_join, s.hi_join) { << 0 }
+    emit_load_value(a, m, fi, fr, s.lo_phi, 20)
+    emit_load_value(a, m, fi, fr, s.hi_phi, 21)
+    if s.v_local >= 0 {
+        a.load(22, 15, slot_off(fr.local_slot[s.v_local]))
+    } else {
+        emit_load_value(a, m, fi, fr, s.v, 22)
+    }
+    vec_ssa_clobber_gprs(a)
+    a.mov(6, 20)
+    a.mov(1, 21)
+    a.mov(12, 22)
+    emit_bsearch_core(a, m, fi, fr, bi, s.arr, true)
+    vec_ssa_clobber_gprs(a)
+    a.mov(20, 6)
+    a.mov(21, 1)
+    emit_store_temp(a, fr, s.lo_join, 20)
+    emit_store_temp(a, fr, s.hi_join, 21)
+    rc_spill(a)
+    a.jmp(types.mir_fn_label(m, fi) + "_bb" + str(s.exit))
+    << 1
+}
