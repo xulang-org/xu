@@ -8,7 +8,7 @@ Packages self-contained, production-grade SDK distribution archives for:
   - devkit-all (all-in-one multi-platform devkit)
 
 Each bundle contains:
-  1. bin/ (xu compiler + xu-doctor + xu-fmt + xu-doc + xu-map + xu-desktop)
+  1. bin/ (xu compiler + xu-doctor + xu-fmt + xu-doc + xu-map + xu-desktop + xu-setup + xu-lsp + xu-native)
   2. src/ (standard library + UI runtime host source)
   3. packages/ (optional external ecosystem drivers: redis, mysql, postgres, sqlite, etcd, etc.)
   4. include/ (C FFI header xu_native.h)
@@ -50,15 +50,26 @@ SUPPORTED_TARGETS = [
     "windows-arm64",
 ]
 
-SIBLING_TOOLS = [
-    ("xu-doctor", "src/cmd/doctor"),
-    ("xu-fmt", "src/cmd/fmt"),
-    ("xu-doc", "src/cmd/doc"),
-    ("xu-map", "src/cmd/map"),
-    ("xu-desktop", "src/cmd/desktop"),
-    ("xu-setup", "src/cmd/setup"),
-    ("xu-native", "src/cmd/native"),
-]
+def discover_sibling_tools() -> list[tuple[str, str]]:
+    cmd_dir = REPO_ROOT / "src" / "cmd"
+    tools = []
+    if cmd_dir.is_dir():
+        for d in sorted(cmd_dir.iterdir()):
+            if d.is_dir() and d.name != "compile" and not d.name.startswith("."):
+                tools.append((f"xu-{d.name}", f"src/cmd/{d.name}"))
+    return tools or [
+        ("xu-doctor", "src/cmd/doctor"),
+        ("xu-fmt", "src/cmd/fmt"),
+        ("xu-doc", "src/cmd/doc"),
+        ("xu-map", "src/cmd/map"),
+        ("xu-desktop", "src/cmd/desktop"),
+        ("xu-setup", "src/cmd/setup"),
+        ("xu-lsp", "src/cmd/lsp"),
+        ("xu-native", "src/cmd/native"),
+    ]
+
+
+SIBLING_TOOLS = discover_sibling_tools()
 
 
 def get_host_target() -> str:
@@ -331,6 +342,7 @@ Xu is a fast, safe, GC-free systems programming language combining Go-style tool
   - `xu-doc`: Markdown API documentation generator & HTTP server
   - `xu-map`: Visual flowchart & architecture graph generator
   - `xu-desktop`: Cross-platform desktop native app & webview packager
+  - `xu-lsp`: Language Server Protocol (LSP) daemon for IDE code completion & diagnostics
   - `xu-native`: Native C module compilation, archiving & multi-target container packaging
 - **`src/`**: Standard library source code (`#os`, `#io`, `#net`, `#crypto`, `#database/sql`, `#ui`, etc.)
 - **`packages/`**: Optional external database, storage and messaging modules from the independent packages repository (when available at packaging time)
@@ -576,7 +588,7 @@ def main():
         for archive, target, size_mb, sha in generated_archives:
             f.write(f"| `{archive.name}` | `{target}` | {size_mb:.2f} MB | `{sha[:16]}...` |\n")
         f.write("\n## 🚀 包含核心组件\n\n")
-        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-setup`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`, `xu-native`\n")
+        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-setup`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`, `xu-lsp`, `xu-native`\n")
         f.write("- **官方标准库源码 (`src/`)**: 包含 `os`, `io`, `net`, `sync`, `crypto`, `database/sql`, `ui` 等完整源码\n")
         f.write("- **独立 packages 仓库的扩展模块（选装） (`packages/`)**: `redis`, `mysql`, `postgres`, `sqlite`, `clickhouse`, `mongodb`, `nats`, `mqtt`, `etcd`, `elasticsearch`, `influxdb`, `memcached`, `s3`\n")
         f.write("- **C/C++ 原生交互头文件 (`include/`)**: `xu_native.h`\n")

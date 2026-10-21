@@ -1,0 +1,321 @@
+@xu/types
+
+// Counted loop in promoted SSA form. Header `bi` branches to a latch made
+// only of phi copies (back into `bi`) or to the exit. The induction phi
+// steps by one and the header leaves when `i_next < limit` (`<=` with le)
+// fails; `limit` is a constant or a temp defined outside the loop. Every
+// other entry jumps in with the same constant `init`, and is proved to
+// satisfy the loop condition, so the do-while header runs exactly
+// limit - init (or limit + 1 - init) times.
+pub struct MirSsaLoop {
+    pub ok bool
+    pub latch int
+    pub exit int
+    pub i_phi int
+    pub i_next int
+    pub init int
+    pub limit int
+    pub le bool
+    pub ncopy int
+    // >= 0: limit is the header's reload of this local's length; the
+    // header only reads, so every reload sees the same value.
+    pub len_local int
+}
+
+pub fn mir_ssa_loop_none() MirSsaLoop {
+    << MirSsaLoop{ok: false, latch: -1, exit: -1, i_phi: -1, i_next: -1, init: 0, limit: 0, le: false, ncopy: 0, len_local: -1}
+}
+
+fn mir_ssa_pure_kind(k int) bool {
+    << k == mi_nop || k == mi_copy || k == mi_bin || k == mi_un || k == mi_load_local || k == mi_load_field || k == mi_load_index || k == mi_load_ptr
+}
+
+// t = LoadField(LoadLocal L, 8, 1) inside block b, L a 3-slot descriptor.
+// Returns L or -1.
+fn mir_ssa_len_of(f &MFn, b int, t int) int {
+    li := mir_ssa_def_in(f, b, t)
+    if li < 0 || mfn_ikind(&f.instrs, li) != mi_load_field || mfn_ic(&f.instrs, li) != 8 || mfn_id(&f.instrs, li) != 1 { << -1 }
+    base := mfn_ib(&f.instrs, li)
+    if base < 0 || base >= f.temps.len { << -1 }
+    bi := mir_ssa_def_in(f, b, base)
+    if bi < 0 || mfn_ikind(&f.instrs, bi) != mi_load_local { << -1 }
+    l := mfn_ib(&f.instrs, bi)
+    if l < 0 || l >= f.locals_nslots.len || f.locals_nslots[l] != 3 { << -1 }
+    << l
+}
+
+// From the end of block b back to (not including) instruction after,
+// nothing writes memory or locals.
+fn mir_ssa_pure_tail(f &MFn, b int, after int) bool {
+    mut seen := after < 0
+    mut ii := f.blocks[b].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { << true }
+        if seen && !mir_ssa_pure_kind(mfn_ikind(&f.instrs, ii)) { << false }
+        if ii == after { seen = true }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << false
+}
+
+fn mir_ssa_def_in(f &MFn, bi int, t int) int {
+    mut found := -1
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_chan_try_recv && (mfn_ia(&f.instrs, ii) == t || mfn_ib(&f.instrs, ii) == t) { << -2 }
+        if mir_instr_has_dest(k) && mfn_ia(&f.instrs, ii) == t { found = ii }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << found
+}
+
+fn mir_ssa_npreds(f &MFn, bi int) int {
+    mut n := 0
+    for pi in 0:f.blocks.len {
+        tk := f.blocks[pi].tkind
+        if tk == 1 && f.blocks[pi].ta == bi { n += 1 }
+        if tk == 2 && f.blocks[pi].tb == bi { n += 1 }
+        if tk == 2 && f.blocks[pi].tc == bi { n += 1 }
+    }
+    << n
+}
+
+fn mir_ssa_same_operand(f &MFn, defs &[]int, a int, b int) bool {
+    if a == b { << true }
+    ca := mir_iand_ssa_const_ix(f, defs, a)
+    cb := mir_iand_ssa_const_ix(f, defs, b)
+    << ca >= 0 && cb >= 0 && f.consts[ca] == f.consts[cb]
+}
+
+// Entry `pi` jumps into the header; its unique predecessor branches into it
+// on `init < limit` (`<=` with le), the same test the header repeats.
+// With len_local >= 0 the guard may read that local's length itself, as
+// long as nothing writes between that read and the header.
+fn mir_ssa_entry_guarded(f &MFn, defs &[]int, pi int, init_v int, limit int, le bool, len_local int) bool {
+    if mir_ssa_npreds(f, pi) != 1 { << false }
+    for qi in 0:f.blocks.len {
+        if f.blocks[qi].tkind != 2 || f.blocks[qi].tb != pi || f.blocks[qi].tc == pi { -> }
+        cond := f.blocks[qi].ta
+        if cond < 0 || cond >= f.temps.len { << false }
+        di := mir_ssa_def_in(f, qi, cond)
+        if di < 0 || mfn_ikind(&f.instrs, di) != mi_bin { << false }
+        op := mfn_ib(&f.instrs, di)
+        if (le && op != 9) || (!le && op != 8) { << false }
+        if !mir_ssa_same_operand(f, defs, mfn_ic(&f.instrs, di), init_v) { << false }
+        g := mfn_id(&f.instrs, di)
+        if len_local < 0 { << mir_ssa_same_operand(f, defs, g, limit) }
+        if g < 0 || g >= f.temps.len || mir_ssa_len_of(f, qi, g) != len_local { << false }
+        << mir_ssa_pure_tail(f, qi, mir_ssa_def_in(f, qi, g)) && mir_ssa_pure_tail(f, pi, -1)
+    }
+    << false
+}
+
+fn mir_ssa_loop_f(f &MFn, bi int) MirSsaLoop {
+    mut r := mir_ssa_loop_none()
+    nblk := f.blocks.len
+    if bi < 0 || bi >= nblk || f.blocks[bi].tkind != 2 || f.phis.len != 0 { << r }
+    lb := f.blocks[bi].tb
+    ex := f.blocks[bi].tc
+    if lb < 0 || lb >= nblk || ex < 0 || ex >= nblk || lb == bi || ex == bi || lb == ex { << r }
+    if f.blocks[lb].tkind != 1 || f.blocks[lb].ta != bi || mir_ssa_npreds(f, lb) != 1 { << r }
+    nt := f.temps.len
+    mut defs := []int{}
+    mir_count_temp_defs(f, mut &defs)
+    cond := f.blocks[bi].ta
+    if cond < 0 || cond >= nt { << r }
+    ci := mir_ssa_def_in(f, bi, cond)
+    if ci < 0 || mfn_ikind(&f.instrs, ci) != mi_bin || defs[cond] != 1 { << r }
+    op := mfn_ib(&f.instrs, ci)
+    if op != 8 && op != 9 { << r }
+    inext := mfn_ic(&f.instrs, ci)
+    limit := mfn_id(&f.instrs, ci)
+    if inext < 0 || inext >= nt || defs[inext] != 1 { << r }
+    mut len_local := -1
+    if limit >= 0 {
+        if limit >= nt || f.temps[limit] != 1 || f.temps_nslots[limit] != 1 { << r }
+        if mir_ssa_def_in(f, lb, limit) != -1 { << r }
+        if mir_ssa_def_in(f, bi, limit) != -1 {
+            len_local = mir_ssa_len_of(f, bi, limit)
+            if len_local < 0 || defs[limit] != 1 || !mir_ssa_pure_tail(f, bi, -1) { << r }
+        }
+    } else if -limit - 2 >= f.consts.len {
+        << r
+    }
+    ni := mir_ssa_def_in(f, bi, inext)
+    if ni < 0 || mfn_ikind(&f.instrs, ni) != mi_bin || mfn_ib(&f.instrs, ni) != 1 { << r }
+    lc := mfn_ic(&f.instrs, ni)
+    ld := mfn_id(&f.instrs, ni)
+    mut iphi := -1
+    if ld <= -2 && -ld - 2 < f.consts.len && f.consts[-ld - 2] == 1 { iphi = lc }
+    if lc <= -2 && -lc - 2 < f.consts.len && f.consts[-lc - 2] == 1 { iphi = ld }
+    if iphi < 0 || iphi >= nt || f.temps[iphi] != 1 || f.temps_nslots[iphi] != 1 || f.temps[inext] != 1 { << r }
+    mut ncopy := 0
+    mut back := false
+    mut ii := f.blocks[lb].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_copy {
+            ncopy += 1
+            if mfn_ia(&f.instrs, ii) == iphi {
+                if back || mfn_ib(&f.instrs, ii) != inext { << r }
+                back = true
+            }
+        } else if k != mi_nop {
+            << r
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    if !back { << r }
+    if mir_ssa_def_in(f, bi, iphi) != -1 { << r }
+    mut entries := 0
+    mut init := 0
+    for pi in 0:nblk {
+        if pi == lb { -> }
+        tk := f.blocks[pi].tkind
+        if tk == 2 && (f.blocks[pi].tb == bi || f.blocks[pi].tc == bi) { << r }
+        if tk != 1 || f.blocks[pi].ta != bi { -> }
+        di := mir_ssa_def_in(f, pi, iphi)
+        if di < 0 || mfn_ikind(&f.instrs, di) != mi_copy { << r }
+        src := mfn_ib(&f.instrs, di)
+        cix := mir_iand_ssa_const_ix(f, &defs, src)
+        if cix < 0 { << r }
+        v := f.consts[cix]
+        if entries > 0 && v != init { << r }
+        init = v
+        entries += 1
+        if limit < 0 {
+            lv := f.consts[-limit - 2]
+            if (op == 8 && v >= lv) || (op == 9 && v > lv) { << r }
+        } else if !mir_ssa_entry_guarded(f, &defs, pi, src, limit, op == 9, len_local) {
+            << r
+        }
+    }
+    if entries == 0 { << r }
+    r.ok = true
+    r.latch = lb
+    r.exit = ex
+    r.i_phi = iphi
+    r.i_next = inext
+    r.init = init
+    r.limit = limit
+    r.le = op == 9
+    r.ncopy = ncopy
+    r.len_local = len_local
+    << r
+}
+
+pub fn mir_ssa_loop(m &Mir, fi int, bi int) MirSsaLoop {
+    if fi < 0 || fi >= m.fns.len || bi < 0 { << mir_ssa_loop_none() }
+    nblk := mir_nblocks(m, fi)
+    if bi >= nblk || nblk > 64 || mir_nins(m, fi) > 512 || mir_ntemps(m, fi) > 512 { << mir_ssa_loop_none() }
+    if mir_btkind(m, fi, bi) != 2 { << mir_ssa_loop_none() }
+    lb := mir_btb(m, fi, bi)
+    if lb < 0 || lb >= nblk || lb == bi || mir_btkind(m, fi, lb) != 1 || mir_bta(m, fi, lb) != bi { << mir_ssa_loop_none() }
+    f := mir_cfg_clone_fn(m, fi, false)
+    << mir_ssa_loop_f(&f, bi)
+}
+
+pub fn mir_ssa_temp_used_beyond(m &Mir, fi int, t int, b1 int, b2 int) bool {
+    f := mir_cfg_clone_fn(m, fi, false)
+    << mir_iand_ssa_used_beyond(&f, t, b1, b2)
+}
+
+// Temps defined in the header are dead after it except keep1/keep2, and
+// the induction phi is read only by the header and latch.
+pub fn mir_ssa_loop_closed(m &Mir, fi int, bi int, lp &MirSsaLoop, keep1 int, keep2 int) bool {
+    f := mir_cfg_clone_fn(m, fi, false)
+    if mir_iand_ssa_used_beyond(&f, lp.i_phi, bi, lp.latch) { << false }
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_chan_try_recv { << false }
+        if mir_instr_has_dest(k) {
+            d := mfn_ia(&f.instrs, ii)
+            if d >= 0 && d != keep1 && d != keep2 && mir_temp_used_outside(&f, d, bi) { << false }
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << true
+}
+
+// No temp in temps is read outside the blocks in blocks.
+pub fn mir_ssa_temps_confined(m &Mir, fi int, temps &[]int, blocks &[]int) bool {
+    f := mir_cfg_clone_fn(m, fi, false)
+    for bj in 0:f.blocks.len {
+        mut inside := false
+        for x in 0:blocks.len {
+            if blocks[x] == bj { inside = true }
+        }
+        if inside { -> }
+        for ti in 0:temps.len {
+            t := temps[ti]
+            if t < 0 { -> }
+            mut ii := f.blocks[bj].head
+            for _ in 0:f.instrs.len {
+                if ii < 0 { <- }
+                if f.instr_uses_temp(ii, t) { << false }
+                ii = mfn_inext(&f.instrs, ii)
+            }
+            tk := f.blocks[bj].tkind
+            if (tk == 2 || tk == 3) && mir_val_is_temp_t(f.blocks[bj].ta, t) { << false }
+        }
+    }
+    << true
+}
+
+// None of temps is live on entry to block b: no path from b reads one
+// before redefining it. Unknown instructions count as uses, never as defs.
+pub fn mir_ssa_temps_dead_at(m &Mir, fi int, temps &[]int, b int) bool {
+    f := mir_cfg_clone_fn(m, fi, false)
+    nb := f.blocks.len
+    if b < 0 || b >= nb { << false }
+    for ti in 0:temps.len {
+        t := temps[ti]
+        if t < 0 { -> }
+        mut seen := []int{}
+        for _ in 0:nb { seen.push(0) }
+        mut work := []int{}
+        work.push(b)
+        seen[b] = 1
+        mut wi := 0
+        while wi < work.len {
+            bj := work[wi]
+            wi += 1
+            mut killed := false
+            mut ii := f.blocks[bj].head
+            for _ in 0:f.instrs.len {
+                if ii < 0 { <- }
+                if f.instr_uses_temp(ii, t) { << false }
+                k := mfn_ikind(&f.instrs, ii)
+                if mir_instr_use_schema(k, mfn_ic(&f.instrs, ii)) >= 0 && mir_instr_has_dest(k) && mfn_ia(&f.instrs, ii) == t {
+                    killed = true
+                    <-
+                }
+                ii = mfn_inext(&f.instrs, ii)
+            }
+            if killed { -> }
+            tk := f.blocks[bj].tkind
+            if (tk == 2 || tk == 3) && mir_val_is_temp_t(f.blocks[bj].ta, t) { << false }
+            if tk == 0 || tk == 3 { -> }
+            if tk != 1 && tk != 2 { << false }
+            mut s := f.blocks[bj].ta
+            if tk == 2 { s = f.blocks[bj].tb }
+            for k in 0:2 {
+                if k == 1 {
+                    if tk != 2 { <- }
+                    s = f.blocks[bj].tc
+                }
+                if s < 0 || s >= nb { << false }
+                if seen[s] == 0 {
+                    seen[s] = 1
+                    work.push(s)
+                }
+            }
+        }
+    }
+    << true
+}

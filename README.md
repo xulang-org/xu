@@ -17,26 +17,41 @@
   <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?label=Release&color=0284c7" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
   <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
-  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-13%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
   <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
 <p align="center">
   <a href="https://xulang.org">🌐 <b>Online Playground (No Install)</b></a> &nbsp;•&nbsp;
-  <a href="https://xulang.org/benchmarks">⚡ <b>13-Task Benchmark Dashboard</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>47-Task Benchmark Dashboard</b></a> &nbsp;•&nbsp;
   <a href="#-zero-friction-quick-start">🚀 <b>30s Quick Start</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/xulang-org/xu/releases">📦 <b>Download Installers</b></a>
 </p>
 
 ---
 
-## Xu 0.8.13
+## Xu 0.10.0 source update
 
-Xu 0.8.13 is the stable release of the pure Xu self-hosted toolchain. Build with a published Xu SDK seed; every generation compiles the original source and manifest and confirms a fixed point. Rust/Cargo and the historical bootstrap checkout are no longer required.
+This update adds the UI drawing and desktop foundations while retaining the compiler improvements from 0.9.4:
 
-This release fixes floating-point call preservation and element-address copies, repairs x64 map adapters and assembly symbol resolution, and simplifies MIR field updates and backend label forwarding. SDK installation keeps metadata and package discovery consistent across supported platforms.
+- Frame recording, reusable display lists, paths, image/text resources, layers, gradients and bounded caches.
+- A retained layout tree with repaint boundaries, input routing, focus, scrolling and basic controls.
+- Dynamic desktop windows and asynchronous clipboard, file-open, save-path and folder requests with cancellation and timeouts.
+- Compiler-owned version identity for `xu env`, project initialization and update checks; downloaded compilers must match the requested version before installation.
 
-Download the [0.8.13 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.8.13). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance; existing 0.8.12 measurements are not 0.8.13 results.
+The broader UI work remains in progress: editor controls, expanded menus/screen queries and WebView request lifecycle work are still pending. Published installers remain available from the release link below.
+
+## Xu 0.9.4
+
+Xu 0.9.4 is a compiler consistency and optimizer release:
+
+- **Borrow Checking Soundness**: The borrow checker now walks every expression kind (with a conservative fallback for unknown kinds), so aliasing such as `f(mut &v, &v)` is reported even when nested inside casts or arithmetic; borrows taken inside a loop now stay live across the back edge. Programs that previously compiled only because of these gaps now receive a diagnostic.
+- **Generics and Type Table Limits**: Generic declarations are no longer limited to four type parameters, type-id range overflow is asserted instead of silently wrapping, and backends that do not support a requested target fail explicitly.
+- **MIR Verification**: `XU_VERIFY=1` runs the full MIR verifier after every optimization pass; mismatches between the verifier, lowering and the backend were fixed. `XU_DUMP_MIR=<fn>` dumps a function's MIR.
+- **SSA Loop Optimization**: Scalar SSA promotion no longer depends on a per-shape whitelist, and the ARM64 loop kernels (scan, saxpy, CRC, binary search, fill, stride, predicated scan) have SSA-based matchers. Loops bounded by an `[]int` length are rotated so they qualify. Measured speedups versus 0.9.3 include `bloom_filter` ~12%, `chase_index` 9-11%, `f64_sum` ~8% and `algorithm_search` ~9% at `-O3`, with no regressions and slightly faster self-compilation.
+- **Pattern Diagnostics**: `--timings` reports `pattern-hits:` and per-function register-allocation mode; `XU_PATTERNS_OFF` disables named backend patterns for differential testing (`scripts/pattern_diff.sh`).
+
+Download the [0.9.4 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.4). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
@@ -160,17 +175,15 @@ xu build main.xu -o myapp
 
 ### CLI Command Quick Reference
 
+#### Projects and Dependencies
+
 | Command | Description |
 | :--- | :--- |
-| `xu run <file.xu>` | Rapid compilation and in-memory execution |
-| `xu build <file.xu> -o <bin>` | AOT compile to an optimized, standalone native binary |
-| `xu build --target wasm32 <file.xu>` | Cross-compile directly to WebAssembly |
-| `xu test <file.xu>` | Execute integrated unit tests and assertion suites |
-| `xu get <module>@<version>` | Add or update a dependency, install it, and update `xu.lock` |
-| `xu install [dir]` | Install the dependencies already declared in `xu.xun` |
-| `xu fmt <file.xu> -w` | Automatically format code according to official guidelines |
-| `xu doc <dir> --public` | Extract doc comments and generate clean API references |
-| `xu doctor` | Diagnostics tool checking native C linkers and SDK health |
+| `xu init [module]` | Create `xu.xun` in the current directory and a starter `main.xu` when missing |
+| `xu get <module>@<version>` | Add or upgrade an exact dependency, install into `vendor/`, and update `xu.lock` |
+| `xu install [dir]` | Install dependencies already declared in the project's `xu.xun` |
+| `xu build . --frozen -o myapp` | Build offline using the existing lockfile and local dependencies |
+| `xu env [var...]` | Inspect effective toolchain, standard-library, cache, and target settings |
 
 In a project with `xu.xun`, run `xu get github.com/xulang-org/packages@v0.1.1`
 to add or update the root module under `require:` and install its dependency
@@ -179,23 +192,64 @@ and package subpath discovery are not supported. `--offline` uses verified local
 cache/vendor data. Failed resolution or installation preserves the project's
 manifest, lock file, and vendor directory. `--frozen` rejects dependency changes.
 
+#### Building, Running, and Verification
+
+| Command | Description |
+| :--- | :--- |
+| `xu run <file.xu> -- <args...>` | Compile and launch a native program, forwarding arguments after `--` |
+| `xu build <file.xu> -o <bin>` | AOT compile a native executable; project directories are also accepted |
+| `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
+| `xu parse <file.xu>` | Parse source and print file, function, and declaration statistics |
+| `xu test <file.xu> -v` | Run `fn test_*` tests with detailed results; filter with `-run <REGEXP>` |
+| `xu test <file.xu> -bench <REGEXP>` | Run matching `fn bench_*` benchmark functions |
+| `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
+| `xu build <file.xu> --target wasm32 -o app.wasm` | Emit a WebAssembly module |
+| `xu build <AppDir> --desktop` | Package a desktop application using the required host UI SDK and tools |
+| `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
+| `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
+
+0.9.4 also provides per-pass MIR verification with `XU_VERIFY=1`,
+`XU_DUMP_MIR=<function>`, and differential pattern diagnostics with
+`XU_PATTERNS_OFF=all`. See the [CLI reference](https://xulang.org/docs/cli/) for full options.
+
+#### Development Tools and Toolchain Management
+
+| Command | Description |
+| :--- | :--- |
+| `xu fmt <file.xu> -w` | Format source in place; omit `-w` to print to stdout |
+| `xu doc <dir> --public` | Generate Markdown for public declarations; `--serve` starts a local documentation server |
+| `xu map <dir> -o flow.md` | Generate a Mermaid source flowchart; `--graph` emits structured graph data |
+| `xu doctor` | Check host tools; `--desktop --webview` checks desktop and WebView dependencies |
+| `xu native <command> [options]` | Compile/archive C modules and pack, inspect, or extract `.xulib` slices |
+| `xu lsp` | Start the stdio LSP server for VS Code, Cursor, Neovim, and other editors |
+| `xu setup -y` | Install and configure the toolchain without interactive prompts |
+| `xu up --check` | Check official releases; `xu up` and `xu update` are aliases |
+| `xu update --version 0.9.4` | Install a specific official toolchain release |
+| `xu --version` | Show the actual compiler version and host target |
+| `xu help <command>` | Show subcommand help; `<command> --help` also works |
+
 ---
 
 ## 🗺️ Project Roadmap
 
-Driven by continuous active iteration, Xu is rapidly evolving. Here is our current status and roadmap:
+This roadmap uses the **official 0.9.4 SDK** as its baseline. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
 
-- [x] **Static Native AOT Compilation**: Direct emission of optimized machine code with fixed-point bootstrap verification (`Gen2 == Gen3`)
-- [x] **Compile-Time Ownership & Borrow Inference**: Zero-GC runtime, deterministic deallocation, eliminating dangling pointers
+- [x] **Pure Xu Self-Hosting and Native AOT**: Bootstrap from a published Xu SDK, verify a fixed point, and directly emit native machine code and WebAssembly
+- [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges
 - [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication
 - [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
-- [x] **Universal Architecture Support**: Windows / macOS / Linux / LoongArch64 / RISC-V 64 / WebAssembly
-- [x] **Standalone Native Setup Wizards**: Zero-dependency self-rendered GUI wizards for Windows / macOS PKG / Linux installers
-- [x] **Production Infrastructure Packages**: Native drivers for MySQL, Postgres, Redis, ClickHouse, Kafka, SQLite, etc.
-- [ ] **Language Server Protocol (LSP)**: Deep VS Code & Neovim integration with real-time diagnostics and autocompletion
-- [ ] **Interactive Source Debugger**: Native breakpoint debugging, stack unwinding, and variable inspection
-- [ ] **Deep Monomorphization & Inlining Optimizations**: Cross-module automatic inlining and enhanced escape analysis
-- [ ] **Central Package Registry**: Cryptographically verified package distribution and automated dependency resolution
+- [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V / ARM32, WASM, and bare-metal targets
+- [x] **SDK Installation and Self-Updates**: Windows wizard, macOS PKG, cross-platform single-file Setup, and `xu up/update`
+- [x] **Reproducible Module Dependencies**: `init/get/install`, MVS, locks/vendor, proxies, offline/frozen builds, and a trusted-key checksum client
+- [x] **LSP and Editor Integration**: `xu-lsp` and VS Code/Cursor extensions; diagnostics, completion, definitions, hover, symbols, references, rename, and formatting
+- [x] **Generics and SSA Optimization Foundations**: Monomorphization without the four-type-parameter cap, scalar SSA promotion, ARM64 SSA loop kernels, and loop rotation
+- [x] **Compiler Diagnostics and Verification**: Per-pass MIR verification, MIR dumps, pattern-hit counters, and named-pattern controls
+- [x] **Infrastructure Packages**: The separate packages module provides 29 extensions including MySQL, Postgres, Redis, ClickHouse, Kafka, and SQLite
+- [x] **Traceable Cross-Language Benchmarks**: 47 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
+- [ ] **Integrated Interactive Source Debugger**: DWARF line output is available; continue the interactive breakpoint, call-stack, and variable-inspection workflow
+- [ ] **Further Optimizer Expansion**: Deeper cross-module inlining, generic specialization, escape analysis, and loop/vector optimizations across more backends
+- [ ] **Complete Target-Machine Runtime Validation**: Expand end-to-end coverage of standard libraries, networking, concurrency, and desktop UI on each platform
+- [ ] **Public Package Infrastructure**: Central registry, public proxy/checksum-log services, independent witnesses, and version hosting
 
 ---
 
@@ -205,7 +259,7 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 - ⭐ **Star the Repo**: If Xu resonates with your engineering philosophy, give us a **Star** on [GitHub](https://github.com/xulang-org/xu)—it fuels our development!
 - 💬 **Feedback & Discussions**: Have feature requests or suggestions? Open a discussion or ticket on [GitHub Issues](https://github.com/xulang-org/xu/issues).
-- 📊 **Benchmark Insights**: Explore deep CPU and memory benchmarks across 13 tasks at [xulang.org/benchmarks](https://xulang.org/benchmarks).
+- 📊 **Benchmark Insights**: Explore deep CPU and memory benchmarks across 47 tasks at [xulang.org/benchmarks](https://xulang.org/benchmarks).
 - 📚 **Comprehensive Documentation**: Read guides, syntax specifications, and tutorials at [xulang.org](https://xulang.org).
 
 ---
