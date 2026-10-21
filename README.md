@@ -164,17 +164,15 @@ xu build main.xu -o myapp
 
 ### CLI Command Quick Reference
 
+#### Projects and Dependencies
+
 | Command | Description |
 | :--- | :--- |
-| `xu run <file.xu>` | Rapid compilation and in-memory execution |
-| `xu build <file.xu> -o <bin>` | AOT compile to an optimized, standalone native binary |
-| `xu build --target wasm32 <file.xu>` | Cross-compile directly to WebAssembly |
-| `xu test <file.xu>` | Execute integrated unit tests and assertion suites |
-| `xu get <module>@<version>` | Add or update a dependency, install it, and update `xu.lock` |
-| `xu install [dir]` | Install the dependencies already declared in `xu.xun` |
-| `xu fmt <file.xu> -w` | Automatically format code according to official guidelines |
-| `xu doc <dir> --public` | Extract doc comments and generate clean API references |
-| `xu doctor` | Diagnostics tool checking native C linkers and SDK health |
+| `xu init [module]` | Create `xu.xun` in the current directory and a starter `main.xu` when missing |
+| `xu get <module>@<version>` | Add or upgrade an exact dependency, install into `vendor/`, and update `xu.lock` |
+| `xu install [dir]` | Install dependencies already declared in the project's `xu.xun` |
+| `xu build . --frozen -o myapp` | Build offline using the existing lockfile and local dependencies |
+| `xu env [var...]` | Inspect effective toolchain, standard-library, cache, and target settings |
 
 In a project with `xu.xun`, run `xu get github.com/xulang-org/packages@v0.1.1`
 to add or update the root module under `require:` and install its dependency
@@ -183,23 +181,64 @@ and package subpath discovery are not supported. `--offline` uses verified local
 cache/vendor data. Failed resolution or installation preserves the project's
 manifest, lock file, and vendor directory. `--frozen` rejects dependency changes.
 
+#### Building, Running, and Verification
+
+| Command | Description |
+| :--- | :--- |
+| `xu run <file.xu> -- <args...>` | Compile and launch a native program, forwarding arguments after `--` |
+| `xu build <file.xu> -o <bin>` | AOT compile a native executable; project directories are also accepted |
+| `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
+| `xu parse <file.xu>` | Parse source and print file, function, and declaration statistics |
+| `xu test <file.xu> -v` | Run `fn test_*` tests with detailed results; filter with `-run <REGEXP>` |
+| `xu test <file.xu> -bench <REGEXP>` | Run matching `fn bench_*` benchmark functions |
+| `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
+| `xu build <file.xu> --target wasm32 -o app.wasm` | Emit a WebAssembly module |
+| `xu build <AppDir> --desktop` | Package a desktop application using the required host UI SDK and tools |
+| `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
+| `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
+
+0.9.4 also provides per-pass MIR verification with `XU_VERIFY=1`,
+`XU_DUMP_MIR=<function>`, and differential pattern diagnostics with
+`XU_PATTERNS_OFF=all`. See the [CLI reference](https://xulang.org/docs/cli/) for full options.
+
+#### Development Tools and Toolchain Management
+
+| Command | Description |
+| :--- | :--- |
+| `xu fmt <file.xu> -w` | Format source in place; omit `-w` to print to stdout |
+| `xu doc <dir> --public` | Generate Markdown for public declarations; `--serve` starts a local documentation server |
+| `xu map <dir> -o flow.md` | Generate a Mermaid source flowchart; `--graph` emits structured graph data |
+| `xu doctor` | Check host tools; `--desktop --webview` checks desktop and WebView dependencies |
+| `xu native <command> [options]` | Compile/archive C modules and pack, inspect, or extract `.xulib` slices |
+| `xu lsp` | Start the stdio LSP server for VS Code, Cursor, Neovim, and other editors |
+| `xu setup -y` | Install and configure the toolchain without interactive prompts |
+| `xu up --check` | Check official releases; `xu up` and `xu update` are aliases |
+| `xu update --version 0.9.4` | Install a specific official toolchain release |
+| `xu --version` | Show the actual compiler version and host target |
+| `xu help <command>` | Show subcommand help; `<command> --help` also works |
+
 ---
 
 ## 🗺️ Project Roadmap
 
-Driven by continuous active iteration, Xu is rapidly evolving. Here is our current status and roadmap:
+This roadmap uses the **official 0.9.4 SDK** as its baseline. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
 
-- [x] **Static Native AOT Compilation**: Direct emission of optimized machine code with fixed-point bootstrap verification (`Gen2 == Gen3`)
-- [x] **Compile-Time Ownership & Borrow Inference**: Zero-GC runtime, deterministic deallocation, eliminating dangling pointers
+- [x] **Pure Xu Self-Hosting and Native AOT**: Bootstrap from a published Xu SDK, verify a fixed point, and directly emit native machine code and WebAssembly
+- [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges
 - [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication
 - [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
-- [x] **Universal Architecture Support**: Windows / macOS / Linux / LoongArch64 / RISC-V 64 / WebAssembly
-- [x] **Standalone Native Setup Wizards**: Zero-dependency self-rendered GUI wizards for Windows / macOS PKG / Linux installers
-- [x] **Production Infrastructure Packages**: Native drivers for MySQL, Postgres, Redis, ClickHouse, Kafka, SQLite, etc.
-- [ ] **Language Server Protocol (LSP)**: Deep VS Code & Neovim integration with real-time diagnostics and autocompletion
-- [ ] **Interactive Source Debugger**: Native breakpoint debugging, stack unwinding, and variable inspection
-- [ ] **Deep Monomorphization & Inlining Optimizations**: Cross-module automatic inlining and enhanced escape analysis
-- [ ] **Central Package Registry**: Cryptographically verified package distribution and automated dependency resolution
+- [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V / ARM32, WASM, and bare-metal targets
+- [x] **SDK Installation and Self-Updates**: Windows wizard, macOS PKG, cross-platform single-file Setup, and `xu up/update`
+- [x] **Reproducible Module Dependencies**: `init/get/install`, MVS, locks/vendor, proxies, offline/frozen builds, and a trusted-key checksum client
+- [x] **LSP and Editor Integration**: `xu-lsp` and VS Code/Cursor extensions; diagnostics, completion, definitions, hover, symbols, references, rename, and formatting
+- [x] **Generics and SSA Optimization Foundations**: Monomorphization without the four-type-parameter cap, scalar SSA promotion, ARM64 SSA loop kernels, and loop rotation
+- [x] **Compiler Diagnostics and Verification**: Per-pass MIR verification, MIR dumps, pattern-hit counters, and named-pattern controls
+- [x] **Infrastructure Packages**: The separate packages module provides 29 extensions including MySQL, Postgres, Redis, ClickHouse, Kafka, and SQLite
+- [x] **Traceable Cross-Language Benchmarks**: 47 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
+- [ ] **Integrated Interactive Source Debugger**: DWARF line output is available; continue the interactive breakpoint, call-stack, and variable-inspection workflow
+- [ ] **Further Optimizer Expansion**: Deeper cross-module inlining, generic specialization, escape analysis, and loop/vector optimizations across more backends
+- [ ] **Complete Target-Machine Runtime Validation**: Expand end-to-end coverage of standard libraries, networking, concurrency, and desktop UI on each platform
+- [ ] **Public Package Infrastructure**: Central registry, public proxy/checksum-log services, independent witnesses, and version hosting
 
 ---
 
