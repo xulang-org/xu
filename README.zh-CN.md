@@ -164,33 +164,77 @@ xu build main.xu -o myapp
 
 ### 常用开发命令速查
 
+#### 项目与依赖
+
 | 命令 | 说明 |
 | :--- | :--- |
-| `xu run <file.xu>` | 极速编译并直接在内存中执行，快速迭代逻辑 |
-| `xu build <file.xu> -o <bin>` | 原生 AOT 静态编译生成优化后的无依赖机器码 |
-| `xu build --target wasm32 <file.xu>` | 一键跨架构输出浏览器端 WebAssembly 二进制 |
-| `xu test <file.xu>` | 执行内置单元测试与断言套件 |
-| `xu fmt <file.xu> -w` | 官方格式化器，一键统一代码风格排版 |
-| `xu doc <dir> --public` | 自动提取函数与模块注释，生成 API 文档 |
-| `xu doctor` | 环境健康诊断，检测系统 C 链接器与图形 SDK 状态 |
+| `xu init [module]` | 在当前目录创建 `xu.xun`，缺少 `main.xu` 时同时生成入口示例 |
+| `xu get <module>@<version>` | 添加或升级精确版本依赖，安装到 `vendor/` 并更新 `xu.lock` |
+| `xu install [dir]` | 安装指定项目 `xu.xun` 中已有的依赖 |
+| `xu build . --frozen -o myapp` | 使用现有锁文件和本地依赖执行冻结、离线构建 |
+| `xu env [var...]` | 查看工具链、标准库、依赖缓存与目标平台的有效配置 |
+
+在含有 `xu.xun` 的项目中，执行 `xu get github.com/xulang-org/packages@v0.1.1`
+即可添加官方扩展模块。依赖需要显式版本；`--offline` 使用本地缓存或 vendor，
+`--frozen` 拒绝依赖变化。
+
+#### 构建、运行与验证
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `xu run <file.xu> -- <args...>` | 编译并启动本机程序，`--` 后的参数传给程序 |
+| `xu build <file.xu> -o <bin>` | AOT 编译为原生可执行文件；项目目录也可作为输入 |
+| `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
+| `xu parse <file.xu>` | 解析源码，输出文件、函数与声明统计 |
+| `xu test <file.xu> -v` | 执行 `fn test_*` 测试并显示详细结果；可用 `-run <REGEXP>` 过滤 |
+| `xu test <file.xu> -bench <REGEXP>` | 执行匹配的 `fn bench_*` 基准函数 |
+| `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
+| `xu build <file.xu> --target wasm32 -o app.wasm` | 生成 WebAssembly 模块 |
+| `xu build <AppDir> --desktop` | 打包桌面应用；需要对应宿主 UI SDK 与工具链 |
+| `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
+| `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
+
+0.9.4 还提供 `XU_VERIFY=1` 逐 pass MIR 验证、`XU_DUMP_MIR=<函数名>`
+与 `XU_PATTERNS_OFF=all` 模式对拍诊断。完整选项见[命令行参考](https://xulang.org/zh/docs/cli/)。
+
+#### 开发工具与工具链管理
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `xu fmt <file.xu> -w` | 原地格式化源码；省略 `-w` 时输出到终端 |
+| `xu doc <dir> --public` | 提取公开声明，生成 Markdown API 文档；`--serve` 启动本地文档服务 |
+| `xu map <dir> -o flow.md` | 生成 Mermaid 源码流程图；`--graph` 输出结构化图数据 |
+| `xu doctor` | 检查宿主工具链；`--desktop --webview` 检查桌面与 WebView 依赖 |
+| `xu native <command> [options]` | 编译、归档 C 模块，打包、检视或提取 `.xulib` 平台切片 |
+| `xu lsp` | 启动标准输入/输出上的 LSP 服务，供 VS Code、Cursor、Neovim 等编辑器调用 |
+| `xu setup -y` | 静默安装并配置工具链环境 |
+| `xu up --check` | 仅检查官方发布版本；`xu up` 与 `xu update` 为同义命令 |
+| `xu update --version 0.9.4` | 安装指定版本的官方工具链 |
+| `xu --version` | 显示实际编译器版本及宿主目标 |
+| `xu help <command>` | 查看子命令帮助，也可使用 `<command> --help` |
 
 ---
 
 ## 🗺️ 项目路线图 (Roadmap)
 
-通过持续的高频迭代，Xu 正在稳步成长。以下是当前的研发进展与未来规划：
+以下以 **0.9.4 正式 SDK** 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
 
-- [x] **全静态 AOT 编译闭环**：多架构优化机器码直出，自举不动点验证（`Gen2 == Gen3`）
-- [x] **编译期所有权与借用推导**：零 GC 停顿，确定性生命周期回收，杜绝悬垂指针
+- [x] **纯 Xu 自举与原生 AOT**：以已发布 Xu SDK 为种子，验证自举固定点；直接生成原生机器码与 WebAssembly
+- [x] **编译期所有权与借用推导**：确定性资源回收；0.9.4 补齐嵌套表达式与循环回边的借用检查
 - [x] **原生协程与管道并发**：`xu` 关键字轻量调度 + 强类型 `chan` 信道机制
 - [x] **极简符号流控制**：`<<` 返回、`>>` 抛错与 `or (err) { ... }` 强制就地处理
-- [x] **全平台与多架构矩阵**：支持 Windows / macOS / Linux / LoongArch64 / RISC-V 64 / WASM
-- [x] **单文件自绘原生安装程序**：零依赖 Windows 自绘向导 / macOS PKG / Linux 单文件
-- [x] **主流基础设施生态包**：开箱即用 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等
-- [ ] **LSP 语言服务协议（Language Server Protocol）**：深度支持 VS Code / Neovim 自动补全与符号跳转
-- [ ] **原生源代码调试器（Interactive Debugger）**：支持断点调试、调用栈回溯与变量监视
-- [ ] **泛型单态化深度特化优化**：跨模块函数自动内联、循环向量化与逃逸分析增强
-- [ ] **官方中央包注册中心（Package Registry）**：自动化签名依赖解析、发布与版本托管
+- [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V / ARM32、WASM 及裸机目标
+- [x] **SDK 安装与自更新**：Windows 安装向导、macOS PKG、跨平台单文件 Setup 与 `xu up/update`
+- [x] **可复现模块依赖**：`init/get/install`、MVS、锁文件/vendor、代理、离线/冻结构建与固定公钥校验客户端
+- [x] **LSP 与编辑器集成**：`xu-lsp`、VS Code/Cursor 扩展；诊断、补全、定义、悬停、大纲、引用、重命名与格式化
+- [x] **泛型与 SSA 优化基础**：泛型单态化、移除 4 类型参数限制、标量 SSA 提升、ARM64 SSA 循环内核与循环旋转
+- [x] **编译器诊断与验证**：逐 pass MIR 验证、MIR 导出、模式命中统计与具名模式开关
+- [x] **主流基础设施生态包**：独立 packages 模块提供 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等 29 个扩展包
+- [x] **可追溯的跨语言横测**：47 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
+- [ ] **集成交互式源代码调试器**：已有 DWARF 行号输出，继续完善断点、调用栈与变量监视的交互工作流
+- [ ] **优化器进一步扩展**：深化跨模块内联、泛型特化、逃逸分析与更多后端的循环/向量优化
+- [ ] **完整目标机运行验收**：补齐各平台标准库、网络、并发与桌面 UI 的端到端运行覆盖
+- [ ] **公共包基础设施**：中央注册中心、公共代理/校验日志服务、独立见证与版本托管
 
 ---
 
