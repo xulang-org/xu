@@ -30,9 +30,9 @@
 
 ---
 
-## Xu 0.9.4
+## Xu 0.10.1（当前源码树）
 
-Xu 0.9.4 是一个编译器一致性与优化器版本：
+当前源码树报告的 Xu 版本是 0.10.1，包含以下编译器一致性与优化器改进：
 
 - **借用检查完整性**：借用检查器现在遍历全部表达式种类（未知种类保守处理），像 `f(mut &v, &v)` 这样的别名即使嵌套在类型转换或算术表达式中也会被报告；循环内产生的借用在回边上保持存活。此前依赖这些漏洞才能通过编译的程序现在会收到诊断。
 - **泛型与类型表上限**：泛型声明不再限制最多 4 个类型参数；类型号段溢出改为断言而非静默回绕；不支持所请求目标的后端会显式报错。
@@ -40,7 +40,11 @@ Xu 0.9.4 是一个编译器一致性与优化器版本：
 - **SSA 循环优化**：标量 SSA 提升不再依赖按形状划分的白名单；ARM64 循环内核（scan、saxpy、CRC、二分查找、fill、stride、带谓词 scan）均有基于 SSA 的匹配器；以 `[]int` 长度为界的循环会被旋转以满足匹配条件。相对 0.9.3 实测：`bloom_filter` 约 12%、`chase_index` 9–11%、`f64_sum` 约 8%、`algorithm_search`（`-O3`）约 9% 的提速，无性能回退，自举编译也略快。
 - **模式诊断**：`--timings` 输出 `pattern-hits:` 以及每个函数的寄存器分配模式；`XU_PATTERNS_OFF` 可关闭具名后端模式，用于差分测试（`scripts/pattern_diff.sh`）。
 
-下载 [0.9.4 SDK 与安装包](https://github.com/xulang-org/xu/releases/tag/v0.9.4)。[基准页面](https://xulang.org/zh/benchmarks)保留每次实测的编译器版本与来源。
+已发布的 SDK 与安装包请查看 [发布页面](https://github.com/xulang-org/xu/releases)。[基准页面](https://xulang.org/zh/benchmarks)保留每次实测的编译器版本与来源。
+
+产品自举链使用经过验证的 hosted seed，对源码清单计算哈希，并要求相邻代际达到固定点。当前仓库不宣称仅凭已提交源码完成无种子自举。
+
+协程调用是所有权边界：`xu` 传递拥有型值或使用信道，借用型 `&T` 与 `&mut T` 不会跨入另一个协程。`<-` 按上下文区分语义：语句形式表示 `break`，表达式形式（例如 `<-ch`）表示从信道接收。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 
@@ -186,8 +190,8 @@ xu build main.xu -o myapp
 - [x] **极简符号流控制**：`<<` 返回、`>>` 抛错与 `or (err) { ... }` 强制就地处理
 - [x] **全平台与多架构矩阵**：支持 Windows / macOS / Linux / LoongArch64 / RISC-V 64 / WASM
 - [x] **单文件自绘原生安装程序**：零依赖 Windows 自绘向导 / macOS PKG / Linux 单文件
-- [x] **主流基础设施生态包**：开箱即用 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等
-- [ ] **LSP 语言服务协议（Language Server Protocol）**：深度支持 VS Code / Neovim 自动补全与符号跳转
+- [x] **主流基础设施生态包**：官方 packages 仓库提供 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等原生驱动，可用 `xu get` 添加
+- [x] **LSP 语言服务协议（Language Server Protocol）**：`xu-lsp` 与 VS Code 集成通过标准 LSP 提供实时诊断、格式化、跳转、悬停、符号、补全、引用查找和重命名
 - [ ] **原生源代码调试器（Interactive Debugger）**：支持断点调试、调用栈回溯与变量监视
 - [ ] **泛型单态化深度特化优化**：跨模块函数自动内联、循环向量化与逃逸分析增强
 - [ ] **官方中央包注册中心（Package Registry）**：自动化签名依赖解析、发布与版本托管

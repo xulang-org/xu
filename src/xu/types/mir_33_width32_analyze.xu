@@ -1,0 +1,453 @@
+@xu/types
+
+// Function-local flow-sensitive analysis. State cells are locals followed by
+// temporaries. Unknown or unsupported definitions are full i32 carriers, so
+// only a producer whose computed interval is outside i32 creates a finding.
+pub struct W32Bad {
+    pub fi int
+    pub ii int
+    pub bi int
+    pub op int
+    pub reason int
+}
+
+const w32_budget_blocks = 4096
+const w32_budget_steps = 131072
+const w32_arg_limit = 1024
+
+fn w32_copy_iv(v &W32Iv) W32Iv { << W32Iv{lo: v.lo, hi: v.hi, top: v.top} }
+fn w32_copy_state(a &[]W32Iv) []W32Iv {
+    mut out := []W32Iv{}
+    for i in 0:a.len { out.push(W32Iv{lo: a[i].lo, hi: a[i].hi, top: a[i].top}) }
+    << out
+}
+fn w32_state_eq(a &[]W32Iv, b &[]W32Iv) bool {
+    if a.len != b.len { << false }
+    for i in 0:a.len {
+        if a[i].top != b[i].top || a[i].lo != b[i].lo || a[i].hi != b[i].hi { << false }
+    }
+    << true
+}
+
+fn w32_note(bad &mut []W32Bad, fi int, ii int, bi int, op int, reason int) {
+    // A producer may be revisited by a loop. Keep one diagnostic per MIR
+    // instruction and function; this also makes warning counts stable.
+    for i in 0:bad.len {
+        if bad[i].fi == fi && bad[i].ii == ii && bad[i].bi == bi && bad[i].reason == reason { << }
+    }
+    bad.push(W32Bad{fi: fi, ii: ii, bi: bi, op: op, reason: reason})
+}
+
+fn w32_is_int_temp(m &Mir, fi int, t int) bool {
+    << t >= 0 && t < mir_ntemps(m, fi) && mir_temp_ty(m, fi, t) == 1
+}
+
+fn w32_is_int_local(m &Mir, fi int, l int) bool {
+    << l >= 0 && l < mir_nlocals(m, fi) && mir_local_ty(m, fi, l) == 1
+}
+
+fn w32_const_index(m &Mir, fi int, v int) int {
+    if v > -2 { << -1 }
+    // Do not evaluate -v first: v can be the minimum host integer.
+    ci := 0 - (v + 2)
+    if ci < 0 || ci >= mir_nconsts(m, fi) { << -1 }
+    << ci
+}
+
+fn w32_value(m &Mir, fi int, st &[]W32Iv, nl int, v int) W32Iv {
+    if v >= 0 {
+        idx := nl + v
+        if v >= mir_ntemps(m, fi) || idx < 0 || idx >= st.len { << w32_full() }
+        << W32Iv{lo: st[idx].lo, hi: st[idx].hi, top: st[idx].top}
+    }
+    ci := w32_const_index(m, fi, v)
+    if ci >= 0 { << w32_const(mir_const_at(m, fi, ci)) }
+    << w32_full()
+}
+
+fn w32_value_is_bad_const(m &Mir, fi int, v int) bool {
+    ci := w32_const_index(m, fi, v)
+    if ci < 0 { << false }
+    << !w32_fits(&w32_const(mir_const_at(m, fi, ci)))
+}
+
+fn w32_check_const(m &Mir, fi int, v int, record bool, bad &mut []W32Bad, ii int, bi int, op int) {
+    if record && w32_value_is_bad_const(m, fi, v) { w32_note(bad, fi, ii, bi, op, 2) }
+}
+
+fn w32_set(st &mut []W32Iv, i int, v &W32Iv) {
+    if i >= 0 && i < st.len { st[i] = w32_copy_iv(v) }
+}
+
+fn w32_produce(st &mut []W32Iv, cell int, v &W32Iv, record bool, bad &mut []W32Bad,
+               fi int, ii int, bi int, op int, reason int) {
+    if record && !w32_fits(v) { w32_note(bad, fi, ii, bi, op, reason) }
+    if w32_fits(v) {
+        w32_set(st, cell, v)
+    } else {
+        full := w32_full()
+        w32_set(st, cell, &full)
+    }
+}
+
+fn w32_call_is_unbounded(k int) bool {
+    // Runtime-produced ints whose host value can exceed signed i32.
+    if k == 28 || k == 136 { << true } // now_ns / wall_time_ns
+    if k >= 47 && k <= 50 { << true } // uid/gid/euid/egid
+    if k == 25 || k == 57 || k == 63 || k == 127 || k == 128 { << true } // parse/stat/atomic/seek/pipe
+    << false
+}
+
+fn w32_call_arg_check(m &Mir, fi int, ii int, kind int, ap int, record bool, bad &mut []W32Bad, bi int) {
+    mut n := 0
+    mut p := ap
+    while p >= 0 && n < w32_arg_limit {
+        // volatile address constants are unsigned u32 addresses and have a
+        // separate MMIO-window check; skip only the first argument.
+        if !(kind >= 41 && kind <= 44 && n == 0) {
+            w32_check_const(m, fi, mir_marg_v(m, fi, p), record, bad, ii, bi, 0)
+        }
+        p = mir_marg_next(m, fi, p)
+        n += 1
+    }
+}
+
+fn w32_step(m &Mir, fi int, ii int, bi int, st &mut []W32Iv, nl int,
+            record bool, bad &mut []W32Bad) {
+    k := mir_ikind(m, fi, ii)
+    a := mir_ia(m, fi, ii)
+    b := mir_ib(m, fi, ii)
+    c := mir_ic(m, fi, ii)
+    d := mir_id(m, fi, ii)
+    if k == mi_nop { << }
+    if k == mi_call || k == mi_xu || k == mi_store_ptr || k == mi_store_buf_ptr {
+        for ai in 0:mir_nins(m, fi) {
+            if mir_ikind(m, fi, ai) == mi_addr && mir_ic(m, fi, ai) == 0 {
+                local := mir_ib(m, fi, ai)
+                if w32_is_int_local(m, fi, local) { st[local] = w32_full() }
+            }
+        }
+    }
+    if k == mi_copy {
+        if !w32_is_int_temp(m, fi, a) { << }
+        w32_check_const(m, fi, b, record, bad, ii, bi, 0)
+        x := w32_value(m, fi, &*st, nl, b)
+        w32_produce(st, nl + a, &x, record, bad, fi, ii, bi, 0, 2)
+        <<
+    }
+    if k == mi_load_local {
+        if !w32_is_int_temp(m, fi, a) || !w32_is_int_local(m, fi, b) { << }
+        if b >= 0 && b < st.len {
+            v := W32Iv{lo: st[b].lo, hi: st[b].hi, top: st[b].top}
+            w32_set(st, nl + a, &v)
+        }
+        <<
+    }
+    if k == mi_store_local {
+        if !w32_is_int_local(m, fi, a) { << }
+        w32_check_const(m, fi, b, record, bad, ii, bi, 0)
+        x := w32_value(m, fi, &*st, nl, b)
+        w32_produce(st, a, &x, record, bad, fi, ii, bi, 0, 2)
+        <<
+    }
+    if k == mi_bin {
+        // Comparisons return bool but still consume int constants. Reject
+        // an out-of-range operand before the backend can truncate it.
+        if !w32_is_int_temp(m, fi, a) {
+            if w32_is_int_temp(m, fi, c) || w32_is_int_temp(m, fi, d) || (c <= -2 && d <= -2) {
+                w32_check_const(m, fi, c, record, bad, ii, bi, b)
+                w32_check_const(m, fi, d, record, bad, ii, bi, b)
+            }
+            <<
+        }
+        w32_check_const(m, fi, c, record, bad, ii, bi, b)
+        w32_check_const(m, fi, d, record, bad, ii, bi, b)
+        x := w32_value(m, fi, &*st, nl, c)
+        y := w32_value(m, fi, &*st, nl, d)
+        r := w32_binop(b, &x, &y)
+        w32_produce(st, nl + a, &r, record, bad, fi, ii, bi, b, 1)
+        <<
+    }
+    if k == mi_un {
+        if !w32_is_int_temp(m, fi, a) { << }
+        w32_check_const(m, fi, c, record, bad, ii, bi, b)
+        if b == 1 {
+            x := w32_value(m, fi, &*st, nl, c)
+            r := w32_neg(&x)
+            w32_produce(st, nl + a, &r, record, bad, fi, ii, bi, b, 1)
+            <<
+        }
+        if b == 5 {
+            mut src_ty := 1
+            if c >= 0 && c < mir_ntemps(m, fi) { src_ty = mir_temp_ty(m, fi, c) }
+            if src_ty == 8 {
+                r := w32_full()
+                w32_set(st, nl + a, &r)
+                <<
+            }
+            if src_ty == 10 {
+                r := w32_iv(0, 255)
+                w32_set(st, nl + a, &r)
+                <<
+            }
+            if src_ty == 9 {
+                r := w32_iv(0, 4294967295)
+                w32_produce(st, nl + a, &r, record, bad, fi, ii, bi, b, 3)
+                <<
+            }
+            x := w32_value(m, fi, &*st, nl, c)
+            w32_produce(st, nl + a, &x, record, bad, fi, ii, bi, b, 3)
+            <<
+        }
+        if b == 4 {
+            r := w32_top()
+            w32_produce(st, nl + a, &r, record, bad, fi, ii, bi, b, 3)
+            <<
+        }
+        r := w32_full()
+        w32_set(st, nl + a, &r)
+        <<
+    }
+    // Direct stores can carry a literal without an intermediate Copy. The
+    // element byte count is the only type information retained in these MIR
+    // forms; 8-byte elements are the int candidates.
+    if k == mi_store_index {
+        if d == 8 || d == -8 { w32_check_const(m, fi, c, record, bad, ii, bi, 0) }
+        <<
+    }
+    if k == mi_arr_push {
+        if d == 8 || d == -8 { w32_check_const(m, fi, b, record, bad, ii, bi, 0) }
+        <<
+    }
+    if k == mi_arr_push4 || (k == mi_array_lit && d == 8) {
+        mut ap := c
+        if k == mi_arr_push4 { ap = b }
+        mut count := 0
+        while ap >= 0 && count < w32_arg_limit {
+            w32_check_const(m, fi, mir_marg_v(m, fi, ap), record, bad, ii, bi, 0)
+            ap = mir_marg_next(m, fi, ap)
+            count += 1
+        }
+        <<
+    }
+    if k == mi_store_ptr || k == mi_store_buf_ptr || k == mi_store_field {
+        if d == 1 { w32_check_const(m, fi, a, record, bad, ii, bi, 0) }
+        <<
+    }
+    if k == mi_chan_send {
+        w32_check_const(m, fi, b, record, bad, ii, bi, 0)
+        <<
+    }
+    if k == mi_index_rmw || k == mi_field_rmw {
+        mut op := mir_icol(m, fi, ii)
+        if k == mi_field_rmw { op = mir_icol(m, fi, ii) }
+        // Index RMW d is element bytes; field RMW d is the field type tag.
+        mut int_rmw := k == mi_field_rmw && d == 1
+        if k == mi_index_rmw { int_rmw = d == 8 || d == -8 }
+        if int_rmw {
+            lhs := w32_full()
+            rhs := w32_value(m, fi, &*st, nl, c)
+            result := w32_binop(op, &lhs, &rhs)
+            if record && !w32_fits(&result) { w32_note(bad, fi, ii, bi, op, 1) }
+        }
+        <<
+    }
+    if k == mi_call {
+        // Some runtime results wrap the wide int in a result/aggregate.
+        // Check the producer before filtering the destination's outer type.
+        if w32_call_is_unbounded(b) && record { w32_note(bad, fi, ii, bi, b, 4) }
+        w32_call_arg_check(m, fi, ii, b, c, record, bad, bi)
+        if a >= 0 && w32_is_int_temp(m, fi, a) {
+            if b == 43 {
+                r := w32_full()
+                w32_set(st, nl + a, &r)
+                <<
+            }
+            if b == 44 {
+                r := w32_iv(0, 255)
+                w32_set(st, nl + a, &r)
+                <<
+            }
+            if w32_call_is_unbounded(b) {
+                r := w32_top()
+                w32_produce(st, nl + a, &r, record, bad, fi, ii, bi, b, 4)
+                <<
+            }
+            r := w32_full()
+        w32_set(st, nl + a, &r)
+        }
+        <<
+    }
+    // mi_xu has no destination in its current ABI; its argument chain is a
+    // carrier boundary and remains checked by call-site propagation.
+}
+
+fn w32_entry_state(m &Mir, fi int, params &[]W32Iv) []W32Iv {
+    mut st := []W32Iv{}
+    n := mir_nlocals(m, fi) + mir_ntemps(m, fi)
+    for i in 0:n { st.push(w32_full()) }
+    np := mir_fn_nparams(m, fi)
+    for i in 0:np {
+        if i < params.len && w32_is_int_local(m, fi, i) { st[i] = W32Iv{lo: params[i].lo, hi: params[i].hi, top: params[i].top} }
+    }
+    << st
+}
+
+fn w32_branch_cmp(m &Mir, fi int, bi int, cond int) []int {
+    mut out := [-1, -1, -1]
+    if cond < 0 { << out }
+    mut ii := mir_bhead(m, fi, bi)
+    mut def := -1
+    while ii >= 0 {
+        if mir_ikind(m, fi, ii) == mi_bin && mir_ia(m, fi, ii) == cond { def = ii }
+        ii = mir_inext(m, fi, ii)
+    }
+    if def >= 0 && mir_ib(m, fi, def) >= 6 && mir_ib(m, fi, def) <= 11 {
+        out = [mir_ib(m, fi, def), mir_ic(m, fi, def), mir_id(m, fi, def)]
+    }
+    << out
+}
+
+fn w32_edge(m &Mir, fi int, bi int, st &[]W32Iv, nl int, then_edge bool) []W32Iv {
+    mut out := w32_copy_state(st)
+    if mir_btkind(m, fi, bi) != 2 { << out }
+    cmp := w32_branch_cmp(m, fi, bi, mir_bta(m, fi, bi))
+    if cmp[0] < 0 { << out }
+    x := w32_value(m, fi, &out, nl, cmp[1])
+    y := w32_value(m, fi, &out, nl, cmp[2])
+    r := w32_refine(cmp[0], &x, &y, then_edge)
+    if cmp[1] >= 0 && cmp[1] < mir_ntemps(m, fi) { w32_set(mut &out, nl + cmp[1], &r) }
+    << out
+}
+
+// Decide only when the whole operand intervals agree. Unknown conditions
+// keep both edges, so path enumeration never discards a feasible execution.
+fn w32_edge_possible(m &Mir, fi int, bi int, st &[]W32Iv, nl int, taken bool) bool {
+    if mir_btkind(m, fi, bi) != 2 { << true }
+    cmp := w32_branch_cmp(m, fi, bi, mir_bta(m, fi, bi))
+    if cmp[0] < 0 { << true }
+    x := w32_value(m, fi, st, nl, cmp[1])
+    y := w32_value(m, fi, st, nl, cmp[2])
+    if x.top || y.top { << true }
+    op := cmp[0]
+    mut yes := false
+    mut no := false
+    if op == 6 {
+        yes = x.lo == x.hi && y.lo == y.hi && x.lo == y.lo
+        no = x.hi < y.lo || y.hi < x.lo
+    }
+    if op == 7 {
+        no = x.lo == x.hi && y.lo == y.hi && x.lo == y.lo
+        yes = x.hi < y.lo || y.hi < x.lo
+    }
+    if op == 8 { yes = x.hi < y.lo
+        no = x.lo >= y.hi }
+    if op == 9 { yes = x.hi <= y.lo
+        no = x.lo > y.hi }
+    if op == 10 { yes = x.lo > y.hi
+        no = x.hi <= y.lo }
+    if op == 11 { yes = x.lo >= y.hi
+        no = x.hi < y.lo }
+    if taken { << !no }
+    << !yes
+}
+
+// Keep bounded path states until a previously visited state covers the new
+// one. This proves small counted loops without losing the correlation
+// between their induction variable and accumulator. The cell/state budgets
+// fail closed: no partially explored state is ever accepted as a proof.
+fn w32_fixpoint(m &Mir, fi int, params &[]W32Iv, entries &mut []W32Iv, reachable &mut []bool) bool {
+    nb := mir_nblocks(m, fi)
+    nl := mir_nlocals(m, fi)
+    nc := nl + mir_ntemps(m, fi)
+    if nb <= 0 { << true }
+    if nb > w32_budget_blocks || nc < 0 || nc > 2048 { << false }
+    for i in 0:nb { reachable.push(false) }
+    for i in 0:nb * nc { entries.push(w32_full()) }
+    mut states := w32_entry_state(m, fi, params)
+    mut work := [0]
+    mut at := 0
+    while at < work.len {
+        if work.len > 4096 || states.len > 1048576 { << false }
+        bi := work[at]
+        mut st := []W32Iv{}
+        for c in 0:nc { st.push(states[at * nc + c]) }
+        at += 1
+        for c in 0:nc {
+            v := st[c]
+            idx := bi * nc + c
+            if !reachable[bi] { entries[idx] = v } else {
+                old := entries[idx]
+                entries[idx] = w32_join(&old, &v)
+            }
+        }
+        reachable[bi] = true
+        mut ii := mir_bhead(m, fi, bi)
+        mut scratch := []W32Bad{}
+        mut steps := 0
+        while ii >= 0 {
+            steps += 1
+            if steps > mir_nins(m, fi) { << false }
+            w32_step(m, fi, ii, bi, mut &st, nl, false, mut &scratch)
+            ii = mir_inext(m, fi, ii)
+        }
+        mut succ := []int{}
+        tk := mir_btkind(m, fi, bi)
+        if tk == 1 { succ.push(mir_bta(m, fi, bi)) }
+        if tk == 2 {
+            succ.push(mir_btb(m, fi, bi))
+            succ.push(mir_btc(m, fi, bi))
+        }
+        for si in 0:succ.len {
+            to := succ[si]
+            if to < 0 || to >= nb { << false }
+            if !w32_edge_possible(m, fi, bi, &st, nl, si == 0) { -> }
+            edge := w32_edge(m, fi, bi, &st, nl, si == 0)
+            mut covered := false
+            for wi in 0:work.len {
+                if work[wi] != to { -> }
+                mut contains := true
+                for c in 0:nc {
+                    old := states[wi * nc + c]
+                    v := edge[c]
+                    if !old.top && (v.top || old.lo > v.lo || old.hi < v.hi) { contains = false }
+                }
+                if contains { covered = true
+                    <- }
+            }
+            if covered { -> }
+            work.push(to)
+            for c in 0:nc { states.push(edge[c]) }
+        }
+    }
+    << true
+}
+
+pub fn w32_check_fn(m &Mir, fi int, params &[]W32Iv, bad &mut []W32Bad) bool {
+    mut entries := []W32Iv{}
+    mut reachable := []bool{}
+    if !w32_fixpoint(m, fi, params, mut &entries, mut &reachable) { << false }
+    nb := mir_nblocks(m, fi)
+    nl := mir_nlocals(m, fi)
+    nc := nl + mir_ntemps(m, fi)
+    for bi in 0:nb {
+        if !reachable[bi] { -> }
+        mut st := []W32Iv{}
+        for c in 0:nc {
+            v := entries[bi * nc + c]
+            st.push(w32_copy_iv(&v))
+        }
+        mut ii := mir_bhead(m, fi, bi)
+        while ii >= 0 {
+            w32_step(m, fi, ii, bi, mut &st, nl, true, bad)
+            ii = mir_inext(m, fi, ii)
+        }
+        if mir_btkind(m, fi, bi) == 3 && mir_fn_ret(m, fi) == 1 {
+            rv := mir_bta(m, fi, bi)
+            w32_check_const(m, fi, rv, true, bad, -1, bi, 0)
+            x := w32_value(m, fi, &st, nl, rv)
+            if !w32_fits(&x) { w32_note(bad, fi, -1, bi, 0, 1) }
+        }
+    }
+    << true
+}

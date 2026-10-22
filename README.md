@@ -30,9 +30,10 @@
 
 ---
 
-## Xu 0.9.4
+## Xu 0.10.1 (current source tree)
 
-Xu 0.9.4 is a compiler consistency and optimizer release:
+The current source tree reports Xu 0.10.1. It carries the compiler consistency and
+optimizer work described below:
 
 - **Borrow Checking Soundness**: The borrow checker now walks every expression kind (with a conservative fallback for unknown kinds), so aliasing such as `f(mut &v, &v)` is reported even when nested inside casts or arithmetic; borrows taken inside a loop now stay live across the back edge. Programs that previously compiled only because of these gaps now receive a diagnostic.
 - **Generics and Type Table Limits**: Generic declarations are no longer limited to four type parameters, type-id range overflow is asserted instead of silently wrapping, and backends that do not support a requested target fail explicitly.
@@ -40,7 +41,16 @@ Xu 0.9.4 is a compiler consistency and optimizer release:
 - **SSA Loop Optimization**: Scalar SSA promotion no longer depends on a per-shape whitelist, and the ARM64 loop kernels (scan, saxpy, CRC, binary search, fill, stride, predicated scan) have SSA-based matchers. Loops bounded by an `[]int` length are rotated so they qualify. Measured speedups versus 0.9.3 include `bloom_filter` ~12%, `chase_index` 9-11%, `f64_sum` ~8% and `algorithm_search` ~9% at `-O3`, with no regressions and slightly faster self-compilation.
 - **Pattern Diagnostics**: `--timings` reports `pattern-hits:` and per-function register-allocation mode; `XU_PATTERNS_OFF` disables named backend patterns for differential testing (`scripts/pattern_diff.sh`).
 
-Download the [0.9.4 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.4). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
+Published SDKs and installers are listed on the [releases page](https://github.com/xulang-org/xu/releases). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
+
+The product self-host chain uses a verified hosted seed, hashes the source manifest,
+and requires a fixed point between adjacent generations. The repository does not
+claim a seed-free bootstrap from only the checked-in sources.
+
+Coroutine calls are ownership boundaries: `xu` transfers owned values or uses
+channels, while borrowed `&T` and `&mut T` values do not cross into another
+coroutine. The `<-` token is context-sensitive by design: a statement form is
+`break`, while an expression such as `<-ch` receives from a channel.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
@@ -195,8 +205,8 @@ Driven by continuous active iteration, Xu is rapidly evolving. Here is our curre
 - [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
 - [x] **Universal Architecture Support**: Windows / macOS / Linux / LoongArch64 / RISC-V 64 / WebAssembly
 - [x] **Standalone Native Setup Wizards**: Zero-dependency self-rendered GUI wizards for Windows / macOS PKG / Linux installers
-- [x] **Production Infrastructure Packages**: Native drivers for MySQL, Postgres, Redis, ClickHouse, Kafka, SQLite, etc.
-- [ ] **Language Server Protocol (LSP)**: Deep VS Code & Neovim integration with real-time diagnostics and autocompletion
+- [x] **Production Infrastructure Packages**: The official packages repository provides native drivers for MySQL, Postgres, Redis, ClickHouse, Kafka, SQLite, and more; add them with `xu get`.
+- [x] **Language Server Protocol (LSP)**: `xu-lsp` and the VS Code integration provide live diagnostics, formatting, navigation, hover, symbols, completion, references, and rename through the standard LSP endpoint.
 - [ ] **Interactive Source Debugger**: Native breakpoint debugging, stack unwinding, and variable inspection
 - [ ] **Deep Monomorphization & Inlining Optimizations**: Cross-module automatic inlining and enhanced escape analysis
 - [ ] **Central Package Registry**: Cryptographically verified package distribution and automated dependency resolution
