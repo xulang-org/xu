@@ -402,6 +402,7 @@ final class DockIconBadgeView: NSView {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
+  private var structuredMenu: NSMenu?
 
   /// Weak shared for mailbox → UI-thread kick (shell cmd latency).
   static weak var sharedKick: AppDelegate?
@@ -623,6 +624,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func windowDidBecomeKey(_ notification: Notification) {
+    buildMenu()
     appendShellFile("focused")
   }
 
@@ -1254,6 +1256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func buildMenu() {
+    if buildStructuredMenu() { return }
     let items = readLines(slot: "xu_ui_menu.txt")
     let menubar = NSMenu()
     let appMenu = NSMenu(title: "Xu")
@@ -1425,7 +1428,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     let command = stripCmdPrefix(raw)
     let toContent = raw.hasPrefix("wv.") || raw.hasPrefix("content.")
     if let host = target,!host.notifiedClose {
-      if toContent { if !host.handleDesktopFiles(command) && !host.handleDesktopClipboard(command) { _ = host.contentHandleCmd(command) } }
+      if toContent { if !host.handleScreens(command) && !host.handleDesktopFiles(command) && !host.handleDesktopClipboard(command) { _ = host.contentHandleCmd(command) } }
       else if !host.handleShellCmd(command) { _ = host.contentHandleCmd(command) }
     }
     if toContent { command.withCString { xuDrawDiscardMarker($0); xuRequestDiscardMarker($0) } }
@@ -1542,6 +1545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   /// Returns true if handled as a shell/window command.
   @discardableResult
   func handleShellCmd(_ s: String) -> Bool {
+    if s == "menu_v2" { buildMenu();return true }
     if s == "close" { if closeGuard { promptCloseConfirm() } else { performQuitFromClose() }; return true }
     if s.hasPrefix("title\t") { window.title = String(s.dropFirst(6)); lastTitle = window.title; writeSlot("xu_ui_title.txt",window.title); return true }
     if s.hasPrefix("size\t") {
@@ -1965,3 +1969,97 @@ enum XuNativeHostMain {
   }
 }
 #endif
+
+private struct XuMenuNode {
+  var parent: Int, kind: Int, flags: Int, key: Int, modifiers: Int, depth: Int
+  var id: String, label: String
+}
+private func xuMenuNodes(_ body: String) -> [XuMenuNode]? {
+  guard body.utf8.count <= 524288,body.hasPrefix("XUM1\n"),body.hasSuffix("\n") else { return nil }
+  func number(_ text: Substring,_ parent: Bool = false) -> Int? {
+    if parent && text == "-1" { return -1 }
+    guard !text.isEmpty,text.utf8.count <= 8,text.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),let value = Int(text),value <= 65536 else { return nil };return value
+  }
+  func unhex(_ text: Substring) -> String? {
+    let chars = Array(text.utf8);guard chars.count % 2 == 0 else { return nil };var bytes = [UInt8]()
+    func digit(_ c: UInt8) -> UInt8? { if c >= 48 && c <= 57 { return c - 48 };if c >= 97 && c <= 102 { return c - 87 };return nil }
+    for i in stride(from: 0,to: chars.count,by: 2) { guard let a = digit(chars[i]),let b = digit(chars[i+1]),a != 0 || b != 0 else { return nil };bytes.append(a * 16 + b) }
+    return String(bytes: bytes,encoding: .utf8)
+  }
+  var result = [XuMenuNode](),ids = Set<String>()
+  let lines = body.dropFirst(5).split(separator: "\n",omittingEmptySubsequences: false)
+  for line in lines.dropLast() {
+    let f = line.split(separator: "\t",omittingEmptySubsequences: false)
+    guard result.count < 256,f.count == 7,let parent = number(f[0],true),let kind = number(f[1]),let flags = number(f[2]),let key = number(f[3]),let mods = number(f[4]),let id = unhex(f[5]),let label = unhex(f[6]),
+      parent >= -1,parent < result.count,(1...4).contains(kind),flags <= 3,mods <= 31,id.utf8.count <= 64,label.utf8.count <= 1024,key == 0 || (32...126).contains(key) || (288..<300).contains(key) else { return nil }
+    var depth = 1,enabledFlags = flags
+    if parent >= 0 { guard result[parent].kind == 2 else { return nil };depth = result[parent].depth + 1;if result[parent].flags & 1 == 0 { enabledFlags &= ~1 } }
+    else if kind != 2 { return nil }
+    guard (flags & 2 == 0 || kind == 4),depth <= 8,kind == 1 || kind == 4 || (flags & 2 == 0 && key == 0 && mods == 0) else { return nil }
+    if kind == 3 { guard id.isEmpty,label.isEmpty,key == 0 else { return nil } }
+    else { guard !id.isEmpty,!label.isEmpty,!ids.contains(id),id.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45,46,95].contains($0) }) else { return nil };ids.insert(id) }
+    result.append(XuMenuNode(parent: parent,kind: kind,flags: enabledFlags,key: key,modifiers: mods,depth: depth,id: id,label: label))
+  }
+  return result
+}
+extension AppDelegate {
+  func buildStructuredMenu() -> Bool {
+    let body = readSlotRaw("xu_ui_menu_v2.txt")
+    guard !body.isEmpty else { structuredMenu = nil;return false }
+    guard let entries = xuMenuNodes(body) else { if let structuredMenu { NSApp.mainMenu = structuredMenu;return true };return false }
+    guard !entries.isEmpty else { structuredMenu = nil;return false }
+    let bar = NSMenu(),appItem = NSMenuItem(title: "Xu",action: nil,keyEquivalent: ""),app = NSMenu(title: "Xu")
+    app.autoenablesItems = false
+    let quit = NSMenuItem(title: "Quit",action: #selector(onStructuredQuit(_:)),keyEquivalent: "q");quit.target = self;app.addItem(quit);appItem.submenu = app;bar.addItem(appItem)
+    bar.autoenablesItems = false
+    if !entries.contains(where: { $0.parent < 0 && $0.label.lowercased() == "edit" }) {
+      let edit = NSMenu(title: "Edit"),item = NSMenuItem(title: "Edit",action: nil,keyEquivalent: "")
+      for (title,selector,key) in [("Cut","cut:","x"),("Copy","copy:","c"),("Paste","paste:","v"),("Select All","selectAll:","a")] {
+        edit.addItem(NSMenuItem(title: title,action: NSSelectorFromString(selector),keyEquivalent: key))
+      }
+      item.submenu = edit;bar.addItem(item)
+    }
+    var submenus = [Int: NSMenu]()
+    for (i,e) in entries.enumerated() {
+      let parent = e.parent < 0 ? bar : submenus[e.parent]!
+      if e.kind == 3 { parent.addItem(.separator());continue }
+      let item = NSMenuItem(title: e.label,action: (e.kind == 1 || e.kind == 4) ? #selector(onStructuredMenu(_:)) : nil,keyEquivalent: "")
+      item.target = self;item.representedObject = e.id;item.isEnabled = e.flags & 1 != 0;item.state = e.flags & 2 != 0 ? .on : .off
+      if e.kind == 2 { let child = NSMenu(title: e.label);child.autoenablesItems = false;item.submenu = child;submenus[i] = child }
+      if e.key != 0 {
+        item.keyEquivalent = e.key >= 288 ? String(UnicodeScalar(0xF704 + e.key - 288)!) : String(UnicodeScalar(e.key)!).lowercased()
+        var mask = NSEvent.ModifierFlags();if e.modifiers & 1 != 0 { mask.insert(.shift) };if e.modifiers & 2 != 0 { mask.insert(.control) };if e.modifiers & 4 != 0 { mask.insert(.option) };if e.modifiers & 24 != 0 { mask.insert(.command) };item.keyEquivalentModifierMask = mask
+      }
+      parent.addItem(item)
+    }
+    structuredMenu = bar;NSApp.mainMenu = bar;return true
+  }
+  @objc func onStructuredMenu(_ sender: NSMenuItem) {
+    guard !notifiedClose,sender.isEnabled,let id = sender.representedObject as? String else { return }
+    appendShellFile("menu_clicked\t" + id)
+  }
+  @objc func onStructuredQuit(_ sender: Any?) { dispatchCommand("shell.quit_app") }
+}
+
+
+extension AppDelegate {
+  func handleScreens(_ command: String) -> Bool {
+    guard command.hasPrefix("__request\t"),let id = UInt64(command.dropFirst(10)),id > 0 else { return false }
+    guard let wire = xuDesktopRequestTake(id,canvasID,canvasGeneration,7) else { return false }
+    free(wire)
+    let displays = NSScreen.screens
+    guard !displays.isEmpty,displays.count <= 64 else { _ = xuDesktopRequestComplete(id,2,nil,0);return true }
+    let top = displays.first?.frame.maxY ?? 0
+    var body = "XUS1\n"
+    func hex(_ text: String) -> String { text.utf8.map { String(format: "%02x",$0) }.joined() }
+    for (i,screen) in displays.enumerated() {
+      let identity = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.stringValue ?? String(i)
+      let bounds = screen.frame,work = screen.visibleFrame
+      let flags = 16 | 4 | (i == 0 ? 1 : 0) | (screen === window.screen ? 2 : 0)
+      let values = [bounds.minX,top-bounds.maxY,bounds.width,bounds.height,work.minX,top-work.maxY,work.width,work.height,screen.backingScaleFactor,screen.backingScaleFactor]
+      body += hex(identity) + "\t" + hex(screen.localizedName) + "\t" + String(flags) + "\t" + values.map { String(format: "%.17g",Double($0)) }.joined(separator: "\t") + "\n"
+    }
+    _ = body.withCString { xuDesktopRequestComplete(id,0,$0,UInt32(body.utf8.count)) }
+    return true
+  }
+}

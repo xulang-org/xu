@@ -29,6 +29,7 @@ static void extra_close(XuWinWindow &w,bool force=false) {
   if(!w.id || w.closing)return;
   if(w.close_guard && !force){xu_ui_window_event(w.id,w.generation,"close_requested");return;}
   w.closing=true;unsigned id=w.id,generation=w.generation;
+  native_menu_close(w.window);
   desktop_files_close_owner(id,generation);
   if(w.content && w.vt && w.vt->destroy)w.vt->destroy(w.content);w.content=NULL;
   xu_ui_window_closed(id,generation);xu_ui_window_event(id,generation,"closed");
@@ -40,6 +41,7 @@ static LRESULT CALLBACK ExtraWndProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp)
   auto *w=(XuWinWindow *)GetWindowLongPtrW(hwnd,GWLP_USERDATA);
   if(message==WM_NCCREATE){w=(XuWinWindow *)((CREATESTRUCTW *)lp)->lpCreateParams;w->window=hwnd;SetWindowLongPtrW(hwnd,GWLP_USERDATA,(LONG_PTR)w);}
   if(w && !w->closing){
+    if(message==WM_COMMAND && native_menu_command(hwnd,LOWORD(wp)))return 0;
     if(message==WM_CLOSE){extra_close(*w);return 0;}
     if(message==WM_GETMINMAXINFO){
       auto *limits=(MINMAXINFO *)lp;
@@ -92,7 +94,8 @@ static bool extra_dispatch(const char *line) {
   if(identity[0]==1){unsigned meta[6];return g_root_closed || (scoped && !xu_ui_window_info(1,identity[1],meta,NULL,0));}
   const char *cmd=strip_prefix(raw);auto *w=extra_find(identity[0],identity[1]);bool content=!strncmp(raw,"content.",8) || !strncmp(raw,"wv.",3);
   if(w){
-    if(content){if(!desktop_files(cmd,w->id,w->generation,w->window) && !desktop_clipboard(cmd,w->id,w->generation) && w->content && w->vt && w->vt->handle_cmd)w->vt->handle_cmd(w->content,cmd);}
+    if(content){if(!desktop_screens(cmd,w->id,w->generation,w->window) && !desktop_files(cmd,w->id,w->generation,w->window) && !desktop_clipboard(cmd,w->id,w->generation) && w->content && w->vt && w->vt->handle_cmd)w->vt->handle_cmd(w->content,cmd);}
+    else if(!strcmp(cmd,"menu_v2"))native_menu_install(w->window,w->id,w->generation);
     else if(!strcmp(cmd,"show")){ShowWindow(w->window,SW_SHOW);SetForegroundWindow(w->window);}
     else if(!strcmp(cmd,"hide"))ShowWindow(w->window,SW_HIDE);
     else if(!strcmp(cmd,"close") || !strcmp(cmd,"quit"))extra_close(*w);

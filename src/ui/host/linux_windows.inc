@@ -28,6 +28,7 @@ static void extra_close(XuGtkWindow &w,bool force=false) {
   if(!w.id || w.closing)return;
   if(w.close_guard && !force){xu_ui_window_event(w.id,w.generation,"close_requested");return;}
   w.closing=true;unsigned id=w.id,generation=w.generation;
+  native_menu_close(w.window);
   if(w.content && w.vt && w.vt->destroy)w.vt->destroy(w.content);
   w.content=NULL;gtk_window_destroy(w.window);xu_ui_window_closed(id,generation);
   xu_ui_window_event(id,generation,"closed");w={};
@@ -73,7 +74,8 @@ static bool extra_dispatch(const char *line) {
   const char *cmd=strip_prefix(raw);auto *w=extra_find(identity[0],identity[1]);
   bool content=!strncmp(raw,"content.",8) || !strncmp(raw,"wv.",3);
   if(w){
-    if(content){if(!desktop_files(cmd,w->id,w->generation,w->window) && !desktop_clipboard(cmd,w->id,w->generation) && w->content && w->vt && w->vt->handle_cmd)w->vt->handle_cmd(w->content,cmd);}
+    if(content){if(!desktop_screens(cmd,w->id,w->generation,w->window) && !desktop_files(cmd,w->id,w->generation,w->window) && !desktop_clipboard(cmd,w->id,w->generation) && w->content && w->vt && w->vt->handle_cmd)w->vt->handle_cmd(w->content,cmd);}
+    else if(!strcmp(cmd,"menu_v2"))native_menu_install(w->window,w->box,w->id,w->generation);
     else if(!strcmp(cmd,"show"))gtk_window_present(w->window);
     else if(!strcmp(cmd,"hide"))gtk_widget_set_visible(GTK_WIDGET(w->window),FALSE);
     else if(!strcmp(cmd,"close") || !strcmp(cmd,"quit"))extra_close(*w);
