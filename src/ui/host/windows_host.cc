@@ -811,7 +811,11 @@ static void resize_to_client(int width, int height, UINT flags = 0) {
                SWP_NOMOVE | SWP_NOZORDER | flags);
 }
 
+static void native_menu_close(HWND);
+static bool native_menu_install(HWND,unsigned,unsigned);
+static bool native_menu_present(HWND);
 static void menu_install_or_update(void) {
+  unsigned menu_meta[6]={};xu_ui_window_info(1,0,menu_meta,NULL,0);if(native_menu_install(g_hwnd,1,menu_meta[1])||native_menu_present(g_hwnd))return;
   if (!g_hwnd) return;
   char visible[16];
   read_trim_file("xu_ui_menu_visible.txt", visible, sizeof(visible));
@@ -1227,7 +1231,7 @@ static void tray_install_or_update(void) {
 static void do_quit(void) {
   if(g_quitting)return;
   if(!g_root_closed){
-    g_root_closed=true;
+    g_root_closed=true;native_menu_close(g_hwnd);
     desktop_files_close_owner(1,g_root_generation);
     if(g_content && g_content_vt && g_content_vt->destroy)g_content_vt->destroy(g_content);
     g_content=NULL;xu_ui_window_closed(1,g_root_generation);append_shell_event("closed");
@@ -1563,7 +1567,10 @@ static void drain_title_size(void) {
   }
 }
 
+#include "windows_screens.inc"
+#include "windows_menus.inc"
 static void handle_shell_cmd(const char *s) {
+  if(!strcmp(s,"menu_v2")){unsigned meta[6]={};xu_ui_window_info(1,0,meta,NULL,0);native_menu_install(g_hwnd,1,meta[1]);return;}
   if(g_root_closed)return;
   if(!strcmp(s,"close")){request_close();return;}
   if(!strncmp(s,"title\t",6)){write_tmp("xu_ui_title.txt",s+6);drain_title_size();return;}
@@ -1854,7 +1861,7 @@ static void drain_cmds(void) {
       const char *cmd = strip_prefix(unscoped);
       int to_content = (strncmp(unscoped, "wv.", 3) == 0 || strncmp(unscoped, "content.", 8) == 0);
       if (to_content) {
-        if (!desktop_files(cmd,1,g_root_generation,g_hwnd) && !desktop_clipboard(cmd,1,g_root_generation) && g_content && g_content_vt && g_content_vt->handle_cmd) {
+        if (!desktop_screens(cmd,1,g_root_generation,g_hwnd) && !desktop_files(cmd,1,g_root_generation,g_hwnd) && !desktop_clipboard(cmd,1,g_root_generation) && g_content && g_content_vt && g_content_vt->handle_cmd) {
           g_content_vt->handle_cmd(g_content, cmd);
         }
         xu_ui_draw_discard_marker(cmd);
@@ -1926,6 +1933,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     break;
   }
   case WM_COMMAND: {
+    if(native_menu_command(hwnd,LOWORD(wParam)))return 0;
     UINT id = LOWORD(wParam);
     if (id == MENU_ID_DEVTOOLS) {
       if (g_content && g_content_vt && g_content_vt->handle_cmd) {
@@ -2190,7 +2198,7 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
 
   MSG msg;
   while (GetMessageW(&msg, NULL, 0, 0)) {
-    if (xu_ui_dialog_message(&msg)) continue;
+    if (xu_ui_dialog_message(&msg) || native_menu_accel(&msg)) continue;
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
