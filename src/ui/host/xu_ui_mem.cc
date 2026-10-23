@@ -134,6 +134,8 @@ static char *g_inv_resp = NULL;
 static unsigned g_inv_resp_len = 0;
 static int g_inv_state = INV_IDLE;
 
+#include "xu_ui_web_requests.inc"
+
 static int invoke_pending_unlocked(void) { return g_inv_state == INV_REQ; }
 
 static int invoke_pending(void) {
@@ -930,11 +932,12 @@ int xu_ui_request_submit(const void *data, unsigned length) {
     } else { if (!wire[i] || wire[i] == '\n' || wire[i] == '\r') return 0; ++sizes[index]; }
   }
   if (index != 8) return 0;
-  uint64_t numbers[7], limits[] = {INT64_MAX, 0x7fffffff, 0x7fffffff, UINT32_MAX, XU_REQUEST_SELECT_FOLDERS, 3600000, 1};
+  uint64_t numbers[7], limits[] = {INT64_MAX, 0x7fffffff, 0x7fffffff, UINT32_MAX, XU_REQUEST_WEBVIEW_COOKIES_CLEAR, 3600000, 1};
   for (unsigned i = 0; i < 7; ++i) if (!request_number(fields[i], sizes[i], limits[i], &numbers[i])) return 0;
   if (!numbers[0] || !numbers[1] || !numbers[2] || !numbers[3] || !numbers[4] || !numbers[5]) return 0;
   if ((numbers[4] == XU_REQUEST_CLIPBOARD_READ || numbers[4] == XU_REQUEST_CLIPBOARD_WRITE) &&
       (sizes[7] || (numbers[4] == XU_REQUEST_CLIPBOARD_READ && sizes[8]))) return 0;
+  if (numbers[4] == XU_REQUEST_SCREENS && (sizes[7] || sizes[8])) return 0;
   // Validate decoded UTF-8 before accepting, including embedded NUL. Neither
   // native toolkit receives unbounded strings or command delimiters.
   for (unsigned i = 7; i < 9; ++i) {
@@ -1409,7 +1412,7 @@ int xu_ui_mem_wait_ipc(int timeout_ms) {
   // Shell events have their own consumer; they must not turn the invoke
   // worker into a busy loop while pointer/progress events are queued.
   return wait_for_predicate([] {
-    return invoke_pending() || slot_nonempty("xu_ui_ipc_req.txt");
+    return !web_running() || invoke_pending() || web_pending() || slot_nonempty("xu_ui_ipc_req.txt");
   }, timeout_ms);
 }
 
@@ -1683,7 +1686,8 @@ int xu_ui_mem_try_write(const char *path_z, const void *data, unsigned data_len,
       if (out_n) *out_n = data_len;
       return 1;
     }
-    if (strcmp(key, "__invoke_reply") == 0) {
+    if (!strcmp(key,"__web_invoke_reply")) {bool ok=web_reply(data,data_len);if(out_n)*out_n=ok?data_len:0;return 1;}
+  if (strcmp(key, "__invoke_reply") == 0) {
       int accepted = invoke_try_reply(data, data_len);
       if (out_n) *out_n = accepted ? data_len : 0;
       return 1;
@@ -1850,6 +1854,43 @@ static void text_query_record(const char *key, void *output) {
   }
 }
 
+// One retained native layout and one mailbox read for an entire selection.
+static std::string text_selection_record(const char *key) {
+  uint64_t values[5]={}; const char *start=key+17;unsigned n=0;bool valid=true;
+  for(const char *p=start;;++p)if(!*p || *p=='/') {
+    if(n==5 || !request_number(start,(unsigned)(p-start),n==0?INT64_MAX:UINT32_MAX,&values[n])){valid=false;break;}
+    ++n;if(!*p)break;start=p+1;
+  }
+  valid=valid && n==5 && values[3]<=values[4];
+  lock_r();auto *slot=valid?text_slot(values[0]):NULL;
+  auto *layout=slot && slot->state==3 && slot->canvas==values[1] &&
+    (slot->generation==values[2] || (!values[2] && values[1]==1))?slot->layout:NULL;
+  if(layout)xu_ui_text_retain(layout);unlock_r();
+  valid=layout && text_boundary(layout,(unsigned)values[3]) && text_boundary(layout,(unsigned)values[4]);
+  struct Rect{double x,y,w,h;};std::vector<Rect> rects;
+  unsigned pos=(unsigned)values[3];
+  while(valid && pos<values[4]) {
+    double a[7],b[7];valid=text_query_layout(layout,1,pos,0,0,0,a) && text_query_layout(layout,1,pos,1,0,0,b);
+    if(!valid)break;
+    Rect r={std::min(a[4],b[4]),a[5],std::max(1.0,fabs(b[4]-a[4])),a[6]};
+    if(fabs(a[5]-b[5])>0.01)r.w=1.0;
+    if(!rects.empty()) {auto &last=rects.back();
+      if(fabs(last.y-r.y)<0.01 && fabs(last.h-r.h)<0.01 && r.x<=last.x+last.w+0.01 && last.x<=r.x+r.w+0.01) {
+        double right=std::max(last.x+last.w,r.x+r.w);last.x=std::min(last.x,r.x);last.w=right-last.x;
+      }else rects.push_back(r);
+    }else rects.push_back(r);
+    unsigned next=(unsigned)(a[0]+a[1]);
+    if(next<=pos) {next=pos+1;while(next<layout->length && !text_boundary(layout,next))++next;}
+    pos=next;valid=rects.size()<=XU_UI_TEXT_MAX_LENGTH;
+  }
+  if(layout)xu_ui_text_release(layout);
+  std::string out="XTS1";
+  auto word=[&](uint64_t x,unsigned bytes){for(unsigned i=0;i<bytes;++i)out+=(char)(x>>(i*8));};
+  word(valid?1:0,4);word(valid?rects.size():0,4);
+  if(valid)for(auto r:rects)for(double x:{r.x,r.y,r.w,r.h}){uint64_t bits;memcpy(&bits,&x,8);word(bits,8);}
+  return out;
+}
+
 int xu_ui_mem_try_read_len(const char *path_z, unsigned *out_len) {
   bool exists = false; const unsigned char *asset = NULL; unsigned asset_len = 0;
   if (asset_lookup(path_z, &exists, &asset, &asset_len)) { if (out_len) *out_len = exists ? 1 : asset_len; return 1; }
@@ -1860,6 +1901,10 @@ int xu_ui_mem_try_read_len(const char *path_z, unsigned *out_len) {
     if (out_len) *out_len = 0;
     return 1;
   }
+  if (!strcmp(key,"__web_invoke_id")) {if(out_len)*out_len=20;return 1;}
+  if (!strncmp(key,"__web_invoke_packet/",20)) {uint64_t id=0;unsigned size=xu_request_id(key+20,&id)?web_packet_length(id):0;if(out_len)*out_len=size;return 1;}
+  if (!strcmp(key,"__web_dispatch_running")) {if(out_len)*out_len=1;return 1;}
+  if (!strcmp(key,"__web_invoke_take")) {if(out_len)*out_len=web_take_length();return 1;}
   if (strcmp(key, "__ui_protocol") == 0) {
     if (out_len) *out_len = 4;
     return 1;
@@ -1874,6 +1919,7 @@ int xu_ui_mem_try_read_len(const char *path_z, unsigned *out_len) {
   if (strncmp(key, "__image_info/", 13) == 0) { if (out_len) *out_len = 32; return 1; }
   if(!strncmp(key,"__display_list_info/",20)) {if(out_len)*out_len=8;return 1;}
   if (strncmp(key, "__text_info/", 12) == 0) { if (out_len) *out_len = 80; return 1; }
+  if (!strncmp(key,"__text_selection/",17)) {auto data=text_selection_record(key);if(out_len)*out_len=(unsigned)data.size();return 1;}
   if (text_query_key(key)) { if (out_len) *out_len = 72; return 1; }
   if (input_query_mode(key)) { if(out_len) *out_len=80; return 1; }
   if (!strncmp(key,"__text_input_info/",18)) { if(out_len) *out_len=XU_UI_TEXT_INPUT_SNAPSHOT_BYTES; return 1; }
@@ -1926,6 +1972,10 @@ int xu_ui_mem_try_read_copy(const char *path_z, void *out, unsigned cap) {
    * empty handled read; callers can distinguish this from a non-virtual path
    * via the return value of xu_ui_mem_try_read_copy. */
   if (!out || cap == 0) return 1;
+  if (!strcmp(key,"__web_invoke_id")) {if(cap>=21)snprintf((char *)out,cap,"%020llu",(unsigned long long)web_dispatch_reserve());else ((char *)out)[0]=0;return 1;}
+  if (!strncmp(key,"__web_invoke_packet/",20)) {uint64_t id=0;if(xu_request_id(key+20,&id))web_packet_copy(id,out,cap);else memset(out,0,cap);return 1;}
+  if (!strcmp(key,"__web_dispatch_running")) {((char *)out)[0]=web_running()?'1':'0';if(cap>1)((char *)out)[1]=0;return 1;}
+  if (!strcmp(key,"__web_invoke_take")) {web_take_copy(out,cap);return 1;}
   if (!strncmp(key,"__window_info/",14)) {
     if(cap>=25){auto *p=(unsigned char *)out;memset(p,0,25);const char *separator=strchr(key+14,'/');uint64_t id=0,generation=0;unsigned meta[6]={};
       if(separator && request_number(key+14,(unsigned)(separator-key-14),0x7fffffff,&id) && xu_request_id(separator+1,&generation) && generation<=UINT32_MAX)
@@ -1942,6 +1992,7 @@ int xu_ui_mem_try_read_copy(const char *path_z, void *out, unsigned cap) {
     unsigned size=(unsigned)sizeof(g_ui_licenses)-1; if(size>=cap) size=cap-1;
     memcpy(out,g_ui_licenses,size); ((char *)out)[size]=0; return 1;
   }
+  if (!strncmp(key,"__text_selection/",17)) {auto data=text_selection_record(key);memset(out,0,cap);if(data.size()<cap)memcpy(out,data.data(),data.size());return 1;}
   if (text_query_key(key)) {
     if (cap < 73) ((char *)out)[0] = 0;
     else text_query_record(key, out);

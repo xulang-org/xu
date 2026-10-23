@@ -730,7 +730,7 @@ static XuContentPlugin *draw_create(XuContentHost *host) {
   p->bg.on = 1;
   p->bg.r = p->bg.g = p->bg.b = 26;
   p->bg.a = 255;
-  p->pan_enabled = 1;
+  p->pan_enabled = 0;
   p->display_bg = p->bg;
   p->building = false;
   reset_pen(p);

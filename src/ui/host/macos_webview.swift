@@ -56,9 +56,48 @@ final class FileDropOverlay: NSView {
 
 /// Same body as webview.bridge_script() / Windows kXuBridgeJs.
 /// WKScriptMessageHandlerWithReply: postMessage returns a Promise (no evaluateJavaScript round-trip).
-private let kXuBridgeJs = """
-window.__XU__=window.__XU__||{};(function(X){function sc(s){s=String(s==null?'':s);if(!s.length)return '!s ';for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);if(c===10||c===13||c===9||c===35||c===58||c===32||c===33||c===64||c===36)return '!s '+s;}return s;}function enc(n,p){return 'name: '+sc(n)+'\\npayload: '+sc(p)+'\\n';}function dec(t){var o={};String(t||'').split('\\n').forEach(function(line){var i=line.indexOf(': ');if(i>0){var k=line.slice(0,i),v=line.slice(i+2);if(v.indexOf('!s ')===0)v=v.slice(3);o[k]=v;}});return o;}var B='xu://app/__xu';X._deliver=function(n,p){var cb=(X._L||{})[n];if(cb)try{cb(p);}catch(e){}};X.invoke=function(n,p){var wh=window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.xuInvoke;if(wh){var body={name:String(n==null?'':n),payload:String(p==null?'':p)};var pr=wh.postMessage(body);if(pr&&typeof pr.then==='function')return pr;}return fetch(B+'/invoke',{method:'POST',headers:{'Content-Type':'text/xun; charset=utf-8'},body:enc(n,p)}).then(function(r){return r.text();}).then(function(t){var o=dec(t);if(o.ok==='false'||o.ok==='0')throw new Error(o.error||'error');return o.result!=null?o.result:t;});};X.listen=function(n,cb){(X._L=X._L||{})[n]=cb;};window.invoke=X.invoke;window.listen=function(n,cb){return X.listen(n,cb);};})(window.__XU__);
-"""
+private let kXuBridgeJs = #"""
+/* Embedded by sync_ui_webview_bridge.py; keep bridge and native protocol together. */
+window.__XU__=window.__XU__||{};
+(function(X){
+  'use strict';
+  var B='xu://app/__xu',pending=new Map(),listeners=new Map(),closed=false;
+  var encoder=new TextEncoder(),decoder=new TextDecoder('utf-8',{fatal:true});
+  function error(name,message){var e=new Error(message);e.name=name;return e;}
+  X._deliver=function(name,payload){var callback=listeners.get(name);if(callback)try{callback(payload);}catch(e){setTimeout(function(){throw e;},0);}};
+  X._accept=function(text){var o={};String(text||'').split('\n').forEach(function(line){var i=line.indexOf(': ');if(i>0){var value=line.slice(i+2);o[line.slice(0,i)]=value.indexOf('!s ')===0?value.slice(3):value;}});if(o.name!=null)X._deliver(o.name,o.payload||'');};
+  X.listen=function(name,callback){if(typeof callback!=='function')throw new TypeError('listener must be a function');name=String(name);listeners.set(name,callback);return function(){if(listeners.get(name)===callback)listeners.delete(name);};};
+  X.invoke=function(name,payload,options){
+    options=options||{};var timeout=options.timeoutMs==null?30000:Number(options.timeoutMs),signal=options.signal;
+    if(closed)return Promise.reject(error('AbortError','page closed'));
+    if(pending.size>=64)return Promise.reject(error('QuotaExceededError','64 requests already pending'));
+    if(!Number.isInteger(timeout)||timeout<1||timeout>3600000)return Promise.reject(new RangeError('timeoutMs must be 1..3600000'));
+    if(signal&&signal.aborted)return Promise.reject(error('AbortError','request cancelled'));
+    var n=encoder.encode(String(name==null?'':name)),p=encoder.encode(String(payload==null?'':payload));
+    if(!n.length||n.length>256||16+n.length+p.length>1048576)return Promise.reject(new RangeError('invoke exceeds the 1 MiB request limit'));
+    var random=new Uint8Array(16);crypto.getRandomValues(random);var id=Array.from(random,function(b){return b.toString(16).padStart(2,'0');}).join('');
+    var body=new Uint8Array(16+n.length+p.length),view=new DataView(body.buffer);
+    body.set([88,87,86,49]);view.setUint32(4,timeout,true);view.setUint32(8,n.length,true);view.setUint32(12,p.length,true);body.set(n,16);body.set(p,16+n.length);
+    var controller=new AbortController(),settled=false,timer,abortListener,resolve,reject;
+    var promise=new Promise(function(a,b){resolve=a;reject=b;});
+    function finish(failed,value){if(settled)return false;settled=true;pending.delete(id);clearTimeout(timer);if(signal&&abortListener)signal.removeEventListener('abort',abortListener);if(failed)reject(value);else resolve(value);return true;}
+    function cancel(name){if(settled)return false;fetch(B+'/cancel2/'+id,{method:'POST'}).catch(function(){});controller.abort();return finish(true,error(name||'AbortError',name==='TimeoutError'?'request timed out':'request cancelled'));}
+    promise.id=id;promise.cancel=function(){return cancel('AbortError');};pending.set(id,promise);
+    timer=setTimeout(function(){cancel('TimeoutError');},timeout);
+    if(signal){abortListener=function(){cancel('AbortError');};signal.addEventListener('abort',abortListener,{once:true});}
+    fetch(B+'/invoke2/'+id,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:body,signal:controller.signal}).then(function(response){return response.arrayBuffer();}).then(function(buffer){
+      if(settled)return;var bytes=new Uint8Array(buffer),v=new DataView(buffer);
+      if(bytes.length<12||decoder.decode(bytes.subarray(0,4))!=='XWO1'||v.getUint32(8,true)!==bytes.length-12)throw new Error('invalid native response');
+      var status=v.getUint32(4,true),value=decoder.decode(bytes.subarray(12));
+      if(status)finish(true,error(status===1?'AbortError':status===2?'TimeoutError':'Error',value||'native request failed'));else finish(false,value);
+    }).catch(function(e){finish(true,e);});
+    return promise;
+  };
+  addEventListener('pagehide',function(){closed=true;Array.from(pending.values()).forEach(function(p){p.cancel();});});
+  addEventListener('pageshow',function(){closed=false;});
+  window.invoke=X.invoke;window.listen=X.listen;
+})(window.__XU__);
+"""#
 
 private enum XuXun {
   static func scalar(_ s: String) -> String {
@@ -89,9 +128,48 @@ private enum XuXun {
   }
 }
 
+@_silgen_name("xu_ui_web_invoke_start")
+private func xuWebStart(_ window: UInt32,_ generation: UInt32,_ key: UnsafePointer<CChar>?,_ body: UnsafeRawPointer?,_ length: UInt32,_ timeout: UInt32) -> UInt64
+@_silgen_name("xu_ui_web_invoke_cancel")
+private func xuWebCancel(_ window: UInt32,_ generation: UInt32,_ key: UnsafePointer<CChar>?) -> Int32
+@_silgen_name("xu_ui_web_invoke_result")
+private func xuWebResult(_ id: UInt64,_ length: UnsafeMutablePointer<UInt32>?,_ status: UnsafeMutablePointer<UInt32>?) -> UnsafeMutableRawPointer?
+@_silgen_name("xu_ui_web_invoke_close")
+private func xuWebClose(_ window: UInt32,_ generation: UInt32)
+
+private final class XuWebRequests {
+  weak var shell: AppDelegate?
+  struct Pending { var key: String;var completion: (UInt32,Data) -> Void }
+  var pending = [UInt64: Pending]()
+  func begin(_ body: Data,key requestedKey: String = "",completion: @escaping (UInt32,Data) -> Void) -> UInt64 {
+    guard let shell,!shell.notifiedClose,body.count <= 1048576 else { completion(3,Data("window closed".utf8));return 0 }
+    let key = requestedKey.isEmpty ? UUID().uuidString.replacingOccurrences(of: "-",with: "").lowercased() : requestedKey
+    var timeout: UInt32 = 30000
+    if body.count >= 16 && body.prefix(4) == Data("XWV1".utf8) { timeout = (0..<4).reduce(0) { $0 | UInt32(body[4+$1]) << ($1*8) } }
+    let id = key.withCString { key in body.withUnsafeBytes { bytes in xuWebStart(shell.windowID,shell.canvasGeneration,key,bytes.baseAddress,UInt32(body.count),timeout) } }
+    guard id != 0 else { completion(4,Data("request capacity or invalid target".utf8));return 0 }
+    pending[id] = Pending(key: key,completion: completion);return id
+  }
+  func poll() {
+    for id in Array(pending.keys) { var length: UInt32 = 0,status: UInt32 = 4
+      guard let bytes = xuWebResult(id,&length,&status) else { continue }
+      let data = Data(bytes: bytes,count: Int(length));free(bytes)
+      let item = pending.removeValue(forKey: id);item?.completion(status,data)
+    }
+  }
+  func cancel(_ key: String) { guard let shell else { return };_ = key.withCString { xuWebCancel(shell.windowID,shell.canvasGeneration,$0) };poll() }
+  func cancel(_ id: UInt64) { if let item = pending[id] { cancel(item.key) } }
+  func close() {
+    if let shell { xuWebClose(shell.windowID,shell.canvasGeneration) }
+    let callbacks = Array(pending.values);pending.removeAll()
+    for item in callbacks { item.completion(3,Data("window closed".utf8)) }
+  }
+}
+
 /// JS → native invoke via WKScriptMessageHandlerWithReply (Promise resolves in-engine).
 final class XuInvokeScriptHandler: NSObject, WKScriptMessageHandlerWithReply {
   weak var shell: AppDelegate?
+  fileprivate weak var requests: XuWebRequests?
 
   func userContentController(
     _ userContentController: WKUserContentController,
@@ -111,20 +189,12 @@ final class XuInvokeScriptHandler: NSObject, WKScriptMessageHandlerWithReply {
       name = s
     }
     let req = XuXun.encode(name: name, payload: payload)
-    let t0 = CFAbsoluteTimeGetCurrent()
-    shell.xuIpcInvokeAsync(req) { [weak shell] resp in
-      guard let shell,!shell.notifiedClose else { replyHandler(nil,"window closed");return }
-      let o = XuXun.decode(resp)
-      let ok = (o["ok"] != "false" && o["ok"] != "0")
-      let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
-      if ProcessInfo.processInfo.environment["XU_UI_TIMING"] == "1" {
-        fputs(String(format: "xu_ui_timing name=%@ total=%.1fms\n", name, totalMs), stderr)
-      }
-      if ok {
-        replyHandler(o["result"] ?? "", nil)
-      } else {
-        replyHandler(nil, o["error"] ?? "error")
-      }
+    guard let requests else { replyHandler(nil,"no request host");return }
+    _ = requests.begin(Data(req.utf8)) { status,data in
+      guard status == 0 else { replyHandler(nil,"request " + String(status));return }
+      let response = XuXun.decode(String(data: data,encoding: .utf8) ?? "")
+      if response["ok"] == "false" || response["ok"] == "0" { replyHandler(nil,response["error"] ?? "error") }
+      else { replyHandler(response["result"] ?? "",nil) }
     }
   }
 }
@@ -139,7 +209,8 @@ private func xuLoadBridgeJs(shell: AppDelegate) -> Data {
 /// Custom xu:// scheme: page assets + IPC (no TCP listen).
 final class XuSchemeHandler: NSObject, WKURLSchemeHandler {
   weak var shell: AppDelegate?
-  private var stopped = Set<ObjectIdentifier>()
+  fileprivate weak var requests: XuWebRequests?
+  private var pending = [ObjectIdentifier: UInt64]()
 
   func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
     guard let shell = shell,!shell.notifiedClose, let url = urlSchemeTask.request.url else {
@@ -154,13 +225,24 @@ final class XuSchemeHandler: NSObject, WKURLSchemeHandler {
     // Fold WK quirks: /app.css from xu://app/ may become xu://app.css (host=app.css).
     let route = Self.normalizeRoute(host: host, path: path)
 
-    if route == "/__xu/invoke" || route.hasSuffix("/__xu/invoke") {
-      // Intercept → ask Xu worker (mailbox) → finish with response. Never block this thread.
-      let body = requestBodyString(urlSchemeTask.request)
-      shell.xuIpcInvokeAsync(body) { [weak self] resp in
-        guard let self = self else { return }
-        self.finish(urlSchemeTask, id: id, data: Data(resp.utf8), mime: "text/xun; charset=utf-8")
+    if route.hasPrefix("/__xu/cancel2/") {
+      requests?.cancel(String(route.dropFirst(14)))
+      finish(urlSchemeTask,id: id,data: Data("cancelled".utf8),mime: "text/plain");return
+    }
+    if route == "/__xu/invoke" || route.hasPrefix("/__xu/invoke2/") {
+      guard urlSchemeTask.request.httpMethod == "POST",let requests,let body = requestBodyData(urlSchemeTask.request) else {
+        finish(urlSchemeTask,id: id,data: Data("invalid request".utf8),mime: "text/plain",status: 400);return
       }
+      let binary = route.hasPrefix("/__xu/invoke2/")
+      pending[id] = 0
+      let ticket = requests.begin(body,key: binary ? String(route.dropFirst(14)) : "") { [weak self] status,data in
+        guard let self,self.pending.removeValue(forKey: id) != nil else { return }
+        var result = data
+        if binary { result = Data("XWO1".utf8);for value in [status,UInt32(data.count)] { for i in 0..<4 { result.append(UInt8(truncatingIfNeeded: value >> (i*8))) } };result.append(data) }
+        else if status != 0 { result = Data("ok: false\nerror: !s request \(status)\n".utf8) }
+        self.finish(urlSchemeTask,id: id,data: result,mime: binary ? "application/octet-stream" : "text/xun; charset=utf-8")
+      }
+      if pending[id] != nil { pending[id] = ticket }
       return
     }
     if route == "/__xu/poll" || route.hasSuffix("/__xu/poll") {
@@ -230,7 +312,8 @@ final class XuSchemeHandler: NSObject, WKURLSchemeHandler {
   }
 
   func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
-    stopped.insert(ObjectIdentifier(urlSchemeTask))
+    let id = ObjectIdentifier(urlSchemeTask)
+    if let ticket = pending.removeValue(forKey: id) { requests?.cancel(ticket) }
   }
 
   static func mimeFor(route: String) -> String {
@@ -270,29 +353,17 @@ final class XuSchemeHandler: NSObject, WKURLSchemeHandler {
     return try? Data(contentsOf: URL(fileURLWithPath: path))
   }
 
-  private func requestBodyString(_ req: URLRequest) -> String {
-    guard let body = req.httpBody else {
-      if let stream = req.httpBodyStream {
-        stream.open()
-        defer { stream.close() }
-        var data = Data()
-        let bufSize = 4096
-        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: bufSize)
-        defer { buf.deallocate() }
-        while stream.hasBytesAvailable {
-          let n = stream.read(buf, maxLength: bufSize)
-          if n <= 0 { break }
-          data.append(buf, count: n)
-        }
-        return String(data: data, encoding: .utf8) ?? ""
-      }
-      return ""
-    }
-    return String(data: body, encoding: .utf8) ?? ""
+  private func requestBodyData(_ req: URLRequest) -> Data? {
+    if let body = req.httpBody { return body.count <= 1048576 ? body : nil }
+    guard let stream = req.httpBodyStream else { return Data() }
+    stream.open();defer { stream.close() };var data = Data(),bytes = [UInt8](repeating: 0,count: 4096)
+    while stream.hasBytesAvailable { let count = stream.read(&bytes,maxLength: bytes.count);if count < 0 { return nil };if count == 0 { break }
+      guard data.count + count <= 1048576 else { return nil };data.append(contentsOf: bytes.prefix(count)) }
+    return data
   }
 
   private func finish(_ task: WKURLSchemeTask, id: ObjectIdentifier, data: Data, mime: String, status: Int = 200) {
-    if stopped.contains(id) || shell == nil || shell?.notifiedClose == true { return }
+    if shell == nil || shell?.notifiedClose == true { return }
     let headers = [
       "Content-Type": mime,
       "Content-Length": "\(data.count)",
@@ -323,6 +394,8 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   var contextMenuEnabled = true
   var schemeHandler: XuSchemeHandler?
   var invokeHandler: XuInvokeScriptHandler?
+  private let requests = XuWebRequests()
+  private var nativeQueries = Set<UInt64>()
   var wantsDevToolsMenu: Bool { true }
 
   init(shell: AppDelegate) {
@@ -331,6 +404,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   }
 
   func shutdown() {
+    requests.close()
     progressObs?.invalidate();progressObs = nil
     invokeHandler?.shell = nil;schemeHandler?.shell = nil
     if let web {
@@ -344,16 +418,19 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
 
   func install(into root: NSView, host: AppDelegate) {
     self.shell = host
+    requests.shell = host
     let config = WKWebViewConfiguration()
     // xu://app/* → XuSchemeHandler returns www + /__xu (no HTTP server).
     let handler = XuSchemeHandler()
     handler.shell = host
+    handler.requests = requests
     config.setURLSchemeHandler(handler, forURLScheme: "xu")
     self.schemeHandler = handler
     // Fast invoke: WithReply so JS postMessage Promise resolves without eval round-trip.
     let inv = XuInvokeScriptHandler()
     inv.shell = host
     config.userContentController.addScriptMessageHandler(inv, contentWorld: .page, name: "xuInvoke")
+    inv.requests = requests
     self.invokeHandler = inv
     let web = WKWebView(frame: root.bounds, configuration: config)
     web.autoresizingMask = [.width, .height]
@@ -434,6 +511,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   }
 
   func onPoll() {
+    requests.poll()
     drainEval()
     drainPage()
     pushEmits()
@@ -441,7 +519,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
 
   /// Host pushes emits into the page (no JS setInterval + xu://poll hammering).
   func pushEmits() {
-    guard let shell = shell else { return }
+    guard let shell = shell,shell.windowID == 1 else { return }
     for _ in 0..<16 {
       let t = shell.xuIpcPoll()
       if t.isEmpty { break }
@@ -498,6 +576,8 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   /// Returns true if the command was a webview/content command.
   @discardableResult
   func handleCmd(_ s: String) -> Bool {
+    if handleNativeRequest(s) { return true }
+    if s.hasPrefix("__web_reply\t") { requests.poll();return true }
     if s == "reload" {
       web.reload()
       return true
@@ -644,6 +724,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   }
 
   func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+    requests.close()
     lastProgressPct = -1
     shell.appendShellFile("loading")
     shell.appendShellFile("progress\t0")
@@ -1116,5 +1197,65 @@ public class XuWebViewPluginBootstrap: NSObject {
   @objc public static func registerPlugin() {
     XuContentRegistry.make = { host in XuWebViewPlugin(shell: host) }
     XuContentRegistry.factories[1] = XuContentRegistry.make
+  }
+}
+@_silgen_name("xu_ui_request_take_kind")
+private func xuWebNativeTake(_ id: UInt64,_ canvas: UInt32,_ generation: UInt32,_ kind: UInt32) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("xu_ui_request_alive")
+private func xuWebNativeAlive(_ id: UInt64) -> Int32
+@_silgen_name("xu_ui_request_complete")
+private func xuWebNativeComplete(_ id: UInt64,_ status: UInt32,_ text: UnsafePointer<CChar>?,_ length: UInt32) -> Int32
+private func xuWebUnhex(_ text: Substring) -> String? {
+  let source = Array(text.utf8);guard source.count % 2 == 0 else { return nil };var bytes = [UInt8]()
+  func digit(_ c: UInt8) -> UInt8? { if c >= 48 && c <= 57 { return c-48 };if c >= 97 && c <= 102 { return c-87 };return nil }
+  for i in stride(from: 0,to: source.count,by: 2) { guard let a = digit(source[i]),let b = digit(source[i+1]),a != 0 || b != 0 else { return nil };bytes.append(a*16+b) }
+  return String(bytes: bytes,encoding: .utf8)
+}
+extension XuWebViewPlugin {
+  func handleNativeRequest(_ command: String) -> Bool {
+    guard command.hasPrefix("__request\t"),let id = UInt64(command.dropFirst(10)),let shell else { return false }
+    var kind: UInt32 = 8,payload: UnsafeMutablePointer<CChar>?
+    while kind <= 12 { payload = xuWebNativeTake(id,shell.canvasID,shell.canvasGeneration,kind);if payload != nil { break };kind += 1 }
+    guard let payload else { return false };defer { free(payload) }
+    guard nativeQueries.count < 64 else { let error = "native query capacity exceeded";_ = error.withCString { xuWebNativeComplete(id,2,$0,UInt32(error.utf8.count)) };return true }
+    nativeQueries.insert(id)
+    let owner = shell.canvasGeneration
+    let complete: (Bool,String) -> Void = { [weak self] ok,value in
+      DispatchQueue.main.async {
+        guard let self else { return };self.nativeQueries.remove(id)
+        guard let shell = self.shell,!shell.notifiedClose,shell.canvasGeneration == owner,xuWebNativeAlive(id) != 0 else { return }
+        var text = value,status: UInt32 = ok ? 0 : 2
+        if text.utf8.count > 65536 || text.utf8.contains(0) { text = "invalid or oversized native result";status = 2 }
+        _ = text.withCString { xuWebNativeComplete(id,status,$0,UInt32(text.utf8.count)) }
+      }
+    }
+    let fields = String(cString: payload).split(separator: "\t",omittingEmptySubsequences: false)
+    guard fields.count == 9,let value = xuWebUnhex(fields[8]),let web else { complete(false,"WebView is not ready");return true }
+    if kind == 8 || kind == 9 {
+      var script = value
+      if kind == 9 {
+        let quoted = (try? JSONSerialization.data(withJSONObject: [value])).flatMap { String(data: $0,encoding: .utf8) } ?? "[\"\"]"
+        script = "(function(){return window.find(\(quoted)[0])?1:0;})()"
+      }
+      web.evaluateJavaScript(script) { result,error in
+        if let error { complete(false,error.localizedDescription) }
+        else if let text = result as? String { complete(true,text) }
+        else if let number = result as? NSNumber { complete(true,number.stringValue) }
+        else if let result,JSONSerialization.isValidJSONObject(result),let data = try? JSONSerialization.data(withJSONObject: result),let text = String(data: data,encoding: .utf8) { complete(true,text) }
+        else { complete(true,result == nil ? "" : String(describing: result!)) }
+      }
+    } else if kind == 10 {
+      web.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+        complete(true,cookies.map { "\($0.name)=\($0.value);domain=\($0.domain);path=\($0.path)" }.joined(separator: "\n"))
+      }
+    } else if kind == 12 {
+      web.configuration.websiteDataStore.removeData(ofTypes: [WKWebsiteDataTypeCookies],modifiedSince: Date(timeIntervalSince1970: 0)) { complete(true,"") }
+    } else {
+      let cookieFields = value.split(separator: "\t",omittingEmptySubsequences: false)
+      guard cookieFields.count == 4,cookieFields[0] == "C1",let name = xuWebUnhex(cookieFields[1]),let text = xuWebUnhex(cookieFields[2]),let domain = xuWebUnhex(cookieFields[3]),!name.isEmpty,!domain.isEmpty,
+        let cookie = HTTPCookie(properties: [.name: name,.value: text,.domain: domain,.path: "/"]) else { complete(false,"invalid cookie fields");return true }
+      web.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) { complete(true,"") }
+    }
+    return true
   }
 }

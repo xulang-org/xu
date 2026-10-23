@@ -890,7 +890,7 @@ final class DrawCanvasView: NSView {
   var didPan = false
   var camX: CGFloat = 0 { didSet { textInputClient?.refresh() } }
   var camY: CGFloat = 0 { didSet { textInputClient?.refresh() } }
-  var panEnabled = true
+  var panEnabled = false
   var inputEnabled = false
   var inputButtons: UInt32 = 0
   var inputPoint: NSPoint?
@@ -1047,6 +1047,14 @@ final class DrawCanvasView: NSView {
       return scalar.value < 128 ? scalar.value : 0
     }
   }
+  @objc override func selectAll(_ sender: Any?) {
+    focusTextInput()
+    if let client = textInputClient { client.doCommand(by: NSSelectorFromString("selectAll:")) }
+    else { emitInput(78, modifiers: 8, key: 65) }
+  }
+  @objc func copy(_ sender: Any?) { emitInput(78, modifiers: 8, key: 67) }
+  @objc func cut(_ sender: Any?) { emitInput(78, modifiers: 8, key: 88) }
+  @objc func paste(_ sender: Any?) { emitInput(78, modifiers: 8, key: 86) }
   override func keyDown(with event: NSEvent) {
     emitInput(78, modifiers: inputModifiers(event), key: inputKey(event), scan: UInt32(event.keyCode), repeated: event.isARepeat)
     focusTextInput()
