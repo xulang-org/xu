@@ -5,6 +5,10 @@
 #include "xu_content_abi.h"
 #include "xu_pack_assets.h"
 #include "xu_ui_mem.h"
+#include "xu_ui_web_requests.h"
+#include <vector>
+#include <memory>
+#include <atomic>
 #include "webview2_min.h"
 
 #include <shellapi.h>
@@ -13,7 +17,12 @@
 #include <string.h>
 #include <string>
 
-struct XuContentPlugin {
+struct XuInvokeJob;
+struct XuWebViewPlugin;
+struct XuPluginLife { XuWebViewPlugin *plugin=NULL;unsigned native_queries=0; };
+struct XuWebViewPlugin {
+  std::vector<XuInvokeJob *> invokes;
+  std::shared_ptr<XuPluginLife> life=std::make_shared<XuPluginLife>();
   XuContentHost host;
   HWND child = NULL;
   HMODULE loader = NULL;
@@ -32,6 +41,7 @@ struct XuContentPlugin {
 // --- COM handler helpers ---
 template <typename TIface, const IID *TIid>
 struct ComHandler : public TIface {
+  virtual ~ComHandler() = default;
   LONG refs = 1;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
     if (!ppv) return E_POINTER;
@@ -53,11 +63,11 @@ struct ComHandler : public TIface {
   }
 };
 
-static void eval_raw(XuContentPlugin *p, const char *js_utf8, bool want_result);
+static void eval_raw(XuWebViewPlugin *p, const char *js_utf8, bool want_result);
 static void wv_log(const char *step);
-static HRESULT put_xu_response(XuContentPlugin *p, ICoreWebView2WebResourceRequestedEventArgs *args,
+static HRESULT put_xu_response(XuWebViewPlugin *p, ICoreWebView2WebResourceRequestedEventArgs *args,
                                int status, const char *mime, const std::string &body);
-static void xu_kick_host_drain(XuContentPlugin *p);
+static void xu_kick_host_drain(XuWebViewPlugin *p);
 
 static void utf8_to_wide(const char *src, std::wstring &dst) {
   if (!src) src = "";
@@ -86,20 +96,20 @@ static void wide_to_utf8(LPCWSTR src, std::string &dst) {
   if (!dst.empty() && dst.back() == '\0') dst.pop_back();
 }
 
-static void host_event(XuContentPlugin *p, const char *payload) {
+static void host_event(XuWebViewPlugin *p, const char *payload) {
   if (p && p->host.append_shell_event) xu_content_event(&p->host,payload);
 }
 
-static void host_write(XuContentPlugin *p, const char *name, const char *body) {
+static void host_write(XuWebViewPlugin *p, const char *name, const char *body) {
   if (p && p->host.write_tmp) xu_content_write(&p->host,name,body);
 }
 
-static void host_read_trim(XuContentPlugin *p, const char *name, char *out, unsigned n) {
+static void host_read_trim(XuWebViewPlugin *p, const char *name, char *out, unsigned n) {
   if (out && n) out[0] = 0;
   if (p && p->host.read_trim) xu_content_read(&p->host,name,out,n,true);
 }
 
-static void host_read_raw(XuContentPlugin *p, const char *name, char *out, unsigned n) {
+static void host_read_raw(XuWebViewPlugin *p, const char *name, char *out, unsigned n) {
   if (out && n) out[0] = 0;
   if (p && p->host.read_raw) xu_content_read(&p->host,name,out,n,false);
 }
@@ -113,46 +123,25 @@ static void show_missing_message(HWND hwnd, const char *msg_utf8) {
   MessageBoxW(hwnd, w, L"Xu WebView2", MB_OK | MB_ICONERROR);
 }
 
-static void sync_bounds(XuContentPlugin *p) {
+static void sync_bounds(XuWebViewPlugin *p) {
   if (!p || !p->child || !p->controller) return;
   RECT rc;
   GetClientRect(p->child, &rc);
   p->controller->put_Bounds(rc);
 }
 
-static std::string read_tmp_all(XuContentPlugin *p, const char *name) {
+static std::string read_tmp_all(XuWebViewPlugin *p, const char *name) {
   char buf[256 * 1024];
   host_read_raw(p, name, buf, sizeof(buf));
   return std::string(buf);
 }
 
 // Same body as webview.bridge_script() — used when PE has no __xu/bridge.js and TMP is empty.
-static const char kXuBridgeJs[] =
-    "window.__XU__=window.__XU__||{};"
-    "(function(X){"
-    "function sc(s){s=String(s==null?'':s);if(!s.length)return '!s ';for(var i=0;i<s.length;i++){var "
-    "c=s.charCodeAt(i);if(c===10||c===13||c===9||c===35||c===58||c===32||c===33||c===64||c===36)return "
-    "'!s '+s;}return s;}"
-    "function enc(n,p){return 'name: '+sc(n)+'\\npayload: '+sc(p)+'\\n';}"
-    "function dec(t){var o={};String(t||'').split('\\n').forEach(function(line){var "
-    "i=line.indexOf(': ');if(i>0){var k=line.slice(0,i),v=line.slice(i+2);if(v.indexOf('!s "
-    "')===0)v=v.slice(3);o[k]=v;}});return o;}"
-    "var B='xu://app/__xu';"
-    "X.invoke=function(n,p){return fetch(B+'/invoke',{method:'POST',headers:{'Content-Type':'text/xun; "
-    "charset=utf-8'},body:enc(n,p)}).then(function(r){return r.text();}).then(function(t){var "
-    "o=dec(t);if(o.ok==='false'||o.ok==='0')throw new "
-    "Error(o.error||'error');return o.result!=null?o.result:t;});};"
-    "X.listen=function(n,cb){(X._L=X._L||{})[n]=cb;};"
-    "window.invoke=X.invoke;window.listen=function(n,cb){return X.listen(n,cb);};"
-    "async function poll(){try{const t=await fetch(B+'/poll').then(function(r){return "
-    "r.text();});if(!t||!t.length)return;const o=dec(t);const n=o.name||'';const "
-    "p=o.payload!=null?o.payload:'';const cb=(X._L||{})[n];if(cb)cb(p);}catch(e){}}"
-    "setInterval(poll,50);"
-    "})(window.__XU__);";
+#include "xu_webview_bridge.inc"
 
 static bool pack_bytes(const char *rel, std::string &out);
 
-static std::string load_bridge_js(XuContentPlugin *p) {
+static std::string load_bridge_js(XuWebViewPlugin *p) {
   std::string out;
   if (pack_bytes("__xu/bridge.js", out) && !out.empty()) return out;
   if (pack_bytes("/__xu/bridge.js", out) && !out.empty()) return out;
@@ -163,7 +152,7 @@ static std::string load_bridge_js(XuContentPlugin *p) {
 
 // Packed :mem: index.html has no inlined bridge; inject so window.__XU__ exists
 // before page onclick handlers (AddScriptToExecuteOnDocumentCreated alone can race Navigate).
-static void ensure_html_has_bridge(XuContentPlugin *p, std::string &html) {
+static void ensure_html_has_bridge(XuWebViewPlugin *p, std::string &html) {
   // Already inlined (marker or full bridge body) — skip.
   if (html.find("__XU_BRIDGE__") != std::string::npos) return;
   if (html.find("X.invoke=function") != std::string::npos) return;
@@ -184,7 +173,7 @@ static void ensure_html_has_bridge(XuContentPlugin *p, std::string &html) {
   }
 }
 
-static std::string xu_ipc_invoke_poll(XuContentPlugin *p, const std::string &body) {
+static std::string xu_ipc_invoke_poll(XuWebViewPlugin *p, const std::string &body) {
   (void)p;
   // Scheme invoke: sync rendezvous with Xu worker (no req/resp slot files).
   char *raw = xu_ui_invoke_sync(body.c_str());
@@ -195,83 +184,34 @@ static std::string xu_ipc_invoke_poll(XuContentPlugin *p, const std::string &bod
 }
 
 struct XuInvokeJob {
-  XuContentPlugin *plugin;
-  ICoreWebView2WebResourceRequestedEventArgs *args;
-  ICoreWebView2Deferral *deferral;
-  std::string body;
-  std::string out;
+  XuWebViewPlugin *plugin;ICoreWebView2WebResourceRequestedEventArgs *args;ICoreWebView2Deferral *deferral;uint64_t ticket;bool binary;
 };
-
-enum { WM_XU_IPC_DONE = WM_APP + 41, WM_XU_KICK_HOST = WM_APP + 43 };
-
-static void xu_kick_host_drain(XuContentPlugin *p) {
-  if (!p) return;
-  HWND shell = (HWND)(p->host.native_window ? p->host.native_window : nullptr);
-  if (!shell && p->child) shell = GetParent(p->child);
-  if (shell) PostMessageW(shell, WM_XU_KICK_HOST, 0, 0);
+enum { WM_XU_KICK_HOST = WM_APP + 43 };
+static void xu_kick_host_drain(XuWebViewPlugin *p) {
+ if(!p)return;HWND shell=(HWND)p->host.native_window;if(!shell&&p->child)shell=GetParent(p->child);if(shell)PostMessageW(shell,WM_XU_KICK_HOST,0,0);
+}
+static void xu_invoke_finish(XuInvokeJob *job,const std::string &out){
+ put_xu_response(job->plugin,job->args,200,job->binary?"application/octet-stream":"text/xun; charset=utf-8",out);
+ job->deferral->Complete();job->deferral->Release();job->args->Release();delete job;
+}
+static void xu_invoke_poll(XuWebViewPlugin *p){
+ for(size_t i=0;i<p->invokes.size();){auto *job=p->invokes[i];unsigned size=0,status=4;void *data=xu_ui_web_invoke_result(job->ticket,&size,&status);if(!data){++i;continue;}
+  auto out=xu_web_response(job->binary,status,data,size);free(data);p->invokes.erase(p->invokes.begin()+i);xu_invoke_finish(job,out);
+ }
+}
+static void xu_invoke_close(XuWebViewPlugin *p){
+ xu_ui_web_invoke_close(p->host.window_id,p->host.canvas_generation);
+ for(auto *job:p->invokes)xu_invoke_finish(job,xu_web_response(job->binary,3,"window closed",13));p->invokes.clear();
+}
+static bool xu_ipc_invoke_async(XuWebViewPlugin *p,ICoreWebView2WebResourceRequestedEventArgs *args,const std::string &body,const std::string &client_key=""){
+ bool binary=xu_web_binary(body);std::string key=client_key;if(key.empty()){static uint64_t serial=0;char text[33];snprintf(text,sizeof(text),"%08x%08x%016llx",p->host.window_id,p->host.canvas_generation,(unsigned long long)++serial);key=text;}
+ ICoreWebView2Deferral *deferral=NULL;if(FAILED(args->GetDeferral(&deferral))||!deferral){put_xu_response(p,args,503,"text/plain","deferral unavailable");return true;}
+ uint64_t ticket=xu_ui_web_invoke_start(p->host.window_id,p->host.canvas_generation,key.c_str(),body.data(),(unsigned)body.size(),xu_web_timeout(body));
+ if(!ticket){auto out=xu_web_response(binary,4,"request capacity or invalid target",34);put_xu_response(p,args,429,"application/octet-stream",out);deferral->Complete();deferral->Release();return true;}
+ auto *job=new XuInvokeJob{p,args,deferral,ticket,binary};args->AddRef();p->invokes.push_back(job);return true;
 }
 
-static void xu_invoke_finish(XuInvokeJob *job) {
-  if (!job) return;
-  put_xu_response(job->plugin, job->args, 200, "text/xun; charset=utf-8", job->out);
-  if (job->deferral) {
-    job->deferral->Complete();
-    job->deferral->Release();
-  }
-  if (job->args) job->args->Release();
-  delete job;
-}
-
-static DWORD WINAPI xu_invoke_worker(LPVOID param) {
-  XuInvokeJob *job = (XuInvokeJob *)param;
-  if (!job) return 0;
-  job->out = xu_ipc_invoke_poll(job->plugin, job->body);
-  HWND hwnd = job->plugin && job->plugin->child ? job->plugin->child : NULL;
-  if (hwnd && PostMessageW(hwnd, WM_XU_IPC_DONE, 0, (LPARAM)job)) {
-    return 0;
-  }
-  xu_invoke_finish(job);
-  return 0;
-}
-
-static bool xu_ipc_invoke_async(XuContentPlugin *p, ICoreWebView2WebResourceRequestedEventArgs *args,
-                                const std::string &body) {
-  if (!p || !args) return false;
-  {
-    char line[192];
-    snprintf(line, sizeof(line), "xu_webview: invoke body_len=%u", (unsigned)body.size());
-    wv_log(line);
-  }
-  ICoreWebView2Deferral *def = nullptr;
-  HRESULT dhr = args->GetDeferral(&def);
-  if (FAILED(dhr) || !def) {
-    // NEVER block the WebResourceRequested thread — UI shell cmds need that thread.
-    wv_log("xu_webview: GetDeferral failed; invoke rejected (no sync wait)");
-    put_xu_response(p, args, 200, "text/xun; charset=utf-8",
-                    "ok: false\nerror: !s invoke deferral unavailable\n");
-    return true;
-  }
-  XuInvokeJob *job = new XuInvokeJob();
-  job->plugin = p;
-  job->args = args;
-  job->deferral = def;
-  job->body = body;
-  args->AddRef();
-  HANDLE th = CreateThread(nullptr, 0, xu_invoke_worker, job, 0, nullptr);
-  if (!th) {
-    put_xu_response(p, args, 200, "text/xun; charset=utf-8",
-                    "ok: false\nerror: !s invoke thread failed\n");
-    def->Complete();
-    def->Release();
-    args->Release();
-    delete job;
-    return true;
-  }
-  CloseHandle(th);
-  return true;
-}
-
-static std::string xu_ipc_poll(XuContentPlugin *p) {
+static std::string xu_ipc_poll(XuWebViewPlugin *p) {
   const char *tmp = p->host.tmp;
   if (!tmp || !tmp[0] || !strcmp(tmp, ":xu:") || !strcmp(tmp, ":mem:")) {
     unsigned len = 0; char *body = xu_ui_emit_take(&len);
@@ -295,13 +235,14 @@ static std::string stream_to_string(IStream *st) {
   char buf[4096];
   ULONG n = 0;
   while (SUCCEEDED(st->Read(buf, sizeof(buf), &n)) && n > 0) {
+    if(out.size()+n>XU_WEB_MAX_BODY)return {};
     out.append(buf, buf + n);
     n = 0;
   }
   return out;
 }
 
-static HRESULT put_xu_response(XuContentPlugin *p, ICoreWebView2WebResourceRequestedEventArgs *args,
+static HRESULT put_xu_response(XuWebViewPlugin *p, ICoreWebView2WebResourceRequestedEventArgs *args,
                                int status, const char *mime, const std::string &body) {
   if (!p || !p->env || !args) return E_FAIL;
   HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, body.size() > 0 ? body.size() : 1);
@@ -367,7 +308,7 @@ static bool pack_bytes(const char *rel, std::string &out) {
   return true;
 }
 
-static bool load_www_file(XuContentPlugin *p, const std::string &route, std::string &out) {
+static bool load_www_file(XuWebViewPlugin *p, const std::string &route, std::string &out) {
   std::string rel = route;
   if (rel.empty() || rel == "/") rel = "/index.html";
   if (rel.find("..") != std::string::npos) return false;
@@ -425,7 +366,7 @@ static bool xu_parse_app_uri(const std::string &uri, std::string &host, std::str
   return true;
 }
 
-static bool xu_handle_uri(XuContentPlugin *p, ICoreWebView2WebResourceRequestedEventArgs *args,
+static bool xu_handle_uri(XuWebViewPlugin *p, ICoreWebView2WebResourceRequestedEventArgs *args,
                           const std::string &uri, const std::string &method,
                           const std::string &req_body) {
   if (!xu_is_app_uri(uri)) return false;
@@ -439,6 +380,8 @@ static bool xu_handle_uri(XuContentPlugin *p, ICoreWebView2WebResourceRequestedE
     host = "app";
   }
 
+  if(path.rfind("/__xu/cancel2/",0)==0){xu_ui_web_invoke_cancel(p->host.window_id,p->host.canvas_generation,path.substr(14).c_str());xu_invoke_poll(p);put_xu_response(p,args,200,"text/plain","cancelled");return true;}
+  if(path.rfind("/__xu/invoke2/",0)==0){if(method!="POST"){put_xu_response(p,args,405,"text/plain","POST required");return true;}return xu_ipc_invoke_async(p,args,req_body,path.substr(14));}
   if (path == "/__xu/invoke" ||
       (path.size() >= 12 && path.compare(path.size() - 12, 12, "/__xu/invoke") == 0)) {
     // OPTIONS preflight (some WebView2 builds) — do not block on IPC.
@@ -509,10 +452,11 @@ static bool xu_handle_uri(XuContentPlugin *p, ICoreWebView2WebResourceRequestedE
 struct WebResourceHandler
     : public ComHandler<ICoreWebView2WebResourceRequestedEventHandler,
                         &IID_ICoreWebView2WebResourceRequestedEventHandler> {
-  XuContentPlugin *plugin;
-  explicit WebResourceHandler(XuContentPlugin *p) : plugin(p) {}
+  std::shared_ptr<XuPluginLife> life;
+  explicit WebResourceHandler(XuWebViewPlugin *p) : life(p->life) {}
   HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
                                    ICoreWebView2WebResourceRequestedEventArgs *args) override {
+    auto *plugin=life->plugin;if(!plugin)return S_OK;
     (void)sender;
     if (!plugin || !args) return S_OK;
     ICoreWebView2WebResourceRequest *req = nullptr;
@@ -544,7 +488,7 @@ struct WebResourceHandler
   }
 };
 
-static void emit_progress(XuContentPlugin *p, int pct) {
+static void emit_progress(XuWebViewPlugin *p, int pct) {
   if (!p) return;
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
@@ -569,12 +513,14 @@ static void emit_progress(XuContentPlugin *p, int pct) {
 struct NavStartingHandler
     : public ComHandler<ICoreWebView2NavigationStartingEventHandler,
                         &IID_ICoreWebView2NavigationStartingEventHandler> {
-  XuContentPlugin *plugin;
-  explicit NavStartingHandler(XuContentPlugin *p) : plugin(p) {}
+  std::shared_ptr<XuPluginLife> life;
+  explicit NavStartingHandler(XuWebViewPlugin *p) : life(p->life) {}
   HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
                                    ICoreWebView2NavigationStartingEventArgs *args) override {
+    auto *plugin=life->plugin;if(!plugin)return S_OK;
     (void)sender;
     if (!plugin || !args) return S_OK;
+    xu_invoke_close(plugin);
     plugin->last_progress = -1;
     host_event(plugin, "loading");
     host_event(plugin, "progress\t0");
@@ -633,10 +579,11 @@ struct NavStartingHandler
 struct NavCompletedHandler
     : public ComHandler<ICoreWebView2NavigationCompletedEventHandler,
                         &IID_ICoreWebView2NavigationCompletedEventHandler> {
-  XuContentPlugin *plugin;
-  explicit NavCompletedHandler(XuContentPlugin *p) : plugin(p) {}
+  std::shared_ptr<XuPluginLife> life;
+  explicit NavCompletedHandler(XuWebViewPlugin *p) : life(p->life) {}
   HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
                                    ICoreWebView2NavigationCompletedEventArgs *args) override {
+    auto *plugin=life->plugin;if(!plugin)return S_OK;
     (void)sender;
     if (!plugin) return S_OK;
     BOOL ok = FALSE;
@@ -661,10 +608,11 @@ struct NavCompletedHandler
 struct NewWindowHandler
     : public ComHandler<ICoreWebView2NewWindowRequestedEventHandler,
                         &IID_ICoreWebView2NewWindowRequestedEventHandler> {
-  XuContentPlugin *plugin;
-  explicit NewWindowHandler(XuContentPlugin *p) : plugin(p) {}
+  std::shared_ptr<XuPluginLife> life;
+  explicit NewWindowHandler(XuWebViewPlugin *p) : life(p->life) {}
   HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
                                    ICoreWebView2NewWindowRequestedEventArgs *args) override {
+    auto *plugin=life->plugin;if(!plugin)return S_OK;
     (void)sender;
     if (!args) return S_OK;
     LPWSTR uri = nullptr;
@@ -688,8 +636,8 @@ struct NewWindowHandler
 struct EnvCreatedHandler
     : public ComHandler<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                         &IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler> {
-  XuContentPlugin *plugin;
-  explicit EnvCreatedHandler(XuContentPlugin *p) : plugin(p) {}
+  std::shared_ptr<XuPluginLife> life;
+  explicit EnvCreatedHandler(XuWebViewPlugin *p) : life(p->life) {}
   HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode,
                                    ICoreWebView2Environment *createdEnvironment) override;
 };
@@ -697,8 +645,8 @@ struct EnvCreatedHandler
 struct ControllerCreatedHandler
     : public ComHandler<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
                         &IID_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> {
-  XuContentPlugin *plugin;
-  explicit ControllerCreatedHandler(XuContentPlugin *p) : plugin(p) {}
+  std::shared_ptr<XuPluginLife> life;
+  explicit ControllerCreatedHandler(XuWebViewPlugin *p) : life(p->life) {}
   HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode,
                                    ICoreWebView2Controller *createdController) override;
 };
@@ -706,10 +654,14 @@ struct ControllerCreatedHandler
 struct EvalHandler
     : public ComHandler<ICoreWebView2ExecuteScriptCompletedHandler,
                         &IID_ICoreWebView2ExecuteScriptCompletedHandler> {
-  XuContentPlugin *plugin;
-  bool want = false;
-  explicit EvalHandler(XuContentPlugin *p, bool w) : plugin(p), want(w) {}
+  std::shared_ptr<XuPluginLife> life;
+  bool want = false;uint64_t request=0;
+  bool counted=false;
+  explicit EvalHandler(XuWebViewPlugin *p, bool w,uint64_t id=0) : life(p->life), want(w),request(id) {if(id){++life->native_queries;counted=true;}}
+  ~EvalHandler(){if(counted)--life->native_queries;}
+  void finish_query(){if(counted){--life->native_queries;counted=false;}}
   HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, LPCWSTR resultObjectAsJson) override {
+    finish_query();auto *plugin=life->plugin;if(!plugin)return S_OK;
     if (!want || !plugin) return S_OK;
     std::string out;
     if (FAILED(errorCode)) {
@@ -718,26 +670,15 @@ struct EvalHandler
       wide_to_utf8(resultObjectAsJson, out);
       // JSON string results arrive quoted; peel simple "..." form.
       if (out.size() >= 2 && out.front() == '"' && out.back() == '"') {
-        out = out.substr(1, out.size() - 2);
-        std::string unesc;
-        for (size_t i = 0; i < out.size(); i++) {
-          if (out[i] == '\\' && i + 1 < out.size()) {
-            char n = out[++i];
-            if (n == 'n') unesc.push_back('\n');
-            else if (n == 't') unesc.push_back('\t');
-            else if (n == 'r') unesc.push_back('\r');
-            else if (n == '"' || n == '\\' || n == '/') unesc.push_back(n);
-            else unesc.push_back(n);
-          } else {
-            unesc.push_back(out[i]);
-          }
-        }
-        out = unesc;
+        std::string decoded;
+        if(!xu_web_unquote(out,&decoded)){if(request)xu_web_native_complete(request,false,"invalid JSON result");return S_OK;}
+        out=std::move(decoded);
       } else if (out == "null") {
         out.clear();
       }
     }
-    host_write(plugin, "xu_ui_eval_result.txt", out.c_str());
+    if(request)xu_web_native_complete(request,SUCCEEDED(errorCode),out);
+    else host_write(plugin, "xu_ui_eval_result.txt", out.c_str());
     return S_OK;
   }
 };
@@ -745,9 +686,14 @@ struct EvalHandler
 struct CookiesHandler
     : public ComHandler<ICoreWebView2GetCookiesCompletedHandler,
                         &IID_ICoreWebView2GetCookiesCompletedHandler> {
-  XuContentPlugin *plugin;
-  explicit CookiesHandler(XuContentPlugin *p) : plugin(p) {}
+  std::shared_ptr<XuPluginLife> life;
+  uint64_t request=0;
+  bool counted=false;
+  explicit CookiesHandler(XuWebViewPlugin *p,uint64_t id=0) : life(p->life),request(id) {if(id){++life->native_queries;counted=true;}}
+  ~CookiesHandler(){if(counted)--life->native_queries;}
+  void finish_query(){if(counted){--life->native_queries;counted=false;}}
   HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2CookieList *list) override {
+    finish_query();auto *plugin=life->plugin;if(!plugin)return S_OK;
     if (!plugin) return S_OK;
     std::string body;
     UINT count = 0;
@@ -774,6 +720,7 @@ struct CookiesHandler
         c->Release();
       }
     }
+    if(request){xu_web_native_complete(request,SUCCEEDED(result),body);return S_OK;}
     host_write(plugin, "xu_ui_cookies.txt", body.c_str());
     char js[128];
     snprintf(js, sizeof(js),
@@ -783,7 +730,7 @@ struct CookiesHandler
   }
 };
 
-static void eval_raw(XuContentPlugin *p, const char *js_utf8, bool want_result) {
+static void eval_raw(XuWebViewPlugin *p, const char *js_utf8, bool want_result) {
   if (!p || !p->webview || !js_utf8) return;
   std::wstring wjs;
   utf8_to_wide(js_utf8, wjs);
@@ -792,7 +739,7 @@ static void eval_raw(XuContentPlugin *p, const char *js_utf8, bool want_result) 
   h->Release();
 }
 
-static void load_initial(XuContentPlugin *p) {
+static void load_initial(XuWebViewPlugin *p) {
   if (!p || !p->webview) return;
   char html[256 * 1024];
   char url[8192];
@@ -861,6 +808,7 @@ static void load_initial(XuContentPlugin *p) {
 
 HRESULT STDMETHODCALLTYPE ControllerCreatedHandler::Invoke(
     HRESULT errorCode, ICoreWebView2Controller *createdController) {
+  auto *plugin=life->plugin;if(!plugin){if(createdController)createdController->Close();return S_OK;}
   if (!plugin) return S_OK;
   if (FAILED(errorCode) || !createdController) {
     show_missing_message(plugin->child,
@@ -923,9 +871,10 @@ HRESULT STDMETHODCALLTYPE ControllerCreatedHandler::Invoke(
       struct ScriptReadyHandler
           : public ComHandler<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler,
                               &IID_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler> {
-        XuContentPlugin *plugin;
-        explicit ScriptReadyHandler(XuContentPlugin *p) : plugin(p) {}
+        std::shared_ptr<XuPluginLife> life;
+        explicit ScriptReadyHandler(XuWebViewPlugin *p) : life(p->life) {}
         HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, LPCWSTR id) override {
+    auto *plugin=life->plugin;if(!plugin)return S_OK;
           (void)errorCode;
           (void)id;
           if (plugin) {
@@ -954,6 +903,7 @@ HRESULT STDMETHODCALLTYPE ControllerCreatedHandler::Invoke(
 
 HRESULT STDMETHODCALLTYPE EnvCreatedHandler::Invoke(HRESULT errorCode,
                                                     ICoreWebView2Environment *createdEnvironment) {
+  auto *plugin=life->plugin;if(!plugin)return S_OK;
   if (!plugin) return S_OK;
   if (FAILED(errorCode) || !createdEnvironment) {
     show_missing_message(plugin->child,
@@ -971,11 +921,8 @@ HRESULT STDMETHODCALLTYPE EnvCreatedHandler::Invoke(HRESULT errorCode,
 }
 
 static LRESULT CALLBACK ChildWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-  XuContentPlugin *p = (XuContentPlugin *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+  XuWebViewPlugin *p = (XuWebViewPlugin *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
   switch (msg) {
-  case WM_XU_IPC_DONE:
-    xu_invoke_finish((XuInvokeJob *)lParam);
-    return 0;
   case WM_SIZE:
     if (p) sync_bounds(p);
     return 0;
@@ -1016,14 +963,15 @@ static void ensure_child_class(void) {
   RegisterClassW(&wc);
 }
 
-static XuContentPlugin *plugin_create(XuContentHost *host) {
-  auto *p = new XuContentPlugin();
+static XuWebViewPlugin *plugin_create(XuContentHost *host) {
+  auto *p = new XuWebViewPlugin();p->life->plugin=p;
   if (host) p->host = *host;
   return p;
 }
 
-static void plugin_destroy(XuContentPlugin *p) {
+static void plugin_destroy(XuWebViewPlugin *p) {
   if (!p) return;
+  p->life->plugin=NULL;xu_invoke_close(p);
   if (p->controller) {
     p->controller->Close();
     p->controller->Release();
@@ -1204,7 +1152,7 @@ struct XuEnvOptions : public ICoreWebView2EnvironmentOptions,
   }
 };
 
-static void plugin_install(XuContentPlugin *p) {
+static void plugin_install(XuWebViewPlugin *p) {
   if (!p) return;
   wv_log("xu_webview: plugin_install");
   ensure_child_class();
@@ -1270,7 +1218,7 @@ static void plugin_install(XuContentPlugin *p) {
   }
 }
 
-static ICoreWebView2CookieManager *get_cookie_manager(XuContentPlugin *p) {
+static ICoreWebView2CookieManager *get_cookie_manager(XuWebViewPlugin *p) {
   if (!p || !p->webview) return nullptr;
   ICoreWebView2_2 *v2 = nullptr;
   if (FAILED(p->webview->QueryInterface(IID_ICoreWebView2_2, (void **)&v2)) || !v2)
@@ -1281,7 +1229,7 @@ static ICoreWebView2CookieManager *get_cookie_manager(XuContentPlugin *p) {
   return cm;
 }
 
-static void drain_eval(XuContentPlugin *p) {
+static void drain_eval(XuWebViewPlugin *p) {
   if (!p || !p->ready) return;
   char js[256 * 1024];
   host_read_raw(p, "xu_ui_eval.js", js, sizeof(js));
@@ -1296,7 +1244,7 @@ static void drain_eval(XuContentPlugin *p) {
   eval_raw(p, js, want[0] == '1');
 }
 
-static void drain_page(XuContentPlugin *p) {
+static void drain_page(XuWebViewPlugin *p) {
   if (!p || !p->ready || !p->webview) return;
   char url[8192], html[256 * 1024];
   host_read_trim(p, "xu_ui_page.url", url, sizeof(url));
@@ -1318,7 +1266,7 @@ static void drain_page(XuContentPlugin *p) {
   }
 }
 
-static void clear_cache(XuContentPlugin *p) {
+static void clear_cache(XuWebViewPlugin *p) {
   if (!p || !p->webview) return;
   ICoreWebView2CookieManager *cm = get_cookie_manager(p);
   if (cm) {
@@ -1329,7 +1277,7 @@ static void clear_cache(XuContentPlugin *p) {
   host_event(p, "cache_cleared");
 }
 
-static void cookies_clear(XuContentPlugin *p) {
+static void cookies_clear(XuWebViewPlugin *p) {
   ICoreWebView2CookieManager *cm = get_cookie_manager(p);
   if (cm) {
     cm->DeleteAllCookies();
@@ -1340,7 +1288,7 @@ static void cookies_clear(XuContentPlugin *p) {
            false);
 }
 
-static void cookies_get(XuContentPlugin *p) {
+static void cookies_get(XuWebViewPlugin *p) {
   ICoreWebView2CookieManager *cm = get_cookie_manager(p);
   if (!cm) {
     host_write(p, "xu_ui_cookies.txt", "");
@@ -1352,7 +1300,7 @@ static void cookies_get(XuContentPlugin *p) {
   cm->Release();
 }
 
-static void cookie_set(XuContentPlugin *p) {
+static void cookie_set(XuWebViewPlugin *p) {
   char raw[4096];
   host_read_trim(p, "xu_ui_cookie_set.txt", raw, sizeof(raw));
   // name\tvalue[\tdomain]
@@ -1391,7 +1339,7 @@ static void cookie_set(XuContentPlugin *p) {
   cm->Release();
 }
 
-static void apply_bgcolor(XuContentPlugin *p, const char *hex) {
+static void apply_bgcolor(XuWebViewPlugin *p, const char *hex) {
   if (!p || !hex) return;
   while (*hex == '#' || *hex == ' ') hex++;
   unsigned r = 0, g = 0, b = 0;
@@ -1417,7 +1365,7 @@ static void apply_bgcolor(XuContentPlugin *p, const char *hex) {
   eval_raw(p, js, false);
 }
 
-static void find_in_page(XuContentPlugin *p) {
+static void find_in_page(XuWebViewPlugin *p) {
   char text[4096];
   host_read_trim(p, "xu_ui_find.txt", text, sizeof(text));
   if (!text[0]) {
@@ -1445,9 +1393,10 @@ static void find_in_page(XuContentPlugin *p) {
   struct FindHandler
       : public ComHandler<ICoreWebView2ExecuteScriptCompletedHandler,
                           &IID_ICoreWebView2ExecuteScriptCompletedHandler> {
-    XuContentPlugin *plugin;
-    explicit FindHandler(XuContentPlugin *p) : plugin(p) {}
+    std::shared_ptr<XuPluginLife> life;
+    explicit FindHandler(XuWebViewPlugin *p) : life(p->life) {}
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, LPCWSTR resultObjectAsJson) override {
+    auto *plugin=life->plugin;if(!plugin)return S_OK;
       const char *v = "0";
       if (SUCCEEDED(errorCode) && resultObjectAsJson) {
         std::string s;
@@ -1463,7 +1412,7 @@ static void find_in_page(XuContentPlugin *p) {
   h->Release();
 }
 
-static void inject_css(XuContentPlugin *p) {
+static void inject_css(XuWebViewPlugin *p) {
   char css[256 * 1024];
   host_read_raw(p, "xu_ui_inject.css", css, sizeof(css));
   if (!css[0]) return;
@@ -1483,7 +1432,7 @@ static void inject_css(XuContentPlugin *p) {
   eval_raw(p, js.c_str(), false);
 }
 
-static void set_ua(XuContentPlugin *p) {
+static void set_ua(XuWebViewPlugin *p) {
   char ua[2048];
   host_read_trim(p, "xu_ui_ua.txt", ua, sizeof(ua));
   ICoreWebView2Settings *settings = nullptr;
@@ -1498,7 +1447,7 @@ static void set_ua(XuContentPlugin *p) {
   settings->Release();
 }
 
-static void set_context_menu(XuContentPlugin *p, bool on) {
+static void set_context_menu(XuWebViewPlugin *p, bool on) {
   p->context_menu = on;
   ICoreWebView2Settings *settings = nullptr;
   if (p->webview && SUCCEEDED(p->webview->get_Settings(&settings)) && settings) {
@@ -1524,7 +1473,7 @@ static void set_context_menu(XuContentPlugin *p, bool on) {
   eval_raw(p, js, false);
 }
 
-static void set_muted(XuContentPlugin *p, bool muted) {
+static void set_muted(XuWebViewPlugin *p, bool muted) {
   p->media_muted = muted;
   const char *flag = muted ? "true" : "false";
   const char *label = muted ? "muted" : "unmuted";
@@ -1539,7 +1488,24 @@ static void set_muted(XuContentPlugin *p, bool muted) {
   eval_raw(p, js, false);
 }
 
-static int plugin_handle_cmd(XuContentPlugin *p, const char *cmd) {
+static bool native_web_request(XuWebViewPlugin *p,const char *command){
+ uint64_t id=0;unsigned kind=0;std::string value;if(!xu_web_native_take(command,p->host.canvas_id,p->host.canvas_generation,&id,&kind,&value))return false;
+ if(!kind)return true;if(!p->ready||!p->webview){xu_web_native_complete(id,false,"WebView is not ready");return true;}
+ if(p->life->native_queries>=XU_UI_REQUEST_MAX_PENDING){xu_web_native_complete(id,false,"native query capacity exceeded");return true;}
+ if(kind==8||kind==9){auto script=kind==9?"(function(){return window.find("+xu_web_json(value)+")?1:0;})()":value;
+  std::wstring wide;utf8_to_wide(script.c_str(),wide);auto *handler=new EvalHandler(p,true,id);HRESULT hr=p->webview->ExecuteScript(wide.c_str(),handler);handler->Release();if(FAILED(hr))xu_web_native_complete(id,false,"JavaScript evaluation failed");return true;}
+ auto *manager=get_cookie_manager(p);if(!manager){xu_web_native_complete(id,false,"cookie manager unavailable");return true;}
+ if(kind==10){auto *handler=new CookiesHandler(p,id);HRESULT hr=manager->GetCookies(NULL,handler);handler->Release();if(FAILED(hr))xu_web_native_complete(id,false,"cookie read failed");}
+ else if(kind==12)xu_web_native_complete(id,SUCCEEDED(manager->DeleteAllCookies()),"");
+ else{std::string name,text,domain;if(!xu_web_cookie_fields(value,&name,&text,&domain))xu_web_native_complete(id,false,"invalid cookie fields");
+  else {std::wstring wn,wv,wd;utf8_to_wide(name.c_str(),wn);utf8_to_wide(text.c_str(),wv);utf8_to_wide(domain.c_str(),wd);ICoreWebView2Cookie *cookie=NULL;
+   HRESULT hr=manager->CreateCookie(wn.c_str(),wv.c_str(),wd.c_str(),L"/",&cookie);if(SUCCEEDED(hr)&&cookie){hr=manager->AddOrUpdateCookie(cookie);cookie->Release();}xu_web_native_complete(id,SUCCEEDED(hr),"");}}
+ manager->Release();return true;
+}
+
+static int plugin_handle_cmd(XuWebViewPlugin *p, const char *cmd) {
+  if(p && native_web_request(p,cmd))return 1;
+  if(p && !strncmp(cmd,"__web_reply\t",12)){xu_invoke_poll(p);return 1;}
   if (!p || !cmd) return 0;
   if (strcmp(cmd, "reload") == 0) {
     if (p->webview) p->webview->Reload();
@@ -1641,13 +1607,20 @@ static int plugin_handle_cmd(XuContentPlugin *p, const char *cmd) {
   return 0;
 }
 
-static void plugin_on_poll(XuContentPlugin *p) {
+static void plugin_on_poll(XuWebViewPlugin *p) {
   if (!p) return;
+  xu_invoke_poll(p);
   drain_eval(p);
   drain_page(p);
+  // The unscoped compatibility bus belongs to the primary window only.
+  if(p->host.window_id==1)for(unsigned i=0;i<16;++i){auto event=xu_ipc_poll(p);if(event.empty())break;
+    auto script="window.__XU__&&window.__XU__._accept&&window.__XU__._accept("+xu_web_json(event)+");";
+    eval_raw(p,script.c_str(),false);
+  }
+
 }
 
-static void plugin_sync_frame(XuContentPlugin *p) {
+static void plugin_sync_frame(XuWebViewPlugin *p) {
   if (!p || !p->child) return;
   HWND parent = GetParent(p->child);
   if (!parent) return;
@@ -1658,13 +1631,18 @@ static void plugin_sync_frame(XuContentPlugin *p) {
   sync_bounds(p);
 }
 
-static void plugin_eval_js(XuContentPlugin *p, const char *js) {
+static void plugin_eval_js(XuWebViewPlugin *p, const char *js) {
   eval_raw(p, js, false);
 }
 
 static const XuContentVTable g_webview_vtable = {
-    plugin_create,     plugin_destroy, plugin_install, plugin_handle_cmd,
-    plugin_on_poll,    plugin_sync_frame, plugin_eval_js,
+  [](XuContentHost *host)->XuContentPlugin *{return reinterpret_cast<XuContentPlugin *>(plugin_create(host));},
+  [](XuContentPlugin *p){plugin_destroy(reinterpret_cast<XuWebViewPlugin *>(p));},
+  [](XuContentPlugin *p){plugin_install(reinterpret_cast<XuWebViewPlugin *>(p));},
+  [](XuContentPlugin *p,const char *text)->int{return plugin_handle_cmd(reinterpret_cast<XuWebViewPlugin *>(p),text);},
+  [](XuContentPlugin *p){plugin_on_poll(reinterpret_cast<XuWebViewPlugin *>(p));},
+  [](XuContentPlugin *p){plugin_sync_frame(reinterpret_cast<XuWebViewPlugin *>(p));},
+  [](XuContentPlugin *p,const char *text){plugin_eval_js(reinterpret_cast<XuWebViewPlugin *>(p),text);},
 };
 
 extern "C" const XuContentVTable *xu_webview_plugin_vtable(void) { return &g_webview_vtable; }

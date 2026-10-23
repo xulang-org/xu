@@ -30,6 +30,35 @@
 
 ---
 
+## Xu 0.10.1-dev.3
+
+UI controls add a compatible `Styles` API while retaining the existing `Theme` and painting APIs.
+
+- Dark, light and high-contrast palettes; global font family, weight, line height, text scale and control density; per-control font and palette overrides.
+- Button radius, borders, padding, alignment, layered shadows and image icon placement, size and opacity; checkbox mark size, gap and stroke; rounded progress with disabled and error states.
+- Input/TextArea selection foreground/background, placeholder, caret, preedit underline, hover, error and read-only states. Read-only controls retain selection/copy and release the native edit session.
+- Styled scrollbars share painting and hit-test geometry, with thumb dragging, page clicks, keyboard and wheel support.
+- `View.set_styles`, `set_style_scope` and `clear_style_scope` invalidate affected descendant repaint boundaries automatically. Palette changes reuse shaped text; font and geometry changes also remeasure controls. Local scopes are complete theme snapshots preserving explicit overrides.
+
+Use `StyledLabel`, `set_style_measure`, `layout_styled` / `present_styled` for retained scenes. Call `mark_measure` after changing label text and `place_editor` after layout to update native IME geometry. `StyledPainter.overlay_styled` paints scrollbars after children. Shadows use a bounded approximation of up to eight layers. Applications switch themes explicitly; system menus/dialogs and WebView content use platform appearance and CSS respectively.
+
+
+`ControlStyle.states` supports ordered `StatePaint` overrides for combined hover/press/focus/selected/disabled/error/read-only states, including foreground, border, selection, focus and icon opacity. Each rule declares a `when` mask, optional `unless` exclusions and the paint fields to override.
+
+UI object builds reserve a separate coroutine stack budget for native font-library calls. Styled painting borrows themes instead of copying them at every tree level; the gallery drains input bursts before submitting a frame. Ordinary CLI task stacks keep their existing size.
+
+## Xu 0.10.1-dev.2
+
+Draw canvases keep their position by default on macOS, Windows and Linux. Drag and wheel events still reach the application; built-in camera panning requires explicit opt-in with `draw.set_pan_enabled(1)` after the canvas is ready.
+
+This development version also adds:
+
+- Persistent `widgets.input` / `widgets.text_area` controls with native text sessions, shaped selection/caret geometry, keyboard focus, multiline scrolling and asynchronous clipboard edits. Place editors after retained layout with `widgets.place_editor` before presenting.
+- Per-window `MenuEntry` trees with submenus, separators, checked/disabled items and shortcuts, plus asynchronous `screens_async` snapshots. Screen results explicitly report coordinate units and whether primary/work-area information is known.
+- Bounded WebView requests with unique IDs, cancellation, deadlines, window-generation ownership and UI-thread completion. `__XU__.invoke` supports `timeoutMs`, `AbortSignal` and `.cancel()`; scoped Xu callbacks use `bind_ipc_requests_www`. Eval/find/cookie requests finish through `ev_request`.
+
+WebView limits are 64 outstanding dispatch leases, 1 MiB per invoke body and an 8 MiB shared body/result budget. Cancelling a running callback discards its response; its lease remains occupied until user code returns. Native query results are limited to 64 KiB. Windows editor hit testing requires real DirectWrite; older Wine builds return `E_NOTIMPL`.
+
 ## Xu 0.10.0 source update
 
 This update adds the UI drawing and desktop foundations while retaining the compiler improvements from 0.9.4:
@@ -39,7 +68,7 @@ This update adds the UI drawing and desktop foundations while retaining the comp
 - Dynamic desktop windows and asynchronous clipboard, file-open, save-path and folder requests with cancellation and timeouts.
 - Compiler-owned version identity for `xu env`, project initialization and update checks; downloaded compilers must match the requested version before installation.
 
-The broader UI work remains in progress: editor controls, expanded menus/screen queries and WebView request lifecycle work are still pending. Published installers remain available from the release link below.
+These are source-development changes. Published installers remain available from the release link below.
 
 ## Xu 0.9.4
 
