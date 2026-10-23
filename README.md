@@ -30,6 +30,14 @@
 
 ---
 
+## Xu 0.10.1 release
+
+This official release includes all development changes through `930f189`: styled UI controls and the unified style switcher, desktop request handling, Thumb-2 code generation, cryptography fixes, and HTTP, regexp, JSON and compression corrections.
+
+**Migration:** regexp match/find/split/replace APIs now require error handling when their work budget is exhausted. HTTP handlers can run concurrently; synchronize shared mutable state. Draw camera panning requires `draw.set_pan_enabled(1)`. See the development entries below for API details and limits.
+
+The earlier `0.11.0-dev.3` preview remains a separate historical release. The official release source and SDK use **0.10.1**; this development branch retains **0.11.0-dev.3**. Download from [Xu v0.10.1](https://github.com/xulang-org/xu/releases/tag/v0.10.1).
+
 ## Xu 0.11.0-dev.2
 
 This development update integrates the remote `arm32` compiler changes: Thumb-2 register allocation, compact 16-bit instruction encoding and branch relaxation. It retains the standard library changes and migration requirements below.
