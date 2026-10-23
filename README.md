@@ -30,6 +30,17 @@
 
 ---
 
+## Xu 0.11.0-dev.1 development update
+
+This development branch integrates the latest `main` and `arm32` work, then fixes standard library correctness and concurrency issues:
+
+- HTTP servers dispatch complete requests concurrently. Idle and partial requests are polled with bounded connection, buffer and timeout limits. Handlers may now overlap; synchronize shared mutable state. `server_options()` supplies defaults for `serve_with_options`.
+- Regexp matching uses explicit heap stacks and a work budget. **Migration:** matching, finding, splitting and replacement calls now require error handling, for example `matched := re.match_string(&text) or (err) { << 1 }`. Budget exhaustion reports an error; valid nonmatches retain their usual empty/false results. Expressions are limited to 65,536 bytes and 64 nested groups.
+- DEFLATE writers now use bounded LZ77 matches with fixed Huffman codes and a stored-block fallback for incompressible data.
+- JSON `as_int` and `as_f64` propagate conversion errors. Legacy `number_int` and `number_f64` retain their zero fallback; use the checked accessors when conversion must succeed.
+
+This is a development source version; published installers remain on the releases page.
+
 ## Xu 0.10.1-dev.3
 
 UI controls add a compatible `Styles` API while retaining the existing `Theme` and painting APIs.
@@ -72,8 +83,7 @@ These are source-development changes. Published installers remain available from
 
 ## Xu 0.9.4
 
-The current source tree reports Xu 0.10.1. It carries the compiler consistency and
-optimizer work described below:
+The source tree also retains the compiler consistency and optimizer work described below:
 
 - **Borrow Checking Soundness**: The borrow checker now walks every expression kind (with a conservative fallback for unknown kinds), so aliasing such as `f(mut &v, &v)` is reported even when nested inside casts or arithmetic; borrows taken inside a loop now stay live across the back edge. Programs that previously compiled only because of these gaps now receive a diagnostic.
 - **Generics and Type Table Limits**: Generic declarations are no longer limited to four type parameters, type-id range overflow is asserted instead of silently wrapping, and backends that do not support a requested target fail explicitly.
