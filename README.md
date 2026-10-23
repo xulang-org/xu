@@ -30,6 +30,29 @@
 
 ---
 
+## Xu 0.10.1 release
+
+This official release includes all development changes through `930f189`: styled UI controls and the unified style switcher, desktop request handling, Thumb-2 code generation, cryptography fixes, and HTTP, regexp, JSON and compression corrections.
+
+**Migration:** regexp match/find/split/replace APIs now require error handling when their work budget is exhausted. HTTP handlers can run concurrently; synchronize shared mutable state. Draw camera panning requires `draw.set_pan_enabled(1)`. See the development entries below for API details and limits.
+
+The earlier `0.11.0-dev.3` preview remains a separate historical release. This source and its SDK use the explicitly selected official version **0.10.1**. Download from [Xu v0.10.1](https://github.com/xulang-org/xu/releases/tag/v0.10.1).
+
+## Xu 0.11.0-dev.2
+
+This development update integrates the remote `arm32` compiler changes: Thumb-2 register allocation, compact 16-bit instruction encoding and branch relaxation. It retains the standard library changes and migration requirements below.
+
+## Xu 0.11.0-dev.1 development update
+
+This development branch integrates the latest `main` and `arm32` work, then fixes standard library correctness and concurrency issues:
+
+- HTTP servers dispatch complete requests concurrently. Idle and partial requests are polled with bounded connection, buffer and timeout limits. Handlers may now overlap; synchronize shared mutable state. `server_options()` supplies defaults for `serve_with_options`.
+- Regexp matching uses explicit heap stacks and a work budget. **Migration:** matching, finding, splitting and replacement calls now require error handling, for example `matched := re.match_string(&text) or (err) { << 1 }`. Budget exhaustion reports an error; valid nonmatches retain their usual empty/false results. Expressions are limited to 65,536 bytes and 64 nested groups.
+- DEFLATE writers now use bounded LZ77 matches with fixed Huffman codes and a stored-block fallback for incompressible data.
+- JSON `as_int` and `as_f64` propagate conversion errors. Legacy `number_int` and `number_f64` retain their zero fallback; use the checked accessors when conversion must succeed.
+
+This is a development source version; published installers remain on the releases page.
+
 ## Xu 0.10.1-dev.3
 
 UI controls add a compatible `Styles` API while retaining the existing `Theme` and painting APIs.
@@ -72,7 +95,7 @@ These are source-development changes. Published installers remain available from
 
 ## Xu 0.9.4
 
-Xu 0.9.4 is a compiler consistency and optimizer release:
+The source tree also retains the compiler consistency and optimizer work described below:
 
 - **Borrow Checking Soundness**: The borrow checker now walks every expression kind (with a conservative fallback for unknown kinds), so aliasing such as `f(mut &v, &v)` is reported even when nested inside casts or arithmetic; borrows taken inside a loop now stay live across the back edge. Programs that previously compiled only because of these gaps now receive a diagnostic.
 - **Generics and Type Table Limits**: Generic declarations are no longer limited to four type parameters, type-id range overflow is asserted instead of silently wrapping, and backends that do not support a requested target fail explicitly.
@@ -80,7 +103,16 @@ Xu 0.9.4 is a compiler consistency and optimizer release:
 - **SSA Loop Optimization**: Scalar SSA promotion no longer depends on a per-shape whitelist, and the ARM64 loop kernels (scan, saxpy, CRC, binary search, fill, stride, predicated scan) have SSA-based matchers. Loops bounded by an `[]int` length are rotated so they qualify. Measured speedups versus 0.9.3 include `bloom_filter` ~12%, `chase_index` 9-11%, `f64_sum` ~8% and `algorithm_search` ~9% at `-O3`, with no regressions and slightly faster self-compilation.
 - **Pattern Diagnostics**: `--timings` reports `pattern-hits:` and per-function register-allocation mode; `XU_PATTERNS_OFF` disables named backend patterns for differential testing (`scripts/pattern_diff.sh`).
 
-Download the [0.9.4 SDK and installers](https://github.com/xulang-org/xu/releases/tag/v0.9.4). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
+Published SDKs and installers are listed on the [releases page](https://github.com/xulang-org/xu/releases). The [benchmark dashboard](https://xulang.org/benchmarks) retains each measurement's actual compiler version and provenance.
+
+The product self-host chain uses a verified hosted seed, hashes the source manifest,
+and requires a fixed point between adjacent generations. The repository does not
+claim a seed-free bootstrap from only the checked-in sources.
+
+Coroutine calls are ownership boundaries: `xu` transfers owned values or uses
+channels, while borrowed `&T` and `&mut T` values do not cross into another
+coroutine. The `<-` token is context-sensitive by design: a statement form is
+`break`, while an expression such as `<-ch` receives from a channel.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 

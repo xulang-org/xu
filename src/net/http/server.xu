@@ -1,0 +1,247 @@
+@net/http
+
+#errors
+#net
+#os
+#strings
+
+// Limits apply per server. Read time is an absolute request-intake budget;
+// write time bounds blocking response I/O. max_buffer_bytes bounds pending
+// input across connections; max_connections also counts active handlers.
+pub struct ServerOptions {
+    pub read_timeout_ns int
+    pub write_timeout_ns int
+    pub max_connections int
+    pub max_header_bytes int
+    pub max_body_bytes int
+    pub max_buffer_bytes int
+}
+
+// Defaults: 10-second I/O budgets, 256 connections, 64 KiB headers,
+// 10 MiB bodies and 32 MiB total pending input.
+pub fn server_options() ServerOptions {
+    << ServerOptions{read_timeout_ns: 10000000000, write_timeout_ns: 10000000000,
+        max_connections: 256, max_header_bytes: 65536, max_body_bytes: 10485760,
+        max_buffer_bytes: 33554432}
+}
+
+struct PendingRequest {
+    fd int
+    data string
+    deadline int
+    header_end int
+    header_scan int
+    length int
+    chunked bool
+    chunk_pos int
+    body_bytes int
+}
+
+fn pending_request(fd int, deadline int) PendingRequest {
+    << PendingRequest{fd: fd, data: "", deadline: deadline, header_end: -1,
+        header_scan: 0, length: 0, chunked: false, chunk_pos: 0, body_bytes: 0}
+}
+
+// Advance only over complete framing. Request parsing below must never need
+// another socket read, even for chunked bodies and trailers.
+fn pending_request_complete(peers &mut []PendingRequest, index int, options &ServerOptions) bool {
+    if peers[index].header_end < 0 {
+        end := find_crlf_crlf_from(&peers[index].data, peers[index].header_scan)
+        if end < 0 {
+            if peers[index].data.len > options.max_header_bytes { >> errors.new("net/http: request headers too large") }
+            peers[index].header_scan = peers[index].data.len - 3
+            if peers[index].header_scan < 0 { peers[index].header_scan = 0 }
+            << false
+        }
+        if end + 4 > options.max_header_bytes { >> errors.new("net/http: request headers too large") }
+        peers[index].header_end = end
+        head := peers[index].data[0:end]
+        length := header_lookup(&head, "content-length")
+        transfer := header_lookup(&head, "transfer-encoding")
+        if length.len > 0 && transfer.len > 0 { >> errors.new("net/http: ambiguous request framing") }
+        if length.len > 0 { peers[index].length = http_decimal(length, options.max_body_bytes) or >> }
+        if transfer.len > 0 {
+            if strings.to_lower(&transfer) != "chunked" { >> errors.new("net/http: unsupported Transfer-Encoding") }
+            peers[index].chunked = true
+        }
+        peers[index].chunk_pos = end + 4
+    }
+    if !peers[index].chunked { << peers[index].data.len - peers[index].header_end - 4 >= peers[index].length }
+    while true {
+        line_end := find_crlf_from(&peers[index].data, peers[index].chunk_pos)
+        if line_end < 0 {
+            if peers[index].data.len - peers[index].chunk_pos > options.max_header_bytes { >> errors.new("net/http: chunk header too large") }
+            << false
+        }
+        line := peers[index].data[peers[index].chunk_pos:line_end]
+        size := parse_hex_size(line + "") or >>
+        if size > options.max_body_bytes - peers[index].body_bytes { >> errors.new("net/http: request body too large") }
+        start := line_end + 2
+        if size == 0 {
+            if peers[index].data.len - start > options.max_header_bytes { >> errors.new("net/http: trailers too large") }
+            if start + 2 <= peers[index].data.len && peers[index].data[start:start + 2] == "\r\n" { << true }
+            << find_crlf_crlf_from(&peers[index].data, start) >= 0
+        }
+        if size + 2 > peers[index].data.len - start { << false }
+        if peers[index].data[start + size:start + size + 2] != "\r\n" { >> errors.new("net/http: bad chunk CRLF") }
+        peers[index].body_bytes += size
+        peers[index].chunk_pos = start + size + 2
+    }
+    << false
+}
+
+fn pending_readiness(fd int) int {
+    << os.socket_poll(fd, 1) or (err) { << -1 }
+}
+
+fn pending_read(fd int) string {
+    << net.conn_read(fd, read_chunk_bytes) or (err) { << "" }
+}
+
+fn pending_timeout(fd int) bool {
+    os.set_sock_timeout(fd, 1000000) or (err) { << false }
+    << true
+}
+
+fn pending_complete(peers &mut []PendingRequest, index int, options &ServerOptions) int {
+    ready := pending_request_complete(peers, index, options) or (err) { << -1 }
+    if ready { << 1 }
+    << 0
+}
+
+fn dispatch_pending(fd int, data string, handle fn(Context), done chan int, timeout_ns int, file_root string) bool {
+    os.set_sock_timeout(fd, timeout_ns) or (err) { << false }
+    xu dispatch_request(fd, data, handle, done, file_root)
+    << true
+}
+
+fn invoke_request(fd int, data string, handle fn(Context), file_root string) {
+    // Build the owning request on its worker; only the input string and
+    // scalar handles cross the coroutine boundary.
+    if file_root.len > 0 {
+        input := data + ""
+        req := buffered_request(input) or (err) { << }
+        ctx := Context{fd: fd, req: req}
+        fs := file_server(file_root)
+        fs.serve_context(ctx)
+    } else {
+        input := data + ""
+        req := buffered_request(input) or (err) { << }
+        ctx := Context{fd: fd, req: req}
+        handle(ctx)
+    }
+}
+
+fn dispatch_request(fd int, data string, handle fn(Context), done chan int, file_root string) {
+    invoke_request(fd, data, handle, file_root)
+    close_http_fd(fd)
+    done <- 1
+}
+
+// All server helpers share the same incremental intake. Idle and partial
+// requests stay here and never consume a worker waiting for socket input.
+// Complete requests run concurrently; handlers must synchronize shared state.
+// Retains the legacy integer status contract (1 on invalid configuration).
+pub fn serve_listener(lfd int, handle fn(Context)) int {
+    options := server_options()
+    << serve_listener_with_options(lfd, handle, options) or (err) { << 1 }
+}
+
+// Serves concurrently with validated positive limits. Invalid options throw.
+pub fn (s Server) serve_with_options(handle fn(Context), options ServerOptions) int {
+    << serve_listener_with_options(s.lfd, handle, options) or >>
+}
+
+fn serve_listener_with_options(lfd int, handle fn(Context), options ServerOptions) int {
+    << serve_listener_root(lfd, handle, options, "") or >>
+}
+
+fn serve_file_listener(lfd int, root string) int {
+    options := server_options()
+    fs := file_server(root)
+    << serve_listener_root(lfd, file_server_handler, options, fs.root + "") or (err) { << 1 }
+}
+
+fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
+    if options.read_timeout_ns <= 0 || options.write_timeout_ns <= 0 || options.max_connections <= 0 || options.max_connections > 4096 || options.max_header_bytes <= 0 || options.max_header_bytes > max_message_bytes || options.max_body_bytes < 0 || options.max_body_bytes > max_message_bytes || options.max_buffer_bytes <= 0 {
+        >> errors.new("net/http: invalid server options")
+    }
+    mut peers := []PendingRequest{}
+    for i in 0:options.max_connections { peers.push(pending_request(-1, 0)) }
+    done := chan int{cap: options.max_connections}
+    mut active := 0
+    mut buffered := 0
+    mut running := true
+    while running {
+        while sys_wait_cancel(done, 0) {
+            _ := <-done
+            active -= 1
+        }
+        // Bound admission work so a burst cannot prevent existing peers from
+        // making progress. Only this loop accepts or reads these sockets.
+        for admission in 0:32 {
+            if active >= options.max_connections { <- }
+            ready := os.socket_poll(lfd, 1) or (err) { running = false
+                <- }
+            if ready == 0 { <- }
+            fd := net.accept(lfd) or (err) { running = false
+                <- }
+            deadline := http_deadline(options.read_timeout_ns) or (err) { close_http_fd(fd)
+                -> }
+            for i in 0:peers.len {
+                if peers[i].fd < 0 {
+                    peers[i] = pending_request(fd, deadline)
+                    active += 1
+                    <-
+                }
+            }
+        }
+        for i in 0:peers.len {
+            fd := peers[i].fd
+            if fd < 0 { -> }
+            mut discard := now_ns() >= peers[i].deadline
+            mut ready := 0
+            if !discard {
+                ready = pending_readiness(fd)
+                if ready < 0 { discard = true }
+            }
+            if !discard && ready > 0 {
+                // Readiness is advisory; bound the syscall as well. An
+                // absolute lifetime below prevents drips renewing the budget.
+                if !pending_timeout(fd) { discard = true }
+                if !discard {
+                    part := pending_read(fd)
+                    if part.len == 0 { discard = true }
+                    if part.len > options.max_buffer_bytes - buffered || part.len > max_message_bytes - peers[i].data.len {
+                        discard = true
+                    }
+                    if !discard {
+                        peers[i].data = peers[i].data + part
+                        buffered += part.len
+                        state := pending_complete(mut &peers, i, &options)
+                        if state < 0 { discard = true }
+                        if state > 0 {
+                            input := peers[i].data + ""
+                            root_copy := file_root + ""
+                            if dispatch_pending(fd, input, handle, done, options.write_timeout_ns, root_copy) {
+                                buffered -= peers[i].data.len
+                                peers[i] = pending_request(-1, 0)
+                            } else {
+                                discard = true
+                            }
+                        }
+                    }
+                }
+            }
+            if discard {
+                buffered -= peers[i].data.len
+                peers[i] = pending_request(-1, 0)
+                active -= 1
+                close_http_fd(fd)
+            }
+        }
+        if running { sleep_ns(1000000) }
+    }
+    for i in 0:peers.len { if peers[i].fd >= 0 { close_http_fd(peers[i].fd) } }
+    << 0
+}
