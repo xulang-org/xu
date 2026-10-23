@@ -81,6 +81,7 @@ static void apply_app_icon(void);
 static void show_desktop_notify(void);
 static void menu_install_or_update(void);
 static void tray_install_or_update(void);
+static void native_menu_close(GtkWindow *);
 static void handle_shell_cmd(const char *s);
 static void drain_title_size(void);
 
@@ -361,7 +362,7 @@ static bool g_root_closed=false;
 static void do_quit(void) {
   if (g_quitting) return;
   if(!g_root_closed){
-    g_root_closed=true;
+    g_root_closed=true;native_menu_close(g_win);
     if(g_content && g_content_vt && g_content_vt->destroy)g_content_vt->destroy(g_content);
     g_content=NULL;
     unsigned meta[6];if(xu_ui_window_info(1,0,meta,NULL,0))xu_ui_window_closed(1,meta[1]);
@@ -606,7 +607,10 @@ static void drain_title_size(void) {
   apply_app_icon();
 }
 
+#include "linux_screens.inc"
+#include "linux_menus.inc"
 static void handle_shell_cmd(const char *s) {
+  if(!strcmp(s,"menu_v2")){unsigned meta[6]={};xu_ui_window_info(1,0,meta,NULL,0);native_menu_install(g_win,g_content_box,1,meta[1]);return;}
   if(g_root_closed)return;
   if(!strcmp(s,"close")){gtk_window_close(g_win);return;}
   if(!strncmp(s,"title\t",6)){write_tmp("xu_ui_title.txt",s+6);drain_title_size();return;}
@@ -950,6 +954,7 @@ static int g_menu_action_ready = 0;
 static int g_tray_action_ready = 0;
 
 static void menu_install_or_update(void) {
+  unsigned menu_meta[6]={};xu_ui_window_info(1,0,menu_meta,NULL,0);if(native_menu_install(g_win,g_content_box,1,menu_meta[1])||g_structured_menus.count(g_win))return;
   if (!g_app || !g_win) return;
   char items[4096];
   read_file_raw("xu_ui_menu.txt", items, sizeof(items));
@@ -1336,7 +1341,7 @@ static gboolean drain_cmds(gpointer data) {
       const char *cmd = strip_prefix(unscoped);
       int to_content = (strncmp(unscoped, "wv.", 3) == 0 || strncmp(unscoped, "content.", 8) == 0);
       if (to_content) {
-        if (!desktop_files(cmd,1,g_root_generation,g_win) && !desktop_clipboard(cmd,1,g_root_generation) && g_content && g_content_vt && g_content_vt->handle_cmd) {
+        if (!desktop_screens(cmd,1,g_root_generation,g_win) && !desktop_files(cmd,1,g_root_generation,g_win) && !desktop_clipboard(cmd,1,g_root_generation) && g_content && g_content_vt && g_content_vt->handle_cmd) {
           g_content_vt->handle_cmd(g_content, cmd);
         }
         xu_ui_draw_discard_marker(cmd);

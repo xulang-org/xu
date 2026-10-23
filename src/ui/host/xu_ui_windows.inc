@@ -32,7 +32,7 @@ int xu_ui_window_reserve(unsigned *identity) {
 }
 void xu_ui_window_abandon(unsigned id,unsigned generation) {
   lock_w();auto *w=window_find(id,generation);bool release=w && w->state==1;
-  if(release)*w={};unlock_w();if(release)xu_ui_canvas_close(id,generation);
+  if(release)*w={};unlock_w();if(release){xu_ui_web_invoke_close(id,generation);xu_ui_canvas_close(id,generation);}
 }
 static int window_upload(const void *data,unsigned size) {
   if(!data || size<32 || size>32+XU_UI_WINDOW_MAX_TITLE)return 0;
@@ -76,13 +76,13 @@ void xu_ui_window_closed(unsigned id,unsigned generation) {
   // Scoped slots cannot survive a window or exhaust the mailbox after repeated opens.
   char prefix[48];snprintf(prefix,sizeof(prefix),"window/%u/%u/",id,generation);size_t length=strlen(prefix);
   if(release)for(auto &s:g_slots)if(s.used && !strncmp(s.name,prefix,length)){free(s.body);memset(&s,0,sizeof(s));}
-  unlock_w();if(release)xu_ui_canvas_close(id,generation);
+  unlock_w();if(release){xu_ui_web_invoke_close(id,generation);xu_ui_canvas_close(id,generation);}
 }
 void xu_ui_windows_shutdown(void) {
   unsigned identities[XU_UI_WINDOW_MAX_COUNT][2]={};
   lock_w();g_windows_stopped=true;unsigned count=0;
   for(auto &w:g_windows)if(w.id){identities[count][0]=w.id;identities[count++][1]=w.generation;}
-  unlock_w();for(unsigned i=0;i<count;++i)xu_ui_window_closed(identities[i][0],identities[i][1]);
+  unlock_w();xu_ui_web_invoke_shutdown();for(unsigned i=0;i<count;++i)xu_ui_window_closed(identities[i][0],identities[i][1]);
 }
 void xu_ui_window_event(unsigned id,unsigned generation,const char *payload) {
   if(!payload)return;
@@ -98,7 +98,9 @@ int xu_ui_command_owner(const char *command,unsigned *identity) {
   if(!command || !identity)return 0;identity[0]=identity[1]=0;
   const char *s=command;
   if(!strncmp(s,"content.",8))s+=8;else if(!strncmp(s,"wv.",3))s+=3;
-  uint64_t id=0;bool found=false;lock_r();
+  uint64_t id=0;bool found=false;
+  if(!strncmp(s,"__web_reply\t",12) && xu_request_id(s+12,&id))return xu_ui_web_invoke_owner(id,identity);
+  lock_r();
   if(!strncmp(s,"__draw_frame\t",13) && xu_request_id(s+13,&id)){
     for(auto &f:g_draw_pending)if(f.lease && f.ticket==id){identity[0]=f.window_id;identity[1]=f.generation;found=true;break;}
   }else if(xu_request_marker(s,&id)){auto *r=request_find(id);if(r){identity[0]=r->window;identity[1]=r->generation;found=true;}}
