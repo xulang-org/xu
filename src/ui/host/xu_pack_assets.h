@@ -21,6 +21,10 @@ extern const unsigned int xu_pack_icon_png_len;
 /* Windows tray prefers a real .ico blob (optional; pack embeds when available). */
 extern const unsigned char xu_pack_icon_ico[];
 extern const unsigned int xu_pack_icon_ico_len;
+/* Optional Windows loader; declared here so weak defaults also keep external
+ * C linkage when the Linux oneexe build compiles its .c inputs with C++. */
+extern const unsigned char xu_pack_webview2_loader[];
+extern const unsigned int xu_pack_webview2_loader_len;
 
 typedef struct XuPackSlice {
   const unsigned char *data;
@@ -42,6 +46,8 @@ XuPackSlice xu_pack_path_slice(const char *path);
 const unsigned char *xu_pack_www_ptr(const char *rel, unsigned *len);
 const unsigned char *xu_pack_icon_ptr(unsigned *len);
 const unsigned char *xu_pack_path_ptr(const char *path, unsigned *len);
+/* Exact embedded name, without URL/icon aliases or basename fallbacks. */
+const unsigned char *xu_pack_asset_ptr(const char *relative_path, unsigned *len);
 
 #ifdef __cplusplus
 }

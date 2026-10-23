@@ -87,21 +87,21 @@ static void wide_to_utf8(LPCWSTR src, std::string &dst) {
 }
 
 static void host_event(XuContentPlugin *p, const char *payload) {
-  if (p && p->host.append_shell_event) p->host.append_shell_event(payload);
+  if (p && p->host.append_shell_event) xu_content_event(&p->host,payload);
 }
 
 static void host_write(XuContentPlugin *p, const char *name, const char *body) {
-  if (p && p->host.write_tmp) p->host.write_tmp(name, body ? body : "");
+  if (p && p->host.write_tmp) xu_content_write(&p->host,name,body);
 }
 
 static void host_read_trim(XuContentPlugin *p, const char *name, char *out, unsigned n) {
   if (out && n) out[0] = 0;
-  if (p && p->host.read_trim) p->host.read_trim(name, out, n);
+  if (p && p->host.read_trim) xu_content_read(&p->host,name,out,n,true);
 }
 
 static void host_read_raw(XuContentPlugin *p, const char *name, char *out, unsigned n) {
   if (out && n) out[0] = 0;
-  if (p && p->host.read_raw) p->host.read_raw(name, out, n);
+  if (p && p->host.read_raw) xu_content_read(&p->host,name,out,n,false);
 }
 
 static void show_missing_message(HWND hwnd, const char *msg_utf8) {
@@ -272,6 +272,11 @@ static bool xu_ipc_invoke_async(XuContentPlugin *p, ICoreWebView2WebResourceRequ
 }
 
 static std::string xu_ipc_poll(XuContentPlugin *p) {
+  const char *tmp = p->host.tmp;
+  if (!tmp || !tmp[0] || !strcmp(tmp, ":xu:") || !strcmp(tmp, ":mem:")) {
+    unsigned len = 0; char *body = xu_ui_emit_take(&len);
+    std::string message(body ? body : "", len); free(body); return message;
+  }
   std::string raw = read_tmp_all(p, "xu_ui_emit_q.txt");
   if (raw.empty()) return "";
   size_t pos = raw.find('\x1e');

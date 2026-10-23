@@ -1,0 +1,92 @@
+@xu/types
+
+// O1+ optimizer pipeline. Stages run in table order. The order is mostly a
+// performance contract: later shape matchers (inline_cfg leaf checks, LICM,
+// promote, emit_vec_*) only fire on the MIR earlier stages leave behind.
+// Breaking it does not miscompile; it silently loses optimizations, so treat
+// reordering as a benchmark-gated change.
+//
+// Phi metadata exists only between promote and phi_elim; XU_VERIFY=1 checks
+// that contract and runs the full verifier after every stage.
+
+struct MirStage {
+    name string
+    min_opt int  // lowest -O level that runs the stage
+    max_nfn int  // stage is skipped when the unit has this many live fns; 0 = no cap
+    sweep bool   // release superseded MFn tombstones after the stage
+    phis bool    // Phi metadata may exist after the stage
+}
+
+const ms_inline_const = 0
+const ms_inline_scalar = 1
+const ms_inline_rmw = 2
+const ms_inline_cfg = 3
+const ms_lism = 4
+const ms_simplify = 5
+const ms_cse = 6
+const ms_late_opt = 7
+const ms_sroa = 8
+const ms_promote = 9
+const ms_phi_elim = 10
+const ms_late_const = 11
+const ms_count = 12
+
+fn mir_stage(id int) MirStage {
+    // Const/scalar/rmw leaves use a per-caller instruction budget so a `#math`
+    // import does not disable user kernels; compiler-sized callers skip.
+    if id == ms_inline_const { << MirStage{name: "inline_const", min_opt: 1, max_nfn: 0, sweep: false, phis: false} }
+    if id == ms_inline_scalar { << MirStage{name: "inline_scalar", min_opt: 1, max_nfn: 0, sweep: false, phis: false} }
+    if id == ms_inline_rmw { << MirStage{name: "inline_rmw", min_opt: 1, max_nfn: 0, sweep: false, phis: false} }
+    // Must see the pre-SimplifyCFG body: simplifying index kernels first made
+    // search_ints fail leaf_safe (algorithm_search stayed a Call). Compiler
+    // units (nfn >= 64) skip it inside mir_inline_cfg_leaves; that pass
+    // SEGV'd time.date / unix_nano there.
+    if id == ms_inline_cfg { << MirStage{name: "inline_cfg", min_opt: 1, max_nfn: 0, sweep: true, phis: false} }
+    // 1-slot struct field RMW -> scalar local in self-loops (method_sum).
+    // Before LICM so the latch no longer has AddrOf (LICM skips such blocks).
+    if id == ms_lism { << MirStage{name: "lism", min_opt: 1, max_nfn: 0, sweep: false, phis: false} }
+    // copy_prop + LICM + BCE + SimplifyCFG on index kernels. Small units only
+    // (`nfn < 64` inside); turns counted for-range into self-loops so O1
+    // matmul / byte-scan match the O2 inner loop.
+    if id == ms_simplify { << MirStage{name: "simplify", min_opt: 1, max_nfn: 0, sweep: false, phis: false} }
+    if id == ms_cse { << MirStage{name: "cse", min_opt: 1, max_nfn: 0, sweep: true, phis: false} }
+    // O2 copy_prop/SimplifyCFG/LICM/BCE; O3 adds self-loop unrolling.
+    if id == ms_late_opt { << MirStage{name: "late_opt", min_opt: 2, max_nfn: 0, sweep: false, phis: false} }
+    // Final canonicalization starts only after every slot-shaped peephole,
+    // SimplifyCFG and O3 unroll: those match LoadLocal/StoreLocal shapes.
+    // Aggregate SROA keeps a small-unit gate; promotion has its own proofs.
+    if id == ms_sroa { << MirStage{name: "sroa", min_opt: 1, max_nfn: 256, sweep: false, phis: false} }
+    // Commits formal SSA/Phi metadata. Tombstones from earlier commits must
+    // not count toward its unit gate (mir_nfn_live, not fns.len).
+    if id == ms_promote { << MirStage{name: "promote", min_opt: 1, max_nfn: 0, sweep: false, phis: true} }
+    // Lowers Phi to the edge copies consumed by fixed homes.
+    if id == ms_phi_elim { << MirStage{name: "phi_elim", min_opt: 1, max_nfn: 0, sweep: false, phis: false} }
+    if id == ms_late_const { << MirStage{name: "late_const", min_opt: 1, max_nfn: 0, sweep: true, phis: false} }
+    << MirStage{name: "", min_opt: 0, max_nfn: 0, sweep: false, phis: false}
+}
+
+fn mir_stage_run(m &mut Mir, id int) {
+    if id == ms_inline_const { mir_inline_const_leaves(m) }
+    if id == ms_inline_scalar { mir_inline_scalar_leaves(m) }
+    if id == ms_inline_rmw { mir_inline_rmw_leaves(m) }
+    if id == ms_inline_cfg { mir_inline_cfg_leaves(m) }
+    if id == ms_lism { mir_each_clone_lism(m) }
+    if id == ms_simplify { mir_each_clone_simplify(m) }
+    if id == ms_cse { mir_each_clone_cse(m) }
+    if id == ms_late_opt { mir_each_clone_late_opt(m) }
+    if id == ms_sroa { mir_each_sroa_scalar_fields(m) }
+    if id == ms_promote { mir_each_promote_scalar_locals(m, mir_nfn_live(&*m) < 64) }
+    if id == ms_phi_elim { mir_each_phi_elim(m) }
+    if id == ms_late_const { mir_each_late_const(m) }
+}
+
+fn (c &Checker) mir_run_pipeline(m &mut Mir) {
+    for id in 0:ms_count {
+        st := mir_stage(id)
+        if m.opt_level < st.min_opt { -> }
+        if st.max_nfn > 0 && mir_nfn_live(&*m) >= st.max_nfn { -> }
+        mir_stage_run(m, id)
+        if st.sweep { mir_sweep_superseded(m) }
+        c.mir_verify_stage(m, st.name, st.phis)
+    }
+}

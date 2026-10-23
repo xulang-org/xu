@@ -17,29 +17,41 @@
   <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?label=Release&color=0284c7" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
   <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
-  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-13%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
   <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
 <p align="center">
   <a href="https://xulang.org">🌐 <b>在线 Playground（免安装试玩）</b></a> &nbsp;•&nbsp;
-  <a href="https://xulang.org/benchmarks">⚡ <b>13 项跨语言横测看板</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>47 项跨语言横测看板</b></a> &nbsp;•&nbsp;
   <a href="#-零阻力快速上手-quick-start">🚀 <b>30 秒上手</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/xulang-org/xu/releases">📦 <b>下载安装包</b></a>
 </p>
 
 ---
 
-## Xu 0.9.1
+## Xu 0.10.0 源码更新
 
-Xu 0.9.1 正式发布，带来深度的二进制体积优化与完善的工具链生态支持：
+本次加入 UI 绘图与桌面能力基础，并保留 0.9.4 的编译器改进：
 
-- **调用图 Tree-Shaking**：实现全程序静态可达性分析，自动剔除未引用的死代码与全局符号，大幅精简编译产物体积。
-- **静态常量下沉 (.rodata)**：将只读常量数组与切片直接下沉至只读数据段，消除运行时动态立即数逐项赋值与多余堆栈开销。
-- **自举编译器零警告**：彻底修复自举中的除零静态分析警告、终结语句控制流分支流分析，调优大栈帧诊断阈值。
-- **全量动态扩展包升级与子命令分发**：`xu up` 支持动态解包所有 `bin/` 扩展工具（如 `xu-lsp`、`xu-native` 等），主命令 `xu <subcmd>` 自动发现同级扩展并平滑委托执行。
+- 帧记录、可复用 DisplayList、路径、图片与文字资源、图层、渐变和有界缓存。
+- 持久布局树、重绘边界、输入路由、焦点、滚动和基础控件。
+- 动态多窗口，以及支持取消和超时的异步剪贴板、文件打开、保存路径和目录选择。
+- `xu env`、项目初始化和更新检查统一使用运行中编译器的版本；安装前校验下载的编译器版本与请求一致。
 
-下载 [0.9.1 SDK 与安装包](https://github.com/xulang-org/xu/releases/tag/v0.9.1)。[基准页面](https://xulang.org/zh/benchmarks)保留每次实测的编译器版本与来源。
+完整 UI 建设仍在继续：编辑控件、扩展菜单与屏幕查询、WebView 请求生命周期等尚未完成。已发布安装包仍使用下方发行链接。
+
+## Xu 0.9.4
+
+Xu 0.9.4 是一个编译器一致性与优化器版本：
+
+- **借用检查完整性**：借用检查器现在遍历全部表达式种类（未知种类保守处理），像 `f(mut &v, &v)` 这样的别名即使嵌套在类型转换或算术表达式中也会被报告；循环内产生的借用在回边上保持存活。此前依赖这些漏洞才能通过编译的程序现在会收到诊断。
+- **泛型与类型表上限**：泛型声明不再限制最多 4 个类型参数；类型号段溢出改为断言而非静默回绕；不支持所请求目标的后端会显式报错。
+- **MIR 验证**：`XU_VERIFY=1` 在每个优化 pass 之后运行完整 MIR 验证器，并修复了验证器与降级、后端之间的不一致；`XU_DUMP_MIR=<函数名>` 可导出指定函数的 MIR。
+- **SSA 循环优化**：标量 SSA 提升不再依赖按形状划分的白名单；ARM64 循环内核（scan、saxpy、CRC、二分查找、fill、stride、带谓词 scan）均有基于 SSA 的匹配器；以 `[]int` 长度为界的循环会被旋转以满足匹配条件。相对 0.9.3 实测：`bloom_filter` 约 12%、`chase_index` 9–11%、`f64_sum` 约 8%、`algorithm_search`（`-O3`）约 9% 的提速，无性能回退，自举编译也略快。
+- **模式诊断**：`--timings` 输出 `pattern-hits:` 以及每个函数的寄存器分配模式；`XU_PATTERNS_OFF` 可关闭具名后端模式，用于差分测试（`scripts/pattern_diff.sh`）。
+
+下载 [0.9.4 SDK 与安装包](https://github.com/xulang-org/xu/releases/tag/v0.9.4)。[基准页面](https://xulang.org/zh/benchmarks)保留每次实测的编译器版本与来源。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 
@@ -163,33 +175,77 @@ xu build main.xu -o myapp
 
 ### 常用开发命令速查
 
+#### 项目与依赖
+
 | 命令 | 说明 |
 | :--- | :--- |
-| `xu run <file.xu>` | 极速编译并直接在内存中执行，快速迭代逻辑 |
-| `xu build <file.xu> -o <bin>` | 原生 AOT 静态编译生成优化后的无依赖机器码 |
-| `xu build --target wasm32 <file.xu>` | 一键跨架构输出浏览器端 WebAssembly 二进制 |
-| `xu test <file.xu>` | 执行内置单元测试与断言套件 |
-| `xu fmt <file.xu> -w` | 官方格式化器，一键统一代码风格排版 |
-| `xu doc <dir> --public` | 自动提取函数与模块注释，生成 API 文档 |
-| `xu doctor` | 环境健康诊断，检测系统 C 链接器与图形 SDK 状态 |
+| `xu init [module]` | 在当前目录创建 `xu.xun`，缺少 `main.xu` 时同时生成入口示例 |
+| `xu get <module>@<version>` | 添加或升级精确版本依赖，安装到 `vendor/` 并更新 `xu.lock` |
+| `xu install [dir]` | 安装指定项目 `xu.xun` 中已有的依赖 |
+| `xu build . --frozen -o myapp` | 使用现有锁文件和本地依赖执行冻结、离线构建 |
+| `xu env [var...]` | 查看工具链、标准库、依赖缓存与目标平台的有效配置 |
+
+在含有 `xu.xun` 的项目中，执行 `xu get github.com/xulang-org/packages@v0.1.1`
+即可添加官方扩展模块。依赖需要显式版本；`--offline` 使用本地缓存或 vendor，
+`--frozen` 拒绝依赖变化。
+
+#### 构建、运行与验证
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `xu run <file.xu> -- <args...>` | 编译并启动本机程序，`--` 后的参数传给程序 |
+| `xu build <file.xu> -o <bin>` | AOT 编译为原生可执行文件；项目目录也可作为输入 |
+| `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
+| `xu parse <file.xu>` | 解析源码，输出文件、函数与声明统计 |
+| `xu test <file.xu> -v` | 执行 `fn test_*` 测试并显示详细结果；可用 `-run <REGEXP>` 过滤 |
+| `xu test <file.xu> -bench <REGEXP>` | 执行匹配的 `fn bench_*` 基准函数 |
+| `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
+| `xu build <file.xu> --target wasm32 -o app.wasm` | 生成 WebAssembly 模块 |
+| `xu build <AppDir> --desktop` | 打包桌面应用；需要对应宿主 UI SDK 与工具链 |
+| `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
+| `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
+
+0.9.4 还提供 `XU_VERIFY=1` 逐 pass MIR 验证、`XU_DUMP_MIR=<函数名>`
+与 `XU_PATTERNS_OFF=all` 模式对拍诊断。完整选项见[命令行参考](https://xulang.org/zh/docs/cli/)。
+
+#### 开发工具与工具链管理
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `xu fmt <file.xu> -w` | 原地格式化源码；省略 `-w` 时输出到终端 |
+| `xu doc <dir> --public` | 提取公开声明，生成 Markdown API 文档；`--serve` 启动本地文档服务 |
+| `xu map <dir> -o flow.md` | 生成 Mermaid 源码流程图；`--graph` 输出结构化图数据 |
+| `xu doctor` | 检查宿主工具链；`--desktop --webview` 检查桌面与 WebView 依赖 |
+| `xu native <command> [options]` | 编译、归档 C 模块，打包、检视或提取 `.xulib` 平台切片 |
+| `xu lsp` | 启动标准输入/输出上的 LSP 服务，供 VS Code、Cursor、Neovim 等编辑器调用 |
+| `xu setup -y` | 静默安装并配置工具链环境 |
+| `xu up --check` | 仅检查官方发布版本；`xu up` 与 `xu update` 为同义命令 |
+| `xu update --version 0.9.4` | 安装指定版本的官方工具链 |
+| `xu --version` | 显示实际编译器版本及宿主目标 |
+| `xu help <command>` | 查看子命令帮助，也可使用 `<command> --help` |
 
 ---
 
 ## 🗺️ 项目路线图 (Roadmap)
 
-通过持续的高频迭代，Xu 正在稳步成长。以下是当前的研发进展与未来规划：
+以下以 **0.9.4 正式 SDK** 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
 
-- [x] **全静态 AOT 编译闭环**：多架构优化机器码直出，自举不动点验证（`Gen2 == Gen3`）
-- [x] **编译期所有权与借用推导**：零 GC 停顿，确定性生命周期回收，杜绝悬垂指针
+- [x] **纯 Xu 自举与原生 AOT**：以已发布 Xu SDK 为种子，验证自举固定点；直接生成原生机器码与 WebAssembly
+- [x] **编译期所有权与借用推导**：确定性资源回收；0.9.4 补齐嵌套表达式与循环回边的借用检查
 - [x] **原生协程与管道并发**：`xu` 关键字轻量调度 + 强类型 `chan` 信道机制
 - [x] **极简符号流控制**：`<<` 返回、`>>` 抛错与 `or (err) { ... }` 强制就地处理
-- [x] **全平台与多架构矩阵**：支持 Windows / macOS / Linux / LoongArch64 / RISC-V 64 / WASM
-- [x] **单文件自绘原生安装程序**：零依赖 Windows 自绘向导 / macOS PKG / Linux 单文件
-- [x] **主流基础设施生态包**：开箱即用 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等
-- [ ] **LSP 语言服务协议（Language Server Protocol）**：深度支持 VS Code / Neovim 自动补全与符号跳转
-- [ ] **原生源代码调试器（Interactive Debugger）**：支持断点调试、调用栈回溯与变量监视
-- [ ] **泛型单态化深度特化优化**：跨模块函数自动内联、循环向量化与逃逸分析增强
-- [ ] **官方中央包注册中心（Package Registry）**：自动化签名依赖解析、发布与版本托管
+- [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V / ARM32、WASM 及裸机目标
+- [x] **SDK 安装与自更新**：Windows 安装向导、macOS PKG、跨平台单文件 Setup 与 `xu up/update`
+- [x] **可复现模块依赖**：`init/get/install`、MVS、锁文件/vendor、代理、离线/冻结构建与固定公钥校验客户端
+- [x] **LSP 与编辑器集成**：`xu-lsp`、VS Code/Cursor 扩展；诊断、补全、定义、悬停、大纲、引用、重命名与格式化
+- [x] **泛型与 SSA 优化基础**：泛型单态化、移除 4 类型参数限制、标量 SSA 提升、ARM64 SSA 循环内核与循环旋转
+- [x] **编译器诊断与验证**：逐 pass MIR 验证、MIR 导出、模式命中统计与具名模式开关
+- [x] **主流基础设施生态包**：独立 packages 模块提供 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等 29 个扩展包
+- [x] **可追溯的跨语言横测**：47 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
+- [ ] **集成交互式源代码调试器**：已有 DWARF 行号输出，继续完善断点、调用栈与变量监视的交互工作流
+- [ ] **优化器进一步扩展**：深化跨模块内联、泛型特化、逃逸分析与更多后端的循环/向量优化
+- [ ] **完整目标机运行验收**：补齐各平台标准库、网络、并发与桌面 UI 的端到端运行覆盖
+- [ ] **公共包基础设施**：中央注册中心、公共代理/校验日志服务、独立见证与版本托管
 
 ---
 

@@ -17,29 +17,31 @@ struct XuContentPlugin {
   XuContentHost host;
   WebKitWebView *web = nullptr;
   GtkWidget *widget = nullptr;
+  GtkEventController *drop = nullptr;
   bool media_muted = false;
   bool context_menu = true;
   std::string last_url;
   std::string last_html;
   int last_progress = -1;
+  bool load_failed = false;
 };
 
 static void host_event(XuContentPlugin *p, const char *ev) {
-  if (p && p->host.append_shell_event) p->host.append_shell_event(ev);
+  if (p && p->host.append_shell_event) xu_content_event(&p->host,ev);
 }
 
 static void host_write(XuContentPlugin *p, const char *name, const char *body) {
-  if (p && p->host.write_tmp) p->host.write_tmp(name, body);
+  if (p && p->host.write_tmp) xu_content_write(&p->host,name,body);
 }
 
 static void host_read_trim(XuContentPlugin *p, const char *name, char *out, unsigned n) {
   out[0] = 0;
-  if (p && p->host.read_trim) p->host.read_trim(name, out, n);
+  if (p && p->host.read_trim) xu_content_read(&p->host,name,out,n,true);
 }
 
 static void host_read_raw(XuContentPlugin *p, const char *name, char *out, unsigned n) {
   out[0] = 0;
-  if (p && p->host.read_raw) p->host.read_raw(name, out, n);
+  if (p && p->host.read_raw) xu_content_read(&p->host,name,out,n,false);
 }
 
 static void eval_js_raw(XuContentPlugin *p, const char *js) {
@@ -51,28 +53,30 @@ static void on_load_changed(WebKitWebView *web, WebKitLoadEvent ev, gpointer dat
   XuContentPlugin *p = (XuContentPlugin *)data;
   (void)web;
   if (ev == WEBKIT_LOAD_STARTED) {
+    p->load_failed = false;
     p->last_progress = -1;
     host_event(p, "loading");
     host_event(p, "progress\t0");
-  } else if (ev == WEBKIT_LOAD_FINISHED) {
+  } else if (ev == WEBKIT_LOAD_FINISHED && !p->load_failed) {
     host_event(p, "loaded");
     if (p->media_muted) {
       eval_js_raw(p,
                   "(function(){document.querySelectorAll('video,audio').forEach(function(e){"
                   "e.muted=true;e.volume=0;});})();");
     }
-  } else if (ev == WEBKIT_LOAD_FAILED) {
-    host_event(p, "load_failed");
   }
 }
 
-static void on_load_failed(WebKitWebView *web, WebKitLoadEvent ev, gchar *uri, GError *err,
+static gboolean on_load_failed(WebKitWebView *web, WebKitLoadEvent ev, const gchar *uri, GError *err,
                            gpointer data) {
   (void)web;
   (void)ev;
   (void)uri;
   (void)err;
-  host_event((XuContentPlugin *)data, "load_failed");
+  XuContentPlugin *p = (XuContentPlugin *)data;
+  p->load_failed = true;
+  host_event(p, "load_failed");
+  return FALSE;
 }
 
 static gboolean on_decide_policy(WebKitWebView *web, WebKitPolicyDecision *decision,
@@ -149,10 +153,17 @@ static XuContentPlugin *wv_create(XuContentHost *host) {
 
 static void wv_destroy(XuContentPlugin *p) {
   if (!p) return;
-  if (p->widget) {
-    /* owned by parent */
-    p->widget = nullptr;
-    p->web = nullptr;
+  if(p->web){
+    g_signal_handlers_disconnect_by_data(p->web,p);
+    g_object_set_data(G_OBJECT(p->web),"xu-ui-content",NULL);
+    webkit_web_view_stop_loading(p->web);
+  }
+  if(p->drop && p->widget){g_signal_handlers_disconnect_by_data(p->drop,p);gtk_widget_remove_controller(p->widget,p->drop);p->drop=NULL;}
+  if(p->widget){
+    GtkWidget *parent=gtk_widget_get_parent(p->widget);
+    if(parent && GTK_IS_BOX(parent))gtk_box_remove(GTK_BOX(parent),p->widget);
+    else if(parent && GTK_IS_WINDOW(parent))gtk_window_set_child(GTK_WINDOW(parent),NULL);
+    p->widget=NULL;p->web=NULL;
   }
   delete p;
 }
@@ -173,6 +184,11 @@ static std::string xu_ipc_invoke(XuContentPlugin *p, const std::string &body) {
 }
 
 static std::string xu_ipc_poll(XuContentPlugin *p) {
+  const char *tmp = p->host.tmp;
+  if (!tmp || !tmp[0] || !strcmp(tmp, ":xu:") || !strcmp(tmp, ":mem:")) {
+    unsigned len = 0; char *body = xu_ui_emit_take(&len);
+    std::string message(body ? body : "", len); free(body); return message;
+  }
   std::string raw = read_tmp_all(p, "xu_ui_emit_q.txt");
   if (raw.empty()) return "";
   size_t pos = raw.find('\x1e');
@@ -255,7 +271,10 @@ static bool load_www_file(XuContentPlugin *p, const std::string &route, std::str
 }
 
 static void xu_scheme_cb(WebKitURISchemeRequest *request, gpointer data) {
-  XuContentPlugin *p = (XuContentPlugin *)data;
+  (void)data;
+  auto *web=webkit_uri_scheme_request_get_web_view(request);
+  auto *p=web ? (XuContentPlugin *)g_object_get_data(G_OBJECT(web),"xu-ui-content") : NULL;
+  if(!p){xu_scheme_finish(request,410,"text/plain","window closed\n");return;}
   const char *uri = webkit_uri_scheme_request_get_uri(request);
   if (!uri) {
     xu_scheme_finish(request, 400, "text/plain", "bad uri\n");
@@ -402,9 +421,11 @@ static void wv_install(XuContentPlugin *p) {
   if (!p || !p->host.content_parent) return;
   GtkWidget *parent = GTK_WIDGET(p->host.content_parent);
   WebKitWebContext *ctx = webkit_web_context_get_default();
-  webkit_web_context_register_uri_scheme(ctx, "xu", xu_scheme_cb, p, NULL);
+  static bool registered=false;
+  if(!registered){webkit_web_context_register_uri_scheme(ctx,"xu",xu_scheme_cb,NULL,NULL);registered=true;}
   WebKitWebView *web = WEBKIT_WEB_VIEW(webkit_web_view_new());
   p->web = web;
+  g_object_set_data(G_OBJECT(web),"xu-ui-content",p);
   p->widget = GTK_WIDGET(web);
   gtk_widget_set_hexpand(p->widget, TRUE);
   gtk_widget_set_vexpand(p->widget, TRUE);
@@ -435,7 +456,8 @@ static void wv_install(XuContentPlugin *p) {
 
   GtkDropTarget *drop = gtk_drop_target_new(GDK_TYPE_FILE_LIST, GDK_ACTION_COPY);
   g_signal_connect(drop, "drop", G_CALLBACK(on_drop), p);
-  gtk_widget_add_controller(p->widget, GTK_EVENT_CONTROLLER(drop));
+  p->drop=GTK_EVENT_CONTROLLER(drop);
+  gtk_widget_add_controller(p->widget, p->drop);
 
   if (GTK_IS_BOX(parent)) {
     gtk_box_append(GTK_BOX(parent), p->widget);
@@ -447,7 +469,8 @@ static void wv_install(XuContentPlugin *p) {
 }
 
 static void on_eval_done(GObject *src, GAsyncResult *res, gpointer data) {
-  XuContentPlugin *pl = (XuContentPlugin *)data;
+  (void)data;
+  auto *pl=(XuContentPlugin *)g_object_get_data(src,"xu-ui-content");
   GError *err = NULL;
   JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(src), res, &err);
   std::string out;
@@ -467,16 +490,19 @@ static void on_eval_done(GObject *src, GAsyncResult *res, gpointer data) {
       out = jsc_value_to_boolean(val) ? "true" : "false";
     }
   }
+  if(val)g_object_unref(val);
   host_write(pl, "xu_ui_eval_result.txt", out.c_str());
 }
 
 static void on_find_done(GObject *src, GAsyncResult *res, gpointer data) {
-  XuContentPlugin *pl = (XuContentPlugin *)data;
+  (void)data;
+  auto *pl=(XuContentPlugin *)g_object_get_data(src,"xu-ui-content");
   GError *err = NULL;
   JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(src), res, &err);
   const char *out = "0";
   if (!err && val && jsc_value_is_boolean(val) && jsc_value_to_boolean(val)) out = "1";
   if (err) g_error_free(err);
+  if(val)g_object_unref(val);
   host_write(pl, "xu_ui_find_result.txt", out);
 }
 
@@ -491,7 +517,7 @@ static void drain_eval(XuContentPlugin *p) {
   host_read_trim(p, "xu_ui_eval_want.txt", want, sizeof(want));
   host_write(p, "xu_ui_eval_want.txt", "");
   if (strcmp(want, "1") == 0) {
-    webkit_web_view_evaluate_javascript(p->web, js, -1, NULL, NULL, NULL, on_eval_done, p);
+    webkit_web_view_evaluate_javascript(p->web, js, -1, NULL, NULL, NULL, on_eval_done, NULL);
   } else {
     eval_js_raw(p, js);
   }
@@ -572,14 +598,14 @@ static int wv_handle_cmd(XuContentPlugin *p, const char *s) {
   }
   if (strcmp(s, "clear_cache") == 0) {
     WebKitWebsiteDataManager *dm =
-      webkit_web_context_get_website_data_manager(webkit_web_view_get_context(p->web));
+      webkit_network_session_get_website_data_manager(webkit_web_view_get_network_session(p->web));
     webkit_website_data_manager_clear(dm, WEBKIT_WEBSITE_DATA_ALL, 0, NULL, NULL, NULL);
     host_event(p, "cache_cleared");
     return 1;
   }
   if (strcmp(s, "cookies_clear") == 0) {
     WebKitWebsiteDataManager *dm =
-      webkit_web_context_get_website_data_manager(webkit_web_view_get_context(p->web));
+      webkit_network_session_get_website_data_manager(webkit_web_view_get_network_session(p->web));
     webkit_website_data_manager_clear(dm, WEBKIT_WEBSITE_DATA_COOKIES, 0, NULL, NULL, NULL);
     host_event(p, "cookies_cleared");
     return 1;
@@ -643,7 +669,7 @@ static int wv_handle_cmd(XuContentPlugin *p, const char *s) {
     esc[j] = 0;
     char js[4096];
     snprintf(js, sizeof(js), "window.find('%s',false,false,true,false,false,false)", esc);
-    webkit_web_view_evaluate_javascript(p->web, js, -1, NULL, NULL, NULL, on_find_done, p);
+    webkit_web_view_evaluate_javascript(p->web, js, -1, NULL, NULL, NULL, on_find_done, NULL);
     return 1;
   }
   if (strcmp(s, "find_clear") == 0) {

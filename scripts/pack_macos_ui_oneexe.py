@@ -355,7 +355,7 @@ def main() -> None:
             cwd=str(ROOT),
         )
 
-        host_srcs = [str(ROOT / "src/ui/host/macos_host.swift")]
+        host_srcs = [str(ROOT / "src/ui/host/macos_host.swift"), str(ROOT / "src/ui/host/macos_draw.swift")]
         if cfg["plugin"]:
             host_srcs.append(str(ROOT / cfg["plugin"]))
         # swiftc -c writes .o next to sources by default; force -o via one module emit
@@ -408,7 +408,7 @@ def main() -> None:
         pack_assets_weak_o = td / "xu_pack_assets_weak.o"
         mem_o = td / "xu_ui_mem.o"
         clang_c = ["clang", "-target", triple, "-c", "-O2", "-Isrc/ui/host"]
-        clang_cxx = ["clang++", "-target", triple, "-c", "-O2", "-Isrc/ui/host"]
+        clang_cxx = ["clang++", "-std=c++17", "-target", triple, "-c", "-O2", "-Isrc/ui/host"]
         for src, dst in (
             (ROOT / "src/ui/host/xu_pack_assets.c", pack_assets_o),
             (ROOT / "src/ui/host/xu_pack_assets_weak.c", pack_assets_weak_o),
@@ -433,8 +433,9 @@ def main() -> None:
         www_o = None
         if www is not None:
             www_c = td / "www_blob.c"
-            extra = brand_www_extras(xu_src, icon_png)
-            extra.append(("__xu/bridge.js", XU_BRIDGE_JS.encode("utf-8")))
+            extra = brand_www_extras(xu_src, icon_png) if cfg["need_webview"] else []
+            if cfg["need_webview"]:
+                extra.append(("__xu/bridge.js", XU_BRIDGE_JS.encode("utf-8")))
             n = write_www_blob_c(www, www_c, extra=extra)
             www_o = td / "www_blob.o"
             subprocess.check_call([*clang_c, str(www_c), "-o", str(www_o)])
@@ -443,11 +444,11 @@ def main() -> None:
         shim = td / "shim.c"
         shim.write_text(
             "/* Packaged UI entry: www/icon stay in the binary; IPC is in-process :xu: mailbox. */\n"
-            "#include <stdlib.h>\n"
+            "#include <stdlib.h>\n#include \"xu_ui_mem.h\"\n#include \"xu_pack_assets.h\"\n#include \"xu_ui_text.h\"\n"
             "\n"
             "void xu_app_start(int argc, char **argv);\n"
             "\n"
-            "static void xu_pack_setup(void) {\n"
+            "static void xu_pack_setup(void) {\n  xu_ui_set_asset_reader(xu_pack_asset_ptr);\n  xu_draw_text_init();\n"
             "  /* No /tmp/xu_ui_* workdir — mailbox is in-process (:xu: / xu_ui_mem). */\n"
             "  unsetenv(\"XU_UI_TMP\");\n"
             "  setenv(\"XU_UI_PACK\", \"1\", 1);\n"

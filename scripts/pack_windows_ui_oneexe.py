@@ -401,6 +401,7 @@ def link_static(
     console: bool = False,
     icon_png: pathlib.Path | None = None,
     xu_src: pathlib.Path | None = None,
+    with_webview: bool = True,
 ) -> None:
     icon = icon_png if icon_png is not None else ICON_PNG
     if not icon.is_file():
@@ -495,8 +496,9 @@ def link_static(
         www_o = None
         if www is not None:
             www_c = td / "www_blob.c"
-            extra = brand_www_extras(xu_src if xu_src is not None else icon, icon)
-            extra.append(("__xu/bridge.js", XU_BRIDGE_JS.encode("utf-8")))
+            extra = brand_www_extras(xu_src if xu_src is not None else icon, icon) if with_webview else []
+            if with_webview:
+                extra.append(("__xu/bridge.js", XU_BRIDGE_JS.encode("utf-8")))
             n = write_www_blob_c(www, www_c, extra=extra)
             www_o = td / "www_blob.o"
             subprocess.check_call(
@@ -541,6 +543,7 @@ def link_static(
             "#include <string.h>\n"
             "#include <stdint.h>\n"
             "#include <windows.h>\n"
+            "#include \"xu_ui_mem.h\"\n#include \"xu_pack_assets.h\"\n#include \"xu_ui_text.h\"\n"
             "\n"
             "typedef void (WINAPI *ExitProcessFn)(UINT);\n"
             "\n"
@@ -840,6 +843,7 @@ def link_static(
             "}\n"
             "\n"
             "static int xu_pack_setup(void) {\n"
+            "  xu_ui_set_asset_reader(xu_pack_asset_ptr);\n  xu_draw_text_init();\n"
             "  char exe_dir[MAX_PATH];\n"
             "  char line[640];\n"
             "  char *slash;\n"
@@ -939,13 +943,15 @@ def link_static(
         )
         shim_o = td / "winmain_shim.o"
         subprocess.check_call(
-            [GCC, "-O2", "-c", str(shim), "-o", str(shim_o)],
+            [GCC, "-O2", "-c", "-Isrc/ui/host", str(shim), "-o", str(shim_o)],
         )
 
         libs = [
             "-luser32",
             "-lgdi32",
             "-lgdiplus",
+            "-ldwrite",
+            "-limm32",
             "-lole32",
             "-lshell32",
             "-luuid",
@@ -1142,6 +1148,7 @@ def main() -> None:
             objs,
             out_exe,
             www=www,
+            with_webview=cfg["need_webview"],
             loader=loader,
             console=args.console,
             icon_png=resolve_project_icon(pathlib.Path(xu_src)),

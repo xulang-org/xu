@@ -103,9 +103,18 @@ def pkg_flags(pkg: str) -> list[str]:
     return out.split()
 
 
+def gtk_flags() -> list[str]:
+    flags = pkg_flags("gtk4")
+    # The shell calls Xlib directly when GTK was built with its X11 backend.
+    # GTK's public pkg-config flags do not propagate that direct dependency.
+    if subprocess.call(["pkg-config", "--exists", "x11"]) == 0:
+        flags.extend(pkg_flags("x11"))
+    return flags
+
+
 def build_host_a(*, with_webview: bool, td: pathlib.Path, cxx: str) -> pathlib.Path:
     common = [cxx, "-O2", "-std=c++17", "-c", "-DXU_UI_STATIC", "-Isrc/ui/host"]
-    gtk = pkg_flags("gtk4")
+    gtk = gtk_flags()
     host_o = td / "linux_host.o"
     subprocess.check_call(
         [*common, "src/ui/host/linux_host.cc", "-o", str(host_o), *gtk],
@@ -114,7 +123,7 @@ def build_host_a(*, with_webview: bool, td: pathlib.Path, cxx: str) -> pathlib.P
     objs = [host_o]
     mem_o = td / "xu_ui_mem.o"
     subprocess.check_call(
-        [cxx, "-O2", "-c", "-Isrc/ui/host", "src/ui/host/xu_ui_mem.cc", "-o", str(mem_o)],
+        [cxx, "-O2", "-std=c++17", "-c", "-Isrc/ui/host", "src/ui/host/xu_ui_mem.cc", "-o", str(mem_o)],
         cwd=str(ROOT),
     )
     objs.append(mem_o)
@@ -125,7 +134,7 @@ def build_host_a(*, with_webview: bool, td: pathlib.Path, cxx: str) -> pathlib.P
         ("src/ui/host/xu_pack_assets_weak.c", assets_weak_o),
     ):
         subprocess.check_call(
-            [cxx, "-O2", "-c", "-Isrc/ui/host", src, "-o", str(dst)],
+            [cxx, "-O2", "-x", "c", "-c", "-Isrc/ui/host", src, "-o", str(dst)],
             cwd=str(ROOT),
         )
     objs.append(assets_o)
@@ -323,25 +332,30 @@ def main() -> None:
             comment="Embedded brand/xu_app_logo.png — in-memory",
         )
         icon_o = td / "icon_blob.o"
-        subprocess.check_call([args.cxx, "-c", "-O2", str(icon_c), "-o", str(icon_o)])
+        subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", str(icon_c), "-o", str(icon_o)])
 
         extra_o: list[str] = [str(icon_o)]
-        if cfg["need_webview"] and www is not None and www.is_dir():
+        if www is not None:
             www_c = td / "www_blob.c"
-            extra = brand_www_extras(xu_src, icon_png)
+            extra = brand_www_extras(xu_src, icon_png) if cfg["need_webview"] else None
             n = write_www_blob_c(www, www_c, extra=extra)
             www_o = td / "www_blob.o"
-            subprocess.check_call([args.cxx, "-c", "-O2", str(www_c), "-o", str(www_o)])
+            subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", str(www_c), "-o", str(www_o)])
             extra_o.append(str(www_o))
             print(f"www: embed {n} files from {www} (in-memory xu://)")
 
         shim = td / "shim.c"
         shim.write_text(
             "/* Pack entry: www/icon stay in the ELF; IPC is in-process :xu: mailbox. */\n"
-            "#include <stdlib.h>\n"
+            "#include <stdlib.h>\n#include \"xu_ui_mem.h\"\n#include \"xu_pack_assets.h\"\n#include \"xu_ui_text.h\"\n"
             "#include <unistd.h>\n"
-            "void xu_app_start(int argc, char **argv);\n"
-            "static void xu_pack_setup(void) {\n"
+            "#include <sys/auxv.h>\n"
+            "extern char **environ;\n"
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+            "void xu_app_start_hosted(int argc, char **argv, char **envp, long page_size, unsigned long hwcap, int (*start_worker)(void *(*)(void *), void *));\n"
+            "int xu_ui_runtime_start_worker(void *(*entry)(void *), void *argument);\n"
+            "#ifdef __cplusplus\n}\n#endif\n"
+            "static void xu_pack_setup(void) {\n  xu_ui_set_asset_reader(xu_pack_asset_ptr);\n  xu_draw_text_init();\n"
             "  /* No /tmp/xu_ui_* workdir — mailbox is in-process (:xu: / xu_ui_mem). */\n"
             "  unsetenv(\"XU_UI_TMP\");\n"
             "  setenv(\"XU_UI_PACK\", \"1\", 1);\n"
@@ -350,13 +364,13 @@ def main() -> None:
             "__attribute__((constructor)) static void xu_pack_ctor(void) { xu_pack_setup(); }\n"
             "int main(int argc, char **argv) {\n"
             "  xu_pack_setup();\n"
-            "  xu_app_start(argc, argv);\n"
+            "  xu_app_start_hosted(argc, argv, environ, sysconf(_SC_PAGESIZE), getauxval(AT_HWCAP), xu_ui_runtime_start_worker);\n"
             "  return 0;\n"
             "}\n",
             encoding="utf-8",
         )
         shim_o = td / "shim.o"
-        subprocess.check_call([args.cxx, "-c", "-O2", str(shim), "-o", str(shim_o)])
+        subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", "-Isrc/ui/host", str(shim), "-o", str(shim_o)])
 
         link = [
             args.cxx,
@@ -371,7 +385,7 @@ def main() -> None:
             "-Wl,--allow-multiple-definition",
             "-o",
             str(out),
-            *pkg_flags("gtk4"),
+            *gtk_flags(),
         ]
         if cfg["need_webview"]:
             link.extend(pkg_flags("webkitgtk-6.0"))

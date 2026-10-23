@@ -1,7 +1,51 @@
+@_silgen_name("xu_ui_draw_discard_marker")
+private func xuDrawDiscardMarker(_ command: UnsafePointer<CChar>?)
+@_silgen_name("xu_ui_request_discard_marker")
+private func xuRequestDiscardMarker(_ command: UnsafePointer<CChar>?)
+@_silgen_name("xu_ui_request_take_kind")
+private func xuDesktopRequestTake(_ id: UInt64, _ canvas: UInt32, _ generation: UInt32, _ kind: UInt32) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("xu_ui_request_alive")
+private func xuDesktopRequestAlive(_ id: UInt64) -> Int32
+@_silgen_name("xu_ui_request_complete")
+private func xuDesktopRequestComplete(_ id: UInt64, _ status: UInt32, _ text: UnsafePointer<CChar>?, _ length: UInt32) -> Int32
+@_silgen_name("xu_ui_request_poll")
+private func xuDesktopRequestPoll()
+
 import AppKit
 import UserNotifications
 import QuartzCore
 import Darwin
+
+private func xuFileDecode(_ hex: Substring) -> String? {
+  let digits = Array(hex.utf8)
+  guard digits.count % 2 == 0 && digits.count <= 131072 else { return nil }
+  func digit(_ c: UInt8) -> UInt8? { if c >= 48 && c <= 57 { return c-48 }; if c >= 97 && c <= 102 { return c-87 }; return nil }
+  var bytes: [UInt8] = []
+  for i in stride(from: 0,to: digits.count,by: 2) {
+    guard let a = digit(digits[i]),let b = digit(digits[i+1]),a != 0 || b != 0 else { return nil }
+    bytes.append(a*16+b)
+  }
+  return String(bytes: bytes,encoding: .utf8)
+}
+private struct XuFileOptions {
+  let multiple: Bool
+  let directory: String
+  let name: String
+  let extensions: [String]
+  init?(_ seed: String) {
+    let fields = seed.split(separator: "\t",omittingEmptySubsequences: false)
+    guard fields.count >= 5,fields[0] == "F1",let directory = xuFileDecode(fields[2]),let name = xuFileDecode(fields[3]),let count = Int(fields[4]),count >= 0 && count <= 16 else { return nil }
+    self.multiple = fields[1] == "1"; self.directory = directory; self.name = name
+    var cursor = 5,extensions: [String] = []
+    for _ in 0..<count {
+      guard cursor+2 <= fields.count,let size = Int(fields[cursor+1]),size > 0,size <= 16,cursor+2+size <= fields.count else { return nil }
+      cursor += 2
+      for _ in 0..<size { extensions.append(String(fields[cursor])); cursor += 1 }
+    }
+    guard cursor == fields.count else { return nil }
+    self.extensions = extensions
+  }
+}
 
 // Packed www/icon blobs live in the binary (xu_pack_assets.c). No TEMP extract.
 @_silgen_name("xu_pack_www_ptr")
@@ -18,6 +62,15 @@ func xu_ui_mem_set(_ name: UnsafePointer<CChar>?, _ body: UnsafePointer<CChar>?)
 
 @_silgen_name("xu_ui_mem_get")
 func xu_ui_mem_get(_ name: UnsafePointer<CChar>?, _ out: UnsafeMutablePointer<CChar>?, _ n: UInt32) -> Int32
+
+@_silgen_name("xu_ui_mem_take")
+func xu_ui_mem_take(_ name: UnsafePointer<CChar>?, _ len: UnsafeMutablePointer<UInt32>?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("xu_ui_emit_take")
+func xu_ui_emit_take(_ len: UnsafeMutablePointer<UInt32>?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("xu_ui_emit_start")
+func xu_ui_emit_start()
+@_silgen_name("xu_ui_emit_close")
+func xu_ui_emit_close()
 
 @_silgen_name("xu_ui_mem_append")
 func xu_ui_mem_append(_ name: UnsafePointer<CChar>?, _ body: UnsafePointer<CChar>?, _ add_nl: Int32)
@@ -86,6 +139,14 @@ func xuUiReadSlot(_ name: String, cap: Int = 65536) -> String? {
 
 func xuUiReadSlotTrimmed(_ name: String) -> String {
   (xuUiReadSlot(name) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func xuUiTakeSlot(_ name: String) -> String? {
+  var len: UInt32 = 0
+  guard let body = name.withCString({ xu_ui_mem_take($0, &len) }) else { return nil }
+  defer { free(body) }
+  let bytes = UnsafeRawPointer(body).assumingMemoryBound(to: UInt8.self)
+  return String(decoding: UnsafeBufferPointer(start: bytes, count: Int(len)), as: UTF8.self)
 }
 
 /// Launch-time read: mem first, then disk if real TMP (aligned with Windows host).
@@ -260,11 +321,30 @@ protocol XuContentPlugin: AnyObject {
   func onFilesDropped(_ paths: [String])
   /// Optional chrome (e.g. WebView DevTools). Draw/native typically false.
   var wantsDevToolsMenu: Bool { get }
+  func shutdown()
 }
+
+extension XuContentPlugin { func shutdown() {} }
+
+@_silgen_name("xu_ui_window_info")
+func xuWindowInfo(_ id: UInt32,_ generation: UInt32,_ meta: UnsafeMutablePointer<UInt32>?,_ title: UnsafeMutablePointer<CChar>?,_ capacity: UInt32) -> Int32
+@_silgen_name("xu_ui_window_claim")
+func xuWindowClaim(_ id: UInt32,_ generation: UInt32) -> Int32
+@_silgen_name("xu_ui_window_ready")
+func xuWindowReady(_ id: UInt32,_ generation: UInt32) -> Int32
+@_silgen_name("xu_ui_window_closed")
+func xuWindowClosed(_ id: UInt32,_ generation: UInt32)
+@_silgen_name("xu_ui_windows_shutdown")
+func xuWindowsShutdown()
+@_silgen_name("xu_ui_window_count")
+func xuWindowCount() -> UInt32
+@_silgen_name("xu_ui_command_owner")
+func xuCommandOwner(_ command: UnsafePointer<CChar>?,_ identity: UnsafeMutablePointer<UInt32>?) -> Int32
 
 enum XuContentRegistry {
   /// Set by a linked content plugin's +registerPlugin (nil = shell-only / empty slot).
   static var make: ((AppDelegate) -> XuContentPlugin)?
+  static var factories: [UInt32: (AppDelegate) -> XuContentPlugin] = [:]
 }
 
 /// Draw icon + badge ourselves. System `badgeLabel` is often a no-op on macOS 26
@@ -325,13 +405,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
   /// Weak shared for mailbox → UI-thread kick (shell cmd latency).
   static weak var sharedKick: AppDelegate?
+  static var windows: [UInt32: AppDelegate] = [:]
 
   let window: NSWindow
+  let windowID: UInt32
+  let canvasID: UInt32
+  let canvasGeneration: UInt32
   let tmp: String
   let port: String
   weak var rootView: NSView?
   var content: XuContentPlugin?
   var statusItem: NSStatusItem?
+  var filePanels: [UInt64: NSSavePanel] = [:]
   var pollTimer: Timer?
   var lastTitle: String = ""
   var notifiedClose = false
@@ -354,13 +439,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   var dragBar: DragRegionView?
   var dockTileView: DockIconBadgeView?
 
-  init(window: NSWindow, tmp: String, port: String) {
+  init(window: NSWindow, tmp: String, port: String, windowID: UInt32 = 1, canvasID: UInt32 = 1) {
     self.window = window
+    self.windowID = windowID
+    self.canvasID = canvasID
+    var meta = [UInt32](repeating: 0,count: 6)
+    _ = xuWindowInfo(windowID,0,&meta,nil,0)
+    self.canvasGeneration = meta[1]
     self.tmp = tmp
     self.port = port
     super.init()
-    AppDelegate.sharedKick = self
-    xu_ui_host_set_kick {
+    if windowID == 1 {
+      // A queued create can be kicked before applicationDidFinishLaunching.
+      loadRegisteredContentBootstraps()
+      AppDelegate.sharedKick = self
+      xu_ui_host_set_kick {
       // Coalesce: one drain per turn of the main runloop.
       DispatchQueue.main.async {
         guard let d = AppDelegate.sharedKick else { return }
@@ -369,6 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         d.drainCmds()
         d.drainCloseGuardFlag()
       }
+      }
     }
   }
 
@@ -376,11 +470,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   /// Class names come from ui.register_content_plugin(..., bootstrap) — not hardcoded.
   func loadRegisteredContentBootstraps() {
     let raw = readSlotRaw("xu_ui_plugin_bootstrap.txt")
-    for line in raw.split(separator: "\n") {
+    for line in ("XuDrawPluginBootstrap\nXuWebViewPluginBootstrap\n" + raw).split(separator: "\n") {
       let name = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
       if name.isEmpty { continue }
       if let cls = NSClassFromString(name) as? NSObject.Type {
         cls.perform(NSSelectorFromString("registerPlugin"))
+        if name != "XuDrawPluginBootstrap" && name != "XuWebViewPluginBootstrap" { XuContentRegistry.factories[3] = XuContentRegistry.make }
       }
     }
   }
@@ -389,11 +484,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     window.delegate = self
     // Load whatever bootstrap class names Xu registered (webview / draw / native / …).
     loadRegisteredContentBootstraps()
-    if let root = rootView, let make = XuContentRegistry.make {
-      let plugin = make(self)
-      content = plugin
-      plugin.install(into: root, host: self)
-    }
+    Self.windows[windowID] = self
+    _ = xuWindowClaim(windowID,canvasGeneration)
+    installContent()
+    _ = xuWindowReady(windowID,canvasGeneration)
     // Apply chrome flags written before App.run() so the first paint has no titlebar.
     applyLaunchChrome()
     // No content plugin: leave FillView empty (shaped mask draws the face).
@@ -410,14 +504,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     if lastSizeFileKey.isEmpty {
       lastSizeFileKey = lastSizeKey
     }
+    appendShellFile("window_ready")
     appendShellFile("ready")
     pollTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-      self?.content?.syncFrame()
-      self?.content?.onPoll()
-      self?.drainTitle()
-      self?.drainSize()
+      for host in Array(Self.windows.values) where !host.notifiedClose {
+        host.content?.syncFrame()
+        host.content?.onPoll()
+        host.drainTitle()
+        host.drainSize()
+        host.drainCloseGuardFlag()
+      }
       self?.drainCmds()
-      self?.drainCloseGuardFlag()
+    }
+    if let pollTimer {
+      RunLoop.main.add(pollTimer,forMode: .common)
+      RunLoop.main.add(pollTimer,forMode: .modalPanel)
     }
   }
 
@@ -433,6 +534,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
   func applicationWillTerminate(_ notification: Notification) {
+    xu_ui_host_set_kick(nil)
+    xu_ui_emit_close()
+    xuWindowsShutdown()
+    for host in Array(Self.windows.values) { host.cancelFilePanels(); host.content?.shutdown(); xuWindowClosed(host.windowID,host.canvasGeneration) }
+    Self.windows.removeAll()
     notifyShell(payload: "exit")
   }
 
@@ -447,12 +553,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func performQuitFromClose() {
+    if notifiedClose { return }
+    cancelFilePanels()
+    content?.shutdown(); content = nil
+    resizeWork?.cancel(); moveWork?.cancel(); bounceClearWork?.cancel()
     hiddenByCmd = false
     closePending = false
     notifyShell(payload: "closed")
-    DispatchQueue.main.async { [weak self] in
-      self?.notifyShell(payload: "exit")
-      NSApp.terminate(nil)
+    window.orderOut(nil)
+    window.close()
+    xuWindowClosed(windowID,canvasGeneration)
+    if windowID != 1 { Self.windows.removeValue(forKey: windowID) }
+    let otherLive = Self.windows.values.contains { !$0.notifiedClose }
+    if !otherLive && xuWindowCount() == 0 {
+      xuWindowsShutdown()
+      Self.sharedKick?.pollTimer?.invalidate()
+      Self.sharedKick?.pollTimer = nil
+      DispatchQueue.main.async {
+        Self.sharedKick?.notifyShell(payload: "exit")
+        NSApp.terminate(nil)
+      }
     }
   }
 
@@ -496,8 +616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         promptCloseConfirm()
         return
       }
-      notifyShell(payload: "exit")
-      NSApp.terminate(nil)
+      performQuitFromClose()
       return
     }
     postInvoke(name: "menu", payload: id)
@@ -567,8 +686,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         promptCloseConfirm()
         return
       }
-      notifyShell(payload: "exit")
-      NSApp.terminate(nil)
+      performQuitFromClose()
       return
     }
     if id == "show" {
@@ -605,10 +723,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func appendShellFile(_ payload: String) {
-    xuUiAppendSlot("xu_ui_shell_event.txt", payload, addNl: true)
+    if (notifiedClose || notifiedExit) && payload != "closed" && payload != "exit" { return }
+    let record = canvasGeneration != 0 && payload != "ready" && payload != "exit" &&
+      !payload.hasPrefix("input") && !payload.hasPrefix("canvas_") && !payload.hasPrefix("request\t") && !payload.hasPrefix("text_edit\t")
+      ? "window\t\(windowID)\t\(canvasGeneration)\t\(payload)" : payload
+    xuUiAppendSlot("xu_ui_shell_event.txt", record, addNl: true)
     if xuUiMemOnlyTmp(tmp) { return }
     let path = (tmp as NSString).appendingPathComponent("xu_ui_shell_event.txt")
-    let line = payload + "\n"
+    let line = record + "\n"
     if FileManager.default.fileExists(atPath: path),
        let handle = FileHandle(forWritingAtPath: path) {
       defer { try? handle.close() }
@@ -630,6 +752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func drainTitle() {
+    if notifiedClose { return }
     let t = readTrimmed("xu_ui_title.txt")
     if t.isEmpty || t == lastTitle { return }
     lastTitle = t
@@ -637,6 +760,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func drainSize() {
+    if notifiedClose { return }
     // Do not fight user zoom / fullscreen with the last scripted size.
     if window.styleMask.contains(.fullScreen) || window.isZoomed { return }
     let t = readTrimmed("xu_ui_size.txt")
@@ -966,25 +1090,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
   }
 
-  func readTrimmed(_ name: String) -> String {
+  func slotName(_ name: String) -> String {
+    windowID == 1 ? name : "window/\(windowID)/\(canvasGeneration)/\(name)"
+  }
+
+  func readTrimmed(_ rawName: String) -> String {
+    let name = slotName(rawName)
     if let mem = xuUiReadSlot(name) {
       return mem.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+    if windowID > 1 && ["xu_ui_scheme.txt","xu_ui_www_root.txt","xu_ui_bridge.js"].contains(rawName),let shared = xuUiReadSlot(rawName) { return shared }
     if xuUiMemOnlyTmp(tmp) { return "" }
     let path = (tmp as NSString).appendingPathComponent(name)
     let raw = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
     return raw.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  func writeSlot(_ name: String, _ body: String) {
+  func writeSlot(_ rawName: String, _ body: String) {
+    if notifiedClose { return }
+    let name = slotName(rawName)
     xuUiWriteSlot(name, body)
     if xuUiMemOnlyTmp(tmp) { return }
     let path = (tmp as NSString).appendingPathComponent(name)
     try? body.write(toFile: path, atomically: true, encoding: .utf8)
   }
 
-  func readSlotRaw(_ name: String) -> String {
+  func readSlotRaw(_ rawName: String) -> String {
+    let name = slotName(rawName)
     if let mem = xuUiReadSlot(name) { return mem }
+    if windowID > 1 && ["xu_ui_scheme.txt","xu_ui_www_root.txt","xu_ui_bridge.js"].contains(rawName),let shared = xuUiReadSlot(rawName) { return shared }
     if xuUiMemOnlyTmp(tmp) { return "" }
     let path = (tmp as NSString).appendingPathComponent(name)
     return (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
@@ -1034,6 +1168,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
   /// Pop one XUN emit record from xu_ui_emit_q.txt (RS 0x1e separated).
   func xuIpcPoll() -> String {
+    if xuUiMemOnlyTmp(tmp) {
+      var len: UInt32 = 0
+      guard let body = xu_ui_emit_take(&len) else { return "" }
+      defer { free(body) }
+      return String(data: Data(bytes: body, count: Int(len)), encoding: .utf8) ?? ""
+    }
     let raw = readSlotRaw("xu_ui_emit_q.txt")
     if raw.isEmpty { return "" }
     let rs = "\u{001e}"
@@ -1203,29 +1343,214 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func drainCmds() {
-    let raw = readSlotRaw("xu_ui_cmd.txt")
-    if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
-    writeSlot("xu_ui_cmd.txt", "")
-    for line in raw.split(separator: "\n") {
-      let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
-      if trimmed.isEmpty { continue }
-      let toContent = trimmed.hasPrefix("wv.") || trimmed.hasPrefix("content.")
-      let s = stripCmdPrefix(trimmed)
-      if toContent {
-        _ = contentHandleCmd(s)
-        continue
-      }
-      if handleShellCmd(s) {
-        continue
-      }
-      // Legacy unprefixed: try content after shell.
-      _ = contentHandleCmd(s)
+    xuDesktopRequestPoll()
+    for host in Array(Self.windows.values) { host.pollDesktopFiles() }
+    let raw: String
+    if let queued = xuUiTakeSlot("xu_ui_cmd.txt") {
+      raw = queued
+    } else if !xuUiMemOnlyTmp(tmp) {
+      let path = (tmp as NSString).appendingPathComponent("xu_ui_cmd.txt")
+      guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+            data.count <= 64 * 1024 * 1024,
+            let text = String(data: data, encoding: .utf8) else { return }
+      guard (try? Data().write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else { return }
+      raw = text
+    } else {
+      return
     }
+    if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+    for line in raw.split(separator: "\n") { dispatchCommand(String(line)) }
+  }
+
+  func installContent() {
+    guard content == nil,let root = rootView,!notifiedClose else { return }
+    var meta = [UInt32](repeating: 0,count: 6)
+    let registered = xuWindowInfo(windowID,canvasGeneration,&meta,nil,0) != 0
+    let kind = registered ? meta[4] : (UInt32(readTrimmed("xu_ui_content_kind.txt")) ?? 0)
+    let make = XuContentRegistry.factories[kind]
+    guard let make else { return }
+    let plugin = make(self)
+    content = plugin
+    plugin.install(into: root,host: self)
+  }
+
+  func openManagedWindow(_ id: UInt32,_ generation: UInt32) {
+    guard xuWindowClaim(id,generation) != 0 else { return }
+    var meta = [UInt32](repeating: 0,count: 6)
+    var title = [CChar](repeating: 0,count: 4097)
+    guard xuWindowInfo(id,generation,&meta,&title,4097) != 0 else { xuWindowClosed(id,generation); return }
+    let rect = NSRect(x: 80,y: 80,width: Int(meta[2]),height: Int(meta[3]))
+    let win = NSWindow(contentRect: rect,styleMask: [.titled,.closable,.miniaturizable,.resizable],backing: .buffered,defer: false)
+    win.isReleasedWhenClosed = false
+    win.title = String(cString: title)
+    let root = FillView(frame: NSRect(origin: .zero,size: rect.size))
+    win.contentView = root
+    let host = AppDelegate(window: win,tmp: tmp,port: port,windowID: id,canvasID: id)
+    root.host = host; host.rootView = root; win.delegate = host
+    Self.windows[id] = host
+    host.installContent()
+    _ = xuWindowReady(id,generation)
+    win.center(); win.makeKeyAndOrderFront(nil)
+    host.lastTitle = win.title
+    host.appendShellFile("window_ready")
+  }
+
+  func dispatchCommand(_ line: String) {
+    if line.hasPrefix("__window_open\t") || line.hasPrefix("__window_bind\t") {
+      let fields = line.split(separator: "\t")
+      guard fields.count == 3,let id = UInt32(fields[1]),let generation = UInt32(fields[2]) else { return }
+      if fields[0] == "__window_open" { openManagedWindow(id,generation) }
+      else if let host = Self.windows[id],host.canvasGeneration == generation { host.installContent() }
+      return
+    }
+    if line == "shell.quit_app" {
+      xuWindowsShutdown()
+      for host in Array(Self.windows.values) { host.closeGuard = false; host.performQuitFromClose() }
+      return
+    }
+    var raw = line
+    var target: AppDelegate? = self
+    if line.hasPrefix("window\t") {
+      let fields = line.split(separator: "\t",maxSplits: 3,omittingEmptySubsequences: false)
+      guard fields.count == 4,let id = UInt32(fields[1]),let generation = UInt32(fields[2]),
+        let host = Self.windows[id],host.canvasGeneration == generation else { return }
+      target = host; raw = String(fields[3])
+    } else {
+      var identity = [UInt32](repeating: 0,count: 2)
+      if line.withCString({ xuCommandOwner($0,&identity) }) != 0 {
+        target = Self.windows[identity[0]] ?? (identity[0] == windowID ? self : nil)
+        if let host = target,identity[1] != 0 && host.canvasGeneration != 0 && host.canvasGeneration != identity[1] { target = nil }
+      }
+    }
+    let command = stripCmdPrefix(raw)
+    let toContent = raw.hasPrefix("wv.") || raw.hasPrefix("content.")
+    if let host = target,!host.notifiedClose {
+      if toContent { if !host.handleDesktopFiles(command) && !host.handleDesktopClipboard(command) { _ = host.contentHandleCmd(command) } }
+      else if !host.handleShellCmd(command) { _ = host.contentHandleCmd(command) }
+    }
+    if toContent { command.withCString { xuDrawDiscardMarker($0); xuRequestDiscardMarker($0) } }
+  }
+
+  func pollDesktopFiles() {
+    for (id,panel) in Array(filePanels) where xuDesktopRequestAlive(id) == 0 {
+      filePanels.removeValue(forKey: id)
+      if let parent = panel.sheetParent { parent.endSheet(panel,returnCode: .cancel) }
+      panel.orderOut(nil)
+    }
+  }
+
+  func cancelFilePanels() {
+    for (id,panel) in Array(filePanels) {
+      _ = xuDesktopRequestComplete(id,1,nil,0)
+      filePanels.removeValue(forKey: id)
+      if let parent = panel.sheetParent { parent.endSheet(panel,returnCode: .cancel) }
+      panel.orderOut(nil)
+    }
+  }
+
+  @discardableResult
+  func handleDesktopFiles(_ command: String) -> Bool {
+    guard command.hasPrefix("__request\t"),let id = UInt64(command.dropFirst(10)),id > 0 else { return false }
+    var kind: UInt32 = 4
+    var payload: UnsafeMutablePointer<CChar>?
+    while kind <= 6 {
+      payload = xuDesktopRequestTake(id,canvasID,canvasGeneration,kind)
+      if payload != nil { break }
+      kind += 1
+    }
+    guard let payload else { return false }
+    defer { free(payload) }
+    guard xuDesktopRequestAlive(id) != 0 else { return true }
+    let fields = String(cString: payload).split(separator: "\t",omittingEmptySubsequences: false)
+    guard fields.count == 9,let title = xuFileDecode(fields[7]),let seed = xuFileDecode(fields[8]),
+      let options = XuFileOptions(seed),filePanels.count < 8,
+      options.directory.isEmpty || options.directory.hasPrefix("/") else {
+      _ = xuDesktopRequestComplete(id,2,nil,0); return true
+    }
+    let panel: NSSavePanel
+    if kind == 5 { panel = NSSavePanel() }
+    else {
+      let open = NSOpenPanel()
+      open.canChooseFiles = kind == 4; open.canChooseDirectories = kind == 6
+      open.allowsMultipleSelection = options.multiple
+      panel = open
+    }
+    panel.title = title
+    panel.canCreateDirectories = true
+    if !options.directory.isEmpty { panel.directoryURL = URL(fileURLWithPath: options.directory,isDirectory: true) }
+    if !options.name.isEmpty { panel.nameFieldStringValue = options.name }
+    if !options.extensions.isEmpty && !options.extensions.contains("*") {
+      panel.allowedFileTypes = options.extensions
+      panel.allowsOtherFileTypes = false
+    }
+    filePanels[id] = panel
+    panel.beginSheetModal(for: window) { [weak self,weak panel] response in
+      self?.filePanels.removeValue(forKey: id)
+      guard xuDesktopRequestAlive(id) != 0 else { return }
+      var status: UInt32 = response == .cancel || response == .abort ? 1 : 2
+      var value = ""
+      if response == .OK,let panel {
+        let urls: [URL] = (panel as? NSOpenPanel)?.urls ?? panel.url.map { [$0] } ?? []
+        if !urls.isEmpty && urls.count <= 64 && urls.allSatisfy({ $0.isFileURL }) {
+          value = "XUF1\t\(urls.count)"
+          for url in urls {
+            let bytes = Array(url.path.utf8)
+            if bytes.count > (65536-value.utf8.count-1)/2 { value = ""; break }
+            value += "\t" + bytes.map { String(format: "%02x",$0) }.joined()
+          }
+          if !value.isEmpty { status = 0 }
+        }
+      }
+      _ = value.withCString { xuDesktopRequestComplete(id,status,$0,UInt32(value.utf8.count)) }
+    }
+    return true
+  }
+
+  // Shell services work before a content plugin is attached. All pasteboard
+  // access stays on the main thread; the request table owns terminal delivery.
+  @discardableResult
+  func handleDesktopClipboard(_ command: String, pasteboard: NSPasteboard = .general) -> Bool {
+    guard command.hasPrefix("__request\t"),let id = UInt64(command.dropFirst(10)),id > 0 else { return false }
+    var kind: UInt32 = 2
+    var payload = xuDesktopRequestTake(id,canvasID,canvasGeneration,kind)
+    if payload == nil { kind = 3; payload = xuDesktopRequestTake(id,canvasID,canvasGeneration,kind) }
+    guard let payload else { return false }
+    defer { free(payload) }
+    guard xuDesktopRequestAlive(id) != 0 else { return true }
+    let fields = String(cString: payload).split(separator: "\t",omittingEmptySubsequences: false)
+    var status: UInt32 = 2
+    var result = ""
+    if kind == 2 {
+      // Bound conversion and result delivery even for an external provider.
+      if let value = pasteboard.string(forType: .string) {
+        if value.utf8.prefix(65537).count <= 65536 { result = value; status = 0 }
+      } else { status = 0 }
+    } else if fields.count == 9 {
+      let digits = Array(fields[8].utf8)
+      var bytes: [UInt8] = []
+      func nibble(_ c: UInt8) -> UInt8 { c <= 57 ? c - 48 : c - 87 }
+      for i in stride(from: 0,to: digits.count,by: 2) { bytes.append(nibble(digits[i]) * 16 + nibble(digits[i+1])) }
+      if let value = String(bytes: bytes,encoding: .utf8),xuDesktopRequestAlive(id) != 0 {
+        pasteboard.clearContents()
+        if pasteboard.setString(value,forType: .string) { status = 0 }
+      }
+    }
+    _ = result.withCString { xuDesktopRequestComplete(id,status,$0,UInt32(result.utf8.count)) }
+    return true
   }
 
   /// Returns true if handled as a shell/window command.
   @discardableResult
   func handleShellCmd(_ s: String) -> Bool {
+    if s == "close" { if closeGuard { promptCloseConfirm() } else { performQuitFromClose() }; return true }
+    if s.hasPrefix("title\t") { window.title = String(s.dropFirst(6)); lastTitle = window.title; writeSlot("xu_ui_title.txt",window.title); return true }
+    if s.hasPrefix("size\t") {
+      let fields = s.split(separator: "\t")
+      if fields.count == 3,let w = Double(fields[1]),let h = Double(fields[2]),w >= 40,h >= 40,w <= 16384,h <= 16384 {
+        writeSlot("xu_ui_size.txt","\(Int(w)) \(Int(h))"); drainSize()
+      }
+      return true
+    }
     if s == "show" {
       bringToFront()
       return true
@@ -1581,6 +1906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 /// `tmpDir` is the UI temp directory (title/size/cmd files); empty/`:xu:` → mem mailbox.
 @_cdecl("xu_ui_host_run")
 public func xu_ui_host_run(_ tmpDir: UnsafePointer<CChar>?) -> Int32 {
+  xu_ui_emit_start()
   var tmp = tmpDir.map { String(cString: $0) }
     ?? ProcessInfo.processInfo.environment["XU_UI_TMP"]
     ?? ""

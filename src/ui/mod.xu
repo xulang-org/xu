@@ -1,6 +1,7 @@
 @ui
 
 #errors
+#strings
 
 // Desktop shell: App / Window / Icon / Menu / Tray / events / post queue.
 // Owns the UI (shell) runtime event loop and host process.
@@ -74,6 +75,12 @@ pub const ev_click = 68
 pub const ev_prompt = 69
 pub const ev_scroll = 70
 pub const ev_drag = 71
+// WebView notification enqueue failed. menu_id retains the encoded record;
+// width is its byte length, height is 1 (oversize) or 2 (enqueue/host failure).
+pub const ev_emit_failed = 84
+pub const ev_window_ready = 94
+pub const ev_window_failed = 95
+pub const ev_command_unsupported = 96
 
 pub struct Event {
     pub kind int
@@ -103,6 +110,7 @@ pub struct WindowOpts {
 }
 
 pub struct Window {
+    pub generation int
     pub id int
     pub title string
     pub width int
@@ -124,6 +132,7 @@ pub struct Tray {
 }
 
 pub struct App {
+    has_window bool
     pub next_id int
     pub icon Icon
     pub quit_flag int
@@ -139,16 +148,16 @@ pub struct App {
 pub fn new_app() App {
     ch := chan int{cap: 64}
     ech := chan Event{cap: 256}
-    xu pump_host_events(ech)
-    << App{next_id: 1, icon: Icon{path: ""}, quit_flag: 0, sim: 0, event_ch: ech, post_ch: ch, menu_ids: []string{}, win_title: "Xu", win_w: 800, win_h: 600}
+    if native_enabled() { xu pump_host_events(ech) }
+    << App{has_window: false,next_id: 1, icon: Icon{path: ""}, quit_flag: 0, sim: 0, event_ch: ech, post_ch: ch, menu_ids: []string{}, win_title: "Xu", win_w: 800, win_h: 600}
 }
 
 // new_app_events shares `ech` with IPC / draw workers. Host events are pumped here
 // (not in #ui/webview.bind_ipc).
 pub fn new_app_events(ech chan Event) App {
     ch := chan int{cap: 64}
-    xu pump_host_events(ech)
-    << App{next_id: 1, icon: Icon{path: ""}, quit_flag: 0, sim: 0, event_ch: ech, post_ch: ch, menu_ids: []string{}, win_title: "Xu", win_w: 800, win_h: 600}
+    if native_enabled() { xu pump_host_events(ech) }
+    << App{has_window: false,next_id: 1, icon: Icon{path: ""}, quit_flag: 0, sim: 0, event_ch: ech, post_ch: ch, menu_ids: []string{}, win_title: "Xu", win_w: 800, win_h: 600}
 }
 
 pub fn icon_default() Icon {
@@ -171,8 +180,10 @@ pub fn target_os() int {
     << xu_target_os()
 }
 
+// Target OS support only; App.run still verifies that the native host is linked.
 pub fn platform_supported() bool {
-    << xu_target_os() == os_macos
+    os := xu_target_os()
+    << os == os_macos || os == os_linux || os == os_windows
 }
 
 fn sim_enabled() bool {
@@ -247,24 +258,9 @@ pub fn install_tray_icon(path string) int {
     << 0
 }
 
+// Compatibility allocation. Prefer open_window when allocation failure must be reported.
 pub fn (a &mut App) new_window(opts WindowOpts) Window {
-    id := a.alloc_id()
-    mut title := opts.title
-    if title.len == 0 {
-        title = "Xu"
-    }
-    mut w := opts.width
-    mut h := opts.height
-    if w <= 0 {
-        w = 800
-    }
-    if h <= 0 {
-        h = 600
-    }
-    a.win_title = title + ""
-    a.win_w = w
-    a.win_h = h
-    << Window{id: id, title: title, width: w, height: h, content_kind: content_none, content_backend_id: 0, closed: 0}
+    << a.open_window(opts) or (err) { << Window{id: 0,generation: 0,title: "",width: 0,height: 0,content_kind: 0,content_backend_id: 0,closed: 1} }
 }
 
 fn ui_tmp() string {
@@ -337,12 +333,12 @@ pub fn (a &mut App) new_tray(opts TrayOpts) Tray {
 }
 
 pub fn (w &mut Window) set_title(title string) {
-    w.title = title + ""
-    if native_enabled() {
-        write_file(ui_tmp() + "/xu_ui_title.txt", sanitize_title(title)) or (err) {
-            <<
-        }
+    if w.generation != 0 {
+        w.command("title\t" + sanitize_title(title)) or (err) { << }
+    } else if native_enabled() {
+        write_file(ui_tmp() + "/xu_ui_title.txt",sanitize_title(title)) or (err) { << }
     }
+    w.title = title + ""
 }
 
 // native_set_title updates the live host title file (no Window handle needed).
@@ -373,7 +369,15 @@ fn append_host_cmd(kind string, line string) int {
     if !native_enabled() {
         << 0
     }
-    cmd_path := ui_tmp() + "/xu_ui_cmd.txt"
+    tmp := ui_tmp()
+    if tmp == ":xu:" {
+        // Atomic append: do not read/overwrite a queue concurrently drained by UI.
+        payload := kind + "." + line + "\n"
+        accepted := write_file(":xu:/__cmd_append", payload) or >>
+        if accepted != payload.len { >> errors.new("ui: native command host is not linked") }
+        << 0
+    }
+    cmd_path := tmp + "/xu_ui_cmd.txt"
     // read_plugin_file trims trailing newlines — restore so lines stay separated.
     mut prev := read_plugin_file(cmd_path + "")
     if prev.len > 0 {
@@ -822,8 +826,7 @@ pub fn (a &mut App) remember_menu(m Menu) {
 }
 
 pub fn (w &mut Window) set_content_slot(kind int, backend_id int) {
-    w.content_kind = kind
-    w.content_backend_id = backend_id
+    w.bind_content(kind,backend_id) or (err) { << }
 }
 
 pub fn (w Window) content_slot_kind() int {
@@ -835,11 +838,14 @@ pub fn (w Window) content_slot_backend_id() int {
 }
 
 pub fn (w &mut Window) close() {
-    w.closed = 1
+    if sim_enabled() { w.closed = 1
+        << }
+    w.request_close() or (err) { << }
 }
 
 pub fn (a &mut App) quit() {
     a.quit_flag = 1
+    if native_enabled() { append_shell_cmd("quit_app") or (err) { << } }
 }
 
 pub fn (a &mut App) push_event(ev Event) {
@@ -930,7 +936,12 @@ fn trim_nl(s string) string {
 }
 
 fn write_plugin_field(path string, body string) int {
-    write_file(path, body + "\n") or (err) {
+    if body.len == 0 { << 0 }
+    old := read_plugin_file(path + "")
+    for line in strings.split(&old,"\n") { if line == body { << 0 } }
+    mut value := body + "\n"
+    if old.len > 0 { value = old + "\n" + value }
+    write_file(path, value) or (err) {
         << 0
     }
     << 0
@@ -948,7 +959,7 @@ pub fn content_plugin_draw() ContentPlugin {
 
 // Attach draw backend to a window slot and register the plugin for App.run().
 pub fn use_draw_content(w &mut Window) int {
-    w.set_content_slot(content_draw, w.id)
+    w.bind_content(content_draw, w.id) or (err) { << 0 - 1 }
     << register_content_plugin(content_plugin_draw())
 }
 
@@ -973,7 +984,7 @@ pub fn register_content_plugin(p ContentPlugin) int {
     if !native_enabled() {
         // Still record paths for sim / cross-check; host launch is gated elsewhere.
     }
-    wk := write_plugin_field(content_kind_path(), str(p.kind))
+    wk := register_default_kind(p.kind)
     wb := write_plugin_field(content_plugin_bootstrap_path(), p.bootstrap)
     wms := write_plugin_field(content_plugin_macos_src_path(), p.macos_src)
     wmf := write_plugin_field(content_plugin_macos_frameworks_path(), p.macos_frameworks)
@@ -1020,4 +1031,20 @@ pub fn (a &mut App) run() int {
 
 pub fn load_asset(path string) string {
     << read_file(path) or >>
+}
+
+// Exact relative name in the executable's --www resource directory. Assets
+// remain in memory; empty files are distinct from absent or invalid names.
+pub fn load_embedded_asset(path &string) string {
+    if path.len < 1 || path.len > 4096 { >> errors.new("ui: invalid embedded asset name") }
+    for i in 0:path.len { if (path[i] & 255) == 0 { >> errors.new("ui: embedded asset name contains NUL") } }
+    exists := read_file(":xu:/__asset_exists/" + path) or >>
+    if exists != "1" { >> errors.new("ui: embedded asset is unavailable") }
+    << read_file(":xu:/__asset/" + path) or >>
+}
+
+fn register_default_kind(kind int) int {
+    old := read_plugin_file(content_kind_path())
+    if old.len == 0 { write_file(content_kind_path(),str(kind)) or (err) { << 0 - 1 } }
+    << 0
 }

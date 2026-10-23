@@ -16,6 +16,9 @@ typedef struct XuContentHost {
   void (*write_tmp)(const char *name, const char *body);
   void (*read_trim)(const char *name, char *out, unsigned n);
   void (*read_raw)(const char *name, char *out, unsigned n);
+  unsigned window_id;
+  unsigned canvas_id;
+  unsigned canvas_generation;
 } XuContentHost;
 
 typedef struct XuContentVTable {
@@ -35,5 +38,36 @@ const XuContentVTable *xu_webview_plugin_vtable(void);
 const XuContentVTable *xu_draw_plugin_vtable(void);
 
 #ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+#include "xu_ui_mem.h"
+#include "xu_ui_windows.h"
+#include <stdio.h>
+#include <string.h>
+static inline void xu_content_event(const XuContentHost *host,const char *payload) {
+  if(!host || !payload)return;
+  if(host->window_id>1)xu_ui_window_event(host->window_id,host->canvas_generation,payload);
+  else if(host->append_shell_event)host->append_shell_event(payload);
+}
+static inline bool xu_content_key(const XuContentHost *host,const char *name,char *key,unsigned cap) {
+  if(!host || !name || !key || !cap)return false;
+  int n=host->window_id>1 ? snprintf(key,cap,"window/%u/%u/%s",host->window_id,host->canvas_generation,name) : snprintf(key,cap,"%s",name);
+  return n>0 && (unsigned)n<cap;
+}
+static inline void xu_content_write(const XuContentHost *host,const char *name,const char *body) {
+  if(!host)return;
+  if(host->window_id<=1){if(host->write_tmp)host->write_tmp(name,body);return;}
+  unsigned meta[6];if(!xu_ui_window_info(host->window_id,host->canvas_generation,meta,NULL,0))return;
+  char key[XU_UI_MEM_MAX_NAME+1];if(xu_content_key(host,name,key,sizeof(key)))xu_ui_mem_set(key,body?body:"");
+}
+static inline void xu_content_read(const XuContentHost *host,const char *name,char *out,unsigned cap,bool trim) {
+  if(!out || !cap)return;out[0]=0;if(!host)return;
+  if(host->window_id<=1){auto read=trim?host->read_trim:host->read_raw;if(read)read(name,out,cap);return;}
+  char key[XU_UI_MEM_MAX_NAME+1];if(xu_content_key(host,name,key,sizeof(key)))xu_ui_mem_get(key,out,cap);
+  // Immutable app-wide bridge/assets configuration; page URL/HTML remain per window.
+  if(!out[0] && (!strcmp(name,"xu_ui_scheme.txt") || !strcmp(name,"xu_ui_www_root.txt") || !strcmp(name,"xu_ui_bridge.js")))xu_ui_mem_get(name,out,cap);
+  if(trim){unsigned size=(unsigned)strlen(out);while(size && (out[size-1]=='\n' || out[size-1]=='\r' || out[size-1]==' ' || out[size-1]=='\t'))out[--size]=0;}
 }
 #endif
