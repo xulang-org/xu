@@ -498,6 +498,8 @@ fn emit_function_setup_ra(a &mut Assembler, m &types.Mir, fi int) EmitRA {
         } else {
             a.cs_pairs = 3
         }
+    } else if a.arch == 2 {
+        a.cs_pairs = 3
     }
     << ra
 }
@@ -794,6 +796,15 @@ fn emit_function_entry(a &mut Assembler, m &types.Mir, fi int, fr &Frame, use_vr
             a.cs_pairs = x64_cs_encode(mask)
         }
     }
+    if a.arch == 2 {
+        mut mask := fn_thumb_scratch_callee_mask(m, fi, fr)
+        if use_vregs {
+            mask = mask | frame_thumb_callee_mask(fr)
+        } else if a.rc_on || fn_uses_s_scratch(m, fi) != 0 {
+            mask = mask | 0x0370
+        }
+        a.cs_pairs = thumb_cs_encode(mask)
+    }
     a.label(types.mir_fn_label(m, fi))
     // Record the code offset immediately after defining the function label.
     // Numeric ARM64 function-value fixups use this stable MIR-index mapping
@@ -816,7 +827,7 @@ fn emit_function_entry(a &mut Assembler, m &types.Mir, fi int, fr &Frame, use_vr
     }
     emit_x64_entry_guard(a, m, fi, guard)
     emit_arm64_identity_guard(a, m, fi)
-    if a.stack_check && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || frame_size > 0) {
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || frame_size > 0) {
         // `_rt_run_g` keeps the current G in a callee-saved register. The
         // caller reloads that register from its hidden frame slot before each
         // user call, so synchronous host calls carry a zero marker instead of
@@ -841,7 +852,7 @@ fn emit_function_entry(a &mut Assembler, m &types.Mir, fi int, fr &Frame, use_vr
         a.label(stack_ok)
     }
     a.prologue(frame_size)
-    if a.stack_check && types.mir_nblocks(m, fi) > 0 && types.mir_fn_label(m, fi) != "_xu_main" && (fn_ncalls(m, fi) > 0 || frame_size > 0) {
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_nblocks(m, fi) > 0 && types.mir_fn_label(m, fi) != "_xu_main" && (fn_ncalls(m, fi) > 0 || frame_size > 0) {
         hold := td_stack_holder_home(a.arch)
         a.store(15, -frame_size, hold)
     }
@@ -853,6 +864,19 @@ fn emit_function_entry(a &mut Assembler, m &types.Mir, fi int, fr &Frame, use_vr
     << frame_size
 }
 
+// Resource drop hooks use S1/R15 as their data pointer. That is a different
+// ABI from the coroutine holder, so the hosted stack guard must not interpret
+// the object pointer as a G pointer at hook entry.
+fn fn_is_resource_drop(m &types.Mir, fi int) bool {
+    if fi < 0 || fi >= m.fns.len { << false }
+    label := types.mir_fn_label(m, fi)
+    if label == "" { << false }
+    for si in 0:m.structs.len {
+        if m.structs[si].drop_label.len > 0 && m.structs[si].drop_label == label { << true }
+    }
+    << false
+}
+
 fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &types.MirCallIndex) {
     // Whole-function scalar fixed homes cover reachable CFGs and direct
     // scalar calls. Keep the legacy RegCache disabled for an admitted
@@ -860,13 +884,19 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
     // the existing RA/cache behavior.
     old_rc_on := a.rc_on
     old_s_pool := a.rc_s_pool
+    force_frame_index := regplan_string_index_frame(m, fi)
     mut try_vregs := false
     mut generic_vregs := false
     if env_get("XU_RA_REJ") == "1" { eprintln("emit_fn: " + types.mir_fn_label(m, fi) + " ra=" + str(a.ra_level) + " arch=" + str(a.arch)) }
     // Fixed-home allocation follows the requested RA tier directly. The
     // legacy product_rc_mir_safe predicate only governs RegCache fallback and
     // must not silently disable the independent vreg allocator (or x64).
-    if a.ra_level >= 1 && (a.arch == 0 || a.arch == 1) {
+    if force_frame_index {
+        // Mixed string descriptor/index functions stay on the conservative
+        // frame path until their multi-word forwarding proof is complete.
+        a.rc_on = false
+        a.rc_s_pool = false
+    } else if a.ra_level >= 1 && (a.arch == 0 || a.arch == 1 || a.arch == 2) {
         // Mixed f64 pointer kernels need whole-CFG liveness: the legacy
         // cache loses values across repeated inner-loop pointer loads.
         // Keep general admission closed while using the verified planner
@@ -939,14 +969,14 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
     // layouts), dominating compiler self-emission. The encoded temp slots are
     // the allocation plan and are shared by entry + block emission.
     mut selections := []int{}
-    if a.arch == 0 && !a.cover && !a.test && (!a.rc_on || try_vregs) {
+    if a.arch == 0 && !a.cover && !a.test && !force_frame_index && (!a.rc_on || try_vregs) {
         selections = select_pair_collect(m, fi)
     }
     fallback_park_temps := park_temps
     if selections.len != 0 { park_temps = 0 }
     mut fr := Frame{local_slot: []int{}, temp_slot: []int{}, fp_split: []int{}, select_pairs: selections, sret_slot: -1, size: 0, plan_reason: 0, plan_instr: -1}
     mut reserve_home := -1
-    if a.stack_check { reserve_home = td_stack_holder_home(a.arch) }
+    if a.stack_check && !fn_is_resource_drop(m, fi) { reserve_home = td_stack_holder_home(a.arch) }
     fr.layout(m, fi, park_temps, a.arch, try_vregs, reserve_home)
     mut plan_reason := fr.plan_reason
     mut plan_instr := fr.plan_instr
@@ -1002,7 +1032,7 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
         fr.layout(m, fi, fallback_park, a.arch, false, reserve_home)
         frame_validate(&fr, m, fi)
     }
-    if a.stack_check && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || fr.size > 0) {
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || fr.size > 0) {
         // Reserve one hidden word below the ordinary frame for the current G.
         // It lets every user call reload the runtime holder without exposing
         // a hidden source-level parameter or trusting a caller's scratch S reg.
@@ -1070,7 +1100,7 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
     regplan_report_fn(&*a, m, fi, &fr, try_vregs, has_vreg, plan_reason, plan_instr, code_start)
     a.rc_on = old_rc_on
     a.rc_s_pool = old_s_pool
-    if a.arch == 0 || a.arch == 1 { a.cs_pairs = 3 }
+    if a.arch == 0 || a.arch == 1 || a.arch == 2 { a.cs_pairs = 3 }
     <<
 }
 
