@@ -230,10 +230,61 @@ fi
 
 FAILED_STAGE="seed_to_gen1"
 # Every hop builds the original source and manifest with the same profile.
+SEED_MANIFEST_BRIDGE=none
+BRIDGE_SOCKET_SHA256=SKIPPED
+BRIDGE_SEED_SHA256=SKIPPED
 # shellcheck disable=SC2086
 set +u
-"$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin"
+if "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin" >"$tmp/seed-build.log" 2>&1; then
+    seed_build_rc=0
+else
+    seed_build_rc=$?
+fi
 set -u
+cat "$tmp/seed-build.log"
+if [ "$seed_build_rc" -ne 0 ]; then
+    # Older hosted SDKs cannot type-check the new, unused os wrapper. Build
+    # an intermediate compiler without that wrapper, then restart Gen1 on
+    # the complete original source. Never install or compare the bridge as
+    # a product generation, and never recover unrelated compiler failures.
+    if ! grep -Fq "undefined name 'sys_socket_poll'" "$tmp/seed-build.log"; then
+        exit "$seed_build_rc"
+    fi
+    FAILED_STAGE="socket_poll_seed_bridge"
+    echo "build_hosted_chain: bootstrapping socket_poll support for the older hosted seed"
+    python3 - "$ROOT/src" "$tmp/seed-bridge-src" <<'PY_BRIDGE'
+from pathlib import Path
+import re
+import shutil
+import sys
+
+source, destination = map(Path, sys.argv[1:])
+shutil.copytree(source, destination)
+socket = destination / 'os/socket.xu'
+text, count = re.subn(
+    r'^pub fn socket_poll\(fd int, events int\) int \{\n'
+    r'    << sys_socket_poll\(fd, events\) or >>\n\}\n',
+    '', socket.read_text(), flags=re.MULTILINE,
+)
+if count != 1:
+    raise SystemExit('socket_poll seed bridge: expected the exact versioned wrapper')
+socket.write_text(text)
+PY_BRIDGE
+    BRIDGE_SOCKET_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/socket.xu")
+    # shellcheck disable=SC2086
+    set +u
+    XU_STDLIB_ROOT="$(native_path "$tmp/seed-bridge-src")" \
+        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/socket-poll-bootstrap.xin"
+    set -u
+    BRIDGE_SEED=$(pick_bin "$tmp/socket-poll-bootstrap.xin")
+    BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
+    SEED_MANIFEST_BRIDGE=socket_poll_wrapper_v1
+    FAILED_STAGE="bridged_seed_to_gen1"
+    # shellcheck disable=SC2086
+    set +u
+    "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin"
+    set -u
+fi
 export XU_STDLIB_ROOT="$(native_path "$ROOT/src")"
 G1=$(pick_bin "$tmp/gen1.xin")
 echo "build_hosted_chain: gen1=$G1"
@@ -343,7 +394,9 @@ target_arch=$(uname -m)
 repo_head=$REPO_HEAD
 seed_path=$SEED
 seed_sha256=$SEED_SHA256
-seed_manifest_bridge=none
+seed_manifest_bridge=$SEED_MANIFEST_BRIDGE
+bridge_socket_sha256=$BRIDGE_SOCKET_SHA256
+bridge_seed_sha256=$BRIDGE_SEED_SHA256
 source_seed_files=$SOURCE_SEED_FILES
 source_seed_sha256=$SOURCE_SEED_SHA256
 source_closure_files=$SOURCE_CLOSURE_FILES

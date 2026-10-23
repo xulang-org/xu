@@ -26,7 +26,7 @@ private func compileListNative(_ lease: UnsafeRawPointer?) -> UnsafeMutableRawPo
   }
 }
 private func destroyListNative(_ pointer: UnsafeMutableRawPointer?) {
-  if let pointer {Unmanaged<NativeDrawScene>.fromOpaque(pointer).release()}
+  if let pointer {autoreleasepool {Unmanaged<NativeDrawScene>.fromOpaque(pointer).release()}}
 }
 final class DrawDisplayList {
   private let resource: UnsafeMutableRawPointer
@@ -1221,6 +1221,8 @@ final class XuDrawPlugin: NSObject, XuContentPlugin {
     xuCanvasClose(canvas.canvasID, generation)
     shell?.appendShellFile("canvas_closed\t\(canvas.windowID)\t\(canvas.canvasID)\t\(generation)")
     generation = 0
+    canvas?.ops.removeAll()
+    canvas?.displayOps.removeAll()
     canvas?.onMetrics = nil; canvas?.onInput = nil; canvas?.generation = 0
     canvas?.removeFromSuperview()
     canvas = nil
