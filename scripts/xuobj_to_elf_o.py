@@ -196,8 +196,8 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
         if name in HOST_SYMS:
             continue
         defined.append((name, 2 if is_data else 1, off))
-    if "_start" in local:
-        defined.append(("xu_app_start", 1, local["_start"][0]))
+    # Current compilers emit xu_app_start as a genuine C entry. Never alias
+    # the kernel _start: its argc/env/stack contract is incompatible with libc.
 
     undef: set[str] = set(HOST_SYMS)
     for _kind, _roff, lab in pending:

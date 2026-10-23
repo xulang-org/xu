@@ -1,0 +1,379 @@
+@ui/draw
+
+#ui
+#errors
+#strings
+#math
+#ui/internal/codec
+
+// XDF1 is a bounded little-endian frame ABI. Each recorder owns its storage.
+// Explicit window contexts carry a generation and are revoked on native close.
+pub const max_frame_bytes = 4194304
+pub const max_frame_commands = 100000
+pub const max_state_depth = 256
+
+pub struct Color {
+    packed int
+}
+
+fn color_byte(n int) int {
+    if n < 0 { << 0 }
+    if n > 255 { << 255 }
+    << n
+}
+
+// Straight (unpremultiplied) sRGB bytes. Components saturate to 0...255.
+pub fn rgba(r int, g int, b int, a int) Color {
+    << Color{packed: (color_byte(r) << 24) | (color_byte(g) << 16) | (color_byte(b) << 8) | color_byte(a)}
+}
+
+pub fn rgb(r int, g int, b int) Color {
+    << rgba(r, g, b, 255)
+}
+
+pub struct Context {
+    canvas_id int
+    generation int
+}
+
+pub fn default_context() Context {
+    << Context{canvas_id: 1, generation: 0}
+}
+
+// Bind to a native canvas_ready event. The host rejects this Context after
+// that generation closes, even if its numeric canvas ID is later reused.
+pub fn context_of(event &ui.Event) Context {
+    if event.kind != ui.ev_canvas_ready { >> errors.new("draw: expected canvas_ready") }
+    identity := ui.canvas_of(event) or >>
+    << Context{canvas_id: identity.canvas_id, generation: identity.generation}
+}
+
+pub fn window_context(window &ui.Window) Context {
+    if window.id <= 0 || window.closed != 0 || window.generation == 0 { >> errors.new("draw: expected a live native window") }
+    if window.content_kind != ui.content_draw { >> errors.new("draw: window does not have draw content") }
+    << Context{canvas_id: window.id,generation: window.generation}
+}
+
+pub struct Frame {
+    buffer strings.ByteBuilder
+    canvas_id int
+    generation int
+    sequence int
+    count int
+    depth int
+    active bool
+    sealed bool
+    failed bool
+    layer_stack []LayerState
+    layer_depth int
+    layer_bytes int
+    temporary_images []int
+}
+
+pub fn (c &Context) new_frame(capacity int) Frame {
+    mut cap := capacity
+    if cap < 32 { cap = 4096 }
+    if cap > max_frame_bytes { cap = max_frame_bytes }
+    << Frame{buffer: strings.new_byte_builder(cap), canvas_id: c.canvas_id, generation: c.generation,
+             sequence: 0, count: 0, depth: 0, active: false, sealed: false, failed: false,layer_stack: []LayerState{},layer_bytes: 0,layer_depth: 0,temporary_images: []int{}}
+}
+
+// A complete record reserves once before any scalar is written.
+fn (f &mut Frame) reserve(n int) {
+    buffer := mut &f.buffer
+    buffer.reserve(n)
+}
+
+fn (f &mut Frame) bytes(s string) {
+    base := f.buffer.len
+    for i in 0:s.len { f.buffer.buf[base + i] = s[i] & 255 }
+    f.buffer.len = base + s.len
+}
+
+fn (f &mut Frame) word32(n int) {
+    base := f.buffer.len
+    for i in 0:4 { f.buffer.buf[base + i] = (n >> (i * 8)) & 255 }
+    f.buffer.len = base + 4
+}
+
+fn (f &mut Frame) word64(n int) {
+    base := f.buffer.len
+    for i in 0:8 { f.buffer.buf[base + i] = (n >> (i * 8)) & 255 }
+    f.buffer.len = base + 8
+}
+
+fn (f &mut Frame) patch32(off int, n int) {
+    for i in 0:4 { f.buffer.buf[off + i] = (n >> (i * 8)) & 255 }
+}
+
+// Bit-exact finite IEEE754 encoding using powers of two; no decimal formatting
+// or compiler-specific pointer casts. Subnormals are preserved as well.
+fn frame_float_word(v f64) int {
+    << codec.finite_f64_bits(v)
+}
+
+fn (f &mut Frame) fail(message string) int {
+    f.failed = true
+    >> errors.new(message)
+}
+
+fn (f &mut Frame) writable() int {
+    if !f.active || f.sealed || f.failed { << f.fail("draw: frame is not writable") or >> }
+    << 0
+}
+
+fn (f &mut Frame) record(op int, payload int) int {
+    f.writable() or >>
+    if f.count >= max_frame_commands || payload > max_frame_bytes - 8 ||
+       f.buffer.len > max_frame_bytes - 8 - payload {
+        << f.fail("draw: frame capacity exceeded") or >>
+    }
+    f.reserve(payload + 8)
+    f.word32(op)
+    f.word32(payload + 8)
+    f.count = f.count + 1
+    << 0
+}
+
+// rule: any / nonnegative extent / positive width / nonsingular scale.
+fn (f &mut Frame) scalar(v f64, rule int) int {
+    if math.is_nan(v) || math.is_inf(v) || math.abs(v) > 1000000000.0 ||
+       (rule == 1 && v < 0.0) || (rule == 2 && v <= 0.0) ||
+       (rule == 3 && math.abs(v) < 0.000000001) {
+        << f.fail("draw: invalid coordinate, extent or scale") or >>
+    }
+    f.word64(codec.finite_f64_bits(v))
+    << 0
+}
+
+// Discards only this recorder's unsubmitted work. Capacity is retained.
+pub fn (f &mut Frame) begin() int {
+    f.cancel()
+    << f.reset_recording() or >>
+}
+
+fn (f &mut Frame) reset_recording() int {
+    f.buffer.len = 0
+    f.count = 0
+    f.depth = 0
+    f.failed = false
+    f.sealed = false
+    f.active = true
+    if f.sequence == 9223372036854775807 { f.sequence = 0 }
+    f.sequence = f.sequence + 1
+    f.word32(826688600) // little-endian XDF1
+    mut version := 1
+    if f.generation > 0 { version = 2 }
+    f.word32(version)
+    f.word32(32)
+    f.word32(0)
+    f.word32(f.canvas_id)
+    f.word32(f.generation)
+    f.word64(f.sequence)
+    << 0
+}
+
+pub fn (f &mut Frame) cancel() {
+    f.clear_temporary_images()
+    f.layer_stack = []LayerState{}
+    f.layer_bytes = 0
+    f.layer_depth = 0
+    f.buffer.len = 0
+    f.active = false
+    f.sealed = false
+    f.failed = false
+    f.count = 0
+    f.depth = 0
+}
+
+pub fn (f &Frame) byte_len() int { << f.buffer.len }
+pub fn (f &Frame) capacity() int { << f.buffer.buf.len }
+pub fn (f &Frame) command_count() int { << f.count }
+
+// Successful return means queued, not yet displayed. A full queue returns an
+// error and retains the sealed frame for retry. begin/cancel permit rebuilding.
+// The host also validates cumulative transforms before accepting the frame:
+// matrix coefficients, translation and inverse linear coefficients must stay
+// within 1e9, and the linear matrix must remain invertible at float precision.
+fn (f &mut Frame) seal() int {
+    if f.layer_depth != 0 { << f.fail("draw: unbalanced layer stack") or >> }
+    << f.seal_recording() or >>
+}
+
+fn (f &mut Frame) seal_recording() int {
+    if !f.active || f.failed { << f.fail("draw: invalid frame") or >> }
+    if f.depth != 0 { << f.fail("draw: unbalanced state stack") or >> }
+    if f.canvas_id <= 0 || (f.generation == 0 && f.canvas_id != 1) { << f.fail("draw: invalid canvas") or >> }
+    if ui.host_tmp() != ":xu:" { >> errors.new("draw: frames require the in-process UI host") }
+    f.patch32(8, f.buffer.len)
+    f.patch32(12, f.count)
+    f.sealed = true
+    << 0
+}
+
+pub fn (f &mut Frame) present() int {
+    f.seal() or >>
+    payload := f.buffer.to_string()
+    accepted := write_file(":xu:/__draw_submit", payload) or >>
+    if accepted != payload.len { >> errors.new("draw: frame rejected (invalid data, closed canvas, preparation/queue limit or unavailable host)") }
+    f.active = false
+    f.clear_temporary_images()
+    << 0
+}
+
+pub fn (f &mut Frame) set_bg(color Color) int {
+    if (color.packed & 255) != 255 { << f.fail("draw: background must be opaque") or >> }
+    f.record(1, 4) or >>
+    f.word32(color.packed)
+    << 0
+}
+pub fn (f &mut Frame) set_color(color Color) int {
+    f.record(2, 4) or >>
+    f.word32(color.packed)
+    << 0
+}
+pub fn (f &mut Frame) set_fill(color Color) int {
+    f.record(3, 4) or >>
+    f.word32(color.packed)
+    << 0
+}
+pub fn (f &mut Frame) set_stroke(color Color) int {
+    f.record(4, 4) or >>
+    f.word32(color.packed)
+    << 0
+}
+pub fn (f &mut Frame) set_width(width f64) int {
+    f.record(5, 8) or >>
+    f.scalar(width, 2) or >>
+    << 0
+}
+pub fn (f &mut Frame) push() int {
+    if f.depth >= max_state_depth { << f.fail("draw: state stack overflow") or >> }
+    f.record(6, 0) or >>
+    f.depth = f.depth + 1
+    << 0
+}
+pub fn (f &mut Frame) pop() int {
+    if f.depth <= 0 { << f.fail("draw: state stack underflow") or >> }
+    f.record(7, 0) or >>
+    f.depth = f.depth - 1
+    << 0
+}
+pub fn (f &mut Frame) origin() int { << f.record(8, 0) or >> }
+pub fn (f &mut Frame) translate(x f64, y f64) int {
+    f.record(9, 16) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    << 0
+}
+pub fn (f &mut Frame) rotate(degrees f64) int {
+    f.record(10, 8) or >>
+    f.scalar(degrees, 0) or >>
+    << 0
+}
+// Scale factors: 1 = 100%. The legacy free function still uses percent.
+pub fn (f &mut Frame) scale(x f64, y f64) int {
+    f.record(11, 16) or >>
+    f.scalar(x, 3) or >>
+    f.scalar(y, 3) or >>
+    << 0
+}
+
+pub fn (f &mut Frame) clip_rect(x f64, y f64, w f64, h f64) int {
+    f.record(12, 32) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(w, 1) or >>
+    f.scalar(h, 1) or >>
+    << 0
+}
+
+pub fn (f &mut Frame) rect(x f64, y f64, w f64, h f64) int {
+    f.record(13, 32) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(w, 1) or >>
+    f.scalar(h, 1) or >>
+    << 0
+}
+
+pub fn (f &mut Frame) rect_line(x f64, y f64, w f64, h f64) int {
+    f.record(14, 32) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(w, 1) or >>
+    f.scalar(h, 1) or >>
+    << 0
+}
+
+pub fn (f &mut Frame) fill_rect(x f64, y f64, w f64, h f64, color Color) int {
+    f.record(15, 36) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(w, 1) or >>
+    f.scalar(h, 1) or >>
+    f.word32(color.packed)
+    << 0
+}
+
+pub fn (f &mut Frame) stroke_rect(x f64, y f64, w f64, h f64, color Color, width f64) int {
+    f.record(16, 44) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(w, 1) or >>
+    f.scalar(h, 1) or >>
+    f.scalar(width, 2) or >>
+    f.word32(color.packed)
+    << 0
+}
+
+pub fn (f &mut Frame) ellipse(x f64, y f64, w f64, h f64) int {
+    f.record(20, 32) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(w, 1) or >>
+    f.scalar(h, 1) or >>
+    << 0
+}
+
+pub fn (f &mut Frame) line(x1 f64, y1 f64, x2 f64, y2 f64, color Color, width f64) int {
+    f.record(17, 44) or >>
+    f.scalar(x1, 0) or >>
+    f.scalar(y1, 0) or >>
+    f.scalar(x2, 0) or >>
+    f.scalar(y2, 0) or >>
+    f.scalar(width, 2) or >>
+    f.word32(color.packed)
+    << 0
+}
+
+// UTF-8 text is length-delimited: tabs/newlines cannot inject host commands.
+pub fn (f &mut Frame) text(x f64, y f64, size f64, color Color, text &string) int {
+    if text.len > max_frame_bytes - 36 { << f.fail("draw: text is too large") or >> }
+    f.record(18, 28 + text.len) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(size, 2) or >>
+    f.word32(color.packed)
+    f.bytes(*text)
+    << 0
+}
+
+pub fn (f &mut Frame) circle(x f64, y f64, radius f64) int {
+    f.record(19, 24) or >>
+    f.scalar(x, 0) or >>
+    f.scalar(y, 0) or >>
+    f.scalar(radius, 1) or >>
+    << 0
+}
+
+pub fn (f &mut Frame) triangle(x1 f64, y1 f64, x2 f64, y2 f64, x3 f64, y3 f64) int {
+    f.record(21, 48) or >>
+    f.scalar(x1, 0) or >>
+    f.scalar(y1, 0) or >>
+    f.scalar(x2, 0) or >>
+    f.scalar(y2, 0) or >>
+    f.scalar(x3, 0) or >>
+    f.scalar(y3, 0) or >>
+    << 0
+}

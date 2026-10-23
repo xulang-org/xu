@@ -59,6 +59,12 @@ static int find_www_exact(const char *p, const unsigned char **data, unsigned *l
   }
   return 0;
 }
+const unsigned char *xu_pack_asset_ptr(const char *relative_path, unsigned *len) {
+  const unsigned char *data = 0; unsigned size = 0;
+  if (find_www_exact(relative_path, &data, &size)) { if (len) *len = size; return data; }
+  if (len) *len = 0;
+  return 0;
+}
 
 static const char *skip_slashes(const char *p) {
   if (!p) return "";

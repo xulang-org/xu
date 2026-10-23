@@ -29,6 +29,12 @@
 #include "xu_content_abi.h"
 #include "xu_pack_assets.h"
 #include "xu_ui_mem.h"
+#include "xu_ui_commands.h"
+#include "xu_ui_windows.h"
+#include "xu_ui_requests.h"
+#include "xu_draw_frame.h"
+#include "linux_clipboard.inc"
+#include "linux_files.inc"
 
 extern "C" {
 const XuContentVTable *xu_webview_plugin_vtable(void) __attribute__((weak));
@@ -36,6 +42,7 @@ const XuContentVTable *xu_draw_plugin_vtable(void) __attribute__((weak));
 }
 
 static char g_tmp[1024];
+static unsigned g_root_generation=0;
 static GtkWindow *g_win = NULL;
 static GtkApplication *g_app = NULL;
 static GtkWidget *g_area = NULL;
@@ -75,6 +82,7 @@ static void show_desktop_notify(void);
 static void menu_install_or_update(void);
 static void tray_install_or_update(void);
 static void handle_shell_cmd(const char *s);
+static void drain_title_size(void);
 
 static void write_tmp(const char *name, const char *body) {
   // Pack/oneexe: prefer in-process mailbox (no /tmp/xu_ui_* dir).
@@ -89,7 +97,7 @@ static void write_tmp(const char *name, const char *body) {
 }
 
 static void append_shell_event(const char *payload) {
-  xu_ui_mem_append("xu_ui_shell_event.txt", payload ? payload : "", 1);
+  xu_ui_window_event(1,(payload && strcmp(payload,"ready") && strcmp(payload,"exit"))?g_root_generation:0,payload?payload:"");
   if (!g_tmp[0]) return;
   char path[1200];
   snprintf(path, sizeof(path), "%s/xu_ui_shell_event.txt", g_tmp);
@@ -150,7 +158,7 @@ static void apply_transparent(gboolean on) {
     ? "window, drawingarea { background-color: rgba(0,0,0,0); }"
     : "window { background-color: @theme_bg_color; }";
 #if GTK_CHECK_VERSION(4, 12, 0)
-  gtk_css_provider_load_from_data(prov, css);
+  gtk_css_provider_load_from_string(prov, css);
 #else
   gtk_css_provider_load_from_data(prov, css, -1);
 #endif
@@ -347,18 +355,29 @@ static void clear_mask(void) {
   if (g_area) gtk_widget_queue_draw(g_area);
 }
 
+static gboolean g_quitting = FALSE;
+static bool g_root_closed=false;
+
 static void do_quit(void) {
-  append_shell_event("closed");
-  append_shell_event("exit");
-  if (g_poll_id) {
-    g_source_remove(g_poll_id);
-    g_poll_id = 0;
+  if (g_quitting) return;
+  if(!g_root_closed){
+    g_root_closed=true;
+    if(g_content && g_content_vt && g_content_vt->destroy)g_content_vt->destroy(g_content);
+    g_content=NULL;
+    unsigned meta[6];if(xu_ui_window_info(1,0,meta,NULL,0))xu_ui_window_closed(1,meta[1]);
+    append_shell_event("closed");if(g_win)gtk_widget_set_visible(GTK_WIDGET(g_win),FALSE);
   }
-  if (g_content && g_content_vt && g_content_vt->destroy) {
-    g_content_vt->destroy(g_content);
-    g_content = NULL;
-  }
-  if (g_app) g_application_quit(G_APPLICATION(g_app));
+  desktop_files_poll();
+  // Keep the main context running until cancelled file-dialog callbacks release
+  // their GObjects. The hidden root keeps GtkApplication alive during this drain.
+  if(xu_ui_window_count() || !desktop_files_idle())return;
+  g_quitting=TRUE;xu_ui_windows_shutdown();xu_ui_emit_close();
+  desktop_clipboard_poll();
+  desktop_files_poll();
+  if(g_poll_id){g_source_remove(g_poll_id);g_poll_id=0;}
+  xu_ui_host_set_kick(NULL);
+  if(g_win){gtk_window_destroy(g_win);g_win=NULL;g_content_box=NULL;g_area=NULL;}
+  append_shell_event("exit");if(g_app)g_application_quit(G_APPLICATION(g_app));
 }
 
 static void try_move_window(int x, int y) {
@@ -588,6 +607,12 @@ static void drain_title_size(void) {
 }
 
 static void handle_shell_cmd(const char *s) {
+  if(g_root_closed)return;
+  if(!strcmp(s,"close")){gtk_window_close(g_win);return;}
+  if(!strncmp(s,"title\t",6)){write_tmp("xu_ui_title.txt",s+6);drain_title_size();return;}
+  if(!strncmp(s,"size\t",5)){int width=0,height=0;char tail=0;
+    if(sscanf(s+5,"%d\t%d%c",&width,&height,&tail)==2 && width>=40 && height>=40 && width<=16384 && height<=16384){char size[40];snprintf(size,sizeof(size),"%d %d",width,height);write_tmp("xu_ui_size.txt",size);drain_title_size();}return;
+  }
   if (strcmp(s, "show") == 0) {
     g_hidden = FALSE;
     gtk_widget_set_visible(GTK_WIDGET(g_win), TRUE);
@@ -1265,17 +1290,25 @@ static void tray_install_or_update(void) {
   snprintf(g_tray_sig, sizeof(g_tray_sig), "%s", sig);
 }
 
-static void strip_prefix(const char *raw, char *out, size_t n) {
-  const char *s = raw;
-  if (strncmp(s, "shell.", 6) == 0) s += 6;
-  else if (strncmp(s, "content.", 8) == 0) s += 8;
-  else if (strncmp(s, "wv.", 3) == 0) s += 3;
-  snprintf(out, n, "%s", s);
+static const char *strip_prefix(const char *raw) {
+  if (strncmp(raw, "shell.", 6) == 0) return raw + 6;
+  if (strncmp(raw, "content.", 8) == 0) return raw + 8;
+  if (strncmp(raw, "wv.", 3) == 0) return raw + 3;
+  return raw;
 }
+
+static void maybe_install_content_plugin(void);
+#include "linux_windows.inc"
 
 static gboolean drain_cmds(gpointer data) {
   (void)data;
-  drain_title_size();
+  desktop_clipboard_poll();
+  desktop_files_poll();
+  if(!g_root_closed)drain_title_size();
+  extra_poll();
+  if(g_root_closed && !xu_ui_window_count()){
+    do_quit();if(g_quitting)return G_SOURCE_REMOVE;
+  }
   tray_install_or_update();
   menu_install_or_update();
   if (g_content && g_content_vt && g_content_vt->on_poll) {
@@ -1284,34 +1317,30 @@ static gboolean drain_cmds(gpointer data) {
   if (g_content && g_content_vt && g_content_vt->sync_frame) {
     g_content_vt->sync_frame(g_content);
   }
-  char buf[8192];
-  buf[0] = 0;
-  if (xu_ui_mem_get("xu_ui_cmd.txt", buf, sizeof(buf)) >= 0) {
-    xu_ui_mem_clear("xu_ui_cmd.txt");
-  } else if (g_tmp[0]) {
-    char path[1200];
-    snprintf(path, sizeof(path), "%s/xu_ui_cmd.txt", g_tmp);
-    FILE *f = fopen(path, "r");
-    if (!f) return G_SOURCE_CONTINUE;
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    buf[n] = 0;
-    f = fopen(path, "w");
-    if (f) fclose(f);
-  }
+  std::string commands = xu_ui_take_commands(g_tmp);
+  char *buf = commands.data();
   if (!buf[0]) return G_SOURCE_CONTINUE;
   char *save = NULL;
   char *line = strtok_r(buf, "\n", &save);
   while (line) {
     while (*line == ' ') line++;
     if (*line) {
-      char cmd[4096];
-      strip_prefix(line, cmd, sizeof(cmd));
-      int to_content = (strncmp(line, "wv.", 3) == 0 || strncmp(line, "content.", 8) == 0);
+      if(!strcmp(line,"shell.quit_app")){
+        for(auto &window:g_extra_windows)extra_close(window,true);
+        xu_ui_windows_shutdown();
+        do_quit();return G_SOURCE_CONTINUE;
+      }
+      if(extra_dispatch(line)){line=strtok_r(NULL,"\n",&save);continue;}
+      unsigned identity[2];const char *unscoped=line;
+      xu_ui_scoped_command(line,identity,&unscoped);
+      const char *cmd = strip_prefix(unscoped);
+      int to_content = (strncmp(unscoped, "wv.", 3) == 0 || strncmp(unscoped, "content.", 8) == 0);
       if (to_content) {
-        if (g_content && g_content_vt && g_content_vt->handle_cmd) {
+        if (!desktop_files(cmd,1,g_root_generation,g_win) && !desktop_clipboard(cmd,1,g_root_generation) && g_content && g_content_vt && g_content_vt->handle_cmd) {
           g_content_vt->handle_cmd(g_content, cmd);
         }
+        xu_ui_draw_discard_marker(cmd);
+        xu_ui_request_discard_marker(cmd);
       } else {
         handle_shell_cmd(cmd);
       }
@@ -1332,7 +1361,7 @@ static gboolean on_close(GtkWindow *w, gpointer user) {
     return TRUE;
   }
   do_quit();
-  return FALSE;
+  return TRUE;
 }
 
 static void on_map(GtkWidget *w, gpointer user) {
@@ -1352,6 +1381,9 @@ static void host_read_raw(const char *name, char *out, unsigned n) {
 }
 
 static const XuContentVTable *resolve_content_vtable(void) {
+  unsigned meta[6];if(xu_ui_window_info(1,0,meta,NULL,0))return content_kind_vtable(meta[4]);
+  char kind[16];read_trim_file("xu_ui_content_kind.txt",kind,sizeof(kind));
+  if(kind[0])return content_kind_vtable((unsigned)atoi(kind));
   char boot[256];
   read_trim_file("xu_ui_plugin_bootstrap.txt", boot, sizeof(boot));
   if (strcmp(boot, "XuWebViewPluginBootstrap") == 0) {
@@ -1370,6 +1402,9 @@ static void maybe_install_content_plugin(void) {
   if (!g_content_vt || !g_content_vt->create || !g_content_vt->install) return;
   memset(&g_content_host, 0, sizeof(g_content_host));
   g_content_host.tmp = g_tmp;
+  g_content_host.window_id = 1;
+  g_content_host.canvas_id = 1;
+  unsigned meta[6];if(xu_ui_window_info(1,0,meta,NULL,0))g_content_host.canvas_generation=meta[1];
   g_content_host.native_window = (void *)g_win;
   g_content_host.content_parent = (void *)g_content_box;
   g_content_host.append_shell_event = host_append_event;
@@ -1413,7 +1448,9 @@ static void activate(GApplication *app, gpointer user) {
   g_content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_window_set_child(g_win, g_content_box);
 
+  unsigned identity[6];if(xu_ui_window_info(1,0,identity,NULL,0)){g_root_generation=identity[1];xu_ui_window_claim(1,identity[1]);}
   maybe_install_content_plugin();
+  if(identity[1])xu_ui_window_ready(1,identity[1]);
   if (!g_content) {
     g_area = gtk_drawing_area_new();
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(g_area), on_draw, NULL, NULL);
@@ -1432,6 +1469,7 @@ static void activate(GApplication *app, gpointer user) {
   apply_app_icon();
   menu_install_or_update();
   tray_install_or_update();
+  append_shell_event("window_ready");
   append_shell_event("ready");
   xu_ui_host_set_kick([]() {
     g_idle_add(
@@ -1445,6 +1483,8 @@ static void activate(GApplication *app, gpointer user) {
 }
 
 extern "C" int xu_ui_host_run(const char *tmp_dir) {
+  g_quitting = FALSE;
+  xu_ui_emit_start();
   const char *tmp = tmp_dir;
   if (!tmp || !tmp[0]) tmp = getenv("XU_UI_TMP");
   // Pack/oneexe: no /tmp/xu_ui_* workdir — mailbox is xu_ui_mem (g_tmp empty).
