@@ -3,7 +3,8 @@
 
 #errors
 // Minimal regexp subset (Go regexp-shaped API, not full RE2).
-// Flat node pool + bounded backtracking (step budget). No backrefs.
+// Flat node pool + iterative, bounded backtracking. No native recursion while matching.
+// Work exhaustion throws an error; it is never reported as a failed match.
 
 const kind_lit = 1
 const kind_any = 2
@@ -20,7 +21,7 @@ const kind_empty = 12
 const kind_cap_start = 13
 const kind_cap_end = 14
 
-const steps_default = 1000000
+const steps_default = 16000000
 
 pub struct Regexp {
     pub nodes []Node
@@ -43,6 +44,7 @@ struct Parser {
     class_data string
     err string
     num_caps int
+    depth int
 }
 
 struct Matcher {
@@ -51,7 +53,14 @@ struct Matcher {
     steps int
     ok bool
     end_pos int
-    cont []int
+    tasks []MatchTask
+    task_count int
+    choices []MatchChoice
+    choice_count int
+    saved_tasks []MatchTask
+    saved_count int
+    saved_captures []int
+    capture_count int
     cap_start []int
     cap_end []int
 }
@@ -82,7 +91,8 @@ pub fn quote_meta(s &string) string {
 }
 
 pub fn compile(expr string) Regexp {
-    mut p := Parser{expr: expr, pos: 0, nodes: []Node{}, class_data: "", err: "", num_caps: 0}
+    if expr.len > 65536 { >> errors.new("regexp: expression exceeds 65536 bytes") }
+    mut p := Parser{expr: expr, pos: 0, nodes: []Node{}, class_data: "", err: "", num_caps: 0, depth: 0}
     root := p.parse_alt()
     if p.err.len > 0 {
         >> errors.new(p.err + "")
@@ -188,11 +198,17 @@ fn (p &mut Parser) parse_atom() int {
         << 0
     }
     if c == 40 {
+        if p.depth >= 64 {
+            p.fail("regexp: group nesting exceeds 64")
+            << 0
+        }
+        p.depth += 1
         _ := p.next()
         idx := p.num_caps
         p.num_caps = p.num_caps + 1
         start_n := p.add(kind_cap_start, idx, 0)
         inner := p.parse_alt()
+        p.depth -= 1
         if p.next() != 41 {
             p.fail("regexp: missing )")
         }
@@ -382,242 +398,153 @@ fn class_has_data(data &string, off int, n int, ch int) bool {
 }
 
 fn (m &mut Matcher) bump() bool {
-    m.steps = m.steps + 1
-    if m.steps > m.re.steps_max {
-        m.ok = false
-        << false
+    if m.re.steps_max <= 0 || m.steps >= m.re.steps_max {
+        >> errors.new("regexp: match work limit exceeded")
     }
+    m.steps += 1
     << true
 }
 
-fn (m &mut Matcher) cont_push(ni int) {
-    m.cont.push(ni)
+struct MatchTask {
+    node int
+    previous int
 }
 
-fn (m &mut Matcher) cont_pop() int {
-    if m.cont.len == 0 {
-        << -1
-    }
-    last := m.cont[m.cont.len - 1]
-    mut next := []int{}
-    for i in 0:(m.cont.len - 1) {
-        next.push(m.cont[i])
-    }
-    m.cont = next
-    << last
+struct MatchChoice {
+    pos int
+    task_start int
+    task_count int
+    capture_start int
 }
 
-fn (m &mut Matcher) cont_clone() []int {
-    mut c := []int{}
-    for i in 0:m.cont.len {
-        c.push(m.cont[i])
-    }
-    << c
+fn (m &mut Matcher) task_push(node int, previous int) {
+    task := MatchTask{node: node, previous: previous}
+    if m.task_count < m.tasks.len { m.tasks[m.task_count] = task } else { m.tasks.push(task) }
+    m.task_count += 1
 }
 
-fn (m &mut Matcher) cont_restore(saved &[]int) {
-    mut c := []int{}
-    for i in 0:saved.len {
-        c.push(saved[i])
+fn (m &mut Matcher) choice_push(pos int) int {
+    _ := m.bump() or >>
+    choice := MatchChoice{pos: pos, task_start: m.saved_count, task_count: m.task_count, capture_start: m.capture_count}
+    for i in 0:m.task_count {
+        _ := m.bump() or >>
+        task := m.tasks[i]
+        if m.saved_count < m.saved_tasks.len { m.saved_tasks[m.saved_count] = task } else { m.saved_tasks.push(task) }
+        m.saved_count += 1
     }
-    m.cont = c
-}
-
-fn (m &mut Matcher) caps_clone_start() []int {
-    mut c := []int{}
     for i in 0:m.cap_start.len {
-        c.push(m.cap_start[i])
+        _ := m.bump() or >>
+        if m.capture_count < m.saved_captures.len {
+            m.saved_captures[m.capture_count] = m.cap_start[i]
+            m.saved_captures[m.capture_count + 1] = m.cap_end[i]
+        } else {
+            m.saved_captures.push(m.cap_start[i])
+            m.saved_captures.push(m.cap_end[i])
+        }
+        m.capture_count += 2
     }
-    << c
+    if m.choice_count < m.choices.len { m.choices[m.choice_count] = choice } else { m.choices.push(choice) }
+    m.choice_count += 1
+    << 0
 }
 
-fn (m &mut Matcher) caps_clone_end() []int {
-    mut c := []int{}
-    for i in 0:m.cap_end.len {
-        c.push(m.cap_end[i])
+fn (m &mut Matcher) backtrack() int {
+    if m.choice_count == 0 { << -1 }
+    m.choice_count -= 1
+    choice := m.choices[m.choice_count]
+    m.task_count = 0
+    for i in 0:choice.task_count {
+        task := m.saved_tasks[choice.task_start + i]
+        m.task_push(task.node, task.previous)
     }
-    << c
+    for i in 0:m.cap_start.len {
+        m.cap_start[i] = m.saved_captures[choice.capture_start + i * 2]
+        m.cap_end[i] = m.saved_captures[choice.capture_start + i * 2 + 1]
+    }
+    m.saved_count = choice.task_start
+    m.capture_count = choice.capture_start
+    << choice.pos
 }
 
-fn (m &mut Matcher) caps_restore(starts &[]int, ends &[]int) {
-    mut cs := []int{}
-    mut ce := []int{}
-    for i in 0:starts.len {
-        cs.push(starts[i])
+// Native stack usage is independent of input length. Choices keep the
+// pending continuation and captures on the heap, including alternatives
+// inside a repeated group.
+fn (m &mut Matcher) go(root int, start int) bool {
+    m.task_count = 0
+    m.choice_count = 0
+    m.saved_count = 0
+    m.capture_count = 0
+    for i in 0:m.cap_start.len {
+        m.cap_start[i] = -1
+        m.cap_end[i] = -1
     }
-    for i in 0:ends.len {
-        ce.push(ends[i])
-    }
-    m.cap_start = cs
-    m.cap_end = ce
-}
-
-fn (m &mut Matcher) finish(pos int) bool {
-    if m.cont.len == 0 {
-        m.end_pos = pos
-        << true
-    }
-    ni := m.cont_pop()
-    << m.go(ni, pos)
-}
-
-fn (m &mut Matcher) go(ni int, pos int) bool {
-    if !m.bump() {
-        << false
-    }
-    node := m.re.nodes[ni]
-    kind := node.kind
-    if kind == kind_empty {
-        << m.finish(pos)
-    }
-    if kind == kind_cap_start {
-        idx := node.a
-        if idx >= 0 && idx < m.cap_start.len {
-            m.cap_start[idx] = pos
-            m.cap_end[idx] = -1
-        }
-        << m.finish(pos)
-    }
-    if kind == kind_cap_end {
-        idx := node.a
-        if idx >= 0 && idx < m.cap_end.len {
-            m.cap_end[idx] = pos
-        }
-        << m.finish(pos)
-    }
-    if kind == kind_bol {
-        if pos != 0 {
-            << false
-        }
-        << m.finish(pos)
-    }
-    if kind == kind_eol {
-        if pos != m.text.len {
-            << false
-        }
-        << m.finish(pos)
-    }
-    if kind == kind_lit {
-        if pos >= m.text.len {
-            << false
-        }
-        if (m.text[pos] & 255) != node.a {
-            << false
-        }
-        << m.finish(pos + 1)
-    }
-    if kind == kind_any {
-        if pos >= m.text.len {
-            << false
-        }
-        << m.finish(pos + 1)
-    }
-    if kind == kind_class {
-        if pos >= m.text.len {
-            << false
-        }
-        cd := m.re.class_data + ""
-        ch := m.text[pos] & 255
-        if !class_has_data(&cd, node.a, node.b, ch) {
-            << false
-        }
-        << m.finish(pos + 1)
-    }
-    if kind == kind_nclass {
-        if pos >= m.text.len {
-            << false
-        }
-        cd := m.re.class_data + ""
-        ch := m.text[pos] & 255
-        if class_has_data(&cd, node.a, node.b, ch) {
-            << false
-        }
-        << m.finish(pos + 1)
-    }
-    if kind == kind_cat {
-        m.cont_push(node.b)
-        << m.go(node.a, pos)
-    }
-    if kind == kind_alt {
-        saved := m.cont_clone()
-        save_cs := m.caps_clone_start()
-        save_ce := m.caps_clone_end()
-        save_steps := m.steps
-        if m.go(node.a, pos) {
+    m.task_push(root, -1)
+    mut pos := start
+    while true {
+        _ := m.bump() or >>
+        if m.task_count == 0 {
+            m.end_pos = pos
             << true
         }
-        if !m.ok {
-            << false
+        m.task_count -= 1
+        task := m.tasks[m.task_count]
+        mut ni := task.node
+        mut repeat := false
+        if ni < 0 {
+            if pos == task.previous { -> }
+            ni = 0 - ni - 1
+            repeat = true
         }
-        m.cont_restore(&saved)
-        m.caps_restore(&save_cs, &save_ce)
-        m.steps = save_steps
-        << m.go(node.b, pos)
-    }
-    if kind == kind_quest {
-        saved := m.cont_clone()
-        save_cs := m.caps_clone_start()
-        save_ce := m.caps_clone_end()
-        save_steps := m.steps
-        if m.go(node.a, pos) {
-            << true
-        }
-        if !m.ok {
-            << false
-        }
-        m.cont_restore(&saved)
-        m.caps_restore(&save_cs, &save_ce)
-        m.steps = save_steps
-        << m.finish(pos)
-    }
-    if kind == kind_star {
-        << m.go_star(node.a, pos, true)
-    }
-    if kind == kind_plus {
-        << m.go_star(node.a, pos, false)
-    }
-    << false
-}
-
-fn (m &mut Matcher) go_star(child int, pos int, allow_zero bool) bool {
-    // greedy: prefer consuming one more child, then backtrack into continuation
-    saved := m.cont_clone()
-    save_cs := m.caps_clone_start()
-    save_ce := m.caps_clone_end()
-    save_steps := m.steps
-    outer := m.cont_clone()
-    m.cont = []int{}
-    mut took := false
-    mut mid := pos
-    if m.go(child, pos) {
-        if m.ok {
-            mid = m.end_pos
-            if mid != pos {
-                took = true
+        node := m.re.nodes[ni]
+        kind := node.kind
+        mut failed := false
+        if kind == kind_empty {
+            ->
+        } else if kind == kind_cat {
+            m.task_push(node.b, -1)
+            m.task_push(node.a, -1)
+        } else if kind == kind_alt {
+            m.task_push(node.b, -1)
+            m.choice_push(pos) or >>
+            m.task_count -= 1
+            m.task_push(node.a, -1)
+        } else if kind == kind_quest {
+            m.choice_push(pos) or >>
+            m.task_push(node.a, -1)
+        } else if kind == kind_star || kind == kind_plus {
+            if kind == kind_star || repeat { m.choice_push(pos) or >> }
+            m.task_push(0 - ni - 1, pos)
+            m.task_push(node.a, -1)
+        } else if kind == kind_cap_start {
+            m.cap_start[node.a] = pos
+            m.cap_end[node.a] = -1
+        } else if kind == kind_cap_end {
+            m.cap_end[node.a] = pos
+        } else if kind == kind_bol {
+            failed = pos != 0
+        } else if kind == kind_eol {
+            failed = pos != m.text.len
+        } else {
+            if pos >= m.text.len {
+                failed = true
+            } else {
+                ch := m.text[pos] & 255
+                if kind == kind_lit {
+                    failed = ch != node.a
+                } else if kind == kind_class || kind == kind_nclass {
+                    has := class_has_data(&m.re.class_data, node.a, node.b, ch)
+                    failed = !has
+                    if kind == kind_nclass { failed = has }
+                } else if kind != kind_any {
+                    failed = true
+                }
+                if !failed { pos += 1 }
             }
         }
-    }
-    if !m.ok {
-        << false
-    }
-    m.cont_restore(&outer)
-    m.steps = save_steps
-    if took {
-        if m.go_star(child, mid, true) {
-            << true
+        if failed {
+            pos = m.backtrack()
+            if pos < 0 { << false }
         }
-        if !m.ok {
-            << false
-        }
-        m.cont_restore(&saved)
-        m.caps_restore(&save_cs, &save_ce)
-        m.steps = save_steps
-    }
-    if allow_zero {
-        m.cont_restore(&saved)
-        m.caps_restore(&save_cs, &save_ce)
-        m.steps = save_steps
-        << m.finish(pos)
     }
     << false
 }
@@ -638,12 +565,12 @@ fn make_matcher(re &Regexp, text &string) Matcher {
         cs.push(-1)
         ce.push(-1)
     }
-    << Matcher{re: clone_re(re), text: text + "", steps: 0, ok: true, end_pos: -1, cont: []int{}, cap_start: cs, cap_end: ce}
+    << Matcher{re: clone_re(re), text: text + "", steps: 0, ok: true, end_pos: -1, tasks: []MatchTask{}, task_count: 0, choices: []MatchChoice{}, choice_count: 0, saved_tasks: []MatchTask{}, saved_count: 0, saved_captures: []int{}, capture_count: 0, cap_start: cs, cap_end: ce}
 }
 
-fn (re Regexp) try_at(text &string, start int) int {
-    mut m := make_matcher(&re, text)
-    if m.go(re.root, start) && m.ok {
+fn (m &mut Matcher) try_at(start int) int {
+    matched := m.go(m.re.root, start) or >>
+    if matched && m.ok {
         << m.end_pos
     }
     if !m.ok {
@@ -658,10 +585,11 @@ pub fn (re Regexp) num_subexp() int {
 
 pub fn (re Regexp) find_submatch(s &string) []string {
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     while i <= text.len {
-        mut m := make_matcher(&re, &text)
-        if m.go(re.root, i) && m.ok {
+        matched := m.go(m.re.root, i) or >>
+        if matched && m.ok {
             mut out := []string{}
             out.push(text[i:m.end_pos] + "")
             for g in 0:re.num_caps {
@@ -689,19 +617,18 @@ pub struct Submatch {
     pub parts []string
 }
 
-fn (re Regexp) fill_into(s &string, from int, sm &mut Submatch) bool {
-    text := s + ""
+fn (m &mut Matcher) fill_into(from int, sm &mut Submatch) bool {
     mut i := from
-    while i <= text.len {
-        mut m := make_matcher(&re, &text)
-        if m.go(re.root, i) && m.ok {
+    while i <= m.text.len {
+        matched := m.go(m.re.root, i) or >>
+        if matched && m.ok {
             mut out := []string{}
-            out.push(text[i:m.end_pos] + "")
-            for g in 0:re.num_caps {
+            out.push(m.text[i:m.end_pos] + "")
+            for g in 0:m.re.num_caps {
                 gs := m.cap_start[g]
                 ge := m.cap_end[g]
-                if gs >= 0 && ge >= gs && ge <= text.len {
-                    out.push(text[gs:ge] + "")
+                if gs >= 0 && ge >= gs && ge <= m.text.len {
+                    out.push(m.text[gs:ge] + "")
                 } else {
                     out.push("")
                 }
@@ -722,6 +649,7 @@ fn (re Regexp) fill_into(s &string, from int, sm &mut Submatch) bool {
 pub fn (re Regexp) find_all_submatch(s &string, n int) [][]string {
     mut rows := [][]string{}
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     mut found := 0
     mut sm := Submatch{start: 0, end: 0, parts: []string{}}
@@ -729,7 +657,8 @@ pub fn (re Regexp) find_all_submatch(s &string, n int) [][]string {
         if n >= 0 && found >= n {
             <-
         }
-        if !re.fill_into(&text, i, mut &sm) {
+        found_match := m.fill_into(i, mut &sm) or >>
+        if !found_match {
             <-
         }
         mut row := []string{}
@@ -786,7 +715,9 @@ fn expand_repl(sm &Submatch, repl &string) string {
 
 pub fn (re Regexp) expand(s &string, repl &string) string {
     mut sm := Submatch{start: 0, end: 0, parts: []string{}}
-    if !re.fill_into(s, 0, mut &sm) {
+    mut m := make_matcher(&re, s)
+    found_match := m.fill_into(0, mut &sm) or >>
+    if !found_match {
         << ""
     }
     << expand_repl(&sm, repl)
@@ -804,26 +735,25 @@ struct PrefixWalk {
 }
 
 fn (re &Regexp) prefix_walk(idx int, out0 string) PrefixWalk {
-    n := re.nodes[idx]
-    if n.kind == kind_lit {
-        << PrefixWalk{prefix: out0 + string_from_byte(n.a), complete: true, stop: false}
-    }
-    if n.kind == kind_cat {
-        left := re.prefix_walk(n.a, out0)
-        if left.stop {
-            << PrefixWalk{prefix: left.prefix, complete: false, stop: true}
+    mut stack := []int{}
+    stack.push(idx)
+    mut top := 1
+    mut out := out0 + ""
+    while top > 0 {
+        top -= 1
+        n := re.nodes[stack[top]]
+        if n.kind == kind_lit {
+            out = out + string_from_byte(n.a)
+        } else if n.kind == kind_cat {
+            if top < stack.len { stack[top] = n.b } else { stack.push(n.b) }
+            top += 1
+            if top < stack.len { stack[top] = n.a } else { stack.push(n.a) }
+            top += 1
+        } else if n.kind != kind_empty && n.kind != kind_bol && n.kind != kind_eol && n.kind != kind_cap_start && n.kind != kind_cap_end {
+            << PrefixWalk{prefix: out, complete: false, stop: true}
         }
-        right := re.prefix_walk(n.b, left.prefix)
-        mut complete := false
-        if left.complete && right.complete && !right.stop {
-            complete = true
-        }
-        << PrefixWalk{prefix: right.prefix, complete: complete, stop: right.stop}
     }
-    if n.kind == kind_empty || n.kind == kind_bol || n.kind == kind_eol || n.kind == kind_cap_start || n.kind == kind_cap_end {
-        << PrefixWalk{prefix: out0, complete: true, stop: false}
-    }
-    << PrefixWalk{prefix: out0, complete: false, stop: true}
+    << PrefixWalk{prefix: out, complete: true, stop: false}
 }
 
 pub fn (re Regexp) literal_prefix() LiteralPrefix {
@@ -833,9 +763,10 @@ pub fn (re Regexp) literal_prefix() LiteralPrefix {
 
 pub fn (re Regexp) match_string(s &string) bool {
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     while i <= text.len {
-        end := re.try_at(&text, i)
+        end := m.try_at(i) or >>
         if end == -2 {
             << false
         }
@@ -849,9 +780,10 @@ pub fn (re Regexp) match_string(s &string) bool {
 
 pub fn (re Regexp) find(s &string) string {
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     while i <= text.len {
-        end := re.try_at(&text, i)
+        end := m.try_at(i) or >>
         if end == -2 {
             << ""
         }
@@ -870,9 +802,10 @@ pub struct Index {
 
 pub fn (re Regexp) find_index(s &string) Index {
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     while i <= text.len {
-        end := re.try_at(&text, i)
+        end := m.try_at(i) or >>
         if end == -2 {
             << Index{start: 0 - 1, end: 0 - 1}
         }
@@ -890,13 +823,14 @@ pub fn (re Regexp) find_all_index(s &string, n int) []Index {
         << out
     }
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     mut found := 0
     while i <= text.len {
         if n >= 0 && found >= n {
             <-
         }
-        end := re.try_at(&text, i)
+        end := m.try_at(i) or >>
         if end == -2 {
             << out
         }
@@ -918,13 +852,14 @@ pub fn (re Regexp) find_all_index(s &string, n int) []Index {
 pub fn (re Regexp) find_all(s &string, n int) []string {
     mut out := []string{}
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     mut found := 0
     while i <= text.len {
         if n >= 0 && found >= n {
             <-
         }
-        end := re.try_at(&text, i)
+        end := m.try_at(i) or >>
         if end == -2 {
             << out
         }
@@ -953,6 +888,7 @@ pub fn (re Regexp) split(s &string, n int) []string {
         out.push(text)
         << out
     }
+    mut m := make_matcher(&re, &text)
     mut i := 0
     mut parts := 0
     mut last := 0
@@ -960,7 +896,7 @@ pub fn (re Regexp) split(s &string, n int) []string {
         if n > 0 && parts >= n - 1 {
             <-
         }
-        end := re.try_at(&text, i)
+        end := m.try_at(i) or >>
         if end == -2 {
             <-
         }
@@ -984,10 +920,11 @@ pub fn (re Regexp) split(s &string, n int) []string {
 
 pub fn (re Regexp) find_submatch_index(s &string) []Index {
     text := s + ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     while i <= text.len {
-        mut m := make_matcher(&re, &text)
-        if m.go(re.root, i) && m.ok {
+        matched := m.go(m.re.root, i) or >>
+        if matched && m.ok {
             mut out := []Index{}
             out.push(Index{start: i, end: m.end_pos})
             for g in 0:re.num_caps {
@@ -1012,10 +949,12 @@ pub fn (re Regexp) find_submatch_index(s &string) []Index {
 pub fn (re Regexp) replace_all_literal(s &string, repl &string) string {
     text := s + ""
     mut out := ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     mut sm := Submatch{start: 0, end: 0, parts: []string{}}
     while i <= text.len {
-        if !re.fill_into(&text, i, mut &sm) {
+        found_match := m.fill_into(i, mut &sm) or >>
+        if !found_match {
             out = out + text[i:text.len]
             <-
         }
@@ -1038,10 +977,12 @@ pub fn (re Regexp) replace_all_literal(s &string, repl &string) string {
 pub fn (re Regexp) replace_all(s &string, repl &string) string {
     text := s + ""
     mut out := ""
+    mut m := make_matcher(&re, &text)
     mut i := 0
     mut sm := Submatch{start: 0, end: 0, parts: []string{}}
     while i <= text.len {
-        if !re.fill_into(&text, i, mut &sm) {
+        found_match := m.fill_into(i, mut &sm) or >>
+        if !found_match {
             out = out + text[i:text.len]
             <-
         }

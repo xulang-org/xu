@@ -547,6 +547,8 @@ fn emit_function_setup_ra(a &mut Assembler, m &types.Mir, fi int) EmitRA {
         } else {
             a.cs_pairs = 3
         }
+    } else if a.arch == 2 {
+        a.cs_pairs = 3
     }
     << ra
 }
@@ -843,6 +845,15 @@ fn emit_function_entry(a &mut Assembler, m &types.Mir, fi int, fr &Frame, use_vr
             a.cs_pairs = x64_cs_encode(mask)
         }
     }
+    if a.arch == 2 {
+        mut mask := fn_thumb_scratch_callee_mask(m, fi, fr)
+        if use_vregs {
+            mask = mask | frame_thumb_callee_mask(fr)
+        } else if a.rc_on || fn_uses_s_scratch(m, fi) != 0 {
+            mask = mask | 0x0370
+        }
+        a.cs_pairs = thumb_cs_encode(mask)
+    }
     a.label(types.mir_fn_label(m, fi))
     // Record the code offset immediately after defining the function label.
     // Numeric ARM64 function-value fixups use this stable MIR-index mapping
@@ -865,13 +876,54 @@ fn emit_function_entry(a &mut Assembler, m &types.Mir, fi int, fr &Frame, use_vr
     }
     emit_x64_entry_guard(a, m, fi, guard)
     emit_arm64_identity_guard(a, m, fi)
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || frame_size > 0) {
+        // `_rt_run_g` keeps the current G in a callee-saved register. The
+        // caller reloads that register from its hidden frame slot before each
+        // user call, so synchronous host calls carry a zero marker instead of
+        // an arbitrary host register value.
+        hold := td_stack_holder_home(a.arch)
+        stack_ok := types.mir_fn_label(m, fi) + "_stack_ok"
+        a.vm_cbz(hold, stack_ok + "")
+        a.load(0, hold, rt_g_stack_offset)
+        // Leave room for this frame and the small runtime call seam below
+        // the current SP. Checking the range before touching the bottom
+        // cookie turns the fixed-stack SIGBUS into the runtime diagnostic.
+        a.vm_mov_imm64(1, frame_size + 64)
+        a.add(0, 0, 1)
+        a.mov(4, 16)
+        a.cmp(4, 0)
+        a.jlt("_rt_stack_overflow")
+        a.load(0, hold, rt_g_stack_offset)
+        a.load(1, 0, 0)
+        a.vm_mov_imm64(2, rt_g_stack_cookie)
+        a.cmp(1, 2)
+        a.jne("_rt_stack_overflow")
+        a.label(stack_ok)
+    }
     a.prologue(frame_size)
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_nblocks(m, fi) > 0 && types.mir_fn_label(m, fi) != "_xu_main" && (fn_ncalls(m, fi) > 0 || frame_size > 0) {
+        hold := td_stack_holder_home(a.arch)
+        a.store(15, -frame_size, hold)
+    }
     // Callee-saved homes can contain the caller's live values. The retired
     // velocity-forwarding emitter returns before using its old S4 sentinel;
     // there is no scratch initialization to perform at ordinary entry.
     if sret_slot >= 0 { a.store(15, slot_off(sret_slot), 0) }
     emit_function_bind_params(a, m, fi, fr, use_vregs)
     << frame_size
+}
+
+// Resource drop hooks use S1/R15 as their data pointer. That is a different
+// ABI from the coroutine holder, so the hosted stack guard must not interpret
+// the object pointer as a G pointer at hook entry.
+fn fn_is_resource_drop(m &types.Mir, fi int) bool {
+    if fi < 0 || fi >= m.fns.len { << false }
+    label := types.mir_fn_label(m, fi)
+    if label == "" { << false }
+    for si in 0:m.structs.len {
+        if m.structs[si].drop_label.len > 0 && m.structs[si].drop_label == label { << true }
+    }
+    << false
 }
 
 fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &types.MirCallIndex) {
@@ -881,13 +933,19 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
     // the existing RA/cache behavior.
     old_rc_on := a.rc_on
     old_s_pool := a.rc_s_pool
+    force_frame_index := regplan_string_index_frame(m, fi)
     mut try_vregs := false
     mut generic_vregs := false
     if env_get("XU_RA_REJ") == "1" { eprintln("emit_fn: " + types.mir_fn_label(m, fi) + " ra=" + str(a.ra_level) + " arch=" + str(a.arch)) }
     // Fixed-home allocation follows the requested RA tier directly. The
     // legacy product_rc_mir_safe predicate only governs RegCache fallback and
     // must not silently disable the independent vreg allocator (or x64).
-    if a.ra_level >= 1 && (a.arch == 0 || a.arch == 1) {
+    if force_frame_index {
+        // Mixed string descriptor/index functions stay on the conservative
+        // frame path until their multi-word forwarding proof is complete.
+        a.rc_on = false
+        a.rc_s_pool = false
+    } else if a.ra_level >= 1 && (a.arch == 0 || a.arch == 1 || a.arch == 2) {
         // Mixed f64 pointer kernels need whole-CFG liveness: the legacy
         // cache loses values across repeated inner-loop pointer loads.
         // Keep general admission closed while using the verified planner
@@ -960,13 +1018,15 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
     // layouts), dominating compiler self-emission. The encoded temp slots are
     // the allocation plan and are shared by entry + block emission.
     mut selections := []int{}
-    if a.arch == 0 && !a.cover && !a.test && (!a.rc_on || try_vregs) {
+    if a.arch == 0 && !a.cover && !a.test && !force_frame_index && (!a.rc_on || try_vregs) {
         selections = select_pair_collect(m, fi)
     }
     fallback_park_temps := park_temps
     if selections.len != 0 { park_temps = 0 }
     mut fr := Frame{local_slot: []int{}, temp_slot: []int{}, fp_split: []int{}, select_pairs: selections, sret_slot: -1, size: 0, plan_reason: 0, plan_instr: -1}
-    fr.layout(m, fi, park_temps, a.arch, try_vregs)
+    mut reserve_home := -1
+    if a.stack_check && !fn_is_resource_drop(m, fi) { reserve_home = td_stack_holder_home(a.arch) }
+    fr.layout(m, fi, park_temps, a.arch, try_vregs, reserve_home)
     mut plan_reason := fr.plan_reason
     mut plan_instr := fr.plan_instr
     frame_validate(&fr, m, fi)
@@ -979,7 +1039,7 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
     }
     mut ordinary := Frame{local_slot: []int{}, temp_slot: []int{}, fp_split: []int{}, select_pairs: []int{}, sret_slot: -1, size: 0, plan_reason: 0, plan_instr: -1}
     if fr.select_pairs.len != 0 {
-        ordinary.layout(m, fi, fallback_park_temps, a.arch, try_vregs)
+        ordinary.layout(m, fi, fallback_park_temps, a.arch, try_vregs, reserve_home)
         frame_validate(&ordinary, m, fi)
         if !select_pair_profitable(&fr) || !select_pair_pressure_ok(&fr, &ordinary, m, fi, a.arch) {
             fr.select_pairs = []int{}
@@ -988,7 +1048,7 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
             fr.fp_split = []int{}
             fr.sret_slot = -1
             fr.size = 0
-            fr.layout(m, fi, fallback_park_temps, a.arch, try_vregs)
+            fr.layout(m, fi, fallback_park_temps, a.arch, try_vregs, reserve_home)
             plan_reason = fr.plan_reason
             plan_instr = fr.plan_instr
             frame_validate(&fr, m, fi)
@@ -1018,8 +1078,14 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
         fr.size = 0
         mut fallback_park := 0
         if a.rc_on { fallback_park = 1 }
-        fr.layout(m, fi, fallback_park, a.arch, false)
+        fr.layout(m, fi, fallback_park, a.arch, false, reserve_home)
         frame_validate(&fr, m, fi)
+    }
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || fr.size > 0) {
+        // Reserve one hidden word below the ordinary frame for the current G.
+        // It lets every user call reload the runtime holder without exposing
+        // a hidden source-level parameter or trusting a caller's scratch S reg.
+        fr.size += 16
     }
     a.rc_fp_hold = false
     a.rc_vreg_mask = 0
@@ -1083,7 +1149,7 @@ fn emit_function(a &mut Assembler, m &types.Mir, fi int, ct &CoverTable, calls &
     regplan_report_fn(&*a, m, fi, &fr, try_vregs, has_vreg, plan_reason, plan_instr, code_start)
     a.rc_on = old_rc_on
     a.rc_s_pool = old_s_pool
-    if a.arch == 0 || a.arch == 1 { a.cs_pairs = 3 }
+    if a.arch == 0 || a.arch == 1 || a.arch == 2 { a.cs_pairs = 3 }
     <<
 }
 
