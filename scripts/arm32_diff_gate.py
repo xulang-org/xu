@@ -23,6 +23,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from .prove_no_syscalls import check_file as check_no_syscalls
+except ImportError:
+    # The gate is also loaded directly by pytest via importlib.spec_from_file_location.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from prove_no_syscalls import check_file as check_no_syscalls
+
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "tests" / "arm32_diff"
 KNOWN = CORPUS / "known_diffs.txt"
@@ -277,6 +284,12 @@ def run_gate(args: argparse.Namespace, targets: list[str]) -> int:
                     record(program.stem, target, "run_fail", "compiler succeeded without an output binary")
                 elif target == "linux-arm32":
                     docker_exes[program.stem] = output
+                elif target == "thumbv7em-none":
+                    syscall_free, diagnostic = check_no_syscalls(output)
+                    if not syscall_free:
+                        record(program.stem, target, "run_fail", diagnostic)
+                    else:
+                        qemu_jobs.append((program.stem, target, output))
                 else:
                     qemu_jobs.append((program.stem, target, output))
 
