@@ -30,6 +30,10 @@
 
 ---
 
+## Xu 0.11.0-dev.2
+
+This development update integrates the remote `arm32` compiler changes: Thumb-2 register allocation, compact 16-bit instruction encoding and branch relaxation. It retains the standard library changes and migration requirements below.
+
 ## Xu 0.11.0-dev.1 development update
 
 This development branch integrates the latest `main` and `arm32` work, then fixes standard library correctness and concurrency issues:
