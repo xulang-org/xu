@@ -127,6 +127,13 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
             old = read_version(old_text[manifest]) if manifest in old_text else None
             previous = old or (0, 1, 0)
             existing_changed = manifest in old_text and manifest in changed_modules
+            same_core_branch = (
+                isinstance(current, Version)
+                and isinstance(old, Version)
+                and tuple(current) == tuple(old)
+                and bool(current.prerelease)
+                and current.prerelease[0].startswith("arm32-")
+            )
             if manifest == COMPILER_MANIFEST:
                 product = read_version("version: " + (root / "VERSION").read_text().strip() + "\n")
                 if current != product:
@@ -135,7 +142,8 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
                     if not bool(old.prerelease) or not bool(current.prerelease):
                         raise ValueError(f"version regressed from {format_version(old)}")
             elif current is not None and old is not None and current < old:
-                raise ValueError(f"version regressed from {format_version(old)}")
+                if not same_core_branch:
+                    raise ValueError(f"version regressed from {format_version(old)}")
             if bump:
                 target = current or previous
                 if existing_changed and target <= previous and manifest != COMPILER_MANIFEST:
@@ -147,7 +155,7 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
             elif existing_changed and current <= previous:
                 if manifest == COMPILER_MANIFEST and bool(previous.prerelease) and bool(current.prerelease):
                     pass
-                else:
+                elif not same_core_branch:
                     raise ValueError(f"module changed but version did not increase past {format_version(previous)}")
         except ValueError as error:
             errors.append(f"{manifest}: {error}")
