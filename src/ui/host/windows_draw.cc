@@ -939,9 +939,21 @@ static int draw_handle(XuContentPlugin *p, const char *cmd) {
     else { p->input_enabled = 1; p->pointer_inside = 0; }
     return 1;
   }
+  if (strcmp(cmd, "motion_preferences") == 0) {
+    BOOL animations = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+    char event[128];
+    snprintf(event, sizeof(event), "canvas_preferences\t%u\t%u\t%u\t%d", p->host.window_id, p->host.canvas_id, p->canvas_generation, animations ? 0 : 1);
+    xu_content_event(&p->host, event);
+    return 1;
+  }
   if (strncmp(cmd, "cursor\t", 7) == 0) {
     if (cmd[7] < '0' || cmd[7] > '5' || cmd[8]) return 0;
     p->cursor = cmd[7] - '0';
+    if (p->pointer_inside) {
+      const unsigned cursors[] = {32512, 32513, 32515, 32649, 32644, 32645};
+      SetCursor(LoadCursorW(NULL, MAKEINTRESOURCEW(cursors[p->cursor])));
+    }
     return 1;
   }
   if (strncmp(cmd, "__draw_frame\t", 13) == 0) return draw_take_frame(p, cmd);
