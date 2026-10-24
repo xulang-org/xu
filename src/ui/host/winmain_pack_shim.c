@@ -153,12 +153,45 @@ static LONG WINAPI xu_veh(EXCEPTION_POINTERS *ep) {
 #else
     rip = (void *)(uintptr_t)ep->ContextRecord->Rip;
     rsp = (void *)(uintptr_t)ep->ContextRecord->Rsp;
+    {
+      char regs[512];
+      snprintf(regs, sizeof(regs),
+        "rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n"
+        "rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+        "r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n"
+        "r12=%016llx r13=%016llx r14=%016llx r15=%016llx",
+        (unsigned long long)ep->ContextRecord->Rax,
+        (unsigned long long)ep->ContextRecord->Rbx,
+        (unsigned long long)ep->ContextRecord->Rcx,
+        (unsigned long long)ep->ContextRecord->Rdx,
+        (unsigned long long)ep->ContextRecord->Rsi,
+        (unsigned long long)ep->ContextRecord->Rdi,
+        (unsigned long long)ep->ContextRecord->Rbp,
+        (unsigned long long)ep->ContextRecord->Rsp,
+        (unsigned long long)ep->ContextRecord->R8,
+        (unsigned long long)ep->ContextRecord->R9,
+        (unsigned long long)ep->ContextRecord->R10,
+        (unsigned long long)ep->ContextRecord->R11,
+        (unsigned long long)ep->ContextRecord->R12,
+        (unsigned long long)ep->ContextRecord->R13,
+        (unsigned long long)ep->ContextRecord->R14,
+        (unsigned long long)ep->ContextRecord->R15);
+      log_line(regs);
+    }
 #endif
   }
   snprintf(msg, sizeof(msg),
            "VEH exception 0x%08lX at %p rip=%p rsp=%p",
            code, addr, rip, rsp);
   log_line(msg);
+  if (rsp) {
+    void **p = (void **)rsp;
+    char stack_msg[512];
+    snprintf(stack_msg, sizeof(stack_msg),
+             "stack: %p %p %p %p %p %p %p %p",
+             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    log_line(stack_msg);
+  }
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
