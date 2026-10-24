@@ -1,0 +1,848 @@
+@main
+
+#xu/types
+
+// 2D Register-Blocked (4x2 C-resident) + L1D Cache-Tiled (Kc = 64) GEMM
+// micro-kernel emitter for ARM64 and x86_64.
+//
+// Triggered at the outer header `bi` of a proved 3-level matrix multiply loop
+// nest (`types.mir_tile_plan`). Emits an O(1) entry guard over volatile
+// non-home registers (V0, V1, Ret, A1..A5); if any guard fails (non-positive
+// bounds, insufficient slice lengths, or slice aliasing with C), branches to
+// `fallback_lbl` which emits the original scalar instructions of `bi`.
+
+fn tile_arm64_stp(a &mut Assembler, rt1 int, rt2 int, rn int, offset int) {
+    imm7 := (offset >> 3) & 127
+    a.emit32(2835349504 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+fn tile_arm64_ldp(a &mut Assembler, rt1 int, rt2 int, rn int, offset int) {
+    imm7 := (offset >> 3) & 127
+    a.emit32(2839543808 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+fn tile_valid_operand(fr &Frame, v int) bool {
+    if v < 0 { << false }
+    if v >= types.mir_local_operand_base {
+        lid := v - types.mir_local_operand_base
+        << lid >= 0 && lid < fr.local_slot.len && is_frame_slot(fr.local_slot[lid])
+    }
+    if v >= fr.temp_slot.len { << false }
+    slot := fr.temp_slot[v]
+    << is_vreg_slot(slot) || is_frame_slot(slot)
+}
+
+fn tile_valid_bound(fr &Frame, lim_t int, lim int) bool {
+    if lim_t >= 0 { << tile_valid_operand(fr, lim_t) }
+    << lim > 0
+}
+
+fn tile_load_operand(a &mut Assembler, fr &Frame, v int, dest int) {
+    if v >= types.mir_local_operand_base {
+        lid := v - types.mir_local_operand_base
+        slot := fr.local_slot[lid]
+        if a.rc_on {
+            h := rc_find(&*a, slot)
+            if h >= 0 {
+                if h != dest { a.mov(dest, h) }
+                <<
+            }
+        }
+        a.load(dest, 15, slot_off(slot))
+        <<
+    }
+    slot := fr.temp_slot[v]
+    if is_vreg_slot(slot) {
+        home := vreg_slot_home(slot)
+        if home != dest { a.mov(dest, home) }
+        <<
+    }
+    if a.rc_on {
+        h := rc_find(&*a, slot)
+        if h >= 0 {
+            if h != dest { a.mov(dest, h) }
+            <<
+        }
+    }
+    a.load(dest, 15, slot_off(slot))
+}
+
+fn tile_load_bound(a &mut Assembler, fr &Frame, lim_t int, lim int, dest int) {
+    if lim_t >= 0 {
+        tile_load_operand(a, fr, lim_t, dest)
+        <<
+    }
+    a.vm_mov_imm64(dest, lim)
+}
+
+fn tile_store_exit_val(a &mut Assembler, fr &Frame, v int, src_vr int) {
+    if v < 0 { << }
+    if v >= types.mir_local_operand_base {
+        lid := v - types.mir_local_operand_base
+        slot := fr.local_slot[lid]
+        a.store(15, slot_off(slot), src_vr)
+        if a.rc_on {
+            h := rc_find(&*a, slot)
+            if h >= 0 && h != src_vr { a.mov(h, src_vr) }
+        }
+        <<
+    }
+    slot := fr.temp_slot[v]
+    if is_vreg_slot(slot) {
+        home := vreg_slot_home(slot)
+        if home != src_vr { a.mov(home, src_vr) }
+        <<
+    }
+    if is_frame_slot(slot) {
+        a.store(15, slot_off(slot), src_vr)
+        if a.rc_on {
+            h := rc_find(&*a, slot)
+            if h >= 0 && h != src_vr { a.mov(h, src_vr) }
+        }
+    }
+}
+
+// Entry on ARM64: x0 = ptr_b, x1 = M, x2 = N, x3 = K, x4 = ptr_c, x5 = ptr_a.
+fn emit_tile_gemm_arm64(a &mut Assembler, pref string) {
+    a.sub_imm(31, 31, 160)
+    tile_arm64_stp(a, 10, 11, 31, 0)
+    tile_arm64_stp(a, 12, 13, 31, 16)
+    tile_arm64_stp(a, 14, 15, 31, 32)
+    tile_arm64_stp(a, 19, 20, 31, 48)
+    tile_arm64_stp(a, 21, 22, 31, 64)
+    tile_arm64_stp(a, 23, 24, 31, 80)
+    tile_arm64_stp(a, 25, 26, 31, 96)
+    tile_arm64_stp(a, 27, 28, 31, 112)
+
+    a.mov_reg(19, 1)         // x19 = M
+    a.mov_reg(20, 2)         // x20 = N
+    a.mov_reg(21, 3)         // x21 = K
+    a.mov_reg(22, 4)         // x22 = ptr_c
+    a.mov_reg(23, 5)         // x23 = ptr_a
+    a.mov_reg(24, 0)         // x24 = ptr_b
+    a.lsl_imm(25, 20, 3)     // x25 = stride_c = stride_b = N * 8
+    a.lsl_imm(26, 21, 3)     // x26 = stride_a = K * 8
+    a.mov_imm(27, 0)         // x27 = k0 = 0
+
+    // Outer L1 cache strip loop: k0 in 0..K step 64
+    a.label(pref + "_k0_loop")
+    a.cmp_reg(27, 21)
+    a.bge(pref + "_k0_done")
+    a.sub_reg(28, 21, 27)    // x28 = K - k0
+    a.mov_imm(16, 64)
+    a.cmp_reg(28, 16)
+    a.csel(28, 16, 28, 12)   // x28 = min(64, K - k0)
+    a.mov_imm(16, 0)
+    a.str(16, 31, 128)       // [sp + 128] = i = 0
+
+    // 4-row tile loop: while i + 4 <= M
+    a.label(pref + "_i4_loop")
+    a.ldr(16, 31, 128)
+    a.add_imm(8, 16, 4)
+    a.cmp_reg(8, 19)
+    a.bgt(pref + "_i1_loop")
+    a.mul_reg(8, 16, 25)
+    a.add_reg(8, 22, 8)
+    a.str(8, 31, 136)        // [sp + 136] = c_row0 = ptr_c + i * stride_c
+    a.mul_reg(9, 16, 26)
+    a.add_reg(9, 23, 9)
+    a.add_lsl(9, 9, 27, 3)
+    a.str(9, 31, 144)        // [sp + 144] = a_row0 = ptr_a + i * stride_a + k0 * 8
+    a.mov_imm(17, 0)         // x17 = j = 0
+
+    // 4x2 C-resident micro-kernel: while j + 2 <= N
+    a.label(pref + "_i4_j2")
+    a.add_imm(8, 17, 2)
+    a.cmp_reg(8, 20)
+    a.bgt(pref + "_i4_j1")
+    a.ldr(10, 31, 136)
+    a.add_lsl(10, 10, 17, 3)
+    a.add_reg(11, 10, 25)
+    a.add_reg(12, 11, 25)
+    a.add_reg(13, 12, 25)
+    tile_arm64_ldp(a, 0, 1, 10, 0)
+    tile_arm64_ldp(a, 2, 3, 11, 0)
+    tile_arm64_ldp(a, 4, 5, 12, 0)
+    tile_arm64_ldp(a, 6, 7, 13, 0)
+
+    a.ldr(10, 31, 144)
+    a.add_reg(11, 10, 26)
+    a.add_reg(12, 11, 26)
+    a.add_reg(13, 12, 26)
+    a.mul_reg(14, 27, 25)
+    a.add_reg(14, 24, 14)
+    a.add_lsl(14, 14, 17, 3)
+    a.mov_imm(15, 0)
+
+    a.label(pref + "_i4_j2_k")
+    tile_arm64_ldp(a, 8, 9, 14, 0)
+    a.add_reg(14, 14, 25)
+    a.ldr_reg_lsl(16, 10, 15, 8)
+    a.madd_reg(0, 16, 8, 0)
+    a.madd_reg(1, 16, 9, 1)
+    a.ldr_reg_lsl(16, 11, 15, 8)
+    a.madd_reg(2, 16, 8, 2)
+    a.madd_reg(3, 16, 9, 3)
+    a.ldr_reg_lsl(16, 12, 15, 8)
+    a.madd_reg(4, 16, 8, 4)
+    a.madd_reg(5, 16, 9, 5)
+    a.ldr_reg_lsl(16, 13, 15, 8)
+    a.madd_reg(6, 16, 8, 6)
+    a.madd_reg(7, 16, 9, 7)
+    a.add_imm(15, 15, 1)
+    a.cmp_reg(15, 28)
+    a.blt(pref + "_i4_j2_k")
+
+    a.ldr(10, 31, 136)
+    a.add_lsl(10, 10, 17, 3)
+    a.add_reg(11, 10, 25)
+    a.add_reg(12, 11, 25)
+    a.add_reg(13, 12, 25)
+    tile_arm64_stp(a, 0, 1, 10, 0)
+    tile_arm64_stp(a, 2, 3, 11, 0)
+    tile_arm64_stp(a, 4, 5, 12, 0)
+    tile_arm64_stp(a, 6, 7, 13, 0)
+    a.add_imm(17, 17, 2)
+    a.b(pref + "_i4_j2")
+
+    // 4x1 odd-column cleanup: when j < N
+    a.label(pref + "_i4_j1")
+    a.cmp_reg(17, 20)
+    a.bge(pref + "_i4_next")
+    a.ldr(10, 31, 136)
+    a.add_lsl(10, 10, 17, 3)
+    a.add_reg(11, 10, 25)
+    a.add_reg(12, 11, 25)
+    a.add_reg(13, 12, 25)
+    a.ldr(0, 10, 0)
+    a.ldr(2, 11, 0)
+    a.ldr(4, 12, 0)
+    a.ldr(6, 13, 0)
+
+    a.ldr(10, 31, 144)
+    a.add_reg(11, 10, 26)
+    a.add_reg(12, 11, 26)
+    a.add_reg(13, 12, 26)
+    a.mul_reg(14, 27, 25)
+    a.add_reg(14, 24, 14)
+    a.add_lsl(14, 14, 17, 3)
+    a.mov_imm(15, 0)
+
+    a.label(pref + "_i4_j1_k")
+    a.ldr(8, 14, 0)
+    a.add_reg(14, 14, 25)
+    a.ldr_reg_lsl(16, 10, 15, 8)
+    a.madd_reg(0, 16, 8, 0)
+    a.ldr_reg_lsl(16, 11, 15, 8)
+    a.madd_reg(2, 16, 8, 2)
+    a.ldr_reg_lsl(16, 12, 15, 8)
+    a.madd_reg(4, 16, 8, 4)
+    a.ldr_reg_lsl(16, 13, 15, 8)
+    a.madd_reg(6, 16, 8, 6)
+    a.add_imm(15, 15, 1)
+    a.cmp_reg(15, 28)
+    a.blt(pref + "_i4_j1_k")
+
+    a.ldr(10, 31, 136)
+    a.add_lsl(10, 10, 17, 3)
+    a.add_reg(11, 10, 25)
+    a.add_reg(12, 11, 25)
+    a.add_reg(13, 12, 25)
+    a.str(0, 10, 0)
+    a.str(2, 11, 0)
+    a.str(4, 12, 0)
+    a.str(6, 13, 0)
+
+    a.label(pref + "_i4_next")
+    a.ldr(16, 31, 128)
+    a.add_imm(16, 16, 4)
+    a.str(16, 31, 128)
+    a.b(pref + "_i4_loop")
+
+    // Remaining rows cleanup: while i < M
+    a.label(pref + "_i1_loop")
+    a.ldr(16, 31, 128)
+    a.cmp_reg(16, 19)
+    a.bge(pref + "_k0_next")
+    a.mul_reg(8, 16, 25)
+    a.add_reg(8, 22, 8)
+    a.str(8, 31, 136)
+    a.mul_reg(9, 16, 26)
+    a.add_reg(9, 23, 9)
+    a.add_lsl(9, 9, 27, 3)
+    a.str(9, 31, 144)
+    a.mov_imm(17, 0)
+
+    // 1x2 C-resident cleanup: while j + 2 <= N
+    a.label(pref + "_i1_j2")
+    a.add_imm(8, 17, 2)
+    a.cmp_reg(8, 20)
+    a.bgt(pref + "_i1_j1")
+    a.ldr(10, 31, 136)
+    a.add_lsl(10, 10, 17, 3)
+    tile_arm64_ldp(a, 0, 1, 10, 0)
+    a.ldr(11, 31, 144)
+    a.mul_reg(14, 27, 25)
+    a.add_reg(14, 24, 14)
+    a.add_lsl(14, 14, 17, 3)
+    a.mov_imm(15, 0)
+
+    a.label(pref + "_i1_j2_k")
+    tile_arm64_ldp(a, 8, 9, 14, 0)
+    a.add_reg(14, 14, 25)
+    a.ldr_reg_lsl(16, 11, 15, 8)
+    a.madd_reg(0, 16, 8, 0)
+    a.madd_reg(1, 16, 9, 1)
+    a.add_imm(15, 15, 1)
+    a.cmp_reg(15, 28)
+    a.blt(pref + "_i1_j2_k")
+
+    tile_arm64_stp(a, 0, 1, 10, 0)
+    a.add_imm(17, 17, 2)
+    a.b(pref + "_i1_j2")
+
+    // 1x1 scalar corner cleanup: when j < N
+    a.label(pref + "_i1_j1")
+    a.cmp_reg(17, 20)
+    a.bge(pref + "_i1_next")
+    a.ldr(10, 31, 136)
+    a.add_lsl(10, 10, 17, 3)
+    a.ldr(0, 10, 0)
+    a.ldr(11, 31, 144)
+    a.mul_reg(14, 27, 25)
+    a.add_reg(14, 24, 14)
+    a.add_lsl(14, 14, 17, 3)
+    a.mov_imm(15, 0)
+
+    a.label(pref + "_i1_j1_k")
+    a.ldr(8, 14, 0)
+    a.add_reg(14, 14, 25)
+    a.ldr_reg_lsl(16, 11, 15, 8)
+    a.madd_reg(0, 16, 8, 0)
+    a.add_imm(15, 15, 1)
+    a.cmp_reg(15, 28)
+    a.blt(pref + "_i1_j1_k")
+
+    a.str(0, 10, 0)
+
+    a.label(pref + "_i1_next")
+    a.ldr(16, 31, 128)
+    a.add_imm(16, 16, 1)
+    a.str(16, 31, 128)
+    a.b(pref + "_i1_loop")
+
+    a.label(pref + "_k0_next")
+    a.add_imm(27, 27, 64)
+    a.b(pref + "_k0_loop")
+
+    a.label(pref + "_k0_done")
+    tile_arm64_ldp(a, 10, 11, 31, 0)
+    tile_arm64_ldp(a, 12, 13, 31, 16)
+    tile_arm64_ldp(a, 14, 15, 31, 32)
+    tile_arm64_ldp(a, 19, 20, 31, 48)
+    tile_arm64_ldp(a, 21, 22, 31, 64)
+    tile_arm64_ldp(a, 23, 24, 31, 80)
+    tile_arm64_ldp(a, 25, 26, 31, 96)
+    tile_arm64_ldp(a, 27, 28, 31, 112)
+    a.add_imm(31, 31, 160)
+}
+
+// Entry on x86_64: rax(0)=ptr_b, rsi(6)=M, rdx(2)=N, rcx(1)=K, r8(8)=ptr_c, r9(9)=ptr_a.
+fn emit_tile_gemm_x64(a &mut Assembler, pref string) {
+    a.x64_sub_imm(4, 176)
+    a.x64_store_offset(4, 0, 3)      // save rbx
+    a.x64_store_offset(4, 8, 12)     // save r12
+    a.x64_store_offset(4, 16, 13)    // save r13
+    a.x64_store_offset(4, 24, 14)    // save r14
+    a.x64_store_offset(4, 32, 15)    // save r15
+
+    a.x64_store_offset(4, 40, 6)     // [rsp + 40] = M
+    a.x64_store_offset(4, 48, 2)     // [rsp + 48] = N
+    a.x64_store_offset(4, 56, 1)     // [rsp + 56] = K
+    a.x64_store_offset(4, 64, 8)     // [rsp + 64] = ptr_c
+    a.x64_store_offset(4, 72, 9)     // [rsp + 72] = ptr_a
+    a.x64_store_offset(4, 80, 0)     // [rsp + 80] = ptr_b
+
+    a.x64_mov_reg(10, 2)
+    a.x64_shl_imm(10, 3)
+    a.x64_store_offset(4, 88, 10)    // [rsp + 88] = stride_c = stride_b = N * 8
+    a.x64_mov_reg(11, 1)
+    a.x64_shl_imm(11, 3)
+    a.x64_store_offset(4, 96, 11)    // [rsp + 96] = stride_a = K * 8
+
+    a.x64_mov_imm(0, 0)
+    a.x64_store_offset(4, 104, 0)    // [rsp + 104] = k0 = 0
+
+    // Outer L1 cache strip loop: k0 in 0..K step 64
+    a.label(pref + "_k0_loop")
+    a.x64_load_offset(0, 4, 104)     // rax = k0
+    a.x64_load_offset(1, 4, 56)      // rcx = K
+    a.x64_cmp_reg(0, 1)
+    a.x64_jcc(13, pref + "_k0_done") // jge
+    a.x64_sub_reg(1, 0)              // rcx = K - k0
+    a.x64_mov_imm(2, 64)
+    a.x64_cmp_reg(1, 2)
+    a.x64_cmovcc(1, 2, 15)           // if rcx > 64, rcx = 64
+    a.x64_store_offset(4, 112, 1)    // [rsp + 112] = k_len
+    a.x64_mov_imm(0, 0)
+    a.x64_store_offset(4, 120, 0)    // [rsp + 120] = i = 0
+
+    // 4-row tile loop: while i + 4 <= M
+    a.label(pref + "_i4_loop")
+    a.x64_load_offset(0, 4, 120)     // rax = i
+    a.x64_mov_reg(1, 0)
+    a.x64_add_imm(1, 4)
+    a.x64_load_offset(2, 4, 40)      // rdx = M
+    a.x64_cmp_reg(1, 2)
+    a.x64_jcc(15, pref + "_i1_loop") // jg
+    a.x64_mov_reg(1, 0)
+    a.x64_load_offset(2, 4, 88)      // stride_c
+    a.x64_imul(1, 2)
+    a.x64_load_offset(2, 4, 64)      // ptr_c
+    a.x64_add_reg(1, 2)
+    a.x64_store_offset(4, 136, 1)    // [rsp + 136] = c_row0
+    a.x64_mov_reg(1, 0)
+    a.x64_load_offset(2, 4, 96)      // stride_a
+    a.x64_imul(1, 2)
+    a.x64_load_offset(2, 4, 72)      // ptr_a
+    a.x64_add_reg(1, 2)
+    a.x64_load_offset(2, 4, 104)     // k0
+    a.x64_shl_imm(2, 3)
+    a.x64_add_reg(1, 2)
+    a.x64_store_offset(4, 144, 1)    // [rsp + 144] = a_row0
+    a.x64_mov_imm(0, 0)
+    a.x64_store_offset(4, 128, 0)    // [rsp + 128] = j = 0
+
+    // 4x2 C-resident micro-kernel: while j + 2 <= N
+    a.label(pref + "_i4_j2")
+    a.x64_load_offset(0, 4, 128)     // rax = j
+    a.x64_mov_reg(1, 0)
+    a.x64_add_imm(1, 2)
+    a.x64_load_offset(2, 4, 48)      // rdx = N
+    a.x64_cmp_reg(1, 2)
+    a.x64_jcc(15, pref + "_i4_j1")   // jg
+
+    // Load 4x2 C tile into r8..r15
+    a.x64_load_offset(3, 4, 136)     // rbx = c_row0
+    a.x64_mov_reg(1, 0)
+    a.x64_shl_imm(1, 3)
+    a.x64_add_reg(3, 1)              // rbx = c_row0 + j*8
+    a.x64_load_offset(2, 4, 88)      // rdx = stride_c
+    a.x64_load_offset(8, 3, 0)       // c00
+    a.x64_load_offset(9, 3, 8)       // c01
+    a.x64_add_reg(3, 2)
+    a.x64_load_offset(10, 3, 0)      // c10
+    a.x64_load_offset(11, 3, 8)      // c11
+    a.x64_add_reg(3, 2)
+    a.x64_load_offset(12, 3, 0)      // c20
+    a.x64_load_offset(13, 3, 8)      // c21
+    a.x64_add_reg(3, 2)
+    a.x64_load_offset(14, 3, 0)      // c30
+    a.x64_load_offset(15, 3, 8)      // c31
+
+    // Prepare b_ptr in [rsp + 152], k_rem in [rsp + 160], rbx = a_row0, rcx = stride_a
+    a.x64_load_offset(3, 4, 104)     // k0
+    a.x64_imul(3, 2)                 // k0 * stride_b
+    a.x64_load_offset(6, 4, 80)      // ptr_b
+    a.x64_add_reg(3, 6)
+    a.x64_add_reg(3, 1)              // + j * 8
+    a.x64_store_offset(4, 152, 3)    // [rsp + 152] = b_ptr
+    a.x64_load_offset(0, 4, 112)
+    a.x64_store_offset(4, 160, 0)    // [rsp + 160] = k_rem
+    a.x64_load_offset(3, 4, 144)     // rbx = a_col_ptr = a_row0
+    a.x64_load_offset(1, 4, 96)      // rcx = stride_a
+
+    a.label(pref + "_i4_j2_k")
+    a.x64_load_offset(0, 4, 152)     // rax = b_ptr
+    a.x64_load_offset(6, 0, 0)       // rsi = b0
+    a.x64_load_offset(7, 0, 8)       // rdi = b1
+    a.x64_load_offset(2, 4, 88)
+    a.x64_add_reg(0, 2)
+    a.x64_store_offset(4, 152, 0)    // b_ptr += stride_b
+
+    a.x64_load_offset(0, 3, 0)       // rax = a0
+    a.x64_mov_reg(2, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(8, 0)
+    a.x64_imul(2, 7)
+    a.x64_add_reg(9, 2)
+
+    a.x64_load_sib(0, 3, 1, 0, 0)    // rax = a1 = [rbx + rcx]
+    a.x64_mov_reg(2, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(10, 0)
+    a.x64_imul(2, 7)
+    a.x64_add_reg(11, 2)
+
+    a.x64_load_sib(0, 3, 1, 1, 0)    // rax = a2 = [rbx + rcx*2]
+    a.x64_mov_reg(2, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(12, 0)
+    a.x64_imul(2, 7)
+    a.x64_add_reg(13, 2)
+
+    a.x64_mov_reg(0, 3)
+    a.x64_add_reg(0, 1)
+    a.x64_load_sib(0, 0, 1, 1, 0)    // rax = a3 = [rbx + rcx + rcx*2]
+    a.x64_mov_reg(2, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(14, 0)
+    a.x64_imul(2, 7)
+    a.x64_add_reg(15, 2)
+
+    a.x64_add_imm(3, 8)              // a_col_ptr += 8
+    a.x64_load_offset(0, 4, 160)
+    a.x64_sub_imm(0, 1)
+    a.x64_store_offset(4, 160, 0)
+    a.x64_test_reg(0, 0)
+    a.x64_jcc(5, pref + "_i4_j2_k")  // jne
+
+    // Store 4x2 C tile back from r8..r15
+    a.x64_load_offset(0, 4, 128)     // j
+    a.x64_shl_imm(0, 3)
+    a.x64_load_offset(3, 4, 136)     // c_row0
+    a.x64_add_reg(3, 0)
+    a.x64_load_offset(2, 4, 88)      // stride_c
+    a.x64_store_offset(3, 0, 8)
+    a.x64_store_offset(3, 8, 9)
+    a.x64_add_reg(3, 2)
+    a.x64_store_offset(3, 0, 10)
+    a.x64_store_offset(3, 8, 11)
+    a.x64_add_reg(3, 2)
+    a.x64_store_offset(3, 0, 12)
+    a.x64_store_offset(3, 8, 13)
+    a.x64_add_reg(3, 2)
+    a.x64_store_offset(3, 0, 14)
+    a.x64_store_offset(3, 8, 15)
+
+    a.x64_load_offset(0, 4, 128)
+    a.x64_add_imm(0, 2)
+    a.x64_store_offset(4, 128, 0)
+    a.x64_jmp(pref + "_i4_j2")
+
+    // 4x1 odd-column cleanup: when j < N
+    a.label(pref + "_i4_j1")
+    a.x64_load_offset(0, 4, 128)     // j
+    a.x64_load_offset(2, 4, 48)      // N
+    a.x64_cmp_reg(0, 2)
+    a.x64_jcc(13, pref + "_i4_next") // jge
+
+    a.x64_mov_reg(1, 0)
+    a.x64_shl_imm(1, 3)
+    a.x64_load_offset(3, 4, 136)     // c_row0
+    a.x64_add_reg(3, 1)
+    a.x64_load_offset(2, 4, 88)      // stride_c
+    a.x64_load_offset(8, 3, 0)       // c00
+    a.x64_add_reg(3, 2)
+    a.x64_load_offset(10, 3, 0)      // c10
+    a.x64_add_reg(3, 2)
+    a.x64_load_offset(12, 3, 0)      // c20
+    a.x64_add_reg(3, 2)
+    a.x64_load_offset(14, 3, 0)      // c30
+
+    a.x64_load_offset(7, 4, 104)     // k0
+    a.x64_imul(7, 2)
+    a.x64_load_offset(6, 4, 80)      // ptr_b
+    a.x64_add_reg(7, 6)
+    a.x64_add_reg(7, 1)              // rdi = b_ptr
+    a.x64_load_offset(3, 4, 144)     // rbx = a_col_ptr
+    a.x64_load_offset(1, 4, 96)      // rcx = stride_a
+    a.x64_load_offset(15, 4, 112)    // r15 = k_rem
+
+    a.label(pref + "_i4_j1_k")
+    a.x64_load_offset(6, 7, 0)       // rsi = b0
+    a.x64_add_reg(7, 2)              // b_ptr += stride_b
+    a.x64_load_offset(0, 3, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(8, 0)
+    a.x64_load_sib(0, 3, 1, 0, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(10, 0)
+    a.x64_load_sib(0, 3, 1, 1, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(12, 0)
+    a.x64_mov_reg(0, 3)
+    a.x64_add_reg(0, 1)
+    a.x64_load_sib(0, 0, 1, 1, 0)
+    a.x64_imul(0, 6)
+    a.x64_add_reg(14, 0)
+    a.x64_add_imm(3, 8)
+    a.x64_sub_imm(15, 1)
+    a.x64_test_reg(15, 15)
+    a.x64_jcc(5, pref + "_i4_j1_k")
+
+    a.x64_load_offset(0, 4, 128)
+    a.x64_shl_imm(0, 3)
+    a.x64_load_offset(3, 4, 136)
+    a.x64_add_reg(3, 0)
+    a.x64_store_offset(3, 0, 8)
+    a.x64_add_reg(3, 2)
+    a.x64_store_offset(3, 0, 10)
+    a.x64_add_reg(3, 2)
+    a.x64_store_offset(3, 0, 12)
+    a.x64_add_reg(3, 2)
+    a.x64_store_offset(3, 0, 14)
+
+    a.label(pref + "_i4_next")
+    a.x64_load_offset(0, 4, 120)
+    a.x64_add_imm(0, 4)
+    a.x64_store_offset(4, 120, 0)
+    a.x64_jmp(pref + "_i4_loop")
+
+    // Remaining rows cleanup: while i < M
+    a.label(pref + "_i1_loop")
+    a.x64_load_offset(0, 4, 120)     // i
+    a.x64_load_offset(2, 4, 40)      // M
+    a.x64_cmp_reg(0, 2)
+    a.x64_jcc(13, pref + "_k0_next") // jge
+    a.x64_mov_reg(1, 0)
+    a.x64_load_offset(2, 4, 88)
+    a.x64_imul(1, 2)
+    a.x64_load_offset(2, 4, 64)
+    a.x64_add_reg(1, 2)
+    a.x64_store_offset(4, 136, 1)    // c_row0
+    a.x64_mov_reg(1, 0)
+    a.x64_load_offset(2, 4, 96)
+    a.x64_imul(1, 2)
+    a.x64_load_offset(2, 4, 72)
+    a.x64_add_reg(1, 2)
+    a.x64_load_offset(2, 4, 104)
+    a.x64_shl_imm(2, 3)
+    a.x64_add_reg(1, 2)
+    a.x64_store_offset(4, 144, 1)    // a_row0
+    a.x64_mov_imm(0, 0)
+    a.x64_store_offset(4, 128, 0)    // j = 0
+
+    // 1x2 C-resident cleanup: while j + 2 <= N
+    a.label(pref + "_i1_j2")
+    a.x64_load_offset(0, 4, 128)     // j
+    a.x64_mov_reg(1, 0)
+    a.x64_add_imm(1, 2)
+    a.x64_load_offset(2, 4, 48)      // N
+    a.x64_cmp_reg(1, 2)
+    a.x64_jcc(15, pref + "_i1_j1")   // jg
+
+    a.x64_mov_reg(1, 0)
+    a.x64_shl_imm(1, 3)
+    a.x64_load_offset(3, 4, 136)
+    a.x64_add_reg(3, 1)              // rbx = c_ptr
+    a.x64_load_offset(8, 3, 0)       // c00
+    a.x64_load_offset(9, 3, 8)       // c01
+    a.x64_load_offset(2, 4, 88)      // rdx = stride_b
+    a.x64_load_offset(7, 4, 104)     // k0
+    a.x64_imul(7, 2)
+    a.x64_load_offset(6, 4, 80)      // ptr_b
+    a.x64_add_reg(7, 6)
+    a.x64_add_reg(7, 1)              // rdi = b_ptr
+    a.x64_load_offset(6, 4, 144)     // rsi = a_ptr
+    a.x64_load_offset(1, 4, 112)     // rcx = k_rem
+
+    a.label(pref + "_i1_j2_k")
+    a.x64_load_offset(0, 6, 0)       // rax = a0
+    a.x64_add_imm(6, 8)
+    a.x64_load_offset(10, 7, 0)      // r10 = b0
+    a.x64_load_offset(11, 7, 8)      // r11 = b1
+    a.x64_add_reg(7, 2)
+    a.x64_imul(10, 0)
+    a.x64_add_reg(8, 10)
+    a.x64_imul(11, 0)
+    a.x64_add_reg(9, 11)
+    a.x64_sub_imm(1, 1)
+    a.x64_test_reg(1, 1)
+    a.x64_jcc(5, pref + "_i1_j2_k")
+
+    a.x64_store_offset(3, 0, 8)
+    a.x64_store_offset(3, 8, 9)
+    a.x64_load_offset(0, 4, 128)
+    a.x64_add_imm(0, 2)
+    a.x64_store_offset(4, 128, 0)
+    a.x64_jmp(pref + "_i1_j2")
+
+    // 1x1 scalar corner cleanup: when j < N
+    a.label(pref + "_i1_j1")
+    a.x64_load_offset(0, 4, 128)
+    a.x64_load_offset(2, 4, 48)
+    a.x64_cmp_reg(0, 2)
+    a.x64_jcc(13, pref + "_i1_next")
+
+    a.x64_mov_reg(1, 0)
+    a.x64_shl_imm(1, 3)
+    a.x64_load_offset(3, 4, 136)
+    a.x64_add_reg(3, 1)              // rbx = c_ptr
+    a.x64_load_offset(8, 3, 0)       // c00
+    a.x64_load_offset(2, 4, 88)      // rdx = stride_b
+    a.x64_load_offset(7, 4, 104)
+    a.x64_imul(7, 2)
+    a.x64_load_offset(6, 4, 80)
+    a.x64_add_reg(7, 6)
+    a.x64_add_reg(7, 1)              // rdi = b_ptr
+    a.x64_load_offset(6, 4, 144)     // rsi = a_ptr
+    a.x64_load_offset(1, 4, 112)     // rcx = k_rem
+
+    a.label(pref + "_i1_j1_k")
+    a.x64_load_offset(0, 6, 0)
+    a.x64_add_imm(6, 8)
+    a.x64_load_offset(10, 7, 0)
+    a.x64_add_reg(7, 2)
+    a.x64_imul(10, 0)
+    a.x64_add_reg(8, 10)
+    a.x64_sub_imm(1, 1)
+    a.x64_test_reg(1, 1)
+    a.x64_jcc(5, pref + "_i1_j1_k")
+
+    a.x64_store_offset(3, 0, 8)
+
+    a.label(pref + "_i1_next")
+    a.x64_load_offset(0, 4, 120)
+    a.x64_add_imm(0, 1)
+    a.x64_store_offset(4, 120, 0)
+    a.x64_jmp(pref + "_i1_loop")
+
+    a.label(pref + "_k0_next")
+    a.x64_load_offset(0, 4, 104)
+    a.x64_add_imm(0, 64)
+    a.x64_store_offset(4, 104, 0)
+    a.x64_jmp(pref + "_k0_loop")
+
+    a.label(pref + "_k0_done")
+    a.x64_load_offset(3, 4, 0)
+    a.x64_load_offset(12, 4, 8)
+    a.x64_load_offset(13, 4, 16)
+    a.x64_load_offset(14, 4, 24)
+    a.x64_load_offset(15, 4, 32)
+    a.x64_add_imm(4, 176)
+}
+
+fn emit_tile_gemm(a &mut Assembler, m &types.Mir, fi int, fr &Frame, bi int, pins &[]int, tp &types.MirTilePlan) int {
+    if a.arch != 0 && a.arch != 1 { << 0 }
+    if !tp.ok || tp.outer_exit < 0 { << 0 }
+    if !tile_valid_operand(fr, tp.arr_c) || !tile_valid_operand(fr, tp.arr_a) || !tile_valid_operand(fr, tp.arr_b) {
+        << 0
+    }
+    if !tile_valid_operand(fr, tp.outer_ind) || !tile_valid_operand(fr, tp.mid_ind) || !tile_valid_operand(fr, tp.inner_ind) {
+        << 0
+    }
+    if tp.is_ssa {
+        if !tile_valid_operand(fr, tp.outer_next) || !tile_valid_operand(fr, tp.mid_next) || !tile_valid_operand(fr, tp.inner_next) {
+            << 0
+        }
+    }
+    if !tile_valid_bound(fr, tp.m_lim_t, tp.m_lim) || !tile_valid_bound(fr, tp.n_lim_t, tp.n_lim) || !tile_valid_bound(fr, tp.k_lim_t, tp.k_lim) {
+        << 0
+    }
+
+    pref := types.mir_fn_label(m, fi) + "_bb" + str(bi) + "_tgemm"
+    fallback_lbl := pref + "_fallback"
+    no_ov_ca := pref + "_no_ov_ca"
+    no_ov_cb := pref + "_no_ov_cb"
+    exit_lbl := types.mir_fn_label(m, fi) + "_bb" + str(tp.outer_exit)
+
+    // 1. Entry Guard: verify outer_ind == 0 and M, N, K in [1, 268435455]
+    tile_load_operand(a, fr, tp.outer_ind, 0)
+    a.vm_cmp_imm(0, 0)
+    a.jne(fallback_lbl + "")
+    tile_load_bound(a, fr, tp.m_lim_t, tp.m_lim, 19)
+    tile_load_bound(a, fr, tp.n_lim_t, tp.n_lim, 20)
+    tile_load_bound(a, fr, tp.k_lim_t, tp.k_lim, 21)
+    a.vm_cmp_imm(19, 0)
+    a.jle(fallback_lbl + "")
+    a.vm_cmp_imm(20, 0)
+    a.jle(fallback_lbl + "")
+    a.vm_cmp_imm(21, 0)
+    a.jle(fallback_lbl + "")
+    a.vm_mov_imm64(0, 268435455)
+    a.cmp(19, 0)
+    a.jgt(fallback_lbl + "")
+    a.cmp(20, 0)
+    a.jgt(fallback_lbl + "")
+    a.cmp(21, 0)
+    a.jgt(fallback_lbl + "")
+
+    // 2. Verify len(C) >= M*N, len(A) >= M*K, len(B) >= K*N and no byte-range overlap with C
+    a.mul(1, 19, 20)
+    emit_index_desc_addr(a, m, fi, fr, tp.arr_c)
+    a.load(14, 0, -8)
+    a.cmp(14, 1)
+    a.jlt(fallback_lbl + "")
+    a.load(22, 0, 0)
+
+    emit_index_desc_addr(a, m, fi, fr, tp.arr_a)
+    a.load(14, 0, -8)
+    a.load(23, 0, 0)
+    a.mul(0, 19, 21)
+    a.cmp(14, 0)
+    a.jlt(fallback_lbl + "")
+    a.shl_imm(14, 1, 3)
+    a.add(14, 22, 14)
+    a.cmp(23, 14)
+    a.jae(no_ov_ca + "")
+    a.shl_imm(14, 0, 3)
+    a.add(14, 23, 14)
+    a.cmp(22, 14)
+    a.jae(no_ov_ca + "")
+    a.jmp(fallback_lbl + "")
+    a.label(no_ov_ca + "")
+
+    emit_index_desc_addr(a, m, fi, fr, tp.arr_b)
+    a.load(14, 0, -8)
+    a.mul(0, 21, 20)
+    a.cmp(14, 0)
+    a.jlt(fallback_lbl + "")
+    emit_index_desc_addr(a, m, fi, fr, tp.arr_b)
+    a.load(14, 0, 0)
+    a.shl_imm(1, 1, 3)
+    a.add(1, 22, 1)
+    a.cmp(14, 1)
+    a.jae(no_ov_cb + "")
+    a.shl_imm(0, 0, 3)
+    a.add(0, 14, 0)
+    a.cmp(22, 0)
+    a.jae(no_ov_cb + "")
+    a.jmp(fallback_lbl + "")
+    a.label(no_ov_cb + "")
+
+    // 3. Emit 2D Register-Blocked + L1 Cache-Tiled Micro-Kernel
+    if a.arch == 0 {
+        emit_tile_gemm_arm64(a, pref + "")
+    } else {
+        emit_tile_gemm_x64(a, pref + "")
+    }
+
+    // 4. Write live-out induction variables and jump to outer_exit
+    tile_load_bound(a, fr, tp.m_lim_t, tp.m_lim, 19)
+    tile_load_bound(a, fr, tp.n_lim_t, tp.n_lim, 20)
+    tile_load_bound(a, fr, tp.k_lim_t, tp.k_lim, 21)
+    if tp.is_ssa {
+        tile_store_exit_val(a, fr, tp.outer_next, 19)
+        a.vm_sub_imm(0, 19, 1)
+        tile_store_exit_val(a, fr, tp.outer_ind, 0)
+        mut mid_b_vr := 21
+        mut in_b_vr := 20
+        if tp.order == 2 {
+            mid_b_vr = 20
+            in_b_vr = 21
+        }
+        tile_store_exit_val(a, fr, tp.mid_next, mid_b_vr)
+        a.vm_sub_imm(0, mid_b_vr, 1)
+        tile_store_exit_val(a, fr, tp.mid_ind, 0)
+        tile_store_exit_val(a, fr, tp.inner_next, in_b_vr)
+        a.vm_sub_imm(0, in_b_vr, 1)
+        tile_store_exit_val(a, fr, tp.inner_ind, 0)
+    } else {
+        tile_store_exit_val(a, fr, tp.outer_ind, 19)
+        tile_store_exit_val(a, fr, tp.mid_ind, 21)
+        tile_store_exit_val(a, fr, tp.inner_ind, 20)
+    }
+    a.jmp(exit_lbl + "")
+
+    // 5. Scalar fallback for non-positive bounds, OOB panics, or aliased slices
+    a.label(fallback_lbl + "")
+    mut ii := types.mir_bhead(m, fi, bi)
+    for _ in 0:types.mir_nins(m, fi) {
+        if ii < 0 { <- }
+        emit_instr(a, m, fi, fr, ii)
+        ii = types.mir_inext(m, fi, ii)
+    }
+    emit_term(a, m, fi, fr, bi, pins)
+    << 1
+}
