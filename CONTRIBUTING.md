@@ -2,6 +2,8 @@
 
 本仓库遵守 [XU GitHub 仓库管理规范](https://github.com/xulang-org/xulang-org/blob/main/.github/REPOSITORY_RULES.md)。分支、版本、PR、文档与发布要求以统一规范为基线；本文件补充编译器的实际入口。
 
+XU 源码还须遵守 [XU 代码规范](.github/XU_CODING_STANDARDS.md)；涉及配套语言或跨语言接口时，按各语言工具链及其中的边界契约验证。
+
 日常产品开发从 `dev` 建立任务分支，通过 PR 合回 `dev`；正式验收后才进入 `main`。开发版本保留 `-dev.N`，候选版保留 `-rc.N`。独立的仓库规则和贡献文档可走规范中的维护 PR。后台门禁是否启用另按 [配置清单](https://github.com/xulang-org/xulang-org/blob/main/.github/GITHUB_SETTINGS.md) 验收，不能从文档存在推定保护生效。
 
 ## 修改与验证

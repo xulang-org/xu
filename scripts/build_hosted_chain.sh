@@ -247,11 +247,11 @@ if [ "$seed_build_rc" -ne 0 ]; then
     # an intermediate compiler without that wrapper, then restart Gen1 on
     # the complete original source. Never install or compare the bridge as
     # a product generation, and never recover unrelated compiler failures.
-    if ! grep -Fq "undefined name 'sys_socket_poll'" "$tmp/seed-build.log"; then
+    if ! grep -Eq "undefined name 'sys_socket_(poll|wait)'" "$tmp/seed-build.log"; then
         exit "$seed_build_rc"
     fi
-    FAILED_STAGE="socket_poll_seed_bridge"
-    echo "build_hosted_chain: bootstrapping socket_poll support for the older hosted seed"
+    FAILED_STAGE="socket_seed_bridge"
+    echo "build_hosted_chain: bootstrapping socket readiness support for the older hosted seed"
     python3 - "$ROOT/src" "$tmp/seed-bridge-src" <<'PY_BRIDGE'
 from pathlib import Path
 import re
@@ -261,13 +261,17 @@ import sys
 source, destination = map(Path, sys.argv[1:])
 shutil.copytree(source, destination)
 socket = destination / 'os/socket.xu'
-text, count = re.subn(
+text = socket.read_text()
+text = re.sub(
     r'^pub fn socket_poll\(fd int, events int\) int \{\n'
     r'    << sys_socket_poll\(fd, events\) or >>\n\}\n',
-    '', socket.read_text(), flags=re.MULTILINE,
+    '', text, flags=re.MULTILINE,
 )
-if count != 1:
-    raise SystemExit('socket_poll seed bridge: expected the exact versioned wrapper')
+text = re.sub(
+    r'^pub fn socket_wait\(fd int, events int, timeout_ns int\) int \{\n'
+    r'    << sys_socket_wait\(fd, events, timeout_ns\) or >>\n\}\n',
+    '', text, flags=re.MULTILINE,
+)
 socket.write_text(text)
 PY_BRIDGE
     BRIDGE_SOCKET_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/socket.xu")

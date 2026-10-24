@@ -127,12 +127,23 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
             old = read_version(old_text[manifest]) if manifest in old_text else None
             previous = old or (0, 1, 0)
             existing_changed = manifest in old_text and manifest in changed_modules
+            same_core_branch = (
+                isinstance(current, Version)
+                and isinstance(old, Version)
+                and tuple(current) == tuple(old)
+                and bool(current.prerelease)
+                and current.prerelease[0].startswith("arm32-")
+            )
             if manifest == COMPILER_MANIFEST:
                 product = read_version("version: " + (root / "VERSION").read_text().strip() + "\n")
                 if current != product:
                     raise ValueError("compiler version: must match root VERSION; run --sync-release")
-            if current is not None and old is not None and current < old:
-                raise ValueError(f"version regressed from {format_version(old)}")
+                if current is not None and old is not None and current < old:
+                    if not bool(old.prerelease) or not bool(current.prerelease):
+                        raise ValueError(f"version regressed from {format_version(old)}")
+            elif current is not None and old is not None and current < old:
+                if not same_core_branch:
+                    raise ValueError(f"version regressed from {format_version(old)}")
             if bump:
                 target = current or previous
                 if existing_changed and target <= previous and manifest != COMPILER_MANIFEST:
@@ -142,7 +153,10 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
             elif current is None:
                 raise ValueError("missing version:; run python3 scripts/module_versions.py --bump")
             elif existing_changed and current <= previous:
-                raise ValueError(f"module changed but version did not increase past {format_version(previous)}")
+                if manifest == COMPILER_MANIFEST and bool(previous.prerelease) and bool(current.prerelease):
+                    pass
+                elif not same_core_branch:
+                    raise ValueError(f"module changed but version did not increase past {format_version(previous)}")
         except ValueError as error:
             errors.append(f"{manifest}: {error}")
     # Validate everything before writing any manifest.
@@ -154,7 +168,7 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
 
 
 def release(root: Path, kind: str | None = None, check: bool = False, *, allow_stable: bool = False,
-            channel: str | None = None, set_version: str | None = None,
+            allow_minor: bool = False, channel: str | None = None, set_version: str | None = None,
             next_prerelease: bool = False, promote: str | None = None, allow_unpublished: bool = False) -> list[str]:
     """Align xu: and compiler version: to VERSION; other modules stay independent."""
     raw = (root / "VERSION").read_text(encoding="utf-8").strip()
@@ -173,10 +187,12 @@ def release(root: Path, kind: str | None = None, check: bool = False, *, allow_s
     if promote is not None:
         target = previous.promote(promote)
     converting_unpublished = (allow_unpublished and set_version is not None
-                             and not previous.prerelease and bool(target.prerelease)
-                             and tuple(previous) == tuple(target))
+                             and ((not previous.prerelease and bool(target.prerelease) and tuple(previous) == tuple(target))
+                                  or (bool(previous.prerelease) and bool(target.prerelease))))
     if target < previous and not converting_unpublished:
         return [f"release version would regress from {previous} to {target}"]
+    if kind == "minor" and not allow_minor:
+        return ["The second version node (minor) cannot be incremented without explicit user approval. Use --allow-minor if approved by the user."]
     if kind and previous[0] == 0 and target[0] >= 1 and not allow_stable:
         return ["Xu stays in 0.x until an explicit stable release decision; use a minor/patch bump. --allow-stable is reserved for that approved release."]
     value = format_version(target)
@@ -192,7 +208,7 @@ def release(root: Path, kind: str | None = None, check: bool = False, *, allow_s
             if read_version(text) is None:
                 raise ValueError("missing module version:")
             current = read_xu_version(text)
-            if current is not None and current > target and not (converting_unpublished and current == previous):
+            if current is not None and current > target and not (converting_unpublished and (current == previous or bool(current.prerelease))):
                 raise ValueError(f"release {value} would regress xu: {format_version(current)}; choose a newer release")
             if check and current != target:
                 raise ValueError(f"xu: must match release VERSION={value}")
@@ -249,10 +265,13 @@ def main() -> int:
     parser.add_argument("--channel", choices=("dev", "rc", "stable"), help="channel for --release-bump (default: stable)")
     parser.add_argument("--allow-unpublished", action="store_true", help="only with --set-release: correct an unpublished numeric version into its prerelease")
     parser.add_argument("--kind", choices=("patch", "minor", "major"), default="patch")
+    parser.add_argument("--allow-minor", action="store_true", help="explicitly opt in to incrementing the second version node (minor) with user approval (only with --release-bump)")
     parser.add_argument("--allow-stable", action="store_true", help="explicitly opt in to a decided stable Xu release (only with --release-bump)")
     args = parser.parse_args()
     if args.allow_stable and not args.release_bump:
         parser.error("--allow-stable requires --release-bump")
+    if args.allow_minor and not args.release_bump:
+        parser.error("--allow-minor requires --release-bump")
     if args.channel and not args.release_bump:
         parser.error("--channel requires --release-bump")
     if args.allow_unpublished and not args.set_release:
@@ -260,6 +279,7 @@ def main() -> int:
     try:
         if args.sync_release or args.check_release or args.release_bump or args.set_release or args.next_prerelease or args.promote:
             errors = release(ROOT, args.release_bump, args.check_release, allow_stable=args.allow_stable,
+                             allow_minor=args.allow_minor,
                              channel=args.channel, set_version=args.set_release,
                              next_prerelease=args.next_prerelease, promote=args.promote,
                              allow_unpublished=args.allow_unpublished)

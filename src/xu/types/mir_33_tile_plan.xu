@@ -1,0 +1,925 @@
+@xu/types
+
+// Multi-dimensional loop nest recognition and affine/alias proof for 2D
+// register-blocked and L1 cache-tiled matrix multiplication (C += A * B).
+// Supports both promoted SSA loop nests (mir_promote) and slot-shaped
+// loop nests (LoadLocal/StoreLocal), as well as i-k-j and i-j-k orders.
+
+pub struct MirTilePlan {
+    pub ok bool
+    pub is_ssa bool
+    pub order int          // 1 = i-k-j, 2 = i-j-k
+    pub outer_hdr int
+    pub mid_hdr int
+    pub inner_hdr int
+    pub outer_exit int
+    pub arr_c int
+    pub arr_a int
+    pub arr_b int
+    pub m_lim int
+    pub m_lim_t int
+    pub n_lim int
+    pub n_lim_t int
+    pub k_lim int
+    pub k_lim_t int
+    pub outer_ind int
+    pub mid_ind int
+    pub inner_ind int
+    pub outer_next int
+    pub mid_next int
+    pub inner_next int
+}
+
+pub fn mir_tile_plan_none() MirTilePlan {
+    << MirTilePlan{
+        ok: false,
+        is_ssa: false,
+        order: 0,
+        outer_hdr: -1,
+        mid_hdr: -1,
+        inner_hdr: -1,
+        outer_exit: -1,
+        arr_c: -1,
+        arr_a: -1,
+        arr_b: -1,
+        m_lim: 0,
+        m_lim_t: -1,
+        n_lim: 0,
+        n_lim_t: -1,
+        k_lim: 0,
+        k_lim_t: -1,
+        outer_ind: -1,
+        mid_ind: -1,
+        inner_ind: -1,
+        outer_next: -1,
+        mid_next: -1,
+        inner_next: -1
+    }
+}
+
+struct TileBound {
+    kind int  // 0 = invalid, 1 = const, 2 = local, 3 = invariant temp
+    val int
+}
+
+fn tile_bound_none() TileBound {
+    << TileBound{kind: 0, val: -1}
+}
+
+fn tile_bound_eq(a TileBound, b TileBound) bool {
+    << a.kind != 0 && a.kind == b.kind && a.val == b.val
+}
+
+fn tile_block_in(bs &[]int, b int) bool {
+    for i in 0:bs.len {
+        if bs[i] == b { << true }
+    }
+    << false
+}
+
+fn tile_find_single_def(f &MFn, t int) int {
+    if t < 0 || t >= f.temps.len { << -1 }
+    mut found := -1
+    for bi in 0:f.blocks.len {
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            k := mfn_ikind(&f.instrs, ii)
+            if k == mi_chan_try_recv && (mfn_ia(&f.instrs, ii) == t || mfn_ib(&f.instrs, ii) == t) {
+                << -2
+            }
+            if k != mi_nop && mir_instr_has_dest(k) && mfn_ia(&f.instrs, ii) == t {
+                if found >= 0 { << -2 }
+                found = ii
+            }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    << found
+}
+
+fn tile_find_def_owner(f &MFn, target_ii int) int {
+    for bi in 0:f.blocks.len {
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            if ii == target_ii { << bi }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    << -1
+}
+
+fn tile_trace_single_copy(f &MFn, v0 int) int {
+    mut v := v0
+    for _ in 0:8 {
+        if v < 0 { << v }
+        di := tile_find_single_def(f, v)
+        if di < 0 || mfn_ikind(&f.instrs, di) != mi_copy { << v }
+        v = mfn_ib(&f.instrs, di)
+    }
+    << v
+}
+
+fn tile_const_val(f &MFn, v0 int, want int) bool {
+    v := tile_trace_single_copy(f, v0)
+    if v > -2 { << false }
+    cix := -v - 2
+    << cix >= 0 && cix < f.consts.len && f.consts[cix] == want
+}
+
+fn tile_local_written_in(f &MFn, nest &[]int, lid int) bool {
+    if lid < 0 { << true }
+    for i in 0:nest.len {
+        bi := nest[i]
+        mut ii := f.blocks[bi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            k := mfn_ikind(&f.instrs, ii)
+            if k == mi_store_local && mfn_ia(&f.instrs, ii) == lid { << true }
+            if k == mi_addr && mfn_ic(&f.instrs, ii) == 0 && mfn_ib(&f.instrs, ii) == lid { << true }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    << false
+}
+
+fn tile_resolve_bound(f &MFn, nest &[]int, v0 int) TileBound {
+    v := tile_trace_single_copy(f, v0)
+    if v <= -2 {
+        cix := -v - 2
+        if cix < 0 || cix >= f.consts.len { << tile_bound_none() }
+        if f.consts[cix] <= 0 { << tile_bound_none() }
+        << TileBound{kind: 1, val: f.consts[cix]}
+    }
+    if v < 0 || v >= f.temps.len || f.temps[v] != 1 || f.temps_nslots[v] != 1 {
+        << tile_bound_none()
+    }
+    di := tile_find_single_def(f, v)
+    if di < 0 { << tile_bound_none() }
+    if mfn_ikind(&f.instrs, di) == mi_load_local {
+        lid := mfn_ib(&f.instrs, di)
+        if lid < 0 || lid >= f.locals.len || f.locals[lid] != 1 || f.locals_nslots[lid] != 1 {
+            << tile_bound_none()
+        }
+        if tile_local_written_in(f, nest, lid) { << tile_bound_none() }
+        << TileBound{kind: 2, val: lid}
+    }
+    owner := tile_find_def_owner(f, di)
+    if owner < 0 || tile_block_in(nest, owner) { << tile_bound_none() }
+    << TileBound{kind: 3, val: v}
+}
+
+fn tile_encode_bound_lim(b TileBound) int {
+    if b.kind == 1 { << b.val }
+    << 0
+}
+
+fn tile_encode_bound_t(b TileBound) int {
+    if b.kind == 2 { << mir_local_operand_base + b.val }
+    if b.kind == 3 { << b.val }
+    << -1
+}
+
+// Single-copy jump block: `phi_temp = src_temp; jump target_bb`.
+fn tile_match_copy_jump(f &MFn, bi int, want_target int) int {
+    if bi < 0 || bi >= f.blocks.len { << -1 }
+    if f.blocks[bi].tkind != 1 || f.blocks[bi].ta != want_target { << -1 }
+    if mir_ssa_npreds(f, bi) != 1 { << -1 }
+    mut cp := -1
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_copy {
+            if cp >= 0 { << -1 }
+            cp = ii
+        } else if k != mi_nop {
+            << -1
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << cp
+}
+
+struct TileLatch {
+    bound TileBound
+    next_or_loc int
+    exit_bb int
+    latch_bb int
+}
+
+fn tile_latch_none() TileLatch {
+    << TileLatch{bound: tile_bound_none(), next_or_loc: -1, exit_bb: -1, latch_bb: -1}
+}
+
+// Verify that `latch_hdr` increments `phi` by 1 (`next = phi + 1`) and
+// branches on `next < bound` to `latch_bb` (which copies `phi = next` and
+// jumps to `hdr_bb`) or `exit_bb`.
+fn tile_match_ssa_latch(f &MFn, hdr_bb int, latch_hdr int, nest &[]int, phi int) TileLatch {
+    if latch_hdr < 0 || latch_hdr >= f.blocks.len || f.blocks[latch_hdr].tkind != 2 {
+        << tile_latch_none()
+    }
+    latch_bb := f.blocks[latch_hdr].tb
+    exit_bb := f.blocks[latch_hdr].tc
+    if latch_bb == exit_bb || latch_bb == hdr_bb || exit_bb == hdr_bb {
+        << tile_latch_none()
+    }
+    cp := tile_match_copy_jump(f, latch_bb, hdr_bb)
+    if cp < 0 || mfn_ia(&f.instrs, cp) != phi {
+        << tile_latch_none()
+    }
+    next_t := mfn_ib(&f.instrs, cp)
+    if next_t < 0 || next_t == phi { << tile_latch_none() }
+    mut add_ii := -1
+    mut cmp_ii := -1
+    cond_t := f.blocks[latch_hdr].ta
+    mut ii := f.blocks[latch_hdr].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_bin {
+            if mfn_ia(&f.instrs, ii) == next_t {
+                if add_ii >= 0 { << tile_latch_none() }
+                add_ii = ii
+            } else if mfn_ia(&f.instrs, ii) == cond_t {
+                if cmp_ii >= 0 { << tile_latch_none() }
+                cmp_ii = ii
+            } else {
+                << tile_latch_none()
+            }
+        } else if k != mi_load_local && k != mi_copy && k != mi_nop {
+            << tile_latch_none()
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    if add_ii < 0 || cmp_ii < 0 { << tile_latch_none() }
+    if mfn_ib(&f.instrs, add_ii) != 1 { << tile_latch_none() }
+    ac := tile_trace_single_copy(f, mfn_ic(&f.instrs, add_ii))
+    ad := tile_trace_single_copy(f, mfn_id(&f.instrs, add_ii))
+    mut step_ok := false
+    if ac == phi && tile_const_val(f, ad, 1) { step_ok = true }
+    if ad == phi && tile_const_val(f, ac, 1) { step_ok = true }
+    if !step_ok { << tile_latch_none() }
+    if mfn_ib(&f.instrs, cmp_ii) != 8 { << tile_latch_none() }
+    if tile_trace_single_copy(f, mfn_ic(&f.instrs, cmp_ii)) != next_t {
+        << tile_latch_none()
+    }
+    b := tile_resolve_bound(f, nest, mfn_id(&f.instrs, cmp_ii))
+    if b.kind == 0 { << tile_latch_none() }
+    << TileLatch{bound: b, next_or_loc: next_t, exit_bb: exit_bb, latch_bb: latch_bb}
+}
+
+// Verify array base operand resolves to a mutable/immutable `[]int` slice local
+// (`nslots == 3` local or `nslots == 1` `&[]int`/`&mut []int` ref local).
+fn tile_resolve_arr_local(m &Mir, f &MFn, nest &[]int, v0 int) int {
+    v := tile_trace_single_copy(f, v0)
+    if v < 0 || v >= f.temps.len { << -1 }
+    di := tile_find_single_def(f, v)
+    if di < 0 { << -1 }
+    mut lid := -1
+    mut aty := f.temps[v]
+    k := mfn_ikind(&f.instrs, di)
+    if k == mi_load_local {
+        lid = mfn_ib(&f.instrs, di)
+        if lid < 0 || lid >= f.locals.len || f.locals_nslots[lid] != 3 { << -1 }
+        aty = f.locals[lid]
+    } else if k == mi_load_ptr && mfn_ic(&f.instrs, di) == 0 && mfn_id(&f.instrs, di) == 3 {
+        ptr := tile_trace_single_copy(f, mfn_ib(&f.instrs, di))
+        pi := tile_find_single_def(f, ptr)
+        if pi < 0 || mfn_ikind(&f.instrs, pi) != mi_load_local { << -1 }
+        lid = mfn_ib(&f.instrs, pi)
+        if lid < 0 || lid >= f.locals.len || f.locals_nslots[lid] != 1 { << -1 }
+        if !is_ref_type(f.locals[lid]) { << -1 }
+    } else {
+        << -1
+    }
+    if tile_local_written_in(f, nest, lid) { << -1 }
+    if !is_array_type(aty) { << -1 }
+    ai := aty - 200
+    if ai < 0 || ai >= m.arrays.len { << -1 }
+    if m.arrays[ai].fixed_len != 0 || m.arrays[ai].elem_ty != 1 { << -1 }
+    << lid
+}
+
+// Match `idx_t = row_ind * stride_bound + col_ind`.
+fn tile_match_affine_2d(f &MFn, nest &[]int, idx0 int, row_phi int, col_phi int, want_stride TileBound) bool {
+    idx := tile_trace_single_copy(f, idx0)
+    di := tile_find_single_def(f, idx)
+    if di < 0 || mfn_ikind(&f.instrs, di) != mi_bin || mfn_ib(&f.instrs, di) != 1 {
+        << false
+    }
+    x := tile_trace_single_copy(f, mfn_ic(&f.instrs, di))
+    y := tile_trace_single_copy(f, mfn_id(&f.instrs, di))
+    mut mul_t := -1
+    if x == col_phi { mul_t = y }
+    if y == col_phi { mul_t = x }
+    if mul_t < 0 { << false }
+    mi := tile_find_single_def(f, mul_t)
+    if mi < 0 || mfn_ikind(&f.instrs, mi) != mi_bin || mfn_ib(&f.instrs, mi) != 3 {
+        << false
+    }
+    mx := tile_trace_single_copy(f, mfn_ic(&f.instrs, mi))
+    my := tile_trace_single_copy(f, mfn_id(&f.instrs, mi))
+    mut stride_op := -1
+    if mx == row_phi { stride_op = my }
+    if my == row_phi { stride_op = mx }
+    if stride_op == -1 { << false }
+    sb := tile_resolve_bound(f, nest, stride_op)
+    << tile_bound_eq(sb, want_stride)
+}
+
+fn mir_tile_plan_ssa(m &Mir, fi int, bi int) MirTilePlan {
+    mut none := mir_tile_plan_none()
+    if mir_btkind(m, fi, bi) != 2 { << none }
+    f := mir_cfg_clone_fn(m, fi, false)
+    if f.phis.len != 0 { << none }
+    // 1. Structure of outer_hdr (bi) -> mid_pre -> mid_hdr and outer_latch_hdr -> outer_latch / outer_exit
+    mid_pre := f.blocks[bi].tb
+    outer_latch_hdr := f.blocks[bi].tc
+    if mid_pre < 0 || outer_latch_hdr < 0 || mid_pre == bi || outer_latch_hdr == bi || mid_pre == outer_latch_hdr {
+        << none
+    }
+    if f.blocks[mid_pre].tkind != 1 { << none }
+    mid_hdr := f.blocks[mid_pre].ta
+    if mid_hdr < 0 || mid_hdr >= f.blocks.len || mid_hdr == bi || f.blocks[mid_hdr].tkind != 2 {
+        << none
+    }
+    cp_mid_pre := tile_match_copy_jump(&f, mid_pre, mid_hdr)
+    if cp_mid_pre < 0 { << none }
+    mid_phi := mfn_ia(&f.instrs, cp_mid_pre)
+    mid_init := mfn_ib(&f.instrs, cp_mid_pre)
+    if !tile_const_val(&f, mid_init, 0) { << none }
+
+    // 2. Structure of mid_hdr -> inner_pre -> inner_hdr and mid_latch_hdr
+    inner_pre := f.blocks[mid_hdr].tb
+    mid_latch_hdr := f.blocks[mid_hdr].tc
+    if inner_pre < 0 || mid_latch_hdr < 0 || inner_pre == mid_latch_hdr || f.blocks[inner_pre].tkind != 1 {
+        << none
+    }
+    inner_hdr := f.blocks[inner_pre].ta
+    if inner_hdr < 0 || inner_hdr >= f.blocks.len || f.blocks[inner_hdr].tkind != 2 {
+        << none
+    }
+    cp_in_pre := tile_match_copy_jump(&f, inner_pre, inner_hdr)
+    if cp_in_pre < 0 { << none }
+    inner_phi := mfn_ia(&f.instrs, cp_in_pre)
+    inner_init := mfn_ib(&f.instrs, cp_in_pre)
+    if !tile_const_val(&f, inner_init, 0) { << none }
+    if f.blocks[inner_hdr].tc != mid_latch_hdr { << none }
+    inner_latch := f.blocks[inner_hdr].tb
+    cp_in_lat := tile_match_copy_jump(&f, inner_latch, inner_hdr)
+    if cp_in_lat < 0 || mfn_ia(&f.instrs, cp_in_lat) != inner_phi { << none }
+
+    // 3. Find outer_phi from outer_latch_hdr's latch block jumping back to bi
+    if f.blocks[outer_latch_hdr].tkind != 2 { << none }
+    outer_latch := f.blocks[outer_latch_hdr].tb
+    cp_out_lat := tile_match_copy_jump(&f, outer_latch, bi)
+    if cp_out_lat < 0 { << none }
+    outer_phi := mfn_ia(&f.instrs, cp_out_lat)
+    if outer_phi == mid_phi || outer_phi == inner_phi || mid_phi == inner_phi { << none }
+
+    if f.blocks[mid_latch_hdr].tkind != 2 || f.blocks[mid_latch_hdr].tc != outer_latch_hdr {
+        << none
+    }
+    mid_latch := f.blocks[mid_latch_hdr].tb
+    cp_mid_lat := tile_match_copy_jump(&f, mid_latch, mid_hdr)
+    if cp_mid_lat < 0 || mfn_ia(&f.instrs, cp_mid_lat) != mid_phi { << none }
+
+    // Verify predecessor counts for mid_hdr and inner_hdr (only preheader and latch)
+    if mir_ssa_npreds(&f, mid_hdr) != 2 || mir_ssa_npreds(&f, inner_hdr) != 2 {
+        << none
+    }
+    if mir_ssa_npreds(&f, mid_latch_hdr) != 2 || mir_ssa_npreds(&f, outer_latch_hdr) != 2 {
+        << none
+    }
+    // Verify all outside entries to outer_hdr (bi) set outer_phi = 0
+    mut out_entries := 0
+    for pi in 0:f.blocks.len {
+        if pi == outer_latch { -> }
+        tk := f.blocks[pi].tkind
+        if tk == 2 && (f.blocks[pi].tb == bi || f.blocks[pi].tc == bi) { << none }
+        if tk != 1 || f.blocks[pi].ta != bi { -> }
+        cp_entry := tile_match_copy_jump(&f, pi, bi)
+        if cp_entry < 0 || mfn_ia(&f.instrs, cp_entry) != outer_phi { << none }
+        if !tile_const_val(&f, mfn_ib(&f.instrs, cp_entry), 0) { << none }
+        out_entries += 1
+    }
+    if out_entries != 1 { << none }
+
+    mut nest := []int{}
+    nest.push(bi)
+    nest.push(mid_pre)
+    nest.push(mid_hdr)
+    nest.push(inner_pre)
+    nest.push(inner_hdr)
+    nest.push(inner_latch)
+    nest.push(mid_latch_hdr)
+    nest.push(mid_latch)
+    nest.push(outer_latch_hdr)
+    nest.push(outer_latch)
+
+    // 4. Match latch increments and bounds for outer, mid, inner
+    l_outer := tile_match_ssa_latch(&f, bi, outer_latch_hdr, &nest, outer_phi)
+    b_outer := l_outer.bound
+    outer_next := l_outer.next_or_loc
+    outer_exit := l_outer.exit_bb
+    if b_outer.kind == 0 || tile_block_in(&nest, outer_exit) { << none }
+
+    l_mid := tile_match_ssa_latch(&f, mid_hdr, mid_latch_hdr, &nest, mid_phi)
+    b_mid := l_mid.bound
+    mid_next := l_mid.next_or_loc
+    mid_exit := l_mid.exit_bb
+    if b_mid.kind == 0 || mid_exit != outer_latch_hdr { << none }
+
+    // Match inner_hdr latch increment and bound
+    inner_next := mfn_ib(&f.instrs, cp_in_lat)
+    in_cond := f.blocks[inner_hdr].ta
+    in_cmp := tile_find_single_def(&f, in_cond)
+    in_add := tile_find_single_def(&f, inner_next)
+    if in_cmp < 0 || in_add < 0 { << none }
+    if mfn_ikind(&f.instrs, in_add) != mi_bin || mfn_ib(&f.instrs, in_add) != 1 { << none }
+    iac := tile_trace_single_copy(&f, mfn_ic(&f.instrs, in_add))
+    iad := tile_trace_single_copy(&f, mfn_id(&f.instrs, in_add))
+    if !((iac == inner_phi && tile_const_val(&f, iad, 1)) || (iad == inner_phi && tile_const_val(&f, iac, 1))) {
+        << none
+    }
+    if mfn_ikind(&f.instrs, in_cmp) != mi_bin || mfn_ib(&f.instrs, in_cmp) != 8 { << none }
+    if tile_trace_single_copy(&f, mfn_ic(&f.instrs, in_cmp)) != inner_next { << none }
+    b_inner := tile_resolve_bound(&f, &nest, mfn_id(&f.instrs, in_cmp))
+    if b_inner.kind == 0 { << none }
+
+    // 5. Verify outer_hdr and mid_hdr branch guards (either const 1 or 0 < bound)
+    for lvl in 0:2 {
+        mut hbb := bi
+        mut want_b := b_mid
+        if lvl == 1 {
+            hbb = mid_hdr
+            want_b = b_inner
+        }
+        hc := f.blocks[hbb].ta
+        if !tile_const_val(&f, hc, 1) {
+            hci := tile_find_single_def(&f, hc)
+            if hci < 0 || mfn_ikind(&f.instrs, hci) != mi_bin || mfn_ib(&f.instrs, hci) != 8 {
+                << none
+            }
+            if !tile_const_val(&f, mfn_ic(&f.instrs, hci), 0) { << none }
+            hb := tile_resolve_bound(&f, &nest, mfn_id(&f.instrs, hci))
+            if !tile_bound_eq(hb, want_b) { << none }
+        }
+    }
+
+    // 6. Scan instructions in bi, mid_hdr, inner_hdr
+    mut rmw_ii := -1
+    mut loads := []int{}
+    for sbi in 0:3 {
+        mut cur_bb := bi
+        if sbi == 1 { cur_bb = mid_hdr }
+        if sbi == 2 { cur_bb = inner_hdr }
+        mut ii := f.blocks[cur_bb].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            k := mfn_ikind(&f.instrs, ii)
+            if k == mi_load_index {
+                if sbi == 0 { << none }
+                w := mfn_id(&f.instrs, ii)
+                if w != 8 && w != -8 { << none }
+                if f.temps[mfn_ia(&f.instrs, ii)] != 1 { << none }
+                loads.push(ii)
+            } else if k == mi_index_rmw {
+                if sbi != 2 || rmw_ii >= 0 { << none }
+                w := mfn_id(&f.instrs, ii)
+                if (w != 8 && w != -8) || mfn_icol(&f.instrs, ii) != 1 { << none }
+                rmw_ii = ii
+            } else if k == mi_load_ptr {
+                if mfn_ic(&f.instrs, ii) != 0 || mfn_id(&f.instrs, ii) != 3 { << none }
+            } else if k != mi_nop && k != mi_copy && k != mi_load_local && k != mi_bin {
+                << none
+            }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    if rmw_ii < 0 || loads.len != 2 { << none }
+
+    // 7. Verify RMW multiply `rhs = val0 * val1`
+    rhs := tile_trace_single_copy(&f, mfn_ic(&f.instrs, rmw_ii))
+    mul_ii := tile_find_single_def(&f, rhs)
+    if mul_ii < 0 || mfn_ikind(&f.instrs, mul_ii) != mi_bin || mfn_ib(&f.instrs, mul_ii) != 3 {
+        << none
+    }
+    val0 := mfn_ia(&f.instrs, loads[0])
+    val1 := mfn_ia(&f.instrs, loads[1])
+    mc := tile_trace_single_copy(&f, mfn_ic(&f.instrs, mul_ii))
+    md := tile_trace_single_copy(&f, mfn_id(&f.instrs, mul_ii))
+    if !((mc == val0 && md == val1) || (mc == val1 && md == val0)) {
+        << none
+    }
+
+    // 8. Identify loop order (1 = i-k-j where inner=j, mid=k; 2 = i-j-k where inner=k, mid=j)
+    mut order := 0
+    mut j_phi := -1
+    mut k_phi := -1
+    mut b_n := tile_bound_none()
+    mut b_k := tile_bound_none()
+    idx_c := mfn_ib(&f.instrs, rmw_ii)
+    if tile_match_affine_2d(&f, &nest, idx_c, outer_phi, inner_phi, b_inner) {
+        order = 1
+        j_phi = inner_phi
+        k_phi = mid_phi
+        b_n = b_inner
+        b_k = b_mid
+    } else if tile_match_affine_2d(&f, &nest, idx_c, outer_phi, mid_phi, b_mid) {
+        order = 2
+        j_phi = mid_phi
+        k_phi = inner_phi
+        b_n = b_mid
+        b_k = b_inner
+    } else {
+        << none
+    }
+
+    // Match the two loads to A[i * K + k] and B[k * N + j]
+    mut ld_a := -1
+    mut ld_b := -1
+    if tile_match_affine_2d(&f, &nest, mfn_ic(&f.instrs, loads[0]), outer_phi, k_phi, b_k) && tile_match_affine_2d(&f, &nest, mfn_ic(&f.instrs, loads[1]), k_phi, j_phi, b_n) {
+        ld_a = loads[0]
+        ld_b = loads[1]
+    } else if tile_match_affine_2d(&f, &nest, mfn_ic(&f.instrs, loads[1]), outer_phi, k_phi, b_k) && tile_match_affine_2d(&f, &nest, mfn_ic(&f.instrs, loads[0]), k_phi, j_phi, b_n) {
+        ld_a = loads[1]
+        ld_b = loads[0]
+    } else {
+        << none
+    }
+
+    // 9. Resolve and verify array descriptors (C != A and C != B)
+    loc_c := tile_resolve_arr_local(m, &f, &nest, mfn_ia(&f.instrs, rmw_ii))
+    loc_a := tile_resolve_arr_local(m, &f, &nest, mfn_ib(&f.instrs, ld_a))
+    loc_b := tile_resolve_arr_local(m, &f, &nest, mfn_ib(&f.instrs, ld_b))
+    if loc_c < 0 || loc_a < 0 || loc_b < 0 { << none }
+    if loc_c == loc_a || loc_c == loc_b { << none }
+
+    // 10. Verify temp confinement: any temp defined inside nest (except induction phis/nexts)
+    // is not used outside nest.
+    mut keep := []int{}
+    keep.push(outer_phi)
+    keep.push(outer_next)
+    keep.push(mid_phi)
+    keep.push(mid_next)
+    keep.push(inner_phi)
+    keep.push(inner_next)
+    mut nest_temps := []int{}
+    for ni in 0:nest.len {
+        nbi := nest[ni]
+        mut ii := f.blocks[nbi].head
+        for _ in 0:f.instrs.len {
+            if ii < 0 { <- }
+            k := mfn_ikind(&f.instrs, ii)
+            if k != mi_nop && mir_instr_has_dest(k) {
+                d := mfn_ia(&f.instrs, ii)
+                if d >= 0 && !tile_block_in(&keep, d) {
+                    nest_temps.push(d)
+                }
+            }
+            ii = mfn_inext(&f.instrs, ii)
+        }
+    }
+    if !mir_ssa_temps_confined(m, fi, &nest_temps, &nest) { << none }
+
+    << MirTilePlan{
+        ok: true,
+        is_ssa: true,
+        order: order,
+        outer_hdr: bi,
+        mid_hdr: mid_hdr,
+        inner_hdr: inner_hdr,
+        outer_exit: outer_exit,
+        arr_c: mir_local_operand_base + loc_c,
+        arr_a: mir_local_operand_base + loc_a,
+        arr_b: mir_local_operand_base + loc_b,
+        m_lim: tile_encode_bound_lim(b_outer),
+        m_lim_t: tile_encode_bound_t(b_outer),
+        n_lim: tile_encode_bound_lim(b_n),
+        n_lim_t: tile_encode_bound_t(b_n),
+        k_lim: tile_encode_bound_lim(b_k),
+        k_lim_t: tile_encode_bound_t(b_k),
+        outer_ind: outer_phi,
+        mid_ind: mid_phi,
+        inner_ind: inner_phi,
+        outer_next: outer_next,
+        mid_next: mid_next,
+        inner_next: inner_next
+    }
+}
+
+fn tile_temp_loads_local(f &MFn, bi int, t0 int, want_loc int) bool {
+    t := tile_trace_single_copy(f, t0)
+    if t < 0 { << false }
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        if mfn_ikind(&f.instrs, ii) == mi_load_local && mfn_ia(&f.instrs, ii) == t && mfn_ib(&f.instrs, ii) == want_loc {
+            << true
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    << false
+}
+
+fn tile_match_slot_affine_2d(f &MFn, bi int, nest &[]int, idx0 int, row_loc int, col_loc int, want_stride TileBound) bool {
+    idx := tile_trace_single_copy(f, idx0)
+    di := tile_find_single_def(f, idx)
+    if di < 0 || mfn_ikind(&f.instrs, di) != mi_bin || mfn_ib(&f.instrs, di) != 1 {
+        << false
+    }
+    x := mfn_ic(&f.instrs, di)
+    y := mfn_id(&f.instrs, di)
+    mut mul_t := -1
+    if tile_temp_loads_local(f, bi, x, col_loc) { mul_t = y }
+    if tile_temp_loads_local(f, bi, y, col_loc) { mul_t = x }
+    if mul_t < 0 { << false }
+    mi := tile_find_single_def(f, tile_trace_single_copy(f, mul_t))
+    if mi < 0 || mfn_ikind(&f.instrs, mi) != mi_bin || mfn_ib(&f.instrs, mi) != 3 {
+        << false
+    }
+    mx := mfn_ic(&f.instrs, mi)
+    my := mfn_id(&f.instrs, mi)
+    mut stride_op := -1
+    if tile_temp_loads_local(f, bi, mx, row_loc) { stride_op = my }
+    if tile_temp_loads_local(f, bi, my, row_loc) { stride_op = mx }
+    if stride_op == -1 { << false }
+    sb := tile_resolve_bound(f, nest, stride_op)
+    << tile_bound_eq(sb, want_stride)
+}
+
+// Match slot-form latch block: `t0 = load_local loc; t1 = t0 + 1; store_local loc, t1; t2 = load_local loc; cond = t2 < bound; branch cond ? hdr : exit`
+fn tile_match_slot_latch(f &MFn, latch_bb int, want_hdr int, nest &[]int) TileLatch {
+    if latch_bb < 0 || latch_bb >= f.blocks.len || f.blocks[latch_bb].tkind != 2 {
+        << tile_latch_none()
+    }
+    if f.blocks[latch_bb].tb != want_hdr { << tile_latch_none() }
+    exit_bb := f.blocks[latch_bb].tc
+    if exit_bb == want_hdr || exit_bb == latch_bb { << tile_latch_none() }
+    mut st_loc := -1
+    mut st_val := -1
+    mut ii := f.blocks[latch_bb].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_store_local {
+            if st_loc >= 0 { << tile_latch_none() }
+            st_loc = mfn_ia(&f.instrs, ii)
+            st_val = mfn_ib(&f.instrs, ii)
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    if st_loc < 0 || st_val < 0 { << tile_latch_none() }
+    ai := tile_find_single_def(f, tile_trace_single_copy(f, st_val))
+    if ai < 0 || mfn_ikind(&f.instrs, ai) != mi_bin || mfn_ib(&f.instrs, ai) != 1 {
+        << tile_latch_none()
+    }
+    ac := mfn_ic(&f.instrs, ai)
+    ad := mfn_id(&f.instrs, ai)
+    if !((tile_temp_loads_local(f, latch_bb, ac, st_loc) && tile_const_val(f, ad, 1)) || (tile_temp_loads_local(f, latch_bb, ad, st_loc) && tile_const_val(f, ac, 1))) {
+        << tile_latch_none()
+    }
+    cond_t := f.blocks[latch_bb].ta
+    ci := tile_find_single_def(f, cond_t)
+    if ci < 0 || mfn_ikind(&f.instrs, ci) != mi_bin || mfn_ib(&f.instrs, ci) != 8 {
+        << tile_latch_none()
+    }
+    if !tile_temp_loads_local(f, latch_bb, mfn_ic(&f.instrs, ci), st_loc) && tile_trace_single_copy(f, mfn_ic(&f.instrs, ci)) != st_val {
+        << tile_latch_none()
+    }
+    b := tile_resolve_bound(f, nest, mfn_id(&f.instrs, ci))
+    if b.kind == 0 { << tile_latch_none() }
+    << TileLatch{bound: b, next_or_loc: st_loc, exit_bb: exit_bb, latch_bb: latch_bb}
+}
+
+fn mir_tile_plan_slot(m &Mir, fi int, bi int) MirTilePlan {
+    mut none := mir_tile_plan_none()
+    if mir_btkind(m, fi, bi) != 2 { << none }
+    f := mir_cfg_clone_fn(m, fi, false)
+    if f.phis.len != 0 { << none }
+    mid_hdr := f.blocks[bi].tb
+    outer_latch := f.blocks[bi].tc
+    if mid_hdr < 0 || outer_latch < 0 || mid_hdr == bi || outer_latch == bi || mid_hdr == outer_latch {
+        << none
+    }
+    if f.blocks[mid_hdr].tkind != 2 { << none }
+    inner_hdr := f.blocks[mid_hdr].tb
+    mid_latch := f.blocks[mid_hdr].tc
+    if inner_hdr < 0 || mid_latch < 0 || inner_hdr == mid_latch { << none }
+    if f.blocks[inner_hdr].tkind != 2 || f.blocks[inner_hdr].tb != inner_hdr || f.blocks[inner_hdr].tc != mid_latch {
+        << none
+    }
+    if mir_ssa_npreds(&f, mid_hdr) != 2 || mir_ssa_npreds(&f, inner_hdr) != 2 {
+        << none
+    }
+    mut nest_no_ind := []int{}
+    l_outer := tile_match_slot_latch(&f, outer_latch, bi, &nest_no_ind)
+    b_outer := l_outer.bound
+    loc_outer := l_outer.next_or_loc
+    outer_exit := l_outer.exit_bb
+    if b_outer.kind == 0 { << none }
+
+    l_mid := tile_match_slot_latch(&f, mid_latch, mid_hdr, &nest_no_ind)
+    b_mid := l_mid.bound
+    loc_mid := l_mid.next_or_loc
+    mid_exit := l_mid.exit_bb
+    if b_mid.kind == 0 || mid_exit != outer_latch { << none }
+
+    l_inner := tile_match_slot_latch(&f, inner_hdr, inner_hdr, &nest_no_ind)
+    b_inner := l_inner.bound
+    loc_inner := l_inner.next_or_loc
+    in_exit := l_inner.exit_bb
+    if b_inner.kind == 0 || in_exit != mid_latch { << none }
+    if loc_outer == loc_mid || loc_outer == loc_inner || loc_mid == loc_inner { << none }
+
+    mut nest := []int{}
+    nest.push(bi)
+    nest.push(mid_hdr)
+    nest.push(inner_hdr)
+    nest.push(mid_latch)
+    nest.push(outer_latch)
+    if tile_block_in(&nest, outer_exit) { << none }
+    if b_outer.kind == 2 && (b_outer.val == loc_outer || b_outer.val == loc_mid || b_outer.val == loc_inner || tile_local_written_in(&f, &nest, b_outer.val)) { << none }
+    if b_mid.kind == 2 && (b_mid.val == loc_outer || b_mid.val == loc_mid || b_mid.val == loc_inner || tile_local_written_in(&f, &nest, b_mid.val)) { << none }
+    if b_inner.kind == 2 && (b_inner.val == loc_outer || b_inner.val == loc_mid || b_inner.val == loc_inner || tile_local_written_in(&f, &nest, b_inner.val)) { << none }
+
+    // Verify outer_hdr only initializes loc_mid = 0 and compares loc_mid < b_mid
+    mut mid_init_ok := false
+    mut ii := f.blocks[bi].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_store_local {
+            if mid_init_ok || mfn_ia(&f.instrs, ii) != loc_mid || !tile_const_val(&f, mfn_ib(&f.instrs, ii), 0) {
+                << none
+            }
+            mid_init_ok = true
+        } else if k != mi_load_local && k != mi_bin && k != mi_copy && k != mi_nop {
+            << none
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    if !mid_init_ok { << none }
+
+    // Verify mid_hdr loads aik = a[i*K + k], stores to loc_aik, and sets loc_inner = 0
+    mut ld_a := -1
+    mut loc_aik := -1
+    mut in_init_ok := false
+    ii = f.blocks[mid_hdr].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_load_index {
+            if ld_a >= 0 { << none }
+            w := mfn_id(&f.instrs, ii)
+            if w != 8 && w != -8 { << none }
+            ld_a = ii
+        } else if k == mi_store_local {
+            dst_l := mfn_ia(&f.instrs, ii)
+            if dst_l == loc_inner {
+                if in_init_ok || !tile_const_val(&f, mfn_ib(&f.instrs, ii), 0) { << none }
+                in_init_ok = true
+            } else if ld_a >= 0 && loc_aik < 0 && mfn_ib(&f.instrs, ii) == mfn_ia(&f.instrs, ld_a) {
+                loc_aik = dst_l
+            } else {
+                << none
+            }
+        } else if k == mi_load_ptr {
+            if mfn_ic(&f.instrs, ii) != 0 || mfn_id(&f.instrs, ii) != 3 { << none }
+        } else if k != mi_load_local && k != mi_bin && k != mi_copy && k != mi_nop {
+            << none
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    if !in_init_ok || ld_a < 0 { << none }
+    if !tile_match_slot_affine_2d(&f, mid_hdr, &nest, mfn_ic(&f.instrs, ld_a), loc_outer, loc_mid, b_mid) {
+        << none
+    }
+
+    // Verify inner_hdr has one load_index (b[k*N + j]), one index_rmw (c[i*N + j] += aik * b_val), and loc_inner += 1
+    mut ld_b := -1
+    mut rmw_c := -1
+    mut st_cnt := 0
+    ii = f.blocks[inner_hdr].head
+    for _ in 0:f.instrs.len {
+        if ii < 0 { <- }
+        k := mfn_ikind(&f.instrs, ii)
+        if k == mi_load_index {
+            if ld_b >= 0 { << none }
+            w := mfn_id(&f.instrs, ii)
+            if w != 8 && w != -8 { << none }
+            ld_b = ii
+        } else if k == mi_index_rmw {
+            if rmw_c >= 0 { << none }
+            w := mfn_id(&f.instrs, ii)
+            if (w != 8 && w != -8) || mfn_icol(&f.instrs, ii) != 1 { << none }
+            rmw_c = ii
+        } else if k == mi_store_local {
+            if mfn_ia(&f.instrs, ii) != loc_inner { << none }
+            st_cnt += 1
+        } else if k == mi_load_ptr {
+            if mfn_ic(&f.instrs, ii) != 0 || mfn_id(&f.instrs, ii) != 3 { << none }
+        } else if k != mi_load_local && k != mi_bin && k != mi_copy && k != mi_nop {
+            << none
+        }
+        ii = mfn_inext(&f.instrs, ii)
+    }
+    if ld_b < 0 || rmw_c < 0 || st_cnt != 1 { << none }
+    if !tile_match_slot_affine_2d(&f, inner_hdr, &nest, mfn_ib(&f.instrs, rmw_c), loc_outer, loc_inner, b_inner) {
+        << none
+    }
+    if !tile_match_slot_affine_2d(&f, inner_hdr, &nest, mfn_ic(&f.instrs, ld_b), loc_mid, loc_inner, b_inner) {
+        << none
+    }
+    rhs := tile_trace_single_copy(&f, mfn_ic(&f.instrs, rmw_c))
+    mul_ii := tile_find_single_def(&f, rhs)
+    if mul_ii < 0 || mfn_ikind(&f.instrs, mul_ii) != mi_bin || mfn_ib(&f.instrs, mul_ii) != 3 {
+        << none
+    }
+    aval := mfn_ia(&f.instrs, ld_a)
+    bval := mfn_ia(&f.instrs, ld_b)
+    mc := mfn_ic(&f.instrs, mul_ii)
+    md := mfn_id(&f.instrs, mul_ii)
+    mc_is_a := (loc_aik >= 0 && tile_temp_loads_local(&f, inner_hdr, mc, loc_aik)) || tile_trace_single_copy(&f, mc) == aval
+    md_is_a := (loc_aik >= 0 && tile_temp_loads_local(&f, inner_hdr, md, loc_aik)) || tile_trace_single_copy(&f, md) == aval
+    if !((tile_trace_single_copy(&f, mc) == bval && md_is_a) || (tile_trace_single_copy(&f, md) == bval && mc_is_a)) {
+        << none
+    }
+
+    loc_c := tile_resolve_arr_local(m, &f, &nest, mfn_ia(&f.instrs, rmw_c))
+    loc_a := tile_resolve_arr_local(m, &f, &nest, mfn_ib(&f.instrs, ld_a))
+    loc_b := tile_resolve_arr_local(m, &f, &nest, mfn_ib(&f.instrs, ld_b))
+    if loc_c < 0 || loc_a < 0 || loc_b < 0 || loc_c == loc_a || loc_c == loc_b {
+        << none
+    }
+
+    // Verify loc_aik (when present) is never read outside nest
+    if loc_aik >= 0 {
+        for bj in 0:f.blocks.len {
+            if tile_block_in(&nest, bj) { -> }
+            ii = f.blocks[bj].head
+            for _ in 0:f.instrs.len {
+                if ii < 0 { <- }
+                if mfn_ikind(&f.instrs, ii) == mi_load_local && mfn_ib(&f.instrs, ii) == loc_aik {
+                    << none
+                }
+                ii = mfn_inext(&f.instrs, ii)
+            }
+        }
+    }
+
+    << MirTilePlan{
+        ok: true,
+        is_ssa: false,
+        order: 1,
+        outer_hdr: bi,
+        mid_hdr: mid_hdr,
+        inner_hdr: inner_hdr,
+        outer_exit: outer_exit,
+        arr_c: mir_local_operand_base + loc_c,
+        arr_a: mir_local_operand_base + loc_a,
+        arr_b: mir_local_operand_base + loc_b,
+        m_lim: tile_encode_bound_lim(b_outer),
+        m_lim_t: tile_encode_bound_t(b_outer),
+        n_lim: tile_encode_bound_lim(b_inner),
+        n_lim_t: tile_encode_bound_t(b_inner),
+        k_lim: tile_encode_bound_lim(b_mid),
+        k_lim_t: tile_encode_bound_t(b_mid),
+        outer_ind: mir_local_operand_base + loc_outer,
+        mid_ind: mir_local_operand_base + loc_mid,
+        inner_ind: mir_local_operand_base + loc_inner,
+        outer_next: -1,
+        mid_next: -1,
+        inner_next: -1
+    }
+}
+
+pub fn mir_tile_plan(m &Mir, fi int, bi int) MirTilePlan {
+    if fi < 0 || fi >= m.fns.len || bi < 0 { << mir_tile_plan_none() }
+    nblk := mir_nblocks(m, fi)
+    if bi >= nblk || nblk > 64 || mir_nins(m, fi) > 512 || mir_ntemps(m, fi) > 512 {
+        << mir_tile_plan_none()
+    }
+    p_ssa := mir_tile_plan_ssa(m, fi, bi)
+    if p_ssa.ok { << p_ssa }
+    << mir_tile_plan_slot(m, fi, bi)
+}
+
+pub fn mir_in_tile_plan(m &Mir, fi int, bi int) bool {
+    if fi < 0 || fi >= m.fns.len || bi < 0 { << false }
+    nblk := mir_nblocks(m, fi)
+    if bi >= nblk || nblk > 64 || mir_nins(m, fi) > 512 || mir_ntemps(m, fi) > 512 {
+        << false
+    }
+    for obi in 0:nblk {
+        if obi == bi { -> }
+        tp := mir_tile_plan(m, fi, obi)
+        if tp.ok && (tp.inner_hdr == bi || tp.mid_hdr == bi) {
+            << true
+        }
+    }
+    << false
+}
