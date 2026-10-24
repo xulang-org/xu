@@ -23,10 +23,20 @@ static const char g_ui_licenses[] = "Xu UI: libgrapheme 3.0.0 / Unicode 17.0.0\n
 ;
 
 #ifdef _WIN32
+extern "C" __attribute__((weak)) void xu_trace(const char *msg);
+static void do_trace(const char *msg) {
+  if (xu_trace) xu_trace(msg);
+}
+#else
+static void do_trace(const char *) {}
+#endif
+
+#ifdef _WIN32
 #include <windows.h>
 static SRWLOCK g_lock = SRWLOCK_INIT;
 static CRITICAL_SECTION g_wait_cs;
 static CONDITION_VARIABLE g_wait_cv;
+static HANDLE g_wait_event = NULL;
 static LONG g_wait_init = 0;
 static void lock_w(void) { AcquireSRWLockExclusive(&g_lock); }
 static void unlock_w(void) { ReleaseSRWLockExclusive(&g_lock); }
@@ -36,6 +46,7 @@ static void wait_init(void) {
   if (InterlockedCompareExchange(&g_wait_init, 1, 0) == 0) {
     InitializeCriticalSection(&g_wait_cs);
     InitializeConditionVariable(&g_wait_cv);
+    g_wait_event = CreateEventA(NULL, FALSE, FALSE, NULL);
     InterlockedExchange(&g_wait_init, 2);
   } else {
     while (InterlockedCompareExchange(&g_wait_init, 2, 2) != 2) Sleep(0);
@@ -46,6 +57,7 @@ static void wake_waiters(void) {
   EnterCriticalSection(&g_wait_cs);
   g_wait_epoch.fetch_add(1, std::memory_order_release);
   WakeAllConditionVariable(&g_wait_cv);
+  if (g_wait_event) SetEvent(g_wait_event);
   LeaveCriticalSection(&g_wait_cs);
 }
 #else
@@ -98,11 +110,13 @@ enum { INV_IDLE = 0, INV_REQ = 1, INV_BUSY = 2, INV_RESP = 3 };
 #ifdef _WIN32
 static CRITICAL_SECTION g_inv_cs;
 static CONDITION_VARIABLE g_inv_cv;
+static HANDLE g_inv_event = NULL;
 static LONG g_inv_init = 0;
 static void inv_init(void) {
   if (InterlockedCompareExchange(&g_inv_init, 1, 0) == 0) {
     InitializeCriticalSection(&g_inv_cs);
     InitializeConditionVariable(&g_inv_cv);
+    g_inv_event = CreateEventA(NULL, FALSE, FALSE, NULL);
     InterlockedExchange(&g_inv_init, 2);
   } else {
     while (InterlockedCompareExchange(&g_inv_init, 2, 2) != 2) Sleep(0);
@@ -113,9 +127,13 @@ static void inv_unlock(void) { LeaveCriticalSection(&g_inv_cs); }
 static void inv_signal(void) {
   inv_init();
   WakeAllConditionVariable(&g_inv_cv);
+  if (g_inv_event) SetEvent(g_inv_event);
 }
 static void inv_wait(DWORD ms) {
-  SleepConditionVariableCS(&g_inv_cv, &g_inv_cs, ms == 0 ? INFINITE : ms);
+  DWORD wait_ms = (ms == 0) ? 20 : (ms > 20 ? 20 : ms);
+  LeaveCriticalSection(&g_inv_cs);
+  WaitForSingleObject(g_inv_event, wait_ms);
+  EnterCriticalSection(&g_inv_cs);
 }
 #else
 static pthread_mutex_t g_inv_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -1358,7 +1376,10 @@ static int wait_for_predicate(Predicate ready, int timeout_ms) {
       else {
 #ifdef _WIN32
         auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count() + 1;
-        SleepConditionVariableCS(&g_wait_cv, &g_wait_cs, (DWORD)milliseconds);
+        if (milliseconds > 20) milliseconds = 20;
+        LeaveCriticalSection(&g_wait_cs);
+        WaitForSingleObject(g_wait_event, (DWORD)milliseconds);
+        EnterCriticalSection(&g_wait_cs);
 #else
         auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count();
         struct timespec until;
@@ -1397,6 +1418,9 @@ int xu_ui_request_wait(uint64_t id, int timeout_ms) {
 }
 
 int xu_ui_mem_wait_nonempty(const char *name, int timeout_ms) {
+  char tb[160];
+  snprintf(tb, sizeof(tb), "mem_wait_nonempty: %s ms=%d", name ? name : "(null)", timeout_ms);
+  do_trace(tb);
   const char *key = slot_key(name);
   if (!key || !key[0]) return -1;
   return wait_for_predicate([&] { return slot_nonempty(key); }, timeout_ms);
@@ -1487,6 +1511,9 @@ static bool asset_lookup(const char *path, bool *exists_query, const unsigned ch
 }
 
 int xu_ui_mem_try_write(const char *path_z, const void *data, unsigned data_len, unsigned *out_n) {
+  char tb[160];
+  snprintf(tb, sizeof(tb), "mem_try_write: %s len=%u", path_z ? path_z : "(null)", data_len);
+  do_trace(tb);
   const char *key = mem_path_key(path_z);
   int ms;
   if (!xu_ui_mem_is_path(path_z)) return 0;
@@ -1892,6 +1919,9 @@ static std::string text_selection_record(const char *key) {
 }
 
 int xu_ui_mem_try_read_len(const char *path_z, unsigned *out_len) {
+  char tb[160];
+  snprintf(tb, sizeof(tb), "mem_try_read_len: %s", path_z ? path_z : "(null)");
+  do_trace(tb);
   bool exists = false; const unsigned char *asset = NULL; unsigned asset_len = 0;
   if (asset_lookup(path_z, &exists, &asset, &asset_len)) { if (out_len) *out_len = exists ? 1 : asset_len; return 1; }
   const char *key = mem_path_key(path_z);

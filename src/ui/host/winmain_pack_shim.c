@@ -134,15 +134,49 @@ static void init_log_path(void) {
   SetEnvironmentVariableA("XU_UI_LOG", g_log_path);
 }
 
+static void log_ptr_module(const char *prefix, void *ptr) {
+  HMODULE mod = NULL;
+  char line[512];
+  if (!ptr) return;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ptr, &mod)) {
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(mod, path, MAX_PATH);
+    if (n > 0) {
+      char *fn = strrchr(path, '\\');
+      if (!fn) fn = strrchr(path, '/');
+      if (fn) fn++; else fn = path;
+      snprintf(line, sizeof(line), "%s%p (%s+0x%llx base=%p)", prefix, ptr, fn,
+               (unsigned long long)((uintptr_t)ptr - (uintptr_t)mod), (void *)mod);
+      log_line(line);
+      return;
+    }
+  }
+  snprintf(line, sizeof(line), "%s%p", prefix, ptr);
+  log_line(line);
+}
+
+void xu_trace(const char *msg) {
+  log_line(msg);
+}
+
 static LONG WINAPI xu_veh(EXCEPTION_POINTERS *ep) {
   char msg[768];
   unsigned long code = 0;
   void *addr = NULL;
   void *rip = NULL;
   void *rsp = NULL;
+  void *rbp = NULL;
+  ULONG_PTR fault_op = 0;
+  ULONG_PTR fault_addr = 0;
+  DWORD tid = GetCurrentThreadId();
+
   if (ep && ep->ExceptionRecord) {
     code = (unsigned long)ep->ExceptionRecord->ExceptionCode;
     addr = ep->ExceptionRecord->ExceptionAddress;
+    if (ep->ExceptionRecord->NumberParameters >= 2) {
+      fault_op = ep->ExceptionRecord->ExceptionInformation[0];
+      fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+    }
   }
   if (code == 0x40010006UL || code == 0x4001000AUL)
     return EXCEPTION_CONTINUE_SEARCH;
@@ -150,9 +184,11 @@ static LONG WINAPI xu_veh(EXCEPTION_POINTERS *ep) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     rip = (void *)(uintptr_t)ep->ContextRecord->Pc;
     rsp = (void *)(uintptr_t)ep->ContextRecord->Sp;
+    rbp = (void *)(uintptr_t)ep->ContextRecord->Fp;
 #else
     rip = (void *)(uintptr_t)ep->ContextRecord->Rip;
     rsp = (void *)(uintptr_t)ep->ContextRecord->Rsp;
+    rbp = (void *)(uintptr_t)ep->ContextRecord->Rbp;
     {
       char regs[512];
       snprintf(regs, sizeof(regs),
@@ -181,17 +217,53 @@ static LONG WINAPI xu_veh(EXCEPTION_POINTERS *ep) {
 #endif
   }
   snprintf(msg, sizeof(msg),
-           "VEH exception 0x%08lX at %p rip=%p rsp=%p",
-           code, addr, rip, rsp);
+           "VEH exception 0x%08lX (op=%llu addr=%p) at %p rip=%p rsp=%p tid=%lu (main=%lu)",
+           code, (unsigned long long)fault_op, (void *)fault_addr, addr, rip, rsp,
+           (unsigned long)tid, (unsigned long)g_main_tid);
   log_line(msg);
+
+  log_ptr_module("  rip in module: ", rip);
+
+  /* Walk RBP frame pointer chain */
+  if (rbp) {
+    void **frame = (void **)rbp;
+    for (int f = 0; f < 16 && frame; f++) {
+      char prefix[64];
+      void *next;
+      void *ret;
+      if (IsBadReadPtr(frame, sizeof(void *) * 2)) {
+        log_line("  frame: invalid rbp pointer");
+        break;
+      }
+      next = frame[0];
+      ret = frame[1];
+      snprintf(prefix, sizeof(prefix), "  frame #%d rbp=%p ret=", f, (void *)frame);
+      log_ptr_module(prefix, ret);
+      if ((uintptr_t)next <= (uintptr_t)frame || (uintptr_t)next - (uintptr_t)frame > 0x1000000)
+        break;
+      frame = (void **)next;
+    }
+  }
+
+  /* Scan stack words for pointers into loaded modules */
   if (rsp) {
-    void **p = (void **)rsp;
+    void **sp = (void **)rsp;
     char stack_msg[512];
     snprintf(stack_msg, sizeof(stack_msg),
              "stack: %p %p %p %p %p %p %p %p",
-             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+             sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7]);
     log_line(stack_msg);
+    for (int i = 0; i < 64; i++) {
+      char prefix[64];
+      HMODULE smod = NULL;
+      if (IsBadReadPtr(&sp[i], sizeof(void *))) break;
+      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)sp[i], &smod)) {
+        snprintf(prefix, sizeof(prefix), "  stack[%02d]=%p -> ", i, sp[i]);
+        log_ptr_module(prefix, sp[i]);
+      }
+    }
   }
+
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
