@@ -147,8 +147,13 @@ static LONG WINAPI xu_veh(EXCEPTION_POINTERS *ep) {
   if (code == 0x40010006UL || code == 0x4001000AUL)
     return EXCEPTION_CONTINUE_SEARCH;
   if (ep && ep->ContextRecord) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    rip = (void *)(uintptr_t)ep->ContextRecord->Pc;
+    rsp = (void *)(uintptr_t)ep->ContextRecord->Sp;
+#else
     rip = (void *)(uintptr_t)ep->ContextRecord->Rip;
     rsp = (void *)(uintptr_t)ep->ContextRecord->Rsp;
+#endif
   }
   snprintf(msg, sizeof(msg),
            "VEH exception 0x%08lX at %p rip=%p rsp=%p",
@@ -307,6 +312,14 @@ int WINAPI WinMain(HINSTANCE a, HINSTANCE b, LPSTR c, int d) {
     log_line("after xu_force_cxx_string_syms");
     cmdline = GetCommandLineA();
     log_line("GetCommandLineA ok");
+#if defined(__aarch64__) || defined(_M_ARM64)
+    __asm__ __volatile__(
+      "mov x0, %[cl]\n\t"
+      "bl _rt_collect_args\n\t"
+      :
+      : [cl] "r" (cmdline)
+      : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
+#else
     __asm__ __volatile__(
       "mov %[cl], %%rdi\n\t"
       "call _rt_collect_args\n\t"
@@ -314,6 +327,7 @@ int WINAPI WinMain(HINSTANCE a, HINSTANCE b, LPSTR c, int d) {
       : [cl] "r" (cmdline)
       : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
         "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
+#endif
     log_line("after _rt_collect_args");
     _rt_xu_mark();
     log_line("after _rt_xu_mark");
@@ -322,6 +336,14 @@ int WINAPI WinMain(HINSTANCE a, HINSTANCE b, LPSTR c, int d) {
     _rt_win_sysinfo();
     log_line("after _rt_win_sysinfo");
     log_line("calling _xu_main");
+#if defined(__aarch64__) || defined(_M_ARM64)
+    __asm__ __volatile__(
+      "bl _xu_main\n\t"
+      "mov %w[rc], w0\n\t"
+      : [rc] "=r" (rc)
+      :
+      : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
+#else
     __asm__ __volatile__(
       "push %%rbp\n\t"
       "mov %%rsp, %%rbp\n\t"
@@ -335,6 +357,7 @@ int WINAPI WinMain(HINSTANCE a, HINSTANCE b, LPSTR c, int d) {
       :
       : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
         "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
+#endif
     {
       char m[64];
       snprintf(m, sizeof(m), "_xu_main returned %d", rc);

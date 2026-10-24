@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Convert Xu XUOBJ (windows-x64) → PE-COFF .o for linking with mingw UI host."""
+"""Convert Xu XUOBJ (windows-x64 / windows-arm64) → PE-COFF .o for linking with mingw UI host."""
 from __future__ import annotations
 
 import struct
 import sys
 from pathlib import Path
 
-MACHINE = 0x8664  # IMAGE_FILE_MACHINE_AMD64
+MACHINE_AMD64 = 0x8664
+MACHINE_ARM64 = 0xAA64
 SCN_CNT_CODE = 0x00000020
 SCN_CNT_INIT_DATA = 0x00000040
 SCN_MEM_EXECUTE = 0x20000000
@@ -110,10 +111,24 @@ def realign_data(data: bytearray, labs: list[tuple[str, int, bool]], align_n: in
     return new, out_labs
 
 
+def apply_local_branch_arm64(code: bytearray, kind: int, roff: int, target_off: int) -> None:
+    delta = (target_off - roff) // 4
+    if kind in (0, 1):
+        imm26 = delta & 0x03FFFFFF
+        opcode = 0x14000000 if kind == 0 else 0x94000000
+        struct.pack_into("<I", code, roff, opcode | imm26)
+    elif kind in (2, 3):
+        imm19 = delta & 0x0007FFFF
+        rt = code[roff] & 0x1F
+        opcode = 0xB4000000 if kind == 2 else 0xB5000000
+        struct.pack_into("<I", code, roff, opcode | (imm19 << 5) | rt)
+
+
 def convert(xuobj_path: Path, out_path: Path) -> None:
     obj = decode_xuobj(xuobj_path.read_bytes())
-    if obj["arch"] != 2:
-        raise SystemExit(f"only x64 xuobj supported (arch={obj['arch']})")
+    is_arm64 = obj["arch"] == 1
+    if obj["arch"] not in (1, 2):
+        raise SystemExit(f"only arm64=1 or x64=2 xuobj supported (arch={obj['arch']})")
     code: bytearray = obj["code"]
     data, labs = realign_data(obj["data"], list(obj["labs"]))
     local = {n: (off, is_data) for n, off, is_data in labs}
@@ -123,10 +138,16 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
         if lab in HOST_SYMS:
             pending.append((kind, roff, lab))
             continue
-        if kind == FK_REL32 and lab in local and not local[lab][1]:
-            target = local[lab][0]
-            struct.pack_into("<i", code, roff, target - (roff + 4))
-            continue
+        if is_arm64:
+            if kind in (0, 1, 2, 3) and lab in local and not local[lab][1]:
+                target = local[lab][0]
+                apply_local_branch_arm64(code, kind, roff, target)
+                continue
+        else:
+            if kind == FK_REL32 and lab in local and not local[lab][1]:
+                target = local[lab][0]
+                struct.pack_into("<i", code, roff, target - (roff + 4))
+                continue
         pending.append((kind, roff, lab))
 
     defined: list[tuple[str, int, int]] = []
@@ -156,15 +177,24 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
 
     text_relocs: list[tuple[int, int, int]] = []
     for kind, roff, lab in pending:
-        if kind == FK_REL32:
-            text_relocs.append((roff, sym_index[lab], IMAGE_REL_AMD64_REL32))
-        elif kind == FK_RIP32:
-            if lab.startswith("_iat_"):
-                text_relocs.append((roff, sym_index[iat_imp_name(lab)], IMAGE_REL_AMD64_REL32))
+        sym_name = iat_imp_name(lab) if lab.startswith("_iat_") else lab
+        if is_arm64:
+            if kind in (0, 1):
+                text_relocs.append((roff, sym_index[sym_name], 3))
+            elif kind in (2, 3):
+                text_relocs.append((roff, sym_index[sym_name], 15))
+            elif kind == 4:
+                text_relocs.append((roff, sym_index[sym_name], 4))
+                text_relocs.append((roff + 4, sym_index[sym_name], 6))
             else:
-                text_relocs.append((roff, sym_index[lab], IMAGE_REL_AMD64_REL32))
+                raise SystemExit(f"unknown arm64 reloc kind {kind}")
         else:
-            raise SystemExit(f"unknown reloc kind {kind}")
+            if kind == FK_REL32:
+                text_relocs.append((roff, sym_index[lab], IMAGE_REL_AMD64_REL32))
+            elif kind == FK_RIP32:
+                text_relocs.append((roff, sym_index[sym_name], IMAGE_REL_AMD64_REL32))
+            else:
+                raise SystemExit(f"unknown x64 reloc kind {kind}")
 
     strings = bytearray()
     str_index: dict[str, int] = {}
@@ -201,7 +231,7 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
             raw_off,
             reloc_off,
             0,
-            nreloc,
+            nreloc if nreloc < 65535 else 0xFFFF,
             0,
             chars,
         )
@@ -209,7 +239,7 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
     out = bytearray()
     out += struct.pack(
         "<HHIIIHH",
-        MACHINE,
+        MACHINE_ARM64 if is_arm64 else MACHINE_AMD64,
         nsections,
         0,
         symtab_off,
