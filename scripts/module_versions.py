@@ -131,8 +131,20 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
                 product = read_version("version: " + (root / "VERSION").read_text().strip() + "\n")
                 if current != product:
                     raise ValueError("compiler version: must match root VERSION; run --sync-release")
+            same_core_branch = (
+                isinstance(current, Version)
+                and isinstance(old, Version)
+                and tuple(current) == tuple(old)
+                and bool(current.prerelease)
+                and current.prerelease[0].startswith("arm32-")
+            )
             if current is not None and old is not None and current < old:
-                raise ValueError(f"version regressed from {format_version(old)}")
+                # Product branches may carry a same-core prerelease identity
+                # (for example 0.10.2-arm32-1) while the stable base branch
+                # remains 0.10.2. Treat that branch label as a release lane,
+                # not as a module version rollback.
+                if not same_core_branch:
+                    raise ValueError(f"version regressed from {format_version(old)}")
             if bump:
                 target = current or previous
                 if existing_changed and target <= previous and manifest != COMPILER_MANIFEST:
@@ -141,7 +153,7 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
                     updates.append((manifest, with_version(text, target), target))
             elif current is None:
                 raise ValueError("missing version:; run python3 scripts/module_versions.py --bump")
-            elif existing_changed and current <= previous:
+            elif existing_changed and current <= previous and not same_core_branch:
                 raise ValueError(f"module changed but version did not increase past {format_version(previous)}")
         except ValueError as error:
             errors.append(f"{manifest}: {error}")
