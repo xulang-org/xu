@@ -920,6 +920,15 @@ static int draw_handle(XuContentPlugin *p, const char *cmd) {
     else { p->input_enabled = 1; p->pointer_inside = 0; }
     return 1;
   }
+  if (strcmp(cmd, "motion_preferences") == 0) {
+    gboolean animations = TRUE;
+    GtkSettings *settings = p->area ? gtk_widget_get_settings(p->area) : gtk_settings_get_default();
+    if (settings) g_object_get(settings, "gtk-enable-animations", &animations, NULL);
+    char event[128];
+    snprintf(event, sizeof(event), "canvas_preferences\t%u\t%u\t%u\t%d", p->host.window_id, p->host.canvas_id, p->canvas_generation, animations ? 0 : 1);
+    xu_content_event(&p->host, event);
+    return 1;
+  }
   if (strncmp(cmd, "cursor\t", 7) == 0) {
     if (cmd[7] < '0' || cmd[7] > '5' || cmd[8]) return 0;
     const char *cursors[] = {"default", "text", "crosshair", "pointer", "ew-resize", "ns-resize"};

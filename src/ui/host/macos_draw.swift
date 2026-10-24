@@ -1278,10 +1278,20 @@ final class XuDrawPlugin: NSObject, XuContentPlugin {
       else { canvas.inputEnabled = true; canvas.inputPoint = nil }
       return true
     }
+    if s == "motion_preferences" {
+      let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 1 : 0
+      shell.appendShellFile("canvas_preferences\t\(canvas.windowID)\t\(canvas.canvasID)\t\(generation)\t\(reduced)")
+      return true
+    }
     if s.hasPrefix("cursor\t") {
       guard let index = Int(s.dropFirst(7)), (0...5).contains(index) else { return false }
       canvas.cursorIndex = index
       canvas.window?.invalidateCursorRects(for: canvas)
+      if let window = canvas.window, window.isKeyWindow,
+         canvas.bounds.contains(canvas.convert(window.mouseLocationOutsideOfEventStream, from: nil)) {
+        let cursors: [NSCursor] = [.arrow, .iBeam, .crosshair, .pointingHand, .resizeLeftRight, .resizeUpDown]
+        cursors[index].set()
+      }
       return true
     }
     if s.hasPrefix("__draw_frame\t") {

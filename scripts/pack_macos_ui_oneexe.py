@@ -240,6 +240,7 @@ def run_product_compiler(xu: pathlib.Path, args: list[str]) -> None:
     subprocess.check_call(
         [str(PRODUCT_COMPILER_RUNNER), str(xu), *args],
         cwd=str(ROOT),
+        env=dict(os.environ, XU_UI_PACK="1"),
     )
 
 
