@@ -98,6 +98,22 @@ PY
     esac
 }
 
+run_qemu_stm32f4() {
+    local elf=$1 want=$2 name=$3
+    out=$(python3 - "$elf" <<'PY'
+import subprocess, sys
+p = subprocess.Popen(["qemu-system-arm","-M","olimex-stm32-h405","-nographic","-kernel",sys.argv[1]],
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+try: out, _ = p.communicate(timeout=8)
+except subprocess.TimeoutExpired: p.kill(); out, _ = p.communicate()
+print(out.decode("utf-8", "replace"))
+PY
+)
+    case "$out" in *"$want"*) echo "PASS $name (stm32f4/$want)"; pass=$((pass + 1)) ;;
+        *) echo "FAIL $name (stm32f4 missing '$want')"; echo "$out"; fail_n=$((fail_n + 1)) ;;
+    esac
+}
+
 run_qemu_rv32() {
     local elf=$1 want=$2 name=$3
     out=$(python3 - "$elf" <<'PY'
@@ -121,6 +137,14 @@ if command -v qemu-system-arm >/dev/null 2>&1; then
     compile_product tests/embedded/irq_xu.xu --target thumbv7em-none -o "$tmp/irq_thumb.elf" \
         || fail "gen1 thumb irq_xu build"
     run_qemu_arm "$tmp/irq_thumb.elf" "7" "irq_xu"
+    if qemu-system-arm -M help 2>&1 | grep -q "olimex-stm32-h405"; then
+        compile_product tests/embedded/stm32f4_smoke.xu --target thumbv7em-none --board stm32f4 -o "$tmp/stm32f4_smoke.elf" \
+            || fail "gen1 thumb stm32f4_smoke build"
+        run_qemu_stm32f4 "$tmp/stm32f4_smoke.elf" "STM32F4_OK" "stm32f4_smoke"
+    else
+        echo "SKIP stm32f4 (no olimex-stm32-h405 machine in qemu-system-arm)"
+        skip=$((skip + 1))
+    fi
 else
     echo "SKIP thumb (no qemu-system-arm)"
     skip=$((skip + 2))
