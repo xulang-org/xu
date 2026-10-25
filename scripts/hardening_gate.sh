@@ -113,7 +113,7 @@ step "LLVM-style virtual-register matrix"
 run ./scripts/test_vreg_matrix.sh --xu="$XU_COMPILER_PATH"
 
 step "Gen1 heap-ledger capability"
-if rg -q 'const[[:space:]]+gen1_heap_ledger_enabled[[:space:]]*=[[:space:]]*1' \
+if rg -q 'const[[:space:]]+(GEN1_HEAP_LEDGER_ENABLED|gen1_heap_ledger_enabled)[[:space:]]*=[[:space:]]*1' \
     "$ROOT/src/cmd/compile/rt_heap_sync.xu"; then
     echo "hardening_gate: Gen1 heap ledger capability=enabled"
 else

@@ -35,11 +35,12 @@ cmp path/to/file.xu /tmp/xu-file-formatted.xu
 | 编号 | 要求 |
 | --- | --- |
 | XU-NAME-01 | struct、enum、方法集、类型参数和枚举变体使用 PascalCase，例如 `HttpRequest`、`Reader`、`T`。 |
-| XU-NAME-02 | 函数、方法、变量、参数、字段、常量与生命周期名称使用 snake_case，例如 `read_exact`、`buffer_size`、`max_body_bytes`；常量不使用全大写下划线形式。 |
-| XU-NAME-03 | 对外可见性显式使用 `pub`；类型名首字母大写不表示导出。只开放实际契约需要的声明与字段。 |
-| XU-NAME-04 | 不遮蔽被调用的内建入口、包别名或重要类型；包装函数须确认调用的是底层实现，避免同名递归。 |
+| XU-NAME-02 | 函数、方法、变量、参数、字段与生命周期名称使用 snake_case，例如 `read_exact`、`buffer_size`、`max_body_bytes`。 |
+| XU-NAME-03 | 常量（`const` / `pub const`）标识符必须使用全大写下划线形式（SCREAMING_SNAKE_CASE），例如 `BLOCK_SIZE`、`MAX_BUFFER_BYTES`、`DEFAULT_TIMEOUT_MS`；新增或修改的代码中常量禁止使用小写形式。存量历史代码在过渡期逐步整改。 |
+| XU-NAME-04 | 对外可见性显式使用 `pub`；类型名首字母大写不表示导出。只开放实际契约需要的声明与字段。 |
+| XU-NAME-05 | 不遮蔽被调用的内建入口、包别名或重要类型；包装函数须确认调用的是底层实现，避免同名递归。 |
 
-命名规则由 `src/xu/types/check_00_names.xu` 实施；单个前导 `_` 和弃值 `_` 按语言实际规则使用。`__` 等内部保留标识不作为用户代码规避命名检查的手段。
+命名规则由 `src/xu/types/check_00_names.xu` 及门禁脚本 `scripts/check_const_casing.py` 实施；单个前导 `_` 和弃值 `_` 按语言实际规则使用。`__` 等内部保留标识不作为用户代码规避命名检查的手段。
 
 名称说明角色、单位或边界，例如 `timeout_ms`、`body_len`、`read_count`。局部循环中的 `i`、`j`，编译器惯用的 AST/MIR 标识可以保留；跨较长作用域时使用更具体的名称。不要在同一接口中混用含义不同的 `size`、`len` 和 `cap`。
 

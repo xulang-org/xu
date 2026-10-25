@@ -201,8 +201,11 @@ xu build main.xu -o myapp
 | `xu setup -y` | 静默安装并配置工具链环境 |
 | `xu up --check` | 仅检查官方发布版本；`xu up` 与 `xu update` 为同义命令 |
 | `xu update --version 0.9.4` | 安装指定版本的官方工具链 |
+| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | 从本地 SDK 归档安装，无需联网 |
 | `xu --version` | 显示实际编译器版本及宿主目标 |
 | `xu help <command>` | 查看子命令帮助，也可使用 `<command> --help` |
+
+自更新由独立工具 `xu-update`（`src/cmd/update`）执行，HTTPS、gzip、tar、ZIP 和文件操作使用 Xu 标准库。可通过 `make xu-update` 构建，发布 SDK 默认包含此工具。`xu-setup` 共用 `internal/sdk` 下载与解包代码。下载时实时显示已下载量；服务器提供总大小时同时显示百分比，安装向导也会更新进度条。 安装向导使用 `ui/layout` 与 `ui/widgets` 的标准组件，自动识别安装位置，支持键盘操作和失败重试。默认沿用 PATH 中现有 SDK，首次安装使用 `~/.xu`。Windows 可选择当前用户或所有用户，系统安装会请求管理员授权；命令行仍支持 `--prefix DIR`。
 
 ---
 

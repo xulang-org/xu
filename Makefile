@@ -12,7 +12,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help memsafe all xu xu-desktop xu-fmt xu-doctor xu-map xu-doc xu-setup xu-lsp xu-native xu-platform tools \
+.PHONY: help memsafe all xu xu-desktop xu-fmt xu-doctor xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-platform tools \
 	server-build-local server-build-linux server-check-linux server-start server-health server-smoke-local server-unit \
 	server-remote-check server-remote-deploy server-remote-status server-remote-health server-remote-smoke \
 	server-remote-restart server-remote-stop server-remote-rollback \
@@ -40,10 +40,11 @@ help:
 	@echo "  make xu-fmt          formatter → $(BIN)/xu-fmt"
 	@echo "  make xu-map          source path map → $(BIN)/xu-map"
 	@echo "  make xu-doc          declaration docs → $(BIN)/xu-doc"
+	@echo "  make xu-update       standard-library self-updater → $(BIN)/xu-update"
 	@echo "  make xu-setup        standalone installer → $(BIN)/xu-setup"
 	@echo "  make xu-lsp          language server → $(BIN)/xu-lsp"
 	@echo "  make xu-native       native C module tool → $(BIN)/xu-native"
-	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup + xu-lsp + xu-native (needs $(XU))"
+	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup + xu-update + xu-lsp + xu-native (needs $(XU))"
 	@echo "  make server-build-local  build xu-examples/examples/11_http_server for this host"
 	@echo "  make server-build-linux  cross-build Xu HTTP server for linux-x64"
 	@echo "  make server-check-linux  build + verify linux-x64 ELF"
@@ -99,6 +100,7 @@ DOCTOR_XU  := $(wildcard src/cmd/doctor/*.xu)
 FMT_XU     := $(wildcard src/cmd/fmt/*.xu)
 MAP_XU     := $(wildcard src/cmd/map/*.xu)
 DOC_XU     := $(wildcard src/cmd/doc/*.xu)
+UPDATE_XU  := $(wildcard src/cmd/update/*.xu)
 SETUP_XU   := $(wildcard src/cmd/setup/*.xu)
 LSP_XU     := $(wildcard src/cmd/lsp/*.xu)
 NATIVE_XU  := $(wildcard src/cmd/native/*.xu)
@@ -121,6 +123,7 @@ XU_DOCTOR  := $(BIN)/xu-doctor$(EXE_SUFFIX)
 XU_FMT     := $(BIN)/xu-fmt$(EXE_SUFFIX)
 XU_MAP     := $(BIN)/xu-map$(EXE_SUFFIX)
 XU_DOC     := $(BIN)/xu-doc$(EXE_SUFFIX)
+XU_UPDATE  := $(BIN)/xu-update$(EXE_SUFFIX)
 XU_SETUP   := $(BIN)/xu-setup$(EXE_SUFFIX)
 XU_LSP     := $(BIN)/xu-lsp$(EXE_SUFFIX)
 XU_NATIVE  := $(BIN)/xu-native$(EXE_SUFFIX)
@@ -161,13 +164,14 @@ product-selfhost: $(XU)
 xu-platform: $(XU)
 	./scripts/build_platform_xu.sh $(XU) $(BIN)/platform
 
-tools: xu-doctor xu-desktop xu-fmt xu-map xu-doc xu-setup xu-lsp xu-native
+tools: xu-doctor xu-desktop xu-fmt xu-map xu-doc xu-setup xu-update xu-lsp xu-native
 
 xu-desktop: $(XU_DESKTOP)
 xu-doctor: $(XU_DOCTOR)
 xu-fmt: $(XU_FMT)
 xu-map: $(XU_MAP)
 xu-doc: $(XU_DOC)
+xu-update: $(XU_UPDATE)
 xu-setup: $(XU_SETUP)
 xu-lsp: $(XU_LSP)
 xu-native: $(XU_NATIVE)
@@ -202,6 +206,9 @@ $(XU_MAP): $(XU) src/cmd/map/xu.xun $(MAP_XU) $(XU_PKG_XU) | $(BIN)
 
 $(XU_DOC): $(XU) src/cmd/doc/xu.xun $(DOC_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-doc)
+
+$(XU_UPDATE): $(XU) src/cmd/update/xu.xun $(UPDATE_XU) $(XU_SOURCE_XU) | $(BIN)
+	$(call build_product_tool,xu-update)
 
 $(XU_SETUP): $(XU) src/cmd/setup/xu.xun $(SETUP_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-setup)
