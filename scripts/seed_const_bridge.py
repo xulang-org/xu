@@ -61,6 +61,13 @@ def main() -> None:
     digest = prepare(seed, destination)
     print('seed_const_bridge: disposable published-SDK source sha256=' + digest, flush=True)
     (destination / 'source.sha256').write_text(digest + '\n')
+    # Legacy internal-package lookup also considers the executable's SDK root.
+    # Keep the seed beside the private sources so a CI bin/xu cannot shadow
+    # them with the current repository's incompatible constant declarations.
+    private_seed = destination / 'bin' / seed.name
+    private_seed.parent.mkdir()
+    shutil.copy2(seed, private_seed)
+    private_seed.chmod(0o755)
     sources = sorted((destination / 'src/cmd/compile').glob('*.xu'))
     main_source = destination / 'src/cmd/compile/main.xu'
     sources.remove(main_source)
@@ -68,7 +75,7 @@ def main() -> None:
     if profile[:1] == ['--']:
         profile = profile[1:]
     env = dict(os.environ, XU_ROOT=destination.as_posix(), XU_STDLIB_ROOT=(destination / 'src').as_posix(), XUPATH='')
-    subprocess.run([str(seed), 'build', *profile, str(main_source), *map(str, sources), '-o', str(output)],
+    subprocess.run([str(private_seed), 'build', *profile, str(main_source), *map(str, sources), '-o', str(output)],
                    cwd=destination, env=env, check=True)
 
 
