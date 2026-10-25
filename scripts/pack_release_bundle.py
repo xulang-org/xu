@@ -185,7 +185,12 @@ def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, c
         "-o",
         str(cached_tool),
     ]
-    if tool_name == "xu-setup" and target == "windows-x64":
+    if tool_name == "xu-setup" and target.startswith("macos-") and sys.platform == "darwin":
+        cmd = [sys.executable, str(REPO_ROOT / "scripts/pack_macos_ui_oneexe.py"),
+               "--src", str(REPO_ROOT / src_dir / "main.xu"), "--no-webview",
+               "--arch", target.removeprefix("macos-"), "--xu", str(xu_bin),
+               "-o", str(cached_tool)]
+    elif tool_name == "xu-setup" and target == "windows-x64":
         cross_cxx = shutil.which("x86_64-w64-mingw32-g++") or (shutil.which("g++") if os.name == "nt" else None)
         if cross_cxx:
             cmd = [sys.executable, str(REPO_ROOT / "scripts/pack_windows_ui_oneexe.py"),
