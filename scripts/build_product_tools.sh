@@ -46,6 +46,14 @@ build_one() {
         fi
         echo "build_product_tools: Windows UI setup unavailable; falling back to standard setup" >&2
     fi
+    if [ "$name" = xu-setup ] && [ "$("$XU" env HOST_OS)" = macos ]; then
+        if python3 scripts/pack_macos_ui_oneexe.py --src "$src/main.xu" \
+            --no-webview --xu "$XU" -o "$tools_staged/$name"; then
+            install_one "$tools_staged/$name" "$OUT/$name"
+            return
+        fi
+        echo "build_product_tools: macOS UI setup unavailable; falling back to console setup" >&2
+    fi
     # After gen1/gen2/gen3 the compiler hop can sit near 6GiB RSS. The next
     # `xu build` is a new process; macOS may still SIGKILL it (137). Retry once.
     if ! "$PRODUCT_RUN" "$XU" build "$src" -o "$tools_staged/$name"; then
