@@ -205,8 +205,11 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu setup -y` | Install and configure the toolchain without interactive prompts |
 | `xu up --check` | Check official releases; `xu up` and `xu update` are aliases |
 | `xu update --version 0.9.4` | Install a specific official toolchain release |
+| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | Install a local SDK archive without network access |
 | `xu --version` | Show the actual compiler version and host target |
 | `xu help <command>` | Show subcommand help; `<command> --help` also works |
+
+Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using Xu standard libraries for HTTPS, gzip, tar, ZIP, and file operations. Build it with `make xu-update`; release SDKs include it. `xu-setup` uses the same `internal/sdk` download and extraction code. Downloads show transferred bytes and, when the total size is known, a percentage; the setup wizard also updates its progress bar. The wizard uses standard `ui/layout` and `ui/widgets` components, with automatic SDK detection, keyboard navigation, and retry on failure. The existing SDK selected by PATH is reused; a new installation defaults to `~/.xu`. Windows offers current-user and all-users scopes; the system scope requests administrator elevation. Use `--prefix DIR` to override the destination from the CLI.
 
 ---
 

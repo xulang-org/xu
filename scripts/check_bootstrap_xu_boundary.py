@@ -590,12 +590,12 @@ class BoundaryCheck:
             self.error(f"cannot read Gen1 heap policy: {exc}")
         else:
             declarations = re.findall(
-                r"\bconst\s+gen1_heap_ledger_enabled\s*=\s*(-?\d+)\b", heap_source
+                r"\bconst\s+(?:GEN1_HEAP_LEDGER_ENABLED|gen1_heap_ledger_enabled)\s*=\s*(-?\d+)\b", heap_source
             )
             if declarations != [str(default_ledger)]:
                 self.error(
                     "Gen1 heap ledger default must be exactly "
-                    f"const gen1_heap_ledger_enabled = {default_ledger}; got {declarations!r}"
+                    f"const GEN1_HEAP_LEDGER_ENABLED = {default_ledger}; got {declarations!r}"
                 )
             self.info["gen1_heap_ledger_enabled"] = int(declarations[0]) if declarations else None
 

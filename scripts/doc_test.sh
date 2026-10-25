@@ -31,11 +31,11 @@ cp tests/doc/basic.xu "$doc_tmp/tree/nested/basic.xu"
 grep -q '### pub struct Box#T' "$doc_tmp/nested.md"
 
 "$DOC_BIN" tests/doc_public.xu --public > "$doc_tmp/public.md"
-grep -q '### pub const Visible' "$doc_tmp/public.md"
+grep -q '### pub const VISIBLE' "$doc_tmp/public.md"
 grep -q '### pub struct PublicBox' "$doc_tmp/public.md"
 grep -q '### struct@ Contract' "$doc_tmp/public.md"
 grep -q 'pub value int' "$doc_tmp/public.md"
-if grep -Eq 'Hidden|Secret|helper|private int' "$doc_tmp/public.md"; then
+if grep -Eq 'HIDDEN|Secret|helper|private int' "$doc_tmp/public.md"; then
     echo "doc_test: --public leaked a private declaration or field" >&2
     exit 1
 fi
