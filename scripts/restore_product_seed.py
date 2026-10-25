@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Restore a hosted seed from a published SDK; never substitute a primer."""
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -56,6 +57,19 @@ def restore(target: str, archives: Path, destination: Path, *, replace_existing:
     with tempfile.TemporaryDirectory(prefix='xu-product-seed-') as temporary:
         compiler = extract_seed(archives, target, Path(temporary) / 'sdk')
         destination.parent.mkdir(parents=True, exist_ok=True)
+        # Preserve the matching published sources for one-time language
+        # migrations. The binary digest prevents reusing another SDK's tree.
+        sdk_root = compiler.parent.parent
+        if (sdk_root / 'src/cmd/compile/main.xu').is_file() and (sdk_root / 'VERSION').is_file():
+            digest = hashlib.sha256(compiler.read_bytes()).hexdigest()
+            source_cache = destination.parent / '.xu-seed-sources' / digest
+            if not source_cache.exists():
+                source_cache.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix='.seed-source-', dir=source_cache.parent) as source_stage:
+                    staged_source = Path(source_stage) / 'sdk'
+                    shutil.copytree(sdk_root / 'src', staged_source / 'src')
+                    shutil.copy2(sdk_root / 'VERSION', staged_source / 'VERSION')
+                    os.rename(staged_source, source_cache)
         # Complete SDK identity verification and copying before replacing a
         # partially restored cache. A failed download/extraction/install keeps
         # the previous bytes, and Mach-O installation receives a fresh inode.
