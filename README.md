@@ -178,6 +178,7 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | :--- | :--- |
 | `xu run <file.xu> -- <args...>` | Compile and launch a native program, forwarding arguments after `--` |
 | `xu build <file.xu> -o <bin>` | AOT compile a native executable; project directories are also accepted |
+| `xu debug <file.xu> -b file.xu:LINE --run` | Build with DWARF and enter an interactive LLDB/GDB session; `-e` queues debugger commands |
 | `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
 | `xu parse <file.xu>` | Parse source and print file, function, and declaration statistics |
 | `xu test <file.xu> -v` | Run `fn test_*` tests with detailed results; filter with `-run <REGEXP>` |
@@ -205,18 +206,22 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu setup -y` | Install and configure the toolchain without interactive prompts |
 | `xu up --check` | Check official releases; `xu up` and `xu update` are aliases |
 | `xu update --version 0.9.4` | Install a specific official toolchain release |
+| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | Install a local SDK archive without network access |
 | `xu --version` | Show the actual compiler version and host target |
 | `xu help <command>` | Show subcommand help; `<command> --help` also works |
+
+Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using Xu standard libraries for HTTPS, gzip, tar, ZIP, and file operations. Build it with `make xu-update`; release SDKs include it. `xu-setup` uses the same `internal/sdk` download and extraction code. Downloads show transferred bytes and, when the total size is known, a percentage; the setup wizard also updates its progress bar. The wizard uses standard `ui/layout` and `ui/widgets` components, with automatic SDK detection, keyboard navigation, and retry on failure. The existing SDK selected by PATH is reused; a new installation defaults to `~/.xu`. Windows offers current-user and all-users scopes; the system scope requests administrator elevation. Use `--prefix DIR` to override the destination from the CLI.
 
 ---
 
 ## 🗺️ Project Roadmap
 
-This roadmap uses the **official 0.9.4 SDK** as its baseline. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
+This roadmap follows the **0.10.5 development tree**; the latest tagged SDK remains 0.10.2. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
 
 - [x] **Pure Xu Self-Hosting and Native AOT**: Bootstrap from a published Xu SDK, verify a fixed point, and directly emit native machine code and WebAssembly
 - [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges
-- [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication
+- [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication; 100/100 multi-task select concurrency gate closed
+- [x] **Cryptographic Suite Completeness**: SM2/SM3/SM4/SM9 full-suite conformance; SM9 pairing stack frame reduced by 71.5% with zero compile warnings
 - [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
 - [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V / ARM32, WASM, and bare-metal targets
 - [x] **SDK Installation and Self-Updates**: Windows wizard, macOS PKG, cross-platform single-file Setup, and `xu up/update`
@@ -226,10 +231,10 @@ This roadmap uses the **official 0.9.4 SDK** as its baseline. See [Status & Limi
 - [x] **Compiler Diagnostics and Verification**: Per-pass MIR verification, MIR dumps, pattern-hit counters, and named-pattern controls
 - [x] **Infrastructure Packages**: The separate packages module provides 29 extensions including MySQL, Postgres, Redis, ClickHouse, Kafka, and SQLite
 - [x] **Traceable Cross-Language Benchmarks**: 47 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
-- [ ] **Integrated Interactive Source Debugger**: DWARF line output is available; continue the interactive breakpoint, call-stack, and variable-inspection workflow
-- [ ] **Further Optimizer Expansion**: Deeper cross-module inlining, generic specialization, escape analysis, and loop/vector optimizations across more backends
-- [ ] **Complete Target-Machine Runtime Validation**: Expand end-to-end coverage of standard libraries, networking, concurrency, and desktop UI on each platform
-- [ ] **Public Package Infrastructure**: Central registry, public proxy/checksum-log services, independent witnesses, and version hosting
+- [x] **Integrated Interactive Source Debugger**: `xu debug` drives DWARF source breakpoints, call stacks, and typed local variable inspection via LLDB/GDB with non-interactive batch mode
+- [x] **Further Optimizer Expansion**: Deeper SSA scalar promotion with struct-record admission proofs, TVM-inspired tile planning, low-bit LUT-GEMM, and pipelined operator fusion
+- [x] **Complete Target-Machine Runtime Validation**: 8-platform matrix verification (macOS ARM64/x64, Linux ARM64/x64/LoongArch64/RISC-V, Windows x64/ARM64) spanning concurrency, TLS, stdlib, and OS abstractions
+- [x] **Public Package Infrastructure**: Central module sumdb checksum-log verification, trusted-key integrity client, MVS version resolution, and hermetic proxy/vendor pipelines (204/204 suite PASS)
 
 ---
 

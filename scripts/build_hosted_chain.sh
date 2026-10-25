@@ -233,6 +233,7 @@ FAILED_STAGE="seed_to_gen1"
 SEED_MANIFEST_BRIDGE=none
 BRIDGE_SOCKET_SHA256=SKIPPED
 BRIDGE_SEED_SHA256=SKIPPED
+BRIDGE_CONST_SOURCE_SHA256=SKIPPED
 # shellcheck disable=SC2086
 set +u
 if "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin" >"$tmp/seed-build.log" 2>&1; then
@@ -242,7 +243,22 @@ else
 fi
 set -u
 cat "$tmp/seed-build.log"
-if [ "$seed_build_rc" -ne 0 ]; then
+if [ "$seed_build_rc" -ne 0 ] && grep -Eq "const '[A-Z_][A-Z0-9_]*' must be snake_case" "$tmp/seed-build.log"; then
+    FAILED_STAGE="const_naming_seed_bridge"
+    set +u
+    python3 scripts/seed_const_bridge.py --seed "$SEED" \
+        --destination "$tmp/const-bridge" --output "$tmp/const-bootstrap.xin" -- "${HOSTED_ARGS[@]}"
+    set -u
+    BRIDGE_SEED=$(pick_bin "$tmp/const-bootstrap.xin")
+    BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
+    BRIDGE_CONST_SOURCE_SHA256=$(cat "$tmp/const-bridge/source.sha256")
+    SEED_MANIFEST_BRIDGE=const_naming_v1
+    FAILED_STAGE="bridged_seed_to_gen1"
+    # The transition artifact is not counted as Gen1 and is never installed.
+    set +u
+    "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin"
+    set -u
+elif [ "$seed_build_rc" -ne 0 ]; then
     # Older hosted SDKs cannot type-check the new, unused os wrapper. Build
     # an intermediate compiler without that wrapper, then restart Gen1 on
     # the complete original source. Never install or compare the bridge as
@@ -401,6 +417,7 @@ seed_sha256=$SEED_SHA256
 seed_manifest_bridge=$SEED_MANIFEST_BRIDGE
 bridge_socket_sha256=$BRIDGE_SOCKET_SHA256
 bridge_seed_sha256=$BRIDGE_SEED_SHA256
+bridge_const_source_sha256=$BRIDGE_CONST_SOURCE_SHA256
 source_seed_files=$SOURCE_SEED_FILES
 source_seed_sha256=$SOURCE_SEED_SHA256
 source_closure_files=$SOURCE_CLOSURE_FILES

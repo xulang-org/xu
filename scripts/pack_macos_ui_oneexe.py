@@ -343,7 +343,7 @@ def main() -> None:
             xu,
             [
                 "build",
-                str(xu_src),
+                str(xu_src.parent if xu_src.name == "main.xu" and (xu_src.parent / "xu.xun").is_file() else xu_src),
                 "--target",
                 xu_target,
                 "--emit-obj",

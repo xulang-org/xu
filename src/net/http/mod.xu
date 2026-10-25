@@ -200,6 +200,10 @@ fn find_crlf_crlf(s &string) int {
 }
 
 fn parse_content_length(headers &string) int {
+    << parse_content_length_limit(headers, MAX_MESSAGE_BYTES)
+}
+
+fn parse_content_length_limit(headers &string, limit int) int {
     cl := "content-length"
     h := headers + ""
     hlen := h.len
@@ -257,8 +261,11 @@ fn parse_content_length(headers &string) int {
                     if c < 48 || c > 57 {
                         << -1
                     }
+                    if n > (limit - (c - 48)) / 10 {
+                        << -1
+                    }
                     n = n * 10 + (c - 48)
-                    if n > max_message_bytes {
+                    if n > limit {
                         << -1
                     }
                     k = k + 1
@@ -467,6 +474,10 @@ fn is_chunked(headers &string) bool {
 }
 
 fn parse_hex_size(s0 string) int {
+    << parse_hex_size_limit(s0, MAX_MESSAGE_BYTES) or >>
+}
+
+fn parse_hex_size_limit(s0 string, limit int) int {
     s := s0 + ""
     mut end := s.len
     for i in 0:s.len {
@@ -491,8 +502,9 @@ fn parse_hex_size(s0 string) int {
         } else {
             >> errors.new("net/http: bad chunk size")
         }
+        if n > (limit - v) / 16 { >> errors.new("net/http: chunk too large") }
         n = n * 16 + v
-        if n > max_message_bytes {
+        if n > limit {
             >> errors.new("net/http: chunk too large")
         }
     }
@@ -527,26 +539,34 @@ struct MsgBuf {
     tls_h int
     tls_conn tls.Conn
     deadline_ns int
+    max_bytes int
+    progress DownloadProgress
+}
+
+fn (b &MsgBuf) message_limit() int {
+    if b.max_bytes > 0 { << b.max_bytes }
+    << MAX_MESSAGE_BYTES
 }
 
 fn (b &mut MsgBuf) read_more() int {
     mut chunk := ""
     if b.tls_h != 0 {
         t := mut &b.tls_conn
-        chunk = t.read(read_chunk_bytes) or >>
+        chunk = t.read(READ_CHUNK_BYTES) or >>
     } else {
         if b.deadline_ns > 0 {
             apply_http_deadline(b.fd, b.deadline_ns) or >>
         }
-        chunk = net.conn_read(b.fd, read_chunk_bytes) or >>
+        chunk = net.conn_read(b.fd, READ_CHUNK_BYTES) or >>
     }
     if chunk.len == 0 {
         << 0
     }
     b.data = b.data + chunk
-    if b.data.len > max_message_bytes {
+    if b.data.len > b.message_limit() {
         >> errors.new("net/http: message too large")
     }
+    b.report_buffered_progress(false)
     << chunk.len
 }
 
@@ -563,16 +583,18 @@ fn (b &mut MsgBuf) decode_chunked(body_start int) string {
             line_end = find_crlf_from(&b.data, i)
         }
         size_line := b.data[i:line_end]
-        size_r := parse_hex_size(size_line + "") or >>
+        size_r := parse_hex_size_limit(size_line + "", b.message_limit()) or >>
         size := size_r
         i = line_end + 2
         if size == 0 {
             if i + 1 < b.data.len && (b.data[i] & 255) == 13 && (b.data[i + 1] & 255) == 10 {
+                b.report_progress(out.len, true)
                 << out + ""
             }
             mut trailer_end := find_crlf_crlf_from(&b.data, i)
             while trailer_end < 0 {
                 if i + 1 < b.data.len && (b.data[i] & 255) == 13 && (b.data[i + 1] & 255) == 10 {
+                    b.report_progress(out.len, true)
                     << out + ""
                 }
                 n_r2 := b.read_more() or >>
@@ -581,22 +603,27 @@ fn (b &mut MsgBuf) decode_chunked(body_start int) string {
                 }
                 trailer_end = find_crlf_crlf_from(&b.data, i)
             }
+            b.report_progress(out.len, true)
             << out + ""
         }
         need := i + size + 2
         while b.data.len < need {
+            mut available := b.data.len - i
+            if available > size { available = size }
+            b.report_progress(out.len + available, false)
             n_r3 := b.read_more() or >>
             if n_r3 == 0 {
                 >> errors.new("net/http: truncated chunk")
             }
         }
         out = out + b.data[i:(i + size)]
+        b.report_progress(out.len, false)
         i = i + size
         if (b.data[i] & 255) != 13 || (b.data[i + 1] & 255) != 10 {
             >> errors.new("net/http: bad chunk CRLF")
         }
         i = i + 2
-        if round > max_read_iterations {
+        if round > MAX_READ_ITERATIONS {
             >> errors.new("net/http: too many chunks")
         }
     }
@@ -653,30 +680,22 @@ fn read_http_message_buf(b &mut MsgBuf, until_close bool) string {
             header_end = find_crlf_crlf(&b.data)
             if header_end >= 0 {
                 hdr := b.data[0:header_end]
-                cl = parse_content_length(&hdr)
+                cl = parse_content_length_limit(&hdr, b.message_limit())
                 chunked = is_chunked(&hdr)
                 if chunked {
                     cl = -1
                 }
+                b.start_progress(header_end, cl, chunked)
             }
         }
         if header_end >= 0 {
-            if chunked {
-                <-
-            }
-            body_so_far := b.data.len - (header_end + 4)
-            if cl >= 0 && body_so_far >= cl {
-                <-
-            }
-            if cl < 0 && !until_close {
-                <-
-            }
+            <-
         }
         n_r := b.read_more()
         if n_r == 0 {
             <-
         }
-        if round > max_read_iterations {
+        if round > MAX_READ_ITERATIONS {
             <-
         }
     }
@@ -699,6 +718,7 @@ fn read_http_message_buf(b &mut MsgBuf, until_close bool) string {
                 >> errors.new("net/http: truncated body")
             }
         }
+        b.report_buffered_progress(true)
         msg := b.data[0:need] + ""
         if b.data.len > need {
             b.data = b.data[need:b.data.len]
@@ -707,6 +727,17 @@ fn read_http_message_buf(b &mut MsgBuf, until_close bool) string {
         }
         << msg
     }
+    if until_close {
+        mut ended := false
+        for round in 0:MAX_READ_ITERATIONS {
+            if b.read_more() == 0 {
+                ended = true
+                <-
+            }
+        }
+        if !ended { >> errors.new("net/http: too many reads") }
+    }
+    b.report_buffered_progress(true)
     msg2 := b.data + ""
     b.data = ""
     << msg2
@@ -716,13 +747,17 @@ fn read_http_message_buf(b &mut MsgBuf, until_close bool) string {
 // Requests without Content-Length / chunked encoding have an empty body
 // (RFC 7230) and must not block waiting for the client to close.
 fn read_http_message_mode(fd int, until_close bool, tls_h int) string {
-    mut b := MsgBuf{data: "", fd: fd, tls_h: tls_h, tls_conn: tls.closed_conn(), deadline_ns: 0}
+    mut b := MsgBuf{data: "", fd: fd, tls_h: tls_h, tls_conn: tls.closed_conn(), deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
     << read_http_message_buf(mut &b, until_close) or (err) {
         << ""
     }
 }
 
 fn (r &mut Response) fill_from_message(msg0 string) int {
+    << r.fill_from_message_limit(msg0, MAX_MESSAGE_BYTES) or >>
+}
+
+fn (r &mut Response) fill_from_message_limit(msg0 string, limit int) int {
     msg := msg0 + ""
     header_end := find_crlf_crlf(&msg)
     if header_end < 0 {
@@ -730,7 +765,7 @@ fn (r &mut Response) fill_from_message(msg0 string) int {
     }
     head := msg[0:header_end]
     mut body := msg[(header_end + 4):msg.len]
-    cl := parse_content_length(&head)
+    cl := parse_content_length_limit(&head, limit)
     if cl >= 0 {
         if body.len < cl {
             >> errors.new("net/http: truncated body")
@@ -808,8 +843,15 @@ fn exchange_once(https bool, addr string, sni string, req string) string {
 }
 
 fn exchange_deadline(https bool, addr string, sni string, req string, deadline_ns int) string {
+    << exchange_deadline_limit(https, addr, sni, req, deadline_ns, 0, no_download_progress) or >>
+}
+
+fn exchange_deadline_limit(https bool, addr string, sni string, req string, deadline_ns int, max_bytes int, report fn(int, int)) string {
     if https {
         mut cfg := tls.new_config(sni)
+        // This transport speaks HTTP/1.1; advertising h2 makes compliant
+        // servers expect an HTTP/2 preface and reject these request bytes.
+        cfg.set_next_protos(["http/1.1"])
         remaining := http_remaining(deadline_ns) or >>
         mut nc := net.dial_timeout("tcp", addr, remaining) or >>
         nc.set_deadline(deadline_ns)
@@ -824,7 +866,7 @@ fn exchange_deadline(https bool, addr string, sni string, req string, deadline_n
             http_remaining(deadline_ns) or >>
             >> err
         }
-        mut b := MsgBuf{data: "", fd: -1, tls_h: 1, tls_conn: tc, deadline_ns: deadline_ns}
+        mut b := MsgBuf{data: "", fd: -1, tls_h: 1, tls_conn: tc, deadline_ns: deadline_ns, max_bytes: max_bytes, progress: download_progress(report)}
         msg := read_http_message_buf(mut &b, true) or (err) {
             http_remaining(deadline_ns) or >>
             >> err
@@ -839,7 +881,7 @@ fn exchange_deadline(https bool, addr string, sni string, req string, deadline_n
     }
     remaining := http_remaining(deadline_ns) or >>
     fd := net.dial_ns(addr, remaining) or >>
-    msg := exchange_http_fd(fd, req, "", deadline_ns) or (err) {
+    msg := exchange_http_fd_limit(fd, req, "", deadline_ns, max_bytes, report) or (err) {
         close_http_fd(fd)
         http_remaining(deadline_ns) or >>
         >> err
@@ -873,7 +915,7 @@ fn (c &mut Client) exchange_http(addr string, req string, deadline_ns int, retry
         remaining := http_remaining(deadline_ns) or >>
         fd = net.dial_ns(addr, remaining) or >>
     }
-    result := exchange_http_fd(fd, req + "", leftover, deadline_ns) or (err) {
+    result := exchange_http_fd_limit(fd, req + "", leftover, deadline_ns, c.max_response_bytes, c.progress) or (err) {
         close_http_fd(fd)
         http_remaining(deadline_ns) or >>
         // Retry a stale idle connection once, only for GET/HEAD. The
@@ -928,7 +970,7 @@ fn (r &mut Response) do_request_ex(method string, raw_url string, body &string, 
 fn (c &mut Client) do_exchange(https bool, addr string, sni string, req string, deadline_ns int, retry_safe bool) string {
     if https {
         c.close_idle()
-        << exchange_deadline(true, addr, sni, req, deadline_ns) or >>
+        << exchange_deadline_limit(true, addr, sni, req, deadline_ns, c.max_response_bytes, c.progress) or >>
     }
     << c.exchange_http(addr, req, deadline_ns, retry_safe) or >>
 }
@@ -972,11 +1014,15 @@ pub struct Client {
     // One budget for HTTP/TLS I/O and redirects; 0 disables it. Synchronous
     // DNS and Linux TCP connect still need cancellable platform adapters.
     pub timeout_ns int
+    // Negative returns redirect responses unchanged; zero uses the default 10.
     pub max_redirects int
+    // Positive overrides the default 10 MiB buffered response limit, including headers.
+    pub max_response_bytes int
+    progress fn(int, int)
 }
 
 pub fn new_client() Client {
-    << Client{jar: cookiejar.new_jar(), jar_on: 0, idle_fd: -1, idle_https: 0, idle_addr: "", idle_buf: "", timeout_ns: 0, max_redirects: 10}
+    << Client{jar: cookiejar.new_jar(), jar_on: 0, idle_fd: -1, idle_https: 0, idle_addr: "", idle_buf: "", timeout_ns: 0, max_redirects: 10, max_response_bytes: 0, progress: no_download_progress}
 }
 
 pub fn (c &mut Client) set_jar(j cookiejar.Jar) {
@@ -1041,7 +1087,9 @@ fn (c &mut Client) do_once(method string, raw_url string, body &string, deadline
     retry_safe := method == "GET" || method == "HEAD"
     req := build_request(method, &u, body, extra)
     msg := c.do_exchange(https, addr, sni, req, deadline_ns, retry_safe) or >>
-    r.fill_from_message(msg + "") or >>
+    mut limit := MAX_MESSAGE_BYTES
+    if c.max_response_bytes > 0 { limit = c.max_response_bytes }
+    r.fill_from_message_limit(msg + "", limit) or >>
     if c.jar_on != 0 {
         ingest_cookies(mut &c.jar, &u, &r.headers)
     }
@@ -1080,13 +1128,13 @@ pub fn (req &mut Request) read(fd int) int {
 // A zero timeout preserves the caller-owned blocking read contract.
 pub fn (req &mut Request) read_timeout(fd int, timeout_ns int) int {
     deadline := http_deadline(timeout_ns) or >>
-    mut b := MsgBuf{data: "", fd: fd, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: deadline}
+    mut b := MsgBuf{data: "", fd: fd, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: deadline, max_bytes: 0, progress: download_progress(no_download_progress)}
     msg := read_http_message_buf(mut &b, false) or >>
     << req.parse_message(&msg) or >>
 }
 
 fn buffered_request(data string) Request {
-    mut b := MsgBuf{data: data, fd: -1, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: 0}
+    mut b := MsgBuf{data: data, fd: -1, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
     msg := read_http_message_buf(mut &b, false) or >>
     mut req := new_request()
     req.parse_message(&msg) or >>

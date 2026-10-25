@@ -256,12 +256,17 @@ run_fixture_target() {
                     && { echo "PASS $name/$target (compile+file only: Unix sockets unsupported)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
+            # The test lane uses `test-harness.exe`, while ordinary fixtures
+            # use `a.exe`. Execute the artifact that was actually compiled;
+            # hard-coding a.exe made a missing-file error look like a stdout
+            # regression in the Windows test runner.
+            win_exe="/w/$(basename "$out")"
                 if [ "$WINE_DOCKER_OK" = 1 ]; then
                 if [ "$name" = "crypto_x509_pool" ]; then
                     if docker run --rm --platform linux/amd64 -e WINEPREFIX=/wineprefix \
                         -e 'SSL_CERT_FILE=Z:\w\test-root.pem' \
                         -v "$WINEPREFIX_DIR":/wineprefix -v "$tmp":/w \
-                        -w /w --entrypoint wine "$WINE_IMG" /w/a.exe $extra_args >"$tmp/stdout" 2>/dev/null; then
+                        -w /w --entrypoint wine "$WINE_IMG" "$win_exe" $extra_args >"$tmp/stdout" 2>/dev/null; then
                         code=0
                     else
                         code=$?
@@ -269,7 +274,7 @@ run_fixture_target() {
                 else
                     if docker run --rm --platform linux/amd64 -e WINEPREFIX=/wineprefix \
                         -v "$WINEPREFIX_DIR":/wineprefix -v "$tmp":/w \
-                        -w /w --entrypoint wine "$WINE_IMG" /w/a.exe $extra_args >"$tmp/stdout" 2>/dev/null; then
+                        -w /w --entrypoint wine "$WINE_IMG" "$win_exe" $extra_args >"$tmp/stdout" 2>/dev/null; then
                         code=0
                     else
                         code=$?

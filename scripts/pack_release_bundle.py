@@ -8,7 +8,7 @@ Packages self-contained, production-grade SDK distribution archives for:
   - devkit-all (all-in-one multi-platform devkit)
 
 Each bundle contains:
-  1. bin/ (xu compiler + xu-doctor + xu-fmt + xu-doc + xu-map + xu-desktop + xu-setup + xu-lsp + xu-native)
+  1. bin/ (xu compiler + xu-doctor + xu-fmt + xu-doc + xu-map + xu-desktop + xu-setup + xu-update + xu-lsp + xu-native)
   2. src/ (standard library + UI runtime host source)
   3. packages/ (optional external ecosystem drivers: redis, mysql, postgres, sqlite, etcd, etc.)
   4. include/ (C FFI header xu_native.h)
@@ -64,6 +64,7 @@ def discover_sibling_tools() -> list[tuple[str, str]]:
         ("xu-map", "src/cmd/map"),
         ("xu-desktop", "src/cmd/desktop"),
         ("xu-setup", "src/cmd/setup"),
+        ("xu-update", "src/cmd/update"),
         ("xu-lsp", "src/cmd/lsp"),
         ("xu-native", "src/cmd/native"),
     ]
@@ -184,7 +185,12 @@ def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, c
         "-o",
         str(cached_tool),
     ]
-    if tool_name == "xu-setup" and target == "windows-x64":
+    if tool_name == "xu-setup" and target.startswith("macos-") and sys.platform == "darwin":
+        cmd = [sys.executable, str(REPO_ROOT / "scripts/pack_macos_ui_oneexe.py"),
+               "--src", str(REPO_ROOT / src_dir / "main.xu"), "--no-webview",
+               "--arch", target.removeprefix("macos-"), "--xu", str(xu_bin),
+               "-o", str(cached_tool)]
+    elif tool_name == "xu-setup" and target == "windows-x64":
         cross_cxx = shutil.which("x86_64-w64-mingw32-g++") or (shutil.which("g++") if os.name == "nt" else None)
         if cross_cxx:
             cmd = [sys.executable, str(REPO_ROOT / "scripts/pack_windows_ui_oneexe.py"),
@@ -342,6 +348,7 @@ Xu is a fast, safe, GC-free systems programming language combining Go-style tool
   - `xu-doc`: Markdown API documentation generator & HTTP server
   - `xu-map`: Visual flowchart & architecture graph generator
   - `xu-desktop`: Cross-platform desktop native app & webview packager
+  - `xu-update`: SDK self-updater using Xu HTTP and archive libraries
   - `xu-lsp`: Language Server Protocol (LSP) daemon for IDE code completion & diagnostics
   - `xu-native`: Native C module compilation, archiving & multi-target container packaging
 - **`src/`**: Standard library source code (`#os`, `#io`, `#net`, `#crypto`, `#database/sql`, `#ui`, etc.)
@@ -588,7 +595,7 @@ def main():
         for archive, target, size_mb, sha in generated_archives:
             f.write(f"| `{archive.name}` | `{target}` | {size_mb:.2f} MB | `{sha[:16]}...` |\n")
         f.write("\n## 🚀 包含核心组件\n\n")
-        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-setup`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`, `xu-lsp`, `xu-native`\n")
+        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-setup`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`, `xu-update`, `xu-lsp`, `xu-native`\n")
         f.write("- **官方标准库源码 (`src/`)**: 包含 `os`, `io`, `net`, `sync`, `crypto`, `database/sql`, `ui` 等完整源码\n")
         f.write("- **独立 packages 仓库的扩展模块（选装） (`packages/`)**: `redis`, `mysql`, `postgres`, `sqlite`, `clickhouse`, `mongodb`, `nats`, `mqtt`, `etcd`, `elasticsearch`, `influxdb`, `memcached`, `s3`\n")
         f.write("- **C/C++ 原生交互头文件 (`include/`)**: `xu_native.h`\n")

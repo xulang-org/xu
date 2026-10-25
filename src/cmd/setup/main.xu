@@ -5,9 +5,7 @@
 #path/filepath
 #errors
 #strings
-#archive/zip
-#ui
-#ui/draw
+#internal/sdk
 
 fn str_clone(s &string) string {
     << s + ""
@@ -114,15 +112,31 @@ fn str_contains_lit(s &string, sub string) bool {
     << val_contains(s, &s2)
 }
 
+// Replace the file identity as well as its bytes. In-place truncation of an
+// executed Mach-O invalidates the kernel's cached code signature.
 fn copy_file(src &string, dst &string, is_executable bool) bool {
-    data := read_file(src + "") or (err) {
+    data := os.read(src + "") or (err) { << false }
+    parent := filepath.dir(dst)
+    staged := os.create_temp(parent, ".xu-setup-copy-") or (err) { << false }
+    os.write(staged + "", data) or (err) {
+        os.remove(staged + "") or (cleanup) { << false }
         << false
     }
-    write_file(dst + "", data) or (err) {
-        << false
+    if xu_target_os() != 2 {
+        info := os.stat(src + "") or (err) {
+            os.remove(staged + "") or (cleanup) { << false }
+            << false
+        }
+        mut mode := info.mode & 511
+        if is_executable { mode = 493 }
+        os.chmod(staged + "", mode) or (err) {
+            os.remove(staged + "") or (cleanup) { << false }
+            << false
+        }
     }
-    if is_executable && xu_target_os() != 2 {
-        setup_chmod(dst, 493) // 0755
+    os.rename(staged + "", dst + "") or (err) {
+        os.remove(staged + "") or (cleanup) { << false }
+        << false
     }
     << true
 }
@@ -154,22 +168,7 @@ fn detect_host_platform() string {
     else if os_code == 1 { os_name = "linux" }
     else if os_code == 2 { os_name = "windows" }
 
-    mut arch_name := "x64"
-    mut cmd := exec.command("uname", "-m")
-    out := setup_cmd_output(&cmd)
-    trimmed := setup_trim(out)
-    if trimmed == "arm64" || trimmed == "aarch64" {
-        arch_name = "arm64"
-    } else if trimmed == "loongarch64" {
-        arch_name = "loongarch64"
-    } else if trimmed == "riscv64" {
-        arch_name = "riscv64"
-    }
-    if os_code == 2 {
-        pa := os.getenv("PROCESSOR_ARCHITECTURE")
-        if pa == "ARM64" { arch_name = "arm64" }
-        else { arch_name = "x64" }
-    }
+    arch_name := setup_arch()
     << os_name + "-" + arch_name
 }
 
@@ -191,79 +190,49 @@ fn run_cmd_quiet(cmd &exec.Cmd) bool {
 }
 
 fn download_release(url &string, dest &string) bool {
-    u := url + ""
-    d1 := dest + ""
-    mut curl_cmd := exec.command("curl", "-fSL", "--connect-timeout", "15", "--retry", "2", "-o", d1, "--", u)
-    if run_cmd_quiet(&curl_cmd) { << true }
-
-    u2 := url + ""
-    d2 := dest + ""
-    mut wget_cmd := exec.command("wget", "-q", "-O", d2, u2)
-    if run_cmd_quiet(&wget_cmd) { << true }
-
-    if xu_target_os() == 2 {
-        u3 := url + ""
-        d3 := dest + ""
-        mut ps_cmd := exec.command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('" + u3 + "', '" + d3 + "')")
-        if run_cmd_quiet(&ps_cmd) { << true }
+    << setup_download(url, dest) or (err) {
+        eprintln("xu-setup: download failed: " + err.msg())
+        << false
     }
-    << false
 }
 
 fn extract_archive(archive &string, dest_dir &string, is_windows bool) bool {
-    a1 := archive + ""
-    d1 := dest_dir + ""
-    if !is_windows {
-        mut cmd := exec.command("tar", "-xzf", a1, "-C", d1)
-        << run_cmd_quiet(&cmd)
+    data := os.read(archive + "") or (err) {
+        eprintln("xu-setup: cannot read archive: " + err.msg())
+        << false
     }
-    // Windows SDKs use ordinary ZIP/deflate: extract with Xu itself, without
-    // PowerShell, tar, WebView or a separately installed runtime.
-    data := read_file(a1) or (err) { << false }
-    mut reader := zip.new_reader(&data)
-    mut count := 0
-    while true {
-        file := reader.next() or (err) {
-            << err.msg() == "EOF" && count > 0
-        }
-        name := filepath.to_slash(&file.name)
-        if name.len == 0 || filepath.is_abs(&name) || str_contains_lit(&name, ":") { << false }
-        clean := filepath.clean(&name)
-        if clean == ".." || val_has_prefix(&clean, "../") { << false }
-        dest := d1 + "/" + clean
-        if name[name.len - 1] == 47 {
-            if !setup_mkdir(&dest) { << false }
-        } else {
-            parent := filepath.dir(&dest)
-            if !setup_mkdir(&parent) { << false }
-            write_file(dest, file.body + "") or (err) { << false }
-        }
-        count = count + 1
+    sdk.extract(&data, dest_dir, is_windows) or (err) {
+        eprintln("xu-setup: extract failed: " + err.msg())
+        << false
     }
-    << false
+    << true
 }
 
-fn configure_windows_env(prefix &string) bool {
+fn configure_windows_env(prefix &string, all_users bool) bool {
+    mut key := "HKCU\\Environment"
+    if all_users { key = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" }
     bin_dir := prefix + "\\bin"
-    println("[3/4] 正在配置 Windows 用户环境变量 (PATH / XU_ROOT)...")
+    if all_users { println("[3/4] 正在配置 Windows 系统环境变量 (PATH / XU_ROOT)...") }
+    else { println("[3/4] 正在配置 Windows 用户环境变量 (PATH / XU_ROOT)...") }
 
     // 1. Set XU_ROOT
-    mut cmd_root := exec.command("reg", "add", "HKCU\\Environment", "/v", "XU_ROOT", "/t", "REG_SZ", "/d", prefix + "", "/f")
+    mut cmd_root := exec.command("reg", "add", key + "", "/v", "XU_ROOT", "/t", "REG_SZ", "/d", prefix + "", "/f")
     if !run_cmd_quiet(&cmd_root) { << false }
 
     // 2. Set XU_STDLIB_ROOT
     std_dir := prefix + "\\src"
-    mut cmd_std := exec.command("reg", "add", "HKCU\\Environment", "/v", "XU_STDLIB_ROOT", "/t", "REG_SZ", "/d", std_dir + "", "/f")
+    mut cmd_std := exec.command("reg", "add", key + "", "/v", "XU_STDLIB_ROOT", "/t", "REG_SZ", "/d", std_dir + "", "/f")
     if !run_cmd_quiet(&cmd_std) { << false }
 
     // 3. Update User Path
-    mut cmd_query := exec.command("reg", "query", "HKCU\\Environment", "/v", "Path")
+    mut cmd_query := exec.command("reg", "query", key + "", "/v", "Path")
     out := setup_cmd_output(&cmd_query)
     mut current_path := ""
     lines := setup_split_lines(out)
     for i in 0:lines.len {
         line := setup_trim(lines[i])
-        if val_has_prefix(&line, "Path") {
+        lower := strings.to_lower(&line)
+        if val_has_prefix(&lower, "path") {
             mut cut := 0 - 1
             for j in 4:line.len - 3 {
                 if line[j:j + 3] == "REG" {
@@ -291,7 +260,7 @@ fn configure_windows_env(prefix &string) bool {
         if current_path.len > 0 {
             new_path = bin_dir + ";" + current_path
         }
-        mut cmd_add_path := exec.command("reg", "add", "HKCU\\Environment", "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", new_path, "/f")
+        mut cmd_add_path := exec.command("reg", "add", key + "", "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", new_path, "/f")
         if !run_cmd_quiet(&cmd_add_path) { << false }
     }
 
@@ -383,7 +352,7 @@ fn extract_embedded_payload(self_exe string, temp_stage string) int {
     file_sz := info.size
     if file_sz <= 24 { << 0 }
 
-    fd := os_open(self_exe + "", os.o_rdonly) or (err) { << 0 - 1 }
+    fd := os_open(self_exe + "", os.O_RDONLY) or (err) { << 0 - 1 }
 
     os_fd_seek(fd, file_sz - 24, 0) or (err) {
         setup_close_fd(fd)
@@ -435,7 +404,7 @@ fn extract_embedded_payload(self_exe string, temp_stage string) int {
         out_archive = temp_stage + "\\embedded_payload.zip"
     }
 
-    out_fd := os_open(out_archive + "", os.o_create) or (err) {
+    out_fd := os_open(out_archive + "", os.O_CREATE) or (err) {
         setup_close_fd(fd)
         << 0 - 1
     }
@@ -483,152 +452,85 @@ fn extract_embedded_payload(self_exe string, temp_stage string) int {
 
 
 
-// -------------------------------------------------------------
-// 官方甲骨文朱砂金石 LOGO 纯矢量自绘
-// -------------------------------------------------------------
-fn draw_xu_logo(ox int, oy int, size int, color string) {
-    mut lw := size * 26 / 500
-    if lw < 2 {
-        lw = 2
+// Prefer the SDK that PATH already selects. A loose compiler outside an SDK
+// layout does not make its parent a safe installation destination.
+fn setup_install_root(prefix &string) string {
+    if prefix.len > 0 { << filepath.abs(prefix) or >> }
+    selected := exec.look_path("xu") or (err) { << setup_default_root() or >> }
+    actual := sdk.real_path(&selected) or (err) { << setup_default_root() or >> }
+    bin := filepath.dir(&actual)
+    name := filepath.base(&bin)
+    if strings.to_lower(&name) == "bin" {
+        root := filepath.dir(&bin)
+        source := root + "/src"
+        git := root + "/.git"
+        if is_dir(&source) && !path_exists(&git) { << root }
     }
-
-    c := color + ""
-
-    // 1. 外部甲骨扁平 U 型器皿外框
-    x1 := ox + 105 * size / 500
-    y1 := oy + 140 * size / 500
-    x2 := ox + 90 * size / 500
-    y2 := oy + 295 * size / 500
-    x3 := ox + 250 * size / 500
-    y3 := oy + 370 * size / 500
-    x4 := ox + 410 * size / 500
-    y4 := oy + 295 * size / 500
-    x5 := ox + 395 * size / 500
-    y5 := oy + 140 * size / 500
-
-    draw.line(x1, y1, x2, y2, c + "", lw)
-    draw.line(x2, y2, x3, y3, c + "", lw)
-    draw.line(x3, y3, x4, y4, c + "", lw)
-    draw.line(x4, y4, x5, y5, c + "", lw)
-
-    // 2. 内部左折笔 (>)
-    lx1 := ox + 165 * size / 500
-    ly1 := oy + 155 * size / 500
-    lx2 := ox + 230 * size / 500
-    ly2 := oy + 218 * size / 500
-    lx3 := ox + 165 * size / 500
-    ly3 := oy + 280 * size / 500
-    draw.line(lx1, ly1, lx2, ly2, c + "", lw)
-    draw.line(lx2, ly2, lx3, ly3, c + "", lw)
-
-    // 3. 内部右折笔 (<)
-    rx1 := ox + 335 * size / 500
-    ry1 := oy + 155 * size / 500
-    rx2 := ox + 270 * size / 500
-    ry2 := oy + 218 * size / 500
-    rx3 := ox + 335 * size / 500
-    ry3 := oy + 280 * size / 500
-    draw.line(rx1, ry1, rx2, ry2, c + "", lw)
-    draw.line(rx2, ry2, rx3, ry3, c, lw)
+    << setup_default_root() or >>
 }
 
-fn point_in_rect(px int, py int, rx int, ry int, rw int, rh int) bool {
-    if px >= rx && px <= rx + rw && py >= ry && py <= ry + rh {
-        << true
-    }
-    << false
+fn setup_default_root() string {
+    home := os.home_dir()
+    if home.len == 0 { >> errors.new("无法获取用户主目录，请通过 --prefix 指定安装目录") }
+    << filepath.join([home, ".xu"])
 }
 
-// -------------------------------------------------------------
-// 自绘图形安装向导界面
-// -------------------------------------------------------------
-fn paint_gui(host_target string, target_dir string, progress int, status string, done int) {
-    draw.begin()
-    draw.set_bg("#0B1020")
-
-    // 顶部 Header 装饰卡片
-    draw.round_rect(20, 16, 520, 84, 10, "#111A2E", "#1E293B", 1)
-
-    // 官方朱砂红甲骨文矢量 LOGO
-    draw_xu_logo(28, 20, 68, "#E11D48")
-
-    // 标题与副标题
-    draw.text(108, 30, 17, "#F8FAFC", "Xu 语言开发环境安装向导")
-    draw.text(108, 54, 12, "#94A3B8", "零 GC · 高性能 · 极速编译系统级编程语言")
-    draw.text(108, 74, 11, "#38BDF8", "系统架构: " + host_target + " · 全局环境开箱即用")
-
-    // 主体卡片
-    draw.round_rect(20, 112, 520, 150, 10, "#111A2E", "#1E293B", 1)
-
-    // 安装目录展示
-    draw.text(36, 126, 12, "#CBD5E1", "安装目标路径:")
-    draw.round_rect(36, 144, 488, 34, 6, "#0B1020", "#334155", 1)
-    draw.text(48, 154, 12, "#38BDF8", target_dir)
-
-    // 安装状态与进度
-    draw.text(36, 192, 12, "#CBD5E1", "安装进度:")
-    mut stat_color := "#94A3B8"
-    if done == 1 {
-        stat_color = "#4ADE80"
-    } else if progress > 0 {
-        stat_color = "#F59E0B"
-    }
-    draw.text(102, 192, 12, stat_color, status)
-
-    // 进度条底槽与填充
-    draw.round_rect(36, 212, 488, 16, 8, "#0B1020", "#1E293B", 1)
-    if progress > 0 {
-        mut bar_w := progress * 488 / 100
-        if bar_w > 488 {
-            bar_w = 488
-        }
-        mut fill_col := "#38BDF8"
-        if done == 1 {
-            fill_col = "#22C55E"
-        }
-        draw.round_rect(36, 212, bar_w, 16, 8, fill_col + "", fill_col + "", 0)
-    }
-
-
-    // 底部操作区
-    if done == 1 {
-        // 完成按钮 (绿色)
-        draw.round_rect(374, 278, 150, 42, 8, "#16A34A", "#4ADE80", 1)
-        draw.text(410, 291, 14, "#FFFFFF", "完成并退出")
-    } else if progress > 0 {
-        // 正在安装中 (灰色等待)
-        draw.round_rect(374, 278, 150, 42, 8, "#334155", "#475569", 1)
-        draw.text(418, 291, 14, "#94A3B8", "正在安装...")
-    } else {
-        // 初始一键安装按钮 (朱砂红主操作)
-        draw.round_rect(374, 278, 150, 42, 8, "#E11D48", "#FB7185", 1)
-        draw.text(418, 291, 14, "#FFFFFF", "一键安装")
-
-        // 退出按钮
-        draw.round_rect(280, 278, 80, 42, 8, "#1E293B", "#334155", 1)
-        draw.text(304, 291, 13, "#94A3B8", "退出")
-    }
-
-    draw.present()
+fn setup_has_sdk(root &string) bool {
+    mut compiler := root + "/bin/xu"
+    if xu_target_os() == 2 { compiler = compiler + ".exe" }
+    source := root + "/src"
+    << path_exists(&compiler) && is_dir(&source)
 }
 
-// -------------------------------------------------------------
-// 执行安装核心逻辑（CLI 与 GUI 共享）
-// -------------------------------------------------------------
-fn execute_install_step(target_dir string, self_exe string, req_version string, gui bool, progress &mut int, status &mut string) int {
+fn setup_system_root() string {
+    mut programs := os.getenv("ProgramW6432")
+    if programs.len == 0 { programs = os.getenv("ProgramFiles") }
+    if programs.len == 0 { programs = "C:\\Program Files" }
+    << filepath.join([programs, "XU"])
+}
+
+fn setup_system_install(root &string) bool {
+    standard := setup_system_root()
+    parent := filepath.dir(&standard)
+    << setup_path_within(parent, root + "")
+}
+
+fn setup_scope_root(all_users bool) string {
+    empty := ""
+    selected := setup_install_root(&empty) or >>
+    if setup_system_install(&selected) == all_users { << selected }
+    if all_users { << setup_system_root() }
+    << setup_default_root() or >>
+}
+
+// CLI and GUI share the same installer; only GUI publishes status notices.
+
+fn execute_install_step(target_dir string, self_exe string, req_version string, progress &mut int, status &mut string) int {
+    << execute_install_reported(target_dir, self_exe, req_version, SetupReporter{notices: chan SetupNotice{cap: 1},enabled: false}, progress, status, false)
+}
+
+fn execute_install_reported(target_dir string, self_exe string, req_version string, report SetupReporter, progress &mut int, status &mut string, all_users bool) int {
     is_windows := xu_target_os() == 2
     platform := detect_host_platform()
+    git := target_dir + "/.git"
+    if path_exists(&git) {
+        *status = "目标目录是源码仓库，拒绝覆盖。"
+        << 1
+    }
 
     mut tmp_dir := os.temp_dir()
     if tmp_dir.len == 0 {
         if is_windows { tmp_dir = "C:\\Temp" }
         else { tmp_dir = "/tmp" }
     }
-    mut temp_stage := tmp_dir + "/xu_install_" + str(os.getpid())
+    temp_stage := os.mkdir_temp(tmp_dir, "xu-install-") or (err) {
+        *status = "无法创建安装临时目录: " + err.msg()
+        << 1
+    }
 
     *progress = 20
     *status = "正在解压离线 SDK 文件..."
-    if gui { paint_gui(platform + "", target_dir + "", 20, status + "", 0) }
+    report.send(20, status + "")
 
     embedded := extract_embedded_payload(self_exe + "", temp_stage + "")
     if embedded < 0 {
@@ -649,7 +551,7 @@ fn execute_install_step(target_dir string, self_exe string, req_version string, 
         *status = "检测到本地发布包，正在提取核心组件..."
     } else {
         *status = "正在从 GitHub 下载官方 SDK..."
-        if gui { paint_gui(platform + "", target_dir + "", 20, status + "", 0) }
+        report.send(20, status + "")
         mut tag := req_version + ""
         if tag.len > 0 && tag[0] != 118 { tag = "v" + tag }
         mut ext := ".tar.gz"
@@ -660,21 +562,24 @@ fn execute_install_step(target_dir string, self_exe string, req_version string, 
         setup_mkdir(&temp_stage)
         archive_dest := temp_stage + "/" + archive_name
 
-        if !download_release(&url, &archive_dest) {
+        if !download_release_reported(&url, &archive_dest, report) {
             *status = "下载官方发布包失败，请检查网络连接。"
+            setup_remove_all(&temp_stage)
             << 1
         }
+        *progress = 45
         *status = "正在解压安装包..."
-        if gui { paint_gui(platform + "", target_dir + "", 30, status + "", 0) }
+        report.send(45, status + "")
         if !extract_archive(&archive_dest, &temp_stage, is_windows) {
             *status = "解压安装包失败。"
+            setup_remove_all(&temp_stage)
             << 1
         }
     }
 
     *progress = 50
     *status = "正在部署编译器与标准库核心文件..."
-    if gui { paint_gui(platform + "", target_dir + "", 50, status + "", 0) }
+    report.send(50, status + "")
     mut deploy_src := ""
     if has_embedded {
         deploy_src = temp_stage + "/xu-v" + req_version
@@ -807,11 +712,11 @@ fn execute_install_step(target_dir string, self_exe string, req_version string, 
     }
 
     *progress = 75
-    *status = "正在自动配置操作系统全局环境变量..."
-    if gui { paint_gui(platform + "", target_dir + "", 75, status + "", 0) }
+    *status = "正在配置环境变量..."
+    report.send(75, status + "")
     if is_windows {
-        if !configure_windows_env(&target_dir) {
-            *status = "Windows 用户环境变量配置失败。"
+        if !configure_windows_env(&target_dir, all_users) {
+            *status = "Windows 环境变量配置失败。"
             setup_remove_all(&temp_stage)
             << 1
         }
@@ -825,7 +730,7 @@ fn execute_install_step(target_dir string, self_exe string, req_version string, 
 
     *progress = 90
     *status = "正在进行工具链完整性自检..."
-    if gui { paint_gui(platform + "", target_dir + "", 90, status + "", 0) }
+    report.send(90, status + "")
     mut exe_name := target_dir + "/bin/xu"
     if is_windows { exe_name = target_dir + "\\bin\\xu.exe" }
     mut check_cmd := exec.command(exe_name, "--version")
@@ -836,70 +741,7 @@ fn execute_install_step(target_dir string, self_exe string, req_version string, 
     }
 
     *progress = 100
-    *status = "安装完成，请重新打开终端使用 Xu。"
-    << 0
-}
-
-fn run_gui_event_loop(ech chan ui.Event, target_dir string, platform string, self_exe string, req_version string) {
-    mut progress := 0
-    mut status := "准备就绪，点击开始安装"
-    mut done := 0
-    mut installing := 0
-
-    paint_gui(platform + "", target_dir + "", progress, status + "", done)
-
-
-    while true {
-        sleep_ns(40000000) // 25 fps
-        c := draw.poll_click(ech)
-        if c.ok == 1 {
-            if done == 1 {
-                // 点击了完成按钮 (374, 278, 150, 42)
-                if point_in_rect(c.x, c.y, 374, 278, 150, 42) {
-                    <<< 0
-                }
-            } else if installing == 0 {
-                // 检查是否点击了“退出” (280, 278, 80, 42)
-                if point_in_rect(c.x, c.y, 280, 278, 80, 42) {
-                    <<< 0
-                }
-                // 检查是否点击了“一键安装” (374, 278, 150, 42)
-                if point_in_rect(c.x, c.y, 374, 278, 150, 42) {
-                    installing = 1
-                    status = "正在准备 SDK 文件..."
-                    progress = 10
-                    paint_gui(platform + "", target_dir + "", progress, status + "", done)
-
-                    rc := execute_install_step(target_dir + "", self_exe + "", req_version + "", true, mut &progress, mut &status)
-                    if rc == 0 {
-                        done = 1
-                    } else {
-                        installing = 0
-                        progress = 0
-                    }
-                    paint_gui(platform + "", target_dir + "", progress, status + "", done)
-                }
-            }
-        }
-    }
-}
-
-
-fn launch_gui_installer(target_dir string, platform string, self_exe string, req_version string) int {
-    mut app := ui.new_app()
-    mut win := app.new_window(ui.WindowOpts{title: "Xu 语言安装向导", width: 560, height: 340})
-    r := mut &win
-    _ := draw.attach(r)
-    if ui.target_os() == ui.os_windows {
-        ui.native_set_menu_visible(0) or (err) { << 1 }
-        _ := draw.set_pan_enabled(0)
-    }
-    ui.native_set_resizable(0) or (err) { << 1 }
-    xu run_gui_event_loop(app.event_ch, target_dir, platform, self_exe, req_version)
-    app.run() or (err) {
-        eprintln("xu-setup: 无法启动原生安装界面。")
-        << 1
-    }
+    *status = "安装完成，请重新打开终端使用 XU。"
     << 0
 }
 
@@ -907,8 +749,12 @@ fn main() int {
     argv := os.argv()
     mut is_silent := false
     mut custom_prefix := ""
-    mut req_version := "0.10.2"
+    mut req_version := "0.10.5"
     mut force_cli := false
+    mut force_gui := false
+    mut all_users := false
+    mut scope_explicit := false
+    mut auto_start := false
 
     mut i := 1
     while i < argv.len {
@@ -921,20 +767,39 @@ fn main() int {
             println("  xu-setup.exe [options] (Windows)")
             println("")
             println("选项 (Options):")
-            println("  --prefix DIR, -p DIR   指定安装目标目录 (默认: Unix ~/.xu, Windows %USERPROFILE%\\.xu)")
-            println("  --yes, -y, --silent    静默一键安装 (无需确认，自动写入系统全局环境变量)")
-            println("  --cli                  强制控制台命令行交互模式 (Windows 下跳过自绘图形向导)")
+            println("  --prefix DIR, -p DIR   指定安装目标目录 (默认沿用 PATH 中的 Xu，否则 ~/.xu)")
+            println("  --current-user         Windows: 仅当前用户 (默认)")
+            println("  --all-users            Windows: 所有用户 (需要管理员权限)")
+            println("  --yes, -y, --silent    静默一键安装 (自动配置环境变量)")
+            println("  --gui                  显示原生安装向导 (可配合 --prefix 使用)")
+            println("  --cli                  强制控制台命令行交互模式 (Windows 下跳过图形安装向导)")
             println("  --version VER          指定下载版本 (仅在线模式有效；离线包默认安装内嵌版本)")
             println("  -h, --help, /?         查看帮助信息")
             println("")
             println("说明:")
             println("  - 独立离线安装包已内嵌完整 SDK（编译器、配套工具、标准库源码与上手示例）。")
-            println("  - Windows 下双击直接拉起自绘图形安装向导，自动配置 Path 与 XU_ROOT。")
+            println("  - Windows 下双击直接拉起原生组件安装向导，自动配置 Path 与 XU_ROOT。")
             println("  - 纯原生执行，零外部依赖，无需预装 Python、PowerShell 脚本策略或解压工具。")
             << 0
         }
         if arg == "-y" || arg == "--yes" || arg == "--silent" || arg == "/S" {
             is_silent = true
+            i = i + 1
+            ->
+        }
+        if arg == "--all-users" || arg == "--current-user" {
+            all_users = arg == "--all-users"
+            scope_explicit = true
+            i = i + 1
+            ->
+        }
+        if arg == "--start" { auto_start = true
+            i = i + 1
+            -> }
+        if arg == "--elevate-ui" { i = i + 1
+            -> }
+        if arg == "--gui" {
+            force_gui = true
             i = i + 1
             ->
         }
@@ -964,33 +829,39 @@ fn main() int {
         i = i + 1
     }
 
+    req_version = sdk.release_version(&req_version) or (err) {
+        eprintln("xu-setup: " + err.msg())
+        << 1
+    }
     is_windows := xu_target_os() == 2
     platform := detect_host_platform()
 
-    mut target_dir := custom_prefix + ""
-    if target_dir.len == 0 {
-        home := os.home_dir()
-        if home.len == 0 {
-            eprintln("xu-setup: 无法获取用户主目录，请通过 --prefix <DIR> 指定安装目录")
-            << 1
-        }
-        if is_windows {
-            target_dir = home + "\\.xu"
-        } else {
-            target_dir = home + "/.xu"
-        }
+    mut target_dir := setup_install_root(&custom_prefix) or (err) {
+        eprintln("xu-setup: " + err.msg())
+        << 1
     }
+
+    if !is_windows && scope_explicit {
+        eprintln("xu-setup: --all-users 和 --current-user 仅适用于 Windows")
+        << 1
+    }
+    if is_windows && scope_explicit && custom_prefix.len == 0 {
+        target_dir = setup_scope_root(all_users) or (err) { eprintln(err.msg())
+            << 1 }
+    }
+    if is_windows && !scope_explicit { all_users = setup_system_install(&target_dir) }
 
     mut self_exe := argv[0] + ""
     self_exe = filepath.abs(&self_exe) or (err) { << 1 }
     target_dir = filepath.abs(&target_dir) or (err) { << 1 }
 
-    // 双击无参启动，且未显式指定命令行模式时，优先拉起自绘图形向导
-    if argv.len <= 1 && !force_cli && !is_silent {
-        gui_rc := launch_gui_installer(target_dir + "", platform + "", self_exe + "", req_version + "")
+    // 无参启动或显式选择 GUI 时，使用标准布局和原生组件安装向导。
+    if (force_gui || argv.len <= 1) && !force_cli && !is_silent {
+        gui_rc := launch_gui_installer(target_dir + "", platform + "", self_exe + "", req_version + "", all_users, auto_start)
         if gui_rc == 0 {
             << 0
         }
+        if force_gui { << gui_rc }
         // 若当前环境无法启动 GUI (如无图形界面的终端/服务器)，平滑降级到命令行交互
     }
 
@@ -1001,7 +872,7 @@ fn main() int {
 
     mut cli_progress := 0
     mut cli_status := ""
-    rc := execute_install_step(target_dir + "", self_exe + "", req_version + "", false, mut &cli_progress, mut &cli_status)
+    rc := execute_install_reported(target_dir + "", self_exe + "", req_version + "", SetupReporter{notices: chan SetupNotice{cap: 1},enabled: false}, mut &cli_progress, mut &cli_status, all_users)
 
     if rc != 0 {
         eprintln("xu-setup: " + cli_status)
@@ -1029,12 +900,6 @@ fn main() int {
         println("       xu run \"" + target_dir + "/examples/01_hello/main.xu\"")
     }
     println("")
-
-    if is_windows && !is_silent {
-        println("按回车键完成安装并退出...")
-        mut pause_cmd := exec.command("cmd", "/c", "pause >nul")
-        run_cmd_quiet(&pause_cmd)
-    }
 
     << 0
 }
