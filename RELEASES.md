@@ -6,6 +6,18 @@
 
 ---
 
+## Xu 0.10.6 release
+
+This patch release completes the imported-constant migration in the bundled examples. UI, WebSocket and DNS examples now use the uppercase constants exported by the compiler and bundled packages. The release, SDK and core CI workflows pin the corrected examples at `854c7c3`. Installed-SDK validation checks real UI and service examples, so a working compiler alone cannot hide this packaging regression.
+
+All 54 website-curated examples pass compilation with the corrected sources; SQLite examples require the native bridge described in their README. Compiler, tools and SDK manifests use 0.10.6. Install the full SDK to keep its components together.
+
+[Download Xu v0.10.6](https://github.com/xulang-org/xu/releases/tag/v0.10.6). The original v0.10.5 tag and archives remain intact.
+
+## Xu 0.10.5 release
+
+Adds source debugging through `xu debug`, compiler/stdlib improvements, native Setup installation and standard-library update progress, uppercase constant naming, ARM32 integer/ABI support, LSP diagnostic URI preservation and a simplified version banner. The original bundles contain incomplete imported-constant migrations in some examples; use 0.10.6 for the corrected full SDK.
+
 ## Xu 0.10.2 release
 
 This official release resolves ambient toolchain resolution issues, brings native non-blocking socket readiness across all supported operating systems, adds bounded LZ77 RFC1951 DEFLATE compression, and integrates ergonomic UI abstractions:
