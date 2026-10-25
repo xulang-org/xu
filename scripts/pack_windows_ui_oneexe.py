@@ -431,6 +431,15 @@ def link_static(
             'IDI_XUAPP ICON "xu_app_icon.ico"\n',
             encoding="utf-8",
         )
+        if xu_src is not None and xu_src.resolve().parent == (ROOT / "src/cmd/setup").resolve():
+            manifest = td / "xu_setup.manifest"
+            manifest.write_text(
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
+                '<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>'
+                '<requestedExecutionLevel level="asInvoker" uiAccess="false"/>'
+                '</requestedPrivileges></security></trustInfo></assembly>', encoding="utf-8")
+            rc_path.write_text(rc_path.read_text(encoding="utf-8") + '1 24 "xu_setup.manifest"\n', encoding="utf-8")
         icon_res_o = td / "xu_app_res.o"
         subprocess.check_call(
             [
@@ -941,6 +950,22 @@ def link_static(
             "}\n",
             encoding="utf-8",
         )
+        setup_project = ROOT / "src" / "cmd" / "setup"
+        if xu_src is not None and xu_src.resolve().parent == setup_project.resolve():
+            startup = setup_project / "windows_startup.h"
+            shim_source = shim.read_text(encoding="utf-8")
+            shim_source = '#include "' + startup.as_posix() + '"\n' + shim_source
+            # The header needs Win32 types before its helper declarations.
+            shim_source = '#include <windows.h>\n' + shim_source
+            shim_source = shim_source.replace(
+                "  g_main_tid = GetCurrentThreadId();",
+                "  { int setup_code = xu_setup_startup(); if (setup_code >= 0) return setup_code; }\n"
+                "  g_main_tid = GetCurrentThreadId();", 1)
+            shim_source = shim_source.replace(
+                "    if (g_real_ExitProcess) g_real_ExitProcess((UINT)rc);",
+                "    if (rc == 0) xu_setup_notify_environment();\n"
+                "    if (g_real_ExitProcess) g_real_ExitProcess((UINT)rc);", 1)
+            shim.write_text(shim_source, encoding="utf-8")
         shim_o = td / "winmain_shim.o"
         subprocess.check_call(
             [GCC, "-O2", "-c", "-Isrc/ui/host", str(shim), "-o", str(shim_o)],
@@ -948,6 +973,7 @@ def link_static(
 
         libs = [
             "-luser32",
+            "-ladvapi32",
             "-lgdi32",
             "-lgdiplus",
             "-ldwrite",
@@ -1107,7 +1133,9 @@ def main() -> None:
             xu,
             [
                 "build",
-                str(xu_src),
+                # A module entry may use sibling files (for example setup's
+                # architecture adapters and native SDK downloader).
+                str(xu_src.parent if xu_src.name == "main.xu" and (xu_src.parent / "xu.xun").is_file() else xu_src),
                 "--target",
                 "windows-x64",
                 "--emit-obj",

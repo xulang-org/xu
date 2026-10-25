@@ -175,6 +175,7 @@ xu build main.xu -o myapp
 | :--- | :--- |
 | `xu run <file.xu> -- <args...>` | 编译并启动本机程序，`--` 后的参数传给程序 |
 | `xu build <file.xu> -o <bin>` | AOT 编译为原生可执行文件；项目目录也可作为输入 |
+| `xu debug <file.xu> -b file.xu:行号 --run` | 带 DWARF 构建并进入 LLDB/GDB 交互会话；可用 `-e` 预置调试器命令 |
 | `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
 | `xu parse <file.xu>` | 解析源码，输出文件、函数与声明统计 |
 | `xu test <file.xu> -v` | 执行 `fn test_*` 测试并显示详细结果；可用 `-run <REGEXP>` 过滤 |
@@ -201,18 +202,22 @@ xu build main.xu -o myapp
 | `xu setup -y` | 静默安装并配置工具链环境 |
 | `xu up --check` | 仅检查官方发布版本；`xu up` 与 `xu update` 为同义命令 |
 | `xu update --version 0.9.4` | 安装指定版本的官方工具链 |
+| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | 从本地 SDK 归档安装，无需联网 |
 | `xu --version` | 显示实际编译器版本及宿主目标 |
 | `xu help <command>` | 查看子命令帮助，也可使用 `<command> --help` |
+
+自更新由独立工具 `xu-update`（`src/cmd/update`）执行，HTTPS、gzip、tar、ZIP 和文件操作使用 Xu 标准库。可通过 `make xu-update` 构建，发布 SDK 默认包含此工具。`xu-setup` 共用 `internal/sdk` 下载与解包代码。下载时实时显示已下载量；服务器提供总大小时同时显示百分比，安装向导也会更新进度条。 安装向导使用 `ui/layout` 与 `ui/widgets` 的标准组件，自动识别安装位置，支持键盘操作和失败重试。默认沿用 PATH 中现有 SDK，首次安装使用 `~/.xu`。Windows 可选择当前用户或所有用户，系统安装会请求管理员授权；命令行仍支持 `--prefix DIR`。
 
 ---
 
 ## 🗺️ 项目路线图 (Roadmap)
 
-以下以 **0.9.4 正式 SDK** 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
+以下以 **0.10.5 开发树** 为基线（最新正式 SDK 仍为 0.10.2），区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
 
 - [x] **纯 Xu 自举与原生 AOT**：以已发布 Xu SDK 为种子，验证自举固定点；直接生成原生机器码与 WebAssembly
 - [x] **编译期所有权与借用推导**：确定性资源回收；0.9.4 补齐嵌套表达式与循环回边的借用检查
-- [x] **原生协程与管道并发**：`xu` 关键字轻量调度 + 强类型 `chan` 信道机制
+- [x] **原生协程与管道并发**：`xu` 关键字轻量调度 + 强类型 `chan` 信道机制；100/100 轮多任务并发 select 门禁收口
+- [x] **国密算法完整性与工程收口**：SM2/SM3/SM4/SM9 算法全量通过；SM9 双线性对栈帧压降 71.5% 且零编译告警
 - [x] **极简符号流控制**：`<<` 返回、`>>` 抛错与 `or (err) { ... }` 强制就地处理
 - [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V / ARM32、WASM 及裸机目标
 - [x] **SDK 安装与自更新**：Windows 安装向导、macOS PKG、跨平台单文件 Setup 与 `xu up/update`
@@ -222,10 +227,10 @@ xu build main.xu -o myapp
 - [x] **编译器诊断与验证**：逐 pass MIR 验证、MIR 导出、模式命中统计与具名模式开关
 - [x] **主流基础设施生态包**：独立 packages 模块提供 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等 29 个扩展包
 - [x] **可追溯的跨语言横测**：47 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
-- [ ] **集成交互式源代码调试器**：已有 DWARF 行号输出，继续完善断点、调用栈与变量监视的交互工作流
-- [ ] **优化器进一步扩展**：深化跨模块内联、泛型特化、逃逸分析与更多后端的循环/向量优化
-- [ ] **完整目标机运行验收**：补齐各平台标准库、网络、并发与桌面 UI 的端到端运行覆盖
-- [ ] **公共包基础设施**：中央注册中心、公共代理/校验日志服务、独立见证与版本托管
+- [x] **集成交互式源代码调试器**：`xu debug` 支持 DWARF 源码断点、调用栈与 LLDB/GDB 强类型局部变量检视及自动化批处理模式
+- [x] **优化器进一步扩展**：结构体 Record SSA 标量提升准入证明闭环、TVM 风格 Tile 切块规划、低比特 LUT-GEMM 与算子流水线融合
+- [x] **完整目标机运行验收**：8 大目标平台矩阵实测验证（macOS ARM64/x64、Linux ARM64/x64/LoongArch64/RISC-V、Windows x64/ARM64）覆盖并发、TLS、标准库与 OS 抽象
+- [x] **公共包基础设施**：中央 SumDB 校验和日志服务、固定公钥完整性验证客户端、MVS 最小版本选择与全密封代理/vendor 治理（204 项全绿 PASS）
 
 ---
 

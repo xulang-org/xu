@@ -272,7 +272,7 @@ def main() -> None:
             text = xu_src.read_text(encoding="utf-8", errors="ignore")
             need_webview = "#ui/webview" in text or "#webview" in text or "webview." in text
         cfg = {
-            "xu_src": str(xu_src),
+            "xu_src": str(xu_src.parent if xu_src.name == "main.xu" and (xu_src.parent / "xu.xun").is_file() else xu_src),
             "out_default": xu_src.stem,
             "need_webview": need_webview,
         }
@@ -312,7 +312,7 @@ def main() -> None:
         xu = resolve_product_xu(args.xu_compiler)
         xuobj = td / "app.xuobj"
         xu_o = td / "app.o"
-        xu_cmd = ["build", str(xu_src), "--emit-obj", "-o", str(xuobj)]
+        xu_cmd = ["build", str(xu_src.parent if xu_src.name == "main.xu" and (xu_src.parent / "xu.xun").is_file() else xu_src), "--emit-obj", "-o", str(xuobj)]
         if args.target:
             xu_cmd[2:2] = ["--target", args.target]
         run_product_compiler(xu, xu_cmd)
