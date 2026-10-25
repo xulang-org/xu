@@ -31,7 +31,7 @@
 
 ---
 
-> **最新正式版本**：[Xu v0.10.2](https://github.com/xulang-org/xu/releases/tag/v0.10.2) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
+> **最新正式版本**：[Xu v0.10.6](https://github.com/xulang-org/xu/releases/tag/v0.10.6) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 
@@ -212,7 +212,7 @@ xu build main.xu -o myapp
 
 ## 🗺️ 项目路线图 (Roadmap)
 
-以下以 **0.10.5 开发树** 为基线（最新正式 SDK 仍为 0.10.2），区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
+以下以 **0.10.6 正式 SDK** 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
 
 - [x] **纯 Xu 自举与原生 AOT**：以已发布 Xu SDK 为种子，验证自举固定点；直接生成原生机器码与 WebAssembly
 - [x] **编译期所有权与借用推导**：确定性资源回收；0.9.4 补齐嵌套表达式与循环回边的借用检查
