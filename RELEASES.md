@@ -12,6 +12,8 @@ This patch release completes the imported-constant migration in the bundled exam
 
 Offline extraction also reuses one DEFLATE history buffer and reads TAR headers without cloning the whole archive per entry. This removes repeated archive-sized copies that caused the Intel macOS standalone installer to exceed its installation timeout. Timeout diagnostics preserve the captured installer output.
 
+The full release also builds and includes the pinned VS Code extension VSIX (extension version 0.3.0). An explicitly selected extension checkout without its built VSIX now fails packaging instead of silently shipping only metadata.
+
 All 54 website-curated examples pass compilation with the corrected sources; SQLite examples require the native bridge described in their README. Compiler, tools and SDK manifests use 0.10.6. Install the full SDK to keep its components together.
 
 [Download Xu v0.10.6](https://github.com/xulang-org/xu/releases/tag/v0.10.6). The original v0.10.5 tag and archives remain intact.
