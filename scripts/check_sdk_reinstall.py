@@ -86,8 +86,20 @@ fn main() int {
         kernel.CreateFileW.restype = ctypes.c_void_p
         kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
                                       ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
-        handle = kernel.CreateFileW(str(stage), 0, 3, None, 3, 0x02000000, None)
+        handle = kernel.CreateFileW(str(stage), 0x80000000, 3, None, 3, 0x02000000, None)
         assert handle not in (None, ctypes.c_void_p(-1).value), ctypes.get_last_error()
+        # Query-only handles do not reliably deny directory deletion. Prove
+        # that this read handle blocks the second rename before testing rollback.
+        moved = stage.with_name("unexpected unlocked stage")
+        try:
+            stage.rename(moved)
+        except OSError:
+            pass
+        else:
+            moved.rename(stage)
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel.CloseHandle(handle)
+            raise RuntimeError("Windows rollback fixture did not block directory rename")
     else:
         if os.geteuid() == 0:
             raise RuntimeError("readonly reinstall validation requires a non-root account")

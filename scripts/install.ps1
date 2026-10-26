@@ -171,15 +171,25 @@ try {
     }
     # Current SDKs deploy through the native directory replacement transaction.
     $NativeSetup = Join-Path $BinarySource "xu-setup.exe"
+    $RequiresTransaction = $false
+    if (Test-Path "$SourceDir\bundle.json" -PathType Leaf) {
+        $Manifest = Get-Content "$SourceDir\bundle.json" -Raw | ConvertFrom-Json
+        $RequiresTransaction = $Manifest.PSObject.Properties.Name -contains "files"
+    }
+    # The GUI setup writes help to its own log. Current manifests declare the
+    # native transaction contract; stdout probing is only for older bundles.
     $NativeHelp = ""
-    if (Test-Path $NativeSetup -PathType Leaf) {
+    if (-not $RequiresTransaction -and (Test-Path $NativeSetup -PathType Leaf)) {
         $NativeHelp = (& $NativeSetup --help 2>$null | Out-String)
     }
-    if ($NativeHelp.Contains("--no-modify-path")) {
+    if ($RequiresTransaction -or $NativeHelp.Contains("--no-modify-path")) {
+        if (-not (Test-Path $NativeSetup -PathType Leaf)) {
+            throw "The SDK requires its transactional native installer, but it is missing."
+        }
         $NativeArgs = @("--yes")
         if ($PrefixExplicit) { $NativeArgs += @("--prefix", $Prefix) }
         if ($NoModifyPath) { $NativeArgs += "--no-modify-path" }
-        & $NativeSetup @NativeArgs
+        & $NativeSetup @NativeArgs | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "Native SDK replacement failed (exit $LASTEXITCODE)." }
         if ($env:XU_SKIP_EDITOR_INSTALL -ne "1" -and (Get-Command "code" -ErrorAction SilentlyContinue)) {
             $EditorMeta = Join-Path $SourceDir "editors\vscode\package.json"
@@ -200,12 +210,6 @@ try {
             }
         }
         return
-    }
-    if (Test-Path "$SourceDir\bundle.json" -PathType Leaf) {
-        $Manifest = Get-Content "$SourceDir\bundle.json" -Raw | ConvertFrom-Json
-        if ($Manifest.PSObject.Properties.Name -contains "files") {
-            throw "The SDK requires its transactional native installer, but it cannot run."
-        }
     }
 
     if ($Prefix -eq (Resolve-Path $SourceDir).Path) {
