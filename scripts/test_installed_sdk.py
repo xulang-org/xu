@@ -15,7 +15,13 @@ import zipfile
 
 
 def run(args, *, cwd, env):
-    result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=180)
+    try:
+        result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=180)
+    except subprocess.TimeoutExpired as error:
+        def text(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+        raise RuntimeError(f"{args}: timed out after {error.timeout}s\n"
+                           f"{text(error.stdout)}\n{text(error.stderr)}") from error
     if result.returncode:
         raise RuntimeError(f"{args}: exit {result.returncode}\n{result.stdout}\n{result.stderr}")
     return result.stdout

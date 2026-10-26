@@ -10,6 +10,8 @@
 
 This patch release completes the imported-constant migration in the bundled examples. UI, WebSocket and DNS examples now use the uppercase constants exported by the compiler and bundled packages. The release, SDK and core CI workflows pin the corrected examples at `854c7c3`. Installed-SDK validation checks real UI and service examples, so a working compiler alone cannot hide this packaging regression.
 
+Offline extraction also reuses one DEFLATE history buffer and reads TAR headers without cloning the whole archive per entry. This removes repeated archive-sized copies that caused the Intel macOS standalone installer to exceed its installation timeout. Timeout diagnostics preserve the captured installer output.
+
 All 54 website-curated examples pass compilation with the corrected sources; SQLite examples require the native bridge described in their README. Compiler, tools and SDK manifests use 0.10.6. Install the full SDK to keep its components together.
 
 [Download Xu v0.10.6](https://github.com/xulang-org/xu/releases/tag/v0.10.6). The original v0.10.5 tag and archives remain intact.
