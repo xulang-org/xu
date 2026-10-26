@@ -31,7 +31,7 @@
 
 ---
 
-> **最新正式版本**：[Xu v0.10.2](https://github.com/xulang-org/xu/releases/tag/v0.10.2) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
+> **最新正式版本**：[Xu v0.10.6](https://github.com/xulang-org/xu/releases/tag/v0.10.6) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 
@@ -212,7 +212,7 @@ xu build main.xu -o myapp
 
 ## 🗺️ 项目路线图 (Roadmap)
 
-以下以 **0.10.5 开发树** 为基线（最新正式 SDK 仍为 0.10.2），区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
+以下以 **0.10.6 正式 SDK** 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
 
 - [x] **纯 Xu 自举与原生 AOT**：以已发布 Xu SDK 为种子，验证自举固定点；直接生成原生机器码与 WebAssembly
 - [x] **编译期所有权与借用推导**：确定性资源回收；0.9.4 补齐嵌套表达式与循环回边的借用检查
@@ -229,8 +229,8 @@ xu build main.xu -o myapp
 - [x] **可追溯的跨语言横测**：47 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
 - [x] **集成交互式源代码调试器**：`xu debug` 支持 DWARF 源码断点、调用栈与 LLDB/GDB 强类型局部变量检视及自动化批处理模式
 - [x] **优化器进一步扩展**：结构体 Record SSA 标量提升准入证明闭环、TVM 风格 Tile 切块规划、低比特 LUT-GEMM 与算子流水线融合
-- [x] **完整目标机运行验收**：8 大目标平台矩阵实测验证（macOS ARM64/x64、Linux ARM64/x64/LoongArch64/RISC-V、Windows x64/ARM64）覆盖并发、TLS、标准库与 OS 抽象
-- [x] **公共包基础设施**：中央 SumDB 校验和日志服务、固定公钥完整性验证客户端、MVS 最小版本选择与全密封代理/vendor 治理（204 项全绿 PASS）
+- [ ] **完整目标机运行验收**：原生 SDK 安装门禁覆盖 macOS ARM64/x64、Linux ARM64/x64 与 Windows x64/ARM64；继续补齐各目标的库、网络、并发和桌面运行检查。LoongArch64 与 RISC-V SDK 通过交叉编译交付。
+- [ ] **公共包基础设施**：固定公钥校验、MVS 与代理/vendor 客户端已实现；公共代理/校验服务及独立见证仍需单独部署与可用性验收。
 
 ---
 

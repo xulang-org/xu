@@ -31,7 +31,7 @@
 
 ---
 
-> **Latest Official Release**: [Xu v0.10.2](https://github.com/xulang-org/xu/releases/tag/v0.10.2) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
+> **Latest Official Release**: [Xu v0.10.6](https://github.com/xulang-org/xu/releases/tag/v0.10.6) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
@@ -216,7 +216,7 @@ Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using 
 
 ## 🗺️ Project Roadmap
 
-This roadmap follows the **0.10.5 development tree**; the latest tagged SDK remains 0.10.2. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
+This roadmap follows the **official 0.10.6 SDK**. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
 
 - [x] **Pure Xu Self-Hosting and Native AOT**: Bootstrap from a published Xu SDK, verify a fixed point, and directly emit native machine code and WebAssembly
 - [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges
@@ -233,8 +233,8 @@ This roadmap follows the **0.10.5 development tree**; the latest tagged SDK rema
 - [x] **Traceable Cross-Language Benchmarks**: 47 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
 - [x] **Integrated Interactive Source Debugger**: `xu debug` drives DWARF source breakpoints, call stacks, and typed local variable inspection via LLDB/GDB with non-interactive batch mode
 - [x] **Further Optimizer Expansion**: Deeper SSA scalar promotion with struct-record admission proofs, TVM-inspired tile planning, low-bit LUT-GEMM, and pipelined operator fusion
-- [x] **Complete Target-Machine Runtime Validation**: 8-platform matrix verification (macOS ARM64/x64, Linux ARM64/x64/LoongArch64/RISC-V, Windows x64/ARM64) spanning concurrency, TLS, stdlib, and OS abstractions
-- [x] **Public Package Infrastructure**: Central module sumdb checksum-log verification, trusted-key integrity client, MVS version resolution, and hermetic proxy/vendor pipelines (204/204 suite PASS)
+- [ ] **Complete Target-Machine Runtime Validation**: Native SDK installation gates cover macOS ARM64/x64, Linux ARM64/x64, and Windows x64/ARM64. Extend library, networking, concurrency, and desktop runtime checks on each target; LoongArch64 and RISC-V SDKs are cross-built.
+- [ ] **Public Package Infrastructure**: Trusted-key checksum verification, MVS, and proxy/vendor clients are implemented. Public proxy/checksum services and independent witnesses require separate deployment and availability validation.
 
 ---
 
