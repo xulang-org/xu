@@ -10,6 +10,7 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
+$PrefixExplicit = $PSBoundParameters.ContainsKey("Prefix") -or [bool]$env:XU_INSTALL_DIR
 
 # Enable TLS 1.2 (required for downloading from GitHub on Windows PowerShell 5.1)
 try {
@@ -87,7 +88,7 @@ if ($IsLocalScript -and $ScriptDir) {
 }
 
 # Resolve version
-$FallbackVersion = "0.8.13"
+$FallbackVersion = "0.10.7"
 if (-not $Version) {
     if ($SourceDir -and (Test-Path "$SourceDir\VERSION")) {
         $Version = (Get-Content "$SourceDir\VERSION" -Raw).Trim()
@@ -168,6 +169,27 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Distribution compiler cannot run on $Platform."
     }
+    # Current SDKs deploy through the native directory replacement transaction.
+    $NativeSetup = Join-Path $BinarySource "xu-setup.exe"
+    $NativeHelp = ""
+    if (Test-Path $NativeSetup -PathType Leaf) {
+        $NativeHelp = (& $NativeSetup --help 2>$null | Out-String)
+    }
+    if ($NativeHelp.Contains("--no-modify-path")) {
+        $NativeArgs = @("--yes", "--current-user")
+        if ($PrefixExplicit) { $NativeArgs += @("--prefix", $Prefix) }
+        if ($NoModifyPath) { $NativeArgs += "--no-modify-path" }
+        & $NativeSetup @NativeArgs
+        if ($LASTEXITCODE -ne 0) { throw "Native SDK replacement failed (exit $LASTEXITCODE)." }
+        return
+    }
+    if (Test-Path "$SourceDir\bundle.json" -PathType Leaf) {
+        $Manifest = Get-Content "$SourceDir\bundle.json" -Raw | ConvertFrom-Json
+        if ($Manifest.PSObject.Properties.Name -contains "files") {
+            throw "The SDK requires its transactional native installer, but it cannot run."
+        }
+    }
+
     if ($Prefix -eq (Resolve-Path $SourceDir).Path) {
         throw "Install directory must differ from source distribution. Use . .\env.ps1 to activate in place."
     }
