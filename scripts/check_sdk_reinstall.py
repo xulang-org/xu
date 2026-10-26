@@ -148,10 +148,14 @@ def check(archive):
             script = ["pwsh", "-NoProfile", "-File", payload / "install.ps1", "-Prefix", prefix, "-NoModifyPath"]
         else:
             script = ["bash", payload / "install.sh", "--prefix", prefix, "--no-modify-path", "--yes"]
-        for command in (native, script):
+        automatic = ["pwsh", "-NoProfile", "-File", payload / "install.ps1", "-NoModifyPath"] if os.name == "nt" else [
+            "bash", payload / "install.sh", "--no-modify-path", "--yes"]
+        selected_env = env | {"PATH": str(prefix / "bin") + os.pathsep + env.get("PATH", "")}
+        selected_env.pop("XU_INSTALL_DIR", None)
+        for command in (native, script, automatic):
             before = set(work.glob(".xu-setup-backup-*"))
             poison(prefix, suffix)
-            run(command, work, env)
+            run(command, work, selected_env)
             verify(prefix, manifest)
             assert not (prefix / "src/obsolete.xu").exists()
             assert (private / "settings").read_text() == "preserve user state"
