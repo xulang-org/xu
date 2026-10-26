@@ -273,6 +273,23 @@ if [[ "$NATIVE_HELP" == *--no-modify-path* ]]; then
     if [[ "$PREFIX_EXPLICIT" -eq 1 ]]; then NATIVE_ARGS+=(--prefix "$INSTALL_DIR"); fi
     if [[ "$MODIFY_PATH" -eq 0 ]]; then NATIVE_ARGS+=(--no-modify-path); fi
     "$NATIVE_SETUP" "${NATIVE_ARGS[@]}"
+    # Keep the online installer's existing editor integration after the native
+    # transaction has verified the bundled extension and committed the SDK.
+    if [[ "${XU_SKIP_EDITOR_INSTALL:-0}" != 1 ]] && command -v code >/dev/null 2>&1; then
+        EDITOR_META="$SOURCE_DIR/editors/vscode/package.json"
+        if [[ -f "$EDITOR_META" ]]; then
+            EDITOR_NAME=$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$EDITOR_META" | head -n 1)
+            EDITOR_VERSION=$(sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$EDITOR_META" | head -n 1)
+            if [[ "$EDITOR_NAME" =~ ^[A-Za-z0-9_-]+$ && "$EDITOR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+                EDITOR_VSIX="$SOURCE_DIR/editors/vscode/$EDITOR_NAME-$EDITOR_VERSION.vsix"
+                if [[ -f "$EDITOR_VSIX" ]]; then
+                    code --install-extension "$EDITOR_VSIX" --force >/dev/null 2>&1 && \
+                        log_ok "VS Code extension installed successfully." || \
+                        log_warn "Failed to install VS Code extension automatically."
+                fi
+            fi
+        fi
+    fi
     exit 0
 fi
 if [[ -f "$SOURCE_DIR/bundle.json" ]] && grep -q '"files"[[:space:]]*:' "$SOURCE_DIR/bundle.json"; then
