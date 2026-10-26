@@ -39,8 +39,7 @@ on:
         type: boolean
 
 permissions:
-  contents: write
-  actions: read
+  contents: read
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref_name }}
@@ -93,12 +92,17 @@ jobs:
             echo "Release $TAG is already published; leaving its tag and assets intact."
           fi
 
-  publish-release:
-    name: Build release SDKs
+  build-release:
+    name: Build and validate release SDKs
     needs: release-policy
     if: needs.release-policy.outputs.published == 'false'
-    runs-on: macos-26
+    runs-on: macos-15-intel
     timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -106,6 +110,7 @@ jobs:
           fetch-depth: 0
 
       - name: Validate release version and tag
+        id: identity
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
         run: |
@@ -119,6 +124,13 @@ jobs:
             exit 1
           fi
           python3 scripts/module_versions.py --check-release
+          # A manual release must use accepted main; tags must point into main.
+          if [[ "${{ inputs.build_only }}" != true ]]; then
+            git fetch origin main
+            git merge-base --is-ancestor HEAD origin/main
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout companion examples
         uses: actions/checkout@v4
@@ -176,16 +188,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: bin/xu
-          key: hosted-seed-macos-arm64-${{ hashFiles('VERSION') }}
+          key: hosted-seed-macos-x64-${{ hashFiles('VERSION') }}
           restore-keys: |
-            hosted-seed-macos-arm64-
+            hosted-seed-macos-x64-
 
       - name: Restore seed from a published product SDK
         if: steps.seed-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           XU_SDK_SEED_VERSION: ${{ vars.XU_SDK_SEED_VERSION }}
-        run: python3 scripts/restore_product_seed.py --target macos-arm64 --destination bin/xu --replace-existing
+        run: python3 scripts/restore_product_seed.py --target macos-x64 --destination bin/xu --replace-existing
 
       - name: Build hosted compiler chain
         run: |
@@ -206,10 +218,29 @@ jobs:
       - name: Test installed host SDK and native setup installer
         run: |
           VERSION=$(cat VERSION)
-          python3 scripts/test_installed_sdk.py --archive "dist/release/xu-v$VERSION-macos-arm64.tar.gz" --native-setup
-          if [ -f "dist/release/xu-setup-macos-arm64" ]; then
-            python3 scripts/test_installed_sdk.py --installer "dist/release/xu-setup-macos-arm64"
+          python3 scripts/test_installed_sdk.py --archive "dist/release/xu-v$VERSION-macos-x64.tar.gz" --native-setup
+          python3 scripts/check_sdk_reinstall.py --archive "dist/release/xu-v$VERSION-macos-x64.tar.gz"
+          if [ -f "dist/release/xu-setup-macos-x64" ]; then
+            python3 scripts/test_installed_sdk.py --installer "dist/release/xu-setup-macos-x64"
           fi
+
+      - name: Verify graphical macOS package fresh install and reinstall
+        run: |
+          PKG="dist/release/xu-v$(cat VERSION)-macos-x64.pkg"
+          sudo installer -pkg "$PKG" -target /
+          sudo touch /usr/local/xu/src/obsolete-install-probe.xu
+          sudo chmod 555 /usr/local/xu/src
+          sudo installer -pkg "$PKG" -target /
+          test ! -e /usr/local/xu/src/obsolete-install-probe.xu
+          python3 - <<'PYTHON'
+          import hashlib, json, pathlib
+          root = pathlib.Path("/usr/local/xu")
+          metadata = json.loads((root / "bundle.json").read_text())
+          for name, expected in metadata["files"].items():
+              with (root / name).open("rb") as source:
+                  assert hashlib.file_digest(source, "sha256").hexdigest() == expected, name
+          print("macOS PKG fresh install and readonly reinstall: full inventory PASS")
+          PYTHON
 
       - name: Generate structured release notes
         id: notes
@@ -217,10 +248,7 @@ jobs:
           CUSTOM_NOTES: ${{ inputs.custom_notes }}
           PREVIOUS_TAG: ${{ inputs.previous_tag }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          if [[ "$TAG" != v* ]]; then
-            TAG="v$(cat VERSION)"
-          fi
+          TAG="${{ steps.identity.outputs.tag }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           NOTE_ARGS=()
           if [ -n "$PREVIOUS_TAG" ]; then
@@ -248,53 +276,90 @@ jobs:
           head -n 50 dist/release/RELEASE_NOTES.md
           cat dist/release/RELEASE_NOTES.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Determine release flags
-        id: flags
-        run: |
-          TAG="${{ steps.notes.outputs.tag }}"
-          FLAGS=()
-          PRERELEASE="${{ inputs.prerelease || 'auto' }}"
-          if [ "$PRERELEASE" = "true" ] || ([ "$PRERELEASE" = "auto" ] && [[ "$TAG" =~ -(dev|rc|alpha|beta) ]]); then
-            FLAGS+=(--prerelease)
-          fi
-          if [ "${{ inputs.draft }}" = "true" ]; then
-            FLAGS+=(--draft)
-          fi
-          echo "flags=${FLAGS[*]}" >> "$GITHUB_OUTPUT"
+      - name: Verify all archives and record publishable asset hashes
+        run: python3 scripts/verify_release_bundle.py --root dist/release --receipt dist/validation.json
 
-      - name: Publish GitHub Release
-        if: inputs.build_only != true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${{ steps.notes.outputs.tag }}"
-          FLAGS=(${{ steps.flags.outputs.flags }})
-
-          echo "Publishing Release: $TAG (flags: ${FLAGS[*]})"
-
-          if IS_DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
-            if [[ "$IS_DRAFT" != true ]]; then
-              echo "Release $TAG was published while building; leaving its tag and assets intact."
-              exit 0
-            fi
-            echo "Release $TAG is a draft, updating its unpublished assets..."
-            gh release upload "$TAG" dist/release/* --clobber
-            gh release edit "$TAG" --notes-file dist/release/RELEASE_NOTES.md "${FLAGS[@]}"
-          else
-            echo "Creating new release $TAG..."
-            gh release create "$TAG" dist/release/* \
-              --target "${{ github.sha }}" \
-              --title "Xu $TAG" \
-              --notes-file dist/release/RELEASE_NOTES.md \
-              "${FLAGS[@]}"
-          fi
-
-          echo "Release successfully published: $(gh release view "$TAG" --json url -q .url)"
-
-      - name: Upload validated release bundle
-        if: always()
+      - name: Upload verified release bundle
         uses: actions/upload-artifact@v4
         with:
-          name: xu-release-bundle-${{ steps.notes.outputs.tag }}
-          path: dist/release/
-          if-no-files-found: warn
+          name: xu-release-bundle-${{ steps.identity.outputs.tag }}-${{ github.run_attempt }}
+          path: |
+            dist/release/
+            dist/validation.json
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish verified CI artifacts
+    needs: build-release
+    if: inputs.build_only != true
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # This job never checks out or executes the product or its dependencies.
+      - uses: actions/download-artifact@v4
+        with:
+          name: xu-release-bundle-${{ needs.build-release.outputs.tag }}-${{ github.run_attempt }}
+          path: verified
+
+      - name: Check artifact receipt and publish without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_TAG: ${{ needs.build-release.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.build-release.outputs.version }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease || 'auto' }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, re, subprocess
+          root = pathlib.Path("verified/release")
+          receipt = json.loads(pathlib.Path("verified/validation.json").read_text())
+          tag, version, sha = (os.environ[k] for k in ("EXPECTED_TAG", "EXPECTED_VERSION", "EXPECTED_SHA"))
+          assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", tag)
+          assert receipt["tag"] == tag == "v" + version
+          assert receipt["version"] == version and receipt["source_commit"] == sha
+          assets = receipt["assets"]
+          assert len(assets) == 30
+          assert {p.name for p in root.iterdir()} == set(assets)
+          for name, record in assets.items():
+              assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+              path = root / name
+              assert path.is_file() and not path.is_symlink()
+              with path.open("rb") as source:
+                  digest = hashlib.file_digest(source, "sha256").hexdigest()
+              assert digest == record["sha256"] and path.stat().st_size == record["size"], name
+          def gh(*args):
+              return subprocess.check_output(["gh", *args], text=True)
+          existing = subprocess.run(["gh", "api", f"repos/{os.environ['GH_REPO']}/releases/tags/{tag}"],
+                                    text=True, capture_output=True)
+          if existing.returncode:
+              assert "HTTP 404" in existing.stderr, existing.stderr
+              gh("release", "create", tag, "--draft", "--target", sha, "--title", "Xu " + tag,
+                 "--notes-file", str(root / "RELEASE_NOTES.md"))
+              release = json.loads(gh("api", f"repos/{os.environ['GH_REPO']}/releases/tags/{tag}"))
+          else:
+              release = json.loads(existing.stdout)
+          if not release["draft"]:
+              print(f"{tag} is already published; preserving its tag and assets")
+              raise SystemExit(0)
+          published = {asset["name"]: asset for asset in release["assets"]}
+          assert set(published) <= set(assets), "draft has unexpected assets"
+          for name, asset in published.items():
+              assert asset["size"] == assets[name]["size"]
+              assert asset.get("digest") == "sha256:" + assets[name]["sha256"], name
+          missing = [str(root / name) for name in sorted(set(assets) - set(published))]
+          if missing:
+              gh("release", "upload", tag, *missing)
+          prerelease = os.environ["RELEASE_PRERELEASE"]
+          is_prerelease = prerelease == "true" or (prerelease == "auto" and bool(re.search(r"-(dev|rc|alpha|beta)", tag)))
+          gh("release", "edit", tag, "--notes-file", str(root / "RELEASE_NOTES.md"),
+             "--prerelease=" + str(is_prerelease).lower(),
+             "--draft=" + str(os.environ["RELEASE_DRAFT"] == "true").lower())
+          final = json.loads(gh("api", f"repos/{os.environ['GH_REPO']}/releases/tags/{tag}"))
+          assert len(final["assets"]) == 30
+          for asset in final["assets"]:
+              assert asset["digest"] == "sha256:" + assets[asset["name"]]["sha256"]
+          print("Published verified CI bundle: " + final["html_url"])
+          PYTHON
