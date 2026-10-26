@@ -31,7 +31,7 @@
 
 ---
 
-> **Latest Official Release**: [Xu v0.10.6](https://github.com/xulang-org/xu/releases/tag/v0.10.6) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
+> **Latest Official Release**: [Xu v0.10.7](https://github.com/xulang-org/xu/releases/tag/v0.10.7) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
@@ -216,7 +216,7 @@ Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using 
 
 ## 🗺️ Project Roadmap
 
-This roadmap follows the **official 0.10.6 SDK**. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
+This roadmap follows the **official 0.10.7 SDK**. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
 
 - [x] **Pure Xu Self-Hosting and Native AOT**: Bootstrap from a published Xu SDK, verify a fixed point, and directly emit native machine code and WebAssembly
 - [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges
