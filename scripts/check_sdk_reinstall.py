@@ -134,7 +134,9 @@ def check(archive):
         verify(prefix, manifest)
         banner = run([prefix / "bin" / ("xu" + suffix), "--version"], work, env).stdout
         assert "Xu Compiler Toolchain v" + manifest["version"] + " (self-hosted)" in banner
-        assert ("Xu Compiler Toolchain v" + manifest["version"]) in banner.splitlines()
+        versions = [line.split("Xu Compiler Toolchain v", 1)[1]
+                    for line in banner.splitlines() if "Xu Compiler Toolchain v" in line]
+        assert versions == [manifest["version"], manifest["version"] + " (self-hosted)"], banner
         private = prefix / "user-data"
         private.mkdir(mode=0o700)
         (private / "settings").write_text("preserve user state")
