@@ -233,8 +233,8 @@ This roadmap follows the **official 0.10.6 SDK**. See [Status & Limitations](htt
 - [x] **Traceable Cross-Language Benchmarks**: 47 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
 - [x] **Integrated Interactive Source Debugger**: `xu debug` drives DWARF source breakpoints, call stacks, and typed local variable inspection via LLDB/GDB with non-interactive batch mode
 - [x] **Further Optimizer Expansion**: Deeper SSA scalar promotion with struct-record admission proofs, TVM-inspired tile planning, low-bit LUT-GEMM, and pipelined operator fusion
-- [x] **Complete Target-Machine Runtime Validation**: 8-platform matrix verification (macOS ARM64/x64, Linux ARM64/x64/LoongArch64/RISC-V, Windows x64/ARM64) spanning concurrency, TLS, stdlib, and OS abstractions
-- [x] **Public Package Infrastructure**: Central module sumdb checksum-log verification, trusted-key integrity client, MVS version resolution, and hermetic proxy/vendor pipelines (204/204 suite PASS)
+- [ ] **Complete Target-Machine Runtime Validation**: Native SDK installation gates cover macOS ARM64/x64, Linux ARM64/x64, and Windows x64/ARM64. Extend library, networking, concurrency, and desktop runtime checks on each target; LoongArch64 and RISC-V SDKs are cross-built.
+- [ ] **Public Package Infrastructure**: Trusted-key checksum verification, MVS, and proxy/vendor clients are implemented. Public proxy/checksum services and independent witnesses require separate deployment and availability validation.
 
 ---
 
