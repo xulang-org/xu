@@ -181,6 +181,24 @@ try {
         if ($NoModifyPath) { $NativeArgs += "--no-modify-path" }
         & $NativeSetup @NativeArgs
         if ($LASTEXITCODE -ne 0) { throw "Native SDK replacement failed (exit $LASTEXITCODE)." }
+        if ($env:XU_SKIP_EDITOR_INSTALL -ne "1" -and (Get-Command "code" -ErrorAction SilentlyContinue)) {
+            $EditorMeta = Join-Path $SourceDir "editors\vscode\package.json"
+            if (Test-Path $EditorMeta -PathType Leaf) {
+                $Editor = Get-Content $EditorMeta -Raw | ConvertFrom-Json
+                if ($Editor.name -match '^[A-Za-z0-9_-]+$' -and $Editor.version -match '^\d+\.\d+\.\d+([.-][A-Za-z0-9.-]+)?$') {
+                    $EditorVsix = Join-Path $SourceDir "editors\vscode\$($Editor.name)-$($Editor.version).vsix"
+                    if (Test-Path $EditorVsix -PathType Leaf) {
+                        try {
+                            & code --install-extension $EditorVsix --force | Out-Null
+                            if ($LASTEXITCODE -ne 0) { throw "VS Code CLI exited with $LASTEXITCODE" }
+                            Write-Color "[OK] VS Code extension installed." -Color Green
+                        } catch {
+                            Write-Color "[WARN] Failed to install VS Code extension automatically." -Color Yellow
+                        }
+                    }
+                }
+            }
+        }
         return
     }
     if (Test-Path "$SourceDir\bundle.json" -PathType Leaf) {
