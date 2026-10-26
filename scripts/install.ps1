@@ -176,7 +176,7 @@ try {
         $NativeHelp = (& $NativeSetup --help 2>$null | Out-String)
     }
     if ($NativeHelp.Contains("--no-modify-path")) {
-        $NativeArgs = @("--yes", "--current-user")
+        $NativeArgs = @("--yes")
         if ($PrefixExplicit) { $NativeArgs += @("--prefix", $Prefix) }
         if ($NoModifyPath) { $NativeArgs += "--no-modify-path" }
         & $NativeSetup @NativeArgs
