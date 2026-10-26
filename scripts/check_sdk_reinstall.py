@@ -72,6 +72,8 @@ fn main() int {
     old = work / "rollback original"
     old.mkdir()
     (old / "value").write_text("original")
+    if os.name != "nt":
+        old.chmod(0o555)
     parent = work / "blocked stage parent"
     parent.mkdir()
     stage = parent / "stage"
@@ -96,6 +98,8 @@ fn main() int {
         assert (old / "value").read_text() == "original"
         assert (stage / "value").read_text() == "new"
         assert not backup.exists()
+        if os.name != "nt":
+            assert old.stat().st_mode & 0o777 == 0o555
     finally:
         if handle is not None:
             kernel.CloseHandle.argtypes = [ctypes.c_void_p]
