@@ -15,7 +15,13 @@ import zipfile
 
 
 def run(args, *, cwd, env):
-    result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=180)
+    try:
+        result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=180)
+    except subprocess.TimeoutExpired as error:
+        def text(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+        raise RuntimeError(f"{args}: timed out after {error.timeout}s\n"
+                           f"{text(error.stdout)}\n{text(error.stderr)}") from error
     if result.returncode:
         raise RuntimeError(f"{args}: exit {result.returncode}\n{result.stdout}\n{result.stderr}")
     return result.stdout
@@ -123,6 +129,23 @@ fn main() int {
         example = prefix / "examples/21_standalone_redis/main.xu"
         if example.is_file():
             run([xu, "check", str(example)], cwd=project, env=active)
+    # Imported constant names are checked through real installed examples.
+    # Declaration-only migration can leave the compiler and hello-world smoke
+    # green while the bundled UI and service examples no longer type-check.
+    if (prefix / "examples").is_dir():
+        examples = [
+            "16_ui_webview/draw/main.xu",
+            "16_ui_webview/widgets/main.xu",
+            "16_ui_webview/style_gallery/main.xu",
+        ]
+        if (prefix / "packages/xu.xun").is_file():
+            examples += ["47_standalone_websocket/main.xu", "49_standalone_dns/main.xu"]
+        for relative in examples:
+            example = prefix / "examples" / relative
+            if not example.is_file():
+                raise RuntimeError(f"SDK example is missing: {relative}")
+            run([xu, "check", str(example)], cwd=project, env=active)
+            print(f"installed-sdk: example-check PASS {relative}")
     print(f"installed-sdk: PASS target={manifest['target']} lane={manifest['lane']} version={manifest['version']}")
 
 
