@@ -152,7 +152,9 @@ def check(archive):
             "bash", payload / "install.sh", "--no-modify-path", "--yes"]
         selected_env = env | {"PATH": str(prefix / "bin") + os.pathsep + env.get("PATH", "")}
         selected_env.pop("XU_INSTALL_DIR", None)
-        for command in (native, script, automatic):
+        updater = [prefix / "bin" / ("xu" + suffix), "update", "--force", "--version",
+                   manifest["version"], "--archive", archive]
+        for command in (native, script, automatic, updater):
             before = set(work.glob(".xu-setup-backup-*"))
             poison(prefix, suffix)
             run(command, work, selected_env)
@@ -183,7 +185,7 @@ def check(archive):
             lock.unlink()
         rollback_probe(payload / "bin" / ("xu" + suffix), work, env)
         print(f"sdk-reinstall: PASS {manifest['target']} {manifest['version']}: readonly native/script "
-              "replacement, complete hashes, userdata, backups, corruption, lock and rollback")
+              "replacement, PATH selection, running updater, complete hashes, userdata, backups, corruption, lock and rollback")
 
 
 if __name__ == "__main__":
