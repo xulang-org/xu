@@ -10,6 +10,7 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
+$PrefixExplicit = $PSBoundParameters.ContainsKey("Prefix") -or [bool]$env:XU_INSTALL_DIR
 
 # Enable TLS 1.2 (required for downloading from GitHub on Windows PowerShell 5.1)
 try {
@@ -87,7 +88,7 @@ if ($IsLocalScript -and $ScriptDir) {
 }
 
 # Resolve version
-$FallbackVersion = "0.8.13"
+$FallbackVersion = "0.10.7"
 if (-not $Version) {
     if ($SourceDir -and (Test-Path "$SourceDir\VERSION")) {
         $Version = (Get-Content "$SourceDir\VERSION" -Raw).Trim()
@@ -168,6 +169,49 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Distribution compiler cannot run on $Platform."
     }
+    # Current SDKs deploy through the native directory replacement transaction.
+    $NativeSetup = Join-Path $BinarySource "xu-setup.exe"
+    $RequiresTransaction = $false
+    if (Test-Path "$SourceDir\bundle.json" -PathType Leaf) {
+        $Manifest = Get-Content "$SourceDir\bundle.json" -Raw | ConvertFrom-Json
+        $RequiresTransaction = $Manifest.PSObject.Properties.Name -contains "files"
+    }
+    # The GUI setup writes help to its own log. Current manifests declare the
+    # native transaction contract; stdout probing is only for older bundles.
+    $NativeHelp = ""
+    if (-not $RequiresTransaction -and (Test-Path $NativeSetup -PathType Leaf)) {
+        $NativeHelp = (& $NativeSetup --help 2>$null | Out-String)
+    }
+    if ($RequiresTransaction -or $NativeHelp.Contains("--no-modify-path")) {
+        if (-not (Test-Path $NativeSetup -PathType Leaf)) {
+            throw "The SDK requires its transactional native installer, but it is missing."
+        }
+        $NativeArgs = @("--yes")
+        if ($PrefixExplicit) { $NativeArgs += @("--prefix", $Prefix) }
+        if ($NoModifyPath) { $NativeArgs += "--no-modify-path" }
+        & $NativeSetup @NativeArgs | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "Native SDK replacement failed (exit $LASTEXITCODE)." }
+        if ($env:XU_SKIP_EDITOR_INSTALL -ne "1" -and (Get-Command "code" -ErrorAction SilentlyContinue)) {
+            $EditorMeta = Join-Path $SourceDir "editors\vscode\package.json"
+            if (Test-Path $EditorMeta -PathType Leaf) {
+                $Editor = Get-Content $EditorMeta -Raw | ConvertFrom-Json
+                if ($Editor.name -match '^[A-Za-z0-9_-]+$' -and $Editor.version -match '^\d+\.\d+\.\d+([.-][A-Za-z0-9.-]+)?$') {
+                    $EditorVsix = Join-Path $SourceDir "editors\vscode\$($Editor.name)-$($Editor.version).vsix"
+                    if (Test-Path $EditorVsix -PathType Leaf) {
+                        try {
+                            & code --install-extension $EditorVsix --force | Out-Null
+                            if ($LASTEXITCODE -ne 0) { throw "VS Code CLI exited with $LASTEXITCODE" }
+                            Write-Color "[OK] VS Code extension installed." -Color Green
+                        } catch {
+                            Write-Color "[WARN] Failed to install VS Code extension automatically." -Color Yellow
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
+
     if ($Prefix -eq (Resolve-Path $SourceDir).Path) {
         throw "Install directory must differ from source distribution. Use . .\env.ps1 to activate in place."
     }

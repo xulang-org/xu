@@ -6,6 +6,16 @@
 
 ---
 
+## Xu 0.10.7 release
+
+This patch repairs reinstalling over an existing SDK, including read-only standard-library files. Setup and `xu update` prepare a complete SDK beside the target, verify every recorded file and all ten tools, retain the old directory as a backup, then replace the target. Failed replacement or verification restores the original SDK. User data outside SDK-managed components is preserved; stale managed files are removed.
+
+The online Bash and PowerShell installers delegate to this same native transaction. They select the existing SDK on PATH unless an explicit prefix is supplied, and support installation without modifying shell profiles. Reinstalling the same version repairs its full contents. The compiler also retains a separate legacy banner so older 0.10.2 updaters can recognize the release.
+
+Release SDKs are built and verified in a read-only CI job. A separate publication job uploads those exact verified files using the short-lived GitHub Actions token; it does not run the packaged tools or dependencies. All published tags and assets remain immutable.
+
+[Download Xu v0.10.7](https://github.com/xulang-org/xu/releases/tag/v0.10.7). For old or partially installed SDKs, rerun the installation command on the [download page](https://xulang.org/download/).
+
 ## Xu 0.10.6 release
 
 This patch release completes the imported-constant migration in the bundled examples. UI, WebSocket and DNS examples now use the uppercase constants exported by the compiler and bundled packages. The release, SDK and core CI workflows pin the corrected examples at `854c7c3`. Installed-SDK validation checks real UI and service examples, so a working compiler alone cannot hide this packaging regression.
