@@ -68,7 +68,7 @@ Usage:
   curl -fsSL https://xulang.org/install.sh | bash -s -- [options]
 
 Options:
-  --prefix <DIR>       Install directory (default: ~/.xu or \$XU_INSTALL_DIR)
+  --prefix <DIR>       Install directory (default: existing PATH SDK, otherwise ~/.xu; or \$XU_INSTALL_DIR)
   --version <VER>      Version to install when downloading (default: latest stable or \$XU_VERSION)
   --online             Force downloading release archive even if executed from local bundle
   --no-modify-path     Do not append environment variables to shell config files
@@ -80,8 +80,10 @@ EOF
 # Configuration defaults
 DEFAULT_INSTALL_DIR="$HOME/.xu"
 INSTALL_DIR="${XU_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+PREFIX_EXPLICIT=0
+if [[ -n "${XU_INSTALL_DIR:-}" ]]; then PREFIX_EXPLICIT=1; fi
 DOWNLOAD_BASE_URL="${XU_DOWNLOAD_URL:-https://github.com/xulang-org/xu/releases/download}"
-FALLBACK_VERSION="0.8.13"
+FALLBACK_VERSION="0.10.7"
 TARGET_VERSION="${XU_VERSION:-}"
 MODIFY_PATH=1
 AUTO_YES=0
@@ -91,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix)
             INSTALL_DIR="$2"
+            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --version)
@@ -255,6 +258,42 @@ fi
 
 if [[ ! -x "$BINARY_SOURCE/xu" ]] || ! "$BINARY_SOURCE/xu" --version >/dev/null 2>&1; then
     log_err "Distribution compiler cannot run on $PLATFORM: $BINARY_SOURCE/xu"
+    exit 1
+fi
+
+# Current SDKs own the complete replacement transaction. Keep the legacy
+# copier only for old SDKs that do not yet advertise the native interface.
+NATIVE_SETUP="$BINARY_SOURCE/xu-setup"
+NATIVE_HELP=""
+if [[ -x "$NATIVE_SETUP" ]]; then
+    NATIVE_HELP="$("$NATIVE_SETUP" --help 2>/dev/null || true)"
+fi
+if [[ "$NATIVE_HELP" == *--no-modify-path* ]]; then
+    NATIVE_ARGS=(--yes)
+    if [[ "$PREFIX_EXPLICIT" -eq 1 ]]; then NATIVE_ARGS+=(--prefix "$INSTALL_DIR"); fi
+    if [[ "$MODIFY_PATH" -eq 0 ]]; then NATIVE_ARGS+=(--no-modify-path); fi
+    "$NATIVE_SETUP" "${NATIVE_ARGS[@]}"
+    # Keep the online installer's existing editor integration after the native
+    # transaction has verified the bundled extension and committed the SDK.
+    if [[ "${XU_SKIP_EDITOR_INSTALL:-0}" != 1 ]] && command -v code >/dev/null 2>&1; then
+        EDITOR_META="$SOURCE_DIR/editors/vscode/package.json"
+        if [[ -f "$EDITOR_META" ]]; then
+            EDITOR_NAME=$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$EDITOR_META" | head -n 1)
+            EDITOR_VERSION=$(sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$EDITOR_META" | head -n 1)
+            if [[ "$EDITOR_NAME" =~ ^[A-Za-z0-9_-]+$ && "$EDITOR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+                EDITOR_VSIX="$SOURCE_DIR/editors/vscode/$EDITOR_NAME-$EDITOR_VERSION.vsix"
+                if [[ -f "$EDITOR_VSIX" ]]; then
+                    code --install-extension "$EDITOR_VSIX" --force >/dev/null 2>&1 && \
+                        log_ok "VS Code extension installed successfully." || \
+                        log_warn "Failed to install VS Code extension automatically."
+                fi
+            fi
+        fi
+    fi
+    exit 0
+fi
+if [[ -f "$SOURCE_DIR/bundle.json" ]] && grep -q '"files"[[:space:]]*:' "$SOURCE_DIR/bundle.json"; then
+    log_err "The SDK requires its transactional native installer, but it cannot run."
     exit 1
 fi
 

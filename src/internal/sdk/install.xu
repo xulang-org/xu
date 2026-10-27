@@ -1,0 +1,405 @@
+@internal/sdk
+
+#crypto/sha256
+#encoding/json
+#errors
+#os
+#os/exec
+#path/filepath
+#strings
+
+// Accept the canonical banner and the suffix required by older updaters.
+pub fn compiler_version(output &string) string {
+    prefix := "Xu Compiler Toolchain v"
+    at := strings.index_of(output, prefix + "")
+    if at < 0 { >> errors.new("invalid compiler version output") }
+    start := at + prefix.len
+    mut end := start
+    while end < output.len {
+        b := output[end]
+        if b == 32 || b == 9 || b == 10 || b == 13 { <- }
+        end = end + 1
+    }
+    version := output[start:end] + ""
+    << release_version(&version) or >>
+}
+
+fn install_exists(path &string) bool {
+    os.stat(path + "") or (err) { << false }
+    << true
+}
+
+// Non-links normally make readlink fail; subsequent stat/read still report
+// inaccessible source entries rather than silently skipping their contents.
+fn install_link(path &string) string {
+    << os.readlink(path + "") or (err) { << "" }
+}
+
+fn install_close(file &mut os.File) string {
+    file.close() or (err) { << "; " + err.msg() }
+    << ""
+}
+
+fn install_copy(src &string, dst &string) int {
+    link := install_link(src)
+    if link.len > 0 {
+        os.symlink(link, dst + "") or >>
+        << 0
+    }
+    info := os.stat(src + "") or >>
+    if info.is_dir {
+        os.mkdir_all(dst + "") or >>
+        entries := os.entries(src + "") or >>
+        for i in 0:entries.len {
+            name := entries[i].name + ""
+            from := src + "/" + name
+            to := dst + "/" + name
+            install_copy(&from, &to) or >>
+        }
+        if xu_target_os() != 2 { os.chmod(dst + "", info.mode & 511) or >> }
+        << 0
+    }
+    mut input := os.open(src + "") or >>
+    mut output := os.create(dst + "") or (err) {
+        input.close() or (cleanup) { >> errors.new(err.msg() + "; " + cleanup.msg()) }
+        >> err
+    }
+    expected := install_stream_copy(&input, &output) or (err) {
+        input_error := install_close(mut &input)
+        output_error := install_close(mut &output)
+        >> errors.new(err.msg() + input_error + output_error)
+    }
+    input.close() or (err) {
+        output.close() or (cleanup) { >> errors.new(err.msg() + "; " + cleanup.msg()) }
+        >> err
+    }
+    output.close() or >>
+    copied := install_file_hash(dst) or >>
+    if copied != expected { >> errors.new("SDK copy verification failed: " + dst) }
+    if xu_target_os() != 2 { os.chmod(dst + "", info.mode & 511) or >> }
+    << 0
+}
+
+// Cleanup only installer-owned staging trees. In particular, unlink preserved
+// user symlinks rather than following them into directories outside the stage.
+fn install_remove(path &string) int {
+    link := install_link(path)
+    if link.len > 0 { os.remove(path + "") or >>
+        << 0 }
+    if !install_exists(path) { << 0 }
+    info := os.stat(path + "") or >>
+    if info.is_dir {
+        if xu_target_os() != 2 { os.chmod(path + "", (info.mode & 63) | 448) or >> }
+        entries := os.entries(path + "") or >>
+        for i in 0:entries.len {
+            child := path + "/" + entries[i].name
+            install_remove(&child) or >>
+        }
+    }
+    os.remove(path + "") or >>
+    << 0
+}
+
+fn install_managed(name &string) bool {
+    names := ["bin", "src", "include", "packages", "examples", "editors", "VERSION", "TARGET",
+              "bundle.json", "README.md", "LICENSE", "install.sh", "install.ps1", "env.sh", "env.ps1",
+              "env.cmd", "uninstall.sh", "uninstall.ps1", ".xu-update.lock"]
+    for i in 0:names.len { if name + "" == names[i] { << true } }
+    << strings.has_prefix(name, ".xu-update-stage-") || strings.has_prefix(name, ".xu-update-backup-")
+}
+
+fn install_preserve(target &string, stage &string) int {
+    if !os.is_dir(target + "") { << 0 }
+    entries := os.entries(target + "") or >>
+    for i in 0:entries.len {
+        name := entries[i].name + ""
+        if install_managed(&name) { -> }
+        dst := stage + "/" + name
+        if install_exists(&dst) { -> }
+        src := target + "/" + name
+        install_copy(&src, &dst) or >>
+    }
+    << 0
+}
+
+fn install_stream_copy(input &os.File, output &os.File) string {
+    mut digest := sha256.new()
+    while true {
+        chunk := input.read(65536) or >>
+        if chunk.len == 0 { <- }
+        digest.write(&chunk)
+        mut offset := 0
+        while offset < chunk.len {
+            written := output.write(chunk[offset:chunk.len] + "") or >>
+            if written <= 0 || written > chunk.len - offset { >> errors.new("SDK copy made no valid write progress") }
+            offset = offset + written
+        }
+    }
+    << digest.sum()
+}
+
+fn install_hash_stream(input &os.File) string {
+    mut digest := sha256.new()
+    while true {
+        chunk := input.read(65536) or >>
+        if chunk.len == 0 { <- }
+        digest.write(&chunk)
+    }
+    << digest.sum()
+}
+
+fn install_file_hash(path &string) string {
+    mut input := os.open(path + "") or >>
+    digest := install_hash_stream(&input) or (err) {
+        input.close() or (cleanup) { >> errors.new(err.msg() + "; " + cleanup.msg()) }
+        >> err
+    }
+    input.close() or >>
+    << digest
+}
+
+fn install_safe_relative(path &string) bool {
+    if path.len == 0 || filepath.is_abs(path) || strings.contains(path, "\\") { << false }
+    parts := strings.split(path, "/")
+    for i in 0:parts.len { if parts[i] == ".." || parts[i] == "." || parts[i].len == 0 { << false } }
+    << true
+}
+
+// Check the complete recorded payload and every tool before and after commit.
+pub fn verify_install(root &string, version &string, platform &string) int {
+    text := os.read(root + "/VERSION") or >>
+    actual := strings.trim_space(&text)
+    if actual != version + "" { >> errors.new("SDK VERSION does not match " + version) }
+    encoded := os.read(root + "/bundle.json") or >>
+    doc := json.parse(&encoded)
+    if !doc.ok() || !doc.is_dict(doc.root()) { >> errors.new("invalid SDK bundle.json") }
+    recorded := doc.as_string(doc.get(doc.root(), "version")) or >>
+    target := doc.as_string(doc.get(doc.root(), "target")) or >>
+    if recorded != actual || (target != platform + "" && target != "devkit-all") {
+        >> errors.new("SDK manifest identity mismatch")
+    }
+    files := doc.get(doc.root(), "files")
+    if files >= 0 {
+        if !doc.is_dict(files) { >> errors.new("invalid SDK file inventory") }
+        names := doc.dict_keys(files)
+        for i in 0:names.len {
+            name := names[i] + ""
+            if !install_safe_relative(&name) { >> errors.new("invalid SDK inventory path") }
+            if target == "devkit-all" && strings.has_prefix(&name, "bin/") {
+                rest := name[4:name.len] + ""
+                if strings.index_of(&rest, "/") < 0 { -> }
+            }
+            expected := doc.as_string(doc.get(files, name + "")) or >>
+            path := root + "/" + name
+            digest := install_file_hash(&path) or >>
+            if digest != expected { >> errors.new("SDK file checksum mismatch: " + name) }
+        }
+    }
+    tools := ["xu", "xu-setup", "xu-doctor", "xu-fmt", "xu-doc", "xu-map", "xu-desktop", "xu-update", "xu-lsp", "xu-native"]
+    mut suffix := ""
+    if strings.has_prefix(platform, "windows-") { suffix = ".exe" }
+    binaries := doc.get(doc.root(), "binaries")
+    for i in 0:tools.len {
+        name := tools[i] + suffix
+        path := root + "/bin/" + name
+        digest := install_file_hash(&path) or >>
+        if target == "devkit-all" {
+            source := root + "/bin/platform/" + platform + "/" + name
+            source_hash := install_file_hash(&source) or >>
+            if source_hash != digest { >> errors.new("SDK platform tool mismatch: " + name) }
+        } else {
+            if binaries < 0 || !doc.is_dict(binaries) { >> errors.new("SDK binary inventory is missing") }
+            expected := doc.as_string(doc.get(binaries, name + "")) or >>
+            if digest != expected { >> errors.new("SDK tool checksum mismatch: " + name) }
+        }
+    }
+    if !os.is_dir(root + "/src") { >> errors.new("SDK standard library is missing") }
+    mut command := exec.command(root + "/bin/xu" + suffix, "--version")
+    output := command.output() or >>
+    got := compiler_version(&output) or >>
+    if got != actual { >> errors.new("installed compiler version does not match SDK VERSION") }
+    << 0
+}
+
+// Directory moves can require owner write permission on a read-only SDK root.
+// Restore its original mode at the new path, including on rollback.
+fn install_move_directory(source &string, destination &string) int {
+    if xu_target_os() == 2 {
+        os.rename(source + "", destination + "") or >>
+        << 0
+    }
+    info := os.stat(source + "") or >>
+    mode := info.mode & 511
+    changed := (mode & 448) != 448
+    if changed {
+        os.chmod(source + "", mode | 448) or (permission_error) {
+            // A writable parent can permit renaming a directory we do not own.
+            os.rename(source + "", destination + "") or (rename_error) {
+                >> errors.new("cannot move SDK directory " + source + ": " + rename_error.msg())
+            }
+            << 0
+        }
+    }
+    os.rename(source + "", destination + "") or (err) {
+        if changed {
+            os.chmod(source + "", mode) or (cleanup) { >> errors.new(err.msg() + "; restore directory mode: " + cleanup.msg()) }
+        }
+        >> errors.new("cannot move SDK directory " + source + ": " + err.msg())
+    }
+    if changed {
+        os.chmod(destination + "", mode) or (err) {
+            os.rename(destination + "", source + "") or (restore_error) {
+                >> errors.new(err.msg() + "; directory retained at " + destination + ": " + restore_error.msg())
+            }
+            os.chmod(source + "", mode) or (cleanup) { >> errors.new(err.msg() + "; restore directory mode: " + cleanup.msg()) }
+            >> err
+        }
+    }
+    << 0
+}
+
+// The caller supplies a verified stage and an unused backup path on the same
+// filesystem. A failed second rename restores the original directory.
+pub fn commit_install(stage &string, target &string, backup &string) int {
+    if !os.is_dir(stage + "") { >> errors.new("SDK installation stage is missing") }
+    if install_exists(backup) { >> errors.new("SDK backup path already exists") }
+    had_target := install_exists(target)
+    if had_target { install_move_directory(target, backup) or >> }
+    install_move_directory(stage, target) or (err) {
+        if had_target {
+            install_move_directory(backup, target) or (restore_error) {
+                >> errors.new("SDK replacement failed: " + err.msg() + "; restore failed: " + restore_error.msg() +
+                              "; original SDK retained at " + backup)
+            }
+        }
+        >> errors.new("SDK replacement failed; original installation preserved: " + err.msg())
+    }
+    << 0
+}
+
+fn install_staged(payload &string, target &string, version &string, platform &string, parent &string) string {
+    stage := os.mkdir_temp(parent + "", ".xu-setup-stage-") or >>
+    backup_dir := os.mkdir_temp(parent + "", ".xu-setup-backup-") or (err) {
+        install_remove(&stage) or (cleanup) { >> errors.new(err.msg() + "; " + cleanup.msg()) }
+        >> err
+    }
+    // Keep the backup in the same parent. Moving a read-only directory into
+    // a different parent can require updating its parent entry on macOS.
+    backup := backup_dir + ""
+    os.remove(backup_dir + "") or >>
+    install_prepare(payload, target, &stage, version, platform) or (err) {
+        install_remove(&stage) or (cleanup) { >> errors.new(err.msg() + "; " + cleanup.msg()) }
+        >> errors.new("SDK staging failed: " + err.msg())
+    }
+    had_target := install_exists(target)
+    commit_install(&stage, target, &backup) or (err) {
+        install_remove(&stage) or (cleanup) { >> errors.new(err.msg() + "; stage retained: " + stage) }
+        >> err
+    }
+    verify_install(target, version, platform) or (err) {
+        install_move_directory(target, &stage) or (restore_error) {
+            >> errors.new(err.msg() + "; cannot move failed installation: " + restore_error.msg() + "; backup: " + backup)
+        }
+        if had_target {
+            install_move_directory(&backup, target) or (restore_error) {
+                >> errors.new(err.msg() + "; cannot restore original: " + restore_error.msg() + "; backup: " + backup)
+            }
+        }
+        install_remove(&stage) or (cleanup) { >> errors.new(err.msg() + "; failed stage retained: " + stage) }
+        >> errors.new("SDK verification failed; original installation restored: " + err.msg())
+    }
+    if had_target { << backup }
+    << ""
+}
+
+fn install_payload(payload &string, stage &string) int {
+    encoded := os.read(payload + "/bundle.json") or >>
+    doc := json.parse(&encoded)
+    if !doc.ok() || !doc.is_dict(doc.root()) { >> errors.new("invalid SDK bundle.json") }
+    inventory := doc.get(doc.root(), "files")
+    if inventory >= 0 {
+        if !doc.is_dict(inventory) { >> errors.new("invalid SDK file inventory") }
+        names := doc.dict_keys(inventory)
+        if names.len == 0 { >> errors.new("empty SDK file inventory") }
+        for i in 0:names.len {
+            name := names[i] + ""
+            if !install_safe_relative(&name) { >> errors.new("invalid SDK inventory path") }
+            src := payload + "/" + name
+            dst := stage + "/" + name
+            os.mkdir_all(filepath.dir(&dst)) or >>
+            install_copy(&src, &dst) or >>
+        }
+    } else {
+        // Older releases have only a binary inventory. Never copy local
+        // checkout files, caches or development records from the source root.
+        names := ["src", "bin", "include", "packages", "examples", "editors", "VERSION", "TARGET",
+                  "README.md", "LICENSE", "install.sh", "install.ps1", "env.sh", "env.ps1",
+                  "uninstall.sh", "uninstall.ps1", "xu-setup", "xu-setup.exe"]
+        for i in 0:names.len {
+            src := payload + "/" + names[i]
+            if !install_exists(&src) { -> }
+            dst := stage + "/" + names[i]
+            install_copy(&src, &dst) or >>
+        }
+    }
+    src := payload + "/bundle.json"
+    dst := stage + "/bundle.json"
+    install_copy(&src, &dst) or >>
+    << 0
+}
+
+fn install_prepare(payload &string, target &string, stage &string, version &string, platform &string) int {
+    install_payload(payload, stage) or >>
+    selected := stage + "/bin/platform/" + platform
+    if os.is_dir(selected + "") {
+        binaries := stage + "/bin"
+        install_copy(&selected, &binaries) or >>
+    }
+    install_preserve(target, stage) or >>
+    verify_install(stage, version, platform) or >>
+    if xu_target_os() != 2 && install_exists(target) {
+        previous := os.stat(target + "") or >>
+        os.chmod(stage + "", (previous.mode & 63) | 448) or >>
+    }
+    << 0
+}
+
+// Prepare privately beside the prefix, then replace its directory. Old SDKs
+// remain in a private backup, including read-only files and locally edited
+// managed components. Unmanaged root entries are copied into the new SDK.
+fn install_destination(payload &string, target &string, version &string, platform &string) string {
+    parent := filepath.dir(target)
+    if parent == target + "" { >> errors.new("refusing to replace a filesystem root") }
+    git := target + "/.git"
+    if install_exists(&git) { >> errors.new("refusing to replace a Git checkout") }
+    old_lock := target + "/.xu-update.lock"
+    if install_exists(&old_lock) { >> errors.new("another update holds " + old_lock) }
+    os.mkdir_all(parent + "") or >>
+    lock_path := parent + "/." + filepath.base(target) + ".xu-install.lock"
+    mut lock := os.create_excl(lock_path + "") or (err) {
+        >> errors.new("cannot acquire SDK installation lock " + lock_path + ": " + err.msg())
+    }
+    lock.close() or (err) {
+        os.remove(lock_path + "") or (cleanup) { >> errors.new(err.msg() + "; " + cleanup.msg()) }
+        >> err
+    }
+    backup := install_staged(payload, target, version, platform, &parent) or (err) {
+        os.remove(lock_path + "") or (cleanup) { >> errors.new(err.msg() + "; lock retained: " + lock_path) }
+        >> err
+    }
+    os.remove(lock_path + "") or >>
+    << backup
+}
+
+// Resolve both paths before rejecting source/target overlap and acquiring the lock.
+pub fn install_sdk(payload &string, target &string, version &string, platform &string) string {
+    source := real_path(payload) or >>
+    destination := real_path(target) or >>
+    source_prefix := source + "/"
+    target_prefix := destination + "/"
+    if source == destination || strings.has_prefix(&source, target_prefix) || strings.has_prefix(&destination, source_prefix) {
+        >> errors.new("SDK source and installation prefix overlap")
+    }
+    expected := release_version(version) or >>
+    << install_destination(&source, &destination, &expected, platform) or >>
+}
