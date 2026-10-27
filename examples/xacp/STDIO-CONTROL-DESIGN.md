@@ -1,9 +1,8 @@
-# XACP stdio 控制通道设计（方案 B）
+# XACP stdio 控制通道设计（方案 B，历史资料）
 
-日期：2026-10-27  
-工作目录：`/workspace/xu-dev`  
-基线分支：`cursor/xacp-usability-smoke`（基于 `origin/dev`）  
-范围：先打通 **stdio** 控制通道；**TCP 本阶段不做**（端口仍为编译期元数据）。
+> **历史设计，已被后续实现取代。** 当前 `dev` 已实现 stdio 和 loopback TCP 控制通道：编译时以 `--xacp-port PORT` 设置端口，运行时显式传入 `--xacp-tcp` 才在 `127.0.0.1` 监听，客户端使用 `xu xacp connect PORT`。端口 0 禁用 TCP。当前命令、权限和适配器边界以[可运行样例 README](README.md)为准；传输实现见 [`src/xacp/stdio.xu`](../../src/xacp/stdio.xu)。
+
+原方案日期：2026-10-27。以下保留当时的 stdio 阶段设计与待选方案，不代表当前行为。当时范围为先打通 **stdio** 控制通道，TCP 留待后续；后续已完成 TCP listen / connect。
 
 ## 目标
 
@@ -18,7 +17,6 @@
 5. `--xacp-help` 发现文档标明 `stdio` 传输与已接线 ops（不再只报 `help_only`）。
 6. 冒烟覆盖 hello、proc.status、至少一个 UI 读、一个 UI mutate；接入 `xacp-test` / `scripts/xacp_smoke.py`。
 7. 无控制 stdin 时行为与现网一致（业务 main / `--xacp-help`）。
-8. 不 push；不 force；TCP listen 本阶段明确不做。
 
 ## 非目标
 
@@ -93,15 +91,8 @@ xu-xacp control/run  --  pipes  --►  target (--xacp)
 - `scripts/xacp_smoke.py` / `make xacp-test`：stdio hello、proc.status、UI 读、UI mutate（无 UI 时期望稳定错误码）
 - 回归：现有 inspect/run/debug/record、`--` 边界、1 MiB record 上限
 
-## 实现约束
+## 后续（原方案规划）
 
-- 在 box 上用 Codex（`CODEX_HOME=/home/box/.codex` / cupfuls）；不用 Mac。
-- 继续 `/workspace/xu-dev`；可留在 `cursor/xacp-usability-smoke` 或建 `cursor/xacp-stdio-control`。
-- 可用 `XU_SEED=/home/box/.xu/bin/xu` 与已有 `bin/xu`；`make` 在 `/home/box/.local/bin/make`。
-- 不 push、不 force；报告写到 `/tmp/xu-codex-box/xacp-stdio-report.md`。
-
-## 后续（非本阶段）
-
-- TCP listen（`--xacp-port` 真正生效）
+- TCP listen / connect（现已实现，见顶部说明）
 - 生产授权（默认拒绝 + 宿主显式授权）
 - 推送/事件流与正式 UI 录制容器
