@@ -34,6 +34,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd -P)
 export XU_ROOT="$ROOT"
+# Only a fixture's xupath.txt may add package roots. An installed SDK in the
+# caller's environment must not shadow this checkout or fail product isolation.
+unset XUPATH
 cd "$ROOT"
 source scripts/test_lib.sh
 
@@ -142,8 +145,16 @@ for dir in tests/fixtures/*/; do
         fi
     fi
     if [ ! -f "$dir/main.xu" ] && [ ! -f "$dir/error.txt" ]; then
-        echo "SKIP $name (no main.xu; library source)"
-        skipped=$((skipped + 1))
+        library_source=0
+        for source in "$dir"/*.xu; do
+            if [ -f "$source" ]; then library_source=1; break; fi
+        done
+        if [ "$library_source" = 1 ]; then
+            echo "SKIP $name (no main.xu; library source)"
+            skipped=$((skipped + 1))
+        else
+            record_fail "$name" "no main.xu or library source"
+        fi
         continue
     fi
     requires=0
