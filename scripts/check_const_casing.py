@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 UPPER_SNAKE_RE = re.compile(r"^_?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$")
+LEGACY_UI_RE = re.compile(r"^(?:ev|button|mod|cursor|key|request|sampler)_[a-z][a-z0-9_]*$")
 CONST_DECL_RE = re.compile(
     r"(?:^|(?<=[;\s]))(?:pub\s+)?const\s+([A-Za-z0-9_]+)\s*="
 )
@@ -31,7 +32,7 @@ CONST_DECL_RE = re.compile(
 def is_upper_snake_case(name: str) -> bool:
     if name == "_":
         return True
-    return bool(UPPER_SNAKE_RE.fullmatch(name))
+    return bool(UPPER_SNAKE_RE.fullmatch(name) or LEGACY_UI_RE.fullmatch(name))
 
 
 def strip_comments_and_strings(content: str) -> list[tuple[int, str]]:

@@ -12,7 +12,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help memsafe all xu xu-desktop xu-fmt xu-doctor xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-platform tools \
+.PHONY: help memsafe all xu xu-desktop xu-fmt xu-doctor xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-xacp xu-platform tools \
 	server-build-local server-build-linux server-check-linux server-start server-health server-smoke-local server-unit \
 	server-remote-check server-remote-deploy server-remote-status server-remote-health server-remote-smoke \
 	server-remote-restart server-remote-stop server-remote-rollback \
@@ -44,6 +44,7 @@ help:
 	@echo "  make xu-setup        standalone installer → $(BIN)/xu-setup"
 	@echo "  make xu-lsp          language server → $(BIN)/xu-lsp"
 	@echo "  make xu-native       native C module tool → $(BIN)/xu-native"
+	@echo "  make xu-xacp         XACP inspect/run/debug tool → $(BIN)/xu-xacp"
 	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup + xu-update + xu-lsp + xu-native (needs $(XU))"
 	@echo "  make server-build-local  build xu-examples/examples/11_http_server for this host"
 	@echo "  make server-build-linux  cross-build Xu HTTP server for linux-x64"
@@ -104,6 +105,7 @@ UPDATE_XU  := $(wildcard src/cmd/update/*.xu)
 SETUP_XU   := $(wildcard src/cmd/setup/*.xu)
 LSP_XU     := $(wildcard src/cmd/lsp/*.xu)
 NATIVE_XU  := $(wildcard src/cmd/native/*.xu)
+XACP_XU    := $(wildcard src/cmd/xacp/*.xu)
 XU_PKG_XU  := $(wildcard src/xu/*/*.xu)
 # The complete product source tree is a dependency of the hosted compiler.
 # The boundary checker still defines the exact Gen1 input closure; this wider
@@ -127,6 +129,7 @@ XU_UPDATE  := $(BIN)/xu-update$(EXE_SUFFIX)
 XU_SETUP   := $(BIN)/xu-setup$(EXE_SUFFIX)
 XU_LSP     := $(BIN)/xu-lsp$(EXE_SUFFIX)
 XU_NATIVE  := $(BIN)/xu-native$(EXE_SUFFIX)
+XU_XACP    := $(BIN)/xu-xacp$(EXE_SUFFIX)
 
 xu: $(XU) tools
 ifneq ($(strip $(BUMP)),)
@@ -164,7 +167,7 @@ product-selfhost: $(XU)
 xu-platform: $(XU)
 	./scripts/build_platform_xu.sh $(XU) $(BIN)/platform
 
-tools: xu-doctor xu-desktop xu-fmt xu-map xu-doc xu-setup xu-update xu-lsp xu-native
+tools: xu-doctor xu-desktop xu-fmt xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-xacp
 
 xu-desktop: $(XU_DESKTOP)
 xu-doctor: $(XU_DOCTOR)
@@ -175,6 +178,7 @@ xu-update: $(XU_UPDATE)
 xu-setup: $(XU_SETUP)
 xu-lsp: $(XU_LSP)
 xu-native: $(XU_NATIVE)
+xu-xacp: $(XU_XACP)
 
 $(BIN):
 	mkdir -p $(BIN)
@@ -218,6 +222,9 @@ $(XU_LSP): $(XU) src/cmd/lsp/xu.xun $(LSP_XU) $(XU_PKG_XU) | $(BIN)
 
 $(XU_NATIVE): $(XU) src/cmd/native/xu.xun $(NATIVE_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-native)
+
+$(XU_XACP): $(XU) $(XACP_XU) $(XU_PKG_XU) | $(BIN)
+	$(call build_product_tool,xu-xacp)
 
 check test: verify-gen3
 
