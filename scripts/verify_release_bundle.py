@@ -17,7 +17,7 @@ import zipfile
 TARGETS = ("macos-arm64", "macos-x64", "linux-x64", "linux-arm64",
            "linux-loongarch64", "linux-riscv64", "windows-x64", "windows-arm64")
 TOOLS = ("xu", "xu-setup", "xu-doctor", "xu-fmt", "xu-doc", "xu-map",
-         "xu-desktop", "xu-update", "xu-lsp", "xu-native")
+         "xu-desktop", "xu-update", "xu-lsp", "xu-native", "xu-xacp")
 ROOT = Path(__file__).resolve().parents[1]
 
 
