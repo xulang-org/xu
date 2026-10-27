@@ -29,7 +29,7 @@ def source_digest(source: Path) -> str:
 
 def prepare(seed: Path, destination: Path) -> str:
     output = subprocess.check_output([str(seed), '--version'], text=True)
-    match = re.search(r'Xu Compiler Toolchain v(\d+\.\d+\.\d+) \(self-hosted\)', output)
+    match = re.search(r'Xu Compiler Toolchain v(\d+\.\d+\.\d+)', output)
     if not match:
         raise ValueError('Constant migration requires a published hosted SDK seed')
     version = match.group(1)
