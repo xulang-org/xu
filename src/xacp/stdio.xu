@@ -1,0 +1,197 @@
+@xacp
+
+#os
+#errors
+#strings
+
+// Explicit control modes skip business main; the first control flag wins.
+// Ordinary invocations never listen or read control stdin. The -- boundary protects application arguments.
+pub fn stdio_preflight(port int) {
+    argv := os.args()
+    for i in 1:argv.len {
+        if argv[i] == "--" { << }
+        if argv[i] == "--xacp-tcp" {
+            code := serve_tcp(port) or (err) {
+                eprintln("xacp tcp: " + err.msg())
+                <<< 1
+            }
+            <<< code
+        }
+        if argv[i] == "--xacp-stdio" {
+            code := serve_stdio() or (err) {
+                eprintln("xacp stdio: " + err.msg())
+                <<< 1
+            }
+            <<< code
+        }
+    }
+}
+
+fn control_write(fd int, tcp bool, text string) int {
+    mut offset := 0
+    while offset < text.len {
+        mut n := 0
+        if tcp {
+            n = os.socket_write(fd, text[offset:text.len]) or >>
+        } else {
+            n = os_fd_write(fd, text[offset:text.len]) or >>
+        }
+        if n <= 0 { >> errors.new("xacp: output made no progress") }
+        offset += n
+    }
+    << 0
+}
+
+fn control_response(fd int, tcp bool, id int, ok bool, code string, data string) int {
+    mut body := "id: !i " + str(id) + "\nok: !b " + str(ok) + "\n"
+    if ok {
+        body = body + "data:\n" + data
+    } else {
+        body = body + "error:\n  code: " + code + "\n"
+    }
+    control_write(fd, tcp, "--- !xacp\n" + body + "===\n") or >>
+    << 0
+}
+
+fn control_request(fd int, tcp bool, s &mut Session, frame string, l &Limits) int {
+    d := parse_frame(frame) or (err) {
+        control_response(fd, tcp, 0, false, "frame_error", "") or >>
+        << 0
+    }
+    req := validate_request(&d, l) or (err) {
+        control_response(fd, tcp, 0, false, "schema_error", "") or >>
+        << 0
+    }
+    started := begin_request(mut &*s, &req)
+    if !started.ok {
+        control_response(fd, tcp, req.id, false, started.err_code, "") or >>
+        << 0
+    }
+    if req.op == "xacp.hello" {
+        if !enable_development(mut &*s) {
+            cancel_request(mut &*s)
+            control_response(fd, tcp, req.id, false, "permission_denied", "") or >>
+            << 0
+        }
+    } else if req.op != "proc.status" {
+        // No Screen or output capture is registered in the startup adapter.
+        // All known operations, including mutate, reach this checked path.
+        cancel_request(mut &*s)
+        control_response(fd, tcp, req.id, false, "not_implemented", "") or >>
+        << 0
+    }
+    finished := finish_request(mut &*s, req.id)
+    if !finished.ok {
+        control_response(fd, tcp, req.id, false, finished.err_code, "") or >>
+        << 0
+    }
+    if req.op == "xacp.hello" {
+        control_response(fd, tcp, req.id, true, "", "  state: OPEN\n  permissions: development\n") or >>
+    } else {
+        control_response(fd, tcp, req.id, true, "", "  pid: !i " + str(os.getpid()) + "\n  state: OPEN\n") or >>
+    }
+    << 0
+}
+
+// Chunked reads and an amortized builder bound memory and copying. EOF and
+// oversize input terminate the session; complete frames may share a read.
+pub fn serve_stdio() int {
+    << serve_control(0, 1, false) or >>
+}
+
+// The caller owns both descriptors. Each call creates one fresh session.
+fn serve_control(input int, fd int, tcp bool) int {
+    mut session := open_session()
+    limits := default_limits()
+    mut frame := strings.builder()
+    delimiter := "\n===\n"
+    mut matched := 0
+    while true {
+        chunk := control_read(input, tcp) or (err) {
+            close_session(mut &session)
+            >> err
+        }
+        if chunk.len == 0 {
+            if frame.length() > 0 {
+                tail := frame.text()
+                trimmed := trim_frame_body(&tail)
+                if has_suffix(&trimmed, "\n===") {
+                    control_request(fd, tcp, mut &session, tail, &limits) or (err) {
+                        close_session(mut &session)
+                        >> err
+                    }
+                } else {
+                    control_response(fd, tcp, 0, false, "truncated_frame", "") or (err) {
+                        close_session(mut &session)
+                        >> err
+                    }
+                }
+            }
+            close_session(mut &session)
+            << 0
+        }
+        for i in 0:chunk.len {
+            if frame.length() >= MAX_FRAME_BYTES {
+                close_session(mut &session)
+                control_response(fd, tcp, 0, false, "frame_too_large", "") or >>
+                << 1
+            }
+            c := chunk[i] & 255
+            frame.write_byte(c)
+            if c == (delimiter[matched] & 255) {
+                matched += 1
+            } else if c == 13 && matched == 4 {
+                // A CR before the final newline is trimmed by parse_frame.
+                matched = 4
+            } else if c == 10 {
+                matched = 1
+            } else {
+                matched = 0
+            }
+            if matched == delimiter.len {
+                control_request(fd, tcp, mut &session, frame.text(), &limits) or (err) {
+                    close_session(mut &session)
+                    >> err
+                }
+                frame.reset()
+                matched = 0
+            }
+        }
+    }
+    << 0
+}
+
+fn control_read(fd int, tcp bool) string {
+    if tcp { << os.socket_read(fd, 4096) or >> }
+    << os_fd_read(fd, 4096) or >>
+}
+
+// Explicit exclusive control mode; loopback only, sequential connections.
+// A malformed/disconnected peer ends its session, not the listener.
+pub fn serve_tcp(port int) int {
+    if port < 1 || port > 65535 {
+        >> errors.new("xacp: TCP requires a build with --xacp-port 1..65535")
+    }
+    listener := os.socket(2, 1, 0) or >>
+    os.bind4(listener, 127, 0, 0, 1, port) or (err) {
+        _ := os.socket_close(listener) or (close_err) { >> err }
+        >> err
+    }
+    os.listen(listener, 16) or (err) {
+        _ := os.socket_close(listener) or (close_err) { >> err }
+        >> err
+    }
+    while true {
+        peer := os.accept(listener) or (err) {
+            _ := os.socket_close(listener) or (close_err) { >> err }
+            >> err
+        }
+        _ := serve_control(peer, peer, true) or (err) {
+            // Peer errors are isolated; the listener remains available.
+            _ := os.socket_close(peer) or >>
+            ->
+        }
+        _ := os.socket_close(peer) or >>
+    }
+    << 0
+}
