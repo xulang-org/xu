@@ -184,12 +184,14 @@ xu build main.xu -o myapp
 | `xu build <file.xu> --target wasm32 -o app.wasm` | 生成 WebAssembly 模块 |
 | `xu build <file.xu> --xacp --xacp-port 4321 -o app` | 嵌入 XACP 启动发现元数据 |
 | `./app --xacp-help` | 输出生成程序的机器可读 XACP 摘要 |
-| `xu xacp inspect app` | 检查启用 XACP 程序的发现信息与安全摘要 |
-| `xu xacp run app -- args...` | 使用明确的 AI/用户参数边界运行程序 |
-| `xu xacp record app -- > output.log` | 将有界 stdout 流式输出，由用户自行保存 |
+| `xu xacp inspect ./app` | 检查启用 XACP 程序的发现信息与安全摘要 |
+| `xu xacp run ./app -- args...` | 使用明确的 AI/用户参数边界运行程序 |
+| `xu xacp record ./app -- > output.log` | 将有界 stdout 流式输出，由用户自行保存 |
 | `xu build <AppDir> --desktop` | 打包桌面应用；需要对应宿主 UI SDK 与工具链 |
 | `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
 | `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
+
+使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](examples/xacp/README.md)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
 
 `#xacp` 是传输无关的标准库层，用于宿主注册一个真实的
 `ui/widgets.Screen`。adapter 提供有界的 `ui.tree`、由原生资源承载的
