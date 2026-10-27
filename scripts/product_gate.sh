@@ -30,6 +30,7 @@ ROOT=$(pwd -P)
 export XU_ROOT="$ROOT"
 cd "$ROOT"
 export XU_STDLIB_ROOT="$("${PYTHON:-python3}" -c 'from pathlib import Path; print(Path("src").resolve().as_posix())')"
+source scripts/macos_sdk_env.sh
 source scripts/test_lib.sh
 
 sha256_file() {
