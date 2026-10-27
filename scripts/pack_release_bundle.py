@@ -495,6 +495,8 @@ def main():
         (stage_dir / "bundle.json").write_text(json.dumps({
             "schema": 1, "version": version, "target": target, "lane": args.lane,
             "binaries": {p.name: compute_sha256(p) for p in sorted((stage_dir / "bin").iterdir())},
+            "files": {p.relative_to(stage_dir).as_posix(): compute_sha256(p)
+                      for p in sorted(stage_dir.rglob("*")) if p.is_file() and p.relative_to(stage_dir).as_posix() != "bundle.json"},
         }, indent=2) + "\n", encoding="utf-8")
 
         archive_stem = f"xu-v{version}-{target}"
@@ -563,11 +565,13 @@ def main():
                 shutil.rmtree(platform_stage)
             assemble_bundle_dir(target, platform_stage, xu_bin, cache_dir, version)
             shutil.copytree(platform_stage / "bin", bin_platform_dir / target)
+        (devkit_stage / "TARGET").write_text("devkit-all\n", encoding="utf-8")
         (devkit_stage / "bundle.json").write_text(json.dumps({
             "schema": 1, "version": version, "target": "devkit-all", "lane": args.lane,
             "platforms": SUPPORTED_TARGETS,
+            "files": {p.relative_to(devkit_stage).as_posix(): compute_sha256(p)
+                      for p in sorted(devkit_stage.rglob("*")) if p.is_file() and p.relative_to(devkit_stage).as_posix() != "bundle.json"},
         }, indent=2) + "\n", encoding="utf-8")
-        (devkit_stage / "TARGET").write_text("devkit-all\n", encoding="utf-8")
 
         devkit_archive = out_dir / f"xu-v{version}-devkit-all.tar.gz"
         print(f"  [archive] Creating TAR.GZ: {devkit_archive.name}...")

@@ -40,6 +40,9 @@ def vscode_package_files(checkout: Path) -> list[Path]:
     filename = f"{metadata['name']}-{metadata['version']}.vsix"
     if Path(filename).name != filename or "\\" in filename:
         raise ValueError("VS Code package name/version must form a plain filename")
+    if os.environ.get("XU_VSCODE_ROOT") and not (checkout / filename).is_file():
+        raise FileNotFoundError(f"Missing bundled VS Code extension: {checkout / filename}; "
+                                "run npm ci and npm run package in the selected extension checkout")
     return [checkout / name for name in (filename, "package.json", "language-configuration.json", "README.md")
             if (checkout / name).is_file()]
 
