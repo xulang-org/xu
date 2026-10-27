@@ -29,6 +29,7 @@ const XuContentVTable *xu_draw_plugin_vtable(void) __attribute__((weak));
 
 static char g_tmp[1024];
 static unsigned g_root_generation=0;
+static void native_children_close_parent(unsigned parent,unsigned generation);
 static bool g_root_closed=false;
 static HWND g_hwnd = NULL;
 static BOOL g_frameless = FALSE;
@@ -1231,6 +1232,7 @@ static void tray_install_or_update(void) {
 static void do_quit(void) {
   if(g_quitting)return;
   if(!g_root_closed){
+    native_children_close_parent(1,g_root_generation);
     g_root_closed=true;native_menu_close(g_hwnd);
     desktop_files_close_owner(1,g_root_generation);
     if(g_content && g_content_vt && g_content_vt->destroy)g_content_vt->destroy(g_content);
@@ -1829,12 +1831,14 @@ static const char *strip_prefix(const char *raw) {
 static void maybe_install_content_plugin(void);
 #include "windows_clipboard.inc"
 #include "windows_windows.inc"
+#include "windows_native_views.inc"
 
 static void drain_cmds(void) {
   xu_ui_request_poll();
   desktop_files_poll();
   if(!g_root_closed)drain_title_size();
   extra_poll();
+  native_children_poll();
   if(g_root_closed && !xu_ui_window_count()){do_quit();if(g_quitting)return;}
   apply_app_icon();
   tray_install_or_update();
@@ -1856,7 +1860,7 @@ static void drain_cmds(void) {
     while (*line == ' ') line++;
     if (*line) {
       if(!strcmp(line,"shell.quit_app")){for(auto &window:g_extra_windows)extra_close(window,true);xu_ui_windows_shutdown();do_quit();return;}
-      if(extra_dispatch(line))continue;
+      if(native_children_dispatch(line) || extra_dispatch(line))continue;
       unsigned identity[2];const char *unscoped=line;xu_ui_scoped_command(line,identity,&unscoped);
       const char *cmd = strip_prefix(unscoped);
       int to_content = (strncmp(unscoped, "wv.", 3) == 0 || strncmp(unscoped, "content.", 8) == 0);
@@ -2198,7 +2202,7 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
 
   MSG msg;
   while (GetMessageW(&msg, NULL, 0, 0)) {
-    if (xu_ui_dialog_message(&msg) || native_menu_accel(&msg)) continue;
+    if (native_children_key(&msg) || xu_ui_dialog_message(&msg) || native_menu_accel(&msg)) continue;
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
