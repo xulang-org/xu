@@ -18,7 +18,7 @@ import sys
 import tempfile
 import zlib
 
-from xacp_screen_marshal_smoke import Attached, frame, hello
+from xacp_screen_marshal_smoke import Attached, example_path, frame, hello
 from xacp_frame import fd_reader, read_frame
 from xacp_screen_marshal_smoke import checked
 
@@ -35,7 +35,7 @@ def run(command):
 def build_fixture(xu, directory):
     obj = directory / "screen.xuobj"
     run([ROOT / "scripts/run_product_compiler.sh", xu, "build", "--xacp", "--emit-obj",
-         "examples/xacp/attach/main.xu", "-o", obj])
+         example_path("attach/main.xu"), "-o", obj])
     run([sys.executable, ROOT / "scripts/xuobj_to_elf_o.py", obj, directory / "screen.o"])
     flags = shlex.split(run(["pkg-config", "--cflags", "--libs", "gtk4", "pangocairo"]))
     cxx = shlex.split(os.environ.get("CXX", "c++"))

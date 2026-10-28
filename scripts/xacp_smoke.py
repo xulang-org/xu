@@ -12,8 +12,9 @@ import sys
 import tempfile
 
 from xacp_cross_protocol_probe import probe, wait_listener
-from xacp_screen_marshal_smoke import Attached, checked, run_screen_smoke, stdio_checks
+from xacp_screen_marshal_smoke import Attached, checked, example_path, run_screen_smoke, stdio_checks
 from xacp_screen_marshal_smoke import frame as screen_frame, hello as screen_hello
+from companion_repos import project_root
 from xacp_frame import encode, split, read_frame, fd_reader
 from xacp_frame_fuzz import run_frame_fuzz
 
@@ -291,10 +292,101 @@ def nonce_tcp_checks(app, port):
     print("XACP cross-connection nonce replay smoke: PASS")
 
 
+# The full example lives in https://github.com/xulang-org/examples/tree/main/examples/xacp.
+# Keep only the launcher fixture and core session checks here so standalone Xu
+# checkouts can still exercise control/TCP without fetching a companion repo.
+FALLBACK_MAIN = """@main
+#os
+
+fn main() int {
+    println("business-main")
+    args := os.args()
+    for i in 1:args.len {
+        println("arg: " + args[i])
+    }
+    << 0
+}
+"""
+FALLBACK_CORE = r"""@main
+#xacp
+#os
+#strconv
+#errors
+
+fn check_setting(name string, actual int) int {
+    text := os.getenv(name)
+    if text.len == 0 { << 0 }
+    expected := strconv.parse(&text, 10) or >>
+    if actual != expected { >> errors.new("unexpected XACP setting") }
+    << 0
+}
+
+fn check_core() int {
+    limits := xacp.default_limits()
+    mut nonces := xacp.new_nonce_registry(xacp.DEFAULT_NONCE_CACHE, true)
+    check_setting("XACP_EXPECT_TIMEOUT_MS", xacp.request_timeout_from_env()) or >>
+    check_setting("XACP_EXPECT_HELLO_TIMEOUT_MS", xacp.hello_timeout_from_env()) or >>
+    check_setting("XACP_EXPECT_IDLE_TIMEOUT_MS", xacp.idle_timeout_from_env()) or >>
+    check_setting("XACP_EXPECT_NONCE_CACHE", xacp.nonce_cache_from_env()) or >>
+    replay := os.getenv("XACP_EXPECT_NONCE_REPLAY")
+    if replay.len > 0 && xacp.nonce_replay_from_env() != (replay == "1") { << 7 }
+    mut session := xacp.open_session()
+    hello := xacp.parse_frame("id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: fallback-core\n") or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+    opened := xacp.dispatch(mut &session, &hello, &limits, mut &nonces)
+    if !opened.ok {
+        eprintln(opened.err_msg)
+        << 2
+    }
+    status := xacp.parse_frame("id: !i 2\nop: proc.status\nargs: {}\n") or (err) {
+        eprintln(err.msg())
+        << 3
+    }
+    unimplemented := xacp.dispatch(mut &session, &status, &limits, mut &nonces)
+    if unimplemented.ok || unimplemented.err_code != "not_implemented" { << 4 }
+    if xacp.enable_development(mut &session) { << 5 }
+    xacp.close_session(mut &session)
+    closed := xacp.dispatch(mut &session, &status, &limits, mut &nonces)
+    if closed.ok || closed.err_code != "session_closed" { << 6 }
+    println("XACP core: PASS")
+    << 0
+}
+
+fn main() int {
+    << check_core() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}
+"""
+
+
+def example_sources(tmp):
+    main = example_path("main.xu")
+    core = example_path("core/main.xu")
+    if main.is_file() and core.is_file():
+        print(f"XACP smoke sources: {main.parent}", flush=True)
+        return main, core
+    if os.environ.get("XU_EXAMPLES_ROOT"):
+        raise FileNotFoundError(
+            f"XU_EXAMPLES_ROOT needs examples/xacp/main.xu and core/main.xu: {project_root('examples')}")
+    fixture = Path(tmp) / "fixture"
+    (fixture / "core").mkdir(parents=True)
+    main = fixture / "main.xu"
+    core = fixture / "core/main.xu"
+    main.write_text(FALLBACK_MAIN, encoding="utf-8")
+    core.write_text(FALLBACK_CORE, encoding="utf-8")
+    print("XACP smoke sources: embedded temporary fixture (full example moved to xulang-org/examples)", flush=True)
+    return main, core
+
+
 with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
+    main_source, core_source = example_sources(tmp)
     core = Path(tmp) / ("core.exe" if os.name == "nt" else "core")
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build",
-         "examples/xacp/core/main.xu", "-o", core])
+         core_source, "-o", core])
     assert "XACP core: PASS" in run([core])
     # Parse boundaries, ASCII-only syntax and overflow without waiting 5s each.
     for value, expected in (("", 5000), ("abc", 5000), ("0", 5000), ("-5", 5000),
@@ -328,7 +420,7 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
         assert "XACP core: PASS" in run([core], env=env), value
     app = Path(tmp) / ("app.exe" if os.name == "nt" else "app")
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp",
-         "examples/xacp/main.xu", "-o", app])
+         main_source, "-o", app])
     help_text = run([app, "--xacp-help"])
     assert "hello starts at 1" in help_text and "id not consumed" in help_text
     assert "ui.tree_data: win generation start count total truncated next_start nodes" in help_text
@@ -339,7 +431,7 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
     if sys.argv[1:] == ["--stdio-pagination-id-only"]:
         attached = Path(tmp) / ("attach.exe" if os.name == "nt" else "attach")
         run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp",
-             "examples/xacp/attach/main.xu", "-o", attached])
+             example_path("attach/main.xu"), "-o", attached])
         stdio_checks(attached, TOOL)
         print("XACP pagination/id stdio smoke: PASS")
         sys.exit(0)
@@ -348,20 +440,20 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
     if sys.argv[1:] == ["--stdio-timeouts-only"]:
         attached = Path(tmp) / ("attach.exe" if os.name == "nt" else "attach")
         run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp",
-             "examples/xacp/attach/main.xu", "-o", attached])
+             example_path("attach/main.xu"), "-o", attached])
         session_request_timeout_checks(attached)
         sys.exit(0)
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", f"--xacp-port={port}",
-         "examples/xacp/main.xu", "-o", app])
+         main_source, "-o", app])
     session_tcp_timeout_checks(app, port)
     nonce_tcp_checks(app, port)
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp-port=65536",
-         "examples/xacp/main.xu", "-o", app], code=1)
+         main_source, "-o", app], code=1)
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp", "--target", "wasm32",
-         "examples/xacp/main.xu", "-o", Path(tmp) / "app.wasm"], code=1)
+         main_source, "-o", Path(tmp) / "app.wasm"], code=1)
     assert "record" in run([TOOL, "--help"])
     assert "record" in run([XU, "help", "xacp"])
     for prefix in ([TOOL], [XU, "xacp"]):
@@ -522,7 +614,7 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
     assert "code: invalid_request_id" in out
     granted(out, 1)
     # Exercise the checked-in control fixture with default INFO permissions.
-    out = stdio((ROOT / "examples/xacp/control.xun").read_bytes())
+    out = stdio(example_path("control.xun").read_bytes())
     assert out.count("code: permission_denied") == 2, out
 
     if os.name != "nt":
@@ -615,7 +707,7 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
     run([TOOL, "connect", "65536"], code=1)
     disabled = Path(tmp) / ("disabled.exe" if os.name == "nt" else "disabled")
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp-port", "0",
-         "examples/xacp/main.xu", "-o", disabled])
+         main_source, "-o", disabled])
     assert "tcp: disabled" in run([disabled, "--xacp-help"])
     run([disabled, "--xacp-tcp"], code=1)
     assert "business-main" in run([disabled])
@@ -640,7 +732,7 @@ def timeout_checks():
     with tempfile.TemporaryDirectory(prefix="xu-xacp-timeout-") as tmp:
         app = Path(tmp) / "attach"
         run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp",
-             "examples/xacp/attach/main.xu", "-o", app])
+             example_path("attach/main.xu"), "-o", app])
         session_request_timeout_checks(app)
         for launcher in (None, TOOL):
             peer = Attached(app, launcher, timeout_ms="300", no_poll=True)

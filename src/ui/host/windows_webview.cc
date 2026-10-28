@@ -35,6 +35,7 @@ struct XuWebViewPlugin {
   bool magnify = true;
   std::string last_url;
   std::string last_html;
+  uint64_t native_revision=UINT64_MAX;
   int last_progress = -1;
 };
 
@@ -131,6 +132,13 @@ static void sync_bounds(XuWebViewPlugin *p) {
 }
 
 static std::string read_tmp_all(XuWebViewPlugin *p, const char *name) {
+  if(p->host.canvas_id!=p->host.window_id && !strcmp(name,"xu_ui_page.html")) {
+    char key[XU_UI_MEM_MAX_NAME+1];unsigned length=0;
+    if(!xu_content_key(&p->host,name,key,sizeof(key)))return {};
+    std::string path=":xu:/"+std::string(key);
+    if(!xu_ui_mem_try_read_len(path.c_str(),&length)||length>1048576)return {};
+    std::vector<char> bytes(length+1);xu_ui_mem_try_read_copy(path.c_str(),bytes.data(),length+1);return std::string(bytes.data(),length);
+  }
   char buf[256 * 1024];
   host_read_raw(p, name, buf, sizeof(buf));
   return std::string(buf);
@@ -435,6 +443,7 @@ static bool xu_handle_uri(XuWebViewPlugin *p, ICoreWebView2WebResourceRequestedE
   // http://app.xu/* or xu://app/*
   if (host == "app.xu" || host == "app" || host.empty()) {
     std::string body;
+    if(p->host.canvas_id!=p->host.window_id && (path=="/"||path=="/index.html")){auto html=read_tmp_all(p,"xu_ui_page.html");if(!html.empty()){ensure_html_has_bridge(p,html);put_xu_response(p,args,200,"text/html; charset=utf-8",html);return true;}}
     if (load_www_file(p, path, body)) {
       put_xu_response(p, args, 200, mime_for_path(path), body);
       return true;
@@ -739,7 +748,14 @@ static void eval_raw(XuWebViewPlugin *p, const char *js_utf8, bool want_result) 
   h->Release();
 }
 
+static void load_native_page(XuWebViewPlugin *p) {
+  if(!p->webview)return;uint64_t revision=xu_ui_native_view_revision(p->host.canvas_id,p->host.canvas_generation);if(revision==p->native_revision)return;p->native_revision=revision;
+  char url[8192];host_read_trim(p,"xu_ui_page.url",url,sizeof(url));auto html=read_tmp_all(p,"xu_ui_page.html");std::wstring wide;
+  if(url[0]){p->last_url=url;p->last_html=html;utf8_to_wide(url,wide);p->webview->Navigate(wide.c_str());}
+  else if(!html.empty()){p->last_url="xu://app/";p->last_html=html;p->webview->Navigate(L"xu://app/");}
+}
 static void load_initial(XuWebViewPlugin *p) {
+  if(p->host.canvas_id!=p->host.window_id){load_native_page(p);return;}
   if (!p || !p->webview) return;
   char html[256 * 1024];
   char url[8192];
@@ -1246,6 +1262,7 @@ static void drain_eval(XuWebViewPlugin *p) {
 
 static void drain_page(XuWebViewPlugin *p) {
   if (!p || !p->ready || !p->webview) return;
+  if(p->host.canvas_id!=p->host.window_id){load_native_page(p);return;}
   char url[8192], html[256 * 1024];
   host_read_trim(p, "xu_ui_page.url", url, sizeof(url));
   host_read_raw(p, "xu_ui_page.html", html, sizeof(html));
@@ -1504,6 +1521,7 @@ static bool native_web_request(XuWebViewPlugin *p,const char *command){
 }
 
 static int plugin_handle_cmd(XuWebViewPlugin *p, const char *cmd) {
+  if(p && cmd && !strcmp(cmd,"native_focus")){if(p->controller)p->controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);return 1;}
   if(p && native_web_request(p,cmd))return 1;
   if(p && !strncmp(cmd,"__web_reply\t",12)){xu_invoke_poll(p);return 1;}
   if (!p || !cmd) return 0;
@@ -1610,10 +1628,10 @@ static int plugin_handle_cmd(XuWebViewPlugin *p, const char *cmd) {
 static void plugin_on_poll(XuWebViewPlugin *p) {
   if (!p) return;
   xu_invoke_poll(p);
-  drain_eval(p);
+  if(p->host.canvas_id==p->host.window_id)drain_eval(p);
   drain_page(p);
   // The unscoped compatibility bus belongs to the primary window only.
-  if(p->host.window_id==1)for(unsigned i=0;i<16;++i){auto event=xu_ipc_poll(p);if(event.empty())break;
+  if(p->host.window_id==1 && p->host.canvas_id==1)for(unsigned i=0;i<16;++i){auto event=xu_ipc_poll(p);if(event.empty())break;
     auto script="window.__XU__&&window.__XU__._accept&&window.__XU__._accept("+xu_web_json(event)+");";
     eval_raw(p,script.c_str(),false);
   }

@@ -14,6 +14,7 @@ uint64_t xu_ui_text_input_reserve(void);
 void xu_ui_text_input_abandon(uint64_t);
 // Roll back a newly started session when its creator cannot read metadata.
 void xu_ui_text_input_abort(uint64_t);
+// flags: bit 0 multiline, bit 3 password; these modes are mutually exclusive.
 int xu_ui_text_input_start(uint64_t, unsigned canvas, unsigned generation, const char *, unsigned length,
                             unsigned anchor, unsigned focus, const double *caret4, unsigned flags);
 int xu_ui_text_input_update(uint64_t, unsigned canvas, unsigned generation, uint64_t expected_revision,

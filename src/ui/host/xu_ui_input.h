@@ -1,8 +1,8 @@
 // Raw input ABI. Coordinates are canvas-local logical pixels (before user CTM).
 #pragma once
 #include "xu_content_abi.h"
+#include "xu_ui_mem.h"
 #include <charconv>
-#include <chrono>
 #include <math.h>
 #include <string>
 #include <string.h>
@@ -38,8 +38,7 @@ static inline void xu_ui_input_emit(const XuContentHost *host, unsigned kind,
   const char *tag = generation ? "input2" : "input";
   memcpy(at, tag, strlen(tag)); at += strlen(tag);
   for (double value : {x, y, dx, dy}) if (!isfinite(value) || fabs(value) > 1e9) return;
-  auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const auto now = xu_ui_input_now_ns();
   if (!number(kind) || !number(host->window_id ? host->window_id : 1u) ||
       !number(host->canvas_id ? host->canvas_id : 1u) ||
       (generation && !number(generation)) ||

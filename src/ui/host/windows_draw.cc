@@ -494,7 +494,7 @@ static void paint_ops(XuContentPlugin *p,Graphics &g) {
   }
 }
 
-static void paint(XuContentPlugin *p, HDC hdc, int width, int height) {
+static void paint_content(XuContentPlugin *p, HDC hdc, int width, int height) {
   Graphics g(hdc);
   g.SetSmoothingMode(SmoothingModeAntiAlias);
   SolidBrush bg(Gdiplus::Color(255, p->display_bg.r, p->display_bg.g, p->display_bg.b));
@@ -508,6 +508,31 @@ static void paint(XuContentPlugin *p, HDC hdc, int width, int height) {
     return;
   }
   paint_ops(p,g);
+}
+
+static void paint(XuContentPlugin *p, HDC hdc, int width, int height) {
+  if (width <= 0 || height <= 0) return;
+  // Present a complete frame. Drawing the background and each operation
+  // directly to the window makes caret/hover updates flash the entire canvas.
+  HDC buffer = CreateCompatibleDC(hdc);
+  HBITMAP bitmap = buffer ? CreateCompatibleBitmap(hdc, width, height) : NULL;
+  if (!bitmap) {
+    if (buffer) DeleteDC(buffer);
+    paint_content(p, hdc, width, height);
+    return;
+  }
+  HGDIOBJ previous = SelectObject(buffer, bitmap);
+  if (!previous || previous == HGDI_ERROR) {
+    DeleteObject(bitmap);
+    DeleteDC(buffer);
+    paint_content(p, hdc, width, height);
+    return;
+  }
+  paint_content(p, buffer, width, height);
+  BitBlt(hdc, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
+  SelectObject(buffer, previous);
+  DeleteObject(bitmap);
+  DeleteDC(buffer);
 }
 
 static unsigned input_modifiers() {
@@ -546,6 +571,10 @@ static void cancel_input(XuContentPlugin *p) {
   raw_pointer(p, XUI_POINTER_CANCEL, p->input_x, p->input_y);
 }
 
+static bool draw_focus_within_canvas(XuContentPlugin *p, HWND next) {
+  return p && p->hwnd && next && (next == p->hwnd || IsChild(p->hwnd, next));
+}
+
 #include "windows_text_input.inc"
 
 static void close_canvas(XuContentPlugin *p) {
@@ -578,7 +607,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     SetCursor(LoadCursorW(NULL, MAKEINTRESOURCEW(cursors[p->cursor])));
     return TRUE;
   }
-  if (p && (msg == WM_KILLFOCUS || (msg == WM_CAPTURECHANGED && (p->down || p->buttons)))) cancel_input(p);
+  // A redundant SetCapture can notify this window that capture still belongs
+  // to itself. Only losing capture to another window cancels an active press.
+  if (p && ((msg == WM_KILLFOCUS && !draw_focus_within_canvas(p, (HWND)wp)) ||
+      (msg == WM_CAPTURECHANGED && (HWND)lp != hwnd && (p->down || p->buttons)))) cancel_input(p);
   if (p && (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)) {
     if (p->input_enabled) xu_ui_input_emit(&p->host,
       (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) ? XUI_KEY_DOWN : XUI_KEY_UP,
@@ -591,7 +623,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                       (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) ? 2u : 3u;
     draw_text_input_grab_focus(p);
     p->buttons |= 1u << (button - 1);
-    SetCapture(hwnd);
+    if (GetCapture() != hwnd) SetCapture(hwnd);
     unsigned clicks = (msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK) ? 2u : 1u;
     raw_pointer(p, XUI_POINTER_DOWN, (short)LOWORD(lp), (short)HIWORD(lp), 0, 0, button, clicks);
     if (msg == WM_LBUTTONDBLCLK) msg = WM_LBUTTONDOWN;
@@ -623,7 +655,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     p->dragging = 0;
     p->last_x = (int)(short)LOWORD(lp);
     p->last_y = (int)(short)HIWORD(lp);
-    SetCapture(hwnd);
+    if (GetCapture() != hwnd) SetCapture(hwnd);
     return 0;
   }
   if (msg == WM_MOUSEMOVE && p && p->down) {
@@ -751,7 +783,7 @@ static void draw_install(XuContentPlugin *p) {
   if (!parent) return;
   RECT rc;
   GetClientRect(parent, &rc);
-  p->hwnd = CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE, 0, 0,
+  p->hwnd = CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0,
                             rc.right - rc.left, rc.bottom - rc.top, parent, NULL,
                             GetModuleHandleW(NULL), NULL);
   SetWindowLongPtrW(p->hwnd, GWLP_USERDATA, (LONG_PTR)p);
