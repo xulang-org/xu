@@ -209,9 +209,13 @@ fn (c &mut Checker) borrow_collect_expr(p &parser.Parser, n int, stmt_id int) {
         c.borrow_note_use(c.nlocal[n], stmt_id)
         <<
     }
+    if k == ast.NK_CALL && c.ncall[n] == -80 {
+        c.borrow_note_use(c.nlocal[n], stmt_id)
+    }
     if k == ast.NK_BORROW {
-        // a borrow creates an owner event, but the owner is not a use of the
-        // reference local whose lifetime we are computing.
+        // Reborrowing reads the source reference. Its existing loan must
+        // remain live until this expression (including &r.field / &r[i]).
+        c.borrow_collect_expr(p, p.nodes[n].a, stmt_id)
         <<
     }
     if k == ast.NT_FN_LIT {
@@ -500,18 +504,27 @@ fn (c &Checker) borrow_has_elem(owner int, stmt_id int) bool {
 
 fn (c &Checker) reborrow_reaches(from int, src int) bool {
     mut cur := from
-    for i in 0:8 {
+    for i in 0:c.breb.len {
         if cur < 0 || cur >= c.breb.len { << false }
         if c.breb[cur] == src { << true }
         cur = c.breb[cur]
     }
-    << false
+    // A cycle is malformed provenance; treat it as possibly reaching src.
+    << cur >= 0
 }
 
 fn (c &Checker) borrow_frozen(src int, stmt_id int) bool {
     if src < 0 { << false }
+    // Shared references remain usable while shared descendants are live.
+    if !is_mut_ref_type(c.ltype[src]) { << false }
     for r in 0:c.breb.len {
         if c.borrow_live(r, stmt_id) && c.reborrow_reaches(r, src) { << true }
+    }
+    for i in 0:c.bf_holder.len {
+        if c.borrow_field_live(i, stmt_id) && c.bf_reb[i] >= 0 {
+            parent := c.bf_reb[i]
+            if parent == src || c.reborrow_reaches(parent, src) { << true }
+        }
     }
     << false
 }
@@ -549,200 +562,119 @@ fn (c &mut Checker) borrow_new_event(p &parser.Parser, owner int, exclusive bool
     c.btmp_proj.push(pj)
 }
 
-fn (c &mut Checker) borrow_register_ref(p &parser.Parser, local int, init int, stmt_id int) {
-    if local < 0 { << }
-    if is_ref_type(c.ltype[local]) {
-        // Clear temp previous binding (M149 rebind replaces the borrow).
-        checker_set_i(mut &c.bowner, local, -1)
-        checker_set_i(mut &c.bexcl, local, 0)
-        checker_set_i(mut &c.bdecl, local, -1)
-        if local < c.bproj.len { checker_set_i(mut &c.bproj, local, 0) }
-        if local < c.breb.len { checker_set_i(mut &c.breb, local, -1) }
-        k := p.nodes[init].kind
-        if k == ast.NK_BORROW {
-            tgt := p.nodes[init].a
-            if p.nodes[tgt].kind == ast.NK_UN_OP && p.nodes[tgt].ival == 3 {
-                inner := p.nodes[tgt].a
-                if p.nodes[inner].kind == ast.NK_IDENT {
-                    src := c.nlocal[inner]
-                    if src >= 0 && is_ref_type(c.ltype[src]) {
-                        owner := c.bowner[src]
-                        excl := p.nodes[init].ival == 1
-                        if is_mut_ref_type(c.ltype[src]) {
-                            for r in 0:c.breb.len {
-                                if c.breb[r] == src && c.borrow_live(r, stmt_id) && (excl || c.bexcl[r] != 0) {
-                                    mut nm := c.lname[src]
-                                    if owner >= 0 { nm = c.lname[owner] }
-                                    if excl {
-                                        c.fail_node(p, init, "cannot borrow '" + nm + "' as mutable because it is also borrowed")
-                                    } else {
-                                        c.fail_node(p, init, "cannot borrow '" + nm + "' as immutable because it is also borrowed as mutable")
-                                    }
-                                }
-                            }
-                            if local < c.breb.len { checker_set_i(mut &c.breb, local, src) }
-                        }
-                        checker_set_i(mut &c.bowner, local, owner)
-                        checker_set_i(mut &c.bexcl, local, b2i(excl))
-                        checker_set_i(mut &c.bdecl, local, stmt_id)
-                        if local < c.bproj.len && src < c.bproj.len {
-                            pj := c.bproj[src]
-                            checker_set_i(mut &c.bproj, local, pj)
-                        }
-                    }
-                    <<
-                }
-            }
-            mut owner := c.borrow_root_local(p, tgt)
-            elem := c.place_has_index(p, tgt)
-            owner = c.peel_elem_owner(owner, elem)
-            checker_set_i(mut &c.bowner, local, owner)
-            checker_set_i(mut &c.bexcl, local, b2i(p.nodes[init].ival == 1))
-            checker_set_i(mut &c.bdecl, local, stmt_id)
-            if local < c.bproj.len {
-                pj2 := c.place_proj_of(p, tgt)
-                checker_set_i(mut &c.bproj, local, pj2)
-            }
-            <<
+// A holder keeps every loan carried by its value, including nested fields,
+// call results and closure environments. Field -1 denotes a whole-value loan.
+fn (c &mut Checker) borrow_add_held(holder int, field int, owner int, excl int, proj int, parent int, stmt_id int) {
+    if owner < 0 { << }
+    c.bf_holder.push(holder)
+    c.bf_field.push(field)
+    c.bf_owner.push(owner)
+    c.bf_excl.push(excl)
+    c.bf_decl.push(stmt_id)
+    c.bf_proj.push(proj)
+    c.bf_reb.push(parent)
+}
+
+fn (c &mut Checker) borrow_hold_local(holder int, field int, src int, stmt_id int) {
+    if src < 0 || src >= c.bowner.len { << }
+    if is_ref_type(c.ltype[src]) {
+        mut parent := c.breb[src]
+        if is_mut_ref_type(c.ltype[src]) { parent = src }
+        c.borrow_add_held(holder, field, c.bowner[src], c.bexcl[src], c.bproj[src], parent, stmt_id)
+    }
+    // Bound the walk before appending, including when holder == src.
+    count := c.bf_holder.len
+    for i in 0:count {
+        if c.bf_holder[i] == src {
+            c.borrow_add_held(holder, field, c.bf_owner[i], c.bf_excl[i], c.bf_proj[i], c.bf_reb[i], stmt_id)
         }
-        if k == ast.NK_IDENT {
-            src := c.nlocal[init]
-            if src >= 0 && is_ref_type(c.ltype[src]) {
-                ow := c.bowner[src]
-                ex := c.bexcl[src]
-                checker_set_i(mut &c.bowner, local, ow)
-                checker_set_i(mut &c.bexcl, local, ex)
-                checker_set_i(mut &c.bdecl, local, stmt_id)
-                if local < c.bproj.len && src < c.bproj.len {
-                    pj3 := c.bproj[src]
-                    checker_set_i(mut &c.bproj, local, pj3)
+    }
+}
+
+fn (c &mut Checker) borrow_hold_expr(p &parser.Parser, holder int, field int, init int, stmt_id int) {
+    if init < 0 { << }
+    k := p.nodes[init].kind
+    if k == ast.NK_IDENT {
+        c.borrow_hold_local(holder, field, c.nlocal[init], stmt_id)
+        <<
+    }
+    if k == ast.NK_BORROW {
+        tgt := p.nodes[init].a
+        mut parent := -1
+        mut owner := c.borrow_root_local(p, tgt)
+        mut proj := c.place_proj_of(p, tgt)
+        if p.nodes[tgt].kind == ast.NK_UN_OP && p.nodes[tgt].ival == 3 {
+            parent = c.borrow_root_local(p, p.nodes[tgt].a)
+            if parent >= 0 {
+                owner = c.bowner[parent]
+                proj = c.bproj[parent]
+            }
+        } else {
+            if owner >= 0 && is_ref_type(c.ltype[owner]) {
+                parent = owner
+                owner = c.bowner[parent]
+            }
+        }
+        c.borrow_add_held(holder, field, owner, b2i(p.nodes[init].ival == 1), proj, parent, stmt_id)
+        if parent >= 0 {
+            count := c.bf_holder.len
+            for i in 0:count {
+                if c.bf_holder[i] == parent {
+                    c.borrow_add_held(holder, field, c.bf_owner[i], b2i(p.nodes[init].ival == 1), proj | c.bf_proj[i], parent, stmt_id)
                 }
             }
         }
         <<
     }
-    // M162: struct init with ref fields.
-    c.borrow_clear_fields(local)
-    c.borrow_register_struct_fields(p, local, init, stmt_id)
-}
-
-fn (c &mut Checker) borrow_clear_fields(holder int) {
-    mut nh := []int{}
-    mut nf := []int{}
-    mut no := []int{}
-    mut ne := []int{}
-    mut nd := []int{}
-    mut np := []int{}
-    for i in 0:c.bf_holder.len {
-        if c.bf_holder[i] != holder {
-            nh.push(c.bf_holder[i])
-            nf.push(c.bf_field[i])
-            no.push(c.bf_owner[i])
-            ne.push(c.bf_excl[i])
-            nd.push(c.bf_decl[i])
-            if i < c.bf_proj.len { np.push(c.bf_proj[i]) } else { np.push(0) }
+    if k == ast.NT_FN_LIT {
+        caps := c.fn_lit_captures(init)
+        for i in 0:caps.len { c.borrow_hold_local(holder, field, caps[i], stmt_id) }
+        <<
+    }
+    if !c.type_contains_ref(c.ntype[init]) { << }
+    // A result may retain any reference-bearing input. Conservatively keep
+    // their union; selecting only one argument would lose valid provenance.
+    kids := expr_kids(p, init)
+    for i in 0:kids.len {
+        c.borrow_hold_expr(p, holder, field, kids[i], stmt_id)
+    }
+    if k == ast.NK_METHOD_CALL {
+        recv := p.nodes[init].a
+        root := c.borrow_root_local(p, recv)
+        if root >= 0 && !is_ref_type(c.ltype[root]) {
+            c.borrow_add_held(holder, field, root, b2i(is_mut_ref_type(c.ntype[init])), c.place_proj_of(p, recv), -1, stmt_id)
         }
     }
-    c.bf_holder = nh
-    c.bf_field = nf
-    c.bf_owner = no
-    c.bf_excl = ne
-    c.bf_decl = nd
-    c.bf_proj = np
 }
 
-fn (c &mut Checker) borrow_register_struct_fields(p &parser.Parser, holder int, init int, stmt_id int) {
-    if init < 0 || p.nodes[init].kind != ast.NK_STRUCT_INIT { << } // StructInit
-    sty := c.ntype[init]
-    if !is_struct_type(sty) { << }
-    si := struct_index(sty)
-    mut sf := p.nodes[init].a
-    while sf >= 0 {
-        if p.nodes[sf].kind == ast.NK_S_FIELD {
-            fi := c.find_field(si, p.nodes[sf].sval)
-            if fi >= 0 {
-                fty := c.structs[si].fields[fi].ty
-                if is_ref_type(fty) {
-                    val := p.nodes[sf].a
-                    mut owner := -1
-                    mut exclusive := false
-                    mut proj := 0
-                    if p.nodes[val].kind == ast.NK_BORROW {
-                        owner = c.borrow_root_local(p, p.nodes[val].a)
-                        exclusive = p.nodes[val].ival == 1
-                        proj = c.place_proj_of(p, p.nodes[val].a)
-                        owner = c.peel_elem_owner(owner, proj == 1)
-                    } else if p.nodes[val].kind == ast.NK_IDENT {
-                        src := c.nlocal[val]
-                        if src >= 0 && is_ref_type(c.ltype[src]) {
-                            owner = c.bowner[src]
-                            exclusive = c.bexcl[src] != 0
-                            if src < c.bproj.len { proj = c.bproj[src] }
-                        }
-                    }
-                    if owner >= 0 {
-                        c.bf_holder.push(holder)
-                        c.bf_field.push(fi)
-                        c.bf_owner.push(owner)
-                        c.bf_excl.push(b2i(exclusive))
-                        c.bf_decl.push(stmt_id)
-                        c.bf_proj.push(proj)
-                    }
-                }
-            }
+fn (c &mut Checker) borrow_register_ref(p &parser.Parser, local int, init int, stmt_id int) {
+    if local < 0 { << }
+    // Self-assignment must preserve the input's provenance while collecting.
+    first := c.bf_holder.len
+    c.borrow_hold_expr(p, local, -1, init, stmt_id)
+    mut owner := -1
+    mut excl := 0
+    mut proj := 0
+    mut parent := -1
+    for i in first:c.bf_holder.len {
+        if c.bf_holder[i] == local {
+            if owner < 0 { owner = c.bf_owner[i] }
+            excl = excl | c.bf_excl[i]
+            proj = proj | c.bf_proj[i]
+            if parent < 0 { parent = c.bf_reb[i] }
         }
-        sf = p.nodes[sf].next
     }
+    // Earlier records are retained conservatively. They expire with this
+    // holder's last use; this also preserves loans across control-flow paths.
+    checker_set_i(mut &c.bowner, local, owner)
+    checker_set_i(mut &c.bexcl, local, excl)
+    checker_set_i(mut &c.bproj, local, proj)
+    checker_set_i(mut &c.breb, local, parent)
+    checker_set_i(mut &c.bdecl, local, stmt_id)
 }
 
 fn (c &mut Checker) borrow_register_field(p &parser.Parser, holder int, field int, init int, stmt_id int) {
-    // Drop prior record for this holder.field.
-    mut nh := []int{}
-    mut nf := []int{}
-    mut no := []int{}
-    mut ne := []int{}
-    mut nd := []int{}
-    mut np := []int{}
-    for i in 0:c.bf_holder.len {
-        if !(c.bf_holder[i] == holder && c.bf_field[i] == field) {
-            nh.push(c.bf_holder[i])
-            nf.push(c.bf_field[i])
-            no.push(c.bf_owner[i])
-            ne.push(c.bf_excl[i])
-            nd.push(c.bf_decl[i])
-            if i < c.bf_proj.len { np.push(c.bf_proj[i]) } else { np.push(0) }
-        }
-    }
-    c.bf_holder = nh
-    c.bf_field = nf
-    c.bf_owner = no
-    c.bf_excl = ne
-    c.bf_decl = nd
-    c.bf_proj = np
-    mut owner := -1
-    mut exclusive := false
-    mut proj := 0
-    if p.nodes[init].kind == ast.NK_BORROW {
-        owner = c.borrow_root_local(p, p.nodes[init].a)
-        exclusive = p.nodes[init].ival == 1
-        proj = c.place_proj_of(p, p.nodes[init].a)
-        owner = c.peel_elem_owner(owner, proj == 1)
-    } else if p.nodes[init].kind == ast.NK_IDENT {
-        src := c.nlocal[init]
-        if src >= 0 && is_ref_type(c.ltype[src]) {
-            owner = c.bowner[src]
-            exclusive = c.bexcl[src] != 0
-            if src < c.bproj.len { proj = c.bproj[src] }
-        }
-    }
-    if owner >= 0 {
-        c.bf_holder.push(holder)
-        c.bf_field.push(field)
-        c.bf_owner.push(owner)
-        c.bf_excl.push(b2i(exclusive))
-        c.bf_decl.push(stmt_id)
-        c.bf_proj.push(proj)
-    }
+    c.borrow_hold_expr(p, holder, field, init, stmt_id)
 }
 
 fn (c &mut Checker) borrow_walk_move(p &parser.Parser, n int, stmt_id int) {
@@ -780,8 +712,16 @@ fn (c &mut Checker) borrow_walk_expr(p &parser.Parser, n int, stmt_id int) {
         <<
     }
     if k == ast.NK_BORROW {
-        mut owner := c.borrow_root_local(p, p.nodes[n].a)
-        elem := c.place_has_index(p, p.nodes[n].a)
+        target := p.nodes[n].a
+        if p.nodes[target].kind == ast.NK_UN_OP && p.nodes[target].ival == 3 {
+            src := c.borrow_root_local(p, p.nodes[target].a)
+            if src >= 0 && c.borrow_frozen(src, stmt_id) {
+                c.fail_node(p, n, "cannot reborrow a frozen reference")
+            }
+            <<
+        }
+        mut owner := c.borrow_root_local(p, target)
+        elem := c.place_has_index(p, target)
         owner = c.peel_elem_owner(owner, elem)
         c.borrow_new_event(p, owner, p.nodes[n].ival == 1, elem, n, stmt_id)
         c.borrow_walk_place_index(p, p.nodes[n].a, stmt_id)
@@ -789,6 +729,7 @@ fn (c &mut Checker) borrow_walk_expr(p &parser.Parser, n int, stmt_id int) {
     }
     if k == ast.NK_CALL {
         fi := c.ncall[n]
+        if fi == -80 { c.borrow_read_event(p, c.nlocal[n], n, stmt_id) }
         mut arg := p.nodes[n].a
         mut ai := 0
         while arg >= 0 {
@@ -905,6 +846,16 @@ fn (c &mut Checker) borrow_walk_place_index(p &parser.Parser, n int, stmt_id int
 }
 
 fn (c &mut Checker) borrow_check_stmt(p &parser.Parser, n int) {
+    old_control := c.bcontrol
+    k := p.nodes[n].kind
+    if c.bcontrol < 0 && (k == ast.NK_IF || k == ast.NK_MATCH || k == ast.NK_SELECT || k == ast.NK_FOR || k == ast.NK_FOR_EACH || k == ast.NK_WHILE) {
+        c.bcontrol = c.bstmt[n]
+    }
+    c.borrow_check_stmt_inner(p, n)
+    c.bcontrol = old_control
+}
+
+fn (c &mut Checker) borrow_check_stmt_inner(p &parser.Parser, n int) {
     stmt_id := c.bstmt[n]
     c.btmp_owner = []int{}
     c.btmp_excl = []int{}
@@ -918,6 +869,15 @@ fn (c &mut Checker) borrow_check_stmt(p &parser.Parser, n int) {
     if k == ast.NK_ASSIGN {
         target := p.nodes[n].a
         root := c.borrow_root_local(p, target)
+        mut target_ty := c.ntype[target]
+        if root >= 0 && p.nodes[target].kind == ast.NK_IDENT { target_ty = c.ltype[root] }
+        if target_ty <= 0 { target_ty = c.ntype[p.nodes[n].b] }
+        if root >= 0 && p.nodes[target].kind != ast.NK_IDENT && is_ref_type(c.ltype[root]) && c.type_contains_ref(target_ty) {
+            c.fail_node(p, n, "cannot store a reference-bearing value through a reference without a proven lifetime")
+        }
+        if root >= 0 && c.bcontrol >= 0 && c.bdecl[root] < c.bcontrol && c.type_contains_ref(target_ty) {
+            c.fail_node(p, n, "cannot rebind a reference-bearing value across control-flow paths")
+        }
         if c.ncall[n] == -78 || c.ncall[target] == -78 {
             if root >= 0 && c.borrow_has_any(root, stmt_id) {
                 c.fail_node(p, n, "cannot mutate '" + c.lname[root] + "' while it is borrowed")
@@ -962,6 +922,9 @@ fn (c &mut Checker) borrow_check_stmt(p &parser.Parser, n int) {
             c.borrow_walk_expr(p, p.nodes[target].b, stmt_id)
         }
         c.borrow_walk_move(p, p.nodes[n].b, stmt_id)
+        if root >= 0 {
+            c.borrow_hold_expr(p, root, -1, p.nodes[n].b, stmt_id)
+        }
         <<
     }
     if k == ast.NK_EXPR_STMT {
@@ -1092,6 +1055,8 @@ fn (c &mut Checker) borrow_check_fn(p &parser.Parser, d int) {
     c.bf_excl = []int{}
     c.bf_decl = []int{}
     c.bf_proj = []int{}
+    c.bf_reb = []int{}
+    c.bcontrol = -1
     for i in 0:c.ltype.len {
         c.blast.push(-1)
         c.bdecl.push(-1)
@@ -1099,6 +1064,20 @@ fn (c &mut Checker) borrow_check_fn(p &parser.Parser, d int) {
         c.bexcl.push(0)
         c.bproj.push(0)
         c.breb.push(-1)
+    }
+    mut nparams := 0
+    if p.nodes[d].d >= 0 { nparams += 1 }
+    mut param := p.nodes[d].a
+    while param >= 0 {
+        nparams += 1
+        param = p.nodes[param].next
+    }
+    for id in 0:nparams {
+        if is_ref_type(c.ltype[id]) {
+            exclusive := b2i(is_mut_ref_type(c.ltype[id]))
+            checker_set_i(mut &c.bowner, id, id)
+            checker_set_i(mut &c.bexcl, id, exclusive)
+        }
     }
     c.bseq = 0
     c.borrow_number_block(p, p.nodes[d].c)
