@@ -277,14 +277,18 @@ final class XuSchemeHandler: NSObject, WKURLSchemeHandler {
       finish(urlSchemeTask, id: id, data: Data("icon missing\n".utf8), mime: "text/plain", status: 404)
       return
     }
+    if shell.embedded && (route == "/" || route == "/index.html") {
+      let html = shell.readSlotRaw("xu_ui_page.html")
+      if !html.isEmpty { finish(urlSchemeTask,id: id,data: Data(html.utf8),mime: "text/html; charset=utf-8");return }
+    }
     // xu://app/* (and folded hosts) → static www
     if let data = Self.loadWwwFile(shell: shell, route: route) {
       finish(urlSchemeTask, id: id, data: data, mime: Self.mimeFor(route: route))
       return
     }
     if route == "/" || route == "/index.html" {
-      let htmlPath = (shell.tmp as NSString).appendingPathComponent("xu_ui_page.html")
-      if let html = try? String(contentsOfFile: htmlPath, encoding: .utf8), !html.isEmpty {
+      let html = shell.readSlotRaw("xu_ui_page.html")
+      if !html.isEmpty {
         finish(urlSchemeTask, id: id, data: Data(html.utf8), mime: "text/html; charset=utf-8")
         return
       }
@@ -386,6 +390,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   var dropOverlay: FileDropOverlay?
   var lastUrlKey: String = ""
   var lastHtmlKey: String = ""
+  var lastNativeRevision: UInt64 = 0
   var lastWwwRoot: String = ""
   var progressObs: NSKeyValueObservation?
   var lastProgressPct = -1
@@ -450,6 +455,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
     }
     self.dropOverlay = drop
     setupWebKit()
+    lastNativeRevision = shell.embedded ? xuNativeViewRevision(shell.canvasID,shell.canvasGeneration) : 0
     lastWwwRoot = shell.readTrimmed("xu_ui_www_root.txt")
     lastUrlKey = shell.readTrimmed("xu_ui_page.url")
     lastHtmlKey = shell.readTrimmed("xu_ui_page.html")
@@ -459,7 +465,8 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
     } else if !lastUrlKey.isEmpty,let url = URL(string: lastUrlKey) {
       ensureBridgeUserScript();web.load(URLRequest(url: url));syncWebFrame()
     } else if !lastHtmlKey.isEmpty {
-      ensureBridgeUserScript();web.loadHTMLString(shell.readSlotRaw("xu_ui_page.html"),baseURL: nil)
+      if shell.embedded { loadXuDocument("xu://app/") }
+      else { ensureBridgeUserScript();web.loadHTMLString(shell.readSlotRaw("xu_ui_page.html"),baseURL: nil) }
     }
   }
 
@@ -504,6 +511,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
     ensureBridgeUserScript()
     let u = normalizeAppXuURL(urlString.isEmpty ? "xu://app/" : urlString)
     lastUrlKey = u
+    lastHtmlKey = shell.readTrimmed("xu_ui_page.html")
     if let url = URL(string: u) {
       web.load(URLRequest(url: url))
       syncWebFrame()
@@ -512,14 +520,14 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
 
   func onPoll() {
     requests.poll()
-    drainEval()
+    if !shell.embedded { drainEval() }
     drainPage()
     pushEmits()
   }
 
   /// Host pushes emits into the page (no JS setInterval + xu://poll hammering).
   func pushEmits() {
-    guard let shell = shell,shell.windowID == 1 else { return }
+    guard let shell = shell,shell.windowID == 1,!shell.embedded else { return }
     for _ in 0..<16 {
       let t = shell.xuIpcPoll()
       if t.isEmpty { break }
@@ -897,7 +905,7 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   }
 
   func syncWebFrame() {
-    guard let root = shell.window.contentView else { return }
+    guard let root = shell.rootView else { return }
     let b = root.bounds
     if web.frame != b {
       web.frame = b
@@ -1149,6 +1157,16 @@ final class XuWebViewPlugin: NSObject, XuContentPlugin, WKNavigationDelegate, WK
   }
 
   func drainPage() {
+    if shell.embedded {
+      let revision = xuNativeViewRevision(shell.canvasID,shell.canvasGeneration)
+      if revision == lastNativeRevision { return }
+      lastNativeRevision = revision
+      let url = shell.readTrimmed("xu_ui_page.url")
+      let html = shell.readSlotRaw("xu_ui_page.html")
+      if !url.isEmpty { lastHtmlKey = html; lastUrlKey = url; ensureBridgeUserScript(); if let target = URL(string: normalizeAppXuURL(url)) { web.load(URLRequest(url: target)) } }
+      else if !html.isEmpty { loadXuDocument("xu://app/") }
+      return
+    }
     let urlVal = shell.readTrimmed("xu_ui_page.url")
     let htmlVal = shell.readTrimmed("xu_ui_page.html")
     let www = shell.readTrimmed("xu_ui_www_root.txt")
