@@ -751,7 +751,7 @@ static void draw_install(XuContentPlugin *p) {
   if (!parent) return;
   RECT rc;
   GetClientRect(parent, &rc);
-  p->hwnd = CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE, 0, 0,
+  p->hwnd = CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0,
                             rc.right - rc.left, rc.bottom - rc.top, parent, NULL,
                             GetModuleHandleW(NULL), NULL);
   SetWindowLongPtrW(p->hwnd, GWLP_USERDATA, (LONG_PTR)p);

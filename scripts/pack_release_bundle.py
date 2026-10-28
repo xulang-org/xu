@@ -8,7 +8,7 @@ Packages self-contained, production-grade SDK distribution archives for:
   - devkit-all (all-in-one multi-platform devkit)
 
 Each bundle contains:
-  1. bin/ (xu compiler + xu-doctor + xu-fmt + xu-doc + xu-map + xu-desktop + xu-setup + xu-update + xu-lsp + xu-native)
+  1. bin/ (xu compiler + xu-doctor + xu-fmt + xu-doc + xu-map + xu-desktop + xu-setup + xu-update + xu-lsp + xu-native + xu-xacp)
   2. src/ (standard library + UI runtime host source)
   3. packages/ (optional external ecosystem drivers: redis, mysql, postgres, sqlite, etcd, etc.)
   4. include/ (C FFI header xu_native.h)
@@ -67,6 +67,7 @@ def discover_sibling_tools() -> list[tuple[str, str]]:
         ("xu-update", "src/cmd/update"),
         ("xu-lsp", "src/cmd/lsp"),
         ("xu-native", "src/cmd/native"),
+        ("xu-xacp", "src/cmd/xacp"),
     ]
 
 
@@ -351,6 +352,7 @@ Xu is a fast, safe, GC-free systems programming language combining Go-style tool
   - `xu-update`: SDK self-updater using Xu HTTP and archive libraries
   - `xu-lsp`: Language Server Protocol (LSP) daemon for IDE code completion & diagnostics
   - `xu-native`: Native C module compilation, archiving & multi-target container packaging
+  - `xu-xacp`: XACP discovery and safe process launcher
 - **`src/`**: Standard library source code (`#os`, `#io`, `#net`, `#crypto`, `#database/sql`, `#ui`, etc.)
 - **`packages/`**: Optional external database, storage and messaging modules from the independent packages repository (when available at packaging time)
 - **`include/`**: C ABI FFI headers (`xu_native.h`)
@@ -599,7 +601,7 @@ def main():
         for archive, target, size_mb, sha in generated_archives:
             f.write(f"| `{archive.name}` | `{target}` | {size_mb:.2f} MB | `{sha[:16]}...` |\n")
         f.write("\n## 🚀 包含核心组件\n\n")
-        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-setup`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`, `xu-update`, `xu-lsp`, `xu-native`\n")
+        f.write("- **核心编译器与工具链 (`bin/`)**: `xu`, `xu-setup`, `xu-doctor`, `xu-fmt`, `xu-doc`, `xu-map`, `xu-desktop`, `xu-update`, `xu-lsp`, `xu-native`, `xu-xacp`\n")
         f.write("- **官方标准库源码 (`src/`)**: 包含 `os`, `io`, `net`, `sync`, `crypto`, `database/sql`, `ui` 等完整源码\n")
         f.write("- **独立 packages 仓库的扩展模块（选装） (`packages/`)**: `redis`, `mysql`, `postgres`, `sqlite`, `clickhouse`, `mongodb`, `nats`, `mqtt`, `etcd`, `elasticsearch`, `influxdb`, `memcached`, `s3`\n")
         f.write("- **C/C++ 原生交互头文件 (`include/`)**: `xu_native.h`\n")

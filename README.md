@@ -185,9 +185,29 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu test <file.xu> -bench <REGEXP>` | Run matching `fn bench_*` benchmark functions |
 | `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
 | `xu build <file.xu> --target wasm32 -o app.wasm` | Emit a WebAssembly module |
+| `xu build <file.xu> --xacp --xacp-port 4321 -o app` | Embed XACP startup discovery metadata |
+| `./app --xacp-help` | Print the generated program's machine-readable XACP summary |
+| `xu xacp inspect ./app` | Inspect an XACP-enabled program's discovery and safety summary |
+| `xu xacp run ./app -- args...` | Run it with an explicit AI/user argument boundary |
+| `xu xacp record ./app -- > output.log` | Stream bounded stdout for user-owned recording |
 | `xu build <AppDir> --desktop` | Package a desktop application using the required host UI SDK and tools |
 | `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
 | `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
+
+Build the launcher with `make xu-xacp`; see the [runnable XACP example](examples/xacp/README.md). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
+
+`#xacp` is the transport-neutral standard-library layer for hosts that register
+a live `ui/widgets.Screen`. Its adapter exposes bounded `ui.tree`, native-owned
+`ui.screenshot`, validated `ui.input`/`ui.act`, and a streaming recorder. Use
+`xacp.ui_tree`, `xacp.ui_screenshot`, `xacp.ui_input`, and `xacp.ui_act` only
+through a session with the required permission bits; `xacp.start_recorder`
+keeps the request alive until `finish_recorder` or `abort_recorder`. Screen
+handles, canvas generations, node counts, frame bytes, text lengths, and record
+budgets are checked before the operation reaches the widget. Development hosts
+may call `enable_development` before the hello handshake to grant `PERM_ALL`;
+this does not disable schema, lifecycle, native-resource disposal, or memory
+limits. A screenshot returns an owning `draw.Surface`, which the caller must
+dispose after handing its metadata/resource to the host.
 
 0.9.4 also provides per-pass MIR verification with `XU_VERIFY=1`,
 `XU_DUMP_MIR=<function>`, and differential pattern diagnostics with

@@ -311,7 +311,7 @@ mkdir -p "$INSTALL_DIR/bin"
 if [[ -d "$SOURCE_DIR/bin/platform/$PLATFORM" ]]; then
     cp -Rf "$SOURCE_DIR/bin/platform/$PLATFORM/." "$INSTALL_DIR/bin/"
 elif [[ -d "$SOURCE_DIR/bin" ]]; then
-    for b in xu xu-doctor xu-fmt xu-doc xu-map xu-desktop xu-setup xu-update xu-lsp xu-native; do
+    for b in xu xu-doctor xu-fmt xu-doc xu-map xu-desktop xu-setup xu-update xu-lsp xu-native xu-xacp; do
         if [[ -f "$SOURCE_DIR/bin/$b" ]]; then
             cp -f "$SOURCE_DIR/bin/$b" "$INSTALL_DIR/bin/"
         fi
@@ -604,7 +604,7 @@ fi
 printf "\n${GREEN}${BOLD}🎉 Xu development environment installed successfully!${NC}\n\n"
 cat << EOF
 Installed components:
-  • Core compiler & toolchain: $INSTALL_DIR/bin (xu, xu-setup, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop, xu-update, xu-lsp, xu-native)
+  • Core compiler & toolchain: $INSTALL_DIR/bin (xu, xu-setup, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop, xu-update, xu-lsp, xu-native, xu-xacp)
   • Standard library (src):    $INSTALL_DIR/src
   • External driver modules:   $INSTALL_DIR/packages (redis, mysql, postgres, sqlite, etcd, etc.)
   • Native C headers:          $INSTALL_DIR/include
