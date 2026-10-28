@@ -75,6 +75,9 @@ Implicit downgrade currently requires a local reference name and the identical
 direct pointee type. Ordinary values still need `&x`; the planned `$` mutable
 spellings and automatic borrowing from ordinary values are not implemented.
 
+See [Borrowing and mutable bindings](docs/language/borrowing.md) for current rules
+and the planned borrow syntax direction.
+
 ---
 
 ## 🎯 Pain Points & "Why Xu?"
