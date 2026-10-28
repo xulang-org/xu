@@ -22,7 +22,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 	platform gen1-platform cli-platform bench bench-runtime bench-stdlib bench-opt-levels bench-nbody-residency bench-opt-full bench-crosslang bench-language bench-game \
 	stdlib-matrix stdlib-matrix-check \
 	verify-product-math-x64 verify-product-algorithm-x64 \
-	ci ci-fast doc-test packages-test \
+	ci ci-fast doc-test packages-test xacp-test \
 	boundary module-path-check release-version-prepare release-version-sync release-version-check \
 	clean
 
@@ -44,8 +44,8 @@ help:
 	@echo "  make xu-setup        standalone installer → $(BIN)/xu-setup"
 	@echo "  make xu-lsp          language server → $(BIN)/xu-lsp"
 	@echo "  make xu-native       native C module tool → $(BIN)/xu-native"
-	@echo "  make xu-xacp         XACP inspect/run/debug tool → $(BIN)/xu-xacp"
-	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup + xu-update + xu-lsp + xu-native (needs $(XU))"
+	@echo "  make xu-xacp         XACP inspect/run/debug/record tool → $(BIN)/xu-xacp"
+	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup + xu-update + xu-lsp + xu-native + xu-xacp (needs $(XU))"
 	@echo "  make server-build-local  build xu-examples/examples/11_http_server for this host"
 	@echo "  make server-build-linux  cross-build Xu HTTP server for linux-x64"
 	@echo "  make server-check-linux  build + verify linux-x64 ELF"
@@ -68,6 +68,7 @@ help:
 	@echo "  make platform         multi-target compile matrix"
 	@echo "  make cli-platform     product CLI flags/env smoke (see CLI_CROSS_PLATFORM.md)"
 	@echo "  make doc-test         xu doc Markdown golden + CLI smoke"
+	@echo "  make xacp-test        XACP discovery, safe launcher and protocol core smoke"
 	@echo "  make packages-test    package regressions using product xu and local protocol peers"
 	@echo "  make bench-runtime    运行时基准(xu-bench, confirmed product,--save/--check 见脚本)"
 	@echo "  make bench-stdlib     标准库热路径（os/io/fs/path/time/strings）基准（xu-bench/scripts/bench_stdlib.sh）"
@@ -87,6 +88,9 @@ help:
 	@echo "  make clean"
 
 all: xu
+
+xacp-test: xu-xacp
+	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_smoke.py
 
 # Local peers need no external databases or credentials. Product rebuilds are
 # explicit (make xu); this target never silently swaps in the Rust oracle.
@@ -223,7 +227,7 @@ $(XU_LSP): $(XU) src/cmd/lsp/xu.xun $(LSP_XU) $(XU_PKG_XU) | $(BIN)
 $(XU_NATIVE): $(XU) src/cmd/native/xu.xun $(NATIVE_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-native)
 
-$(XU_XACP): $(XU) $(XACP_XU) $(XU_PKG_XU) | $(BIN)
+$(XU_XACP): $(XU) src/cmd/xacp/xu.xun $(XACP_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-xacp)
 
 check test: verify-gen3

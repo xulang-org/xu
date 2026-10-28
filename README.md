@@ -187,12 +187,14 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu build <file.xu> --target wasm32 -o app.wasm` | Emit a WebAssembly module |
 | `xu build <file.xu> --xacp --xacp-port 4321 -o app` | Embed XACP startup discovery metadata |
 | `./app --xacp-help` | Print the generated program's machine-readable XACP summary |
-| `xu xacp inspect app` | Inspect an XACP-enabled program's discovery and safety summary |
-| `xu xacp run app -- args...` | Run it with an explicit AI/user argument boundary |
-| `xu xacp record app -- > output.log` | Stream bounded stdout for user-owned recording |
+| `xu xacp inspect ./app` | Inspect an XACP-enabled program's discovery and safety summary |
+| `xu xacp run ./app -- args...` | Run it with an explicit AI/user argument boundary |
+| `xu xacp record ./app -- > output.log` | Stream bounded stdout for user-owned recording |
 | `xu build <AppDir> --desktop` | Package a desktop application using the required host UI SDK and tools |
 | `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
 | `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
+
+Build the launcher with `make xu-xacp`; see the [runnable XACP example](examples/xacp/README.md). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
 
 `#xacp` is the transport-neutral standard-library layer for hosts that register
 a live `ui/widgets.Screen`. Its adapter exposes bounded `ui.tree`, native-owned
