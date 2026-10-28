@@ -6,6 +6,18 @@
 
 ---
 
+## Xu 0.10.10
+
+This version brings the public native widget APIs needed by the 45-entry component workshop, including Chart, RangeSlider, SplitView and structured menus. The bundled workshop keeps WebView support, and its action toolbar wraps and scrolls with large text instead of clipping labels at 200%. Native WebView content retains its own CSS and system child surface.
+
+Native map adapters now restore the current coroutine context before calling ordinary Xu hashing and growth-policy functions. Without that context, function entry stack guards could interpret map storage as a coroutine and crash a desktop worker during startup. Installed-SDK validation exercises integer and string maps inside a coroutine at `-O0`, `-O2` and `-O3`.
+
+Compiler updates include borrow-flow join fixes, Thumb/freestanding concurrency checks, stack guards and a LoongArch far-branch correction. **Source migration:** moving an owned non-string field out of a borrowed struct is rejected. Borrow the field when its lifetime permits, or use the public widget `clone()` API for temporary measurement and painting snapshots. The bundled style gallery uses explicit clones; upgrade compiler, standard library and tools together. XACP control examples now live in the companion examples repository.
+
+SDK workflows pin the corrected example sources and check the installed workshop alongside existing UI and service samples. Native installed-SDK checks cover macOS, Linux and Windows on ARM64/x64; these checks do not imply desktop GUI acceptance on every platform. Workshop GUI acceptance is on macOS ARM64. Canvas accessibility bridging, editor undo history and touch long-press remain documented limitations. LoongArch64 and RISC-V SDKs are cross-built.
+
+Published binary availability, source revisions and SHA-256 checksums are recorded in [GitHub Releases](https://github.com/xulang-org/xu/releases).
+
 ## Xu 0.10.7 release
 
 This patch repairs reinstalling over an existing SDK, including read-only standard-library files. Setup and `xu update` prepare a complete SDK beside the target, verify every recorded file and all ten tools, retain the old directory as a backup, then replace the target. Failed replacement or verification restores the original SDK. User data outside SDK-managed components is preserved; stale managed files are removed.
