@@ -8,13 +8,17 @@
 
 ## Xu 0.10.10
 
-This version brings the public native widget APIs needed by the 45-entry component workshop, including Chart, RangeSlider, SplitView and structured menus. The bundled workshop keeps WebView support, and its action toolbar wraps and scrolls with large text instead of clipping labels at 200%. Native WebView content retains its own CSS and system child surface.
+This version brings the public native widget APIs needed by the 46-entry component workshop, including Chart, RangeSlider, SplitView and structured menus. The bundled workshop keeps WebView support, and its action toolbar wraps and scrolls with large text instead of clipping labels at 200%. Native WebView content retains its own CSS and system child surface.
 
 Native map adapters now restore the current coroutine context before calling ordinary Xu hashing and growth-policy functions. Without that context, function entry stack guards could interpret map storage as a coroutine and crash a desktop worker during startup. Installed-SDK validation exercises integer and string maps inside a coroutine at `-O0`, `-O2` and `-O3`.
 
 Aggregate borrows from dynamic arrays and maps are converted to the ordinary reference-call layout; mutable calls write changes back before handling success or errors. Packed array copies preserve their final bytes. Returning a reference through an adapted aggregate call is rejected instead of exposing a temporary view; copy the element to a local before such a call. `Screen.button_with_icon()` adds visible text and supports leading, trailing, above and below icon placement, separately from icon-only buttons. `Screen.measure_button()` returns the intrinsic size for the current text, icon placement, style and scale, allowing content-sized buttons and wrapping layouts.
 
 Tooltips distinguish delayed pointer hover from immediate keyboard/programmatic focus, dismiss during pointer interaction, and position against the visible anchor inside scroll clips. Top/center is the default; `Tooltip.set_placement()` and `Screen.set_tooltip_placement()` configure all four sides with edge flipping. Installed-SDK validation exercises delay, dismissal, refocus and placement without claiming native GUI coverage.
+
+PasswordInput adds grapheme masking, reveal/hide, native editing and paste while blocking copy/cut and native surrounding-text disclosure. `Screen.password_input()`, `set_password_visible()` and `text_value()` keep display policy separate from the application value. Masked native layouts preserve the source UTF-8 positions for selection, caret and input bindings.
+
+Native pointer timestamps now share the Xu monotonic clock. macOS previously used system uptime, which differed by about 4.29 seconds on the acceptance machine and delayed a 500ms tooltip to nearly five seconds. The SDK smoke invokes the actual native mouse callback and checks its timestamp against the runtime clock. Passive hover also works before the window is activated.
 
 Compiler updates include borrow-flow join fixes, Thumb/freestanding concurrency checks, stack guards and a LoongArch far-branch correction. **Source migration:** moving an owned non-string field out of a borrowed struct is rejected. Borrow the field when its lifetime permits, or use the public widget `clone()` API for temporary measurement and painting snapshots. The bundled style gallery uses explicit clones; upgrade compiler, standard library and tools together. XACP control examples now live in the companion examples repository.
 

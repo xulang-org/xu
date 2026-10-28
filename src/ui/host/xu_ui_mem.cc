@@ -104,6 +104,19 @@ static void wake_waiters(void) {
 }
 #endif
 
+long long xu_ui_input_now_ns(void) {
+#ifdef _WIN32
+  LARGE_INTEGER counter, frequency;
+  if (!QueryPerformanceCounter(&counter) || !QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) return 0;
+  return (counter.QuadPart / frequency.QuadPart) * 1000000000LL +
+         (counter.QuadPart % frequency.QuadPart) * 1000000000LL / frequency.QuadPart;
+#else
+  struct timespec now{};
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+  return (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+#endif
+}
+
 /* ---- Sync scheme invoke (Host ↔ Xu worker). Not slot/file shaped. ---- */
 enum { INV_IDLE = 0, INV_REQ = 1, INV_BUSY = 2, INV_RESP = 3 };
 
