@@ -116,6 +116,14 @@ fn main() int {
         match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", doctor.stdout)
         assert match, (doctor.returncode, doctor.stdout, doctor.stderr)
         assert Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
+    # Exercise the actual desktop entry and sibling Doctor invocation. The small
+    # project deliberately has no icon, so it stops before external GUI builds.
+    desktop = subprocess.run([xu, "build", str(project), "--desktop", "--no-webview",
+                              "--target", manifest["target"]], cwd=project,
+                             env=clean, text=True, capture_output=True, timeout=90)
+    match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", desktop.stdout)
+    assert match, (desktop.returncode, desktop.stdout, desktop.stderr)
+    assert Path(match.group(1).strip()).resolve() == prefix.resolve(), desktop.stdout
     stale = work / "stale checkout"
     (stale / "src/ui/host").mkdir(parents=True)
     for marker in ("macos_host.swift", "xu_content_abi.h"):

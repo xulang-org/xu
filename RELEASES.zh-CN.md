@@ -16,6 +16,8 @@
 
 桌面打包与 Doctor 优先从自身可执行文件定位安装后的宿主源码，支持 PATH 与符号链接启动，再考虑环境变量或源码目录回退。`xu build --desktop` 因而可以在仓库外使用，旧 `XU_ROOT` 也不会选中其他 SDK。Linux 与 Windows 宿主编译同时保留含空格的 SDK 头文件路径，所有桌面目标均在生成目标文件时选择 UI 协程栈配置。
 
+Windows 原生桌面打包显式调用打包脚本所需的 Git Bash/MSYS2 `sh`，正确定位同目录 `.exe` 工具，并使用系统临时目录与规范化路径；Doctor 同时检查 shell 依赖。安装后验收从无关目录进入桌面打包器，核对其调用的同目录 Doctor 是否选择当前安装 SDK。
+
 SDK 工作流固定修正后的示例提交，并对安装后的工作坊及既有 UI、服务示例执行检查。原生 SDK 安装验收覆盖 macOS、Linux、Windows 的 ARM64/x64，不代表全部平台均完成桌面 GUI 验收；工作坊 GUI 验收在 macOS ARM64 上完成。Canvas 系统无障碍桥接、编辑器撤销历史与触摸长按仍属已说明的限制。LoongArch64 与 RISC-V SDK 为交叉构建。
 
 已发布二进制、源码提交及 SHA-256 摘要以 [GitHub Releases](https://github.com/xulang-org/xu/releases) 为准。
