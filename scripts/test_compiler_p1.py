@@ -11,6 +11,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -481,19 +482,30 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--xu', default='bin/xu')
     parser.add_argument('--front-only', action='store_true')
+    parser.add_argument('--compare-xu', help='compare fixture acceptance with an unchanged compiler')
     parser.add_argument('--backend-only', action='store_true')
     opts = parser.parse_args()
     xu = (ROOT / opts.xu).resolve()
     env = os.environ.copy()
     env.update(XU_ROOT=str(ROOT), XU_STDLIB_ROOT=str(ROOT / 'src'), XUPATH='')
+    native_tag = 'windows' if sys.platform == 'win32' else 'macos' if sys.platform == 'darwin' else 'linux'
     with tempfile.TemporaryDirectory(prefix='xu-p1-test-') as temp:
         tmp = Path(temp)
         env['XU_CACHE'] = str(tmp / 'cache')
-        def fixture(name, source, error=None, output=None, extra=(), runner=()):
+        comparisons = 0
+        baseline = (ROOT / opts.compare_xu).resolve() if opts.compare_xu else None
+        def fixture(name, source, error=None, output=None, extra=(), runner=(), diagnostics=()):
+            nonlocal comparisons
             src = tmp / (name + '.xu')
             out = tmp / name
             src.write_text('@main\n' + source)
-            run([xu, 'build', '-O0', *extra, src, '-o', out], env=env, expected=1 if error else 0, contains=error)
+            if baseline:
+                run([baseline, 'build', '-O0', *extra, src, '-o', tmp / (name + '.baseline')],
+                    env=env, expected=1 if error else 0)
+                comparisons += 1
+            result = run([xu, 'build', '-O0', *extra, src, '-o', out], env=env, expected=1 if error else 0, contains=error)
+            for diagnostic in diagnostics:
+                assert diagnostic in result.stderr, (name, diagnostic, result.stderr)
             if error:
                 assert not out.exists(), f'{name}: failed build produced executable'
             elif output is not None:
@@ -501,6 +513,345 @@ def main():
             print('PASS', name, flush=True)
             return out
         if not opts.backend_only:
+            # Spec34 safety prerequisite (E21a/F27/H33): temporary loans
+            # of a reference's pointee must retain the writable parent.
+            loan_fns = ('fn both(s &int, w &mut int) { *w = 2\n println(*s) }\n'
+                        'fn reverse(w &mut int, s &int) { *w = 2\n println(*s) }\n'
+                        'fn writes(a &mut int, b &mut int) { *a = 2\n *b = 3 }\n'
+                        'fn view(s &int) &int { << s }\n'
+                        'fn writable(w &mut int) &mut int { << w }\n'
+                        'fn read(s &int) int { << *s }\n'
+                        'fn write(w &mut int) int { *w = 2\n << 0 }\n'
+                        'fn consume(s &int, n int) { println(*s + n) }\n'
+                        'fn consume_w(w &mut int, n int) { *w = n }\n')
+            for tag, call in (
+                ('shared_first', 'both(&*p, p)'),
+                ('writable_first', 'reverse(p, &*p)'),
+                ('explicit_writable', 'both(&*p, mut &*p)'),
+                ('two_writable', 'writes(p, p)'),
+                ('two_explicit_writable', 'writes(mut &*p, mut &*p)'),
+                ('nested_result', 'both(view(&*p), p)'),
+                ('nested_result_reverse', 'reverse(p, view(&*p))'),
+                ('nested_write', 'consume(&*p, write(p))'),
+                ('nested_write_arithmetic', 'consume(&*p, 1 + write(p))'),
+                ('active_writable_result', 'consume_w(writable(p), write(p))'),
+            ):
+                fixture('spec34_E21a_F27_H33_temporary_' + tag,
+                        loan_fns + 'fn check(p &mut int) { ' + call + ' }\n'
+                        'fn main() { mut x := 1\n check(mut &x) }',
+                        'conflicting temporary call loans',
+                        diagnostics=('note: conflicting temporary loan starts here',))
+            fixture('spec34_E19_temporary_shared_siblings',
+                    'fn reads(a &int, b &int) { println(*a + *b) }\n'
+                    'fn check(p &mut int) { reads(&*p, &*p)\n *p = 3 }\n'
+                    'fn main() { mut x := 1\n check(mut &x)\n println(x) }', output='2\n3\n')
+            fixture('spec34_F27_temporary_distinct_owners', loan_fns +
+                    'fn check(p &mut int, q &mut int) { both(&*p, q)\n writes(p, q) }\n'
+                    'fn main() { mut x := 1\n mut y := 4\n check(mut &x, mut &y)\n println(x + y) }', output='1\n5\n')
+            fixture('spec34_F27_completed_scalar_reads', loan_fns +
+                    'fn calc(w &mut int, n int) { *w = n + 1 }\n'
+                    'fn check(p &mut int) { calc(p, read(&*p))\n calc(p, *p) }\n'
+                    'fn main() { mut x := 1\n check(mut &x)\n println(x) }', output='3\n')
+            for tag, call in (('shared_first', 'both(&p.value, p)'),
+                              ('writable_first', 'reverse(p, &p.value)')):
+                fixture('spec34_H32_temporary_field_' + tag,
+                        'struct Item { value int }\n'
+                        'fn both(s &int, w &mut Item) { w.value = 2\n println(*s) }\n'
+                        'fn reverse(w &mut Item, s &int) { w.value = 2\n println(*s) }\n'
+                        'fn check(p &mut Item) { ' + call + ' }\nfn main() {}',
+                        'conflicting temporary call loans')
+            # Spec34 Phase B: pair the inserted adjustment with explicit &*p.
+            read_fn = 'fn read(r &int) int { << *r }\n'
+            fixture('spec34_E19_shared_name_copy', read_fn +
+                    'fn main() { x := 3\n p := &x\n let q: &int = p\n println(read(p) + read(q)) }', output='6\n')
+            fixture('spec34_E20_F26_call_restores_parent', read_fn +
+                    'fn check(p &mut int) { println(read(p))\n *p = 2\n println(read(p)) }\n'
+                    'fn main() { mut x := 1\n check(mut &x) }', output='1\n2\n')
+            fixture('spec34_F26_generic_body_instances', read_fn +
+                    'fn relay#T(tag T, p &mut int) int { << read(p) }\n'
+                    'fn check(p &mut int) { println(relay(0, p))\n println(relay(true, p))\n println(relay(0, p))\n *p = 4 }\n'
+                    'fn main() { mut x := 3\n check(mut &x) }', output='3\n3\n3\n')
+            fixture('spec34_F26_generic_concrete_expectation',
+                    'fn read#T(tag T, r &int) int { << *r }\n'
+                    'fn check(p &mut int) { println(read(0, p))\n println(read(true, p)) }\n'
+                    'fn main() { mut x := 3\n check(mut &x) }', output='3\n3\n')
+            fixture('spec34_G29_method_parameter',
+                    'struct Item { value int }\nfn (i &Item) add(r &int) int { << i.value + *r }\n'
+                    'fn check(p &mut Item, q &mut int) { println(p.add(q))\n *q = 4 }\n'
+                    'fn main() { mut i := Item{value: 2}\n mut x := 3\n check(mut &i, mut &x) }', output='5\n')
+            fixture('spec34_F28_return_parameter_last_use',
+                    'fn view(p &mut int) &int { << p }\n'
+                    'fn main() { mut x := 1\n p := mut &x\n q := view(p)\n println(*q)\n *p = 2\n println(*p) }', output='1\n2\n')
+            for spelling, label in (('p', 'implicit'), ('&*p', 'explicit')):
+                base = 'struct Holder { r &int }\n' + read_fn
+                for tag, body, expected in (
+                    ('typed_let', 'let q: &int = VIEW\n println(*q)\n *p = 2\n println(*p)', '1\n2\n'),
+                    ('assign', 'x := 7\n mut q := &x\n q = VIEW\n println(*q)\n *p = 2', '1\n'),
+                    ('struct_init', 'h := Holder{r: VIEW}\n println(*h.r)\n *p = 2', '1\n'),
+                    ('field_assign', 'x := 7\n mut h := Holder{r: &x}\n h.r = VIEW\n println(*h.r)\n *p = 2', '1\n'),
+                    ('array_fixed', 'a := [1]&int{VIEW}\n println(*a[0])\n *p = 2', '1\n'),
+                    ('array_assign', 'x := 7\n mut a := [&x]\n a[0] = VIEW\n println(*a[0])\n *p = 2', '1\n'),
+                ):
+                    fixture('spec34_E20_C14_H32_' + tag + '_' + label,
+                            base + 'fn check(p &mut int) { ' + body.replace('VIEW', spelling) + ' }\n'
+                            'fn main() { mut x := 1\n check(mut &x) }', output=expected)
+                for tag, body in (
+                    ('local', 'let q: &int = VIEW\n *p = 2\n println(*q)'),
+                    ('move_parent', 'let q: &int = VIEW\n w := p\n println(*q)\n println(*w)'),
+                    ('exclusive_parent', 'let q: &int = VIEW\n w := mut &*p\n println(*q)\n println(*w)'),
+                    ('descendant', 'let q: &int = VIEW\n h := &*q\n *p = 2\n println(*h)'),
+                    ('nested_struct', 'h := Holder{r: VIEW}\n *p = 2\n println(*h.r)'),
+                    ('closure', 'let q: &int = VIEW\n f := fn() int { << *q }\n *p = 2\n println(f())'),
+                    ('result', 'q := view(VIEW)\n *p = 2\n println(*q)'),
+                    ('array', 'a := [1]&int{VIEW}\n *p = 2\n println(*a[0])'),
+                ):
+                    fixture('spec34_E20_H33_freeze_' + tag + '_' + label,
+                            base + 'fn view(r &int) &int { << r }\nfn check(p &mut int) { ' + body.replace('VIEW', spelling) + ' }\nfn main() {}',
+                            'frozen reference' if tag == 'exclusive_parent' else 'mutably borrowed')
+                for tag, child in (('shared', '&*p'), ('exclusive', 'mut &*p')):
+                    fixture('spec34_H33_frozen_' + tag + '_' + label,
+                            read_fn + 'fn check(p &mut int) { r := ' + child + '\n println(read(' + spelling + '))\n println(*r) }\nfn main() {}',
+                            'frozen reference')
+            for tag, call in (
+                ('shared_first', 'both(p, p)'),
+                ('writable_first', 'reverse(p, p)'),
+                ('nested_result', 'both(view(p), p)'),
+                ('nested_result_reverse', 'reverse(p, view(p))'),
+                ('nested_write', 'consume(p, write(p))'),
+            ):
+                fixture('spec34_F26_H33_temporary_implicit_' + tag,
+                        loan_fns + 'fn check(p &mut int) { ' + call + ' }\nfn main() {}',
+                        'conflicting temporary call loans')
+            fixture('spec34_E20_temporary_shared_siblings',
+                    'fn reads(a &int, b &int) { println(*a + *b) }\n'
+                    'fn check(p &mut int) { reads(p, p)\n *p = 3 }\n'
+                    'fn main() { mut x := 1\n check(mut &x)\n println(x) }', output='2\n3\n')
+            fixture('spec34_F26_completed_scalar_both_orders', read_fn +
+                    'fn calc(w &mut int, a int) { *w = a + 1 }\n'
+                    'fn reverse(a int, w &mut int) { *w = a + 1 }\n'
+                    'fn check(p &mut int) { calc(p, read(p))\n reverse(read(p), p)\n println(*p) }\n'
+                    'fn main() { mut x := 1\n check(mut &x) }', output='3\n')
+            for receiver_ty, arg_ty in (('&Item', '&mut Item'), ('&mut Item', '&Item')):
+                fixture('spec34_G29_temporary_receiver_' + str(len(receiver_ty)),
+                        'struct Item { value int }\n'
+                        'fn (p ' + receiver_ty + ') alias(q ' + arg_ty + ') { println(p.value) }\n'
+                        'fn check(p &mut Item) { p.alias(p) }\nfn main() {}',
+                        'conflicting temporary call loans')
+            for tag, expr in (('field', 'h.r'), ('index', 'a[0]'), ('call', 'id(p)'), ('borrow', 'mut &x')):
+                fixture('spec34_E24_implicit_' + tag,
+                        'struct H { r &mut int }\n' + read_fn +
+                        'fn id(r &mut int) &mut int { << r }\n'
+                        'fn check(p &mut int, h H, a []&mut int) { mut x := 1\n println(read(' + expr + ')) }\nfn main() {}',
+                        'implicit shared reborrow requires a local reference name')
+            fixture('spec34_E20_H33_implicit_diagnostic',
+                    'fn check(p &mut int) { let q: &int = p\n *p = 2\n println(*q) }\nfn main() {}',
+                    'mutably borrowed', diagnostics=('implicit shared reborrow inserted for a read-only expectation',
+                        'shared reborrow starts here', 'shared reborrow is last used here'))
+            fixture('spec34_D18_no_expected_move',
+                    'fn check(p &mut int) { q := p\n println(*p)\n println(*q) }\nfn main() {}', 'moved value')
+            fixture('spec34_C12_no_recursive_array',
+                    'fn read(a []&int) {}\nfn check(a []&mut int) { read(a) }\nfn main() {}', 'type mismatch')
+            fixture('spec34_F28_local_escape',
+                    'fn bad(unused &int) &int { mut x := 1\n p := mut &x\n << p }\nfn main() {}', 'cannot return a reference to local data')
+            fixture('spec34_H33_branch_implicit_parents',
+                    'fn bad(flag bool, p &mut int, q &mut int) { let s: &int = p\n mut r := s\n if flag { r = q }\n h := &*r\n *q = 3\n println(*h) }\nfn main() {}', 'mutably borrowed')
+            fixture('spec34_H33_loop_implicit_rebind',
+                    'fn bad(p &mut int) { x := 1\n mut r := &x\n for i in 0:2 { r = p }\n println(*r) }\nfn main() {}', 'loop back-edge')
+            fixture('spec34_E20_struct_and_slice_pointees',
+                    'struct Item { value int }\nfn value(p &Item) int { << p.value }\n'
+                    'fn first(p &[]int) int { << p[0] }\n'
+                    'fn check(p &mut Item, a &mut []int) { println(value(p) + first(a))\n p.value = 4\n a[0] = 5 }\n'
+                    'fn main() { mut x := Item{value: 2}\n mut a := [3]\n check(mut &x, mut &a)\n println(x.value + a[0]) }', output='5\n9\n')
+            for spelling, label in (('p', 'implicit'), ('&*p', 'explicit')):
+                fixture('spec34_H33_nested_cast_write_' + label,
+                        loan_fns + 'fn check(p &mut int) { consume(' + spelling + ', int(i32(write(p)))) }\nfn main() {}',
+                        'conflicting temporary call loans')
+                fixture('spec34_H33_result_union_' + label,
+                        'fn choose(a &view int, b &view int, flag bool) &view int { if flag { << a }\n << b }\n'
+                        'fn check(p &mut int, q &mut int) { r := choose(' + spelling + ', &*q, true)\n *q = 4\n println(*r) }\nfn main() {}',
+                        'mutably borrowed')
+            fixture('spec34_H33_field_store_freezes_parent',
+                    'struct Holder { r &int }\nfn check(p &mut int) { x := 7\n mut h := Holder{r: &x}\n h.r = p\n *p = 2\n println(*h.r) }\nfn main() {}',
+                    'mutably borrowed')
+            # Active explicit writable loans block scalar place reads too;
+            # a bare synchronous writable argument remains a reservation.
+            for tag, first, error in (('active', 'mut &*p', 'mutably borrowed'), ('reserved', 'p', None)):
+                fixture('spec34_F27_H32_scalar_place_' + tag,
+                        'struct Item { value int }\nfn use(w &mut Item, n int) { w.value = n + 1 }\n'
+                        'fn check(p &mut Item) { use(' + first + ', p.value) }\n'
+                        'fn main() { mut x := Item{value: 2}\n check(mut &x)\n println(x.value) }',
+                        error, output=None if error else '3\n')
+            view_methods = ('struct Item { value int }\n'
+                            'fn (p &Item) view() &int { << &p.value }\n'
+                            'fn (p &Item) read() int { << p.value }\n')
+            fixture('spec34_G29_G31_shared_receiver_result', view_methods +
+                    'fn check(p &mut Item) { q := p.view()\n println(p.read())\n println(*q)\n p.value = 4 }\n'
+                    'fn main() { mut x := Item{value: 3}\n check(mut &x) }', output='3\n3\n')
+            fixture('spec34_G29_H33_shared_receiver_result_freezes', view_methods +
+                    'fn check(p &mut Item) { q := p.view()\n p.value = 4\n println(*q) }\nfn main() {}', 'mutably borrowed')
+            fixture('spec34_G29_generic_receiver',
+                    'struct Item#T { value T }\nfn (p &Item#T) read() T { << p.value }\n'
+                    'fn check(p &mut Item#int) { println(p.read())\n p.value = 4 }\n'
+                    'fn main() { mut x := Item#int{value: 3}\n check(mut &x) }', output='3\n')
+            for spelling, label in (('p', 'implicit'), ('&*p', 'explicit')):
+                fixture('spec34_H33_fallback_temporary_' + label,
+                        loan_fns + 'fn value() int { << 0 }\n'
+                        'fn check(p &mut int) { consume(' + spelling + ', value() or (err) { write(p) }) }\nfn main() {}',
+                        'conflicting temporary call loans')
+            fixture('spec34_H33_fallback_shared_and_statement_end', loan_fns +
+                    'fn value() int { << 0 }\n'
+                    'fn check(p &mut int, q &mut int) { consume(p, value() or (err) { read(p)\n r := &*q\n println(*r)\n write(q) }) }\n'
+                    'fn main() { mut x := 1\n mut y := 2\n check(mut &x, mut &y) }', output='1\n')
+            fixture('spec34_F26_function_value_execution', read_fn +
+                    'fn check(p &mut int) { f := read\n println(f(p))\n *p = 2 }\n'
+                    'fn main() { mut x := 1\n check(mut &x)\n println(x) }', output='1\n2\n')
+            fixture('spec34_F26_generic_no_downgrade_inference',
+                    'fn read#T(r &T) {}\nfn check(p &mut int) { read(p) }\nfn main() {}', 'type mismatch')
+            fixture('spec34_C12_no_recursive_reference',
+                    'fn read(r & &int) {}\nfn check(p & &mut int) { read(p) }\nfn main() {}', 'type mismatch')
+            fixture('spec34_H32_implicit_unproven_field_store',
+                    'struct H { r &int }\nfn bad(h &mut H, p &mut int) { h.r = p }\nfn main() {}',
+                    'without a proven lifetime')
+            chain = 'fn check(p &mut int) { r0 := mut &*p\n'
+            chain += ''.join(f'r{i} := mut &*r{i-1}\n' for i in range(1, 70))
+            fixture('spec34_E20_H33_long_implicit_parent_chain', chain +
+                    'let q: &int = r69\n *p = 4\n println(*q) }\nfn main() {}', 'mutably borrowed')
+            receiver_eval = ('struct Item { value int }\n'
+                             'fn (p &Item) plus(n int) int { << p.value + n }\n'
+                             'fn (p &mut Item) set(n int) { p.value = n }\n'
+                             'fn read(p &Item) int { << p.value }\n'
+                             'fn write(p &mut Item) int { p.value = 2\n << 0 }\n')
+            fixture('spec34_G29_H33_receiver_nested_writer', receiver_eval +
+                    'fn check(p &mut Item) { println(p.plus(write(p))) }\nfn main() {}',
+                    'conflicting temporary call loans')
+            fixture('spec34_G29_H33_receiver_nested_shared', receiver_eval +
+                    'fn check(p &mut Item, q &mut Item) { println(p.plus(read(p)))\n'
+                    ' println(p.plus(write(q)))\n p.set(p.value + 1)\n println(p.value) }\n'
+                    'fn main() { mut x := Item{value: 3}\n mut y := Item{value: 7}\n check(mut &x, mut &y) }', output='6\n3\n4\n')
+            clone_receiver = ('struct Item { name string }\n'
+                              'fn (p &Item) show(name string) { println(name) }\n'
+                              'fn use(p &mut Item, name string) { println(name) }\n')
+            fixture('spec34_G29_receiver_cloned_argument', clone_receiver +
+                    'fn check(p &mut Item) { p.show(p.name) }\n'
+                    'fn main() { mut x := Item{name: "xu"}\n check(mut &x) }', output='xu\n')
+            fixture('spec34_H32_active_writable_clone_reject', clone_receiver +
+                    'fn check(p &mut Item) { use(mut &*p, p.name) }\nfn main() {}', 'mutably borrowed')
+            # Spec34 Phase A: H38 marker confusion must stay rejected. Check
+            # actionable spelling, source attribution, and no output executable.
+            for index, (spelling, hint) in enumerate((
+                ('&$x := 1', "use '$name :='"),
+                ('$&x := 1', "use '$x :='"),
+                ('$x := 1', "use 'mut name :='"),
+                ('r := &$x', "writable borrows use '$&x'"),
+                ('r := $&*p', "use '&*r'"),
+                ('r := *$&p', "use '&*r'"),
+                ('r := $&x', "use 'mut &x'"),
+                ('println($x)', "use plain 'name'"),
+                ('r := &mut x', "writable borrow expressions use 'mut &x'"),
+            )):
+                fixture('spec34_H38_expr_' + str(index),
+                        'fn main() { mut x := 1\n p := mut &x\n ' + spelling + '\n}',
+                        hint, diagnostics=(':4:',))
+            for index, spelling in enumerate(('&$int', '$int', '$&int')):
+                fixture('spec34_H38_type_' + str(index),
+                        'fn read(p ' + spelling + ') {}\nfn main() {}',
+                        "currently '&mut T'" if spelling != '$&int' else "use '&mut T'",
+                        diagnostics=(':2:11:',))
+            fixture('spec34_E22_shared_upgrade',
+                    'fn bad(r &int) { w := mut &*r }\nfn main() {}',
+                    'cannot take address of dereference', diagnostics=(
+                        'cannot obtain an exclusive writable borrow from a shared reference',
+                        'borrow mutably from the owner',))
+            for borrow in ('&*h.r', 'mut &*h.r'):
+                fixture('spec34_E24_non_ident_' + str(len(borrow)),
+                        'struct Holder { r &mut int }\nfn bad(h Holder) { q := ' + borrow + '\n println(*q) }\nfn main() {}',
+                        'cannot take address of dereference', diagnostics=(
+                            'requires a local reference name', 'this may move it',))
+            fixture('spec34_A6_binding_not_pointee',
+                    'fn main() { x := 1\n mut r := &x\n *r = 2\n}',
+                    'cannot assign through shared reference', diagnostics=(
+                        'cannot write through a shared reference', "'mut r' allows rebinding",))
+            fixture('spec34_H33_shared_freeze_notes',
+                    'fn bad(p &mut int) { r := &*p\n *p = 2\n println(*r)\n}\nfn main() {}',
+                    'mutably borrowed', diagnostics=(
+                        'note: shared reborrow starts here',
+                        ':4:2: note: shared reborrow is last used here',
+                        'move the write or exclusive reborrow after the last use',))
+            fixture('spec34_E20_F26_plain_name',
+                    'fn read(r &int) int { << *r }\nfn check(p &mut int) { println(read(p)) }\nfn main() {}',
+                    output=None)
+            fixture('spec34_A1_A2_A6_A7_A8_B9_B10_B11_E19_E21a_compat',
+                    'fn write(r &mut int) { *r = 3 }\nfn main() { mut x := 1\n r := mut &x\n write(r)\n println(*r)\n s := &*r\n mut q := s\n println(*q)\n y := 4\n q = &y\n println(*q)\n *r = 5\n println(*r)\n}',
+                    output='3\n3\n4\n5\n')
+            fixture('spec34_H37_tags_interpolation_pub',
+                    '$' + native_tag + '\npub fn visible() int { << 3 }\nfn main() { name := "xu"\n println("$name $$ \\$name")\n println(visible())\n println(3 & 1)\n println(true && true)\n}',
+                    output='xu $ $name\n3\n1\ntrue\n')
+            fixture('spec34_A1_immutable_assignment',
+                    'fn main() { x := 1\n x = 2 }',
+                    'cannot assign to immutable variable', diagnostics=("mut x := value",))
+            fixture('spec34_D17_immutable_owner',
+                    'fn main() { x := 1\n r := mut &x\n println(*r) }',
+                    'cannot mutably borrow immutable variable', diagnostics=("mut x := value",))
+            for target, setup in (('s.value', 'struct Box { value int }\nfn main() { x := Box{value: 1}\n mut s := &x\n'),
+                                  ('s[0]', 'fn main() { x := [1]\n mut s := &x\n')):
+                fixture('spec34_A6_shared_place_' + str(len(target)),
+                        setup + target + ' = 2\n}', 'cannot assign through shared reference',
+                        diagnostics=("'mut s' allows rebinding", 'borrow mutably from the owner'))
+            fixture('spec34_E22_readonly_argument',
+                    'fn write(r &mut int) {}\nfn main() { x := 1\n write(&x) }',
+                    'type mismatch: expected &mut int, found &int',
+                    diagnostics=('cannot obtain an exclusive writable borrow from a shared reference',
+                                 'borrow mutably from the owner'))
+            for name, body in (
+                ('fnval', 'f := read\n println(f(p))'),
+                ('let', 'let s: &int = p'),
+                ('assign', 'x := 1\n mut s := &x\n s = p\n println(*s)'),
+            ):
+                fixture('spec34_E20_' + name,
+                        'fn read(r &int) int { << *r }\nfn bad(p &mut int) { ' + body + ' }\nfn main() {}',
+                        output=None)
+            fixture('spec34_E20_return',
+                    'fn bad(p &mut int) &int { << p }\nfn main() {}',
+                    output=None)
+            fixture('spec34_F25_no_automatic_borrow',
+                    'fn read(r &int) {}\nfn main() { x := 1\n read(x) }',
+                    'type mismatch: expected &int, found int')
+            fixture('spec34_H33_frozen_reborrow_notes',
+                    'fn bad(p &mut int) { r := &*p\n q := mut &*p\n println(*r)\n println(*q) }\nfn main() {}',
+                    'cannot reborrow a frozen reference', diagnostics=(
+                        ':2:22: note: shared reborrow starts here',
+                        ':4:2: note: shared reborrow is last used here',))
+            fixture('spec34_H33_branch_notes',
+                    'fn bad(p &mut int, q &mut int, flag bool) { mut r := &*p\n if flag { r = &*q }\n *q = 9\n println(*r) }\nfn main() {}',
+                    'mutably borrowed', diagnostics=('note: shared reborrow starts here',
+                                                    ':5:2: note: shared reborrow is last used here',))
+            for source in ('fn main() { x := ~1 }', 'fn bad(x ~int) {}\nfn main() {}'):
+                fixture('spec34_H38_tilde_' + str(len(source)), source,
+                        "unexpected character '~'", diagnostics=("'~' stays unused", 'mut &x'))
+            fixture('spec34_H38_typed_binding', 'fn main() { let $x: int = 1 }',
+                    "'let $x: T' is not yet supported", diagnostics=('mut x := value',))
+            for index, source in enumerate((
+                'fn bad() $&int { << 1 }\nfn main() {}',
+                'fn main() { f := fn() $&int { << 1 } }',
+                'fn main() { let f: fn() $&int = 1 }',
+                'struct@ Read { fn read() $&int }\nfn main() {}',
+            )):
+                fixture('spec34_H38_return_type_' + str(index), source,
+                        "use '&mut T'")
+            fixture('spec34_H33_current_function_notes',
+                    'fn first() { println(0)\n println(1)\n println(2) }\nfn bad(p &mut int) { r := &*p\n *p = 9\n println(*r) }\nfn main() {}',
+                    'mutably borrowed', diagnostics=(
+                        ':5:22: note: shared reborrow starts here',
+                        ':7:2: note: shared reborrow is last used here',))
+            fixture('spec34_H33_aggregate_holder_notes',
+                    'struct View { r &int }\nfn bad(p &mut int) { h := View{r: &*p}\n *p = 9\n println(*h.r) }\nfn main() {}',
+                    'mutably borrowed', diagnostics=(
+                        ':3:22: note: shared reborrow starts here',
+                        ':5:2: note: shared reborrow is last used here',))
+            fixture('spec34_H38_borrow_binding', 'fn main() { &x := 1 }',
+                    'a borrow is not a mutable binding declaration', diagnostics=('mut x :=',))
+            fixture('spec34_H38_nested_legacy_borrow',
+                    'fn main() { mut x := 1\n r := &mut &x }')
             fixture('undefined_spawn', 'fn main() { xu missing() }', 'undefined function')
             fixture('invalid_send', 'fn main() { x := 1\n x <- 2\n}', 'send requires a channel')
             fixture('call_loan', 'fn identity(x &int) &int { << x }\nfn main() { mut x := 1\n r := identity(&x)\n x = 2\n println(*r)\n}', 'because it is borrowed')
@@ -579,6 +930,8 @@ fn (p &mut Item) change() { p.value = 2 }
             fixture('receiver_index_loan', reader + 'fn check(p &mut []Item, i &mut int) { r := mut &*i\n println(p[*i].read())\n println(*r)\n}\nfn main() { mut xs := [Item{value: 3}]\n mut i := 0\n check(mut &xs, mut &i)\n}', 'mutably borrowed')
             fixture('mutable_field', 'struct Inner { x int }\nstruct Outer { inner Inner, y int }\nfn (p &mut Inner) set(v int) { p.x = v }\nfn change(p &mut Outer) { r := mut &p.inner\n r.set(2)\n p.y = 3\n}\nfn main() { mut v := Outer{inner: Inner{x: 1}, y: 0}\n change(mut &v)\n println(v.y)\n}', output='3\n')
         if opts.front_only:
+            if baseline:
+                print(f'compiler P1 acceptance comparison: PASS={comparisons} FAIL=0', flush=True)
             return
         # Keep the real compiler functions; only rename its CLI entry point.
         entry = tmp / 'driver_entry.xu'
@@ -823,6 +1176,25 @@ fn main() { out := chan int{cap: 0}
         for target in ('riscv32imac-none', 'thumbv7em-none'):
             fixture('freestanding_nonblocking_' + target, nonblocking, extra=('--target', target))
             fixture('freestanding_spawn_reject_' + target, 'fn worker() {}\nfn main() { xu worker() }', 'require a suspendable scheduler', extra=('--target', target))
+        # Spec34 B adjustments must retain the pointer ABI through optimization
+        # and across native backends, for scalar, struct and slice pointees.
+        for spelling, label in (('p', 'implicit'), ('&*p', 'explicit')):
+            phase_b = ('struct Item { value int }\n'
+                       'fn view(s &int) &int { << s }\n'
+                       'fn read(s &int) int { << *s }\n'
+                       'fn sum(a &[]int, i &Item) int { << a[0] + i.value }\n'
+                       'fn check(p &mut int, a &mut []int, i &mut Item) int { q := view(VIEWP)\n'
+                       ' total := *q + sum(VIEWA, VIEWI)\n *p = total\n << read(VIEWP) }\n'
+                       'fn main() { mut x := 1\n mut a := [2]\n mut i := Item{value: 3}\n'
+                       ' println(check(mut &x, mut &a, mut &i))\n println(x) }')
+            phase_b = phase_b.replace('VIEWP', spelling).replace('VIEWA', spelling.replace('p', 'a')).replace('VIEWI', spelling.replace('p', 'i'))
+            for target, runner in (('host', ()), ('linux-arm64', ('qemu-aarch64',)),
+                                   ('linux-arm32', ('qemu-arm',)), ('linux-loongarch64', ('qemu-loongarch64',)),
+                                   ('linux-riscv64', ('qemu-riscv64',))):
+                for opt in ('-O0', '-O2'):
+                    extra = (opt,) if target == 'host' else (opt, '--target', target)
+                    fixture('spec34_E20_F26_C14_backend_' + label + '_' + target + opt,
+                            phase_b, output='6\n6\n', extra=extra, runner=runner)
         wasm = fixture('casts.wasm', '''pub fn signed(x int) int { << int(i32(x)) }
 pub fn unsigned(x int) int { << int(u32(x)) }
 pub fn bytecast(x int) int { << int(u8(x)) }
@@ -843,6 +1215,8 @@ WebAssembly.instantiate(fs.readFileSync(process.argv[1]), {}).then(({instance}) 
         run(['node', '-e', js, wasm], env=env)
         print('PASS wasm_cast_execution', flush=True)
         fixture('wasm_float_reject', 'pub fn convert(x f64) int { << int(x) }\nfn main() {}', 'floating-point casts are not implemented', extra=('--target', 'wasm32'))
+        if baseline:
+            print(f'compiler P1 acceptance comparison: PASS={comparisons} FAIL=0', flush=True)
     print('compiler P1: PASS', flush=True)
 
 

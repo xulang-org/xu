@@ -140,7 +140,10 @@ struct DrawTextInput {
         auto client = raw->owner->text_input;
         auto *p = client->owner; p->text_input.reset();
         client->detach(message == WM_NCDESTROY);
-        xu_ui_text_input_cancel(client->id); cancel_input(p);
+        xu_ui_text_input_cancel(client->id);
+        // Moving between our native text proxy and its canvas is an internal
+        // focus handoff, not a cancellation of the Screen or its open overlays.
+        if (message == WM_NCDESTROY || !draw_focus_within_canvas(p, (HWND)wp)) cancel_input(p);
         if (message == WM_NCDESTROY) {
           xu_ui_text_input_stop(client->id, p->host.canvas_id, p->canvas_generation, XUTI_NATIVE_UNAVAILABLE);
           p->text_input_id = 0;

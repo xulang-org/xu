@@ -6,6 +6,14 @@
 
 ---
 
+## Xu 0.10.11
+
+This release integrates the validated development branch with the 0.10.10 native widget baseline. It includes the Phase B shared-reborrow checks, framed XACP transport and Screen marshalling, Windows UI boundary fixes, WASM smoke coverage, and terminal progress for SDK installation and updates. The native password input and monotonic pointer-clock fixes from main are retained.
+
+**Source migration:** a writable local reference can be passed where the same direct pointee is expected through a shared reference. Aliasing a shared reborrow and a writable parent in one call is rejected in either argument order; split the operations or end the shared loan before mutating. This does not introduce recursive container conversions or automatic reborrows of arbitrary values. Upgrade the compiler, standard library and product tools together.
+
+XACP clients must use the framed control transport and the matching companion examples. SDK bundle inputs are pinned to complete companion commits. The stricter compiler, native UI, WASM and installed-SDK checks are run on the combined release source; platform-specific binary availability and checksums are listed with the release assets. Cross-built targets are not claimed as native GUI acceptance.
+
 ## Xu 0.10.10
 
 This version brings the public native widget APIs needed by the 46-entry component workshop, including Chart, RangeSlider, SplitView and structured menus. The bundled workshop keeps WebView support, and its action toolbar wraps and scrolls with large text instead of clipping labels at 200%. Native WebView content retains its own CSS and system child surface.

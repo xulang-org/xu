@@ -16,7 +16,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 	server-build-local server-build-linux server-check-linux server-start server-health server-smoke-local server-unit \
 	server-remote-check server-remote-deploy server-remote-status server-remote-health server-remote-smoke \
 	server-remote-restart server-remote-stop server-remote-rollback \
-	check test selfhost product-selfhost \
+	check test selfhost product-selfhost wasm-smoke wasm-ui-smoke \
 	ncall fixtures fixtures-gen3 programs-gen3 verify-gen3 \
 	safety safety-cross safety-embedded safety-escape hardening-gate \
 	platform gen1-platform cli-platform bench bench-runtime bench-stdlib bench-opt-levels bench-nbody-residency bench-opt-full bench-crosslang bench-language bench-game \
@@ -67,8 +67,10 @@ help:
 	@echo "Also"
 	@echo "  make platform         multi-target compile matrix"
 	@echo "  make cli-platform     product CLI flags/env smoke (see CLI_CROSS_PLATFORM.md)"
+	@echo "  make wasm-ui-smoke    build site playground with this compiler + Node UI tests"
+	@echo "  make wasm-smoke       wasm32 optimized/unoptimized frame ABI smoke (requires Node.js)"
 	@echo "  make doc-test         xu doc Markdown golden + CLI smoke"
-	@echo "  make xacp-test        XACP discovery, safe launcher and protocol core smoke"
+	@echo "  make xacp-test        XACP discovery, session security and HTTP POST probe smoke"
 	@echo "  make packages-test    package regressions using product xu and local protocol peers"
 	@echo "  make bench-runtime    运行时基准(xu-bench, confirmed product,--save/--check 见脚本)"
 	@echo "  make bench-stdlib     标准库热路径（os/io/fs/path/time/strings）基准（xu-bench/scripts/bench_stdlib.sh）"
@@ -89,6 +91,7 @@ help:
 
 all: xu
 
+# The smoke also runs xacp_cross_protocol_probe against token/no-token TCP peers.
 xacp-test: xu-xacp
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_smoke.py
 
@@ -231,6 +234,9 @@ $(XU_XACP): $(XU) src/cmd/xacp/xu.xun $(XACP_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-xacp)
 
 check test: verify-gen3
+
+wasm-smoke: $(XU)
+	XU="$(abspath $(XU))" ./scripts/wasm32_smoke.sh
 
 # Historical callers used `make selfhost`; keep that spelling but make its
 # product-only semantics explicit instead of silently routing to the primer.
@@ -391,3 +397,6 @@ ci: ci-fast safety safety-cross safety-embedded verify-gen3
 clean:
 	rm -rf $(BIN)
 	rm -f hello a.out hello.exe
+
+wasm-ui-smoke: $(XU)
+	sh scripts/wasm_ui_smoke.sh
