@@ -59,7 +59,7 @@ for mode in opt no-opt; do
     flags=()
     if [ "$mode" = no-opt ]; then flags=(--no-opt); fi
     for name in fold add mul calls; do
-        "$compiler" build "$tmp/$name.xu" --target wasm32 "${flags[@]}" -o "$tmp/$name.wasm"
+        "$compiler" build "$tmp/$name.xu" --target wasm32 ${flags[@]+"${flags[@]}"} -o "$tmp/$name.wasm"
     done
     echo "wasm32_smoke: $mode"
     node "$tmp/check.js" "$tmp/fold.wasm" main_frame 42

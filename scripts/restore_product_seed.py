@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Restore a hosted seed from a published SDK; never substitute a primer."""
+"""Restore a hosted seed from a published or accepted CI SDK; never a primer."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -51,6 +52,41 @@ def download(target: str, version: str, archives: Path) -> None:
                     '--pattern', f'xu-{tag}-{target}.{extension}', '--dir', str(archives)], check=True)
 
 
+def download_accepted_sdk(run_id: str, target: str, archives: Path) -> None:
+    """Use frozen SDK seeds only after their source and producer are accepted."""
+    if not run_id.isdecimal() or int(run_id) <= 0:
+        raise ValueError('SDK seed run must be a positive Actions run ID')
+    def api(path):
+        return json.loads(subprocess.check_output(
+            ['gh', 'api', 'repos/xulang-org/xu/' + path], text=True, encoding='utf-8'))
+    run = api('actions/runs/' + run_id)
+    workflow = api('actions/workflows/sdk.yml')
+    if run['workflow_id'] != workflow['id'] or run['status'] != 'completed':
+        raise ValueError('SDK seed run must be a completed Installed SDK workflow')
+    source = run['head_sha']
+    if len(source) != 40 or any(c not in '0123456789abcdef' for c in source):
+        raise ValueError('Invalid SDK seed source revision')
+    if api('compare/' + source + '...main')['status'] not in ('ahead', 'identical'):
+        raise ValueError('SDK seed source has not been accepted into main')
+    jobs = api('actions/runs/' + run_id + '/jobs?per_page=100')['jobs']
+    if not any(j['name'] == 'Native macOS Intel SDK and platform seeds'
+               and j['conclusion'] == 'success' for j in jobs):
+        raise ValueError('SDK seed producer did not pass its native acceptance')
+    if target != 'macos-x64' and not any(
+            j['name'] == f'Install and run ({target}, product)' and j['conclusion'] == 'success'
+            for j in jobs):
+        raise ValueError('SDK seed target did not pass native installation acceptance')
+    artifacts = api('actions/runs/' + run_id + '/artifacts?per_page=100')['artifacts']
+    name = 'xu-sdk-product-' + target
+    matches = [a for a in artifacts if a['name'] == name and not a['expired']]
+    if len(matches) != 1:
+        raise ValueError('Expected one unexpired verified SDK seed artifact')
+    archives.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['gh', 'run', 'download', run_id, '--repo', 'xulang-org/xu',
+                    '--name', name, '--dir', str(archives)], check=True)
+    print(f'Accepted SDK seed: run={run_id} source={source} artifact={matches[0]["id"]}')
+
+
 def restore(target: str, archives: Path, destination: Path, *, replace_existing: bool = False) -> None:
     if destination.exists() and not replace_existing:
         raise ValueError('Refusing to overwrite an existing hosted seed')
@@ -91,6 +127,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', choices=SUPPORTED_TARGETS, required=True)
     parser.add_argument('--version', default=os.environ.get('XU_SDK_SEED_VERSION', ''))
+    parser.add_argument('--artifact-run-id', default='',
+                        help='accepted SDK seed run to use when no published version is explicitly selected')
     parser.add_argument('--archives', type=Path)
     parser.add_argument('--destination', type=Path)
     parser.add_argument('--replace-existing', action='store_true',
@@ -101,11 +139,14 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix='xu-product-download-') as temporary:
             archives = args.archives or Path(temporary)
-            download(args.target, args.version, archives)
+            if args.artifact_run_id and not args.version:
+                download_accepted_sdk(args.artifact_run_id, args.target, archives)
+            else:
+                download(args.target, args.version, archives)
             if args.destination:
                 restore(args.target, archives, args.destination, replace_existing=args.replace_existing)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        print('Product seed BLOCKED: no valid published SDK seed. Publish the initial verified SDK '
+        print('Product seed BLOCKED: no verified hosted SDK seed. Publish the initial verified SDK '
               'or configure a successful artifact run; oracle binaries are not product seeds.', file=sys.stderr)
         print(str(error), file=sys.stderr)
         return 1
