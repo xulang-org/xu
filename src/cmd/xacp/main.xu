@@ -1,25 +1,27 @@
 @main
 // xu-xacp — safe launcher/inspector for XACP-enabled Xu programs.
 //
-// This tool deliberately delegates execution to the target process.  It can
-// inspect the target's discovery document and run it with a protected `--`
-// boundary, but it cannot grant permissions or inject control payloads.
+// Control forwards the caller's stdin/stdout to an explicit stdio session.
 
 #os
 #os/exec
 #strconv
+#errors
+#strings
 
 const MAX_RECORD_BYTES = 1048576
 
 fn usage() {
-    println("usage: xu xacp <inspect|run|debug|record> <program> [-- args...]")
+    println("usage: xu xacp <inspect|run|debug|record|control> <program> [-- args...]")
     println("")
     println("  inspect   read the program's --xacp-help discovery document")
+    println("  control   serve framed stdin/stdout exclusively (business main is skipped)")
     println("  run       execute the program and forward args after --")
     println("  debug     inspect first, then execute with the same safe boundary")
     println("  record    stream bounded stdout; redirect it to a file yourself")
     println("")
-    println("The current dispatcher is help-only; no permissions or control events are granted.")
+    println("  connect PORT  relay framed stdin/stdout to 127.0.0.1:PORT")
+    println("control: pipe XACP frames on stdin; validated hello grants development permissions.")
 }
 
 fn target_help(path string) int {
@@ -87,19 +89,33 @@ fn target_record(path string, argv &[]string) int {
     }
     mut total := 0
     mut overflow := false
+    mut failed := false
     while overflow == false {
         chunk := pipe.read(65536) or (err) {
+            eprintln("xu xacp: recording read failed: " + err.msg())
+            failed = true
             <-
         }
         if chunk.len == 0 { <- }
         if chunk.len > MAX_RECORD_BYTES - total {
             overflow = true
         } else {
-            _ := os_fd_write(1, chunk) or (err) {
-                eprintln("xu xacp: recording output failed: " + err.msg())
-                << 1
+            mut written := 0
+            while written < chunk.len {
+                n := os_fd_write(1, chunk[written:chunk.len]) or (err) {
+                    eprintln("xu xacp: recording output failed: " + err.msg())
+                    failed = true
+                    <-
+                }
+                if n <= 0 {
+                    eprintln("xu xacp: recording output made no progress")
+                    failed = true
+                    <-
+                }
+                written += n
             }
-            total = total + chunk.len
+            total = total + written
+            if failed { <- }
         }
     }
     _ := pipe.close() or (err) { << 0 }
@@ -117,6 +133,7 @@ fn target_record(path string, argv &[]string) int {
         eprintln("xu xacp: recording exceeded 1 MiB")
         << 1
     }
+    if failed { << 1 }
     << 0
 }
 
@@ -127,7 +144,18 @@ fn main() int {
         << 0
     }
     mode := argv[1]
-    if mode != "inspect" && mode != "run" && mode != "debug" && mode != "record" {
+    if mode == "connect" {
+        if argv.len != 3 {
+            eprintln("xu xacp: connect requires a loopback port")
+            << 1
+        }
+        code := tcp_connect(argv[2]) or (err) {
+            eprintln("xu xacp: " + err.msg())
+            << 1
+        }
+        << code
+    }
+    if mode != "inspect" && mode != "run" && mode != "debug" && mode != "record" && mode != "control" {
         eprintln("xu xacp: unknown command '" + mode + "'")
         usage()
         << 1
@@ -138,7 +166,26 @@ fn main() int {
         << 1
     }
     path := argv[2]
+    if mode == "control" {
+        if argv.len != 3 {
+            eprintln("xu xacp: control does not accept business arguments")
+            << 1
+        }
+        mut child := exec.command(path + "")
+        child.args.push("--xacp-stdio")
+        child.run() or (err) {
+            eprintln("xu xacp: " + err.msg())
+            code := child_exit_code(err.msg())
+            if code >= 0 { << code }
+            << 1
+        }
+        << 0
+    }
     if mode == "inspect" {
+        if argv.len != 3 {
+            eprintln("xu xacp: inspect does not accept program arguments")
+            << 1
+        }
         << target_help(path)
     }
     mut forwarded := []string{}
@@ -162,4 +209,77 @@ fn main() int {
         if target_help(path) != 0 { << 1 }
     }
     << target_run(path, &forwarded)
+}
+
+// One request/response at a time; bounded frames and short-write handling.
+// EOF at a frame boundary closes the connection without waiting for server EOF.
+fn tcp_connect(port_text string) int {
+    port := strconv.parse(&port_text, 10) or >>
+    if port < 1 || port > 65535 { >> errors.new("invalid TCP port") }
+    fd := os.socket(2, 1, 0) or >>
+    tcp_relay(fd, port) or (err) {
+        _ := os.socket_close(fd) or (close_err) { >> err }
+        >> err
+    }
+    _ := os.socket_close(fd) or >>
+    << 0
+}
+
+fn relay_write(fd int, tcp bool, text string) int {
+    mut offset := 0
+    while offset < text.len {
+        mut n := 0
+        if tcp {
+            n = os.socket_write(fd, text[offset:text.len]) or >>
+        } else {
+            n = os_fd_write(fd, text[offset:text.len]) or >>
+        }
+        if n <= 0 { >> errors.new("control output made no progress") }
+        offset += n
+    }
+    << 0
+}
+
+fn relay_frame(fd int, tcp bool) string {
+    mut frame := strings.builder()
+    mut matched := 0
+    delimiter := "\n===\n"
+    while frame.length() < MAX_RECORD_BYTES {
+        mut chunk := ""
+        if tcp {
+            chunk = os.socket_read(fd, 1) or >>
+        } else {
+            chunk = os_fd_read(fd, 1) or >>
+        }
+        if chunk.len == 0 {
+            if frame.length() == 0 { << "" }
+            >> errors.new("truncated control frame")
+        }
+        c := chunk[0] & 255
+        frame.write_byte(c)
+        if c == (delimiter[matched] & 255) {
+            matched += 1
+        } else if c == 13 && matched == 4 {
+            matched = 4
+        } else if c == 10 {
+            matched = 1
+        } else {
+            matched = 0
+        }
+        if matched == delimiter.len { << frame.text() }
+    }
+    >> errors.new("control frame exceeds 1 MiB")
+}
+
+fn tcp_relay(fd int, port int) int {
+    os.connect4(fd, 127, 0, 0, 1, port) or >>
+    while true {
+        request := relay_frame(0, false) or >>
+        if request.len == 0 { << 0 }
+        relay_write(fd, true, request) or >>
+        response := relay_frame(fd, true) or >>
+        if response.len == 0 { >> errors.new("control peer closed before response") }
+        relay_write(1, false, response) or >>
+    }
+    << 0
 }
