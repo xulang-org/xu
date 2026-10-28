@@ -489,11 +489,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix='xu-p1-test-') as temp:
         tmp = Path(temp)
         env['XU_CACHE'] = str(tmp / 'cache')
-        def fixture(name, source, error=None, output=None, extra=(), runner=()):
+        def fixture(name, source, error=None, output=None, extra=(), runner=(), diagnostics=()):
             src = tmp / (name + '.xu')
             out = tmp / name
             src.write_text('@main\n' + source)
-            run([xu, 'build', '-O0', *extra, src, '-o', out], env=env, expected=1 if error else 0, contains=error)
+            result = run([xu, 'build', '-O0', *extra, src, '-o', out], env=env, expected=1 if error else 0, contains=error)
+            for diagnostic in diagnostics:
+                assert diagnostic in result.stderr, (name, diagnostic, result.stderr)
             if error:
                 assert not out.exists(), f'{name}: failed build produced executable'
             elif output is not None:
@@ -501,6 +503,79 @@ def main():
             print('PASS', name, flush=True)
             return out
         if not opts.backend_only:
+            # Spec34 Phase A: H38 marker confusion must stay rejected. Check
+            # actionable spelling, source attribution, and no output executable.
+            for case_id, (spelling, hint) in enumerate((
+                ('&$x := 1', "use '$name :='"),
+                ('$&x := 1', "use '$x :='"),
+                ('$x := 1', "use 'mut name :='"),
+                ('r := &$x', "writable borrows use '$&x'"),
+                ('r := $&*p', "use '&*r'"),
+                ('r := *$&p', "use '&*r'"),
+                ('r := $&x', "use 'mut &x'"),
+                ('println($x)', "use plain 'name'"),
+                ('r := &mut x', "writable borrow expressions use 'mut &x'"),
+            )):
+                fixture('spec34_H38_expr_' + str(case_id),
+                        'fn main() { mut x := 1\n p := mut &x\n ' + spelling + '\n}',
+                        hint, diagnostics=(':4:',))
+            for case_id, spelling in enumerate(('&$int', '$int', '$&int')):
+                fixture('spec34_H38_type_' + str(case_id),
+                        'fn read(p ' + spelling + ') {}\nfn main() {}',
+                        "currently '&mut T'" if spelling != '$&int' else "use '&mut T'",
+                        diagnostics=(':2:11:',))
+            for case_id, source in enumerate((
+                'struct Holder { r &$int }\nfn main() {}',
+                'fn read() &$int {}\nfn main() {}',
+                'fn read() $int {}\nfn main() {}',
+                'fn main() { f := fn() $int {} }',
+                'fn main() { let r: &$int = 1 }',
+                'fn main() { let f: fn() $int = 1 }',
+            )):
+                fixture('spec34_H38_type_context_' + str(case_id), source,
+                        'writable borrow type')
+            fixture('spec34_A4_typed_binding_not_enabled',
+                    'fn main() { let $x: int = 1 }',
+                    "use 'mut x := value'")
+            fixture('spec34_H38_tilde_stays_unused',
+                    '~fn hidden() {}\nfn main() {}',
+                    "unexpected character '~'", diagnostics=(
+                        "'~' is not a borrow or mutability marker",))
+            fixture('spec34_E22_shared_upgrade',
+                    'fn bad(r &int) { w := mut &*r }\nfn main() {}',
+                    'cannot take address of dereference', diagnostics=(
+                        'cannot obtain an exclusive writable borrow from a shared reference',
+                        'borrow mutably from the owner',))
+            for borrow in ('&*h.r', 'mut &*h.r'):
+                fixture('spec34_E24_non_ident_' + str(len(borrow)),
+                        'struct Holder { r &mut int }\nfn bad(h Holder) { q := ' + borrow + '\n println(*q) }\nfn main() {}',
+                        'cannot take address of dereference', diagnostics=(
+                            'requires a local reference name', 'this may move it',))
+            fixture('spec34_A6_binding_not_pointee',
+                    'fn main() { x := 1\n mut r := &x\n *r = 2\n}',
+                    'cannot assign through shared reference', diagnostics=(
+                        'cannot write through a shared reference', "'mut r' allows rebinding",))
+            fixture('spec34_H33_shared_freeze_notes',
+                    'fn bad(p &mut int) { r := &*p\n *p = 2\n println(*r)\n}\nfn main() {}',
+                    'mutably borrowed', diagnostics=(
+                        'note: shared reborrow starts here',
+                        ':4:2: note: shared reborrow is last used here',
+                        'move the write or exclusive reborrow after the last use',))
+            fixture('spec34_H33_notes_current_function',
+                    'fn earlier() { println(0)\n println(1)\n}\nfn bad(p &mut int) { r := &*p\n *p = 2\n println(*r)\n}\nfn main() {}',
+                    'mutably borrowed', diagnostics=(
+                        ':5:22: note: shared reborrow starts here',
+                        ':7:2: note: shared reborrow is last used here',))
+            fixture('spec34_E20_F26_explicit_help',
+                    'fn read(r &int) int { << *r }\nfn check(p &mut int) { println(read(p)) }\nfn main() {}',
+                    'type mismatch: expected &_, found &mut _', diagnostics=(
+                        'temporarily freezes', 'use &*p',))
+            fixture('spec34_A1_A2_A6_A7_A8_B9_B10_B11_E19_E21a_compat',
+                    'fn write(r &mut int) { *r = 3 }\nfn main() { mut x := 1\n r := mut &x\n write(r)\n println(*r)\n s := &*r\n mut q := s\n println(*q)\n y := 4\n q = &y\n println(*q)\n *r = 5\n println(*r)\n}',
+                    output='3\n3\n4\n5\n')
+            fixture('spec34_H37_tags_interpolation_pub',
+                    '$linux\npub fn visible() int { << 3 }\nfn main() { name := "xu"\n println("$name $$ \\$name")\n println(visible())\n println(3 & 1)\n println(true && true)\n}',
+                    output='xu $ $name\n3\n1\ntrue\n')
             fixture('undefined_spawn', 'fn main() { xu missing() }', 'undefined function')
             fixture('invalid_send', 'fn main() { x := 1\n x <- 2\n}', 'send requires a channel')
             fixture('call_loan', 'fn identity(x &int) &int { << x }\nfn main() { mut x := 1\n r := identity(&x)\n x = 2\n println(*r)\n}', 'because it is borrowed')

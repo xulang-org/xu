@@ -67,6 +67,9 @@ fn main() int {
 > 3. **Native Lightweight Concurrency**: `xu worker()` coroutines + `chan` channels provide effortless Go-like concurrency.
 > 4. **Compile-time Static Safety**: Tracked via ownership & borrow inference. **Zero garbage collection (Zero-GC)**, zero pauses, and ultra-lean deterministic memory consumption.
 
+See [Borrowing and mutable bindings](docs/language/borrowing.md) for current rules
+and the planned borrow syntax direction.
+
 ---
 
 ## 🎯 Pain Points & "Why Xu?"
