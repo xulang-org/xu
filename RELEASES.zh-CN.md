@@ -14,6 +14,8 @@
 
 编译器整合借用流汇合修正、Thumb/裸机并发检查、栈检查及 LoongArch 远分支修正。**源码迁移：**禁止从借用结构体中移出拥有所有权的非字符串字段；生命周期允许时借用字段，临时测量与绘制快照则使用公共组件的 `clone()`。随包样式图库已显式克隆控件。编译器、标准库与工具须一并升级。XACP 控制示例迁至 examples 伙伴仓库。
 
+桌面打包与 Doctor 优先从自身可执行文件定位安装后的宿主源码，支持 PATH 与符号链接启动，再考虑环境变量或源码目录回退。`xu build --desktop` 因而可以在仓库外使用，旧 `XU_ROOT` 也不会选中其他 SDK。Linux 与 Windows 宿主编译同时保留含空格的 SDK 头文件路径，所有桌面目标均在生成目标文件时选择 UI 协程栈配置。
+
 SDK 工作流固定修正后的示例提交，并对安装后的工作坊及既有 UI、服务示例执行检查。原生 SDK 安装验收覆盖 macOS、Linux、Windows 的 ARM64/x64，不代表全部平台均完成桌面 GUI 验收；工作坊 GUI 验收在 macOS ARM64 上完成。Canvas 系统无障碍桥接、编辑器撤销历史与触摸长按仍属已说明的限制。LoongArch64 与 RISC-V SDK 为交叉构建。
 
 已发布二进制、源码提交及 SHA-256 摘要以 [GitHub Releases](https://github.com/xulang-org/xu/releases) 为准。

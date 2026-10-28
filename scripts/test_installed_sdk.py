@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -106,6 +107,23 @@ fn main() int {
     clean.pop("XU_STDLIB_ROOT", None)
     clean.pop("XU_ROOT", None)
     assert run([xu, "run", "main.xu"], cwd=project, env=clean).splitlines() == ["INSTALLED", "42"]
+    # SDK root discovery is independent of external GUI toolchain availability.
+    # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK
+    # before probing those host dependencies. Exercise direct PATH and CLI use.
+    for command in ([xu, "doctor"], ["xu-doctor"]):
+        doctor = subprocess.run([*command, "--target", manifest["target"]], cwd=project,
+                                env=clean, text=True, capture_output=True, timeout=90)
+        match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", doctor.stdout)
+        assert match, (doctor.returncode, doctor.stdout, doctor.stderr)
+        assert Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
+    stale = work / "stale checkout"
+    (stale / "src/ui/host").mkdir(parents=True)
+    for marker in ("macos_host.swift", "xu_content_abi.h"):
+        (stale / "src/ui/host" / marker).write_text("")
+    doctor = subprocess.run([xu, "doctor", "--target", manifest["target"]], cwd=project,
+                            env=clean | {"XU_ROOT": str(stale)}, text=True, capture_output=True, timeout=90)
+    match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", doctor.stdout)
+    assert match and Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
     # PATH lookup finds the compiler and its sibling tools from outside the SDK.
     run([xu, "fmt", "main.xu"], cwd=project, env=active)
     (project / "exit.xu").write_text('@main\nfn main() int { << 7 }\n')
