@@ -10,6 +10,8 @@
 pub struct ControlReply {
     pub outcome Outcome
     pub data string
+    png string
+    file bool
 }
 
 pub struct ControlJob {
@@ -47,17 +49,21 @@ fn new_screen_control() ScreenControl {
     << ScreenControl{jobs: jobs,state: state,done: done}
 }
 
-// Explicit attachment: business main continues; stdin/stdout belong to XACP.
-// Put business logs on stderr. done receives the server exit status at EOF.
+// Explicit attachment: business main continues; stdin/stdout carry XACP.
+// Prefer stderr for logs on this shared transport. Both streams are captured.
+// done receives the server exit status at EOF.
 pub fn attach_stdio() ScreenControl {
+    _ := output_control_fd()
     control := new_screen_control()
     xu attach_stdio_loop(control.jobs,control.state,control.done)
     << control
 }
 
 fn attach_stdio_loop(jobs chan ControlJob,state chan ScreenRegistration,done chan int) {
+    fd := output_control_fd()
     limits := control_limits()
-    code := serve_control(0,1,false,true,jobs,state,&limits) or (err) { done <- 1
+    mut nonces := new_nonce_registry(nonce_cache_from_env(), nonce_replay_from_env())
+    code := serve_control(0,fd,false,true,jobs,state,&limits,mut &nonces) or (err) { done <- 1
         << }
     done <- code
 }
@@ -66,6 +72,7 @@ fn attach_stdio_loop(jobs chan ControlJob,state chan ScreenRegistration,done cha
 // exclusive TCP. The caller must use a valid port and keep polling until exit.
 pub fn attach_tcp(port int) ScreenControl {
     if port < 1 || port > 65535 { >> errors.new("xacp: invalid attach TCP port") }
+    _ := output_control_fd()
     control := new_screen_control()
     xu attach_tcp_loop(port,control.jobs,control.state,control.done)
     << control
@@ -132,7 +139,11 @@ pub fn poll(control &mut ScreenControl,s &mut widgets.Screen) bool {
             session.state = STATE_OPEN
             session.permissions = job.permissions
             session.next_id = job.id
-            result := dispatch_screen(mut &*s,mut &session,&doc,&limits) or (err) {
+            request := validate_request(&doc,&limits) or (err) {
+                job.reply <- screen_failure("schema_error",err.msg())
+                << true
+            }
+            result := dispatch_screen_request(mut &*s,mut &session,&doc,&limits,&request) or (err) {
                 job.reply <- screen_failure("adapter_error",err.msg())
                 << true
             }
@@ -217,7 +228,7 @@ fn marshal_screen(jobs chan ControlJob,states chan ScreenRegistration,req &Reque
 }
 
 fn screen_reply(outcome Outcome,data string) ControlReply {
-    << ControlReply{outcome: outcome,data: data}
+    << ControlReply{outcome: outcome,data: data,png: "",file: false}
 }
 
 fn screen_failure(code string,msg string) ControlReply {
@@ -228,20 +239,40 @@ fn screen_timeout(timeout_ms int) ControlReply {
     << screen_failure("request_timeout","request exceeded " + str(timeout_ms) + " ms")
 }
 
-fn serialize_tree(s &widgets.Screen,nodes []widgets.ScreenNodeInfo,l &Limits) string {
+fn serialize_tree(s &widgets.Screen,tree TreeWindow,l &Limits,raw bool) string {
+    count := tree.nodes.len
+    if !check_window(tree.start,count,tree.total,l) { >> errors.new("xacp: invalid tree window") }
+    next_start := tree.start + count
     mut out := strings.builder()
+    append_xun(mut &out,"  redacted: !b " + str(!raw) + "\n")
     append_xun(mut &out,"  win: !i " + str(s.xacp_window_id()) + "\n  generation: !i " + str(s.xacp_generation()) + "\n")
-    if nodes.len == 0 { append_xun(mut &out,"  nodes: []\n") }
+    append_xun(mut &out,"  start: !i " + str(tree.start) + "\n  count: !i " + str(count) +
+        "\n  total: !i " + str(tree.total) + "\n  truncated: !b " + str(next_start < tree.total) +
+        "\n  next_start: !i " + str(next_start) + "\n")
+    if count == 0 { append_xun(mut &out,"  nodes: []\n") }
     else { append_xun(mut &out,"  nodes:\n") }
-    for node in nodes {
+    for node in tree.nodes {
+        secret := !raw && (node.secure || node.kind == widgets.SCREEN_SECRET_INPUT)
+        mut text := redact_paths(&node.text)
+        mut truncated := false
+        if secret { text = "" }
+        else if !raw && text.len > 256 {
+            mut end := 256
+            while end > 0 && (text[end] & 192) == 128 { end -= 1 }
+            text = text[0:end]
+            truncated = true
+        }
         append_xun(mut &out,"    - id: !i " + str(node.id) + "\n      kind: !i " + str(node.kind) +
             "\n      parent: !i " + str(node.parent) + "\n      x: !f " + event_float(node.x) +
             "\n      y: !f " + event_float(node.y) + "\n      width: !f " + event_float(node.width) +
             "\n      height: !f " + event_float(node.height) + "\n      visible: !b " + str(node.visible) +
             "\n      enabled: !b " + str(node.enabled) + "\n      focusable: !b " + str(node.focusable) +
-            "\n      focused: !b " + str(node.focused) + "\n      text: " + control_string(&node.text) + "\n")
+            "\n      focused: !b " + str(node.focused) + "\n      text: " + control_string(&text) + "\n")
+        if secret { append_xun(mut &out,"      redacted: !b true\n") }
+        if truncated { append_xun(mut &out,"      text_truncated: !b true\n") }
         if out.length() > l.max_frame_bytes - 128 { >> errors.new("xacp: tree response exceeds frame limit") }
     }
+    if out.length() > l.max_frame_bytes - 128 { >> errors.new("xacp: tree response exceeds frame limit") }
     << out.text()
 }
 
@@ -258,8 +289,8 @@ fn serialize_actions(actions []widgets.Action,l &Limits) string {
     << out.text()
 }
 
-fn serialize_surface(surface &draw.Surface) string {
-    << "  width: !f " + event_float(surface.width) + "\n  height: !f " + event_float(surface.height) +
+fn serialize_surface(surface &draw.Surface,raw bool) string {
+    << "  redacted: !b " + str(!raw) + "\n  width: !f " + event_float(surface.width) + "\n  height: !f " + event_float(surface.height) +
         "\n  pixel_width: !i " + str(surface.pixel_width) + "\n  pixel_height: !i " + str(surface.pixel_height) + "\n"
 }
 
