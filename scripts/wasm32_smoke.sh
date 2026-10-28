@@ -61,6 +61,56 @@ fn main() int {
 }
 EOF
 
+# Keep field/element values dynamic so optimization cannot fold the updates.
+cat > "$tmp/f64_rmw.xu" <<'EOF'
+@main
+struct FloatBox { guard int
+    f f64 }
+pub fn fp_field_add(x f64, y f64) f64 {
+    mut box := FloatBox{guard: 17, f: x}
+    fp_field_update(mut &box, y)
+    if box.guard != 18 { <<< 1 }
+    << box.f
+}
+fn fp_field_update(box &mut FloatBox, y f64) {
+    box.f += y
+    box.guard += 1
+}
+pub fn fp_field_literal(x f64) f64 {
+    mut box := FloatBox{guard: 17, f: x}
+    fp_field_update_literal(mut &box)
+    << box.f
+}
+fn fp_field_update_literal(box &mut FloatBox) {
+    box.f += 1.5
+    box.f *= 2.0
+    box.f -= 0.5
+}
+pub fn fp_index_mul(a &mut []f64, i int, y f64) f64 {
+    a[i] *= y
+    << a[i]
+}
+pub fn fp_index_literal(a &mut []f64, i int) f64 {
+    a[i] += 1.5
+    a[i] *= 2.0
+    a[i] -= 0.5
+    << a[i]
+}
+pub fn fp_index_store(a &mut []f64, i int, y f64) f64 {
+    a[i] = y
+    << a[i]
+}
+pub fn fp_buffer_field(a &mut []FloatBox, i int, y f64) f64 {
+    a[i].f += y
+    << a[i].f
+}
+pub fn int_index_add(a &mut []int, i int, y int) int {
+    a[i] += y
+    << a[i]
+}
+fn main() int { << 0 }
+EOF
+
 cat > "$tmp/check.js" <<'EOF'
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -84,6 +134,7 @@ cat > "$tmp/check_f64.js" <<'EOF'
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const bytes = fs.readFileSync(process.argv[2]);
+const rmwBytes = fs.readFileSync(process.argv[3]);
 assert.ok(WebAssembly.validate(bytes), 'invalid f64 WebAssembly');
 const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {});
 const memory = new DataView(instance.exports.memory.buffer);
@@ -140,6 +191,59 @@ for (const a of [0, -0, 42.75, -42.75, 4294967296.5, -4294967296.5,
         : a <= -(2 ** 63) ? min : BigInt(Math.trunc(a));
     check('fp_to_int', ['f64'], 'int', [a], expected);
 }
+// The borrowed array argument points at a descending three-slot descriptor;
+// its elements live in ascending memory. Sentinel neighbors catch bad offsets.
+const rmw = new WebAssembly.Instance(new WebAssembly.Module(rmwBytes), {});
+const rmwMemory = new DataView(rmw.exports.memory.buffer);
+const DESC = 12288, DATA = 16384;
+let rmwCalls = 0;
+function checkRmw(name, args, expected, indexed = false, struct = false, integer = false) {
+    for (let repeat = 0; repeat < 3; ++repeat) {
+        const width = struct ? 16 : 8;
+        rmwMemory.setBigInt64(DESC, BigInt(DATA), true);
+        rmwMemory.setBigInt64(DESC - 8, 3n, true);
+        rmwMemory.setBigInt64(DESC - 16, 3n, true);
+        for (let i = 0; i < 3; ++i) {
+            rmwMemory.setBigInt64(DATA + i * width, 17n, true);
+            if (struct) rmwMemory.setFloat64(DATA + i * width + 8, 23.25, true);
+        }
+        const target = DATA + width + (struct ? 8 : 0);
+        if (indexed) {
+            if (integer) rmwMemory.setBigInt64(target, args[0], true);
+            else rmwMemory.setFloat64(target, args[0], true);
+            rmwMemory.setBigInt64(A, BigInt(DESC), true);
+            rmwMemory.setBigInt64(A - 8, 1n, true);
+            if (args.length > 1) {
+                if (integer) rmwMemory.setBigInt64(A - 16, args[1], true);
+                else rmwMemory.setFloat64(A - 16, args[1], true);
+            }
+        } else args.forEach((x, i) => rmwMemory.setFloat64(A - i * 8, x, true));
+        rmwMemory.setBigInt64(R, -123456789n, true);
+        rmw.exports[`${name}_frame`](A, R);
+        const read = address => integer ? rmwMemory.getBigInt64(address, true)
+            : rmwMemory.getFloat64(address, true);
+        assert.equal(read(R), expected, name);
+        if (indexed) {
+            assert.equal(read(target), expected, `${name}: stored value`);
+            assert.equal(rmwMemory.getBigInt64(DATA, true), 17n);
+            assert.equal(rmwMemory.getBigInt64(DATA + 2 * width, true), 17n);
+            if (struct) assert.equal(rmwMemory.getBigInt64(DATA + width, true), 17n);
+        }
+        ++rmwCalls;
+    }
+}
+for (const [x, y] of pairs) {
+    checkRmw('fp_field_add', [x, y], x + y);
+    checkRmw('fp_index_mul', [x, y], x * y, true);
+    checkRmw('fp_buffer_field', [x, y], x + y, true, true);
+    checkRmw('fp_index_store', [x, y], y, true);
+}
+for (const x of [2.25, -5.5, 0, -0, Infinity, -Infinity, NaN]) {
+    checkRmw('fp_field_literal', [x], (x + 1.5) * 2 - 0.5);
+    checkRmw('fp_index_literal', [x], (x + 1.5) * 2 - 0.5, true);
+}
+checkRmw('int_index_add', [40n, 2n], 42n, true, false, true);
+console.log(`PASS f64 field/index RMW and bit-preserving load/store (${rmwCalls} frame calls)`);
 check('main', [], 'int', [], -16n);
 console.log(`PASS f64 arithmetic/comparison/negation/casts/branches/literals (${calls} frame calls)`);
 EOF
@@ -147,7 +251,7 @@ EOF
 for mode in opt no-opt; do
     flags=()
     if [ "$mode" = no-opt ]; then flags=(--no-opt); fi
-    for name in fold add mul calls f64; do
+    for name in fold add mul calls f64 f64_rmw; do
         "$compiler" build "$tmp/$name.xu" --target wasm32 "${flags[@]}" -o "$tmp/$name.wasm"
     done
     echo "wasm32_smoke: $mode"
@@ -160,6 +264,6 @@ for mode in opt no-opt; do
     node "$tmp/check.js" "$tmp/calls.wasm" main_frame 42
     node "$tmp/check.js" "$tmp/calls.wasm" recur_frame 16 3 10
     node "$tmp/check.js" "$tmp/calls.wasm" recur_frame -9 0 -9
-    node "$tmp/check_f64.js" "$tmp/f64.wasm"
+    node "$tmp/check_f64.js" "$tmp/f64.wasm" "$tmp/f64_rmw.wasm"
 done
-echo "wasm32_smoke: PASS (10 builds, integer and f64 frame ABI)"
+echo "wasm32_smoke: PASS (12 builds, integer and f64 frame ABI/RMW)"
