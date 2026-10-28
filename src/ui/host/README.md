@@ -69,6 +69,12 @@ xu build ../examples/examples/16_ui_webview/open --target linux-x64 --desktop -o
 
 Windows WebView 额外说明：Edge **WebView2 Runtime**（系统 Evergreen）不能打进 PE；NuGet 的 `WebView2LoaderStatic.lib` 仅 MSVC。MinGW pack 可从 `dist/windows-x64-ui/_build/` 选择架构匹配的 `WebView2Loader.dll`（或带架构后缀的文件）**嵌进 exe**，启动时解到 **exe 同目录**（已存在且大小一致则跳过，不进 TEMP）。`www` 与品牌图标不落盘。
 
+Windows ARM64 从配套开发源码使用时，需要同时重建 `xu`、`xu-desktop` 和 `xu-doctor`，保持编译器、内存 mailbox 与原生宿主匹配。`xu doctor --desktop --webview --target windows-arm64` 会检查对应 MinGW 工具、`sh` 和 `xxd`；Windows 系统的 NTFS `convert.exe` 不作为 ImageMagick 使用，缺少 `magick` 时仅跳过可选 ICO 生成。
+
+原生 Canvas 通过离屏缓冲一次提交完整帧。控件内输入代理与 Canvas 之间的焦点转移会保留弹层；真正离开 Canvas 或丢失鼠标捕获仍取消输入。设置 `XU_UI_TRACE_INPUT=1` 可记录按下、松开、取消、命中 ID 和动作结果，便于区分未命中与被取消；该诊断不记录输入文字。
+
+公开的 Windows 回归入口为 `scripts/test_windows_workers.py`、`scripts/test_windows_controls.py` 和 `scripts/test_windows_desktop.py`（传入 `--compiler`）；`scripts/test_windows_focus.py` 使用 `--cxx` 指定本机 C++ 编译器，在模拟窗口树上验证焦点分类，不创建或操作系统窗口。桌面 shell 回归需要 Git Bash / MSYS2 的 `sh` 在 `PATH` 中。
+
 ## 内嵌 WebView 组件
 
 `Screen.webview()` 将系统 WebView 作为 Draw 窗口的子控件。`ui.native_view()` 提供同一能力的底层句柄，`webview.bind_native()` 绑定文档与异步查询 API。macOS 使用剪裁 NSView，Windows 使用子 HWND，Linux 使用 GtkOverlay 与保留完整文档尺寸的裁剪容器。

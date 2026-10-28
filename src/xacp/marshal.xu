@@ -1,0 +1,268 @@
+@xacp
+
+#ui/widgets
+#ui/draw
+#strings
+#errors
+#time
+
+// Only owning strings, scalars and channel handles cross the control coroutine.
+pub struct ControlReply {
+    pub outcome Outcome
+    pub data string
+}
+
+pub struct ControlJob {
+    pub id int
+    pub op string
+    pub body string
+    pub permissions int
+    pub generation int
+    pub reply chan ControlReply
+}
+
+struct ScreenRegistration {
+    window int
+    canvas int
+    screen_generation int
+    generation int
+    closed chan int
+}
+
+// One attachment per process, with one registered Screen. Keep this handle in
+// the Screen-owning coroutine. The state token serializes registration/enqueue;
+// the one-slot mailbox bounds pending work. No Screen reference is retained.
+pub struct ScreenControl {
+    jobs chan ControlJob
+    state chan ScreenRegistration
+    pub done chan int
+}
+
+fn new_screen_control() ScreenControl {
+    jobs := chan ControlJob{cap: 1}
+    state := chan ScreenRegistration{cap: 1}
+    closed := chan int{cap: 1}
+    done := chan int{cap: 1}
+    state <- ScreenRegistration{window: 0,canvas: 0,screen_generation: 0,generation: 1,closed: closed}
+    << ScreenControl{jobs: jobs,state: state,done: done}
+}
+
+// Explicit attachment: business main continues; stdin/stdout belong to XACP.
+// Put business logs on stderr. done receives the server exit status at EOF.
+pub fn attach_stdio() ScreenControl {
+    control := new_screen_control()
+    xu attach_stdio_loop(control.jobs,control.state,control.done)
+    << control
+}
+
+fn attach_stdio_loop(jobs chan ControlJob,state chan ScreenRegistration,done chan int) {
+    limits := control_limits()
+    code := serve_control(0,1,false,true,jobs,state,&limits) or (err) { done <- 1
+        << }
+    done <- code
+}
+
+// Loopback TCP uses the same sequential-peer and authentication policy as
+// exclusive TCP. The caller must use a valid port and keep polling until exit.
+pub fn attach_tcp(port int) ScreenControl {
+    if port < 1 || port > 65535 { >> errors.new("xacp: invalid attach TCP port") }
+    control := new_screen_control()
+    xu attach_tcp_loop(port,control.jobs,control.state,control.done)
+    << control
+}
+
+fn attach_tcp_loop(port int,jobs chan ControlJob,state chan ScreenRegistration,done chan int) {
+    code := serve_tcp_control(port,true,jobs,state) or (err) { done <- 1
+        << }
+    done <- code
+}
+
+// Registration borrows only during this call. Duplicate registration is
+// rejected; unregister before registering another Screen. Close/dispose sends
+// a channel notification so the control side also invalidates idle screens.
+pub fn register_screen(control &mut ScreenControl,s &widgets.Screen) int {
+    if !s.is_open() { >> errors.new("xacp: cannot register a closed Screen") }
+    mut state := <-control.state
+    if state.window != 0 { control.state <- state
+        >> errors.new("xacp: Screen already registered") }
+    state.window = s.xacp_window_id()
+    state.canvas = s.xacp_canvas_id()
+    state.screen_generation = s.xacp_generation()
+    state.generation += 1
+    state.closed = s.xacp_close_events()
+    control.state <- state
+    << 0
+}
+
+// The UI owner must unregister before abandoning the poll loop. A queued job
+// receives stale_window. New requests see not_implemented without needing poll.
+pub fn unregister_screen(control &mut ScreenControl) {
+    mut state := <-control.state
+    state.window = 0
+    state.generation += 1
+    select {
+        job := <-control.jobs { job.reply <- screen_failure("stale_window","Screen unregistered") }
+        else {}
+    }
+    control.state <- state
+}
+
+// Nonblocking: service at most one request between UI event iterations. Never
+// call a blocking UI wait while control work needs polling. A registered owner
+// that stops polling gets request_timeout after the configured deadline. Work
+// already executing is not interrupted; its late reply is buffered and discarded.
+pub fn poll(control &mut ScreenControl,s &mut widgets.Screen) bool {
+    if !s.is_open() { unregister_screen(mut &*control)
+        << false }
+    select {
+        job := <-control.jobs {
+            state := <-control.state
+            valid := state.window == s.xacp_window_id() && state.canvas == s.xacp_canvas_id() &&
+                state.screen_generation == s.xacp_generation() && state.generation == job.generation
+            control.state <- state
+            if !valid { job.reply <- screen_failure("stale_window","registration changed")
+                << true }
+            limits := default_limits()
+            doc := parse_frame(job.body) or (err) { job.reply <- screen_failure("frame_error",err.msg())
+                << true }
+            // The transport has already authorized and reserved this request.
+            // A local session preserves dispatch_screen's own lifecycle checks;
+            // the authoritative session remains solely in the control coroutine.
+            mut session := open_session()
+            session.state = STATE_OPEN
+            session.permissions = job.permissions
+            session.next_id = job.id
+            result := dispatch_screen(mut &*s,mut &session,&doc,&limits) or (err) {
+                job.reply <- screen_failure("adapter_error",err.msg())
+                << true
+            }
+            job.reply <- result
+            << true
+        }
+        else {}
+    }
+    << false
+}
+
+fn marshal_screen(jobs chan ControlJob,states chan ScreenRegistration,req &Request,body string,permissions int,started int,timeout_ms int) ControlReply {
+    mut state := <-states
+    if state.window == 0 { states <- state
+        << screen_failure("not_implemented","no registered Screen") }
+    select {
+        _ := <-state.closed {
+            state.window = 0
+            state.generation += 1
+            states <- state
+            << screen_failure("stale_window","Screen closed")
+        }
+        else {}
+    }
+    // select cannot send an owning struct. Probe the one-slot mailbox while
+    // holding the sole enqueue token instead: restoring a pending job or sending
+    // into an empty mailbox cannot block, since poll only removes jobs.
+    select {
+        pending := <-jobs {
+            jobs <- pending
+            states <- state
+            << screen_failure("request_in_flight","Screen mailbox is full")
+        }
+        else {}
+    }
+    if time.since(started) >= timeout_ms * time.millisecond() {
+        states <- state
+        << screen_timeout(timeout_ms)
+    }
+    reply := chan ControlReply{cap: 1}
+    jobs <- ControlJob{id: req.id,op: req.op + "",body: body,permissions: permissions,generation: state.generation,reply: reply}
+    closed := state.closed
+    generation := state.generation
+    states <- state
+    timer := time.new_timer(timeout_ms * time.millisecond() - time.since(started))
+    select {
+        result := <-reply {
+            timer.stop()
+            // A ready reply and timer can race. Do not finish successfully
+            // after the deadline just because select visits reply first.
+            if time.since(started) >= timeout_ms * time.millisecond() { << screen_timeout(timeout_ms) }
+            << result
+        }
+        _ := <-closed {
+            timer.stop()
+            mut current := <-states
+            if current.generation == generation {
+                current.window = 0
+                current.generation += 1
+                select {
+                    pending := <-jobs { pending.reply <- screen_failure("stale_window","Screen closed") }
+                    else {}
+                }
+            }
+            states <- current
+            << screen_failure("stale_window","Screen closed")
+        }
+        _ := <-timer.c {
+            // Serialize with registration and remove work that has not yet
+            // been polled. An executing job owns its independent buffered reply
+            // and can finish without blocking or replying to a later request.
+            current := <-states
+            select {
+                pending := <-jobs { pending.reply <- screen_timeout(timeout_ms) }
+                else {}
+            }
+            states <- current
+            << screen_timeout(timeout_ms)
+        }
+    }
+    << screen_failure("stale_window","Screen closed")
+}
+
+fn screen_reply(outcome Outcome,data string) ControlReply {
+    << ControlReply{outcome: outcome,data: data}
+}
+
+fn screen_failure(code string,msg string) ControlReply {
+    << screen_reply(fail(code,msg),"")
+}
+
+fn screen_timeout(timeout_ms int) ControlReply {
+    << screen_failure("request_timeout","request exceeded " + str(timeout_ms) + " ms")
+}
+
+fn serialize_tree(s &widgets.Screen,nodes []widgets.ScreenNodeInfo,l &Limits) string {
+    mut out := strings.builder()
+    append_xun(mut &out,"  win: !i " + str(s.xacp_window_id()) + "\n  generation: !i " + str(s.xacp_generation()) + "\n")
+    if nodes.len == 0 { append_xun(mut &out,"  nodes: []\n") }
+    else { append_xun(mut &out,"  nodes:\n") }
+    for node in nodes {
+        append_xun(mut &out,"    - id: !i " + str(node.id) + "\n      kind: !i " + str(node.kind) +
+            "\n      parent: !i " + str(node.parent) + "\n      x: !f " + event_float(node.x) +
+            "\n      y: !f " + event_float(node.y) + "\n      width: !f " + event_float(node.width) +
+            "\n      height: !f " + event_float(node.height) + "\n      visible: !b " + str(node.visible) +
+            "\n      enabled: !b " + str(node.enabled) + "\n      focusable: !b " + str(node.focusable) +
+            "\n      focused: !b " + str(node.focused) + "\n      text: " + control_string(&node.text) + "\n")
+        if out.length() > l.max_frame_bytes - 128 { >> errors.new("xacp: tree response exceeds frame limit") }
+    }
+    << out.text()
+}
+
+fn serialize_actions(actions []widgets.Action,l &Limits) string {
+    mut out := strings.builder()
+    if actions.len == 0 { << "  actions: []\n" }
+    append_xun(mut &out,"  actions:\n")
+    for action in actions {
+        append_xun(mut &out,"    - id: !i " + str(action.id) + "\n      kind: !i " + str(action.kind) +
+            "\n      needs_paint: !b " + str(action.needs_paint) + "\n      request_focus: !b " + str(action.request_focus) +
+            "\n      consumed: !b " + str(action.consumed) + "\n      value: !f " + event_float(action.value) + "\n")
+        if out.length() > l.max_frame_bytes - 128 { >> errors.new("xacp: actions response exceeds frame limit") }
+    }
+    << out.text()
+}
+
+fn serialize_surface(surface &draw.Surface) string {
+    << "  width: !f " + event_float(surface.width) + "\n  height: !f " + event_float(surface.height) +
+        "\n  pixel_width: !i " + str(surface.pixel_width) + "\n  pixel_height: !i " + str(surface.pixel_height) + "\n"
+}
+
+fn append_xun(out &mut strings.Builder,text string) {
+    out.write_string(&text)
+}
