@@ -52,3 +52,16 @@ xu build ../xu-examples/examples/16_ui_webview/shaped --target macos-arm64 --des
 用户只拿**一个**主程序。无 `--desktop` 时普通编译的 UI 二进制未链 host（stub=127），会报 `host not linked`。
 
 Windows WebView 额外说明：Edge **WebView2 Runtime**（系统 Evergreen）不能打进 PE；NuGet 的 `WebView2LoaderStatic.lib` 仅 MSVC。MinGW pack 把约 166KB 的 `WebView2Loader.dll` **嵌进 exe**，启动时解到 **exe 同目录**（已存在且大小一致则跳过，不进 TEMP）。`www` 与品牌图标不落盘。
+
+## 内嵌 WebView 组件
+
+`Screen.webview()` 将系统 WebView 作为 Draw 窗口的子控件。`ui.native_view()` 提供同一能力的底层句柄，`webview.bind_native()` 绑定文档与异步查询 API。macOS 使用剪裁 NSView，Windows 使用子 HWND，Linux 使用 GtkOverlay 与保留完整文档尺寸的裁剪容器。
+
+每个子视图拥有独立 Canvas ID、generation、页面配置和请求作用域；所有事件仍由 App 的单一事件通道分发。组件关闭或父窗口销毁后，旧句柄和回调不能影响其他实例。`InvokeRequest.target()` 返回发起请求的具体组件。
+
+HTML 从组件自己的 `xu://app/` 文档入口加载，重载保留正确来源与 IPC 路由。页面配置带修订号；空闲轮询不会反复复制大段 HTML。单份 HTML 上限为 1 MiB。文档与请求生命周期独立，默认系统 WebView 配置仍共享 Cookie 与网站存储。
+
+原生子表面位于 Canvas 上方。Screen 在重叠的弹出菜单、Tooltip、Toast 或 Modal 显示期间暂时隐藏网页，关闭后恢复页面状态。Canvas 旋转、全局透明度、离屏 Surface 与截图不自动包含网页；Screen.snapshot 对可见原生 WebView 明确报错。网页内部 Tab 继续使用 DOM 焦点顺序，Ctrl+Tab / Ctrl+Shift+Tab 返回 Screen 的焦点链。打包须链接 WebView 插件。
+
+
+原生文字布局与绘制帧中的文字引用按稳定 ID 动态登记，不按 1024 个对象分配固定槽位。释放应用句柄不会撤销绘制帧或输入会话保留的布局；关闭画布会撤销匹配 generation 的应用句柄。保留原有文本长度、坐标与字节预算检查（全局布局 32 MiB、单布局 4 MiB），这些是资源预算，不是控件数量配额。未完成的 ID 预约按期限惰性清理，分配失败返回明确错误。

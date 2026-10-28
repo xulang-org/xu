@@ -702,7 +702,7 @@ struct XuUiFrameLease {
   void *body;
   unsigned len;
   XuUiBitmap *images[XU_UI_IMAGE_MAX_COUNT];
-  XuUiText *texts[XU_UI_TEXT_MAX_COUNT];
+  std::unordered_map<uint64_t, XuUiText *> texts;
   std::vector<XuFramePath> paths;
   XuUiDisplayList *lists[XU_UI_LIST_MAX_COUNT];
 };
@@ -717,8 +717,8 @@ XuUiBitmap *xu_ui_frame_bitmap(const XuUiFrameLease *frame, uint64_t id) {
 }
 XuUiText *xu_ui_frame_text(const XuUiFrameLease *frame, uint64_t id) {
   if (!frame || !id) return NULL;
-  auto *text = frame->texts[id & (XU_UI_TEXT_MAX_COUNT - 1u)];
-  return text && text->id == id ? text : NULL;
+  auto at = frame->texts.find(id);
+  return at == frame->texts.end() ? NULL : at->second;
 }
 const void *xu_ui_frame_path(const XuUiFrameLease *frame,unsigned offset,unsigned *length) {
   if(length) *length=0;
@@ -746,7 +746,7 @@ static bool draw_prepare_paths(XuUiFrameLease *frame) {
 void xu_ui_frame_release(XuUiFrameLease *frame) {
   if (!frame) return;
   for (auto *bitmap : frame->images) xu_ui_bitmap_release(bitmap);
-  for (auto *text : frame->texts) xu_ui_text_release(text);
+  for (const auto &entry : frame->texts) xu_ui_text_release(entry.second);
   for(auto *list:frame->lists)xu_ui_display_list_release(list);
   free(frame->body); delete frame;
 }
@@ -769,9 +769,12 @@ static bool draw_snapshot_images(XuUiFrameLease *frame, unsigned canvas, unsigne
       continue;
     }
     if (command.opcode == XDF_TEXT_LAYOUT) {
-      auto *&text = frame->texts[command.image_id & (XU_UI_TEXT_MAX_COUNT - 1u)];
-      if (!text) text = text_snapshot(command.image_id, canvas, generation);
-      if (!text || text->id != command.image_id) return false;
+      if (frame->texts.find(command.image_id) == frame->texts.end()) {
+        auto *text = text_snapshot(command.image_id, canvas, generation);
+        if (!text) return false;
+        try { frame->texts.emplace(command.image_id, text); }
+        catch (...) { xu_ui_text_release(text); return false; }
+      }
       continue;
     }
     if (command.opcode != XDF_IMAGE) continue;
@@ -1083,7 +1086,10 @@ void xu_ui_canvas_close(unsigned canvas_id, unsigned generation) {
   event_unlock();
 }
 
+#include "xu_ui_native_views.h"
+static void native_views_close_parent(unsigned parent,unsigned generation);
 #include "xu_ui_windows.inc"
+#include "xu_ui_native_views.inc"
 
 static XuUiFrameLease *draw_copy_frame(const void *data, unsigned len) {
   if (!data || len<32 || len>XU_DRAW_FRAME_MAX_BYTES) return NULL;
@@ -1103,10 +1109,11 @@ static int draw_submit(const void *data, unsigned len) {
   if(!data || len<32 || len>XU_DRAW_FRAME_MAX_BYTES)return 0;
   // Reject already-full queues before copying/expanding an expensive frame.
   // Final admission still rechecks after capture and composition validation.
-  lock_r();bool full=g_draw_ticket==UINT64_MAX;unsigned occupied=0;
+  lock_r();bool exhausted=g_draw_ticket==UINT64_MAX;unsigned occupied=0;
   for(const auto &pending:g_draw_pending)if(pending.lease)++occupied;
-  full=full || occupied==XU_DRAW_FRAME_MAX_PENDING;unlock_r();
-  if(full)return 0;
+  bool full=occupied==XU_DRAW_FRAME_MAX_PENDING;unlock_r();
+  if(exhausted)return 0;
+  if(full)return 2; // Capacity pressure is retryable; invalid frames are not.
   auto *lease=draw_copy_frame(data,len);
   if(!lease) return 0;
   const void *copy=lease->body;
@@ -1124,7 +1131,7 @@ static int draw_submit(const void *data, unsigned len) {
   // Once registration begins, absence means closed/unsupported, never reopen.
   if (!window_id && (!g_canvas_started && xdf_u16(header + 4) == 1)) window_id = 1;
   auto *window=window_find(window_id,generation);
-  if (!window_id || (window && window->kind!=2)) { unlock_w(); xu_ui_frame_release(lease); return 0; }
+  if (!window_id || native_view_find(canvas_id,generation) || (window && window->kind!=2)) { unlock_w(); xu_ui_frame_release(lease); return 0; }
   bool captured=draw_snapshot_images(lease,canvas_id,generation);
   unlock_w();
   if(!captured || !draw_composition_valid(lease)) {xu_ui_frame_release(lease);return 0;}
@@ -1132,7 +1139,8 @@ static int draw_submit(const void *data, unsigned len) {
   bool alive=(!generation && !g_canvas_started) || (image_target(canvas_id,generation,&actual) && actual==generation);
   unsigned slot=0;while(slot<XU_DRAW_FRAME_MAX_PENDING && g_draw_pending[slot].lease)++slot;
   if(!alive || slot==XU_DRAW_FRAME_MAX_PENDING || g_draw_ticket==UINT64_MAX) {
-    unlock_w();xu_ui_frame_release(lease);return 0;
+    int result=alive && g_draw_ticket!=UINT64_MAX ? 2 : 0;
+    unlock_w();xu_ui_frame_release(lease);return result;
   }
   uint64_t ticket = ++g_draw_ticket;
   char marker[64];
@@ -1159,6 +1167,7 @@ XuUiFrameLease *xu_ui_draw_acquire_for(uint64_t ticket, unsigned canvas_id, unsi
     }
   }
   unlock_w();
+  if (lease) wake_waiters();
   return lease;
 }
 static void *draw_detach_payload(XuUiFrameLease *lease, unsigned *out_len) {
@@ -1192,6 +1201,7 @@ void *xu_ui_draw_take(uint64_t ticket, unsigned *out_len) {
     }
   }
   unlock_w();
+  if (lease) wake_waiters();
   return draw_detach_payload(lease, out_len);
 }
 
@@ -1528,6 +1538,14 @@ int xu_ui_mem_try_write(const char *path_z, const void *data, unsigned data_len,
     if (out_n) *out_n = 0;
     return 1;
   }
+  if (!strcmp(key,"__native_view_update") || !strcmp(key,"__native_view_slot") || !strcmp(key,"__native_view_command") || !strcmp(key,"__native_view_close")) {
+    int ok=0;
+    if(!strcmp(key,"__native_view_update"))ok=native_view_update(data,data_len);
+    else if(!strcmp(key,"__native_view_slot"))ok=native_view_slot_write(data,data_len);
+    else if(!strcmp(key,"__native_view_command"))ok=native_view_command(data,data_len);
+    else if(data && data_len==8){auto *p=(const unsigned char *)data;xu_ui_native_view_close(xdf_u32(p),xdf_u32(p+4));ok=1;}
+    if(out_n)*out_n=ok?data_len:0;return 1;
+  }
   if (!strcmp(key,"__window_open") || !strcmp(key,"__window_bind") || !strcmp(key,"__window_command") || !strcmp(key,"__window_abandon") || !strcmp(key,"__window_slot")) {
     int ok=0;
     if(!strcmp(key,"__window_open"))ok=window_upload(data,data_len);
@@ -1670,9 +1688,12 @@ int xu_ui_mem_try_write(const char *path_z, const void *data, unsigned data_len,
       if(out_n) *out_n=ok ? data_len : 0;
       return 1;
     }
-    if (strcmp(key, "__draw_submit") == 0) {
-      int ok = draw_submit(data, data_len);
-      if (out_n) *out_n = ok ? data_len : 0;
+    if (strcmp(key, "__draw_submit") == 0 || strcmp(key, "__draw_submit_wait") == 0) {
+      int result = 2;
+      if (strcmp(key, "__draw_submit_wait") == 0) {
+        wait_for_predicate([&] { result=draw_submit(data,data_len);return result!=2; },5000);
+      } else result=draw_submit(data,data_len);
+      if (out_n) *out_n = result==1 ? data_len : 0;
       return 1;
     }
     if (strcmp(key, "__cmd_append") == 0) {
@@ -1931,6 +1952,7 @@ int xu_ui_mem_try_read_len(const char *path_z, unsigned *out_len) {
     if (out_len) *out_len = 0;
     return 1;
   }
+  if (!strncmp(key,"__web_invoke_target/",20)) {if(out_len)*out_len=12;return 1;}
   if (!strcmp(key,"__web_invoke_id")) {if(out_len)*out_len=20;return 1;}
   if (!strncmp(key,"__web_invoke_packet/",20)) {uint64_t id=0;unsigned size=xu_request_id(key+20,&id)?web_packet_length(id):0;if(out_len)*out_len=size;return 1;}
   if (!strcmp(key,"__web_dispatch_running")) {if(out_len)*out_len=1;return 1;}
@@ -1940,6 +1962,8 @@ int xu_ui_mem_try_read_len(const char *path_z, unsigned *out_len) {
     return 1;
   }
   if (!strcmp(key,"__window_reserve")) {if(out_len)*out_len=8;return 1;}
+  if (!strncmp(key,"__native_view_reserve/",22)) {if(out_len)*out_len=8;return 1;}
+  if (!strncmp(key,"__native_view_info/",19)) {if(out_len)*out_len=32;return 1;}
   if (!strncmp(key,"__window_info/",14)) {if(out_len)*out_len=24;return 1;}
   if (strcmp(key, "__ui_licenses") == 0) { if(out_len) *out_len=(unsigned)sizeof(g_ui_licenses)-1; return 1; }
   if (strcmp(key, "__request_id") == 0 || strcmp(key, "__image_id") == 0 || strcmp(key, "__text_id") == 0 || strcmp(key,"__display_list_id")==0 || strcmp(key, "__text_input_id") == 0 || strcmp(key, "__default_canvas") == 0) {
@@ -2002,6 +2026,10 @@ int xu_ui_mem_try_read_copy(const char *path_z, void *out, unsigned cap) {
    * empty handled read; callers can distinguish this from a non-virtual path
    * via the return value of xu_ui_mem_try_read_copy. */
   if (!out || cap == 0) return 1;
+  if (!strncmp(key,"__web_invoke_target/",20)) {
+    memset(out,0,cap);uint64_t id=0;unsigned identity[3]={};
+    if(cap>=13 && xu_request_id(key+20,&id)){web_target(id,identity);auto *p=(unsigned char *)out;for(unsigned i=0;i<3;++i)for(unsigned j=0;j<4;++j)p[i*4+j]=(unsigned char)(identity[i]>>(j*8));}return 1;
+  }
   if (!strcmp(key,"__web_invoke_id")) {if(cap>=21)snprintf((char *)out,cap,"%020llu",(unsigned long long)web_dispatch_reserve());else ((char *)out)[0]=0;return 1;}
   if (!strncmp(key,"__web_invoke_packet/",20)) {uint64_t id=0;if(xu_request_id(key+20,&id))web_packet_copy(id,out,cap);else memset(out,0,cap);return 1;}
   if (!strcmp(key,"__web_dispatch_running")) {((char *)out)[0]=web_running()?'1':'0';if(cap>1)((char *)out)[1]=0;return 1;}
@@ -2011,6 +2039,16 @@ int xu_ui_mem_try_read_copy(const char *path_z, void *out, unsigned cap) {
       if(separator && request_number(key+14,(unsigned)(separator-key-14),0x7fffffff,&id) && xu_request_id(separator+1,&generation) && generation<=UINT32_MAX)
         xu_ui_window_info((unsigned)id,(unsigned)generation,meta,NULL,0);
       for(unsigned i=0;i<6;++i)for(unsigned j=0;j<4;++j)p[i*4+j]=(unsigned char)(meta[i]>>(j*8));
+    }else ((char *)out)[0]=0;return 1;
+  }
+  if (!strncmp(key,"__native_view_info/",19)) {
+    memset(out,0,cap);const char *separator=strchr(key+19,'/');uint64_t id=0,generation=0;unsigned meta[8]={};
+    if(cap>=33 && separator && request_number(key+19,(unsigned)(separator-key-19),0x7fffffff,&id) && xu_request_id(separator+1,&generation) && generation<=UINT32_MAX){
+      xu_ui_native_view_info((unsigned)id,(unsigned)generation,meta,NULL);auto *p=(unsigned char *)out;for(unsigned i=0;i<8;++i)for(unsigned j=0;j<4;++j)p[i*4+j]=(unsigned char)(meta[i]>>(j*8));}return 1;
+  }
+  if (!strncmp(key,"__native_view_reserve/",22)) {
+    if(cap>=9){unsigned identity[2]={};native_view_reserve_key(key,identity);auto *p=(unsigned char *)out;
+      for(unsigned i=0;i<2;++i)for(unsigned j=0;j<4;++j)p[i*4+j]=(unsigned char)(identity[i]>>(j*8));p[8]=0;
     }else ((char *)out)[0]=0;return 1;
   }
   if (!strcmp(key,"__window_reserve")) {

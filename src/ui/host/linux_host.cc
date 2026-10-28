@@ -43,6 +43,7 @@ const XuContentVTable *xu_draw_plugin_vtable(void) __attribute__((weak));
 
 static char g_tmp[1024];
 static unsigned g_root_generation=0;
+static void native_children_close_parent(unsigned parent,unsigned generation);
 static GtkWindow *g_win = NULL;
 static GtkApplication *g_app = NULL;
 static GtkWidget *g_area = NULL;
@@ -362,6 +363,7 @@ static bool g_root_closed=false;
 static void do_quit(void) {
   if (g_quitting) return;
   if(!g_root_closed){
+    native_children_close_parent(1,g_root_generation);
     g_root_closed=true;native_menu_close(g_win);
     if(g_content && g_content_vt && g_content_vt->destroy)g_content_vt->destroy(g_content);
     g_content=NULL;
@@ -1304,6 +1306,7 @@ static const char *strip_prefix(const char *raw) {
 
 static void maybe_install_content_plugin(void);
 #include "linux_windows.inc"
+#include "linux_native_views.inc"
 
 static gboolean drain_cmds(gpointer data) {
   (void)data;
@@ -1311,6 +1314,7 @@ static gboolean drain_cmds(gpointer data) {
   desktop_files_poll();
   if(!g_root_closed)drain_title_size();
   extra_poll();
+  native_children_poll();
   if(g_root_closed && !xu_ui_window_count()){
     do_quit();if(g_quitting)return G_SOURCE_REMOVE;
   }
@@ -1335,7 +1339,7 @@ static gboolean drain_cmds(gpointer data) {
         xu_ui_windows_shutdown();
         do_quit();return G_SOURCE_CONTINUE;
       }
-      if(extra_dispatch(line)){line=strtok_r(NULL,"\n",&save);continue;}
+      if(native_children_dispatch(line) || extra_dispatch(line)){line=strtok_r(NULL,"\n",&save);continue;}
       unsigned identity[2];const char *unscoped=line;
       xu_ui_scoped_command(line,identity,&unscoped);
       const char *cmd = strip_prefix(unscoped);
