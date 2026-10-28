@@ -191,7 +191,7 @@ xu build main.xu -o myapp
 | `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
 | `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
 
-使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](examples/xacp/README.md)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
+使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](https://github.com/xulang-org/examples/tree/main/examples/xacp)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
 
 `#xacp` 是传输无关的标准库层，用于宿主注册一个真实的
 `ui/widgets.Screen`。adapter 提供有界的 `ui.tree`、由原生资源承载的
