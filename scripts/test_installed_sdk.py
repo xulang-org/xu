@@ -121,6 +121,32 @@ fn main() int {
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
+    # Native map adapters must preserve the coroutine context when calling
+    # ordinary Xu hashing and growth policy functions with entry stack guards.
+    (project / "map_worker.xu").write_text('''@main
+fn worker(done chan int) {
+    mut integers := map[int]int{}
+    mut names := map[string]int{}
+    for i in 0:128 {
+        integers[i] = i * 3
+        names[str(i)] = i * 5
+    }
+    mut total := 0
+    for i in 0:128 {
+        total += integers[i]
+        total += names[str(i)]
+    }
+    done <- total
+}
+fn main() {
+    done := chan int{cap: 1}
+    xu worker(done)
+    println(<-done)
+}
+''')
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "map_worker.xu", level, "-o", str(program)], cwd=project, env=active)
+        assert run([str(program)], cwd=project, env=active).strip() == "65024"
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
         (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  "github.com/xulang-org/packages": file:' + (prefix / "packages").as_posix() + '\n')
