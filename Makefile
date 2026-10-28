@@ -16,7 +16,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 	server-build-local server-build-linux server-check-linux server-start server-health server-smoke-local server-unit \
 	server-remote-check server-remote-deploy server-remote-status server-remote-health server-remote-smoke \
 	server-remote-restart server-remote-stop server-remote-rollback \
-	check test selfhost product-selfhost wasm-smoke \
+	check test selfhost product-selfhost wasm-smoke wasm-ui-smoke \
 	ncall fixtures fixtures-gen3 programs-gen3 verify-gen3 \
 	safety safety-cross safety-embedded safety-escape hardening-gate \
 	platform gen1-platform cli-platform bench bench-runtime bench-stdlib bench-opt-levels bench-nbody-residency bench-opt-full bench-crosslang bench-language bench-game \
@@ -67,6 +67,7 @@ help:
 	@echo "Also"
 	@echo "  make platform         multi-target compile matrix"
 	@echo "  make cli-platform     product CLI flags/env smoke (see CLI_CROSS_PLATFORM.md)"
+	@echo "  make wasm-ui-smoke    build site playground with this compiler + Node UI tests"
 	@echo "  make wasm-smoke       wasm32 optimized/unoptimized frame ABI smoke (requires Node.js)"
 	@echo "  make doc-test         xu doc Markdown golden + CLI smoke"
 	@echo "  make xacp-test        XACP discovery, safe launcher and protocol core smoke"
@@ -395,3 +396,6 @@ ci: ci-fast safety safety-cross safety-embedded verify-gen3
 clean:
 	rm -rf $(BIN)
 	rm -f hello a.out hello.exe
+
+wasm-ui-smoke: $(XU)
+	sh scripts/wasm_ui_smoke.sh
