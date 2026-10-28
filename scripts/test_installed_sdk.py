@@ -269,6 +269,91 @@ fn main() int {
     rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=project,
                               env=active, text=True, capture_output=True, timeout=90)
     assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
+    # Passive help has deterministic hover delay, dismissal and edge placement;
+    # this exercises the installed widgets without opening a native GUI.
+    (project / "tooltip_state.xu").write_text('''@main
+#ui
+#ui/widgets
+#ui/layout
+#time
+#errors
+fn expect(value bool,message string) int {
+    if !value { >> errors.new(message) }
+    << 0
+}
+fn input(kind int,x f64,y f64,now time.Instant) ui.InputEvent {
+    << ui.InputEvent{kind: kind,window_id: 1,canvas_id: 1,generation: 1,x: x,y: y,dx: 0.0,dy: 0.0,
+        button: ui.BUTTON_LEFT,buttons: 0,modifiers: 0,key: 0,scan: 0,repeat: 0,click_count: 0,time_ns: now.nanoseconds()}
+}
+fn verify() int {
+    identity := ui.CanvasEvent{window_id: 1,canvas_id: 1,generation: 1}
+    anchor := layout.Rect{x: 140.0,y: 180.0,width: 80.0,height: 40.0}
+    size := layout.Size{width: 120.0,height: 60.0}
+    viewport := layout.Rect{x: 0.0,y: 0.0,width: 400.0,height: 400.0}
+    mut tip := widgets.tooltip(&identity,10,&anchor,&size,&viewport) or >>
+    start := time.instant()
+    move := input(ui.EV_POINTER_MOVE,160.0,200.0,start)
+    _ := tip.input(&move) or >>
+    expect(!tip.is_open(),"hover opened before delay") or >>
+    _ := tip.tick(start.add(time.milliseconds(499) or >>) or >>,true) or >>
+    expect(!tip.is_open(),"hover opened at 499ms") or >>
+    shown := start.add(time.milliseconds(500) or >>) or >>
+    _ := tip.tick(shown,true) or >>
+    expect(tip.is_open(),"hover did not open at 500ms") or >>
+    bounds := tip.bounds()
+    expect(bounds.y + bounds.height <= anchor.y && bounds.x == 120.0,"default top/center placement") or >>
+    click := input(ui.EV_POINTER_DOWN,160.0,200.0,shown)
+    _ := tip.input(&click) or >>
+    expect(!tip.is_open(),"click did not dismiss") or >>
+    _ := tip.input(&move) or >>
+    _ := tip.tick(shown.add(time.seconds(1) or >>) or >>,true) or >>
+    expect(!tip.is_open(),"click suppression lost before leaving") or >>
+    leave := input(ui.EV_POINTER_MOVE,380.0,380.0,shown)
+    _ := tip.input(&leave) or >>
+    _ := tip.input(&move) or >>
+    _ := tip.tick(shown.add(time.seconds(1) or >>) or >>,true) or >>
+    expect(tip.is_open(),"hover did not reset after leaving") or >>
+    _ := tip.input(&leave) or >>
+    expect(!tip.is_open(),"hover leave did not close") or >>
+    tip.set_focus(true,shown) or >>
+    expect(tip.is_open(),"keyboard focus did not open") or >>
+    mut escape := input(ui.EV_KEY_DOWN,0.0,0.0,shown)
+    escape.key = ui.KEY_ESCAPE
+    _ := tip.input(&escape) or >>
+    expect(!tip.is_open(),"Escape did not dismiss") or >>
+    tip.set_focus(true,shown) or >>
+    expect(!tip.is_open(),"Escape suppression lost") or >>
+    tip.set_focus(false,shown) or >>
+    tip.set_focus(true,shown) or >>
+    expect(tip.is_open(),"refocus did not reset suppression") or >>
+    for side in 0:4 {
+        mut placement := widgets.overlay_placement()
+        placement.side = side
+        placement.align = widgets.OVERLAY_CENTER
+        tip.set_placement(&placement) or >>
+        b := tip.bounds()
+        if side == widgets.OVERLAY_BOTTOM { expect(b.y >= anchor.y + anchor.height,"bottom placement") or >> }
+        if side == widgets.OVERLAY_TOP { expect(b.y + b.height <= anchor.y,"top placement") or >> }
+        if side == widgets.OVERLAY_LEFT { expect(b.x + b.width <= anchor.x,"left placement") or >> }
+        if side == widgets.OVERLAY_RIGHT { expect(b.x >= anchor.x + anchor.width,"right placement") or >> }
+    }
+    mut placement := widgets.overlay_placement()
+    placement.side = widgets.OVERLAY_TOP
+    tip.set_placement(&placement) or >>
+    edge := layout.Rect{x: 4.0,y: 4.0,width: 80.0,height: 40.0}
+    tip.set_geometry(&edge,&size,&viewport) or >>
+    flipped := tip.bounds()
+    expect(flipped.y >= edge.y + edge.height,"edge did not flip") or >>
+    tip.set_enabled(false) or >>
+    expect(!tip.is_open() && !tip.is_visible(),"disabled tooltip stayed visible") or >>
+    println("tooltip state and placement PASS")
+    << 0
+}
+fn main() int { << verify() or (err) { eprintln(err.msg())
+    << 1 } }
+''')
+    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=project, env=active)
+    assert run([str(program)], cwd=project, env=active).strip() == "tooltip state and placement PASS"
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
         (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  "github.com/xulang-org/packages": file:' + (prefix / "packages").as_posix() + '\n')
