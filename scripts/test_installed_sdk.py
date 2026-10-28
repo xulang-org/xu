@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -106,6 +107,35 @@ fn main() int {
     clean.pop("XU_STDLIB_ROOT", None)
     clean.pop("XU_ROOT", None)
     assert run([xu, "run", "main.xu"], cwd=project, env=clean).splitlines() == ["INSTALLED", "42"]
+    # SDK root discovery is independent of external GUI toolchain availability.
+    # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK
+    # before probing those host dependencies. Exercise direct PATH and CLI use.
+    # Windows CreateProcess does not use the supplied child environment for
+    # bare-command lookup. Resolve the activated PATH explicitly on every OS.
+    path_doctor = shutil.which("xu-doctor", path=clean["PATH"])
+    assert path_doctor and Path(path_doctor).resolve().parent == (prefix / "bin").resolve(), path_doctor
+    for command in ([xu, "doctor"], [path_doctor]):
+        doctor = subprocess.run([*command, "--target", manifest["target"]], cwd=project,
+                                env=clean, text=True, capture_output=True, timeout=90)
+        match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", doctor.stdout)
+        assert match, (doctor.returncode, doctor.stdout, doctor.stderr)
+        assert Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
+    # Exercise the actual desktop entry and sibling Doctor invocation. The small
+    # project deliberately has no icon, so it stops before external GUI builds.
+    desktop = subprocess.run([xu, "build", str(project), "--desktop", "--no-webview",
+                              "--target", manifest["target"]], cwd=project,
+                             env=clean, text=True, capture_output=True, timeout=90)
+    match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", desktop.stdout)
+    assert match, (desktop.returncode, desktop.stdout, desktop.stderr)
+    assert Path(match.group(1).strip()).resolve() == prefix.resolve(), desktop.stdout
+    stale = work / "stale checkout"
+    (stale / "src/ui/host").mkdir(parents=True)
+    for marker in ("macos_host.swift", "xu_content_abi.h"):
+        (stale / "src/ui/host" / marker).write_text("")
+    doctor = subprocess.run([xu, "doctor", "--target", manifest["target"]], cwd=project,
+                            env=clean | {"XU_ROOT": str(stale)}, text=True, capture_output=True, timeout=90)
+    match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", doctor.stdout)
+    assert match and Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
     # PATH lookup finds the compiler and its sibling tools from outside the SDK.
     run([xu, "fmt", "main.xu"], cwd=project, env=active)
     (project / "exit.xu").write_text('@main\nfn main() int { << 7 }\n')
@@ -121,6 +151,213 @@ fn main() int {
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
+    # Native map adapters must preserve the coroutine context when calling
+    # ordinary Xu hashing and growth policy functions with entry stack guards.
+    (project / "map_worker.xu").write_text('''@main
+fn worker(done chan int) {
+    mut integers := map[int]int{}
+    mut names := map[string]int{}
+    for i in 0:128 {
+        integers[i] = i * 3
+        names[str(i)] = i * 5
+    }
+    mut total := 0
+    for i in 0:128 {
+        total += integers[i]
+        total += names[str(i)]
+    }
+    done <- total
+}
+fn main() {
+    done := chan int{cap: 1}
+    xu worker(done)
+    println(<-done)
+}
+''')
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "map_worker.xu", level, "-o", str(program)], cwd=project, env=active)
+        assert run([str(program)], cwd=project, env=active).strip() == "65024"
+    # Aggregate container borrows cross an ascending-buffer / descending-frame
+    # ABI boundary. Verify shared calls, mutable methods, function values and
+    # exceptional writeback without corrupting adjacent packed records.
+    (project / "borrow_record.xu").write_text('''@main
+#errors
+struct Record { value int
+ guard int
+ label string }
+fn read(r &Record) int { << r.value + r.guard + r.label.len }
+fn change(r &mut Record) int { r.value += 11
+ r.label = "new" + "-field"
+ << 0 }
+fn (r &mut Record) bump() int { r.value += 7
+ << r.value }
+fn fail_after_change(r &mut Record) int { r.value += 3
+ >> errors.new("expected") }
+struct Packed { a i32
+ b i32
+ c u8 }
+fn (p &mut Packed) bump() int { p.a += i32(2)
+ p.c += u8(1)
+ << int(p.a) + int(p.b) + int(p.c) }
+struct@ Mutator { fn change(&mut Record) int }
+struct Worker { n int }
+fn (w Worker) change(r &mut Record) int { << change(r) }
+struct Tiny { a u8
+ b u8 }
+fn main() int {
+ mut records := [Record{value: 1,guard: 100,label: "old"},Record{value: 2,guard: 200,label: "old"}]
+ i := 1
+ r := mut &records[i]
+ println(read(&*r))
+ println(r.bump())
+ f := change
+ _ := f(r)
+ for once in 0:1 { _ := fail_after_change(r) or (err) { println(err.msg())
+ -> } }
+ println(read(&*r))
+ println(records[0].value)
+ println(records[0].guard)
+ println(records[0].label)
+ mut packed := [Packed{a: 1,b: 2,c: 3},Packed{a: 10,b: 20,c: 30}]
+ p := mut &packed[i]
+ println(p.bump())
+ println(int(packed[0].a))
+ println(int(packed[0].c))
+ println(int(packed[1].a))
+ println(int(packed[1].c))
+ mut values := map[int]Record{}
+ values[3] = Record{value: 4,guard: 50,label: "map"}
+ m := mut &values[3]
+ println(m.bump())
+ println(read(&*m))
+ dynamic := Mutator(Worker{n: 1})
+ println(dynamic.change(m))
+ read_fn := read
+ println(read_fn(&*m))
+ packed[1] = Packed{a: 20,b: 30,c: 40}
+ copy := packed[1]
+ println(int(copy.c))
+ packed[1] = copy
+ packed.push(Packed{a: 50,b: 60,c: 70})
+ println(packed.len)
+ mut last := mut &packed[2]
+ println(last.bump())
+ println(int(last.c))
+ println(int(packed[1].c))
+ mut tiny := [Tiny{a: 1,b: 2},Tiny{a: 3,b: 4},Tiny{a: 5,b: 6}]
+ tiny[1] = Tiny{a: 7,b: 8}
+ copied := tiny[1]
+ println(int(copied.b))
+ println(int(tiny[0].a))
+ println(int(tiny[0].b))
+ println(int(tiny[2].a))
+ println(int(tiny[2].b))
+ << 0
+}
+''')
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "borrow_record.xu", level, "-o", str(program)], cwd=project, env=active)
+        actual = run([str(program)], cwd=project, env=active).splitlines()
+        assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81", "40", "3", "183", "71", "40", "8", "1", "2", "5", "6"], actual
+    # A frame view cannot be returned as a borrowed container identity.
+    (project / "borrow_escape.xu").write_text('''@main
+fn identity(s &string) &string { << s }
+fn main() int {
+    words := ["one", "two"]
+    i := 1
+    r := identity(&words[i])
+    println(r.len)
+    << 0
+}
+''')
+    rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=project,
+                              env=active, text=True, capture_output=True, timeout=90)
+    assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
+    # Passive help has deterministic hover delay, dismissal and edge placement;
+    # this exercises the installed widgets without opening a native GUI.
+    (project / "tooltip_state.xu").write_text('''@main
+#ui
+#ui/widgets
+#ui/layout
+#time
+#errors
+fn expect(value bool,message string) int {
+    if !value { >> errors.new(message) }
+    << 0
+}
+fn input(kind int,x f64,y f64,now time.Instant) ui.InputEvent {
+    << ui.InputEvent{kind: kind,window_id: 1,canvas_id: 1,generation: 1,x: x,y: y,dx: 0.0,dy: 0.0,
+        button: ui.BUTTON_LEFT,buttons: 0,modifiers: 0,key: 0,scan: 0,repeat: 0,click_count: 0,time_ns: now.nanoseconds()}
+}
+fn verify() int {
+    identity := ui.CanvasEvent{window_id: 1,canvas_id: 1,generation: 1}
+    anchor := layout.Rect{x: 140.0,y: 180.0,width: 80.0,height: 40.0}
+    size := layout.Size{width: 120.0,height: 60.0}
+    viewport := layout.Rect{x: 0.0,y: 0.0,width: 400.0,height: 400.0}
+    mut tip := widgets.tooltip(&identity,10,&anchor,&size,&viewport) or >>
+    start := time.instant()
+    move := input(ui.EV_POINTER_MOVE,160.0,200.0,start)
+    _ := tip.input(&move) or >>
+    expect(!tip.is_open(),"hover opened before delay") or >>
+    _ := tip.tick(start.add(time.milliseconds(499) or >>) or >>,true) or >>
+    expect(!tip.is_open(),"hover opened at 499ms") or >>
+    shown := start.add(time.milliseconds(500) or >>) or >>
+    _ := tip.tick(shown,true) or >>
+    expect(tip.is_open(),"hover did not open at 500ms") or >>
+    bounds := tip.bounds()
+    expect(bounds.y + bounds.height <= anchor.y && bounds.x == 120.0,"default top/center placement") or >>
+    click := input(ui.EV_POINTER_DOWN,160.0,200.0,shown)
+    _ := tip.input(&click) or >>
+    expect(!tip.is_open(),"click did not dismiss") or >>
+    _ := tip.input(&move) or >>
+    _ := tip.tick(shown.add(time.seconds(1) or >>) or >>,true) or >>
+    expect(!tip.is_open(),"click suppression lost before leaving") or >>
+    leave := input(ui.EV_POINTER_MOVE,380.0,380.0,shown)
+    _ := tip.input(&leave) or >>
+    _ := tip.input(&move) or >>
+    _ := tip.tick(shown.add(time.seconds(1) or >>) or >>,true) or >>
+    expect(tip.is_open(),"hover did not reset after leaving") or >>
+    _ := tip.input(&leave) or >>
+    expect(!tip.is_open(),"hover leave did not close") or >>
+    tip.set_focus(true,shown) or >>
+    expect(tip.is_open(),"keyboard focus did not open") or >>
+    mut escape := input(ui.EV_KEY_DOWN,0.0,0.0,shown)
+    escape.key = ui.KEY_ESCAPE
+    _ := tip.input(&escape) or >>
+    expect(!tip.is_open(),"Escape did not dismiss") or >>
+    tip.set_focus(true,shown) or >>
+    expect(!tip.is_open(),"Escape suppression lost") or >>
+    tip.set_focus(false,shown) or >>
+    tip.set_focus(true,shown) or >>
+    expect(tip.is_open(),"refocus did not reset suppression") or >>
+    for side in 0:4 {
+        mut placement := widgets.overlay_placement()
+        placement.side = side
+        placement.align = widgets.OVERLAY_CENTER
+        tip.set_placement(&placement) or >>
+        b := tip.bounds()
+        if side == widgets.OVERLAY_BOTTOM { expect(b.y >= anchor.y + anchor.height,"bottom placement") or >> }
+        if side == widgets.OVERLAY_TOP { expect(b.y + b.height <= anchor.y,"top placement") or >> }
+        if side == widgets.OVERLAY_LEFT { expect(b.x + b.width <= anchor.x,"left placement") or >> }
+        if side == widgets.OVERLAY_RIGHT { expect(b.x >= anchor.x + anchor.width,"right placement") or >> }
+    }
+    mut placement := widgets.overlay_placement()
+    placement.side = widgets.OVERLAY_TOP
+    tip.set_placement(&placement) or >>
+    edge := layout.Rect{x: 4.0,y: 4.0,width: 80.0,height: 40.0}
+    tip.set_geometry(&edge,&size,&viewport) or >>
+    flipped := tip.bounds()
+    expect(flipped.y >= edge.y + edge.height,"edge did not flip") or >>
+    tip.set_enabled(false) or >>
+    expect(!tip.is_open() && !tip.is_visible(),"disabled tooltip stayed visible") or >>
+    println("tooltip state and placement PASS")
+    << 0
+}
+fn main() int { << verify() or (err) { eprintln(err.msg())
+    << 1 } }
+''')
+    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=project, env=active)
+    assert run([str(program)], cwd=project, env=active).strip() == "tooltip state and placement PASS"
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
         (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  "github.com/xulang-org/packages": file:' + (prefix / "packages").as_posix() + '\n')
@@ -137,6 +374,7 @@ fn main() int {
             "16_ui_webview/draw/main.xu",
             "16_ui_webview/widgets/main.xu",
             "16_ui_webview/style_gallery/main.xu",
+            "16_ui_webview/component_workshop/main.xu",
         ]
         if (prefix / "packages/xu.xun").is_file():
             examples += ["47_standalone_websocket/main.xu", "49_standalone_dns/main.xu"]
