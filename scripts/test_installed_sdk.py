@@ -163,6 +163,7 @@ fn main() {
             "16_ui_webview/draw/main.xu",
             "16_ui_webview/widgets/main.xu",
             "16_ui_webview/style_gallery/main.xu",
+            "16_ui_webview/component_workshop/main.xu",
         ]
         if (prefix / "packages/xu.xun").is_file():
             examples += ["47_standalone_websocket/main.xu", "49_standalone_dns/main.xu"]
