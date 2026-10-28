@@ -16,7 +16,7 @@ XU=$1
 OUT=${2:-bin}
 tool_only=${3:-}
 case "$tool_only" in
-    ""|xu-doctor|xu-fmt|xu-map|xu-doc|xu-desktop|xu-setup|xu-update|xu-lsp|xu-native) ;;
+    ""|xu-doctor|xu-fmt|xu-map|xu-doc|xu-desktop|xu-setup|xu-update|xu-lsp|xu-native|xu-xacp) ;;
     *) echo "build_product_tools: unknown tool: $tool_only" >&2; exit 1 ;;
 esac
 PRODUCT_RUN="$PWD/scripts/run_product_compiler.sh"
@@ -72,3 +72,4 @@ build_one src/cmd/setup xu-setup
 build_one src/cmd/update xu-update
 build_one src/cmd/lsp xu-lsp
 build_one src/cmd/native xu-native
+build_one src/cmd/xacp xu-xacp

@@ -29,6 +29,7 @@ static void extra_close(XuWinWindow &w,bool force=false) {
   if(!w.id || w.closing)return;
   if(w.close_guard && !force){xu_ui_window_event(w.id,w.generation,"close_requested");return;}
   w.closing=true;unsigned id=w.id,generation=w.generation;
+  native_children_close_parent(id,generation);
   native_menu_close(w.window);
   desktop_files_close_owner(id,generation);
   if(w.content && w.vt && w.vt->destroy)w.vt->destroy(w.content);w.content=NULL;

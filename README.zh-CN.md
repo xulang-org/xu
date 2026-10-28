@@ -182,9 +182,26 @@ xu build main.xu -o myapp
 | `xu test <file.xu> -bench <REGEXP>` | 执行匹配的 `fn bench_*` 基准函数 |
 | `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
 | `xu build <file.xu> --target wasm32 -o app.wasm` | 生成 WebAssembly 模块 |
+| `xu build <file.xu> --xacp --xacp-port 4321 -o app` | 嵌入 XACP 启动发现元数据 |
+| `./app --xacp-help` | 输出生成程序的机器可读 XACP 摘要 |
+| `xu xacp inspect ./app` | 检查启用 XACP 程序的发现信息与安全摘要 |
+| `xu xacp run ./app -- args...` | 使用明确的 AI/用户参数边界运行程序 |
+| `xu xacp record ./app -- > output.log` | 将有界 stdout 流式输出，由用户自行保存 |
 | `xu build <AppDir> --desktop` | 打包桌面应用；需要对应宿主 UI SDK 与工具链 |
 | `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
 | `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
+
+使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](examples/xacp/README.md)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
+
+`#xacp` 是传输无关的标准库层，用于宿主注册一个真实的
+`ui/widgets.Screen`。adapter 提供有界的 `ui.tree`、由原生资源承载的
+`ui.screenshot`、经过校验的 `ui.input`/`ui.act`，以及流式录制。调用这些
+API 时必须携带拥有对应权限位的 session；`start_recorder` 会保持请求直到
+`finish_recorder` 或 `abort_recorder`。屏幕句柄、canvas generation、节点数、
+帧字节数、文本长度和录制预算都会在进入 widget 前检查。源码开发宿主可以
+在 hello 握手前调用 `enable_development` 获得 `PERM_ALL`，但这不会关闭
+schema、生命周期、原生资源释放或内存上限。截图返回拥有所有权的
+`draw.Surface`，宿主交给自己的资源层后必须显式 dispose。
 
 0.9.4 还提供 `XU_VERIFY=1` 逐 pass MIR 验证、`XU_DUMP_MIR=<函数名>`
 与 `XU_PATTERNS_OFF=all` 模式对拍诊断。完整选项见[命令行参考](https://xulang.org/zh/docs/cli/)。

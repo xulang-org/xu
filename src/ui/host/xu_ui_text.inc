@@ -1,5 +1,8 @@
 // Included once after the canvas registry and image target helpers.
 #include "xu_ui_text.h"
+#include <unordered_map>
+#include <deque>
+#include <utility>
 struct XuUiText {
   std::atomic<unsigned> references{1};
   uint64_t id;
@@ -17,8 +20,10 @@ struct XuTextSlot {
   long long deadline;
   XuUiText *layout;
 };
-static XuTextSlot g_texts[XU_UI_TEXT_MAX_COUNT];
-static_assert((XU_UI_TEXT_MAX_COUNT & (XU_UI_TEXT_MAX_COUNT - 1u)) == 0, "text slots must be a power of two");
+// Live identities grow with application demand. Erasing a user handle does not
+// revoke immutable layouts retained by a frame or text-input binding.
+static std::unordered_map<uint64_t, XuTextSlot> g_texts;
+static std::deque<std::pair<uint64_t, long long>> g_text_expirations;
 static uint64_t g_text_id = 0;
 static XuUiTextCreate g_text_create = NULL;
 static XuUiTextDestroy g_text_destroy = NULL;
@@ -39,8 +44,8 @@ int xu_ui_text_set_query_backend(XuUiTextQuery query) {
 }
 static XuTextSlot *text_slot(uint64_t id) {
   if (!id) return NULL;
-  auto *slot = &g_texts[id & (XU_UI_TEXT_MAX_COUNT - 1u)];
-  return slot->id == id ? slot : NULL;
+  auto at = g_texts.find(id);
+  return at == g_texts.end() ? NULL : &at->second;
 }
 void xu_ui_text_retain(XuUiText *text) {
   if (text) text->references.fetch_add(1, std::memory_order_relaxed);
@@ -54,20 +59,30 @@ void xu_ui_text_release(XuUiText *text) {
 void *xu_ui_text_native(const XuUiText *text) { return text ? text->native : NULL; }
 unsigned xu_ui_text_live_cost(void) { return g_text_cost.load(std::memory_order_relaxed); }
 uint64_t xu_ui_text_reserve(void) {
-  lock_w(); long long now = image_now();
-  for (auto &slot : g_texts) if (slot.state == 1 && slot.deadline <= now) slot = {};
+  lock_w(); const long long now = image_now();
+  // Reservations are chronological. Expire only due tokens instead of
+  // scanning every live shaped layout on every new allocation.
+  while (!g_text_expirations.empty() && g_text_expirations.front().second <= now) {
+    const auto token = g_text_expirations.front(); g_text_expirations.pop_front();
+    auto at = g_texts.find(token.first);
+    if (at != g_texts.end() && at->second.state == 1 && at->second.deadline == token.second)
+      g_texts.erase(at);
+  }
   uint64_t id = 0;
-  if (g_text_create) for (unsigned i = 0; i < XU_UI_TEXT_MAX_COUNT && g_text_id < INT64_MAX; ++i) {
-    uint64_t candidate = ++g_text_id;
-    auto &slot = g_texts[candidate & (XU_UI_TEXT_MAX_COUNT - 1u)];
-    if (slot.id) continue;
-    slot.id = id = candidate; slot.state = 1; slot.deadline = now + 10000; break;
+  if (g_text_create && g_text_id < INT64_MAX) {
+    const uint64_t candidate = ++g_text_id;
+    try {
+      XuTextSlot slot{}; slot.id = candidate; slot.state = 1; slot.deadline = now + 10000;
+      if (g_texts.emplace(candidate, slot).second) {
+        g_text_expirations.emplace_back(candidate, slot.deadline); id = candidate;
+      }
+    } catch (...) { g_texts.erase(candidate); /* Allocation failure returns zero. */ }
   }
   unlock_w(); return id;
 }
 void xu_ui_text_abandon(uint64_t id) {
   lock_w(); auto *slot = text_slot(id);
-  if (slot && slot->state != 3) *slot = {};
+  if (slot && slot->state != 3) g_texts.erase(id);
   unlock_w();
 }
 static bool text_options(const double *v, unsigned length) {
@@ -128,7 +143,11 @@ int xu_ui_text_create(uint64_t id, unsigned canvas, unsigned generation,
   lock_w(); slot = text_slot(id);
   bool accepted = layout && slot && slot->state == 2 && image_target(slot->canvas, slot->generation, &actual);
   if (accepted) { slot->layout = layout; slot->state = 3; }
-  else if (slot && slot->state == 2) { *slot = {}; slot->id = id; slot->state = 1; slot->deadline = image_now() + 10000; }
+  else if (slot && slot->state == 2) {
+    *slot = {}; slot->id = id; slot->state = 1; slot->deadline = image_now() + 10000;
+    try { g_text_expirations.emplace_back(id, slot->deadline); }
+    catch (...) { g_texts.erase(id); }
+  }
   unlock_w(); if (!accepted) xu_ui_text_release(layout);
   return accepted ? 1 : 0;
 }
@@ -137,7 +156,7 @@ int xu_ui_text_dispose(uint64_t id, unsigned canvas, unsigned generation) {
   bool valid = slot && slot->state == 3 && slot->canvas == canvas &&
     (slot->generation == generation || (!generation && canvas == 1));
   XuUiText *layout = valid ? slot->layout : NULL;
-  if (valid) *slot = {};
+  if (valid) g_texts.erase(id);
   unlock_w(); xu_ui_text_release(layout); return valid ? 1 : 0;
 }
 int xu_ui_text_info(uint64_t id, double *metrics, unsigned *generation) {
@@ -182,11 +201,17 @@ int xu_ui_text_query(uint64_t id, unsigned canvas, unsigned generation, unsigned
   return valid ? 1 : 0;
 }
 static void text_adopt_canvas(unsigned canvas, unsigned generation) {
-  if (canvas == 1) for (auto &slot : g_texts) if (slot.canvas == 1 && !slot.generation) slot.generation = generation;
+  if (canvas == 1) for (auto &entry : g_texts) {
+    auto &slot = entry.second;
+    if (slot.canvas == 1 && !slot.generation) slot.generation = generation;
+  }
 }
 static void text_close_canvas(unsigned canvas, unsigned generation) {
-  for (auto &slot : g_texts) if (slot.canvas == canvas && slot.generation == generation) {
-    auto *layout = slot.layout; slot = {}; xu_ui_text_release(layout);
+  for (auto at = g_texts.begin(); at != g_texts.end();) {
+    const auto &slot = at->second;
+    if (slot.canvas == canvas && slot.generation == generation) {
+      auto *layout = slot.layout; at = g_texts.erase(at); xu_ui_text_release(layout);
+    } else ++at;
   }
 }
 static XuUiText *text_snapshot(uint64_t id, unsigned canvas, unsigned generation) {
