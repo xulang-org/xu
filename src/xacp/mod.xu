@@ -18,6 +18,13 @@ pub const MAX_TABLE_ROWS = 10000
 pub const MAX_NODE_ID = 16777215
 pub const DEFAULT_REQUEST_TIMEOUT_MS = 5000
 pub const MAX_REQUEST_TIMEOUT_MS = 600000
+pub const DEFAULT_HELLO_TIMEOUT_MS = 5000
+pub const MAX_HELLO_TIMEOUT_MS = 600000
+pub const DEFAULT_IDLE_TIMEOUT_MS = 60000
+pub const MIN_IDLE_TIMEOUT_MS = 1000
+pub const MAX_IDLE_TIMEOUT_MS = 3600000
+pub const DEFAULT_NONCE_CACHE = 1024
+pub const MAX_NONCE_CACHE = 65536
 
 pub const STATE_NEW = 0
 pub const STATE_OPEN = 1
@@ -28,7 +35,8 @@ pub const PERM_INFO = 1
 pub const PERM_PROCESS = 2
 pub const PERM_UI_READ = 4
 pub const PERM_UI_MUTATE = 8
-pub const PERM_ALL = 15
+pub const PERM_UI_RAW = 16
+pub const PERM_ALL = 31
 
 pub struct Limits {
     pub max_frame_bytes int
@@ -37,6 +45,8 @@ pub struct Limits {
     pub max_table_rows int
     pub max_node_id int
     pub request_timeout_ms int
+    pub hello_timeout_ms int
+    pub idle_timeout_ms int
 }
 
 pub struct Session {
@@ -49,6 +59,41 @@ pub struct Session {
     pub nonce string
     pub bytes_in int
     pub bytes_out int
+    screenshot_files bool
+}
+
+// The host owns this bounded FIFO across sessions. Sequential listeners borrow
+// it exclusively while negotiating; concurrent hosts must serialize that borrow.
+pub struct NonceRegistry {
+    entries []string
+    capacity int
+    next int
+    enabled bool
+}
+
+// Invalid capacities use the default. Disabled registries retain no nonces.
+pub fn new_nonce_registry(capacity int, enabled bool) NonceRegistry {
+    mut limit := capacity
+    if limit < 1 || limit > MAX_NONCE_CACHE { limit = DEFAULT_NONCE_CACHE }
+    << NonceRegistry{entries: []string{}, capacity: limit, next: 0, enabled: enabled}
+}
+
+// Called only after successful schema, authentication and permission checks.
+// Replays do not refresh FIFO order; evicted nonces may be used again.
+fn register_nonce(registry &mut NonceRegistry, nonce &string) bool {
+    if !registry.enabled { << true }
+    for i in 0:registry.entries.len {
+        if registry.entries[i] == *nonce { << false }
+    }
+    // Keep an owning copy independent of the request document and Session.
+    if registry.entries.len < registry.capacity {
+        registry.entries.push(*nonce + "")
+    } else {
+        registry.entries[registry.next] = *nonce + ""
+        registry.next += 1
+        if registry.next == registry.capacity { registry.next = 0 }
+    }
+    << true
 }
 
 pub struct Request {
@@ -71,42 +116,74 @@ pub fn default_limits() Limits {
         max_fields: MAX_FIELDS,
         max_table_rows: MAX_TABLE_ROWS,
         max_node_id: MAX_NODE_ID,
-        request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS
+        request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+        hello_timeout_ms: DEFAULT_HELLO_TIMEOUT_MS,
+        idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS
     }
 }
 
 // Read once when the control server initializes its limits. Only ASCII decimal
 // 1..600000 is accepted; invalid values silently keep the default deadline.
 pub fn request_timeout_from_env() int {
-    text := os.getenv("XU_XACP_REQUEST_TIMEOUT_MS")
-    if text.len == 0 { << DEFAULT_REQUEST_TIMEOUT_MS }
+    << timeout_from_env("XU_XACP_REQUEST_TIMEOUT_MS", 1, MAX_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, false)
+}
+
+// hello_timeout_from_env accepts ASCII decimal 1..600000, otherwise the default.
+pub fn hello_timeout_from_env() int {
+    << timeout_from_env("XU_XACP_HELLO_TIMEOUT_MS", 1, MAX_HELLO_TIMEOUT_MS, DEFAULT_HELLO_TIMEOUT_MS, false)
+}
+
+// idle_timeout_from_env accepts 1000..3600000 or 0 to disable idle expiry.
+// Empty, malformed, out-of-range and overflowing input keeps the default.
+pub fn idle_timeout_from_env() int {
+    << timeout_from_env("XU_XACP_IDLE_TIMEOUT_MS", MIN_IDLE_TIMEOUT_MS, MAX_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, true)
+}
+
+// Hosts read nonce policy once when starting a listener/control loop.
+pub fn nonce_cache_from_env() int {
+    << timeout_from_env("XU_XACP_NONCE_CACHE", 1, MAX_NONCE_CACHE, DEFAULT_NONCE_CACHE, false)
+}
+
+pub fn nonce_replay_from_env() bool {
+    << os.getenv("XU_XACP_NONCE_REPLAY") != "0"
+}
+
+fn timeout_from_env(name string, minimum int, maximum int, fallback int, allow_zero bool) int {
+    text := os.getenv(name)
+    if text.len == 0 { << fallback }
     mut value := 0
     for i in 0:text.len {
         c := text[i] & 255
-        if c < 48 || c > 57 { << DEFAULT_REQUEST_TIMEOUT_MS }
+        if c < 48 || c > 57 { << fallback }
         digit := c - 48
-        if value > (MAX_REQUEST_TIMEOUT_MS - digit) / 10 { << DEFAULT_REQUEST_TIMEOUT_MS }
+        if value > (maximum - digit) / 10 { << fallback }
         value = value * 10 + digit
     }
-    if value == 0 { << DEFAULT_REQUEST_TIMEOUT_MS }
+    if value == 0 && allow_zero { << 0 }
+    if value < minimum { << fallback }
     << value
 }
 
 pub fn open_session() Session {
     << Session{
         state: STATE_NEW,
-        generation: 1,
+        generation: screenshot_generation(),
         next_id: 1,
         active_id: 0,
         active_generation: 0,
         permissions: PERM_NONE,
         nonce: "",
         bytes_in: 0,
-        bytes_out: 0
+        bytes_out: 0,
+        screenshot_files: false
     }
 }
 
 pub fn close_session(s &mut Session) {
+    if s.screenshot_files {
+        cleanup_screenshots(s.generation)
+        s.screenshot_files = false
+    }
     s.state = STATE_CLOSED
     s.generation = s.generation + 1
     s.active_id = 0
@@ -146,7 +223,7 @@ pub fn enable_development(s &mut Session) bool {
 }
 
 fn fail(code string, msg string) Outcome {
-    << Outcome{ok: false, request_id: 0, err_code: code, err_msg: msg}
+    << Outcome{ok: false, request_id: 0, err_code: code, err_msg: redact_paths(&msg)}
 }
 
 fn pass(id int) Outcome {
@@ -160,6 +237,8 @@ fn valid_limits(l &Limits) bool {
     if l.max_table_rows <= 0 || l.max_table_rows > MAX_TABLE_ROWS { << false }
     if l.max_node_id <= 0 || l.max_node_id > MAX_NODE_ID { << false }
     if l.request_timeout_ms <= 0 || l.request_timeout_ms > MAX_REQUEST_TIMEOUT_MS { << false }
+    if l.hello_timeout_ms <= 0 || l.hello_timeout_ms > MAX_HELLO_TIMEOUT_MS { << false }
+    if l.idle_timeout_ms != 0 && (l.idle_timeout_ms < MIN_IDLE_TIMEOUT_MS || l.idle_timeout_ms > MAX_IDLE_TIMEOUT_MS) { << false }
     << true
 }
 
@@ -276,8 +355,8 @@ fn key_allowed(op string, key string) bool {
     }
     if op == "proc.status" { << false }
     if op == "proc.output" { << key == "stream" || key == "since" || key == "max_bytes" }
-    if op == "ui.tree" { << key == "win" || key == "include_hidden" || key == "max_table_rows" }
-    if op == "ui.screenshot" { << key == "win" || key == "node" || key == "scale" || key == "mode" }
+    if op == "ui.tree" { << key == "raw" || key == "win" || key == "include_hidden" || key == "start" || key == "max_table_rows" }
+    if op == "ui.screenshot" { << key == "raw" || key == "win" || key == "node" || key == "scale" || key == "mode" }
     if op == "ui.input" { << key == "win" || key == "steps" }
     if op == "ui.act" { << key == "win" || key == "node" || key == "act" || key == "text" || key == "checked" }
     if op == "ui.record" { << key == "win" || key == "mode" || key == "max_bytes" }
@@ -360,7 +439,9 @@ fn validate_args(d &xun.Doc, args int, op string, l &Limits) int {
         if !key_allowed(op + "", key_copy + "") {
             >> errors.new("xacp: unknown or disabled field '" + key_copy + "'")
         }
-        if key_copy == "ver" {
+        if key_copy == "raw" {
+            _ := require_bool(d, child, "raw")
+        } else if key_copy == "ver" {
             _ := require_version(d, child)
         } else if key_copy == "nonce" {
             nonce := require_string(d, child, "nonce")
@@ -401,6 +482,10 @@ fn validate_args(d &xun.Doc, args int, op string, l &Limits) int {
             if win < 0 { >> errors.new("xacp: win must be non-negative") }
         }
         if has_field(d, args, "include_hidden") { _ := require_bool(d, d.get(args, "include_hidden"), "include_hidden") }
+        if has_field(d, args, "start") {
+            start := require_int(d, d.get(args, "start"), "start")
+            if start < 0 { >> errors.new("xacp: start must be non-negative") }
+        }
         if has_field(d, args, "max_table_rows") {
             rows := require_int(d, d.get(args, "max_table_rows"), "max_table_rows")
             if rows <= 0 || rows > l.max_table_rows { >> errors.new("xacp: max_table_rows exceeds limit") }
@@ -439,8 +524,7 @@ fn validate_args(d &xun.Doc, args int, op string, l &Limits) int {
     << 0
 }
 
-// validate_request enforces the fixed top-level schema and rejects every
-// request_id_hint returns a positive top-level `id: !i N` if one parses,
+// request_id_hint returns a top-level `id: !i N` if one parses,
 // otherwise 0, so schema errors can still echo the caller's id.
 pub fn request_id_hint(d &xun.Doc) int {
     root := d.root()
@@ -449,12 +533,19 @@ pub fn request_id_hint(d &xun.Doc) int {
     if node < 0 || d.kind(node) != xun.KIND_SCALAR || d.tag(node) != "i" { << 0 }
     text := d.text(node)
     value := strconv.parse(&text, 10) or (err) { << 0 }
-    if value <= 0 { << 0 }
     << value
 }
 
+// validate_request enforces the fixed top-level schema and rejects every
 // operation that has not been explicitly added to this package's schema.
 pub fn validate_request(d &xun.Doc, l &Limits) Request {
+    request := validate_request_envelope(d,l) or >>
+    _ := validate_args(d,request.args,request.op + "",l) or >>
+    << request
+}
+
+// A valid envelope identifies recoverable proc.output argument failures.
+fn validate_request_envelope(d &xun.Doc, l &Limits) Request {
     if !valid_limits(l) {
         >> errors.new("xacp: invalid safety limits")
     }
@@ -471,12 +562,11 @@ pub fn validate_request(d &xun.Doc, l &Limits) Request {
     if id_node < 0 || op_node < 0 || args_node < 0 {
         >> errors.new("xacp: request requires id, op, and args")
     }
+    // Value/sequence checks belong to begin_request so invalid ids stay recoverable.
     id := require_int(d, id_node, "id")
-    if id <= 0 { >> errors.new("xacp: id must be positive") }
     op := require_string(d, op_node, "op")
     known := op == "xacp.hello" || op == "proc.status" || op == "proc.output" || op == "ui.tree" || op == "ui.screenshot" || op == "ui.input" || op == "ui.act" || op == "ui.record"
     if !known { >> errors.new("xacp: unknown operation") }
-    _ := validate_args(d, args_node, op + "", l)
     << Request{id: id, op: op + "", args: args_node}
 }
 
@@ -556,9 +646,9 @@ pub fn check_node(node int, l &Limits) bool {
 }
 
 // negotiate_hello consumes a schema-validated, reserved hello. The host supplies
-// its expected token; this core does not read environment variables or do I/O.
+// its expected token and shared registry; RAW additionally requires host opt-in.
 // A client token alone never grants more than INFO when the host has no token.
-pub fn negotiate_hello(s &mut Session, d &xun.Doc, r &Request, expected_token string) Outcome {
+pub fn negotiate_hello(s &mut Session, d &xun.Doc, r &Request, expected_token string, nonces &mut NonceRegistry) Outcome {
     if s.state != STATE_NEW || r.op != "xacp.hello" || s.active_id != r.id {
         << fail("stale_request", "hello is not active")
     }
@@ -570,7 +660,8 @@ pub fn negotiate_hello(s &mut Session, d &xun.Doc, r &Request, expected_token st
             close_session(mut &*s)
             << fail("auth_failed", "hello authentication failed")
         }
-        allowed = PERM_ALL
+        allowed = PERM_ALL ^ PERM_UI_RAW
+        if os.getenv("XU_XACP_ALLOW_RAW") == "1" { allowed = PERM_ALL }
     }
     mut requested := allowed
     permissions_node := d.get(r.args, "permissions")
@@ -579,18 +670,23 @@ pub fn negotiate_hello(s &mut Session, d &xun.Doc, r &Request, expected_token st
         close_session(mut &*s)
         << fail("schema_error", "invalid hello permissions")
     }
-    s.nonce = d.text(d.get(r.args, "nonce"))
+    nonce := d.text(d.get(r.args, "nonce"))
+    if !register_nonce(mut &*nonces, &nonce) {
+        close_session(mut &*s)
+        << Outcome{ok: false, request_id: r.id, err_code: "nonce_replay", err_msg: "hello nonce already used"}
+    }
+    s.nonce = nonce
     << pass(r.id)
 }
 
 // dispatch performs only the safe core lifecycle with the default INFO policy.
 // Data-bearing adapters implement operations after the same checks.
-pub fn dispatch(s &mut Session, d &xun.Doc, l &Limits) Outcome {
-    << dispatch_with_token(mut &*s, d, l, "")
+pub fn dispatch(s &mut Session, d &xun.Doc, l &Limits, nonces &mut NonceRegistry) Outcome {
+    << dispatch_with_token(mut &*s, d, l, "", mut &*nonces)
 }
 
 // Hosts with an explicit authentication policy pass the expected token here.
-pub fn dispatch_with_token(s &mut Session, d &xun.Doc, l &Limits, expected_token string) Outcome {
+pub fn dispatch_with_token(s &mut Session, d &xun.Doc, l &Limits, expected_token string, nonces &mut NonceRegistry) Outcome {
     req := validate_request(d, l) or (err) {
         close_session(mut &*s)
         << fail("schema_error", err.msg())
@@ -601,7 +697,7 @@ pub fn dispatch_with_token(s &mut Session, d &xun.Doc, l &Limits, expected_token
         cancel_request(mut &*s)
         << fail("not_implemented", "operation has no registered adapter")
     }
-    negotiated := negotiate_hello(mut &*s, d, &req, expected_token)
+    negotiated := negotiate_hello(mut &*s, d, &req, expected_token, mut &*nonces)
     if !negotiated.ok { << negotiated }
     << finish_request(mut &*s, req.id)
 }

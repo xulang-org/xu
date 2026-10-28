@@ -1,0 +1,200 @@
+@xacp
+
+#os
+#errors
+#strconv
+#strings
+#math
+#ui/widgets
+#ui/draw
+#encoding/xun
+#encoding/base64
+#image/png
+
+pub const MAX_SCREENSHOT_BYTES = 33554432
+
+fn request_raw(d &xun.Doc,r &Request) bool {
+    if r.op != "ui.tree" && r.op != "ui.screenshot" { << false }
+    node := d.get(r.args,"raw")
+    << node >= 0 && d.as_bool(node)
+}
+
+// Sanitize before quoting/truncating so even an error's shortened path cannot
+// expose a host prefix. Apply this to user-controlled response text as well.
+fn redact_paths(text &string) string {
+    mut out := strings.builder()
+    mut i := 0
+    while i < text.len {
+        c := text[i] & 255
+        start := path_token_start(text,i)
+        drive := start && i + 2 < text.len && text[i + 1] == 58 && (text[i + 2] == 47 || text[i + 2] == 92)
+        home := i + 5 <= text.len && text[i:i + 5] == "\$HOME"
+        // A URI's // and relative a/b are ordinary text, not host paths.
+        uri := i > 1 && text[i - 1] == 58 && i + 1 < text.len && text[i + 1] == 47
+        if (c == 47 && start && !uri) || drive || home || (start && c == 92 && i + 1 < text.len && text[i + 1] == 92) {
+            out.write_string(&"<path>")
+            i += 1
+            while i < text.len {
+                b := text[i] & 255
+                if b <= 32 || b == 34 || b == 39 || b == 41 || b == 93 || b == 125 { <- }
+                i += 1
+            }
+        } else {
+            out.write_byte(c)
+            i += 1
+        }
+    }
+    << out.text()
+}
+
+fn path_token_start(text &string,i int) bool {
+    if i == 0 { << true }
+    c := text[i - 1] & 255
+    if c <= 32 { << true }
+    // Keep relative path components and URI slashes intact, but recognize
+    // quoted, Markdown, bracketed and key=value absolute paths.
+    if c >= 128 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) { << false }
+    << c != 47 && c != 46 && c != 45 && c != 95
+}
+
+fn screenshot_generation() int {
+    text := read_file(":xu:/__xacp_generation") or (err) { << 1 }
+    if text.len != 20 { << 1 }
+    value := strconv.parse(&text,10) or (err) { << 1 }
+    if value <= 0 { << 1 }
+    << value
+}
+
+// Absolute directory for the host only; the wire always returns a basename.
+// The POSIX native UI host creates/validates private directories on first write.
+pub fn screenshot_dir() string {
+    directory := read_file(":xu:/__xacp_directory") or >>
+    if directory.len == 0 { >> errors.new("xacp: screenshot directory unavailable") }
+    << directory
+}
+
+fn cleanup_screenshots(generation int) {
+    _ := write_file(":xu:/__xacp_cleanup/" + str(generation),"close") or (err) { << }
+}
+
+fn screenshot_max_bytes() int {
+    << timeout_from_env("XU_XACP_SCREENSHOT_MAX_BYTES",1,MAX_SCREENSHOT_BYTES,MAX_SCREENSHOT_BYTES,false)
+}
+
+// PNG encoder uses stored DEFLATE: this is its exact encoded length. Reject
+// oversized requests before snapshot or allocating the RGBA/encoder buffers.
+fn screenshot_png_bytes(width int,height int) int {
+    scan := (width * 4 + 1) * height
+    << 63 + scan + ((scan + 65534) / 65535) * 5
+}
+
+fn screenshot_result(s &mut widgets.Screen,d &xun.Doc,r &Request,l &Limits,raw bool) ControlReply {
+    mut scale := 1.0
+    if d.get(r.args,"scale") >= 0 { scale = require_float(d,d.get(r.args,"scale"),"scale") }
+    file := d.text(d.get(r.args,"mode")) == "file"
+    mut node_id := 0
+    if d.get(r.args,"node") >= 0 { node_id = require_int(d,d.get(r.args,"node"),"node") }
+    // Enumerate the complete tree, independent of ui.tree pagination/visibility.
+    nodes := s.xacp_tree(true,widgets.XACP_MAX_NODES) or >>
+    mut width := s.width()
+    mut height := s.height()
+    mut origin_x := 0.0
+    mut origin_y := 0.0
+    mut found := node_id == 0
+    for node in nodes {
+        if node.id == node_id {
+            width = node.width
+            height = node.height
+            origin_x = node.x
+            origin_y = node.y
+            found = true
+        }
+    }
+    if !found || width <= 0.0 || height <= 0.0 { >> errors.new("xacp: invalid screenshot node") }
+    pw := int(math.ceil(width * scale))
+    ph := int(math.ceil(height * scale))
+    if pw < 1 || ph < 1 || pw > draw.MAX_IMAGE_DIMENSION || ph > draw.MAX_IMAGE_DIMENSION ||
+       pw * ph > draw.MAX_IMAGE_BYTES / 4 {
+        << screenshot_failure(r.id,"screenshot_too_large","screenshot exceeds pixel limit; reduce scale")
+    }
+    // Native snapshots round each dimension up, then map the logical extent
+    // onto that entire backing image. Use those actual densities at the edges.
+    scale_x := f64(pw) / width
+    scale_y := f64(ph) / height
+    size := screenshot_png_bytes(pw,ph)
+    if (file && size > screenshot_max_bytes()) || (!file && ((size + 2) / 3) * 4 > l.max_frame_bytes) {
+        << screenshot_failure(r.id,"screenshot_too_large","reduce scale or use mode=file")
+    }
+    mut surface := screenshot_surface(mut &*s,node_id,scale,l) or >>
+    mut pixels := surface.rgba_bytes() or (err) {
+        surface.dispose() or (dispose_err) { >> err }
+        << screenshot_failure(r.id,"encode_error","screenshot pixels unavailable")
+    }
+    metadata := serialize_surface(&surface,raw)
+    surface.dispose() or >>
+    // Only this owning CPU copy is changed. Never modify a shared Surface.
+    if !raw {
+        for node in nodes {
+            if (!node.secure && node.kind != widgets.SCREEN_SECRET_INPUT) || !node.visible { -> }
+            mut x0 := int(math.floor((node.x - origin_x) * scale_x))
+            mut y0 := int(math.floor((node.y - origin_y) * scale_y))
+            mut x1 := int(math.ceil((node.x + node.width - origin_x) * scale_x))
+            mut y1 := int(math.ceil((node.y + node.height - origin_y) * scale_y))
+            if x0 < 0 { x0 = 0 }
+            if y0 < 0 { y0 = 0 }
+            if x1 > pw { x1 = pw }
+            if y1 > ph { y1 = ph }
+            for y in y0:y1 {
+                for x in x0:x1 {
+                    i := (y * pw + x) * 4
+                    pixels[i] = 128
+                    pixels[i + 1] = 128
+                    pixels[i + 2] = 128
+                    pixels[i + 3] = 255
+                }
+            }
+        }
+    }
+    encoded := png.encode_rgba_bytes(&pixels,pw,ph) or (err) { << screenshot_failure(r.id,"encode_error","PNG encoding failed") }
+    << ControlReply{outcome: pass(r.id),data: metadata,png: encoded,file: file}
+}
+
+fn screenshot_surface(s &mut widgets.Screen,node int,scale f64,l &Limits) draw.Surface {
+    if node > 0 { << screen_screenshot_node(mut &*s,node,scale,l) or >> }
+    << screen_screenshot(mut &*s,scale) or >>
+}
+
+// Only the authoritative session writes files, after a timely UI reply. A
+// timed-out job can finish encoding into its mailbox but cannot create files.
+fn export_screenshot(session &mut Session,result ControlReply,id int,l &Limits) ControlReply {
+    if !result.outcome.ok || result.png.len == 0 { << result }
+    size := result.png.len
+    mut data := result.data + "  mime: image/png\n  bytes: !i " + str(size) + "\n"
+    if result.file {
+        if size > screenshot_max_bytes() { << screenshot_failure(id,"screenshot_too_large","screenshot exceeds file limit") }
+        name := "shot-" + str(session.generation) + "-" + str(id) + ".png"
+        session.screenshot_files = true
+        count := write_file(":xu:/__xacp_file/" + str(session.generation) + "/" + str(id),result.png) or (err) {
+            << screenshot_failure(id,"file_unavailable","screenshot file unavailable")
+        }
+        if count != size { << screenshot_failure(id,"file_unavailable","screenshot file unavailable") }
+        data = data + "  mode: file\n  path: " + control_string(&name) + "\n  dir_hint: xacp-runtime\n"
+    } else {
+        // Includes the exact response envelope and root redacted field.
+        redacted := has_prefix(&data,"  redacted: !b true\n")
+        prefix := "id: !i " + str(id) + "\nok: !b true\nredacted: !b " + str(redacted) + "\ndata:\n"
+        suffix := "  mode: inline_b64\n  data: \"\"\n"
+        if prefix.len + data.len + suffix.len + ((size + 2) / 3) * 4 > l.max_frame_bytes {
+            << screenshot_failure(id,"screenshot_too_large","reduce scale or use mode=file")
+        }
+        encoded := base64.encode_to_string(result.png)
+        data = data + "  mode: inline_b64\n  data: " + control_string(&encoded) + "\n"
+    }
+    << screen_reply(pass(id),data)
+}
+
+fn screenshot_failure(id int,code string,msg string) ControlReply {
+    mut outcome := fail(code,msg)
+    outcome.request_id = id
+    << screen_reply(outcome,"")
+}
