@@ -6,6 +6,26 @@
 
 ---
 
+## Xu 0.10.10
+
+This version brings the public native widget APIs needed by the 45-entry component workshop, including Chart, RangeSlider, SplitView and structured menus. The bundled workshop keeps WebView support, and its action toolbar wraps and scrolls with large text instead of clipping labels at 200%. Native WebView content retains its own CSS and system child surface.
+
+Native map adapters now restore the current coroutine context before calling ordinary Xu hashing and growth-policy functions. Without that context, function entry stack guards could interpret map storage as a coroutine and crash a desktop worker during startup. Installed-SDK validation exercises integer and string maps inside a coroutine at `-O0`, `-O2` and `-O3`.
+
+Aggregate borrows from dynamic arrays and maps are converted to the ordinary reference-call layout; mutable calls write changes back before handling success or errors. Packed array copies preserve their final bytes. Returning a reference through an adapted aggregate call is rejected instead of exposing a temporary view; copy the element to a local before such a call. `Screen.button_with_icon()` adds visible text and supports leading, trailing, above and below icon placement, separately from icon-only buttons. `Screen.measure_button()` returns the intrinsic size for the current text, icon placement, style and scale, allowing content-sized buttons and wrapping layouts.
+
+Tooltips distinguish delayed pointer hover from immediate keyboard/programmatic focus, dismiss during pointer interaction, and position against the visible anchor inside scroll clips. Top/center is the default; `Tooltip.set_placement()` and `Screen.set_tooltip_placement()` configure all four sides with edge flipping. Installed-SDK validation exercises delay, dismissal, refocus and placement without claiming native GUI coverage.
+
+Compiler updates include borrow-flow join fixes, Thumb/freestanding concurrency checks, stack guards and a LoongArch far-branch correction. **Source migration:** moving an owned non-string field out of a borrowed struct is rejected. Borrow the field when its lifetime permits, or use the public widget `clone()` API for temporary measurement and painting snapshots. The bundled style gallery uses explicit clones; upgrade compiler, standard library and tools together. XACP control examples now live in the companion examples repository.
+
+Desktop packing and Doctor locate host sources beside their own installed executables, including PATH/symlink launches, before considering environment or checkout fallbacks. This makes `xu build --desktop` work outside a source checkout without letting a stale `XU_ROOT` select another SDK. Linux and Windows host compilation also preserves SDK include paths containing spaces. Every desktop target selects the UI coroutine-stack profile while emitting its object.
+
+Native Windows desktop packing explicitly launches the Git Bash/MSYS2 `sh` required by its recipes, resolves sibling `.exe` tools, and uses the native temporary directory with normalized paths. Doctor now checks that shell dependency. Installed-SDK validation also enters the desktop packer from an unrelated directory and verifies its sibling Doctor selects the installed SDK.
+
+SDK workflows pin the corrected example sources and check the installed workshop alongside existing UI and service samples. Native installed-SDK checks cover macOS, Linux and Windows on ARM64/x64; these checks do not imply desktop GUI acceptance on every platform. Workshop GUI acceptance is on macOS ARM64. Canvas accessibility bridging, editor undo history and touch long-press remain documented limitations. LoongArch64 and RISC-V SDKs are cross-built.
+
+Published binary availability, source revisions and SHA-256 checksums are recorded in [GitHub Releases](https://github.com/xulang-org/xu/releases).
+
 ## Xu 0.10.7 release
 
 This patch repairs reinstalling over an existing SDK, including read-only standard-library files. Setup and `xu update` prepare a complete SDK beside the target, verify every recorded file and all ten tools, retain the old directory as a backup, then replace the target. Failed replacement or verification restores the original SDK. User data outside SDK-managed components is preserved; stale managed files are removed.
