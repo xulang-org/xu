@@ -173,6 +173,82 @@ fn main() {
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "map_worker.xu", level, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "65024"
+    # Aggregate container borrows cross an ascending-buffer / descending-frame
+    # ABI boundary. Verify shared calls, mutable methods, function values and
+    # exceptional writeback without corrupting adjacent packed records.
+    (project / "borrow_record.xu").write_text('''@main
+#errors
+struct Record { value int
+ guard int
+ label string }
+fn read(r &Record) int { << r.value + r.guard + r.label.len }
+fn change(r &mut Record) int { r.value += 11
+ r.label = "new" + "-field"
+ << 0 }
+fn (r &mut Record) bump() int { r.value += 7
+ << r.value }
+fn fail_after_change(r &mut Record) int { r.value += 3
+ >> errors.new("expected") }
+struct Packed { a i32
+ b i32
+ c u8 }
+fn (p &mut Packed) bump() int { p.a += i32(2)
+ p.c += u8(1)
+ << int(p.a) + int(p.b) + int(p.c) }
+struct@ Mutator { fn change(&mut Record) int }
+struct Worker { n int }
+fn (w Worker) change(r &mut Record) int { << change(r) }
+fn main() int {
+ mut records := [Record{value: 1,guard: 100,label: "old"},Record{value: 2,guard: 200,label: "old"}]
+ i := 1
+ r := mut &records[i]
+ println(read(&*r))
+ println(r.bump())
+ f := change
+ _ := f(r)
+ for once in 0:1 { _ := fail_after_change(r) or (err) { println(err.msg())
+ -> } }
+ println(read(&*r))
+ println(records[0].value)
+ println(records[0].guard)
+ println(records[0].label)
+ mut packed := [Packed{a: 1,b: 2,c: 3},Packed{a: 10,b: 20,c: 30}]
+ p := mut &packed[i]
+ println(p.bump())
+ println(int(packed[0].a))
+ println(int(packed[0].c))
+ println(int(packed[1].a))
+ println(int(packed[1].c))
+ mut values := map[int]Record{}
+ values[3] = Record{value: 4,guard: 50,label: "map"}
+ m := mut &values[3]
+ println(m.bump())
+ println(read(&*m))
+ dynamic := Mutator(Worker{n: 1})
+ println(dynamic.change(m))
+ read_fn := read
+ println(read_fn(&*m))
+ << 0
+}
+''')
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "borrow_record.xu", level, "-o", str(program)], cwd=project, env=active)
+        actual = run([str(program)], cwd=project, env=active).splitlines()
+        assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81"], actual
+    # A frame view cannot be returned as a borrowed container identity.
+    (project / "borrow_escape.xu").write_text('''@main
+fn identity(s &string) &string { << s }
+fn main() int {
+    words := ["one", "two"]
+    i := 1
+    r := identity(&words[i])
+    println(r.len)
+    << 0
+}
+''')
+    rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=project,
+                              env=active, text=True, capture_output=True, timeout=90)
+    assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
         (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  "github.com/xulang-org/packages": file:' + (prefix / "packages").as_posix() + '\n')
