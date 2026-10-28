@@ -93,6 +93,7 @@ all: xu
 
 # The smoke also runs xacp_cross_protocol_probe against token/no-token TCP peers.
 xacp-test: xu-xacp
+	XU="$(abspath $(XU))" $(PYTHON) scripts/fd_wait_read_smoke.py
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_proc_output_smoke.py
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_screenshot_smoke.py
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_smoke.py
