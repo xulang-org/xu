@@ -20,21 +20,91 @@ def run(args, code=0):
     return p.stdout
 
 
+# The full example lives in https://github.com/xulang-org/examples/tree/main/examples/xacp.
+# Keep only the launcher fixture and core session checks here so standalone Xu
+# checkouts can still exercise control/TCP without fetching a companion repo.
+FALLBACK_MAIN = """@main
+#os
+
+fn main() int {
+    println("business-main")
+    args := os.args()
+    for i in 1:args.len {
+        println("arg: " + args[i])
+    }
+    << 0
+}
+"""
+FALLBACK_CORE = r"""@main
+#xacp
+
+fn main() int {
+    limits := xacp.default_limits()
+    mut session := xacp.open_session()
+    hello := xacp.parse_frame("--- !xacp\nid: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n===\n") or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+    opened := xacp.dispatch(mut &session, &hello, &limits)
+    if !opened.ok {
+        eprintln(opened.err_msg)
+        << 2
+    }
+    status := xacp.parse_frame("--- !xacp\nid: !i 2\nop: proc.status\nargs: {}\n===\n") or (err) {
+        eprintln(err.msg())
+        << 3
+    }
+    denied := xacp.dispatch(mut &session, &status, &limits)
+    if denied.ok || denied.err_code != "permission_denied" { << 4 }
+    if xacp.enable_development(mut &session) { << 5 }
+    xacp.close_session(mut &session)
+    closed := xacp.dispatch(mut &session, &status, &limits)
+    if closed.ok || closed.err_code != "session_closed" { << 6 }
+    println("XACP core: PASS")
+    << 0
+}
+"""
+
+
+def example_sources(tmp):
+    configured = os.environ.get("XU_EXAMPLES_ROOT")
+    examples_root = (Path(configured).expanduser().resolve()
+                     if configured else ROOT.parent / "examples")
+    sample = examples_root / "examples/xacp"
+    main = sample / "main.xu"
+    core = sample / "core/main.xu"
+    if main.is_file() and core.is_file():
+        print(f"XACP smoke sources: {sample}", flush=True)
+        return main, core
+    if configured:
+        raise FileNotFoundError(
+            f"XU_EXAMPLES_ROOT needs examples/xacp/main.xu and core/main.xu: {examples_root}")
+    fixture = Path(tmp) / "fixture"
+    (fixture / "core").mkdir(parents=True)
+    main = fixture / "main.xu"
+    core = fixture / "core/main.xu"
+    main.write_text(FALLBACK_MAIN, encoding="utf-8")
+    core.write_text(FALLBACK_CORE, encoding="utf-8")
+    print("XACP smoke sources: embedded temporary fixture (full example moved to xulang-org/examples)", flush=True)
+    return main, core
+
+
 with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
+    main_source, core_source = example_sources(tmp)
     core = Path(tmp) / ("core.exe" if os.name == "nt" else "core")
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build",
-         "examples/xacp/core/main.xu", "-o", core])
+         core_source, "-o", core])
     assert "XACP core: PASS" in run([core])
     app = Path(tmp) / ("app.exe" if os.name == "nt" else "app")
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", f"--xacp-port={port}",
-         "examples/xacp/main.xu", "-o", app])
+         main_source, "-o", app])
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp-port=65536",
-         "examples/xacp/main.xu", "-o", app], code=1)
+         main_source, "-o", app], code=1)
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp", "--target", "wasm32",
-         "examples/xacp/main.xu", "-o", Path(tmp) / "app.wasm"], code=1)
+         main_source, "-o", Path(tmp) / "app.wasm"], code=1)
     assert "record" in run([TOOL, "--help"])
     assert "record" in run([XU, "help", "xacp"])
     for prefix in ([TOOL], [XU, "xacp"]):
@@ -211,7 +281,7 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
         assert not output, output
     disabled = Path(tmp) / ("disabled.exe" if os.name == "nt" else "disabled")
     run([ROOT / "scripts/run_product_compiler.sh", XU, "build", "--xacp-port", "0",
-         "examples/xacp/main.xu", "-o", disabled])
+         main_source, "-o", disabled])
     assert "tcp: disabled" in run([disabled, "--xacp-help"])
     run([disabled, "--xacp-tcp"], code=1)
     assert "business-main" in run([disabled])
