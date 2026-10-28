@@ -1,6 +1,9 @@
 import AppKit
 import CoreText
 
+@_silgen_name("xu_ui_input_now_ns")
+private func xuInputNowNS() -> Int64
+
 private typealias ListCompile = @convention(c) (UnsafeRawPointer?) -> UnsafeMutableRawPointer?
 private typealias ListDestroy = @convention(c) (UnsafeMutableRawPointer?) -> Void
 @_silgen_name("xu_ui_display_list_set_backend")
@@ -392,6 +395,7 @@ struct NativeInputState {
   let anchor: Int, focus: Int, start: Int, end: Int, markedAnchor: Int, markedFocus: Int
   let caret: NSRect
   var composing: Bool { flags & 4 != 0 }
+  var password: Bool { flags & 8 != 0 }
   var display: String {
     if !composing { return source }
     let bytes = Array(source.utf8)
@@ -416,7 +420,7 @@ struct NativeInputState {
     func u32(_ offset: Int) -> UInt32 { p.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian }
     func u64(_ offset: Int) -> UInt64 { p.loadUnaligned(fromByteOffset: offset, as: UInt64.self).littleEndian }
     func f64(_ offset: Int) -> Double { Double(bitPattern: u64(offset)) }
-    guard u32(0) == 0x31534958, u16(4) == 1, u16(6) <= 7, u64(8) == id, id > 0, id <= Int64.max,
+    guard u32(0) == 0x31534958, u16(4) == 1, u16(6) <= 15, u16(6) & 9 != 9, u64(8) == id, id > 0, id <= Int64.max,
           u32(20) == canvas, u32(24) == generation, generation != 0, u32(28) == 2, u32(108) == 0,
           u64(32) > 0, u64(32) <= Int64.max, u32(104) != 0,
           u32(80) <= 16384, u32(84) <= 16384, length == 112 + u32(80) + u32(84) else { return nil }
@@ -512,7 +516,7 @@ final class DrawInputClient: NSResponder, NSTextInputClient {
   func hasMarkedText() -> Bool { current()?.composing == true }
   func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
     actualRange?.pointee = NSRange(location: NSNotFound, length: 0)
-    guard let state = current(), range.location != NSNotFound, range.location >= 0, range.length >= 0 else { return nil }
+    guard let state = current(), !state.password, range.location != NSNotFound, range.location >= 0, range.length >= 0 else { return nil }
     let map = InputUTFMap(state.display), count = map.utf16Bytes.count - 1
     guard range.location <= count else { return nil }
     var first = range.location, last = first + min(range.length, count - first)
@@ -953,7 +957,9 @@ final class DrawCanvasView: NSView {
   override func updateTrackingAreas() {
     super.updateTrackingAreas()
     if let inputTracking { removeTrackingArea(inputTracking) }
-    let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+    // Passive hover must also work before a click activates this window.
+    // Keyboard/editing focus still follows the key-window notifications below.
+    let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
     addTrackingArea(area); inputTracking = area
   }
   override func viewDidMoveToWindow() {
@@ -996,7 +1002,7 @@ final class DrawCanvasView: NSView {
                  button: UInt32 = 0, modifiers: UInt32 = 0, key: UInt32 = 0,
                  scan: UInt32 = 0, repeated: Bool = false, clicks: Int = 0) {
     guard inputEnabled else { return }
-    let stamp = Int64(ProcessInfo.processInfo.systemUptime * 1e9)
+    let stamp = xuInputNowNS()
     let identity = generation == 0 ? "input\t\(kind)\t\(windowID)\t\(canvasID)" :
       "input2\t\(kind)\t\(windowID)\t\(canvasID)\t\(generation)"
     onInput?("\(identity)\t\(Double(point.x))\t\(Double(point.y))\t\(Double(delta.x))\t\(Double(delta.y))\t\(button)\t\(inputButtons)\t\(modifiers)\t\(key)\t\(scan)\t\(repeated ? 1 : 0)\t\(clicks)\t\(stamp)")
