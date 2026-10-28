@@ -44,6 +44,74 @@ def activate(prefix, cwd, env):
     return env | values
 
 
+
+def macos_input_clock(prefix: Path, project: Path, env):
+    """Compare the SDK's actual mouse callback with Xu's Darwin clock domain."""
+    if sys.platform != "darwin":
+        return
+    host = prefix / "src/ui/host"
+    sdk = env.get("XU_TEST_SYSROOT") or run(["xcrun", "--show-sdk-path"], cwd=project, env=env).strip()
+    runtime_source = project / "runtime_clock.xu"
+    runtime_source.write_text('@main\n#time\nfn main() int {\n    println(time.instant().nanoseconds())\n    << 0\n}\n')
+    runtime_clock = project / "runtime-clock"
+    run([str(prefix / "bin/xu"), "build", str(runtime_source), "-o", str(runtime_clock)], cwd=project, env=env)
+    objects = []
+    for name in ("xu_ui_mem.cc", "xu_pack_assets.c", "xu_pack_assets_weak.c"):
+        obj = project / (name + ".o")
+        compiler = "clang++" if name.endswith(".cc") else "clang"
+        flags = ["-std=c++17"] if name.endswith(".cc") else []
+        run(["xcrun", compiler, *flags, "-isysroot", sdk, "-I" + str(host),
+             "-c", str(host / name), "-o", str(obj)], cwd=project, env=env)
+        objects.append(str(obj))
+    source = project / "native_input_clock.swift"
+    source.write_text(r'''import AppKit
+import Darwin
+@main struct InputClockProbe {
+    static func runtimeClock() -> Int64 {
+        let process = Process(), pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: CommandLine.arguments[1])
+        process.standardOutput = pipe
+        try! process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        precondition(process.terminationStatus == 0)
+        return Int64(String(data: data, encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines))!
+    }
+    static func monotonic() -> Int64 {
+        var value = timespec()
+        precondition(clock_gettime(CLOCK_MONOTONIC, &value) == 0)
+        return Int64(value.tv_sec) * 1_000_000_000 + Int64(value.tv_nsec)
+    }
+    static func main() {
+        _ = NSApplication.shared
+        let view = DrawCanvasView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        view.inputEnabled = true
+        var line = ""
+        view.onInput = { line = $0 }
+        let event = NSEvent.mouseEvent(with: .mouseMoved, location: NSPoint(x: 10, y: 20),
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0,
+            context: nil, eventNumber: 0, clickCount: 0, pressure: 0)!
+        let runtimeBefore = runtimeClock()
+        let before = monotonic()
+        view.mouseMoved(with: event)
+        let after = monotonic()
+        let runtimeAfter = runtimeClock()
+        let stamp = Int64(line.split(separator: "\t").last!)!
+        precondition(stamp >= before && stamp <= after, "native input and Xu use different clocks")
+        precondition(stamp >= runtimeBefore && stamp <= runtimeAfter, "native input and installed compiler use different clocks")
+        print("native-input-clock: PASS")
+    }
+}
+''')
+    executable = project / "native-input-clock"
+    run(["xcrun", "swiftc", "-D", "XU_UI_STATIC", "-sdk", sdk, "-module-cache-path", str(project / "swift-cache"),
+         str(host / "macos_host.swift"), str(host / "macos_draw.swift"), str(source), *objects,
+         "-lc++", "-framework", "AppKit", "-framework", "UserNotifications", "-framework", "QuartzCore",
+         "-o", str(executable)], cwd=project, env=env)
+    assert run([str(executable), str(runtime_clock)], cwd=project, env=env).strip() == "native-input-clock: PASS"
+    print("installed-sdk: native-input-clock PASS")
+
+
 def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
     prefix = work / "installed Xu SDK"
     project = work / "user project with spaces"
@@ -120,6 +188,7 @@ fn main() int {
         match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", doctor.stdout)
         assert match, (doctor.returncode, doctor.stdout, doctor.stderr)
         assert Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
+    macos_input_clock(prefix, project, clean)
     # Exercise the actual desktop entry and sibling Doctor invocation. The small
     # project deliberately has no icon, so it stops before external GUI builds.
     desktop = subprocess.run([xu, "build", str(project), "--desktop", "--no-webview",

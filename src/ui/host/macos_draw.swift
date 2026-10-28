@@ -1,6 +1,9 @@
 import AppKit
 import CoreText
 
+@_silgen_name("xu_ui_input_now_ns")
+private func xuInputNowNS() -> Int64
+
 private typealias ListCompile = @convention(c) (UnsafeRawPointer?) -> UnsafeMutableRawPointer?
 private typealias ListDestroy = @convention(c) (UnsafeMutableRawPointer?) -> Void
 @_silgen_name("xu_ui_display_list_set_backend")
@@ -953,7 +956,9 @@ final class DrawCanvasView: NSView {
   override func updateTrackingAreas() {
     super.updateTrackingAreas()
     if let inputTracking { removeTrackingArea(inputTracking) }
-    let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+    // Passive hover must also work before a click activates this window.
+    // Keyboard/editing focus still follows the key-window notifications below.
+    let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
     addTrackingArea(area); inputTracking = area
   }
   override func viewDidMoveToWindow() {
@@ -996,7 +1001,7 @@ final class DrawCanvasView: NSView {
                  button: UInt32 = 0, modifiers: UInt32 = 0, key: UInt32 = 0,
                  scan: UInt32 = 0, repeated: Bool = false, clicks: Int = 0) {
     guard inputEnabled else { return }
-    let stamp = Int64(ProcessInfo.processInfo.systemUptime * 1e9)
+    let stamp = xuInputNowNS()
     let identity = generation == 0 ? "input\t\(kind)\t\(windowID)\t\(canvasID)" :
       "input2\t\(kind)\t\(windowID)\t\(canvasID)\t\(generation)"
     onInput?("\(identity)\t\(Double(point.x))\t\(Double(point.y))\t\(Double(delta.x))\t\(Double(delta.y))\t\(button)\t\(inputButtons)\t\(modifiers)\t\(key)\t\(scan)\t\(repeated ? 1 : 0)\t\(clicks)\t\(stamp)")
