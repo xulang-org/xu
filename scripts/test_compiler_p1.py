@@ -2,7 +2,7 @@
 """Compiler P1 regressions; fixtures and probe builds stay in a temporary directory.
 
 Usage: python3 scripts/test_compiler_p1.py --xu bin/xu
-Requires node and qemu-riscv32/qemu-riscv64/qemu-loongarch64 for execution checks.
+Requires node and qemu-user (ARM32/ARM64/LoongArch64/RV32/RV64).
 """
 import argparse
 import os
@@ -100,6 +100,64 @@ fn probe_cmp(a &mut Assembler, wide bool) {
     a.v_ecall()
     if wide { a.v_fixup_all() } else { a.r_fixup_all() }
 }
+fn probe_loong_cmp(a &mut Assembler) {
+    a.arch = 4
+    vals := [-9223372036854775807 - 1, -1, 0, 1, 9223372036854775807]
+    conds := [0, 1, 10, 11, 12, 13, 2]
+    for i in 0:vals.len {
+        for j in 0:vals.len {
+            x := vals[i]
+            y := vals[j]
+            for ci in 0:conds.len {
+                cond := conds[ci]
+                mut expect := false
+                if cond == 0 { expect = x == y }
+                if cond == 1 { expect = x != y }
+                if cond == 10 { expect = x >= y }
+                if cond == 11 { expect = x < y }
+                if cond == 12 { expect = x > y }
+                if cond == 13 { expect = x <= y }
+                if cond == 2 { expect = (x < 0 && y >= 0) || ((x < 0) == (y < 0) && x >= y) }
+                for imm in 0:2 {
+                    a.lbe_mov_imm64(0, x)
+                    a.lbe_mov_imm64(1, y)
+                    if imm == 0 { a.lbe_cmp(0, 1) } else { a.lbe_cmp_imm(0, y) }
+                    ok := "_probe_l_ok_" + str(a.drop_seq)
+                    a.drop_seq += 1
+                    mut target := "_probe_l_fail"
+                    if expect { target = ok + "" }
+                    if cond == 0 { a.lbe_jeq(target + "") }
+                    if cond == 1 { a.lbe_jne(target + "") }
+                    if cond == 10 { a.lbe_jge(target + "") }
+                    if cond == 11 { a.lbe_jlt(target + "") }
+                    if cond == 12 { a.lbe_jgt(target + "") }
+                    if cond == 13 { a.lbe_jle(target + "") }
+                    if cond == 2 { a.lbe_jae(target + "") }
+                    if expect { a.l_b("_probe_l_fail") }
+                    a.label(ok)
+                }
+            }
+        }
+    }
+    a.lbe_mov_imm(0, 0)
+    a.lbe_cbnz(0, "_probe_l_fail")
+    a.lbe_cbz(0, "_probe_l_zero")
+    a.l_b("_probe_l_fail")
+    a.label("_probe_l_zero")
+    a.lbe_mov_imm(0, 1)
+    a.lbe_cbz(0, "_probe_l_fail")
+    a.lbe_cbnz(0, "_probe_l_done")
+    a.l_b("_probe_l_fail")
+    a.label("_probe_l_done")
+    a.l_mov_imm(4, 0)
+    a.l_mov_imm(11, 93)
+    a.l_syscall()
+    a.label("_probe_l_fail")
+    a.l_mov_imm(4, 1)
+    a.l_mov_imm(11, 93)
+    a.l_syscall()
+    a.l_fixup_all()
+}
 fn probe_mem(a &mut Assembler) {
     a.rbe_prologue(8192)
     a.r_sub(5, 8, 2)
@@ -187,6 +245,10 @@ fn probe_fixup(a &mut Assembler, mode string, rel int) {
         a.v_lea(5, "probe_target") }
     if mode == "rv_imm" { a.arch = 3
         a.r_beq(5, 6, rel) }
+    if mode == "loong_far_eq" { a.arch = 4
+        a.lbe_jeq("probe_target") }
+    if mode == "loong_far_zero" { a.arch = 4
+        a.lbe_cbz(0, "probe_target") }
     if mode == "loong_b" { a.arch = 4
         a.l_b("probe_target") }
     if mode == "loong_b16" { a.arch = 4
@@ -210,6 +272,100 @@ fn probe_atomics(a &mut Assembler, thumb bool) {
     a.be_atomic_xchg(0, 1, 2)
     a.be_atomic_add(0, 1, 2)
     a.be_atomic_cas(0, 1, 2, 3)
+}
+// Execute the actual freestanding nonblocking runtime under qemu-user.
+// Only allocation and process exit are supplied by this standalone harness;
+// the channel new/try/close functions below are the production emitters.
+fn probe_chan_call(a &mut Assembler, lab string, src string) {
+    a.load(18, 15, -8)
+    a.lea(19, src)
+    a.vm_mov_imm(20, 2)
+    a.call(lab)
+}
+fn probe_chan_expect(a &mut Assembler, value int) {
+    a.vm_cmp_imm(14, value)
+    a.jne("_probe_fail")
+}
+fn probe_chan_exit(a &mut Assembler, code int) {
+    if a.arch == 2 {
+        a.t_mov_imm(0, code)
+        a.t_mov_imm(7, 1)
+        a.t_svc(0)
+    } else {
+        a.r_li32(10, code)
+        a.r_li32(17, 93)
+        a.v_ecall()
+    }
+}
+fn probe_chan(a &mut Assembler, thumb bool) {
+    a.arch = 3
+    if thumb { a.arch = 2 }
+    a.os = 3
+    a.code_vaddr = 65620
+    a.prologue(32)
+    a.vm_mov_imm(18, 2)
+    a.vm_mov_imm(19, 2)
+    a.call("_rt_chan_new")
+    a.store(15, -8, 14)
+    probe_chan_call(a, "_rt_chan_try_send", "_probe_src")
+    probe_chan_expect(a, 1)
+    probe_chan_call(a, "_rt_chan_try_send", "_probe_src2")
+    probe_chan_expect(a, 1)
+    probe_chan_call(a, "_rt_chan_try_send", "_probe_src")
+    probe_chan_expect(a, 0)
+    for pass in 0:2 {
+        probe_chan_call(a, "_rt_chan_try_recv", "_probe_dst")
+        probe_chan_expect(a, 1)
+        a.lea(0, "_probe_dst")
+        mut src := "_probe_src"
+        if pass == 1 { src = "_probe_src2" }
+        a.lea(1, src)
+        for word in 0:4 {
+            a.load(2, 0, word * 4)
+            a.load(3, 1, word * 4)
+            a.cmp(2, 3)
+            a.jne("_probe_fail")
+        }
+    }
+    probe_chan_call(a, "_rt_chan_try_recv", "_probe_dst")
+    probe_chan_expect(a, 0)
+    a.load(18, 15, -8)
+    a.call("_rt_chan_close")
+    probe_chan_call(a, "_rt_chan_try_recv", "_probe_dst")
+    probe_chan_expect(a, 2)
+    a.lea(0, "_probe_dst")
+    for word in 0:4 {
+        a.load(2, 0, word * 4)
+        a.vm_cmp_imm(2, 0)
+        a.jne("_probe_fail")
+    }
+    probe_chan_exit(a, 0)
+    a.label("_rt_al_oom")
+    a.label("_rt_exit")
+    a.label("_probe_fail")
+    probe_chan_exit(a, 1)
+    a.label("_rt_alloc")
+    a.lea(14, "_probe_arena")
+    a.vm_ret()
+    a.label("_rt_free")
+    a.vm_ret()
+    rt_emit_chan_new(a)
+    rt_emit_chan_try_send(a)
+    rt_emit_chan_try_recv(a)
+    rt_emit_chan_close(a)
+    a.data_label("_probe_src")
+    rt_emit_u64(a, 4294967297)
+    rt_emit_u64(a, -8589934597)
+    a.data_label("_probe_src2")
+    rt_emit_u64(a, -4294967299)
+    rt_emit_u64(a, 12884901895)
+    a.data_label("_probe_dst")
+    rt_emit_zeros(a, 16)
+    a.data_label("_probe_arena")
+    rt_emit_zeros(a, RT_CHAN_HEADER_BYTES + 32)
+    a.data_vaddr = a.code_vaddr + a.code.len
+    a.fixup_all()
+    for i in 0:a.data.len { a.code.push(a.data[i]) }
 }
 fn probe_loong_jump(a &mut Assembler, cond int, label string) {
     if cond == 0 { a.lbe_jeq(label) }
@@ -280,6 +436,7 @@ fn main() int {
     mut a := Assembler{}
     a.os = 1
     a.arch = 3
+    if mode == "chan_rv32" || mode == "chan_thumb" { probe_chan(mut &a, mode == "chan_thumb") }
     if mode == "loong_long" { a.arch = 4
         a.cmp_a = 4
         a.cmp_b = 5
@@ -287,6 +444,7 @@ fn main() int {
     if mode == "cmp64" { a.arch = 5 }
     if mode == "cmp32" || mode == "cmp64" { probe_cmp(mut &a, mode == "cmp64") }
     if mode == "mem32" { probe_mem(mut &a) }
+    if mode == "cmp_loong" { probe_loong_cmp(mut &a) }
     if mode == "store" { a.arch = 1
         probe_store(mut &a) }
     if mode == "i12" { a.r_addi(5, 5, 4096) }
@@ -306,15 +464,15 @@ def run(cmd, *, env, expected=0, contains=None, timeout=240):
     return result
 
 
-def elf(code, wide, machine=243):
+def elf(code, wide, thumb=False, loong=False):
     base = 0x10000
     if wide:
         size = 64 + 56
-        hdr = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01'+bytes(9), 2, machine, 1, base+size, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+        hdr = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01'+bytes(9), 2, 258 if loong else 243, 1, base+size, 64, 0, 0, 64, 56, 1, 0, 0, 0)
         ph = struct.pack('<IIQQQQQQ', 1, 7, 0, base, base, size+len(code), size+len(code), 4096)
     else:
         size = 52 + 32
-        hdr = struct.pack('<16sHHIIIIIHHHHHH', b'\x7fELF\x01\x01\x01'+bytes(9), 2, 243, 1, base+size, 52, 0, 0, 52, 32, 1, 0, 0, 0)
+        hdr = struct.pack('<16sHHIIIIIHHHHHH', b'\x7fELF\x01\x01\x01'+bytes(9), 2, 40 if thumb else 243, 1, (base+size) | int(thumb), 52, 0, 0x05000200 if thumb else 0, 52, 32, 1, 0, 0, 0)
         ph = struct.pack('<IIIIIIII', 1, 0, base, base, size+len(code), size+len(code), 7, 4096)
     return hdr + ph + code
 
@@ -346,7 +504,27 @@ def main():
             fixture('undefined_spawn', 'fn main() { xu missing() }', 'undefined function')
             fixture('invalid_send', 'fn main() { x := 1\n x <- 2\n}', 'send requires a channel')
             fixture('call_loan', 'fn identity(x &int) &int { << x }\nfn main() { mut x := 1\n r := identity(&x)\n x = 2\n println(*r)\n}', 'because it is borrowed')
-            fixture('branch_loan', 'fn bad(flag bool) { mut xs := [1]\n ys := [2]\n mut r := &xs[0]\n if flag { r = &ys[0] }\n xs.push(3)\n println(*r)\n}\nfn main() { bad(false) }', 'reference-bearing value across control-flow')
+            fixture('branch_loan', 'fn bad(flag bool) { mut xs := [1]\n ys := [2]\n mut r := &xs[0]\n if flag { r = &ys[0] }\n xs.push(3)\n println(*r)\n}\nfn main() { bad(false) }', 'element is borrowed')
+            fixture('branch_safe_rebind', 'fn check(flag bool) { mut xs := [1]\n ys := [2]\n zs := [3]\n mut r := &xs[0]\n if flag { r = &ys[0] } else { r = &zs[0] }\n xs.push(4)\n println(*r)\n}\nfn main() { check(true)\n check(false)\n}', output='2\n3\n')
+            fixture('branch_sibling_isolation', 'fn check(flag bool) { mut xs := [1]\n zs := [3]\n mut r := &zs[0]\n if flag { r = &xs[0] } else { xs.push(2) }\n println(*r)\n}\nfn main() { check(true)\n check(false)\n}', output='1\n3\n')
+            fixture('branch_call_copy_loan', 'fn identity(x &int) &int { << x }\nfn bad(flag bool) { mut xs := [1]\n ys := [2]\n mut r := identity(&xs[0])\n if flag { r = identity(&ys[0]) }\n q := r\n xs.push(3)\n println(*q)\n}\nfn main() { bad(false) }', 'element is borrowed')
+            fixture('branch_call_other_loan', 'fn identity(x &int) &int { << x }\nfn bad(flag bool) { xs := [1]\n mut ys := [2]\n mut r := &xs[0]\n if flag { r = identity(&ys[0]) }\n q := &*r\n ys.push(3)\n println(*q)\n}\nfn main() { bad(true) }', 'element is borrowed')
+            fixture('branch_nested_aggregate_loan', 'struct Inner { r &int }\nstruct Outer { inner Inner }\nfn bad(flag bool) { mut x := 1\n y := 2\n mut h := Outer{inner: Inner{r: &x}}\n if flag { h = Outer{inner: Inner{r: &y}} }\n z := h\n x = 3\n println(*z.inner.r)\n}\nfn main() { bad(false) }', 'because it is borrowed')
+            fixture('branch_closure_loan', 'fn bad(flag bool) { mut x := 1\n y := 2\n mut r := &x\n if flag { r = &y }\n f := fn() int { << *r }\n x = 3\n println(f())\n}\nfn main() { bad(false) }', 'because it is borrowed')
+            fixture('branch_return_edge', 'fn check(flag bool) { mut xs := [1]\n ys := [2]\n mut r := &xs[0]\n if flag { println(*r)\n << } else { r = &ys[0] }\n xs.push(3)\n println(*r)\n}\nfn main() { check(false) }', output='2\n')
+            fixture('branch_owner_escape', 'fn bad(flag bool) { x := 1\n mut r := &x\n if flag { y := 2\n r = &y }\n println(*r)\n}\nfn main() { bad(true) }', 'does not outlive')
+            fixture('loop_rebind_reject', 'fn main() { x := 1\n y := 2\n mut r := &x\n for i in 0:2 { r = &y }\n println(*r)\n}', 'loop back-edge')
+            fixture('linear_rebind_kills_loan', 'fn main() { mut xs := [1]\n ys := [2]\n mut r := &xs[0]\n r = &ys[0]\n xs.push(3)\n println(*r)\n}', output='2\n')
+            fixture('branch_local_nll', 'fn check(flag bool) { mut x := 1\n r := &x\n if flag { x = 2 } else { println(*r) }\n}\nfn main() { check(true)\n check(false)\n}', output='1\n')
+            fixture('match_safe_rebind', 'fn check(flag int) { mut xs := [1]\n ys := [2]\n zs := [3]\n mut r := &xs[0]\n match flag { 0 { r = &ys[0] } else { r = &zs[0] } }\n xs.push(4)\n println(*r)\n}\nfn main() { check(0)\n check(1)\n}', output='2\n3\n')
+            fixture('match_missing_edge_loan', 'fn bad(flag int) { mut xs := [1]\n ys := [2]\n mut r := &xs[0]\n match flag { 0 { r = &ys[0] } }\n xs.push(3)\n println(*r)\n}\nfn main() { bad(1) }', 'element is borrowed')
+            fixture('select_safe_rebind', 'fn main() { mut xs := [1]\n ys := [2]\n zs := [3]\n mut r := &xs[0]\n ch := chan int{cap: 1}\n ch <- 1\n select { v := <-ch { r = &ys[0] } else { r = &zs[0] } }\n xs.push(4)\n println(*r)\n}', output='2\n')
+            fixture('select_empty_default_loan', 'fn main() { mut xs := [1]\n ys := [2]\n mut r := &xs[0]\n ch := chan int{cap: 0}\n select { v := <-ch { r = &ys[0] } else {} }\n xs.push(3)\n println(*r)\n}', 'element is borrowed')
+            fixture('branch_reborrow_freezes_all_parents', 'fn bad(flag bool) { mut x := 1\n mut y := 2\n p := mut &x\n q := mut &y\n mut r := &*p\n if flag { r = &*q }\n h := &*r\n *q = 3\n println(*h)\n}\nfn main() { bad(true) }', 'mutably borrowed')
+            fixture('loop_tail_branch_loan', 'fn bad(flag bool) { mut xs := [1]\n r := &xs[0]\n for i in 0:2 { if flag { xs.push(2) } else { println(*r) } }\n}\nfn main() { bad(true) }', 'element is borrowed')
+            fixture('nested_loop_tail_branch_loan', 'fn bad(flag bool) { for j in 0:2 { mut xs := [1]\n r := &xs[0]\n for i in 0:2 { if flag { xs.push(2) } else { println(*r) } }\n} }\nfn main() { bad(true) }', 'element is borrowed')
+            fixture('fallback_rebind_reject', 'fn value() int { << 1 }\nfn main() { x := 1\n y := 2\n mut r := &x\n v := value() or (err) { r = &y }\n println(*r)\n}', 'error fallback without expression-level loan tracking')
+            fixture('nested_branch_safe_rebind', 'fn check(a bool, b bool) { mut xs := [1]\n ys := [2]\n zs := [3]\n mut r := &xs[0]\n if a { if b { r = &ys[0] } else { r = &zs[0] } } else { r = &ys[0] }\n xs.push(4)\n println(*r)\n}\nfn main() { check(true, false)\n check(false, true)\n}', output='3\n2\n')
             fixture('nested_loan', 'struct Inner { r &int }\nstruct Outer { inner Inner }\nfn main() { mut x := 1\n h := Outer{inner: Inner{r: &x}}\n x = 2\n println(*h.inner.r)\n}', 'because it is borrowed')
             fixture('nested_assign_loan', 'struct Inner { r &int }\nstruct Outer { inner Inner }\nfn main() { mut x := 1\n y := 2\n mut h := Outer{inner: Inner{r: &y}}\n h.inner = Inner{r: &x}\n x = 3\n println(*h.inner.r)\n}', 'because it is borrowed')
             fixture('field_escape', 'struct Holder { r &int }\nfn bad(h &mut Holder) { x := 1\n h.r = &x\n}\nfn main() { y := 2\n mut h := Holder{r: &y}\n bad(mut &h)\n println(*h.r)\n}', 'without a proven lifetime')
@@ -356,6 +534,34 @@ def main():
             fixture('long_reborrow', chain, 'mutably borrowed')
             fixture('late_reborrow', 'fn main() { mut xs := [1]\n r := &xs[0]\n xs.push(2)\n q := &*r\n println(*q)\n}', 'element is borrowed')
             fixture('shared_and_last_use', 'struct Item { value int }\nfn shared(p &Item) int { r := &p.value\n << p.value + *r\n}\nfn main() { mut x := 1\n r := &x\n println(*r)\n x = 2\n a := Item{value: 3}\n println(shared(&a))\n}', output='1\n6\n')
+            chart = '''struct Point { series int, id int, opacity f64 }
+struct Chart { data []Point, selected int }
+fn (c &Chart) datum_visible(i int) bool { << c.data[i].opacity > 0.001 }
+fn (c &mut Chart) select_point(series int, id int) {
+    for i in 0:c.data.len { p := &c.data[i]
+        if p.series == series && p.id == id && p.opacity > 0.0 && c.datum_visible(i) {
+            c.selected = i
+            <<
+        }
+    }
+}
+fn main() {
+    mut c := Chart{data: [Point{series: 1, id: 2, opacity: 0.0}, Point{series: 1, id: 3, opacity: 1.0}], selected: -1}
+    c.select_point(1, 3)
+    println(c.selected)
+}'''
+            fixture('chart_shared_receiver_condition', chart, output='1\n')
+            receiver = '''struct Item { value int }
+fn (p &Item) read() int { << p.value }
+fn (p &mut Item) change() { p.value = 2 }
+'''
+            fixture('shared_receiver_live_child', receiver + 'fn check(p &mut Item) { r := &p.value\n println(p.read())\n println(*r)\n}\nfn main() { mut v := Item{value: 1}\n check(mut &v)\n}', output='1\n1\n')
+            fixture('shared_receiver_local_parent', receiver + 'fn main() { mut v := Item{value: 1}\n p := mut &v\n r := &p.value\n println(p.read())\n println(*r)\n}', output='1\n1\n')
+            fixture('shared_receiver_exclusive_child', receiver + 'fn check(p &mut Item) { r := mut &p.value\n println(p.read())\n println(*r)\n}\nfn main() { mut v := Item{value: 1}\n check(mut &v)\n}', 'mutably borrowed')
+            fixture('shared_receiver_exclusive_local_child', receiver + 'fn main() { mut v := Item{value: 1}\n p := mut &v\n r := mut &p.value\n println(p.read())\n println(*r)\n}', 'mutably borrowed')
+            fixture('mutable_receiver_shared_child', receiver + 'fn check(p &mut Item) { r := &p.value\n p.change()\n println(*r)\n}\nfn main() { mut v := Item{value: 1}\n check(mut &v)\n}', 'mutably borrowed')
+            fixture('write_after_shared_receiver', receiver + 'fn check(p &mut Item) { r := &p.value\n println(p.read())\n p.value = 2\n println(*r)\n}\nfn main() { mut v := Item{value: 1}\n check(mut &v)\n}', 'mutably borrowed')
+            fixture('exclusive_reborrow_after_shared_receiver', receiver + 'fn check(p &mut Item) { r := &p.value\n println(p.read())\n q := mut &*p\n println(*r)\n println(q.read())\n}\nfn main() { mut v := Item{value: 1}\n check(mut &v)\n}', 'frozen reference')
             reader = 'struct Item { value int }\nfn (p &Item) read() int { << p.value }\nfn (p &mut Item) write() { p.value = 9 }\n'
             fixture('shared_receiver_reborrow', reader + 'fn check(p &mut Item) { r := &p.value\n println(p.read() + *r)\n p.write()\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n println(x.value)\n}', output='6\n9\n')
             fixture('shared_receiver_held', reader + 'struct Holder { r &int }\nfn check(p &mut Item) { h := Holder{r: &p.value}\n println(p.read() + *h.r)\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n}', output='6\n')
@@ -400,7 +606,7 @@ def main():
         result = run([executable, 'loong_long'], env=env)
         code = bytes(int(s) for s in result.stdout.splitlines())
         image = tmp / 'loong_long'
-        image.write_bytes(elf(code, True, machine=258))
+        image.write_bytes(elf(code, True, loong=True))
         image.chmod(0o755)
         run(['qemu-loongarch64', image], env=env)
         print('PASS loong_long_branches', flush=True)
@@ -414,6 +620,30 @@ def main():
             assert emulator, 'qemu-user required'
             run([emulator, image], env=env)
             print('PASS', mode, flush=True)
+        for mode, emulator, thumb in [('chan_rv32', 'qemu-riscv32', False), ('chan_thumb', 'qemu-arm', True)]:
+            result = run([executable, mode], env=env)
+            code = bytes(int(s) for s in result.stdout.splitlines())
+            artifact = tmp / mode
+            artifact.write_bytes(elf(code, False, thumb))
+            artifact.chmod(0o755)
+            run([emulator, artifact], env=env)
+            print('PASS freestanding_channel_runtime', mode, flush=True)
+        result = run([executable, 'cmp_loong'], env=env)
+        code = bytes(int(s) for s in result.stdout.splitlines())
+        artifact = tmp / 'cmp_loong'
+        artifact.write_bytes(elf(code, True, loong=True))
+        artifact.chmod(0o755)
+        run(['qemu-loongarch64', artifact], env=env)
+        print('PASS loong_conditional_execution', flush=True)
+        for mode in ('loong_far_eq', 'loong_far_zero'):
+            result = run([executable, mode, 5000000], env=env)
+            code = bytes(int(s) for s in result.stdout.splitlines())
+            inverse, branch = struct.unpack('<II', code)
+            assert inverse >> 26 == 23 and (inverse >> 10) & 65535 == 2
+            assert branch >> 26 == 20
+            delta = (((branch >> 10) & 65535) | ((branch & 1023) << 16)) * 4
+            assert delta + 4 == 5000000
+            print('PASS loong_far_conditional', mode, flush=True)
         bounds = [
             ('a64_b', -134217728, 134217724, 4),
             ('a64_cb', -1048576, 1048572, 4),
@@ -489,10 +719,110 @@ fn main() { ch := chan int{cap: 0}
     println(sum)
 }''', output='800\n', extra=('--target', 'linux-riscv64'), runner=('qemu-riscv64',))
         channel = 'fn main() { ch := chan int{cap: 1}\n ch <- 4294967297\n println(<-ch)\n}'
-        fixture('thumb_channel_reject', channel, 'Thumb spawn/channel ABI', extra=('--target', 'linux-arm32'))
-        fixture('thumb_spawn_reject', 'fn worker(a int, b int, c int) {}\nfn main() { xu worker(1, 2, 3) }', 'Thumb spawn/channel ABI', extra=('--target', 'linux-arm32'))
+        # These scalar cases were blanket ABI rejections before round 2.
+        # Keep both inputs as acceptance regressions for the supported ABI.
+        fixture('thumb_channel_pair', channel, output='4294967297\n', extra=('--target', 'linux-arm32'), runner=('qemu-arm',))
+        fixture('thumb_spawn_scalar', 'fn worker(a int, b int, c int) {}\nfn main() { xu worker(1, 2, 3) }', output='', extra=('--target', 'linux-arm32'), runner=('qemu-arm',))
+        fixture('thumb_atomic64_reject', atomic, 'Thumb int64 atomics require', extra=('--target', 'linux-arm32'))
+        fixture('thumb_spawn_aggregate_reject', 'enum Message { Text(string) }\nfn worker(value Message) {}\nfn main() { xu worker(Message.Text("payload")) }', 'Thumb spawn aggregate pair ABI', extra=('--target', 'linux-arm32'))
+        fixture('thumb_channel_aggregate_reject', 'struct Payload { left int, right int }\nfn main() { ch := chan Payload{cap: 1}\n ch <- Payload{left: 4294967297, right: -4294967299}\n}', 'Thumb channel aggregate pair ABI', extra=('--target', 'linux-arm32'))
+        thumb_spawn = """fn worker(out chan int, a bool, b int, c bool, d int, e int) {
+    if a && c { out <- b + d + e }
+}
+fn main() { out := chan int{cap: 0}
+    xu worker(out, true, 4294967297, true, 8589934595, -4294967297)
+    println(<-out)
+}"""
+        thumb_fifo = """fn worker(ch chan int, done chan int) {
+    ch <- 4294967297
+    ch <- -4294967299
+    done <- 1
+}
+fn main() {
+    ch := chan int{cap: 1}
+    done := chan int{cap: 0}
+    xu worker(ch, done)
+    println(<-ch)
+    println(<-ch)
+    token := <-done
+    close(ch)
+    println(<-ch)
+}"""
+        thumb_select = """fn main() { ch := chan int{cap: 1}
+    select { ch <- -4294967299 { println(1) } else { println(0) } }
+    select { ch <- 99 { println(0) } else { println(2) } }
+    select { v := <-ch { println(v) } else { println(0) } }
+    select { v := <-ch { println(0) } else { println(3) } }
+    close(ch)
+    select { v := <-ch { println(v) } else { println(99) } }
+}"""
+        poison = 'fn poison(n int) int { if n < 0 { << poison(-n) }\n'
+        poison += ''.join(f' v{i} := n + {i}\n' for i in range(64))
+        poison += ' << ' + ' + '.join(f'v{i}' for i in range(64)) + '\n}\n'
+        thumb_status = poison + """fn attempt(ch chan int) int {
+    select { ch <- 1 { << 1 } else { << 2 } }
+}
+fn attempt_recv(ch chan int) int {
+    select { v := <-ch { << 1 } else { << 2 } }
+}
+fn main() { ch := chan int{cap: 0}
+    mut total := 0
+    for i in 0:20 {
+        if poison(4294967297 + i) < 0 { println(99) }
+        total += attempt(ch)
+        if poison(4294967297 + i) < 0 { println(99) }
+        total += attempt_recv(ch)
+    }
+    println(total)
+}"""
+        for opt in ('-O0', '-O2'):
+            fixture('thumb_spawn_pair' + opt, thumb_spawn, output='8589934595\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
+            fixture('thumb_channel_fifo' + opt, thumb_fifo, output='4294967297\n-4294967299\n0\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
+            fixture('thumb_channel_select' + opt, thumb_select, output='1\n2\n-4294967299\n3\n0\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
+            fixture('thumb_select_status_pair' + opt, thumb_status, output='80\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
+            for capacity in (4294967297, 613566757):
+                out = fixture('thumb_capacity_bound_' + str(capacity) + opt, f'fn main() {{ ch := chan int{{cap: {capacity}}}\n close(ch)\n}}', extra=(opt, '--target', 'linux-arm32'))
+                run(['qemu-arm', out], env=env, expected=1)
+                print('PASS thumb_capacity_bound_execution', capacity, opt, flush=True)
+        fixture('thumb_channel_contention', 'fn worker(ch chan int) { for i in 0:100 { ch <- 4294967297 } }\nfn main() { ch := chan int{cap: 0}\n for i in 0:8 { xu worker(ch) }\n mut sum := 0\n for i in 0:800 { sum += <-ch }\n println(sum)\n}', output='3435973837600\n', extra=('-O2', '--target', 'linux-arm32'), runner=('qemu-arm',))
+        stack_overflow = """fn recurse(n int) int {
+    if n == 0 { << 0 }
+    << n + recurse(n - 1)
+}
+fn worker(out chan int) { out <- recurse(100000) }
+fn main() { out := chan int{cap: 0}
+    xu worker(out)
+    println(<-out)
+}"""
+        stack_sret = """struct Pair { a int, b int }
+fn make_pair(x int) Pair {
+    if x < 0 { << make_pair(-x) }
+    << Pair{a: x, b: x + 1}
+}
+fn worker(out chan int) { value := make_pair(41)
+    out <- value.a + value.b
+}
+fn main() { out := chan int{cap: 0}
+    xu worker(out)
+    println(<-out)
+}"""
+        for target, emulator in (('linux-arm64', 'qemu-aarch64'), ('linux-loongarch64', 'qemu-loongarch64'), ('linux-riscv64', 'qemu-riscv64')):
+            for opt in ('-O0', '-O2'):
+                out = fixture('stack_guard_' + target + opt, stack_overflow, extra=(opt, '--target', target))
+                run([emulator, out], env=env, expected=1, contains='coroutine stack overflow')
+                print('PASS stack_overflow_execution', target, opt, flush=True)
+                fixture('stack_args_' + target + opt, spawn, output='spawn enum payload\n', extra=(opt, '--target', target), runner=(emulator,))
+                fixture('stack_sret_' + target + opt, stack_sret, output='83\n', extra=(opt, '--target', target), runner=(emulator,))
         for target in ('riscv32imac-none', 'thumbv7em-none'):
             fixture('freestanding_reject_' + target, channel.replace('4294967297', '1'), 'require a suspendable scheduler', extra=('--target', target))
+        nonblocking = """fn main() { ch := chan int{cap: 2}
+    select { ch <- 17 {} else {} }
+    select { v := <-ch { println(v) } else {} }
+    close(ch)
+}"""
+        for target in ('riscv32imac-none', 'thumbv7em-none'):
+            fixture('freestanding_nonblocking_' + target, nonblocking, extra=('--target', target))
+            fixture('freestanding_spawn_reject_' + target, 'fn worker() {}\nfn main() { xu worker() }', 'require a suspendable scheduler', extra=('--target', target))
         wasm = fixture('casts.wasm', '''pub fn signed(x int) int { << int(i32(x)) }
 pub fn unsigned(x int) int { << int(u32(x)) }
 pub fn bytecast(x int) int { << int(u8(x)) }
