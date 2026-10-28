@@ -16,6 +16,8 @@ Compiler updates include borrow-flow join fixes, Thumb/freestanding concurrency 
 
 Desktop packing and Doctor locate host sources beside their own installed executables, including PATH/symlink launches, before considering environment or checkout fallbacks. This makes `xu build --desktop` work outside a source checkout without letting a stale `XU_ROOT` select another SDK. Linux and Windows host compilation also preserves SDK include paths containing spaces. Every desktop target selects the UI coroutine-stack profile while emitting its object.
 
+Native Windows desktop packing explicitly launches the Git Bash/MSYS2 `sh` required by its recipes, resolves sibling `.exe` tools, and uses the native temporary directory with normalized paths. Doctor now checks that shell dependency. Installed-SDK validation also enters the desktop packer from an unrelated directory and verifies its sibling Doctor selects the installed SDK.
+
 SDK workflows pin the corrected example sources and check the installed workshop alongside existing UI and service samples. Native installed-SDK checks cover macOS, Linux and Windows on ARM64/x64; these checks do not imply desktop GUI acceptance on every platform. Workshop GUI acceptance is on macOS ARM64. Canvas accessibility bridging, editor undo history and touch long-press remain documented limitations. LoongArch64 and RISC-V SDKs are cross-built.
 
 Published binary availability, source revisions and SHA-256 checksums are recorded in [GitHub Releases](https://github.com/xulang-org/xu/releases).
