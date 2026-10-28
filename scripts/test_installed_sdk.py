@@ -198,6 +198,8 @@ fn (p &mut Packed) bump() int { p.a += i32(2)
 struct@ Mutator { fn change(&mut Record) int }
 struct Worker { n int }
 fn (w Worker) change(r &mut Record) int { << change(r) }
+struct Tiny { a u8
+ b u8 }
 fn main() int {
  mut records := [Record{value: 1,guard: 100,label: "old"},Record{value: 2,guard: 200,label: "old"}]
  i := 1
@@ -228,13 +230,31 @@ fn main() int {
  println(dynamic.change(m))
  read_fn := read
  println(read_fn(&*m))
+ packed[1] = Packed{a: 20,b: 30,c: 40}
+ copy := packed[1]
+ println(int(copy.c))
+ packed[1] = copy
+ packed.push(Packed{a: 50,b: 60,c: 70})
+ println(packed.len)
+ mut last := mut &packed[2]
+ println(last.bump())
+ println(int(last.c))
+ println(int(packed[1].c))
+ mut tiny := [Tiny{a: 1,b: 2},Tiny{a: 3,b: 4},Tiny{a: 5,b: 6}]
+ tiny[1] = Tiny{a: 7,b: 8}
+ copied := tiny[1]
+ println(int(copied.b))
+ println(int(tiny[0].a))
+ println(int(tiny[0].b))
+ println(int(tiny[2].a))
+ println(int(tiny[2].b))
  << 0
 }
 ''')
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "borrow_record.xu", level, "-o", str(program)], cwd=project, env=active)
         actual = run([str(program)], cwd=project, env=active).splitlines()
-        assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81"], actual
+        assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81", "40", "3", "183", "71", "40", "8", "1", "2", "5", "6"], actual
     # A frame view cannot be returned as a borrowed container identity.
     (project / "borrow_escape.xu").write_text('''@main
 fn identity(s &string) &string { << s }
