@@ -213,7 +213,7 @@ xu test test.example.xu -v -o test-example
 
 On Windows, the output gains an `.exe` suffix; run `./test-example.exe`. Use `-count N` when building to repeat the test suite. The current parser accepts 1–1000; the CLI help still displays 1–100.
 
-Build the launcher with `make xu-xacp`; see the [runnable XACP example](examples/xacp/README.md). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
+Build the launcher with `make xu-xacp`; see the [runnable XACP example](https://github.com/xulang-org/examples/tree/main/examples/xacp). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
 
 `#xacp` is the transport-neutral standard-library layer for hosts that register
 a live `ui/widgets.Screen`. Its adapter exposes bounded `ui.tree`, native-owned
