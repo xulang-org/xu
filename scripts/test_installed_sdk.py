@@ -83,7 +83,6 @@ import Darwin
         return Int64(value.tv_sec) * 1_000_000_000 + Int64(value.tv_nsec)
     }
     static func main() {
-        _ = NSApplication.shared
         let view = DrawCanvasView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
         view.inputEnabled = true
         var line = ""
