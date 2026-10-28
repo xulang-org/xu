@@ -84,7 +84,7 @@ struct DrawTextInput {
   }
   static gboolean surrounding(GtkIMContext *context, gpointer data) {
     auto client = retain(context, data); if (!client) return FALSE;
-    XuTextInputSnapshot state; if (!client->snapshot(&state)) return FALSE;
+    XuTextInputSnapshot state; if (!client->snapshot(&state) || state.password()) return FALSE;
     g_object_ref(context);
 #if GTK_CHECK_VERSION(4, 2, 0)
     gtk_im_context_set_surrounding_with_selection(context, state.source.c_str(), (int)state.source.size(),
@@ -110,6 +110,10 @@ struct DrawTextInput {
   }
   void install() {
     context = gtk_im_multicontext_new();
+    XuTextInputSnapshot state;
+    if (snapshot(&state) && state.password())
+      g_object_set(context, "input-purpose", GTK_INPUT_PURPOSE_PASSWORD,
+                   "input-hints", GTK_INPUT_HINT_NO_SPELLCHECK, NULL);
     gtk_im_context_set_client_widget(context, owner->area);
     gtk_im_context_set_use_preedit(context, TRUE);
     g_signal_connect(context, "commit", G_CALLBACK(commit), this);
