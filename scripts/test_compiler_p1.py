@@ -2,7 +2,7 @@
 """Compiler P1 regressions; fixtures and probe builds stay in a temporary directory.
 
 Usage: python3 scripts/test_compiler_p1.py --xu bin/xu
-Requires node and qemu-riscv32/qemu-riscv64 for execution checks.
+Requires node and qemu-riscv32/qemu-riscv64/qemu-loongarch64 for execution checks.
 """
 import argparse
 import os
@@ -211,12 +211,79 @@ fn probe_atomics(a &mut Assembler, thumb bool) {
     a.be_atomic_add(0, 1, 2)
     a.be_atomic_cas(0, 1, 2, 3)
 }
+fn probe_loong_jump(a &mut Assembler, cond int, label string) {
+    if cond == 0 { a.lbe_jeq(label) }
+    if cond == 1 { a.lbe_jne(label) }
+    if cond == 10 { a.lbe_jge(label) }
+    if cond == 11 { a.lbe_jlt(label) }
+    if cond == 12 { a.lbe_jgt(label) }
+    if cond == 13 { a.lbe_jle(label) }
+    if cond == 2 { a.lbe_jae(label) }
+}
+fn probe_loong_branches(a &mut Assembler) {
+    vals := [-1, 0, 1]
+    conds := [0, 1, 10, 11, 12, 13, 2]
+    mut expected := []bool{}
+    // The forward targets and backward tests are on the other side of a
+    // spacer larger than I16 can encode. Exercise both paths of every jump.
+    for i in 0:vals.len { for j in 0:vals.len { for ci in 0:conds.len {
+        x := vals[i]
+        y := vals[j]
+        cond := conds[ci]
+        mut ok := false
+        if cond == 0 { ok = x == y }
+        if cond == 1 { ok = x != y }
+        if cond == 10 { ok = x >= y }
+        if cond == 11 { ok = x < y }
+        if cond == 12 { ok = x > y }
+        if cond == 13 { ok = x <= y }
+        if cond == 2 { ok = (x < 0 && y >= 0) || ((x < 0) == (y < 0) && x >= y) }
+        id := str(expected.len)
+        expected.push(ok)
+        a.l_mov_imm(4, x)
+        a.l_mov_imm(5, y)
+        probe_loong_jump(a, cond, "forward_" + id)
+        if ok { a.l_b("fail") }
+        a.label("continue_forward_" + id)
+    } } }
+    a.l_b("backward_tests")
+    for i in 0:expected.len {
+        a.label("backward_" + str(i))
+        if expected[i] { a.l_b("continue_backward_" + str(i)) } else { a.l_b("fail") }
+    }
+    for i in 0:40000 { a.l_addi_d(0, 0, 0) }
+    for i in 0:expected.len {
+        a.label("forward_" + str(i))
+        if expected[i] { a.l_b("continue_forward_" + str(i)) } else { a.l_b("fail") }
+    }
+    a.label("backward_tests")
+    for i in 0:vals.len { for j in 0:vals.len { for ci in 0:conds.len {
+        index := (i * vals.len + j) * conds.len + ci
+        a.l_mov_imm(4, vals[i])
+        a.l_mov_imm(5, vals[j])
+        probe_loong_jump(a, conds[ci], "backward_" + str(index))
+        if expected[index] { a.l_b("fail") }
+        a.label("continue_backward_" + str(index))
+    } } }
+    a.l_mov_imm(4, 0)
+    a.l_mov_imm(11, 93)
+    a.l_syscall()
+    a.label("fail")
+    a.l_mov_imm(4, 1)
+    a.l_mov_imm(11, 93)
+    a.l_syscall()
+    a.l_fixup_all()
+}
 fn main() int {
     args := os.argv()
     mode := args[1]
     mut a := Assembler{}
     a.os = 1
     a.arch = 3
+    if mode == "loong_long" { a.arch = 4
+        a.cmp_a = 4
+        a.cmp_b = 5
+        probe_loong_branches(mut &a) }
     if mode == "cmp64" { a.arch = 5 }
     if mode == "cmp32" || mode == "cmp64" { probe_cmp(mut &a, mode == "cmp64") }
     if mode == "mem32" { probe_mem(mut &a) }
@@ -239,11 +306,11 @@ def run(cmd, *, env, expected=0, contains=None, timeout=240):
     return result
 
 
-def elf(code, wide):
+def elf(code, wide, machine=243):
     base = 0x10000
     if wide:
         size = 64 + 56
-        hdr = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01'+bytes(9), 2, 243, 1, base+size, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+        hdr = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01'+bytes(9), 2, machine, 1, base+size, 64, 0, 0, 64, 56, 1, 0, 0, 0)
         ph = struct.pack('<IIQQQQQQ', 1, 7, 0, base, base, size+len(code), size+len(code), 4096)
     else:
         size = 52 + 32
@@ -289,6 +356,21 @@ def main():
             fixture('long_reborrow', chain, 'mutably borrowed')
             fixture('late_reborrow', 'fn main() { mut xs := [1]\n r := &xs[0]\n xs.push(2)\n q := &*r\n println(*q)\n}', 'element is borrowed')
             fixture('shared_and_last_use', 'struct Item { value int }\nfn shared(p &Item) int { r := &p.value\n << p.value + *r\n}\nfn main() { mut x := 1\n r := &x\n println(*r)\n x = 2\n a := Item{value: 3}\n println(shared(&a))\n}', output='1\n6\n')
+            reader = 'struct Item { value int }\nfn (p &Item) read() int { << p.value }\nfn (p &mut Item) write() { p.value = 9 }\n'
+            fixture('shared_receiver_reborrow', reader + 'fn check(p &mut Item) { r := &p.value\n println(p.read() + *r)\n p.write()\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n println(x.value)\n}', output='6\n9\n')
+            fixture('shared_receiver_held', reader + 'struct Holder { r &int }\nfn check(p &mut Item) { h := Holder{r: &p.value}\n println(p.read() + *h.r)\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n}', output='6\n')
+            fixture('shared_local_receiver', reader + 'fn main() { mut x := Item{value: 3}\n p := mut &x\n r := &p.value\n println(p.read() + *r)\n}', output='6\n')
+            fixture('exclusive_local_receiver', reader + 'fn main() { mut x := Item{value: 3}\n p := mut &x\n r := mut &p.value\n println(p.read())\n println(*r)\n}', 'mutably borrowed')
+            fixture('exclusive_receiver_reborrow', reader + 'fn check(p &mut Item) { r := mut &p.value\n println(p.read())\n println(*r)\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n}', 'mutably borrowed')
+            fixture('exclusive_receiver_held', reader + 'struct Holder { r &mut int }\nfn check(p &mut Item) { h := Holder{r: mut &p.value}\n println(p.read())\n println(*h.r)\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n}', 'mutably borrowed')
+            fixture('shared_receiver_mutation', reader + 'fn check(p &mut Item) { r := &p.value\n p.write()\n println(*r)\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n}', 'mutably borrowed')
+            fixture('shared_place_read', 'struct Data { values []int, name string }\nfn check(p &mut Data) { r := &p.values[0]\n println(p.name + "!")\n println(p.values[0] + *r)\n}\nfn main() { mut x := Data{values: [3], name: "chart"}\n check(mut &x)\n}', output='chart!\n6\n')
+            fixture('shared_place_write', reader + 'fn check(p &mut Item) { r := &p.value\n p.value = 9\n println(*r)\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n}', 'mutably borrowed')
+            fixture('shared_index_write', 'fn check(p &mut []int) { r := &p[0]\n p[0] = 9\n println(*r)\n}\nfn main() { mut xs := [3]\n check(mut &xs)\n}', 'mutably borrowed')
+            fixture('shared_field_push', 'struct Data { values []int }\nfn check(p &mut Data) { r := &p.values[0]\n p.values.push(9)\n println(*r)\n}\nfn main() { mut x := Data{values: [3]}\n check(mut &x)\n}', 'element is borrowed')
+            fixture('shared_place_move', 'struct Item { name string }\nfn check(p &mut Item) { r := &p.name\n s := p.name\n println(*r)\n println(s)\n}\nfn main() { mut x := Item{name: "chart"}\n check(mut &x)\n}', 'mutably borrowed')
+            fixture('exclusive_place_read', reader + 'fn check(p &mut Item) { r := mut &p.value\n println(p.value)\n println(*r)\n}\nfn main() { mut x := Item{value: 3}\n check(mut &x)\n}', 'mutably borrowed')
+            fixture('receiver_index_loan', reader + 'fn check(p &mut []Item, i &mut int) { r := mut &*i\n println(p[*i].read())\n println(*r)\n}\nfn main() { mut xs := [Item{value: 3}]\n mut i := 0\n check(mut &xs, mut &i)\n}', 'mutably borrowed')
             fixture('mutable_field', 'struct Inner { x int }\nstruct Outer { inner Inner, y int }\nfn (p &mut Inner) set(v int) { p.x = v }\nfn change(p &mut Outer) { r := mut &p.inner\n r.set(2)\n p.y = 3\n}\nfn main() { mut v := Outer{inner: Inner{x: 1}, y: 0}\n change(mut &v)\n println(v.y)\n}', output='3\n')
         if opts.front_only:
             return
@@ -315,6 +397,13 @@ def main():
         print('PASS invalid_storeindex', flush=True)
         run([executable, 'i12'], env=env, expected=1, contains='12-bit range')
         print('PASS raw_i12_reject', flush=True)
+        result = run([executable, 'loong_long'], env=env)
+        code = bytes(int(s) for s in result.stdout.splitlines())
+        image = tmp / 'loong_long'
+        image.write_bytes(elf(code, True, machine=258))
+        image.chmod(0o755)
+        run(['qemu-loongarch64', image], env=env)
+        print('PASS loong_long_branches', flush=True)
         for mode, wide in [('cmp32', False), ('cmp64', True), ('mem32', False)]:
             result = run([executable, mode], env=env)
             code = bytes(int(s) for s in result.stdout.splitlines())

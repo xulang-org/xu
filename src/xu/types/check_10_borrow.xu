@@ -513,15 +513,15 @@ fn (c &Checker) reborrow_reaches(from int, src int) bool {
     << cur >= 0
 }
 
-fn (c &Checker) borrow_frozen(src int, stmt_id int) bool {
+fn (c &Checker) borrow_frozen(src int, stmt_id int, exclusive_only bool) bool {
     if src < 0 { << false }
     // Shared references remain usable while shared descendants are live.
     if !is_mut_ref_type(c.ltype[src]) { << false }
     for r in 0:c.breb.len {
-        if c.borrow_live(r, stmt_id) && c.reborrow_reaches(r, src) { << true }
+        if c.borrow_live(r, stmt_id) && (!exclusive_only || c.bexcl[r] != 0) && c.reborrow_reaches(r, src) { << true }
     }
     for i in 0:c.bf_holder.len {
-        if c.borrow_field_live(i, stmt_id) && c.bf_reb[i] >= 0 {
+        if c.borrow_field_live(i, stmt_id) && (!exclusive_only || c.bf_excl[i] != 0) && c.bf_reb[i] >= 0 {
             parent := c.bf_reb[i]
             if parent == src || c.reborrow_reaches(parent, src) { << true }
         }
@@ -530,19 +530,19 @@ fn (c &Checker) borrow_frozen(src int, stmt_id int) bool {
 }
 
 fn (c &mut Checker) borrow_read_event(p &parser.Parser, owner int, n int, stmt_id int) {
-    if owner >= 0 && (c.borrow_has_exclusive(owner, stmt_id) || c.borrow_frozen(owner, stmt_id)) {
+    if owner >= 0 && (c.borrow_has_exclusive(owner, stmt_id) || c.borrow_frozen(owner, stmt_id, false)) {
         c.fail_node(p, n, "cannot use '" + c.lname[owner] + "' while it is mutably borrowed")
     }
 }
 
 fn (c &mut Checker) borrow_write_event(p &parser.Parser, owner int, n int, stmt_id int) {
-    if owner >= 0 && (c.borrow_has_any(owner, stmt_id) || c.borrow_frozen(owner, stmt_id)) {
+    if owner >= 0 && (c.borrow_has_any(owner, stmt_id) || c.borrow_frozen(owner, stmt_id, false)) {
         c.fail_node(p, n, "cannot assign to '" + c.lname[owner] + "' because it is borrowed")
     }
 }
 
 fn (c &mut Checker) borrow_move_event(p &parser.Parser, owner int, n int, stmt_id int) {
-    if owner >= 0 && (c.borrow_has_any(owner, stmt_id) || c.borrow_frozen(owner, stmt_id)) {
+    if owner >= 0 && (c.borrow_has_any(owner, stmt_id) || c.borrow_frozen(owner, stmt_id, false)) {
         c.fail_node(p, n, "cannot move '" + c.lname[owner] + "' because it is borrowed")
     }
 }
@@ -679,6 +679,13 @@ fn (c &mut Checker) borrow_register_field(p &parser.Parser, holder int, field in
 
 fn (c &mut Checker) borrow_walk_move(p &parser.Parser, n int, stmt_id int) {
     if n < 0 { << }
+    // Moving a field is not a shared place read.
+    if c.type_owning(c.ntype[n]) {
+        root := c.borrow_root_local(p, n)
+        if root >= 0 && is_ref_type(c.ltype[root]) {
+            c.borrow_read_event(p, root, n, stmt_id)
+        }
+    }
     if p.nodes[n].kind == ast.NK_IDENT && c.type_owning(c.ntype[n]) {
         c.borrow_move_event(p, c.nlocal[n], n, stmt_id)
         <<
@@ -688,6 +695,16 @@ fn (c &mut Checker) borrow_walk_move(p &parser.Parser, n int, stmt_id int) {
 
 fn (c &mut Checker) borrow_walk_receiver(p &parser.Parser, n int, write bool, stmt_id int) {
     root := c.borrow_root_local(p, n)
+    // An &T receiver reborrows the parent for reading; shared descendants
+    // permit that even when the parent is &mut T. Keep moves and mutations
+    // on the full frozen check, and still reject exclusive descendants.
+    if root >= 0 && is_ref_type(c.ltype[root]) && !write {
+        if c.borrow_has_exclusive(root, stmt_id) || c.borrow_frozen(root, stmt_id, true) {
+            c.fail_node(p, n, "cannot use '" + c.lname[root] + "' while it is mutably borrowed")
+        }
+        c.borrow_walk_place_index(p, n, stmt_id)
+        <<
+    }
     if root >= 0 && !is_ref_type(c.ltype[root]) {
         if write {
             c.borrow_write_event(p, root, n, stmt_id)
@@ -695,6 +712,9 @@ fn (c &mut Checker) borrow_walk_receiver(p &parser.Parser, n int, write bool, st
             c.borrow_read_event(p, root, n, stmt_id)
         }
         <<
+    }
+    if root >= 0 && write {
+        c.borrow_read_event(p, root, n, stmt_id)
     }
     c.borrow_walk_expr(p, n, stmt_id)
 }
@@ -715,7 +735,7 @@ fn (c &mut Checker) borrow_walk_expr(p &parser.Parser, n int, stmt_id int) {
         target := p.nodes[n].a
         if p.nodes[target].kind == ast.NK_UN_OP && p.nodes[target].ival == 3 {
             src := c.borrow_root_local(p, p.nodes[target].a)
-            if src >= 0 && c.borrow_frozen(src, stmt_id) {
+            if src >= 0 && c.borrow_frozen(src, stmt_id, false) {
                 c.fail_node(p, n, "cannot reborrow a frozen reference")
             }
             <<
@@ -751,8 +771,20 @@ fn (c &mut Checker) borrow_walk_expr(p &parser.Parser, n int, stmt_id int) {
         }
         <<
     }
-    if k == ast.NK_FIELD {
+    if k == ast.NK_FIELD || k == ast.NK_INDEX {
+        root := c.borrow_root_local(p, n)
+        // Reading data through a place can share the parent with shared
+        // descendants. Reference-bearing values still use the strict path:
+        // copying one could grant the caller mutable access to the referent.
+        if root >= 0 && is_ref_type(c.ltype[root]) && !c.type_contains_ref(c.ntype[n]) {
+            c.borrow_walk_receiver(p, n, false, stmt_id)
+            <<
+        }
+        if root >= 0 && c.type_contains_ref(c.ntype[n]) {
+            c.borrow_read_event(p, root, n, stmt_id)
+        }
         c.borrow_walk_expr(p, p.nodes[n].a, stmt_id)
+        if k == ast.NK_INDEX { c.borrow_walk_expr(p, p.nodes[n].b, stmt_id) }
         <<
     }
     if k == ast.NK_METHOD_CALL {
@@ -771,12 +803,18 @@ fn (c &mut Checker) borrow_walk_expr(p &parser.Parser, n int, stmt_id int) {
             if root >= 0 && !is_ref_type(c.ltype[root]) {
                 c.borrow_new_event(p, root, true, false, n, stmt_id)
             } else {
-                c.borrow_walk_expr(p, p.nodes[n].a, stmt_id)
+                c.borrow_walk_receiver(p, p.nodes[n].a, true, stmt_id)
             }
         } else if fi == -14 || fi == -96 {
             c.borrow_walk_move(p, p.nodes[n].a, stmt_id)
         } else if fi >= 0 {
+            if !is_ref_type(c.fns[fi].recv) {
+                root := c.borrow_root_local(p, p.nodes[n].a)
+                c.borrow_read_event(p, root, p.nodes[n].a, stmt_id)
+            }
             c.borrow_walk_receiver(p, p.nodes[n].a, c.fns[fi].recv_mut, stmt_id)
+        } else if fi == -86 || fi == -88 {
+            c.borrow_walk_receiver(p, p.nodes[n].a, true, stmt_id)
         } else {
             c.borrow_walk_expr(p, p.nodes[n].a, stmt_id)
         }
@@ -916,6 +954,7 @@ fn (c &mut Checker) borrow_check_stmt_inner(p &parser.Parser, n int) {
         if root >= 0 && !is_ref_type(c.ltype[root]) {
             c.borrow_write_event(p, root, p.nodes[n].b, stmt_id)
         } else {
+            if root >= 0 { c.borrow_read_event(p, root, target, stmt_id) }
             c.borrow_walk_expr(p, target, stmt_id)
         }
         if p.nodes[target].kind == ast.NK_INDEX {
