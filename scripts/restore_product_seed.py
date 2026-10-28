@@ -58,7 +58,7 @@ def download_accepted_sdk(run_id: str, target: str, archives: Path) -> None:
         raise ValueError('SDK seed run must be a positive Actions run ID')
     def api(path):
         return json.loads(subprocess.check_output(
-            ['gh', 'api', 'repos/xulang-org/xu/' + path], text=True))
+            ['gh', 'api', 'repos/xulang-org/xu/' + path], text=True, encoding='utf-8'))
     run = api('actions/runs/' + run_id)
     workflow = api('actions/workflows/sdk.yml')
     if run['workflow_id'] != workflow['id'] or run['status'] != 'completed':
@@ -146,7 +146,7 @@ def main() -> int:
             if args.destination:
                 restore(args.target, archives, args.destination, replace_existing=args.replace_existing)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        print('Product seed BLOCKED: no valid published SDK seed. Publish the initial verified SDK '
+        print('Product seed BLOCKED: no verified hosted SDK seed. Publish the initial verified SDK '
               'or configure a successful artifact run; oracle binaries are not product seeds.', file=sys.stderr)
         print(str(error), file=sys.stderr)
         return 1
