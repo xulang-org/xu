@@ -151,7 +151,7 @@ func xuUiTakeSlot(_ name: String) -> String? {
 
 /// Launch-time read: mem first, then disk if real TMP (aligned with Windows host).
 func xuUiLaunchRead(_ tmp: String, _ name: String) -> String {
-  if let mem = xuUiReadSlot(name) {
+  if let mem = xuUiReadSlot(name,cap: name == "xu_ui_page.html" ? 1048577 : 65536) {
     return mem.trimmingCharacters(in: .whitespacesAndNewlines)
   }
   if xuUiMemOnlyTmp(tmp) { return "" }
@@ -183,6 +183,97 @@ func xuImageFromPathOrPack(_ raw: String) -> NSImage? {
 // Content backends plug in via XuContentRegistry (e.g. #ui/webview → macos_webview.swift).
 // Built into XuUIHost.app so Bundle.main / notifications work.
 
+@_silgen_name("xu_ui_native_view_info")
+func xuNativeViewInfo(_ id: UInt32,_ generation: UInt32,_ meta: UnsafeMutablePointer<UInt32>?,_ geometry: UnsafeMutablePointer<Double>?) -> Int32
+@_silgen_name("xu_ui_native_view_revision")
+func xuNativeViewRevision(_ id: UInt32,_ generation: UInt32) -> UInt64
+@_silgen_name("xu_ui_native_view_ready")
+func xuNativeViewReady(_ id: UInt32,_ generation: UInt32) -> Int32
+@_silgen_name("xu_ui_native_view_close")
+func xuNativeViewClose(_ id: UInt32,_ generation: UInt32)
+@_silgen_name("xu_ui_native_view_event")
+func xuNativeViewEvent(_ id: UInt32,_ generation: UInt32,_ payload: UnsafePointer<CChar>?)
+
+// The outer view clips; its full-size content keeps the document viewport stable.
+final class XuNativeClipView: NSView {
+  var inputEnabled = true
+  override func hitTest(_ point: NSPoint) -> NSView? { inputEnabled ? super.hitTest(point) : nil }
+}
+final class XuNativeChild {
+  let host: AppDelegate
+  let clip: XuNativeClipView
+  let root: FillView
+  weak var parent: AppDelegate?
+  var focusEpoch: UInt32 = 0
+  var hasFocus = false
+  var appliedGeometry: [Double] = []
+  var appliedFlags: UInt32 = UInt32.max
+  var monitor: Any?
+  init(parent: AppDelegate,id: UInt32,generation: UInt32) {
+    self.parent = parent
+    clip = XuNativeClipView(frame: .zero)
+    root = FillView(frame: .zero)
+    host = AppDelegate(window: parent.window,tmp: parent.tmp,port: parent.port,windowID: parent.windowID,canvasID: id,generation: generation,embedded: true)
+    host.rootView = root; root.host = host
+    clip.wantsLayer = true; clip.layer?.masksToBounds = true
+    root.wantsLayer = true; root.layer?.masksToBounds = true
+    clip.addSubview(root); clip.isHidden = true
+    parent.rootView?.addSubview(clip)
+    monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+      guard let self,self.ownsFocus(),event.keyCode == 48,event.modifierFlags.contains(.control) else { return event }
+      self.returnFocus()
+      self.host.appendShellFile(event.modifierFlags.contains(.shift) ? "focus_previous" : "focus_next")
+      return nil
+    }
+  }
+  func ownsFocus() -> Bool {
+    guard let responder = host.window.firstResponder as? NSView else { return false }
+    return responder === root || responder.isDescendant(of: root)
+  }
+  func returnFocus() {
+    if let canvas = parent?.rootView?.subviews.first(where: { !($0 is XuNativeClipView) && $0.acceptsFirstResponder }) {
+      host.window.makeFirstResponder(canvas)
+    }
+  }
+  func update() {
+    var meta = [UInt32](repeating: 0,count: 8),g = [Double](repeating: 0,count: 9)
+    guard xuNativeViewInfo(host.canvasID,host.canvasGeneration,&meta,&g) != 0,let parentRoot = parent?.rootView else { return }
+    let geometry = g + [parentRoot.bounds.width,parentRoot.bounds.height]
+    let changed = geometry != appliedGeometry || (meta[6] & 3) != appliedFlags
+    if changed { appliedGeometry = geometry; appliedFlags = meta[6] & 3
+    let full = NSRect(x: g[0],y: parentRoot.bounds.height-g[1]-g[3],width: g[2],height: g[3])
+    let requestedClip = NSRect(x: g[4],y: parentRoot.bounds.height-g[5]-g[7],width: g[6],height: g[7])
+    let visible = full.intersection(requestedClip).intersection(parentRoot.bounds)
+    clip.isHidden = meta[6] & 1 == 0 || visible.isEmpty
+    clip.inputEnabled = meta[6] & 2 != 0
+    if !visible.isEmpty {
+      clip.frame = visible
+      root.frame = full.offsetBy(dx: -visible.minX,dy: -visible.minY)
+      root.layer?.cornerRadius = g[8]
+    }
+    }
+    if (clip.isHidden || !clip.inputEnabled) && ownsFocus() { returnFocus() }
+    if focusEpoch != meta[7] && (meta[6] & 4 == 0 || (!clip.isHidden && clip.inputEnabled)) {
+      focusEpoch = meta[7]
+      if meta[6] & 4 != 0 && !clip.isHidden && clip.inputEnabled {
+        if !ownsFocus(),let web = root.subviews.first(where: { $0.acceptsFirstResponder }) { host.window.makeFirstResponder(web) }
+      } else if ownsFocus() { returnFocus() }
+    }
+    if changed { host.content?.syncFrame() }
+  }
+  func poll() {
+    update(); host.content?.onPoll()
+    let focused = ownsFocus()
+    if hasFocus != focused { hasFocus = focused; host.appendShellFile(focused ? "focused" : "blurred") }
+  }
+  func close() {
+    if ownsFocus() { returnFocus() }
+    if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+    host.cancelFilePanels(); host.content?.shutdown(); host.content = nil; host.notifiedClose = true
+    clip.removeFromSuperview()
+  }
+}
+
 /// Top strip for dragging frameless windows (WKWebView eats background-drag).
 final class DragRegionView: NSView {
   override func mouseDown(with event: NSEvent) {
@@ -205,7 +296,7 @@ final class FillView: NSView {
   override func layout() {
     super.layout()
     let b = bounds
-    for v in subviews {
+    for v in subviews where !(v is XuNativeClipView) {
       if v.frame != b {
         v.frame = b
       }
@@ -216,7 +307,7 @@ final class FillView: NSView {
   override func resizeSubviews(withOldSize oldSize: NSSize) {
     super.resizeSubviews(withOldSize: oldSize)
     let b = bounds
-    for v in subviews {
+    for v in subviews where !(v is XuNativeClipView) {
       v.frame = b
     }
     applyLayerMask()
@@ -407,11 +498,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   /// Weak shared for mailbox → UI-thread kick (shell cmd latency).
   static weak var sharedKick: AppDelegate?
   static var windows: [UInt32: AppDelegate] = [:]
+  static var nativeChildren: [UInt32: XuNativeChild] = [:]
 
   let window: NSWindow
   let windowID: UInt32
   let canvasID: UInt32
   let canvasGeneration: UInt32
+  let embedded: Bool
   let tmp: String
   let port: String
   weak var rootView: NSView?
@@ -440,17 +533,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   var dragBar: DragRegionView?
   var dockTileView: DockIconBadgeView?
 
-  init(window: NSWindow, tmp: String, port: String, windowID: UInt32 = 1, canvasID: UInt32 = 1) {
+  init(window: NSWindow, tmp: String, port: String, windowID: UInt32 = 1, canvasID: UInt32 = 1,generation: UInt32 = 0,embedded: Bool = false) {
     self.window = window
     self.windowID = windowID
     self.canvasID = canvasID
     var meta = [UInt32](repeating: 0,count: 6)
     _ = xuWindowInfo(windowID,0,&meta,nil,0)
-    self.canvasGeneration = meta[1]
+    self.canvasGeneration = generation == 0 ? meta[1] : generation
+    self.embedded = embedded
     self.tmp = tmp
     self.port = port
     super.init()
-    if windowID == 1 {
+    if windowID == 1 && !embedded {
       // A queued create can be kicked before applicationDidFinishLaunching.
       loadRegisteredContentBootstraps()
       AppDelegate.sharedKick = self
@@ -515,6 +609,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         host.drainSize()
         host.drainCloseGuardFlag()
       }
+      for (id,child) in Array(Self.nativeChildren) {
+        if xuNativeViewInfo(id,child.host.canvasGeneration,nil,nil) == 0 { child.close(); Self.nativeChildren.removeValue(forKey: id) }
+        else { child.poll() }
+      }
       self?.drainCmds()
     }
     if let pollTimer {
@@ -539,6 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     xu_ui_emit_close()
     xuWindowsShutdown()
     for host in Array(Self.windows.values) { host.cancelFilePanels(); host.content?.shutdown(); xuWindowClosed(host.windowID,host.canvasGeneration) }
+    for child in Self.nativeChildren.values { child.close() }; Self.nativeChildren.removeAll()
     Self.windows.removeAll()
     notifyShell(payload: "exit")
   }
@@ -555,6 +654,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
   func performQuitFromClose() {
     if notifiedClose { return }
+    for (id,child) in Array(Self.nativeChildren) where child.host.windowID == windowID { child.close(); Self.nativeChildren.removeValue(forKey: id) }
     cancelFilePanels()
     content?.shutdown(); content = nil
     resizeWork?.cancel(); moveWork?.cancel(); bounceClearWork?.cancel()
@@ -725,6 +825,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func appendShellFile(_ payload: String) {
+    if embedded {
+      if !notifiedClose { payload.withCString { xuNativeViewEvent(canvasID,canvasGeneration,$0) } }
+      return
+    }
     if (notifiedClose || notifiedExit) && payload != "closed" && payload != "exit" { return }
     let record = canvasGeneration != 0 && payload != "ready" && payload != "exit" &&
       !payload.hasPrefix("input") && !payload.hasPrefix("canvas_") && !payload.hasPrefix("request\t") && !payload.hasPrefix("text_edit\t")
@@ -1093,15 +1197,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func slotName(_ name: String) -> String {
-    windowID == 1 ? name : "window/\(windowID)/\(canvasGeneration)/\(name)"
+    embedded ? "view/\(canvasID)/\(canvasGeneration)/\(name)" : (windowID == 1 ? name : "window/\(windowID)/\(canvasGeneration)/\(name)")
   }
 
   func readTrimmed(_ rawName: String) -> String {
     let name = slotName(rawName)
-    if let mem = xuUiReadSlot(name) {
+    if let mem = xuUiReadSlot(name,cap: rawName == "xu_ui_page.html" ? 1048577 : 65536) {
       return mem.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    if windowID > 1 && ["xu_ui_scheme.txt","xu_ui_www_root.txt","xu_ui_bridge.js"].contains(rawName),let shared = xuUiReadSlot(rawName) { return shared }
+    if (windowID > 1 || embedded) && (!embedded || rawName != "xu_ui_scheme.txt") && ["xu_ui_scheme.txt","xu_ui_www_root.txt","xu_ui_bridge.js"].contains(rawName),let shared = xuUiReadSlot(rawName) { return shared }
     if xuUiMemOnlyTmp(tmp) { return "" }
     let path = (tmp as NSString).appendingPathComponent(name)
     let raw = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
@@ -1119,8 +1223,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
   func readSlotRaw(_ rawName: String) -> String {
     let name = slotName(rawName)
-    if let mem = xuUiReadSlot(name) { return mem }
-    if windowID > 1 && ["xu_ui_scheme.txt","xu_ui_www_root.txt","xu_ui_bridge.js"].contains(rawName),let shared = xuUiReadSlot(rawName) { return shared }
+    if let mem = xuUiReadSlot(name,cap: rawName == "xu_ui_page.html" ? 1048577 : 65536) { return mem }
+    if (windowID > 1 || embedded) && (!embedded || rawName != "xu_ui_scheme.txt") && ["xu_ui_scheme.txt","xu_ui_www_root.txt","xu_ui_bridge.js"].contains(rawName),let shared = xuUiReadSlot(rawName) { return shared }
     if xuUiMemOnlyTmp(tmp) { return "" }
     let path = (tmp as NSString).appendingPathComponent(name)
     return (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
@@ -1368,8 +1472,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   func installContent() {
     guard content == nil,let root = rootView,!notifiedClose else { return }
     var meta = [UInt32](repeating: 0,count: 6)
-    let registered = xuWindowInfo(windowID,canvasGeneration,&meta,nil,0) != 0
-    let kind = registered ? meta[4] : (UInt32(readTrimmed("xu_ui_content_kind.txt")) ?? 0)
+    let registered = !embedded && xuWindowInfo(windowID,canvasGeneration,&meta,nil,0) != 0
+    let kind: UInt32 = embedded ? 1 : (registered ? meta[4] : (UInt32(readTrimmed("xu_ui_content_kind.txt")) ?? 0))
     let make = XuContentRegistry.factories[kind]
     guard let make else { return }
     let plugin = make(self)
@@ -1399,6 +1503,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
   }
 
   func dispatchCommand(_ line: String) {
+    if line.hasPrefix("__view_") {
+      let f = line.split(separator: "\t")
+      guard f.count == 5,let parent = UInt32(f[1]),let parentGeneration = UInt32(f[2]),let id = UInt32(f[3]),let generation = UInt32(f[4]) else { return }
+      if f[0] == "__view_close" {
+        if let child = Self.nativeChildren[id],child.host.canvasGeneration == generation { child.close(); Self.nativeChildren.removeValue(forKey: id) }
+        return
+      }
+      guard let owner = Self.windows[parent],owner.canvasGeneration == parentGeneration,!owner.notifiedClose,xuNativeViewInfo(id,generation,nil,nil) != 0 else { return }
+      if f[0] == "__view_create",Self.nativeChildren[id] == nil {
+        owner.loadRegisteredContentBootstraps()
+        guard XuContentRegistry.factories[1] != nil else {
+          "load_failed\tWebView backend is not linked".withCString { xuNativeViewEvent(id,generation,$0) }; xuNativeViewClose(id,generation); return
+        }
+        let child = XuNativeChild(parent: owner,id: id,generation: generation)
+        Self.nativeChildren[id] = child
+        child.host.installContent(); child.update(); _ = xuNativeViewReady(id,generation)
+      } else { Self.nativeChildren[id]?.update() }
+      return
+    }
     if line.hasPrefix("__window_open\t") || line.hasPrefix("__window_bind\t") {
       let fields = line.split(separator: "\t")
       guard fields.count == 3,let id = UInt32(fields[1]),let generation = UInt32(fields[2]) else { return }
@@ -1413,7 +1536,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     var raw = line
     var target: AppDelegate? = self
-    if line.hasPrefix("window\t") {
+    if line.hasPrefix("view\t") {
+      let f = line.split(separator: "\t",maxSplits: 4,omittingEmptySubsequences: false)
+      guard f.count == 5,let parent = UInt32(f[1]),let id = UInt32(f[2]),let generation = UInt32(f[3]),
+        let child = Self.nativeChildren[id],child.host.windowID == parent,child.host.canvasGeneration == generation,
+        xuNativeViewInfo(id,generation,nil,nil) != 0 else { return }
+      target = child.host; raw = String(f[4])
+    } else if line.hasPrefix("window\t") {
       let fields = line.split(separator: "\t",maxSplits: 3,omittingEmptySubsequences: false)
       guard fields.count == 4,let id = UInt32(fields[1]),let generation = UInt32(fields[2]),
         let host = Self.windows[id],host.canvasGeneration == generation else { return }
@@ -1421,7 +1550,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     } else {
       var identity = [UInt32](repeating: 0,count: 2)
       if line.withCString({ xuCommandOwner($0,&identity) }) != 0 {
-        target = Self.windows[identity[0]] ?? (identity[0] == windowID ? self : nil)
+        target = Self.nativeChildren.values.first(where: { $0.host.windowID == identity[0] && $0.host.canvasGeneration == identity[1] })?.host ?? Self.windows[identity[0]] ?? (identity[0] == windowID ? self : nil)
         if let host = target,identity[1] != 0 && host.canvasGeneration != 0 && host.canvasGeneration != identity[1] { target = nil }
       }
     }
