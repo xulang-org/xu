@@ -19,6 +19,13 @@ LOCAL_FILES = {
     "bootstrap/SYNC_DIFF.md", "CLAUDE.md", "AGENTS.md", "REPOSITORIES.md",
     ".impeccable.md", "server.example.md", "server.md", "pytest.ini",
 }
+# Exact public GitHub Pages files. Every other docs/ path stays local-only.
+PAGES_FILES = {
+    "docs/.nojekyll",
+    "docs/index.html",
+    "docs/assets/favicon.svg",
+    "docs/assets/xu_classic.svg",
+}
 CACHE_DIRS = {"target", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 OUTPUT_SUFFIXES = {
     ".log", ".tmp", ".temp", ".partial", ".stdout", ".stderr", ".bak", ".orig",
@@ -41,11 +48,15 @@ def git(root: Path, *args: str, input: bytes | None = None) -> bytes:
 
 
 def local_only_path(name: str) -> bool:
+    if name in PAGES_FILES:
+        return False
     return (name.split("/", 1)[0] in {"docs", "tests"} or name in LOCAL_FILES
             or name == "xu-site/xu-api-extract.md" or name.lower() == "readme.txt")
 
 
 def local_reason(name: str) -> str | None:
+    if name in PAGES_FILES:
+        return None
     path = PurePosixPath(name)
     if path.parts[0] in LOCAL_ROOTS or name in LOCAL_FILES or name == "xu-site/xu-api-extract.md":
         return "本机文档或研发材料"

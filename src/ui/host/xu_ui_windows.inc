@@ -21,7 +21,7 @@ int xu_ui_window_reserve(unsigned *identity) {
   identity[0]=identity[1]=0;
   lock_w();XuUiWindowSlot *slot=NULL;
   for(auto &w:g_windows)if(!w.id){slot=&w;break;}
-  if(!slot || g_windows_stopped || g_window_id==0x7fffffffu){unlock_w();return 0;}
+  if(!slot || g_windows_stopped || g_window_id==XU_UI_NATIVE_VIEW_ID_BASE-1){unlock_w();return 0;}
   unsigned id=++g_window_id;*slot={};slot->id=id;slot->state=1;unlock_w();
   unsigned generation=xu_ui_canvas_open(id,id);
   lock_w();
@@ -76,7 +76,7 @@ void xu_ui_window_closed(unsigned id,unsigned generation) {
   // Scoped slots cannot survive a window or exhaust the mailbox after repeated opens.
   char prefix[48];snprintf(prefix,sizeof(prefix),"window/%u/%u/",id,generation);size_t length=strlen(prefix);
   if(release)for(auto &s:g_slots)if(s.used && !strncmp(s.name,prefix,length)){free(s.body);memset(&s,0,sizeof(s));}
-  unlock_w();if(release){xu_ui_web_invoke_close(id,generation);xu_ui_canvas_close(id,generation);}
+  unlock_w();if(release){native_views_close_parent(id,generation);xu_ui_web_invoke_close(id,generation);xu_ui_canvas_close(id,generation);}
 }
 void xu_ui_windows_shutdown(void) {
   unsigned identities[XU_UI_WINDOW_MAX_COUNT][2]={};
