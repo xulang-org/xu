@@ -10,10 +10,19 @@ import tempfile
 import time
 
 from xacp_cross_protocol_probe import probe, wait_listener
+from companion_repos import project_root
 from xacp_frame import encode, fd_reader, read_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "screen-smoke-token"
+
+
+def example_path(relative):
+    companion = project_root("examples") / "examples/xacp" / relative
+    if os.environ.get("XU_EXAMPLES_ROOT"):
+        return companion
+    local = ROOT / "examples/xacp" / relative
+    return local if local.is_file() else companion
 
 
 def frame(i, op, args="{}"):
@@ -268,7 +277,7 @@ def run_screen_smoke(xu, tool):
     with tempfile.TemporaryDirectory(prefix="xu-xacp-screen-") as tmp:
         app = Path(tmp) / "attach"
         result = subprocess.run([str(ROOT / "scripts/run_product_compiler.sh"), str(xu),
-                                 "build", "--xacp", "examples/xacp/attach/main.xu", "-o", str(app)],
+                                 "build", "--xacp", str(example_path("attach/main.xu")), "-o", str(app)],
                                 cwd=ROOT, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, (result.stdout, result.stderr)
         stdio_checks(app, tool)

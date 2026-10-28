@@ -31,7 +31,7 @@
 
 ---
 
-> **最新正式版本**：[Xu v0.10.7](https://github.com/xulang-org/xu/releases/tag/v0.10.7) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
+> **正式 SDK 下载**：[GitHub Releases](https://github.com/xulang-org/xu/releases) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 
@@ -66,6 +66,13 @@ fn main() int {
 > 2. **轻量错误捕获**：调用处通过 `or (err) { ... }` 强制就地处理或传播，杜绝到处充斥的 `if err != nil` 样板代码与 `unwrap()` 崩溃风险。
 > 3. **原生极简并发**：`xu worker()` 启动协程配合 `chan` 管道通信，心智像 Go 一样平易近人。
 > 4. **编译期全静态安全**：基于所有权与借用推导，**无垃圾回收器（Zero-GC）**，没有 GC 停顿，内存极度精炼。
+
+可写引用名 `r: &mut T` 可满足 `&T` 期望：写 `read(r)` 或 `let view: &T = r`。
+共享 view 及其后代存活到最后一次使用之前，父引用的冲突写入和移动会被拒绝；存储的 view 和调用结果也保留借用约束。
+同一调用中的冲突共享与可写参数会被拒绝。隐式降级目前只支持局部引用名，且直接 pointee 类型必须相同。
+普通值仍需写 `&x`；计划中的 `$` 可变拼写和普通值自动借用尚未实现。
+
+当前借用与可变绑定规则，以及后续语法方向，见[借用指南](docs/language/borrowing.md)。
 
 ---
 
@@ -107,7 +114,7 @@ fn main() int {
 
 ### 选项 1：浏览器免安装秒玩
 
-无需在本地配置任何环境，直接访问 **[xulang.org 在线演练场](https://xulang.org)**。底层由 Xu 源码直接 AOT 编译为纯客户端 WebAssembly 沙箱，即开即用。
+无需在本地配置环境，直接访问 **[xulang.org 在线演练场](https://xulang.org/zh/playground/)**。纯客户端 WebAssembly 沙箱支持 Xu 的部分能力，包括基础类型、控制流、结构体、借用诊断和协作式信道调度。具体范围见演练场的能力说明；真实多线程、网络 I/O、原生 C FFI 和桌面 UI 需要安装原生 SDK。
 
 ### 选项 2：一行命令极速安装（推荐）
 
@@ -178,8 +185,8 @@ xu build main.xu -o myapp
 | `xu debug <file.xu> -b file.xu:行号 --run` | 带 DWARF 构建并进入 LLDB/GDB 交互会话；可用 `-e` 预置调试器命令 |
 | `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
 | `xu parse <file.xu>` | 解析源码，输出文件、函数与声明统计 |
-| `xu test <file.xu> -v` | 执行 `fn test_*` 测试并显示详细结果；可用 `-run <REGEXP>` 过滤 |
-| `xu test <file.xu> -bench <REGEXP>` | 执行匹配的 `fn bench_*` 基准函数 |
+| `xu test test.example.xu -v` | 构建 `fn test_*` 测试程序并启用详细结果；可用 `-run <REGEXP>` 过滤 |
+| `xu test test.example.xu -bench <REGEXP>` | 构建匹配 `fn bench_*` 基准函数的测试程序 |
 | `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
 | `xu build <file.xu> --target wasm32 -o app.wasm` | 生成 WebAssembly 模块 |
 | `xu build <file.xu> --xacp --xacp-port 4321 -o app` | 嵌入 XACP 启动发现元数据 |
@@ -191,7 +198,26 @@ xu build main.xu -o myapp
 | `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
 | `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
 
-使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](examples/xacp/README.md)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
+测试与基准函数必须位于 `@main` 的 `test.<name>.xu` 文件中，不得带参数、类型参数或声明返回类型。例如将以下内容保存为 `test.example.xu`：
+
+```xu
+@main
+
+fn test_addition() {
+    assert(1 + 1 == 2)
+}
+```
+
+`xu test` 当前生成测试可执行文件，需另行启动才能执行测试。在 macOS/Linux 上：
+
+```sh
+xu test test.example.xu -v -o test-example
+./test-example
+```
+
+Windows 输出带 `.exe` 后缀，运行 `./test-example.exe`。构建时使用 `-count N` 可重复执行测试套件；当前解析器接受 1–1000，CLI 帮助仍显示 1–100。
+
+使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](https://github.com/xulang-org/examples/tree/main/examples/xacp)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
 
 `#xacp` 是传输无关的标准库层，用于宿主注册一个真实的
 `ui/widgets.Screen`。adapter 提供有界的 `ui.tree`、由原生资源承载的
@@ -229,7 +255,7 @@ schema、生命周期、原生资源释放或内存上限。截图返回拥有�
 
 ## 🗺️ 项目路线图 (Roadmap)
 
-以下以 **0.10.7 正式 SDK** 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
+以下以已发布的正式 SDK 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
 
 - [x] **纯 Xu 自举与原生 AOT**：以已发布 Xu SDK 为种子，验证自举固定点；直接生成原生机器码与 WebAssembly
 - [x] **编译期所有权与借用推导**：确定性资源回收；0.9.4 补齐嵌套表达式与循环回边的借用检查

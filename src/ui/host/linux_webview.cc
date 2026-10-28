@@ -33,6 +33,7 @@ struct XuWebViewPlugin {
   bool context_menu = true;
   std::string last_url;
   std::string last_html;
+  uint64_t native_revision=UINT64_MAX;
   int last_progress = -1;
   bool load_failed = false;
 };
@@ -185,6 +186,13 @@ static void wv_destroy(XuWebViewPlugin *p) {
 }
 
 static std::string read_tmp_all(XuWebViewPlugin *p, const char *name) {
+  if(p->host.canvas_id!=p->host.window_id && !strcmp(name,"xu_ui_page.html")) {
+    char key[XU_UI_MEM_MAX_NAME+1];unsigned length=0;
+    if(!xu_content_key(&p->host,name,key,sizeof(key)))return {};
+    std::string path=":xu:/"+std::string(key);
+    if(!xu_ui_mem_try_read_len(path.c_str(),&length)||length>1048576)return {};
+    std::vector<char> bytes(length+1);xu_ui_mem_try_read_copy(path.c_str(),bytes.data(),length+1);return std::string(bytes.data(),length);
+  }
   char buf[256 * 1024];
   host_read_raw(p, name, buf, sizeof(buf));
   return std::string(buf);
@@ -383,6 +391,7 @@ static void xu_scheme_cb(WebKitURISchemeRequest *request, gpointer data) {
     }
     if (host == "app" || host.empty()) {
       std::string body;
+      if(p->host.canvas_id!=p->host.window_id && (path=="/"||path=="/index.html")){auto html=read_tmp_all(p,"xu_ui_page.html");if(!html.empty()){xu_scheme_finish(request,200,"text/html; charset=utf-8",html);return;}}
       if (load_www_file(p, path, body)) {
         xu_scheme_finish(request, 200, mime_for_path(path), body);
         return;
@@ -421,7 +430,14 @@ static void load_app_document(XuWebViewPlugin *p, const char *app_url) {
   webkit_web_view_load_uri(p->web, u.c_str());
 }
 
+static void load_native_page(XuWebViewPlugin *p) {
+  uint64_t revision=xu_ui_native_view_revision(p->host.canvas_id,p->host.canvas_generation);if(revision==p->native_revision)return;p->native_revision=revision;
+  char url[8192];host_read_trim(p,"xu_ui_page.url",url,sizeof(url));auto html=read_tmp_all(p,"xu_ui_page.html");
+  if(url[0]){p->last_url=url;p->last_html=html;webkit_web_view_load_uri(p->web,normalize_app_xu_url(url).c_str());}
+  else if(!html.empty())load_app_document(p,"xu://app/");
+}
 static void load_initial(XuWebViewPlugin *p) {
+  if(p->host.canvas_id!=p->host.window_id){load_native_page(p);return;}
   char html[65536];
   char url[4096];
   char scheme[32];
@@ -569,6 +585,7 @@ static void drain_eval(XuWebViewPlugin *p) {
 }
 
 static void drain_page(XuWebViewPlugin *p) {
+  if(p->host.canvas_id!=p->host.window_id){load_native_page(p);return;}
   char url[4096], html[65536], scheme[32];
   host_read_trim(p, "xu_ui_page.url", url, sizeof(url));
   host_read_raw(p, "xu_ui_page.html", html, sizeof(html));
@@ -760,10 +777,10 @@ static void wv_on_poll(XuWebViewPlugin *p) {
   if (!p || !p->web) return;
   xu_invoke_poll(p);
   native_queries_poll(p);
-  drain_eval(p);
+  if(p->host.canvas_id==p->host.window_id)drain_eval(p);
   drain_page(p);
   // The unscoped compatibility bus belongs to the primary window only.
-  if(p->host.window_id==1)for(unsigned i=0;i<16;++i){auto event=xu_ipc_poll(p);if(event.empty())break;
+  if(p->host.window_id==1 && p->host.canvas_id==1)for(unsigned i=0;i<16;++i){auto event=xu_ipc_poll(p);if(event.empty())break;
     auto script="window.__XU__&&window.__XU__._accept&&window.__XU__._accept("+xu_web_json(event)+");";
     eval_js_raw(p,script.c_str());
   }

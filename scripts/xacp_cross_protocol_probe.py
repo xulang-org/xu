@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 
+from companion_repos import project_root
 from xacp_frame import encode, split
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,7 +75,7 @@ def main():
             app = Path(tmp) / ("app.exe" if os.name == "nt" else "app")
             subprocess.run([str(ROOT / "scripts/run_product_compiler.sh"),
                             str(args.xu.resolve()), "build", f"--xacp-port={port}",
-                            "examples/xacp/main.xu", "-o", str(app)],
+                            str(project_root("examples") / "examples/xacp/main.xu"), "-o", str(app)],
                            cwd=ROOT, check=True, timeout=180)
         for token in ("", secrets.token_hex(24)):
             env = os.environ.copy()

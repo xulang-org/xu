@@ -31,7 +31,7 @@
 
 ---
 
-> **Latest Official Release**: [Xu v0.10.7](https://github.com/xulang-org/xu/releases/tag/v0.10.7) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
+> **Official SDK Downloads**: [GitHub Releases](https://github.com/xulang-org/xu/releases) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
@@ -66,6 +66,17 @@ fn main() int {
 > 2. **Ergonomic Error Flow**: Handled at the call site with `or (err) { ... }`. Eliminates screen-cluttering `if err != nil` and catastrophic runtime `unwrap()` panics.
 > 3. **Native Lightweight Concurrency**: `xu worker()` coroutines + `chan` channels provide effortless Go-like concurrency.
 > 4. **Compile-time Static Safety**: Tracked via ownership & borrow inference. **Zero garbage collection (Zero-GC)**, zero pauses, and ultra-lean deterministic memory consumption.
+
+A writable reference name `r: &mut T` can satisfy an `&T` expectation: write
+`read(r)` or `let view: &T = r`. The shared view keeps the parent frozen against
+conflicting writes and moves through its last use, including stored views and
+call results. Conflicting shared and writable arguments in one call are rejected.
+Implicit downgrade currently requires a local reference name and the identical
+direct pointee type. Ordinary values still need `&x`; the planned `$` mutable
+spellings and automatic borrowing from ordinary values are not implemented.
+
+See [Borrowing and mutable bindings](docs/language/borrowing.md) for current rules
+and the planned borrow syntax direction.
 
 ---
 
@@ -107,7 +118,7 @@ As software engineers building high-performance systems and services, we are con
 
 ### Option 1: Instant Browser Sandbox (Zero Install)
 
-Jump directly into the **[xulang.org Online Playground](https://xulang.org)**. Powered by a client-side WebAssembly build of Xu, you can test and experiment with full language features instantly.
+Jump directly into the **[xulang.org Online Playground](https://xulang.org/playground/)**. The client-side WebAssembly sandbox supports a subset of Xu, including basic types, control flow, structs, borrow diagnostics, and cooperative channel scheduling. See the playground's capability guide for its scope; real multithreading, network I/O, native C FFI, and desktop UI require the native SDK.
 
 ### Option 2: One-Liner Fast Install (Recommended)
 
@@ -181,8 +192,8 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu debug <file.xu> -b file.xu:LINE --run` | Build with DWARF and enter an interactive LLDB/GDB session; `-e` queues debugger commands |
 | `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
 | `xu parse <file.xu>` | Parse source and print file, function, and declaration statistics |
-| `xu test <file.xu> -v` | Run `fn test_*` tests with detailed results; filter with `-run <REGEXP>` |
-| `xu test <file.xu> -bench <REGEXP>` | Run matching `fn bench_*` benchmark functions |
+| `xu test test.example.xu -v` | Build a harness for `fn test_*` tests with detailed results; filter with `-run <REGEXP>` |
+| `xu test test.example.xu -bench <REGEXP>` | Build a harness for matching `fn bench_*` benchmark functions |
 | `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
 | `xu build <file.xu> --target wasm32 -o app.wasm` | Emit a WebAssembly module |
 | `xu build <file.xu> --xacp --xacp-port 4321 -o app` | Embed XACP startup discovery metadata |
@@ -194,7 +205,26 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
 | `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
 
-Build the launcher with `make xu-xacp`; see the [runnable XACP example](examples/xacp/README.md). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
+Tests and benchmarks must be declared in `test.<name>.xu` files in `@main`, with no parameters, type parameters, or declared return type. For example, save this as `test.example.xu`:
+
+```xu
+@main
+
+fn test_addition() {
+    assert(1 + 1 == 2)
+}
+```
+
+`xu test` currently emits a harness executable; launch it separately to execute the tests. On macOS/Linux:
+
+```sh
+xu test test.example.xu -v -o test-example
+./test-example
+```
+
+On Windows, the output gains an `.exe` suffix; run `./test-example.exe`. Use `-count N` when building to repeat the test suite. The current parser accepts 1–1000; the CLI help still displays 1–100.
+
+Build the launcher with `make xu-xacp`; see the [runnable XACP example](https://github.com/xulang-org/examples/tree/main/examples/xacp). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
 
 `#xacp` is the transport-neutral standard-library layer for hosts that register
 a live `ui/widgets.Screen`. Its adapter exposes bounded `ui.tree`, native-owned
@@ -236,7 +266,7 @@ Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using 
 
 ## 🗺️ Project Roadmap
 
-This roadmap follows the **official 0.10.7 SDK**. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
+The published SDK is the baseline for this roadmap. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
 
 - [x] **Pure Xu Self-Hosting and Native AOT**: Bootstrap from a published Xu SDK, verify a fixed point, and directly emit native machine code and WebAssembly
 - [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges

@@ -1,7 +1,6 @@
 // Immutable text layouts. Coordinates and font sizes are logical pixels.
 #pragma once
 #include <stdint.h>
-#define XU_UI_TEXT_MAX_COUNT 1024u
 #define XU_UI_TEXT_MAX_LENGTH 16384u
 #define XU_UI_TEXT_MAX_COST (32u * 1024u * 1024u)
 #define XU_UI_TEXT_LAYOUT_MAX_COST (4u * 1024u * 1024u)

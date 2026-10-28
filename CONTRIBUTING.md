@@ -30,7 +30,7 @@ python3 scripts/check_release_identity.py --require-cli
 
 普通 `make xu` 不递增版本；版本准备和产物重建是不同步骤，不重复执行递增入口。实际可用的构建与检查目标见 `make help`。不能用历史 Rust 引导实现代替产品编译器证据。
 
-远端验证使用仓库公开源码契约、自举与 SDK 安装验收；完整研发回归遵守本机约定。不要为修复 CI 上传本机 `docs/`、`tests/`、agent 配置或过程记录。仅修改规则和模板时，检查文档、链接、表单及模板一致性，不要求无关的产品重建。
+远端验证使用仓库公开源码契约、自举与 SDK 安装验收；完整研发回归遵守本机约定。不要为修复 CI 上传本机 `docs/`、`tests/`、agent 配置或过程记录。公开的 GitHub Pages 落地页只允许跟踪 `docs/index.html`、`docs/.nojekyll` 和 `docs/assets/` 里的两份品牌图；其余 `docs/` 仍是本机材料。仅修改规则和模板时，检查文档、链接、表单及模板一致性，不要求无关的产品重建。
 
 ## 提交 PR
 
