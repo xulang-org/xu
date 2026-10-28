@@ -68,7 +68,7 @@ help:
 	@echo "  make platform         multi-target compile matrix"
 	@echo "  make cli-platform     product CLI flags/env smoke (see CLI_CROSS_PLATFORM.md)"
 	@echo "  make doc-test         xu doc Markdown golden + CLI smoke"
-	@echo "  make xacp-test        XACP discovery, safe launcher and protocol core smoke"
+	@echo "  make xacp-test        XACP discovery, session security and HTTP POST probe smoke"
 	@echo "  make packages-test    package regressions using product xu and local protocol peers"
 	@echo "  make bench-runtime    运行时基准(xu-bench, confirmed product,--save/--check 见脚本)"
 	@echo "  make bench-stdlib     标准库热路径（os/io/fs/path/time/strings）基准（xu-bench/scripts/bench_stdlib.sh）"
@@ -89,6 +89,7 @@ help:
 
 all: xu
 
+# The smoke also runs xacp_cross_protocol_probe against token/no-token TCP peers.
 xacp-test: xu-xacp
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_smoke.py
 

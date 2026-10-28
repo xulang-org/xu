@@ -3,6 +3,7 @@
 #os
 #errors
 #strings
+#time
 
 // Explicit control modes skip business main; the first control flag wins.
 // Ordinary invocations never listen or read control stdin. The -- boundary protects application arguments.
@@ -42,120 +43,237 @@ fn control_write(fd int, tcp bool, text string) int {
     << 0
 }
 
-fn control_response(fd int, tcp bool, id int, ok bool, code string, data string) int {
+pub const MAX_ERROR_MSG_BYTES = 256
+
+// frame_text wraps a body in the XACP/1 length prefix (byte length).
+fn frame_text(body string) string {
+    << "XACP/1\n" + str(body.len) + "\n" + body
+}
+
+// msg is written only when non-empty; it is truncated to MAX_ERROR_MSG_BYTES
+// (at a UTF-8 boundary) and always emitted as a one-line quoted string.
+fn control_response(fd int, tcp bool, id int, ok bool, code string, data string, msg string) int {
     mut body := "id: !i " + str(id) + "\nok: !b " + str(ok) + "\n"
     if ok {
         body = body + "data:\n" + data
     } else {
         body = body + "error:\n  code: " + code + "\n"
+        if msg.len > 0 {
+            mut end := msg.len
+            if end > MAX_ERROR_MSG_BYTES {
+                end = MAX_ERROR_MSG_BYTES
+                while end > 0 && (msg[end] & 192) == 128 { end -= 1 }
+            }
+            m := msg[0:end]
+            body = body + "  msg: " + control_string(&m) + "\n"
+        }
     }
-    control_write(fd, tcp, "--- !xacp\n" + body + "===\n") or >>
+    control_write(fd, tcp, frame_text(body)) or >>
     << 0
 }
 
-fn control_request(fd int, tcp bool, s &mut Session, frame string, l &Limits) int {
-    d := parse_frame(frame) or (err) {
-        control_response(fd, tcp, 0, false, "frame_error", "") or >>
+fn control_request(fd int, tcp bool, s &mut Session, frame string, l &Limits, expected_token string, attach bool, jobs chan ControlJob, states chan ScreenRegistration) int {
+    d := parse_frame(frame + "") or (err) {
+        close_session(mut &*s)
+        control_response(fd, tcp, 0, false, "frame_error", "", err.msg()) or >>
         << 0
     }
     req := validate_request(&d, l) or (err) {
-        control_response(fd, tcp, 0, false, "schema_error", "") or >>
+        close_session(mut &*s)
+        control_response(fd, tcp, request_id_hint(&d), false, "schema_error", "", err.msg()) or >>
         << 0
     }
     started := begin_request(mut &*s, &req)
     if !started.ok {
-        control_response(fd, tcp, req.id, false, started.err_code, "") or >>
+        control_response(fd, tcp, req.id, false, started.err_code, "", started.err_msg) or >>
         << 0
     }
+    marshaled := attach && (req.op == "ui.tree" || req.op == "ui.screenshot" || req.op == "ui.act" || req.op == "ui.input" || req.op == "ui.record")
+    mut request_started := 0
+    if marshaled { request_started = time.now() }
     if req.op == "xacp.hello" {
-        if !enable_development(mut &*s) {
-            cancel_request(mut &*s)
-            control_response(fd, tcp, req.id, false, "permission_denied", "") or >>
+        negotiated := negotiate_hello(mut &*s, &d, &req, expected_token)
+        if !negotiated.ok {
+            control_response(fd, tcp, req.id, false, negotiated.err_code, "", negotiated.err_msg) or >>
             << 0
         }
+    } else if marshaled {
+        // Only the attach path can wait for a UI owner. Start its monotonic
+        // deadline at reservation, before registration/enqueue or reply waits.
+        result := marshal_screen(jobs,states,&req,frame,s.permissions,request_started,l.request_timeout_ms)
+        if !result.outcome.ok {
+            cancel_request(mut &*s)
+            control_response(fd,tcp,req.id,false,result.outcome.err_code,"",result.outcome.err_msg) or >>
+            << 0
+        }
+        finished := finish_request(mut &*s,req.id)
+        if !finished.ok {
+            control_response(fd,tcp,req.id,false,finished.err_code,"",finished.err_msg) or >>
+            << 0
+        }
+        control_response(fd,tcp,req.id,true,"",result.data,"") or >>
+        << 0
     } else if req.op != "proc.status" {
         // No Screen or output capture is registered in the startup adapter.
         // All known operations, including mutate, reach this checked path.
         cancel_request(mut &*s)
-        control_response(fd, tcp, req.id, false, "not_implemented", "") or >>
+        control_response(fd, tcp, req.id, false, "not_implemented", "", "operation has no registered adapter: " + req.op) or >>
         << 0
     }
     finished := finish_request(mut &*s, req.id)
     if !finished.ok {
-        control_response(fd, tcp, req.id, false, finished.err_code, "") or >>
+        control_response(fd, tcp, req.id, false, finished.err_code, "", finished.err_msg) or >>
         << 0
     }
     if req.op == "xacp.hello" {
-        control_response(fd, tcp, req.id, true, "", "  state: OPEN\n  permissions: development\n") or >>
+        control_hello_response(fd, tcp, req.id, &*s) or >>
     } else {
-        control_response(fd, tcp, req.id, true, "", "  pid: !i " + str(os.getpid()) + "\n  state: OPEN\n") or >>
+        control_response(fd, tcp, req.id, true, "", "  pid: !i " + str(os.getpid()) + "\n  state: OPEN\n", "") or >>
     }
     << 0
 }
 
-// Chunked reads and an amortized builder bound memory and copying. EOF and
-// oversize input terminate the session; complete frames may share a read.
-pub fn serve_stdio() int {
-    << serve_control(0, 1, false) or >>
+// Always quote the nonce on one physical line: framing must not depend on its
+// contents. These are the escapes accepted by XUN's quoted string parser.
+fn control_string(value &string) string {
+    mut out := strings.builder()
+    out.write_byte(34)
+    for i in 0:value.len {
+        c := value[i] & 255
+        if c == 34 || c == 92 {
+            out.write_byte(92)
+            out.write_byte(c)
+        } else if c == 10 {
+            out.write_byte(92)
+            out.write_byte(110)
+        } else if c == 13 {
+            out.write_byte(92)
+            out.write_byte(114)
+        } else if c == 9 {
+            out.write_byte(92)
+            out.write_byte(116)
+        } else {
+            out.write_byte(c)
+        }
+    }
+    out.write_byte(34)
+    << out.text()
 }
 
-// The caller owns both descriptors. Each call creates one fresh session.
-fn serve_control(input int, fd int, tcp bool) int {
+fn control_hello_response(fd int, tcp bool, id int, s &Session) int {
+    mut label := "custom"
+    if s.permissions == PERM_NONE { label = "none" }
+    if s.permissions == PERM_INFO { label = "info" }
+    if s.permissions == PERM_ALL { label = "development" }
+    data := "  state: OPEN\n  nonce: " + control_string(&s.nonce) +
+        "\n  permissions: !i " + str(s.permissions) + "\n  permission_label: " + label + "\n"
+    control_response(fd, tcp, id, true, "", data, "") or >>
+    << 0
+}
+
+// Chunked reads and an amortized builder bound memory and copying. EOF and
+// fatal frame/schema/auth errors terminate the session; complete frames may share a read.
+pub fn serve_stdio() int {
+    control := new_screen_control()
+    limits := control_limits()
+    << serve_control(0, 1, false, false, control.jobs, control.state, &limits) or >>
+}
+
+fn control_limits() Limits {
+    mut limits := default_limits()
+    limits.request_timeout_ms = request_timeout_from_env()
+    << limits
+}
+
+const FRAME_MAGIC = "XACP/1"
+const FRAME_LINE_MAX = 16
+
+fn frame_fatal(fd int, tcp bool, s &mut Session, code string, msg string) int {
+    close_session(mut &*s)
+    control_response(fd, tcp, 0, false, code, "", msg) or >>
+    << 0
+}
+
+// Length-prefixed reader: phase 0 = magic line, 1 = length line, 2 = body.
+// The body is exactly N bytes and may contain any bytes, including "\n===\n".
+fn serve_control(input int, fd int, tcp bool, attach bool, jobs chan ControlJob, states chan ScreenRegistration, limits &Limits) int {
     mut session := open_session()
-    limits := default_limits()
-    mut frame := strings.builder()
-    delimiter := "\n===\n"
-    mut matched := 0
+    expected_token := os.getenv("XU_XACP_TOKEN")
+    mut line := strings.builder()
+    mut body := strings.builder()
+    mut phase := 0
+    mut need := 0
     while true {
         chunk := control_read(input, tcp) or (err) {
             close_session(mut &session)
             >> err
         }
         if chunk.len == 0 {
-            if frame.length() > 0 {
-                tail := frame.text()
-                trimmed := trim_frame_body(&tail)
-                if has_suffix(&trimmed, "\n===") {
-                    control_request(fd, tcp, mut &session, tail, &limits) or (err) {
-                        close_session(mut &session)
-                        >> err
-                    }
-                } else {
-                    control_response(fd, tcp, 0, false, "truncated_frame", "") or (err) {
-                        close_session(mut &session)
-                        >> err
-                    }
+            if phase != 0 || line.length() > 0 {
+                frame_fatal(fd, tcp, mut &session, "truncated_frame", "EOF inside frame") or (err) {
+                    close_session(mut &session)
+                    >> err
                 }
             }
             close_session(mut &session)
             << 0
         }
-        for i in 0:chunk.len {
-            if frame.length() >= MAX_FRAME_BYTES {
-                close_session(mut &session)
-                control_response(fd, tcp, 0, false, "frame_too_large", "") or >>
+        mut i := 0
+        while i < chunk.len {
+            c := chunk[i] & 255
+            if phase == 2 {
+                mut take := chunk.len - i
+                if take > need - body.length() { take = need - body.length() }
+                part := chunk[i:i + take]
+                body.write_string(&part)
+                i += take
+                if body.length() == need {
+                    control_request(fd, tcp, mut &session, body.text(), limits, expected_token + "", attach, jobs, states) or (err) {
+                        close_session(mut &session)
+                        >> err
+                    }
+                    if session.state == STATE_CLOSED { << 0 }
+                    body.reset()
+                    phase = 0
+                }
+                ->
+            }
+            i += 1
+            if c != 10 {
+                if line.length() >= FRAME_LINE_MAX {
+                    frame_fatal(fd, tcp, mut &session, "frame_error", "frame header line too long") or >>
+                    << 0
+                }
+                line.write_byte(c)
+                ->
+            }
+            text := line.text()
+            line.reset()
+            if phase == 0 {
+                if text != FRAME_MAGIC {
+                    frame_fatal(fd, tcp, mut &session, "frame_error", "expected XACP/1 magic line") or >>
+                    << 0
+                }
+                phase = 1
+                ->
+            }
+            mut n := 0
+            mut valid := text.len > 0 && text.len <= 8
+            for k in 0:text.len {
+                d := text[k] & 255
+                if d < 48 || d > 57 { valid = false }
+                else if valid { n = n * 10 + (d - 48) }
+            }
+            if !valid || n == 0 {
+                frame_fatal(fd, tcp, mut &session, "frame_error", "invalid frame length") or >>
+                << 0
+            }
+            if n > MAX_FRAME_BYTES {
+                frame_fatal(fd, tcp, mut &session, "frame_too_large", "frame length exceeds " + str(MAX_FRAME_BYTES)) or >>
                 << 1
             }
-            c := chunk[i] & 255
-            frame.write_byte(c)
-            if c == (delimiter[matched] & 255) {
-                matched += 1
-            } else if c == 13 && matched == 4 {
-                // A CR before the final newline is trimmed by parse_frame.
-                matched = 4
-            } else if c == 10 {
-                matched = 1
-            } else {
-                matched = 0
-            }
-            if matched == delimiter.len {
-                control_request(fd, tcp, mut &session, frame.text(), &limits) or (err) {
-                    close_session(mut &session)
-                    >> err
-                }
-                frame.reset()
-                matched = 0
-            }
+            need = n
+            phase = 2
         }
     }
     << 0
@@ -169,9 +287,15 @@ fn control_read(fd int, tcp bool) string {
 // Explicit exclusive control mode; loopback only, sequential connections.
 // A malformed/disconnected peer ends its session, not the listener.
 pub fn serve_tcp(port int) int {
+    control := new_screen_control()
+    << serve_tcp_control(port,false,control.jobs,control.state) or >>
+}
+
+fn serve_tcp_control(port int,attach bool,jobs chan ControlJob,states chan ScreenRegistration) int {
     if port < 1 || port > 65535 {
         >> errors.new("xacp: TCP requires a build with --xacp-port 1..65535")
     }
+    limits := control_limits()
     listener := os.socket(2, 1, 0) or >>
     os.bind4(listener, 127, 0, 0, 1, port) or (err) {
         _ := os.socket_close(listener) or (close_err) { >> err }
@@ -186,7 +310,7 @@ pub fn serve_tcp(port int) int {
             _ := os.socket_close(listener) or (close_err) { >> err }
             >> err
         }
-        _ := serve_control(peer, peer, true) or (err) {
+        _ := serve_control(peer, peer, true, attach, jobs, states, &limits) or (err) {
             // Peer errors are isolated; the listener remains available.
             _ := os.socket_close(peer) or >>
             ->
