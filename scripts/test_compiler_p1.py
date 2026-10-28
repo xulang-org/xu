@@ -11,6 +11,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -487,6 +488,7 @@ def main():
     xu = (ROOT / opts.xu).resolve()
     env = os.environ.copy()
     env.update(XU_ROOT=str(ROOT), XU_STDLIB_ROOT=str(ROOT / 'src'), XUPATH='')
+    native_tag = 'windows' if sys.platform == 'win32' else 'macos' if sys.platform == 'darwin' else 'linux'
     with tempfile.TemporaryDirectory(prefix='xu-p1-test-') as temp:
         tmp = Path(temp)
         env['XU_CACHE'] = str(tmp / 'cache')
@@ -782,7 +784,7 @@ def main():
                     'fn write(r &mut int) { *r = 3 }\nfn main() { mut x := 1\n r := mut &x\n write(r)\n println(*r)\n s := &*r\n mut q := s\n println(*q)\n y := 4\n q = &y\n println(*q)\n *r = 5\n println(*r)\n}',
                     output='3\n3\n4\n5\n')
             fixture('spec34_H37_tags_interpolation_pub',
-                    '$linux\npub fn visible() int { << 3 }\nfn main() { name := "xu"\n println("$name $$ \\$name")\n println(visible())\n println(3 & 1)\n println(true && true)\n}',
+                    '$' + native_tag + '\npub fn visible() int { << 3 }\nfn main() { name := "xu"\n println("$name $$ \\$name")\n println(visible())\n println(3 & 1)\n println(true && true)\n}',
                     output='xu $ $name\n3\n1\ntrue\n')
             fixture('spec34_A1_immutable_assignment',
                     'fn main() { x := 1\n x = 2 }',
