@@ -110,7 +110,11 @@ fn main() int {
     # SDK root discovery is independent of external GUI toolchain availability.
     # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK
     # before probing those host dependencies. Exercise direct PATH and CLI use.
-    for command in ([xu, "doctor"], ["xu-doctor"]):
+    # Windows CreateProcess does not use the supplied child environment for
+    # bare-command lookup. Resolve the activated PATH explicitly on every OS.
+    path_doctor = shutil.which("xu-doctor", path=clean["PATH"])
+    assert path_doctor and Path(path_doctor).resolve().parent == (prefix / "bin").resolve(), path_doctor
+    for command in ([xu, "doctor"], [path_doctor]):
         doctor = subprocess.run([*command, "--target", manifest["target"]], cwd=project,
                                 env=clean, text=True, capture_output=True, timeout=90)
         match = re.search(r"(?m)^  \[ok\]\s+Xu SDK root\s+(.+)$", doctor.stdout)
