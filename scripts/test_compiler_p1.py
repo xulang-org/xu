@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 
+from borrow_phase_c_cases import check_phase_c, check_phase_c_backends
+
 ROOT = Path(__file__).resolve().parents[1]
 PROBE = r'''@main
 #os
@@ -513,6 +515,7 @@ def main():
             print('PASS', name, flush=True)
             return out
         if not opts.backend_only:
+            check_phase_c(fixture)
             # Spec34 safety prerequisite (E21a/F27/H33): temporary loans
             # of a reference's pointee must retain the writable parent.
             loan_fns = ('fn both(s &int, w &mut int) { *w = 2\n println(*s) }\n'
@@ -736,27 +739,25 @@ def main():
                     'fn main() { mut x := Item{name: "xu"}\n check(mut &x) }', output='xu\n')
             fixture('spec34_H32_active_writable_clone_reject', clone_receiver +
                     'fn check(p &mut Item) { use(mut &*p, p.name) }\nfn main() {}', 'mutably borrowed')
-            # Spec34 Phase A: H38 marker confusion must stay rejected. Check
+            # Spec34 H38: rejected marker permutations stay rejected. Check
             # actionable spelling, source attribution, and no output executable.
             for index, (spelling, hint) in enumerate((
                 ('&$x := 1', "use '$name :='"),
-                ('$&x := 1', "use '$x :='"),
-                ('$x := 1', "use 'mut name :='"),
-                ('r := &$x', "writable borrows use '$&x'"),
-                ('r := $&*p', "use '&*r'"),
-                ('r := *$&p', "use '&*r'"),
-                ('r := $&x', "use 'mut &x'"),
+                ('$&x := 1', "mutable binding declarations use '$x :='"),
+                ('r := &$x', "use '$name :='"),
+                ('r := $&*p', "explicit reborrow uses '&*r'"),
+                ('r := *$&p', "explicit reborrow uses '&*r'"),
                 ('println($x)', "use plain 'name'"),
                 ('r := &mut x', "writable borrow expressions use 'mut &x'"),
             )):
                 fixture('spec34_H38_expr_' + str(index),
                         'fn main() { mut x := 1\n p := mut &x\n ' + spelling + '\n}',
-                        hint, diagnostics=(':4:',))
-            for index, spelling in enumerate(('&$int', '$int', '$&int')):
+                        hint, diagnostics=(':4:',) if spelling == 'r := &mut x' else (':4:', 'H38:'))
+            for index, spelling in enumerate(('&$int', '$int')):
                 fixture('spec34_H38_type_' + str(index),
                         'fn read(p ' + spelling + ') {}\nfn main() {}',
-                        "currently '&mut T'" if spelling != '$&int' else "use '&mut T'",
-                        diagnostics=(':2:11:',))
+                        "writable reference types use '$&T'",
+                        diagnostics=(':2:11:', 'H38:'))
             fixture('spec34_E22_shared_upgrade',
                     'fn bad(r &int) { w := mut &*r }\nfn main() {}',
                     'cannot take address of dereference', diagnostics=(
@@ -813,9 +814,9 @@ def main():
             fixture('spec34_E20_return',
                     'fn bad(p &mut int) &int { << p }\nfn main() {}',
                     output=None)
-            fixture('spec34_F25_no_automatic_borrow',
-                    'fn read(r &int) {}\nfn main() { x := 1\n read(x) }',
-                    'type mismatch: expected &int, found int')
+            fixture('spec34_F25_automatic_borrow',
+                    'fn read(r &int) int { << *r }\nfn main() { x := 1\n println(read(x)) }',
+                    output='1\n')
             fixture('spec34_H33_frozen_reborrow_notes',
                     'fn bad(p &mut int) { r := &*p\n q := mut &*p\n println(*r)\n println(*q) }\nfn main() {}',
                     'cannot reborrow a frozen reference', diagnostics=(
@@ -828,16 +829,8 @@ def main():
             for source in ('fn main() { x := ~1 }', 'fn bad(x ~int) {}\nfn main() {}'):
                 fixture('spec34_H38_tilde_' + str(len(source)), source,
                         "unexpected character '~'", diagnostics=("'~' stays unused", 'mut &x'))
-            fixture('spec34_H38_typed_binding', 'fn main() { let $x: int = 1 }',
-                    "'let $x: T' is not yet supported", diagnostics=('mut x := value',))
-            for index, source in enumerate((
-                'fn bad() $&int { << 1 }\nfn main() {}',
-                'fn main() { f := fn() $&int { << 1 } }',
-                'fn main() { let f: fn() $&int = 1 }',
-                'struct@ Read { fn read() $&int }\nfn main() {}',
-            )):
-                fixture('spec34_H38_return_type_' + str(index), source,
-                        "use '&mut T'")
+            fixture('spec34_C_typed_binding', 'fn main() { let $x: int = 1\n x = 2\n println(x) }',
+                    output='2\n')
             fixture('spec34_H33_current_function_notes',
                     'fn first() { println(0)\n println(1)\n println(2) }\nfn bad(p &mut int) { r := &*p\n *p = 9\n println(*r) }\nfn main() {}',
                     'mutably borrowed', diagnostics=(
@@ -930,9 +923,11 @@ fn (p &mut Item) change() { p.value = 2 }
             fixture('receiver_index_loan', reader + 'fn check(p &mut []Item, i &mut int) { r := mut &*i\n println(p[*i].read())\n println(*r)\n}\nfn main() { mut xs := [Item{value: 3}]\n mut i := 0\n check(mut &xs, mut &i)\n}', 'mutably borrowed')
             fixture('mutable_field', 'struct Inner { x int }\nstruct Outer { inner Inner, y int }\nfn (p &mut Inner) set(v int) { p.x = v }\nfn change(p &mut Outer) { r := mut &p.inner\n r.set(2)\n p.y = 3\n}\nfn main() { mut v := Outer{inner: Inner{x: 1}, y: 0}\n change(mut &v)\n println(v.y)\n}', output='3\n')
         if opts.front_only:
+            print('compiler P1 frontend: PASS', flush=True)
             if baseline:
                 print(f'compiler P1 acceptance comparison: PASS={comparisons} FAIL=0', flush=True)
             return
+        check_phase_c_backends(fixture)
         # Keep the real compiler functions; only rename its CLI entry point.
         entry = tmp / 'driver_entry.xu'
         text = (ROOT / 'src/cmd/compile/driver_entry.xu').read_text()
