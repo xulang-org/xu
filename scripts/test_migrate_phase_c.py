@@ -52,6 +52,14 @@ def test_nested_mut_ref_type() -> None:
     assert migrate_text(src).text == "fn f(p $&$&int) {\n}\n"
 
 
+def test_nested_shared_ref_keeps_separate_amp_tokens() -> None:
+    src = "fn f(p &mut &int) {\n  r := mut & &x\n}\n"
+    result = migrate_text(src)
+    assert result.text == "fn f(p $& &int) {\n  r := $& &x\n}\n"
+    assert not any(tok.text == "&&" for tok in lex(result.text))
+    assert migrate_text(result.text).text == result.text
+
+
 def test_infix_amp_and_and_and_are_left_alone() -> None:
     src = "fn main() {\n  mut x := 1\n  y := x & 1\n  z := x && y\n}\n"
     result = migrate_text(src)
@@ -98,6 +106,15 @@ def test_skips_strings_comments_and_compile_tags() -> None:
     assert [hit.kind for hit in result.hits] == ["mut-bind"]
 
 
+@pytest.mark.parametrize("prefix", ["$", "$$", "\\$"])
+def test_mut_named_tag_is_not_a_mut_marker(prefix: str) -> None:
+    src = prefix + "mut &*r\n"
+    result = migrate_text(src, omit_read_borrows=True, simplify_reborrow=True)
+    assert result.text == src
+    assert result.hits == []
+    assert rejected_spellings(result.text) == []
+
+
 def test_comment_between_mut_and_name_is_preserved() -> None:
     src = "fn main() {\n  mut /*keep*/ x := 1\n}\n"
     assert migrate_text(src).text == "fn main() {\n  /*keep*/ $x := 1\n}\n"
@@ -107,6 +124,33 @@ def test_does_not_match_mut_binding_across_newline_or_split_colon() -> None:
     src = "fn main() {\n  mut\n  x := 1\n  mut y : = 2\n}\n"
     assert migrate_text(src).text == src
     assert migrate_text(src).hits == []
+
+
+@pytest.mark.parametrize("src", [
+    "mut /* keep\nnewline */ x := 1\n",
+    "mut x /* keep\nnewline */ := 1\n",
+    "mut /* keep\nnewline */ &x\n",
+    "& /* keep\nnewline */ mut int\n",
+])
+def test_multiline_comment_breaks_mapping(src: str) -> None:
+    result = migrate_text(src)
+    assert result.text == src
+    assert result.hits == []
+
+
+@pytest.mark.parametrize("src", [
+    "fn f() { v := *mut &x }\n",
+    "fn f() { v := &mut x := 1 }\n",
+    "fn f() { v := &mut *r }\n",
+    "fn f() { v := mut &\n*r }\n",
+    "fn f() { v := mut & /* keep\nnewline */ *r }\n",
+])
+def test_unsafe_default_mapping_is_candidate(src: str) -> None:
+    result = migrate_text(src)
+    assert result.text == src
+    assert result.hits == []
+    assert result.candidates
+    assert rejected_spellings(result.text) == []
 
 
 def test_rejected_spellings_are_not_produced() -> None:
@@ -189,6 +233,16 @@ def test_omit_read_borrow_candidates_are_not_rewritten() -> None:
     assert not any("a & b" in item.text for item in result.candidates)
 
 
+@pytest.mark.parametrize("expr", ["&x + y", "&x == &y", "&x & y", "&x\n + y"])
+@pytest.mark.parametrize("statement", ["f({expr})", "let s: &int = {expr}"])
+def test_omit_requires_whole_argument_or_initializer(expr: str, statement: str) -> None:
+    src = "fn f() {\n  " + statement.format(expr=expr) + "\n}\n"
+    result = migrate_text(src, omit_read_borrows=True)
+    assert result.text == src
+    assert result.hits == []
+    assert result.candidates
+
+
 def test_omit_does_not_touch_types_or_fn_types() -> None:
     src = "fn f(p &int) &int {\n  let s: &int = x\n  g(fn(&int))\n}\n"
     result = migrate_text(src, omit_read_borrows=True)
@@ -242,6 +296,31 @@ def test_method_receiver_shared_reborrow() -> None:
     src = "fn (p &int) read() {\n  f(&*p)\n}\n"
     result = migrate_text(src, simplify_reborrow=True)
     assert result.text == "fn (p &int) read() {\n  f(p)\n}\n"
+
+
+@pytest.mark.parametrize("declaration", ["p := other", "let p: int = 0"])
+def test_same_line_shadow_is_not_a_known_shared_borrow(declaration: str) -> None:
+    src = "fn f(p &int) {\n  { " + declaration + "; g(&*p) }\n  g(&*p)\n}\n"
+    result = migrate_text(src, simplify_reborrow=True)
+    assert result.text == src.replace("\n  g(&*p)", "\n  g(p)")
+    assert len(result.candidates) == 1
+
+
+@pytest.mark.parametrize("header", ["for p in xs", "for p, v in xs", "for k, p in xs"])
+def test_loop_names_shadow_shared_parameters(header: str) -> None:
+    src = "fn f(p &int) {\n  " + header + " {\n    g(&*p)\n  }\n}\n"
+    result = migrate_text(src, simplify_reborrow=True)
+    assert result.text == src
+    assert result.hits == []
+    assert len(result.candidates) == 1
+
+
+def test_borrow_prefix_in_compound_initializer_does_not_prove_shared_type() -> None:
+    src = "fn main() {\n  s := &x == &y\n  g(&*s)\n}\n"
+    result = migrate_text(src, simplify_reborrow=True)
+    assert result.text == src
+    assert result.hits == []
+    assert len(result.candidates) == 1
 
 
 def test_mut_reborrow_of_writable_stays_shared_spelling() -> None:

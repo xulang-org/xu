@@ -100,6 +100,12 @@ CALL_EXCLUDED_CALLEES = {
     "select",
 }
 
+# A newline alone does not prove a borrow is the whole expression.
+EXPR_CONTINUATIONS = {
+    ".", "[", "(", "#", "+", "-", "*", "/", "%", "&", "|", "^",
+    "&&", "||", "==", "!=", "<", ">", "<=", ">=", "<<", ">>",
+}
+
 _PLAIN_NAME = re.compile(r"^[a-z_][A-Za-z0-9_]*$")
 _OPS = (
     "<->",
@@ -392,12 +398,18 @@ def _match_mut(
     hits: list[Hit],
     candidates: list[Candidate],
 ) -> int | None:
+    prev = _prev_same_line(tokens, i)
+    if prev is not None and tokens[prev].end == tokens[i].start and tokens[prev].text in ("$", "\\$"):
+        return None
     amp = _match_kind(tokens, i, "AMP")
     if amp is not None:
         star = _match_kind(tokens, amp[0], "STAR")
         if star is not None:
             return _rewrite_mut_reborrow(src, tokens, i, amp, star, options, bindings, out, hits, candidates)
         if _match_kind(tokens, amp[0], "MUT") is None:
+            reason = _writable_prefix_reason(tokens, i, _next_code(tokens, amp[0]))
+            if reason is not None:
+                return _keep_mapping_candidate(src, tokens, i, amp[0], "mut-borrow", reason, out, candidates)
             return _rewrite_mut_borrow(src, tokens, i, amp, out, hits)
         return None
     name = _match_kind(tokens, i, "IDENT")
@@ -406,6 +418,9 @@ def _match_mut(
     coloneq = _match_kind(tokens, name[0], "COLONEQ")
     if coloneq is None:
         return None
+    prev = _prev_cross(tokens, i)
+    if prev is not None and tokens[prev].kind in ("AMP", "STAR", "DOLLAR"):
+        return _keep_mapping_candidate(src, tokens, i, coloneq[0], "mut-bind", "ambiguous marker prefix", out, candidates)
     _emit_comments(out, name[1])
     out.append("$")
     out.append(tokens[name[0]].text)
@@ -433,6 +448,8 @@ def _rewrite_mut_borrow(
     n = len(tokens)
     while j < n and tokens[j].kind == "WS":
         j += 1
+    if j < n and tokens[j].kind == "AMP" and _match_kind(tokens, j, "MUT") is None:
+        out.append(" ")  # Keep two borrow markers from lexing as &&.
     old = _compact(src[tokens[mut_i].start:tokens[amp_i].end])
     hits.append(Hit(tokens[mut_i].line, tokens[mut_i].col, "mut-borrow", old, "$&"))
     return j
@@ -488,6 +505,12 @@ def _match_amp(
         return None
     mut = _match_kind(tokens, i, "MUT")
     if mut is not None:
+        target = _next_code(tokens, mut[0])
+        reason = _writable_prefix_reason(tokens, i, target)
+        if target is not None and _match_kind(tokens, target, "COLONEQ") is not None:
+            reason = "borrow marker before a binding declaration"
+        if reason is not None:
+            return _keep_mapping_candidate(src, tokens, i, mut[0], "mut-type", reason, out, candidates)
         return _rewrite_mut_type(src, tokens, i, mut, out, hits)
     star = _match_kind(tokens, i, "STAR")
     if star is not None:
@@ -501,6 +524,27 @@ def _match_amp(
     if _is_infix_amp(tokens, i) or _amp_is_type_context(tokens, i):
         return None
     return _rewrite_or_note_read_borrow(src, tokens, i, out, hits, candidates)
+
+
+def _writable_prefix_reason(tokens: list[Tok], start: int, target: int | None) -> str | None:
+    prev = _prev_cross(tokens, start)
+    if prev is not None and tokens[prev].kind in ("AMP", "STAR", "DOLLAR"):
+        return "rewriting would create a rejected marker sequence"
+    if target is None:
+        return "operand is missing or crosses a newline"
+    if tokens[target].kind == "STAR":
+        return "rewriting would create $&*"
+    return None
+
+
+def _keep_mapping_candidate(
+    src: str, tokens: list[Tok], start: int, end: int, kind: str,
+    reason: str, out: list[str], candidates: list[Candidate],
+) -> int:
+    text = src[tokens[start].start:tokens[end].end]
+    out.append(text)
+    _add_candidate(tokens, start, kind, _compact(text), reason, candidates)
+    return end + 1
 
 
 def _rewrite_mut_type(
@@ -518,6 +562,8 @@ def _rewrite_mut_type(
     n = len(tokens)
     while j < n and tokens[j].kind == "WS":
         j += 1
+    if j < n and tokens[j].kind == "AMP" and _match_kind(tokens, j, "MUT") is None:
+        out.append(" ")
     old = _compact(src[tokens[amp_i].start:tokens[mut_i].end])
     hits.append(Hit(tokens[amp_i].line, tokens[amp_i].col, "mut-type", old, "$&"))
     return j
@@ -593,6 +639,16 @@ def _rewrite_or_note_read_borrow(
         return None
     if not _is_safe_read_borrow(tokens, amp_i):
         _add_candidate(tokens, amp_i, "omit-read-borrow", preview, _unsafe_read_reason(tokens, amp_i), candidates)
+        return None
+    post = _next_code(tokens, name_i)
+    prev = _prev_cross(tokens, amp_i)
+    is_initializer = prev is not None and tokens[prev].text == "="
+    end_markers = (";", "}") if is_initializer else (",", ")")
+    following = _next_cross(tokens, name_i)
+    if not is_initializer or following is not None and tokens[following].text in EXPR_CONTINUATIONS:
+        post = following
+    if post is not None and tokens[post].text not in end_markers:
+        _add_candidate(tokens, amp_i, "omit-read-borrow", preview, "borrow is part of a larger expression", candidates)
         return None
     _emit_comments(out, comments)
     out.append(tokens[name_i].text)
@@ -750,6 +806,8 @@ def _match_kind(tokens: list[Tok], i: int, kind: str) -> tuple[int, list[str]] |
     n = len(tokens)
     comments: list[str] = []
     while j < n and tokens[j].kind in ("WS", "COMMENT"):
+        if "\n" in tokens[j].text:
+            return None
         if tokens[j].kind == "COMMENT":
             comments.append(tokens[j].text)
         j += 1
@@ -762,6 +820,8 @@ def _next_code(tokens: list[Tok], i: int) -> int | None:
     j = i + 1
     n = len(tokens)
     while j < n and tokens[j].kind in ("WS", "COMMENT"):
+        if "\n" in tokens[j].text:
+            return None
         j += 1
     if j >= n or tokens[j].kind == "NL":
         return None
@@ -771,6 +831,8 @@ def _next_code(tokens: list[Tok], i: int) -> int | None:
 def _prev_same_line(tokens: list[Tok], i: int) -> int | None:
     j = i - 1
     while j >= 0 and tokens[j].kind in ("WS", "COMMENT"):
+        if "\n" in tokens[j].text:
+            return None
         j -= 1
     if j < 0 or tokens[j].kind == "NL":
         return None
@@ -847,6 +909,8 @@ def _collect_bindings(tokens: list[Tok]) -> dict[str, list[_Binding]]:
             if name_i is None or tokens[name_i].kind != "IDENT":
                 continue
             init = _next_code(tokens, i)
+            # Until the declaration ends, do not fall back to an outer name.
+            add(tokens[name_i].text, "unknown", name_i, next_nl(i))
             add(tokens[name_i].text, _classify_init(tokens, init), next_nl(i), scope_end(name_i))
             continue
         if tok.kind == "IDENT" and tok.text == "let":
@@ -860,7 +924,24 @@ def _collect_bindings(tokens: list[Tok]) -> dict[str, list[_Binding]]:
                 continue
             head = _next_code(tokens, colon)
             kind = _ref_kind_at(tokens, head) if head is not None else "unknown"
+            add(tokens[name_i].text, "unknown", name_i, next_nl(i))
             add(tokens[name_i].text, kind, next_nl(i), scope_end(name_i))
+            continue
+        if tok.kind == "IDENT" and tok.text == "for":
+            name_i = _next_cross(tokens, i)
+            names: list[str] = []
+            while name_i is not None and tokens[name_i].kind == "IDENT":
+                names.append(tokens[name_i].text)
+                after = _next_cross(tokens, name_i)
+                if after is not None and tokens[after].text == ",":
+                    name_i = _next_cross(tokens, after)
+                    continue
+                if after is not None and tokens[after].text == "in":
+                    # No type proof for loop variables. Keep this barrier to
+                    # the enclosing scope end rather than guess the loop body.
+                    for name in names:
+                        add(name, "unknown", i, scope_end(i))
+                break
             continue
         if tok.kind == "IDENT" and tok.text == "fn":
             _record_fn_params(tokens, i, end_of_open, add)
@@ -896,9 +977,13 @@ def _classify_init(tokens: list[Tok], init: int | None) -> str:
         return "unknown"
     if tok.kind == "AMP":
         nxt = _next_code(tokens, init)
-        if nxt is not None and tokens[nxt].kind in ("STAR", "MUT"):
-            return "unknown"
-        return "shared"
+        if nxt is not None and _name_shape_reason(tokens, nxt) is None:
+            end = _next_code(tokens, nxt)
+            following = _next_cross(tokens, nxt)
+            continues = following is not None and tokens[following].text in EXPR_CONTINUATIONS
+            if not continues and (end is None or tokens[end].text in (";", "}")):
+                return "shared"
+        return "unknown"
     return "unknown"
 
 
