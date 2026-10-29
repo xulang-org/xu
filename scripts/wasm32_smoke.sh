@@ -23,7 +23,7 @@ fn main() int { << add(40, 2) }
 EOF
 cat > "$tmp/mul.xu" <<'EOF'
 @main
-pub fn mul(a int, b int) int { mut r := a * b
+pub fn mul(a int, b int) int { $r := a * b
     << r }
 fn main() int { << 0 }
 EOF
@@ -67,44 +67,44 @@ cat > "$tmp/f64_rmw.xu" <<'EOF'
 struct FloatBox { guard int
     f f64 }
 pub fn fp_field_add(x f64, y f64) f64 {
-    mut box := FloatBox{guard: 17, f: x}
-    fp_field_update(mut &box, y)
+    $box := FloatBox{guard: 17, f: x}
+    fp_field_update($&box, y)
     if box.guard != 18 { <<< 1 }
     << box.f
 }
-fn fp_field_update(box &mut FloatBox, y f64) {
+fn fp_field_update(box $&FloatBox, y f64) {
     box.f += y
     box.guard += 1
 }
 pub fn fp_field_literal(x f64) f64 {
-    mut box := FloatBox{guard: 17, f: x}
-    fp_field_update_literal(mut &box)
+    $box := FloatBox{guard: 17, f: x}
+    fp_field_update_literal($&box)
     << box.f
 }
-fn fp_field_update_literal(box &mut FloatBox) {
+fn fp_field_update_literal(box $&FloatBox) {
     box.f += 1.5
     box.f *= 2.0
     box.f -= 0.5
 }
-pub fn fp_index_mul(a &mut []f64, i int, y f64) f64 {
+pub fn fp_index_mul(a $&[]f64, i int, y f64) f64 {
     a[i] *= y
     << a[i]
 }
-pub fn fp_index_literal(a &mut []f64, i int) f64 {
+pub fn fp_index_literal(a $&[]f64, i int) f64 {
     a[i] += 1.5
     a[i] *= 2.0
     a[i] -= 0.5
     << a[i]
 }
-pub fn fp_index_store(a &mut []f64, i int, y f64) f64 {
+pub fn fp_index_store(a $&[]f64, i int, y f64) f64 {
     a[i] = y
     << a[i]
 }
-pub fn fp_buffer_field(a &mut []FloatBox, i int, y f64) f64 {
+pub fn fp_buffer_field(a $&[]FloatBox, i int, y f64) f64 {
     a[i].f += y
     << a[i].f
 }
-pub fn int_index_add(a &mut []int, i int, y int) int {
+pub fn int_index_add(a $&[]int, i int, y int) int {
     a[i] += y
     << a[i]
 }

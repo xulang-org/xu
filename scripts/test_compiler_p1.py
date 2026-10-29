@@ -27,10 +27,10 @@ PROBE = r'''@main
 fn probe_dump(a &Assembler) {
     for i in 0:a.code.len { println(a.code[i]) }
 }
-fn probe_branch(a &mut Assembler, wide bool, cond int, expected bool) {
+fn probe_branch(a $&Assembler, wide bool, cond int, expected bool) {
     ok := "probe_cmp_ok_" + str(a.drop_seq)
     a.drop_seq += 1
-    mut target := "probe_fail"
+    $target := "probe_fail"
     if expected { target = ok + "" }
     if wide {
         if cond == 0 { a.vbe_jeq(target + "") }
@@ -53,8 +53,8 @@ fn probe_branch(a &mut Assembler, wide bool, cond int, expected bool) {
     if expected { a.r_j("probe_fail") }
     a.label(ok)
 }
-fn probe_cmp(a &mut Assembler, wide bool) {
-    mut vals := [-2147483648, -1, 0, 1, 2147483647]
+fn probe_cmp(a $&Assembler, wide bool) {
+    $vals := [-2147483648, -1, 0, 1, 2147483647]
     if wide { vals = [-9223372036854775807 - 1, -1, 0, 1, 9223372036854775807] }
     conds := [0, 1, 10, 11, 12, 13, 2, 3]
     for i in 0:vals.len {
@@ -63,7 +63,7 @@ fn probe_cmp(a &mut Assembler, wide bool) {
             y := vals[j]
             for ci in 0:conds.len {
                 cond := conds[ci]
-                mut expect := false
+                $expect := false
                 if cond == 0 { expect = x == y }
                 if cond == 1 { expect = x != y }
                 if cond == 10 { expect = x >= y }
@@ -86,7 +86,7 @@ fn probe_cmp(a &mut Assembler, wide bool) {
                         probe_branch(a, false, cond, expect)
                         a.rbe_cset(2, cond)
                     }
-                    mut expected := 0
+                    $expected := 0
                     if expect { expected = 1 }
                     a.r_li32(6, expected)
                     a.r_bcond_jal(false, 7, 6, "probe_fail")
@@ -103,7 +103,7 @@ fn probe_cmp(a &mut Assembler, wide bool) {
     a.v_ecall()
     if wide { a.v_fixup_all() } else { a.r_fixup_all() }
 }
-fn probe_loong_cmp(a &mut Assembler) {
+fn probe_loong_cmp(a $&Assembler) {
     a.arch = 4
     vals := [-9223372036854775807 - 1, -1, 0, 1, 9223372036854775807]
     conds := [0, 1, 10, 11, 12, 13, 2]
@@ -113,7 +113,7 @@ fn probe_loong_cmp(a &mut Assembler) {
             y := vals[j]
             for ci in 0:conds.len {
                 cond := conds[ci]
-                mut expect := false
+                $expect := false
                 if cond == 0 { expect = x == y }
                 if cond == 1 { expect = x != y }
                 if cond == 10 { expect = x >= y }
@@ -127,7 +127,7 @@ fn probe_loong_cmp(a &mut Assembler) {
                     if imm == 0 { a.lbe_cmp(0, 1) } else { a.lbe_cmp_imm(0, y) }
                     ok := "_probe_l_ok_" + str(a.drop_seq)
                     a.drop_seq += 1
-                    mut target := "_probe_l_fail"
+                    $target := "_probe_l_fail"
                     if expect { target = ok + "" }
                     if cond == 0 { a.lbe_jeq(target + "") }
                     if cond == 1 { a.lbe_jne(target + "") }
@@ -161,7 +161,7 @@ fn probe_loong_cmp(a &mut Assembler) {
     a.l_syscall()
     a.l_fixup_all()
 }
-fn probe_mem(a &mut Assembler) {
+fn probe_mem(a $&Assembler) {
     a.rbe_prologue(8192)
     a.r_sub(5, 8, 2)
     a.r_li32(6, 8192)
@@ -194,16 +194,16 @@ fn probe_mem(a &mut Assembler) {
     a.v_ecall()
     a.r_fixup_all()
 }
-fn probe_store(a &mut Assembler) {
-    mut toks := []ast.Token{}
-    scanner.lex("@main\nfn main() { mut xs := [\"a\"]\n xs[0] = \"b\"\n println(xs[0])\n}\n", mut &toks, "probe.xu")
-    mut p := parser.new_parser(toks)
+fn probe_store(a $&Assembler) {
+    $toks := []ast.Token{}
+    scanner.lex("@main\nfn main() { mut xs := [\"a\"]\n xs[0] = \"b\"\n println(xs[0])\n}\n", $&toks, "probe.xu")
+    $p := parser.new_parser(toks)
     p.parse_module()
-    mut c := types.Checker{}
-    mut m := types.empty_mir()
-    mut fs := []types.CFn{}
-    types.run_checker(mut &c, &p, 11, 0, 0, []string{}, []string{}, 1, mut &m, []string{}, "", false, false, 1, false, mut &fs)
-    mut ct := CoverTable{files: []int{}, lines: []int{}}
+    $c := types.Checker{}
+    $m := types.empty_mir()
+    $fs := []types.CFn{}
+    types.run_checker($&c, &p, 11, 0, 0, []string{}, []string{}, 1, $&m, []string{}, "", false, false, 1, false, $&fs)
+    $ct := CoverTable{files: []int{}, lines: []int{}}
     calls := types.new_mir_call_index(&m)
     for fi in 0:m.fns.len {
         for ii in 0:types.mir_nins(&m, fi) {
@@ -220,14 +220,14 @@ fn probe_store(a &mut Assembler) {
     <<< 2
 }
 fn probe_num(s string) int {
-    mut v := 0
-    mut sign := 1
+    $v := 0
+    $sign := 1
     for i in 0:s.len {
         if s[i] == 45 { sign = -1 } else { v = v * 10 + s[i] - 48 }
     }
     << v * sign
 }
-fn probe_fixup(a &mut Assembler, mode string, rel int) {
+fn probe_fixup(a $&Assembler, mode string, rel int) {
     a.code_vaddr = 8589934592
     a.data_vaddr = a.code_vaddr + rel
     a.data_label("probe_target")
@@ -268,7 +268,7 @@ fn probe_fixup(a &mut Assembler, mode string, rel int) {
         a.x64_jmp("probe_target") }
     a.fixup_all()
 }
-fn probe_atomics(a &mut Assembler, thumb bool) {
+fn probe_atomics(a $&Assembler, thumb bool) {
     if thumb { a.arch = 2 } else { a.arch = 5 }
     a.be_atomic_load(0, 1)
     a.be_atomic_store(1, 2)
@@ -279,17 +279,17 @@ fn probe_atomics(a &mut Assembler, thumb bool) {
 // Execute the actual freestanding nonblocking runtime under qemu-user.
 // Only allocation and process exit are supplied by this standalone harness;
 // the channel new/try/close functions below are the production emitters.
-fn probe_chan_call(a &mut Assembler, lab string, src string) {
+fn probe_chan_call(a $&Assembler, lab string, src string) {
     a.load(18, 15, -8)
     a.lea(19, src)
     a.vm_mov_imm(20, 2)
     a.call(lab)
 }
-fn probe_chan_expect(a &mut Assembler, value int) {
+fn probe_chan_expect(a $&Assembler, value int) {
     a.vm_cmp_imm(14, value)
     a.jne("_probe_fail")
 }
-fn probe_chan_exit(a &mut Assembler, code int) {
+fn probe_chan_exit(a $&Assembler, code int) {
     if a.arch == 2 {
         a.t_mov_imm(0, code)
         a.t_mov_imm(7, 1)
@@ -300,7 +300,7 @@ fn probe_chan_exit(a &mut Assembler, code int) {
         a.v_ecall()
     }
 }
-fn probe_chan(a &mut Assembler, thumb bool) {
+fn probe_chan(a $&Assembler, thumb bool) {
     a.arch = 3
     if thumb { a.arch = 2 }
     a.os = 3
@@ -320,7 +320,7 @@ fn probe_chan(a &mut Assembler, thumb bool) {
         probe_chan_call(a, "_rt_chan_try_recv", "_probe_dst")
         probe_chan_expect(a, 1)
         a.lea(0, "_probe_dst")
-        mut src := "_probe_src"
+        $src := "_probe_src"
         if pass == 1 { src = "_probe_src2" }
         a.lea(1, src)
         for word in 0:4 {
@@ -370,7 +370,7 @@ fn probe_chan(a &mut Assembler, thumb bool) {
     a.fixup_all()
     for i in 0:a.data.len { a.code.push(a.data[i]) }
 }
-fn probe_loong_jump(a &mut Assembler, cond int, label string) {
+fn probe_loong_jump(a $&Assembler, cond int, label string) {
     if cond == 0 { a.lbe_jeq(label) }
     if cond == 1 { a.lbe_jne(label) }
     if cond == 10 { a.lbe_jge(label) }
@@ -379,17 +379,17 @@ fn probe_loong_jump(a &mut Assembler, cond int, label string) {
     if cond == 13 { a.lbe_jle(label) }
     if cond == 2 { a.lbe_jae(label) }
 }
-fn probe_loong_branches(a &mut Assembler) {
+fn probe_loong_branches(a $&Assembler) {
     vals := [-1, 0, 1]
     conds := [0, 1, 10, 11, 12, 13, 2]
-    mut expected := []bool{}
+    $expected := []bool{}
     // The forward targets and backward tests are on the other side of a
     // spacer larger than I16 can encode. Exercise both paths of every jump.
     for i in 0:vals.len { for j in 0:vals.len { for ci in 0:conds.len {
         x := vals[i]
         y := vals[j]
         cond := conds[ci]
-        mut ok := false
+        $ok := false
         if cond == 0 { ok = x == y }
         if cond == 1 { ok = x != y }
         if cond == 10 { ok = x >= y }
@@ -436,23 +436,23 @@ fn probe_loong_branches(a &mut Assembler) {
 fn main() int {
     args := os.argv()
     mode := args[1]
-    mut a := Assembler{}
+    $a := Assembler{}
     a.os = 1
     a.arch = 3
-    if mode == "chan_rv32" || mode == "chan_thumb" { probe_chan(mut &a, mode == "chan_thumb") }
+    if mode == "chan_rv32" || mode == "chan_thumb" { probe_chan($&a, mode == "chan_thumb") }
     if mode == "loong_long" { a.arch = 4
         a.cmp_a = 4
         a.cmp_b = 5
-        probe_loong_branches(mut &a) }
+        probe_loong_branches($&a) }
     if mode == "cmp64" { a.arch = 5 }
-    if mode == "cmp32" || mode == "cmp64" { probe_cmp(mut &a, mode == "cmp64") }
-    if mode == "mem32" { probe_mem(mut &a) }
-    if mode == "cmp_loong" { probe_loong_cmp(mut &a) }
+    if mode == "cmp32" || mode == "cmp64" { probe_cmp($&a, mode == "cmp64") }
+    if mode == "mem32" { probe_mem($&a) }
+    if mode == "cmp_loong" { probe_loong_cmp($&a) }
     if mode == "store" { a.arch = 1
-        probe_store(mut &a) }
+        probe_store($&a) }
     if mode == "i12" { a.r_addi(5, 5, 4096) }
-    if mode == "atomic_rv" || mode == "atomic_thumb" { probe_atomics(mut &a, mode == "atomic_thumb") }
-    if args.len > 2 { probe_fixup(mut &a, mode, probe_num(args[2])) }
+    if mode == "atomic_rv" || mode == "atomic_thumb" { probe_atomics($&a, mode == "atomic_thumb") }
+    if args.len > 2 { probe_fixup($&a, mode, probe_num(args[2])) }
     probe_dump(&a)
     << 0
 }
@@ -516,6 +516,9 @@ def main():
             return out
         if not opts.backend_only:
             check_phase_c(fixture)
+            # Keep the legacy-spelled corpus below as Phase C compatibility
+            # coverage beside check_phase_c's new markers. In particular,
+            # rejection inputs and their expected diagnostics stay unchanged.
             # Spec34 safety prerequisite (E21a/F27/H33): temporary loans
             # of a reference's pointee must retain the writable parent.
             loan_fns = ('fn both(s &int, w &mut int) { *w = 2\n println(*s) }\n'

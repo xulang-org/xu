@@ -21,7 +21,7 @@ CASES = [
 @main
 struct U { a string b string }
 fn main() int {
-    mut u := U{a: "a0_" + "padpadpadpadpad", b: "b0_" + "padpadpadpadpad"}
+    $u := U{a: "a0_" + "padpadpadpadpad", b: "b0_" + "padpadpadpadpad"}
     u.a = "a1_" + "padpadpadpadpad"
     u.b = "b1_" + "padpadpadpadpad"
     u.a = "a2_" + "padpadpad"
@@ -35,7 +35,7 @@ fn main() int {
 @main
 struct U { s string }
 fn main() int {
-    mut u := U{s: "init_" + "padpadpadpad"}
+    $u := U{s: "init_" + "padpadpadpad"}
     for i in 0 -< 20 {
         u.s = "v" + str(i) + "_" + "padpadpadpad"
     }
@@ -48,7 +48,7 @@ fn main() int {
 @main
 struct U { a string b string }
 fn main() int {
-    mut u := U{a: "a0_" + "padpadpadpad", b: "b0_" + "padpadpadpad"}
+    $u := U{a: "a0_" + "padpadpadpad", b: "b0_" + "padpadpadpad"}
     for i in 0 -< 12 {
         u.a = "a" + str(i) + "_" + "padpadpadpad"
         u.b = "b" + str(i) + "_" + "padpadpadpad"
@@ -64,7 +64,7 @@ fn main() int {
 struct Leaf { s string }
 struct Root { a Leaf b Leaf }
 fn main() int {
-    mut r := Root{a: Leaf{s: "A0_" + "padpadpadpad"}, b: Leaf{s: "B0_" + "padpadpadpad"}}
+    $r := Root{a: Leaf{s: "A0_" + "padpadpadpad"}, b: Leaf{s: "B0_" + "padpadpadpad"}}
     for i in 0 -< 8 {
         r.a.s = "A" + str(i) + "_" + "padpadpadpad"
         r.b.s = "B" + str(i) + "_" + "padpadpadpad"
@@ -78,7 +78,7 @@ fn main() int {
 ("array_elem_assign", """
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     for i in 0 -< 6 {
         a.push("s" + str(i) + "_" + "padpadpadpad")
     }
@@ -95,7 +95,7 @@ fn main() int {
 @main
 struct P { name string id int }
 fn main() int {
-    mut ps := []P{}
+    $ps := []P{}
     for i in 0 -< 8 {
         ps.push(P{name: "n" + str(i) + "_" + "padpadpadpad", id: i})
     }
@@ -111,7 +111,7 @@ fn main() int {
 ("map_value_assign", """
 @main
 fn main() int {
-    mut m := map[string]string{}
+    $m := map[string]string{}
     for i in 0 -< 8 {
         m["k" + str(i)] = "v" + str(i) + "_" + "padpadpadpad"
     }
@@ -127,7 +127,7 @@ fn main() int {
 @main
 struct U { s string }
 fn main() int {
-    mut u := U{s: "old_" + "padpadpadpad"}
+    $u := U{s: "old_" + "padpadpadpad"}
     u = U{s: "new_" + "padpadpadpad"}
     println(u.s)
     << 0
@@ -141,7 +141,7 @@ fn make(i int) string {
     << "m" + str(i) + "_" + "padpadpadpad"
 }
 fn main() int {
-    mut u := U{s: make(0)}
+    $u := U{s: make(0)}
     u.s = make(1)
     u.s = make(2)
     println(u.s)
@@ -153,7 +153,7 @@ fn main() int {
 @main
 struct Cell { s string }
 fn main() int {
-    mut a := []Cell{}
+    $a := []Cell{}
     a.push(Cell{s: "c0_" + "padpadpadpad"})
     a.push(Cell{s: "c1_" + "padpadpadpad"})
     a[0] = Cell{s: "d0_" + "padpadpadpad"}
@@ -168,7 +168,7 @@ fn main() int {
 @main
 struct U { s string }
 fn main() int {
-    mut u := U{s: ""}
+    $u := U{s: ""}
     for i in 0 -< 10 {
         u.s = "x" + str(i) + "_" + "padpadpadpad"
         u.s = u.s + "_tailpadpad"
@@ -185,7 +185,7 @@ fn take(s string) {
     println(s)
 }
 fn main() int {
-    mut u := U{s: "mv_" + "padpadpadpad"}
+    $u := U{s: "mv_" + "padpadpadpad"}
     take(u.s)
     u.s = "after_" + "padpadpadpad"
     println(u.s)
@@ -196,7 +196,7 @@ fn main() int {
 ("map_get_println_drop", """
 @main
 fn main() int {
-    mut m := map[string]string{}
+    $m := map[string]string{}
     m["a"] = "aa_" + "padpadpadpad"
     m["b"] = "bb_" + "padpadpadpad"
     println(m["a"])
@@ -209,7 +209,7 @@ fn main() int {
 ("map_str_loop_get_drop", """
 @main
 fn main() int {
-    mut m := map[string]string{}
+    $m := map[string]string{}
     for i in 0 -< 4 {
         m["k" + str(i)] = "v" + str(i) + "_" + "padpadpadpad"
     }

@@ -67,16 +67,18 @@ fn main() int {
 > 3. **Native Lightweight Concurrency**: `xu worker()` coroutines + `chan` channels provide effortless Go-like concurrency.
 > 4. **Compile-time Static Safety**: Tracked via ownership & borrow inference. **Zero garbage collection (Zero-GC)**, zero pauses, and ultra-lean deterministic memory consumption.
 
-A writable reference name `r: &mut T` can satisfy an `&T` expectation: write
+A writable reference name `r: $&T` can satisfy an `&T` expectation: write
 `read(r)` or `let view: &T = r`. The shared view keeps the parent frozen against
 conflicting writes and moves through its last use, including stored views and
 call results. Conflicting shared and writable arguments in one call are rejected.
 Implicit downgrade currently requires a local reference name and the identical
-direct pointee type. Ordinary values still need `&x`; the planned `$` mutable
-spellings and automatic borrowing from ordinary values are not implemented.
+direct pointee type. Declare a mutable binding once with `$x := value` (or
+`let $x: T = value`); use plain `x` afterward. Ordinary values need `&x` for a
+shared borrow or `$&x` for a writable borrow, whose reference type is `$&T`.
+Reuse reference names as `r`, or write `&*r` for an explicit reborrow.
+Automatic borrowing from ordinary values is not implemented.
 
-See [Borrowing and mutable bindings](docs/language/borrowing.md) for current rules
-and the planned borrow syntax direction.
+See [Borrowing and mutable bindings](docs/language/borrowing.md) for the current rules.
 
 ---
 
