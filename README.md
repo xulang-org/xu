@@ -31,7 +31,7 @@
 
 ---
 
-> **Latest Official Release**: [Xu v0.10.7](https://github.com/xulang-org/xu/releases/tag/v0.10.7) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
+> **Official SDK Downloads**: [GitHub Releases](https://github.com/xulang-org/xu/releases) — See [Release Notes](RELEASES.md) for full changelog, breaking changes, and migration details.
 
 ## ⚡ Xu at a Glance (Show, Don't Tell)
 
@@ -66,6 +66,14 @@ fn main() int {
 > 2. **Ergonomic Error Flow**: Handled at the call site with `or (err) { ... }`. Eliminates screen-cluttering `if err != nil` and catastrophic runtime `unwrap()` panics.
 > 3. **Native Lightweight Concurrency**: `xu worker()` coroutines + `chan` channels provide effortless Go-like concurrency.
 > 4. **Compile-time Static Safety**: Tracked via ownership & borrow inference. **Zero garbage collection (Zero-GC)**, zero pauses, and ultra-lean deterministic memory consumption.
+
+A writable reference name `r: &mut T` can satisfy an `&T` expectation: write
+`read(r)` or `let view: &T = r`. The shared view keeps the parent frozen against
+conflicting writes and moves through its last use, including stored views and
+call results. Conflicting shared and writable arguments in one call are rejected.
+Implicit downgrade currently requires a local reference name and the identical
+direct pointee type. Ordinary values still need `&x`; the planned `$` mutable
+spellings and automatic borrowing from ordinary values are not implemented.
 
 See [Borrowing and mutable bindings](docs/language/borrowing.md) for current rules
 and the planned borrow syntax direction.
@@ -258,7 +266,7 @@ Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using 
 
 ## 🗺️ Project Roadmap
 
-This roadmap follows the **official 0.10.7 SDK**. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
+The published SDK is the baseline for this roadmap. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
 
 - [x] **Pure Xu Self-Hosting and Native AOT**: Bootstrap from a published Xu SDK, verify a fixed point, and directly emit native machine code and WebAssembly
 - [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges
