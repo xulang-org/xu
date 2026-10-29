@@ -81,7 +81,37 @@ fn invalid_socket_rejected() bool {
     << false
 }
 
+fn invalid_write_rejected() bool {
+    text := "probe"
+    _ := net.conn_write(-1, &text) or (err) { << true }
+    << false
+}
+
+fn invalid_read_rejected() bool {
+    _ := net.conn_read(-1, 1) or (err) { << true }
+    << false
+}
+
+fn invalid_sendto_rejected() bool {
+    address := string_from_bytes([127, 0, 0, 1, 0, 1])
+    _ := os.sendto(-1, address, "probe") or (err) { << true }
+    << false
+}
+
+fn invalid_recvfrom_rejected() bool {
+    _ := os.recvfrom(-1, 1) or (err) { << true }
+    << false
+}
+
+fn invalid_timeout_rejected() bool {
+    _ := os.set_sock_timeout(-1, 1000000) or (err) { << true }
+    << false
+}
+
 fn probe(addr string) int {
+    if !invalid_write_rejected() || !invalid_read_rejected() || !invalid_sendto_rejected() || !invalid_recvfrom_rejected() || !invalid_timeout_rejected() {
+        >> errors.new("invalid socket I/O accepted")
+    }
     lfd := net.listen(addr + "") or >>
     // No client exists yet: every readiness result must be exactly zero.
     for i in 0:64 {
