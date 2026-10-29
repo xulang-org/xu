@@ -263,7 +263,7 @@ elif [ "$seed_build_rc" -ne 0 ]; then
     # an intermediate compiler without that wrapper, then restart Gen1 on
     # the complete original source. Never install or compare the bridge as
     # a product generation, and never recover unrelated compiler failures.
-    if ! grep -Eq "undefined name 'sys_socket_(poll|wait)'" "$tmp/seed-build.log"; then
+    if ! grep -Eq "undefined name 'sys_(socket_(poll|wait)|fd_peek_read)'" "$tmp/seed-build.log"; then
         exit "$seed_build_rc"
     fi
     FAILED_STAGE="socket_seed_bridge"
@@ -286,6 +286,15 @@ text = re.sub(
 text = re.sub(
     r'^pub fn socket_wait\(fd int, events int, timeout_ns int\) int \{\n'
     r'    << sys_socket_wait\(fd, events, timeout_ns\) or >>\n\}\n',
+    '', text, flags=re.MULTILINE,
+)
+# Seeds older than the Windows non-consuming peek builtin: drop the
+# Windows-only fd_wait_read branch so the bridge type-checks. The bridge is
+# only used to compile the original, complete source.
+text = re.sub(
+    r'^    if xu_target_os\(\) == 2 \{\n        started := now_ns\(\)\n'
+    r'        while true \{\n            ready := sys_fd_peek_read\(fd\) or >>\n'
+    r'(?:.*\n)*?        \}\n        << 0\n    \}\n',
     '', text, flags=re.MULTILINE,
 )
 socket.write_text(text)
