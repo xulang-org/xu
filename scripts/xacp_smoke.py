@@ -51,7 +51,11 @@ def deadline_stdio(app, **overrides):
             child.kill()
             child.wait(timeout=5)
         for stream in (child.stdin, child.stdout, child.stderr):
-            stream.close()
+            try:
+                stream.close()
+            except OSError:
+                # Closing a pipe can flush bytes after the timed-out child exits.
+                pass
 
 
 def request_id_checks(app):
@@ -100,8 +104,13 @@ def session_stdio_timeout_checks(app):
         return
 
     def send(child, data):
-        child.stdin.write(data)
-        child.stdin.flush()
+        try:
+            child.stdin.write(data)
+            child.stdin.flush()
+        except BrokenPipeError:
+            # The deadline may close stdin before either write or flush finishes.
+            # Callers still verify the expected response and session termination.
+            pass
 
     def response(child, request_id, error=None):
         return checked(read_frame(fd_reader(child.stdout.fileno())), request_id, error)
