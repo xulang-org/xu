@@ -14,7 +14,7 @@ Winsock adapters sign-extend 32-bit status and byte-count results, including TCP
 
 ## Xu 0.10.12-rc.1 (prerelease)
 
-This release candidate promotes the validated development branch for wider testing. It adds the Phase C borrow syntax: `$` and `$&` forms, explicit `mut` bindings and `&mut` writable references. A name of type `&mut T` is accepted where a shared `&T` is expected. XACP smoke tests pin the companion examples to the current XACP API and tolerate stdin closing at the hello deadline on slow runners.
+This release candidate promotes the validated development branch for wider testing. It adds the Phase C markers: `$name :=` for mutable bindings and `$&` for writable borrow expressions and reference types. The legacy `mut name :=`, `mut &value` and `&mut T` spellings remain compatible. A name of type `$&T` is accepted where a shared `&T` is expected. XACP smoke tests pin the companion examples to the current XACP API and tolerate stdin closing at the hello deadline on slow runners.
 
 This is a prerelease; APIs and syntax may still change before 0.10.12. Upgrade the compiler, standard library and product tools together. Published binaries and checksums are listed with the release assets.
 
@@ -155,7 +155,7 @@ These are source-development changes. Published installers remain available from
 
 The source tree also retains the compiler consistency and optimizer work described below:
 
-- **Borrow Checking Soundness**: The borrow checker now walks every expression kind (with a conservative fallback for unknown kinds), so aliasing such as `f(mut &v, &v)` is reported even when nested inside casts or arithmetic; borrows taken inside a loop now stay live across the back edge. Programs that previously compiled only because of these gaps now receive a diagnostic.
+- **Borrow Checking Soundness**: The borrow checker now walks every expression kind (with a conservative fallback for unknown kinds), so aliasing such as `f($&v, &v)` is reported even when nested inside casts or arithmetic; borrows taken inside a loop now stay live across the back edge. Programs that previously compiled only because of these gaps now receive a diagnostic.
 - **Generics and Type Table Limits**: Generic declarations are no longer limited to four type parameters, type-id range overflow is asserted instead of silently wrapping, and backends that do not support a requested target fail explicitly.
 - **MIR Verification**: `XU_VERIFY=1` runs the full MIR verifier after every optimization pass; mismatches between the verifier, lowering and the backend were fixed. `XU_DUMP_MIR=<fn>` dumps a function's MIR.
 - **SSA Loop Optimization**: Scalar SSA promotion no longer depends on a per-shape whitelist, and the ARM64 loop kernels (scan, saxpy, CRC, binary search, fill, stride, predicated scan) have SSA-based matchers. Loops bounded by an `[]int` length are rotated so they qualify. Measured speedups versus 0.9.3 include `bloom_filter` ~12%, `chase_index` 9-11%, `f64_sum` ~8% and `algorithm_search` ~9% at `-O3`, with no regressions and slightly faster self-compilation.
@@ -168,6 +168,6 @@ and requires a fixed point between adjacent generations. The repository does not
 claim a seed-free bootstrap from only the checked-in sources.
 
 Coroutine calls are ownership boundaries: `xu` transfers owned values or uses
-channels, while borrowed `&T` and `&mut T` values do not cross into another
+channels, while borrowed `&T` and `$&T` values do not cross into another
 coroutine. The `<-` token is context-sensitive by design: a statement form is
 `break`, while an expression such as `<-ch` receives from a channel.

@@ -45,7 +45,7 @@ fn main() int {
     ("tmp_loop_drop", '''
 @main
 fn main() int {
-    mut s := ""
+    $s := ""
     for i in 0 -< 12 {
         s = s + "0123456789abcdef"
     }
@@ -58,7 +58,7 @@ fn main() int {
     ("tmp_arr_push_drop", '''
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     for i in 0 -< 30 {
         a.push("x" + str(i) + "_pad")
     }
@@ -70,7 +70,7 @@ fn main() int {
     ("tmp_arr_overwrite", '''
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     a.push("aaaa_padpad")
     a.push("bbbb_padpad")
     a[0] = "cccc"
@@ -82,7 +82,7 @@ fn main() int {
 @main
 struct U { s string }
 fn main() int {
-    mut u := U{s: "init"}
+    $u := U{s: "init"}
     for i in 0 -< 20 {
         u.s = "v" + str(i) + "_padpad"
     }
@@ -103,7 +103,7 @@ fn main() int {
     ("tmp_map_owning", '''
 @main
 fn main() int {
-    mut m := map[string]string{}
+    $m := map[string]string{}
     for i in 0 -< 15 {
         m["k" + str(i)] = "v" + str(i) + "_pad"
     }
@@ -141,7 +141,7 @@ fn main() int {
     ("tmp_live_end", '''
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     for i in 0 -< 10 {
         a.push("keep" + str(i))
     }
@@ -153,7 +153,7 @@ fn main() int {
 @main
 fn main() int {
     a := [3]int{1,2,3}
-    mut i := 3
+    $i := 3
     println(a[i])
     << 0
 }
@@ -161,7 +161,7 @@ fn main() int {
     ("loud_div", '''
 @main
 fn main() int {
-    mut z := 0
+    $z := 0
     println(1/z)
     << 0
 }

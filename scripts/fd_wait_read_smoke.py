@@ -63,10 +63,10 @@ fn main() int {
         }
         << 1
     }
-    mut timeout := 200000000
+    $timeout := 200000000
     if mode == "probe" { timeout = -1 }
     if mode == "infinite" { timeout = 0 }
-    mut ready := os.fd_wait_read(0, timeout) or (err) {
+    $ready := os.fd_wait_read(0, timeout) or (err) {
         eprintln(err.msg())
         << 2
     }

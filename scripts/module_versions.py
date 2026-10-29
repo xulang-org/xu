@@ -224,7 +224,7 @@ def release(root: Path, kind: str | None = None, check: bool = False, *, allow_s
             errors.append(f"{name}: {error}")
     # Update only the product version fields, not arbitrary version strings.
     fields = (
-        ("src/cmd/setup/main.xu", r'(mut req_version := ")([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)'),
+        ("src/cmd/setup/main.xu", r'((?:mut |\$)req_version := ")([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)'),
         ("src/cmd/compile/driver_entry.xu", r'(fn compiler_version\(\) string \{\s*<< ")([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)'),
         ("src/cmd/desktop/pack_macos.xu", r"(CFBundleShortVersionString</key>[^\n]*?<string>)([0-9]+\.[0-9]+\.[0-9]+)"),
         ("src/cmd/desktop/pack_macos.xu", r"(XuToolchainVersion</key>[^\n]*?<string>)([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)"),
