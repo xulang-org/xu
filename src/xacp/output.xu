@@ -1,0 +1,69 @@
+@xacp
+
+#encoding/xun
+#errors
+
+const DEFAULT_OUTPUT_BUFFER = 65536
+const MIN_OUTPUT_BUFFER = 4096
+const MAX_OUTPUT_BUFFER = 16777216
+
+// Idempotent activation. The runtime owns the rings and dedicated fd until
+// process exit; callers borrow the fd and must never close it. Hosts without
+// capture retain the ordinary stdio transport and return not_implemented.
+fn output_control_fd() int {
+    capacity := timeout_from_env("XU_XACP_OUTPUT_BUFFER",MIN_OUTPUT_BUFFER,MAX_OUTPUT_BUFFER,DEFAULT_OUTPUT_BUFFER,false)
+    fd := sys_xacp_output_init(capacity)
+    if fd < 0 { << 1 }
+    << fd
+}
+
+// The private runtime bridge prefixes snapshots with two LE64 counters. This
+// byte contract avoids exposing runtime pointers or borrowed ring storage.
+fn output_counter(snapshot &string,offset int) int {
+    mut value := 0
+    for i in 0:8 { value = value | ((snapshot[offset + i] & 255) << (i * 8)) }
+    << value
+}
+
+fn output_page(stream &string,since int,total int,base int,dropped int,bytes &string) string {
+    next_since := since + bytes.len
+    << "  stream: " + *stream + "\n  since: !i " + str(since) + "\n  count: !i " + str(bytes.len) +
+        "\n  total: !i " + str(total) + "\n  base: !i " + str(base) + "\n  dropped: !i " + str(dropped) +
+        "\n  truncated: !b " + str(next_since < total) + "\n  next_since: !i " + str(next_since) +
+        "\n  data: " + control_string(bytes) + "\n"
+}
+
+// Schema and PERM_PROCESS are checked by the control thread before this call.
+// A single snapshot fixes base/total even if a writer wraps the ring while
+// escape expansion is being fitted to the response frame budget.
+fn process_output(d &xun.Doc,r &Request,l &Limits) ControlReply {
+    stream := require_string(d,d.get(r.args,"stream"),"stream")
+    mut fd := 1
+    if stream == "stderr" { fd = 2 }
+    mut requested := 0
+    if has_field(d,r.args,"since") { requested = require_int(d,d.get(r.args,"since"),"since") }
+    mut max_bytes := 4096
+    if l.max_frame_bytes / 2 < max_bytes { max_bytes = l.max_frame_bytes / 2 }
+    if has_field(d,r.args,"max_bytes") { max_bytes = require_int(d,d.get(r.args,"max_bytes"),"max_bytes") }
+    snapshot := sys_xacp_output_read(fd,requested,max_bytes)
+    if snapshot.len == 0 { << screen_failure("not_implemented","host has no output capture") }
+    if snapshot.len < 16 { >> errors.new("invalid output snapshot") }
+    base := output_counter(&snapshot,0)
+    total := output_counter(&snapshot,8)
+    if requested > total { >> errors.new("since beyond end of stream") }
+    mut since := requested
+    if since < base { since = base }
+    dropped := since - requested
+    overhead := ("id: !i " + str(r.id) + "\nok: !b true\ndata:\n").len
+    mut count := snapshot.len - 16
+    while true {
+        bytes := snapshot[16:16 + count]
+        page := output_page(&stream,since,total,base,dropped,&bytes)
+        if page.len <= l.max_frame_bytes - overhead { << screen_reply(pass(r.id),page) }
+        // Escape expansion is unknowable to clients. Fit it automatically,
+        // retaining forward progress whenever this snapshot has any bytes.
+        if count <= 1 { >> errors.new("output metadata exceeds frame limit") }
+        count = count / 2
+    }
+    << screen_failure("adapter_error","output frame unavailable")
+}

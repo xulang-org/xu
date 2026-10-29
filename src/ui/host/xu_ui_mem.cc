@@ -1533,11 +1533,19 @@ static bool asset_lookup(const char *path, bool *exists_query, const unsigned ch
   return true;
 }
 
+#include "xu_ui_xacp.inc"
+
 int xu_ui_mem_try_write(const char *path_z, const void *data, unsigned data_len, unsigned *out_n) {
   char tb[160];
   snprintf(tb, sizeof(tb), "mem_try_write: %s len=%u", path_z ? path_z : "(null)", data_len);
   do_trace(tb);
   const char *key = mem_path_key(path_z);
+  if (key && !strncmp(key,"__xacp_file/",12)) {
+    bool ok = xacp_write_file(key,data,data_len); if(out_n) *out_n = ok ? data_len : 0; return 1;
+  }
+  if (key && !strncmp(key,"__xacp_cleanup/",15)) {
+    xacp_cleanup_files(key); if(out_n) *out_n = data_len; return 1;
+  }
   int ms;
   if (!xu_ui_mem_is_path(path_z)) return 0;
   if (!strncmp(path_z, ":xu:/__asset/", 13) || !strncmp(path_z, ":xu:/__asset_exists/", 20)) {
@@ -1967,6 +1975,9 @@ int xu_ui_mem_try_read_len(const char *path_z, unsigned *out_len) {
   }
   if (!strncmp(key,"__web_invoke_target/",20)) {if(out_len)*out_len=12;return 1;}
   if (!strcmp(key,"__web_invoke_id")) {if(out_len)*out_len=20;return 1;}
+  if (!strcmp(key,"__xacp_generation")) {if(out_len)*out_len=20;return 1;}
+  if (!strcmp(key,"__xacp_directory")) {if(out_len)*out_len=(unsigned)xacp_directory().size();return 1;}
+  if (!strncmp(key,"__image_rgba/",13)) {if(out_len)*out_len=xacp_rgba_length(key);return 1;}
   if (!strncmp(key,"__web_invoke_packet/",20)) {uint64_t id=0;unsigned size=xu_request_id(key+20,&id)?web_packet_length(id):0;if(out_len)*out_len=size;return 1;}
   if (!strcmp(key,"__web_dispatch_running")) {if(out_len)*out_len=1;return 1;}
   if (!strcmp(key,"__web_invoke_take")) {if(out_len)*out_len=web_take_length();return 1;}
@@ -2039,6 +2050,9 @@ int xu_ui_mem_try_read_copy(const char *path_z, void *out, unsigned cap) {
    * empty handled read; callers can distinguish this from a non-virtual path
    * via the return value of xu_ui_mem_try_read_copy. */
   if (!out || cap == 0) return 1;
+  if (!strcmp(key,"__xacp_generation")) {if(cap>=21)snprintf((char *)out,cap,"%020llu",(unsigned long long)g_xacp_generation.fetch_add(1));return 1;}
+  if (!strcmp(key,"__xacp_directory")) {auto directory=xacp_directory();if(cap>directory.size())memcpy(out,directory.c_str(),directory.size()+1);else memset(out,0,cap);return 1;}
+  if (!strncmp(key,"__image_rgba/",13)) {xacp_rgba_copy(key,out,cap);return 1;}
   if (!strncmp(key,"__web_invoke_target/",20)) {
     memset(out,0,cap);uint64_t id=0;unsigned identity[3]={};
     if(cap>=13 && xu_request_id(key+20,&id)){web_target(id,identity);auto *p=(unsigned char *)out;for(unsigned i=0;i<3;++i)for(unsigned j=0;j<4;++j)p[i*4+j]=(unsigned char)(identity[i]>>(j*8));}return 1;
