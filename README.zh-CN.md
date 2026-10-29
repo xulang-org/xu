@@ -217,6 +217,8 @@ xu test test.example.xu -v -o test-example
 
 Windows 输出带 `.exe` 后缀，运行 `./test-example.exe`。构建时使用 `-count N` 可重复执行测试套件；当前解析器接受 1–1000，CLI 帮助仍显示 1–100。
 
+Windows socket 就绪与并发 HTTP 回归可从仓库根运行 `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64`（或 `windows-x64`）。它检查空闲监听器与无效 socket，再在 O0–O3 各运行三次并发回环请求；构建和执行均有超时限制。
+
 使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](https://github.com/xulang-org/examples/tree/main/examples/xacp)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
 
 `#xacp` 是传输无关的标准库层，用于宿主注册一个真实的
