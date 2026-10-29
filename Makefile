@@ -70,7 +70,7 @@ help:
 	@echo "  make wasm-ui-smoke    build site playground with this compiler + Node UI tests"
 	@echo "  make wasm-smoke       wasm32 optimized/unoptimized frame ABI smoke (requires Node.js)"
 	@echo "  make doc-test         xu doc Markdown golden + CLI smoke"
-	@echo "  make xacp-test        XACP discovery, safe launcher and protocol core smoke"
+	@echo "  make xacp-test        XACP discovery, session security and HTTP POST probe smoke"
 	@echo "  make packages-test    package regressions using product xu and local protocol peers"
 	@echo "  make bench-runtime    运行时基准(xu-bench, confirmed product,--save/--check 见脚本)"
 	@echo "  make bench-stdlib     标准库热路径（os/io/fs/path/time/strings）基准（xu-bench/scripts/bench_stdlib.sh）"
@@ -91,7 +91,11 @@ help:
 
 all: xu
 
+# The smoke also runs xacp_cross_protocol_probe against token/no-token TCP peers.
 xacp-test: xu-xacp
+	XU="$(abspath $(XU))" $(PYTHON) scripts/fd_wait_read_smoke.py
+	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_proc_output_smoke.py
+	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_screenshot_smoke.py
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_smoke.py
 
 # Local peers need no external databases or credentials. Product rebuilds are

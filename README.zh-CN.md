@@ -31,7 +31,7 @@
 
 ---
 
-> **最新正式版本**：[Xu v0.10.7](https://github.com/xulang-org/xu/releases/tag/v0.10.7) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
+> **正式 SDK 下载**：[GitHub Releases](https://github.com/xulang-org/xu/releases) — 详细更新记录、变更与迁移指南请查阅 [版本说明 (Release Notes)](RELEASES.zh-CN.md)。
 
 ## ⚡ 一眼看懂 Xu（Show, Don't Tell）
 
@@ -66,6 +66,11 @@ fn main() int {
 > 2. **轻量错误捕获**：调用处通过 `or (err) { ... }` 强制就地处理或传播，杜绝到处充斥的 `if err != nil` 样板代码与 `unwrap()` 崩溃风险。
 > 3. **原生极简并发**：`xu worker()` 启动协程配合 `chan` 管道通信，心智像 Go 一样平易近人。
 > 4. **编译期全静态安全**：基于所有权与借用推导，**无垃圾回收器（Zero-GC）**，没有 GC 停顿，内存极度精炼。
+
+可写引用名 `r: &mut T` 可满足 `&T` 期望：写 `read(r)` 或 `let view: &T = r`。
+共享 view 及其后代存活到最后一次使用之前，父引用的冲突写入和移动会被拒绝；存储的 view 和调用结果也保留借用约束。
+同一调用中的冲突共享与可写参数会被拒绝。隐式降级目前只支持局部引用名，且直接 pointee 类型必须相同。
+普通值仍需写 `&x`；计划中的 `$` 可变拼写和普通值自动借用尚未实现。
 
 当前借用与可变绑定规则，以及后续语法方向，见[借用指南](docs/language/borrowing.md)。
 
@@ -250,7 +255,7 @@ schema、生命周期、原生资源释放或内存上限。截图返回拥有�
 
 ## 🗺️ 项目路线图 (Roadmap)
 
-以下以 **0.10.7 正式 SDK** 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
+以下以已发布的正式 SDK 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
 
 - [x] **纯 Xu 自举与原生 AOT**：以已发布 Xu SDK 为种子，验证自举固定点；直接生成原生机器码与 WebAssembly
 - [x] **编译期所有权与借用推导**：确定性资源回收；0.9.4 补齐嵌套表达式与循环回边的借用检查

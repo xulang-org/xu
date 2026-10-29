@@ -78,7 +78,7 @@ pub fn input_record(event &ui.InputEvent) string {
 }
 
 pub fn surface_record(surface &draw.Surface) string {
-    << "width=" + event_float(surface.width) + "\theight=" + event_float(surface.height) +
+    << "redacted=true\twidth=" + event_float(surface.width) + "\theight=" + event_float(surface.height) +
         "\tpixel_width=" + str(surface.pixel_width) + "\tpixel_height=" + str(surface.pixel_height)
 }
 
@@ -133,11 +133,25 @@ fn request_input_events(d &xun.Doc,args int,s &widgets.Screen,l &Limits) []ui.In
     << out
 }
 
-// Read-only tree operation. The returned nodes are copies and remain valid
+pub struct TreeWindow {
+    pub start int
+    pub total int
+    pub nodes []widgets.ScreenNodeInfo
+}
+
+// Read-only tree window. The returned nodes are copies and remain valid
 // after the caller releases the Screen borrow.
-pub fn screen_tree(s &mut widgets.Screen,include_hidden bool,max_rows int,l &Limits) []widgets.ScreenNodeInfo {
+pub fn screen_tree(s &mut widgets.Screen,include_hidden bool,start int,max_rows int,l &Limits) TreeWindow {
     if max_rows <= 0 || max_rows > l.max_table_rows { >> errors.new("xacp: ui.tree row limit exceeds safety limit") }
-    << s.xacp_tree(include_hidden,max_rows) or >>
+    nodes := s.xacp_tree(include_hidden,widgets.XACP_MAX_NODES) or >>
+    total := nodes.len
+    if start < 0 || start > total { >> errors.new("xacp: ui.tree start exceeds node count") }
+    mut count := total - start
+    if count > max_rows { count = max_rows }
+    if !check_window(start,count,total,l) { >> errors.new("xacp: invalid tree window") }
+    mut page := []widgets.ScreenNodeInfo{}
+    for i in start:start + count { page.push(nodes[i]) }
+    << TreeWindow{start: start,total: total,nodes: page}
 }
 
 // The Surface is a native resource with explicit ownership. The caller must
@@ -217,9 +231,9 @@ fn screen_window_matches(s &widgets.Screen,d &xun.Doc,args int,required bool) bo
 
 // Permission-bearing entry points. Every operation reserves a monotonic
 // request id and releases it on both success and adapter failure.
-pub fn ui_tree(s &mut widgets.Screen,session &mut Session,id int,include_hidden bool,max_rows int,l &Limits) []widgets.ScreenNodeInfo {
+pub fn ui_tree(s &mut widgets.Screen,session &mut Session,id int,include_hidden bool,start int,max_rows int,l &Limits) TreeWindow {
     begin_ui(mut &*session,id,"ui.tree") or >>
-    result := screen_tree(mut &*s,include_hidden,max_rows,l) or (err) { cancel_request(mut &*session)
+    result := screen_tree(mut &*s,include_hidden,start,max_rows,l) or (err) { cancel_request(mut &*session)
         >> err }
     end_ui(mut &*session,id) or >>
     << result
@@ -270,49 +284,65 @@ pub fn ui_act(s &mut widgets.Screen,session &mut Session,id int,request_id int,a
 }
 
 // dispatch_screen executes the schema-approved UI operations against the
-// registered Screen. Data-bearing callers should use the typed entry points
-// above (tree/actions/screenshot ownership); this function is the transport
-// adapter hook and preserves the same request lifecycle and policy checks.
-pub fn dispatch_screen(s &mut widgets.Screen,session &mut Session,d &xun.Doc,l &Limits) Outcome {
-    request := validate_request(d,l) or (err) { << fail("schema_error",err.msg()) }
-    started := begin_request(mut &*session,&request)
-    if !started.ok { << started }
+// registered Screen and serializes every successful result before releasing
+// the borrow. Native Surfaces are disposed before the owning PNG reply crosses
+// the mailbox; only the authoritative session can export a screenshot file.
+pub fn dispatch_screen(s &mut widgets.Screen,session &mut Session,d &xun.Doc,l &Limits,nonces &mut NonceRegistry) ControlReply {
+    request := validate_request(d,l) or (err) { close_session(mut &*session)
+        << screen_failure("schema_error",err.msg()) }
     if request.op == "xacp.hello" {
-        << finish_request(mut &*session,request.id)
+        << screen_reply(dispatch(mut &*session,d,l,mut &*nonces), "")
     }
+    result := dispatch_screen_request(mut &*s,mut &*session,d,l,&request) or >>
+    << export_screenshot(mut &*session,result,request.id,l)
+}
+
+// Attached jobs have already negotiated hello in the transport coroutine.
+fn dispatch_screen_request(s &mut widgets.Screen,session &mut Session,d &xun.Doc,l &Limits,request &Request) ControlReply {
+    started := begin_request(mut &*session,request)
+    if !started.ok { << screen_reply(started, "") }
+    raw := request_raw(d,request)
+    if raw && (session.permissions & PERM_UI_RAW) == 0 {
+        cancel_request(mut &*session)
+        session.next_id = request.id
+        << screen_reply(Outcome{ok: false,request_id: request.id,err_code: "permission_denied",err_msg: "RAW is not authorized"},"")
+    }
+    if !s.is_open() { cancel_request(mut &*session)
+        << screen_failure("stale_window","screen is closed") }
+    mut data := ""
     if request.op == "ui.tree" {
         if !screen_window_matches(&*s,d,request.args,false) { cancel_request(mut &*session)
-            << fail("stale_window","stale or foreign screen window") }
+            << screen_failure("stale_window","stale or foreign screen window") }
         include_hidden := d.get(request.args,"include_hidden") >= 0 && require_bool(d,d.get(request.args,"include_hidden"),"include_hidden")
-        mut max_rows := l.max_table_rows
+        mut max_rows := widgets.XACP_MAX_NODES
+        if l.max_table_rows < max_rows { max_rows = l.max_table_rows }
         if d.get(request.args,"max_table_rows") >= 0 { max_rows = require_int(d,d.get(request.args,"max_table_rows"),"max_table_rows") }
-        tree_result := screen_tree(mut &*s,include_hidden,max_rows,l) or (err) { cancel_request(mut &*session)
+        mut start := 0
+        if d.get(request.args,"start") >= 0 { start = require_int(d,d.get(request.args,"start"),"start") }
+        tree_result := screen_tree(mut &*s,include_hidden,start,max_rows,l) or (err) { cancel_request(mut &*session)
             >> err }
-        if tree_result.len < 0 { >> errors.new("xacp: invalid tree result") }
+        data = serialize_tree(&*s,tree_result,l,raw) or (err) { cancel_request(mut &*session)
+            >> err }
     } else if request.op == "ui.screenshot" {
         if !screen_window_matches(&*s,d,request.args,true) { cancel_request(mut &*session)
-            << fail("stale_window","stale or foreign screen window") }
-        mut scale := 1.0
-        if d.get(request.args,"scale") >= 0 { scale = require_float(d,d.get(request.args,"scale"),"scale") }
-        if d.get(request.args,"node") >= 0 {
-            node := require_int(d,d.get(request.args,"node"),"node")
-            mut surface := screen_screenshot_node(mut &*s,node,scale,l) or (err) { cancel_request(mut &*session)
-                >> err }
-            surface.dispose()
-        } else {
-            mut surface := screen_screenshot(mut &*s,scale) or (err) { cancel_request(mut &*session)
-                >> err }
-            surface.dispose()
-        }
+            << screen_failure("stale_window","stale or foreign screen window") }
+        mut result := screenshot_result(mut &*s,d,request,l,raw) or (err) { cancel_request(mut &*session)
+            >> err }
+        if !result.outcome.ok { cancel_request(mut &*session)
+            result.outcome.request_id = request.id
+            << result }
+        result.outcome = finish_request(mut &*session,request.id)
+        << result
     } else if request.op == "ui.input" {
         if !screen_window_matches(&*s,d,request.args,true) { cancel_request(mut &*session)
-            << fail("stale_window","stale or foreign screen window") }
+            << screen_failure("stale_window","stale or foreign screen window") }
         input_result := screen_input_request(mut &*s,d,request.args,l) or (err) { cancel_request(mut &*session)
             >> err }
-        if input_result.len < 0 { >> errors.new("xacp: invalid input result") }
+        data = serialize_actions(input_result,l) or (err) { cancel_request(mut &*session)
+            >> err }
     } else if request.op == "ui.act" {
         if !screen_window_matches(&*s,d,request.args,true) { cancel_request(mut &*session)
-            << fail("stale_window","stale or foreign screen window") }
+            << screen_failure("stale_window","stale or foreign screen window") }
         node := require_int(d,d.get(request.args,"node"),"node")
         act := require_string(d,d.get(request.args,"act"),"act")
         mut text := ""
@@ -321,15 +351,16 @@ pub fn dispatch_screen(s &mut widgets.Screen,session &mut Session,d &xun.Doc,l &
         if d.get(request.args,"checked") >= 0 { checked = require_bool(d,d.get(request.args,"checked"),"checked") }
         act_result := screen_act(mut &*s,node,act,text,checked,l) or (err) { cancel_request(mut &*session)
             >> err }
-        if act_result.len < 0 { >> errors.new("xacp: invalid action result") }
+        data = serialize_actions(act_result,l) or (err) { cancel_request(mut &*session)
+            >> err }
     } else if request.op == "ui.record" {
         if !screen_window_matches(&*s,d,request.args,true) { cancel_request(mut &*session)
-            << fail("stale_window","stale or foreign screen window") }
+            << screen_failure("stale_window","stale or foreign screen window") }
         cancel_request(mut &*session)
-        << fail("stream_required","use start_recorder with a StreamWriter for ui.record")
+        << screen_failure("stream_required","use start_recorder with a StreamWriter for ui.record")
     } else {
         cancel_request(mut &*session)
-        << fail("not_implemented","operation has no registered Screen adapter")
+        << screen_failure("not_implemented","operation has no registered Screen adapter")
     }
-    << finish_request(mut &*session,request.id)
+    << screen_reply(finish_request(mut &*session,request.id),data)
 }

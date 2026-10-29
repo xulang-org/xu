@@ -28,7 +28,7 @@ fn rt_win_load_written(a &mut Assembler) {
 
 // Pack/oneexe ":xu:" mailbox — Win/mac/Linux x64+arm64 (aligned with bootstrap xurt).
 fn rt_ui_mem_mailbox(a &Assembler) bool {
-    if a.os == 2 && a.arch == 1 {
+    if a.os == 2 && (a.arch == 0 || a.arch == 1) {
         << true
     }
     if a.os == 0 && (a.arch == 0 || a.arch == 1) {
@@ -990,6 +990,99 @@ fn rt_emit_os_open(a &mut Assembler) {
     <<
 }
 
+// Windows fd APIs accept native HANDLEs from os_open/os_pipe, and the
+// conventional 0/1/2 for redirected standard streams. No CRT fd table exists.
+fn rt_emit_win_fd_handle(a &mut Assembler) {
+    a.label("_rt_win_fd_handle")
+    a.prologue(16)
+    a.vm_cmp_imm(18, 0)
+    a.jlt("_rt_wfh_done")
+    a.vm_cmp_imm(18, 2)
+    a.jgt("_rt_wfh_done")
+    a.vm_mov_imm(1, -10) // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+    a.sub(18, 1, 18)
+    a.vm_call_iat("_iat_GetStdHandle")
+    a.mov(18, 14)
+    a.label("_rt_wfh_done")
+    a.epilogue()
+}
+
+// Non-consuming Windows file probe. No overlapped read, helper thread, or
+// handle-mode change: anonymous stdio pipes need synchronous HANDLEs. The
+// caller must exclusively own reads; synchronous PeekNamedPipe can block
+// behind another thread's pending I/O on the same handle. Console signals
+// include non-key events and do not promise a complete line to ReadFile.
+fn rt_emit_fd_peek_read(a &mut Assembler) {
+    a.data_label("_rt_fd_wait_failed")
+    rt_emit_bytes(a, "os: fd wait failed")
+    a.data_label("_rt_fd_wait_unsupported")
+    rt_emit_bytes(a, "os: unsupported handle type")
+    if a.os == 2 { rt_emit_win_fd_handle(a) }
+    a.label("_rt_fd_peek_read")
+    a.prologue(32)
+    a.store(15, -8, 0)
+    if a.os == 2 {
+        a.call("_rt_win_fd_handle")
+        a.store(15, -16, 18)
+        a.vm_call_iat("_iat_GetFileType")
+        a.vm_cmp_imm(14, 1) // FILE_TYPE_DISK: reads/EOF never wait for input.
+        a.jeq("_rt_fpr_ready")
+        a.vm_cmp_imm(14, 2) // FILE_TYPE_CHAR
+        a.jeq("_rt_fpr_char")
+        a.vm_cmp_imm(14, 3) // FILE_TYPE_PIPE (Winsock SOCKETs are unsupported).
+        a.jeq("_rt_fpr_pipe")
+        a.vm_cbnz(14, "_rt_fpr_unsupported")
+        a.vm_call_iat("_iat_GetLastError")
+        a.vm_cbnz(14, "_rt_fpr_fail")
+        a.jmp("_rt_fpr_unsupported")
+        a.label("_rt_fpr_pipe")
+        a.vm_mov_imm(1, 0)
+        a.store(15, -24, 1) // Zero all 8 bytes; PeekNamedPipe writes a DWORD.
+        a.load(18, 15, -16)
+        a.vm_mov_imm(19, 0)
+        a.vm_mov_imm(20, 0)
+        a.vm_mov_imm(21, 0)
+        a.vm_sub_imm(22, 15, 24)
+        a.vm_mov_imm(23, 0)
+        // The existing seven-argument bridge also passes A5 on Win64's
+        // stack. PeekNamedPipe takes six arguments and ignores the NULL tail.
+        a.vm_call_iat7("_iat_PeekNamedPipe")
+        a.vm_cbz(14, "_rt_fpr_pipe_error")
+        a.load(1, 15, -24)
+        a.vm_cbnz(1, "_rt_fpr_ready")
+        a.jmp("_rt_fpr_pending")
+        a.label("_rt_fpr_pipe_error")
+        a.vm_call_iat("_iat_GetLastError")
+        a.vm_cmp_imm(14, 109) // ERROR_BROKEN_PIPE: next ReadFile yields EOF.
+        a.jeq("_rt_fpr_ready")
+        a.jmp("_rt_fpr_fail")
+        a.label("_rt_fpr_char")
+        a.load(18, 15, -16)
+        a.vm_mov_imm(19, 0)
+        a.vm_call_iat("_iat_WaitForSingleObject")
+        a.vm_cbz(14, "_rt_fpr_ready") // WAIT_OBJECT_0
+        a.vm_cmp_imm(14, 258) // WAIT_TIMEOUT
+        a.jne("_rt_fpr_fail")
+        a.label("_rt_fpr_pending")
+        a.vm_mov_imm(14, 0)
+        a.jmp("_rt_fpr_ok")
+        a.label("_rt_fpr_ready")
+        a.vm_mov_imm(14, 1)
+        a.label("_rt_fpr_ok")
+        a.load(0, 15, -8)
+        a.vm_mov_imm(1, 0)
+        a.store(0, 0, 1)
+        a.store(0, -8, 14)
+        a.epilogue()
+        a.label("_rt_fpr_fail")
+        rt_call_throw_strerr_static(a, -8, "_rt_fd_wait_failed", 18)
+        a.epilogue()
+    }
+    a.label("_rt_fpr_unsupported")
+    rt_call_throw_strerr_static(a, -8, "_rt_fd_wait_unsupported", 27)
+    a.epilogue()
+}
+
 fn rt_emit_os_fd_read(a &mut Assembler) {
     a.label("_rt_os_fd_read")
     a.prologue(48)
@@ -1002,17 +1095,21 @@ fn rt_emit_os_fd_read(a &mut Assembler) {
     a.mov(18, 1)
     a.call("_rt_alloc")
     a.store(15, -32, 14)
+    // Pipe/terminal reads can block. Hand runnable peers to a worker first.
+    a.call("_rt_enter_syscall")
     a.load(18, 15, -16)
+    if a.os == 2 { a.call("_rt_win_fd_handle") }
     a.load(19, 15, -32)
     a.load(20, 15, -24)
     if a.os == 2 {
-        a.lea(1, "_rt_written")
+        a.mov(1, 15)
+        a.vm_sub_imm(1, 1, 48)
         a.vm_mov_imm(0, 0)
         a.store(1, 0, 0)
         a.mov(21, 1)
         a.vm_mov_imm(22, 0)
         a.vm_call_iat("_iat_ReadFile")
-        rt_win_load_written(a)
+        a.load(14, 15, -48)
     } else {
         a.vm_syscall(syscall_number(a.os, a.arch, 5))
         a.vm_normalize_syscall("_rt_frd_n")
@@ -1057,23 +1154,35 @@ fn rt_emit_os_fd_write(a &mut Assembler) {
     a.store(15, -16, 18)
     a.store(15, -24, 19)
     a.store(15, -32, 20)
+    // Backpressure on stdout must not suspend unrelated coroutines.
+    a.call("_rt_enter_syscall")
     a.load(18, 15, -16)
+    if a.os == 2 { a.call("_rt_win_fd_handle") }
     a.load(19, 15, -24)
     a.load(20, 15, -32)
     if a.os == 2 {
-        a.lea(1, "_rt_written")
+        a.mov(1, 15)
+        a.vm_sub_imm(1, 1, 48)
         a.vm_mov_imm(0, 0)
         a.store(1, 0, 0)
         a.mov(21, 1)
         a.vm_mov_imm(22, 0)
         a.vm_call_iat("_iat_WriteFile")
-        rt_win_load_written(a)
+        a.load(14, 15, -48)
     } else {
         a.vm_syscall(syscall_number(a.os, a.arch, 1))
         a.vm_normalize_syscall("_rt_fwr_n")
     }
     a.vm_cmp_imm(14, 0)
     a.jlt("_rt_fwr_fail")
+    if xacp_output_supported(&*a) {
+        a.store(15, -40, 14)
+        a.load(18, 15, -16)
+        a.load(19, 15, -24)
+        a.mov(20, 14)
+        a.call("_rt_xacp_output_append")
+        a.load(14, 15, -40)
+    }
     a.load(0, 15, -8)
     a.vm_mov_imm(1, 0)
     a.store(0, 0, 1)
