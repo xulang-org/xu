@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.10.12-rc.2 (unreleased)
+
+Windows socket readiness fully initializes the `WSAPOLLFD` event fields and rejects zero-extended `SOCKET_ERROR` results. Previously stale stack flags could make a nonblocking readiness check report a large positive count, causing the HTTP intake loop to block in `accept` before processing connected clients. No public API or ABI changes.
+
 ## Xu 0.10.12-rc.1 (prerelease)
 
 This release candidate promotes the validated development branch for wider testing. It adds the Phase C borrow syntax: `$` and `$&` forms, explicit `mut` bindings and `&mut` writable references. A name of type `&mut T` is accepted where a shared `&T` is expected. XACP smoke tests pin the companion examples to the current XACP API and tolerate stdin closing at the hello deadline on slow runners.
