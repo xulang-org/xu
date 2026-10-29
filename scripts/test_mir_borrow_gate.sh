@@ -55,12 +55,12 @@ echo "test_mir_borrow_gate: xu=$XU"
 cat >"$tmp/kernel.xu" <<'XU'
 @main
 fn sum(xs &[]int) int {
-    mut result := 0
+    $result := 0
     for i in 0:xs.len { result += xs[i] }
     << result
 }
 fn main() {
-    mut xs := [1, 2, 3]
+    $xs := [1, 2, 3]
     for i in 0:xs.len { xs[i] *= 2 }
     println(sum(&xs))
     ch := chan string{cap: 1}

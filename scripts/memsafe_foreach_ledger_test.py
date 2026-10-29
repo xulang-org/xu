@@ -14,11 +14,11 @@ CASES = [
 ("foreach_array_string", f'''
 @main
 fn main() int {{
-    mut a := []string{{}}
+    $a := []string{{}}
     for i in 0:4 {{
         a.push("s"+str(i)+"_"+ "{P}")
     }}
-    mut n := 0
+    $n := 0
     for s in a {{
         n = n + s.len
     }}
@@ -32,11 +32,11 @@ fn main() int {{
 @main
 struct P {{ name string id int }}
 fn main() int {{
-    mut ps := []P{{}}
+    $ps := []P{{}}
     for i in 0:3 {{
         ps.push(P{{name: "p"+str(i)+"_"+ "{P}", id: i}})
     }}
-    mut n := 0
+    $n := 0
     for p in ps {{
         n = n + p.name.len + p.id
     }}
@@ -50,7 +50,7 @@ fn main() int {{
 @main
 fn main() int {
     a := [4]int{1,2,3,4}
-    mut s := 0
+    $s := 0
     for x in a {
         s = s + x
     }
@@ -62,11 +62,11 @@ fn main() int {
 ("foreach_array_int_only", '''
 @main
 fn main() int {
-    mut a := []int{}
+    $a := []int{}
     for i in 0:5 {
         a.push(i)
     }
-    mut s := 0
+    $s := 0
     for x in a {
         s = s + x
     }
@@ -86,7 +86,7 @@ fn sender(ch chan int) {
 fn main() int {
     ch := chan int{cap: 3}
     xu sender(ch)
-    mut s := 0
+    $s := 0
     for x in ch {
         s = s + x
     }
@@ -98,10 +98,10 @@ fn main() int {
 ("foreach_nested_array_str", f'''
 @main
 fn main() int {{
-    mut a := []string{{}}
+    $a := []string{{}}
     a.push("r0_"+ "{P}")
     a.push("r1_"+ "{P}")
-    mut n := 0
+    $n := 0
     for s in a {{
         n = n + s.len
     }}
@@ -113,10 +113,10 @@ fn main() int {{
 ("array_index_after_foreach", f'''
 @main
 fn main() int {{
-    mut a := []string{{}}
+    $a := []string{{}}
     a.push("x_"+ "{P}")
     a.push("y_"+ "{P}")
-    mut n := 0
+    $n := 0
     for s in a {{
         n = n + 1
     }}

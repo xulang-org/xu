@@ -13,10 +13,10 @@ SOURCE = r'''@main
 #time
 fn probe() int {
     ready := ui.Event{kind:ui.EV_CANVAS_READY,window_id:1,menu_id:"canvas_ready\t1\t1\t1",width:800,height:600}
-    mut screen := widgets.screen(&ready) or >>
+    $screen := widgets.screen(&ready) or >>
     id := screen.button("Test") or >>
     screen.place(id,24.0,24.0,200.0,40.0) or >>
-    mut event := ui.InputEvent{kind:ui.EV_POINTER_DOWN,window_id:1,canvas_id:1,generation:1,x:40.0,y:40.0,dx:0.0,dy:0.0,button:1,buttons:1,modifiers:0,key:0,scan:0,repeat:0,click_count:1,time_ns:0}
+    $event := ui.InputEvent{kind:ui.EV_POINTER_DOWN,window_id:1,canvas_id:1,generation:1,x:40.0,y:40.0,dx:0.0,dy:0.0,button:1,buttons:1,modifiers:0,key:0,scan:0,repeat:0,click_count:1,time_ns:0}
     first := screen.dispatch(&event) or >>
     _ := screen.advance(time.instant()) or >>
     screen.place(id,24.0,24.0,200.0,40.0) or >>
@@ -29,7 +29,7 @@ fn probe() int {
 }
 fn popover_probe() int {
     ready := ui.Event{kind:ui.EV_CANVAS_READY,window_id:1,menu_id:"canvas_ready\t1\t1\t1",width:800,height:600}
-    mut screen := widgets.screen(&ready) or >>
+    $screen := widgets.screen(&ready) or >>
     screen.set_reduced_motion(true)
     trigger := screen.button("Open") or >>
     screen.place(trigger,24.0,24.0,200.0,40.0) or >>

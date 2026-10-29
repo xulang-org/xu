@@ -267,8 +267,8 @@ later request, but a timed-out mutation may already have taken effect.
 ## 6. Screen marshalling and tree pagination
 
 The supported model is one attached controller and one registered Screen per
-process. The Screen-owning coroutine calls `register_screen(mut &control, &screen)`
-and nonblocking `poll(mut &control, mut &screen)` between UI iterations. A poll
+process. The Screen-owning coroutine calls `register_screen($&control, &screen)`
+and nonblocking `poll($&control, $&screen)` between UI iterations. A poll
 services at most one job. Closed-Screen or duplicate registration is rejected;
 unregister before registering a replacement or abandoning an open poll loop.
 

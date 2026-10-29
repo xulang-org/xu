@@ -64,7 +64,7 @@ fn main() int {{
 ("array_push_concat", f'''
 @main
 fn main() int {{
-    mut a := []string{{}}
+    $a := []string{{}}
     for i in 0 -< 5 {{
         a.push("p"+str(i)+"_"+ "{P}")
     }}
@@ -127,10 +127,10 @@ fn main() int {
 ("foreach_array_concat_store", f'''
 @main
 fn main() int {{
-    mut a := []string{{}}
+    $a := []string{{}}
     a.push("a0_"+ "{P}")
     a.push("a1_"+ "{P}")
-    mut n := 0
+    $n := 0
     for s in a {{
         n = n + s.len
     }}
@@ -145,7 +145,7 @@ fn mk(i int) string {{
     << "m"+str(i)+"_"+ "{P}"
 }}
 fn main() int {{
-    mut u := U{{s: mk(0)}}
+    $u := U{{s: mk(0)}}
     u.s = mk(1)
     println(u.s)
     << 0
@@ -169,7 +169,7 @@ fn main() int {{
 ("map_both_concat", f'''
 @main
 fn main() int {{
-    mut m := map[string]string{{}}
+    $m := map[string]string{{}}
     for i in 0 -< 6 {{
         m["k"+str(i)] = "v"+str(i)+"_"+ "{P}"
     }}
@@ -183,7 +183,7 @@ fn main() int {{
 ("string_rebind_loop", f'''
 @main
 fn main() int {{
-    mut s := "s0_"+ "{P}"
+    $s := "s0_"+ "{P}"
     for i in 0 -< 8 {{
         s = "s"+str(i)+"_"+ "{P}"
     }}
@@ -203,11 +203,11 @@ fn main() int {{
 ("map_foreach_strings", f'''
 @main
 fn main() int {{
-    mut m := map[string]string{{}}
+    $m := map[string]string{{}}
     for i in 0 -< 3 {{
         m["k"+str(i)] = "v"+str(i)+"_"+ "{P}"
     }}
-    mut n := 0
+    $n := 0
     for k, v in m {{
         n = n + k.len + v.len
     }}
@@ -219,10 +219,10 @@ fn main() int {{
 ("map_foreach_intkey", f'''
 @main
 fn main() int {{
-    mut m := map[int]string{{}}
+    $m := map[int]string{{}}
     m[1] = "one_"+ "{P}"
     m[2] = "two_"+ "{P}"
-    mut n := 0
+    $n := 0
     for k, v in m {{
         n = n + k + v.len
     }}
