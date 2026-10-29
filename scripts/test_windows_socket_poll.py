@@ -24,14 +24,14 @@ fn close_quiet(fd int) {
 
 fn exchange(fd int) int {
     request := "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    mut sent := 0
+    $sent := 0
     while sent < request.len {
         part := request[sent:request.len]
         n := net.conn_write(fd, &part) or >>
         if n <= 0 || n > part.len { >> errors.new("request write made invalid progress") }
         sent += n
     }
-    mut response := ""
+    $response := ""
     while response.len < 8192 {
         part := net.conn_read(fd, 1024) or >>
         if part.len == 0 { >> errors.new("response ended before body") }
@@ -67,7 +67,7 @@ fn serve(lfd int) {
 }
 
 fn worker(addr string, out chan int) {
-    mut count := 0
+    $count := 0
     for i in 0:3 {
         count += request(addr + "") or (err) { eprintln(err.msg())
             out <- -1
