@@ -30,18 +30,64 @@ pub fn stdio_preflight(port int) {
     }
 }
 
-fn control_write(fd int, tcp bool, text string) int {
+// One monotonic budget per complete frame. The control transport owns writes;
+// POSIX pipe readiness reserves no space against competing writers. A write
+// of at most 512 bytes fits the minimum PIPE_BUF after POLLOUT. TCP also gets
+// a remaining-budget send timeout to bound a blocking send after readiness.
+// Windows pipe/console handles have no write probe: keep best-effort writes.
+fn control_write(fd int, tcp bool, text string, timeout_ms int) int {
+    started := time.now()
+    budget := timeout_ms * time.millisecond()
+    bounded := tcp || xu_target_os() != 2
     $offset := 0
     while offset < text.len {
+        if bounded {
+            remaining := budget - time.since(started)
+            if remaining <= 0 {
+                >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
+            }
+            // Immediate poll supports POSIX files/pipes and Windows WSAPoll.
+            // Recompute the frame budget after every bounded sleep/wakeup.
+            ready := os.socket_poll(fd, 4) or >>
+            if ready == 0 {
+                $delay := time.millisecond()
+                if delay > remaining { delay = remaining }
+                time.sleep(delay)
+                ->
+            }
+            left := budget - time.since(started)
+            if left <= 0 {
+                >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
+            }
+            if tcp {
+                // Round up to ms so a socket timeout cannot precede the
+                // frame deadline (Windows socket timeouts have ms units).
+                ms := (left + 999999) / 1000000
+                os.set_sock_timeout(fd, ms * time.millisecond()) or >>
+            }
+        }
+        $end := text.len
+        if bounded && end - offset > 512 { end = offset + 512 }
         $n := 0
         if tcp {
-            n = os.socket_write(fd, text[offset:text.len]) or >>
+            n = os.socket_write(fd, text[offset:end]) or (err) {
+                if time.since(started) >= budget {
+                    >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
+                }
+                >> err
+            }
         } else {
-            n = os_fd_write(fd, text[offset:text.len]) or >>
+            n = os_fd_write(fd, text[offset:end]) or >>
+        }
+        if bounded && time.since(started) >= budget {
+            >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
         }
         if n <= 0 { >> errors.new("xacp: output made no progress") }
         offset += n
     }
+    // set_sock_timeout sets receive as well as send timeouts. Read waits must
+    // retain their independent hello/idle policy after a successful frame.
+    if tcp { os.set_sock_timeout(fd, 0) or >> }
     << 0
 }
 
@@ -54,7 +100,7 @@ fn frame_text(body string) string {
 
 // msg is written only when non-empty; it is truncated to MAX_ERROR_MSG_BYTES
 // (at a UTF-8 boundary) and always emitted as a one-line quoted string.
-fn control_response(fd int, tcp bool, id int, ok bool, code string, data string, msg string) int {
+fn control_response(fd int, tcp bool, l &Limits, id int, ok bool, code string, data string, msg string) int {
     $body := "id: !i " + str(id) + "\nok: !b " + str(ok) + "\n"
     if ok {
         if has_prefix(&data,"  redacted: !b true\n") { body = body + "redacted: !b true\n" }
@@ -73,38 +119,38 @@ fn control_response(fd int, tcp bool, id int, ok bool, code string, data string,
             body = body + "  msg: " + control_string(&m) + "\n"
         }
     }
-    control_write(fd, tcp, frame_text(body)) or >>
+    control_write(fd, tcp, frame_text(body), l.write_timeout_ms) or >>
     << 0
 }
 
 fn control_request(fd int, tcp bool, s $&Session, frame string, l &Limits, expected_token string, attach bool, jobs chan ControlJob, states chan ScreenRegistration, session_started int, nonces $&NonceRegistry) int {
     d := parse_frame(frame + "") or (err) {
         close_session(&*s)
-        control_response(fd, tcp, 0, false, "frame_error", "", err.msg()) or >>
+        control_response(fd, tcp, l, 0, false, "frame_error", "", err.msg()) or >>
         << 0
     }
     req := validate_request_envelope(&d, l) or (err) {
         close_session(&*s)
-        control_response(fd, tcp, request_id_hint(&d), false, "schema_error", "", err.msg()) or >>
+        control_response(fd, tcp, l, request_id_hint(&d), false, "schema_error", "", err.msg()) or >>
         << 0
     }
     _ := validate_args(&d,req.args,req.op + "",l) or (err) {
         // Argument errors in an OPEN output session neither close it nor
         // reserve an id. Keep the existing fatal policy for other schemas.
         if req.op != "proc.output" || s.state != STATE_OPEN { close_session(&*s) }
-        control_response(fd,tcp,req.id,false,"schema_error","",err.msg()) or >>
+        control_response(fd,tcp,l,req.id,false,"schema_error","",err.msg()) or >>
         << 0
     }
     started := begin_request(&*s, &req)
     if !started.ok {
-        control_response(fd, tcp, req.id, false, started.err_code, "", started.err_msg) or >>
+        control_response(fd, tcp, l, req.id, false, started.err_code, "", started.err_msg) or >>
         << 0
     }
     if request_raw(&d,&req) && (s.permissions & PERM_UI_RAW) == 0 {
         // Like other permission denials, this does not consume the id.
         cancel_request(&*s)
         s.next_id = req.id
-        control_response(fd,tcp,req.id,false,"permission_denied","","RAW is not authorized") or >>
+        control_response(fd,tcp,l,req.id,false,"permission_denied","","RAW is not authorized") or >>
         << 0
     }
     marshaled := attach && (req.op == "ui.tree" || req.op == "ui.screenshot" || req.op == "ui.act" || req.op == "ui.input" || req.op == "ui.record")
@@ -117,7 +163,7 @@ fn control_request(fd int, tcp bool, s $&Session, frame string, l &Limits, expec
         }
         negotiated := negotiate_hello(&*s, &d, &req, expected_token, &*nonces)
         if !negotiated.ok {
-            control_response(fd, tcp, req.id, false, negotiated.err_code, "", negotiated.err_msg) or >>
+            control_response(fd, tcp, l, req.id, false, negotiated.err_code, "", negotiated.err_msg) or >>
             << 0
         }
     } else if marshaled {
@@ -127,46 +173,46 @@ fn control_request(fd int, tcp bool, s $&Session, frame string, l &Limits, expec
         result := export_screenshot(&*s,pending,req.id,l)
         if !result.outcome.ok {
             cancel_request(&*s)
-            control_response(fd,tcp,req.id,false,result.outcome.err_code,"",result.outcome.err_msg) or >>
+            control_response(fd,tcp,l,req.id,false,result.outcome.err_code,"",result.outcome.err_msg) or >>
             << 0
         }
         finished := finish_request(&*s,req.id)
         if !finished.ok {
-            control_response(fd,tcp,req.id,false,finished.err_code,"",finished.err_msg) or >>
+            control_response(fd,tcp,l,req.id,false,finished.err_code,"",finished.err_msg) or >>
             << 0
         }
-        control_response(fd,tcp,req.id,true,"",result.data,"") or >>
+        control_response(fd,tcp,l,req.id,true,"",result.data,"") or >>
         << 0
     } else if req.op == "proc.output" {
         result := process_output(&d,&req,l) or (err) {
             cancel_request(&*s)
-            control_response(fd,tcp,req.id,false,"adapter_error","",err.msg()) or >>
+            control_response(fd,tcp,l,req.id,false,"adapter_error","",err.msg()) or >>
             << 0
         }
         if !result.outcome.ok {
             cancel_request(&*s)
-            control_response(fd,tcp,req.id,false,result.outcome.err_code,"",result.outcome.err_msg) or >>
+            control_response(fd,tcp,l,req.id,false,result.outcome.err_code,"",result.outcome.err_msg) or >>
             << 0
         }
         finished := finish_request(&*s,req.id)
-        control_response(fd,tcp,req.id,finished.ok,finished.err_code,result.data,finished.err_msg) or >>
+        control_response(fd,tcp,l,req.id,finished.ok,finished.err_code,result.data,finished.err_msg) or >>
         << 0
     } else if req.op != "proc.status" {
         // No Screen is registered in the startup adapter.
         // All known operations, including mutate, reach this checked path.
         cancel_request(&*s)
-        control_response(fd, tcp, req.id, false, "not_implemented", "", "operation has no registered adapter: " + req.op) or >>
+        control_response(fd, tcp, l, req.id, false, "not_implemented", "", "operation has no registered adapter: " + req.op) or >>
         << 0
     }
     finished := finish_request(&*s, req.id)
     if !finished.ok {
-        control_response(fd, tcp, req.id, false, finished.err_code, "", finished.err_msg) or >>
+        control_response(fd, tcp, l, req.id, false, finished.err_code, "", finished.err_msg) or >>
         << 0
     }
     if req.op == "xacp.hello" {
-        control_hello_response(fd, tcp, req.id, &*s) or >>
+        control_hello_response(fd, tcp, req.id, &*s, l) or >>
     } else {
-        control_response(fd, tcp, req.id, true, "", "  pid: !i " + str(os.getpid()) + "\n  state: OPEN\n", "") or >>
+        control_response(fd, tcp, l, req.id, true, "", "  pid: !i " + str(os.getpid()) + "\n  state: OPEN\n", "") or >>
     }
     << 0
 }
@@ -219,7 +265,7 @@ fn control_utf8_width(value &string,i int) int {
     << utf8.decode_width(value,i) or (err) { << 0 }
 }
 
-fn control_hello_response(fd int, tcp bool, id int, s &Session) int {
+fn control_hello_response(fd int, tcp bool, id int, s &Session, l &Limits) int {
     $label := "custom"
     if s.permissions == PERM_NONE { label = "none" }
     if s.permissions == PERM_INFO { label = "info" }
@@ -227,7 +273,7 @@ fn control_hello_response(fd int, tcp bool, id int, s &Session) int {
     nonce := redact_paths(&s.nonce)
     data := "  state: OPEN\n  nonce: " + control_string(&nonce) +
         "\n  permissions: !i " + str(s.permissions) + "\n  permission_label: " + label + "\n"
-    control_response(fd, tcp, id, true, "", data, "") or >>
+    control_response(fd, tcp, l, id, true, "", data, "") or >>
     << 0
 }
 
@@ -244,6 +290,7 @@ pub fn serve_stdio() int {
 fn control_limits() Limits {
     $limits := default_limits()
     limits.request_timeout_ms = request_timeout_from_env()
+    limits.write_timeout_ms = write_timeout_from_env()
     limits.hello_timeout_ms = hello_timeout_from_env()
     limits.idle_timeout_ms = idle_timeout_from_env()
     << limits
@@ -252,9 +299,9 @@ fn control_limits() Limits {
 const FRAME_MAGIC = "XACP/1"
 const FRAME_LINE_MAX = 16
 
-fn frame_fatal(fd int, tcp bool, s $&Session, code string, msg string) int {
+fn frame_fatal(fd int, tcp bool, s $&Session, l &Limits, code string, msg string) int {
     close_session(&*s)
-    control_response(fd, tcp, 0, false, code, "", msg) or >>
+    control_response(fd, tcp, l, 0, false, code, "", msg) or >>
     << 0
 }
 
@@ -293,7 +340,7 @@ fn serve_control(input int, fd int, tcp bool, attach bool, jobs chan ControlJob,
         received := time.now()
         if chunk.len == 0 {
             if phase != 0 || line.length() > 0 {
-                frame_fatal(fd, tcp, $&session, "truncated_frame", "EOF inside frame") or (err) {
+                frame_fatal(fd, tcp, $&session, limits, "truncated_frame", "EOF inside frame") or (err) {
                     close_session($&session)
                     >> err
                 }
@@ -331,7 +378,7 @@ fn serve_control(input int, fd int, tcp bool, attach bool, jobs chan ControlJob,
             i += 1
             if c != 10 {
                 if line.length() >= FRAME_LINE_MAX {
-                    frame_fatal(fd, tcp, $&session, "frame_error", "frame header line too long") or >>
+                    frame_fatal(fd, tcp, $&session, limits, "frame_error", "frame header line too long") or >>
                     << 0
                 }
                 line.write_byte(c)
@@ -341,7 +388,7 @@ fn serve_control(input int, fd int, tcp bool, attach bool, jobs chan ControlJob,
             line.reset()
             if phase == 0 {
                 if text != FRAME_MAGIC {
-                    frame_fatal(fd, tcp, $&session, "frame_error", "expected XACP/1 magic line") or >>
+                    frame_fatal(fd, tcp, $&session, limits, "frame_error", "expected XACP/1 magic line") or >>
                     << 0
                 }
                 phase = 1
@@ -355,11 +402,11 @@ fn serve_control(input int, fd int, tcp bool, attach bool, jobs chan ControlJob,
                 else if valid { n = n * 10 + (d - 48) }
             }
             if !valid || n == 0 {
-                frame_fatal(fd, tcp, $&session, "frame_error", "invalid frame length") or >>
+                frame_fatal(fd, tcp, $&session, limits, "frame_error", "invalid frame length") or >>
                 << 0
             }
             if n > MAX_FRAME_BYTES {
-                frame_fatal(fd, tcp, $&session, "frame_too_large", "frame length exceeds " + str(MAX_FRAME_BYTES)) or >>
+                frame_fatal(fd, tcp, $&session, limits, "frame_too_large", "frame length exceeds " + str(MAX_FRAME_BYTES)) or >>
                 << 1
             }
             need = n
@@ -386,9 +433,9 @@ fn control_remaining(s &Session, l &Limits, started int, last_frame int) int {
 
 fn control_expired(fd int, tcp bool, s $&Session, l &Limits) int {
     if s.state == STATE_NEW {
-        << frame_fatal(fd, tcp, s, "hello_timeout", "hello not completed within " + str(l.hello_timeout_ms) + " ms") or >>
+        << frame_fatal(fd, tcp, s, l, "hello_timeout", "hello not completed within " + str(l.hello_timeout_ms) + " ms") or >>
     }
-    << frame_fatal(fd, tcp, s, "session_idle", "no complete frame for " + str(l.idle_timeout_ms) + " ms") or >>
+    << frame_fatal(fd, tcp, s, l, "session_idle", "no complete frame for " + str(l.idle_timeout_ms) + " ms") or >>
 }
 
 fn control_wait(fd int, tcp bool, timeout_ns int) bool {
@@ -434,6 +481,10 @@ fn serve_tcp_control(port int,attach bool,jobs chan ControlJob,states chan Scree
             >> err
         }
         _ := serve_control(peer, peer, true, attach, jobs, states, &limits, $&nonces) or (err) {
+            // A failed write cannot carry an error frame. Diagnose only the
+            // deadline here; ordinary malformed/disconnected peers stay quiet.
+            msg := err.msg()
+            if has_prefix(&msg, "xacp: write timed out after ") { eprintln(msg) }
             // Peer errors are isolated; the listener remains available.
             _ := os.socket_close(peer) or >>
             ->
