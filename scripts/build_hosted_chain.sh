@@ -277,7 +277,7 @@ import sys
 source, destination = map(Path, sys.argv[1:])
 shutil.copytree(source, destination)
 socket = destination / 'os/socket.xu'
-text = socket.read_text()
+text = socket.read_text(encoding="utf-8")
 # These wrappers are unused by the compiler itself. Remove their complete
 # declarations only in this disposable stdlib; production Gen1 and later
 # compile the original wrappers with the newly supported intrinsics.
@@ -287,7 +287,7 @@ text, removed = re.subn(
 )
 if removed != 4:
     raise SystemExit('unsupported socket readiness wrapper layout; refusing seed bridge')
-socket.write_text(text)
+socket.write_text(text, encoding="utf-8")
 PY_BRIDGE
     BRIDGE_SOCKET_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/socket.xu")
     # shellcheck disable=SC2086
