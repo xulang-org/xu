@@ -277,7 +277,7 @@ import sys
 source, destination = map(Path, sys.argv[1:])
 shutil.copytree(source, destination)
 socket = destination / 'os/socket.xu'
-text = socket.read_text()
+text = socket.read_text(encoding="utf-8")
 text = re.sub(
     r'^pub fn socket_poll\(fd int, events int\) int \{\n'
     r'    << sys_socket_poll\(fd, events\) or >>\n\}\n',
@@ -297,7 +297,7 @@ text = re.sub(
     r'(?:.*\n)*?        \}\n        << 0\n    \}\n',
     '', text, flags=re.MULTILINE,
 )
-socket.write_text(text)
+socket.write_text(text, encoding="utf-8")
 PY_BRIDGE
     BRIDGE_SOCKET_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/socket.xu")
     # shellcheck disable=SC2086
