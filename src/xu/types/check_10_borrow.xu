@@ -3,6 +3,16 @@
 #xu/ast
 #xu/parser
 
+// Spec34 C adjustments preserve the source AST and source coordinates.
+fn (c &Checker) borrow_target(p &parser.Parser, n int) int {
+    if c.nshared[n] == -1 { << n }
+    << p.nodes[n].a
+}
+
+fn (c &Checker) borrow_exclusive(p &parser.Parser, n int) bool {
+    << (p.nodes[n].kind == ast.NK_BORROW && p.nodes[n].ival == 1) || c.nshared[n] == -2
+}
+
 // A branch owns a deep snapshot. Sibling arms start from the same incoming
 // state; only reaching predecessors contribute loans at the join. The scalar
 // tables summarize a reference for lowering; bf_* carries its complete set.
@@ -621,8 +631,8 @@ fn (c &Checker) expr_ref_is_buf(p &parser.Parser, n int) bool {
         if id >= 0 && id < c.bproj.len && c.bproj[id] == 1 { << true }
         << false
     }
-    if k == ast.NK_BORROW {
-        << c.place_has_index(p, p.nodes[n].a)
+    if k == ast.NK_BORROW || c.nshared[n] == -1 {
+        << c.place_has_index(p, c.borrow_target(p, n))
     }
     << false
 }
@@ -764,7 +774,8 @@ fn (c &Checker) borrow_frozen(src int, stmt_id int, exclusive_only bool) bool {
 fn (c &Checker) borrow_tmp_note(p &parser.Parser, i int) string {
     n := c.btmp_node[i]
     mut why := "conflicting temporary loan starts here"
-    if c.nshared[n] != 0 { why = why + "; implicit shared reborrow inserted for a read-only expectation" }
+    if c.nshared[n] > 0 { why = why + "; implicit shared reborrow inserted for a read-only expectation" }
+    if c.nshared[n] == -1 { why = why + "; automatic read-only borrow inserted for a read-only expectation" }
     << "\n" + c.cur_file_name + ":" + str(p.nodes[n].line) + ":" + str(p.nodes[n].col) + ": note: " + why
 }
 
@@ -853,6 +864,38 @@ fn (c &Checker) borrow_shared_note_at(p &parser.Parser, stmt_id int, message str
     << "\n" + c.cur_file_name + ":" + str(p.nodes[n].line) + ":" + str(p.nodes[n].col) + ": note: " + message
 }
 
+// Locate the actual source expression of an inserted place borrow in a
+// declaration/call/aggregate, without inventing an '&' in the diagnostic.
+fn (c &Checker) borrow_auto_source(p &parser.Parser, n int) int {
+    if n < 0 { << -1 }
+    if c.nshared[n] == -1 { << n }
+    kids := expr_kids(p, n)
+    for i in 0:kids.len {
+        found := c.borrow_auto_source(p, kids[i])
+        if found >= 0 { << found }
+    }
+    << -1
+}
+
+fn (c &Checker) borrow_auto_conflict_help(p &parser.Parser, owner int, stmt_id int) string {
+    for i in 0:c.bf_holder.len {
+        if c.borrow_field_live(i, stmt_id) && c.bf_owner[i] == owner && c.bf_excl[i] == 0 {
+            decl := c.bf_decl[i]
+            node := c.bnote_stmt[decl]
+            mut init := p.nodes[node].a
+            if p.nodes[node].kind == ast.NK_ASSIGN { init = p.nodes[node].b }
+            src := c.borrow_auto_source(p, init)
+            if src >= 0 {
+                << "\n" + c.cur_file_name + ":" + str(p.nodes[src].line) + ":" + str(p.nodes[src].col) +
+                    ": note: automatic read-only borrow inserted for a read-only expectation" +
+                    c.borrow_shared_note_at(p, c.blast[c.bf_holder[i]], "read-only borrow is last used here") +
+                    "\nhelp: move the write or exclusive borrow after the last use of the read-only borrow"
+            }
+        }
+    }
+    << ""
+}
+
 fn (c &Checker) borrow_shared_conflict_help(p &parser.Parser, src int, stmt_id int) string {
     mut decl := -1
     mut last := -1
@@ -871,12 +914,12 @@ fn (c &Checker) borrow_shared_conflict_help(p &parser.Parser, src int, stmt_id i
             }
         }
     }
-    if decl < 0 { << "" }
+    if decl < 0 { << c.borrow_auto_conflict_help(p, src, stmt_id) }
     mut why := ""
     node := c.bnote_stmt[decl]
     mut init := p.nodes[node].a
     if p.nodes[node].kind == ast.NK_ASSIGN { init = p.nodes[node].b }
-    if init >= 0 && c.nshared[init] != 0 {
+    if init >= 0 && c.nshared[init] > 0 {
         why = "\nnote: implicit shared reborrow inserted for a read-only expectation at '" + p.nodes[init].sval + "'"
     }
     << why + c.borrow_shared_note_at(p, decl, "shared reborrow starts here") +
@@ -904,11 +947,22 @@ fn (c &mut Checker) borrow_move_event(p &parser.Parser, owner int, n int, stmt_i
 
 fn (c &mut Checker) borrow_new_event(p &parser.Parser, owner int, exclusive bool, elem bool, n int, stmt_id int) {
     if owner < 0 { << }
-    if exclusive && c.borrow_has_any(owner, stmt_id) {
-        c.fail_node(p, n, "cannot borrow '" + c.lname[owner] + "' as mutable because it is also borrowed")
-    }
-    if !exclusive && c.borrow_has_exclusive(owner, stmt_id) {
-        c.fail_node(p, n, "cannot borrow '" + c.lname[owner] + "' as immutable because it is also borrowed as mutable")
+    if (exclusive && c.borrow_has_any(owner, stmt_id)) || (!exclusive && c.borrow_has_exclusive(owner, stmt_id)) {
+        mut hint := c.borrow_auto_conflict_help(p, owner, stmt_id)
+        for i in 0:c.btmp_owner.len {
+            if c.btmp_owner[i] == owner && (exclusive || c.btmp_excl[i] != 0) {
+                hint = hint + c.borrow_tmp_note(p, i)
+                <-
+            }
+        }
+        if c.nshared[n] == -1 {
+            hint = hint + "\nnote: automatic read-only borrow inserted for a read-only expectation"
+        }
+        if exclusive {
+            c.fail_node(p, n, "cannot borrow '" + c.lname[owner] + "' as mutable because it is also borrowed" + hint)
+        } else {
+            c.fail_node(p, n, "cannot borrow '" + c.lname[owner] + "' as immutable because it is also borrowed as mutable" + hint)
+        }
     }
     c.btmp_reb.push(-1)
     c.btmp_node.push(n)
@@ -971,16 +1025,16 @@ fn (c &mut Checker) borrow_hold_shared(holder int, field int, src int, stmt_id i
 fn (c &mut Checker) borrow_hold_expr(p &parser.Parser, holder int, field int, init int, stmt_id int) {
     if init < 0 { << }
     k := p.nodes[init].kind
-    if k == ast.NK_IDENT && c.nshared[init] != 0 {
+    if k == ast.NK_IDENT && c.nshared[init] > 0 {
         c.borrow_hold_shared(holder, field, c.nlocal[init], stmt_id)
         <<
     }
-    if k == ast.NK_IDENT {
+    if k == ast.NK_IDENT && c.nshared[init] != -1 {
         c.borrow_hold_local(holder, field, c.nlocal[init], stmt_id)
         <<
     }
-    if k == ast.NK_BORROW {
-        tgt := p.nodes[init].a
+    if k == ast.NK_BORROW || c.nshared[init] == -1 {
+        tgt := c.borrow_target(p, init)
         mut parent := -1
         mut owner := c.borrow_root_local(p, tgt)
         mut proj := c.place_proj_of(p, tgt)
@@ -996,12 +1050,12 @@ fn (c &mut Checker) borrow_hold_expr(p &parser.Parser, holder int, field int, in
                 owner = c.bowner[parent]
             }
         }
-        c.borrow_add_held(holder, field, owner, b2i(p.nodes[init].ival == 1), proj, parent, stmt_id)
+        c.borrow_add_held(holder, field, owner, b2i(c.borrow_exclusive(p, init)), proj, parent, stmt_id)
         if parent >= 0 {
             count := c.bf_holder.len
             for i in 0:count {
                 if c.bf_holder[i] == parent {
-                    c.borrow_add_held(holder, field, c.bf_owner[i], b2i(p.nodes[init].ival == 1), proj | c.bf_proj[i], parent, stmt_id)
+                    c.borrow_add_held(holder, field, c.bf_owner[i], b2i(c.borrow_exclusive(p, init)), proj | c.bf_proj[i], parent, stmt_id)
                 }
             }
         }
@@ -1149,26 +1203,26 @@ fn (c &mut Checker) borrow_walk_expr(p &parser.Parser, n int, stmt_id int) {
         }
         <<
     }
-    if k == ast.NK_IDENT && c.nshared[n] != 0 {
+    if k == ast.NK_IDENT && c.nshared[n] > 0 {
         c.borrow_tmp_ref(p, c.nlocal[n], false, n, stmt_id, false, false)
         <<
     }
-    if k == ast.NK_IDENT {
+    if k == ast.NK_IDENT && c.nshared[n] != -1 {
         c.borrow_read_event(p, c.nlocal[n], n, stmt_id)
         <<
     }
-    if k == ast.NK_BORROW {
-        target := p.nodes[n].a
+    if k == ast.NK_BORROW || c.nshared[n] == -1 {
+        target := c.borrow_target(p, n)
         if p.nodes[target].kind == ast.NK_UN_OP && p.nodes[target].ival == 3 {
             src := c.borrow_root_local(p, p.nodes[target].a)
-            c.borrow_tmp_ref(p, src, p.nodes[n].ival == 1, n, stmt_id, false, false)
+            c.borrow_tmp_ref(p, src, c.borrow_exclusive(p, n), n, stmt_id, false, false)
             <<
         }
         mut owner := c.borrow_root_local(p, target)
         elem := c.place_has_index(p, target)
         if owner >= 0 && is_ref_type(c.ltype[owner]) && p.nodes[target].kind != ast.NK_IDENT {
             first := c.btmp_owner.len
-            c.borrow_tmp_ref(p, owner, p.nodes[n].ival == 1, n, stmt_id, true, false)
+            c.borrow_tmp_ref(p, owner, c.borrow_exclusive(p, n), n, stmt_id, true, false)
             if elem {
                 for i in first:c.btmp_proj.len { checker_set_i(mut &c.btmp_proj, i, 1) }
             }
@@ -1176,8 +1230,8 @@ fn (c &mut Checker) borrow_walk_expr(p &parser.Parser, n int, stmt_id int) {
             <<
         }
         owner = c.peel_elem_owner(owner, elem)
-        c.borrow_new_event(p, owner, p.nodes[n].ival == 1, elem, n, stmt_id)
-        c.borrow_walk_place_index(p, p.nodes[n].a, stmt_id)
+        c.borrow_new_event(p, owner, c.borrow_exclusive(p, n), elem, n, stmt_id)
+        c.borrow_walk_place_index(p, target, stmt_id)
         <<
     }
     if k == ast.NK_CALL {
