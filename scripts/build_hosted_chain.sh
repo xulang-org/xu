@@ -267,7 +267,7 @@ elif [ "$seed_build_rc" -ne 0 ]; then
         exit "$seed_build_rc"
     fi
     FAILED_STAGE="socket_seed_bridge"
-    echo "build_hosted_chain: bootstrapping socket readiness support for the older hosted seed"
+    echo "build_hosted_chain: bootstrapping file/socket readiness support for the older hosted seed"
     python3 - "$ROOT/src" "$tmp/seed-bridge-src" <<'PY_BRIDGE'
 from pathlib import Path
 import re
@@ -278,25 +278,15 @@ source, destination = map(Path, sys.argv[1:])
 shutil.copytree(source, destination)
 socket = destination / 'os/socket.xu'
 text = socket.read_text(encoding="utf-8")
-text = re.sub(
-    r'^pub fn socket_poll\(fd int, events int\) int \{\n'
-    r'    << sys_socket_poll\(fd, events\) or >>\n\}\n',
-    '', text, flags=re.MULTILINE,
+# These wrappers are unused by the compiler itself. Remove their complete
+# declarations only in this disposable stdlib; production Gen1 and later
+# compile the original wrappers with the newly supported intrinsics.
+text, removed = re.subn(
+    r'^pub fn (?:socket_poll|socket_wait|socket_wait_read|fd_wait_read)\([^\n]*\) int \{\n.*?^\}\n',
+    '', text, flags=re.MULTILINE | re.DOTALL,
 )
-text = re.sub(
-    r'^pub fn socket_wait\(fd int, events int, timeout_ns int\) int \{\n'
-    r'    << sys_socket_wait\(fd, events, timeout_ns\) or >>\n\}\n',
-    '', text, flags=re.MULTILINE,
-)
-# Seeds older than the Windows non-consuming peek builtin: drop the
-# Windows-only fd_wait_read branch so the bridge type-checks. The bridge is
-# only used to compile the original, complete source.
-text = re.sub(
-    r'^    if xu_target_os\(\) == 2 \{\n        started := now_ns\(\)\n'
-    r'        while true \{\n            ready := sys_fd_peek_read\(fd\) or >>\n'
-    r'(?:.*\n)*?        \}\n        << 0\n    \}\n',
-    '', text, flags=re.MULTILINE,
-)
+if removed != 4:
+    raise SystemExit('unsupported socket readiness wrapper layout; refusing seed bridge')
 socket.write_text(text, encoding="utf-8")
 PY_BRIDGE
     BRIDGE_SOCKET_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/socket.xu")
@@ -307,7 +297,7 @@ PY_BRIDGE
     set -u
     BRIDGE_SEED=$(pick_bin "$tmp/socket-poll-bootstrap.xin")
     BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
-    SEED_MANIFEST_BRIDGE=socket_poll_wrapper_v1
+    SEED_MANIFEST_BRIDGE=socket_readiness_wrapper_v2
     FAILED_STAGE="bridged_seed_to_gen1"
     # shellcheck disable=SC2086
     set +u
