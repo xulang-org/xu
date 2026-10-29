@@ -25,9 +25,9 @@ class WindowsTemporaryDirectory(tempfile.TemporaryDirectory):
 
 SOURCE = """@main
 fn worker(ch chan int,value int) {
-    mut flags := map[int]bool{}
+    $flags := map[int]bool{}
     flags[value] = true
-    mut values := map[string]int{}
+    $values := map[string]int{}
     values["worker"] = value
     for i in 0:64 {
         flags[value * 100 + i] = true
@@ -43,7 +43,7 @@ fn main() int {
     for round in 0:8 {
         ch := chan int{cap: 0}
         for i in 0:32 { xu worker(ch,i) }
-        mut total := 0
+        $total := 0
         for i in 0:32 { total += <-ch }
         if total != 496 { eprintln("worker result mismatch")
             << 1 }

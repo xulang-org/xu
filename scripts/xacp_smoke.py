@@ -332,19 +332,19 @@ fn check_setting(name string, actual int) int {
 
 fn check_core() int {
     limits := xacp.default_limits()
-    mut nonces := xacp.new_nonce_registry(xacp.DEFAULT_NONCE_CACHE, true)
+    $nonces := xacp.new_nonce_registry(xacp.DEFAULT_NONCE_CACHE, true)
     check_setting("XACP_EXPECT_TIMEOUT_MS", xacp.request_timeout_from_env()) or >>
     check_setting("XACP_EXPECT_HELLO_TIMEOUT_MS", xacp.hello_timeout_from_env()) or >>
     check_setting("XACP_EXPECT_IDLE_TIMEOUT_MS", xacp.idle_timeout_from_env()) or >>
     check_setting("XACP_EXPECT_NONCE_CACHE", xacp.nonce_cache_from_env()) or >>
     replay := os.getenv("XACP_EXPECT_NONCE_REPLAY")
     if replay.len > 0 && xacp.nonce_replay_from_env() != (replay == "1") { << 7 }
-    mut session := xacp.open_session()
+    $session := xacp.open_session()
     hello := xacp.parse_frame("id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: fallback-core\n") or (err) {
         eprintln(err.msg())
         << 1
     }
-    opened := xacp.dispatch(mut &session, &hello, &limits, mut &nonces)
+    opened := xacp.dispatch($&session, &hello, &limits, $&nonces)
     if !opened.ok {
         eprintln(opened.err_msg)
         << 2
@@ -353,11 +353,11 @@ fn check_core() int {
         eprintln(err.msg())
         << 3
     }
-    unimplemented := xacp.dispatch(mut &session, &status, &limits, mut &nonces)
+    unimplemented := xacp.dispatch($&session, &status, &limits, $&nonces)
     if unimplemented.ok || unimplemented.err_code != "not_implemented" { << 4 }
-    if xacp.enable_development(mut &session) { << 5 }
-    xacp.close_session(mut &session)
-    closed := xacp.dispatch(mut &session, &status, &limits, mut &nonces)
+    if xacp.enable_development($&session) { << 5 }
+    xacp.close_session($&session)
+    closed := xacp.dispatch($&session, &status, &limits, $&nonces)
     if closed.ok || closed.err_code != "session_closed" { << 6 }
     println("XACP core: PASS")
     << 0
