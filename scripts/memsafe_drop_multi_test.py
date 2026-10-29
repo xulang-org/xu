@@ -213,7 +213,7 @@ reject("partial_move_struct_field_array", """
 struct H { xs []string }
 fn take(xs []string) { println(xs.len) }
 fn main() int {
-    mut h := H{xs: []string{}}
+    $h := H{xs: []string{}}
     h.xs.push("a")
     take(h.xs)
     println(h.xs.len)
@@ -237,11 +237,11 @@ fn main() int {
 loud("oob_after_drop_loop", """
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     a.push("x")
     a.push("y")
     a[0] = "z_padpad"
-    mut i := 5
+    $i := 5
     println(a[i])
     << 0
 }

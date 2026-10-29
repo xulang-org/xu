@@ -307,7 +307,7 @@ loud("oob_dyn_hi", """
 @main
 fn main() int {
     a := [4]int{1,2,3,4}
-    mut i := 4
+    $i := 4
     println(a[i])
     << 0
 }
@@ -316,7 +316,7 @@ loud("oob_dyn_lo", """
 @main
 fn main() int {
     a := [4]int{1,2,3,4}
-    mut i := 0
+    $i := 0
     i -= 1
     println(a[i])
     << 0
@@ -325,7 +325,7 @@ fn main() int {
 loud("div_zero", """
 @main
 fn main() int {
-    mut z := 0
+    $z := 0
     println(1 / z)
     << 0
 }
@@ -342,7 +342,7 @@ fn main() int {
 loud("mod_zero", """
 @main
 fn main() int {
-    mut z := 0
+    $z := 0
     println(5 % z)
     << 0
 }
@@ -350,7 +350,7 @@ fn main() int {
 loud("map_missing_key", """
 @main
 fn main() int {
-    mut m := map[string]int{}
+    $m := map[string]int{}
     m["ok"] = 1
     println(m["nope"])
     << 0
@@ -418,7 +418,7 @@ fn main() int {
 reject("double_mut_borrow", """
 @main
 fn main() int {
-    mut s := "abc"
+    $s := "abc"
     a := &mut s
     b := &mut s
     println(a + "" + b)
@@ -428,7 +428,7 @@ fn main() int {
 reject("mut_and_shared_borrow", """
 @main
 fn main() int {
-    mut s := "abc"
+    $s := "abc"
     a := &mut s
     b := &s
     println(a)
@@ -535,7 +535,7 @@ reject("map_owning_index_move", """
 @main
 struct Item { s string }
 fn main() int {
-    mut m := map[string]Item{}
+    $m := map[string]Item{}
     m["k"] = Item{s: "padpad"}
     x := m["k"]
     println(m["k"].s)

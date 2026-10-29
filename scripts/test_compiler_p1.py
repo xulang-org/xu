@@ -196,7 +196,7 @@ fn probe_mem(a $&Assembler) {
 }
 fn probe_store(a $&Assembler) {
     $toks := []ast.Token{}
-    scanner.lex("@main\nfn main() { mut xs := [\"a\"]\n xs[0] = \"b\"\n println(xs[0])\n}\n", $&toks, "probe.xu")
+    scanner.lex("@main\nfn main() { \$xs := [\"a\"]\n xs[0] = \"b\"\n println(xs[0])\n}\n", $&toks, "probe.xu")
     $p := parser.new_parser(toks)
     p.parse_module()
     $c := types.Checker{}
@@ -1051,13 +1051,13 @@ fn main() { gate := chan int{cap: 1}
         for opt in ('-O0', '-O2'):
             fixture('spawn_enum_host' + opt, spawn, output='spawn enum payload\n', extra=(opt,))
             fixture('spawn_enum_rv' + opt, spawn, output='spawn enum payload\n', extra=(opt, '--target', 'linux-riscv64'), runner=('qemu-riscv64',))
-        atomic = '''fn main() { mut value := 0
-    atomic_store(mut &value, 42)
-    println(atomic_load(mut &value))
-    println(atomic_add(mut &value, 5))
-    println(atomic_cas(mut &value, 47, 99))
-    println(atomic_cas(mut &value, 47, 100))
-    println(atomic_load(mut &value))
+        atomic = '''fn main() { $value := 0
+    atomic_store($&value, 42)
+    println(atomic_load($&value))
+    println(atomic_add($&value, 5))
+    println(atomic_cas($&value, 47, 99))
+    println(atomic_cas($&value, 47, 100))
+    println(atomic_load($&value))
 }'''
         fixture('rv_atomic_values', atomic, output='42\n42\ntrue\nfalse\n99\n', extra=('--target', 'linux-riscv64'), runner=('qemu-riscv64',))
         fixture('rv_channel_contention', '''fn worker(ch chan int) {
@@ -1065,7 +1065,7 @@ fn main() { gate := chan int{cap: 1}
 }
 fn main() { ch := chan int{cap: 0}
     for i in 0:8 { xu worker(ch) }
-    mut sum := 0
+    $sum := 0
     for i in 0:800 { sum += <-ch }
     println(sum)
 }''', output='800\n', extra=('--target', 'linux-riscv64'), runner=('qemu-riscv64',))
@@ -1117,7 +1117,7 @@ fn attempt_recv(ch chan int) int {
     select { v := <-ch { << 1 } else { << 2 } }
 }
 fn main() { ch := chan int{cap: 0}
-    mut total := 0
+    $total := 0
     for i in 0:20 {
         if poison(4294967297 + i) < 0 { println(99) }
         total += attempt(ch)
@@ -1135,7 +1135,7 @@ fn main() { ch := chan int{cap: 0}
                 out = fixture('thumb_capacity_bound_' + str(capacity) + opt, f'fn main() {{ ch := chan int{{cap: {capacity}}}\n close(ch)\n}}', extra=(opt, '--target', 'linux-arm32'))
                 run(['qemu-arm', out], env=env, expected=1)
                 print('PASS thumb_capacity_bound_execution', capacity, opt, flush=True)
-        fixture('thumb_channel_contention', 'fn worker(ch chan int) { for i in 0:100 { ch <- 4294967297 } }\nfn main() { ch := chan int{cap: 0}\n for i in 0:8 { xu worker(ch) }\n mut sum := 0\n for i in 0:800 { sum += <-ch }\n println(sum)\n}', output='3435973837600\n', extra=('-O2', '--target', 'linux-arm32'), runner=('qemu-arm',))
+        fixture('thumb_channel_contention', 'fn worker(ch chan int) { for i in 0:100 { ch <- 4294967297 } }\nfn main() { ch := chan int{cap: 0}\n for i in 0:8 { xu worker(ch) }\n $sum := 0\n for i in 0:800 { sum += <-ch }\n println(sum)\n}', output='3435973837600\n', extra=('-O2', '--target', 'linux-arm32'), runner=('qemu-arm',))
         stack_overflow = """fn recurse(n int) int {
     if n == 0 { << 0 }
     << n + recurse(n - 1)
@@ -1181,10 +1181,10 @@ fn main() { out := chan int{cap: 0}
                        'fn view(s &int) &int { << s }\n'
                        'fn read(s &int) int { << *s }\n'
                        'fn sum(a &[]int, i &Item) int { << a[0] + i.value }\n'
-                       'fn check(p &mut int, a &mut []int, i &mut Item) int { q := view(VIEWP)\n'
+                       'fn check(p $&int, a $&[]int, i $&Item) int { q := view(VIEWP)\n'
                        ' total := *q + sum(VIEWA, VIEWI)\n *p = total\n << read(VIEWP) }\n'
-                       'fn main() { mut x := 1\n mut a := [2]\n mut i := Item{value: 3}\n'
-                       ' println(check(mut &x, mut &a, mut &i))\n println(x) }')
+                       'fn main() { $x := 1\n $a := [2]\n $i := Item{value: 3}\n'
+                       ' println(check($&x, $&a, $&i))\n println(x) }')
             phase_b = phase_b.replace('VIEWP', spelling).replace('VIEWA', spelling.replace('p', 'a')).replace('VIEWI', spelling.replace('p', 'i'))
             for target, runner in (('host', ()), ('linux-arm64', ('qemu-aarch64',)),
                                    ('linux-arm32', ('qemu-arm',)), ('linux-loongarch64', ('qemu-loongarch64',)),
