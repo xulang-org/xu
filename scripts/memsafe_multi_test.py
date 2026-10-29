@@ -71,7 +71,7 @@ pos("arr_overwrite_owning", """
 @main
 fn main() int {
     mut a := []string{}
-    for i in 0 -< 40 {
+    for i in 0:40 {
         a.push("item_" + str(i) + "_padpad")
     }
     a[3] = "replaced_padpad"
@@ -116,7 +116,7 @@ pos("map_owning_values", """
 @main
 fn main() int {
     mut m := map[string]string{}
-    for i in 0 -< 25 {
+    for i in 0:25 {
         m["k" + str(i)] = "v" + str(i) + "_padpad"
     }
     m["k0"] = "replaced0"
@@ -157,12 +157,12 @@ fn main() int {
     xu sender(3, ch, done)
     xu sender(4, ch, done)
     mut got := 0
-    for i in 0 -< 4 {
+    for i in 0:4 {
         s := <-ch
         println(s)
         got = got + s.len
     }
-    for i in 0 -< 4 {
+    for i in 0:4 {
         <-done
     }
     println(got)
@@ -197,7 +197,7 @@ pos("slice_copy_borrow_src", """
 @main
 fn main() int {
     s := "0123456789abcdef"
-    t := s[3 -< 9]
+    t := s[3:9]
     println(t)
     println(s)
     << 0
@@ -267,7 +267,7 @@ pos("field_churn", """
 struct U { s string }
 fn main() int {
     mut u := U{s: "init"}
-    for i in 0 -< 60 {
+    for i in 0:60 {
         u.s = "val_" + str(i) + "_padpadpadpad"
     }
     println(u.s)
@@ -279,7 +279,7 @@ pos("live_string_array", """
 @main
 fn main() int {
     mut a := []string{}
-    for i in 0 -< 80 {
+    for i in 0:80 {
         a.push("live_" + str(i) + "_padpadpadpad")
     }
     println(a.len)
@@ -293,7 +293,7 @@ pos("concat_loop", """
 @main
 fn main() int {
     mut acc := ""
-    for i in 0 -< 40 {
+    for i in 0:40 {
         acc = acc + str(i % 10)
     }
     println(acc.len)
@@ -362,7 +362,7 @@ reject("const_slice_oob", """
 @main
 fn main() int {
     s := "abcd"
-    println(s[10 -< 12])
+    println(s[10:12])
     << 0
 }
 """)

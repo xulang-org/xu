@@ -71,9 +71,10 @@ fn rt_emit_net_win_data(a &mut Assembler) {
     a.data_label("_rt_iocp_ready")
     rt_emit_zeros(a, 8)
     a.data_label("_rt_iocp_fp")
-    rt_emit_zeros(a, 32)
-    a.data_label("_rt_iocp_port")
-    rt_emit_zeros(a, 8)
+    rt_emit_zeros(a, 40)
+    a.data_label("_rt_iocp_n_close")
+    rt_emit_bytes(a, "CloseHandle")
+    a.emit_data([0])
     a.data_label("_rt_iocp_dll")
     rt_emit_bytes(a, "kernel32.dll")
     a.emit_data([0])
@@ -115,6 +116,7 @@ fn rt_ws2_call(a &mut Assembler, fp_off int) {
     a.lea(1, "_rt_ws2_fp")
     a.load(1, 1, fp_off)
     a.vm_call_win_fp(1)
+    if fp_off != 8 && fp_off != 40 { rt_ws2_int_result(a) }
     <<
 }
 
@@ -122,6 +124,7 @@ fn rt_ws2_call6(a &mut Assembler, fp_off int) {
     a.lea(1, "_rt_ws2_fp")
     a.load(1, 1, fp_off)
     a.vm_call_win_fp6(1)
+    rt_ws2_int_result(a)
     <<
 }
 
@@ -129,7 +132,17 @@ fn rt_ws2_call7(a &mut Assembler, fp_off int) {
     a.lea(1, "_rt_ws2_fp")
     a.load(1, 1, fp_off)
     a.vm_call_win_fp7(1)
+    rt_ws2_int_result(a)
     <<
+}
+
+// Winsock int results are 32-bit, while Xu int is signed 64-bit. Windows
+// leaves SOCKET_ERROR zero-extended in W0/EAX. SOCKET/accept handles above
+// are pointer-sized and must retain all their bits.
+fn rt_ws2_int_result(a &mut Assembler) {
+    a.shl_imm(14, 14, 32)
+    a.vm_mov_imm(1, 32)
+    a.shr(14, 14, 1)
 }
 
 fn rt_emit_ws2_init(a &mut Assembler) {
@@ -2332,7 +2345,7 @@ fn rt_iocp_call7(a &mut Assembler, fp_off int, arg7 int) {
     <<
 }
 
-// Resolve kernel32's IOCP entry points and create one process-wide port.
+// Cache the IOCP API entry points. Each wait owns its completion port.
 fn rt_emit_iocp_init(a &mut Assembler) {
     a.label("_rt_iocp_init")
     a.prologue(80)
@@ -2360,22 +2373,12 @@ fn rt_emit_iocp_init(a &mut Assembler) {
     rt_iocp_gpa(a, -8, "_rt_iocp_n_get", 8, "_rt_iocp_fail")
     rt_iocp_gpa(a, -8, "_rt_iocp_n_cancel", 16, "_rt_iocp_fail")
     rt_iocp_gpa(a, -16, "_rt_ws2_n_process_notifications", 24, "_rt_iocp_process_missing")
-    // INVALID_HANDLE_VALUE, NULL existing port, NULL key, no thread limit.
-    a.vm_mov_imm(18, -1)
-    a.vm_mov_imm(19, 0)
-    a.vm_mov_imm(20, 0)
-    a.vm_mov_imm(21, 0)
-    rt_iocp_call6(a, 0)
-    a.vm_cmp_imm(14, 0)
-    a.jeq("_rt_iocp_fail")
-    a.lea(0, "_rt_iocp_port")
-    a.store(0, 0, 14)
+    rt_iocp_gpa(a, -8, "_rt_iocp_n_close", 32, "_rt_iocp_fail")
     a.lea(0, "_rt_iocp_ready")
     a.vm_mov_imm(1, 1)
     a.store(0, 0, 1)
     a.label("_rt_iocp_ok")
-    a.lea(0, "_rt_iocp_port")
-    a.load(14, 0, 0)
+    a.vm_mov_imm(14, 0)
     a.epilogue()
     a.label("_rt_iocp_process_missing")
     a.lea(0, "_rt_iocp_unsupported")
@@ -2391,15 +2394,26 @@ fn rt_emit_iocp_init(a &mut Assembler) {
     <<
 }
 
+// DWORD fields must not read neighboring fields or structure padding.
+fn rt_iocp_load_u32(a &mut Assembler, offset int, dest int) {
+    a.load_byte(dest, 15, offset)
+    for i in 1:4 {
+        a.load_byte(3, 15, offset + i)
+        a.shl_imm(3, 3, i * 8)
+        a.ior(dest, dest, 3)
+    }
+}
+
 // Register one socket-state notification, dequeue the matching IOCP packet,
-// and remove the registration before the stack frame goes away. This uses
-// the non-consuming Winsock readiness API rather than fake zero-byte I/O.
+// then remove the registration and close the private completion port.
 fn rt_emit_iocp_wait(a &mut Assembler) {
     a.label("_rt_iocp_wait")
     // fd -16, events -24, timeout_ms -32, port -40;
-    // SOCK_NOTIFY_REGISTRATION -64..-88, OVERLAPPED_ENTRY -96..-128,
+    // SOCK_NOTIFY_REGISTRATION -64..-41, OVERLAPPED_ENTRY -96..-65,
     // received count -136, returned event mask -144.
     a.prologue(176)
+    a.vm_mov_imm(1, 0)
+    a.store(15, -40, 1)
     a.store(15, -16, 18)
     a.store(15, -24, 19)
     a.store(15, -32, 20)
@@ -2408,15 +2422,23 @@ fn rt_emit_iocp_wait(a &mut Assembler) {
     a.jeq("_rt_iocp_wait_unsupported")
     a.vm_cmp_imm(14, -1)
     a.jeq("_rt_iocp_wait_fail")
+    // A private queue prevents independent waits from consuming each
+    // other's completion packets. Remove the registration before closing it.
+    a.vm_mov_imm(18, -1)
+    a.vm_mov_imm(19, 0)
+    a.vm_mov_imm(20, 0)
+    a.vm_mov_imm(21, 0)
+    rt_iocp_call6(a, 0)
+    a.vm_cbz(14, "_rt_iocp_wait_fail")
     a.store(15, -40, 14)
 
     // Zero registration and completion storage, then install a one-shot
     // level-triggered notification for the requested direction plus hangup.
     a.vm_mov_imm(1, 0)
-    for i in 0:112 { a.store_byte(15, -64 - i, 1) }
+    for i in 0:136 { a.store_byte(15, -176 + i, 1) }
     a.load(1, 15, -16)
     a.store(15, -64, 1) // socket
-    a.store(15, -72, 1) // completionKey = socket
+    a.store(15, -56, 1) // completionKey at registration +8
     a.load(1, 15, -24)
     a.vm_mov_imm(2, 4) // SOCK_NOTIFY_REGISTER_EVENT_HANGUP
     a.ior(1, 1, 2)
@@ -2439,14 +2461,14 @@ fn rt_emit_iocp_wait(a &mut Assembler) {
     a.mov(5, 15)
     a.vm_sub_imm(5, 5, 136)
     rt_iocp_call7(a, 24, 5)
-    a.load(1, 15, -44) // registrationResult at +20
+    rt_iocp_load_u32(a, -44, 1) // registrationResult at +20
     a.vm_cmp_imm(1, 0)
     a.jne("_rt_iocp_wait_fail")
     a.vm_cmp_imm(14, 258) // WAIT_TIMEOUT
     a.jeq("_rt_iocp_wait_remove")
     a.vm_cmp_imm(14, 0)
     a.jne("_rt_iocp_wait_fail")
-    a.load(1, 15, -136)
+    rt_iocp_load_u32(a, -136, 1)
     a.vm_cmp_imm(1, 0)
     a.jeq("_rt_iocp_wait_remove")
     a.load(1, 15, -96)
@@ -2454,21 +2476,22 @@ fn rt_emit_iocp_wait(a &mut Assembler) {
     a.cmp(1, 2)
     a.jne("_rt_iocp_wait_remove")
     // OVERLAPPED_ENTRY.dwNumberOfBytesTransferred is at +24.
-    a.load(2, 15, -72)
+    rt_iocp_load_u32(a, -72, 2)
     a.store(15, -144, 2)
-    a.jmp("_rt_iocp_wait_remove_result")
+    a.jmp("_rt_iocp_wait_remove")
 
     a.label("_rt_iocp_wait_remove")
     a.vm_mov_imm(1, 4)
     a.store_byte(15, -46, 1) // operation REMOVE
     a.vm_mov_imm(1, 0)
     a.store_byte(15, -48, 1) // eventFilter = 0
+    a.store_byte(15, -45, 1) // triggerFlags = 0
     a.label("_rt_iocp_wait_remove_loop")
     a.load(18, 15, -40)
     a.vm_mov_imm(19, 1)
     a.mov(20, 15)
     a.vm_sub_imm(20, 20, 64)
-    a.vm_mov_imm(21, -1) // INFINITE while waiting for REMOVE
+    a.vm_mov_imm(21, 5000) // bounded wait for REMOVE
     a.vm_mov_imm(22, 1)
     a.mov(23, 15)
     a.vm_sub_imm(23, 23, 96)
@@ -2477,52 +2500,43 @@ fn rt_emit_iocp_wait(a &mut Assembler) {
     rt_iocp_call7(a, 24, 5)
     a.vm_cmp_imm(14, 0)
     a.jne("_rt_iocp_wait_fail")
-    a.load(1, 15, -44) // registrationResult at +20
+    rt_iocp_load_u32(a, -44, 1) // registrationResult at +20
     a.vm_cmp_imm(1, 0)
     a.jne("_rt_iocp_wait_fail")
-    a.load(1, 15, -136)
+    rt_iocp_load_u32(a, -136, 1)
     a.vm_cmp_imm(1, 0)
     a.jeq("_rt_iocp_wait_remove_loop")
-    a.load(1, 15, -72)
+    rt_iocp_load_u32(a, -72, 1)
     a.vm_mov_imm(2, 128) // SOCK_NOTIFY_EVENT_REMOVE
     a.iand(3, 1, 2)
     a.vm_cbz(3, "_rt_iocp_wait_remove_loop")
     a.label("_rt_iocp_wait_remove_result")
     a.load(1, 15, -144)
-    a.vm_cbz(1, "_rt_iocp_wait_timeout")
-    a.vm_mov_imm(2, 1)
-    a.iand(3, 1, 2)
-    a.vm_cbz(3, "_rt_iocp_wait_no_read")
-    a.vm_mov_imm(2, 1)
-    a.store(15, -144, 2)
-    a.label("_rt_iocp_wait_no_read")
-    a.vm_mov_imm(2, 2)
-    a.iand(3, 1, 2)
-    a.vm_cbz(3, "_rt_iocp_wait_no_write")
-    a.vm_mov_imm(2, 2)
-    a.ior(1, 1, 2)
-    a.label("_rt_iocp_wait_no_write")
-    a.vm_mov_imm(2, 4)
-    a.iand(3, 1, 2)
-    a.vm_cbz(3, "_rt_iocp_wait_no_hangup")
-    a.vm_mov_imm(2, 8)
-    a.ior(1, 1, 2)
-    a.label("_rt_iocp_wait_no_hangup")
-    a.vm_mov_imm(2, 64)
-    a.iand(3, 1, 2)
-    a.vm_cbz(3, "_rt_iocp_wait_done_mask")
-    a.vm_mov_imm(2, 4)
-    a.ior(1, 1, 2)
-    a.label("_rt_iocp_wait_done_mask")
-    a.mov(14, 1)
-    a.epilogue()
-    a.label("_rt_iocp_wait_timeout")
-    a.vm_mov_imm(14, 0)
+    a.vm_mov_imm(4, 0)
+    input_flags := [1, 2, 4, 64]
+    output_flags := [1, 2, 8, 4]
+    for i in 0:4 {
+        label := "_rt_iocp_wait_mask_" + str(i)
+        a.vm_mov_imm(2, input_flags[i])
+        a.iand(3, 1, 2)
+        a.vm_cbz(3, label + "")
+        a.vm_mov_imm(2, output_flags[i])
+        a.ior(4, 4, 2)
+        a.label(label)
+    }
+    a.store(15, -144, 4)
+    a.load(18, 15, -40)
+    rt_iocp_call6(a, 32)
+    a.load(14, 15, -144)
     a.epilogue()
     a.label("_rt_iocp_wait_unsupported")
     a.vm_mov_imm(14, -2)
     a.epilogue()
     a.label("_rt_iocp_wait_fail")
+    a.load(18, 15, -40)
+    a.vm_cbz(18, "_rt_iocp_wait_fail_no_port")
+    rt_iocp_call6(a, 32)
+    a.label("_rt_iocp_wait_fail_no_port")
     a.vm_mov_imm(14, -1)
     a.epilogue()
     <<

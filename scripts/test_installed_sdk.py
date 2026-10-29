@@ -16,7 +16,7 @@ import zipfile
 
 def run(args, *, cwd, env):
     try:
-        result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=180)
+        result = subprocess.run(args, cwd=cwd, env=env, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=180)
     except subprocess.TimeoutExpired as error:
         def text(value):
             return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
@@ -56,7 +56,7 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
     env.update(XU_SKIP_EDITOR_INSTALL="1", XUPATH=str(extra), XU_CACHE=str(work / "package cache"))
 
     if installer:
-        run([str(installer), "--prefix", str(prefix), "--yes"], cwd=project, env=env)
+        run([str(installer), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
         manifest_file = prefix / "bundle.json"
         manifest = json.loads(manifest_file.read_text()) if manifest_file.is_file() else {"version": "", "target": "host", "lane": "product"}
     else:
@@ -73,7 +73,7 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
         manifest = json.loads((bundle / "bundle.json").read_text())
         if native_setup:
             setup = bundle / ("xu-setup.exe" if os.name == "nt" else "xu-setup")
-            run([str(setup), "--prefix", str(prefix), "--yes"], cwd=project, env=env)
+            run([str(setup), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
         elif os.name == "nt":
             run(["pwsh", "-NoProfile", "-File", str(bundle / "install.ps1"), "-Prefix", str(prefix), "-NoModifyPath"], cwd=project, env=env)
         else:

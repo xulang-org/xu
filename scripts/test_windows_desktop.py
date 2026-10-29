@@ -10,6 +10,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -25,6 +26,15 @@ fn main() int {
         << 2 }
     if desktop_windows_find_loader_for(root,21) != x64 { eprintln("x64 loader discovery failed")
         << 3 }
+    if doctor_windows_find_loader_for(root,20) != arm { << 14 }
+    if doctor_windows_find_loader_for(root,21) != x64 { << 15 }
+    if doctor_windows_find_loader_for(root + "/arm-only",21).len != 0 { << 16 }
+    if doctor_windows_find_loader_for(root + "/x64-only",20).len != 0 { << 17 }
+    if doctor_windows_find_loader_for(root + "/misnamed",21).len != 0 { << 18 }
+    if desktop_windows_find_loader_for(root + "/arm-only",21).len != 0 { << 10 }
+    if desktop_windows_find_loader_for(root + "/x64-only",20).len != 0 { << 11 }
+    if desktop_windows_find_loader_for(root + "/misnamed",21).len != 0 { << 12 }
+    if desktop_windows_find_loader_for(root + "/generic",20) != root + "/generic/dist/windows-x64-ui/_build/WebView2Loader.dll" { << 13 }
     expected := "spaces / 中文 / apostrophe ' / quote \" / slash \\ / $$HOME"
     output := root + "/shell result.txt"
     command := "printf '%s' " + desktop_shell_quote(&expected) + " > " + desktop_shell_quote(&output)
@@ -65,11 +75,28 @@ def main() -> int:
             if file.name == "main.xu":
                 text = text.replace("fn main() int {", "fn original_desktop_main() int {", 1)
             (source / file.name).write_text(text, encoding="utf-8")
-        (source / "regression.xu").write_text("@main\n" + HARNESS, encoding="utf-8")
+        doctor = (root / "src/cmd/doctor/main.xu").read_text(encoding="utf-8")
+        start = doctor.index("fn doctor_windows_loader_matches(")
+        end = doctor.index("fn doctor_check_macos(", start)
+        (source / "regression.xu").write_text("@main\n" + doctor[start:end] + HARNESS, encoding="utf-8")
         loaders = workspace / "dist/windows-x64-ui/_build"
         loaders.mkdir(parents=True)
-        for arch in ("arm64", "x64"):
-            (loaders / f"WebView2Loader_{arch}.dll").write_bytes(b"fixture")
+        def pe(machine):
+            data = bytearray(70)
+            data[:2] = b"MZ"
+            struct.pack_into("<I", data, 60, 64)
+            data[64:68] = b"PE\0\0"
+            struct.pack_into("<H", data, 68, machine)
+            return data
+        for arch, machine in (("arm64", 0xAA64), ("x64", 0x8664)):
+            (loaders / f"WebView2Loader_{arch}.dll").write_bytes(pe(machine))
+            only = workspace / ("arm-only" if arch == "arm64" else "x64-only") / "dist/windows-x64-ui/_build"
+            only.mkdir(parents=True)
+            (only / f"WebView2Loader_{arch}.dll").write_bytes(pe(machine))
+        for folder, filename in (("misnamed", "WebView2Loader_x64.dll"), ("generic", "WebView2Loader.dll")):
+            directory = workspace / folder / "dist/windows-x64-ui/_build"
+            directory.mkdir(parents=True)
+            (directory / filename).write_bytes(pe(0xAA64))
         executable = workspace / "regression.exe"
         # Only existence is probed by the harness; these are never executed.
         (workspace / "xu-doctor.exe").write_bytes(b"fixture")

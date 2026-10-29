@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import zipfile
 
 
@@ -118,6 +119,31 @@ fn main() int {
             kernel.CloseHandle(handle)
         else:
             parent.chmod(0o755)
+
+    if os.name == "nt":
+        # Unlike the permanent lock above, a scanner/loader handle can close
+        # shortly after verification. Commit must then finish without losing
+        # either the new payload or the backup of the previous installation.
+        retry_old = work / "retry original"
+        retry_old.mkdir()
+        (retry_old / "value").write_text("original")
+        retry_stage = work / "retry stage"
+        retry_stage.mkdir()
+        (retry_stage / "value").write_text("new")
+        retry_backup = work / "retry backup"
+        retry_handle = kernel.CreateFileW(str(retry_stage), 0x80000000, 3, None, 3, 0x02000000, None)
+        assert retry_handle not in (None, ctypes.c_void_p(-1).value), ctypes.get_last_error()
+        closed = []
+        release = threading.Timer(3, lambda: closed.append(kernel.CloseHandle(retry_handle)))
+        release.start()
+        try:
+            run([probe, retry_stage, retry_old, retry_backup], work, env)
+        finally:
+            release.join()
+        assert closed == [1]
+        assert (retry_old / "value").read_text() == "new"
+        assert (retry_backup / "value").read_text() == "original"
+        assert not retry_stage.exists()
 
 
 def check(archive):

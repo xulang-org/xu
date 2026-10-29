@@ -12,13 +12,17 @@ import time
 
 class WindowsTemporaryDirectory(tempfile.TemporaryDirectory):
     def cleanup(self) -> None:
-        # x64 emulation can briefly retain the executable mapping after exit.
-        for attempt in range(20):
+        # WoA emulation can retain the executable mapping after exit, longer
+        # under concurrent compiler/SDK workloads (observed beyond 30 seconds).
+        # Retry only this transient
+        # permission error, with a bounded deadline and no ignored cleanup.
+        deadline = time.monotonic() + 120
+        while True:
             try:
                 super().cleanup()
                 return
             except PermissionError:
-                if attempt == 19:
+                if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.25)
 

@@ -36,7 +36,7 @@ def vscode_package_files(checkout: Path) -> list[Path]:
         if os.environ.get("XU_VSCODE_ROOT"):
             raise FileNotFoundError(f"XU_VSCODE_ROOT does not exist: {checkout}")
         return []
-    metadata = json.loads((checkout / "package.json").read_text())
+    metadata = json.loads((checkout / "package.json").read_text(encoding="utf-8"))
     filename = f"{metadata['name']}-{metadata['version']}.vsix"
     if Path(filename).name != filename or "\\" in filename:
         raise ValueError("VS Code package name/version must form a plain filename")

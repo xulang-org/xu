@@ -107,7 +107,7 @@ struct TextOutlineRenderer final : IDWriteTextRenderer {
   HRESULT WINAPI DrawStrikethrough(void *, FLOAT, FLOAT, const DWRITE_STRIKETHROUGH *, IUnknown *) override { return E_NOTIMPL; }
   HRESULT WINAPI DrawInlineObject(void *, FLOAT, FLOAT, IDWriteInlineObject *, BOOL, BOOL, IUnknown *) override { return E_NOTIMPL; }
 };
-static void *text_create_native(const char *family, unsigned family_len, const char *value, unsigned length,
+static void *text_create_native_local(const char *family, unsigned family_len, const char *value, unsigned length,
                                  const double *v, double *metrics, unsigned *cost) {
   if (!text_factory) return NULL;
   std::wstring name = family_len ? text_wide(family, family_len) : L"Segoe UI", text = text_wide(value, length);
@@ -167,8 +167,8 @@ static void *text_create_native(const char *family, unsigned family_len, const c
   *cost = 4096u + length * 32u + points * 16u;
   return result.release();
 }
-static void text_destroy_native(void *layout) { delete (DrawTextLayout *)layout; }
-static int text_query_native(void *pointer, unsigned mode, unsigned index, unsigned trailing, double x, double y, double *out) {
+static void text_destroy_native_local(void *layout) { delete (DrawTextLayout *)layout; }
+static int text_query_native_local(void *pointer, unsigned mode, unsigned index, unsigned trailing, double x, double y, double *out) {
   auto *text = (DrawTextLayout *)pointer;
   std::lock_guard<std::mutex> lock(text->mutex);
   DWRITE_HIT_TEST_METRICS hit = {}; BOOL edge = trailing != 0, inside = TRUE;
@@ -200,6 +200,82 @@ static int text_query_native(void *pointer, unsigned mode, unsigned index, unsig
   out[4] = cx; out[5] = cy; out[6] = caret.height;
   return 1;
 }
+// Xu tasks use alternate stacks. Run DirectWrite on an OS-managed stack so
+// Windows/WoA font probing and exception unwinding see valid thread bounds.
+// One serial worker is reused for layout creation, queries and destruction.
+struct TextNativeWork {
+  void (*invoke)(void *); void *argument;
+  std::atomic<bool> finished{false};
+};
+class TextNativeWorker {
+  HANDLE wake = NULL, done = NULL, thread = NULL;
+  std::mutex callers;
+  std::atomic<TextNativeWork *> pending{NULL};
+  static DWORD WINAPI entry(void *opaque) {
+    auto *self = static_cast<TextNativeWorker *>(opaque);
+    while (WaitForSingleObject(self->wake, INFINITE) == WAIT_OBJECT_0) {
+      auto *work = self->pending.load(std::memory_order_acquire);
+      if (!work) break;
+      work->invoke(work->argument);
+      work->finished.store(true, std::memory_order_release);
+      SetEvent(self->done);
+    }
+    return 0;
+  }
+public:
+  TextNativeWorker() {
+    wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    done = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (wake && done) thread = CreateThread(NULL, 0, entry, this, 0, NULL);
+    if (!thread) {
+      if (wake) CloseHandle(wake);
+      if (done) CloseHandle(done);
+      wake = done = NULL;
+    }
+  }
+  ~TextNativeWorker() {
+    if (!thread) return;
+    pending.store(NULL, std::memory_order_release);
+    SetEvent(wake);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread); CloseHandle(wake); CloseHandle(done);
+  }
+  bool run(void (*invoke)(void *), void *argument) {
+    std::lock_guard<std::mutex> lock(callers);
+    if (!thread) return false;
+    TextNativeWork work{invoke, argument};
+    pending.store(&work, std::memory_order_release);
+    SetEvent(wake);
+    do { WaitForSingleObject(done, INFINITE); }
+    while (!work.finished.load(std::memory_order_acquire));
+    return true;
+  }
+};
+static TextNativeWorker &text_worker() { static TextNativeWorker worker; return worker; }
+static void *text_create_native(const char *family, unsigned family_len, const char *value, unsigned length,
+                                const double *options, double *metrics, unsigned *cost) {
+  struct Call { const char *family; unsigned family_len; const char *value; unsigned length;
+    const double *options; double *metrics; unsigned *cost; void *result; };
+  Call call{family, family_len, value, length, options, metrics, cost, NULL};
+  text_worker().run([](void *opaque) {
+    auto *c = static_cast<Call *>(opaque);
+    c->result = text_create_native_local(c->family, c->family_len, c->value, c->length, c->options, c->metrics, c->cost);
+  }, &call);
+  return call.result;
+}
+static int text_query_native(void *pointer, unsigned mode, unsigned index, unsigned trailing, double x, double y, double *out) {
+  struct Call { void *pointer; unsigned mode, index, trailing; double x, y; double *out; int result; };
+  Call call{pointer, mode, index, trailing, x, y, out, 0};
+  text_worker().run([](void *opaque) {
+    auto *c = static_cast<Call *>(opaque);
+    c->result = text_query_native_local(c->pointer, c->mode, c->index, c->trailing, c->x, c->y, c->out);
+  }, &call);
+  return call.result;
+}
+static void text_destroy_native(void *pointer) {
+  text_worker().run([](void *p) { text_destroy_native_local(p); }, pointer);
+}
+
 }
 extern "C" void xu_draw_text_init(void) {
   std::call_once(text_once, [] {
