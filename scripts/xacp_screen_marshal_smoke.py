@@ -17,6 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "screen-smoke-token"
 
 
+def example_path(relative):
+    companion = project_root("examples") / "examples/xacp" / relative
+    if os.environ.get("XU_EXAMPLES_ROOT"):
+        return companion
+    local = ROOT / "examples/xacp" / relative
+    return local if local.is_file() else companion
+
+
 def frame(i, op, args="{}"):
     return encode(f"id: !i {i}\nop: {op}\nargs: {args}\n")
 
@@ -24,8 +32,8 @@ def frame(i, op, args="{}"):
 LEGACY = b"--- !xacp\nid: !i 1\nop: proc.status\nargs: {}\n===\n"
 
 
-def hello(token=TOKEN, permissions=None):
-    args = "\n  ver: !ver 1.0.0\n  nonce: screen-nonce"
+def hello(token=TOKEN, permissions=None, nonce="screen-nonce"):
+    args = f"\n  ver: !ver 1.0.0\n  nonce: {nonce}"
     if token:
         args += f"\n  token: {token}"
     if permissions is not None:
@@ -54,17 +62,21 @@ def checked(response, i, error=None):
         # Every error the transport can describe carries a bounded msg.
         assert "\n  msg: " in response, response
     else:
-        assert "ok: !b true\ndata:\n" in response, response
+        assert "ok: !b true\n" in response and "\ndata:\n" in response, response
     return response
 
 
 class Attached:
     def __init__(self, app, tool=None, mode="", token=TOKEN, port=None,
-                 timeout_ms="", no_poll=False):
+                 timeout_ms="", no_poll=False, hello_timeout_ms="", idle_timeout_ms="", env_overrides=None):
         env = dict(os.environ, XU_UI_SIM="1", XU_XACP_TOKEN=token,
                    XU_XACP_REQUEST_TIMEOUT_MS=timeout_ms,
+                   XU_XACP_HELLO_TIMEOUT_MS=hello_timeout_ms,
+                   XU_XACP_IDLE_TIMEOUT_MS=idle_timeout_ms,
+                   XU_XACP_NONCE_CACHE="", XU_XACP_NONCE_REPLAY="", XU_XACP_ALLOW_RAW="",
                    XACP_EXAMPLE_NO_POLL="1" if no_poll else "0",
                    XACP_EXAMPLE_LIFECYCLE=mode, XACP_EXAMPLE_TCP=str(port) if port else "")
+        env.update(env_overrides or {})
         command = [str(app)] if tool is None else [str(tool), "attach", str(app)]
         self.child = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -110,7 +122,10 @@ def stdio_checks(app, tool):
             for field in ('text: "business-main: attached Screen"', 'text: "Control button"',
                           "win: !i 1\n", "x: !f 12\n", "y: !f 24\n", "width: !f 320\n"):
                 assert field in response, (field, response)
-            assert response.count("    - id: !i ") == 2, response
+            assert response.count("    - id: !i ") == 3, response
+            for field in ("start: !i 0\n", "count: !i 3\n", "total: !i 3\n",
+                          "truncated: !b false\n", "next_start: !i 3\n"):
+                assert "  " + field in response, response
             changed = '真实节点 "quote" \\ slash\n===\ntrailer\r\t'
             args = '\n  win: !i 1\n  node: !i 1\n  act: set_text\n  text: ' + json.dumps(changed, ensure_ascii=False)
             assert "actions: []" in peer.request(frame(3, "ui.act", args), 3)
@@ -130,10 +145,29 @@ def stdio_checks(app, tool):
             else:
                 checked(screenshot, 7, "adapter_error")
             peer.request(frame(8, "ui.tree", "\n  win: !i 2"), 8, "stale_window")
-            peer.request(frame(9, "ui.tree", "\n  max_table_rows: !i 1"), 9, "adapter_error")
-            peer.request(frame(10, "ui.act", "\n  win: !i 1\n  node: !i 99\n  act: click"), 10, "adapter_error")
-            peer.request(frame(11, "ui.tree"), 11)
-            response = peer.request(frame(12, "proc.status"), 12)
+            first = peer.request(frame(9, "ui.tree", "\n  max_table_rows: !i 1\n  start: !i 0"), 9)
+            for field in ("start: !i 0\n", "count: !i 1\n", "total: !i 3\n",
+                          "truncated: !b true\n", "next_start: !i 1\n", "  - id: !i 1\n"):
+                assert "  " + field in first, first
+            assert first.count("    - id: !i ") == 1, first
+            next_start = int(next(line.removeprefix("  next_start: !i ")
+                                  for line in first.splitlines() if line.startswith("  next_start: !i ")))
+            second = peer.request(frame(10, "ui.tree", f"\n  max_table_rows: !i 1\n  start: !i {next_start}"), 10)
+            for field in ("start: !i 1\n", "count: !i 1\n", "total: !i 3\n",
+                          "truncated: !b true\n", "next_start: !i 2\n", "  - id: !i 2\n"):
+                assert "  " + field in second, second
+            assert second.count("    - id: !i ") == 1, second
+            assert next(line for line in first.splitlines() if line.startswith("  generation:")) == next(
+                line for line in second.splitlines() if line.startswith("  generation:"))
+            empty = peer.request(frame(11, "ui.tree", "\n  start: !i 3\n  max_table_rows: !i 1"), 11)
+            for field in ("start: !i 3\n", "count: !i 0\n", "total: !i 3\n",
+                          "truncated: !b false\n", "next_start: !i 3\n", "nodes: []\n"):
+                assert "  " + field in empty, empty
+            peer.request(frame(12, "ui.tree", "\n  start: !i 4"), 12, "adapter_error")
+            peer.request(frame(13, "ui.act", "\n  win: !i 1\n  node: !i 99\n  act: click"), 13, "adapter_error")
+            # A valid session limit above the widget node cap is still legal.
+            peer.request(frame(14, "ui.tree", "\n  max_table_rows: !i 10000"), 14)
+            response = peer.request(frame(15, "proc.status"), 15)
             if launcher is None:
                 assert f"pid: !i {peer.child.pid}\n" in response, response
             peer.finish()
@@ -175,6 +209,18 @@ def stdio_checks(app, tool):
         finally:
             peer.stop()
 
+    # Schema failures close the control session and echo the parsed id.
+    for args in ("\n  start: !i -1", "\n  start: !b true",
+                 "\n  max_table_rows: !i 0", "\n  max_table_rows: !i -1",
+                 "\n  max_table_rows: !i 10001"):
+        peer = Attached(app)
+        try:
+            peer.request(hello(), 1)
+            peer.request(frame(2, "ui.tree", args), 2, "schema_error")
+            peer.finish()
+        finally:
+            peer.stop()
+
     # Fatal session errors must terminate attach control without killing main
     # prematurely or dispatching a later request from the same input chunk.
     for payload, error, request_id in (
@@ -201,9 +247,9 @@ def tcp_checks(app):
         try:
             wait_listener(server.child, port)
             probe(port, token)
-            for _ in range(2):
+            for index in range(2):
                 with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
-                    for payload, i, error in ((hello(token), 1, None),
+                    for payload, i, error in ((hello(token, nonce=f"screen-peer-{index}"), 1, None),
                                               (frame(2, "ui.tree"), 2, None if token else "permission_denied")):
                         data = payload
                         for start in range(0, len(data), 5):
@@ -212,6 +258,13 @@ def tcp_checks(app):
                         checked(response, i, error)
                         if i == 2 and token:
                             assert 'text: "business-main: attached Screen"' in response
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                sock.sendall(hello(token, nonce="screen-peer-0") + frame(2, "proc.status"))
+                checked(read_frame(sock.recv), 1, "nonce_replay")
+                try:
+                    assert sock.recv(1) == b"", "replayed hello did not close attached peer"
+                except ConnectionResetError:
+                    pass
             assert server.child.poll() is None
         finally:
             server.stop()
@@ -224,7 +277,7 @@ def run_screen_smoke(xu, tool):
     with tempfile.TemporaryDirectory(prefix="xu-xacp-screen-") as tmp:
         app = Path(tmp) / "attach"
         result = subprocess.run([str(ROOT / "scripts/run_product_compiler.sh"), str(xu),
-                                 "build", "--xacp", str(project_root("examples") / "examples/xacp/attach/main.xu"), "-o", str(app)],
+                                 "build", "--xacp", str(example_path("attach/main.xu")), "-o", str(app)],
                                 cwd=ROOT, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, (result.stdout, result.stderr)
         stdio_checks(app, tool)
