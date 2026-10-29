@@ -5,6 +5,11 @@
 extern "C" {
 #endif
 
+/* Input event timestamps share Xu time.instant(): CLOCK_MONOTONIC on Unix,
+ * QueryPerformanceCounter on Windows. Do not substitute a different uptime
+ * clock: an epoch/rate difference delays hover and animation deadlines. */
+long long xu_ui_input_now_ns(void);
+
 /*
  * Resource limits for the in-process mailbox ABI.
  *
