@@ -4,7 +4,7 @@
 
 ## 口径与结论
 
-扫描全部 **139 个可导入包**（127 个当前 inventory stdlib 分类、12 个扩展）、**573 个源文件 / 8392 个公开声明**。公开声明包含方法及类型，不等于独立能力数。
+扫描全部 **141 个可导入包**（129 个当前 inventory stdlib 分类、12 个扩展）、**608 个源文件 / 8904 个公开声明**。公开声明包含方法及类型，不等于独立能力数。
 
 这是全目录静态盘点与重点 API 复核，不是逐 API 全量语义/安全审计。未登记问题的包仍为 inventory-only，不能据此声称完整。源码中的 subset/unsupported 只是待复核线索；合法的非法输入拒绝也会命中，不自动当作缺陷。
 
@@ -132,7 +132,7 @@ CBC/CTR/GCM 硬编码绑定在 aes.Cipher，未抽象通用分组密码接口，
 
 ## 全包覆盖表
 
-无直接 import fixture 的包共 139 个：`archive/tar`、`archive/zip`、`bufio`、`bufio/file`、`bytes`、`cmp`、`compress/bzip2`、`compress/flate`、`compress/gzip`、`compress/lzw`、`compress/zlib`、`container/heap`、`container/list`、`container/ring`、`context`、`crypto/aes`、`crypto/cipher`、`crypto/des`、`crypto/ecdsa`、`crypto/ed25519`、`crypto/gmtls`、`crypto/hmac`、`crypto/jwt`、`crypto/md5`、`crypto/password`、`crypto/rand`、`crypto/rc4`、`crypto/rsa`、`crypto/rsa/oaep`、`crypto/sha1`、`crypto/sha256`、`crypto/sha3`、`crypto/sha512`、`crypto/sm2`、`crypto/sm3`、`crypto/sm4`、`crypto/sm9`、`crypto/subtle`、`crypto/tls`、`crypto/x509`、`crypto/x509/pkix`、`crypto/zuc`、`database/sql`、`database/sql/driver`、`encoding/ascii85`、`encoding/asn1`、`encoding/base32`、`encoding/base64`、`encoding/binary`、`encoding/csv`、`encoding/hex`、`encoding/json`、`encoding/pem`、`encoding/xml`、`encoding/xun`、`errors`、`flag`、`fmt`、`hash/adler32`、`hash/crc32`、`hash/crc64`、`hash/fnv`、`hash/maphash`、`html`、`html/query`、`html/template`、`id`、`image`、`image/color`、`image/draw`、`image/gif`、`image/jpeg`、`image/png`、`index/suffixarray`、`internal/dependency`、`internal/modulepath`、`internal/modulezip`、`internal/sdk`、`internal/semver`、`internal/sumdb`、`internal/toolpath`、`io`、`io/fs`、`log`、`log/slog`、`maps`、`math`、`math/big`、`math/bits`、`math/rand`、`mime`、`mime/multipart`、`mime/quotedprintable`、`net`、`net/apns`、`net/http`、`net/http/cookiejar`、`net/http/httptest`、`net/http2`、`net/mail`、`net/netip`、`net/poller`、`net/pool`、`net/smtp`、`net/stream`、`net/textproto`、`net/url`、`os`、`os/exec`、`os/signal`、`os/user`、`path`、`path/filepath`、`rate`、`regexp`、`slices`、`sort`、`strconv`、`strings`、`sync`、`testing`、`testing/fstest`、`testing/iotest`、`text/scanner`、`text/tabwriter`、`text/template`、`tile`、`time`、`timer`、`ui`、`ui/draw`、`ui/internal/codec`、`ui/layout`、`ui/webview`、`ui/widgets`、`unicode`、`unicode/utf16`、`unicode/utf8`、`xacp`。
+无直接 import fixture 的包共 141 个：`archive/tar`、`archive/zip`、`bufio`、`bufio/file`、`bytes`、`cmp`、`compress/bzip2`、`compress/flate`、`compress/gzip`、`compress/lzw`、`compress/zlib`、`container/heap`、`container/list`、`container/ring`、`context`、`crypto/aes`、`crypto/cipher`、`crypto/des`、`crypto/ecdsa`、`crypto/ed25519`、`crypto/gmtls`、`crypto/hkdf`、`crypto/hmac`、`crypto/jwt`、`crypto/md5`、`crypto/password`、`crypto/rand`、`crypto/rc4`、`crypto/rsa`、`crypto/rsa/oaep`、`crypto/sha1`、`crypto/sha256`、`crypto/sha3`、`crypto/sha512`、`crypto/sm2`、`crypto/sm3`、`crypto/sm4`、`crypto/sm9`、`crypto/subtle`、`crypto/tls`、`crypto/x509`、`crypto/x509/pkix`、`crypto/zuc`、`database/sql`、`database/sql/driver`、`encoding/ascii85`、`encoding/asn1`、`encoding/base32`、`encoding/base64`、`encoding/binary`、`encoding/csv`、`encoding/hex`、`encoding/json`、`encoding/pem`、`encoding/xml`、`encoding/xun`、`errors`、`flag`、`fmt`、`hash/adler32`、`hash/crc32`、`hash/crc64`、`hash/fnv`、`hash/maphash`、`html`、`html/query`、`html/template`、`id`、`image`、`image/color`、`image/draw`、`image/gif`、`image/jpeg`、`image/png`、`index/suffixarray`、`internal/dependency`、`internal/modulepath`、`internal/modulezip`、`internal/sdk`、`internal/semver`、`internal/sumdb`、`internal/toolpath`、`io`、`io/fs`、`log`、`log/slog`、`maps`、`math`、`math/big`、`math/bits`、`math/rand`、`mime`、`mime/multipart`、`mime/quotedprintable`、`net`、`net/apns`、`net/http`、`net/http/cookiejar`、`net/http/httptest`、`net/http2`、`net/mail`、`net/netip`、`net/poller`、`net/pool`、`net/smtp`、`net/stream`、`net/textproto`、`net/url`、`net/websocket`、`os`、`os/exec`、`os/signal`、`os/user`、`path`、`path/filepath`、`rate`、`regexp`、`slices`、`sort`、`strconv`、`strings`、`sync`、`testing`、`testing/fstest`、`testing/iotest`、`text/scanner`、`text/tabwriter`、`text/template`、`tile`、`time`、`timer`、`ui`、`ui/draw`、`ui/internal/codec`、`ui/layout`、`ui/webview`、`ui/widgets`、`unicode`、`unicode/utf16`、`unicode/utf8`、`xacp`。
 
 fixture 只按显式 `#import` 关联；0 不等于没有间接测试。平台状态来自有指纹的日志；`not-measured` 表示证据不足，不能推断代码不支持。完整符号、fixture 和哈希见 [stdlib_matrix.json](stdlib_matrix.json)。
 
@@ -159,6 +159,7 @@ fixture 只按显式 `#import` 关联；0 不等于没有间接测试。平台�
 | [src/crypto/ecdsa/mod.xu](../../src/crypto/ecdsa/mod.xu) | 28 | 0 | 4 | not-measured | not-measured | 0 |
 | [src/crypto/ed25519/mod.xu](../../src/crypto/ed25519/mod.xu) | 10 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/crypto/gmtls/mod.xu](../../src/crypto/gmtls/mod.xu) | 12 | 0 | 1 | not-measured | not-measured | 0 |
+| [src/crypto/hkdf/mod.xu](../../src/crypto/hkdf/mod.xu) | 3 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/crypto/hmac/mod.xu](../../src/crypto/hmac/mod.xu) | 13 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/crypto/jwt/mod.xu](../../src/crypto/jwt/mod.xu) | 9 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/crypto/md5/mod.xu](../../src/crypto/md5/mod.xu) | 8 | 0 | 0 | not-measured | not-measured | 0 |
@@ -231,12 +232,12 @@ fixture 只按显式 `#import` 关联；0 不等于没有间接测试。平台�
 | [src/mime/mod.xu](../../src/mime/mod.xu) | 24 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/mime/multipart/mod.xu](../../src/mime/multipart/mod.xu) | 17 | 0 | 1 | not-measured | not-measured | 0 |
 | [src/mime/quotedprintable/mod.xu](../../src/mime/quotedprintable/mod.xu) | 2 | 0 | 0 | not-measured | not-measured | 0 |
-| [src/net/mod.xu](../../src/net/mod.xu) | 400 | 0 | 11 | not-measured | not-measured | 0 |
+| [src/net/mod.xu](../../src/net/mod.xu) | 423 | 0 | 11 | not-measured | not-measured | 0 |
 | [src/net/apns/mod.xu](../../src/net/apns/mod.xu) | 7 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/net/http/mod.xu](../../src/net/http/mod.xu) | 102 | 0 | 8 | not-measured | not-measured | 0 |
 | [src/net/http/cookiejar/mod.xu](../../src/net/http/cookiejar/mod.xu) | 7 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/net/http/httptest/mod.xu](../../src/net/http/httptest/mod.xu) | 12 | 0 | 1 | not-measured | not-measured | 0 |
-| [src/net/http2/mod.xu](../../src/net/http2/mod.xu) | 18 | 0 | 1 | not-measured | not-measured | 0 |
+| [src/net/http2/mod.xu](../../src/net/http2/mod.xu) | 18 | 0 | 10 | not-measured | not-measured | 0 |
 | [src/net/mail/mod.xu](../../src/net/mail/mod.xu) | 4 | 0 | 1 | not-measured | not-measured | 0 |
 | [src/net/netip/mod.xu](../../src/net/netip/mod.xu) | 25 | 0 | 1 | not-measured | not-measured | 0 |
 | [src/net/poller/mod.xu](../../src/net/poller/mod.xu) | 14 | 0 | 0 | not-measured | not-measured | 0 |
@@ -245,6 +246,7 @@ fixture 只按显式 `#import` 关联；0 不等于没有间接测试。平台�
 | [src/net/stream/mod.xu](../../src/net/stream/mod.xu) | 12 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/net/textproto/mod.xu](../../src/net/textproto/mod.xu) | 15 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/net/url/mod.xu](../../src/net/url/mod.xu) | 31 | 0 | 2 | not-measured | not-measured | 0 |
+| [src/net/websocket/mod.xu](../../src/net/websocket/mod.xu) | 23 | 0 | 1 | not-measured | not-measured | 0 |
 | [src/os/mod.xu](../../src/os/mod.xu) | 135 | 0 | 1 | not-measured | not-measured | 0 |
 | [src/os/exec/mod.xu](../../src/os/exec/mod.xu) | 13 | 0 | 3 | not-measured | not-measured | 0 |
 | [src/os/signal/mod.xu](../../src/os/signal/mod.xu) | 11 | 0 | 3 | not-measured | not-measured | 0 |
@@ -267,16 +269,16 @@ fixture 只按显式 `#import` 关联；0 不等于没有间接测试。平台�
 | [src/tile/mod.xu](../../src/tile/mod.xu) | 54 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/time/mod.xu](../../src/time/mod.xu) | 102 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/timer/mod.xu](../../src/timer/mod.xu) | 8 | 0 | 0 | not-measured | not-measured | 0 |
-| [src/ui/mod.xu](../../src/ui/mod.xu) | 2655 | 0 | 10 | not-measured | not-measured | 0 |
-| [src/ui/draw/mod.xu](../../src/ui/draw/mod.xu) | 206 | 0 | 0 | not-measured | not-measured | 0 |
+| [src/ui/mod.xu](../../src/ui/mod.xu) | 2885 | 0 | 10 | not-measured | not-measured | 0 |
+| [src/ui/draw/mod.xu](../../src/ui/draw/mod.xu) | 396 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/ui/internal/codec/mod.xu](../../src/ui/internal/codec/mod.xu) | 5 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/ui/layout/mod.xu](../../src/ui/layout/mod.xu) | 69 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/ui/webview/mod.xu](../../src/ui/webview/mod.xu) | 61 | 0 | 4 | not-measured | not-measured | 0 |
-| [src/ui/widgets/mod.xu](../../src/ui/widgets/mod.xu) | 1988 | 0 | 15 | not-measured | not-measured | 0 |
+| [src/ui/widgets/mod.xu](../../src/ui/widgets/mod.xu) | 2028 | 0 | 15 | not-measured | not-measured | 0 |
 | [src/unicode/mod.xu](../../src/unicode/mod.xu) | 35 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/unicode/utf16/mod.xu](../../src/unicode/utf16/mod.xu) | 6 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/unicode/utf8/mod.xu](../../src/unicode/utf8/mod.xu) | 12 | 0 | 0 | not-measured | not-measured | 0 |
-| [src/xacp/mod.xu](../../src/xacp/mod.xu) | 94 | 0 | 1 | not-measured | not-measured | 0 |
+| [src/xacp/mod.xu](../../src/xacp/mod.xu) | 97 | 0 | 1 | not-measured | not-measured | 0 |
 
 ## 重放
 
