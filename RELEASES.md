@@ -6,7 +6,12 @@
 
 ---
 
-## Xu 0.10.12-rc.2 (unreleased)
+## Xu 0.10.12
+
+Stable release of the 0.10.12 line. Phase C markers are now the documented spelling: `$name :=` declares a mutable binding, `$&value` takes a writable borrow and `$&T` names its type. Product sources, examples (including `examples/xacp`) and compiler diagnostics use these markers; diagnostics for immutable assignment and mutable borrows now suggest `$x := value` and `$&owner`. Upgrade the compiler, standard library and product tools together. Published binaries and checksums are listed with the release assets.
+
+Also includes the fixes from 0.10.12-rc.2 and rc.3:
+
 
 Windows socket readiness fully initializes the `WSAPOLLFD` event fields and rejects zero-extended `SOCKET_ERROR` results. Previously stale stack flags could make a nonblocking readiness check report a large positive count, causing the HTTP intake loop to block in `accept` before processing connected clients. No public API or ABI changes.
 
