@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.10.13-dev.3 (development)
+
+HTTP/2 TCP and TLS clients only report success after the current stream ends with complete frames and header blocks. Truncation, resets, GOAWAY, malformed frames and resource limits now return errors and retire the connection while preserving the received response prefix. Reads and writes check progress; SETTINGS and PING are acknowledged, header continuations and padding are handled, and HPACK static status indexes are corrected. Unsupported HPACK encodings and oversized single-frame requests fail explicitly. Full HPACK and flow control remain outside this subset. This is a development build.
+
 ## Xu 0.10.13-dev.2 (development)
 
 Interface method calls now restore the coroutine stack-check marker before entering user code. The ARM64 register cache reserves that marker home for pinned locals and call results, preventing optimized SQL pool operations from crashing or replacing live scalar values. This is a development build; no stable release is published.
