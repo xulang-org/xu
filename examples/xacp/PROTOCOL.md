@@ -236,6 +236,7 @@ values silently use defaults.
 | Setting | Default | Accepted values | Scope/result |
 | --- | --- | --- | --- |
 | `XU_XACP_REQUEST_TIMEOUT_MS` | 5000 | 1..600000 | Attached UI wait; same-id `request_timeout`, keep OPEN |
+| `XU_XACP_WRITE_TIMEOUT_MS` | 10000 | 1..600000 | Each complete outgoing frame; transport failure, close without another frame |
 | `XU_XACP_HELLO_TIMEOUT_MS` | 5000 | 1..600000 | Control-loop start (stdio/attach loop or TCP accept) to successful hello; id-0 `hello_timeout`, close |
 | `XU_XACP_IDLE_TIMEOUT_MS` | 60000 | 1000..3600000, or 0 to disable | OPEN time since complete inbound frame; id-0 `session_idle`, close |
 
@@ -244,8 +245,24 @@ enqueue, and reply wait; frame reading/parsing/validation is excluded. The
 implemented timer bounds attached `ui.tree/ui.screenshot/ui.act/ui.input/ui.record`
 marshal waits. Hello, process operations, and exclusive adapter failures execute
 synchronously without an independent cancellation timer. File export after a
-timely UI reply is synchronous too. Blocked response-write deadlines are
-unspecified.
+timely UI reply is synchronous too.
+
+Each outgoing frame has its own monotonic write deadline, starting when its
+write begins; partial progress does not renew it. Read waits use only their
+hello/idle deadlines; frame writes use only the write deadline, including fatal
+`hello_timeout` and `session_idle` responses. On write expiry, no further frame
+is attempted: a partially written stream cannot reliably deliver an error frame.
+The session closes; exclusive stdio exits nonzero (attached stdio reports 1 on
+`done`), while TCP drops only that peer and continues listening. Stderr contains
+`"xacp: write timed out after W ms"`, with the configured numeric value.
+
+POSIX stdio pipes and TCP sockets (including Windows Winsock) use non-consuming
+write readiness and writes of at most 512 bytes. TCP also bounds blocking sends
+with the remaining frame budget, clearing the socket timeout before input waits.
+The control transport must own writes to its descriptor. Windows pipe/console
+stdio has no non-consuming write-readiness probe: its write deadline is
+best-effort and a blocking write can remain unbounded. Kernel scheduling can
+add latency to expiry; these are transport deadlines, not real-time guarantees.
 
 Partial headers/bodies do not renew hello/idle time. Recoverable NEW errors do
 not restart hello time. Complete request bodies refresh the OPEN idle reference,
@@ -529,7 +546,7 @@ breakpoint debugging; CLI `record` copies bounded stdout (at most 1 MiB on
 supported Unix hosts), not a UI event/frame stream.
 
 Multiple controllers/Screens beyond the supported model, atomic multi-page
-snapshots, write deadlines, crash-proof screenshot cleanup, id rollover, and
+snapshots, crash-proof screenshot cleanup, id rollover, and
 diagnostic wording not fixed above are unspecified. Discovery's operation list
 and historical proposals do not imply additional operations or guarantees.
 
