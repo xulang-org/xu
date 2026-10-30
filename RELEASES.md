@@ -8,7 +8,9 @@
 
 ## Xu 0.10.13-dev.4 (development)
 
-HTTP/2 TCP and TLS clients only report success after the current stream ends with complete frames and header blocks. Truncation, resets, GOAWAY, malformed frames and resource limits now return errors and retire the connection while preserving the received response prefix. Reads and writes check progress; SETTINGS and PING are acknowledged, header continuations and padding are handled, and HPACK static status indexes are corrected. Unsupported HPACK encodings and oversized single-frame requests fail explicitly. Full HPACK and flow control remain outside this subset. This is a development build.
+HTTP/2 TCP and TLS clients only report success after the current stream ends with complete frames and header blocks. Truncation, resets, GOAWAY, malformed frames and resource limits now return errors and retire the connection while preserving the received response prefix. Reads and writes check progress; SETTINGS and PING are acknowledged, header continuations and padding are handled, and HPACK static status indexes are corrected. Unsupported HPACK encodings and oversized single-frame requests fail explicitly. Full HPACK and flow control remain outside this subset.
+
+XACP control sessions now bound each outgoing frame with a monotonic write deadline (`XU_XACP_WRITE_TIMEOUT_MS`, default 10000 ms, range 1..600000). POSIX stdio and TCP wait for write readiness and write bounded chunks; expiry closes the session as a transport failure. This is a development build.
 
 ## Xu 0.10.13-dev.3 (development)
 
