@@ -184,7 +184,18 @@ UI 超时后到达的回复不能写文件；未链接原生文件桥接或不�
 | `encode_error` | 像素读回或 PNG 编码失败；带 id，不断连。 |
 
 `surface_record` 仍仅导出尺寸元数据，标记 `redacted=true`，不导出帧像素。
-`ui.record` 仍需独立流式接收器，注册后返回 `stream_required`。
+`ui.record` 在匹配的 Screen 上使用内存有界 sink，同步采样后返回一段完整 XAR1。
+客户端重复请求形成拉取式分段流，每段序号从 1 开始；每请求仍只有一个 XACP 响应，
+没有跨请求录制状态或续传游标。参数为 `win: !i`（正数）、`mode: events|frames`，
+可选 `max_bytes: !i`（默认 65536，1..max_frame_bytes）、`max_records: !i`（默认 64，>=1）
+及 `duration_ms: !i`（默认 0，范围 0..request_timeout_ms-1）。0 表示立即采样一次，
+正数窗口内重复采样，采样间最多等待 10 ms；排队时间计入请求超时。
+成功 data 含 `mode`、`records`、`bytes`、`truncated` 和带引号的 XAR1 `payload`。
+`frames` 使用截图的尺寸元数据；Screen 未公开输入事件历史/订阅，故 `events` 如实返回
+标记 `state=true` 的当前 `window/canvas/generation/open` 状态，不注入输入，不要求 UI_MUTATE。
+采样占用 UI-owner 的本次 poll，不推进业务事件循环，也不补录请求间的事件。
+无 Screen 为 `not_implemented`，窗口不符为 `stale_window`；`stream_required` 仅保留给
+未提供 sink/采样能力的适配器，常规 Screen 路径不再返回。
 `proc.output` 接受 `stream`（stdout/stderr）、`since`（>=0）和 `max_bytes`
 （1..max_frame_bytes，默认 min(4096, max_frame_bytes/2)，越界为 `schema_error`）。
 启用 XACP 的 64 位 POSIX 宿主捕获 Xu 运行时 print/eprint 和 fd-write 路径的
@@ -200,8 +211,12 @@ fd 1/2 写入，原样透传；不是对全部外部原生代码或子进程输�
 id，返回 `schema_error` 后可重试。stdio 控制帧通过 stdout 的专用复制 fd 写出，
 不进入缓冲；该 fd 仍指向原 stdout，业务 stdout 不会自动重定向，须避免日志与帧混写。
 attach 的输出请求直接由控制协程处理，不需要 Screen 注册或 UI-owner poll。
-`ui.record.max_bytes` 是录制预算（越界为
-`schema_error`，超预算报错），不是分页游标。
+`ui.record.max_bytes` 含 XAR1 头和尾 LF。实现将有效预算进一步限制为
+`(max_frame_bytes-256)/2`，预留信封和转义空间，并校验完整响应大小。
+参数越界/未知字段为 `schema_error`；首条记录超预算、sink/截图失败为 `adapter_error`，
+并中止 recorder；已有完整记录后字节预算耗尽则返回有效前缀，`truncated=true`。
+达到记录数上限也标记 `truncated=true`；采样窗口正常结束不单独标记截断。
+响应仍遵守 `XU_XACP_WRITE_TIMEOUT_MS`，超时后保留原传输关闭语义。
 
 未注册时返回 `not_implemented`；注销使已入队请求得到 `stale_window`。
 Screen close/dispose（含窗口关闭事件）通过单槽 channel 通知控制侧失效，
@@ -225,3 +240,6 @@ main 自行处理；TCP 顺序监听持续运行至进程退出，单个坏 peer
 `python3 scripts/xacp_screenshot_smoke.py` 在 Linux 链接实际 Cairo/Pango 渲染后端，
 不创建桌面窗口，覆盖 stdio 和 attach 两种启动方式的 PNG/RAW/脱敏像素、私有文件、
 FIFO/断连清理、超限、目录权限/符号链接、UTF-8 截断及路径过滤；需要 C++、GTK4/Pango 开发库。
+`python3 scripts/xacp_ui_record_smoke.py` 复用该真实渲染夹具，检查 stdio/attach 的
+XAR1 分段、序号/长度、字节与记录预算、坏参数错误码、无 Screen、权限和请求超时，
+并验证 sink 失败时的原子写入与 recorder 生命周期；已加入 `make xacp-test`。

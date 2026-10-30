@@ -1,0 +1,132 @@
+@xacp
+
+#ui/widgets
+#encoding/xun
+#errors
+#strings
+#time
+
+const DEFAULT_RECORD_BYTES = 65536
+const DEFAULT_RECORD_COUNT = 64
+const RECORD_INTERVAL_MS = 10
+
+// StreamWriter with all-or-error appends. Neither a failed write nor a
+// caller-supplied large max_records can grow the retained payload past limit.
+pub struct RecordBuffer {
+    data string
+    limit int
+}
+
+pub fn record_buffer(max_bytes int) RecordBuffer {
+    if max_bytes <= 0 || max_bytes > MAX_FRAME_BYTES { >> errors.new("xacp: invalid record buffer limit") }
+    << RecordBuffer{data: "",limit: max_bytes}
+}
+
+pub fn (b $&RecordBuffer) write_str(data string) int {
+    if data.len > b.limit - b.data.len { >> errors.new("xacp: record buffer byte budget exceeded") }
+    n := data.len
+    dst := $&b.data
+    dst.push_str(data)
+    << n
+}
+
+pub fn (b &RecordBuffer) text() string { << b.data + "" }
+
+fn record_expired(started int,l &Limits) bool {
+    << time.since(started) >= l.request_timeout_ms * time.millisecond()
+}
+
+fn record_sample(s $&widgets.Screen,mode &string) string {
+    if *mode == "frames" {
+        $surface := screen_screenshot(&*s,1.0) or >>
+        data := surface_record(&surface)
+        surface.dispose() or >>
+        << data
+    }
+    // Screen exposes no input history/subscription. UI_READ must not inject
+    // events. Emit an explicitly labelled current-state observation instead.
+    << "state=true\twindow=" + str(s.xacp_window_id()) + "\tcanvas=" + str(s.xacp_canvas_id()) +
+        "\tgeneration=" + str(s.xacp_generation()) + "\topen=" + str(s.is_open())
+}
+
+fn record_segment(s $&widgets.Screen,d &xun.Doc,request &Request,l &Limits,r $&Recorder,started int) string {
+    $sink := record_buffer(r.max_bytes) or >>
+    $max_records := DEFAULT_RECORD_COUNT
+    if has_field(d,request.args,"max_records") { max_records = require_int(d,d.get(request.args,"max_records"),"max_records") }
+    $duration_ms := 0
+    if has_field(d,request.args,"duration_ms") { duration_ms = require_int(d,d.get(request.args,"duration_ms"),"duration_ms") }
+    mode := r.mode + ""
+    $kind := "event"
+    if mode == "frames" { kind = "frame" }
+    sampling_started := time.now()
+    $truncated := false
+    while true {
+        if record_expired(started,l) { >> errors.new("xacp: recording request timed out") }
+        data := record_sample(&*s,&mode) or >>
+        // Leave complete records only. An unusably small first-record budget
+        // is an adapter error; a later exhausted budget returns a valid prefix.
+        size := ("XAR1\t" + str(r.sequence) + "\t" + kind + "\t" + str(data.len) + "\n").len + data.len + 1
+        if size > r.max_bytes - r.bytes {
+            if r.sequence == 1 { >> errors.new("xacp: first record exceeds byte budget") }
+            truncated = true
+            <-
+        }
+        _ := write_record(&*r,$&sink,kind + "",data) or >>
+        if r.bytes == r.max_bytes || r.sequence - 1 >= max_records { truncated = true
+            <- }
+        if duration_ms == 0 { <- }
+        remaining := duration_ms * time.millisecond() - time.since(sampling_started)
+        if remaining <= 0 { <- }
+        request_remaining := l.request_timeout_ms * time.millisecond() - time.since(started)
+        if request_remaining <= 0 { >> errors.new("xacp: recording request timed out") }
+        $delay := RECORD_INTERVAL_MS * time.millisecond()
+        if delay > remaining { delay = remaining }
+        if delay > request_remaining { delay = request_remaining }
+        time.sleep(delay)
+        if time.since(sampling_started) >= duration_ms * time.millisecond() { <- }
+    }
+    payload := sink.text()
+    result := "  mode: " + mode + "\n  records: !i " + str(r.sequence - 1) + "\n  bytes: !i " + str(r.bytes) +
+        "\n  truncated: !b " + str(truncated) + "\n  payload: " + control_string(&payload) + "\n"
+    overhead := ("id: !i " + str(request.id) + "\nok: !b true\ndata:\n").len
+    if result.len > l.max_frame_bytes - overhead { >> errors.new("xacp: recording response exceeds frame limit") }
+    if record_expired(started,l) { >> errors.new("xacp: recording request timed out") }
+    << result
+}
+
+fn dispatch_screen_record(s $&widgets.Screen,session $&Session,d &xun.Doc,l &Limits,request &Request,started int) ControlReply {
+    mode := require_string(d,d.get(request.args,"mode"),"mode")
+    $max_bytes := DEFAULT_RECORD_BYTES
+    if has_field(d,request.args,"max_bytes") { max_bytes = require_int(d,d.get(request.args,"max_bytes"),"max_bytes") }
+    // Generated samples are ASCII; tabs/LF expand at most twofold. Reserve
+    // envelope/metadata space too, then verify the exact serialized size above.
+    frame_budget := (l.max_frame_bytes - 256) / 2
+    if max_bytes > frame_budget { max_bytes = frame_budget }
+    $recorder := start_recorder(&*session,request.id,mode,max_bytes,l) or (err) {
+        // The public recorder API reports begin_request's code as a prefix.
+        msg := err.msg()
+        split := strings.index_of(&msg,": ")
+        if split > 0 {
+            code := msg[0:split]
+            if code == "session_closed" || code == "hello_required" || code == "request_in_flight" ||
+               code == "invalid_request_id" || code == "permission_denied" {
+                << screen_failure(code,msg[split + 2:msg.len])
+            }
+        }
+        << screen_failure("adapter_error",msg)
+    }
+    if !s.is_open() || !screen_window_matches(&*s,d,request.args,true) {
+        abort_recorder(&*session,$&recorder)
+        << screen_failure("stale_window","stale or foreign screen window")
+    }
+    data := record_segment(&*s,d,request,l,$&recorder,started) or (err) {
+        abort_recorder(&*session,$&recorder)
+        if record_expired(started,l) { << screen_timeout(l.request_timeout_ms) }
+        << screen_failure("adapter_error",err.msg())
+    }
+    _ := finish_recorder(&*session,$&recorder) or (err) {
+        abort_recorder(&*session,$&recorder)
+        << screen_failure("adapter_error",err.msg())
+    }
+    << screen_reply(pass(request.id),data)
+}
