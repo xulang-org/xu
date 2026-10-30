@@ -6,7 +6,9 @@
 
 ---
 
-## Xu 0.10.13-dev.2 (development)
+## Xu 0.10.13-dev.3 (development)
+
+`@ui/widgets` expands `Chart` from 5 to 20 series types (`CHART_STEP_LINE`, `CHART_STACKED_AREA`, `CHART_STACKED_BAR`, `CHART_HORIZONTAL_BAR`, `CHART_PIE`, `CHART_ROSE`, `CHART_RADAR`, `CHART_GAUGE`, `CHART_BUBBLE`, `CHART_HISTOGRAM`, `CHART_BOXPLOT`, `CHART_HEATMAP`, `CHART_CANDLESTICK`, `CHART_WATERFALL`, and `CHART_FUNNEL`) with `chart_bubble_point` and `chart_range_point` constructors, hit testing, and animated transitions. `@ui/draw` adds high-level `Path` geometry builders (`rect`, `round_rect`, `round_rect_corners`, `capsule`, `circle`, `ellipse`, `diamond`, `arc`, `ellipse_arc`, `sector`, `ring_sector`, `polyline`, `polygon`, `regular_polygon`, `star`), `Frame` vector primitives (`fill/stroke_circle`, `fill/stroke_ellipse`, `fill/stroke_triangle`, `fill/stroke_round_rect`, `fill/stroke_capsule`, `fill/stroke_diamond`, `arc`, `fill/stroke_sector`, `fill/stroke_ring_sector`, `polyline`, `fill/stroke_polygon`, `fill/stroke_regular_polygon`, `fill/stroke_star`, `quad_curve`, `cubic_curve`, `dashed_line`, `dashed_rect`, `arrow`, `grid`, `box_shadow`, and gradient shape fills), and color/stroke utilities (`hex`, `hsl`, `hsla`, `lerp_color`, `with_opacity`, `opacity`, `lighten`, `darken`, `round_stroke`, `dashed_stroke`, `two_stop_linear`, `two_stop_radial`).
 
 Interface method calls now restore the coroutine stack-check marker before entering user code. The ARM64 register cache reserves that marker home for pinned locals and call results, preventing optimized SQL pool operations from crashing or replacing live scalar values. This is a development build; no stable release is published.
 

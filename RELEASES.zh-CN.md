@@ -6,7 +6,9 @@
 
 ---
 
-## Xu 0.10.13-dev.2（开发版）
+## Xu 0.10.13-dev.3（开发版）
+
+`@ui/widgets` 将 `Chart` 组件从 5 种扩展至 20 种图表类型（新增 `CHART_STEP_LINE`、`CHART_STACKED_AREA`、`CHART_STACKED_BAR`、`CHART_HORIZONTAL_BAR`、`CHART_PIE`、`CHART_ROSE`、`CHART_RADAR`、`CHART_GAUGE`、`CHART_BUBBLE`、`CHART_HISTOGRAM`、`CHART_BOXPLOT`、`CHART_HEATMAP`、`CHART_CANDLESTICK`、`CHART_WATERFALL` 与 `CHART_FUNNEL`），提供 `chart_bubble_point` 与 `chart_range_point` 构造函数、命中测试与过渡动画。`@ui/draw` 新增 `Path` 几何构建器（`rect`、`round_rect`、`round_rect_corners`、`capsule`、`circle`、`ellipse`、`diamond`、`arc`、`ellipse_arc`、`sector`、`ring_sector`、`polyline`、`polygon`、`regular_polygon`、`star`）、`Frame` 高阶绘图原语（圆/椭圆/三角形/圆角矩形/胶囊/菱形填充与描边、圆弧、扇形、环形扇区、折线、多边形、正多边形、星形、二次/三次贝塞尔曲线、虚线与虚线框、箭头、网格、阴影及渐变填充）以及颜色与描边工具（`hex`、`hsl`、`hsla`、`lerp_color`、`with_opacity`、`opacity`、`lighten`、`darken`、`round_stroke`、`dashed_stroke`、`two_stop_linear`、`two_stop_radial`）。
 
 接口方法调用进入用户代码前恢复协程栈检查标记。ARM64 寄存器缓存为该标记保留寄存器，不再用于固定局部值或调用结果，修复优化后 SQL 连接池操作的崩溃及存活标量被覆盖的问题。这是开发构建，尚未发布正式版本。
 
