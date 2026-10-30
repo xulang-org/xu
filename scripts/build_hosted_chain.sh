@@ -229,6 +229,15 @@ if [ "$SOURCE_MANIFEST_STATUS" != "PASS" ]; then
 fi
 
 FAILED_STAGE="seed_to_gen1"
+# Adapt the published seed privately; provenance still identifies the original.
+ORIGINAL_SEED=$SEED
+SEED=$(python3 scripts/seed_phase_c_bridge.py --seed "$SEED" --destination "$tmp/phase-c-seed")
+SEED_SYNTAX_BRIDGE=none
+BRIDGE_SYNTAX_SEED_SHA256=SKIPPED
+if [ "$SEED" != "$ORIGINAL_SEED" ]; then
+    SEED_SYNTAX_BRIDGE=phase_c_driver_anchor_v1
+    BRIDGE_SYNTAX_SEED_SHA256=$(sha256_file "$SEED")
+fi
 # Every hop builds the original source and manifest with the same profile.
 SEED_MANIFEST_BRIDGE=none
 BRIDGE_SOCKET_SHA256=SKIPPED
@@ -347,7 +356,7 @@ else
 fi
 
 # Capture the actual compared generations. Never claim a skipped Gen4 exists.
-SEED_SHA256=$(sha256_file "$SEED")
+SEED_SHA256=$(sha256_file "$ORIGINAL_SEED")
 GEN1_SHA256=$(sha256_file "$G1")
 GEN2_SHA256=$(sha256_file "$G2")
 GEN3_SHA256=$(sha256_file "$G3")
@@ -411,8 +420,10 @@ hosted_args=$HOSTED_ARGS_TEXT
 target_os=$(uname -s)
 target_arch=$(uname -m)
 repo_head=$REPO_HEAD
-seed_path=$SEED
+seed_path=$ORIGINAL_SEED
 seed_sha256=$SEED_SHA256
+seed_syntax_bridge=$SEED_SYNTAX_BRIDGE
+bridge_syntax_seed_sha256=$BRIDGE_SYNTAX_SEED_SHA256
 seed_manifest_bridge=$SEED_MANIFEST_BRIDGE
 bridge_socket_sha256=$BRIDGE_SOCKET_SHA256
 bridge_seed_sha256=$BRIDGE_SEED_SHA256

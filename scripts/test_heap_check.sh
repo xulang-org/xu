@@ -58,9 +58,9 @@ cat >"$tmp/df.xu" <<'EOF'
 @main
 
 fn main() {
-    mut s := "hello-xu-heap"
+    $s := "hello-xu-heap"
     // Force a heap copy so _rt_alloc/_rt_free see a real block.
-    mut t := s + "-suffix"
+    $t := s + "-suffix"
     println(t)
 }
 EOF
