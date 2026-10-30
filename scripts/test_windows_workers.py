@@ -73,7 +73,12 @@ def main() -> int:
         # Supply mixed casing directly; Windows lookup must ignore name casing.
         run_env = dict(env)
         run_env["Xu_Windows_Regression"] = "case-insensitive"
-        subprocess.run([str(executable)], env=run_env, check=True, timeout=30)
+        result = subprocess.run([str(executable)], env=run_env, capture_output=True, timeout=30)
+        expected = b"Windows worker regression passed\n"
+        if result.returncode != 0 or result.stdout != expected or result.stderr:
+            raise RuntimeError(f"worker regression: exit {result.returncode}; "
+                               f"stdout={result.stdout!r}; stderr={result.stderr!r}")
+        print(expected.decode(), end="", flush=True)
     return 0
 
 
