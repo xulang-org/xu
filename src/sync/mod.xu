@@ -5,8 +5,8 @@
 // copies of Mutex share that object (like Go channel variables). Protected
 // data still must move through channels — $& must not cross xu (S6).
 
-// Capacity shared by Cond notification buffering and bounded broadcast.
-const COND_SIGNAL_CAPACITY = 64
+// Capacity shared by Cond notification buffering and broadcast.
+const COND_SIGNAL_CAPACITY = 4096
 
 pub struct Mutex {
     pub tok chan int
@@ -140,51 +140,78 @@ pub fn (o $&Once) do(f fn()) {
     }
 }
 
-// ===== RWMutex (Go sync.RWMutex; reads do not run in parallel) =====
-// a single Mutex plus a reader count. Writers take the mutex; a reader
-// takes it on entry (first-in) and releases it on exit (last-out), so reads
-// serialize with each other and with writers — a documented divergence from
-// Go's parallel reads.
+// Capacity for concurrent readers in RWMutex.
+const RW_MAX_READERS = 1024
+
+// ===== RWMutex (Go sync.RWMutex; parallel reads) =====
+// Uses an unbuffered writer mutex (mu) and a shared token channel semaphore.
+// Multiple readers acquire tokens concurrently without serializing on
+// the writer lock. Writers drain all reader tokens before proceeding,
+// guaranteeing exclusive writer access while allowing true parallel readers.
 
 pub struct RWMutex {
     pub mu Mutex
-    pub readers int
+    pub tokens chan int
 }
 
 pub fn rw_mutex() RWMutex {
-    << RWMutex{mu: mutex(), readers: 0}
-}
-
-fn (m $&RWMutex) lock_mu() {
-    mu := $&m.mu
-    mu.lock()
-}
-
-fn (m $&RWMutex) unlock_mu() {
-    mu := $&m.mu
-    mu.unlock()
+    ch := chan int{cap: RW_MAX_READERS}
+    $i := 0
+    while i < RW_MAX_READERS {
+        ch <- 1
+        i = i + 1
+    }
+    << RWMutex{mu: mutex(), tokens: ch}
 }
 
 pub fn (m $&RWMutex) read_lock() {
-    m.lock_mu()
-    m.readers = m.readers + 1
+    tok := <- m.tokens
+    if tok != 1 {
+        eprintln("sync: corrupted rwmutex token")
+        <<< 1
+    }
 }
 
 pub fn (m $&RWMutex) read_unlock() {
-    if m.readers <= 0 {
-        eprintln("sync: read_unlock without read_lock")
-        <<< 1
+    select {
+        m.tokens <- 1 {
+        }
+        else {
+            eprintln("sync: read_unlock of unlocked rwmutex")
+            <<< 1
+        }
     }
-    m.readers = m.readers - 1
-    m.unlock_mu()
 }
 
 pub fn (m $&RWMutex) write_lock() {
-    m.lock_mu()
+    mu := $&m.mu
+    mu.lock()
+    $i := 0
+    while i < RW_MAX_READERS {
+        tok := <- m.tokens
+        if tok != 1 {
+            eprintln("sync: corrupted rwmutex token")
+            <<< 1
+        }
+        i = i + 1
+    }
 }
 
 pub fn (m $&RWMutex) write_unlock() {
-    m.unlock_mu()
+    $i := 0
+    while i < RW_MAX_READERS {
+        select {
+            m.tokens <- 1 {
+            }
+            else {
+                eprintln("sync: write_unlock corrupted token capacity")
+                <<< 1
+            }
+        }
+        i = i + 1
+    }
+    mu := $&m.mu
+    mu.unlock()
 }
 
 // ===== Cond (Go sync.Cond subset; M144) =====
@@ -238,3 +265,149 @@ pub fn (c $&Cond) broadcast() {
         }
     }
 }
+
+// ===== Map (Go sync.Map subset; thread-safe map) =====
+// Uses RWMutex for concurrent reads and exclusive writes.
+// Keys and values are strings; values are owned copies.
+
+pub struct MapVal {
+    pub value string
+    pub found bool
+}
+
+pub struct MapEntry {
+    pub key string
+    pub val string
+    pub active bool
+}
+
+pub struct Map {
+    pub mu RWMutex
+    pub entries []MapEntry
+}
+
+pub fn sync_map() Map {
+    $e := []MapEntry{}
+    << Map{mu: rw_mutex(), entries: e}
+}
+
+fn (m $&Map) rlock() {
+    mu := $&m.mu
+    mu.read_lock()
+}
+
+fn (m $&Map) runlock() {
+    mu := $&m.mu
+    mu.read_unlock()
+}
+
+fn (m $&Map) wlock() {
+    mu := $&m.mu
+    mu.write_lock()
+}
+
+fn (m $&Map) wunlock() {
+    mu := $&m.mu
+    mu.write_unlock()
+}
+
+pub fn (m $&Map) load(key &string) MapVal {
+    m.rlock()
+    $i := 0
+    k := key + ""
+    while i < m.entries.len {
+        e := m.entries[i]
+        if e.active && e.key == k {
+            v := e.val + ""
+            m.runlock()
+            << MapVal{value: v, found: true}
+        }
+        i = i + 1
+    }
+    m.runlock()
+    << MapVal{value: "", found: false}
+}
+
+pub fn (m $&Map) store(key string, val string) {
+    m.wlock()
+    $i := 0
+    $found := false
+    while i < m.entries.len {
+        if m.entries[i].key == key {
+            m.entries[i].val = val + ""
+            m.entries[i].active = true
+            found = true
+            i = m.entries.len
+        } else {
+            i = i + 1
+        }
+    }
+    if !found {
+        m.entries.push(MapEntry{key: key + "", val: val + "", active: true})
+    }
+    m.wunlock()
+}
+
+pub fn (m $&Map) delete(key &string) {
+    m.wlock()
+    $i := 0
+    k := key + ""
+    while i < m.entries.len {
+        if m.entries[i].key == k {
+            m.entries[i].active = false
+            i = m.entries.len
+        } else {
+            i = i + 1
+        }
+    }
+    m.wunlock()
+}
+
+pub fn (m $&Map) load_or_store(key string, val string) MapVal {
+    m.wlock()
+    $i := 0
+    while i < m.entries.len {
+        e := m.entries[i]
+        if e.active && e.key == key {
+            v := e.val + ""
+            m.wunlock()
+            << MapVal{value: v, found: true}
+        }
+        i = i + 1
+    }
+    m.entries.push(MapEntry{key: key + "", val: val + "", active: true})
+    m.wunlock()
+    << MapVal{value: val, found: false}
+}
+
+pub fn (m $&Map) load_and_delete(key &string) MapVal {
+    m.wlock()
+    $i := 0
+    k := key + ""
+    while i < m.entries.len {
+        if m.entries[i].active && m.entries[i].key == k {
+            v := m.entries[i].val + ""
+            m.entries[i].active = false
+            m.wunlock()
+            << MapVal{value: v, found: true}
+        }
+        i = i + 1
+    }
+    m.wunlock()
+    << MapVal{value: "", found: false}
+}
+
+pub fn (m $&Map) len() int {
+    m.rlock()
+    $count := 0
+    $i := 0
+    while i < m.entries.len {
+        if m.entries[i].active {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    m.runlock()
+    << count
+}
+
