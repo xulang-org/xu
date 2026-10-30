@@ -6,7 +6,9 @@
 
 ---
 
-## Xu 0.10.13-dev.2（开发版）
+## Xu 0.10.13-dev.3（开发版）
+
+`@ui/widgets` 将 `Chart` 组件从 5 种扩展至 30 种图表类型（新增 `CHART_STEP_LINE`、`CHART_STACKED_AREA`、`CHART_STACKED_BAR`、`CHART_HORIZONTAL_BAR`、`CHART_PIE`、`CHART_ROSE`、`CHART_RADAR`、`CHART_GAUGE`、`CHART_BUBBLE`、`CHART_HISTOGRAM`、`CHART_BOXPLOT`、`CHART_HEATMAP`、`CHART_CANDLESTICK`、`CHART_WATERFALL`、`CHART_FUNNEL`、`CHART_SMOOTH_LINE`、`CHART_SMOOTH_AREA`、`CHART_POLAR_BAR`、`CHART_TREEMAP`、`CHART_SANKEY`、`CHART_VIOLIN`、`CHART_BULLET`、`CHART_LOLLIPOP`、`CHART_DUMBBELL` 与 `CHART_PARETO`），提供 `chart_bubble_point` 与 `chart_range_point` 构造函数、命中测试与过渡动画。`@ui/draw` 新增 2D 仿射变换矩阵（`Matrix2D`、`rotate_around`、`scale_around`、`Path.transform`、`Path.append`、`Path.bounds`）、几何命中检测与路径展平（`point_in_rect`、`point_in_circle`、`point_in_ellipse`、`point_in_round_rect`、`point_in_triangle`、`point_in_polygon`、`point_in_sector`、`distance_to_segment`、`point_near_polyline`、`Path.flatten`、`Path.contains`、`Path.hit_stroke`）、`Path` 与 `Frame` 高阶几何/曲线/图案构建器（`rect`、`round_rect`、`round_rect_corners`、`capsule`、`circle`、`ellipse`、`diamond`、`arc`、`ellipse_arc`、`sector`、`ring_sector`、`ring`、`polyline`、`polygon`、`rounded_polyline`、`rounded_polygon`、`regular_polygon`、`star`、`smooth_spline`、`smooth_curve`、`wave`、`cross`、`checkmark`、`chevron`、`callout`、`ribbon`、`heart`、`shield`、`gear`、`spiral`、`hatch_rect`、`cross_hatch_rect`、`dot_grid`、`quad_curve`、`cubic_curve`、`dashed_line`、`dashed_rect`、`arrow`、`double_arrow`、`grid`、`box_shadow` 及渐变填充）、文本与图像适配辅助（`measure_text`、`text_aligned`、`text_pill`、`image_fit`）以及颜色、科学色板与描边工具（`hex`、`hsl`、`hsla`、`lerp_color`、`with_opacity`、`opacity`、`lighten`、`darken`、`invert`、`grayscale`、`luminance`、`contrast_ratio`、`contrasting_ink`、`mix_palette`、`palette_colors`、`sample_palette`、`multi_stop_linear`、`multi_stop_radial`、`round_stroke`、`dashed_stroke`、`two_stop_linear`、`two_stop_radial`）。
 
 接口方法调用进入用户代码前恢复协程栈检查标记。ARM64 寄存器缓存为该标记保留寄存器，不再用于固定局部值或调用结果，修复优化后 SQL 连接池操作的崩溃及存活标量被覆盖的问题。这是开发构建，尚未发布正式版本。
 
