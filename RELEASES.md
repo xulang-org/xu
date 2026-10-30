@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.10.13-dev.1 (development)
+
+Interface method calls now restore the coroutine stack-check marker before entering user code. The ARM64 register cache reserves that marker home for pinned locals and call results, preventing optimized SQL pool operations from crashing or replacing live scalar values. This is a development build; no stable release is published.
+
 ## Xu 0.10.12
 
 Stable release of the 0.10.12 line. Phase C markers are now the documented spelling: `$name :=` declares a mutable binding, `$&value` takes a writable borrow and `$&T` names its type. Product sources, examples (including `examples/xacp`) and compiler diagnostics use these markers; diagnostics for immutable assignment and mutable borrows now suggest `$x := value` and `$&owner`. Upgrade the compiler, standard library and product tools together. Published binaries and checksums are listed with the release assets.
