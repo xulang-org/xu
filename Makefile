@@ -123,6 +123,7 @@ XU_PKG_XU  := $(wildcard src/xu/*/*.xu)
 # package edit cannot leave bin/xu looking newer than its product source.
 XU_SOURCE_XU := $(shell find -P src -type f -name '*.xu' -print 2>/dev/null | LC_ALL=C sort)
 SELFHOST_POLICY := scripts/gen1_sources.sh scripts/xu_host_seed.sh scripts/build_hosted_chain.sh \
+	scripts/seed_phase_c_bridge.py \
 	scripts/check_module_paths.py \
 	scripts/install_product_executable.sh \
 	BOUNDARY.json scripts/check_bootstrap_xu_boundary.py scripts/run_product_compiler.sh \

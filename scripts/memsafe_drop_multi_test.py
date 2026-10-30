@@ -27,7 +27,7 @@ pos("struct_scope_drop", """
 @main
 struct U { s string n int }
 fn main() int {
-    mut u := U{s: "init_padpad", n: 1}
+    $u := U{s: "init_padpad", n: 1}
     for i in 0 -< 15 {
         u.s = "v" + str(i) + "_padpadpad"
     }
@@ -43,7 +43,7 @@ struct Leaf { s string }
 struct Mid { a Leaf b Leaf }
 struct Root { m Mid t string }
 fn main() int {
-    mut r := Root{m: Mid{a: Leaf{s: "A_padpad"}, b: Leaf{s: "B_padpad"}}, t: "top"}
+    $r := Root{m: Mid{a: Leaf{s: "A_padpad"}, b: Leaf{s: "B_padpad"}}, t: "top"}
     r.m.a.s = "AA_padpad"
     println(r.m.a.s)
     println(r.m.b.s)
@@ -101,7 +101,7 @@ pos("array_struct_scope", """
 @main
 struct P { name string id int }
 fn main() int {
-    mut ps := []P{}
+    $ps := []P{}
     for i in 0 -< 12 {
         ps.push(P{name: "p" + str(i) + "_padpad", id: i})
     }
@@ -115,7 +115,7 @@ pos("rebind_struct_field_loop", """
 @main
 struct Box { a string b string }
 fn main() int {
-    mut x := Box{a: "a0_padpad", b: "b0_padpad"}
+    $x := Box{a: "a0_padpad", b: "b0_padpad"}
     for i in 0 -< 8 {
         x.a = "a" + str(i) + "_padpad"
         x.b = "b" + str(i) + "_padpad"
@@ -162,7 +162,7 @@ fn main() int {
 pos("map_string_churn", """
 @main
 fn main() int {
-    mut m := map[string]string{}
+    $m := map[string]string{}
     for i in 0 -< 12 {
         m["k" + str(i)] = "v" + str(i) + "_padpad"
     }
@@ -213,7 +213,7 @@ reject("partial_move_struct_field_array", """
 struct H { xs []string }
 fn take(xs []string) { println(xs.len) }
 fn main() int {
-    mut h := H{xs: []string{}}
+    $h := H{xs: []string{}}
     h.xs.push("a")
     take(h.xs)
     println(h.xs.len)
@@ -237,11 +237,11 @@ fn main() int {
 loud("oob_after_drop_loop", """
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     a.push("x")
     a.push("y")
     a[0] = "z_padpad"
-    mut i := 5
+    $i := 5
     println(a[i])
     << 0
 }

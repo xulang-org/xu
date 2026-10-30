@@ -45,7 +45,7 @@ pos("str_field_clone", """
 @main
 struct U { name string n int }
 fn main() int {
-    mut u := U{name: "field", n: 1}
+    $u := U{name: "field", n: 1}
     x := u.name
     u.name = "other"
     println(x)
@@ -70,7 +70,7 @@ fn main() int {
 pos("arr_overwrite_owning", """
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     for i in 0 -< 40 {
         a.push("item_" + str(i) + "_padpad")
     }
@@ -86,7 +86,7 @@ pos("struct_arr_overwrite", """
 @main
 struct P { name string id int }
 fn main() int {
-    mut ps := []P{}
+    $ps := []P{}
     ps.push(P{name: "a", id: 1})
     ps.push(P{name: "bb", id: 2})
     x := ps[0].name
@@ -115,7 +115,7 @@ fn main() int {
 pos("map_owning_values", """
 @main
 fn main() int {
-    mut m := map[string]string{}
+    $m := map[string]string{}
     for i in 0 -< 25 {
         m["k" + str(i)] = "v" + str(i) + "_padpad"
     }
@@ -156,7 +156,7 @@ fn main() int {
     xu sender(2, ch, done)
     xu sender(3, ch, done)
     xu sender(4, ch, done)
-    mut got := 0
+    $got := 0
     for i in 0 -< 4 {
         s := <-ch
         println(s)
@@ -217,11 +217,11 @@ fn main() int {
 pos("method_mut_str", """
 @main
 struct C { buf string }
-fn (c &mut C) add(s string) {
+fn (c $&C) add(s string) {
     c.buf = c.buf + s
 }
 fn main() int {
-    mut c := C{buf: "x"}
+    $c := C{buf: "x"}
     c.add("yy")
     c.add("zzz")
     println(c.buf)
@@ -232,11 +232,11 @@ fn main() int {
 pos("nested_array_str", """
 @main
 fn main() int {
-    mut a := [][]string{}
-    mut row0 := []string{}
+    $a := [][]string{}
+    $row0 := []string{}
     row0.push("r0c0")
     row0.push("r0c1")
-    mut row1 := []string{}
+    $row1 := []string{}
     row1.push("r1c0")
     a.push(row0)
     a.push(row1)
@@ -266,7 +266,7 @@ pos("field_churn", """
 @main
 struct U { s string }
 fn main() int {
-    mut u := U{s: "init"}
+    $u := U{s: "init"}
     for i in 0 -< 60 {
         u.s = "val_" + str(i) + "_padpadpadpad"
     }
@@ -278,7 +278,7 @@ fn main() int {
 pos("live_string_array", """
 @main
 fn main() int {
-    mut a := []string{}
+    $a := []string{}
     for i in 0 -< 80 {
         a.push("live_" + str(i) + "_padpadpadpad")
     }
@@ -292,7 +292,7 @@ fn main() int {
 pos("concat_loop", """
 @main
 fn main() int {
-    mut acc := ""
+    $acc := ""
     for i in 0 -< 40 {
         acc = acc + str(i % 10)
     }
@@ -307,7 +307,7 @@ loud("oob_dyn_hi", """
 @main
 fn main() int {
     a := [4]int{1,2,3,4}
-    mut i := 4
+    $i := 4
     println(a[i])
     << 0
 }
@@ -316,7 +316,7 @@ loud("oob_dyn_lo", """
 @main
 fn main() int {
     a := [4]int{1,2,3,4}
-    mut i := 0
+    $i := 0
     i -= 1
     println(a[i])
     << 0
@@ -325,7 +325,7 @@ fn main() int {
 loud("div_zero", """
 @main
 fn main() int {
-    mut z := 0
+    $z := 0
     println(1 / z)
     << 0
 }
@@ -342,7 +342,7 @@ fn main() int {
 loud("mod_zero", """
 @main
 fn main() int {
-    mut z := 0
+    $z := 0
     println(5 % z)
     << 0
 }
@@ -350,7 +350,7 @@ fn main() int {
 loud("map_missing_key", """
 @main
 fn main() int {
-    mut m := map[string]int{}
+    $m := map[string]int{}
     m["ok"] = 1
     println(m["nope"])
     << 0
@@ -418,7 +418,7 @@ fn main() int {
 reject("double_mut_borrow", """
 @main
 fn main() int {
-    mut s := "abc"
+    $s := "abc"
     a := &mut s
     b := &mut s
     println(a + "" + b)
@@ -428,7 +428,7 @@ fn main() int {
 reject("mut_and_shared_borrow", """
 @main
 fn main() int {
-    mut s := "abc"
+    $s := "abc"
     a := &mut s
     b := &s
     println(a)
@@ -535,7 +535,7 @@ reject("map_owning_index_move", """
 @main
 struct Item { s string }
 fn main() int {
-    mut m := map[string]Item{}
+    $m := map[string]Item{}
     m["k"] = Item{s: "padpad"}
     x := m["k"]
     println(m["k"].s)

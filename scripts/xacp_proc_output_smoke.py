@@ -31,7 +31,7 @@ FIXTURE = r'''@main
 #errors
 
 fn write_all(fd int,data &string) int {
-    mut offset := 0
+    $offset := 0
     while offset < data.len {
         n := os.fd_write(fd,data[offset:data.len]) or >>
         if n <= 0 { >> errors.new("output made no progress") }

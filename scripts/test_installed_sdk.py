@@ -215,7 +215,7 @@ fn main() int {
         assert actual == arguments, (arguments, actual)
     # Exercise optimized compilation and child execution in the installed CLI.
     # All input is created in the user's temporary project, independent of tests/.
-    (project / "loop.xu").write_text('@main\nfn main() int {\n    mut total := 0\n    mut i := 0\n    while i < 32768 {\n        total = total + i\n        i = i + 1\n    }\n    println(total)\n    << 0\n}\n')
+    (project / "loop.xu").write_text('@main\nfn main() int {\n    $total := 0\n    $i := 0\n    while i < 32768 {\n        total = total + i\n        i = i + 1\n    }\n    println(total)\n    << 0\n}\n')
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
@@ -223,13 +223,13 @@ fn main() int {
     # ordinary Xu hashing and growth policy functions with entry stack guards.
     (project / "map_worker.xu").write_text('''@main
 fn worker(done chan int) {
-    mut integers := map[int]int{}
-    mut names := map[string]int{}
+    $integers := map[int]int{}
+    $names := map[string]int{}
     for i in 0:128 {
         integers[i] = i * 3
         names[str(i)] = i * 5
     }
-    mut total := 0
+    $total := 0
     for i in 0:128 {
         total += integers[i]
         total += names[str(i)]
@@ -254,28 +254,28 @@ struct Record { value int
  guard int
  label string }
 fn read(r &Record) int { << r.value + r.guard + r.label.len }
-fn change(r &mut Record) int { r.value += 11
+fn change(r $&Record) int { r.value += 11
  r.label = "new" + "-field"
  << 0 }
-fn (r &mut Record) bump() int { r.value += 7
+fn (r $&Record) bump() int { r.value += 7
  << r.value }
-fn fail_after_change(r &mut Record) int { r.value += 3
+fn fail_after_change(r $&Record) int { r.value += 3
  >> errors.new("expected") }
 struct Packed { a i32
  b i32
  c u8 }
-fn (p &mut Packed) bump() int { p.a += i32(2)
+fn (p $&Packed) bump() int { p.a += i32(2)
  p.c += u8(1)
  << int(p.a) + int(p.b) + int(p.c) }
-struct@ Mutator { fn change(&mut Record) int }
+struct@ Mutator { fn change($&Record) int }
 struct Worker { n int }
-fn (w Worker) change(r &mut Record) int { << change(r) }
+fn (w Worker) change(r $&Record) int { << change(r) }
 struct Tiny { a u8
  b u8 }
 fn main() int {
- mut records := [Record{value: 1,guard: 100,label: "old"},Record{value: 2,guard: 200,label: "old"}]
+ $records := [Record{value: 1,guard: 100,label: "old"},Record{value: 2,guard: 200,label: "old"}]
  i := 1
- r := mut &records[i]
+ r := $&records[i]
  println(read(&*r))
  println(r.bump())
  f := change
@@ -286,16 +286,16 @@ fn main() int {
  println(records[0].value)
  println(records[0].guard)
  println(records[0].label)
- mut packed := [Packed{a: 1,b: 2,c: 3},Packed{a: 10,b: 20,c: 30}]
- p := mut &packed[i]
+ $packed := [Packed{a: 1,b: 2,c: 3},Packed{a: 10,b: 20,c: 30}]
+ p := $&packed[i]
  println(p.bump())
  println(int(packed[0].a))
  println(int(packed[0].c))
  println(int(packed[1].a))
  println(int(packed[1].c))
- mut values := map[int]Record{}
+ $values := map[int]Record{}
  values[3] = Record{value: 4,guard: 50,label: "map"}
- m := mut &values[3]
+ m := $&values[3]
  println(m.bump())
  println(read(&*m))
  dynamic := Mutator(Worker{n: 1})
@@ -308,11 +308,11 @@ fn main() int {
  packed[1] = copy
  packed.push(Packed{a: 50,b: 60,c: 70})
  println(packed.len)
- mut last := mut &packed[2]
+ $last := $&packed[2]
  println(last.bump())
  println(int(last.c))
  println(int(packed[1].c))
- mut tiny := [Tiny{a: 1,b: 2},Tiny{a: 3,b: 4},Tiny{a: 5,b: 6}]
+ $tiny := [Tiny{a: 1,b: 2},Tiny{a: 3,b: 4},Tiny{a: 5,b: 6}]
  tiny[1] = Tiny{a: 7,b: 8}
  copied := tiny[1]
  println(int(copied.b))
@@ -362,7 +362,7 @@ fn verify() int {
     anchor := layout.Rect{x: 140.0,y: 180.0,width: 80.0,height: 40.0}
     size := layout.Size{width: 120.0,height: 60.0}
     viewport := layout.Rect{x: 0.0,y: 0.0,width: 400.0,height: 400.0}
-    mut tip := widgets.tooltip(&identity,10,&anchor,&size,&viewport) or >>
+    $tip := widgets.tooltip(&identity,10,&anchor,&size,&viewport) or >>
     start := time.instant()
     move := input(ui.EV_POINTER_MOVE,160.0,200.0,start)
     _ := tip.input(&move) or >>
@@ -389,7 +389,7 @@ fn verify() int {
     expect(!tip.is_open(),"hover leave did not close") or >>
     tip.set_focus(true,shown) or >>
     expect(tip.is_open(),"keyboard focus did not open") or >>
-    mut escape := input(ui.EV_KEY_DOWN,0.0,0.0,shown)
+    $escape := input(ui.EV_KEY_DOWN,0.0,0.0,shown)
     escape.key = ui.KEY_ESCAPE
     _ := tip.input(&escape) or >>
     expect(!tip.is_open(),"Escape did not dismiss") or >>
@@ -399,7 +399,7 @@ fn verify() int {
     tip.set_focus(true,shown) or >>
     expect(tip.is_open(),"refocus did not reset suppression") or >>
     for side in 0:4 {
-        mut placement := widgets.overlay_placement()
+        $placement := widgets.overlay_placement()
         placement.side = side
         placement.align = widgets.OVERLAY_CENTER
         tip.set_placement(&placement) or >>
@@ -409,7 +409,7 @@ fn verify() int {
         if side == widgets.OVERLAY_LEFT { expect(b.x + b.width <= anchor.x,"left placement") or >> }
         if side == widgets.OVERLAY_RIGHT { expect(b.x >= anchor.x + anchor.width,"right placement") or >> }
     }
-    mut placement := widgets.overlay_placement()
+    $placement := widgets.overlay_placement()
     placement.side = widgets.OVERLAY_TOP
     tip.set_placement(&placement) or >>
     edge := layout.Rect{x: 4.0,y: 4.0,width: 80.0,height: 40.0}

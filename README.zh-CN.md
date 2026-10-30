@@ -67,12 +67,14 @@ fn main() int {
 > 3. **原生极简并发**：`xu worker()` 启动协程配合 `chan` 管道通信，心智像 Go 一样平易近人。
 > 4. **编译期全静态安全**：基于所有权与借用推导，**无垃圾回收器（Zero-GC）**，没有 GC 停顿，内存极度精炼。
 
-可写引用名 `r: &mut T` 可满足 `&T` 期望：写 `read(r)` 或 `let view: &T = r`。
+可写引用名 `r: $&T` 可满足 `&T` 期望：写 `read(r)` 或 `let view: &T = r`。
 共享 view 及其后代存活到最后一次使用之前，父引用的冲突写入和移动会被拒绝；存储的 view 和调用结果也保留借用约束。
 同一调用中的冲突共享与可写参数会被拒绝。隐式降级目前只支持局部引用名，且直接 pointee 类型必须相同。
-普通值仍需写 `&x`；计划中的 `$` 可变拼写和普通值自动借用尚未实现。
+可变绑定在声明处标记一次：`$x := value` 或 `let $x: T = value`，随后使用普通名称 `x`。
+普通值的共享借用写 `&x`，可写借用写 `$&x`，对应引用类型为 `$&T`。
+复用引用直接写 `r`，显式再借用写 `&*r`；普通值自动借用尚未实现。
 
-当前借用与可变绑定规则，以及后续语法方向，见[借用指南](docs/language/borrowing.md)。
+当前借用与可变绑定规则见[借用指南](docs/language/borrowing.md)。
 
 ---
 
@@ -216,6 +218,8 @@ xu test test.example.xu -v -o test-example
 ```
 
 Windows 输出带 `.exe` 后缀，运行 `./test-example.exe`。构建时使用 `-count N` 可重复执行测试套件；当前解析器接受 1–1000，CLI 帮助仍显示 1–100。
+
+Windows socket 就绪与并发 HTTP 回归可从仓库根运行 `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64`（或 `windows-x64`）。它检查空闲监听器与无效 socket，再在 O0–O3 各运行三次并发回环请求；构建和执行均有超时限制。
 
 使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](https://github.com/xulang-org/examples/tree/main/examples/xacp)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
 

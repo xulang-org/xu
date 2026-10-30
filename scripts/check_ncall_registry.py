@@ -42,7 +42,7 @@ MIR_CALL_IDS = {
 # Allow markdown bold: | **-50** | name |
 ID_ROW = re.compile(r"^\|\s*\*{0,2}(-?\d+)\*{0,2}\s*\|")
 ASSIGN = re.compile(
-    r"(?:ncall\[[^\]]+\]\s*=\s*|checker_set_i\(\s*mut\s*&c\.ncall\s*,\s*[^,]+,\s*)(-?\d+)"
+    r"(?:ncall\[[^\]]+\]\s*=\s*|checker_set_i\(\s*\$&c\.ncall\s*,\s*[^,]+,\s*)(-?\d+)"
 )
 COMPARE = re.compile(
     r"(?:ncall\[[^\]]+\]\s*==\s*|fi\s*==\s*|c\.ncall\[[^\]]+\]\s*==\s*)(-?\d+)"
