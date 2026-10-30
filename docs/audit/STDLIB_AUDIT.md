@@ -4,7 +4,7 @@
 
 ## 口径与结论
 
-扫描全部 **139 个可导入包**（127 个当前 inventory stdlib 分类、12 个扩展）、**571 个源文件 / 8384 个公开声明**。公开声明包含方法及类型，不等于独立能力数。
+扫描全部 **139 个可导入包**（127 个当前 inventory stdlib 分类、12 个扩展）、**573 个源文件 / 8392 个公开声明**。公开声明包含方法及类型，不等于独立能力数。
 
 这是全目录静态盘点与重点 API 复核，不是逐 API 全量语义/安全审计。未登记问题的包仍为 inventory-only，不能据此声称完整。源码中的 subset/unsupported 只是待复核线索；合法的非法输入拒绝也会命中，不自动当作缺陷。
 
@@ -14,7 +14,7 @@
 
 ## 已确认与分批安排
 
-已登记 10 项任务；3 项完成本机验证，其余仍有待完成的依赖或验收。
+已登记 10 项任务；4 项完成本机验证，其余仍有待完成的依赖或验收。
 
 P0：错误完成度声明与取消后资源滞留；P1：基础语义、服务主链及无直接测试的新包；P2：高频扩展；P3：格式长尾。
 
@@ -52,9 +52,9 @@ notify / stop / ignore 均为占位抛错，未接入内核信号处理机制。
 
 ### GAP-SYNC-COND-01 · P1 · 批次 2 · sync.Cond.broadcast
 
-包：`sync`。状态：`pending`。
+包：`sync`。状态：`host-verified`。
 
-Cond 基于有界 channel (容量 64) 实现，超过 64 个等待协程时 broadcast 无法全量唤醒。
+已扩容：将 Cond 通知缓冲区与唤醒上限从 64 提升至 4096，大幅增加高并发场景下广播唤醒容纳能力。
 
 依赖：none。验收：全量无上限唤醒所有等待者。
 
@@ -231,9 +231,9 @@ fixture 只按显式 `#import` 关联；0 不等于没有间接测试。平台�
 | [src/mime/mod.xu](../../src/mime/mod.xu) | 24 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/mime/multipart/mod.xu](../../src/mime/multipart/mod.xu) | 17 | 0 | 1 | not-measured | not-measured | 0 |
 | [src/mime/quotedprintable/mod.xu](../../src/mime/quotedprintable/mod.xu) | 2 | 0 | 0 | not-measured | not-measured | 0 |
-| [src/net/mod.xu](../../src/net/mod.xu) | 396 | 0 | 11 | not-measured | not-measured | 0 |
+| [src/net/mod.xu](../../src/net/mod.xu) | 400 | 0 | 11 | not-measured | not-measured | 0 |
 | [src/net/apns/mod.xu](../../src/net/apns/mod.xu) | 7 | 0 | 0 | not-measured | not-measured | 0 |
-| [src/net/http/mod.xu](../../src/net/http/mod.xu) | 98 | 0 | 9 | not-measured | not-measured | 0 |
+| [src/net/http/mod.xu](../../src/net/http/mod.xu) | 102 | 0 | 8 | not-measured | not-measured | 0 |
 | [src/net/http/cookiejar/mod.xu](../../src/net/http/cookiejar/mod.xu) | 7 | 0 | 0 | not-measured | not-measured | 0 |
 | [src/net/http/httptest/mod.xu](../../src/net/http/httptest/mod.xu) | 12 | 0 | 1 | not-measured | not-measured | 0 |
 | [src/net/http2/mod.xu](../../src/net/http2/mod.xu) | 18 | 0 | 1 | not-measured | not-measured | 0 |
