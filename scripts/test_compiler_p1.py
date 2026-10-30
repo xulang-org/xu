@@ -751,7 +751,7 @@ def main():
                 ('r := $&*p', "explicit reborrow uses '&*r'"),
                 ('r := *$&p', "explicit reborrow uses '&*r'"),
                 ('println($x)', "use plain 'name'"),
-                ('r := &mut x', "writable borrow expressions use 'mut &x'"),
+                ('r := &mut x', "writable borrow expressions use '$&x'"),
             )):
                 fixture('spec34_H38_expr_' + str(index),
                         'fn main() { mut x := 1\n p := mut &x\n ' + spelling + '\n}',
@@ -774,7 +774,7 @@ def main():
             fixture('spec34_A6_binding_not_pointee',
                     'fn main() { x := 1\n mut r := &x\n *r = 2\n}',
                     'cannot assign through shared reference', diagnostics=(
-                        'cannot write through a shared reference', "'mut r' allows rebinding",))
+                        'cannot write through a shared reference', "'$r' allows rebinding",))
             fixture('spec34_H33_shared_freeze_notes',
                     'fn bad(p &mut int) { r := &*p\n *p = 2\n println(*r)\n}\nfn main() {}',
                     'mutably borrowed', diagnostics=(
@@ -792,18 +792,18 @@ def main():
                     output='xu $ $name\n3\n1\ntrue\n')
             fixture('spec34_A1_immutable_assignment',
                     'fn main() { x := 1\n x = 2 }',
-                    'cannot assign to immutable variable', diagnostics=("mut x := value",))
+                    'cannot assign to immutable variable', diagnostics=("$x := value",))
             fixture('spec34_D17_immutable_owner',
                     'fn main() { x := 1\n r := mut &x\n println(*r) }',
-                    'cannot mutably borrow immutable variable', diagnostics=("mut x := value",))
+                    'cannot mutably borrow immutable variable', diagnostics=("$x := value",))
             for target, setup in (('s.value', 'struct Box { value int }\nfn main() { x := Box{value: 1}\n mut s := &x\n'),
                                   ('s[0]', 'fn main() { x := [1]\n mut s := &x\n')):
                 fixture('spec34_A6_shared_place_' + str(len(target)),
                         setup + target + ' = 2\n}', 'cannot assign through shared reference',
-                        diagnostics=("'mut s' allows rebinding", 'borrow mutably from the owner'))
+                        diagnostics=("'$s' allows rebinding", 'borrow mutably from the owner'))
             fixture('spec34_E22_readonly_argument',
                     'fn write(r &mut int) {}\nfn main() { x := 1\n write(&x) }',
-                    'type mismatch: expected &mut int, found &int',
+                    'type mismatch: expected $&int, found &int',
                     diagnostics=('cannot obtain an exclusive writable borrow from a shared reference',
                                  'borrow mutably from the owner'))
             for name, body in (
@@ -831,7 +831,7 @@ def main():
                                                     ':5:2: note: shared reborrow is last used here',))
             for source in ('fn main() { x := ~1 }', 'fn bad(x ~int) {}\nfn main() {}'):
                 fixture('spec34_H38_tilde_' + str(len(source)), source,
-                        "unexpected character '~'", diagnostics=("'~' stays unused", 'mut &x'))
+                        "unexpected character '~'", diagnostics=("'~' stays unused", '$&x'))
             fixture('spec34_C_typed_binding', 'fn main() { let $x: int = 1\n x = 2\n println(x) }',
                     output='2\n')
             fixture('spec34_H33_current_function_notes',
