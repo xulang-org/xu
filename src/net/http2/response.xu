@@ -1,0 +1,169 @@
+@net/http2
+
+#errors
+#strconv
+
+const MAX_FRAME_BYTES = 16384
+const MAX_HEADER_BYTES = 65536
+const MAX_BODY_BYTES = 16777216
+const MAX_RESPONSE_FRAMES = 4096
+const FRAME_RST_STREAM = 3
+const FRAME_PING = 6
+const FRAME_PUSH_PROMISE = 5
+const FRAME_WINDOW_UPDATE = 8
+const FRAME_CONTINUATION = 9
+const FLAG_PADDED = 8
+const FLAG_PRIORITY = 32
+
+struct ResponseState {
+    status int
+    body string
+    headers string
+    pending_headers bool
+    pending_end bool
+    final_headers bool
+    frames int
+}
+
+fn response_state() ResponseState {
+    << ResponseState{status: 0, body: "", headers: "", pending_headers: false, pending_end: false, final_headers: false, frames: 0}
+}
+
+fn response_result(state &ResponseState, ok bool, message string) Response {
+    << Response{status: state.status, body: state.body + "", ok: ok, err: message}
+}
+
+fn frame_header(header &string) Frame {
+    if header.len != 9 { >> errors.new("http2: truncated frame header") }
+    size := u24_at(header, 0)
+    if size > MAX_FRAME_BYTES { >> errors.new("http2: frame size limit exceeded") }
+    << Frame{typ: header[3] & 255, flags: header[4] & 255, stream_id: u32_at(header, 5) & 2147483647, payload: ""}
+}
+
+fn validate_settings(f &Frame) int {
+    if f.stream_id != 0 || f.payload.len % 6 != 0 { >> errors.new("http2: invalid SETTINGS") }
+    if (f.flags & FLAG_ACK) != 0 && f.payload.len != 0 { >> errors.new("http2: invalid SETTINGS ack") }
+    $off := 0
+    while off < f.payload.len {
+        id := ((f.payload[off] & 255) << 8) | (f.payload[off + 1] & 255)
+        value := u32_at(&f.payload, off + 2)
+        if id == 2 && value > 1 { >> errors.new("http2: invalid ENABLE_PUSH") }
+        if id == 4 && value > 2147483647 { >> errors.new("http2: invalid initial window") }
+        if id == 5 && (value < MAX_FRAME_BYTES || value > 16777215) { >> errors.new("http2: invalid max frame size") }
+        off += 6
+    }
+    << 0
+}
+
+fn initial_settings(f &Frame) int {
+    if f.typ != FRAME_SETTINGS || (f.flags & FLAG_ACK) != 0 { >> errors.new("http2: expected initial SETTINGS") }
+    << validate_settings(f) or >>
+}
+
+// The caller writes this response before it considers the received frame done.
+fn control_reply(f &Frame) string {
+    if f.typ == FRAME_SETTINGS && (f.flags & FLAG_ACK) == 0 {
+        << encode_frame(FRAME_SETTINGS, FLAG_ACK, 0, "")
+    }
+    if f.typ == FRAME_PING && (f.flags & FLAG_ACK) == 0 {
+        << encode_frame(FRAME_PING, FLAG_ACK, 0, f.payload + "")
+    }
+    << ""
+}
+
+fn field_fragment(f &Frame) string {
+    $start := 0
+    $end := f.payload.len
+    if (f.flags & FLAG_PADDED) != 0 {
+        if end == 0 { >> errors.new("http2: missing pad length") }
+        padding := f.payload[0] & 255
+        start = 1
+        if padding > end - start { >> errors.new("http2: invalid padding") }
+        end -= padding
+    }
+    if f.typ == FRAME_HEADERS && (f.flags & FLAG_PRIORITY) != 0 {
+        if end - start < 5 { >> errors.new("http2: truncated priority") }
+        if (u32_at(&f.payload, start) & 2147483647) == f.stream_id { >> errors.new("http2: self-dependent priority") }
+        start += 5
+    }
+    << f.payload[start:end] + ""
+}
+
+fn (s $&ResponseState) finish_headers() bool {
+    code := header_status(&s.headers) or >>
+    s.headers = ""
+    s.pending_headers = false
+    if s.final_headers {
+        if code != 0 || !s.pending_end { >> errors.new("http2: invalid trailers") }
+        << true
+    }
+    if code == 0 || code == 101 { >> errors.new("http2: missing or invalid status") }
+    if code < 200 {
+        if s.pending_end { >> errors.new("http2: informational response ended stream") }
+        << false
+    }
+    s.status = code
+    s.final_headers = true
+    << s.pending_end
+}
+
+fn (s $&ResponseState) append_headers(data string) int {
+    if data.len > MAX_HEADER_BYTES - s.headers.len { >> errors.new("http2: header size limit exceeded") }
+    s.headers = s.headers + data
+    << 0
+}
+
+// Count every frame, including connection-level and unrelated-stream frames.
+// END_STREAM only completes DATA or a fully assembled field block for sid.
+fn (s $&ResponseState) accept(f &Frame, sid int) bool {
+    s.frames += 1
+    if s.frames > MAX_RESPONSE_FRAMES { >> errors.new("http2: response frame limit exceeded") }
+    if s.pending_headers {
+        if f.typ != FRAME_CONTINUATION || f.stream_id != sid { >> errors.new("http2: expected CONTINUATION") }
+        s.append_headers(f.payload + "") or >>
+        if (f.flags & FLAG_END_HEADERS) != 0 { << s.finish_headers() or >> }
+        << false
+    }
+    if f.typ == FRAME_CONTINUATION { >> errors.new("http2: unexpected CONTINUATION") }
+    if f.typ == FRAME_GOAWAY {
+        if f.stream_id != 0 || f.payload.len < 8 { >> errors.new("http2: invalid GOAWAY") }
+        >> errors.new("http2: goaway " + strconv.itoa(u32_at(&f.payload, 4)))
+    }
+    if f.typ == FRAME_SETTINGS {
+        validate_settings(f) or >>
+        << false
+    }
+    if f.typ == FRAME_PING {
+        if f.stream_id != 0 || f.payload.len != 8 { >> errors.new("http2: invalid PING") }
+        << false
+    }
+    if f.typ == FRAME_WINDOW_UPDATE {
+        if f.payload.len != 4 || (u32_at(&f.payload, 0) & 2147483647) == 0 { >> errors.new("http2: invalid WINDOW_UPDATE") }
+        << false
+    }
+    if f.typ == FRAME_RST_STREAM {
+        if f.stream_id == 0 || f.payload.len != 4 { >> errors.new("http2: invalid RST_STREAM") }
+        if f.stream_id == sid { >> errors.new("http2: stream reset " + strconv.itoa(u32_at(&f.payload, 0))) }
+        << false
+    }
+    if f.typ == FRAME_PUSH_PROMISE { >> errors.new("http2: server push is unsupported") }
+    if f.typ == FRAME_HEADERS || f.typ == FRAME_DATA {
+        if f.stream_id == 0 { >> errors.new("http2: zero stream id") }
+    }
+    if f.stream_id != sid { << false }
+    if f.typ == FRAME_HEADERS {
+        s.pending_end = (f.flags & FLAG_END_STREAM) != 0
+        s.append_headers(field_fragment(f) or >>) or >>
+        if (f.flags & FLAG_END_HEADERS) != 0 { << s.finish_headers() or >> }
+        s.pending_headers = true
+        << false
+    }
+    if f.typ == FRAME_DATA {
+        if !s.final_headers { >> errors.new("http2: DATA before final headers") }
+        data := field_fragment(f) or >>
+        if data.len > MAX_BODY_BYTES - s.body.len { >> errors.new("http2: body size limit exceeded") }
+        s.body = s.body + data
+        << (f.flags & FLAG_END_STREAM) != 0
+    }
+    << false
+}

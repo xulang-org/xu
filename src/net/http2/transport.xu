@@ -1,0 +1,250 @@
+@net/http2
+
+#crypto/tls
+#errors
+#io
+#net
+
+pub struct TcpClient {
+    c net.Conn
+    next_sid int
+}
+
+pub struct TlsClient {
+    c tls.Conn
+    next_sid int
+}
+
+// Best-effort close is isolated from the caller's primary transport error.
+fn tcp_discard(t $&TcpClient) {
+    c := $&t.c
+    c.close() or (err) { << }
+}
+
+fn tls_discard(t $&TlsClient) {
+    c := $&t.c
+    c.close() or (err) { << }
+}
+
+fn (t $&TcpClient) fail(state &ResponseState, message string) Response {
+    tcp_discard(t)
+    << response_result(state, false, message)
+}
+
+fn (t $&TlsClient) fail(state &ResponseState, message string) Response {
+    tls_discard(t)
+    << response_result(state, false, message)
+}
+
+fn (t $&TcpClient) wr(data &string) int {
+    $off := 0
+    while off < data.len {
+        part := data[off:data.len] + ""
+        c := &t.c
+        count := c.write(&part) or >>
+        if count <= 0 || count > part.len { >> errors.new("http2: invalid write progress") }
+        off += count
+    }
+    << 0
+}
+
+fn (t $&TcpClient) rd_exact(n int) string {
+    $got := ""
+    while got.len < n {
+        c := &t.c
+        chunk := c.read(n - got.len) or >>
+        if chunk.len == 0 { >> errors.new("http2: unexpected EOF") }
+        if chunk.len > n - got.len { >> errors.new("http2: invalid read progress") }
+        got = got + chunk
+    }
+    << got
+}
+
+fn (t $&TcpClient) rd_frame() Frame {
+    header := t.rd_exact(9) or >>
+    $f := frame_header(&header) or >>
+    size := u24_at(&header, 0)
+    if size > 0 { f.payload = t.rd_exact(size) or >> }
+    << f
+}
+
+fn tls_wr(conn $&tls.Conn, data &string) int {
+    $off := 0
+    while off < data.len {
+        part := data[off:data.len] + ""
+        size := part.len
+        written := conn.write_result(part) or >>
+        match written {
+            io.WriteResult.Written(count) {
+                if count <= 0 || count > size { >> errors.new("http2: invalid write progress") }
+                off += count
+            }
+            io.WriteResult.Failed(count, err) { >> err }
+            io.WriteResult.Unknown(err) { >> err }
+        }
+    }
+    << 0
+}
+
+fn tls_read_exact(conn $&tls.Conn, n int) string {
+    $got := ""
+    while got.len < n {
+        incoming := conn.read_result(n - got.len) or >>
+        match incoming {
+            io.ReadResult.Data(data) {
+                if data.len == 0 || data.len > n - got.len { >> errors.new("http2: invalid read progress") }
+                got = got + data
+            }
+            io.ReadResult.End(data) {
+                if data.len != n - got.len { >> errors.new("http2: unexpected EOF") }
+                got = got + data
+            }
+            io.ReadResult.Failed(data, err) { >> err }
+        }
+    }
+    << got
+}
+
+fn (t $&TlsClient) rd_frame() Frame {
+    conn := $&t.c
+    header := tls_read_exact(conn, 9) or >>
+    $f := frame_header(&header) or >>
+    size := u24_at(&header, 0)
+    if size > 0 { f.payload = tls_read_exact(conn, size) or >> }
+    << f
+}
+
+// dial_tcp speaks prior-knowledge h2c. Failed prefaces close the connection.
+pub fn dial_tcp(addr string) TcpClient {
+    nc := net.dial_to("tcp", addr) or >>
+    $t := TcpClient{c: nc, next_sid: 1}
+    pf := PREFACE + ""
+    t.wr(&pf) or (err) {
+        tcp_discard($&t)
+        >> err
+    }
+    settings := encode_frame(FRAME_SETTINGS, 0, 0, "")
+    t.wr(&settings) or (err) {
+        tcp_discard($&t)
+        >> err
+    }
+    f := t.rd_frame() or (err) {
+        tcp_discard($&t)
+        >> err
+    }
+    initial_settings(&f) or (err) {
+        tcp_discard($&t)
+        >> err
+    }
+    ack := encode_frame(FRAME_SETTINGS, FLAG_ACK, 0, "")
+    t.wr(&ack) or (err) {
+        tcp_discard($&t)
+        >> err
+    }
+    << t
+}
+
+// dial_tls verifies the peer, offers h2 ALPN and completes the HTTP/2 preface.
+pub fn dial_tls(addr string, server_name string) TlsClient {
+    cfg := tls.new_config(server_name)
+    d := tls.Dialer{timeout_ns: DEFAULT_TLS_TIMEOUT_NS, config: cfg}
+    conn := d.dial("tcp", addr) or >>
+    $t := TlsClient{c: conn, next_sid: 1}
+    preface := PREFACE + encode_frame(FRAME_SETTINGS, 0, 0, "")
+    tc := $&t.c
+    tls_wr(tc, &preface) or (err) {
+        tls_discard($&t)
+        >> err
+    }
+    f := t.rd_frame() or (err) {
+        tls_discard($&t)
+        >> err
+    }
+    initial_settings(&f) or (err) {
+        tls_discard($&t)
+        >> err
+    }
+    ack := encode_frame(FRAME_SETTINGS, FLAG_ACK, 0, "")
+    tc2 := $&t.c
+    tls_wr(tc2, &ack) or (err) {
+        tls_discard($&t)
+        >> err
+    }
+    << t
+}
+
+fn valid_request(sid int, headers &string, body_len int) int {
+    if sid <= 0 || sid > 2147483647 { >> errors.new("http2: stream id exhausted") }
+    if headers.len > MAX_FRAME_BYTES { >> errors.new("http2: request headers exceed frame limit") }
+    if body_len > MAX_FRAME_BYTES { >> errors.new("http2: request body exceeds single-frame limit") }
+    << 0
+}
+
+fn (t $&TcpClient) collect_response(sid int) Response {
+    $state := response_state()
+    while true {
+        f := t.rd_frame() or (err) { << t.fail(&state, err.msg()) }
+        done := state.accept(&f, sid) or (err) { << t.fail(&state, err.msg()) }
+        reply := control_reply(&f)
+        if reply.len > 0 { t.wr(&reply) or (err) { << t.fail(&state, err.msg()) } }
+        if done { << response_result(&state, true, "") }
+    }
+}
+
+fn (t $&TlsClient) collect_response(sid int) Response {
+    $state := response_state()
+    while true {
+        f := t.rd_frame() or (err) { << t.fail(&state, err.msg()) }
+        done := state.accept(&f, sid) or (err) { << t.fail(&state, err.msg()) }
+        reply := control_reply(&f)
+        if reply.len > 0 {
+            tc := $&t.c
+            tls_wr(tc, &reply) or (err) { << t.fail(&state, err.msg()) }
+        }
+        if done { << response_result(&state, true, "") }
+    }
+}
+
+// Success requires a complete current stream. Failures preserve received data
+// for diagnostics and retire the connection; partial responses are never reused.
+pub fn (t $&TcpClient) get(authority string, path string) Response {
+    sid := t.next_sid
+    empty := response_state()
+    headers := encode_get_headers(authority, path)
+    valid_request(sid, &headers, 0) or (err) { << t.fail(&empty, err.msg()) }
+    t.next_sid += 2
+    request := encode_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, sid, headers)
+    t.wr(&request) or (err) { << t.fail(&empty, err.msg()) }
+    << t.collect_response(sid)
+}
+
+pub fn (t $&TlsClient) get(authority string, path string) Response {
+    sid := t.next_sid
+    empty := response_state()
+    headers := encode_get_headers(authority, path)
+    valid_request(sid, &headers, 0) or (err) { << t.fail(&empty, err.msg()) }
+    t.next_sid += 2
+    request := encode_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, sid, headers)
+    tc := $&t.c
+    tls_wr(tc, &request) or (err) { << t.fail(&empty, err.msg()) }
+    << t.collect_response(sid)
+}
+
+// POST remains the single-DATA-frame subset; oversized requests fail explicitly.
+pub fn (t $&TlsClient) post(authority string, path string, content_type string, authorization string, body string) Response {
+    sid := t.next_sid
+    empty := response_state()
+    headers := encode_post_headers(authority, path, content_type, authorization)
+    valid_request(sid, &headers, body.len) or (err) { << t.fail(&empty, err.msg()) }
+    t.next_sid += 2
+    request := encode_frame(FRAME_HEADERS, FLAG_END_HEADERS, sid, headers)
+    tc := $&t.c
+    tls_wr(tc, &request) or (err) { << t.fail(&empty, err.msg()) }
+    data := encode_frame(FRAME_DATA, FLAG_END_STREAM, sid, body)
+    tc2 := $&t.c
+    tls_wr(tc2, &data) or (err) { << t.fail(&empty, err.msg()) }
+    << t.collect_response(sid)
+}
+
+pub fn (t $&TcpClient) close() { tcp_discard(t) }
+pub fn (t $&TlsClient) close() { tls_discard(t) }
