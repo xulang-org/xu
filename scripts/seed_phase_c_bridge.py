@@ -20,12 +20,15 @@ LEGACY = b"    mut mod_map := types.new_strmap()"
 CURRENT = b"    $mod_map := types.new_strmap() //"
 CORE_START = b"@main\n#xu/scanner\n#xu/parser\n#xu/ast\n// Generated."
 CORE_END = b"\n<<\n}\n"
+# Published hosted seed containers: ELF64 LE (Linux), Mach-O 64 LE (macOS),
+# and PE/COFF (Windows). The injected payload is identical in all three.
+SEED_MAGICS = (b"\x7fELF\x02\x01", b"\xcf\xfa\xed\xfe", b"MZ")
 
 
 def retarget(data: bytes) -> bytes:
     if LEGACY not in data:
         return data
-    if not data.startswith(b"\x7fELF\x02\x01") or data.count(LEGACY) != 4 or data.count(CORE_START) != 1:
+    if not data.startswith(SEED_MAGICS) or data.count(LEGACY) != 4 or data.count(CORE_START) != 1:
         raise ValueError("unsupported legacy seed injection layout")
     start = data.index(CORE_START)
     end = data.index(CORE_END, start) + len(CORE_END)
