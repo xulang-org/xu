@@ -6,7 +6,7 @@
 
 ---
 
-## Xu 0.10.13-dev.1 (development)
+## Xu 0.10.13-dev.2 (development)
 
 Interface method calls now restore the coroutine stack-check marker before entering user code. The ARM64 register cache reserves that marker home for pinned locals and call results, preventing optimized SQL pool operations from crashing or replacing live scalar values. This is a development build; no stable release is published.
 
