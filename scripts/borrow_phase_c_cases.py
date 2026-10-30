@@ -110,7 +110,7 @@ fn main() { $x := 2
  println(x) }''', output='2\n2\n2\n2\n4\n')
     fixture('spec34_C_no_expectation_value', 'fn main() { $x := 1\n y := x\n x = 2\n println(y)\n println(x) }', output='1\n2\n')
     fixture('spec34_C_no_expectation_move', 'fn main() { $x := 1\n p := $&x\n q := p\n println(*p)\n println(*q) }', 'use of moved value')
-    fixture('spec34_C_no_automatic_writable', 'fn write(p $&int) {}\nfn main() { $x := 1\n write(x) }', 'type mismatch: expected &mut int, found int')
+    fixture('spec34_C_no_automatic_writable', 'fn write(p $&int) {}\nfn main() { $x := 1\n write(x) }', 'type mismatch: expected $&int, found int')
     fixture('spec34_C_shared_binding_permission', 'fn main() { x := 1\n let $s: &int = x\n *s = 2 }', 'cannot assign through shared reference')
     fixture('spec34_C_immutable_owner', 'fn main() { x := 1\n r := $&x }', 'cannot mutably borrow immutable variable')
     fixture('spec34_C_shared_upgrade', 'fn write(p $&int) {}\nfn bad(s &int) { write(&*s) }\nfn main() {}', 'cannot obtain an exclusive writable borrow from a shared reference')
@@ -138,7 +138,7 @@ fn main() { $x := 2
     fixture('spec34_C_F25_index_boundary', 'fn read(p &int) {}\nfn main() { xs := [1]\n read(xs[0 + 0]) }', 'element borrow index must be a variable or integer literal')
     fixture('spec34_C_F25_unknown_generic', 'fn read#T(p T) {}\nfn main() { x := 1\n read(x)\n println(x) }', output='1\n')
 
-    fixture('spec34_C_anon_return_type', 'fn main() { f := fn() $&int { << 1 } }', 'type mismatch: expected &mut int, found int')
+    fixture('spec34_C_anon_return_type', 'fn main() { f := fn() $&int { << 1 } }', 'type mismatch: expected $&int, found int')
 
     fixture('spec34_C_anon_parameter', 'fn main() { offset := 1\n f := fn(p $&int) int { << *p + offset }\n $x := 4\n println(f($&x)) }', output='5\n')
 
