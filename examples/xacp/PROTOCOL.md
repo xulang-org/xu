@@ -211,9 +211,9 @@ the active reservation without rolling back `next_id`.
 | `request_in_flight` | Active core reservation or full Screen mailbox | Keep; core rejection preserves id; mailbox rejection is after reservation and consumes it |
 | `request_timeout` | Attached UI reply deadline expires | Keep; id consumed |
 | `not_implemented` | No Screen/adapter or output capture unavailable | Keep; id consumed |
-| `adapter_error` | Execution failure: bad tree window/node, output cursor past end, response overflow, raster backend unavailable, etc. | Keep; id consumed |
+| `adapter_error` | Execution failure: bad tree window/node, output cursor past end, response overflow, recording sink failure/first record exceeds budget, raster backend unavailable, etc. | Keep; id consumed |
 | `stale_window` | Foreign/closed window or changed/removed registration | Keep; id consumed |
-| `stream_required` | Registered `ui.record` needs a separate sink | Keep; id consumed |
+| `stream_required` | Reserved for a library/adapter without a recording sink or sampling capability; the supplied Screen adapter supports bounded sampling | Keep; id consumed |
 | `screenshot_too_large` | Pixel, inline response, or file limit exceeded | Keep; id consumed |
 | `file_unavailable` | Private screenshot file cannot be written | Keep; id consumed |
 | `encode_error` | Pixel readback/PNG encoding failure | Keep; id consumed |
@@ -246,6 +246,9 @@ implemented timer bounds attached `ui.tree/ui.screenshot/ui.act/ui.input/ui.reco
 marshal waits. Hello, process operations, and exclusive adapter failures execute
 synchronously without an independent cancellation timer. File export after a
 timely UI reply is synchronous too.
+`ui.record` also checks this same deadline between samples and before returning
+its segment. Queue time counts toward the budget; a native snapshot already in
+progress cannot be interrupted. Its late reply is discarded as with other UI work.
 
 Each outgoing frame has its own monotonic write deadline, starting when its
 write begins; partial progress does not renew it. Read waits use only their
@@ -437,18 +440,53 @@ after partial execution is not provided.
 
 ### `ui.record` and library recording
 
-`ui.record` requires UI_READ, positive `win: !i`, `mode: events|frames`, and
-optional `max_bytes: !i` in 1..`limits.max_frame_bytes`. This is a recording
-budget, not a cursor/page size. A matching registered Screen returns
-`stream_required`; no Screen returns `not_implemented`. The transport does not
-attach a streaming sink or push frames.
+`ui.record` requires UI_READ, positive `win: !i`, and `mode: events|frames`.
+Optional arguments (unknown fields or wrong types/bounds are `schema_error`):
 
-Separate library `start_recorder`/`write_record` APIs use a `StreamWriter`.
-Records are `XAR1\t<sequence>\t<event|frame>\t<byte_length>\n<payload>\n`,
-starting at sequence 1, with cumulative budget including headers/trailing LF.
-Failed writes do not advance accounting. `surface_record` exports dimensions
-only with `redacted=true`, not frame pixels. This is separate from XACP/1 and
-CLI stdout recording.
+| Argument | Default | Bound/meaning |
+| --- | --- | --- |
+| `max_bytes: !i` | 65536, reduced to fit the response | 1..`limits.max_frame_bytes`; cumulative XAR1 bytes, including headers and trailing LF |
+| `max_records: !i` | 64 | >=1; maximum complete records in this segment |
+| `duration_ms: !i` | 0 | 0..`limits.request_timeout_ms - 1`; 0 takes one immediate sample, positive values bound the sampling window |
+
+A matching registered Screen starts a recorder with an in-memory bounded
+`StreamWriter`, samples synchronously, and finishes it within this request.
+Between samples it sleeps for up to 10 ms, stopping at the duration or
+record/byte budget. Request queue time reduces the available window. Each success contains
+`mode`, `records: !i`, `bytes: !i`, `truncated: !b`, and `payload` (a quoted XAR1
+string). `truncated` means the byte or record budget was exhausted; expiry of
+the requested sampling duration alone is normal completion. Only complete
+records are returned. The effective byte budget is at most
+`(limits.max_frame_bytes - 256) / 2` to reserve envelope and string-escape space;
+the exact serialized response is checked against the frame limit as well.
+If the first record cannot fit, or a sink/snapshot fails, the recorder is
+aborted and the request returns `adapter_error`. A later record that cannot
+fit returns the completed prefix with `truncated=true`. The response uses the
+normal `XU_XACP_WRITE_TIMEOUT_MS` frame write deadline.
+
+`frames` uses `screen_screenshot` followed by `surface_record`, exporting
+dimensions only with `redacted=true`; each native Surface is disposed before
+continuing. It does not export frame pixels. Screen has no public input event
+history/subscription, so `events` emits current-state observations labelled
+`state=true`, with `window`, `canvas`, `generation`, and `open`. These are not
+input events, and sampling neither injects input nor requires UI_MUTATE.
+The Screen owner services the request synchronously, so samples do not pump
+the application's UI event loop or reconstruct events between requests.
+
+Clients pull successive segments by repeating `ui.record`; every segment
+starts at sequence 1 and there is no persistent recorder or continuation
+cursor. Each request still has exactly one XACP/1 response. No Screen returns
+`not_implemented`; a foreign/closed window returns `stale_window`.
+`stream_required` is reserved for adapters without a sink/sampling capability,
+and is not returned by the supplied Screen sampling path. Platform support
+follows the registered Screen and its snapshot backend, including Windows.
+
+Library `start_recorder`/`write_record`/`finish_recorder` APIs also accept other
+`StreamWriter` sinks; callers must `abort_recorder` on failure. Records are
+`XAR1\t<sequence>\t<event|frame>\t<byte_length>\n<payload>\n`, starting at sequence
+1, with cumulative budget including headers/trailing LF. Failed writes do not
+advance accounting. Library users with an input source can write `input_record`
+payloads. XAR1 segments are distinct from CLI stdout recording.
 
 ## 8. Process operations and output capture
 

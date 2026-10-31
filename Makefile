@@ -97,6 +97,7 @@ xacp-test: xu-xacp
 	XU="$(abspath $(XU))" $(PYTHON) scripts/fd_wait_read_smoke.py
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_proc_output_smoke.py
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_screenshot_smoke.py
+	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_ui_record_smoke.py
 	XU="$(abspath $(XU))" $(PYTHON) scripts/xacp_smoke.py
 
 # Local peers need no external databases or credentials. Product rebuilds are

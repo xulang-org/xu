@@ -2,6 +2,8 @@
 
 Certificates are valid 2020–2099. Keys are public test material, never credentials.
 ECDSA scalars 1/2/3 identify root/intermediate/leaf; the pipe uses a test RSA key.
+RSA integer fixtures use that same key; the independent PSS signature uses
+SHA-256, MGF1-SHA-256 and a 32-byte salt over "Xu independent RSA-PSS fixture".
 """
 import base64
 from pathlib import Path
@@ -115,6 +117,24 @@ FIXTURES = {
         'dzZmClhKcnNsM2Y2MHo0QitpdUtHUzJFSTRQL1pzRmFGOThIQU1EWitnV0Q0ZDFVa2JDL0RYMWFuUmRNSS95ajdB'
         'NEMKRE5LVCtUTS9DbXRIUlpxR3BBajltMG89Ci0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0K'
     ),
+    'rsa-modulus': (
+        'l6X6vxgX7aaos9bPGXghvPJwnfkLJbNM9mNuhEFKlpAkXt+sUSw3R9qTH/AzjaDB21aw/NsRzMCQW1MCWlBi6c20'
+        'wouaFV4vqUN8L7FwtrP2NYUhKFxvcw/CniJbBHj6+qqTscfqdMVp19i95iGG7y0aNJpTGRJPkmBkfV0QyOKUD6dw'
+        'kZeG6jcGyKK6n7qXa3LvMBsaGS6F/uQ1/4UZLDkh2VgwG/KTFwXTN91aOmFIw59PtUPf9jrYCqUb8JJyRYD56w/v'
+        '/Cz77+ZFvJOyytov+YwvZL4BH4xdjtIwDpBxlALa8aaaVrUpCJJwAE+le1Y4yORqQSX3x5s9q6dVEQ=='
+    ),
+    'rsa-private-exponent': (
+        'AwRycMrx7vCZ+roTdNZHFZNdWkdSSXW/2kcwM8F40nYbwyeALj1K/EsFEmWdIPxJ3ytiaiWRvRk3xhloupNO5IgL'
+        'SLOuZS5ylFObbPeC3p/GDlqPxlXQgeGWZb8ZQIWHuOUb+zWXHKuw53KQlLumC6xCETng3WbX3nm8hiIL63NO1sFc'
+        'S9n4VUJzBUxdA3JG/jbaMlF8of+cc0wdgQMplu+zl4TS3T8k+q8DsSHyK9Zqjik2Dwfmm4hJYeu2/xgDjIiNP6dq'
+        '9K3igbvMj7OLcENlrwrPbXHV4pknhRuu+8djnxpvhJWfVq1stzWBGErYEHvYZMDfJedehJBiSGeJYQ=='
+    ),
+    'rsa-pss-signature': (
+        'EijCVkmJ+ZeNjHuxT0mEyOvBeIfo4uoplskDqQd99tzd3DT2yZrFx85NxKzzIYKt9PC2FqOTk2XQqDDP8d/6Ml0E'
+        '/sPHhQCURfCLiqycvAN8T9SAAEiQSSuYzSGjmj1KEOb+ea7FgrpfqJEh2H7SNcrZe7AG6lTlXASasMPJeLoayXG4'
+        'cCa1AwSpj57wub3NzyKvZHiqG9rLahttc3qbhB4H31r2DxFUGdJ4MkfgQz64phwgg0cJfvPeTtKI6SUyGzh2RGED'
+        'yF5UydwWeS6QlgXsA78ajWNSqIx1uu+l5boltV8IUlS0qp/rwrA1HHjeadhaHr3/AnDwXSjAIVXupw=='
+    ),
     'ecdsa-public': (
         'BF7L5NGmMwpEyPfvlR1L8WXmxrch762phftBZhvG5/1shzRkDEmY/343SwbOGmSi7NgqsDY4T7g9mnmxJ6J9UDI='
     ),
@@ -135,6 +155,9 @@ SOURCE = r'''@main
 #errors
 #crypto/ecdsa
 #crypto/sha256
+#crypto/rsa
+#crypto/rsa/oaep
+#math/big
 #crypto/x509
 #crypto/tls
 #net
@@ -164,6 +187,56 @@ fn crypto() int {
     if system.certs.len != 1 { << 4 }
     cert.verify_with_pools("localhost", time.now_time(), &system, &inter) or >>
     println("ECDSA and X509 chain/pool passed")
+    << 0
+}
+fn bad_pss(key &rsa.PublicKey, digest &string, signature &string) bool {
+    oaep.verify_pss(key, rsa.SHA256, digest, signature) or (err) { << true }
+    << false
+}
+fn rsa_probe() int {
+    $n := big.new_int(0)
+    n.set_bytes(os.read("rsa-modulus") or >>)
+    $d := big.new_int(0)
+    d.set_bytes(os.read("rsa-private-exponent") or >>)
+    key := rsa.PrivateKey{public: rsa.PublicKey{n: n, e: 65537}, d: d, p: big.new_int(0), q: big.new_int(0)}
+    digest := sha256.sum256_bytes("Xu independent RSA-PSS fixture")
+    signature := os.read("rsa-pss-signature") or >>
+    oaep.verify_pss(&key.public, rsa.SHA256, &digest, &signature) or >>
+    wrong := sha256.sum256_bytes("altered RSA-PSS message")
+    if !bad_pss(&key.public, &wrong, &signature) { << 2 }
+    $corrupt := signature + ""
+    corrupt[0] = corrupt[0] ^ 1
+    if !bad_pss(&key.public, &digest, &corrupt) { << 3 }
+    short := signature[0:signature.len - 1]
+    if !bad_pss(&key.public, &digest, &short) { << 4 }
+    for i in 0:2 {
+        signed := oaep.sign_pss(&key, rsa.SHA256, &digest) or >>
+        oaep.verify_pss(&key.public, rsa.SHA256, &digest, &signed) or >>
+    }
+    << 0
+}
+fn crypto_worker(gate chan int, done chan int) {
+    _ := <-gate
+    for i in 0:64 {
+        if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+            done <- 5
+            <<
+        }
+    }
+    rc := rsa_probe() or (err) { eprintln(err.msg())
+        done <- 6
+        << }
+    done <- rc
+}
+fn parallel_crypto() int {
+    gate := chan int{cap: 0}
+    done := chan int{cap: 8}
+    for i in 0:8 { xu crypto_worker(gate, done) }
+    for i in 0:8 { gate <- 1 }
+    $failed := 0
+    for i in 0:8 { failed += <-done }
+    if failed != 0 { << 1 }
+    println("Parallel SHA256 and RSA-PSS passed")
     << 0
 }
 fn pipe_serve(pc net.PipeConn, result chan int) {
@@ -225,6 +298,7 @@ fn interop(address string) int {
 fn probe() int {
     a := args()
     if a[1] == "crypto" { << crypto() or >> }
+    if a[1] == "parallel" { << parallel_crypto() }
     if a[1] == "pipe" { << pipe_probe() or >> }
     << interop(a[2] + "") or >>
 }
