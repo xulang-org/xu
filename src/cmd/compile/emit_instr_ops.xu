@@ -244,6 +244,158 @@ fn emit_instr_bin_peep(a $&Assembler, m &types.Mir, fi int, fr &Frame, ii int) b
     << false
 }
 
+// shl + add/sub → add_lsl / sub_lsl on ARM64 when shl dest is only used by the next add/sub.
+// E.g. `(idx << sh) + base` or `base + (idx << sh)` → `add base, idx, lsl #sh`
+//      `base - (idx << sh)` → `sub base, idx, lsl #sh`
+// Supports both fixed virtual registers and frame/RegCache allocation modes.
+fn emit_instr_bin_shift_arith(a $&Assembler, m &types.Mir, fi int, fr &Frame, ii int) bool {
+    op := types.mir_ib(m, fi, ii)
+    if op != 17 || a.arch != 0 {
+        << false
+    }
+    ni := types.mir_inext(m, fi, ii)
+    id := types.mir_id(m, fi, ii)
+    ic := types.mir_ic(m, fi, ii)
+    if ni < 0 || id >= 0 || ic < 0 {
+        << false
+    }
+    shift := types.mir_const_at(m, fi, -id - 2) & 63
+    if shift <= 0 || shift >= 64 {
+        << false
+    }
+    ia := types.mir_ia(m, fi, ii)
+    $mid := ni
+    $skip_load := -1
+    $load_temp := -1
+    if types.mir_ikind(m, fi, mid) == types.MI_LOAD_LOCAL {
+        load_temp = types.mir_ia(m, fi, mid)
+        skip_load = mid
+        mid = types.mir_inext(m, fi, mid)
+    }
+    if mid < 0 || types.mir_ikind(m, fi, mid) != types.MI_BIN {
+        << false
+    }
+    mid_op := types.mir_ib(m, fi, mid)
+    if mid_op != 1 && mid_op != 2 {
+        << false
+    }
+    if mir_temp_uses_from(m, fi, ia, ni) != 1 {
+        << false
+    }
+    ad := types.mir_ia(m, fi, mid)
+    ac := types.mir_ic(m, fi, mid)
+    mid_d := types.mir_id(m, fi, mid)
+    $matched := false
+    $other := -1
+    if mid_op == 1 {
+        // ADD is commutative: ia + other or other + ia
+        if ac == ia {
+            matched = true
+            other = mid_d
+        } else if mid_d == ia {
+            matched = true
+            other = ac
+        }
+    } else if mid_op == 2 {
+        // SUB is not commutative: only other - ia (rd = rn - (rm << sh))
+        if mid_d == ia {
+            matched = true
+            other = ac
+        }
+    }
+    if !matched || other < 0 || types.mir_temp_ty(m, fi, ad) == 4 {
+        << false
+    }
+    if skip_load >= 0 {
+        if other != load_temp || mir_temp_uses_from(m, fi, load_temp, ni) != 1 {
+            << false
+        }
+    }
+    nni := types.mir_inext(m, fi, mid)
+    idx_r := rc_load_reg(a, m, fi, fr, ic, 0)
+    $ao_scratch := 0
+    if ao_scratch == idx_r {
+        ao_scratch = 1
+    }
+    $base_r := ao_scratch
+    if skip_load >= 0 {
+        loc := types.mir_ib(m, fi, skip_load)
+        if loc >= 0 && loc < fr.local_slot.len {
+            lo := fr.local_slot[loc]
+            h := rc_find(&*a, lo)
+            if h >= 0 {
+                rc_touch(a, h)
+                base_r = h
+            } else {
+                p := rc_pin_index(&*a, lo)
+                if p >= 0 {
+                    base_r = rc_pin_vr(&*a, p)
+                } else {
+                    rc_clobber(a, ao_scratch)
+                    a.load(ao_scratch, 15, slot_off(lo))
+                    base_r = ao_scratch
+                }
+            }
+        } else {
+            base_r = rc_load_reg(a, m, fi, fr, other, ao_scratch)
+        }
+    } else {
+        base_r = rc_load_reg(a, m, fi, fr, other, ao_scratch)
+    }
+    $dest_r := -1
+    $coalesced := 0
+    if ad >= 0 && ad < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[ad]) {
+        dest_r = vreg_slot_home(fr.temp_slot[ad])
+    } else {
+        dest_pin := rc_coalesce_store_pin(&*a, m, fi, fr, ad, nni)
+        if dest_pin >= 0 {
+            dest_r = dest_pin
+            coalesced = 1
+        } else if a.rc_on {
+            dest_r = rc_pick_alu(&*a)
+            rc_clobber(a, dest_r)
+        } else {
+            dest_r = 0
+        }
+    }
+    $is_fixed := false
+    if ad >= 0 && ad < fr.temp_slot.len && is_vreg_slot(fr.temp_slot[ad]) {
+        is_fixed = true
+    }
+    if !is_fixed && (dest_r == idx_r || dest_r == base_r) {
+        if a.rc_on {
+            dest_r = rc_pick_alu(&*a)
+            rc_clobber(a, dest_r)
+        }
+        if dest_r == idx_r || dest_r == base_r {
+            $tmp := 0
+            if tmp == idx_r || tmp == base_r { tmp = 1 }
+            if tmp == idx_r || tmp == base_r { tmp = 7 }
+            dest_r = tmp
+            rc_clobber(a, dest_r)
+        }
+        coalesced = 0
+    }
+    if mid_op == 1 {
+        a.be_add_lsl(dest_r, base_r, idx_r, shift)
+    } else {
+        a.be_sub_lsl(dest_r, base_r, idx_r, shift)
+    }
+    emit_wrap_at(a, dest_r, types.mir_temp_ty(m, fi, ad))
+    if a.rc_on {
+        rc_commit_alu(a, m, fi, fr, ad, dest_r, coalesced, nni)
+    } else {
+        emit_store_scalar_temp(a, m, fi, fr, ad, dest_r)
+    }
+    if skip_load >= 0 {
+        a.rc_fp_skip = skip_load
+        a.rc_fp_skip2 = mid
+    } else {
+        a.rc_fp_skip = mid
+    }
+    << true
+}
+
 fn emit_instr_bin_str(a $&Assembler, m &types.Mir, fi int, fr &Frame, ii int) bool {
     ia := types.mir_ia(m, fi, ii)
     ib := types.mir_ib(m, fi, ii)
@@ -722,6 +874,9 @@ fn emit_instr_bin(a $&Assembler, m &types.Mir, fi int, fr &Frame, ii int) {
         <<
     }
     if !fixed_vregs && emit_instr_bin_peep(a, m, fi, fr, ii) {
+        <<
+    }
+    if emit_instr_bin_shift_arith(a, m, fi, fr, ii) {
         <<
     }
     ni := types.mir_inext(m, fi, ii)
