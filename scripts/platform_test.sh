@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# CI: --ci-native --targets=<one native target> runs the public library,
+# networking and concurrency suite. Execution is mandatory in this mode.
+# The historical default matrix below is for the untracked local corpus.
 # Cross-platform execution matrix: compile representative fixtures to all
 # four targets and run them — native (macos-arm64), Rosetta 2 (macos-x64),
 # Docker (linux-arm64 / linux-x64). stdout and exit code are compared
@@ -20,12 +23,14 @@ XU=""
 REQUESTED_LANE=""
 REQUESTED_TARGETS=""
 REQUESTED_FIXTURES=""
+CI_NATIVE=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --xu=*) XU="${1#*=}" ;;
         --lane=*) REQUESTED_LANE="${1#*=}" ;;
         --targets=*) REQUESTED_TARGETS="${1#*=}" ;;
         --fixtures=*) REQUESTED_FIXTURES="${1#*=}" ;;
+        --ci-native) CI_NATIVE=1 ;;
         *) echo "platform_test: unknown arg $1" >&2; exit 1 ;;
     esac
     shift
@@ -38,6 +43,15 @@ PRODUCT_COMPILER_RUNNER="$ROOT/scripts/run_product_compiler.sh"
 BIN=$(XU_SEED="$XU" "$HOST_SEED_RESOLVER")
 LANE=product
 echo "platform_test: lane=product compiler=$BIN" >&2
+# Public, self-contained native runtime gate. The local tests/ corpus is
+# deliberately untracked; CI must neither require it nor fall back to file(1).
+if [ "$CI_NATIVE" = 1 ]; then
+    [ -n "$REQUESTED_TARGETS" ] && [ -z "$REQUESTED_FIXTURES" ] || {
+        echo "platform_test: --ci-native requires one --targets target and uses public fixtures" >&2
+        exit 2
+    }
+    exec python3 scripts/test_platform_runtime.py --compiler "$BIN" --target "$REQUESTED_TARGETS"
+fi
 compile_source() {
     local subcommand=build
     local arguments=()
