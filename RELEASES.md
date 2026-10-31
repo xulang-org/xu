@@ -6,6 +6,19 @@
 
 ---
 
+## Xu 0.11.1
+
+Stable release integrating the changes since 0.10.12. Upgrade the compiler, standard library and product tools together. Platform binaries and checksums are listed with the release assets.
+
+**Source migration:** legacy `mut name :=`, `let mut name: T = ...`, `mut &value` and `&mut T` syntax is removed. The parser rejects these spellings with H38 diagnostics. Use `$name :=` or `let $name: T = ...` for mutable bindings, `$&value` for writable borrows and `$&T` for writable reference types. LSP completions and highlighting follow the current syntax.
+
+- Compiler performance work ([#84](https://github.com/xulang-org/xu/pull/84)) improves scan/carry vector pattern recognition, small-unit CFG inlining and single-byte string replacement.
+- Constant array literals receive independent owned storage, fixing shared SHA-256 workspace races that corrupted RSA-PSS and TLS verification on macOS x64 ([#78](https://github.com/xulang-org/xu/pull/78)). Optimized interface calls also preserve coroutine context and live ARM64 scalar values, fixing SQL pool crashes.
+- UI adds typed action dispatch by control ID, separates Screen appearance from event handling and includes split project sources in desktop builds. Chart expands to 30 series types; drawing gains affine transforms, geometry and path helpers, hit testing, text/image fitting and palettes. Menu hover and active items use contrasting accent colors across dark, light and high-contrast themes.
+- HTTP/2 TCP and TLS clients require complete responses and report truncation, resets, GOAWAY, malformed frames and resource limits as errors while preserving the received prefix. Frame handling, SETTINGS/PING acknowledgments and HPACK static status indexes are corrected; full HPACK and flow control remain outside the supported subset. HTTP adds ServeMux and reverse-proxy/dump helpers; WebSocket and HTTP upgrade support are expanded, with fallible errors propagated.
+- Standard library additions include HKDF, X25519 ECDH, PBKDF2, ChaCha20-Poly1305, CFB/OFB modes, `sync.Map`, `sync.Pool`, parallel-reader RWMutex, timezone/DST fallback, JSON `parse_max`, regexp character classes and subprocess stderr pipes. Basic TOML parsing and Zstandard raw/RLE block support are added, alongside tar and signal handling improvements.
+- XACP `ui.record` samples registered Screens into bounded XAR1 segments with byte, record, duration and frame limits. Frame mode captures screenshots; event mode reports current-state observations rather than input history. Control transport applies a monotonic per-frame write deadline through `XU_XACP_WRITE_TIMEOUT_MS`, closing stalled sessions on expiry.
+
 ## Xu 0.10.13-dev.4 (development)
 
 HTTP/2 TCP and TLS clients only report success after the current stream ends with complete frames and header blocks. Truncation, resets, GOAWAY, malformed frames and resource limits now return errors and retire the connection while preserving the received response prefix. Reads and writes check progress; SETTINGS and PING are acknowledged, header continuations and padding are handled, and HPACK static status indexes are corrected. Unsupported HPACK encodings and oversized single-frame requests fail explicitly. Full HPACK and flow control remain outside this subset.
