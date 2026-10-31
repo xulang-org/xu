@@ -10,7 +10,9 @@
 
 HTTP/2 的 TCP、TLS 客户端仅在当前流结束且帧、头部块完整后报告成功。截断、复位、GOAWAY、无效帧及资源超限会返回错误、关闭连接，并保留已收到的响应前缀。读写检查实际进度，确认 SETTINGS、PING，处理头部续帧与填充，修正 HPACK 静态状态码索引。不支持的 HPACK 编码与超出单帧范围的请求会明确失败；完整 HPACK 和流控仍待后续完善。
 
-XACP 控制会话为每个完整出站帧设置单调写截止时间（`XU_XACP_WRITE_TIMEOUT_MS`，默认 10000 ms，范围 1..600000）。POSIX stdio 与 TCP 等待写就绪并分块写入；超时按传输失败关闭会话。这是开发构建。
+XACP 控制会话为每个完整出站帧设置单调写截止时间（`XU_XACP_WRITE_TIMEOUT_MS`，默认 10000 ms，范围 1..600000）。POSIX stdio 与 TCP 等待写就绪并分块写入；超时按传输失败关闭会话。
+
+`@ui/widgets` 通过 `styles.menu_style()` 优化 `Menu` 菜单项悬停与激活样式，在暗色、亮色及高对比度主题下均提供高对比度的 `palette.accent` 主题色背景以及 `palette.on_accent` 文字、指示符与快捷键反馈。这是开发构建。
 
 ## Xu 0.10.13-dev.3（开发版）
 

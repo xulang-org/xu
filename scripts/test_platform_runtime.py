@@ -39,7 +39,21 @@ LIBRARY = r'''@main
 #crypto/sha256
 #crypto/rand
 #encoding/json
+fn literal_values() []int {
+    << [0, 1, 2, 3, 4, 5, 6, 7]
+}
 fn main() int {
+    // Separate evaluations must own separate storage, including literals
+    // whose constant elements can be initialized from a compiler data pool.
+    $first := literal_values()
+    $second := literal_values()
+    first[0] = 99
+    if second[0] != 0 { << 12 }
+    second[7] = 88
+    $third := literal_values()
+    if third[0] != 0 || third[7] != 7 || first[7] != 7 { << 13 }
+    third.push(8)
+    if third.len != 9 || third[8] != 8 || second[7] != 88 { << 14 }
     os.write("roundtrip", "Xu\nbytes") or (err) { eprintln(err.msg())
         << 1 }
     body := os.read("roundtrip") or (err) { eprintln(err.msg())
@@ -259,6 +273,7 @@ def main() -> int:
         env["SSL_CERT_FILE"] = str(work / "root.pem")
         crypto = build("crypto", CRYPTO)
         run("crypto_ecdsa/crypto_x509_chain/crypto_x509_pool", crypto, "crypto", expected="ECDSA and X509 chain/pool passed")
+        run("crypto_sha256_parallel/crypto_rsa_pss", crypto, "parallel", expected="Parallel SHA256 and RSA-PSS passed")
         run("crypto_tls_pipe", crypto, "pipe", expected="TLS pipe passed")
         stream = build("stream", STREAM)
         udp = build("udp", UDP)
