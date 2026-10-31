@@ -419,8 +419,8 @@ reject("double_mut_borrow", """
 @main
 fn main() int {
     $s := "abc"
-    a := &mut s
-    b := &mut s
+    a := $&s
+    b := $&s
     println(a + "" + b)
     << 0
 }
@@ -429,7 +429,7 @@ reject("mut_and_shared_borrow", """
 @main
 fn main() int {
     $s := "abc"
-    a := &mut s
+    a := $&s
     b := &s
     println(a)
     println(b)
