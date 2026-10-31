@@ -79,7 +79,7 @@ XU
 cat >"$tmp/uam_assign.xu" <<'XU'
 @main
 fn main() { xs := [1]
-    mut ys := [2]
+    $ys := [2]
     ys = xs
     println(xs[0])
     println(ys[0])
@@ -87,9 +87,9 @@ fn main() { xs := [1]
 XU
 cat >"$tmp/dmut.xu" <<'XU'
 @main
-fn main() { mut x := 1
-    p := mut &x
-    q := mut &x
+fn main() { $x := 1
+    p := $&x
+    q := $&x
     println(*p)
     println(*q)
 }
