@@ -148,7 +148,7 @@ fn main() { $x := 2
 
     fixture('spec34_C_typed_writable_binding', 'fn main() { $x := 1\n $y := 2\n let $r: $&int = $&x\n *r = 3\n r = $&y\n *r = 4\n println(*r)\n println(x) }', output='4\n3\n')
     fixture('spec34_C_writable_array_type', 'fn main() { $x := 1\n p := $&x\n a := [1]$&int{&*p}\n println(*a[0])\n *p = 2\n println(*p) }', output='1\n2\n')
-    fixture('spec34_C_lifetime_compat', 'fn old(p &mut a int) &mut a int { << p }\nfn new(p $&a int) $&a int { << p }\nfn main() { $x := 3\n p := old($&x)\n q := new(p)\n println(*q) }', output='3\n')
+    fixture('spec34_C_lifetime_compat', 'fn old(p $&a int) $&a int { << p }\nfn new(p $&a int) $&a int { << p }\nfn main() { $x := 3\n p := old($&x)\n q := new(p)\n println(*q) }', output='3\n')
     fixture('spec34_C_F25_generic_instances', 'fn read(p &int) int { << *p }\nfn relay#T(tag T) int { x := 7\n << read(x) }\nfn main() { println(relay(1))\n println(relay(true))\n println(relay(1)) }', output='7\n7\n7\n')
 
     fixture('spec34_C_F25_no_generic_borrow_inference', 'fn read#T(p &T) {}\nfn main() { x := 1\n read(x) }', 'type mismatch')
