@@ -6,6 +6,8 @@
 #os
 #strings
 
+const MAX_ACCEPT_BATCH = 128
+
 // Limits apply per server. Read time is an absolute request-intake budget;
 // write time bounds blocking response I/O. max_buffer_bytes bounds pending
 // input across connections; max_connections also counts active handlers.
@@ -137,29 +139,6 @@ fn pending_complete(peers $&[]PendingRequest, index int, options &ServerOptions)
     << 0
 }
 
-// When all admission slots are occupied, incomplete requests are load-shed
-// before accepting more peers. A slow header/body must not pin every slot
-// until the ordinary ten-second read deadline; completed requests keep their
-// normal handler/write budget.
-fn shed_incomplete(peers $&[]PendingRequest, active $&int, buffered $&int, options &ServerOptions) int {
-    $shed := 0
-    for i in 0:peers.len {
-        if peers[i].fd < 0 {
-            ->
-        }
-        state := pending_complete(&*peers, i, options)
-        if state == 1 {
-            ->
-        }
-        *buffered -= peers[i].data.len
-        close_http_fd(peers[i].fd)
-        peers[i] = pending_request(-1, 0, -1)
-        *active -= 1
-        shed += 1
-    }
-    << shed
-}
-
 fn dispatch_pending(fd int, data string, handle fn(Context), done chan int, timeout_ns int, file_root string) bool {
     os.set_sock_timeout(fd, timeout_ns) or (err) { << false }
     xu dispatch_request(fd, data, handle, done, file_root)
@@ -260,14 +239,11 @@ fn serve_listener_root_legacy(lfd int, handle fn(Context), options ServerOptions
         }
         // Bound admission work so a burst cannot prevent existing peers from
         // making progress. Only this loop accepts or reads these sockets.
-        for admission in 0:32 {
+        for admission in 0:MAX_ACCEPT_BATCH {
+            if active >= options.max_connections { <- }
             ready := os.socket_poll(lfd, 1) or (err) { running = false
                 <- }
             if ready == 0 { <- }
-            if active >= options.max_connections {
-                shed_incomplete($&peers, $&active, $&buffered, &options)
-                if active >= options.max_connections { <- }
-            }
             fd := net.accept(lfd) or (err) { running = false
                 <- }
             deadline := http_deadline(options.read_timeout_ns) or (err) { close_http_fd(fd)
@@ -422,25 +398,6 @@ fn next_event_wait(peers &[]PendingRequest, timers &PendingTimers, now int) int 
     << remaining
 }
 
-fn shed_incomplete_event_set(peers $&[]PendingRequest, active $&int, buffered $&int, options &ServerOptions, events $&poller.EventSet, timers $&PendingTimers, free_slots $&FreeSlots) int {
-    $shed := 0
-    for i in 0:peers.len {
-        if peers[i].fd < 0 { -> }
-        state := pending_complete(&*peers, i, options)
-        if state == 1 { -> }
-        fd := peers[i].fd
-        _ := event_set_remove(events, fd)
-        timers.remove(&*peers, i)
-        *buffered -= peers[i].data.len
-        close_http_fd(fd)
-        peers[i] = pending_request(-1, 0, -1)
-        free_slots.release(i)
-        *active -= 1
-        shed += 1
-    }
-    << shed
-}
-
 // Linux and Darwin keep one persistent kernel readiness set for the listener
 // and pending sockets. Worker completion wakes that same blocking wait, so
 // readiness does not require a fixed-interval scan.
@@ -508,21 +465,21 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
         for ei in 0:batch.len {
             token := batch[ei].id
             if token == 0 {
-                for admission in 0:32 {
+                for admission in 0:MAX_ACCEPT_BATCH {
+                    // Apply backpressure at the configured cap. Keep already
+                    // accepted peers until their request completes or reaches
+                    // its read deadline; shedding here races their unread data.
+                    if active >= options.max_connections {
+                        if listening_watch {
+                            _ := event_set_remove($&events, lfd)
+                            listening_watch = false
+                        }
+                        <-
+                    }
                     ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) { running = false
                         <-
                     }
                     if ready == 0 { <- }
-                    if active >= options.max_connections {
-                        shed_incomplete_event_set($&peers, $&active, $&buffered, &options, $&events, $&timers, $&free_slots)
-                        if active >= options.max_connections {
-                            if listening_watch {
-                                _ := event_set_remove($&events, lfd)
-                                listening_watch = false
-                            }
-                            <-
-                        }
-                    }
                     fd := net.accept(lfd) or (err) { running = false
                         <- }
                     deadline := http_deadline(options.read_timeout_ns) or (err) {
@@ -544,6 +501,11 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
                     peers[slot] = pending_request(fd, deadline, peer_token)
                     timers.add(&peers, slot)
                     active += 1
+                    if active >= options.max_connections {
+                        _ := event_set_remove($&events, lfd)
+                        listening_watch = false
+                        <-
+                    }
                 }
                 ->
             }
