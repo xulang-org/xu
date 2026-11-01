@@ -2,6 +2,7 @@
 
 #errors
 #net
+#net/poller
 #os
 #strings
 
@@ -27,6 +28,7 @@ pub fn server_options() ServerOptions {
 
 struct PendingRequest {
     fd int
+    token int
     data string
     deadline int
     header_end int
@@ -37,8 +39,34 @@ struct PendingRequest {
     body_bytes int
 }
 
-fn pending_request(fd int, deadline int) PendingRequest {
-    << PendingRequest{fd: fd, data: "", deadline: deadline, header_end: -1,
+// Indexed min-heap of pending-request deadlines. A slot appears at most once,
+// so completed requests cannot leave stale timer records behind.
+struct PendingTimers {
+    heap []int
+    positions []int
+    len int
+}
+
+// Fixed-size free-slot stack keeps admission O(1) without allocating.
+struct FreeSlots {
+    values []int
+    len int
+}
+
+fn (s $&FreeSlots) take() int {
+    if s.len <= 0 { << -1 }
+    s.len -= 1
+    << s.values[s.len]
+}
+
+fn (s $&FreeSlots) release(slot int) {
+    if s.len >= s.values.len { << }
+    s.values[s.len] = slot
+    s.len += 1
+}
+
+fn pending_request(fd int, deadline int, token int) PendingRequest {
+    << PendingRequest{fd: fd, token: token, data: "", deadline: deadline, header_end: -1,
         header_scan: 0, length: 0, chunked: false, chunk_pos: 0, body_bytes: 0}
 }
 
@@ -125,7 +153,7 @@ fn shed_incomplete(peers $&[]PendingRequest, active $&int, buffered $&int, optio
         }
         *buffered -= peers[i].data.len
         close_http_fd(peers[i].fd)
-        peers[i] = pending_request(-1, 0)
+        peers[i] = pending_request(-1, 0, -1)
         *active -= 1
         shed += 1
     }
@@ -135,6 +163,12 @@ fn shed_incomplete(peers $&[]PendingRequest, active $&int, buffered $&int, optio
 fn dispatch_pending(fd int, data string, handle fn(Context), done chan int, timeout_ns int, file_root string) bool {
     os.set_sock_timeout(fd, timeout_ns) or (err) { << false }
     xu dispatch_request(fd, data, handle, done, file_root)
+    << true
+}
+
+fn dispatch_pending_event_set(fd int, data string, handle fn(Context), done chan int, finished chan int, timeout_ns int, file_root string, wake poller.EventWake) bool {
+    os.set_sock_timeout(fd, timeout_ns) or (err) { << false }
+    xu dispatch_request_event_set(fd, data, handle, done, finished, file_root, wake)
     << true
 }
 
@@ -161,6 +195,14 @@ fn dispatch_request(fd int, data string, handle fn(Context), done chan int, file
     done <- 1
 }
 
+fn dispatch_request_event_set(fd int, data string, handle fn(Context), done chan int, finished chan int, file_root string, wake poller.EventWake) {
+    invoke_request(fd, data, handle, file_root)
+    close_http_fd(fd)
+    done <- 1
+    wake.notify() or (err) { << }
+    finished <- 1
+}
+
 // All server helpers share the same incremental intake. Idle and partial
 // requests stay here and never consume a worker waiting for socket input.
 // Complete requests run concurrently; handlers must synchronize shared state.
@@ -185,12 +227,23 @@ fn serve_file_listener(lfd int, root string) int {
     << serve_listener_root(lfd, file_server_handler, options, fs.root + "") or (err) { << 1 }
 }
 
-fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
+fn validate_server_options(options &ServerOptions) {
     if options.read_timeout_ns <= 0 || options.write_timeout_ns <= 0 || options.max_connections <= 0 || options.max_connections > 4096 || options.max_header_bytes <= 0 || options.max_header_bytes > MAX_MESSAGE_BYTES || options.max_body_bytes < 0 || options.max_body_bytes > MAX_MESSAGE_BYTES || options.max_buffer_bytes <= 0 {
         >> errors.new("net/http: invalid server options")
     }
+}
+
+fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
+    if poller.event_set_supported() {
+        << serve_listener_root_event_set(lfd, handle, options, file_root) or >>
+    }
+    << serve_listener_root_legacy(lfd, handle, options, file_root) or >>
+}
+
+fn serve_listener_root_legacy(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
+    validate_server_options(&options) or >>
     $peers := []PendingRequest{}
-    for i in 0:options.max_connections { peers.push(pending_request(-1, 0)) }
+    for i in 0:options.max_connections { peers.push(pending_request(-1, 0, -1)) }
     done := chan int{cap: options.max_connections}
     $active := 0
     $buffered := 0
@@ -216,7 +269,7 @@ fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_
                 -> }
             for i in 0:peers.len {
                 if peers[i].fd < 0 {
-                    peers[i] = pending_request(fd, deadline)
+                    peers[i] = pending_request(fd, deadline, -1)
                     active += 1
                     <-
                 }
@@ -251,7 +304,7 @@ fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_
                             root_copy := file_root + ""
                             if dispatch_pending(fd, input, handle, done, options.write_timeout_ns, root_copy) {
                                 buffered -= peers[i].data.len
-                                peers[i] = pending_request(-1, 0)
+                                peers[i] = pending_request(-1, 0, -1)
                             } else {
                                 discard = true
                             }
@@ -261,7 +314,7 @@ fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_
             }
             if discard {
                 buffered -= peers[i].data.len
-                peers[i] = pending_request(-1, 0)
+                peers[i] = pending_request(-1, 0, -1)
                 active -= 1
                 close_http_fd(fd)
             }
@@ -269,5 +322,300 @@ fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_
         if running { sleep_ns(1000000) }
     }
     for i in 0:peers.len { if peers[i].fd >= 0 { close_http_fd(peers[i].fd) } }
+    << 0
+}
+
+fn event_set_remove_ignore(events $&poller.EventSet, fd int) {
+    events.remove(fd) or (err) { << }
+}
+
+fn pending_timer_less(peers &[]PendingRequest, left int, right int) bool {
+    if peers[left].deadline != peers[right].deadline {
+        << peers[left].deadline < peers[right].deadline
+    }
+    << left < right
+}
+
+fn (t $&PendingTimers) timer_swap(left int, right int) {
+    left_slot := t.heap[left]
+    right_slot := t.heap[right]
+    t.heap[left] = right_slot
+    t.heap[right] = left_slot
+    t.positions[left_slot] = right
+    t.positions[right_slot] = left
+}
+
+fn (t $&PendingTimers) timer_up(peers &[]PendingRequest, index0 int) {
+    $index := index0
+    while index > 0 {
+        parent := (index - 1) / 2
+        if !pending_timer_less(peers, t.heap[index], t.heap[parent]) { <- }
+        t.timer_swap(index, parent)
+        index = parent
+    }
+}
+
+fn (t $&PendingTimers) timer_down(peers &[]PendingRequest, index0 int) {
+    $index := index0
+    $done := false
+    while !done {
+        left := index * 2 + 1
+        if left >= t.len { done = true
+            -> }
+        $smallest := left
+        right := left + 1
+        if right < t.len && pending_timer_less(peers, t.heap[right], t.heap[left]) {
+            smallest = right
+        }
+        if !pending_timer_less(peers, t.heap[smallest], t.heap[index]) { done = true
+            -> }
+        t.timer_swap(index, smallest)
+        index = smallest
+    }
+}
+
+fn (t $&PendingTimers) add(peers &[]PendingRequest, slot int) {
+    if slot < 0 || slot >= t.positions.len || t.positions[slot] >= 0 { << }
+    if t.len >= t.heap.len { t.heap.push(0) }
+    t.heap[t.len] = slot
+    t.positions[slot] = t.len
+    t.len += 1
+    t.timer_up(peers, t.len - 1)
+}
+
+fn (t $&PendingTimers) remove(peers &[]PendingRequest, slot int) {
+    if slot < 0 || slot >= t.positions.len { << }
+    index := t.positions[slot]
+    if index < 0 || index >= t.len { << }
+    last := t.len - 1
+    t.positions[slot] = -1
+    t.len = last
+    if index == last { << }
+    moved := t.heap[last]
+    t.heap[index] = moved
+    t.positions[moved] = index
+    if index > 0 && pending_timer_less(peers, t.heap[index], t.heap[(index - 1) / 2]) {
+        t.timer_up(peers, index)
+    } else {
+        t.timer_down(peers, index)
+    }
+}
+
+fn (t $&PendingTimers) take_expired(peers &[]PendingRequest, now int) int {
+    if t.len == 0 { << -1 }
+    slot := t.heap[0]
+    if slot < 0 || slot >= peers.len || peers[slot].deadline > now { << -1 }
+    t.remove(peers, slot)
+    << slot
+}
+
+fn next_event_wait(peers &[]PendingRequest, timers &PendingTimers, now int) int {
+    if timers.len == 0 { << 0 }
+    remaining := peers[timers.heap[0]].deadline - now
+    if remaining <= 0 { << -1 }
+    << remaining
+}
+
+fn shed_incomplete_event_set(peers $&[]PendingRequest, active $&int, buffered $&int, options &ServerOptions, events $&poller.EventSet, timers $&PendingTimers, free_slots $&FreeSlots) int {
+    $shed := 0
+    for i in 0:peers.len {
+        if peers[i].fd < 0 { -> }
+        state := pending_complete(&*peers, i, options)
+        if state == 1 { -> }
+        fd := peers[i].fd
+        event_set_remove_ignore($&events, fd)
+        timers.remove(&*peers, i)
+        *buffered -= peers[i].data.len
+        close_http_fd(fd)
+        peers[i] = pending_request(-1, 0, -1)
+        free_slots.release(i)
+        *active -= 1
+        shed += 1
+    }
+    << shed
+}
+
+// Linux and Darwin keep one persistent kernel readiness set for the listener
+// and pending sockets. Worker completion wakes that same blocking wait, so
+// readiness does not require a fixed-interval scan.
+fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
+    validate_server_options(&options) or >>
+    events := poller.new_event_set() or (err) {
+        // Unsupported word sizes and descriptor limits keep the portable
+        // implementation available instead of rejecting a valid server.
+        << serve_listener_root_legacy(lfd, handle, options, file_root) or >>
+    }
+    events.watch(lfd, 0, poller.EVENT_READ) or >>
+    wake := events.wake_token()
+    $listening_watch := true
+    $peers := []PendingRequest{}
+    $generation := []int{}
+    $timer_positions := []int{}
+    $free_values := []int{}
+    for i in 0:options.max_connections {
+        peers.push(pending_request(-1, 0, -1))
+        generation.push(0)
+        timer_positions.push(-1)
+        free_values.push(options.max_connections - i - 1)
+    }
+    $free_slots := FreeSlots{values: free_values, len: options.max_connections}
+    $timers := PendingTimers{heap: []int{}, positions: timer_positions, len: 0}
+    done := chan int{cap: options.max_connections}
+    finished := chan int{cap: options.max_connections}
+    $active := 0
+    $pending_wakes := 0
+    $buffered := 0
+    $running := true
+    while running {
+        while sys_wait_cancel(done, 0) {
+            _ := <-done
+            active -= 1
+        }
+        while sys_wait_cancel(finished, 0) {
+            _ := <-finished
+            pending_wakes -= 1
+        }
+        if !listening_watch && active < options.max_connections {
+            events.watch(lfd, 0, poller.EVENT_READ) or (err) { running = false }
+            if !running { -> }
+            listening_watch = true
+        }
+        wait_ns := next_event_wait(&peers, &timers, now_ns())
+        // Server.close closes the listening fd from another task. An epoll
+        // or kqueue registration is removed by the kernel, so cap an idle
+        // wait and probe only that one fd to preserve the existing shutdown
+        // contract without scanning live connections.
+        if wait_ns == 0 || wait_ns > 100000000 { wait_ns = 100000000 }
+        batch := events.wait(wait_ns) or (err) {
+            running = false
+            []poller.Event{}
+        }
+        if batch.len == 0 {
+            _ := os.socket_poll(lfd, poller.EVENT_READ) or (err) {
+                running = false
+                0
+            }
+        }
+        for ei in 0:batch.len {
+            token := batch[ei].id
+            if token == 0 {
+                for admission in 0:32 {
+                    ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) { 0 }
+                    if ready == 0 { <- }
+                    if active >= options.max_connections {
+                        shed_incomplete_event_set($&peers, $&active, $&buffered, &options, $&events, $&timers, $&free_slots)
+                        if active >= options.max_connections {
+                            if listening_watch {
+                                event_set_remove_ignore($&events, lfd)
+                                listening_watch = false
+                            }
+                            <-
+                        }
+                    }
+                    fd := net.accept(lfd) or (err) { running = false
+                        <- }
+                    deadline := http_deadline(options.read_timeout_ns) or (err) {
+                        close_http_fd(fd)
+                        ->
+                    }
+                    slot := free_slots.take()
+                    if slot < 0 {
+                        close_http_fd(fd)
+                        ->
+                    }
+                    generation[slot] += 1
+                    peer_token := generation[slot] * 4096 + slot
+                    events.watch(fd, peer_token, poller.EVENT_READ) or (err) {
+                        free_slots.release(slot)
+                        close_http_fd(fd)
+                        ->
+                    }
+                    peers[slot] = pending_request(fd, deadline, peer_token)
+                    timers.add(&peers, slot)
+                    active += 1
+                }
+                ->
+            }
+            slot := token % 4096
+            if slot < 0 || slot >= peers.len { -> }
+            if peers[slot].fd < 0 || peers[slot].token != token { -> }
+            fd := peers[slot].fd
+            $discard := now_ns() >= peers[slot].deadline
+            event_mask := batch[ei].events
+            if !discard && (event_mask & (poller.EVENT_READ | poller.EVENT_ERROR | poller.EVENT_HANGUP)) != 0 {
+                if !pending_timeout(fd) { discard = true }
+                if !discard {
+                    part := pending_read(fd)
+                    if part.len == 0 { discard = true }
+                    if part.len > options.max_buffer_bytes - buffered || part.len > MAX_MESSAGE_BYTES - peers[slot].data.len {
+                        discard = true
+                    }
+                    if !discard {
+                        peers[slot].data = peers[slot].data + part
+                        buffered += part.len
+                        state := pending_complete($&peers, slot, &options)
+                        if state < 0 { discard = true }
+                        if state > 0 {
+                            input := peers[slot].data + ""
+                            root_copy := file_root + ""
+                            events.remove(fd) or (err) { discard = true }
+                            if !discard && dispatch_pending_event_set(fd, input, handle, done, finished, options.write_timeout_ns, root_copy, wake) {
+                                timers.remove(&peers, slot)
+                                buffered -= peers[slot].data.len
+                                peers[slot] = pending_request(-1, 0, -1)
+                                free_slots.release(slot)
+                                pending_wakes += 1
+                            } else {
+                                discard = true
+                            }
+                        }
+                    }
+                }
+            }
+            if discard {
+                event_set_remove_ignore($&events, fd)
+                timers.remove(&peers, slot)
+                buffered -= peers[slot].data.len
+                peers[slot] = pending_request(-1, 0, -1)
+                free_slots.release(slot)
+                active -= 1
+                close_http_fd(fd)
+            }
+        }
+        // Expire heap roots only; socket readiness and timer selection avoid
+        // a per-connection probe on every event-loop iteration.
+        now := now_ns()
+        while true {
+            slot := timers.take_expired(&peers, now)
+            if slot < 0 { <- }
+            if peers[slot].fd < 0 { -> }
+            fd := peers[slot].fd
+            event_set_remove_ignore($&events, fd)
+            buffered -= peers[slot].data.len
+            peers[slot] = pending_request(-1, 0, -1)
+            free_slots.release(slot)
+            active -= 1
+            close_http_fd(fd)
+        }
+    }
+    for i in 0:peers.len {
+        if peers[i].fd < 0 { -> }
+        fd := peers[i].fd
+        event_set_remove_ignore($&events, fd)
+        close_http_fd(fd)
+        peers[i] = pending_request(-1, 0, -1)
+        active -= 1
+    }
+    // Keep the set alive until every task has published its wake, preventing
+    // a late worker from writing to a descriptor number that the OS reused.
+    while active > 0 {
+        _ := <-done
+        active -= 1
+    }
+    while pending_wakes > 0 {
+        _ := <-finished
+        pending_wakes -= 1
+    }
+    events.close() or (err) { << 0 }
     << 0
 }
