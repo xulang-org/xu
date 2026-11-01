@@ -241,6 +241,7 @@ fi
 # Every hop builds the original source and manifest with the same profile.
 SEED_MANIFEST_BRIDGE=none
 BRIDGE_SOCKET_SHA256=SKIPPED
+BRIDGE_EXEC_SHA256=SKIPPED
 BRIDGE_SEED_SHA256=SKIPPED
 BRIDGE_CONST_SOURCE_SHA256=SKIPPED
 # shellcheck disable=SC2086
@@ -264,6 +265,51 @@ if [ "$seed_build_rc" -ne 0 ] && grep -Eq "const '[A-Z_][A-Z0-9_]*' must be snak
     SEED_MANIFEST_BRIDGE=const_naming_v1
     FAILED_STAGE="bridged_seed_to_gen1"
     # The transition artifact is not counted as Gen1 and is never installed.
+    set +u
+    if "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin" >"$tmp/const-build.log" 2>&1; then
+        seed_build_rc=0
+    else
+        seed_build_rc=$?
+    fi
+    set -u
+    cat "$tmp/const-build.log"
+    cp "$tmp/const-build.log" "$tmp/seed-build.log"
+    # The naming transition can still predate the exec ABI. Compose only
+    # recognized transitions, retaining the original seed's provenance.
+    SEED=$BRIDGE_SEED
+fi
+if [ "$seed_build_rc" -ne 0 ] && grep -q "os_exec takes exactly 3 arguments" "$tmp/seed-build.log"; then
+    # The old SDK cannot check the optional cancellation arguments in the
+    # compiler's stdlib dependency. This private transition keeps the compiler
+    # on its existing non-context exec path, then restarts Gen1 on full source.
+    FAILED_STAGE="exec_seed_bridge"
+    python3 - "$ROOT/src" "$tmp/exec-bridge-src" <<'PY_EXEC_BRIDGE'
+from pathlib import Path
+import shutil
+import sys
+
+source, destination = map(Path, sys.argv[1:])
+shutil.copytree(source, destination)
+wrapper = destination / 'os/exec/mod.xu'
+text = wrapper.read_text(encoding='utf-8')
+call = 'os_exec(path, blob, redir, done, deadline_ns)'
+if text.count(call) != 1:
+    raise SystemExit('unsupported exec cancellation wrapper; refusing seed bridge')
+wrapper.write_text(text.replace(call, 'os_exec(path, blob, redir)'), encoding='utf-8')
+PY_EXEC_BRIDGE
+    BRIDGE_EXEC_SHA256=$(sha256_file "$tmp/exec-bridge-src/os/exec/mod.xu")
+    set +u
+    XU_STDLIB_ROOT="$(native_path "$tmp/exec-bridge-src")" \
+        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/exec-bootstrap.xin"
+    set -u
+    BRIDGE_SEED=$(pick_bin "$tmp/exec-bootstrap.xin")
+    BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
+    if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
+        SEED_MANIFEST_BRIDGE=exec_cancellation_v1
+    else
+        SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+exec_cancellation_v1"
+    fi
+    FAILED_STAGE="bridged_seed_to_gen1"
     set +u
     "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin"
     set -u
@@ -426,6 +472,7 @@ seed_syntax_bridge=$SEED_SYNTAX_BRIDGE
 bridge_syntax_seed_sha256=$BRIDGE_SYNTAX_SEED_SHA256
 seed_manifest_bridge=$SEED_MANIFEST_BRIDGE
 bridge_socket_sha256=$BRIDGE_SOCKET_SHA256
+bridge_exec_sha256=$BRIDGE_EXEC_SHA256
 bridge_seed_sha256=$BRIDGE_SEED_SHA256
 bridge_const_source_sha256=$BRIDGE_CONST_SOURCE_SHA256
 source_seed_files=$SOURCE_SEED_FILES

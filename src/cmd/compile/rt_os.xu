@@ -628,6 +628,41 @@ fn rt_emit_os_system(a $&Assembler) {
     <<
 }
 
+// Called only by hosted cancellable exec. Reading Done under its channel
+// mutex preserves close/send synchronization and never consumes a value.
+fn rt_emit_exec_context_probe(a $&Assembler) {
+    a.label("_rt_ox_context")
+    a.prologue(32)
+    a.store(15, -8, 18)
+    a.store(15, -16, 19)
+    a.vm_cbz(18, "_rt_ox_ctx_ok")
+    a.vm_cmp_imm(19, 0)
+    a.jle("_rt_ox_ctx_done")
+    a.call("_rt_now_ns")
+    a.load(1, 15, -16)
+    a.cmp(14, 1)
+    a.jge("_rt_ox_ctx_deadline")
+    a.label("_rt_ox_ctx_done")
+    rt_mc_lock(a)
+    a.load(0, 15, -8)
+    a.load(1, 0, RT_CHAN_MC_CLOSED_OFFSET)
+    a.load(2, 0, RT_CHAN_MC_LENGTH_OFFSET)
+    a.add(1, 1, 2)
+    a.store(15, -24, 1)
+    rt_mc_unlock(a)
+    a.load(1, 15, -24)
+    a.vm_cbz(1, "_rt_ox_ctx_ok")
+    a.vm_mov_imm(14, -1)
+    a.epilogue()
+    a.label("_rt_ox_ctx_deadline")
+    a.vm_mov_imm(14, -2)
+    a.epilogue()
+    a.label("_rt_ox_ctx_ok")
+    a.vm_mov_imm(14, 0)
+    a.epilogue()
+    <<
+}
+
 // os_exec(path, blob, redir) → wait(2) status (blocks until the child exits).
 // blob = dir\0 + argv (unix: arg0\0arg1\0...) or dir\0cmdline (windows).
 // redir:
@@ -636,9 +671,17 @@ fn rt_emit_os_system(a $&Assembler) {
 //   [0]==2, [1..8] LE stdout fd; if len>=17, [9..16] LE stdin fd
 //   [0]==3, [1..8] LE stdin fd
 // Parent closes the passed fds after fork. Child dup2 then exec.
-fn rt_emit_os_exec(a $&Assembler) {
+// Optional V0=cancel channel, V1=absolute monotonic deadline. Negative
+// results are private: -1 canceled, -2 deadline, -3 process/wait failure.
+// Cancellation never returns until the direct child has been waited for.
+fn rt_emit_os_exec(a $&Assembler, mc int) {
+    if mc == 1 { rt_emit_exec_context_probe(a) }
     a.label("_rt_os_exec")
-    a.prologue(256)
+    a.prologue(304)
+    a.store(15, -264, 0)
+    a.store(15, -272, 1)
+    a.vm_mov_imm(2, 0)
+    a.store(15, -288, 2) // latched context error, after child reaping only
     a.store(15, -8, 18)
     a.store(15, -16, 19)
     a.store(15, -24, 20)
@@ -744,14 +787,14 @@ fn rt_emit_os_exec(a $&Assembler) {
     a.store(15, -96, 14)
     a.label("_rt_ox_nr")
     if a.os == 2 {
-        rt_emit_os_exec_win(a)
+        rt_emit_os_exec_win(a, mc)
         <<
     }
-    rt_emit_os_exec_unix(a)
+    rt_emit_os_exec_unix(a, mc)
     <<
 }
 
-fn rt_emit_os_exec_unix(a $&Assembler) {
+fn rt_emit_os_exec_unix(a $&Assembler, mc int) {
     a.vm_mov_imm(1, 0)
     a.store(15, -80, 1)
     a.load(2, 15, -120)
@@ -839,6 +882,7 @@ fn rt_emit_os_exec_unix(a $&Assembler) {
     a.vm_cmp_imm(14, 0)
     a.jeq("_rt_ox_child")
     a.jlt("_rt_ox_fail")
+    a.store(15, -280, 14) // own this PID; close/syscalls clobber Ret
     a.load(1, 15, -160)
     a.vm_cbz(1, "_rt_ox_pstdin")
     a.load(18, 15, -168)
@@ -851,10 +895,15 @@ fn rt_emit_os_exec_unix(a $&Assembler) {
     a.label("_rt_ox_wait")
     a.vm_mov_imm(1, 0)
     a.store(15, -88, 1)
-    a.mov(18, 14)
+    a.load(18, 15, -280)
     a.mov(19, 15)
     a.vm_sub_imm(19, 19, 88)
+    // WNOHANG only for cancellable calls; original calls block as before.
     a.vm_mov_imm(20, 0)
+    a.load(1, 15, -264)
+    a.vm_cbz(1, "_rt_ox_wait_go")
+    a.vm_mov_imm(20, 1)
+    a.label("_rt_ox_wait_go")
     a.vm_mov_imm(21, 0)
     if a.os == 0 {
         a.vm_call_iat("_iat_wait4")
@@ -862,9 +911,54 @@ fn rt_emit_os_exec_unix(a $&Assembler) {
         a.vm_syscall(syscall_number(a.os, a.arch, 38))
     }
     a.vm_cmp_imm(14, 0)
-    a.jlt("_rt_ox_fail")
+    a.jgt("_rt_ox_reaped")
+    a.jeq("_rt_ox_pending")
+    if a.os == 0 {
+        a.vm_call_iat("_iat___error")
+        a.load_byte(1, 14, 0)
+        a.load_byte(2, 14, 1)
+        a.shl_imm(2, 2, 8)
+        a.ior(1, 1, 2)
+        a.load_byte(2, 14, 2)
+        a.shl_imm(2, 2, 16)
+        a.ior(1, 1, 2)
+        a.load_byte(2, 14, 3)
+        a.shl_imm(2, 2, 24)
+        a.ior(14, 1, 2)
+        a.vm_cmp_imm(14, 4) // Darwin errno is a positive 32-bit int
+    } else {
+        a.vm_cmp_imm(14, -4) // raw Linux syscall returns -EINTR
+    }
+    a.jeq("_rt_ox_wait")
+    a.jmp("_rt_ox_wait_failed")
+    a.label("_rt_ox_pending")
+    if mc == 1 {
+        a.load(1, 15, -288)
+        a.vm_cbnz(1, "_rt_ox_pause")
+        a.load(18, 15, -264)
+        a.load(19, 15, -272)
+        a.call("_rt_ox_context")
+        a.vm_cbz(14, "_rt_ox_pause")
+        a.store(15, -288, 14)
+        a.load(18, 15, -280)
+        a.vm_mov_imm(19, 9) // SIGKILL; never target a process group or another child
+        a.vm_syscall(syscall_number(a.os, a.arch, 53))
+        // Even if kill races with exit, only wait4 releases child ownership.
+    }
+    a.label("_rt_ox_pause")
+    a.vm_mov_imm(18, 10000000) // bounded polling, no busy wait
+    a.call("_rt_sleep_ns")
+    a.jmp("_rt_ox_wait")
+    a.label("_rt_ox_reaped")
     rt_free_os_exec_temps(a)
+    a.load(14, 15, -288)
+    a.vm_cbnz(14, "_rt_ox_return")
     a.load(14, 15, -88)
+    a.label("_rt_ox_return")
+    a.epilogue()
+    a.label("_rt_ox_wait_failed")
+    rt_free_os_exec_temps(a)
+    a.vm_mov_imm(14, -3)
     a.epilogue()
     a.label("_rt_ox_child")
     a.load(18, 15, -64)
@@ -969,13 +1063,24 @@ fn rt_emit_os_exec_unix(a $&Assembler) {
     a.vm_mov_imm(18, 127)
     a.vm_exit()
     a.label("_rt_ox_fail")
+    // No child owns transferred pipe descriptors if fork failed.
+    a.load(1, 15, -160)
+    a.vm_cbz(1, "_rt_ox_fail_stdin")
+    a.load(18, 15, -168)
+    a.vm_syscall(syscall_number(a.os, a.arch, 6))
+    a.label("_rt_ox_fail_stdin")
+    a.load(1, 15, -176)
+    a.vm_cbz(1, "_rt_ox_fail_free")
+    a.load(18, 15, -184)
+    a.vm_syscall(syscall_number(a.os, a.arch, 6))
+    a.label("_rt_ox_fail_free")
     rt_free_os_exec_temps(a)
-    a.vm_mov_imm(14, 32512)
+    a.vm_mov_imm(14, -3)
     a.epilogue()
     <<
 }
 
-fn rt_emit_os_exec_win(a $&Assembler) {
+fn rt_emit_os_exec_win(a $&Assembler, mc int) {
     a.load(18, 15, -120)
     a.load(19, 15, -128)
     a.call("_rt_cstr")
@@ -1063,13 +1168,46 @@ fn rt_emit_os_exec_win(a $&Assembler) {
     }
     a.vm_cmp_imm(14, 0)
     a.jeq("_rt_oxw_cln")
+    a.label("_rt_oxw_wait")
     a.load(18, 15, -256)
     a.vm_mov_imm(19, 4294967295)
+    a.load(1, 15, -264)
+    a.vm_cbz(1, "_rt_oxw_wait_go")
+    a.vm_mov_imm(19, 10)
+    a.label("_rt_oxw_wait_go")
     a.vm_call_iat("_iat_WaitForSingleObject")
+    a.vm_cbz(14, "_rt_oxw_reaped")
+    a.vm_cmp_imm(14, 258) // WAIT_TIMEOUT
+    a.jne("_rt_oxw_wait_failed")
+    if mc == 1 {
+        a.load(1, 15, -288)
+        a.vm_cbnz(1, "_rt_oxw_wait")
+        a.load(18, 15, -264)
+        a.load(19, 15, -272)
+        a.call("_rt_ox_context")
+        a.vm_cbz(14, "_rt_oxw_wait")
+        a.store(15, -288, 14)
+        a.load(18, 15, -256)
+        a.vm_mov_imm(19, 1)
+        a.vm_call_iat("_iat_TerminateProcess")
+        // TerminateProcess is asynchronous. Retain both handles and wait.
+    }
+    a.jmp("_rt_oxw_wait")
+    a.label("_rt_oxw_wait_failed")
+    a.vm_mov_imm(1, -3)
+    a.store(15, -288, 1)
+    a.jmp("_rt_oxw_handles")
+    a.label("_rt_oxw_reaped")
+    a.vm_mov_imm(1, 0)
+    a.store(15, -88, 1) // GetExitCodeProcess writes only a DWORD
     a.load(18, 15, -256)
     a.mov(19, 15)
     a.vm_sub_imm(19, 19, 88)
     a.vm_call_iat("_iat_GetExitCodeProcess")
+    a.vm_cbnz(14, "_rt_oxw_handles")
+    a.vm_mov_imm(1, -3)
+    a.store(15, -288, 1)
+    a.label("_rt_oxw_handles")
     a.load(18, 15, -248)
     a.vm_call_iat("_iat_CloseHandle")
     a.load(18, 15, -256)
@@ -1079,8 +1217,11 @@ fn rt_emit_os_exec_win(a $&Assembler) {
     a.vm_call_iat("_iat_CloseHandle")
     a.label("_rt_oxw_ok")
     rt_free_os_exec_temps(a)
+    a.load(14, 15, -288)
+    a.vm_cbnz(14, "_rt_oxw_return")
     a.load(14, 15, -88)
     a.shl_imm(14, 14, 8)
+    a.label("_rt_oxw_return")
     a.epilogue()
     a.label("_rt_oxw_cln")
     a.load(18, 15, -112)
