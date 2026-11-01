@@ -18,9 +18,9 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(args, work, env, success=True):
+def run(args, work, env, success=True, timeout: int = 600):
     result = subprocess.run([str(a) for a in args], cwd=work, env=env, text=True,
-                            encoding="utf-8", errors="replace", capture_output=True, timeout=180)
+                            encoding="utf-8", errors="replace", capture_output=True, timeout=timeout)
     if (result.returncode == 0) != success:
         raise RuntimeError(f"{args}: exit {result.returncode}\n{result.stdout}\n{result.stderr}")
     return result
