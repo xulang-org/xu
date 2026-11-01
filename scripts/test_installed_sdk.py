@@ -16,9 +16,9 @@ import tempfile
 import zipfile
 
 
-def run(args, *, cwd, env):
+def run(args, *, cwd, env, timeout: int = 600):
     try:
-        result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=180)
+        result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
         def text(value):
             return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
