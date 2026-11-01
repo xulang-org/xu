@@ -119,6 +119,8 @@ def pack_reloc(addr: int, symnum: int, pcrel: int, length: int, extern: int, rty
 def iat_target(name: str) -> str:
     if name == "_iat__NSGetEnviron":
         return "__NSGetEnviron"
+    if name == "_iat___error":
+        return "___error"
     rest = name[len("_iat_") :]
     return rest if rest.startswith("_") else "_" + rest
 
