@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.2-dev.1 (development)
+
+Commands created with `os/exec.command_context` now observe cancellation and monotonic deadlines while running. `run`, output capture and `start`/`wait` terminate and wait for the direct child before reporting the context error. Unix waits retain the exact child PID across pipe descriptor cleanup and retry interrupted waits; Windows retains process handles until termination completes. Normal exit status and the public command API remain compatible. Descendant process trees are outside this contract. This is a development build.
+
 ## Xu 0.11.1
 
 Stable release integrating the changes since 0.10.12. Upgrade the compiler, standard library and product tools together. Platform binaries and checksums are listed with the release assets.
