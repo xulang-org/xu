@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 from pathlib import Path
 import shutil
@@ -328,7 +329,13 @@ fn main() int {
         actual = run([str(program)], cwd=project, env=active).splitlines()
         assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81", "40", "3", "183", "71", "40", "8", "1", "2", "5", "6"], actual
     # A frame view cannot be returned as a borrowed container identity.
-    (project / "borrow_escape.xu").write_text('''@main
+    # Keep this expected-error entry point out of the main smoke project.
+    # Desktop builds discover sibling Xu sources, so leaving another @main
+    # here makes the later tooltip smoke fail with a duplicate main instead
+    # of exercising the installed UI modules.
+    borrow_project = work / "borrow escape project"
+    borrow_project.mkdir()
+    (borrow_project / "borrow_escape.xu").write_text('''@main
 fn identity(s &string) &string { << s }
 fn main() int {
     words := ["one", "two"]
@@ -338,12 +345,16 @@ fn main() int {
     << 0
 }
 ''')
-    rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=project,
+    rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=borrow_project,
                               env=active, text=True, capture_output=True, timeout=90)
     assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
     # Passive help has deterministic hover delay, dismissal and edge placement;
-    # this exercises the installed widgets without opening a native GUI.
-    (project / "tooltip_state.xu").write_text('''@main
+    # this exercises the installed widgets without opening a native GUI. Keep
+    # its entry point in a separate project because desktop builds discover all
+    # sibling Xu sources, each of which may define its own @main.
+    tooltip_project = work / "tooltip project"
+    tooltip_project.mkdir()
+    (tooltip_project / "tooltip_state.xu").write_text('''@main
 #ui
 #ui/widgets
 #ui/layout
@@ -424,8 +435,17 @@ fn verify() int {
 fn main() int { << verify() or (err) { eprintln(err.msg())
     << 1 } }
 ''')
-    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=project, env=active)
-    assert run([str(program)], cwd=project, env=active).strip() == "tooltip state and placement PASS"
+    tooltip_build = run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
+    tooltip_executable = program
+    if sys.platform == "darwin":
+        match = re.search(r"(?m)^xu: desktop pack → (.+)$", tooltip_build)
+        assert match, tooltip_build
+        app_bundle = Path(match.group(1).strip())
+        with (app_bundle / "Contents/Info.plist").open("rb") as metadata:
+            executable_name = plistlib.load(metadata)["CFBundleExecutable"]
+        tooltip_executable = app_bundle / "Contents/MacOS" / executable_name
+    tooltip_output = run([str(tooltip_executable)], cwd=project, env=active).strip()
+    assert tooltip_output == "tooltip state and placement PASS", tooltip_output
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
         (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  "github.com/xulang-org/packages": file:' + (prefix / "packages").as_posix() + '\n')
