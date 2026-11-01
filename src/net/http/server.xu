@@ -195,11 +195,15 @@ fn dispatch_request(fd int, data string, handle fn(Context), done chan int, file
     done <- 1
 }
 
+fn event_wake_ignore(wake poller.EventWake) {
+    wake.notify() or (err) { << }
+}
+
 fn dispatch_request_event_set(fd int, data string, handle fn(Context), done chan int, finished chan int, file_root string, wake poller.EventWake) {
     invoke_request(fd, data, handle, file_root)
     close_http_fd(fd)
     done <- 1
-    wake.notify() or (err) { << }
+    event_wake_ignore(wake)
     finished <- 1
 }
 
@@ -227,10 +231,11 @@ fn serve_file_listener(lfd int, root string) int {
     << serve_listener_root(lfd, file_server_handler, options, fs.root + "") or (err) { << 1 }
 }
 
-fn validate_server_options(options &ServerOptions) {
+fn validate_server_options(options &ServerOptions) int {
     if options.read_timeout_ns <= 0 || options.write_timeout_ns <= 0 || options.max_connections <= 0 || options.max_connections > 4096 || options.max_header_bytes <= 0 || options.max_header_bytes > MAX_MESSAGE_BYTES || options.max_body_bytes < 0 || options.max_body_bytes > MAX_MESSAGE_BYTES || options.max_buffer_bytes <= 0 {
         >> errors.new("net/http: invalid server options")
     }
+    << 0
 }
 
 fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
@@ -241,7 +246,7 @@ fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_
 }
 
 fn serve_listener_root_legacy(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
-    validate_server_options(&options) or >>
+    _ := validate_server_options(&options) or >>
     $peers := []PendingRequest{}
     for i in 0:options.max_connections { peers.push(pending_request(-1, 0, -1)) }
     done := chan int{cap: options.max_connections}
@@ -325,8 +330,9 @@ fn serve_listener_root_legacy(lfd int, handle fn(Context), options ServerOptions
     << 0
 }
 
-fn event_set_remove_ignore(events $&poller.EventSet, fd int) {
-    events.remove(fd) or (err) { << }
+fn event_set_remove(events $&poller.EventSet, fd int) bool {
+    _ := events.remove(fd) or (err) { << false }
+    << true
 }
 
 fn pending_timer_less(peers &[]PendingRequest, left int, right int) bool {
@@ -423,7 +429,7 @@ fn shed_incomplete_event_set(peers $&[]PendingRequest, active $&int, buffered $&
         state := pending_complete(&*peers, i, options)
         if state == 1 { -> }
         fd := peers[i].fd
-        event_set_remove_ignore($&events, fd)
+        _ := event_set_remove(events, fd)
         timers.remove(&*peers, i)
         *buffered -= peers[i].data.len
         close_http_fd(fd)
@@ -439,11 +445,12 @@ fn shed_incomplete_event_set(peers $&[]PendingRequest, active $&int, buffered $&
 // and pending sockets. Worker completion wakes that same blocking wait, so
 // readiness does not require a fixed-interval scan.
 fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
-    validate_server_options(&options) or >>
-    events := poller.new_event_set() or (err) {
+    _ := validate_server_options(&options) or >>
+    $events := poller.new_event_set() or (err) {
         // Unsupported word sizes and descriptor limits keep the portable
         // implementation available instead of rejecting a valid server.
-        << serve_listener_root_legacy(lfd, handle, options, file_root) or >>
+        fallback_root := file_root + ""
+        << serve_listener_root_legacy(lfd, handle, options, fallback_root) or >>
     }
     events.watch(lfd, 0, poller.EVENT_READ) or >>
     wake := events.wake_token()
@@ -476,11 +483,13 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
             pending_wakes -= 1
         }
         if !listening_watch && active < options.max_connections {
-            events.watch(lfd, 0, poller.EVENT_READ) or (err) { running = false }
+            events.watch(lfd, 0, poller.EVENT_READ) or (err) { running = false
+                <-
+            }
             if !running { -> }
             listening_watch = true
         }
-        wait_ns := next_event_wait(&peers, &timers, now_ns())
+        $wait_ns := next_event_wait(&peers, &timers, now_ns())
         // Server.close closes the listening fd from another task. An epoll
         // or kqueue registration is removed by the kernel, so cap an idle
         // wait and probe only that one fd to preserve the existing shutdown
@@ -488,25 +497,27 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
         if wait_ns == 0 || wait_ns > 100000000 { wait_ns = 100000000 }
         batch := events.wait(wait_ns) or (err) {
             running = false
-            []poller.Event{}
+            ->
         }
         if batch.len == 0 {
             _ := os.socket_poll(lfd, poller.EVENT_READ) or (err) {
                 running = false
-                0
+                <-
             }
         }
         for ei in 0:batch.len {
             token := batch[ei].id
             if token == 0 {
                 for admission in 0:32 {
-                    ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) { 0 }
+                    ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) { running = false
+                        <-
+                    }
                     if ready == 0 { <- }
                     if active >= options.max_connections {
                         shed_incomplete_event_set($&peers, $&active, $&buffered, &options, $&events, $&timers, $&free_slots)
                         if active >= options.max_connections {
                             if listening_watch {
-                                event_set_remove_ignore($&events, lfd)
+                                _ := event_set_remove($&events, lfd)
                                 listening_watch = false
                             }
                             <-
@@ -558,7 +569,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
                         if state > 0 {
                             input := peers[slot].data + ""
                             root_copy := file_root + ""
-                            events.remove(fd) or (err) { discard = true }
+                            if !event_set_remove($&events, fd) { discard = true }
                             if !discard && dispatch_pending_event_set(fd, input, handle, done, finished, options.write_timeout_ns, root_copy, wake) {
                                 timers.remove(&peers, slot)
                                 buffered -= peers[slot].data.len
@@ -573,7 +584,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
                 }
             }
             if discard {
-                event_set_remove_ignore($&events, fd)
+                _ := event_set_remove($&events, fd)
                 timers.remove(&peers, slot)
                 buffered -= peers[slot].data.len
                 peers[slot] = pending_request(-1, 0, -1)
@@ -590,7 +601,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
             if slot < 0 { <- }
             if peers[slot].fd < 0 { -> }
             fd := peers[slot].fd
-            event_set_remove_ignore($&events, fd)
+            _ := event_set_remove($&events, fd)
             buffered -= peers[slot].data.len
             peers[slot] = pending_request(-1, 0, -1)
             free_slots.release(slot)
@@ -601,7 +612,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
     for i in 0:peers.len {
         if peers[i].fd < 0 { -> }
         fd := peers[i].fd
-        event_set_remove_ignore($&events, fd)
+        _ := event_set_remove($&events, fd)
         close_http_fd(fd)
         peers[i] = pending_request(-1, 0, -1)
         active -= 1
