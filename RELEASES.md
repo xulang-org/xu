@@ -6,6 +6,16 @@
 
 ---
 
+## Xu 0.11.2
+
+Stable release integrating architectural modularization, self-hosting reproducibility, scale stability governance, and unified target constraints since 0.11.1. Upgrade the compiler, standard library, and product tools together. Platform binaries and checksums are listed with the release assets.
+
+- **Modular UI Architecture**: Chart components are fully decoupled into an independent `@ui/chart` package, featuring 30 chart series types, animation state management, and high-level drawing, decoupling from `@ui/widgets` and sample applications like `component_workshop`.
+- **Compiler Robustness and Self-Hosting**: Fixed XUN configuration infinite loops on empty keys and block body parsing; added regression tests for invalid inputs and empty-type arrays; restored reproducible three-generation self-hosting (`Gen2 == Gen3` fixed point) across supported seeds.
+- **Optimization Scale Stability**: Established a stability testing harness across varying translation unit sizes, ensuring consistent optimization admission and transformation invariants without threshold-induced divergences.
+- **Unified Register Constraints and Function Analysis Summaries**: Standardized target machine register footprint constraints (`td_extra_gpr_home`) and introduced read-only function analysis summary abstractions (`mir_fn_summary_ro` / `MFn.summary()`).
+- **Runtime and Linker Integrity**: Preserved subprocess interrupt symbol `___error` on macOS native static linking, with full cross-platform deadline and cancellation cleanup in `os/exec.command_context`.
+
 ## Xu 0.11.2-dev.3 (development)
 
 Native macOS static linking preserves the `___error` symbol used when subprocess waits are interrupted. The compiler-owned Mach-O object converter now matches the UI packaging converter, so programs using `os/exec` can link native archives without an undefined `__error` symbol. This is a development build.
