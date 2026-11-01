@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.2-dev.3 (development)
+
+Native macOS static linking preserves the `___error` symbol used when subprocess waits are interrupted. The compiler-owned Mach-O object converter now matches the UI packaging converter, so programs using `os/exec` can link native archives without an undefined `__error` symbol. This is a development build.
+
 ## Xu 0.11.2-dev.2 (development)
 
 Remove duplicate empty-block, operand-freshness and shift-chain helper declarations introduced when optimizer changes were combined in dev. The existing CFG and conservative shift-chain implementations remain authoritative. Conditional branches use the established two-path emission again while the new fallthrough optimization is reworked; this preserves compiler argument parsing and register-cache edge state during self-hosting. This is a development build.
