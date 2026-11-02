@@ -23,6 +23,7 @@ Stable release integrating architectural modularization, self-hosting reproducib
 - **Optimization Scale Stability**: Established a stability testing harness across varying translation unit sizes, ensuring consistent optimization admission and transformation invariants without threshold-induced divergences.
 - **Unified Register Constraints and Function Analysis Summaries**: Standardized target machine register footprint constraints (`td_extra_gpr_home`) and introduced read-only function analysis summary abstractions (`mir_fn_summary_ro` / `MFn.summary()`).
 - **Runtime and Linker Integrity**: Preserved subprocess interrupt symbol `___error` on macOS native static linking, with full cross-platform deadline and cancellation cleanup in `os/exec.command_context`.
+- **Compiler Warning Elimination**: Resolved all compilation and link diagnostics across self-hosted and native product tool builds, including zero-division guard paths, Clang tautological comparisons, Swift UTType migration, and layout modularization for composite desktop UI setup models.
 
 ## Xu 0.11.2-dev.3 (development)
 
