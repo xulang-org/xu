@@ -6,14 +6,15 @@
 #os
 #strings
 
-const MAX_ACCEPT_BATCH = 128
+const MAX_ACCEPT_BATCH = 1024
+const MAX_HTTP_ACTIVE_HANDLERS = 64
 const MAX_HTTP_CONNECTIONS = 110000
 const MAX_LEGACY_CONNECTIONS = 4096
 const EVENT_SLOT_SPAN = 131072
 
 // Limits apply per server. Read time is an absolute request-intake budget;
 // write time bounds blocking response I/O. max_buffer_bytes bounds pending
-// input across connections; max_connections also counts active handlers.
+// input across connections; max_connections bounds accepted client sockets.
 pub struct ServerOptions {
     pub read_timeout_ns int
     pub write_timeout_ns int
@@ -23,12 +24,14 @@ pub struct ServerOptions {
     pub max_buffer_bytes int
 }
 
-// Defaults: 10-second I/O budgets, 256 connections (configurable up to
-// 110,000 with the event-set backend), 64 KiB headers,
+// Defaults: 10-second I/O budgets, 110,000 connections with the event-set
+// backend (256 with the portable legacy backend), 64 KiB headers,
 // 10 MiB bodies and 32 MiB total pending input.
 pub fn server_options() ServerOptions {
+    $max_connections := 110000
+    if !poller.event_set_supported() { max_connections = 256 }
     << ServerOptions{read_timeout_ns: 10000000000, write_timeout_ns: 10000000000,
-        max_connections: 256, max_header_bytes: 65536, max_body_bytes: 10485760,
+        max_connections: max_connections, max_header_bytes: 65536, max_body_bytes: 10485760,
         max_buffer_bytes: 33554432}
 }
 
@@ -43,6 +46,10 @@ struct PendingRequest {
     chunked bool
     chunk_pos int
     body_bytes int
+    message_len int
+    keep_alive bool
+    processing bool
+    queued bool
 }
 
 // Indexed min-heap of pending-request deadlines. A slot appears at most once,
@@ -59,6 +66,15 @@ struct FreeSlots {
     len int
 }
 
+// Completed requests wait here when all runtime workers already have work.
+// This bounds runnable xu tasks without reducing accepted connection capacity.
+struct ReadySlots {
+    values []int
+    head int
+    tail int
+    len int
+}
+
 fn (s $&FreeSlots) take() int {
     if s.len <= 0 { << -1 }
     s.len -= 1
@@ -71,9 +87,107 @@ fn (s $&FreeSlots) release(slot int) {
     s.len += 1
 }
 
+fn (s $&ReadySlots) push(slot int) bool {
+    if s.len >= s.values.len { << false }
+    s.values[s.tail] = slot
+    s.tail += 1
+    if s.tail >= s.values.len { s.tail = 0 }
+    s.len += 1
+    << true
+}
+
+fn (s $&ReadySlots) take() int {
+    if s.len <= 0 { << -1 }
+    slot := s.values[s.head]
+    s.head += 1
+    if s.head >= s.values.len { s.head = 0 }
+    s.len -= 1
+    << slot
+}
+
 fn pending_request(fd int, deadline int, token int) PendingRequest {
     << PendingRequest{fd: fd, token: token, data: "", deadline: deadline, header_end: -1,
-        header_scan: 0, length: 0, chunked: false, chunk_pos: 0, body_bytes: 0}
+        header_scan: 0, length: 0, chunked: false, chunk_pos: 0, body_bytes: 0,
+        message_len: 0, keep_alive: false, processing: false, queued: false}
+}
+
+fn http_ascii_lower(c int) int {
+    if c >= 65 && c <= 90 { << c + 32 }
+    << c
+}
+
+fn request_token_equal(data &string, start0 int, end0 int, token string) bool {
+    $start := start0
+    $end := end0
+    while start < end {
+        c := data[start] & 255
+        if c != 32 && c != 9 { <- }
+        start += 1
+    }
+    while end > start {
+        c := data[end - 1] & 255
+        if c != 32 && c != 9 { <- }
+        end -= 1
+    }
+    if end - start != token.len { << false }
+    for j in 0:token.len {
+        if http_ascii_lower(data[start + j] & 255) != (token[j] & 255) { << false }
+    }
+    << true
+}
+
+fn request_connection_flags(data &string, head_end int) int {
+    first_end := find_crlf_from(data, 0)
+    if first_end < 0 || first_end >= head_end { << 0 }
+    $flags := 0
+    $i := first_end + 2
+    while i < head_end {
+        $end := find_crlf_from(data, i)
+        if end < 0 || end > head_end { end = head_end }
+        if end == i { << flags }
+        $colon := -1
+        for j in i:end {
+            if (data[j] & 255) == 58 { colon = j
+                <- }
+        }
+        if colon > i {
+            if colon - i == 10 {
+                $is_connection := true
+                for j in 0:10 {
+                    if http_ascii_lower(data[i + j] & 255) != ("connection"[j] & 255) {
+                        is_connection = false
+                        <-
+                    }
+                }
+                if is_connection {
+                    $token_start := colon + 1
+                    while token_start < end {
+                        $token_end := token_start
+                        while token_end < end {
+                            if (data[token_end] & 255) == 44 { <- }
+                            token_end += 1
+                        }
+                        if request_token_equal(data, token_start, token_end, "close") { flags = flags | 1 }
+                        if request_token_equal(data, token_start, token_end, "keep-alive") { flags = flags | 2 }
+                        token_start = token_end + 1
+                    }
+                }
+            }
+        }
+        i = end + 2
+    }
+    << flags
+}
+
+fn request_is_persistent(data &string, head_end int) bool {
+    line_end := find_crlf_from(data, 0)
+    if line_end < 0 || line_end < 8 { << false }
+    version := data[(line_end - 8):line_end]
+    flags := request_connection_flags(data, head_end)
+    if (flags & 1) != 0 { << false }
+    if version == "HTTP/1.1" { << true }
+    if version == "HTTP/1.0" && (flags & 2) != 0 { << true }
+    << false
 }
 
 // Advance only over complete framing. Request parsing below must never need
@@ -90,6 +204,7 @@ fn pending_request_complete(peers $&[]PendingRequest, index int, options &Server
         if end + 4 > options.max_header_bytes { >> errors.new("net/http: request headers too large") }
         peers[index].header_end = end
         head := peers[index].data[0:end]
+        peers[index].keep_alive = request_is_persistent(&peers[index].data, end)
         length := header_lookup(&head, "content-length")
         transfer := header_lookup(&head, "transfer-encoding")
         if length.len > 0 && transfer.len > 0 { >> errors.new("net/http: ambiguous request framing") }
@@ -100,7 +215,13 @@ fn pending_request_complete(peers $&[]PendingRequest, index int, options &Server
         }
         peers[index].chunk_pos = end + 4
     }
-    if !peers[index].chunked { << peers[index].data.len - peers[index].header_end - 4 >= peers[index].length }
+    if !peers[index].chunked {
+        if peers[index].data.len - peers[index].header_end - 4 >= peers[index].length {
+            peers[index].message_len = peers[index].header_end + 4 + peers[index].length
+            << true
+        }
+        << false
+    }
     while true {
         line_end := find_crlf_from(&peers[index].data, peers[index].chunk_pos)
         if line_end < 0 {
@@ -113,8 +234,16 @@ fn pending_request_complete(peers $&[]PendingRequest, index int, options &Server
         start := line_end + 2
         if size == 0 {
             if peers[index].data.len - start > options.max_header_bytes { >> errors.new("net/http: trailers too large") }
-            if start + 2 <= peers[index].data.len && peers[index].data[start:start + 2] == "\r\n" { << true }
-            << find_crlf_crlf_from(&peers[index].data, start) >= 0
+            if start + 2 <= peers[index].data.len && peers[index].data[start:start + 2] == "\r\n" {
+                peers[index].message_len = start + 2
+                << true
+            }
+            trailer_end := find_crlf_crlf_from(&peers[index].data, start)
+            if trailer_end >= 0 {
+                peers[index].message_len = trailer_end + 4
+                << true
+            }
+            << false
         }
         if size + 2 > peers[index].data.len - start { << false }
         if peers[index].data[start + size:start + size + 2] != "\r\n" { >> errors.new("net/http: bad chunk CRLF") }
@@ -149,31 +278,66 @@ fn dispatch_pending(fd int, data string, handle fn(Context), done chan int, time
     << true
 }
 
-fn dispatch_pending_event_set(fd int, data string, handle fn(Context), done chan int, finished chan int, timeout_ns int, file_root string, wake poller.EventWake) bool {
+fn dispatch_pending_event_set(slot int, fd int, data string, keep_alive bool, simple_request bool, handle fn(Context), done chan int, finished chan int, timeout_ns int, file_root string, wake poller.EventWake) bool {
     os.set_sock_timeout(fd, timeout_ns) or (err) { << false }
-    xu dispatch_request_event_set(fd, data, handle, done, finished, file_root, wake)
+    xu dispatch_request_event_set(slot, fd, data, keep_alive, simple_request, handle, done, finished, file_root, wake)
     << true
 }
 
-fn invoke_request(fd int, data string, handle fn(Context), file_root string) {
+fn buffered_request_without_body(data string) Request {
+    header_end := find_crlf_crlf(&data)
+    if header_end < 0 { >> errors.new("net/http: incomplete request headers") }
+    line_end := find_crlf_from(&data, 0)
+    if line_end < 0 || line_end > header_end { >> errors.new("net/http: bad request line") }
+    line := data[0:line_end]
+    $sp1 := -1
+    for i in 0:line.len {
+        if (line[i] & 255) == 32 { sp1 = i
+            <- }
+    }
+    if sp1 <= 0 { >> errors.new("net/http: bad request line") }
+    $sp2 := -1
+    for i in (sp1 + 1):line.len {
+        if (line[i] & 255) == 32 { sp2 = i
+            <- }
+    }
+    if sp2 < 0 { >> errors.new("net/http: bad request line") }
+    $req := new_request()
+    req.method = line[0:sp1] + ""
+    req.path = line[(sp1 + 1):sp2] + ""
+    if line_end + 2 < header_end {
+        req.headers = data[(line_end + 2):header_end] + ""
+    }
+    << req
+}
+
+fn invoke_request(fd int, data string, keep_alive bool, simple_request bool, handle fn(Context), file_root string) bool {
     // Build the owning request on its worker; only the input string and
     // scalar handles cross the coroutine boundary.
     if file_root.len > 0 {
         input := data + ""
-        req := buffered_request(input) or (err) { << }
-        ctx := Context{fd: fd, req: req}
+        $req := new_request()
+        if simple_request { req = buffered_request_without_body(input) or (err) { << false } }
+        else { req = buffered_request(input) or (err) { << false } }
+        $keep_alive_state := keep_alive
+        ctx := Context{fd: fd, req: req, keep_alive: $&keep_alive_state}
         fs := file_server(file_root)
         fs.serve_context(ctx)
+        << keep_alive_state
     } else {
         input := data + ""
-        req := buffered_request(input) or (err) { << }
-        ctx := Context{fd: fd, req: req}
+        $req := new_request()
+        if simple_request { req = buffered_request_without_body(input) or (err) { << false } }
+        else { req = buffered_request(input) or (err) { << false } }
+        $keep_alive_state := keep_alive
+        ctx := Context{fd: fd, req: req, keep_alive: $&keep_alive_state}
         handle(ctx)
+        << keep_alive_state
     }
 }
 
 fn dispatch_request(fd int, data string, handle fn(Context), done chan int, file_root string) {
-    invoke_request(fd, data, handle, file_root)
+    invoke_request(fd, data, false, false, handle, file_root)
     close_http_fd(fd)
     done <- 1
 }
@@ -182,17 +346,21 @@ fn event_wake_ignore(wake poller.EventWake) {
     wake.notify() or (err) { << }
 }
 
-fn dispatch_request_event_set(fd int, data string, handle fn(Context), done chan int, finished chan int, file_root string, wake poller.EventWake) {
-    invoke_request(fd, data, handle, file_root)
-    close_http_fd(fd)
-    done <- 1
+fn dispatch_request_event_set(slot int, fd int, data string, keep_alive bool, simple_request bool, handle fn(Context), done chan int, finished chan int, file_root string, wake poller.EventWake) {
+    still_persistent := invoke_request(fd, data, keep_alive, simple_request, handle, file_root)
+    if still_persistent {
+        done <- (slot + 1)
+    } else {
+        close_http_fd(fd)
+        done <- (0 - slot - 1)
+    }
     event_wake_ignore(wake)
     finished <- 1
 }
 
 // All server helpers share the same incremental intake. Idle and partial
 // requests stay here and never consume a worker waiting for socket input.
-// Complete requests run concurrently; handlers must synchronize shared state.
+// Complete requests run in a bounded worker set; handlers must synchronize shared state.
 // Retains the legacy integer status contract (1 on invalid configuration).
 pub fn serve_listener(lfd int, handle fn(Context)) int {
     options := server_options()
@@ -318,6 +486,87 @@ fn event_set_remove(events $&poller.EventSet, fd int) bool {
     << true
 }
 
+fn queue_complete_event_set(slot int, peers $&[]PendingRequest, timers $&PendingTimers, ready_slots $&ReadySlots) bool {
+    if slot < 0 || slot >= peers.len || peers[slot].fd < 0 || peers[slot].processing { << false }
+    message_len := peers[slot].message_len
+    if message_len <= 0 || message_len > peers[slot].data.len { << false }
+    timers.remove(peers, slot)
+    peers[slot].processing = true
+    peers[slot].queued = true
+    if !ready_slots.push(slot) {
+        peers[slot].processing = false
+        peers[slot].queued = false
+        << false
+    }
+    << true
+}
+
+fn dispatch_queued_event_set(slot int, peers $&[]PendingRequest, buffered $&int, pending_wakes $&int, active_handlers $&int, handle fn(Context), done chan int, finished chan int, options &ServerOptions, file_root string, wake poller.EventWake) bool {
+    if slot < 0 || slot >= peers.len || peers[slot].fd < 0 || !peers[slot].processing || !peers[slot].queued { << true }
+    fd := peers[slot].fd
+    message_len := peers[slot].message_len
+    if message_len <= 0 || message_len > peers[slot].data.len { << false }
+    input := peers[slot].data[0:message_len] + ""
+    remainder := peers[slot].data[message_len:peers[slot].data.len] + ""
+    keep_alive := peers[slot].keep_alive
+    simple_request := peers[slot].length == 0 && !peers[slot].chunked
+    peers[slot].data = remainder
+    peers[slot].queued = false
+    *buffered = *buffered - message_len
+    root_copy := file_root + ""
+    if !dispatch_pending_event_set(slot, fd, input, keep_alive, simple_request, handle, done, finished, options.write_timeout_ns, root_copy, wake) {
+        peers[slot].processing = false
+        << false
+    }
+    *pending_wakes = *pending_wakes + 1
+    *active_handlers = *active_handlers + 1
+    << true
+}
+
+fn drain_ready_event_set(peers $&[]PendingRequest, buffered $&int, pending_wakes $&int, active_handlers $&int, active $&int, ready_slots $&ReadySlots, free_slots $&FreeSlots, timers $&PendingTimers, events $&poller.EventSet, handle fn(Context), done chan int, finished chan int, options &ServerOptions, file_root string, wake poller.EventWake) {
+    while *active_handlers < MAX_HTTP_ACTIVE_HANDLERS && ready_slots.len > 0 {
+        slot := ready_slots.take()
+        if slot < 0 || slot >= peers.len { -> }
+        if peers[slot].fd < 0 || !peers[slot].processing || !peers[slot].queued { -> }
+        fd := peers[slot].fd
+        if !dispatch_queued_event_set(slot, peers, buffered, pending_wakes, active_handlers, handle, done, finished, options, file_root, wake) {
+            timers.remove(peers, slot)
+            *buffered = *buffered - peers[slot].data.len
+            peers[slot] = pending_request(-1, 0, -1)
+            free_slots.release(slot)
+            *active = *active - 1
+            close_http_fd(fd)
+        }
+    }
+}
+
+fn rearm_event_set_peer(slot int, peers $&[]PendingRequest, generation $&[]int, buffered $&int, timers $&PendingTimers, ready_slots $&ReadySlots, events $&poller.EventSet, options &ServerOptions) bool {
+    fd := peers[slot].fd
+    deadline := http_deadline(options.read_timeout_ns) or (err) { << false }
+    peers[slot].deadline = deadline
+    peers[slot].header_end = -1
+    peers[slot].header_scan = 0
+    peers[slot].length = 0
+    peers[slot].chunked = false
+    peers[slot].chunk_pos = 0
+    peers[slot].body_bytes = 0
+    peers[slot].message_len = 0
+    peers[slot].keep_alive = false
+    peers[slot].processing = false
+    peers[slot].queued = false
+    generation[slot] += 1
+    token := generation[slot] * EVENT_SLOT_SPAN + slot
+    peers[slot].token = token
+    state := pending_complete(peers, slot, options)
+    if state < 0 { << false }
+    if state > 0 {
+        << queue_complete_event_set(slot, peers, timers, ready_slots)
+    }
+    events.watch(fd, token, poller.EVENT_READ) or (err) { << false }
+    timers.add(peers, slot)
+    << true
+}
+
 fn pending_timer_less(peers &[]PendingRequest, left int, right int) bool {
     if peers[left].deadline != peers[right].deadline {
         << peers[left].deadline < peers[right].deadline
@@ -405,6 +654,46 @@ fn next_event_wait(peers &[]PendingRequest, timers &PendingTimers, now int) int 
     << remaining
 }
 
+fn accept_ready_event_set(lfd int, peers $&[]PendingRequest, generation $&[]int, timers $&PendingTimers, free_slots $&FreeSlots, events $&poller.EventSet, active $&int, listening_watch $&bool, options &ServerOptions) bool {
+    for admission in 0:MAX_ACCEPT_BATCH {
+        if *active >= options.max_connections {
+            if *listening_watch {
+                _ := event_set_remove(events, lfd)
+                *listening_watch = false
+            }
+            <-
+        }
+        ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) { << false }
+        if ready == 0 { <- }
+        fd := net.accept(lfd) or (err) { << false }
+        deadline := http_deadline(options.read_timeout_ns) or (err) {
+            close_http_fd(fd)
+            ->
+        }
+        slot := free_slots.take()
+        if slot < 0 {
+            close_http_fd(fd)
+            ->
+        }
+        generation[slot] += 1
+        peer_token := generation[slot] * EVENT_SLOT_SPAN + slot
+        events.watch(fd, peer_token, poller.EVENT_READ) or (err) {
+            free_slots.release(slot)
+            close_http_fd(fd)
+            ->
+        }
+        peers[slot] = pending_request(fd, deadline, peer_token)
+        timers.add(peers, slot)
+        *active = *active + 1
+        if *active >= options.max_connections {
+            _ := event_set_remove(events, lfd)
+            *listening_watch = false
+            <-
+        }
+    }
+    << true
+}
+
 // Linux and Darwin keep one persistent kernel readiness set for the listener
 // and pending sockets. Worker completion wakes that same blocking wait, so
 // readiness does not require a fixed-interval scan.
@@ -423,31 +712,58 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
     $generation := []int{}
     $timer_positions := []int{}
     $free_values := []int{}
+    $ready_values := []int{}
     for i in 0:options.max_connections {
         peers.push(pending_request(-1, 0, -1))
         generation.push(0)
         timer_positions.push(-1)
         free_values.push(options.max_connections - i - 1)
+        ready_values.push(0)
     }
     $free_slots := FreeSlots{values: free_values, len: options.max_connections}
+    $ready_slots := ReadySlots{values: ready_values, head: 0, tail: 0, len: 0}
     $timers := PendingTimers{heap: []int{}, positions: timer_positions, len: 0}
     done := chan int{cap: options.max_connections}
     finished := chan int{cap: options.max_connections}
     $active := 0
+    $active_handlers := 0
     $pending_wakes := 0
     $buffered := 0
     $running := true
     while running {
         while sys_wait_cancel(done, 0) {
-            _ := <-done
-            active -= 1
+            result := <-done
+            active_handlers -= 1
+            $slot := result - 1
+            if result < 0 { slot = 0 - result - 1 }
+            if slot < 0 || slot >= peers.len { -> }
+            if peers[slot].fd < 0 || !peers[slot].processing { -> }
+            fd := peers[slot].fd
+            if result < 0 {
+                buffered -= peers[slot].data.len
+                peers[slot] = pending_request(-1, 0, -1)
+                free_slots.release(slot)
+                active -= 1
+                ->
+            }
+            if !rearm_event_set_peer(slot, $&peers, $&generation, $&buffered, $&timers, $&ready_slots, $&events, &options) {
+                _ := event_set_remove($&events, fd)
+                timers.remove(&peers, slot)
+                buffered -= peers[slot].data.len
+                peers[slot] = pending_request(-1, 0, -1)
+                free_slots.release(slot)
+                active -= 1
+                close_http_fd(fd)
+            }
         }
         while sys_wait_cancel(finished, 0) {
             _ := <-finished
             pending_wakes -= 1
         }
+        drain_ready_event_set($&peers, $&buffered, $&pending_wakes, $&active_handlers, $&active, $&ready_slots, $&free_slots, $&timers, $&events, handle, done, finished, &options, file_root, wake)
         if !listening_watch && active < options.max_connections {
-            events.watch(lfd, 0, poller.EVENT_READ) or (err) { running = false
+            events.watch(lfd, 0, poller.EVENT_READ) or (err) {
+                running = false
                 <-
             }
             if !running { -> }
@@ -463,6 +779,19 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
             running = false
             ->
         }
+        // Give a ready listener priority over socket reads. Under a burst,
+        // peer events can fill the event batch before the listener token is
+        // returned; accepting first keeps the kernel listen queue draining.
+        if running && listening_watch && active < options.max_connections {
+            ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) {
+                running = false
+                <-
+            }
+            if ready > 0 && !accept_ready_event_set(lfd, $&peers, $&generation, $&timers, $&free_slots, $&events, $&active, $&listening_watch, &options) {
+                running = false
+            }
+        }
+        if !running { -> }
         if batch.len == 0 {
             _ := os.socket_poll(lfd, poller.EVENT_READ) or (err) {
                 running = false
@@ -472,82 +801,32 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
         for ei in 0:batch.len {
             token := batch[ei].id
             if token == 0 {
-                for admission in 0:MAX_ACCEPT_BATCH {
-                    // Apply backpressure at the configured cap. Keep already
-                    // accepted peers until their request completes or reaches
-                    // its read deadline; shedding here races their unread data.
-                    if active >= options.max_connections {
-                        if listening_watch {
-                            _ := event_set_remove($&events, lfd)
-                            listening_watch = false
-                        }
-                        <-
-                    }
-                    ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) { running = false
-                        <-
-                    }
-                    if ready == 0 { <- }
-                    fd := net.accept(lfd) or (err) { running = false
-                        <- }
-                    deadline := http_deadline(options.read_timeout_ns) or (err) {
-                        close_http_fd(fd)
-                        ->
-                    }
-                    slot := free_slots.take()
-                    if slot < 0 {
-                        close_http_fd(fd)
-                        ->
-                    }
-                    generation[slot] += 1
-                    peer_token := generation[slot] * EVENT_SLOT_SPAN + slot
-                    events.watch(fd, peer_token, poller.EVENT_READ) or (err) {
-                        free_slots.release(slot)
-                        close_http_fd(fd)
-                        ->
-                    }
-                    peers[slot] = pending_request(fd, deadline, peer_token)
-                    timers.add(&peers, slot)
-                    active += 1
-                    if active >= options.max_connections {
-                        _ := event_set_remove($&events, lfd)
-                        listening_watch = false
-                        <-
-                    }
+                if !accept_ready_event_set(lfd, $&peers, $&generation, $&timers, $&free_slots, $&events, $&active, $&listening_watch, &options) {
+                    running = false
                 }
                 ->
             }
             slot := token % EVENT_SLOT_SPAN
             if slot < 0 || slot >= peers.len { -> }
-            if peers[slot].fd < 0 || peers[slot].token != token { -> }
+            if peers[slot].fd < 0 || peers[slot].processing || peers[slot].token != token { -> }
             fd := peers[slot].fd
             $discard := now_ns() >= peers[slot].deadline
             event_mask := batch[ei].events
             if !discard && (event_mask & (poller.EVENT_READ | poller.EVENT_ERROR | poller.EVENT_HANGUP)) != 0 {
-                if !pending_timeout(fd) { discard = true }
+                part := pending_read(fd)
+                if part.len == 0 { discard = true }
+                if part.len > options.max_buffer_bytes - buffered || part.len > MAX_MESSAGE_BYTES - peers[slot].data.len {
+                    discard = true
+                }
                 if !discard {
-                    part := pending_read(fd)
-                    if part.len == 0 { discard = true }
-                    if part.len > options.max_buffer_bytes - buffered || part.len > MAX_MESSAGE_BYTES - peers[slot].data.len {
-                        discard = true
-                    }
-                    if !discard {
-                        peers[slot].data = peers[slot].data + part
-                        buffered += part.len
-                        state := pending_complete($&peers, slot, &options)
-                        if state < 0 { discard = true }
-                        if state > 0 {
-                            input := peers[slot].data + ""
-                            root_copy := file_root + ""
-                            if !event_set_remove($&events, fd) { discard = true }
-                            if !discard && dispatch_pending_event_set(fd, input, handle, done, finished, options.write_timeout_ns, root_copy, wake) {
-                                timers.remove(&peers, slot)
-                                buffered -= peers[slot].data.len
-                                peers[slot] = pending_request(-1, 0, -1)
-                                free_slots.release(slot)
-                                pending_wakes += 1
-                            } else {
-                                discard = true
-                            }
+                    peers[slot].data = peers[slot].data + part
+                    buffered += part.len
+                    state := pending_complete($&peers, slot, &options)
+                    if state < 0 { discard = true }
+                    if state > 0 {
+                        if !event_set_remove($&events, fd) { discard = true }
+                        if discard || !queue_complete_event_set(slot, $&peers, $&timers, $&ready_slots) {
+                            if !discard { discard = true }
                         }
                     }
                 }
@@ -562,6 +841,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
                 close_http_fd(fd)
             }
         }
+        drain_ready_event_set($&peers, $&buffered, $&pending_wakes, $&active_handlers, $&active, $&ready_slots, $&free_slots, $&timers, $&events, handle, done, finished, &options, file_root, wake)
         // Expire heap roots only; socket readiness and timer selection avoid
         // a per-connection probe on every event-loop iteration.
         now := now_ns()
@@ -579,17 +859,27 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
         }
     }
     for i in 0:peers.len {
-        if peers[i].fd < 0 { -> }
+        if peers[i].fd < 0 || (peers[i].processing && !peers[i].queued) { -> }
         fd := peers[i].fd
         _ := event_set_remove($&events, fd)
         close_http_fd(fd)
         peers[i] = pending_request(-1, 0, -1)
         active -= 1
     }
+    ready_slots.len = 0
     // Keep the set alive until every task has published its wake, preventing
     // a late worker from writing to a descriptor number that the OS reused.
-    while active > 0 {
-        _ := <-done
+    while active_handlers > 0 {
+        result := <-done
+        active_handlers -= 1
+        $slot := result - 1
+        if result < 0 { slot = 0 - result - 1 }
+        if slot >= 0 && slot < peers.len && peers[slot].fd >= 0 && peers[slot].processing {
+            fd := peers[slot].fd
+            if result > 0 { close_http_fd(fd) }
+            buffered -= peers[slot].data.len
+            peers[slot] = pending_request(-1, 0, -1)
+        }
         active -= 1
     }
     while pending_wakes > 0 {
