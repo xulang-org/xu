@@ -79,7 +79,7 @@ echo "run_fixtures: lane=product compiler=$BIN" >&2
 
 compile_source() {
     # The matrix supplies a space-separated list of optimization flags.
-    local extra=(${XU_FIXTURE_EXTRA_ARGS-})
+    local extra=(--no-desktop ${XU_FIXTURE_EXTRA_ARGS-})
     if [ -n "$TARGET" ]; then extra+=(--target "$TARGET"); fi
     XU_PRODUCT_XUPATH="${XUPATH-}" \
         "$PRODUCT_COMPILER_RUNNER" "$BIN" "$SUB" ${extra[@]+"${extra[@]}"} "$@"
