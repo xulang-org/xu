@@ -169,6 +169,15 @@ fn main() int {
     program = project / ("user program.exe" if os.name == "nt" else "user program")
     run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=active)
     assert run([str(program)], cwd=project, env=active).splitlines() == ["INSTALLED", "42"]
+    # Values of CLI options must not become dependency policy flags. This
+    # project has a real dependency but deliberately no existing lock entry.
+    policy_project = work / "output named like a policy flag"
+    policy_project.mkdir()
+    (policy_project / "main.xu").write_text('@main\n#sdk_probe\nfn main() int { println(sdk_probe.answer())\n    << 0 }\n')
+    (policy_project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  sdk_probe: file:../custom package search root\n')
+    run([xu, "build", "main.xu", "-o", "--frozen"], cwd=policy_project, env=active)
+    policy_program = policy_project / ("--frozen.exe" if os.name == "nt" else "--frozen")
+    assert run([str(policy_program)], cwd=policy_project, env=active).strip() == "42"
     # Executable-relative stdlib discovery must work without activation.
     clean = active.copy()
     clean.pop("XU_STDLIB_ROOT", None)
