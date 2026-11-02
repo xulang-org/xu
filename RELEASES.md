@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.1 (development)
+
+The SSA simplifier linearizes bounded, same-block word-integer addition/subtraction and AND/OR/XOR trees before common-subexpression elimination. It combines separated constants and masks, cancels opposite arithmetic terms and duplicate XOR terms, and removes repeated AND/OR operands. Shared intermediate values remain intact; floating-point, narrow integers, address-exposed storage and Phi edges retain their existing semantics. No API or ABI changes. This is a development build.
+
 ## Xu 0.11.2
 
 - **Event-driven HTTP server**: Linux epoll/eventfd and macOS kqueue manage persistent connections with bounded accept and handler scheduling. The EventSet backend has a configurable 110,000-connection ceiling; actual capacity depends on OS limits and resources. Optional `sync_handlers` runs short, nonblocking handlers on the event-loop thread; other platforms retain the legacy backend.
