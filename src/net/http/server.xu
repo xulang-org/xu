@@ -22,6 +22,9 @@ pub struct ServerOptions {
     pub max_header_bytes int
     pub max_body_bytes int
     pub max_buffer_bytes int
+    // Runs handlers directly on the event-loop owner instead of `xu`. Defaults
+    // to false; enable only when handlers do not block or wait for I/O.
+    pub sync_handlers bool
 }
 
 // Defaults: 10-second I/O budgets, 110,000 connections with the event-set
@@ -32,7 +35,7 @@ pub fn server_options() ServerOptions {
     if !poller.event_set_supported() { max_connections = 256 }
     << ServerOptions{read_timeout_ns: 10000000000, write_timeout_ns: 10000000000,
         max_connections: max_connections, max_header_bytes: 65536, max_body_bytes: 10485760,
-        max_buffer_bytes: 33554432}
+        max_buffer_bytes: 33554432, sync_handlers: false}
 }
 
 struct PendingRequest {
@@ -266,6 +269,11 @@ fn pending_timeout(fd int) bool {
     << true
 }
 
+fn http_set_write_timeout(fd int, timeout_ns int) bool {
+    os.set_sock_timeout(fd, timeout_ns) or (err) { << false }
+    << true
+}
+
 fn pending_complete(peers $&[]PendingRequest, index int, options &ServerOptions) int {
     ready := pending_request_complete(peers, index, options) or (err) { << -1 }
     if ready { << 1 }
@@ -383,6 +391,9 @@ fn serve_file_listener(lfd int, root string) int {
 }
 
 fn validate_server_options(options &ServerOptions) int {
+    if options.sync_handlers && !poller.event_set_supported() {
+        >> errors.new("net/http: synchronous handlers require event-set backend")
+    }
     if options.read_timeout_ns <= 0 || options.write_timeout_ns <= 0 || options.max_connections <= 0 || options.max_connections > MAX_HTTP_CONNECTIONS || options.max_header_bytes <= 0 || options.max_header_bytes > MAX_MESSAGE_BYTES || options.max_body_bytes < 0 || options.max_body_bytes > MAX_MESSAGE_BYTES || options.max_buffer_bytes <= 0 {
         >> errors.new("net/http: invalid server options")
     }
@@ -523,13 +534,15 @@ fn dispatch_queued_event_set(slot int, peers $&[]PendingRequest, buffered $&int,
     << true
 }
 
-fn drain_ready_event_set(peers $&[]PendingRequest, buffered $&int, pending_wakes $&int, active_handlers $&int, active $&int, ready_slots $&ReadySlots, free_slots $&FreeSlots, timers $&PendingTimers, events $&poller.EventSet, handle fn(Context), done chan int, finished chan int, options &ServerOptions, file_root string, wake poller.EventWake) {
-    while *active_handlers < MAX_HTTP_ACTIVE_HANDLERS && ready_slots.len > 0 {
+fn drain_ready_event_set(peers $&[]PendingRequest, generation $&[]int, buffered $&int, pending_wakes $&int, active_handlers $&int, active $&int, ready_slots $&ReadySlots, free_slots $&FreeSlots, timers $&PendingTimers, events $&poller.EventSet, handle fn(Context), done chan int, finished chan int, options &ServerOptions, file_root string, wake poller.EventWake) {
+    while ready_slots.len > 0 && (options.sync_handlers || *active_handlers < MAX_HTTP_ACTIVE_HANDLERS) {
         slot := ready_slots.take()
         if slot < 0 || slot >= peers.len { -> }
         if peers[slot].fd < 0 || !peers[slot].processing || !peers[slot].queued { -> }
         fd := peers[slot].fd
-        if !dispatch_queued_event_set(slot, peers, buffered, pending_wakes, active_handlers, handle, done, finished, options, file_root, wake) {
+        if options.sync_handlers {
+            handle_queued_event_set_sync(slot, peers, generation, buffered, active, ready_slots, free_slots, timers, events, handle, options, file_root)
+        } else if !dispatch_queued_event_set(slot, peers, buffered, pending_wakes, active_handlers, handle, done, finished, options, file_root, wake) {
             timers.remove(peers, slot)
             *buffered = *buffered - peers[slot].data.len
             peers[slot] = pending_request(-1, 0, -1)
@@ -565,6 +578,31 @@ fn rearm_event_set_peer(slot int, peers $&[]PendingRequest, generation $&[]int, 
     events.watch(fd, token, poller.EVENT_READ) or (err) { << false }
     timers.add(peers, slot)
     << true
+}
+
+fn handle_queued_event_set_sync(slot int, peers $&[]PendingRequest, generation $&[]int, buffered $&int, active $&int, ready_slots $&ReadySlots, free_slots $&FreeSlots, timers $&PendingTimers, events $&poller.EventSet, handle fn(Context), options &ServerOptions, file_root string) {
+    fd := peers[slot].fd
+    message_len := peers[slot].message_len
+    input := peers[slot].data[0:message_len] + ""
+    remainder := peers[slot].data[message_len:peers[slot].data.len] + ""
+    keep_alive := peers[slot].keep_alive
+    simple_request := peers[slot].length == 0 && !peers[slot].chunked
+    peers[slot].data = remainder
+    peers[slot].queued = false
+    *buffered = *buffered - message_len
+    root_copy := file_root + ""
+    $still_persistent := false
+    if http_set_write_timeout(fd, options.write_timeout_ns) {
+        still_persistent = invoke_request(fd, input, keep_alive, simple_request, handle, root_copy)
+    }
+    if still_persistent && rearm_event_set_peer(slot, peers, generation, buffered, timers, ready_slots, events, options) { << }
+    _ := event_set_remove(events, fd)
+    timers.remove(peers, slot)
+    *buffered = *buffered - peers[slot].data.len
+    peers[slot] = pending_request(-1, 0, -1)
+    free_slots.release(slot)
+    *active = *active - 1
+    close_http_fd(fd)
 }
 
 fn pending_timer_less(peers &[]PendingRequest, left int, right int) bool {
@@ -760,7 +798,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
             _ := <-finished
             pending_wakes -= 1
         }
-        drain_ready_event_set($&peers, $&buffered, $&pending_wakes, $&active_handlers, $&active, $&ready_slots, $&free_slots, $&timers, $&events, handle, done, finished, &options, file_root, wake)
+        drain_ready_event_set($&peers, $&generation, $&buffered, $&pending_wakes, $&active_handlers, $&active, $&ready_slots, $&free_slots, $&timers, $&events, handle, done, finished, &options, file_root, wake)
         if !listening_watch && active < options.max_connections {
             events.watch(lfd, 0, poller.EVENT_READ) or (err) {
                 running = false
@@ -841,7 +879,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
                 close_http_fd(fd)
             }
         }
-        drain_ready_event_set($&peers, $&buffered, $&pending_wakes, $&active_handlers, $&active, $&ready_slots, $&free_slots, $&timers, $&events, handle, done, finished, &options, file_root, wake)
+        drain_ready_event_set($&peers, $&generation, $&buffered, $&pending_wakes, $&active_handlers, $&active, $&ready_slots, $&free_slots, $&timers, $&events, handle, done, finished, &options, file_root, wake)
         // Expire heap roots only; socket readiness and timer selection avoid
         // a per-connection probe on every event-loop iteration.
         now := now_ns()
