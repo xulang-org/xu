@@ -11,11 +11,11 @@ extern const unsigned char xu_pack_icon_ico[];
 extern const unsigned int xu_pack_icon_ico_len;
 
 int xu_pack_has_www(void) {
-  return xu_pack_www_files_count > 0 && xu_pack_www_files != 0 &&
+  return xu_pack_www_files_count > 0 &&
          xu_pack_www_files[0].path != 0;
 }
 
-int xu_pack_has_icon(void) { return xu_pack_icon_png_len > 0 && xu_pack_icon_png != 0; }
+int xu_pack_has_icon(void) { return xu_pack_icon_png_len > 0; }
 
 int xu_pack_icon(const unsigned char **data, unsigned *len) {
   if (!xu_pack_has_icon()) return 0;
@@ -25,7 +25,7 @@ int xu_pack_icon(const unsigned char **data, unsigned *len) {
 }
 
 int xu_pack_get_icon_ico(const unsigned char **data, unsigned *len) {
-  if (!(xu_pack_icon_ico_len > 0 && xu_pack_icon_ico != 0)) return 0;
+  if (xu_pack_icon_ico_len == 0) return 0;
   if (data) *data = xu_pack_icon_ico;
   if (len) *len = xu_pack_icon_ico_len;
   return 1;

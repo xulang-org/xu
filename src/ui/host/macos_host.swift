@@ -15,6 +15,7 @@ import AppKit
 import UserNotifications
 import QuartzCore
 import Darwin
+import UniformTypeIdentifiers
 
 private func xuFileDecode(_ hex: Substring) -> String? {
   let digits = Array(hex.utf8)
@@ -1612,7 +1613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     if !options.directory.isEmpty { panel.directoryURL = URL(fileURLWithPath: options.directory,isDirectory: true) }
     if !options.name.isEmpty { panel.nameFieldStringValue = options.name }
     if !options.extensions.isEmpty && !options.extensions.contains("*") {
-      panel.allowedFileTypes = options.extensions
+      panel.allowedContentTypes = options.extensions.compactMap { UTType(filenameExtension: $0) }
       panel.allowsOtherFileTypes = false
     }
     filePanels[id] = panel
