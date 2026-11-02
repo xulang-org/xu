@@ -470,7 +470,8 @@ fn main() int { << verify() or (err) { eprintln(err.msg())
             example = prefix / "examples" / relative
             if not example.is_file():
                 raise RuntimeError(f"SDK example is missing: {relative}")
-            run([xu, "check", str(example)], cwd=project, env=active)
+            check_target = str(example.parent if (example.parent / "xu.xun").is_file() else example)
+            run([xu, "check", check_target], cwd=project, env=active)
             print(f"installed-sdk: example-check PASS {relative}")
     print(f"installed-sdk: PASS target={manifest['target']} lane={manifest['lane']} version={manifest['version']}")
 
