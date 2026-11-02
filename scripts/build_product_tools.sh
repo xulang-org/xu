@@ -57,8 +57,13 @@ build_one() {
     # After gen1/gen2/gen3 the compiler hop can sit near 6GiB RSS. The next
     # `xu build` is a new process; macOS may still SIGKILL it (137). Retry once.
     if ! "$PRODUCT_RUN" "$XU" build "$src" -o "$tools_staged/$name"; then
-        echo "build_product_tools: retry $name" >&2
-        "$PRODUCT_RUN" "$XU" build "$src" -o "$tools_staged/$name"
+        if [ "$name" = xu-setup ] || [ "$name" = xu-setup.exe ]; then
+            echo "build_product_tools: desktop setup failed; falling back to console setup (--no-desktop)" >&2
+            "$PRODUCT_RUN" "$XU" build "$src" --no-desktop -o "$tools_staged/$name"
+        else
+            echo "build_product_tools: retry $name" >&2
+            "$PRODUCT_RUN" "$XU" build "$src" -o "$tools_staged/$name"
+        fi
     fi
     install_one "$tools_staged/$name" "$OUT/$name"
 }
