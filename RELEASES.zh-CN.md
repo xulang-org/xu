@@ -8,6 +8,9 @@
 
 ## Xu 0.11.2
 
+- **事件驱动 HTTP 服务**：Linux 使用 epoll/eventfd，macOS 使用 kqueue，连接保持、accept 和 handler 调度均受边界约束。EventSet 后端可配置最高 110,000 个连接，实际容量仍取决于系统限制与资源。可选 `sync_handlers` 在事件线程执行短且不阻塞的 handler；其他平台保留 legacy 后端。
+- **显式桌面构建**：`xu build` 不再因 UI 导入或 `www/` 目录自动启用桌面打包或 WebView。Draw 应用使用 `xu build App/ --desktop`；WebView 应用再显式加上 `--webview`。
+
 - 将宿主凭据存储与 socket 就绪调用分派到专用代码生成路径，未知 MIR 调用明确报错。Darwin socket 就绪按正确的寄存器操作数、字段宽度和标志构造、解析 kevent。
 - SQL 池在容量变化或数据库关闭时唤醒等待者，覆盖连接丢弃、过期和连接上限提高的情况；归还空闲连接与状态更新在同一锁内完成。
 - HTTP 请求体限制正确处理零与其他十进制边界。内存 Pipe 将关闭状态通知双方，中断阻塞操作，并允许读取对端关闭前已缓冲的数据，再返回 EOF。

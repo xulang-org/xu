@@ -8,6 +8,9 @@
 
 ## Xu 0.11.2
 
+- **Event-driven HTTP server**: Linux epoll/eventfd and macOS kqueue manage persistent connections with bounded accept and handler scheduling. The EventSet backend has a configurable 110,000-connection ceiling; actual capacity depends on OS limits and resources. Optional `sync_handlers` runs short, nonblocking handlers on the event-loop thread; other platforms retain the legacy backend.
+- **Explicit desktop builds**: UI imports and a `www/` directory no longer enable desktop packaging or WebView during `xu build`. Use `xu build App/ --desktop` for the Draw host, and add `--webview` explicitly for WebView applications.
+
 - Route hosted security-store and socket-readiness calls to their dedicated emitters; reject unknown MIR calls explicitly. Darwin socket readiness now builds and decodes kevent fields using the correct register operands, widths and flags.
 - Wake SQL pool waiters when capacity changes or the database closes, including discarded/expired connections and increased connection limits. Publish returned idle connections under the pool state lock.
 - Enforce HTTP request-body limits at zero and other decimal boundaries. In-memory pipes notify both endpoints of closure, interrupt blocked operations and retain already-buffered reads before peer EOF.
