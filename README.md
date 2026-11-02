@@ -205,8 +205,11 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu xacp run ./app -- args...` | Run it with an explicit AI/user argument boundary |
 | `xu xacp record ./app -- > output.log` | Stream bounded stdout for user-owned recording |
 | `xu build <AppDir> --desktop` | Package a desktop application using the required host UI SDK and tools |
+| `xu build <AppDir> --desktop --webview` | Explicitly include the WebView host plugin in a desktop application |
 | `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
 | `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
+
+`xu build` always compiles a plain executable unless `--desktop` is explicitly supplied. Importing `ui` or `ui/webview`, or adding a `www/` directory, does not enable desktop packaging or WebView. Desktop packaging also requires an explicit `--webview` to include the WebView host plugin; otherwise it uses the Draw-only host.
 
 Tests and benchmarks must be declared in `test.<name>.xu` files in `@main`, with no parameters, type parameters, or declared return type. For example, save this as `test.example.xu`:
 

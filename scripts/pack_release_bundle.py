@@ -186,10 +186,6 @@ def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, c
         "-o",
         str(cached_tool),
     ]
-    if tool_name == "xu-setup":
-        # The direct compiler path is the console installer. Only the explicit
-        # native packagers below should require a desktop host toolchain.
-        cmd.append("--no-desktop")
     if tool_name == "xu-setup" and target.startswith("macos-") and sys.platform == "darwin":
         cmd = [sys.executable, str(REPO_ROOT / "scripts/pack_macos_ui_oneexe.py"),
                "--src", str(REPO_ROOT / src_dir / "main.xu"), "--no-webview",

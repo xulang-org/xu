@@ -348,8 +348,8 @@ fn main() int {
                               env=active, text=True, capture_output=True, timeout=90)
     assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
     # Passive help has deterministic hover delay, dismissal and edge placement.
-    # Disable automatic desktop packaging: this probe exercises widget state
-    # without needing a native GUI host, brand icon, or external GUI toolchain.
+    # An ordinary build must remain a plain executable even with UI imports;
+    # no native GUI host, brand icon, or external GUI toolchain is needed.
     tooltip_project = work / "tooltip project"
     tooltip_project.mkdir()
     (tooltip_project / "tooltip_state.xu").write_text('''@main
@@ -433,7 +433,7 @@ fn verify() int {
 fn main() int { << verify() or (err) { eprintln(err.msg())
     << 1 } }
 ''')
-    run([xu, "build", "tooltip_state.xu", "--no-desktop", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
+    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
     tooltip_output = run([str(program)], cwd=project, env=active).strip()
     assert tooltip_output == "tooltip state and placement PASS", tooltip_output
     # Canonical bundled modules resolve from their installed manifest root.
