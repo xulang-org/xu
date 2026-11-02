@@ -104,6 +104,10 @@ struct PoolState {
     pub max_lifetime_closed int
     pub max_lifetime_ns int
     pub max_idle_time_ns int
+    // A generation channel wakes all callers that observed an unavailable
+    // pool. It is replaced under st before releasing that same state token.
+    pub changed chan int
+    pub waiters int
 }
 
 struct PooledConn {
@@ -245,7 +249,18 @@ pub fn named(name string, value temp) NamedArg {
 }
 
 fn default_pool_state() PoolState {
-    << PoolState{closed: 0, max_open: 0, max_idle: 2, num_open: 0, num_in_use: 0, wait_count: 0, max_idle_closed: 0, max_idle_time_closed: 0, max_lifetime_closed: 0, max_lifetime_ns: 0, max_idle_time_ns: 0}
+    changed := chan int{cap: 0}
+    << PoolState{closed: 0, max_open: 0, max_idle: 2, num_open: 0, num_in_use: 0, wait_count: 0, max_idle_closed: 0, max_idle_time_closed: 0, max_lifetime_closed: 0, max_lifetime_ns: 0, max_idle_time_ns: 0, changed: changed, waiters: 0}
+}
+
+// Cancellation may leave a conservative waiter count until the next state
+// change. That only causes one unnecessary notification; it cannot lose a wake.
+fn pool_notify(s $&PoolState) {
+    if s.waiters == 0 { << }
+    previous := s.changed
+    s.changed = chan int{cap: 0}
+    s.waiters = 0
+    close(previous)
 }
 
 fn new_db(drv driver.Driver, dsn string, use_connector int, opener chan ConnSlot) DB {
@@ -275,6 +290,7 @@ fn pool_put(idle chan PooledConn, pst chan PoolState, pc PooledConn) {
         if s.num_open > 0 {
             s.num_open = s.num_open - 1
         }
+        pool_notify($&s)
         pst <- s
         _ := pc.dc.close()
         <<
@@ -286,6 +302,7 @@ fn pool_put(idle chan PooledConn, pst chan PoolState, pc PooledConn) {
             if s.num_open > 0 {
                 s.num_open = s.num_open - 1
             }
+            pool_notify($&s)
             pst <- s
             _ := pc.dc.close()
             <<
@@ -295,6 +312,7 @@ fn pool_put(idle chan PooledConn, pst chan PoolState, pc PooledConn) {
         if s.num_open > 0 {
             s.num_open = s.num_open - 1
         }
+        pool_notify($&s)
         pst <- s
         _ := pc.dc.close()
         <<
@@ -305,14 +323,18 @@ fn pool_put(idle chan PooledConn, pst chan PoolState, pc PooledConn) {
         if s.num_open > 0 {
             s.num_open = s.num_open - 1
         }
+        pool_notify($&s)
         pst <- s
         _ := pc.dc.close()
         <<
     }
-    pst <- s
     $x := pc
     x.idle_ns = now
+    // Publication and accounting share the state lock. A close cannot drain
+    // idle between our accounting update and a late enqueue of this conn.
     idle <- x
+    pool_notify($&s)
+    pst <- s
 }
 
 // Go: ErrBadConn conn is closed, not returned to idle.
@@ -324,6 +346,7 @@ fn pool_drop(pst chan PoolState, pc PooledConn) {
     if s.num_open > 0 {
         s.num_open = s.num_open - 1
     }
+    pool_notify($&s)
     pst <- s
     _ := pc.dc.close()
 }
@@ -347,7 +370,9 @@ fn pool_expired(s &PoolState, created_ns int, idle_ns int, now int) int {
 fn pool_get_src(drv driver.Driver, dsn string, use_connector int, opener chan ConnSlot, idle chan PooledConn, pst chan PoolState, ctx &context.Context) PooledConn {
     context.err(ctx) or >>
     $spin := 1
+    $waited := false
     while spin != 0 {
+        context.err(ctx) or >>
         $s := <-pst
         if s.closed != 0 {
             pst <- s
@@ -366,6 +391,7 @@ fn pool_get_src(drv driver.Driver, dsn string, use_connector int, opener chan Co
                     if s.num_open > 0 {
                         s.num_open = s.num_open - 1
                     }
+                    pool_notify($&s)
                     pst <- s
                     _ := got.dc.close()
                     ->
@@ -374,6 +400,7 @@ fn pool_get_src(drv driver.Driver, dsn string, use_connector int, opener chan Co
                     if s.num_open > 0 {
                         s.num_open = s.num_open - 1
                     }
+                    pool_notify($&s)
                     pst <- s
                     _ := got.dc.close()
                     ->
@@ -383,6 +410,7 @@ fn pool_get_src(drv driver.Driver, dsn string, use_connector int, opener chan Co
                     if s.num_open > 0 {
                         s.num_open = s.num_open - 1
                     }
+                    pool_notify($&s)
                     pst <- s
                     _ := got.dc.close()
                     ->
@@ -393,38 +421,18 @@ fn pool_get_src(drv driver.Driver, dsn string, use_connector int, opener chan Co
             }
             else {
                 if s.max_open > 0 && s.num_open >= s.max_open {
-                    s.wait_count = s.wait_count + 1
+                    if !waited { s.wait_count = s.wait_count + 1
+                        waited = true }
+                    changed := s.changed
+                    s.waiters = s.waiters + 1
                     pst <- s
                     select {
-                        got := <-idle {
-                            $s2 := <-pst
-                            if s2.closed != 0 {
-                                pst <- s2
-                                _ := got.dc.close()
-                                >> errors.new("sql: database is closed")
-                            }
-                            if !got.dc.is_valid() {
-                                if s2.num_open > 0 {
-                                    s2.num_open = s2.num_open - 1
-                                }
-                                pst <- s2
-                                _ := got.dc.close()
-                                ->
-                            }
-                            rmsg := got.dc.reset_session(ctx)
-                            if rmsg.len > 0 {
-                                if s2.num_open > 0 {
-                                    s2.num_open = s2.num_open - 1
-                                }
-                                pst <- s2
-                                _ := got.dc.close()
-                                ->
-                            }
-                            s2.num_in_use = s2.num_in_use + 1
-                            pst <- s2
-                            << got
+                        _ := <-changed {
+                            // Recheck close, idle validation, expiry and the
+                            // capacity to dial; the signal reserves no conn.
                         }
                         _ := <-ctx.done {
+                            context.err(ctx) or >>
                             >> errors.new("context canceled")
                         }
                     }
@@ -468,6 +476,7 @@ fn pool_trim_idle(idle chan PooledConn, pst chan PoolState) {
                     s2.num_open = s2.num_open - 1
                 }
                 s2.max_idle_closed = s2.max_idle_closed + 1
+                pool_notify($&s2)
                 pst <- s2
                 _ := pc.dc.close()
             }
@@ -1118,6 +1127,7 @@ pub fn (db &DB) set_max_open_conns(n int) {
     if v > 0 && s.max_idle > v {
         s.max_idle = v
     }
+    pool_notify($&s)
     db.st <- s
     pool_trim_idle(db.idle, db.st)
 }
@@ -1177,6 +1187,7 @@ pub fn (db $&DB) close() int {
         << 0
     }
     s.closed = 1
+    pool_notify($&s)
     db.st <- s
     $last := ""
     $spin := 1

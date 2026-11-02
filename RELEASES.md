@@ -8,6 +8,10 @@
 
 ## Xu 0.11.2
 
+- Route hosted security-store and socket-readiness calls to their dedicated emitters; reject unknown MIR calls explicitly. Darwin socket readiness now builds and decodes kevent fields using the correct register operands, widths and flags.
+- Wake SQL pool waiters when capacity changes or the database closes, including discarded/expired connections and increased connection limits. Publish returned idle connections under the pool state lock.
+- Enforce HTTP request-body limits at zero and other decimal boundaries. In-memory pipes notify both endpoints of closure, interrupt blocked operations and retain already-buffered reads before peer EOF.
+
 Stable release integrating architectural modularization, self-hosting reproducibility, scale stability governance, and unified target constraints since 0.11.1. Upgrade the compiler, standard library, and product tools together. Platform binaries and checksums are listed with the release assets.
 
 - **Modular UI Architecture**: Chart components are fully decoupled into an independent `@ui/chart` package, featuring 30 chart series types, animation state management, and high-level drawing, decoupling from `@ui/widgets` and sample applications like `component_workshop`.
