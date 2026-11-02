@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import plistlib
 import re
 from pathlib import Path
 import shutil
@@ -170,6 +169,15 @@ fn main() int {
     program = project / ("user program.exe" if os.name == "nt" else "user program")
     run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=active)
     assert run([str(program)], cwd=project, env=active).splitlines() == ["INSTALLED", "42"]
+    # Values of CLI options must not become dependency policy flags. This
+    # project has a real dependency but deliberately no existing lock entry.
+    policy_project = work / "output named like a policy flag"
+    policy_project.mkdir()
+    (policy_project / "main.xu").write_text('@main\n#sdk_probe\nfn main() int { println(sdk_probe.answer())\n    << 0 }\n')
+    (policy_project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  sdk_probe: file:../custom package search root\n')
+    run([xu, "build", "main.xu", "-o", "--frozen"], cwd=policy_project, env=active)
+    policy_program = policy_project / ("--frozen.exe" if os.name == "nt" else "--frozen")
+    assert run([str(policy_program)], cwd=policy_project, env=active).strip() == "42"
     # Executable-relative stdlib discovery must work without activation.
     clean = active.copy()
     clean.pop("XU_STDLIB_ROOT", None)
@@ -348,10 +356,9 @@ fn main() int {
     rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=borrow_project,
                               env=active, text=True, capture_output=True, timeout=90)
     assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
-    # Passive help has deterministic hover delay, dismissal and edge placement;
-    # this exercises the installed widgets without opening a native GUI. Keep
-    # its entry point in a separate project because desktop builds discover all
-    # sibling Xu sources, each of which may define its own @main.
+    # Passive help has deterministic hover delay, dismissal and edge placement.
+    # An ordinary build must remain a plain executable even with UI imports;
+    # no native GUI host, brand icon, or external GUI toolchain is needed.
     tooltip_project = work / "tooltip project"
     tooltip_project.mkdir()
     (tooltip_project / "tooltip_state.xu").write_text('''@main
@@ -435,16 +442,8 @@ fn verify() int {
 fn main() int { << verify() or (err) { eprintln(err.msg())
     << 1 } }
 ''')
-    tooltip_build = run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
-    tooltip_executable = program
-    if sys.platform == "darwin":
-        match = re.search(r"(?m)^xu: desktop pack → (.+)$", tooltip_build)
-        assert match, tooltip_build
-        app_bundle = Path(match.group(1).strip())
-        with (app_bundle / "Contents/Info.plist").open("rb") as metadata:
-            executable_name = plistlib.load(metadata)["CFBundleExecutable"]
-        tooltip_executable = app_bundle / "Contents/MacOS" / executable_name
-    tooltip_output = run([str(tooltip_executable)], cwd=project, env=active).strip()
+    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
+    tooltip_output = run([str(program)], cwd=project, env=active).strip()
     assert tooltip_output == "tooltip state and placement PASS", tooltip_output
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
