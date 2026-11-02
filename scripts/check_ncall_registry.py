@@ -31,12 +31,14 @@ MIR_CALL_IDS = {
     -125: 134,
     -126: 135,
     -127: 136,
+    -128: 137,
     -129: 155,
     -130: 156,
     -131: 138,
     -132: 157,
     -133: 158,
     -134: 159,
+    -135: 166,
 }
 
 # Allow markdown bold: | **-50** | name |
@@ -154,6 +156,26 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+    # A lowering/emitter mapping is incomplete if the top-level dispatcher
+    # never reaches the dedicated emitter. Its system condition is a union
+    # of integer equalities and inclusive ranges; inspect that actual union,
+    # rather than finding an id in an unrelated comment or helper.
+    dispatcher = (ROOT / "src/cmd/compile/emit_instr_call_os_test.xu").read_text()
+    system = re.search(
+        r"if !done && \(([^\n]+)\) \{\n\s*emit_instr_call_sys\(", dispatcher
+    )
+    if system is None:
+        print("FAIL: top-level system call dispatcher is missing", file=sys.stderr)
+        return 1
+    condition = system.group(1)
+    dispatched = {int(n) for n in re.findall(r"\bib\s*==\s*(\d+)", condition)}
+    for lower, upper in re.findall(r"ib\s*>=\s*(\d+)\s*&&\s*ib\s*<=\s*(\d+)", condition):
+        dispatched.update(range(int(lower), int(upper) + 1))
+    # Wall time (136) and wait_cancel (155) have explicit os/select routes.
+    missing_dispatch = sorted(set(MIR_CALL_IDS.values()) - {136, 155} - dispatched)
+    if missing_dispatch:
+        print(f"FAIL: top-level system dispatcher omits MIR call ids: {missing_dispatch}", file=sys.stderr)
+        return 1
     print(
         f"ok: {len(MIR_CALL_IDS)} source ABI mappings; "
         f"{len(check_files)} check file(s) assign {len(assigned)}"
