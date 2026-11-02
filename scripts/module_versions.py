@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -89,7 +90,28 @@ def owner(path: str, manifests: set[str]) -> str | None:
     return None
 
 
-def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> list[str]:
+def confirm_unpublished_release(root: Path, version: Version) -> None:
+    """Allow recovery of a selected stable identity only before publication."""
+    result = subprocess.run(["gh", "api", f"repos/{{owner}}/{{repo}}/releases/tags/v{version}"],
+                            cwd=root, capture_output=True, text=True)
+    if result.returncode:
+        if "HTTP 404" in result.stderr:
+            return
+        raise ValueError("cannot verify unpublished release: " + result.stderr.strip())
+    release = json.loads(result.stdout)
+    if not isinstance(release, dict) or "draft" not in release or "published_at" not in release:
+        raise ValueError("invalid release publication response")
+    if not release.get("draft") and release.get("published_at"):
+        raise ValueError(f"v{version} is already published; a new product version is required")
+
+
+def process(root: Path, base: str, bump: bool = False, kind: str = "patch",
+            unpublished_release: str | None = None) -> list[str]:
+    recovery = Version.parse(unpublished_release) if unpublished_release else None
+    if recovery is not None:
+        product = Version.parse((root / "VERSION").read_text().strip())
+        if recovery != product or recovery.prerelease:
+            raise ValueError("--unpublished-release must select the current stable VERSION")
     # Git's inventory excludes ignored build products. Limit ownership to real
     # project domains; fixtures, historical audits and dist snapshots are data.
     files = set(git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *DOMAINS).split("\0"))
@@ -155,6 +177,8 @@ def process(root: Path, base: str, bump: bool = False, kind: str = "patch") -> l
             elif existing_changed and current <= previous:
                 if manifest == COMPILER_MANIFEST and bool(previous.prerelease) and bool(current.prerelease):
                     pass
+                elif manifest == COMPILER_MANIFEST and current == previous == recovery:
+                    confirm_unpublished_release(root, recovery)
                 elif not same_core_branch:
                     raise ValueError(f"module changed but version did not increase past {format_version(previous)}")
         except ValueError as error:
@@ -264,6 +288,7 @@ def main() -> int:
     mode.add_argument("--promote", choices=("rc", "stable"), help="advance dev to rc.1, or a prerelease to the final version")
     parser.add_argument("--channel", choices=("dev", "rc", "stable"), help="channel for --release-bump (default: stable)")
     parser.add_argument("--allow-unpublished", action="store_true", help="only with --set-release: correct an unpublished numeric version into its prerelease")
+    parser.add_argument("--unpublished-release", metavar="VERSION", help="check an explicitly selected stable compiler recovery; refuse if already published")
     parser.add_argument("--kind", choices=("patch", "minor", "major"), default="patch")
     parser.add_argument("--allow-minor", action="store_true", help="explicitly opt in to incrementing the second version node (minor) with user approval (only with --release-bump)")
     parser.add_argument("--allow-stable", action="store_true", help="explicitly opt in to a decided stable Xu release (only with --release-bump)")
@@ -276,6 +301,8 @@ def main() -> int:
         parser.error("--channel requires --release-bump")
     if args.allow_unpublished and not args.set_release:
         parser.error("--allow-unpublished requires --set-release")
+    if args.unpublished_release and (args.bump or args.sync_release or args.check_release or args.release_bump or args.set_release or args.next_prerelease or args.promote):
+        parser.error("--unpublished-release is only supported by the read-only module check")
     try:
         if args.sync_release or args.check_release or args.release_bump or args.set_release or args.next_prerelease or args.promote:
             errors = release(ROOT, args.release_bump, args.check_release, allow_stable=args.allow_stable,
@@ -284,7 +311,7 @@ def main() -> int:
                              next_prerelease=args.next_prerelease, promote=args.promote,
                              allow_unpublished=args.allow_unpublished)
         else:
-            errors = process(ROOT, args.base, args.bump, args.kind)
+            errors = process(ROOT, args.base, args.bump, args.kind, args.unpublished_release)
     except (subprocess.CalledProcessError, ValueError, OSError) as error:
         print(error, file=sys.stderr)
         return 1
