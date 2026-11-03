@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.8 (development)
+
+Integer GEMM Tile lowering now keeps tiny positive nests with M+N+K below five on ARM64 or four on x64 on the original scalar path, avoiding the micro-kernel's full entry guards and register saves. Known tiny bounds omit the guarded micro-kernel entirely; bounds that already prove the minimum size need no runtime cost check. Bounds, alias checks and scalar trap behavior remain intact. This is a development build.
+
 ## Xu 0.11.3-dev.7 (development)
 
 Integer GEMM Tile recognition now accepts a proven inner backedge copy at the end of a merged self-loop as well as a separate copy latch. It preserves B's element count across descriptor reloads in the alias guard, retains bounds and dependence proofs, and writes the correct final induction value for each representation. Unsafe early copies, side effects and ambiguous entries retain scalar lowering. This is a development build.
