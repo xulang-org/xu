@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.3 (development)
+
+Proved ARM64 integer reductions of `(i & mask) + bias` use a constant-step periodic sum when the mask is `2^k - 1` through 65535. The slot and SSA paths share the same lowering, preserving signed starting indices, wrapping accumulation, zero-trip guards and the final induction value. Other masks keep the existing SIMD path. This is a development build.
+
 ## Xu 0.11.3-dev.2 (development)
 
 ARM64 shift/add and shift/sub fusion now proves that the shift result and any skipped local load have only one use across the whole function. This preserves values shared across basic blocks by CSE instead of leaving later reads uninitialized. It fixes optimized compilation failures in mutable-method and named-function-value reduction loops while keeping their SIMD lowering available. No API or ABI changes. This is a development build.
