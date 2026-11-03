@@ -1,0 +1,438 @@
+@embedded/bluetooth
+
+// Legacy Just Works peripheral SMP, one connection per instance. No SC,
+// OOB, MITM, identity-key distribution, or signed-write support is claimed.
+// AES uses Bluetooth little-endian key/block/result bytes. The caller must
+// supply fresh 16-byte radio-entropy random material for every connection.
+// Only TK is the protocol-defined zero value; STK/LTK are never constants.
+pub const SMP_CID = 0x0006
+pub const SMP_IDLE = 0
+pub const SMP_WAIT_CONFIRM = 1
+pub const SMP_WAIT_RANDOM = 2
+pub const SMP_WAIT_ENCRYPTION = 3
+pub const SMP_ENCRYPTED = 4
+pub const SMP_FAILED = 5
+pub const SMP_ERROR_OOB_UNAVAILABLE = 0x02
+pub const SMP_ERROR_AUTH_REQUIREMENTS = 0x03
+pub const SMP_ERROR_CONFIRM_FAILED = 0x04
+pub const SMP_ERROR_KEY_SIZE = 0x06
+pub const SMP_ERROR_COMMAND_UNSUPPORTED = 0x07
+pub const SMP_ERROR_UNSPECIFIED = 0x08
+pub const SMP_ERROR_REPEATED_ATTEMPTS = 0x09
+pub const SMP_ERROR_INVALID_PARAMETERS = 0x0A
+
+fn smp_byte(bytes &[]int, i int) int {
+    $view := bytes
+    << view[i] & 255
+}
+
+fn smp_copy(source &[]int) []int {
+    $out := []int{}
+    for i in 0:source.len { out.push(smp_byte(source, i)) }
+    << out
+}
+
+fn smp_bytes_valid(bytes &[]int, length int) bool {
+    if bytes.len != length { << false }
+    for i in 0:length { if bytes[i] < 0 || bytes[i] > 255 { << false } }
+    << true
+}
+
+fn smp_equal(a &[]int, b &[]int) bool {
+    if a.len != b.len { << false }
+    $different := 0
+    for i in 0:a.len { different = different | (a[i] ^ b[i]) }
+    << different == 0
+}
+
+fn smp_all_zero(bytes &[]int) bool {
+    $bits := 0
+    for i in 0:bytes.len { bits = bits | bytes[i] }
+    << bits == 0
+}
+
+// Core legacy c1: p1 = pres || preq || rat || iat and
+// p2 = padding || ia || ra, represented least-significant byte first.
+pub fn smp_c1(aes fn(&[]int, &[]int) []int, key &[]int, random &[]int,
+    request &[]int, response &[]int, initiator_type int, responder_type int,
+    initiator &[]int, responder &[]int) []int {
+    if !smp_bytes_valid(key, 16) || !smp_bytes_valid(random, 16) ||
+        !smp_bytes_valid(request, 7) || !smp_bytes_valid(response, 7) ||
+        !smp_bytes_valid(initiator, 6) || !smp_bytes_valid(responder, 6) ||
+        initiator_type < 0 || initiator_type > 1 || responder_type < 0 || responder_type > 1 {
+        << []int{}
+    }
+    $p1 := hci_zeros(16)
+    p1[0] = initiator_type
+    p1[1] = responder_type
+    for i in 0:7 {
+        p1[i + 2] = request[i]
+        p1[i + 9] = response[i]
+    }
+    for i in 0:16 { p1[i] = p1[i] ^ random[i] }
+    encrypted := aes(key, &p1)
+    if !smp_bytes_valid(&encrypted, 16) { << []int{} }
+    $p2 := hci_zeros(16)
+    for i in 0:6 {
+        p2[i] = responder[i]
+        p2[i + 6] = initiator[i]
+    }
+    for i in 0:16 { p2[i] = p2[i] ^ encrypted[i] }
+    out := aes(key, &p2)
+    if !smp_bytes_valid(&out, 16) { << []int{} }
+    << out
+}
+
+// s1(TK, responder random, initiator random). Only their low 64 bits
+// participate, matching ble_sm_alg_s1(rands, randm) in the reference host.
+pub fn smp_s1(aes fn(&[]int, &[]int) []int, key &[]int,
+    responder_random &[]int, initiator_random &[]int) []int {
+    if !smp_bytes_valid(key, 16) || !smp_bytes_valid(responder_random, 16) ||
+        !smp_bytes_valid(initiator_random, 16) { << []int{} }
+    $block := hci_zeros(16)
+    for i in 0:8 {
+        block[i] = initiator_random[i]
+        block[i + 8] = responder_random[i]
+    }
+    out := aes(key, &block)
+    if !smp_bytes_valid(&out, 16) { << []int{} }
+    << out
+}
+
+pub struct SmpServer {
+    pub ready bool
+    pub connection int
+    pub state int
+    pub failure_reason int
+    pub encrypted bool
+    pub paired bool // encrypted legacy session, not a claim of bonding
+    pub authenticated bool // always false for NoInputNoOutput Just Works
+    pub require_authenticated bool // explicit strict policy rejects this JW-only server
+    pub bonding bool
+    pub bond_distributed bool
+    pub timed_out bool
+    pub initiator_type int
+    pub responder_type int
+    initiator []int
+    responder []int
+    local_random []int
+    peer_random []int
+    peer_confirm []int
+    request []int
+    response []int
+    tk []int
+    stk []int
+    bond_ltk []int
+    bond_rand []int
+    bond_ediv int
+    bond_material_ready bool
+    bond_key_valid bool
+    confirmed bool
+    key_reply_kind int
+    distribution_step int
+    started_ms int
+    aes fn(&[]int, &[]int) []int
+}
+
+// Address bytes must be the exact little-endian addresses used on the
+// connection (including random/static address type), not display strings.
+pub fn smp_server_create(connection int, local_type int, local []int,
+    peer_type int, peer []int, local_random []int,
+    aes fn(&[]int, &[]int) []int) SmpServer {
+    ready := connection >= 0 && connection <= 0x0EFF && local_type >= 0 && local_type <= 1 &&
+        peer_type >= 0 && peer_type <= 1 && smp_bytes_valid(&local, 6) &&
+        smp_bytes_valid(&peer, 6) && smp_bytes_valid(&local_random, 16)
+    << SmpServer{
+        ready: ready, connection: connection, state: SMP_IDLE, failure_reason: 0,
+        encrypted: false, paired: false, authenticated: false, require_authenticated: false,
+        bonding: false, bond_distributed: false, timed_out: false,
+        initiator_type: peer_type, responder_type: local_type, initiator: peer, responder: local,
+        local_random: local_random, peer_random: hci_zeros(16), peer_confirm: hci_zeros(16),
+        request: hci_zeros(7), response: hci_zeros(7), tk: hci_zeros(16), stk: hci_zeros(16),
+        bond_ltk: hci_zeros(16), bond_rand: hci_zeros(8), bond_ediv: 0,
+        bond_material_ready: false, bond_key_valid: false, confirmed: false,
+        key_reply_kind: 0, distribution_step: 0, started_ms: -1, aes: aes
+    }
+}
+
+// Optional fresh responder LTK material. No flash writes and no implicit
+// random generation. A key with EDIV/RAND both zero would collide with STK.
+pub fn (s $&SmpServer) provide_bond_material(ltk &[]int, random &[]int, ediv int) bool {
+    if !s.ready || s.state != SMP_IDLE || !smp_bytes_valid(ltk, 16) ||
+        !smp_bytes_valid(random, 8) || ediv < 0 || ediv > 65535 ||
+        (ediv == 0 && smp_all_zero(random)) { << false }
+    for i in 0:16 { s.bond_ltk[i] = ltk[i] }
+    for i in 0:8 { s.bond_rand[i] = random[i] }
+    s.bond_ediv = ediv
+    s.bond_material_ready = true
+    << true
+}
+
+// Restore only a bond matching this exact connection address/type. RPA
+// identity resolution is not implemented. Do not replace the actual c1
+// connection addresses with identity addresses to work around a mismatch.
+pub fn (s $&SmpServer) restore_bond(peer_type int, peer &[]int,
+    ltk &[]int, random &[]int, ediv int) bool {
+    if peer_type != s.initiator_type || !smp_equal(peer, &s.initiator) { << false }
+    if !s.provide_bond_material(ltk, random, ediv) { << false }
+    s.bond_key_valid = true
+    s.bond_distributed = true
+    << true
+}
+
+fn smp_clear_session(s $&SmpServer) {
+    s.encrypted = false
+    s.paired = false
+    s.authenticated = false
+    s.confirmed = false
+    s.key_reply_kind = 0
+    for i in 0:16 {
+        s.stk[i] = 0
+        s.peer_random[i] = 0
+        s.peer_confirm[i] = 0
+    }
+    for i in 0:s.local_random.len { s.local_random[i] = 0 }
+}
+
+fn smp_fail(s $&SmpServer, reason int) []int {
+    smp_clear_session(s)
+    s.state = SMP_FAILED
+    s.failure_reason = reason
+    $out := []int{}
+    out.push(5)
+    out.push(reason)
+    << out
+}
+
+// Host must poll using its monotonic milliseconds and disconnect a timed
+// out procedure. The deadline is renewed on each accepted SMP exchange. No further SMP messages are sent after the 30 s timeout.
+pub fn (s $&SmpServer) poll_timeout(now_ms int) bool {
+    if s.started_ms >= 0 && s.state >= SMP_WAIT_CONFIRM && s.state <= SMP_WAIT_ENCRYPTION &&
+        now_ms >= s.started_ms && now_ms - s.started_ms >= 30000 {
+        smp_clear_session(s)
+        s.state = SMP_FAILED
+        s.failure_reason = SMP_ERROR_UNSPECIFIED
+        s.timed_out = true
+    }
+    << s.timed_out
+}
+
+pub fn (s &SmpServer) security_request() []int {
+    if !s.ready || s.state != SMP_IDLE { << []int{} }
+    $out := []int{}
+    out.push(0x0B)
+    if s.bond_material_ready { out.push(1) } else { out.push(0) }
+    << out
+}
+
+pub fn (s $&SmpServer) handle_smp_pdu(pdu &[]int, now_ms int) []int {
+    if s.poll_timeout(now_ms) || s.state == SMP_FAILED { << []int{} }
+    if !s.ready || pdu.len == 0 || pdu.len > 65 || now_ms < 0 {
+        << smp_fail(s, SMP_ERROR_INVALID_PARAMETERS)
+    }
+    for i in 0:pdu.len {
+        if pdu[i] < 0 || pdu[i] > 255 { << smp_fail(s, SMP_ERROR_INVALID_PARAMETERS) }
+    }
+    code := smp_byte(pdu, 0)
+    if code == 5 {
+        if pdu.len != 2 { << smp_fail(s, SMP_ERROR_INVALID_PARAMETERS) }
+        smp_clear_session(s)
+        s.state = SMP_FAILED
+        s.failure_reason = pdu[1]
+        << []int{}
+    }
+    if code == 1 {
+        if s.state != SMP_IDLE { << smp_fail(s, SMP_ERROR_REPEATED_ATTEMPTS) }
+        if pdu.len != 7 || pdu[1] > 4 || pdu[2] > 1 ||
+            (pdu[3] & 0xC0) != 0 || (pdu[3] & 3) > 1 ||
+            (pdu[5] & 0xF0) != 0 || (pdu[6] & 0xF0) != 0 {
+            << smp_fail(s, SMP_ERROR_INVALID_PARAMETERS)
+        }
+        if pdu[2] != 0 { << smp_fail(s, SMP_ERROR_OOB_UNAVAILABLE) }
+        // AuthReq.MITM is an input to the standard IO-capability selection
+        // table. NoInputNoOutput selects unauthenticated Just Works even if
+        // the peer requests MITM; never advertise or claim authentication.
+        // A caller requiring authenticated pairing must reject this mode.
+        if s.require_authenticated { << smp_fail(s, SMP_ERROR_AUTH_REQUIREMENTS) }
+        if pdu[4] != 16 { << smp_fail(s, SMP_ERROR_KEY_SIZE) }
+        for i in 0:7 { s.request[i] = pdu[i] }
+        s.bonding = s.bond_material_ready && (pdu[3] & 1) != 0 && (pdu[6] & 1) != 0
+        s.response[0] = 2
+        s.response[1] = 3 // NoInputNoOutput
+        s.response[2] = 0
+        s.response[3] = 0 // SC bit clear negotiates legacy even if peer supports SC
+        s.response[4] = 16
+        s.response[5] = 0 // no initiator key distribution requested
+        s.response[6] = 0
+        if s.bonding {
+            s.response[3] = 1
+            s.response[6] = 1 // responder Encryption Information + Master Identification
+        }
+        s.started_ms = now_ms
+        s.state = SMP_WAIT_CONFIRM
+        << smp_copy(&s.response)
+    }
+    if code == 3 {
+        if s.state != SMP_WAIT_CONFIRM || pdu.len != 17 {
+            << smp_fail(s, SMP_ERROR_INVALID_PARAMETERS)
+        }
+        for i in 0:16 { s.peer_confirm[i] = pdu[i + 1] }
+        encrypt := s.aes
+        confirm := smp_c1(encrypt, &s.tk, &s.local_random, &s.request, &s.response,
+            s.initiator_type, s.responder_type, &s.initiator, &s.responder)
+        if confirm.len != 16 { << smp_fail(s, SMP_ERROR_UNSPECIFIED) }
+        $out := []int{}
+        out.push(3)
+        for i in 0:16 { out.push(confirm[i]) }
+        s.started_ms = now_ms
+        s.state = SMP_WAIT_RANDOM
+        << out
+    }
+    if code == 4 {
+        if s.state != SMP_WAIT_RANDOM || pdu.len != 17 {
+            << smp_fail(s, SMP_ERROR_INVALID_PARAMETERS)
+        }
+        for i in 0:16 { s.peer_random[i] = pdu[i + 1] }
+        encrypt := s.aes
+        confirm := smp_c1(encrypt, &s.tk, &s.peer_random, &s.request, &s.response,
+            s.initiator_type, s.responder_type, &s.initiator, &s.responder)
+        if confirm.len != 16 { << smp_fail(s, SMP_ERROR_UNSPECIFIED) }
+        if !smp_equal(&confirm, &s.peer_confirm) { << smp_fail(s, SMP_ERROR_CONFIRM_FAILED) }
+        key := smp_s1(encrypt, &s.tk, &s.local_random, &s.peer_random)
+        if key.len != 16 { << smp_fail(s, SMP_ERROR_UNSPECIFIED) }
+        for i in 0:16 { s.stk[i] = key[i] }
+        s.confirmed = true
+        s.started_ms = now_ms
+        s.state = SMP_WAIT_ENCRYPTION
+        $out := []int{}
+        out.push(4)
+        for i in 0:16 { out.push(s.local_random[i]) }
+        << out
+    }
+    << smp_fail(s, SMP_ERROR_COMMAND_UNSUPPORTED)
+}
+
+fn smp_bad_hci_packet() HciPacket {
+    << HciPacket{valid: false, kind: 0, opcode: 0, handle: 0, len: 0, payload: []int{}}
+}
+
+// Handles LE Long Term Key Request (subevent 05). The positive response
+// is permitted only after confirm validation or for a restored peer bond.
+pub fn (s $&SmpServer) handle_ltk_request(event &HciPacket) HciPacket {
+    if !event.valid || event.kind != HCI_PKT_EVENT || event.opcode != 0x3E ||
+        event.len != 13 || event.payload.len != 13 { << smp_bad_hci_packet() }
+    $payload := &event.payload
+    if smp_byte(payload, 0) != 5 ||
+        (smp_byte(payload, 1) | (smp_byte(payload, 2) << 8)) != s.connection {
+        << smp_bad_hci_packet()
+    }
+    $random := hci_zeros(8)
+    for i in 0:8 { random[i] = smp_byte(payload, i + 3) }
+    ediv := smp_byte(payload, 11) | (smp_byte(payload, 12) << 8)
+    $kind := 0
+    if s.ready && s.state == SMP_WAIT_ENCRYPTION && s.confirmed && ediv == 0 && smp_all_zero(&random) {
+        kind = 1
+    } else if s.ready && s.bond_key_valid &&
+        (s.state == SMP_IDLE || s.state == SMP_ENCRYPTED ||
+        (s.state == SMP_WAIT_ENCRYPTION && s.key_reply_kind == 2)) && ediv == s.bond_ediv && smp_equal(&random, &s.bond_rand) { kind = 2 }
+    $out := []int{}
+    out.push(s.connection & 255)
+    out.push((s.connection >> 8) & 255)
+    if kind == 0 { << hci_packet_command(0x201B, out) }
+    for i in 0:16 {
+        if kind == 1 { out.push(s.stk[i]) }
+        else { out.push(s.bond_ltk[i]) }
+    }
+    s.key_reply_kind = kind
+    s.state = SMP_WAIT_ENCRYPTION
+    << hci_packet_command(0x201A, out)
+}
+
+// Only verified HCI event 08 with matching connection and successful
+// encryption can authorize ATT/HID. Pairing Confirm/Random alone cannot.
+pub fn (s $&SmpServer) handle_encryption_change(event &HciPacket) bool {
+    if !event.valid || event.kind != HCI_PKT_EVENT || event.opcode != 8 ||
+        event.len != 4 || event.payload.len != 4 { << false }
+    $payload := &event.payload
+    if (smp_byte(payload, 1) | (smp_byte(payload, 2) << 8)) != s.connection { << false }
+    if smp_byte(payload, 0) != 0 || smp_byte(payload, 3) != 1 {
+        smp_clear_session(s)
+        s.state = SMP_FAILED
+        s.failure_reason = SMP_ERROR_UNSPECIFIED
+        << false
+    }
+    if s.key_reply_kind != 0 && s.state == SMP_ENCRYPTED && s.encrypted { << true }
+    if s.state != SMP_WAIT_ENCRYPTION || s.key_reply_kind == 0 { << false }
+    s.encrypted = true
+    s.paired = true
+    s.state = SMP_ENCRYPTED
+    if s.key_reply_kind == 1 && s.bonding { s.distribution_step = 1 }
+    << true
+}
+
+// Peek without consuming: repeat this PDU until the host transport accepts
+// it, then call key_distribution_sent. Key distribution is encrypted only.
+pub fn (s &SmpServer) key_distribution_pdu() []int {
+    if !s.encrypted || !s.bonding || s.distribution_step < 1 || s.distribution_step > 2 {
+        << []int{}
+    }
+    $out := []int{}
+    if s.distribution_step == 1 {
+        out.push(6)
+        for i in 0:16 { out.push(s.bond_ltk[i]) }
+    } else {
+        out.push(7)
+        out.push(s.bond_ediv & 255)
+        out.push((s.bond_ediv >> 8) & 255)
+        for i in 0:8 { out.push(s.bond_rand[i]) }
+    }
+    << out
+}
+
+pub fn (s $&SmpServer) key_distribution_sent() bool {
+    if !s.encrypted || !s.bonding || s.distribution_step < 1 || s.distribution_step > 2 { << false }
+    s.distribution_step += 1
+    if s.distribution_step == 3 {
+        s.bond_key_valid = true
+        s.bond_distributed = true
+    }
+    << true
+}
+
+pub fn (s $&SmpServer) process_smp_acl(packet &HciPacket, now_ms int) HciPacket {
+    if !packet.valid || packet.kind != HCI_PKT_ACLDATA || packet.len < 5 ||
+        packet.len != packet.payload.len || (packet.handle & 0x0FFF) != s.connection ||
+        (packet.handle & 0xC000) != 0 || (packet.handle & 0x3000) == 0x1000 ||
+        (packet.handle & 0x3000) == 0x3000 { << smp_bad_hci_packet() }
+    $payload := &packet.payload
+    length := smp_byte(payload, 0) | (smp_byte(payload, 1) << 8)
+    if length + 4 != packet.len || smp_byte(payload, 2) != SMP_CID ||
+        smp_byte(payload, 3) != 0 { << smp_bad_hci_packet() }
+    $pdu := []int{}
+    for i in 0:length { pdu.push(smp_byte(payload, i + 4)) }
+    response := s.handle_smp_pdu(&pdu, now_ms)
+    if response.len == 0 { << smp_bad_hci_packet() }
+    $out := []int{}
+    out.push(response.len & 255)
+    out.push((response.len >> 8) & 255)
+    out.push(SMP_CID)
+    out.push(0)
+    for i in 0:response.len { out.push(response[i]) }
+    << hci_packet_acl(s.connection, out)
+}
+
+// Revoke and erase a disconnected session. A caller that wants RAM-only
+// reconnects must retain the provisioned bond separately before this call;
+// an MCU reset loses that store unless a separate persistent owner exists.
+pub fn (s $&SmpServer) close_connection() {
+    smp_clear_session(s)
+    for i in 0:16 { s.bond_ltk[i] = 0 }
+    for i in 0:8 { s.bond_rand[i] = 0 }
+    s.bond_ediv = 0
+    s.bond_material_ready = false
+    s.bond_key_valid = false
+    s.bond_distributed = false
+    s.distribution_step = 0
+    s.ready = false
+    s.state = SMP_FAILED
+}

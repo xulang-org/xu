@@ -1,0 +1,178 @@
+@embedded/chips/esp32/flash
+
+// Fixed ESP32 4MiB direct-image bond storage, not a general partition API.
+// Native ELF consumer: compile this entire package and every reachable helper
+// as esp32-iram; obtain the windowed entry through bond_worker_entry/symbols.
+// An IROM build deliberately returns0 from the exported entry provider.
+//
+// Operations:0=read64B into3FFD7D00,1=validate target ownership,
+// 2=erase/program staged64B with final4B commit and readback. slot0/1 are
+// 310000/311000. Caller owns and wipes staging/scratch3FFD7D00..7D4F.
+// Run at boot or after actual HCI disconnect, before advertising, with APP
+// CPU stopped. Raw flash encryption is unsupported and rejected. The record
+// contains plaintext bond keys; never log staging. Unknown sectors are kept.
+//
+// Program ordering follows Espressif Apache-2.0 source
+// components/esp_rom/patches/esp_rom_spiflash.c: WREN/status before loadingW0.
+// Cache disable/flush/enable and read/erase still use chip maskROM only.
+
+// Fixed-slot raw flash backend. Compile the entire module into IRAM.
+// Call only at boot, or after HCI Disconnection Complete and before advertising.
+// No active radio connection, APP CPU, encrypted flash, allocation, or logging.
+// D00..D3F staging contains keys; D40 status, D44 readback, D48 copy, D4C lock.
+fn bond_flash_read_word(address int) int {
+    volatile_store(0x3FFD7D44,0)
+    result := rom_call6(0x40062ED8,address,0x3FFD7D44,4,0,0,0)
+    if result != 0 { << -1 }
+    << 0
+}
+fn bond_flash_ready() {
+    // ROM Wait_SPI_Idle does not retry WIP for nonzero SPI1 dummy_plus.
+    // A timeout cannot cancel a program/erase; remain in IRAM until ready.
+    while true {
+        if (volatile_load(0x3FF420F8) & 7) != 0 || (volatile_load(0x3FF430F8) & 7) != 0 { -> }
+        volatile_store(0x3FFD7D40,0xFFFFFFFF)
+        status := rom_call6(0x400621B0,0x3FFD7D40,5,0,0,0,0)
+        if status == 0 && (volatile_load(0x3FFD7D40) & 1) == 0 { <- }
+    }
+}
+fn bond_flash_partitions_safe() bool {
+    $factory := false
+    $terminated := false
+    for entry in 0:96 {
+        address := 0x8000 + entry * 32
+        if bond_flash_read_word(address) != 0 { << false }
+        header := volatile_load(0x3FFD7D44)
+        magic := header & 65535
+        if magic == 0xFFFF || magic == 0xEBEB { terminated = true
+            <- }
+        if magic != 0x50AA { << false }
+        if bond_flash_read_word(address + 4) != 0 { << false }
+        offset := volatile_load(0x3FFD7D44)
+        if bond_flash_read_word(address + 8) != 0 { << false }
+        size := volatile_load(0x3FFD7D44)
+        if offset < 0 || size <= 0 || offset > 0x400000 || size > 0x400000 - offset { << false }
+        end := offset + size
+        if offset < 0x312000 && end > 0x310000 { << false }
+        if ((header >> 16) & 255) == 0 && offset == 0x10000 && size == 0x300000 { factory = true }
+    }
+    << factory && terminated
+}
+fn bond_flash_slot_owned(address int) bool {
+    $blank := true
+    $ours := false
+    for word in 0:1024 {
+        if bond_flash_read_word(address + word * 4) != 0 { << false }
+        value := volatile_load(0x3FFD7D44)
+        if value != 0xFFFFFFFF { blank = false }
+        if word == 0 { ours = value == 0x31425558 }
+        if word == 1 { ours = ours && (value & 255) == 1 }
+        if word >= 16 && value != 0xFFFFFFFF { << false }
+    }
+    << blank || ours
+}
+fn bond_flash_verify_body(address int, words int) bool {
+    for word in 0:words {
+        if bond_flash_read_word(address + word * 4) != 0 { << false }
+        actual := volatile_load(0x3FFD7D44)
+        rom_call6(0x4000C2C8,0x3FFD7D48,0x3FFD7D00 + word * 4,4,0,0,0)
+        if actual != volatile_load(0x3FFD7D48) { << false }
+    }
+    << true
+}
+// Ordering follows Espressif esp_rom_spiflash_program_page_internal:
+// WREN and status reads BEFORE filling SPI W registers. ROM does the reverse;
+// dummy_plus status reads reuse W0 and corrupt the first program word.
+fn bond_flash_program(address int, source int, count int) int {
+    if count < 4 || count > 32 || count % 4 != 0 || address % 4 != 0 ||
+        address % 256 + count > 256 { << 1 }
+    bond_flash_ready()
+    volatile_store(0x3FF42000,0x40000000)
+    while volatile_load(0x3FF42000) != 0 { }
+    volatile_store(0x3FFD7D40,0xFFFFFFFF)
+    status := rom_call6(0x400621B0,0x3FFD7D40,5,0,0,0,0)
+    if status != 0 || (volatile_load(0x3FFD7D40) & 3) != 2 { << 2 }
+    volatile_store(0x3FF4201C,volatile_load(0x3FF4201C) & 0xDFFFFFFF)
+    volatile_store(0x3FF42020,(volatile_load(0x3FF42020) & 0x03FFFFFF) | 0x5C000000)
+    volatile_store(0x3FF42004,(address & 0xFFFFFF) | (count << 24))
+    rom_call6(0x4000C2C8,0x3FF42080,source,count,0,0,0)
+    volatile_store(0x3FF42000,0x02000000)
+    while volatile_load(0x3FF42000) != 0 { }
+    bond_flash_ready()
+    << 0
+}
+fn bond_flash_commit(address int) int {
+    if volatile_load(0x3FFD7D00) != 0x31425558 ||
+        (volatile_load(0x3FFD7D04) & 255) != 1 ||
+        volatile_load(0x3FFD7D3C) != 0x31444E42 { << 9 }
+    if !bond_flash_partitions_safe() { << 10 }
+    if !bond_flash_slot_owned(address) { << 11 }
+    bond_flash_ready()
+    erased := rom_call6(0x40062CCC,address / 4096,0,0,0,0,0)
+    bond_flash_ready()
+    if erased != 0 { << 12 }
+    for word in 0:1024 {
+        if bond_flash_read_word(address + word * 4) != 0 || volatile_load(0x3FFD7D44) != 0xFFFFFFFF { << 13 }
+    }
+    // ROM SPIWrite's internal >32B loop uses the flawed idle helper.
+    bond_flash_ready()
+    first := bond_flash_program(address,0x3FFD7D00,32)
+    bond_flash_ready()
+    if first != 0 { << 14 }
+    second := bond_flash_program(address + 32,0x3FFD7D20,28)
+    bond_flash_ready()
+    if second != 0 { << 14 }
+    if !bond_flash_verify_body(address,15) { << 15 }
+    // Commit marker is a separate final program, after all 60 body bytes.
+    committed := bond_flash_program(address + 60,0x3FFD7D3C,4)
+    bond_flash_ready()
+    if committed != 0 || !bond_flash_verify_body(address,16) { << 16 }
+    << 0
+}
+fn bond_flash_worker(operation int, slot int, unused int) int {
+    if operation < 0 || operation > 2 || slot < 0 || slot > 1 { << 1 }
+    if volatile_load(0x3FFD7D4C) != 0 { << 2 }
+    // Both CPUs must not execute mapped flash while SPI1 owns the host.
+    app_stopped := (volatile_load(0x3FF0002C) & 1) != 0 ||
+        (volatile_load(0x3FF00030) & 1) == 0 || (volatile_load(0x3FF00034) & 1) != 0
+    if !app_stopped || (volatile_load(0x3FF00058) & 8) != 0 || (volatile_load(0x3FF00040) & 8) == 0 { << 3 }
+    $crypt := (volatile_load(0x3FF5A000) >> 20) & 127
+    $parity := 0
+    for bit in 0:7 { parity = parity ^ (crypt & 1)
+        crypt = crypt >> 1 }
+    if parity != 0 { << 4 }
+    if volatile_load(0x3FFAE274) != 0x400000 || volatile_load(0x3FFAE27C) != 4096 ||
+        volatile_load(0x3FFAE280) != 256 { << 5 }
+    saved := rom_call6(0x4000BFDC,15,0,0,0,0,0)
+    volatile_store(0x3FFD7D4C,1)
+    rom_call6(0x40009AB8,0,0,0,0,0,0)
+    rom_call6(0x40009A14,0,0,0,0,0,0)
+    bond_flash_ready()
+    address := 0x310000 + slot * 4096
+    $result := 0
+    if operation == 0 {
+        if !bond_flash_partitions_safe() { result = 10 }
+        else { result = rom_call6(0x40062ED8,address,0x3FFD7D00,64,0,0,0) }
+    }
+    if operation == 1 {
+        if !bond_flash_partitions_safe() { result = 10 }
+        else if !bond_flash_slot_owned(address) { result = 11 }
+    }
+    if operation == 2 { result = bond_flash_commit(address) }
+    bond_flash_ready()
+    rom_call6(0x40009A84,0,0,0,0,0,0)
+    // Never return into IROM unless cache is known enabled.
+    while (volatile_load(0x3FF00040) & 8) == 0 { }
+    volatile_store(0x3FFD7D40,0)
+    volatile_store(0x3FFD7D44,0)
+    volatile_store(0x3FFD7D48,0)
+    volatile_store(0x3FFD7D4C,0)
+    rom_call6(0x4000BFDC,saved & 15,0,0,0,0,0)
+    << result
+}
+
+pub fn bond_worker_entry() int {
+    entry := rom_callback(bond_flash_worker)
+    if entry < 0x40080000 || entry >= 0x400A0000 || entry % 4 != 0 { << 0 }
+    << entry
+}
