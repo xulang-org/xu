@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.10 (development)
+
+Adds the opt-in `xu-c-2` native ABI for synchronous borrowed i64 spans. `i64_span` and `i64_span_mut` parameters become Xu `&[]int` and `$&[]int`; a call-scoped C view exposes length and contiguous data without transferring array ownership or capacity. The platform adapter handles integer register and stack arguments, including Win64 shadow space. Both native pack tools accept the versioned format; older products reject it instead of interpreting a borrow as an integer. Existing `xu-c-1` archives remain supported. This ABI currently accepts 64-bit `int` scalars and `void`/`int` results; native function values require a Xu wrapper. This is a development build.
+
 ## Xu 0.11.3-dev.9 (development)
 
 Integrates SSA integer/mask reassociation with SCCP, periodic reductions, floating-point negation correctness, and guarded Tile cost selection from the reviewed development stack. Preserve all prior optimization and module versions during integration. Periodic-reduction proofs now follow the additive bias on the actual backedge value, including the reassociated (sum + masked) + bias form, without inferring it from an unused sibling expression. The shared narrow-result normalization now uses the physical GPR width: i32 is already a full register on RV32 and Thumb, so it no longer executes the 64-bit shift/sign-extension idiom there. Native macOS ARM64 SDK checks use the supported macos-15 ARM64 runner after macos-26 jobs repeatedly ended before runner assignment; the same build, installation and runtime checks remain enabled. This is a development build.
