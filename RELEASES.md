@@ -8,7 +8,7 @@
 
 ## Xu 0.11.3-dev.9 (development)
 
-Integrates SSA integer/mask reassociation with SCCP, periodic reductions, floating-point negation correctness, and guarded Tile cost selection from the reviewed development stack. Preserve all prior optimization and module versions during integration. Periodic-reduction proofs now follow the additive bias on the actual backedge value, including the reassociated (sum + masked) + bias form, without inferring it from an unused sibling expression. Native macOS ARM64 SDK checks use the supported macos-15 ARM64 runner after macos-26 jobs repeatedly ended before runner assignment; the same build, installation and runtime checks remain enabled. This is a development build.
+Integrates SSA integer/mask reassociation with SCCP, periodic reductions, floating-point negation correctness, and guarded Tile cost selection from the reviewed development stack. Preserve all prior optimization and module versions during integration. Periodic-reduction proofs now follow the additive bias on the actual backedge value, including the reassociated (sum + masked) + bias form, without inferring it from an unused sibling expression. The shared narrow-result normalization now uses the physical GPR width: i32 is already a full register on RV32 and Thumb, so it no longer executes the 64-bit shift/sign-extension idiom there. Native macOS ARM64 SDK checks use the supported macos-15 ARM64 runner after macos-26 jobs repeatedly ended before runner assignment; the same build, installation and runtime checks remain enabled. This is a development build.
 
 ## Xu 0.11.3-dev.8 (development)
 
