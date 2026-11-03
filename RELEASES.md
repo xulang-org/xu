@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.7 (development)
+
+Integer GEMM Tile recognition now accepts a proven inner backedge copy at the end of a merged self-loop as well as a separate copy latch. It preserves B's element count across descriptor reloads in the alias guard, retains bounds and dependence proofs, and writes the correct final induction value for each representation. Unsafe early copies, side effects and ambiguous entries retain scalar lowering. This is a development build.
+
 ## Xu 0.11.3-dev.6 (development)
 
 Constant unary negation now distinguishes integer arithmetic from f64 bit patterns. Floating constants flip only their sign bit, preserving signed zero, infinities and NaN payloads instead of negating their encoded integer value. This fixes optimized negative floating literals in matrix, norm and reduction code without changing the integer wrapping contract. This is a development build.
