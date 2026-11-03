@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.9 (development)
+
+Integrates SSA integer/mask reassociation with SCCP, periodic reductions, floating-point negation correctness, and guarded Tile cost selection from the reviewed development stack. Preserve all prior optimization and module versions during integration. Native macOS ARM64 SDK checks use the supported macos-15 ARM64 runner after macos-26 jobs repeatedly ended before runner assignment; the same build, installation and runtime checks remain enabled. This is a development build.
+
 ## Xu 0.11.3-dev.8 (development)
 
 Integer GEMM Tile lowering now keeps tiny positive nests with M+N+K below five on ARM64 or four on x64 on the original scalar path, avoiding the micro-kernel's full entry guards and register saves. Known tiny bounds omit the guarded micro-kernel entirely; bounds that already prove the minimum size need no runtime cost check. Bounds, alias checks and scalar trap behavior remain intact. This is a development build.
@@ -33,6 +37,10 @@ Proved ARM64 integer reductions of `(i & mask) + bias` use a constant-step perio
 ## Xu 0.11.3-dev.2 (development)
 
 ARM64 shift/add and shift/sub fusion now proves that the shift result and any skipped local load have only one use across the whole function. This preserves values shared across basic blocks by CSE instead of leaving later reads uninitialized. It fixes optimized compilation failures in mutable-method and named-function-value reduction loops while keeping their SIMD lowering available. No API or ABI changes. This is a development build.
+
+## Xu 0.11.3-dev.1 (development)
+
+The SSA simplifier linearizes bounded, same-block word-integer addition/subtraction and AND/OR/XOR trees before common-subexpression elimination. It combines separated constants and masks, cancels opposite arithmetic terms and duplicate XOR terms, and removes repeated AND/OR operands. Shared intermediate values remain intact; floating-point, narrow integers, address-exposed storage and Phi edges retain their existing semantics. No API or ABI changes. This is a development build.
 
 ## Xu 0.11.2
 
