@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.5 (development)
+
+The verified SSA window now performs bounded sparse conditional constant propagation before Phi destruction. A monotone constant lattice and executable-edge worklist jointly simplify integer/boolean values, branches and Phi inputs, then remove proved unreachable blocks. Loads, calls, floating-point values, exposed storage and exceptional arithmetic remain conservative. Analysis-budget rejection leaves the original function intact. This is a development build.
+
 ## Xu 0.11.3-dev.4 (development)
 
 ARM64 periodic integer reductions with the same proved constant induction at every entry now fold in MIR before register and frame planning. The rewrite preserves the incoming accumulator and final induction, then reuses CFG and dead-code cleanup to remove the loop's temporary storage. Dynamic, differing and width-converting entries keep their existing paths. This is a development build.
