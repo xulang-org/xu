@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.6 (development)
+
+Constant unary negation now distinguishes integer arithmetic from f64 bit patterns. Floating constants flip only their sign bit, preserving signed zero, infinities and NaN payloads instead of negating their encoded integer value. This fixes optimized negative floating literals in matrix, norm and reduction code without changing the integer wrapping contract. This is a development build.
+
 ## Xu 0.11.3-dev.5 (development)
 
 The verified SSA window now performs bounded sparse conditional constant propagation before Phi destruction. A monotone constant lattice and executable-edge worklist jointly simplify integer/boolean values, branches and Phi inputs, then remove proved unreachable blocks. Loads, calls, floating-point values, exposed storage and exceptional arithmetic remain conservative. Analysis-budget rejection leaves the original function intact. This is a development build.
