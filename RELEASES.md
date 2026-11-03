@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.4 (development)
+
+ARM64 periodic integer reductions with the same proved constant induction at every entry now fold in MIR before register and frame planning. The rewrite preserves the incoming accumulator and final induction, then reuses CFG and dead-code cleanup to remove the loop's temporary storage. Dynamic, differing and width-converting entries keep their existing paths. This is a development build.
+
 ## Xu 0.11.3-dev.3 (development)
 
 Proved ARM64 integer reductions of `(i & mask) + bias` use a constant-step periodic sum when the mask is `2^k - 1` through 65535. The slot and SSA paths share the same lowering, preserving signed starting indices, wrapping accumulation, zero-trip guards and the final induction value. Other masks keep the existing SIMD path. This is a development build.
