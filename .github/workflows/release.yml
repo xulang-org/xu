@@ -45,6 +45,14 @@ on:
         description: "Reuse hosted compiler seeds from an earlier recovery run; rebuild and validate every native SDK"
         required: false
         type: string
+      source_sha:
+        description: "Frozen accepted source commit for workflow-only recovery (requires sdk_validation_run_id)"
+        required: false
+        type: string
+      sdk_validation_run_id:
+        description: "Successful six-platform Installed SDK run for exactly source_sha"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -73,7 +81,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SDK_VALIDATION_RUN: ${{ inputs.sdk_validation_run_id }}
         run: |
+          python3 - <<'PYTHON'
+          import os, re
+          source, evidence = os.environ['SOURCE_SHA'], os.environ['SDK_VALIDATION_RUN']
+          assert bool(source) == bool(evidence), 'source_sha and sdk_validation_run_id must be supplied together'
+          if source:
+              assert re.fullmatch(r'[0-9a-f]{40}', source), 'source_sha must be a complete immutable commit'
+              assert evidence.isdecimal(), 'SDK validation run ID must be numeric'
+          PYTHON
           EXPECTED_TAG="v$(cat VERSION)"
           TAG="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
           if [[ "$GITHUB_REF_TYPE" != tag && -z "$REQUESTED_TAG" ]]; then
@@ -102,10 +120,83 @@ jobs:
             echo "Release $TAG is already published; leaving its tag and assets intact."
           fi
 
+  runtime-validation:
+    name: Six-platform runtime and package protocols
+    needs: release-policy
+    if: needs.release-policy.outputs.published == 'false' && inputs.sdk_validation_run_id == ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/sdk.yml
+    with:
+      cross_seed_run_id: ${{ inputs.cross_seed_run_id || '' }}
+
+  accepted-sdk-validation:
+    name: Verify frozen six-platform SDK evidence
+    needs: release-policy
+    if: needs.release-policy.outputs.published == 'false' && inputs.sdk_validation_run_id != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require complete successful native acceptance for the frozen source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SDK_VALIDATION_RUN: ${{ inputs.sdk_validation_run_id }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          EXPECTED_TAG: ${{ needs.release-policy.outputs.tag }}
+        run: |
+          python3 - <<'PYTHON'
+          import base64, json, os, re, subprocess
+          repo, source, run_id = (os.environ[k] for k in ('GH_REPO', 'SOURCE_SHA', 'SDK_VALIDATION_RUN'))
+          assert re.fullmatch(r'[0-9a-f]{40}', source) and run_id.isdecimal()
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}'], text=True))
+          accepted = api(f'compare/{source}...main')
+          assert accepted['status'] in ('ahead', 'identical'), 'source is not accepted main history'
+          delta = api(f"compare/{source}...{os.environ['WORKFLOW_SHA']}")
+          assert delta['status'] in ('ahead', 'identical') and delta['total_commits'] <= 100
+          assert len(delta['files']) < 300 and all(f['filename'].startswith('.github/workflows/') for f in delta['files']), 'product source changed; fresh native validation required'
+          version = base64.b64decode(api(f'contents/VERSION?ref={source}')['content']).decode().strip()
+          assert os.environ['EXPECTED_TAG'] == 'v' + version
+          run = api(f'actions/runs/{run_id}')
+          assert run['workflow_id'] == api('actions/workflows/sdk.yml')['id']
+          assert run['head_repository']['full_name'] == repo and run['head_sha'] == source
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          jobs = api(f'actions/runs/{run_id}/jobs?per_page=100')['jobs']
+          passed = {j['name'] for j in jobs if j['conclusion'] == 'success'}
+          targets = ('linux-x64', 'linux-arm64', 'macos-x64', 'macos-arm64', 'windows-x64', 'windows-arm64')
+          for target in targets:
+              choices = {f'Install and run ({target}, product)'}
+              if target == 'macos-x64':
+                  choices.add('Native macOS Intel SDK and platform seeds')
+              assert choices & passed, f'missing successful native SDK acceptance: {target}'
+          artifacts = api(f'actions/runs/{run_id}/artifacts?per_page=100')['artifacts']
+          evidence = {}
+          for target in targets:
+              matches = [a for a in artifacts if a['name'] == f'xu-sdk-product-{target}' and not a['expired']]
+              assert len(matches) == 1, f'missing or ambiguous native SDK evidence: {target}'
+              artifact = matches[0]
+              assert artifact['workflow_run']['id'] == int(run_id) and artifact['workflow_run']['head_sha'] == source
+              evidence[target] = artifact['id']
+          receipt = {'source_commit': source, 'sdk_run_id': run_id, 'version': version, 'artifacts': evidence}
+          with open('sdk-validation-evidence.json', 'w') as output:
+              json.dump(receipt, output, indent=2)
+          print('Accepted source, unchanged product tree, six successful native SDK jobs and six evidence artifacts: PASS')
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xu-sdk-validation-evidence-${{ github.run_attempt }}
+          path: sdk-validation-evidence.json
+          if-no-files-found: error
+
   reuse-release:
     name: Validate an existing CI release bundle
-    needs: release-policy
-    if: needs.release-policy.outputs.published == 'false' && inputs.artifact_run_id != ''
+    needs: [release-policy, runtime-validation, accepted-sdk-validation]
+    if: always() && needs.release-policy.outputs.published == 'false' && (needs.runtime-validation.result == 'success' || needs.accepted-sdk-validation.result == 'success') && inputs.artifact_run_id != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -123,6 +214,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           SOURCE_RUN: ${{ inputs.artifact_run_id }}
           EXPECTED_TAG: ${{ needs.release-policy.outputs.tag }}
+          REQUESTED_SOURCE: ${{ inputs.source_sha }}
         run: |
           python3 - <<'PYTHON'
           import base64, json, os, re, subprocess
@@ -135,7 +227,7 @@ jobs:
           assert run["head_branch"] == "main" and run["status"] == "completed"
           jobs = api(f"actions/runs/{run_id}/jobs?per_page=100")["jobs"]
           assert any(j["name"] == "Build and validate release SDKs" and j["conclusion"] == "success" for j in jobs)
-          sha = run["head_sha"]
+          sha = os.environ.get('REQUESTED_SOURCE') or run["head_sha"]
           assert re.fullmatch(r"[0-9a-f]{40}", sha)
           comparison = api(f"compare/{sha}...main")
           assert comparison["status"] in ("ahead", "identical"), "source is not accepted main history"
@@ -149,7 +241,7 @@ jobs:
           matches = [a for a in artifacts if not a["expired"] and re.fullmatch(re.escape("xu-release-bundle-" + tag) + r"-\d+", a["name"])]
           assert matches, "verified release bundle is missing"
           artifact = max(matches, key=lambda a: a["id"])
-          assert artifact["workflow_run"]["id"] == int(run_id) and artifact["workflow_run"]["head_sha"] == sha
+          assert artifact["workflow_run"]["id"] == int(run_id) and artifact["workflow_run"]["head_sha"] == run['head_sha']
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"artifact_id={artifact['id']}\nsource_sha={sha}\ntag={tag}\nversion={version}\n")
           PYTHON
@@ -184,9 +276,9 @@ jobs:
 
   build-release:
     name: Build and validate release SDKs
-    needs: release-policy
-    if: needs.release-policy.outputs.published == 'false' && (!inputs.artifact_run_id || inputs.artifact_run_id == '')
-    runs-on: macos-latest
+    needs: [release-policy, runtime-validation, accepted-sdk-validation]
+    if: always() && needs.release-policy.outputs.published == 'false' && (needs.runtime-validation.result == 'success' || needs.accepted-sdk-validation.result == 'success') && inputs.artifact_run_id == ''
+    runs-on: macos-15-intel
     timeout-minutes: 120
     permissions:
       contents: read
@@ -195,11 +287,13 @@ jobs:
       tag: ${{ steps.identity.outputs.tag }}
       version: ${{ steps.identity.outputs.version }}
       artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Validate release version and tag
         id: identity
@@ -223,6 +317,7 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout companion examples
         uses: actions/checkout@v4
@@ -414,7 +509,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ needs.build-release.outputs.source_sha }}
           EXPECTED_TAG: ${{ needs.build-release.outputs.tag }}
           EXPECTED_VERSION: ${{ needs.build-release.outputs.version }}
           RELEASE_PRERELEASE: ${{ inputs.prerelease || 'auto' }}
