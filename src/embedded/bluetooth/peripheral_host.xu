@@ -1,0 +1,731 @@
+@embedded/bluetooth
+
+// Single-link peripheral host over actual H4 events/ACL. Fixed four-slot
+// output queue and 27-byte L2CAP reassembly; no implicit encryption, keys,
+// transport acknowledgements, controller credits or persistent bonding.
+pub const PERIPHERAL_QUEUE_SLOTS = 4
+pub const PERIPHERAL_FRAME_BYTES = 32
+pub const PERIPHERAL_ERROR_FRAME = 1
+pub const PERIPHERAL_ERROR_UNSUPPORTED = 2
+pub const PERIPHERAL_ERROR_QUEUE = 3
+pub const PERIPHERAL_ERROR_ENTROPY = 4
+pub const PERIPHERAL_ERROR_CREDITS = 5
+pub const PERIPHERAL_ERROR_CONTROLLER = 6
+pub const PERIPHERAL_ERROR_FRAGMENT = 7
+pub const PERIPHERAL_ERROR_SECURITY = 8
+pub const PERIPHERAL_ERROR_TIMEOUT = 9
+
+pub struct PeripheralHost {
+    pub ready bool
+    pub connected bool
+    pub closing bool
+    pub connection int
+    pub local_type int // set before connecting; default static random (HCI 2005)
+    pub encrypted bool
+    pub authenticated bool // legacy NoIO Just Works never sets this
+    pub needs_advertising bool
+    pub last_error int
+    pub rejected_frames int
+    pub acl_mtu int
+    pub acl_capacity int
+    pub acl_credits int
+    pub acl_outstanding int
+    pub command_credits int
+    pub bond_available bool // one RAM record, not proof of an OS bond
+    pub accept_connection_parameters bool // opt in to validated remote updates
+    local []int
+    att AttServer
+    smp SmpServer
+    random fn(int) []int
+    queue []int
+    lengths []int
+    tickets []int
+    tags []int
+    serial int
+    pending int
+    rx []int
+    rx_length int
+    rx_expected int
+    now_ms int
+    ltk_accepted bool
+    bond_peer []int
+    bond_peer_type int
+    bond_ltk []int
+    bond_random []int
+    bond_ediv int
+}
+
+// Set before connecting so GAP reads and advertising can use one name.
+pub fn (h $&PeripheralHost) set_device_name(name string) bool {
+    if !h.ready || h.connected || h.closing || name.len < 1 || name.len > 248 { << false }
+    h.att.dev_name = name
+    << true
+}
+
+fn peripheral_bad(h $&PeripheralHost, code int) {
+    h.last_error = code
+    h.rejected_frames += 1
+}
+
+fn peripheral_copy_count(src &[]int, count int) []int {
+    $out := hci_zeros(count)
+    for i in 0:count { out[i] = src[i] }
+    << out
+}
+
+// Keep field borrows confined to a call: Xu's mut method syntax requires
+// a variable receiver and freezes its parent aggregate for a named borrow.
+fn peripheral_att_reset(server $&AttServer) { server.reset_link() }
+fn peripheral_att_encryption(server $&AttServer, value bool) { server.set_link_encrypted(value) }
+fn peripheral_att_acl(server $&AttServer, packet &HciPacket) HciPacket { << server.process_acl_packet(packet) }
+fn peripheral_att_enabled(server &AttServer, handle int) bool { << server.report_notifications_enabled(handle) }
+fn peripheral_att_notify(server $&AttServer, connection int, handle int, report []int) HciPacket {
+    << server.make_hid_notification(connection, handle, report)
+}
+fn peripheral_smp_close(server $&SmpServer) { server.close_connection() }
+fn peripheral_smp_distribution(server &SmpServer) []int { << server.key_distribution_pdu() }
+fn peripheral_smp_distributed(server $&SmpServer) bool { << server.key_distribution_sent() }
+fn peripheral_smp_timeout(server $&SmpServer, now int) bool { << server.poll_timeout(now) }
+fn peripheral_smp_security(server &SmpServer) []int { << server.security_request() }
+fn peripheral_smp_acl(server $&SmpServer, packet &HciPacket, now int) HciPacket { << server.process_smp_acl(packet, now) }
+fn peripheral_smp_encryption(server $&SmpServer, event &HciPacket) bool { << server.handle_encryption_change(event) }
+fn peripheral_smp_ltk(server $&SmpServer, event &HciPacket) HciPacket { << server.handle_ltk_request(event) }
+fn peripheral_smp_encrypted(server &SmpServer) bool { << server.encrypted }
+fn peripheral_smp_distribution_ready(server &SmpServer) bool {
+    << server.encrypted && server.bonding && server.distribution_step >= 1 && server.distribution_step <= 2
+}
+fn peripheral_smp_started(server $&SmpServer, now int) { server.started_ms = now }
+fn peripheral_smp_idle_peer(server &SmpServer, peer_type int, peer &[]int) bool {
+    << server.state == SMP_IDLE && server.initiator_type == peer_type && smp_equal(peer, &server.initiator)
+}
+fn peripheral_smp_bond_ready(server &SmpServer) bool { << server.encrypted && server.bond_distributed }
+fn peripheral_smp_bond_byte(server &SmpServer, field int, i int) int {
+    if field == 0 { << server.bond_ltk[i] }
+    if field == 1 { << server.bond_rand[i] }
+    << server.initiator[i]
+}
+fn peripheral_smp_bond_info(server &SmpServer, field int) int {
+    if field == 0 { << server.bond_ediv }
+    << server.initiator_type
+}
+fn peripheral_smp_restore_byte(server $&SmpServer, field int, i int, value int) {
+    if field == 0 { server.bond_ltk[i] = value }
+    else { server.bond_rand[i] = value }
+}
+fn peripheral_smp_restore_finish(server $&SmpServer, ediv int) {
+    server.bond_ediv = ediv
+    server.bond_key_valid = true
+    server.bond_material_ready = true
+    server.bond_distributed = true
+}
+
+// Borrow the nested server directly. Repeated h.smp.field accesses create
+// large aggregate temporaries on the 32-bit target's stack.
+fn peripheral_restore_bond(h $&PeripheralHost) {
+    for i in 0:16 {
+        value := h.bond_ltk[i]
+        peripheral_smp_restore_byte($&h.smp, 0, i, value)
+    }
+    for i in 0:8 {
+        value := h.bond_random[i]
+        peripheral_smp_restore_byte($&h.smp, 1, i, value)
+    }
+    ediv := h.bond_ediv
+    peripheral_smp_restore_finish($&h.smp, ediv)
+}
+
+pub fn peripheral_host_create(local_addr []int, aes fn(&[]int, &[]int) []int,
+    random fn(int) []int) PeripheralHost {
+    valid := smp_bytes_valid(&local_addr, 6)
+    $h := PeripheralHost{
+        ready: valid, connected: false, closing: false, connection: -1,
+        local_type: 1, encrypted: false, authenticated: false,
+        needs_advertising: false, last_error: 0, rejected_frames: 0,
+        acl_mtu: 0, acl_capacity: 0, acl_credits: 0, acl_outstanding: 0,
+        command_credits: 1, bond_available: false, accept_connection_parameters: false,
+        local: local_addr, att: att_server_create("XU-PURE-HID"),
+        // Inactive preallocated buffers; no zero-random session can be used.
+        smp: smp_server_create(-1, 1, hci_zeros(6), 0, hci_zeros(6), hci_zeros(16), aes),
+        random: random, queue: hci_zeros(128), lengths: hci_zeros(4),
+        tickets: hci_zeros(4), tags: hci_zeros(4), serial: 0, pending: -1,
+        rx: hci_zeros(27), rx_length: 0, rx_expected: 0, now_ms: 0, ltk_accepted: false,
+        bond_peer: hci_zeros(6), bond_peer_type: 0, bond_ltk: hci_zeros(16),
+        bond_random: hci_zeros(8), bond_ediv: 0
+    }
+    if !valid { h.last_error = PERIPHERAL_ERROR_FRAME }
+    else {
+        // Learn actual controller buffers; never invent ACL send credits.
+        query := hci_packet_command(0x2002, []int{})
+        peripheral_enqueue($&h, &query, 0)
+    }
+    << h
+}
+
+fn peripheral_queue_room(h &PeripheralHost) bool {
+    for i in 0:4 { if h.lengths[i] == 0 { << true } }
+    << false
+}
+
+fn peripheral_enqueue(h $&PeripheralHost, packet &HciPacket, tag int) bool {
+    if !packet.valid || packet.len != packet.payload.len ||
+        (packet.kind != HCI_PKT_COMMAND && packet.kind != HCI_PKT_ACLDATA) { << false }
+    size := hci_frame_length(packet)
+    if size < 1 || size > 32 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        << false }
+    $slot := -1
+    for i in 0:4 { if h.lengths[i] == 0 && slot < 0 { slot = i } }
+    if slot < 0 { peripheral_bad(h, PERIPHERAL_ERROR_QUEUE)
+        << false }
+    base := slot * 32
+    h.queue[base] = packet.kind
+    $start := 4
+    if packet.kind == HCI_PKT_COMMAND {
+        h.queue[base + 1] = packet.opcode & 255
+        h.queue[base + 2] = (packet.opcode >> 8) & 255
+        h.queue[base + 3] = packet.len
+    } else {
+        h.queue[base + 1] = packet.handle & 255
+        h.queue[base + 2] = (packet.handle >> 8) & 255
+        h.queue[base + 3] = packet.len & 255
+        h.queue[base + 4] = (packet.len >> 8) & 255
+        start = 5
+    }
+    for i in 0:packet.len { h.queue[base + start + i] = packet.payload[i] }
+    h.serial += 1
+    h.tickets[slot] = h.serial
+    h.tags[slot] = tag
+    h.lengths[slot] = size
+    << true
+}
+
+fn peripheral_drop_queue(h $&PeripheralHost) {
+    for i in 0:128 { h.queue[i] = 0 }
+    for i in 0:4 { h.lengths[i] = 0 }
+    h.pending = -1
+}
+
+fn peripheral_l2cap(connection int, cid int, pdu &[]int) HciPacket {
+    $out := hci_zeros(pdu.len + 4)
+    out[0] = pdu.len & 255
+    out[1] = (pdu.len >> 8) & 255
+    out[2] = cid & 255
+    out[3] = (cid >> 8) & 255
+    for i in 0:pdu.len { out[i + 4] = pdu[i] }
+    << hci_packet_acl(connection, out)
+}
+
+fn peripheral_disconnect(h $&PeripheralHost, error int) {
+    peripheral_bad(h, error)
+    peripheral_att_reset($&h.att)
+    peripheral_smp_close($&h.smp)
+    h.encrypted = false
+    h.authenticated = false
+    h.ltk_accepted = false
+    h.rx_length = 0
+    h.rx_expected = 0
+    if !h.connected || h.closing { << }
+    h.closing = true
+    peripheral_drop_queue(h)
+    params := [h.connection & 255, (h.connection >> 8) & 255, 0x13]
+    packet := hci_packet_command(0x0406, params)
+    peripheral_enqueue(h, &packet, 0)
+}
+
+fn peripheral_remember_bond(h $&PeripheralHost) {
+    if !peripheral_smp_bond_ready(&h.smp) { << }
+    for i in 0:16 {
+        value := peripheral_smp_bond_byte(&h.smp, 0, i)
+        h.bond_ltk[i] = value
+    }
+    for i in 0:8 {
+        value := peripheral_smp_bond_byte(&h.smp, 1, i)
+        h.bond_random[i] = value
+    }
+    for i in 0:6 {
+        value := peripheral_smp_bond_byte(&h.smp, 2, i)
+        h.bond_peer[i] = value
+    }
+    ediv := peripheral_smp_bond_info(&h.smp, 0)
+    peer_type := peripheral_smp_bond_info(&h.smp, 1)
+    h.bond_ediv = ediv
+    h.bond_peer_type = peer_type
+    h.bond_available = true
+}
+
+// Returned frames remain pending until output_accepted. Retry the same
+// returned bytes on a blocked transport; this method never invents TX acks.
+pub fn (h $&PeripheralHost) next_output() []int {
+    if !h.ready { << []int{} }
+    if h.pending < 0 && h.connected && !h.closing && peripheral_smp_encrypted(&h.smp) &&
+        h.acl_credits > 0 && peripheral_queue_room(h) {
+        $has_distribution := false
+        for i in 0:4 { if h.lengths[i] != 0 && h.tags[i] == 1 { has_distribution = true } }
+        if !has_distribution {
+            pdu := peripheral_smp_distribution(&h.smp)
+            if pdu.len > 0 {
+                packet := peripheral_l2cap(h.connection, SMP_CID, &pdu)
+                peripheral_enqueue(h, &packet, 1)
+            }
+        }
+    }
+    if h.pending < 0 {
+        $ticket := 0
+        for i in 0:4 {
+            if h.lengths[i] == 0 { -> }
+            kind := h.queue[i * 32]
+            eligible := (kind == HCI_PKT_COMMAND && h.command_credits > 0) ||
+                (kind == HCI_PKT_ACLDATA && h.connected && !h.closing && h.acl_credits > 0)
+            if eligible && (h.pending < 0 || h.tickets[i] < ticket) {
+                h.pending = i
+                ticket = h.tickets[i]
+            }
+        }
+    }
+    if h.pending < 0 { << []int{} }
+    // A later controller event can remove command credit while an output
+    // remains pending. Do not offer that frame to the transport meanwhile.
+    kind := h.queue[h.pending * 32]
+    if (kind == HCI_PKT_COMMAND && h.command_credits < 1) ||
+        (kind == HCI_PKT_ACLDATA && (!h.connected || h.closing || h.acl_credits < 1)) {
+        << []int{}
+    }
+    $out := hci_zeros(h.lengths[h.pending])
+    for i in 0:out.len { out[i] = h.queue[h.pending * 32 + i] }
+    << out
+}
+
+pub fn (h $&PeripheralHost) output_accepted() bool {
+    slot := h.pending
+    if slot < 0 || slot > 3 || h.lengths[slot] == 0 { << false }
+    if h.tags[slot] == 1 && !peripheral_smp_distribution_ready(&h.smp) { << false }
+    if h.queue[slot * 32] == HCI_PKT_ACLDATA {
+        if !h.connected || h.closing || h.acl_credits < 1 { << false }
+        h.acl_credits -= 1
+        h.acl_outstanding += 1
+    } else {
+        if h.command_credits < 1 { << false }
+        h.command_credits -= 1
+    }
+    if h.tags[slot] == 1 {
+        if !peripheral_smp_distributed($&h.smp) { << false }
+        peripheral_remember_bond(h)
+    } else if h.tags[slot] == 2 {
+        // SMP prepares its key reply before transport acceptance. The host
+        // requires the actual accepted 201A before trusting EncryptionChange.
+        h.ltk_accepted = true
+        now := h.now_ms
+        peripheral_smp_started($&h.smp, now)
+    }
+    for i in 0:32 { h.queue[slot * 32 + i] = 0 }
+    h.lengths[slot] = 0
+    h.pending = -1
+    << true
+}
+
+pub fn (h $&PeripheralHost) poll(now_ms int) []int {
+    if now_ms < h.now_ms { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        << []int{} }
+    h.now_ms = now_ms
+    if h.connected && !h.closing && peripheral_smp_timeout($&h.smp, now_ms) {
+        peripheral_disconnect(h, PERIPHERAL_ERROR_TIMEOUT)
+    }
+    << h.next_output()
+}
+
+fn peripheral_end_link(h $&PeripheralHost) {
+    // HCI disconnect releases this handle's controller buffers as in the
+    // official NimBLE host; late completions for an absent handle are ignored.
+    h.acl_credits += h.acl_outstanding
+    if h.acl_credits > h.acl_capacity { h.acl_credits = h.acl_capacity }
+    h.acl_outstanding = 0
+    h.connected = false
+    h.closing = false
+    h.connection = -1
+    h.encrypted = false
+    h.authenticated = false
+    h.ltk_accepted = false
+    h.needs_advertising = true
+    h.rx_length = 0
+    h.rx_expected = 0
+    peripheral_att_reset($&h.att)
+    peripheral_smp_close($&h.smp)
+    peripheral_drop_queue(h)
+}
+
+fn peripheral_prepare_smp(server $&SmpServer, handle int, local_type int,
+    local &[]int, p &[]int, material $&[]int) bool {
+    server.ready = true
+    server.connection = handle
+    server.state = SMP_IDLE
+    server.failure_reason = 0
+    server.timed_out = false
+    server.bonding = false
+    server.started_ms = -1
+    server.responder_type = local_type
+    server.initiator_type = p[5]
+    for i in 0:6 {
+        server.responder[i] = local[i]
+        server.initiator[i] = p[i + 6]
+    }
+    for i in 0:16 {
+        server.local_random[i] = material[i]
+        server.bond_ltk[i] = material[i + 16]
+    }
+    for i in 0:8 { server.bond_rand[i] = material[i + 32] }
+    server.bond_ediv = material[40] | (material[41] << 8)
+    server.bond_material_ready = true
+    for i in 0:42 { material[i] = 0 }
+    << server.bond_ediv != 0 || !smp_all_zero(&server.bond_rand)
+}
+
+fn peripheral_connected(h $&PeripheralHost, event &HciPacket) {
+    $p := &event.payload
+    if (event.len != 19 && event.len != 31) || p[1] != 0 { << }
+    handle := p[2] | (p[3] << 8)
+    if handle > 0x0EFF {
+        peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        <<
+    }
+    if p[4] != 1 || p[5] > 1 || h.local_type < 0 || h.local_type > 1 {
+        peripheral_bad(h, PERIPHERAL_ERROR_UNSUPPORTED)
+        params := [handle & 255, (handle >> 8) & 255, 0x13]
+        reject := hci_packet_command(0x0406, params)
+        peripheral_enqueue(h, &reject, 0)
+        <<
+    }
+    if h.connected {
+        if handle == h.connection { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        params := [handle & 255, (handle >> 8) & 255, 0x0D]
+        reject := hci_packet_command(0x0406, params)
+        peripheral_enqueue(h, &reject, 0)
+        <<
+    }
+    h.connected = true
+    h.closing = false
+    h.connection = handle
+    h.needs_advertising = false
+    h.encrypted = false
+    h.authenticated = false
+    h.ltk_accepted = false
+    peripheral_att_reset($&h.att)
+    h.rx_length = 0
+    h.rx_expected = 0
+    // Resolved identities/RPAs need c1's actual connection addresses. Until
+    // identity resolution exists, explicitly reject nonzero enhanced RPAs.
+    if event.len == 31 {
+        for i in 12:24 {
+            if p[i] != 0 { peripheral_disconnect(h, PERIPHERAL_ERROR_UNSUPPORTED)
+                << }
+        }
+    }
+    peripheral_smp_close($&h.smp)
+    entropy_source := h.random
+    $material := entropy_source(42)
+    if !smp_bytes_valid(&material, 42) {
+        for i in 0:material.len { material[i] = 0 }
+        peripheral_disconnect(h, PERIPHERAL_ERROR_ENTROPY)
+        <<
+    }
+    local := peripheral_copy_count(&h.local, 6)
+    local_type := h.local_type
+    if !peripheral_prepare_smp($&h.smp, handle, local_type, &local, p, $&material) {
+        peripheral_disconnect(h, PERIPHERAL_ERROR_ENTROPY)
+        <<
+    }
+    security := peripheral_smp_security(&h.smp)
+    packet := peripheral_l2cap(handle, SMP_CID, &security)
+    if !peripheral_enqueue(h, &packet, 0) { peripheral_disconnect(h, PERIPHERAL_ERROR_QUEUE) }
+}
+
+fn peripheral_acl(h $&PeripheralHost, packet &HciPacket) {
+    now := h.now_ms
+    if !h.connected || h.closing || (packet.handle & 0x0FFF) != h.connection {
+        peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        <<
+    }
+    if (packet.handle & 0xC000) != 0 || packet.len == 0 || packet.len > 27 {
+        peripheral_disconnect(h, PERIPHERAL_ERROR_FRAGMENT)
+        <<
+    }
+    boundary := (packet.handle >> 12) & 3
+    if boundary == 0 || boundary == 2 {
+        if h.rx_length != 0 || packet.len < 4 {
+            peripheral_disconnect(h, PERIPHERAL_ERROR_FRAGMENT)
+            <<
+        }
+        h.rx_expected = packet.payload[0] | (packet.payload[1] << 8)
+        h.rx_expected += 4
+        if h.rx_expected < 5 || h.rx_expected > 27 { peripheral_disconnect(h, PERIPHERAL_ERROR_FRAGMENT)
+            << }
+    } else if boundary != 1 || h.rx_length == 0 {
+        peripheral_disconnect(h, PERIPHERAL_ERROR_FRAGMENT)
+        <<
+    }
+    if h.rx_length + packet.len > h.rx_expected {
+        peripheral_disconnect(h, PERIPHERAL_ERROR_FRAGMENT)
+        <<
+    }
+    for i in 0:packet.len { h.rx[h.rx_length + i] = packet.payload[i] }
+    h.rx_length += packet.len
+    if h.rx_length != h.rx_expected { << }
+    payload := peripheral_copy_count(&h.rx, h.rx_expected)
+    complete := hci_packet_acl(h.connection, payload)
+    cid := h.rx[2] | (h.rx[3] << 8)
+    h.rx_length = 0
+    h.rx_expected = 0
+    if cid == ATT_CID {
+        response := peripheral_att_acl($&h.att, &complete)
+        if response.valid && !peripheral_enqueue(h, &response, 0) {
+            peripheral_disconnect(h, PERIPHERAL_ERROR_QUEUE)
+        }
+    } else if cid == SMP_CID {
+        response := peripheral_smp_acl($&h.smp, &complete, now)
+        if response.valid && !peripheral_enqueue(h, &response, 0) {
+            peripheral_disconnect(h, PERIPHERAL_ERROR_QUEUE)
+        }
+    } else if cid == 5 && complete.len >= 8 && complete.payload[5] != 0 &&
+        (complete.payload[6] | (complete.payload[7] << 8)) + 8 == complete.len {
+        if complete.payload[4] == 1 || complete.payload[4] == 0x13 {
+            // Never answer a Command Reject with another Command Reject.
+            // This host has no outstanding LE signaling requests to complete.
+            peripheral_bad(h, PERIPHERAL_ERROR_UNSUPPORTED)
+            <<
+        }
+        // LE signaling command reject: Command Not Understood. No request
+        // is silently accepted and no unsupported parameter policy is implied.
+        reject := [1, complete.payload[5], 2, 0, 0, 0]
+        response := peripheral_l2cap(h.connection, 5, &reject)
+        if !peripheral_enqueue(h, &response, 0) { peripheral_disconnect(h, PERIPHERAL_ERROR_QUEUE) }
+    } else { peripheral_disconnect(h, PERIPHERAL_ERROR_UNSUPPORTED) }
+}
+
+fn peripheral_buffers(h $&PeripheralHost, length int, count int) {
+    if length < 27 || count < 1 || count > 65535 || h.acl_outstanding != 0 {
+        peripheral_bad(h, PERIPHERAL_ERROR_CREDITS)
+        <<
+    }
+    h.acl_mtu = length
+    h.acl_capacity = count
+    h.acl_credits = count
+}
+
+fn peripheral_event(h $&PeripheralHost, event &HciPacket) {
+    $p := &event.payload
+    if event.opcode == 0x10 {
+        if event.len != 1 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        peripheral_bad(h, PERIPHERAL_ERROR_CONTROLLER)
+        peripheral_end_link(h)
+        h.acl_mtu = 0
+        h.acl_capacity = 0
+        h.acl_credits = 0
+        h.command_credits = 0
+        h.ready = false
+        <<
+    }
+    if event.opcode == 0x0E {
+        if event.len < 3 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        h.command_credits = p[0]
+        opcode := p[1] | (p[2] << 8)
+        if opcode == 0x2002 {
+            if event.len != 7 || p[3] != 0 {
+                peripheral_bad(h, PERIPHERAL_ERROR_CONTROLLER)
+                <<
+            }
+            if p[6] == 0 {
+                query := hci_packet_command(0x1005, []int{})
+                peripheral_enqueue(h, &query, 0)
+            } else { peripheral_buffers(h, p[4] | (p[5] << 8), p[6]) }
+        } else if opcode == 0x1005 {
+            if event.len != 11 || p[3] != 0 { peripheral_bad(h, PERIPHERAL_ERROR_CONTROLLER)
+                << }
+            peripheral_buffers(h, p[4] | (p[5] << 8), p[7] | (p[8] << 8))
+        } else if opcode == 0x0C03 && event.len >= 4 && p[3] == 0 {
+            peripheral_end_link(h)
+            h.acl_mtu = 0
+            h.acl_capacity = 0
+            h.acl_credits = 0
+            query := hci_packet_command(0x2002, []int{})
+            peripheral_enqueue(h, &query, 0)
+        } else if (opcode == 0x201A || opcode == 0x201B) && event.len >= 4 && p[3] != 0 {
+            peripheral_disconnect(h, PERIPHERAL_ERROR_CONTROLLER)
+        }
+        <<
+    }
+    if event.opcode == 0x0F {
+        if event.len != 4 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        h.command_credits = p[1]
+        if p[0] != 0 { peripheral_disconnect(h, PERIPHERAL_ERROR_CONTROLLER) }
+        <<
+    }
+    if event.opcode == 0x13 {
+        if event.len < 1 || event.len != 1 + p[0] * 4 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        $completed := 0
+        for i in 0:p[0] {
+            offset := 1 + i * 4
+            handle := p[offset] | (p[offset + 1] << 8)
+            if h.connected && handle == h.connection { completed += p[offset + 2] | (p[offset + 3] << 8) }
+        }
+        if completed > h.acl_outstanding { peripheral_bad(h, PERIPHERAL_ERROR_CREDITS)
+            << }
+        h.acl_outstanding -= completed
+        h.acl_credits += completed
+        <<
+    }
+    if event.opcode == 5 {
+        if event.len != 4 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        if p[0] == 0 && h.connected && (p[1] | (p[2] << 8)) == h.connection { peripheral_end_link(h) }
+        <<
+    }
+    if event.opcode == 8 {
+        if event.len != 4 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        if !h.connected || (p[1] | (p[2] << 8)) != h.connection { << }
+        if p[0] == 0 && p[3] == 1 && !h.ltk_accepted {
+            peripheral_bad(h, PERIPHERAL_ERROR_SECURITY)
+            <<
+        }
+        was_encrypted := h.encrypted
+        verified := peripheral_smp_encryption($&h.smp, event)
+        h.encrypted = verified && peripheral_smp_encrypted(&h.smp) && !h.closing
+        h.authenticated = false
+        peripheral_att_encryption($&h.att, verified)
+        if !h.encrypted && (was_encrypted || p[0] != 0 || p[3] != 1) {
+            peripheral_disconnect(h, PERIPHERAL_ERROR_SECURITY)
+        }
+        <<
+    }
+    if event.opcode != 0x3E { << }
+    if event.len < 1 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        << }
+    if p[0] == 1 || p[0] == 0x0A {
+        if (p[0] == 1 && event.len != 19) || (p[0] == 0x0A && event.len != 31) {
+            peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            <<
+        }
+        peripheral_connected(h, event)
+    } else if p[0] == 5 {
+        if event.len != 13 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        handle := p[1] | (p[2] << 8)
+        if h.connected && !h.closing && handle == h.connection {
+            h.ltk_accepted = false
+            // Restore a previous RAM key only when the central requests
+            // encryption directly; a fresh pairing keeps fresh LTK material.
+            if h.bond_available && peripheral_smp_idle_peer(&h.smp, h.bond_peer_type, &h.bond_peer) {
+                $key_matches := (p[11] | (p[12] << 8)) == h.bond_ediv
+                for i in 0:8 { if p[i + 3] != h.bond_random[i] { key_matches = false } }
+                if key_matches { peripheral_restore_bond(h) }
+            }
+            reply := peripheral_smp_ltk($&h.smp, event)
+            $tag := 0
+            if reply.opcode == 0x201A { tag = 2 }
+            if reply.valid && !peripheral_enqueue(h, &reply, tag) { peripheral_disconnect(h, PERIPHERAL_ERROR_QUEUE) }
+        } else {
+            params := [handle & 255, (handle >> 8) & 255]
+            negative := hci_packet_command(0x201B, params)
+            peripheral_enqueue(h, &negative, 0)
+        }
+    } else if p[0] == 6 {
+        if event.len != 11 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << }
+        if !h.connected || h.closing || (p[1] | (p[2] << 8)) != h.connection { << }
+        minimum := p[3] | (p[4] << 8)
+        maximum := p[5] | (p[6] << 8)
+        latency := p[7] | (p[8] << 8)
+        timeout := p[9] | (p[10] << 8)
+        // Interval units are 1.25 ms; timeout units are 10 ms.
+        // The supervision timeout must strictly exceed two latency windows.
+        valid := minimum >= 6 && minimum <= maximum && maximum <= 3200 &&
+            latency <= 499 && timeout >= 10 && timeout <= 3200 &&
+            timeout * 4 > (latency + 1) * maximum
+        if valid && h.accept_connection_parameters {
+            // 2020 is the 14-byte positive reply, including min/max CE
+            // lengths. Zero CE lengths express no event-length preference.
+            $params := hci_zeros(14)
+            params[0] = h.connection & 255
+            params[1] = (h.connection >> 8) & 255
+            for i in 0:8 { params[i + 2] = p[i + 3] }
+            reply := hci_packet_command(0x2020, params)
+            if !peripheral_enqueue(h, &reply, 0) { peripheral_disconnect(h, PERIPHERAL_ERROR_QUEUE) }
+        } else {
+            // 2021, rather than 2020, carries a three-byte negative reply.
+            params := [h.connection & 255, (h.connection >> 8) & 255, 0x3B]
+            negative := hci_packet_command(0x2021, params)
+            if !peripheral_enqueue(h, &negative, 0) { peripheral_disconnect(h, PERIPHERAL_ERROR_QUEUE) }
+        }
+    }
+}
+
+pub fn (h $&PeripheralHost) handle_h4(frame &[]int, now_ms int) []int {
+    if !h.ready || now_ms < h.now_ms || frame.len < 3 || frame.len > 258 {
+        peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        << []int{}
+    }
+    h.now_ms = now_ms
+    h.last_error = 0
+    for i in 0:frame.len {
+        if frame[i] < 0 || frame[i] > 255 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << []int{} }
+    }
+    kind := frame[0]
+    $header := 3
+    $length := frame[2]
+    $opcode := frame[1]
+    $handle := 0
+    if kind == HCI_PKT_ACLDATA {
+        if frame.len < 5 { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+            << []int{} }
+        header = 5
+        length = frame[3] | (frame[4] << 8)
+        handle = frame[1] | (frame[2] << 8)
+        opcode = 0
+        if length > 27 { peripheral_disconnect(h, PERIPHERAL_ERROR_FRAGMENT)
+            << h.next_output() }
+    } else if kind != HCI_PKT_EVENT { peripheral_bad(h, PERIPHERAL_ERROR_UNSUPPORTED)
+        << []int{} }
+    if length + header != frame.len { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        << []int{} }
+    $payload := hci_zeros(length)
+    for i in 0:length { payload[i] = frame[header + i] }
+    packet := HciPacket{valid: true, kind: kind, opcode: opcode, handle: handle, len: length, payload: payload}
+    if h.connected && !h.closing && peripheral_smp_timeout($&h.smp, now_ms) {
+        peripheral_disconnect(h, PERIPHERAL_ERROR_TIMEOUT)
+    }
+    if kind == HCI_PKT_EVENT { peripheral_event(h, &packet) }
+    else { peripheral_acl(h, &packet) }
+    << h.next_output()
+}
+
+pub fn (h $&PeripheralHost) queue_hid_notification(handle int, report []int) bool {
+    if !h.connected || h.closing || !h.encrypted || !peripheral_smp_encrypted(&h.smp) ||
+        !peripheral_att_enabled(&h.att, handle) {
+        peripheral_bad(h, PERIPHERAL_ERROR_SECURITY)
+        << false
+    }
+    if !peripheral_queue_room(h) { peripheral_bad(h, PERIPHERAL_ERROR_QUEUE)
+        << false }
+    connection := h.connection
+    packet := peripheral_att_notify($&h.att, connection, handle, report)
+    if !packet.valid { peripheral_bad(h, PERIPHERAL_ERROR_FRAME)
+        << false }
+    << peripheral_enqueue(h, &packet, 0)
+}
+
+pub fn (h &PeripheralHost) hid_notifications_enabled(handle int) bool {
+    << h.connected && !h.closing && h.encrypted && peripheral_smp_encrypted(&h.smp) &&
+        peripheral_att_enabled(&h.att, handle)
+}
+
+// Application-side transport failures must revoke the real session without
+// fabricating a controller event. Send the returned Disconnect like any
+// other pending command; it still requires an actual command credit.
+pub fn (h $&PeripheralHost) request_disconnect(error int) []int {
+    peripheral_disconnect(h, error)
+    << h.next_output()
+}
