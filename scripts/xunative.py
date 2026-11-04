@@ -21,6 +21,7 @@ from pathlib import Path
 
 MAGIC = b"XULIB\x01\x00"
 XUOBJ_MAGIC = b"XUOBJ\x01\x00\x00"
+XUOBJ_SPAN_MAGIC = b"XUOBJ\x02\x00\x00"
 FORMAT_VERSION = 1
 TARGETS = {
     "macos-arm64": (1, 1),
@@ -50,7 +51,25 @@ TYPE_CODES = {
     "i32": 8,
     "u32": 9,
     "u8": 10,
+    "i64_span": 11,
+    "i64_span_mut": 12,
 }
+
+
+def abi_version(manifest: dict) -> int:
+    abi = manifest.get("abi")
+    if abi not in ("xu-c-1", "xu-c-2"):
+        raise SystemExit("manifest requires 'abi': 'xu-c-1' or 'xu-c-2'")
+    return 2 if abi == "xu-c-2" else 1
+
+
+def abi_type(name: str, version: int, *, result: bool = False) -> int:
+    code = type_code(name)
+    if code in (11, 12) and (version != 2 or result):
+        raise SystemExit("i64 spans require xu-c-2 and are borrowed parameters only")
+    if version == 2 and code not in (0, 1, 11, 12):
+        raise SystemExit("xu-c-2 currently supports 64-bit int scalars and borrowed i64 spans")
+    return code
 
 
 def xu_string(value: str) -> bytes:
@@ -120,8 +139,7 @@ def export_label(module: str, name: str) -> str:
 
 def encode_xuobj(manifest: dict, target: str) -> bytes:
     os_code, arch_code = target_code(target)
-    if manifest.get("abi") != "xu-c-1":
-        raise SystemExit("manifest requires 'abi': 'xu-c-1'")
+    version = abi_version(manifest)
     module = manifest.get("module")
     if not isinstance(module, str) or not module:
         raise SystemExit("manifest requires a non-empty string 'module'")
@@ -131,7 +149,7 @@ def encode_xuobj(manifest: dict, target: str) -> bytes:
     if not isinstance(exports, list):
         raise SystemExit("manifest 'exports' must be a list")
 
-    out = bytearray(b"XUOBJ\x01\x00\x00")
+    out = bytearray(XUOBJ_SPAN_MAGIC if version == 2 else XUOBJ_MAGIC)
     out += bytes((os_code, arch_code)) + struct.pack("<H", 0)
     out += xu_string(module)
     out += struct.pack("<I", len(exports))
@@ -154,8 +172,8 @@ def encode_xuobj(manifest: dict, target: str) -> bytes:
             raise SystemExit(f"export {name!r} has invalid label")
         out += xu_string(name)
         out += xu_string(label)
-        out += bytes((type_code(ret), len(params)))
-        out += bytes(type_code(p) for p in params)
+        out += bytes((abi_type(ret, version, result=True), len(params)))
+        out += bytes(abi_type(p, version) for p in params)
 
     # Metadata payload. It is wrapped in a valid native object below so the
     # platform linker can validate the archive without understanding XUOBJ.
@@ -353,10 +371,19 @@ def slice_target_codes(raw: bytes) -> tuple[int, int]:
     if not payloads:
         payloads = [raw]
     for payload in payloads:
-        pos = payload.rfind(XUOBJ_MAGIC)
+        pos = max(payload.rfind(XUOBJ_MAGIC), payload.rfind(XUOBJ_SPAN_MAGIC))
         if pos >= 0 and pos + 10 <= len(payload):
             return payload[pos + 8], payload[pos + 9]
     raise SystemExit("slice has no embedded XUOBJ target metadata")
+
+
+def slice_abi_version(raw: bytes) -> int:
+    payloads = [payload for name, payload in archive_member_payloads(raw) if name == "xu.o"]
+    for payload in payloads:
+        pos = max(payload.rfind(XUOBJ_MAGIC), payload.rfind(XUOBJ_SPAN_MAGIC))
+        if pos >= 0:
+            return payload[pos + 5]
+    raise SystemExit("slice has no native ABI metadata")
 
 
 def cmd_archive(args: argparse.Namespace) -> None:
@@ -404,8 +431,8 @@ def cmd_pack(args: argparse.Namespace) -> None:
         raise SystemExit("manifest requires a non-empty string 'module'")
     if not valid_module_path(manifest["module"]):
         raise SystemExit(f"manifest has invalid Xu module id: {manifest['module']!r}")
-    if manifest.get("abi") != "xu-c-1":
-        raise SystemExit("manifest requires 'abi': 'xu-c-1'")
+    version = abi_version(manifest)
+    encode_xuobj(manifest, next(iter(TARGETS)))
     slices: dict[str, Path] = {}
     for raw in args.slice:
         target, path = parse_slice(raw)
@@ -421,6 +448,8 @@ def cmd_pack(args: argparse.Namespace) -> None:
     payload = bytearray()
     for target in sorted(slices):
         raw = slices[target].read_bytes()
+        if slice_abi_version(raw) != version:
+            raise SystemExit(f"slice {slices[target]} ABI does not match the manifest")
         actual_target = slice_target_codes(raw)
         if actual_target != TARGETS[target]:
             raise SystemExit(
@@ -439,7 +468,7 @@ def cmd_pack(args: argparse.Namespace) -> None:
             }
         )
     stored_manifest = dict(manifest)
-    stored_manifest["format"] = "xulib-1"
+    stored_manifest["format"] = f"xulib-{version}"
     stored_manifest["slices"] = [
         {key: value for key, value in item.items() if key not in ("offset",)}
         for item in entries
@@ -451,7 +480,7 @@ def cmd_pack(args: argparse.Namespace) -> None:
         raise SystemExit("manifest is too large")
 
     out = bytearray(MAGIC)
-    out += struct.pack("<HHI", FORMAT_VERSION, 0, len(manifest_bytes))
+    out += struct.pack("<HHI", version, 0, len(manifest_bytes))
     out += manifest_bytes
     out += struct.pack("<I", len(entries))
     table_size = 0
@@ -482,7 +511,7 @@ def read_xulib(path: Path) -> tuple[dict, list[dict], bytes]:
     pos = len(MAGIC)
     version, _flags, manifest_len = struct.unpack_from("<HHI", raw, pos)
     pos += 8
-    if version != FORMAT_VERSION:
+    if version not in (1, 2):
         raise SystemExit(f"unsupported XULIB version: {version}")
     end = pos + manifest_len
     if end > len(raw):
