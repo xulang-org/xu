@@ -71,14 +71,21 @@ each complete MPDU before appending the consumed chain to the active queue,
 without stopping RX. Invalid pointers, loops, capacity or sentinel corruption
 revoke the session; incomplete packets wait for a later completion boundary.
 
-Unicast submissions enable ACK checking and require both DMA completion
-and a successful MAC protocol result. A failed submission is cancelled and
-drained before one of at most three retries; retries reuse the exact MPDU
-and PN with the Retry bit set. Software CCMP can exhaust the RX queue, so the
-backend replenishes it immediately before submitting data and retains up to
-four copied arrivals for the next poll. Overflow drops excess arrivals; this
-is a bounded polling profile, without a general data-send API or throughput
-guarantee. A MAC ACK confirms the next hop, not application delivery.
+Unicast submissions check both DMA completion and the MAC protocol result.
+After writing TX DMA, and before each attempt is enabled, the backend
+replenishes RX and retains up to four copied arrivals for the next poll.
+This placement keeps TX copying out of the window in which RX must remain
+available for the AP ACK. Queue overflow drops excess arrivals.
+
+A failed RF attempt is cancelled and drained before one of at most three
+retries, reusing the same MPDU and PN with the Retry bit set. An unconfirmed
+frame does not revoke the association: management/DHCP/gateway probes retain
+their bounded protocol retry loops, and an unanswered peer Echo Request may
+lose its reply. Fatal DMA/input failures, invalid key selection and unknown
+MAC protocol results revoke the session. A protocol retransmission consumes a
+new sequence and PN; it does not reset key or replay state. A MAC ACK confirms
+the next hop, not application delivery. This bounded polling profile has no
+general data-send API or throughput guarantee.
 
 The station answers ordinary authenticated ARP requests and valid ICMP Echo
 Requests to its leased address, including unfragmented 1500-byte IPv4 packets. `ping_gateway` verifies full matching replies.
