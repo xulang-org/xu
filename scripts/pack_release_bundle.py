@@ -36,6 +36,7 @@ from pathlib import Path
 
 from companion_repos import project_root, package_directories, vscode_package_files
 from inject_offline_payload import create_offline_installer
+from windows_setup_manifest import embed_invoker_manifest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -240,6 +241,8 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
         built_tool = ensure_tool_built(xu_bin, target, tool_name, src_dir, cache_dir)
         dest_name = f"{tool_name}.exe" if is_windows else tool_name
         shutil.copy2(built_tool, bin_dir / dest_name)
+        if is_windows and tool_name == "xu-setup":
+            embed_invoker_manifest(bin_dir / dest_name)
         (bin_dir / dest_name).chmod(0o755)
 
     # 2.1 Copy xu-setup to bundle root for direct execution
