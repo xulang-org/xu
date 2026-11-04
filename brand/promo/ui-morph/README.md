@@ -1,10 +1,14 @@
 # XU UI Morph (1440×1440)
 
-One shape, never cut. Cursor-driven morph through logo → button → loader → check → island → player → volume → toggle → tabs → chart → ⌘K → toast → logo. Pure `seek(t)` (no CSS transitions / timers).
+One shape, never cut. Cursor-driven morph aligned to [xulang.org](https://xulang.org/) messaging:
+
+Logo → Install XU → Loader → Check → Island (Zero GC · Inferred Ownership) → Player (Clear intent. / Native code.) → Volume → Toggle → Tabs (CLI · HTTP · UI) → Benchmarks (72 workloads) → ⌘K (site topics) → Toast (SDK 0.11.2 ready) → Logo
+
+Pure `seek(t)` (no CSS transitions / timers). Mixkit *Slow Trance Morning* @ ~123 BPM, 7 bars.
 
 ## Render
-1. Rebuild HTML embeds: `python3 build_html.py` (needs `/tmp/xu-ui/embed.json` from local asset prep)
-2. Beat stills: Playwright `seek(BEAT(i))`
-3. Full: `python3 render.py` → 60fps, 4 subframes averaged, ffmpeg `tmix`, bed+SFX mux
+1. `python3 build_html.py`
+2. Beat stills via Playwright `seek(BEAT(i))`
+3. `python3 render.py` → 60fps, 4 subframes, `tmix`, bed+SFX
 
-Output artifact: `/opt/cursor/artifacts/xu-ui-morph.mp4`
+Artifact: `/opt/cursor/artifacts/xu-ui-morph.mp4`

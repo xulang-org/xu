@@ -31,7 +31,7 @@ html = rf"""<!DOCTYPE html>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 html, body {{
   width: 1440px; height: 1440px; overflow: hidden;
-  background: #E8E6E1;
+  background: #EDEBE6;
   font-family: 'Geist', system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
 }}
@@ -181,52 +181,52 @@ function contentBlur(t, enterAt, exitAt) {{
 */
 
 const Wchg = [
-  {{t: -1, v: 220}}, // logo
-  {{t: beat(1), v: 280}}, // button
-  {{t: beat(2), v: 120}}, // loader
-  {{t: beat(4), v: 120}}, // check same
-  {{t: beat(6), v: 520}}, // island
-  {{t: beat(7), v: 720}},
-  {{t: beat(8), v: 640}}, // player
-  {{t: beat(11), v: 560}}, // volume wider
-  {{t: beat(12), v: 420}},
-  {{t: beat(13), v: 120}}, // toggle track
-  {{t: beat(15), v: 480}}, // tabs
-  {{t: beat(17), v: 760}}, // chart
-  {{t: beat(20), v: 680}}, // cmdk
-  {{t: beat(23), v: 420}}, // toast
-  {{t: beat(25), v: 220}}, // logo
+  {{t: -1, v: 280}}, // logo + wordmark
+  {{t: beat(1), v: 300}}, // Install XU
+  {{t: beat(2), v: 128}}, // loader
+  {{t: beat(4), v: 128}}, // check
+  {{t: beat(6), v: 560}}, // island
+  {{t: beat(7), v: 760}},
+  {{t: beat(8), v: 680}}, // player
+  {{t: beat(11), v: 600}}, // volume
+  {{t: beat(12), v: 440}},
+  {{t: beat(13), v: 128}}, // toggle
+  {{t: beat(15), v: 520}}, // tabs CLI/HTTP/UI
+  {{t: beat(17), v: 820}}, // chart
+  {{t: beat(20), v: 720}}, // cmdk
+  {{t: beat(23), v: 460}}, // toast
+  {{t: beat(25), v: 280}}, // logo
 ];
 const Hchg = [
-  {{t: -1, v: 220}},
+  {{t: -1, v: 280}},
   {{t: beat(1), v: 96}},
-  {{t: beat(2), v: 120}},
-  {{t: beat(4), v: 120}},
-  {{t: beat(6), v: 96}},
-  {{t: beat(7), v: 110}},
-  {{t: beat(8), v: 280}},
-  {{t: beat(11), v: 72}},
-  {{t: beat(13), v: 64}},
-  {{t: beat(15), v: 72}},
-  {{t: beat(17), v: 480}},
-  {{t: beat(20), v: 360}},
-  {{t: beat(23), v: 88}},
-  {{t: beat(25), v: 220}},
+  {{t: beat(2), v: 128}},
+  {{t: beat(4), v: 128}},
+  {{t: beat(6), v: 88}},
+  {{t: beat(7), v: 100}},
+  {{t: beat(8), v: 260}},
+  {{t: beat(11), v: 76}},
+  {{t: beat(13), v: 68}},
+  {{t: beat(15), v: 76}},
+  {{t: beat(17), v: 500}},
+  {{t: beat(20), v: 380}},
+  {{t: beat(23), v: 92}},
+  {{t: beat(25), v: 280}},
 ];
 const Rchg = [ // corner radius
-  {{t: -1, v: 48}},
+  {{t: -1, v: 40}},
   {{t: beat(1), v: 48}}, // pill button
-  {{t: beat(2), v: 60}}, // circle loader
-  {{t: beat(4), v: 60}},
-  {{t: beat(6), v: 48}}, // island
-  {{t: beat(8), v: 36}},
-  {{t: beat(11), v: 36}},
-  {{t: beat(13), v: 32}},
-  {{t: beat(15), v: 36}},
+  {{t: beat(2), v: 64}}, // circle loader
+  {{t: beat(4), v: 64}},
+  {{t: beat(6), v: 44}}, // island
+  {{t: beat(8), v: 32}},
+  {{t: beat(11), v: 38}},
+  {{t: beat(13), v: 34}},
+  {{t: beat(15), v: 38}},
   {{t: beat(17), v: 28}},
-  {{t: beat(20), v: 24}},
-  {{t: beat(23), v: 20}},
-  {{t: beat(25), v: 48}},
+  {{t: beat(20), v: 22}},
+  {{t: beat(23), v: 18}},
+  {{t: beat(25), v: 40}},
 ];
 const BgChg = [ // 0 black, 1 white, 2 red
   {{t: -1, v: 0}},
@@ -316,20 +316,20 @@ function cursorState(t) {{
 /* Camera zoom so active state fills frame */
 function cameraScale(t) {{
   const ch = [
-    {{t: -1, v: 1.55}}, // logo fills
-    {{t: beat(1), v: 1.35}},
-    {{t: beat(2), v: 1.7}},
-    {{t: beat(6), v: 1.25}},
-    {{t: beat(8), v: 1.15}},
-    {{t: beat(11), v: 1.3}},
-    {{t: beat(13), v: 1.65}},
-    {{t: beat(15), v: 1.25}},
-    {{t: beat(17), v: 1.05}},
-    {{t: beat(20), v: 1.1}},
-    {{t: beat(23), v: 1.35}},
-    {{t: beat(25), v: 1.55}},
+    {{t: -1, v: 1.42}}, // logo fills
+    {{t: beat(1), v: 1.38}},
+    {{t: beat(2), v: 1.75}},
+    {{t: beat(6), v: 1.22}},
+    {{t: beat(8), v: 1.12}},
+    {{t: beat(11), v: 1.28}},
+    {{t: beat(13), v: 1.7}},
+    {{t: beat(15), v: 1.22}},
+    {{t: beat(17), v: 1.02}},
+    {{t: beat(20), v: 1.08}},
+    {{t: beat(23), v: 1.32}},
+    {{t: beat(25), v: 1.42}},
   ];
-  return springTrack(t, ch, 10, 0.9);
+  return springTrack(t, ch, 11, 0.88);
 }}
 
 /* Progress / volume value from direct manipulation while held */
@@ -367,9 +367,9 @@ function chartProgress(t) {{
 }}
 
 function typeText(t) {{
-  const full = 'charts';
+  const full = 'native';
   if (t < beat(21)) return '';
-  const n = Math.min(full.length, Math.floor((t - beat(21)) / (PERIOD / 6.2) + 0.001));
+  const n = Math.min(full.length, Math.floor((t - beat(21)) / (PERIOD / 6.5) + 0.001));
   return full.slice(0, n);
 }}
 
@@ -408,8 +408,9 @@ function renderContent(t) {{
     const alpha = Math.max(a, a2);
     const blur = Math.max(contentBlur(t, -1, beat(1)), contentBlur(t, beat(25), null));
     if (alpha > 0.01) {{
-      parts.push(`<div class="layer" style="opacity:${{alpha}};filter:blur(${{blur}}px)">
-        <img src="${{LOGO}}" width="120" height="120" alt="XU" style="display:block;border-radius:28px"/>
+      parts.push(`<div class="layer" style="opacity:${{alpha}};filter:blur(${{blur}}px);gap:14px">
+        <img src="${{LOGO}}" width="96" height="96" alt="XU" style="display:block;border-radius:22px"/>
+        <div style="font-weight:700;font-size:42px;letter-spacing:-0.04em;color:${{WHITE}}">XU</div>
       </div>`);
     }}
   }}
@@ -419,7 +420,7 @@ function renderContent(t) {{
     const a = contentAlpha(t, beat(1), beat(2));
     const blur = contentBlur(t, beat(1), beat(2));
     if (a > 0.01) {{
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);color:${{WHITE}};font-weight:600;font-size:28px;letter-spacing:0.02em">Get started</div>`);
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);color:${{WHITE}};font-weight:600;font-size:28px;letter-spacing:0.01em">Install XU</div>`);
     }}
   }}
 
@@ -457,7 +458,7 @@ function renderContent(t) {{
     if (a > 0.01) {{
       parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);flex-direction:row;gap:16px;padding:0 28px;justify-content:flex-start">
         <div style="width:14px;height:14px;border-radius:50%;background:${{RED}};margin-left:12px"></div>
-        <div style="color:${{WHITE}};font-size:22px;font-weight:500">Now Playing · XU</div>
+        <div style="color:${{WHITE}};font-size:20px;font-weight:500;letter-spacing:0.01em">Zero GC · Inferred Ownership</div>
       </div>`);
     }}
   }}
@@ -475,8 +476,8 @@ function renderContent(t) {{
         <div style="display:flex;gap:16px;align-items:center">
           <img src="${{LOGO}}" width="64" height="64" style="border-radius:14px;display:block"/>
           <div>
-            <div style="font-weight:600;font-size:24px;color:${{WHITE}}">Supersonic</div>
-            <div style="font-size:16px;color:rgba(250,249,246,0.55);margin-top:4px">XU · Zero GC</div>
+            <div style="font-weight:600;font-size:24px;color:${{WHITE}}">Clear intent.</div>
+            <div style="font-size:16px;color:rgba(250,249,246,0.55);margin-top:4px">Native code. · AOT</div>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:20px;margin-top:18px">
@@ -539,7 +540,7 @@ function renderContent(t) {{
     const a = contentAlpha(t, beat(15), beat(17));
     const blur = contentBlur(t, beat(15), beat(17));
     if (a > 0.01) {{
-      const labels = ['Build', 'Ship', 'Chart'];
+      const labels = ['CLI', 'HTTP', 'UI'];
       const idx = tabIndex(t);
       // liquid indicator edges
       const slot = 140;
@@ -580,13 +581,16 @@ function renderContent(t) {{
       const tipX = pad + (w - pad * 2) * (6 / (n - 1));
       const tipY = pad + (h - pad * 2) * (1 - pts[6]);
       parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:28px;align-items:stretch">
-        <div style="font-weight:600;font-size:22px;color:${{WHITE}};margin-bottom:12px">Throughput</div>
+        <div style="display:flex;justify-content:space-between;align-items:baseline;width:100%;margin-bottom:8px">
+          <div style="font-weight:600;font-size:22px;color:${{WHITE}}">Benchmarks</div>
+          <div style="font-size:14px;color:rgba(250,249,246,0.45)">72 workloads · 6 platforms</div>
+        </div>
         <svg width="100%" height="78%" viewBox="0 0 ${{w}} ${{h}}" preserveAspectRatio="none">
           <path d="${{d}}" fill="none" stroke="${{RED}}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
           ${{tipA > 0.01 ? `<g opacity="${{tipA}}">
             <circle cx="${{tipX}}" cy="${{tipY}}" r="6" fill="${{WHITE}}"/>
-            <rect x="${{tipX + 12}}" y="${{tipY - 36}}" width="96" height="40" rx="10" fill="${{WHITE}}"/>
-            <text x="${{tipX + 24}}" y="${{tipY - 10}}" fill="${{BLACK}}" font-size="16" font-family="Geist" font-weight="600">110k conn</text>
+            <rect x="${{tipX + 12}}" y="${{tipY - 42}}" width="128" height="44" rx="10" fill="${{WHITE}}"/>
+            <text x="${{tipX + 22}}" y="${{tipY - 16}}" fill="${{BLACK}}" font-size="15" font-family="Geist" font-weight="600">XU · vs Go/Rust</text>
           </g>` : ''}}
         </svg>
       </div>`);
@@ -599,15 +603,24 @@ function renderContent(t) {{
     const blur = contentBlur(t, beat(20), beat(23));
     if (a > 0.01) {{
       const q = typeText(t);
-      const items = ['Get started', 'Charts', 'Desktop build', 'Playground'].filter(s => !q || s.toLowerCase().includes(q));
-      const active = items[0] || 'Charts';
+      const catalog = [
+        {{t: 'Install XU', k: 'install'}},
+        {{t: 'Native UI & WebView', k: 'native ui webview'}},
+        {{t: 'Ownership & lifetimes', k: 'ownership lifetimes'}},
+        {{t: 'Coroutines & channels', k: 'coroutines channels'}},
+        {{t: 'WebAssembly AOT', k: 'webassembly wasm aot'}},
+      ];
+      const items = !q ? catalog : catalog.filter(s =>
+        s.k.split(' ').some(w => w.startsWith(q)) ||
+        s.t.toLowerCase().split(/\\s+/).some(w => w.startsWith(q))
+      );
       parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:22px;align-items:stretch;justify-content:flex-start">
         <div style="display:flex;align-items:center;gap:12px;border-bottom:1px solid rgba(250,249,246,0.12);padding-bottom:14px">
           <span style="font-size:22px;color:rgba(250,249,246,0.45)">⌘K</span>
           <span style="font-size:24px;font-weight:500;color:${{WHITE}}">${{q}}<span style="opacity:0.35">|</span></span>
         </div>
         <div style="margin-top:12px;display:flex;flex-direction:column;gap:6px;width:100%">
-          ${{items.slice(0, 4).map((it, i) => `<div style="padding:12px 14px;border-radius:12px;background:${{i===0?RED:'transparent'}};color:${{WHITE}};font-size:20px;font-weight:500">${{it}}</div>`).join('')}}
+          ${{items.slice(0, 4).map((it, i) => `<div style="padding:12px 14px;border-radius:12px;background:${{i===0?RED:'transparent'}};color:${{WHITE}};font-size:20px;font-weight:500">${{it.t}}</div>`).join('')}}
         </div>
       </div>`);
     }}
@@ -622,7 +635,7 @@ function renderContent(t) {{
         <div style="width:22px;height:22px;border-radius:50%;background:${{RED}};display:flex;align-items:center;justify-content:center">
           <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 6 L5 9 L10 3" stroke="${{WHITE}}" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
         </div>
-        <div style="color:${{WHITE}};font-weight:500;font-size:20px">Build complete</div>
+        <div style="color:${{WHITE}};font-weight:500;font-size:20px">SDK 0.11.2 ready</div>
       </div>`);
     }}
   }}
