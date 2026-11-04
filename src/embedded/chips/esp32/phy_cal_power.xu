@@ -1,0 +1,223 @@
+@embedded/chips/esp32
+
+// ROM get_power_db consumes the RAM revision's FM/SAR pair and average.
+// Only actual probe/heap/stack RAM in the reserved Xu radio layout is
+// accepted for the two u16 output pointers; no dynamic MMIO access.
+fn phy_cal_fm_callback(signal int, reference int) int {
+    if signal < 0x3FFD2000 || signal + 2 > 0x3FFE0000 || signal % 2 != 0 ||
+        reference < 0x3FFD2000 || reference + 2 > 0x3FFE0000 || reference % 2 != 0 {
+        volatile_store(0x3FFD7400, 19)
+        << 0
+    }
+    phy_cal_fm_ratio()
+    rom_call6(0x4000C2C8, signal, 0x3FFD7510, 2, 0, 0, 0)
+    rom_call6(0x4000C2C8, reference, 0x3FFD7512, 2, 0, 0, 0)
+    << volatile_load(0x3FFD7514)
+}
+
+pub fn phy_cal_install_sar() bool {
+    entry := rom_callback(phy_cal_fm_callback)
+    old := volatile_load(0x3FFAE1F4)
+    if old != 0x40005204 && old != entry { << false }
+    volatile_store(0x3FFAE1F4, entry)
+    << volatile_load(0x3FFAE1F4) == entry
+}
+
+fn phy_cal_power_frequency(mhz int) bool {
+    if mhz < 2400 || mhz > 2484 { << false }
+    volatile_store(0x3FF4E0C4, (volatile_load(0x3FF4E0C4) & 0xFFFFFF00) | ((mhz - 2400) * 3))
+    cap := volatile_load(0x3FF4E0C0) & 255
+    phy_cal_write(0x62, 1, 1, cap)
+    fraction := (mhz * 262144) / 120 - 2097152
+    packed := ((fraction >> 16) & 255) | (fraction & 0xFF00) | ((fraction & 255) << 16)
+    volatile_store(0x3FFD7428, packed)
+    rom_call6(0x40004740, 0x3FFD7428, 0, 0, 0, 0, 0)
+    phy_cal_pll_restart()
+    << phy_cal_pll_wait()
+}
+
+fn phy_cal_power_tx_start(bb int, dc int) bool {
+    rom_call6(0x40004458, 0, 0, 0, 0, 0, 0)
+    phy_cal_pbus_force(0, 1, 1)
+    phy_cal_pbus_force(1, 1, 0x7C)
+    phy_cal_pbus_force(1, 2, bb)
+    phy_cal_pbus_force(4, 1, 0x7F)
+    phy_cal_pbus_force(5, 1, 0x3F)
+    active := rom_call6(0x40004414, 1, 1, 0, 0, 0, 0)
+    phy_cal_pbus_force(1, 1, active | 2)
+    rom_call6(0x40004638, dc, 0, 0, 0, 0, 0)
+    rom_call6(0x40003564, 1, 0, 0, 0, 0, 0)
+    ok := phy_cal_power_detector_init() && phy_cal_i2c_error() == 0
+    if !ok { rom_call6(0x4000510C, 0, 0, 0, 0, 0, 0) }
+    << ok
+}
+
+fn phy_cal_measured_db() int {
+    // Default ESP32 init_data byte 81 is zero => pwrdet_offset=0x120.
+    raw := rom_call6(0x40005FC8, 0x120, 0, 0, 0, 0, 0)
+    volatile_store(0x3FFD7528, raw)
+    << raw
+}
+
+// Calibrate PA tank capacitance at channels 1/7/11. The three-byte native
+// records and fourth fallback record are kept at 0x3FFD7540..754B.
+pub fn phy_cal_txcap_bt() bool {
+    if (volatile_load(0x3FFD741C) & 15) != 15 || phy_cal_i2c_error() != 0 { << false }
+    if !phy_cal_hw_frequency_disable() || !phy_cal_install_sar() { << false }
+    // Calibrate the native 0x120 baseband setting used for PA tests too.
+    if !phy_cal_power_tx_start(0x120, 0x3FFD7488) { << false }
+    phy_cal_pbus_force(5, 1, 0x5F)
+    phy_cal_pbus_force(1, 1, 0x7C) // native PA-cap calibration uses Wi-Fi/CW mode
+    $ok := phy_cal_dc_trim()
+    volatile_store(0x3FFD7498, volatile_load(0x3FFD7450))
+    volatile_store(0x3FFD749C, volatile_load(0x3FFD7454))
+    rom_call6(0x4000510C, 0, 0, 0, 0, 0, 0)
+    if !ok || phy_cal_i2c_error() != 0 { << false }
+    rom_call6(0x400041FC, 0x6B, 2, 1, 3, 0, 15)
+    rom_call6(0x4000C44C, 0x3FFD7540, 0xA5, 12, 0, 0, 0)
+    $atten := 80
+    $channel := 0
+    while channel < 3 && ok {
+        $mhz := 2412
+        if channel == 1 { mhz = 2442 }
+        else if channel == 2 { mhz = 2462 }
+        if !phy_cal_power_frequency(mhz) { << false }
+        ok = phy_cal_power_tx_start(0x120, 0x3FFD7498)
+        phy_cal_pbus_force(5, 1, 0x5F)
+        phy_cal_pbus_force(1, 1, 0x7C)
+        if ok && channel == 0 {
+            $level := false
+            $trial := 0
+            while trial < 16 && !level && phy_cal_i2c_error() == 0 {
+                rom_call6(0x400035D0, 1, 128, atten, 0, 0, 0)
+                rom_delay_us(2)
+                measured := phy_cal_measured_db() >> 2
+                $error := measured - 40
+                if error >= -3 && error <= 3 { level = true }
+                else {
+                    if error < 0 { error = (error * 3) / 4 }
+                    atten = atten + error
+                    if atten < 0 { atten = 0 }
+                    if atten > 120 { atten = 120 }
+                }
+                trial = trial + 1
+            }
+            ok = level
+            if !ok && phy_cal_i2c_error() == 0 { volatile_store(0x3FFD7400, 20) }
+        }
+        if ok {
+            volatile_store(0x3FFD75B0, atten)
+            rom_call6(0x40005DEC, 128, atten, 0, 0x3FFD7540 + channel * 3, 0, 0)
+            ok = phy_cal_i2c_error() == 0
+        }
+        rom_call6(0x4000510C, 0, 0, 0, 0, 0, 0)
+        channel = channel + 1
+    }
+    if !ok { << false }
+    // Native channel-14 fallback repeats the last calibrated record.
+    rom_call6(0x4000C2C8, 0x3FFD7549, 0x3FFD7546, 3, 0, 0, 0)
+    if volatile_load8(0x3FFD7540) > 15 || volatile_load8(0x3FFD7541) > 15 || volatile_load8(0x3FFD7542) > 7 ||
+        volatile_load8(0x3FFD7543) > 15 || volatile_load8(0x3FFD7544) > 15 || volatile_load8(0x3FFD7545) > 7 ||
+        volatile_load8(0x3FFD7546) > 15 || volatile_load8(0x3FFD7547) > 15 || volatile_load8(0x3FFD7548) > 7 {
+        volatile_store(0x3FFD7400, 21)
+        << false
+    }
+    volatile_store(0x3FFD741C, volatile_load(0x3FFD741C) | 16)
+    << true
+}
+
+// Single-rate form of ram_rfcal_pwrctrl: two measured detector readings,
+// bounded feedback, and the native 10-quarter-dB CW/packet correction.
+fn phy_cal_power_feedback() int {
+    $atten := 24
+    $accumulated := 0
+    $last := 2
+    $trial := 0
+    $done := false
+    $error := 99
+    while trial < 10 && !done && phy_cal_i2c_error() == 0 {
+        atten = 24 + accumulated
+        if atten < 0 { atten = 0 }
+        if atten > 100 { atten = 100 }
+        rom_call6(0x400035D0, 1, 32, atten, 0, 0, 0)
+        rom_delay_us(2)
+        p0 := phy_cal_measured_db()
+        p1 := phy_cal_measured_db()
+        $measured := (p0 + p1 + 4) >> 3
+        if measured < 0 { measured = 0 }
+        error = measured - 46
+        if error > 24 { error = 24 }
+        if error < -24 { error = -24 }
+        if error == 0 || (error == -1 && last == 1) || last == 0 ||
+            (atten == 0 && error < 0) || (atten == 100 && error > 0) {
+            done = true
+        } else {
+            $step := error
+            if error < -2 || error > 2 { step = step - (error >> 2) }
+            accumulated = accumulated + step
+            last = error
+        }
+        trial = trial + 1
+    }
+    volatile_store(0x3FFD752C, error)
+    $result := atten - 10
+    if result < -24 { result = -24 }
+    rom_call6(0x40003F98, 1, 0, 0, 0, 0, 0)
+    << result
+}
+
+pub fn phy_cal_txpower_bt() bool {
+    if (volatile_load(0x3FFD741C) & 31) != 31 || phy_cal_i2c_error() != 0 { << false }
+    if !phy_cal_hw_frequency_disable() { << false }
+    $bb_index := 1
+    $channel := 0
+    $ok := true
+    $base := 0
+    while channel < 4 && ok {
+        $mhz := 2442
+        $ieee := 7
+        if channel == 1 { mhz = 2412
+            ieee = 1 }
+        else if channel == 2 { mhz = 2422
+            ieee = 3 }
+        else if channel == 3 { mhz = 2462
+            ieee = 11 }
+        ok = phy_cal_power_frequency(mhz)
+        rom_call6(0x40005D50, 0x3FFD7540, ieee, 0, 0, 0, 0)
+        $trial := 0
+        $selected := false
+        while trial < 2 && !selected && ok {
+            $bb := 0
+            if bb_index == 1 { bb = 0x20 }
+            else if bb_index == 2 { bb = 0x30 }
+            ok = phy_cal_power_tx_start(bb, 0x3FFD7480 + bb_index * 8)
+            if ok {
+                value := phy_cal_power_feedback()
+                if channel != 0 || (value >= 10 && value < 39) || trial == 1 {
+                    selected = true
+                    if channel == 0 {
+                        base = value
+                        volatile_store(0x3FFD7520, bb_index)
+                        volatile_store(0x3FFD7524, value)
+                        volatile_store(0x3FFD7530, value)
+                    } else if channel == 1 { volatile_store(0x3FFD7534, value - base) }
+                    else if channel == 2 { volatile_store(0x3FFD7538, value - base) }
+                    else { volatile_store(0x3FFD753C, value - base) }
+                    residual := volatile_load(0x3FFD752C)
+                    if residual < -3 || residual > 3 { ok = false }
+                } else if value < 10 { bb_index = 2 }
+                else { bb_index = 0 }
+            }
+            rom_call6(0x4000510C, 0, 0, 0, 0, 0, 0)
+            trial = trial + 1
+        }
+        ok = ok && selected && phy_cal_i2c_error() == 0
+        channel = channel + 1
+    }
+    if !ok {
+        if phy_cal_i2c_error() == 0 { volatile_store(0x3FFD7400, 22) }
+        << false
+    }
+    volatile_store(0x3FFD741C, volatile_load(0x3FFD741C) | 32)
+    << true
+}

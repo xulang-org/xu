@@ -1,0 +1,316 @@
+@embedded/chips/esp32
+
+// BLE-only RX calibration, ported from libphy's set_rx_gain_table,
+// set_rx_gain_testchip_70(true), set_rx_gain_cal_dc(true,1,2),
+// pbus_rx_dco_cal_1step, rxdc_est_min and ram_dc_iq_est. No vendor RAM
+// instructions are linked. Native mask-ROM helpers operate the PBUS/I2C.
+// Requires controller IRQs/events stopped, PLL/channel/TX stages complete.
+// Owns only 3FFD7800..7BFF. This cold-start routine is not ISR-reentrant.
+// 7800 error; 7804 stages: 1 table checked,2 DC converged,4 gain uploaded,
+// 8 analog initialized. These bits never claim Wi-Fi IQ/noise or air RX.
+// 7808 max gain=72;780C RF stage;7810/14 residual;7818 last power dB;
+// 781C last iteration;7820 final I:Q trims;7824 total acquisitions;
+// 7828 rejected samples;7830 completed-calibration magic BRX1;
+// 7840..785F eight measured I:Q RF DC words;
+// 7860..78BF per-RF residual I/Q and iteration count;
+// 7900..7B47 shadows of the 73 uploaded 64-bit BT gain entries;
+// 7B50 SDM scratch;7BF8/7BFC validated scratch copy words.
+
+pub fn phy_cal_rx_error() int { << volatile_load(0x3FFD7800) }
+pub fn phy_cal_rx_stages() int { << volatile_load(0x3FFD7804) }
+pub fn phy_cal_rx_bt_calibrated() bool {
+    << volatile_load(0x3FFD7800) == 0 &&
+        volatile_load(0x3FFD7804) == 15 && volatile_load(0x3FFD7808) == 72 &&
+        volatile_load(0x3FFD7830) == 0x42525831 && volatile_load(0x3FFD7824) >= 16
+}
+
+fn phy_cal_rx_s32(value int) int {
+    x := value & 0xFFFFFFFF
+    if x > 0x7FFFFFFF { << x - 4294967296 }
+    << x
+}
+
+fn phy_cal_rx_abs(value int) int {
+    if value < 0 { << 0 - value }
+    << value
+}
+
+fn phy_cal_rx_put(address int, value int) bool {
+    if address < 0x3FFD7840 || address > 0x3FFD7BF4 || address % 4 != 0 {
+        volatile_store(0x3FFD7800, 1)
+        << false
+    }
+    volatile_store(0x3FFD7BFC, value)
+    rom_call6(0x4000C2C8, address, 0x3FFD7BFC, 4, 0, 0, 0)
+    << true
+}
+
+fn phy_cal_rx_get(address int) int {
+    if address < 0x3FFD7840 || address > 0x3FFD7BF4 || address % 4 != 0 {
+        volatile_store(0x3FFD7800, 1)
+        << 0
+    }
+    rom_call6(0x4000C2C8, 0x3FFD7BF8, address, 4, 0, 0, 0)
+    << volatile_load(0x3FFD7BF8)
+}
+
+pub fn phy_cal_rx_bt_dc(index int) int {
+    if index < 0 || index > 7 { << -1 }
+    << phy_cal_rx_get(0x3FFD7840 + index * 4)
+}
+
+// component 0/1 is signed I/Q differential residual; 2 is iterations.
+pub fn phy_cal_rx_bt_result(index int, component int) int {
+    if index < 0 || index > 7 || component < 0 || component > 2 { << -1 }
+    << phy_cal_rx_s32(phy_cal_rx_get(0x3FFD7860 + index * 12 + component * 4))
+}
+
+fn phy_cal_rx_est_disable() {
+    volatile_store(0x3FF4607C, volatile_load(0x3FF4607C) & 0xFFFFFFFD)
+    rom_delay_us(1)
+    volatile_store(0x3FF4607C, volatile_load(0x3FF4607C) & 0xFFFFFFFE)
+}
+
+// Actual ADC accumulator readout. The RAM revision uses >>6 and
+// smp_num+1; the older ROM estimator has a different scaling contract.
+fn phy_cal_rx_estimate() bool {
+    volatile_store(0x3FF46060, (volatile_load(0x3FF46060) & 0xF3FFFFFF) | 0x04000000)
+    volatile_store(0x3FF4607C, (volatile_load(0x3FF4607C) & 0xFFE7FFFF) | 0x00100000)
+    volatile_store(0x3FF4607C, (volatile_load(0x3FF4607C) & 0xFFFE0003) | (4000 << 2))
+    volatile_store(0x3FF4607C, volatile_load(0x3FF4607C) | 1)
+    rom_delay_us(1)
+    volatile_store(0x3FF4607C, volatile_load(0x3FF4607C) | 2)
+    $ready := false
+    $polls := 0
+    while polls < 2000 && !ready {
+        if (volatile_load(0x3FF4607C) & 0x80000000) != 0 { ready = true }
+        else {
+            rom_delay_us(1)
+            polls += 1
+        }
+    }
+    if !ready {
+        phy_cal_rx_est_disable()
+        volatile_store(0x3FFD7800, 2)
+        << false
+    }
+    i := (phy_cal_rx_s32(volatile_load(0x3FF460DC)) >> 6) / 4001
+    q := (phy_cal_rx_s32(volatile_load(0x3FF460E0)) >> 6) / 4001
+    total := phy_cal_rx_s32(volatile_load(0x3FF460E4))
+    $ac := (total / 4001) * 8 - i * i - q * q
+    if ac < 0 { ac = 0 }
+    db := (phy_cal_rx_s32(rom_call6(0x40005F64, ac, 0, 0, 0, 0, 0)) + 8) >> 4
+    phy_cal_rx_est_disable()
+    volatile_store(0x3FFD7810, i)
+    volatile_store(0x3FFD7814, q)
+    volatile_store(0x3FFD7818, db)
+    volatile_store(0x3FFD7824, volatile_load(0x3FFD7824) + 1)
+    << phy_cal_i2c_error() == 0
+}
+
+// The vendor tries at most 50 acquisitions and independently retains the
+// smallest absolute I/Q among unsaturated samples. Reject an all-saturated
+// run instead of its synthetic fallback residual (3,3).
+fn phy_cal_rx_est_min() bool {
+    $best_i := 1000
+    $best_q := 1000
+    $accepted := 0
+    $tries := 0
+    $done := false
+    while tries < 50 && !done {
+        if !phy_cal_rx_estimate() { << false }
+        power := phy_cal_rx_s32(volatile_load(0x3FFD7818))
+        if power < 53 {
+            i := phy_cal_rx_s32(volatile_load(0x3FFD7810))
+            q := phy_cal_rx_s32(volatile_load(0x3FFD7814))
+            if phy_cal_rx_abs(i) < phy_cal_rx_abs(best_i) { best_i = i }
+            if phy_cal_rx_abs(q) < phy_cal_rx_abs(best_q) { best_q = q }
+            accepted += 1
+            done = power < 36 || accepted > 3
+        } else {
+            volatile_store(0x3FFD7828, volatile_load(0x3FFD7828) + 1)
+        }
+        tries += 1
+    }
+    if accepted == 0 || best_i == 1000 || best_q == 1000 {
+        volatile_store(0x3FFD7800, 3)
+        << false
+    }
+    volatile_store(0x3FFD7810, best_i)
+    volatile_store(0x3FFD7814, best_q)
+    << true
+}
+
+fn phy_cal_rx_dc_one() bool {
+    $i := (volatile_load(0x3FFD7820) >> 16) & 0xFFFF
+    $q := volatile_load(0x3FFD7820) & 0xFFFF
+    $iteration := 0
+    $converged := false
+    while iteration < 20 && !converged {
+        if phy_cal_pbus_force(2, 1, i) != 0 || phy_cal_pbus_force(3, 1, q) != 0 { << false }
+        phy_cal_pbus_force(1, 2, 0)
+        rom_delay_us(10)
+        if !phy_cal_rx_est_min() { << false }
+        base_i := phy_cal_rx_s32(volatile_load(0x3FFD7810))
+        base_q := phy_cal_rx_s32(volatile_load(0x3FFD7814))
+        phy_cal_pbus_force(1, 2, 0x20)
+        rom_delay_us(10)
+        if !phy_cal_rx_est_min() { << false }
+        di := phy_cal_rx_s32(volatile_load(0x3FFD7810)) - base_i
+        dq := phy_cal_rx_s32(volatile_load(0x3FFD7814)) - base_q
+        volatile_store(0x3FFD7810, di)
+        volatile_store(0x3FFD7814, dq)
+        iteration += 1
+        if phy_cal_rx_abs(di) <= 1 && phy_cal_rx_abs(dq) <= 1 {
+            // Native mode=1 subtracts the measured low-BB baseline once
+            // the differential error is inside its one-count threshold.
+            i -= base_i
+            q -= base_q
+            converged = true
+        } else {
+            if phy_cal_rx_abs(di) > 1 { i -= di }
+            if phy_cal_rx_abs(dq) > 1 { q -= dq }
+            if i < 0 { i = 0 }
+            if i > 511 { i = 511 }
+            if q < 0 { q = 0 }
+            if q > 511 { q = 511 }
+        }
+    }
+    volatile_store(0x3FFD781C, iteration)
+    if !converged {
+        volatile_store(0x3FFD7800, 4)
+        << false
+    }
+    if i < 0 || i > 511 || q < 0 || q > 511 {
+        volatile_store(0x3FFD7800, 5)
+        << false
+    }
+    volatile_store(0x3FFD7820, (i << 16) | q)
+    << phy_cal_pbus_force(2, 1, i) == 0 && phy_cal_pbus_force(3, 1, q) == 0
+}
+
+fn phy_cal_rx_frequency() bool {
+    // chip_v7_set_chan_ana(14): RF=2484 MHz, crystal_select=0, offset=0.
+    // Use the already calibrated per-MHz cap and the same SDM formula.
+    volatile_store(0x3FF4E0C4, (volatile_load(0x3FF4E0C4) & 0xFFFFFF00) | 252)
+    cap := volatile_load(0x3FF4E0C0) & 255
+    phy_cal_write(0x62, 1, 1, cap)
+    fraction := (2484 * 262144) / 120 - 2097152
+    packed := ((fraction >> 16) & 255) | (fraction & 0xFF00) | ((fraction & 255) << 16)
+    volatile_store(0x3FFD7B50, packed)
+    rom_call6(0x40004740, 0x3FFD7B50, 0, 0, 0, 0, 0)
+    phy_cal_pll_restart()
+    << phy_cal_pll_wait()
+}
+
+fn phy_cal_rx_analog_init() bool {
+    volatile_store(0x3FFD7B50, 0x01000100)
+    volatile_store(0x3FFD7B54, 0x01000100)
+    rom_call6(0x40004458, 0, 0, 0, 0, 0, 0)
+    phy_cal_pbus_force(4, 1, 0)
+    phy_cal_pbus_force(5, 1, 0)
+    phy_cal_pbus_force(0, 1, 0x184)
+    phy_cal_pbus_force(1, 1, 0x189)
+    phy_cal_pbus_force(1, 2, 0)
+    rom_call6(0x40004638, 0x3FFD7B50, 0, 0, 0, 0, 0)
+    phy_cal_pbus_force(1, 1, 0x18B)
+    phy_cal_pbus_force(1, 2, 0)
+    rom_call6(0x40004638, 0x3FFD7B50, 0, 0, 0, 0, 0)
+    rom_call6(0x4000446C, 0, 0, 0, 0, 0, 0)
+    << phy_cal_i2c_error() == 0
+}
+
+pub fn phy_cal_rx_bt() bool {
+    volatile_store(0x3FFD7800, 0)
+    volatile_store(0x3FFD7804, 0)
+    volatile_store(0x3FFD7808, 72)
+    volatile_store(0x3FFD780C, 0)
+    volatile_store(0x3FFD7820, 0x01000100)
+    volatile_store(0x3FFD7824, 0)
+    volatile_store(0x3FFD7828, 0)
+    volatile_store(0x3FFD7830, 0)
+    if volatile_load(0x3FFD7418) != 0x504C4C31 ||
+        (volatile_load(0x3FFD741C) & 127) != 127 || phy_cal_i2c_error() != 0 ||
+        !phy_cal_hw_frequency_disable() {
+        volatile_store(0x3FFD7800, 6)
+        << false
+    }
+    if phy_cal_rx_bt_gain_at(0) != 0 || phy_cal_rx_bt_gain_at(72) != 0x50ED {
+        volatile_store(0x3FFD7800, 7)
+        << false
+    }
+    volatile_store(0x3FFD7804, 1)
+    saved_i2c := rom_call6(0x400041C0, 0x67, 1, 15, 2, 0, 0)
+    rom_call6(0x400041FC, 0x67, 1, 15, 2, 0, 0)
+    volatile_store(0x3FF460A0, volatile_load(0x3FF460A0) | 0xC000)
+    rom_call6(0x40004458, 0, 0, 0, 0, 0, 0)
+    rom_call6(0x4000453C, 0, 0, 0, 0, 0, 0)
+    active := rom_call6(0x40004414, 1, 1, 0, 0, 0, 0)
+    phy_cal_pbus_force(1, 1, active | 2)
+    volatile_store(0x3FF450DC, volatile_load(0x3FF450DC) & 0xF7FFFFFF)
+    rom_call6(0x4000453C, 0, 0, 0, 0, 0, 0)
+    active_again := rom_call6(0x40004414, 1, 1, 0, 0, 0, 0)
+    phy_cal_pbus_force(1, 1, active_again | 2)
+    rom_call6(0x40003594, 1, 0, 0, 0, 0, 0)
+    rom_call6(0x40003564, 1, 0, 0, 0, 0, 0)
+    $ok := phy_cal_rx_frequency()
+    $rf := 0
+    while rf < 8 && ok {
+        volatile_store(0x3FFD780C, rf)
+        phy_cal_pbus_force(0, 1, 0x184)
+        rom_call6(0x40004480, phy_cal_rx_bt_rf_gain(rf) << 8, 0, 0, 0, 0, 0)
+        phy_cal_pbus_force(2, 2, 0x100)
+        phy_cal_pbus_force(3, 2, 0x100)
+        ok = phy_cal_rx_dc_one()
+        if ok {
+            ok = phy_cal_rx_put(0x3FFD7840 + rf * 4, volatile_load(0x3FFD7820)) &&
+                phy_cal_rx_put(0x3FFD7860 + rf * 12, volatile_load(0x3FFD7810)) &&
+                phy_cal_rx_put(0x3FFD7864 + rf * 12, volatile_load(0x3FFD7814)) &&
+                phy_cal_rx_put(0x3FFD7868 + rf * 12, volatile_load(0x3FFD781C))
+        }
+        rf += 1
+    }
+    rom_call6(0x40003594, 0, 0, 0, 0, 0, 0)
+    rom_call6(0x40003564, 0, 0, 0, 0, 0, 0)
+    volatile_store(0x3FF460A0, volatile_load(0x3FF460A0) & 0xFFFF7FFF)
+    rom_call6(0x4000453C, 0, 0, 0, 0, 0, 0)
+    rom_call6(0x4000446C, 0, 0, 0, 0, 0, 0)
+    rom_call6(0x400041FC, 0x67, 1, 15, 2, 0, saved_i2c)
+    if !ok || phy_cal_i2c_error() != 0 {
+        if phy_cal_rx_error() == 0 { volatile_store(0x3FFD7800, 8) }
+        << false
+    }
+    volatile_store(0x3FFD7804, 3)
+    $rf_index := 0
+    for index in 0:73 {
+        gain := phy_cal_rx_bt_gain_at(index)
+        if (gain >> 8) != phy_cal_rx_bt_rf_gain(rf_index) { rf_index += 1 }
+        if rf_index > 7 || (gain >> 8) != phy_cal_rx_bt_rf_gain(rf_index) {
+            volatile_store(0x3FFD7800, 9)
+            << false
+        }
+        dc := phy_cal_rx_get(0x3FFD7840 + rf_index * 4)
+        // wr_rx_gain_mem BT branch has BB DC fixed at 0x100/0x100 and
+        // no Wi-Fi IQ correction; measured RF I is high16, Q is low16.
+        low := ((gain * 0x20000) + ((dc >> 16) & 0xFFFF) * 0x100 + 0x80) & 0xFFFFFFFF
+        high := ((dc & 0xFFFF) * 0x400000 + 0x200000) & 0xFFFFFFFF
+        phy_cal_write_gain(low, high, index + 0x80)
+        if !phy_cal_rx_put(0x3FFD7900 + index * 8, low) ||
+            !phy_cal_rx_put(0x3FFD7904 + index * 8, high) { << false }
+    }
+    volatile_store(0x3FF5C0A4, (volatile_load(0x3FF5C0A4) & 0xFFC07FFF) | (72 << 15))
+    volatile_store(0x3FF450DC, volatile_load(0x3FF450DC) | 0x18001800)
+    if ((volatile_load(0x3FF5C0A4) >> 15) & 127) != 72 ||
+        (volatile_load(0x3FF45034) & 0x30000) != 0 || phy_cal_rx_error() != 0 {
+        volatile_store(0x3FFD7800, 10)
+        << false
+    }
+    volatile_store(0x3FFD7804, 7)
+    if !phy_cal_rx_analog_init() {
+        volatile_store(0x3FFD7800, 11)
+        << false
+    }
+    volatile_store(0x3FFD7804, 15)
+    volatile_store(0x3FFD7830, 0x42525831)
+    << true
+}
