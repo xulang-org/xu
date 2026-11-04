@@ -31,15 +31,17 @@ pack using `python3 scripts/esp32_image.py pack firmware.elf firmware.bin
 `wifi_create()` hooks remain unavailable until a backend is installed.
 
 The supported hardware profile is ESP32-D0WD-V3 rev 3.1, 40 MHz crystal,
-Wi-Fi-only cold boot, channels 1 through 11, legacy open-system management and
+shared-radio cold boot, channels 1 through 11, legacy open-system management and
 WPA2-PSK with CCMP-128. Passphrases contain 8 through 63 printable ASCII bytes;
 SSIDs contain 1 through 32 bytes. `connect_timeout` accepts 1 through 300000 ms
 and bounds scan/retry scheduling; synchronous PBKDF2 or an in-progress frame
 can finish after that deadline. `connect` uses 60000 ms. Open/WEP/WPA3, PMF,
-A-MSDU, fragmented IP, roaming, SoftAP, and simultaneous BLE operation are
-unsupported. The hardware/profile restrictions are substantive.
+A-MSDU, fragmented IP, roaming and SoftAP are unsupported. The hardware/profile
+restrictions are substantive. The CYD status demo additionally provides a
+fixed-channel BLE HID coexistence integration; installing this backend alone
+does not initialize a BLE controller or provide dynamic radio scheduling.
 
-One device owns the radio, DMA arena and TIMG0/T0 for its lifetime. The timer
+One station owns its MAC, DMA arena and TIMG0/T0 for its lifetime. The timer
 uses APB at 80 MHz; initialization refuses an already enabled T0. `disconnect`
 stops RX/TX, releases session keys and cached handshake material, and revokes
 the visible IP; it retains PHY initialization, timer ownership, and the facade's
@@ -55,11 +57,28 @@ getters and borrowed helper arguments instead of copying large protocol
 values through application call chains. Do not copy or mutate session state
 while the device is active.
 The radio layout reserves Xu data and its bounded heap at
-`0x3FFC0000..0x3FFD2000`, RX DMA at `0x3FFD2000..0x3FFD5500`, PHY/TX/ROM work
-below `0x3FFD8000`, and a downward stack from `0x3FFE0000`. Management, CCMP,
+`0x3FFC0000..0x3FFD2000`, Wi-Fi DMA/PHY work at
+`0x3FFE8000..0x3FFED000`, shared PHY/ROM work below `0x3FFD8000`, and a
+downward stack from `0x3FFE0000`. This keeps BLE KE pools at
+`0x3FFD2000..0x3FFD7000` separate from Wi-Fi, including copy scratch used
+by IRQs. The upper arena requires normal MAC-dump mapping and IRAM below
+`0x400A0000`, avoiding its D/IRAM alias. Management, CCMP,
 and IPv4 processing use successive call frames. Application call chains must
 also respect this 32 KiB stack budget; the product runtime does not supply a
 general stack-overflow guard.
+
+Coexistence cold boot must initialize shared controller memory/PHY once,
+connect Wi-Fi before BLE events start, then initialize the BLE controller
+and call `esp32.wifi_phy_coexist_enable(channel)` while its IRQs/events are
+stopped. This sets the actual AP-frequency restore bytes and enables the
+hardware sequencer/PTA. Re-running this backend's cold initialization or
+scanning/retuning after BLE starts is unsupported. Flash writes require both
+radio engines quiesced. See the status demo for these ordering boundaries.
+
+`probe_gateway($&device.session)` submits one bounded Echo without blocking
+BLE servicing; it requires an existing lease and resolved gateway MAC.
+Submission success is separate from `gateway_replies(&device.session)`,
+which increases only for authenticated, fully matching Echo Replies.
 
 Hardware own-address ACK remains enabled. Native key slots stay empty;
 complete RX MPDUs are checked for hardware status, layout, peer addresses,
