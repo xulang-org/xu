@@ -64,14 +64,24 @@ general stack-overflow guard.
 Hardware own-address ACK remains enabled. Native key slots stay empty;
 complete RX MPDUs are checked for hardware status, layout, peer addresses,
 CCMP MIC and per-key/per-TID PN before plaintext reaches DHCP/ARP/ICMP.
-Each outgoing PN is consumed before queue submission. RX descriptors are
-consumed once and recycled only after stopping DMA. This initial polling
-profile retires a TX submission before buffer reuse using a bounded delay;
-it does not expose delivery confirmation, contention-controlled retries or a
-general data-send API.
+Each outgoing PN is consumed before queue submission. The consumer follows
+the hardware completion boundary and groups descriptors
+through the packet EOF, including packets split across buffers. It copies
+each complete MPDU before appending the consumed chain to the active queue,
+without stopping RX. Invalid pointers, loops, capacity or sentinel corruption
+revoke the session; incomplete packets wait for a later completion boundary.
+
+Unicast submissions enable ACK checking and require both DMA completion
+and a successful MAC protocol result. A failed submission is cancelled and
+drained before one of at most three retries; retries reuse the exact MPDU
+and PN with the Retry bit set. Software CCMP can exhaust the RX queue, so the
+backend replenishes it immediately before submitting data and retains up to
+four copied arrivals for the next poll. Overflow drops excess arrivals; this
+is a bounded polling profile, without a general data-send API or throughput
+guarantee. A MAC ACK confirms the next hop, not application delivery.
 
 The station answers ordinary authenticated ARP requests and valid ICMP Echo
-Requests to its leased address. `ping_gateway` verifies full matching replies.
+Requests to its leased address, including unfragmented 1500-byte IPv4 packets. `ping_gateway` verifies full matching replies.
 An expired local lease, AP silence, received deauthentication/disassociation,
 or fatal DMA/submission failure revokes the connection. Lease seconds use
 network-order bytes and a wrapping monotonic clock. DHCP renewal/rebinding,

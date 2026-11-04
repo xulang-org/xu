@@ -35,7 +35,9 @@ LLC ARP reply only for an ordinary valid request for our acquired address.
 It rejects zero-source probes, conflicts, invalid peer MAC/IP and other
 targets. `echo_response(&payload,&address)` validates an Echo Request and both
 checksums, then returns an exact-length reply with reversed IPs, TTL 64 and
-new checksums. Invalid requests return no response. The driver must supply
+new checksums. It accepts ICMP bodies through 1472 bytes (1500-byte IPv4
+datagrams); the outbound diagnostic request/reply helpers retain their
+1200-byte body limit. Invalid requests return no response. The driver must supply
 authenticated plaintext and validate the corresponding link addresses.
 
 The bounded profile accepts IPv4 datagrams up to 1500 bytes with a 20-byte
