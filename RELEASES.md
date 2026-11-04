@@ -6,6 +6,18 @@
 
 ---
 
+## Xu 0.11.3-dev.14 (development)
+
+Fixes string-array slicing reading later elements at byte offsets instead of descriptor offsets. Source and destination indexing now share the existing scaled element offset, preserving the 24-byte descriptor layout, independent slice ownership and bounds traps without adding another per-element multiplication. This is a development build.
+
+## Xu 0.11.3-dev.13 (development)
+
+Fixes unsigned full-width integer arithmetic in math/bits: mul64 now masks logical high-lane shifts, and div64 divides the complete 128-bit dividend, reports quotient overflow and preserves unsigned quotient/remainder bit patterns. A zero high lane uses bounded unsigned 64/64 shortcuts instead of the general 64-step division. Only ARM64 and x64 calls use the existing native high-multiply helper; other targets retain the semantic implementation. No new ISA or constant-time guarantee is introduced. This is a development build.
+
+## Xu 0.11.3-dev.12 (development)
+
+Fixes software binary64 floor, ceil, truncation and rounding for non-finite values, signed zero and large integral inputs. Round compares the fractional part instead of adding 0.5, avoiding incorrect results near half-integers and the 2^52 boundary. Log now returns negative infinity for either zero and terminates for positive infinity; Frexp preserves zero, infinity and NaN with exponent zero. Hardware rounding paths remain available. This does not change finite Log approximation or provide a new FMA accuracy guarantee. This is a development build.
+
 ## Xu 0.11.3-dev.10 (development)
 
 Adds the opt-in `xu-c-2` native ABI for synchronous borrowed i64 spans. `i64_span` and `i64_span_mut` parameters become Xu `&[]int` and `$&[]int`; a call-scoped C view exposes length and contiguous data without transferring array ownership or capacity. The platform adapter handles integer register and stack arguments, including Win64 shadow space. Both native pack tools accept the versioned format; older products reject it instead of interpreting a borrow as an integer. Existing `xu-c-1` archives remain supported. This ABI currently accepts 64-bit `int` scalars and `void`/`int` results; native function values require a Xu wrapper. This is a development build.
