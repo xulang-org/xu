@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.15 (development)
+
+Integrates binary64 special-value rounding, full-width unsigned arithmetic, correct owned string-slice indexing, Windows SDK current-user installer manifests, and ESP32 WPA2/CCMP/IPv4 protocol primitives. Retains the borrowed i64 native ABI and pure Xu ESP32 backend. Standard `WifiDevice` APIs remain unavailable until a persistent hardware driver is connected; protocol and board probes do not imply a complete Wi-Fi application. No general performance improvement is claimed for this integration.
+
 ## Xu 0.11.3-dev.14 (development)
 
 Fixes string-array slicing reading later elements at byte offsets instead of descriptor offsets. Source and destination indexing now share the existing scaled element offset, preserving the 24-byte descriptor layout, independent slice ownership and bounds traps without adding another per-element multiplication. This is a development build.
