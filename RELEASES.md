@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.4-dev.1 (development)
+
+Repairs XUN duration validation and structural depth accounting, and accepts multiline scalar payload whitespace after checking the required indentation prefix. Restores typed block lists, validates each scalar against its parent tag, and preserves container and element tags through serialization. Value quoting preserves CR/LF/Tab and delimiter-looking strings; compatible homogeneous non-string typed lists use checked compact output. The compiler, standard library and product tools must be upgraded together. This is a development build.
+
 ## Xu 0.11.3
 
 - Compiler: SSA reassociation and periodic-reduction proofs preserve the actual loop backedge; narrow integer normalization follows the physical register width; very small GEMM tiles retain the scalar path when kernel setup would dominate.
