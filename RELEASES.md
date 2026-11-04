@@ -6,6 +6,16 @@
 
 ---
 
+## Xu 0.11.3
+
+- Compiler: SSA reassociation and periodic-reduction proofs preserve the actual loop backedge; narrow integer normalization follows the physical register width; very small GEMM tiles retain the scalar path when kernel setup would dominate.
+- Native interoperability: opt-in `xu-c-2` passes synchronous borrowed i64 spans through checked `&[]int` / `$&[]int` parameters. Call-scoped descriptors expose length and data only. Existing C1 libraries remain supported; older products explicitly reject C2 objects. C2 currently accepts 64-bit integer scalars and `int` / `void` results; use a Xu wrapper for native function values.
+- Correctness: binary64 rounding preserves integral large values, signed zero and non-finite inputs; `log(±0)` returns negative infinity, and `log(+Inf)` / `frexp` special inputs terminate. Wide unsigned multiplication/division use all input lanes and diagnose quotient overflow. Owned string slices index complete descriptors and preserve independent ownership.
+- ESP32: pure Xu Xtensa ELF/image generation, ROM calls/callbacks, BLE building blocks, and bounded WPA2/CCMP/DHCP/ARP/ICMP primitives. The supported board profile is ESP32-D0WD-V3 rev3.1, 40 MHz XTAL, 4 MiB flash. Standard `WifiDevice` APIs remain unavailable; persistent station operation, lease renewal, DNS/TCP, Internet access and BLE/Wi-Fi coexistence are not supplied by these primitives. Just Works and plaintext bond-storage limitations remain as documented in the packages.
+- Windows SDK: installers carry an `asInvoker` application manifest for current-user startup. All-users installation still requires administrator privileges.
+
+Upgrade the compiler, standard library and product tools together. Desktop is `1.3.52`, setup is `1.2.43`, and the native tool remains `0.1.3`. Release acceptance covers native SDK builds, runtime protocols and installation on macOS, Linux and Windows, each on ARM64/x64; LoongArch64 and RISC-V SDKs are cross-built. This release does not claim a general speedup. Cross-language measurements identify their own compiler commit and workload inputs.
+
 ## Xu 0.11.3-dev.15 (development)
 
 Integrates binary64 special-value rounding, full-width unsigned arithmetic, correct owned string-slice indexing, Windows SDK current-user installer manifests, and ESP32 WPA2/CCMP/IPv4 protocol primitives. Retains the borrowed i64 native ABI and pure Xu ESP32 backend. Standard `WifiDevice` APIs remain unavailable until a persistent hardware driver is connected; protocol and board probes do not imply a complete Wi-Fi application. No general performance improvement is claimed for this integration.
