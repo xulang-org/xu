@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.13 (development)
+
+Fixes unsigned full-width integer arithmetic in math/bits: mul64 now masks logical high-lane shifts, and div64 divides the complete 128-bit dividend, reports quotient overflow and preserves unsigned quotient/remainder bit patterns. A zero high lane uses bounded unsigned 64/64 shortcuts instead of the general 64-step division. Only ARM64 and x64 calls use the existing native high-multiply helper; other targets retain the semantic implementation. No new ISA or constant-time guarantee is introduced. This is a development build.
+
 ## Xu 0.11.3-dev.12 (development)
 
 Fixes software binary64 floor, ceil, truncation and rounding for non-finite values, signed zero and large integral inputs. Round compares the fractional part instead of adding 0.5, avoiding incorrect results near half-integers and the 2^52 boundary. Log now returns negative infinity for either zero and terminates for positive infinity; Frexp preserves zero, infinity and NaN with exponent zero. Hardware rounding paths remain available. This does not change finite Log approximation or provide a new FMA accuracy guarantee. This is a development build.
