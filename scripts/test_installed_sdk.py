@@ -13,6 +13,43 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
+
+
+def windows_setup_manifest(binary: Path):
+    """Use the Windows loader to check the actual installer, including on admin CI."""
+    if os.name != "nt":
+        return
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_ulong]
+    kernel.LoadLibraryExW.restype = ctypes.c_void_p
+    kernel.FindResourceW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    kernel.FindResourceW.restype = ctypes.c_void_p
+    kernel.SizeofResource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel.SizeofResource.restype = ctypes.c_ulong
+    kernel.LoadResource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel.LoadResource.restype = ctypes.c_void_p
+    kernel.LockResource.argtypes = [ctypes.c_void_p]
+    kernel.LockResource.restype = ctypes.c_void_p
+    kernel.FreeLibrary.argtypes = [ctypes.c_void_p]
+    module = kernel.LoadLibraryExW(str(binary), None, 0x22)
+    if not module:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        resource = kernel.FindResourceW(module, 1, 24)
+        if not resource:
+            raise RuntimeError(f"installer has no embedded application manifest: {binary}")
+        pointer = kernel.LockResource(kernel.LoadResource(module, resource))
+        size = kernel.SizeofResource(module, resource)
+        if not pointer or not size:
+            raise ctypes.WinError(ctypes.get_last_error())
+        root = ET.fromstring(ctypes.string_at(pointer, size))
+        level = root.find('.//{urn:schemas-microsoft-com:asm.v3}requestedExecutionLevel')
+        if level is None or level.get("level") != "asInvoker" or level.get("uiAccess") != "false":
+            raise RuntimeError(f"installer does not declare current-user execution: {binary}")
+    finally:
+        kernel.FreeLibrary(module)
 
 
 def run(args, *, cwd, env, timeout: int = 600):
@@ -124,7 +161,8 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
     env.update(XU_SKIP_EDITOR_INSTALL="1", XUPATH=str(extra), XU_CACHE=str(work / "package cache"))
 
     if installer:
-        run([str(installer), "--prefix", str(prefix), "--yes"], cwd=project, env=env)
+        windows_setup_manifest(installer)
+        run([str(installer), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
         manifest_file = prefix / "bundle.json"
         manifest = json.loads(manifest_file.read_text()) if manifest_file.is_file() else {"version": "", "target": "host", "lane": "product"}
     else:
@@ -139,9 +177,12 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
                 source.extractall(extract, filter="data")
         bundle, = (p for p in extract.iterdir() if p.is_dir())
         manifest = json.loads((bundle / "bundle.json").read_text())
+        if os.name == "nt":
+            for setup in (bundle / "xu-setup.exe", bundle / "bin/xu-setup.exe"):
+                windows_setup_manifest(setup)
         if native_setup:
             setup = bundle / ("xu-setup.exe" if os.name == "nt" else "xu-setup")
-            run([str(setup), "--prefix", str(prefix), "--yes"], cwd=project, env=env)
+            run([str(setup), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
         elif os.name == "nt":
             run(["pwsh", "-NoProfile", "-File", str(bundle / "install.ps1"), "-Prefix", str(prefix), "-NoModifyPath"], cwd=project, env=env)
         else:

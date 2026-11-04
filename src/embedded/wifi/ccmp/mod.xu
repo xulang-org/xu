@@ -1,0 +1,217 @@
+@embedded/wifi/ccmp
+
+#crypto/aes
+
+// CCMP-128 for ordinary three-address Data/QoS Data MPDUs without FCS.
+// AES is variable-time. PN values are six LITTLE-endian bytes, never int:
+// the physical ESP32 backend uses 32-bit native integer registers.
+pub const MAX_FRAME = 1600
+
+pub struct CcmpPacket {
+    pub valid bool
+    pub payload string
+    pub pn string
+    pub key_index int
+}
+
+fn invalid() CcmpPacket {
+    << CcmpPacket{valid: false, payload: "", pn: "", key_index: 0}
+}
+
+fn nonzero_pn(pn &string) bool {
+    if pn.len != 6 { << false }
+    $bits := 0
+    for i in 0:6 { bits = bits | pn[i] }
+    << bits != 0
+}
+
+// Start with six zero bytes, consume next_pn BEFORE submitting a new frame,
+// and retain the consumed value even when transmission fails. Empty means
+// invalid input or exhaustion: install a fresh key; NEVER wrap or reset the
+// counter while using the same key. Retransmit an already protected MPDU
+// unchanged rather than encrypting different contents with its old PN.
+pub fn next_pn(pn &string) string {
+    if pn.len != 6 { << "" }
+    $next := make_string(6)
+    $carry := 1
+    for i in 0:6 {
+        value := pn[i] + carry
+        next[i] = value & 255
+        carry = value >> 8
+    }
+    if carry != 0 { << "" }
+    << next
+}
+
+fn newer(pn &string, floor &string) bool {
+    if pn.len != 6 || floor.len != 6 { << false }
+    $i := 5
+    while i >= 0 {
+        if pn[i] > floor[i] { << true }
+        if pn[i] < floor[i] { << false }
+        i -= 1
+    }
+    << false
+}
+
+// Only subtype Data (0) and QoS Data (8), protocol version zero. Reject
+// Address4, Order/HT Control, and A-MSDU rather than guessing payload offsets.
+// Fragmented MPDUs remain fragments; this module does not reassemble MSDUs.
+fn header_length(frame &string) int {
+    if frame.len < 24 { << 0 }
+    if frame[0] != 0x08 && frame[0] != 0x88 { << 0 }
+    if (frame[1] & 3) == 3 || (frame[1] & 0x80) != 0 { << 0 }
+    if frame[0] == 0x88 {
+        if frame.len < 26 || (frame[24] & 0x80) != 0 { << 0 }
+        << 26
+    }
+    << 24
+}
+
+// IEEE 802.11 CCMP AAD, matching ESP-IDF wpa_supplicant crypto/ccmp.c:
+// mask subtype bits 4..6, Retry/Power Management/More Data, sequence number,
+// and QoS bits other than TID. Protected is always one in the AAD.
+fn additional_data(header &string, length int) string {
+    $aad := make_string(length - 2)
+    aad[0] = header[0] & 0x8F
+    aad[1] = (header[1] & 0xC7) | 0x40
+    for i in 0:18 { aad[2 + i] = header[4 + i] }
+    aad[20] = header[22] & 15
+    aad[21] = 0
+    if length == 26 {
+        aad[22] = header[24] & 15
+        aad[23] = 0
+    }
+    << aad
+}
+
+fn nonce_bytes(header &string, length int, pn &string) string {
+    $nonce := make_string(13)
+    if length == 26 { nonce[0] = header[24] & 15 }
+    for i in 0:6 { nonce[1 + i] = header[10 + i]
+        nonce[7 + i] = pn[5 - i] }
+    << nonce
+}
+
+// CCM L=2, M=8, 13-byte nonce. Authenticate plaintext internally; no
+// unauthenticated plaintext is returned by the public receive API.
+fn authentication(c &aes.Cipher, nonce &string, aad &string, plain &string) string {
+    $first := make_string(16)
+    first[0] = 0x59
+    for i in 0:13 { first[1 + i] = nonce[i] }
+    first[14] = (plain.len >> 8) & 255
+    first[15] = plain.len & 255
+    $state := c.encrypt(&first) or (err) { << "" }
+    if state.len != 16 { << "" }
+    $encoded_aad := make_string(32)
+    encoded_aad[0] = (aad.len >> 8) & 255
+    encoded_aad[1] = aad.len & 255
+    for i in 0:aad.len { encoded_aad[2 + i] = aad[i] }
+    for part in 0:2 {
+        $block := make_string(16)
+        for i in 0:16 { block[i] = state[i] ^ encoded_aad[part * 16 + i] }
+        state = c.encrypt(&block) or (err) { << "" }
+        if state.len != 16 { << "" }
+    }
+    $offset := 0
+    while offset < plain.len {
+        $block := make_string(16)
+        for i in 0:16 {
+            block[i] = state[i]
+            if offset + i < plain.len { block[i] = block[i] ^ plain[offset + i] }
+        }
+        state = c.encrypt(&block) or (err) { << "" }
+        if state.len != 16 { << "" }
+        offset += 16
+    }
+    $zero_counter := make_string(16)
+    zero_counter[0] = 1
+    for i in 0:13 { zero_counter[1 + i] = nonce[i] }
+    mask := c.encrypt(&zero_counter) or (err) { << "" }
+    if mask.len != 16 { << "" }
+    $tag := make_string(8)
+    for i in 0:8 { tag[i] = state[i] ^ mask[i] }
+    << tag
+}
+
+fn counter_xor(c &aes.Cipher, nonce &string, input &string) string {
+    $out := make_string(input.len)
+    $offset := 0
+    $counter := 1
+    while offset < input.len {
+        $block := make_string(16)
+        block[0] = 1
+        for i in 0:13 { block[1 + i] = nonce[i] }
+        block[14] = (counter >> 8) & 255
+        block[15] = counter & 255
+        mask := c.encrypt(&block) or (err) { << "" }
+        if mask.len != 16 { << "" }
+        for i in 0:16 {
+            if offset + i < input.len { out[offset + i] = input[offset + i] ^ mask[i] }
+        }
+        offset += 16
+        counter += 1
+    }
+    << out
+}
+
+// Protect one MPDU using an explicitly consumed PN. Returns empty on invalid
+// input or AES failure; sets Protected and inserts CCMP header plus 8-byte MIC.
+// This stateless function cannot detect caller PN reuse; follow next_pn's
+// per-key lifetime rules. key_index must select the actual installed key.
+pub fn protect(key &string, header &string, payload &string, pn &string, key_index int) string {
+    length := header_length(header)
+    if key.len != 16 || length == 0 || header.len != length ||
+        payload.len > MAX_FRAME - length - 16 || !nonzero_pn(pn) ||
+        key_index < 0 || key_index > 3 { << "" }
+    c := aes.new_cipher(key) or (err) { << "" }
+    aad := additional_data(header, length)
+    nonce := nonce_bytes(header, length, pn)
+    tag := authentication(&c, &nonce, &aad, payload)
+    if tag.len != 8 { << "" }
+    crypt := counter_xor(&c, &nonce, payload)
+    if crypt.len != payload.len { << "" }
+    $frame := make_string(length + 16 + payload.len)
+    for i in 0:length { frame[i] = header[i] }
+    frame[1] = frame[1] | 0x40
+    frame[length] = pn[0]
+    frame[length + 1] = pn[1]
+    frame[length + 2] = 0
+    frame[length + 3] = 0x20 | (key_index << 6)
+    for i in 0:4 { frame[length + 4 + i] = pn[2 + i] }
+    for i in 0:crypt.len { frame[length + 8 + i] = crypt[i] }
+    for i in 0:8 { frame[length + 8 + crypt.len + i] = tag[i] }
+    << frame
+}
+
+// last_pn is exactly six LE bytes, scoped to installed key + transmitter +
+// TID (a separate non-QoS replay domain). Reject PN <= floor before AES.
+// Commit the returned PN after valid=true, before dispatching the payload.
+// Caller selects the receive key from the CCMP Key ID and checks key_index;
+// the Key ID itself is not included in CCMP's authenticated data.
+pub fn unprotect(key &string, frame &string, last_pn &string) CcmpPacket {
+    length := header_length(frame)
+    if key.len != 16 || length == 0 || frame.len > MAX_FRAME ||
+        frame.len < length + 16 || last_pn.len != 6 ||
+        (frame[1] & 0x40) == 0 { << invalid() }
+    if frame[length + 2] != 0 || (frame[length + 3] & 0x3F) != 0x20 { << invalid() }
+    $pn := make_string(6)
+    pn[0] = frame[length]
+    pn[1] = frame[length + 1]
+    for i in 0:4 { pn[2 + i] = frame[length + 4 + i] }
+    if !nonzero_pn(&pn) || !newer(&pn, last_pn) { << invalid() }
+    c := aes.new_cipher(key) or (err) { << invalid() }
+    aad := additional_data(frame, length)
+    nonce := nonce_bytes(frame, length, &pn)
+    payload_length := frame.len - length - 16
+    $crypt := make_string(payload_length)
+    for i in 0:payload_length { crypt[i] = frame[length + 8 + i] }
+    plain := counter_xor(&c, &nonce, &crypt)
+    if plain.len != payload_length { << invalid() }
+    tag := authentication(&c, &nonce, &aad, &plain)
+    if tag.len != 8 { << invalid() }
+    $difference := 0
+    for i in 0:8 { difference = difference | (tag[i] ^ frame[length + 8 + payload_length + i]) }
+    if difference != 0 { << invalid() }
+    << CcmpPacket{valid: true, payload: plain, pn: pn, key_index: frame[length + 3] >> 6}
+}
