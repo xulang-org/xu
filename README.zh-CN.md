@@ -134,6 +134,7 @@ Xu 提供包含编译器、工具链与标准库的**单文件原生安装包**�
 
 - **Windows**（命令行或双击自绘图形向导）：
   - **图形界面**：在 [Releases](https://github.com/xulang-org/xu/releases) 下载 `xu-setup-windows-x64.exe`，直接双击运行零依赖自绘向导，一键完成安装；
+  - **ARM64 命令行安装器**：下载 `xu-setup-windows-arm64.exe`，在普通 PowerShell 终端执行 `.\xu-setup-windows-arm64.exe --yes`。SDK 安装器声明以当前用户权限启动；为所有用户安装仍需管理员权限。
   - **PowerShell 一行命令**：
     ```powershell
     irm https://xulang.org/install.ps1 | iex

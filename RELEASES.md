@@ -16,6 +16,8 @@ Fixes unsigned full-width integer arithmetic in math/bits: mul64 now masks logic
 
 ## Xu 0.11.3-dev.12 (development)
 
+Windows SDK installers now embed an `asInvoker` application manifest, so current-user installation can start from a normal terminal on ARM64 and on x64 builds using the native PE fallback. Existing GUI installer resources remain intact. SDK installation checks verify the embedded policy through the Windows loader, including on administrator CI runners. This is a development build.
+
 Fixes software binary64 floor, ceil, truncation and rounding for non-finite values, signed zero and large integral inputs. Round compares the fractional part instead of adding 0.5, avoiding incorrect results near half-integers and the 2^52 boundary. Log now returns negative infinity for either zero and terminates for positive infinity; Frexp preserves zero, infinity and NaN with exponent zero. Hardware rounding paths remain available. This does not change finite Log approximation or provide a new FMA accuracy guarantee. This is a development build.
 
 ## Xu 0.11.3-dev.10 (development)
