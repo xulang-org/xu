@@ -30,6 +30,14 @@ sequence,&body)` checks the reverse IP addresses, ICMP type/code, identifier,
 sequence, full body, and both checksums. These are neighbor and gateway checks;
 they do not establish Internet connectivity.
 
+`arp_response(&payload,&mac,&address)` returns a destination MAC and complete
+LLC ARP reply only for an ordinary valid request for our acquired address.
+It rejects zero-source probes, conflicts, invalid peer MAC/IP and other
+targets. `echo_response(&payload,&address)` validates an Echo Request and both
+checksums, then returns an exact-length reply with reversed IPs, TTL 64 and
+new checksums. Invalid requests return no response. The driver must supply
+authenticated plaintext and validate the corresponding link addresses.
+
 The bounded profile accepts IPv4 datagrams up to 1500 bytes with a 20-byte
 header, a nonzero TTL, no fragmentation, and a correct header checksum.
 Ethernet minimum-size padding (46 bytes after the EtherType) is outside the
