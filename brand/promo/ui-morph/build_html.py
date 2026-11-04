@@ -181,52 +181,52 @@ function contentBlur(t, enterAt, exitAt) {{
 */
 
 const Wchg = [
-  {{t: -1, v: 280}}, // logo + wordmark
-  {{t: beat(1), v: 300}}, // Install XU
-  {{t: beat(2), v: 128}}, // loader
-  {{t: beat(4), v: 128}}, // check
-  {{t: beat(6), v: 560}}, // island
-  {{t: beat(7), v: 760}},
-  {{t: beat(8), v: 680}}, // player
-  {{t: beat(11), v: 600}}, // volume
-  {{t: beat(12), v: 440}},
-  {{t: beat(13), v: 128}}, // toggle
-  {{t: beat(15), v: 520}}, // tabs CLI/HTTP/UI
-  {{t: beat(17), v: 820}}, // chart
-  {{t: beat(20), v: 720}}, // cmdk
-  {{t: beat(23), v: 460}}, // toast
-  {{t: beat(25), v: 280}}, // logo
+  {{t: -1, v: 320}}, // logo + wordmark + tagline
+  {{t: beat(1), v: 360}}, // Install CTA
+  {{t: beat(2), v: 280}}, // loader + status
+  {{t: beat(4), v: 280}}, // check + ownership line
+  {{t: beat(6), v: 620}}, // island
+  {{t: beat(7), v: 820}},
+  {{t: beat(8), v: 760}}, // player + code line
+  {{t: beat(11), v: 640}}, // volume / peak load
+  {{t: beat(12), v: 520}},
+  {{t: beat(13), v: 340}}, // labeled toggle
+  {{t: beat(15), v: 720}}, // tabs + pane
+  {{t: beat(17), v: 900}}, // chart deep
+  {{t: beat(20), v: 780}}, // cmdk + descriptions
+  {{t: beat(23), v: 560}}, // toast detail
+  {{t: beat(25), v: 320}}, // logo
 ];
 const Hchg = [
-  {{t: -1, v: 280}},
-  {{t: beat(1), v: 96}},
-  {{t: beat(2), v: 128}},
-  {{t: beat(4), v: 128}},
-  {{t: beat(6), v: 88}},
-  {{t: beat(7), v: 100}},
-  {{t: beat(8), v: 260}},
-  {{t: beat(11), v: 76}},
-  {{t: beat(13), v: 68}},
-  {{t: beat(15), v: 76}},
-  {{t: beat(17), v: 500}},
-  {{t: beat(20), v: 380}},
-  {{t: beat(23), v: 92}},
-  {{t: beat(25), v: 280}},
+  {{t: -1, v: 340}},
+  {{t: beat(1), v: 120}},
+  {{t: beat(2), v: 200}},
+  {{t: beat(4), v: 200}},
+  {{t: beat(6), v: 96}},
+  {{t: beat(7), v: 112}},
+  {{t: beat(8), v: 320}},
+  {{t: beat(11), v: 120}},
+  {{t: beat(13), v: 120}},
+  {{t: beat(15), v: 280}},
+  {{t: beat(17), v: 560}},
+  {{t: beat(20), v: 460}},
+  {{t: beat(23), v: 120}},
+  {{t: beat(25), v: 340}},
 ];
 const Rchg = [ // corner radius
-  {{t: -1, v: 40}},
-  {{t: beat(1), v: 48}}, // pill button
-  {{t: beat(2), v: 64}}, // circle loader
-  {{t: beat(4), v: 64}},
-  {{t: beat(6), v: 44}}, // island
-  {{t: beat(8), v: 32}},
-  {{t: beat(11), v: 38}},
-  {{t: beat(13), v: 34}},
-  {{t: beat(15), v: 38}},
-  {{t: beat(17), v: 28}},
-  {{t: beat(20), v: 22}},
-  {{t: beat(23), v: 18}},
-  {{t: beat(25), v: 40}},
+  {{t: -1, v: 36}},
+  {{t: beat(1), v: 60}}, // pill button
+  {{t: beat(2), v: 36}}, // status card (not forced circle)
+  {{t: beat(4), v: 36}},
+  {{t: beat(6), v: 48}}, // island
+  {{t: beat(8), v: 28}},
+  {{t: beat(11), v: 28}},
+  {{t: beat(13), v: 28}},
+  {{t: beat(15), v: 28}},
+  {{t: beat(17), v: 24}},
+  {{t: beat(20), v: 20}},
+  {{t: beat(23), v: 20}},
+  {{t: beat(25), v: 36}},
 ];
 const BgChg = [ // 0 black, 1 white, 2 red
   {{t: -1, v: 0}},
@@ -316,18 +316,18 @@ function cursorState(t) {{
 /* Camera zoom so active state fills frame */
 function cameraScale(t) {{
   const ch = [
-    {{t: -1, v: 1.42}}, // logo fills
-    {{t: beat(1), v: 1.38}},
-    {{t: beat(2), v: 1.75}},
-    {{t: beat(6), v: 1.22}},
-    {{t: beat(8), v: 1.12}},
-    {{t: beat(11), v: 1.28}},
-    {{t: beat(13), v: 1.7}},
-    {{t: beat(15), v: 1.22}},
-    {{t: beat(17), v: 1.02}},
-    {{t: beat(20), v: 1.08}},
-    {{t: beat(23), v: 1.32}},
-    {{t: beat(25), v: 1.42}},
+    {{t: -1, v: 1.28}},
+    {{t: beat(1), v: 1.32}},
+    {{t: beat(2), v: 1.35}},
+    {{t: beat(6), v: 1.15}},
+    {{t: beat(8), v: 1.05}},
+    {{t: beat(11), v: 1.18}},
+    {{t: beat(13), v: 1.35}},
+    {{t: beat(15), v: 1.08}},
+    {{t: beat(17), v: 0.98}},
+    {{t: beat(20), v: 1.02}},
+    {{t: beat(23), v: 1.2}},
+    {{t: beat(25), v: 1.28}},
   ];
   return springTrack(t, ch, 11, 0.88);
 }}
@@ -367,9 +367,9 @@ function chartProgress(t) {{
 }}
 
 function typeText(t) {{
-  const full = 'native';
+  const full = 'ownership';
   if (t < beat(21)) return '';
-  const n = Math.min(full.length, Math.floor((t - beat(21)) / (PERIOD / 6.5) + 0.001));
+  const n = Math.min(full.length, Math.floor((t - beat(21)) / (PERIOD / 8.5) + 0.001));
   return full.slice(0, n);
 }}
 
@@ -400,70 +400,89 @@ function modeAt(t) {{
 
 function renderContent(t) {{
   const parts = [];
+  const mute = 'rgba(250,249,246,0.55)';
+  const dim = 'rgba(250,249,246,0.38)';
 
-  // LOGO
+  // LOGO — brand + site tagline
   {{
     const a = contentAlpha(t, -1, beat(1));
     const a2 = contentAlpha(t, beat(25), null);
     const alpha = Math.max(a, a2);
     const blur = Math.max(contentBlur(t, -1, beat(1)), contentBlur(t, beat(25), null));
     if (alpha > 0.01) {{
-      parts.push(`<div class="layer" style="opacity:${{alpha}};filter:blur(${{blur}}px);gap:14px">
-        <img src="${{LOGO}}" width="96" height="96" alt="XU" style="display:block;border-radius:22px"/>
-        <div style="font-weight:700;font-size:42px;letter-spacing:-0.04em;color:${{WHITE}}">XU</div>
+      parts.push(`<div class="layer" style="opacity:${{alpha}};filter:blur(${{blur}}px);gap:10px;padding:28px">
+        <img src="${{LOGO}}" width="88" height="88" alt="XU" style="display:block;border-radius:20px"/>
+        <div style="font-weight:700;font-size:40px;letter-spacing:-0.04em;color:${{WHITE}}">XU</div>
+        <div style="font-size:15px;font-weight:500;color:${{mute}};text-align:center;line-height:1.35;max-width:260px">Zero GC · Inferred Ownership<br/>Native &amp; WebAssembly AOT</div>
       </div>`);
     }}
   }}
 
-  // BUTTON
+  // BUTTON — install CTA + one-liner from site
   {{
     const a = contentAlpha(t, beat(1), beat(2));
     const blur = contentBlur(t, beat(1), beat(2));
     if (a > 0.01) {{
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);color:${{WHITE}};font-weight:600;font-size:28px;letter-spacing:0.01em">Install XU</div>`);
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);gap:6px">
+        <div style="color:${{WHITE}};font-weight:600;font-size:28px">Install XU</div>
+        <div style="color:${{dim}};font-size:13px;font-family:ui-monospace,monospace">curl -fsSL xulang.org/install.sh</div>
+      </div>`);
     }}
   }}
 
-  // LOADER
+  // LOADER — install / toolchain progress
   {{
     const a = contentAlpha(t, beat(2), beat(4));
     const blur = contentBlur(t, beat(2), beat(4));
     if (a > 0.01) {{
       const rot = ((t - beat(2)) / PERIOD) * 360;
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px)">
-        <div style="width:54px;height:54px;border-radius:50%;border:4px solid rgba(250,249,246,0.2);border-top-color:${{RED}};transform:rotate(${{rot}}deg)"></div>
+      const steps = ['Detecting architecture', 'Fetching SDK 0.11.2', 'Registering PATH'];
+      const si = Math.min(2, Math.floor((t - beat(2)) / PERIOD));
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);gap:18px;padding:24px">
+        <div style="width:48px;height:48px;border-radius:50%;border:3.5px solid rgba(250,249,246,0.18);border-top-color:${{RED}};transform:rotate(${{rot}}deg)"></div>
+        <div style="text-align:center">
+          <div style="color:${{WHITE}};font-weight:600;font-size:18px">${{steps[si]}}</div>
+          <div style="color:${{dim}};font-size:13px;margin-top:6px;font-family:ui-monospace,monospace">xu · stdlib · full SDK</div>
+        </div>
       </div>`);
     }}
   }}
 
-  // CHECK
+  // CHECK — ownership / zero GC confirmation
   {{
     const a = contentAlpha(t, beat(4), beat(6));
     const blur = contentBlur(t, beat(4), beat(6));
     if (a > 0.01) {{
       const draw = springStep(t - beat(4), 18, 0.85);
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px)">
-        <svg width="64" height="64" viewBox="0 0 64 64">
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);gap:14px;padding:20px">
+        <svg width="56" height="56" viewBox="0 0 64 64">
           <path d="M14 34 L28 48 L50 18" fill="none" stroke="${{WHITE}}" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"
             stroke-dasharray="80" stroke-dashoffset="${{80 * (1 - draw)}}"/>
         </svg>
+        <div style="text-align:center">
+          <div style="color:${{WHITE}};font-weight:600;font-size:18px">Ownership checked</div>
+          <div style="color:rgba(250,249,246,0.75);font-size:13px;margin-top:4px">Deterministic cleanup · no GC</div>
+        </div>
       </div>`);
     }}
   }}
 
-  // ISLAND
+  // ISLAND — live systems status
   {{
     const a = contentAlpha(t, beat(6), beat(8));
     const blur = contentBlur(t, beat(6), beat(8));
     if (a > 0.01) {{
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);flex-direction:row;gap:16px;padding:0 28px;justify-content:flex-start">
-        <div style="width:14px;height:14px;border-radius:50%;background:${{RED}};margin-left:12px"></div>
-        <div style="color:${{WHITE}};font-size:20px;font-weight:500;letter-spacing:0.01em">Zero GC · Inferred Ownership</div>
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);flex-direction:row;gap:14px;padding:0 26px;justify-content:flex-start">
+        <div style="width:12px;height:12px;border-radius:50%;background:${{RED}};margin-left:8px;flex-shrink:0"></div>
+        <div style="min-width:0">
+          <div style="color:${{WHITE}};font-size:17px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">AOT · macos-arm64 · zero GC</div>
+          <div style="color:${{dim}};font-size:12px;margin-top:2px;font-family:ui-monospace,monospace">xu build · inferred ownership</div>
+        </div>
       </div>`);
     }}
   }}
 
-  // PLAYER
+  // PLAYER — hero line + concurrency snippet as "track"
   {{
     const a = contentAlpha(t, beat(8), beat(11));
     const blur = contentBlur(t, beat(8), beat(11));
@@ -471,17 +490,20 @@ function renderContent(t) {{
       const playing = playOn(t);
       const prog = scrubValue(t);
       const p = clamp(prog, 0, 1);
-      // play/pause morph paths
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:36px;align-items:stretch;justify-content:space-between">
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:28px 32px;align-items:stretch;justify-content:space-between">
         <div style="display:flex;gap:16px;align-items:center">
-          <img src="${{LOGO}}" width="64" height="64" style="border-radius:14px;display:block"/>
-          <div>
-            <div style="font-weight:600;font-size:24px;color:${{WHITE}}">Clear intent.</div>
-            <div style="font-size:16px;color:rgba(250,249,246,0.55);margin-top:4px">Native code. · AOT</div>
+          <img src="${{LOGO}}" width="64" height="64" style="border-radius:14px;display:block;flex-shrink:0"/>
+          <div style="min-width:0">
+            <div style="font-weight:600;font-size:22px;color:${{WHITE}}">Clear intent. Native code.</div>
+            <div style="font-size:13px;color:${{mute}};margin-top:4px;font-family:ui-monospace,monospace">xu worker() · chan T · or (err)</div>
           </div>
         </div>
-        <div style="display:flex;align-items:center;gap:20px;margin-top:18px">
-          <svg width="36" height="36" viewBox="0 0 36 36">
+        <div style="margin-top:14px;padding:12px 14px;border-radius:12px;background:rgba(250,249,246,0.06);font-family:ui-monospace,monospace;font-size:13px;color:${{mute}};line-height:1.55">
+          <span style="color:${{RED}}">xu</span> worker("latency", ch)<br/>
+          val := fetch() <span style="color:${{RED}}">or</span> (err) {{ <span style="color:#F59E0B">&lt;&lt;</span> }}
+        </div>
+        <div style="display:flex;align-items:center;gap:18px;margin-top:16px">
+          <svg width="34" height="34" viewBox="0 0 36 36">
             ${{playing
               ? `<rect x="10" y="8" width="5" height="20" rx="1.5" fill="${{WHITE}}"/><rect x="21" y="8" width="5" height="20" rx="1.5" fill="${{WHITE}}"/>`
               : `<path d="M12 8 L28 18 L12 28 Z" fill="${{WHITE}}"/>`}}
@@ -490,152 +512,204 @@ function renderContent(t) {{
             <div style="position:absolute;left:0;top:0;bottom:0;width:${{p * 100}}%;background:${{RED}};border-radius:3px"></div>
             <div style="position:absolute;top:50%;left:${{p * 100}}%;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:50%;background:${{WHITE}}"></div>
           </div>
+          <div style="font-size:12px;color:${{dim}};font-family:ui-monospace,monospace;min-width:52px;text-align:right">${{Math.round(p*100)}}%</div>
         </div>
       </div>`);
     }}
   }}
 
-  // VOLUME
+  // VOLUME — peak-load / connection ceiling metaphor from EventSet story
   {{
     const a = contentAlpha(t, beat(11), beat(13));
     const blur = contentBlur(t, beat(11), beat(13));
     if (a > 0.01) {{
       const v = scrubValue(t);
       const fill = clamp(v, 0, 1);
-      const stretch = Math.max(0, v - 1); // past max
-      const barW = 100 + stretch * 40;
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:0 28px;flex-direction:row;gap:18px">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="${{WHITE}}"><path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a3.5 3.5 0 0 0-1.5-2.9v5.8a3.5 3.5 0 0 0 1.5-2.9z"/></svg>
-        <div style="flex:1;height:10px;border-radius:5px;background:rgba(250,249,246,0.15);transform:scaleX(${{barW / 100}});transform-origin:left center;position:relative">
-          <div style="height:100%;width:${{fill * 100}}%;background:${{RED}};border-radius:5px"></div>
-          <div style="position:absolute;top:50%;left:${{Math.min(fill,1) * 100}}%;width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;background:${{WHITE}}"></div>
+      const stretch = Math.max(0, v - 1);
+      const barW = 100 + stretch * 42;
+      const conns = Math.round(lerp(12, 110, clamp(v, 0, 1.2)) * 1000);
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:18px 28px;align-items:stretch;gap:12px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <div style="color:${{WHITE}};font-weight:600;font-size:16px">EventSet ceiling</div>
+          <div style="color:${{RED}};font-weight:600;font-size:15px;font-family:ui-monospace,monospace">${{conns.toLocaleString()}} conn</div>
         </div>
+        <div style="display:flex;align-items:center;gap:14px">
+          <div style="color:${{dim}};font-size:12px;font-family:ui-monospace,monospace;min-width:36px">load</div>
+          <div style="flex:1;height:10px;border-radius:5px;background:rgba(250,249,246,0.15);transform:scaleX(${{barW / 100}});transform-origin:left center;position:relative">
+            <div style="height:100%;width:${{fill * 100}}%;background:${{RED}};border-radius:5px"></div>
+            <div style="position:absolute;top:50%;left:${{Math.min(fill,1) * 100}}%;width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;background:${{WHITE}}"></div>
+          </div>
+        </div>
+        <div style="color:${{dim}};font-size:12px">${{stretch > 0.02 ? 'Drag past max · configurable connection ceiling' : 'No GC to drag the service down at peak'}}</div>
       </div>`);
     }}
   }}
 
-  // TOGGLE
+  // TOGGLE — Zero GC switch with label
   {{
     const a = contentAlpha(t, beat(13), beat(15));
     const blur = contentBlur(t, beat(13), beat(15));
     if (a > 0.01) {{
       const on = toggleOn(t);
-      // dual-edge knob: left/right different springs
       const knob = dualEdge(t,
         [{{t: -1, v: 6}}, {{t: beat(14) - 0.02, v: 52}}],
         [{{t: -1, v: 42}}, {{t: beat(14) - 0.02, v: 88}}],
         22, 0.78
       );
       const trackBg = on ? RED : 'rgba(250,249,246,0.2)';
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px)">
-        <div style="width:96px;height:52px;border-radius:26px;background:${{trackBg}};position:relative">
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);flex-direction:row;gap:20px;padding:0 28px">
+        <div style="flex:1;min-width:0">
+          <div style="color:${{WHITE}};font-weight:600;font-size:18px">Garbage collector</div>
+          <div style="color:${{dim}};font-size:13px;margin-top:4px">${{on ? 'Off · compile-time ownership' : 'Runtime pauses risk'}}</div>
+        </div>
+        <div style="width:96px;height:52px;border-radius:26px;background:${{trackBg}};position:relative;flex-shrink:0">
           <div style="position:absolute;top:6px;left:${{knob.L}}px;width:${{Math.max(8, knob.R - knob.L)}}px;height:40px;border-radius:20px;background:${{WHITE}}"></div>
         </div>
       </div>`);
     }}
   }}
 
-  // TABS
+  // TABS — CLI / HTTP / UI with site result panes
   {{
     const a = contentAlpha(t, beat(15), beat(17));
     const blur = contentBlur(t, beat(15), beat(17));
     if (a > 0.01) {{
       const labels = ['CLI', 'HTTP', 'UI'];
+      const panes = [
+        {{title: 'Local executable', body: 'xu check · xu run · xu build', api: 'os · flag · fmt'}},
+        {{title: 'Text endpoint', body: 'curl 127.0.0.1:8080 → hello', api: 'net/http · net'}},
+        {{title: 'Draw & interact', body: 'Native draw · WebView host', api: '@ui · desktop'}},
+      ];
       const idx = tabIndex(t);
-      // liquid indicator edges
-      const slot = 140;
-      const base = 24;
+      const slot = 200;
+      const base = 36;
       const Lch = [{{t: -1, v: base}}, {{t: beat(16), v: base + slot}}];
-      const Rch = [{{t: -1, v: base + 110}}, {{t: beat(16), v: base + slot + 110}}];
-      // leading edge uses faster spring on the right when moving right
+      const Rch = [{{t: -1, v: base + 160}}, {{t: beat(16), v: base + slot + 160}}];
+      // also morph toward UI tab near beat 17
+      if (t >= beat(16.5)) {{
+        Lch.push({{t: beat(16.5), v: base + slot * 2}});
+        Rch.push({{t: beat(16.5), v: base + slot * 2 + 160}});
+      }}
       const edges = dualEdge(t, Lch, Rch, 18, 0.8);
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:0 20px">
-        <div style="position:relative;width:100%;height:100%;display:flex;align-items:center">
-          <div style="position:absolute;top:12px;left:${{edges.L}}px;width:${{Math.max(20, edges.R - edges.L)}}px;height:48px;border-radius:14px;background:${{RED}}"></div>
-          <div style="position:relative;display:flex;width:100%;justify-content:space-around;font-weight:500;font-size:22px">
-            ${{labels.map((lb, i) => `<span style="color:${{i === idx ? WHITE : 'rgba(250,249,246,0.45)'}};padding:10px 18px">${{lb}}</span>`).join('')}}
+      const pane = panes[Math.min(idx, 2)];
+      // prefer UI pane late
+      const paneI = t >= beat(16.5) ? 2 : idx;
+      const pshow = panes[paneI];
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:18px 22px;align-items:stretch;justify-content:flex-start;gap:14px">
+        <div style="position:relative;height:48px;display:flex;align-items:center">
+          <div style="position:absolute;top:0;left:${{edges.L}}px;width:${{Math.max(20, edges.R - edges.L)}}px;height:48px;border-radius:14px;background:${{RED}}"></div>
+          <div style="position:relative;display:flex;width:100%;justify-content:space-around;font-weight:600;font-size:18px">
+            ${{labels.map((lb, i) => `<span style="color:${{i === paneI ? WHITE : dim}};padding:12px 22px">${{lb}}</span>`).join('')}}
           </div>
+        </div>
+        <div style="flex:1;border-radius:16px;background:rgba(250,249,246,0.06);padding:18px 20px">
+          <div style="color:${{WHITE}};font-weight:600;font-size:20px">${{pshow.title}}</div>
+          <div style="color:${{mute}};font-size:15px;margin-top:8px">${{pshow.body}}</div>
+          <div style="color:${{dim}};font-size:12px;margin-top:14px;font-family:ui-monospace,monospace">API ${{pshow.api}}</div>
         </div>
       </div>`);
     }}
   }}
 
-  // CHART
+  // CHART — 72 workloads vs languages
   {{
     const a = contentAlpha(t, beat(17), beat(20));
     const blur = contentBlur(t, beat(17), beat(20));
     if (a > 0.01) {{
       const p = chartProgress(t);
-      const pts = [0.2,0.35,0.28,0.55,0.48,0.72,0.66,0.9];
-      const w = 640, h = 280, pad = 40;
-      let d = '';
-      const n = pts.length;
-      const shown = Math.max(2, Math.floor(1 + (n - 1) * p));
-      for (let i = 0; i < shown; i++) {{
-        const x = pad + (w - pad * 2) * (i / (n - 1));
-        const y = pad + (h - pad * 2) * (1 - pts[i]);
-        d += (i === 0 ? `M ${{x}} ${{y}}` : ` L ${{x}} ${{y}}`);
+      const series = {{
+        xu:   [0.42,0.48,0.45,0.58,0.62,0.70,0.74,0.88],
+        go:   [0.38,0.44,0.40,0.52,0.55,0.60,0.63,0.72],
+        rust: [0.40,0.46,0.43,0.55,0.60,0.66,0.70,0.80],
+      }};
+      const w = 760, h = 300, pad = 36;
+      function pathFor(pts) {{
+        const n = pts.length;
+        const shown = Math.max(2, Math.floor(1 + (n - 1) * p));
+        let d = '';
+        for (let i = 0; i < shown; i++) {{
+          const x = pad + (w - pad * 2) * (i / (n - 1));
+          const y = pad + (h - pad * 2) * (1 - pts[i]);
+          d += (i === 0 ? `M ${{x}} ${{y}}` : ` L ${{x}} ${{y}}`);
+        }}
+        return d;
       }}
-      // tooltip on beat 19
       const tipA = contentAlpha(t, beat(19), beat(20));
-      const tipX = pad + (w - pad * 2) * (6 / (n - 1));
-      const tipY = pad + (h - pad * 2) * (1 - pts[6]);
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:28px;align-items:stretch">
-        <div style="display:flex;justify-content:space-between;align-items:baseline;width:100%;margin-bottom:8px">
-          <div style="font-weight:600;font-size:22px;color:${{WHITE}}">Benchmarks</div>
-          <div style="font-size:14px;color:rgba(250,249,246,0.45)">72 workloads · 6 platforms</div>
+      const tipX = pad + (w - pad * 2) * (6 / 7);
+      const tipY = pad + (h - pad * 2) * (1 - series.xu[6]);
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:26px 28px;align-items:stretch">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;width:100%;margin-bottom:10px">
+          <div>
+            <div style="font-weight:600;font-size:22px;color:${{WHITE}}">Benchmark dashboard</div>
+            <div style="font-size:13px;color:${{dim}};margin-top:4px">60 groups · 72 workloads · 6 platforms</div>
+          </div>
+          <div style="display:flex;gap:14px;font-size:12px;font-weight:500;padding-top:4px">
+            <span style="color:${{RED}}">● XU</span>
+            <span style="color:rgba(250,249,246,0.55)">● Go</span>
+            <span style="color:rgba(250,249,246,0.28)">● Rust</span>
+          </div>
         </div>
-        <svg width="100%" height="78%" viewBox="0 0 ${{w}} ${{h}}" preserveAspectRatio="none">
-          <path d="${{d}}" fill="none" stroke="${{RED}}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+        <svg width="100%" height="72%" viewBox="0 0 ${{w}} ${{h}}" preserveAspectRatio="none">
+          <path d="${{pathFor(series.go)}}" fill="none" stroke="rgba(250,249,246,0.28)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="${{pathFor(series.rust)}}" fill="none" stroke="rgba(250,249,246,0.35)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="${{pathFor(series.xu)}}" fill="none" stroke="${{RED}}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
           ${{tipA > 0.01 ? `<g opacity="${{tipA}}">
             <circle cx="${{tipX}}" cy="${{tipY}}" r="6" fill="${{WHITE}}"/>
-            <rect x="${{tipX + 12}}" y="${{tipY - 42}}" width="128" height="44" rx="10" fill="${{WHITE}}"/>
-            <text x="${{tipX + 22}}" y="${{tipY - 16}}" fill="${{BLACK}}" font-size="15" font-family="Geist" font-weight="600">XU · vs Go/Rust</text>
+            <rect x="${{tipX - 150}}" y="${{tipY - 58}}" width="160" height="48" rx="10" fill="${{WHITE}}"/>
+            <text x="${{tipX - 138}}" y="${{tipY - 30}}" fill="${{BLACK}}" font-size="14" font-family="Geist" font-weight="600">Runtime · mem · binary</text>
+            <text x="${{tipX - 138}}" y="${{tipY - 12}}" fill="#666" font-size="12" font-family="Geist">XU vs C / Rust / Go / Swift</text>
           </g>` : ''}}
         </svg>
       </div>`);
     }}
   }}
 
-  // CMD+K
+  // CMD+K — site topics with descriptions
   {{
     const a = contentAlpha(t, beat(20), beat(23));
     const blur = contentBlur(t, beat(20), beat(23));
     if (a > 0.01) {{
       const q = typeText(t);
       const catalog = [
-        {{t: 'Install XU', k: 'install'}},
-        {{t: 'Native UI & WebView', k: 'native ui webview'}},
-        {{t: 'Ownership & lifetimes', k: 'ownership lifetimes'}},
-        {{t: 'Coroutines & channels', k: 'coroutines channels'}},
-        {{t: 'WebAssembly AOT', k: 'webassembly wasm aot'}},
+        {{t: 'Ownership & lifetimes', k: 'ownership lifetimes', d: 'Borrow check · scope-exit cleanup · no lifetime params'}},
+        {{t: 'Coroutines & channels', k: 'coroutines channels', d: 'xu f() · chan T · Go-like concurrency'}},
+        {{t: 'Native UI & WebView', k: 'native ui webview', d: 'Draw · layout · controls · IME'}},
+        {{t: 'WebAssembly AOT', k: 'webassembly wasm aot', d: 'Native + wasm32 · no VM runtime'}},
+        {{t: 'Explicit errors', k: 'errors explicit', d: '<< return · >> raise · or (err)'}},
+        {{t: 'Install XU', k: 'install sdk', d: 'One command · PATH · full SDK'}},
       ];
       const items = !q ? catalog : catalog.filter(s =>
         s.k.split(' ').some(w => w.startsWith(q)) ||
         s.t.toLowerCase().split(/\\s+/).some(w => w.startsWith(q))
       );
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:22px;align-items:stretch;justify-content:flex-start">
-        <div style="display:flex;align-items:center;gap:12px;border-bottom:1px solid rgba(250,249,246,0.12);padding-bottom:14px">
-          <span style="font-size:22px;color:rgba(250,249,246,0.45)">⌘K</span>
-          <span style="font-size:24px;font-weight:500;color:${{WHITE}}">${{q}}<span style="opacity:0.35">|</span></span>
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);padding:20px 22px;align-items:stretch;justify-content:flex-start">
+        <div style="display:flex;align-items:center;gap:12px;border-bottom:1px solid rgba(250,249,246,0.12);padding-bottom:12px">
+          <span style="font-size:20px;color:${{dim}}">⌘K</span>
+          <span style="font-size:22px;font-weight:500;color:${{WHITE}}">${{q || 'Search docs'}}<span style="opacity:0.35">|</span></span>
         </div>
-        <div style="margin-top:12px;display:flex;flex-direction:column;gap:6px;width:100%">
-          ${{items.slice(0, 4).map((it, i) => `<div style="padding:12px 14px;border-radius:12px;background:${{i===0?RED:'transparent'}};color:${{WHITE}};font-size:20px;font-weight:500">${{it.t}}</div>`).join('')}}
+        <div style="margin-top:10px;display:flex;flex-direction:column;gap:4px;width:100%">
+          ${{items.slice(0, 4).map((it, i) => `<div style="padding:10px 14px;border-radius:12px;background:${{i===0?RED:'transparent'}}">
+            <div style="color:${{WHITE}};font-size:17px;font-weight:600">${{it.t}}</div>
+            <div style="color:${{i===0?'rgba(250,249,246,0.85)':dim}};font-size:12px;margin-top:3px;font-family:ui-monospace,monospace">${{it.d}}</div>
+          </div>`).join('')}}
         </div>
       </div>`);
     }}
   }}
 
-  // TOAST
+  // TOAST — install result from site bullets
   {{
     const a = contentAlpha(t, beat(23), beat(25));
     const blur = contentBlur(t, beat(23), beat(25));
     if (a > 0.01) {{
-      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);flex-direction:row;gap:14px;padding:0 22px">
-        <div style="width:22px;height:22px;border-radius:50%;background:${{RED}};display:flex;align-items:center;justify-content:center">
-          <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 6 L5 9 L10 3" stroke="${{WHITE}}" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+      parts.push(`<div class="layer" style="opacity:${{a}};filter:blur(${{blur}}px);flex-direction:row;gap:14px;padding:0 24px;justify-content:flex-start">
+        <div style="width:28px;height:28px;border-radius:50%;background:${{RED}};display:flex;align-items:center;justify-content:center;flex-shrink:0">
+          <svg width="14" height="14" viewBox="0 0 12 12"><path d="M2 6 L5 9 L10 3" stroke="${{WHITE}}" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
         </div>
-        <div style="color:${{WHITE}};font-weight:500;font-size:20px">SDK 0.11.2 ready</div>
+        <div style="min-width:0">
+          <div style="color:${{WHITE}};font-weight:600;font-size:18px">SDK 0.11.2 ready</div>
+          <div style="color:${{dim}};font-size:12px;margin-top:2px">PATH registered · stdlib · full toolchain</div>
+        </div>
       </div>`);
     }}
   }}
