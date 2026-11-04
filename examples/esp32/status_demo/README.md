@@ -8,11 +8,16 @@ vendor radio archive or external linker is used to build the application.
 The board must already have a compatible bootloader and the factory
 application partition at `0x10000`, length `0x300000`.
 
-The two radios run in **exclusive modes**. Tapping the other card disconnects
-the active link and restarts into that mode. This application does not
-implement simultaneous BLE/Wi-Fi coexistence. The current mode survives a
-software reset in the final 16 bytes of RTC slow RAM; a cold boot defaults
-to Wi-Fi. No ULP program may use those bytes.
+The application keeps **Wi-Fi and BLE online together**. One cold PHY setup
+starts the Wi-Fi station first, then initializes the BLE controller without
+clearing shared memory or recalibrating the active radio. The hardware RF
+sequencer restores the actual AP frequency after BLE events, with hardware
+arbitration giving BT priority. The header displays `BOTH`.
+
+This is a fixed-profile coexistence application, not a general coexistence
+SDK: scanning/retuning happens before BLE starts. Wi-Fi reconnection while
+BLE remains connected and dynamic software priority policies are not
+implemented. Changing networks requires a joint restart.
 
 ## Build and flash
 
@@ -22,8 +27,8 @@ The builder also needs Python 3 and `xtensa-esp32-elf-nm`, found through
 reads symbol addresses; it does not compile or link firmware.
 
 Create a **local, untracked** JSON file containing string fields `ssid` and
-`password`. Use the password of the WPA2-PSK 2.4 GHz test network; for an
-open network use an empty password. Keep this file and generated firmware
+`password`. Use a WPA2-PSK 2.4 GHz test network; open networks and WPA3 are not
+supported by this fixed station profile. Keep this file and generated firmware
 private: credentials are embedded in the resulting image.
 
 From the Xu repository root:
@@ -45,24 +50,27 @@ Generated sources and binaries stay in the private output directory.
 
 - **Wi-Fi:** preparation, connection, actual DHCP IP, gateway test result,
   failure and disconnected state. RSSI is shown as `-- dBm` because the
-  backend does not provide a calibrated measurement. Tap the active Wi-Fi
-  card to test the gateway, or reconnect after failure/disconnection.
+  backend does not provide a calibrated measurement. Tap the Wi-Fi
+  card to request a gateway test. Background tests submit without blocking
+  BLE host servicing; only authenticated matching replies update `GW OK`.
 - **BLE:** `XU-PURE-HID14`, advertising, connection, encryption/bond and
   keyboard subscription state. Tap its control row to request one F24
   press/release after the host enables notifications. Reports are not sent
   automatically. The display confirms controller submission; an external
   HID observer is needed to verify reception.
-- Tapping the inactive card changes radio mode. The other card shows
-  standby rather than claiming that its radio is connected.
+- Both cards report actual link state. Touch controls service the selected
+  function without rebooting or disconnecting the other radio.
 
-UART is 115200 baud. `b` selects BLE from Wi-Fi, `w` selects Wi-Fi from
-BLE, `k` requests F24, `p`/`r` tests the gateway or reconnects Wi-Fi, `x`
-disconnects Wi-Fi, and `q` prints its actual IP. From an initialization
-failure screen, `b`/`w` selects the next mode.
+UART is 115200 baud. `k` requests F24, `p` requests a gateway probe and `q`
+prints Wi-Fi/BLE/encryption/subscription flags and the real Echo Reply count.
 
 BLE uses a single-peer legacy SMP Just Works bond with two checked flash
-slots at `0x310000` and `0x311000`. It restores the key cache after a mode
-change, then waits for actual link encryption and fresh CCCD subscription.
+slots at `0x310000` and `0x311000`. It restores the key cache after a
+reboot, then waits for actual link encryption and fresh CCCD
+subscription. A new bond is committed after the real BLE disconnect;
+advertising and Wi-Fi DMA are stopped around cache-off flash work, then
+reception and advertising resume. Wi-Fi lease and keys remain in RAM during
+this brief pause.
 Do not erase those sectors or reuse them for another partition. Just Works
 does not provide MITM protection or LE Secure Connections. Flash records
 contain plaintext keys and must remain private.
@@ -73,6 +81,12 @@ contain plaintext keys and must remain private.
 | --- | --- |
 | LCD | SCK 14, MOSI 13, CS 15, DC 2, backlight 21 |
 | XPT2046 touch | CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36 |
+
+Wi-Fi reserves DMA/PHY work at `0x3FFE8000..0x3FFED000`, with normal MAC-dump
+mapping required. BLE KE pools remain at `0x3FFD2000..0x3FFD7000`; Wi-Fi copy
+scratch is separate from interrupt scratch. Use the radio image layout and
+keep IRAM below `0x400A0000` to avoid the upper DRAM alias. The demo checks
+DMA, stack and arena guards while running.
 
 The panel uses the previous CYD demo's landscape initialization and touch
 calibration. Rendering updates sixteen pixels per event-loop iteration so
