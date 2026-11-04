@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.14 (development)
+
+Fixes string-array slicing reading later elements at byte offsets instead of descriptor offsets. Source and destination indexing now share the existing scaled element offset, preserving the 24-byte descriptor layout, independent slice ownership and bounds traps without adding another per-element multiplication. This is a development build.
+
 ## Xu 0.11.3-dev.13 (development)
 
 Fixes unsigned full-width integer arithmetic in math/bits: mul64 now masks logical high-lane shifts, and div64 divides the complete 128-bit dividend, reports quotient overflow and preserves unsigned quotient/remainder bit patterns. A zero high lane uses bounded unsigned 64/64 shortcuts instead of the general 64-step division. Only ARM64 and x64 calls use the existing native high-multiply helper; other targets retain the semantic implementation. No new ISA or constant-time guarantee is introduced. This is a development build.
