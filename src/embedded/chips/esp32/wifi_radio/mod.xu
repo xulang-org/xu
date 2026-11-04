@@ -120,7 +120,7 @@ fn find_ap(state $&session.State, name &string, began int, timeout_ms int) bool 
             rom_call6(0x40005D50,0x3FFD7540,channel,0,0,0,0)
             request := directed_probe(name,&state.mac,state.sequence)
             state.sequence = (state.sequence + 1) & 4095
-            if !start_receive() || !send_frame(&request) { << false }
+            if !start_receive() || send_frame(state,&request) == TX_FATAL { << false }
             esp32.rom_delay_us(200000)
             frames := finish_receive()
             for i in 0:frames.len {
@@ -157,7 +157,7 @@ fn associate(state $&session.State, began int, timeout_ms int) bool {
             $request := ""
             if phase == 0 { request = sta.authentication_request() }
             else { request = sta.association_request() }
-            if request.len == 0 || !start_receive() || !send_frame(&request) { << false }
+            if request.len == 0 || !start_receive() || send_frame(state,&request) == TX_FATAL { << false }
             esp32.rom_delay_us(100000)
             frames := finish_receive()
             for i in 0:frames.len {
@@ -183,7 +183,7 @@ fn associate(state $&session.State, began int, timeout_ms int) bool {
         if outgoing.len != 0 {
             frame := eapol_frame(&outgoing,&state.mac,&state.ap.bssid,state.sequence)
             state.sequence = (state.sequence + 1) & 4095
-            if !send_frame(&frame) { << false }
+            if send_frame(state,&frame) == TX_FATAL { << false }
             if state.handshake.phase == wifi.WPA2_M4_READY { m4_sent = true }
             outgoing = ""
         }
@@ -348,22 +348,24 @@ fn stream_frames(state $&session.State) []string {
     }
     << frames
 }
-fn send_llc(state $&session.State, payload &string, destination &string) bool {
-    retire_tx()
-    if !state.ready || !state.keys.valid || !stream_start(state) { << false }
-    frame := prepare_encrypted(state,payload,destination,state.sequence)
-    state.sequence = (state.sequence + 1) & 4095
-    if frame.len == 0 { << false }
-    // Software CCMP can outlast the eight-buffer DMA queue. Replenish it
-    // after encryption so the receiver can observe the AP ACK. Preserve
-    // already-copied frames for the next poll, with a fixed backlog bound.
+// Copy pending arrivals without entering crypto recursively. The caller
+// runs this after writing TX DMA, immediately before enabling transmission.
+fn defer_receive(state $&session.State) bool {
     received := stream_frames(state)
     if state.status == esp32.WIFI_STATUS_DISCONNECTED { << false }
     for i in 0:received.len {
         if state.rx_pending.len < 4 { state.rx_pending.push(received[i]) }
     }
-    ok := send_frame(&frame)
-    if ok { state.tx_packets += 1 }
+    << true
+}
+fn send_llc(state $&session.State, payload &string, destination &string) int {
+    retire_tx()
+    if !state.ready || !state.keys.valid || !stream_start(state) { << TX_FATAL }
+    frame := prepare_encrypted(state,payload,destination,state.sequence)
+    state.sequence = (state.sequence + 1) & 4095
+    if frame.len == 0 { << TX_FATAL }
+    ok := send_frame(state,&frame)
+    if ok == TX_ACKED { state.tx_packets += 1 }
     << ok
 }
 
@@ -404,7 +406,7 @@ fn observe_frame(state $&session.State, frame &string) bool {
             packet := eapol_frame(&response,&state.mac,&state.ap.bssid,state.sequence)
             state.sequence = (state.sequence + 1) & 4095
             retire_tx()
-            if !stream_start(state) || !send_frame(&packet) { disconnect(state)
+            if !stream_start(state) || send_frame(state,&packet) == TX_FATAL { disconnect(state)
                 << false }
         }
     }
@@ -423,7 +425,7 @@ fn receive_payload(state $&session.State, frame &string, payload &string) bool {
         << false }
     if state.linked {
         answer := ipv4.arp_response(payload,&state.mac,&state.client.address)
-        if answer.valid && !send_llc(state,&answer.payload,&answer.destination) {
+        if answer.valid && send_llc(state,&answer.payload,&answer.destination) == TX_FATAL {
             disconnect(state)
             << false
         }
@@ -433,7 +435,7 @@ fn receive_payload(state $&session.State, frame &string, payload &string) bool {
             $bits := 0
             for j in 0:6 { destination[j] = frame[16 + j]
                 bits = bits | destination[j] }
-            if bits != 0 && (destination[0] & 1) == 0 && !send_llc(state,&echo,&destination) {
+            if bits != 0 && (destination[0] & 1) == 0 && send_llc(state,&echo,&destination) == TX_FATAL {
                 disconnect(state)
                 << false
             }
@@ -528,15 +530,18 @@ fn connect(state $&session.State, ssid &string, password &string, timeout_ms int
             $payload := ""
             if state.client.state == ipv4.DHCP_READY || state.client.state == ipv4.DHCP_SELECTING { payload = discover_dhcp(state) }
             else if state.client.state == ipv4.DHCP_REQUESTING { payload = request_dhcp(state) }
-            if payload.len != 0 && !send_llc(state,&payload,&broadcast) { disconnect(state)
+            if payload.len != 0 && send_llc(state,&payload,&broadcast) == TX_FATAL {
+                disconnect(state)
                 << false }
             sent_state = state.client.state
             sent_at = now_ms()
         }
         if service(state,20) && state.linked { state.error = 0
             << true }
-        if state.status == esp32.WIFI_STATUS_DISCONNECTED { << false }
+        if state.status == esp32.WIFI_STATUS_DISCONNECTED {
+            << false }
     }
+
     disconnect(state)
     << false
 }
@@ -550,14 +555,16 @@ fn ping_gateway(state $&session.State, timeout_ms int) bool {
         if session.elapsed(now_ms(),sent_at) >= 500 {
             if state.gateway_mac.len != 6 {
                 request := ipv4.arp_request(&state.mac,&state.client.address,&state.client.router)
-                if !send_llc(state,&request,&broadcast) { << false }
+                if send_llc(state,&request,&broadcast) == TX_FATAL { disconnect(state)
+                    << false }
             } else {
                 state.echo_next = (state.echo_next % 65535) + 1
                 state.echo_waiting = state.echo_next
                 body := "xu-pure-wifi"
                 request := ipv4.echo_request(&state.client.address,&state.client.router,0x5855,state.echo_waiting,&body)
                 destination := session.copy(&state.gateway_mac)
-                if !send_llc(state,&request,&destination) { << false }
+                if send_llc(state,&request,&destination) == TX_FATAL { disconnect(state)
+                    << false }
             }
             sent_at = now_ms()
         }
