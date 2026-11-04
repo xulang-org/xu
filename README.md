@@ -307,6 +307,26 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 ---
 
+## Borrowed native i64 spans (development)
+
+The `0.11.3-dev.10` SDK adds opt-in `"abi": "xu-c-2"` native manifests.
+`i64_span` and `i64_span_mut` parameters are checked as `&[]int` and
+`$&[]int`. C entry points take `const xu_i64_span *` and
+`const xu_i64_span_mut *` from `include/xu_native.h`: length is at byte 0,
+then the data pointer at byte 8. The compiler creates a temporary descriptor
+for each call. Native code must finish all access before returning and must
+not retain either pointer, resize the array, or modify the descriptor.
+Mutable views permit writes to existing elements only.
+
+Other `xu-c-2` parameters/results use `xu_int`, with `void` also allowed as a
+result. Floating and narrow C signatures, returned spans, callbacks and
+asynchronous retention are outside this protocol. Wrap a native call in an
+ordinary Xu function when a function value is needed. The distinct XUOBJ and
+XULIB version 2 formats make older products reject these libraries;
+`xu-c-1` scalar libraries remain supported by the new SDK. Native linking
+keeps the existing platform limits; foreign object emission does not establish
+native execution or GPU availability.
+
 ## License
 
 The Xu programming language is open source under the [MIT License](LICENSE).

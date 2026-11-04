@@ -10,6 +10,7 @@
 #encoding/hex
 #encoding/json
 #errors
+#internal/modulepath
 
 fn print_usage() {
     println("usage: xu native <command> [options]")
@@ -106,10 +107,23 @@ fn type_to_code(name &string) int {
     if s == "i32" { << 8 }
     if s == "u32" { << 9 }
     if s == "u8" { << 10 }
+    if s == "i64_span" { << 11 }
+    if s == "i64_span_mut" { << 12 }
     << -1
 }
 
+fn native_manifest_type_ok(code int, version int, result bool) bool {
+    if code < 0 { << false }
+    if code == 0 { << result }
+    if code == 11 || code == 12 { << version == 2 && !result }
+    if version == 2 { << code == 1 }
+    << code == 1 || code == 2 || code == 4 || code == 8 || code == 9 || code == 10
+}
+
 fn default_export_label(module &string, name &string) string {
+    if modulepath.is_external(module) {
+        << "_xu_" + modulepath.symbol(module) + "_" + *name
+    }
     $m := ""
     for i in 0:module.len {
         c := module[i]
@@ -234,6 +248,16 @@ fn encode_xuobj(manifest_json &string, target string) []int {
         << []int{}
     }
     root := doc.root()
+    abi_idx := doc.get(root, "abi")
+    $abi_name := ""
+    if abi_idx >= 0 { abi_name = doc.text(abi_idx) }
+    $version := 1
+    if abi_name == "xu-c-2" { version = 2 }
+    else if abi_name != "xu-c-1" {
+        eprintln("xu native: manifest requires abi xu-c-1 or xu-c-2")
+        << []int{}
+    }
+    out[5] = version
     mod_idx := doc.get(root, "module")
     $mod_name := ""
     if mod_idx >= 0 {
@@ -270,10 +294,18 @@ fn encode_xuobj(manifest_json &string, target string) []int {
         $ret_name := "void"
         if ret_idx >= 0 { ret_name = doc.text(ret_idx) }
         ret_code := type_to_code(&ret_name)
+        if !native_manifest_type_ok(ret_code, version, true) {
+            eprintln("xu native: unsupported result type for selected ABI: " + ret_name)
+            << []int{}
+        }
 
         params_idx := doc.get(item, "params")
         $param_count := 0
         if params_idx >= 0 { param_count = doc.count(params_idx) }
+        if param_count > 255 {
+            eprintln("xu native: export parameter budget exceeded")
+            << []int{}
+        }
 
         write_xu_string($&out, &fn_name)
         write_xu_string($&out, &label)
@@ -282,7 +314,12 @@ fn encode_xuobj(manifest_json &string, target string) []int {
         for p in 0:param_count {
             p_item := doc.at(params_idx, p)
             p_name := doc.text(p_item)
-            out.push(type_to_code(&p_name))
+            code := type_to_code(&p_name)
+            if !native_manifest_type_ok(code, version, false) {
+                eprintln("xu native: unsupported parameter type for selected ABI: " + p_name)
+                << []int{}
+            }
+            out.push(code)
         }
     }
 
@@ -292,6 +329,54 @@ fn encode_xuobj(manifest_json &string, target string) []int {
     write_u32($&out, 0)
     write_u32($&out, 0)
     << out
+}
+
+fn native_decimal(data &string, first int, count int) int {
+    if first < 0 || count < 0 || first > data.len || count > data.len - first { << -1 }
+    $value := 0
+    for i in first:first+count {
+        c := data[i]
+        if c == 32 { -> }
+        if c < 48 || c > 57 || value > data.len { << -1 }
+        value = value * 10 + c - 48
+    }
+    << value
+}
+
+// Native archives have a dedicated xu.o metadata member. Inspect only that
+// member, not arbitrary byte strings in native code or archive symbol tables.
+fn native_slice_abi(data &string, target &string) int {
+    if data.len < 8 || data[0:8] != "!<arch>\n" { << 0 }
+    codes := target_codes(target + "")
+    $pos := 8
+    while pos <= data.len - 60 {
+        size := native_decimal(data, pos + 48, 10)
+        if size < 0 || size > data.len - pos - 60 { << 0 }
+        end := pos + 60 + size
+        $first := pos + 60
+        $name := data[pos:pos + 16]
+        if strings.has_prefix(&name, "#1/") {
+            n := native_decimal(&name, 3, name.len - 3)
+            if n < 0 || n > size { << 0 }
+            name = data[first:first + n]
+            first += n
+        }
+        $trim := name.len
+        while trim > 0 && (name[trim-1] == 0 || name[trim-1] == 32 || name[trim-1] == 47) { trim -= 1 }
+        if name[0:trim] == "xu.o" {
+            $i := first
+            while i <= end - 10 {
+                if data[i:i+5] == "XUOBJ" && (data[i+5] == 1 || data[i+5] == 2) && data[i+6] == 0 && data[i+7] == 0 {
+                    if data[i+8] != codes[0] || data[i+9] != codes[1] { << 0 }
+                    << data[i+5]
+                }
+                i += 1
+            }
+            << 0
+        }
+        pos = end + size % 2
+    }
+    << 0
 }
 
 fn metadata_c_source(meta_bytes &[]int, target string) string {
@@ -730,7 +815,18 @@ fn run_pack(argv &[]string) int {
     $abi_name := "xu-c-1"
     if abi_idx >= 0 { abi_name = doc.text(abi_idx) }
 
-    $manifest_json := "{\"abi\":\"" + abi_name + "\",\"format\":\"xulib-1\",\"module\":\"" + mod_name + "\",\"slices\":["
+    encoded := encode_xuobj(&manifest_raw, slices[0].target)
+    if encoded.len < 8 { << 1 }
+    version := encoded[5]
+    for s_idx in 0:slices.len {
+        raw := payloads[s_idx]
+        selected := slices[s_idx].target
+        if native_slice_abi(&raw, &selected) != version {
+            eprintln("xu native pack: slice target or ABI does not match manifest")
+            << 1
+        }
+    }
+    $manifest_json := "{\"abi\":\"" + abi_name + "\",\"format\":\"xulib-" + str(version) + "\",\"module\":\"" + mod_name + "\",\"slices\":["
     for s_idx in 0:slices.len {
         if s_idx > 0 { manifest_json = manifest_json + "," }
         manifest_json = manifest_json + "{\"kind\":\"" + slices[s_idx].kind + "\",\"sha256\":\"" + slices[s_idx].digest_hex + "\",\"size\":" + str(slices[s_idx].size) + ",\"target\":\"" + slices[s_idx].target + "\"}"
@@ -748,8 +844,8 @@ fn run_pack(argv &[]string) int {
     out_bin.push(1)
     out_bin.push(0)
 
-    // 2. Version = 1 (u16), Flags = 0 (u16), Manifest Len (u32)
-    write_u16($&out_bin, 1)
+    // 2. Selected format version (u16), flags (u16), manifest length (u32).
+    write_u16($&out_bin, version)
     write_u16($&out_bin, 0)
     write_u32($&out_bin, manifest_json.len)
     write_bytes($&out_bin, &manifest_json)
@@ -852,6 +948,10 @@ fn run_inspect(argv &[]string) int {
         << 1
     }
     ver := get_u16_at(&data, 7)
+    if ver != 1 && ver != 2 {
+        eprintln("xu native inspect: unsupported container version")
+        << 1
+    }
     manifest_len := get_u32_at(&data, 11)
     $pos := 15
     if pos + manifest_len > data.len {
