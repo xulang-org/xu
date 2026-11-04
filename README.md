@@ -139,6 +139,7 @@ Xu provides standalone installers with embedded compilers and standard library s
 - **Windows** (GUI Wizard or PowerShell):
   - **GUI Wizard**: Download `xu-setup-windows-x64.exe` from [Releases](https://github.com/xulang-org/xu/releases) and double-click to run the zero-dependency self-rendered wizard.
   - **ARM64 console installer**: Download `xu-setup-windows-arm64.exe` from [Releases](https://github.com/xulang-org/xu/releases) and run `.\xu-setup-windows-arm64.exe --yes` in PowerShell.
+  - SDK installers declare current-user execution and can start from a normal terminal. Installing for all users still requires administrator privileges.
   - **PowerShell One-Liner**:
     ```powershell
     irm https://xulang.org/install.ps1 | iex
