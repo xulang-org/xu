@@ -1,0 +1,236 @@
+@embedded/chips/esp32
+
+// BT_BB is matrix source 4, separate from the RWBT/RWBLE link-layer IRQs.
+// CPU IRQ 8 is level 1. Only enable after complete TX RF calibration commits
+// PHY_TRACKING_READY; all entry points below keep failures observable.
+// IRQ words: count 3FFD73C0, last status C4, sticky error C8.
+// Dynamic RAM field transfer scratch: 3FFD77E0..77E8 (IRQ-owned while masked).
+
+fn irq_btbb_fault(code int) {
+    volatile_store(0x3FFD73C8, volatile_load(0x3FFD73C8) | code)
+}
+
+// C buffers and controller structs are physical DRAM addresses, not Xu
+// owned values. Bounds cover the reserved EM, ROM BSS, and controller heaps.
+fn irq_btbb_load(address int, width int) int {
+    if width < 1 || width > 4 || address < 0x3FFB0000 || address > 0x3FFE0000 - width {
+        irq_btbb_fault(0x100)
+        << 0
+    }
+    volatile_store(0x3FFD77E0, 0)
+    rom_call6(0x4000C2C8, 0x3FFD77E0, address, width, 0, 0, 0)
+    << volatile_load(0x3FFD77E0)
+}
+
+fn irq_btbb_store(address int, value int, width int) {
+    if width < 1 || width > 4 || address < 0x3FFB0000 || address > 0x3FFE0000 - width {
+        irq_btbb_fault(0x100)
+        <<
+    }
+    volatile_store(0x3FFD77E4, value)
+    rom_call6(0x4000C2C8, address, 0x3FFD77E4, width, 0, 0, 0)
+    // Volatile access supplies MEMW around the preceding native memcpy.
+    volatile_store(0x3FFD77E8, value)
+}
+
+// Retry path of RAM r_lld_pdu_tx_prog with is_retry == 1. Calling the ROM
+// normal TX entry here would incorrectly schedule/acknowledge LLCP again.
+// This path requires a connection handle < 9, as lld_retry_tx_prog checks.
+fn irq_btbb_retry_program(event int) bool {
+    if event < 0x3FFD2000 || event > 0x3FFD7000 - 0x74 {
+        irq_btbb_fault(0x200)
+        << false
+    }
+    flags := irq_btbb_load(event + 0x72, 1)
+    irq_btbb_store(event + 0x72, flags & 0xFB, 1)
+    handle := irq_btbb_load(event + 0x68, 2)
+    if handle >= 9 { irq_btbb_fault(0x200)
+        << false }
+    connection := irq_btbb_load(0x3FFB96D0 + handle * 4, 4)
+    if connection < 0x3FFD2000 || connection > 0x3FFD7000 - 0xA6 {
+        irq_btbb_fault(0x200)
+        << false
+    }
+    $node := irq_btbb_load(event + 8, 4)
+    if node != 0 && (irq_btbb_load(connection + 0xA5, 1) & 4) == 0 {
+        volatile_store(0x3FFD77D0, 0)
+        $visited := 0
+        $finished := false
+        while !finished && visited < 32 {
+            sent := rom_call6(0x4004B774, event, node, 0x3FFD77D0, 0, 0, 0)
+            if sent == 0 {
+                finished = true
+            } else {
+                next := irq_btbb_load(node, 4)
+                rom_call6(0x4001404C, event + 8, node, 0, 0, 0, 0) // co_list_extract
+                rom_call6(0x4001A014, node, 0, 0, 0, 0, 0) // ke_free
+                if (volatile_load(0x3FFD77D0) & 0xFF) > 9 || next == 0 {
+                    rom_call6(0x40013F14, event + 8, 0, 0, 0, 0, 0) // co_list_init
+                    finished = true
+                } else { node = next }
+            }
+            visited += 1
+        }
+        if !finished { irq_btbb_fault(0x400)
+            << false }
+    }
+    node = irq_btbb_load(event + 0x30, 4)
+    $tx_pointer := 0
+    $visited := 0
+    while node != 0 && visited < 32 {
+        descriptor := irq_btbb_load(node + 4, 2)
+        em := 0x3FFB05C0 + descriptor * 8
+        if em > 0x3FFB8000 - 2 { irq_btbb_fault(0x200)
+            << false }
+        if (irq_btbb_load(em, 2) & 0x8000) == 0 {
+            tx_pointer = ((descriptor + 0xB8) * 8) & 0xFFFF
+            <-
+        }
+        node = irq_btbb_load(node, 4)
+        visited += 1
+    }
+    if node != 0 && visited >= 32 { irq_btbb_fault(0x400)
+        << false }
+    if irq_btbb_load(event + 0x30, 4) != 0 {
+        if tx_pointer != 0 {
+            irq_btbb_store(event + 0x72, irq_btbb_load(event + 0x72, 1) | 4, 1)
+        }
+        coexistence := volatile_load8(0x3FF99155)
+        control := (irq_btbb_load(0x3FFB00B6 + handle * 0x5A, 2) & 0x1F) | 0xF000 |
+            ((coexistence & 1) << 10) | (((coexistence >> 1) & 1) << 9) |
+            (((coexistence >> 2) & 1) << 8)
+        irq_btbb_store(0x3FFB00B6 + handle * 0x5A, control, 2)
+    }
+    irq_btbb_store(0x3FFB00CC + handle * 0x5A, tx_pointer, 2)
+    volatile_store(0x3FFD77D4, volatile_load(0x3FFD77D4) + 1)
+    << volatile_load(0x3FFD73C8) == 0
+}
+
+fn irq_btbb_retry_tx(eligible int, em_pointer int) bool {
+    if rom_call6(0x40046100, 0, 0, 0, 0, 0, 0) != 1 || eligible == 0 { << true }
+    current := volatile_load(0x3FFB9704)
+    if current == 0 { << true }
+    if irq_btbb_load(current + 0x58, 4) != 0 {
+        programmed := irq_btbb_load(current + 0x5C, 4)
+        descriptor := irq_btbb_load(programmed + 4, 2)
+        if ((descriptor * 8 + 0x3FFB05C0) & 0xFFFF) == em_pointer { << true }
+    }
+    if irq_btbb_load(current + 0x90, 2) >= 9 { << true }
+    << irq_btbb_retry_program(current + 0x28)
+}
+
+// Preserve the transient writes as well as the final values. A decompiler
+// collapses this recovery to self-assignments, losing the reset pulses.
+fn irq_btbb_fifo_recover() {
+    volatile_store(0x3FF71250, 0xA8)
+    state := volatile_load(0x3FF71254) & 15
+    $reset := false
+    if state == 4 {
+        volatile_store(0x3FF71250, 0x82)
+        after := volatile_load(0x3FF71254)
+        reset = (after & 15) == 13 || (after & 7) == 0
+    } else if state == 5 {
+        volatile_store(0x3FF71250, 0x82)
+        reset = (volatile_load(0x3FF71254) & 15) == 0
+    }
+    if !reset { << }
+    low := (volatile_load(0x3FF71300) >> 4) & 3
+    high := (volatile_load(0x3FF71300) >> 6) & 3
+    // APB alias of the vendor's 0x60033D40 register.
+    bus := (volatile_load(0x3FF73D40) >> 3) & 7
+    gpio := volatile_load(0x3FF441C4)
+    volatile_store(0x3FF71300, volatile_load(0x3FF71300) | 0x30)
+    volatile_store(0x3FF71300, volatile_load(0x3FF71300) | 0xC0)
+    volatile_store(0x3FF73D40, (volatile_load(0x3FF73D40) & 0xFFFFFFC7) | 0x20)
+    volatile_store(0x3FF441C4, volatile_load(0x3FF441C4) | 0x40)
+    if (gpio & 0x40) == 0 {
+        volatile_store(0x3FF441C4, volatile_load(0x3FF441C4) & 0xFFFFFFBF)
+    }
+    volatile_store(0x3FF73D40, (volatile_load(0x3FF73D40) & 0xFFFFFFC7) | (bus << 3))
+    volatile_store(0x3FF71300, (volatile_load(0x3FF71300) & 0xFFFFFFCF) | (low << 4))
+    volatile_store(0x3FF71300, (volatile_load(0x3FF71300) & 0xFFFFFF3F) | (high << 6))
+}
+
+pub fn bt_irq_rom_bb_service() int {
+    started := irq_rom_cycle_count()
+    saved := irq_rom_mask(0 - 1)
+    volatile_store(0x3FFD73C0, volatile_load(0x3FFD73C0) + 1)
+    $polls := 0
+    while polls < 32 {
+        status := volatile_load(0x3FF51100)
+        volatile_store(0x3FFD73C4, status)
+        volatile_store(0x3FFD73CC, volatile_load(0x3FFD73CC) | status)
+        if status == 0 {
+            irq_timing_record_bb(started)
+            irq_rom_unmask(saved)
+            << 0
+        }
+        if (status & 0xFFFBFEF6) != 0 {
+            irq_btbb_fault(8)
+            irq_timing_record_bb(started)
+            irq_rom_unmask(saved & 0xFFFFFEFF)
+            << 1
+        }
+        if (status & 1) != 0 {
+            volatile_store(0x3FF51104, 1)
+            if !phy_bt_track_pll_cap() { irq_btbb_fault(1) }
+        }
+        if (status & 8) != 0 {
+            volatile_store(0x3FF51104, 8)
+            if !phy_bt_track_pll_cap() { irq_btbb_fault(1) }
+        }
+        if (status & 0x40000) != 0 {
+            volatile_store(0x3FF51104, 0x40000)
+            irq_btbb_fifo_recover()
+        }
+        if (status & 0x100) != 0 {
+            volatile_store(0x3FF51104, 0x100)
+            volatile_store(0x3FF71250, 0x8F8E)
+            tx := volatile_load(0x3FF71254)
+            if !irq_btbb_retry_tx(((tx >> 15) & 1) ^ 1, tx & 0x7FFF) { irq_btbb_fault(2) }
+        }
+        if volatile_load(0x3FFD73C8) != 0 {
+            irq_timing_record_bb(started)
+            irq_rom_unmask(saved & 0xFFFFFEFF)
+            << 1
+        }
+        polls += 1
+    }
+    irq_btbb_fault(4)
+    irq_timing_record_bb(started)
+    irq_rom_unmask(saved & 0xFFFFFEFF)
+    << 1
+}
+
+pub fn bt_irq_rom_bb_attach() bool {
+    irq_rom_mask(0x100)
+    if !phy_tracking_is_ready() { << false }
+    volatile_store(0x3FFD73C0, 0)
+    volatile_store(0x3FFD73C4, 0)
+    volatile_store(0x3FFD73C8, 0)
+    volatile_store(0x3FFD73CC, 0)
+    volatile_store(0x3FFD77A8, 0)
+    volatile_store(0x3FFD77AC, 0)
+    entry := rom_callback(bt_irq_rom_bb_service)
+    rom_call6(0x4000BF34, 8, entry, 0, 0, 0, 0)
+    volatile_store(0x3FF00114, (volatile_load(0x3FF00114) & 0xFFFFFFE0) | 8)
+    << volatile_load(0x3FFE0710) == entry && (volatile_load(0x3FF00114) & 31) == 8
+}
+
+pub fn bt_irq_rom_bb_enable() bool {
+    if !phy_tracking_is_ready() || volatile_load(0x3FFD73C8) != 0 ||
+        volatile_load(0x3FFE0710) != rom_callback(bt_irq_rom_bb_service) ||
+        (volatile_load(0x3FF00114) & 31) != 8 { << false }
+    // Actual BT_BB peripheral mask from btdm_rf_bb_init_phase2. Each
+    // enabled source has a handler above; CPU INTENABLE alone is not enough.
+    // Temperature power tracking remains disabled by this Xu port.
+    volatile_store(0x3FF510F8, 0x40109)
+    if (volatile_load(0x3FF510F8) & 0x40109) != 0x40109 {
+        irq_btbb_fault(0x800)
+        << false
+    }
+    irq_rom_unmask(0x100)
+    << true
+}
+
+pub fn bt_irq_rom_bb_error() int { << volatile_load(0x3FFD73C8) }

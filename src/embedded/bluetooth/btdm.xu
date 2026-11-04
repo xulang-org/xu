@@ -1,0 +1,1614 @@
+@embedded/bluetooth
+
+// BTDM application layer, ported to Xu.
+//
+// This file replaces the ESP-IDF app layer that lives in
+// `components/bt/controller/esp32/bt.c` (1872 lines) for the parts that can
+// be expressed in Xu:
+//
+//   * the OSI function table (`struct osi_funcs_t`, 59 function slots) and
+//     its registration;
+//   * the controller lifecycle (init / enable / disable / deinit);
+//   * the modem sleep sequencing (three phases) and the wake-up handshake;
+//   * the low power clock selection and divider;
+//   * the VHCI host transport (send / check / callback);
+//   * the work dispatcher that hands work to the controller task.
+//
+// Reference for every constant and for the ordering of the sleep phases:
+//   components/bt/controller/esp32/bt.c
+//   components/bt/controller/esp32/hli_api.c
+//
+// ---------------------------------------------------------------------------
+// ABI note (important)
+// ---------------------------------------------------------------------------
+// The ESP-IDF OSI table is a C structure of *single slot* function pointers.
+// An Xu `fn` value is a *fat pointer* `(code*, env*)`, so an Xu function
+// value can never be stored in a C function pointer slot.  The Xu port
+// therefore models the table with its own shape:
+//
+//   * the table is `struct OsiFuncs`, a struct of 59 named `fn` fields;
+//   * every slot takes the shared runtime context as its first argument,
+//     `&$BtdmController`, so the slots reach the state that the C code keeps in
+//     file scope statics (xu forbids mutable package globals);
+//   * slots whose C signature has more than two payload arguments take a
+//     dedicated argument struct, because an indirect call in Xu supports at
+//     most three arguments (the environment pointer occupies A0).
+//
+// The field order, the version word and the magic word are kept identical to
+// the C table so the two implementations can be diffed slot by slot.  A C
+// trampoline that lowers this table into the C layout is listed as a follow
+// up item in BTDM_XU_PORT.md; it is not part of this change because an Xu
+// object cannot be linked into the ESP32 image yet.
+//
+// ---------------------------------------------------------------------------
+// Bare metal semantics
+// ---------------------------------------------------------------------------
+// The C app layer runs on FreeRTOS.  On bare metal ESP32 there is no
+// FreeRTOS, so the synchronisation primitives are modelled as cooperative
+// primitives inside `BtdmController`:
+//
+//   FreeRTOS                Xu model
+//   ----------------------  ----------------------------------------------
+//   xSemaphoreCreateCounting counting semaphore in ctx.sem_*
+//   xSemaphoreTake(block)   bounded spin, then failure (never blocks)
+//   xSemaphoreGive          counter increment
+//   xSemaphoreCreateMutex   ctx.mutex_* registry
+//   xSemaphoreTake(mutex)   bounded spin, then failure
+//   xQueueCreate            fixed length int queue in ctx.queue_*
+//   xQueueSend              push, fail when full
+//   xQueueReceive           pop, fail when empty
+//   xTaskCreate             not available: the controller task is the
+//                           cooperative loop driven by `ke_run`
+//   portENTER_CRITICAL      software critical section counter (ctx.int_depth)
+//   vTaskDelay               delay_ms()
+
+// ===== OSI table identity ===================================================
+
+// Version of the OSI table.  The ESP32 variant uses 0x00010003; the ESP32-C3
+// and ESP32-S3 variants use 0x00010006.  Do not mix them up.
+pub const OSI_VERSION = 0x00010003
+pub const OSI_MAGIC_VALUE = 0xFADEBEAD
+pub const OSI_FUNCS_TIME_BLOCKING = 0xFFFFFFFF
+
+// Return codes of `btdm_osi_funcs_register`, recovered from the closed
+// library by REA/Ghidra (esp32 `osi.o` @0x10018).  They are plain negative
+// ints, not ESP-IDF error codes: -1 null pointer, -2 magic mismatch,
+// -3 version mismatch, 0 success.
+pub const BTDM_OSI_ERR_NULL    = -1
+pub const BTDM_OSI_ERR_MAGIC   = -2
+pub const BTDM_OSI_ERR_VERSION = -3
+
+// Number of function slots in `struct osi_funcs_t` (bt.c lines 118-180).
+pub const OSI_FUNC_SLOT_COUNT = 59
+
+// ===== Controller configuration mask ======================================
+
+pub const BTDM_CFG_BT_DATA_RELEASE         = 1
+pub const BTDM_CFG_HCI_UART                = 2
+pub const BTDM_CFG_CONTROLLER_RUN_APP_CPU  = 4
+pub const BTDM_CFG_SCAN_DUPLICATE_OPTIONS  = 8
+pub const BTDM_CFG_SEND_ADV_RESERVED_SIZE  = 16
+pub const BTDM_CFG_BLE_FULL_SCAN_SUPPORTED = 32
+
+// ===== Modem sleep modes ===================================================
+
+pub const BTDM_MODEM_SLEEP_MODE_NONE = 0
+pub const BTDM_MODEM_SLEEP_MODE_ORIG = 1
+pub const BTDM_MODEM_SLEEP_MODE_EVED = 2
+
+// ===== Low power clock source selection ===================================
+
+pub const BTDM_LPCLK_SEL_XTAL     = 0
+pub const BTDM_LPCLK_SEL_XTAL32K  = 1
+pub const BTDM_LPCLK_SEL_RTC_SLOW = 2
+pub const BTDM_LPCLK_SEL_8M       = 3
+
+// ===== Sleep timing (bt.c lines 78-79) ====================================
+
+// Threshold of interval in slots to allow to fall into modem sleep.
+pub const BTDM_MIN_SLEEP_DURATION = 12
+// Delay in slots of the modem wake up procedure (PHY/RF re-enable).
+pub const BTDM_MODEM_WAKE_UP_DELAY = 4
+
+// ===== Controller status / mode ============================================
+
+pub const ESP_BT_CONTROLLER_STATUS_IDLE    = 0
+pub const ESP_BT_CONTROLLER_STATUS_INITED  = 1
+pub const ESP_BT_CONTROLLER_STATUS_ENABLED = 2
+
+pub const ESP_BT_MODE_IDLE       = 0
+pub const ESP_BT_MODE_BLE        = 1
+pub const ESP_BT_MODE_CLASSIC_BT = 2
+pub const ESP_BT_MODE_BTDM       = 3
+
+// ===== Error codes (ESP-IDF esp_err.h) =====================================
+
+pub const ESP_OK                 = 0
+pub const ESP_FAIL               = -1
+pub const ESP_ERR_NO_MEM         = 0x101
+pub const ESP_ERR_INVALID_ARG    = 0x102
+pub const ESP_ERR_INVALID_STATE  = 0x103
+pub const ESP_ERR_NOT_SUPPORTED  = 0x106
+
+// ===== Low power clock register layout =====================================
+//
+// The low power clock is a chip register, so the addresses live in the chip
+// package (`chips/esp32/bt.xu`).  What is portable is the *field layout* and
+// the source selection semantics, which are spelled out here and mirrored by
+// the chip binding:
+//
+//   components/soc/esp32/include/soc/dport_reg.h:
+//     DPORT_BT_LPCK_DIV_INT_REG  = DR_REG_DPORT_BASE + 0x0D4
+//     DPORT_BT_LPCK_DIV_FRAC_REG = DR_REG_DPORT_BASE + 0x0D8
+//     INT  [11:0]  divider
+//     FRAC [27:24] source selection (exactly one bit set)
+//
+// NOTE: the pre-existing ESP32 constants used 0x3FF66044 / 0x3FF66048, which
+// on ESP32 is DR_REG_APB_CTRL_BASE (the APB control block), *not* the
+// Bluetooth low power clock divider.  The chip package now carries the
+// correct values.
+
+// Field masks of the two registers.
+pub const BTDM_LPCK_DIV_NUM_MASK   = 0x00000FFF // INT  [11:0]
+pub const BTDM_LPCK_BTEXTWAKEUP_REQ = 0x00001000 // INT  [12]
+pub const BTDM_LPCK_SEL_RTC_SLOW   = 0x01000000 // FRAC [24]
+pub const BTDM_LPCK_SEL_8M         = 0x02000000 // FRAC [25]
+pub const BTDM_LPCK_SEL_XTAL       = 0x04000000 // FRAC [26]
+pub const BTDM_LPCK_SEL_XTAL32K    = 0x08000000 // FRAC [27]
+pub const BTDM_LPCK_SEL_MASK       = 0x0F000000
+
+// ===== Low power clock calibration =========================================
+
+// RTC_CLK_CAL_FRACT is 19 on ESP32.
+pub const RTC_CLK_CAL_FRACT = 19
+// Default low power clock period in microseconds, expressed as
+// `2 << RTC_CLK_CAL_FRACT` in the C code.
+pub const BTDM_LPCYCLE_US_DEFAULT = 1048576
+
+// ===== Bare metal limits ====================================================
+
+pub const BTDM_ISR_SLOTS          = 32
+pub const BTDM_SEM_SLOTS          = 8
+pub const BTDM_MUTEX_SLOTS        = 8
+pub const BTDM_QUEUE_SLOTS        = 8
+pub const BTDM_QUEUE_MAX_ITEMS    = 32
+pub const BTDM_MAC_SLOT_BYTES      = 6
+pub const BTDM_MAC_SLOTS           = 3
+pub const BTDM_VHCI_TX_SLOTS        = 4
+pub const BTDM_VHCI_RX_SLOTS        = 4
+pub const BTDM_WORK_SLOTS           = 8
+
+// Bounded spin limits for the cooperative synchronisation primitives.
+pub const BTDM_SPIN_TRY      = 1
+pub const BTDM_SPIN_BLOCKING = 4096
+
+// Work item ids dispatched to the controller task.
+pub const BTDM_WORK_NONE            = 0
+pub const BTDM_WORK_WAKEUP_REQUEST  = 1
+pub const BTDM_WORK_SLEEP_TIMER     = 2
+pub const BTDM_WORK_VHCI_RX         = 3
+
+// Controller task event ids.
+pub const BTDM_EVT_WORK = 0x01
+pub const BTDM_EVT_TIMER = 0x02
+pub const BTDM_EVT_VHCI_RX = 0x03
+
+// ===== Argument structs ====================================================
+//
+// Slots whose C signature carries more than two payload arguments use these
+// structs, because an indirect call in Xu supports at most three arguments.
+
+// `_set_isr(int n, xt_handler f, void *arg)` / `_set_isr_l3(...)`.
+pub struct OsiIsrArgs {
+    pub n int
+    pub handler int   // Xu handler id (the C version passes a function pointer)
+    pub arg int
+}
+
+// `_queue_send(queue, item, block_time_ms)` and friends.
+pub struct OsiQueueArgs {
+    pub queue int
+    pub item int
+    pub block_time_ms int
+}
+
+// `_task_create(task_func, name, stack_depth, param, prio, task_handle, core_id)`.
+pub struct OsiTaskArgs {
+    pub task_cb int    // index into ctx.task_cbs, the C version passes a pointer
+    pub name string
+    pub stack_depth int
+    pub param int
+    pub prio int
+    pub task_handle int
+    pub core_id int
+}
+
+// `_coex_bt_request(event, latency, duration)`.
+pub struct OsiCoexArgs {
+    pub event int
+    pub latency int
+    pub duration int
+}
+
+// ===== VHCI ================================================================
+
+// Host side callbacks of the VHCI transport.
+//
+// The C contract (components/bt/include/esp32/include/esp_bt.h:388-419) is
+//
+//   void (*notify_host_send_available)(void);
+//   int  (*notify_host_recv)(uint8_t *data, uint16_t len);
+//
+// The Xu version replaces the `uint8_t *data` pointer with a slot index into
+// the receive pool owned by the context, because Xu has no int-to-pointer
+// conversion.  The host reads the bytes from `btdm_vhci_rx_slot()`.
+pub struct VhciHostCallback {
+    pub notify_host_send_available fn()
+    pub notify_host_recv fn(int, int) int
+}
+
+// VHCI transport state.
+pub struct VhciState {
+    pub registered bool
+    pub notify_host_send_available fn()
+    pub notify_host_recv fn(int, int) int
+    pub send_available bool
+    pub tx_packets int
+    pub tx_bytes int
+    pub rx_packets int
+    pub tx_slot int
+    pub tx_len int
+    pub rx_slot int
+    pub rx_len int
+    // Number of times the host callbacks were invoked.  The counters are
+    // incremented *after* the callback returned, so a non zero value proves
+    // that the callback really ran.
+    pub notify_send_available_calls int
+    pub notify_recv_calls int
+}
+
+fn vhci_noop_send_available() {
+}
+
+fn vhci_noop_recv(slot int, len int) int {
+    << 0
+}
+
+// ===== Runtime context ====================================================
+//
+// Everything the C code keeps in file scope statics lives here.  The caller
+// owns the context; xu has no mutable package globals.
+
+pub struct BtdmController {
+    // Controller status and mode.
+    pub status int
+    pub mode int
+    pub config_mask int
+    pub lpclk_sel int
+    pub lpclk_div int
+    pub registered bool
+    // The OSI table.  The table holds `fn` values that take a writable
+    // borrow of the controller, so the type graph is cyclic by design.
+    pub osi OsiFuncs
+    // Chip binding hooks (see backend.xu).  A chip package fills this in;
+    // the default hooks report failure instead of touching an unknown
+    // register, so a controller created without a binding is still safe.
+    pub backend BtBackend
+    // Low power clock calibration (bt.c: btdm_lpcycle_us / _frac).
+    pub lpcycle_us int
+    pub lpcycle_us_frac int
+    // Sleep / power state.
+    pub sleep_mode int
+    pub sleep_enabled bool
+    pub in_wakeup_requesting bool
+    pub power_active bool
+    // Interrupt bookkeeping.
+    pub int_depth int
+    pub ints_mask int
+    pub isr_handlers []int
+    pub isr_args []int
+    // Random number generator state.
+    pub rand_state int
+    // Tick counter for the controller task.
+    pub tick int
+    // Counting semaphores.
+    pub sem_active []int
+    pub sem_count []int
+    pub sem_max []int
+    // Mutexes.
+    pub mutex_active []int
+    pub mutex_locked []int
+    pub mutex_owner []int
+    // Message queues.
+    pub queue_active []int
+    pub queue_len []int
+    pub queue_item_size []int
+    pub queue_items []int
+    pub queue_head []int
+    pub queue_tail []int
+    // VHCI byte pool (transmit slots followed by receive slots).
+    pub pool []int
+    // Bluetooth MAC.
+    pub mac_bytes []int
+    pub mac_slots []int
+    // Task registry (the C version creates real FreeRTOS tasks).
+    pub task_cbs []int
+    pub task_count int
+    // Work items pending for the controller task.
+    pub work_ids []int
+    pub work_args []int
+    pub work_head int
+    pub work_tail int
+    // Controller task context.
+    pub task KeTask
+    // VHCI transport.
+    pub vhci VhciState
+}
+
+// ===== OSI function table =================================================
+
+// The 59 function slots of `struct osi_funcs_t`, in the C field order.
+pub struct OsiFuncs {
+    pub version int
+    pub set_isr fn($&BtdmController, OsiIsrArgs) int
+    pub ints_on fn($&BtdmController, int)
+    pub interrupt_disable fn($&BtdmController)
+    pub interrupt_restore fn($&BtdmController)
+    pub task_yield fn($&BtdmController)
+    pub task_yield_from_isr fn($&BtdmController)
+    pub semphr_create fn($&BtdmController, int, int) int
+    pub semphr_delete fn($&BtdmController, int)
+    pub semphr_take_from_isr fn($&BtdmController, int, int) int
+    pub semphr_give_from_isr fn($&BtdmController, int, int) int
+    pub semphr_take fn($&BtdmController, int, int) int
+    pub semphr_give fn($&BtdmController, int) int
+    pub mutex_create fn($&BtdmController) int
+    pub mutex_delete fn($&BtdmController, int)
+    pub mutex_lock fn($&BtdmController, int) int
+    pub mutex_unlock fn($&BtdmController, int) int
+    pub queue_create fn($&BtdmController, int, int) int
+    pub queue_delete fn($&BtdmController, int)
+    pub queue_send fn($&BtdmController, OsiQueueArgs) int
+    pub queue_send_from_isr fn($&BtdmController, OsiQueueArgs) int
+    pub queue_recv fn($&BtdmController, OsiQueueArgs) int
+    pub queue_recv_from_isr fn($&BtdmController, OsiQueueArgs) int
+    pub task_create fn($&BtdmController, OsiTaskArgs) int
+    pub task_delete fn($&BtdmController, int)
+    pub is_in_isr fn($&BtdmController) bool
+    pub cause_sw_intr_to_core fn($&BtdmController, int, int) int
+    pub malloc fn($&BtdmController, int) int
+    pub malloc_internal fn($&BtdmController, int) int
+    pub free fn($&BtdmController, int)
+    pub read_efuse_mac fn($&BtdmController, int) int
+    pub srand fn($&BtdmController, int)
+    pub rand fn($&BtdmController) int
+    pub btdm_lpcycles_2_us fn($&BtdmController, int) int
+    pub btdm_us_2_lpcycles fn($&BtdmController, int) int
+    pub btdm_sleep_check_duration fn($&BtdmController, $&int) bool
+    pub btdm_sleep_enter_phase1 fn($&BtdmController, int)
+    pub btdm_sleep_enter_phase2 fn($&BtdmController)
+    pub btdm_sleep_exit_phase1 fn($&BtdmController)
+    pub btdm_sleep_exit_phase2 fn($&BtdmController)
+    pub btdm_sleep_exit_phase3 fn($&BtdmController)
+    pub coex_bt_wakeup_request fn($&BtdmController) bool
+    pub coex_bt_wakeup_request_end fn($&BtdmController)
+    pub coex_bt_request fn($&BtdmController, OsiCoexArgs) int
+    pub coex_bt_release fn($&BtdmController, int) int
+    pub coex_register_bt_cb fn($&BtdmController, int) int
+    pub coex_bb_reset_lock fn($&BtdmController) int
+    pub coex_bb_reset_unlock fn($&BtdmController, int)
+    pub coex_schm_register_btdm_callback fn($&BtdmController, int) int
+    pub coex_schm_status_bit_clear fn($&BtdmController, int, int)
+    pub coex_schm_status_bit_set fn($&BtdmController, int, int)
+    pub coex_schm_interval_get fn($&BtdmController) int
+    pub coex_schm_curr_period_get fn($&BtdmController) int
+    pub coex_schm_curr_phase_get fn($&BtdmController) int
+    pub coex_wifi_channel_get fn($&BtdmController, int) int
+    pub coex_register_wifi_channel_change_callback fn($&BtdmController, int) int
+    pub set_isr_l3 fn($&BtdmController, OsiIsrArgs) int
+    pub interrupt_l3_disable fn($&BtdmController)
+    pub interrupt_l3_restore fn($&BtdmController)
+    pub customer_queue_create fn($&BtdmController, int, int) int
+    pub magic int
+}
+
+// ===== Context construction ===============================================
+
+fn btdm_controller_new() BtdmController {
+    $isr_handlers := []int{}
+    $isr_args := []int{}
+    $i := 0
+    while i < BTDM_ISR_SLOTS {
+        isr_handlers.push(-1)
+        isr_args.push(0)
+        i = i + 1
+    }
+    $sem_active := []int{}
+    $sem_count := []int{}
+    $sem_max := []int{}
+    i = 0
+    while i < BTDM_SEM_SLOTS {
+        sem_active.push(0)
+        sem_count.push(0)
+        sem_max.push(0)
+        i = i + 1
+    }
+    $mutex_active := []int{}
+    $mutex_locked := []int{}
+    $mutex_owner := []int{}
+    i = 0
+    while i < BTDM_MUTEX_SLOTS {
+        mutex_active.push(0)
+        mutex_locked.push(0)
+        mutex_owner.push(-1)
+        i = i + 1
+    }
+    $queue_active := []int{}
+    $queue_len := []int{}
+    $queue_item_size := []int{}
+    $queue_items := []int{}
+    $queue_head := []int{}
+    $queue_tail := []int{}
+    i = 0
+    while i < BTDM_QUEUE_SLOTS {
+        queue_active.push(0)
+        queue_len.push(0)
+        queue_item_size.push(0)
+        queue_items.push(0)
+        queue_head.push(0)
+        queue_tail.push(0)
+        i = i + 1
+    }
+    // The pool has a fixed wire-frame capacity. Allocate it once: growing
+    // 2080 entries by push consumes 65472 bytes before the other controller
+    // state on the bare-metal bump heap, where free cannot reclaim buffers.
+    pool := make_ints((BTDM_VHCI_TX_SLOTS + BTDM_VHCI_RX_SLOTS) * HCI_MAX_FRAME)
+    $mac_bytes := []int{}
+    i = 0
+    while i < BTDM_MAC_SLOT_BYTES {
+        mac_bytes.push(0)
+        i = i + 1
+    }
+    $mac_slots := []int{}
+    i = 0
+    while i < BTDM_MAC_SLOT_BYTES * BTDM_MAC_SLOTS {
+        mac_slots.push(0)
+        i = i + 1
+    }
+    $task_cbs := []int{}
+    $work_ids := []int{}
+    $work_args := []int{}
+    i = 0
+    while i < BTDM_WORK_SLOTS {
+        work_ids.push(0)
+        work_args.push(0)
+        i = i + 1
+    }
+    << BtdmController{
+        status: ESP_BT_CONTROLLER_STATUS_IDLE,
+        mode: ESP_BT_MODE_IDLE,
+        config_mask: 0,
+        lpclk_sel: BTDM_LPCLK_SEL_XTAL,
+        lpclk_div: 0,
+        registered: false,
+        osi: btdm_osi_funcs_ro(),
+        backend: bt_default_backend(),
+        lpcycle_us: BTDM_LPCYCLE_US_DEFAULT,
+        lpcycle_us_frac: RTC_CLK_CAL_FRACT,
+        sleep_mode: BTDM_MODEM_SLEEP_MODE_NONE,
+        sleep_enabled: false,
+        in_wakeup_requesting: false,
+        power_active: true,
+        int_depth: 0,
+        ints_mask: 0,
+        isr_handlers: isr_handlers,
+        isr_args: isr_args,
+        rand_state: 1,
+        tick: 0,
+        sem_active: sem_active,
+        sem_count: sem_count,
+        sem_max: sem_max,
+        mutex_active: mutex_active,
+        mutex_locked: mutex_locked,
+        mutex_owner: mutex_owner,
+        queue_active: queue_active,
+        queue_len: queue_len,
+        queue_item_size: queue_item_size,
+        queue_items: queue_items,
+        queue_head: queue_head,
+        queue_tail: queue_tail,
+        pool: pool,
+        mac_bytes: mac_bytes,
+        mac_slots: mac_slots,
+        task_cbs: task_cbs,
+        task_count: 0,
+        work_ids: work_ids,
+        work_args: work_args,
+        work_head: 0,
+        work_tail: 0,
+        task: ke_task_create("btdm", btdm_ke_event_handler, btdm_ke_timer_handler),
+        vhci: VhciState{
+            registered: false,
+            notify_host_send_available: vhci_noop_send_available,
+            notify_host_recv: vhci_noop_recv,
+            send_available: true,
+            tx_packets: 0,
+            tx_bytes: 0,
+            rx_packets: 0,
+            tx_slot: 0,
+            tx_len: 0,
+            rx_slot: 0,
+            rx_len: 0,
+            notify_send_available_calls: 0,
+            notify_recv_calls: 0
+        }
+    }
+}
+
+// Create a controller instance.  The caller owns the value; there is no
+// package global because xu forbids mutable globals.
+pub fn btdm_controller_create() BtdmController {
+    << btdm_controller_new()
+}
+
+// ===== OSI slot implementations ============================================
+
+// `_set_isr(int n, xt_handler f, void *arg)`
+//
+// The C version stores a function pointer; the Xu version stores a handler
+// id in the software dispatch table.  The hardware vector is installed
+// statically by the application through `fn irq_N`; `btdm_irq_dispatch` is
+// the entry point the application calls from its IRQ handler.
+fn osi_set_isr(ctx $&BtdmController, args OsiIsrArgs) int {
+    if args.n < 0 || args.n >= ctx.isr_handlers.len { << -1 }
+    prev := ctx.isr_handlers[args.n]
+    ctx.isr_handlers[args.n] = args.handler
+    ctx.isr_args[args.n] = args.arg
+    << prev
+}
+
+// `_set_isr_l3(int n, xt_handler f, void *arg)`
+fn osi_set_isr_l3(ctx $&BtdmController, args OsiIsrArgs) int {
+    << osi_set_isr(ctx, args)
+}
+
+// `_ints_on(unsigned int mask)`
+//
+// TODO(BTDM-P2): xu has no "set interrupt level" intrinsic, so the Xtensa
+// PS.INTLEVEL register cannot be raised from xu yet.  The mask is recorded
+// so the application can apply it, and the software interrupt dispatcher is
+// notified.
+fn osi_ints_on(ctx $&BtdmController, mask int) {
+    ctx.ints_mask = ctx.ints_mask | mask
+}
+
+// `_interrupt_disable(void)`
+fn osi_interrupt_disable(ctx $&BtdmController) {
+    ctx.int_depth = ctx.int_depth + 1
+}
+
+// `_interrupt_restore(void)`
+fn osi_interrupt_restore(ctx $&BtdmController) {
+    if ctx.int_depth > 0 {
+        ctx.int_depth = ctx.int_depth - 1
+    }
+}
+
+// `_interrupt_l3_disable(void)`
+fn osi_interrupt_l3_disable(ctx $&BtdmController) {
+    ctx.int_depth = ctx.int_depth + 1
+}
+
+// `_interrupt_l3_restore(void)`
+fn osi_interrupt_l3_restore(ctx $&BtdmController) {
+    if ctx.int_depth > 0 {
+        ctx.int_depth = ctx.int_depth - 1
+    }
+}
+
+// `_task_yield(void)`
+//
+// On bare metal there is no preemptive scheduler.  A yield runs one
+// iteration of the controller task so that posted events make progress.
+fn osi_task_yield(ctx $&BtdmController) {
+    ke_run($&ctx.task, 1)
+}
+
+// `_task_yield_from_isr(void)`
+fn osi_task_yield_from_isr(ctx $&BtdmController) {
+    // An ISR must not run the controller loop; the event pump picks the work
+    // up when the ISR returns.
+    ctx.tick = ctx.tick + 1
+}
+
+// `_semphr_create(uint32_t max, uint32_t init)`
+fn osi_semphr_create(ctx $&BtdmController, max int, init int) int {
+    $slot := -1
+    $found := false
+    $i := 0
+    while i < ctx.sem_active.len && !found {
+        if ctx.sem_active[i] == 0 {
+            slot = i
+            found = true
+        } else {
+            i = i + 1
+        }
+    }
+    if slot < 0 { << 0 }
+    ctx.sem_active[slot] = 1
+    ctx.sem_max[slot] = max
+    ctx.sem_count[slot] = init
+    << slot + 1
+}
+
+// `_semphr_delete(void *semphr)`
+fn osi_semphr_delete(ctx $&BtdmController, semphr int) {
+    $slot := semphr - 1
+    if slot < 0 || slot >= ctx.sem_active.len { << }
+    ctx.sem_active[slot] = 0
+    ctx.sem_count[slot] = 0
+    ctx.sem_max[slot] = 0
+}
+
+// `_semphr_take_from_isr(void *semphr, void *hptw)`
+fn osi_semphr_take_from_isr(ctx $&BtdmController, semphr int, hptw int) int {
+    << osi_semphr_take(ctx, semphr, 0)
+}
+
+// `_semphr_give_from_isr(void *semphr, void *hptw)`
+fn osi_semphr_give_from_isr(ctx $&BtdmController, semphr int, hptw int) int {
+    << osi_semphr_give(ctx, semphr)
+}
+
+// `_semphr_take(void *semphr, uint32_t block_time_ms)`
+fn osi_semphr_take(ctx $&BtdmController, semphr int, block_time_ms int) int {
+    $slot := semphr - 1
+    if slot < 0 || slot >= ctx.sem_active.len { << 0 }
+    if ctx.sem_active[slot] == 0 { << 0 }
+    $spins := BTDM_SPIN_TRY
+    if block_time_ms == OSI_FUNCS_TIME_BLOCKING {
+        spins = BTDM_SPIN_BLOCKING
+    } else if block_time_ms > 0 {
+        spins = block_time_ms
+    }
+    $n := 0
+    while n < spins {
+        if ctx.sem_count[slot] > 0 {
+            ctx.sem_count[slot] = ctx.sem_count[slot] - 1
+            << 1
+        }
+        n = n + 1
+    }
+    << 0
+}
+
+// `_semphr_give(void *semphr)`
+fn osi_semphr_give(ctx $&BtdmController, semphr int) int {
+    $slot := semphr - 1
+    if slot < 0 || slot >= ctx.sem_active.len { << 0 }
+    if ctx.sem_active[slot] == 0 { << 0 }
+    if ctx.sem_count[slot] >= ctx.sem_max[slot] { << 0 }
+    ctx.sem_count[slot] = ctx.sem_count[slot] + 1
+    << 1
+}
+
+// `_mutex_create(void)`
+fn osi_mutex_create(ctx $&BtdmController) int {
+    $slot := -1
+    $found := false
+    $i := 0
+    while i < ctx.mutex_active.len && !found {
+        if ctx.mutex_active[i] == 0 {
+            slot = i
+            found = true
+        } else {
+            i = i + 1
+        }
+    }
+    if slot < 0 { << 0 }
+    ctx.mutex_active[slot] = 1
+    ctx.mutex_locked[slot] = 0
+    ctx.mutex_owner[slot] = -1
+    << slot + 1
+}
+
+// `_mutex_delete(void *mutex)`
+fn osi_mutex_delete(ctx $&BtdmController, mutex int) {
+    $slot := mutex - 1
+    if slot < 0 || slot >= ctx.mutex_active.len { << }
+    ctx.mutex_active[slot] = 0
+    ctx.mutex_locked[slot] = 0
+    ctx.mutex_owner[slot] = -1
+}
+
+// `_mutex_lock(void *mutex)`
+fn osi_mutex_lock(ctx $&BtdmController, mutex int) int {
+    $slot := mutex - 1
+    if slot < 0 || slot >= ctx.mutex_active.len { << 0 }
+    if ctx.mutex_active[slot] == 0 { << 0 }
+    $spins := BTDM_SPIN_BLOCKING
+    $n := 0
+    while n < spins {
+        if ctx.mutex_locked[slot] == 0 {
+            ctx.mutex_locked[slot] = 1
+            ctx.mutex_owner[slot] = slot
+            << 1
+        }
+        n = n + 1
+    }
+    << 0
+}
+
+// `_mutex_unlock(void *mutex)`
+fn osi_mutex_unlock(ctx $&BtdmController, mutex int) int {
+    $slot := mutex - 1
+    if slot < 0 || slot >= ctx.mutex_active.len { << 0 }
+    if ctx.mutex_active[slot] == 0 { << 0 }
+    if ctx.mutex_locked[slot] == 0 { << 0 }
+    ctx.mutex_locked[slot] = 0
+    ctx.mutex_owner[slot] = -1
+    << 1
+}
+
+// `_queue_create(uint32_t queue_len, uint32_t item_size)`
+fn osi_queue_create(ctx $&BtdmController, queue_len int, item_size int) int {
+    $slot := -1
+    $found := false
+    $i := 0
+    while i < ctx.queue_active.len && !found {
+        if ctx.queue_active[i] == 0 {
+            slot = i
+            found = true
+        } else {
+            i = i + 1
+        }
+    }
+    if slot < 0 { << 0 }
+    ctx.queue_active[slot] = 1
+    ctx.queue_len[slot] = queue_len
+    ctx.queue_item_size[slot] = item_size
+    ctx.queue_head[slot] = 0
+    ctx.queue_tail[slot] = 0
+    << slot + 1
+}
+
+// `_customer_queue_create(uint32_t queue_len, uint32_t item_size)`
+fn osi_customer_queue_create(ctx $&BtdmController, queue_len int, item_size int) int {
+    << osi_queue_create(ctx, queue_len, item_size)
+}
+
+// `_queue_delete(void *queue)`
+fn osi_queue_delete(ctx $&BtdmController, queue int) {
+    $slot := queue - 1
+    if slot < 0 || slot >= ctx.queue_active.len { << }
+    ctx.queue_active[slot] = 0
+    ctx.queue_len[slot] = 0
+    ctx.queue_head[slot] = 0
+    ctx.queue_tail[slot] = 0
+}
+
+// `_queue_send(void *queue, void *item, uint32_t block_time_ms)`
+fn osi_queue_send(ctx $&BtdmController, args OsiQueueArgs) int {
+    $slot := args.queue - 1
+    if slot < 0 || slot >= ctx.queue_active.len { << 0 }
+    if ctx.queue_active[slot] == 0 { << 0 }
+    if ctx.queue_tail[slot] >= ctx.queue_len[slot] { << 0 }
+    ctx.queue_items[slot * BTDM_QUEUE_MAX_ITEMS + ctx.queue_tail[slot]] = args.item
+    ctx.queue_tail[slot] = ctx.queue_tail[slot] + 1
+    << 1
+}
+
+// `_queue_send_from_isr(void *queue, void *item, void *hptw)`
+fn osi_queue_send_from_isr(ctx $&BtdmController, args OsiQueueArgs) int {
+    << osi_queue_send(ctx, args)
+}
+
+// `_queue_recv(void *queue, void *item, uint32_t block_time_ms)`
+//
+// The C version copies the head element into the caller owned buffer.  Xu
+// has no int-to-pointer conversion, so the slot returns the element value
+// directly and `args.item` is ignored.
+fn osi_queue_recv(ctx $&BtdmController, args OsiQueueArgs) int {
+    $slot := args.queue - 1
+    if slot < 0 || slot >= ctx.queue_active.len { << 0 }
+    if ctx.queue_active[slot] == 0 { << 0 }
+    if ctx.queue_head[slot] >= ctx.queue_tail[slot] { << 0 }
+    item := ctx.queue_items[slot * BTDM_QUEUE_MAX_ITEMS + ctx.queue_head[slot]]
+    ctx.queue_head[slot] = ctx.queue_head[slot] + 1
+    << item
+}
+
+// `_queue_recv_from_isr(void *queue, void *item, void *hptw)`
+fn osi_queue_recv_from_isr(ctx $&BtdmController, args OsiQueueArgs) int {
+    << osi_queue_recv(ctx, args)
+}
+
+// `_task_create(void *task_func, const char *name, uint32_t stack_depth,
+//               void *param, uint32_t prio, void *task_handle, uint32_t core_id)`
+//
+// TODO(BTDM-P2): xu has no preemptive tasks and cannot pass a function
+// pointer as a value.  The slot records the task description and returns a
+// task id; the controller task is the cooperative loop driven by `ke_run`.
+fn osi_task_create(ctx $&BtdmController, args OsiTaskArgs) int {
+    if ctx.task_count >= BTDM_WORK_SLOTS { << 0 }
+    ctx.task_cbs.push(args.task_cb)
+    ctx.task_count = ctx.task_count + 1
+    << ctx.task_count
+}
+
+// `_task_delete(void *task_handle)`
+fn osi_task_delete(ctx $&BtdmController, task_handle int) {
+    if task_handle <= 0 || task_handle > ctx.task_count { << }
+    ctx.task_cbs[task_handle - 1] = 0
+}
+
+// `_is_in_isr(void)`
+fn osi_is_in_isr(ctx $&BtdmController) bool {
+    << ctx.int_depth > 0 || ctx.task.in_isr
+}
+
+// `_cause_sw_intr_to_core(int core_id, int intr_no)`
+//
+// TODO(BTDM-P2): xu can raise a software interrupt with `raise_irq`, but only
+// on the core that executes the call.  Cross core signalling is not modelled.
+fn osi_cause_sw_intr_to_core(ctx $&BtdmController, core_id int, intr_no int) int {
+    if intr_no < 0 || intr_no >= BTDM_ISR_SLOTS { << ESP_ERR_INVALID_ARG }
+    raise_irq(intr_no)
+    << ESP_OK
+}
+
+// `_malloc(size_t size)`
+//
+// TODO(BTDM-P2): the Xu runtime owns the heap; there is no allocator hook
+// that hands out raw pointers.  The slot reports "not supported" instead of
+// returning a fake pointer.
+fn osi_malloc(ctx $&BtdmController, size int) int {
+    << 0
+}
+
+// `_malloc_internal(size_t size)`
+fn osi_malloc_internal(ctx $&BtdmController, size int) int {
+    << osi_malloc(ctx, size)
+}
+
+// `_free(void *p)`
+fn osi_free(ctx $&BtdmController, p int) {
+    // The Xu runtime frees its own allocations; nothing to do for a handle
+    // that was never handed out.
+}
+
+// `_read_efuse_mac(uint8_t mac[6])`
+//
+// TODO(BTDM-P2): xu has no eFuse reader yet.  The Bluetooth MAC is injected
+// by the application into the context (`btdm_set_mac`) and copied into the
+// requested slot here.
+fn osi_read_efuse_mac(ctx $&BtdmController, slot int) int {
+    if slot < 0 || slot >= BTDM_MAC_SLOTS { << ESP_ERR_INVALID_ARG }
+    $i := 0
+    while i < BTDM_MAC_SLOT_BYTES {
+        ctx.mac_slots[slot * BTDM_MAC_SLOT_BYTES + i] = ctx.mac_bytes[i]
+        i = i + 1
+    }
+    << ESP_OK
+}
+
+// `_srand(unsigned int seed)`
+fn osi_srand(ctx $&BtdmController, seed int) {
+    $s := seed
+    if s == 0 { s = 1 }
+    ctx.rand_state = s
+}
+
+// `_rand(void)`
+//
+// xorshift32: deterministic, no libc dependency.
+fn osi_rand(ctx $&BtdmController) int {
+    $x := ctx.rand_state
+    if x == 0 { x = 1 }
+    x = x ^ ((x << 13) & 0xFFFFFFFF)
+    x = x ^ ((x >> 17) & 0xFFFFFFFF)
+    x = x ^ ((x << 5) & 0xFFFFFFFF)
+    x = x & 0xFFFFFFFF
+    ctx.rand_state = x
+    << x
+}
+
+// `_btdm_lpcycles_2_us(uint32_t cycles)`
+fn osi_btdm_lpcycles_2_us(ctx $&BtdmController, cycles int) int {
+    if ctx.lpcycle_us == 0 { << 0 }
+    << (ctx.lpcycle_us * cycles) >> ctx.lpcycle_us_frac
+}
+
+// `_btdm_us_2_lpcycles(uint32_t us)`
+fn osi_btdm_us_2_lpcycles(ctx $&BtdmController, us int) int {
+    if ctx.lpcycle_us == 0 { << 0 }
+    << (us << ctx.lpcycle_us_frac) / ctx.lpcycle_us
+}
+
+// `_btdm_sleep_check_duration(uint32_t *slot_cnt)`
+fn osi_btdm_sleep_check_duration(ctx $&BtdmController, slot_cnt $&int) bool {
+    if *slot_cnt < BTDM_MIN_SLEEP_DURATION { << false }
+    // Wake up in advance considering the delay in enabling PHY/RF.
+    *slot_cnt = *slot_cnt - BTDM_MODEM_WAKE_UP_DELAY
+    << true
+}
+
+// `_btdm_sleep_enter_phase1(uint32_t lpcycles)`
+//
+// Called with the interrupts disabled.  The C version arms an esp_timer so
+// that the PM lock is taken before the modem wakes up.  On bare metal the
+// wake up is driven by the controller task tick instead.
+fn osi_btdm_sleep_enter_phase1(ctx $&BtdmController, lpcycles int) {
+    $now := ctx.tick
+    ke_timer_add($&ctx.task, now, BTDM_WORK_SLEEP_TIMER, 1, 0)
+}
+
+// `_btdm_sleep_enter_phase2(void)`
+fn osi_btdm_sleep_enter_phase2(ctx $&BtdmController) {
+    // The C version disables the PHY (and the baseband in EVED mode).
+    // TODO(BTDM-P2): PHY/RF power sequencing belongs to the closed source
+    // radio core; the xu port only records the state change.
+    ctx.power_active = false
+}
+
+// `_btdm_sleep_exit_phase1(void)`
+fn osi_btdm_sleep_exit_phase1(ctx $&BtdmController) {
+    ctx.power_active = true
+}
+
+// `_btdm_sleep_exit_phase2(void)`
+fn osi_btdm_sleep_exit_phase2(ctx $&BtdmController) {
+    ctx.power_active = true
+}
+
+// `_btdm_sleep_exit_phase3(void)`
+fn osi_btdm_sleep_exit_phase3(ctx $&BtdmController) {
+    ctx.power_active = true
+    ke_timer_cancel($&ctx.task, 0)
+}
+
+// `_coex_bt_wakeup_request(void)`
+fn osi_coex_bt_wakeup_request(ctx $&BtdmController) bool {
+    << btdm_async_wakeup_request(ctx, 1)
+}
+
+// `_coex_bt_wakeup_request_end(void)`
+fn osi_coex_bt_wakeup_request_end(ctx $&BtdmController) {
+    btdm_async_wakeup_request_end(ctx, 1)
+}
+
+// `_coex_bt_request(uint32_t event, uint32_t latency, uint32_t duration)`
+//
+// TODO(BTDM-P2): the software coexistence scheduler lives in the closed
+// source library (coex_schm.o).  The xu port only records the request.
+fn osi_coex_bt_request(ctx $&BtdmController, args OsiCoexArgs) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `_coex_bt_release(uint32_t event)`
+fn osi_coex_bt_release(ctx $&BtdmController, event int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `_coex_register_bt_cb(coex_func_cb_t cb)`
+fn osi_coex_register_bt_cb(ctx $&BtdmController, cb int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `_coex_bb_reset_lock(void)`
+fn osi_coex_bb_reset_lock(ctx $&BtdmController) int {
+    << 0
+}
+
+// `_coex_bb_reset_unlock(uint32_t restore)`
+fn osi_coex_bb_reset_unlock(ctx $&BtdmController, restore int) {
+}
+
+// `_coex_schm_register_btdm_callback(void *callback)`
+fn osi_coex_schm_register_btdm_callback(ctx $&BtdmController, callback int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `_coex_schm_status_bit_clear(uint32_t type, uint32_t status)`
+fn osi_coex_schm_status_bit_clear(ctx $&BtdmController, type int, status int) {
+}
+
+// `_coex_schm_status_bit_set(uint32_t type, uint32_t status)`
+fn osi_coex_schm_status_bit_set(ctx $&BtdmController, type int, status int) {
+}
+
+// `_coex_schm_interval_get(void)`
+fn osi_coex_schm_interval_get(ctx $&BtdmController) int {
+    << 0
+}
+
+// `_coex_schm_curr_period_get(void)`
+fn osi_coex_schm_curr_period_get(ctx $&BtdmController) int {
+    << 1
+}
+
+// `_coex_schm_curr_phase_get(void)`
+fn osi_coex_schm_curr_phase_get(ctx $&BtdmController) int {
+    << 0
+}
+
+// `_coex_wifi_channel_get(uint8_t *primary, uint8_t *secondary)`
+//
+// `out` would be the slot index of the two channel bytes; the values are
+// owned by the coexistence scheduler, which is not ported yet.
+fn osi_coex_wifi_channel_get(ctx $&BtdmController, out int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `_coex_register_wifi_channel_change_callback(void *cb)`
+fn osi_coex_register_wifi_channel_change_callback(ctx $&BtdmController, cb int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// ===== The OSI table =======================================================
+
+// Build the read only OSI table.  The field order mirrors
+// `struct osi_funcs_t` in bt.c line by line.
+pub fn btdm_osi_funcs_ro() OsiFuncs {
+    << OsiFuncs{
+        version: OSI_VERSION,
+        set_isr: osi_set_isr,
+        ints_on: osi_ints_on,
+        interrupt_disable: osi_interrupt_disable,
+        interrupt_restore: osi_interrupt_restore,
+        task_yield: osi_task_yield,
+        task_yield_from_isr: osi_task_yield_from_isr,
+        semphr_create: osi_semphr_create,
+        semphr_delete: osi_semphr_delete,
+        semphr_take_from_isr: osi_semphr_take_from_isr,
+        semphr_give_from_isr: osi_semphr_give_from_isr,
+        semphr_take: osi_semphr_take,
+        semphr_give: osi_semphr_give,
+        mutex_create: osi_mutex_create,
+        mutex_delete: osi_mutex_delete,
+        mutex_lock: osi_mutex_lock,
+        mutex_unlock: osi_mutex_unlock,
+        queue_create: osi_queue_create,
+        queue_delete: osi_queue_delete,
+        queue_send: osi_queue_send,
+        queue_send_from_isr: osi_queue_send_from_isr,
+        queue_recv: osi_queue_recv,
+        queue_recv_from_isr: osi_queue_recv_from_isr,
+        task_create: osi_task_create,
+        task_delete: osi_task_delete,
+        is_in_isr: osi_is_in_isr,
+        cause_sw_intr_to_core: osi_cause_sw_intr_to_core,
+        malloc: osi_malloc,
+        malloc_internal: osi_malloc_internal,
+        free: osi_free,
+        read_efuse_mac: osi_read_efuse_mac,
+        srand: osi_srand,
+        rand: osi_rand,
+        btdm_lpcycles_2_us: osi_btdm_lpcycles_2_us,
+        btdm_us_2_lpcycles: osi_btdm_us_2_lpcycles,
+        btdm_sleep_check_duration: osi_btdm_sleep_check_duration,
+        btdm_sleep_enter_phase1: osi_btdm_sleep_enter_phase1,
+        btdm_sleep_enter_phase2: osi_btdm_sleep_enter_phase2,
+        btdm_sleep_exit_phase1: osi_btdm_sleep_exit_phase1,
+        btdm_sleep_exit_phase2: osi_btdm_sleep_exit_phase2,
+        btdm_sleep_exit_phase3: osi_btdm_sleep_exit_phase3,
+        coex_bt_wakeup_request: osi_coex_bt_wakeup_request,
+        coex_bt_wakeup_request_end: osi_coex_bt_wakeup_request_end,
+        coex_bt_request: osi_coex_bt_request,
+        coex_bt_release: osi_coex_bt_release,
+        coex_register_bt_cb: osi_coex_register_bt_cb,
+        coex_bb_reset_lock: osi_coex_bb_reset_lock,
+        coex_bb_reset_unlock: osi_coex_bb_reset_unlock,
+        coex_schm_register_btdm_callback: osi_coex_schm_register_btdm_callback,
+        coex_schm_status_bit_clear: osi_coex_schm_status_bit_clear,
+        coex_schm_status_bit_set: osi_coex_schm_status_bit_set,
+        coex_schm_interval_get: osi_coex_schm_interval_get,
+        coex_schm_curr_period_get: osi_coex_schm_curr_period_get,
+        coex_schm_curr_phase_get: osi_coex_schm_curr_phase_get,
+        coex_wifi_channel_get: osi_coex_wifi_channel_get,
+        coex_register_wifi_channel_change_callback: osi_coex_register_wifi_channel_change_callback,
+        set_isr_l3: osi_set_isr_l3,
+        interrupt_l3_disable: osi_interrupt_l3_disable,
+        interrupt_l3_restore: osi_interrupt_l3_restore,
+        customer_queue_create: osi_customer_queue_create,
+        magic: OSI_MAGIC_VALUE
+    }
+}
+
+// `btdm_osi_funcs_register(void *osi_funcs)`
+//
+// The C version hands the table to the closed source controller.  The Xu
+// version validates the table identity and records it on the controller.
+//
+// The validation order and the return codes below are not guesses: they are
+// recovered from the closed library by REA/Ghidra.  The esp32 variant is
+//
+//     undefined4 btdm_osi_funcs_register(int *param_1) {
+//         uVar1 = -1;                          // null pointer
+//         if (param_1 != NULL) {
+//             uVar1 = -2;                      // magic mismatch
+//             if ((param_1[0x3c] == 0xFADEBEAD)   // _magic, offset 0xF0
+//                 && (uVar1 = -3, *param_1 == 0x00010003)) {  // _version, offset 0x00
+//                 uVar1 = 0;
+//                 r_osi_funcs_p = param_1;
+//             }
+//         }
+//         return uVar1;
+//     }
+//
+// So the magic is compared FIRST (short-circuit `&&`), the version SECOND.
+// The esp32 controller prints no diagnostic on mismatch, which is why the
+// return code is the only signal a caller gets.
+pub fn btdm_osi_funcs_register(ctl $&BtdmController) int {
+    if ctl.osi.magic != OSI_MAGIC_VALUE { << BTDM_OSI_ERR_MAGIC }
+    if ctl.osi.version != OSI_VERSION { << BTDM_OSI_ERR_VERSION }
+    ctl.registered = true
+    << ESP_OK
+}
+
+// ===== Controller task ====================================================
+
+// Controller task event handler.  The work items are dispatched here, in
+// the controller task context, exactly like `btdm_task_post_impl` does in the
+// C implementation.
+fn btdm_ke_event_handler(id int, param int) int {
+    << 0
+}
+
+// Controller task timer handler.
+fn btdm_ke_timer_handler(id int) int {
+    << 0
+}
+
+// Dispatch work to the controller task context.
+//
+// The C signature is
+//   int btdm_dispatch_work_to_controller(workitem_handler_t cb, void *arg,
+//                                        bool blocking)
+// The Xu version identifies the work item by an id instead of a function
+// pointer, because an Xu `fn` value cannot be nested inside a function type.
+// `blocking` selects whether the caller waits for the work to be executed.
+pub fn btdm_dispatch_work_to_controller(ctl $&BtdmController, work_id int, arg int, blocking bool) int {
+    // Phase-tagged ring cursors distinguish empty from full while keeping
+    // all eight slots usable and the counters bounded on 32-bit targets.
+    tail := ctl.work_tail
+    next := (tail + 1) % (BTDM_WORK_SLOTS * 2)
+    if (tail + BTDM_WORK_SLOTS) % (BTDM_WORK_SLOTS * 2) == ctl.work_head {
+        << ESP_ERR_NO_MEM
+    }
+    if !ke_post_event($&ctl.task, BTDM_EVT_WORK, work_id) { << ESP_ERR_NO_MEM }
+    slot := tail % BTDM_WORK_SLOTS
+    ctl.work_ids[slot] = work_id
+    ctl.work_args[slot] = arg
+    ctl.work_tail = next
+    if blocking {
+        // Run the controller loop until the work item has been consumed.
+        $guard := 0
+        while guard < 64 {
+            if ctl.work_head == next { << ESP_OK }
+            if btdm_controller_pump(ctl, 1) == 0 { << ESP_ERR_INVALID_STATE }
+            guard = guard + 1
+        }
+        << ESP_ERR_INVALID_STATE
+    }
+    << ESP_OK
+}
+
+// Run the controller task loop for up to `max_events` posted events.
+pub fn btdm_controller_pump(ctl $&BtdmController, max_events int) int {
+    ctl.tick = ctl.tick + 1
+    $now := ctl.tick
+    ke_timer_poll($&ctl.task, now)
+    $n := 0
+    while n < max_events {
+        id := ke_peek_event_id(&ctl.task)
+        if ke_run_once($&ctl.task) == 0 { << n }
+        if id == BTDM_EVT_WORK && ctl.work_head != ctl.work_tail {
+            ctl.work_head = (ctl.work_head + 1) % (BTDM_WORK_SLOTS * 2)
+        }
+        n += 1
+    }
+    << n
+}
+
+// ===== VHCI ================================================================
+
+// `api_vhci_host_register_callback(const vhci_host_callback_t *callback)`
+pub fn api_vhci_host_register_callback(ctx $&BtdmController, cb VhciHostCallback) int {
+    ctx.vhci.notify_host_send_available = cb.notify_host_send_available
+    ctx.vhci.notify_host_recv = cb.notify_host_recv
+    ctx.vhci.registered = true
+    ctx.vhci.send_available = true
+    << ESP_OK
+}
+
+// `api_vhci_host_check_send_available(void)`
+//
+// True when the controller can accept another packet from the host.
+pub fn api_vhci_host_check_send_available(ctx $&BtdmController) bool {
+    << ctx.vhci.send_available
+}
+
+// `api_vhci_host_send_packet(uint8_t *data, uint16_t len)`
+//
+// `frame` is the H4 framed packet (type byte + payload).  The C contract is
+// a *copy* contract: the host frees its buffer as soon as the call returns
+// (`ble_hci_trans_buf_free(cmd)` in the NimBLE transport), so the controller
+// must copy the bytes before returning.  The Xu port copies the frame into
+// the transmit pool of the context.
+pub fn api_vhci_host_send_packet(ctx $&BtdmController, frame []int) {
+    if !ctx.vhci.send_available { << }
+    $slot := ctx.vhci.tx_slot
+    if slot >= BTDM_VHCI_TX_SLOTS { slot = 0 }
+    $i := 0
+    while i < frame.len {
+        btdm_vhci_tx_store(ctx, slot, i, frame[i])
+        i = i + 1
+    }
+    ctx.vhci.tx_slot = slot + 1
+    ctx.vhci.tx_len = frame.len
+    ctx.vhci.tx_packets = ctx.vhci.tx_packets + 1
+    ctx.vhci.tx_bytes = ctx.vhci.tx_bytes + frame.len
+    ctx.vhci.send_available = false
+    // Hand the packet to the controller task and tell the host that the
+    // transport can accept more.
+    ke_post_event($&ctx.task, BTDM_EVT_VHCI_RX, slot)
+    ctx.vhci.send_available = true
+    $h := ctx.vhci.notify_host_send_available
+    h()
+    ctx.vhci.notify_send_available_calls = ctx.vhci.notify_send_available_calls + 1
+}
+
+// Bytes of a transmitted frame, for inspection and for the self test.
+pub fn btdm_vhci_tx_byte(ctx &BtdmController, slot int, index int) int {
+    << btdm_vhci_tx_load(ctx, slot, index)
+}
+
+// Deliver a packet from the controller to the host.
+//
+// The controller owns the buffer: the host callback receives a slot index and
+// the length, and reads the bytes with `btdm_vhci_rx_byte`.
+pub fn btdm_vhci_deliver_to_host(ctx $&BtdmController, frame []int) int {
+    $slot := ctx.vhci.rx_slot
+    if slot >= BTDM_VHCI_RX_SLOTS { slot = 0 }
+    $i := 0
+    while i < frame.len {
+        btdm_vhci_rx_store(ctx, slot, i, frame[i])
+        i = i + 1
+    }
+    ctx.vhci.rx_slot = slot + 1
+    ctx.vhci.rx_len = frame.len
+    ctx.vhci.rx_packets = ctx.vhci.rx_packets + 1
+    $h := ctx.vhci.notify_host_recv
+    $r := h(slot, frame.len)
+    ctx.vhci.notify_recv_calls = ctx.vhci.notify_recv_calls + 1
+    << r
+}
+
+// Byte of a received frame.
+pub fn btdm_vhci_rx_byte(ctx &BtdmController, slot int, index int) int {
+    << btdm_vhci_rx_load(ctx, slot, index)
+}
+
+// The transmit and receive pools are byte arrays inside the context.  They
+// are modelled as fixed size int arrays so the pool slots stay contiguous.
+fn btdm_vhci_tx_store(ctx $&BtdmController, slot int, index int, value int) {
+    // The pool is a flat int array in the context; the index is bounded by
+    // the slot size.
+    if index < 0 || index >= HCI_MAX_FRAME { << }
+    btdm_pool_store(ctx, slot * HCI_MAX_FRAME + index, value)
+}
+
+fn btdm_vhci_tx_load(ctx &BtdmController, slot int, index int) int {
+    if index < 0 || index >= HCI_MAX_FRAME { << 0 }
+    << btdm_pool_load(ctx, slot * HCI_MAX_FRAME + index)
+}
+
+fn btdm_vhci_rx_store(ctx $&BtdmController, slot int, index int, value int) {
+    if index < 0 || index >= HCI_MAX_FRAME { << }
+    btdm_pool_store(ctx, (BTDM_VHCI_TX_SLOTS + slot) * HCI_MAX_FRAME + index, value)
+}
+
+fn btdm_vhci_rx_load(ctx &BtdmController, slot int, index int) int {
+    if index < 0 || index >= HCI_MAX_FRAME { << 0 }
+    << btdm_pool_load(ctx, (BTDM_VHCI_TX_SLOTS + slot) * HCI_MAX_FRAME + index)
+}
+
+// ===== VHCI / HCI byte pool ===============================================
+//
+// The pool is a plain int array in the context.  xu has no way to take the
+// address of an array element, so the pool is addressed by index.
+
+fn btdm_pool_store(ctx $&BtdmController, index int, value int) {
+    if index < 0 || index >= ctx.pool.len { << }
+    ctx.pool[index] = value
+}
+
+fn btdm_pool_load(ctx &BtdmController, index int) int {
+    if index < 0 || index >= ctx.pool.len { << 0 }
+    << ctx.pool[index]
+}
+
+// ===== Sleep / power =======================================================
+
+// Asynchronous wake up request sources (bt.c lines 1031-1034).
+pub const BTDM_ASYNC_WAKEUP_REQ_HCI = 0
+pub const BTDM_ASYNC_WAKEUP_REQ_COEX = 1
+pub const BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA = 2
+
+// `btdm_power_state_active(void)`
+pub fn btdm_power_state_active(ctl &BtdmController) bool {
+    << ctl.power_active
+}
+
+// `btdm_wakeup_request(void)`
+//
+// TODO(BTDM-P2): the real wake up request pokes the closed source
+// controller (`rwip.o`).  The xu port raises the power state and asks the
+// controller task to run.
+pub fn btdm_wakeup_request(ctl $&BtdmController) {
+    ctl.power_active = true
+    btdm_dispatch_work_to_controller(ctl, BTDM_WORK_WAKEUP_REQUEST, 0, false)
+}
+
+// `btdm_in_wakeup_requesting_set(bool in_wakeup_requesting)`
+pub fn btdm_in_wakeup_requesting_set(ctl $&BtdmController, in_wakeup_requesting bool) {
+    ctl.in_wakeup_requesting = in_wakeup_requesting
+}
+
+// `btdm_controller_enable_sleep(bool enable)`
+pub fn btdm_controller_enable_sleep(ctl $&BtdmController, enable bool) {
+    ctl.sleep_enabled = enable
+}
+
+// `btdm_controller_set_sleep_mode(uint8_t mode)`
+pub fn btdm_controller_set_sleep_mode(ctl $&BtdmController, mode int) {
+    ctl.sleep_mode = mode
+}
+
+// `btdm_controller_get_sleep_mode(void)`
+pub fn btdm_controller_get_sleep_mode(ctl &BtdmController) int {
+    << ctl.sleep_mode
+}
+
+// Asynchronous wake up handshake (bt.c lines 1052-1108).
+pub fn btdm_async_wakeup_request(ctx $&BtdmController, event int) bool {
+    if event == BTDM_ASYNC_WAKEUP_REQ_HCI {
+        ctx.in_wakeup_requesting = true
+    }
+    if event == BTDM_ASYNC_WAKEUP_REQ_HCI || event == BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA {
+        if !ctx.power_active {
+            ctx.power_active = true
+            btdm_dispatch_work_to_controller(ctx, BTDM_WORK_WAKEUP_REQUEST, 0, false)
+            << true
+        }
+        << false
+    }
+    if event == BTDM_ASYNC_WAKEUP_REQ_COEX {
+        if !ctx.power_active {
+            ctx.power_active = true
+            << true
+        }
+    }
+    << false
+}
+
+pub fn btdm_async_wakeup_request_end(ctx $&BtdmController, event int) {
+    if event == BTDM_ASYNC_WAKEUP_REQ_HCI {
+        ctx.in_wakeup_requesting = false
+    }
+}
+
+// ===== Low power clock =====================================================
+
+// `btdm_lpclk_select_src(uint32_t sel)`
+//
+// Selects the low power clock source.  The source selection is a chip
+// register, so the actual write goes through the chip binding hooks in
+// `backend.xu`; this layer only validates the request.
+pub fn btdm_lpclk_select_src(ctl $&BtdmController, sel int) bool {
+    if !btdm_lpclk_select_src_raw(&ctl.backend, sel) { << false }
+    ctl.lpclk_sel = sel
+    << true
+}
+
+// `btdm_lpclk_set_div(uint32_t div)`
+//
+// Writes the 12 bit integer divider of the low power clock.  The fractional
+// divider fields are left untouched because the C contract only carries an
+// integer divider.
+pub fn btdm_lpclk_set_div(ctl $&BtdmController, div int) bool {
+    if !btdm_lpclk_set_div_raw(&ctl.backend, div) { << false }
+    ctl.lpclk_div = div
+    << true
+}
+
+// Low power clock source selection without a controller instance.
+//
+// `sel` is one of BTDM_LPCLK_SEL_XTAL / _XTAL32K / _RTC_SLOW / _8M.  The
+// mapping from that selection to the chip register bits belongs to the chip
+// binding.
+pub fn btdm_lpclk_select_src_raw(backend &BtBackend, sel int) bool {
+    if sel != BTDM_LPCLK_SEL_XTAL && sel != BTDM_LPCLK_SEL_XTAL32K &&
+        sel != BTDM_LPCLK_SEL_RTC_SLOW && sel != BTDM_LPCLK_SEL_8M {
+        << false
+    }
+    << bt_lpclk_select_src(backend, sel)
+}
+
+// Low power clock divider without a controller instance.
+//
+// ESP-IDF computes the divider as `esp_clk_xtal_freq() * 2 / MHZ - 1`,
+// which is 79 for the 40 MHz main crystal of the ESP32.
+pub fn btdm_lpclk_set_div_raw(backend &BtBackend, div int) bool {
+    if div < 0 || div > 4095 { << false }
+    << bt_lpclk_set_div(backend, div)
+}
+
+// Configure the Bluetooth low power clock the way the C init path does:
+// main crystal as the source and the 40 MHz / 80 / 2 divider.
+pub fn btdm_lpclk_configure_default(backend &BtBackend) bool {
+    if !bt_lpclk_select_src(backend, BTDM_LPCLK_SEL_XTAL) { << false }
+    << bt_lpclk_set_div(backend, 79)
+}
+
+// Read back the low power clock state, for the self test.
+pub fn btdm_lpclk_div_int(backend &BtBackend) int {
+    << bt_lpclk_read_div(backend)
+}
+
+pub fn btdm_lpclk_frac(backend &BtBackend) int {
+    << bt_lpclk_read_src(backend)
+}
+
+// ===== Controller lifecycle ===============================================
+
+// Configuration mask of this build (bt.c lines 1251-1269).
+//
+// The ESP32 build scans with duplicates enabled and reserves the extra
+// advertising room; the UART transport and the second CPU are off.
+pub fn btdm_config_mask_load() int {
+    $mask := 0
+    mask = mask | BTDM_CFG_SCAN_DUPLICATE_OPTIONS
+    mask = mask | BTDM_CFG_SEND_ADV_RESERVED_SIZE
+    << mask
+}
+
+// `btdm_controller_init(uint32_t config_mask, esp_bt_controller_config_t *cfg)`
+//
+// The C version hands the configuration to the closed source controller.  The
+// Xu port initialises the OSI table, the low power clock and the controller
+// task, and records the requested mode.
+pub fn btdm_controller_init(ctl $&BtdmController, config_mask int, mode int) int {
+    if ctl.status != ESP_BT_CONTROLLER_STATUS_IDLE { << ESP_ERR_INVALID_STATE }
+    if btdm_osi_funcs_register(ctl) != ESP_OK { << ESP_ERR_INVALID_ARG }
+    ctl.config_mask = config_mask
+    ctl.mode = mode
+    ctl.power_active = true
+    ctl.lpcycle_us = BTDM_LPCYCLE_US_DEFAULT
+    ctl.lpcycle_us_frac = RTC_CLK_CAL_FRACT
+    // Default low power clock: main crystal, divider 79 (40 MHz / 80 / 2).
+    btdm_lpclk_select_src(ctl, BTDM_LPCLK_SEL_XTAL)
+    btdm_lpclk_set_div(ctl, 79)
+    ctl.status = ESP_BT_CONTROLLER_STATUS_INITED
+    << ESP_OK
+}
+
+// `btdm_controller_enable(esp_bt_mode_t mode)`
+pub fn btdm_controller_enable(ctl $&BtdmController, mode int) int {
+    if ctl.status != ESP_BT_CONTROLLER_STATUS_INITED { << ESP_ERR_INVALID_STATE }
+    if mode != ctl.mode { << ESP_ERR_INVALID_ARG }
+    if ctl.sleep_mode == BTDM_MODEM_SLEEP_MODE_ORIG {
+        btdm_controller_enable_sleep(ctl, true)
+    }
+    ctl.status = ESP_BT_CONTROLLER_STATUS_ENABLED
+    << ESP_OK
+}
+
+// `btdm_controller_disable(void)`
+pub fn btdm_controller_disable(ctl $&BtdmController) int {
+    if ctl.status != ESP_BT_CONTROLLER_STATUS_ENABLED { << ESP_ERR_INVALID_STATE }
+    if ctl.sleep_mode == BTDM_MODEM_SLEEP_MODE_ORIG {
+        btdm_controller_enable_sleep(ctl, false)
+        btdm_async_wakeup_request(ctl, BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA)
+    }
+    ctl.status = ESP_BT_CONTROLLER_STATUS_INITED
+    << ESP_OK
+}
+
+// `btdm_controller_deinit(void)`
+pub fn btdm_controller_deinit(ctl $&BtdmController) int {
+    if ctl.status != ESP_BT_CONTROLLER_STATUS_INITED { << ESP_ERR_INVALID_STATE }
+    ctl.registered = false
+    ctl.status = ESP_BT_CONTROLLER_STATUS_IDLE
+    ctl.lpcycle_us = 0
+    ctl.sleep_mode = BTDM_MODEM_SLEEP_MODE_NONE
+    ctl.power_active = false
+    << ESP_OK
+}
+
+// `btdm_controller_get_mode(void)`
+pub fn btdm_controller_get_mode(ctl &BtdmController) int {
+    << ctl.mode
+}
+
+// `btdm_controller_get_compile_version(void)`
+pub fn btdm_controller_get_compile_version(ctl &BtdmController) string {
+    << "ESP32_BT_Controller_XU_V01"
+}
+
+// `esp_bt_controller_shutdown(void)`
+//
+// TODO(BTDM-P2): the C version stops the controller and powers the PHY off.
+// The xu port stops the controller task and marks the controller idle.
+pub fn esp_bt_controller_shutdown(ctl $&BtdmController) {
+    btdm_controller_disable(ctl)
+    btdm_controller_deinit(ctl)
+}
+
+// Inject the Bluetooth MAC into the context (see `osi_read_efuse_mac`).
+pub fn btdm_set_mac(ctl $&BtdmController, mac []int) {
+    $i := 0
+    while i < BTDM_MAC_SLOT_BYTES && i < mac.len {
+        ctl.mac_bytes[i] = mac[i] & 0xFF
+        i = i + 1
+    }
+}
+
+// ===== TX power (closed source radio core) =================================
+//
+// TODO(BTDM-P2): the transmit power API lives in the closed source radio
+// core (`rf_espressif.o`) and in the BR/EDR SCO path (`lc_sco.o`).  The xu
+// port reports "not supported" instead of pretending to work.
+
+// `ble_txpwr_set(int power_type, int power_level)`
+pub fn ble_txpwr_set(power_type int, power_level int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `ble_txpwr_get(int power_type)`
+//
+// Returns ESP_ERR_NOT_SUPPORTED rather than a plausible looking power
+// level, so that a caller cannot mistake the placeholder for a real value.
+pub fn ble_txpwr_get(power_type int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `bredr_txpwr_set(int min_power_level, int max_power_level)`
+pub fn bredr_txpwr_set(min_power_level int, max_power_level int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `bredr_txpwr_get(int *min_power_level, int *max_power_level)`
+pub fn bredr_txpwr_get(min_power_level int, max_power_level int) int {
+    << ESP_ERR_NOT_SUPPORTED
+}
+
+// `bredr_sco_datapath_set(uint8_t data_path)`
+pub fn bredr_sco_datapath_set(data_path int) {
+}
+
+// `btdm_controller_scan_duplicate_list_clear(void)`
+pub fn btdm_controller_scan_duplicate_list_clear(ctl $&BtdmController) {
+}
+
+// `btdm_rf_bb_init_phase2(void)`
+//
+// TODO(BTDM-P2): the baseband initialisation after the PHY/RF is switched on
+// belongs to the closed source radio core.
+pub fn btdm_rf_bb_init_phase2(ctl $&BtdmController) {
+}
+
+// ===== Interrupt dispatch ==================================================
+
+// Look up the interrupt handler that the OSI `_set_isr` slot registered for
+// interrupt `n` and return its handler id (-1 when nothing is registered).
+//
+// The C `_set_isr` slot takes a function pointer.  An Xu `fn` value cannot be
+// nested inside a function type, so the Xu table stores a handler *id* and
+// the application maps that id to its own handler.  The application calls
+// this from its `fn irq_N` entry.
+pub fn btdm_irq_dispatch(ctx &BtdmController, n int) int {
+    if n < 0 || n >= ctx.isr_handlers.len { << -1 }
+    << ctx.isr_handlers[n]
+}
