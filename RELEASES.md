@@ -6,6 +6,74 @@
 
 ---
 
+## Xu 0.11.3
+
+- Compiler: SSA reassociation and periodic-reduction proofs preserve the actual loop backedge; narrow integer normalization follows the physical register width; very small GEMM tiles retain the scalar path when kernel setup would dominate.
+- Native interoperability: opt-in `xu-c-2` passes synchronous borrowed i64 spans through checked `&[]int` / `$&[]int` parameters. Call-scoped descriptors expose length and data only. Existing C1 libraries remain supported; older products explicitly reject C2 objects. C2 currently accepts 64-bit integer scalars and `int` / `void` results; use a Xu wrapper for native function values.
+- Correctness: binary64 rounding preserves integral large values, signed zero and non-finite inputs; `log(±0)` returns negative infinity, and `log(+Inf)` / `frexp` special inputs terminate. Wide unsigned multiplication/division use all input lanes and diagnose quotient overflow. Owned string slices index complete descriptors and preserve independent ownership.
+- ESP32: pure Xu Xtensa ELF/image generation, ROM calls/callbacks, BLE building blocks, and bounded WPA2/CCMP/DHCP/ARP/ICMP primitives. The supported board profile is ESP32-D0WD-V3 rev3.1, 40 MHz XTAL, 4 MiB flash. Standard `WifiDevice` APIs remain unavailable; persistent station operation, lease renewal, DNS/TCP, Internet access and BLE/Wi-Fi coexistence are not supplied by these primitives. Just Works and plaintext bond-storage limitations remain as documented in the packages.
+- Windows SDK: installers carry an `asInvoker` application manifest for current-user startup. All-users installation still requires administrator privileges.
+
+Upgrade the compiler, standard library and product tools together. Desktop is `1.3.52`, setup is `1.2.43`, and the native tool remains `0.1.3`. Release acceptance covers native SDK builds, runtime protocols and installation on macOS, Linux and Windows, each on ARM64/x64; LoongArch64 and RISC-V SDKs are cross-built. This release does not claim a general speedup. Cross-language measurements identify their own compiler commit and workload inputs.
+
+## Xu 0.11.3-dev.15 (development)
+
+Integrates binary64 special-value rounding, full-width unsigned arithmetic, correct owned string-slice indexing, Windows SDK current-user installer manifests, and ESP32 WPA2/CCMP/IPv4 protocol primitives. Retains the borrowed i64 native ABI and pure Xu ESP32 backend. Standard `WifiDevice` APIs remain unavailable until a persistent hardware driver is connected; protocol and board probes do not imply a complete Wi-Fi application. No general performance improvement is claimed for this integration.
+
+## Xu 0.11.3-dev.14 (development)
+
+Fixes string-array slicing reading later elements at byte offsets instead of descriptor offsets. Source and destination indexing now share the existing scaled element offset, preserving the 24-byte descriptor layout, independent slice ownership and bounds traps without adding another per-element multiplication. This is a development build.
+
+## Xu 0.11.3-dev.13 (development)
+
+Fixes unsigned full-width integer arithmetic in math/bits: mul64 now masks logical high-lane shifts, and div64 divides the complete 128-bit dividend, reports quotient overflow and preserves unsigned quotient/remainder bit patterns. A zero high lane uses bounded unsigned 64/64 shortcuts instead of the general 64-step division. Only ARM64 and x64 calls use the existing native high-multiply helper; other targets retain the semantic implementation. No new ISA or constant-time guarantee is introduced. This is a development build.
+
+## Xu 0.11.3-dev.12 (development)
+
+Windows SDK installers now embed an `asInvoker` application manifest, so current-user installation can start from a normal terminal on ARM64 and on x64 builds using the native PE fallback. Existing GUI installer resources remain intact. SDK installation checks verify the embedded policy through the Windows loader, including on administrator CI runners. This is a development build.
+
+Fixes software binary64 floor, ceil, truncation and rounding for non-finite values, signed zero and large integral inputs. Round compares the fractional part instead of adding 0.5, avoiding incorrect results near half-integers and the 2^52 boundary. Log now returns negative infinity for either zero and terminates for positive infinity; Frexp preserves zero, infinity and NaN with exponent zero. Hardware rounding paths remain available. This does not change finite Log approximation or provide a new FMA accuracy guarantee. This is a development build.
+
+## Xu 0.11.3-dev.10 (development)
+
+Adds the opt-in `xu-c-2` native ABI for synchronous borrowed i64 spans. `i64_span` and `i64_span_mut` parameters become Xu `&[]int` and `$&[]int`; a call-scoped C view exposes length and contiguous data without transferring array ownership or capacity. The platform adapter handles integer register and stack arguments, including Win64 shadow space. Both native pack tools accept the versioned format; older products reject it instead of interpreting a borrow as an integer. Existing `xu-c-1` archives remain supported. This ABI currently accepts 64-bit `int` scalars and `void`/`int` results; native function values require a Xu wrapper. This is a development build.
+
+## Xu 0.11.3-dev.9 (development)
+
+Integrates SSA integer/mask reassociation with SCCP, periodic reductions, floating-point negation correctness, and guarded Tile cost selection from the reviewed development stack. Preserve all prior optimization and module versions during integration. Periodic-reduction proofs now follow the additive bias on the actual backedge value, including the reassociated (sum + masked) + bias form, without inferring it from an unused sibling expression. The shared narrow-result normalization now uses the physical GPR width: i32 is already a full register on RV32 and Thumb, so it no longer executes the 64-bit shift/sign-extension idiom there. Native macOS ARM64 SDK checks use the supported macos-15 ARM64 runner after macos-26 jobs repeatedly ended before runner assignment; the same build, installation and runtime checks remain enabled. This is a development build.
+
+## Xu 0.11.3-dev.8 (development)
+
+Integer GEMM Tile lowering now keeps tiny positive nests with M+N+K below five on ARM64 or four on x64 on the original scalar path, avoiding the micro-kernel's full entry guards and register saves. Known tiny bounds omit the guarded micro-kernel entirely; bounds that already prove the minimum size need no runtime cost check. Bounds, alias checks and scalar trap behavior remain intact. This is a development build.
+
+## Xu 0.11.3-dev.7 (development)
+
+Integer GEMM Tile recognition now accepts a proven inner backedge copy at the end of a merged self-loop as well as a separate copy latch. It preserves B's element count across descriptor reloads in the alias guard, retains bounds and dependence proofs, and writes the correct final induction value for each representation. Unsafe early copies, side effects and ambiguous entries retain scalar lowering. This is a development build.
+
+## Xu 0.11.3-dev.6 (development)
+
+Constant unary negation now distinguishes integer arithmetic from f64 bit patterns. Floating constants flip only their sign bit, preserving signed zero, infinities and NaN payloads instead of negating their encoded integer value. This fixes optimized negative floating literals in matrix, norm and reduction code without changing the integer wrapping contract. This is a development build.
+
+## Xu 0.11.3-dev.5 (development)
+
+The verified SSA window now performs bounded sparse conditional constant propagation before Phi destruction. A monotone constant lattice and executable-edge worklist jointly simplify integer/boolean values, branches and Phi inputs, then remove proved unreachable blocks. Loads, calls, floating-point values, exposed storage and exceptional arithmetic remain conservative. Analysis-budget rejection leaves the original function intact. This is a development build.
+
+## Xu 0.11.3-dev.4 (development)
+
+ARM64 periodic integer reductions with the same proved constant induction at every entry now fold in MIR before register and frame planning. The rewrite preserves the incoming accumulator and final induction, then reuses CFG and dead-code cleanup to remove the loop's temporary storage. Dynamic, differing and width-converting entries keep their existing paths. This is a development build.
+
+## Xu 0.11.3-dev.3 (development)
+
+Proved ARM64 integer reductions of `(i & mask) + bias` use a constant-step periodic sum when the mask is `2^k - 1` through 65535. The slot and SSA paths share the same lowering, preserving signed starting indices, wrapping accumulation, zero-trip guards and the final induction value. Other masks keep the existing SIMD path. This is a development build.
+
+## Xu 0.11.3-dev.2 (development)
+
+ARM64 shift/add and shift/sub fusion now proves that the shift result and any skipped local load have only one use across the whole function. This preserves values shared across basic blocks by CSE instead of leaving later reads uninitialized. It fixes optimized compilation failures in mutable-method and named-function-value reduction loops while keeping their SIMD lowering available. No API or ABI changes. This is a development build.
+
+## Xu 0.11.3-dev.1 (development)
+
+The SSA simplifier linearizes bounded, same-block word-integer addition/subtraction and AND/OR/XOR trees before common-subexpression elimination. It combines separated constants and masks, cancels opposite arithmetic terms and duplicate XOR terms, and removes repeated AND/OR operands. Shared intermediate values remain intact; floating-point, narrow integers, address-exposed storage and Phi edges retain their existing semantics. No API or ABI changes. This is a development build.
+
 ## Xu 0.11.2
 
 - **Event-driven HTTP server**: Linux epoll/eventfd and macOS kqueue manage persistent connections with bounded accept and handler scheduling. The EventSet backend has a configurable 110,000-connection ceiling; actual capacity depends on OS limits and resources. Optional `sync_handlers` runs short, nonblocking handlers on the event-loop thread; other platforms retain the legacy backend.

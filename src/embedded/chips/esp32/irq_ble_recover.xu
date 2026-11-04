@@ -1,0 +1,142 @@
+@embedded/chips/esp32
+
+// RAM rwble.o recovers ERRORSTAT == 0x400; this ROM instead asserts at
+// rwble.c:351. Port the reset/queue repair using this chip's proven ROM
+// layout. Enter from the exact ROM assertion callback so the native ISR
+// has already handled all earlier sources; ROM performs its own final ACK.
+// Caller masks all CPU sources. No Xu allocation or shared memcpy scratch.
+// 71CC: seen errors; D0: attempts; D4: last error; D8: sticky failure;
+// 71DC: successes; E0: aborted queue entries; E4: post-reset ERRORSTAT;
+// 71E8: interrupt status at the assertion; EC: last aborted queue head;
+// 71F0/F4: IRQ memcpy scratch; F8/FC: BTBB mask before/after reset.
+
+fn irq_ble_load(address int, width int) int {
+    volatile_store(0x3FFD71F0, 0)
+    rom_call6(0x4000C2C8, 0x3FFD71F0, address, width, 0, 0, 0)
+    << volatile_load(0x3FFD71F0)
+}
+
+fn irq_ble_u16(address int) int {
+    << irq_ble_load(address, 2)
+}
+
+fn irq_ble_store_byte(address int, value int) {
+    volatile_store(0x3FFD71F4, value & 255)
+    rom_call6(0x4000C2C8, address, 0x3FFD71F4, 1, 0, 0, 0)
+    volatile_store(0x3FFD71F4, 0)
+}
+
+fn irq_ble_recovery_fail(code int) bool {
+    volatile_store(0x3FFD71D8, volatile_load(0x3FFD71D8) | code)
+    << false
+}
+
+fn irq_ble_recover_400() bool {
+    volatile_store(0x3FFD71D0, volatile_load(0x3FFD71D0) + 1)
+    volatile_store(0x3FFD71F8, volatile_load(0x3FF510F8))
+    // BT reset also replaces the RF-LE timing with power-on defaults.
+    // Keep the initialized timing and frequency-control bit across reset;
+    // bt_bb_init_cmplx_reg only restores the BB/filter registers.
+    frequency_control := volatile_load(0x3FF5106C) & 0x4000
+    le_timing0 := volatile_load(0x3FF51098)
+    le_timing1 := volatile_load(0x3FF5109C)
+    // DPORT_BT_RST only. The volatile read supplies a reset pulse longer
+    // than the native four NOPs without changing any clock or PHY reset.
+    volatile_store(0x3FF000D0, volatile_load(0x3FF000D0) | 8)
+    reset := volatile_load(0x3FF000D0)
+    volatile_store(0x3FF000D0, reset & 0xFFFFFFF7)
+    phy_cal_bt_baseband_registers()
+    volatile_store(0x3FF5106C, (volatile_load(0x3FF5106C) & 0xFFFFBFFF) | frequency_control)
+    volatile_store(0x3FF51098, le_timing0)
+    volatile_store(0x3FF5109C, le_timing1)
+    if (volatile_load(0x3FF5106C) & 0x4000) != frequency_control ||
+        volatile_load(0x3FF51098) != le_timing0 ||
+        volatile_load(0x3FF5109C) != le_timing1 { << irq_ble_recovery_fail(128) }
+    volatile_store(0x3FFD71FC, volatile_load(0x3FF510F8))
+    volatile_store(0x3FF510A0, 0x3FFB0000 | (volatile_load(0x3FF510A0) & 0x7FFF))
+
+    // ble_master_soft_rst: the first 64 EM bytes are hardware state, not
+    // descriptors or the Xu heap. Poll only this self-clearing command.
+    rom_call6(0x4000C44C, 0x3FFB0000, 0, 64, 0, 0, 0)
+    volatile_store(0x3FF71200, volatile_load(0x3FF71200) | 0x80000000)
+    $polls := 0
+    while (volatile_load(0x3FF71200) & 0x80000000) != 0 && polls < 2000 {
+        rom_delay_us(1)
+        polls += 1
+    }
+    if (volatile_load(0x3FF71200) & 0x80000000) != 0 {
+        << irq_ble_recovery_fail(1)
+    }
+
+    $visited := 0
+    // ROM literal 400468E0 is the actual co_list header, 3FFB9704.
+    // 3FFB97D8 is a different event pointer and is not advanced by pop.
+    $head := volatile_load(0x3FFB9704)
+    while head != 0 && visited < 32 {
+        // ROM events are allocated from these reserved controller heaps.
+        if head < 0x3FFD2000 || head > 0x3FFD7000 - 0x9C || head % 4 != 0 {
+            << irq_ble_recovery_fail(2)
+        }
+        handle := irq_ble_u16(head + 0x90)
+        // CS stride 90, and the last counter must precede TX descriptors.
+        if handle >= 14 { << irq_ble_recovery_fail(4) }
+        cs_a := 0x3FFB010A + handle * 0x5A
+        cs_b := cs_a + 2
+        sum := ((irq_ble_u16(cs_a) >> 8) + (irq_ble_u16(cs_b) >> 8)) & 255
+        $valid := 0
+        for i in 0:8 {
+            rx := 0x3FFB0948 + i * 12
+            if (irq_ble_u16(rx) & 0x8000) != 0 &&
+                ((irq_ble_u16(rx + 2) >> 11) & 31) == handle { valid += 1 }
+        }
+        accounted := (irq_ble_load(head + 0x96, 1) + valid) & 255
+        if sum != accounted {
+            // Native preserves the low byte and only repairs CS_A's count.
+            irq_ble_store_byte(cs_a + 1, accounted)
+        }
+        // ROM owns pop/abort callbacks and its event structure. Do not
+        // copy newer RAM structure offsets into that implementation.
+        volatile_store(0x3FFD71EC, head)
+        rom_call6(0x4004862C, 1, 0, 0, 0, 0, 0)
+        next := volatile_load(0x3FFB9704)
+        if next == head { << irq_ble_recovery_fail(8) }
+        volatile_store(0x3FFD71E0, volatile_load(0x3FFD71E0) + 1)
+        head = next
+        visited += 1
+    }
+    if head != 0 { << irq_ble_recovery_fail(8) }
+    rx_index := volatile_load8(0x3FFB933C)
+    if rx_index >= 8 { << irq_ble_recovery_fail(16) }
+    volatile_store(0x3FF7122C, 0x948 + rx_index * 12)
+    after := volatile_load(0x3FF71260)
+    volatile_store(0x3FFD71E4, after)
+    if after != 0 && after != 0x400 { << irq_ble_recovery_fail(32) }
+    // This silicon clears BTBB INTENA during DPORT_BT_RST: the isolated
+    // board probe observed 40109 -> 0. Restore the exact pre-reset mask
+    // only after BB registers, LL queues and RX pointer are consistent.
+    // CPU sources are still masked by the assertion callback/outer ISR.
+    mask := volatile_load(0x3FFD71F8)
+    volatile_store(0x3FF510F8, mask)
+    if volatile_load(0x3FF510F8) != mask { << irq_ble_recovery_fail(64) }
+    // Returning through the original assertion call lets ROM ACK exactly
+    // once and clear its own ISR diagnostic marker in the original order.
+    volatile_store(0x3FFD71DC, volatile_load(0x3FFD71DC) + 1)
+    << true
+}
+
+// This is an exact, evidence-bound recovery, not a general assert handler.
+// The application's assertion callback must retain its fatal behavior when
+// this returns false, including unknown/new ERRORSTAT values during repair.
+pub fn bt_irq_rom_recover_assertion(file int, line int, detail int) bool {
+    if file != 0x3FF9E7CA || line != 0x15F || detail != 0x400 ||
+        volatile_load(0x3FF71260) != 0x400 { << false }
+    saved := irq_rom_mask(0 - 1)
+    volatile_store(0x3FFD71E8, volatile_load(0x3FF71210))
+    recovered := irq_ble_recover_400()
+    if recovered { irq_rom_unmask(saved) }
+    else { irq_rom_unmask(saved & 0xFFFFFFEF) }
+    << recovered
+}
+
+pub fn bt_irq_rom_recovery_error() int { << volatile_load(0x3FFD71D8) }
+pub fn bt_irq_rom_recovery_count() int { << volatile_load(0x3FFD71DC) }

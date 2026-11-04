@@ -134,6 +134,7 @@ Xu 提供包含编译器、工具链与标准库的**单文件原生安装包**�
 
 - **Windows**（命令行或双击自绘图形向导）：
   - **图形界面**：在 [Releases](https://github.com/xulang-org/xu/releases) 下载 `xu-setup-windows-x64.exe`，直接双击运行零依赖自绘向导，一键完成安装；
+  - **ARM64 命令行安装器**：下载 `xu-setup-windows-arm64.exe`，在普通 PowerShell 终端执行 `.\xu-setup-windows-arm64.exe --yes`。SDK 安装器声明以当前用户权限启动；为所有用户安装仍需管理员权限。
   - **PowerShell 一行命令**：
     ```powershell
     irm https://xulang.org/install.ps1 | iex
@@ -291,6 +292,20 @@ Xu 是一门开放透明、面向未来的现代系统编程语言。如果你�
 - 📚 **完整文档**：查阅详尽的语法手册与进阶示例，请访问 [xulang.org 官方网站](https://xulang.org)。
 
 ---
+
+## 原生 i64 借用 span（开发版）
+
+`0.11.3-dev.10` SDK 新增显式选择的 `"abi": "xu-c-2"` 原生清单。
+参数 `i64_span`、`i64_span_mut` 对应 Xu `&[]int`、`$&[]int`，C 入口分别接收
+`include/xu_native.h` 定义的 `const xu_i64_span *`、`const xu_i64_span_mut *`。
+临时描述符的长度位于字节 0，数据指针位于字节 8，仅在调用期间有效。
+原生代码必须在返回前完成访问，不能保留指针、改变数组大小或改写描述符；
+可写视图只允许修改已有元素。
+
+其他参数和返回值使用 `xu_int`，返回值另允许 `void`。本协议不包含浮点或窄整数
+C 签名、返回 span、回调及异步保留；需要函数值时使用普通 Xu 包装函数。
+独立的 XUOBJ/XULIB 第 2 版格式使旧产品明确拒绝新库；新 SDK 继续兼容 `xu-c-1`
+标量库。原生链接维持已有平台范围，外国目标对象发射不代表目标真机执行或 GPU 可用。
 
 ## 开源协议
 

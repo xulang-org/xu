@@ -1,0 +1,188 @@
+@embedded/chips/esp32
+
+// Mask-ROM LLC authenticated-payload timer corrections, matching the working
+// ESP32 controller's llc_task/llc_util patches. Keep LE ping and all timers.
+// Install after BTDM data initialization/HCI Reset, before controller IRQs.
+// This contract owns PRO CPU state; APP CPU must not access these tables.
+//
+// Task/connection metadata 3FFD7E00..3F, separate from IRQ-owned copy scratch:
+// 00 native copy word; 04 initialized marker; 08 sticky error; 0C enabled;
+// 10 margin calls; 14 real-timeout calls; 18 last KE state; 1C last margin;
+// 20 last timeout; 24 last local procedure; 28 last task ID; 2C last event.
+// The application clears this area once per MCU boot, before first install:
+// scratch SRAM is not guaranteed to reset with the controller. Installer
+// initializes it when the marker is absent; subsequent enable/restore calls
+// keep errors and counters for same-boot comparisons.
+
+const LLC_AUTH_ROM_DIAGNOSTICS = 0x4C414D31
+
+fn llc_auth_rom_error_set(code int) {
+    saved := irq_rom_mask(0 - 1)
+    volatile_store(0x3FFD7E08, volatile_load(0x3FFD7E08) | code)
+    irq_rom_unmask(saved)
+}
+
+fn llc_auth_rom_native_read(address int, width int) int {
+    heap := address >= 0x3FFD2000 && address <= 0x3FFD7000 - width
+    table := width == 4 && address >= 0x3FFB96D0 && address <= 0x3FFB96F4
+    if (width != 1 && width != 2 && width != 4) ||
+        (width == 2 && address % 2 != 0) ||
+        (width == 4 && address % 4 != 0) || (!heap && !table) {
+        llc_auth_rom_error_set(0x80)
+        << 0
+    }
+    saved := irq_rom_mask(0 - 1)
+    volatile_store(0x3FFD7E00, 0)
+    rom_call6(0x4000C2C8, 0x3FFD7E00, address, width, 0, 0, 0)
+    value := volatile_load(0x3FFD7E00)
+    irq_rom_unmask(saved)
+    << value
+}
+
+fn llc_auth_rom_native_write(address int, value int, width int) bool {
+    if (width != 1 && width != 2) || (width == 2 && address % 2 != 0) ||
+        address < 0x3FFD2000 || address > 0x3FFD7000 - width {
+        llc_auth_rom_error_set(0x80)
+        << false
+    }
+    saved := irq_rom_mask(0 - 1)
+    volatile_store(0x3FFD7E00, value)
+    rom_call6(0x4000C2C8, address, 0x3FFD7E00, width, 0, 0, 0)
+    // Keep native struct transfers ordered before releasing the copy word.
+    volatile_store(0x3FFD7E00, value)
+    irq_rom_unmask(saved)
+    << true
+}
+
+fn llc_auth_rom_environment(handle int) int {
+    // Actual ROM llc_env is ten pointer words at 3FFB96D0..96F7.
+    if handle < 0 || handle >= 10 {
+        llc_auth_rom_error_set(2)
+        << 0
+    }
+    environment := llc_auth_rom_native_read(0x3FFB96D0 + handle * 4, 4)
+    if environment < 0x3FFD2000 || environment > 0x3FFD7000 - 0xA6 ||
+        environment % 4 != 0 {
+        llc_auth_rom_error_set(2)
+        << 0
+    }
+    << environment
+}
+
+fn llc_auth_rom_margin(event int) int {
+    if event < 0x3FFD2000 || event > 0x3FFD7000 - 0x6E || event % 4 != 0 {
+        llc_auth_rom_error_set(1)
+        << 0
+    }
+    saved := irq_rom_mask(0 - 1)
+    environment := llc_auth_rom_environment(llc_auth_rom_native_read(event + 0x68, 2))
+    if environment == 0 { irq_rom_unmask(saved)
+        << 0 }
+    margin := (llc_auth_rom_native_read(event + 0x6C, 2) *
+        llc_auth_rom_native_read(event + 0x52, 2)) & 0xFFFF
+    timeout := (margin + 3000) & 0xFFFF
+    // These are the native patch's two u16 stores, including wrap semantics.
+    if !llc_auth_rom_native_write(environment + 0x5A, margin, 2) ||
+        !llc_auth_rom_native_write(environment + 0x58, timeout, 2) {
+        irq_rom_unmask(saved)
+        << 0
+    }
+    volatile_store(0x3FFD7E10, volatile_load(0x3FFD7E10) + 1)
+    volatile_store(0x3FFD7E1C, margin)
+    volatile_store(0x3FFD7E20, timeout)
+    volatile_store(0x3FFD7E2C, event)
+    irq_rom_unmask(saved)
+    << 0
+}
+
+fn llc_auth_rom_real(msg int, parameter int, task int) int {
+    taskid := task & 0xFFFF
+    if (taskid & 255) != 6 || (taskid >> 8) >= 10 {
+        llc_auth_rom_error_set(4)
+        << 0
+    }
+    state := rom_call6(0x4001A7D8, taskid, 0, 0, 0, 0, 0) & 255
+    saved := irq_rom_mask(0 - 1)
+    volatile_store(0x3FFD7E14, volatile_load(0x3FFD7E14) + 1)
+    volatile_store(0x3FFD7E18, state)
+    volatile_store(0x3FFD7E28, taskid)
+    irq_rom_unmask(saved)
+    if (state & 15) == 15 { << 0 }
+    handle := taskid >> 8
+    environment := llc_auth_rom_environment(handle)
+    if environment == 0 { << 0 }
+    timeout := llc_auth_rom_native_read(environment + 0x58, 2)
+    margin := llc_auth_rom_native_read(environment + 0x5A, 2)
+    rom_call6(0x4001AAC0, 0x103, taskid, timeout - margin, 0, 0, 0)
+    rom_call6(0x4001AAC0, 0x104, taskid, timeout, 0, 0, 0)
+    procedure := llc_auth_rom_native_read(environment + 0xA3, 1)
+    volatile_store(0x3FFD7E24, procedure)
+    // ROM unconditionally clears the local procedure; the native patch
+    // only completes an outstanding LE ping (local procedure 5).
+    if procedure == 5 {
+        rom_call6(0x4001A6FC, taskid, state & 0xFE, 0, 0, 0, 0)
+        if !llc_auth_rom_native_write(environment + 0xA3, 0, 1) { << 0 }
+    }
+    message := rom_call6(0x4001A1E0, 0x803, handle, 0x57, 2, 0, 0)
+    if message < 0x3FFD2000 || message > 0x3FFD7000 - 2 || message % 2 != 0 {
+        llc_auth_rom_error_set(0x40)
+        << 0
+    }
+    if !llc_auth_rom_native_write(message, handle, 2) { << 0 }
+    rom_call6(0x400185BC, message, 0, 0, 0, 0, 0)
+    << 0
+}
+
+pub fn llc_auth_rom_install(enabled bool) bool {
+    saved := irq_rom_mask(0 - 1)
+    if volatile_load(0x3FFD7E04) != LLC_AUTH_ROM_DIAGNOSTICS {
+        rom_call6(0x4000C44C, 0x3FFD7E00, 0, 64, 0, 0, 0)
+        volatile_store(0x3FFD7E04, LLC_AUTH_ROM_DIAGNOSTICS)
+    }
+    // The ROM getter returns the row array itself. Its sentinel/default row
+    // is a real final record and remains untouched.
+    if rom_call6(0x40046058, 0, 0, 0, 0, 0, 0) != 0x3FFAF86C ||
+        volatile_load(0x3FFAE70C) != 0x3FFAE710 ||
+        (volatile_load(0x3FFAF8A4) & 0xFFFF) != 0x104 ||
+        (volatile_load(0x3FFAF8E4) & 0xFFFF) != 5 ||
+        volatile_load(0x3FFAF8E8) != 0x40045A98 {
+        llc_auth_rom_error_set(8)
+        irq_rom_unmask(saved)
+        << false
+    }
+    old_real := volatile_load(0x3FFAF8A8)
+    old_margin := volatile_load(0x3FFAEF84)
+    real := rom_callback(llc_auth_rom_real)
+    margin := rom_callback(llc_auth_rom_margin)
+    if (old_real != 0x40045408 && old_real != real) ||
+        (old_margin != 0x400461F4 && old_margin != margin) {
+        llc_auth_rom_error_set(0x10)
+        irq_rom_unmask(saved)
+        << false
+    }
+    $next_real := 0x40045408
+    $next_margin := 0x400461F4
+    if enabled { next_real = real
+        next_margin = margin }
+    volatile_store(0x3FFAF8A8, next_real)
+    volatile_store(0x3FFAEF84, next_margin)
+    if volatile_load(0x3FFAF8A8) != next_real || volatile_load(0x3FFAEF84) != next_margin {
+        volatile_store(0x3FFAF8A8, old_real)
+        volatile_store(0x3FFAEF84, old_margin)
+        llc_auth_rom_error_set(0x20)
+        irq_rom_unmask(saved)
+        << false
+    }
+    if enabled { volatile_store(0x3FFD7E0C, 1) }
+    else { volatile_store(0x3FFD7E0C, 0) }
+    irq_rom_unmask(saved)
+    << true
+}
+
+pub fn llc_auth_rom_error() int { << volatile_load(0x3FFD7E08) }
+pub fn llc_auth_rom_margin_count() int { << volatile_load(0x3FFD7E10) }
+pub fn llc_auth_rom_timeout_count() int { << volatile_load(0x3FFD7E14) }
+pub fn llc_auth_rom_last_state() int { << volatile_load(0x3FFD7E18) }
+pub fn llc_auth_rom_last_margin() int { << volatile_load(0x3FFD7E1C) }
+pub fn llc_auth_rom_last_timeout() int { << volatile_load(0x3FFD7E20) }
+pub fn llc_auth_rom_last_procedure() int { << volatile_load(0x3FFD7E24) }

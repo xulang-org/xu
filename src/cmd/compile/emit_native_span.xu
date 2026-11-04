@@ -1,0 +1,138 @@
+@main
+
+#xu/types
+
+fn native_i64_span_kind(m &types.Mir, ty int) int {
+    if !types.is_direct_ref_type(ty) { << 0 }
+    inner := types.direct_ref_inner(&m.ref_targets, ty)
+    ai := types.array_index(inner)
+    if ai < 0 || ai >= m.arrays.len { << 0 }
+    if m.arrays[ai].fixed_len != 0 || m.arrays[ai].elem_ty != 1 || m.arrays[ai].elem_bytes != 8 { << 0 }
+    if types.is_mut_ref_type(ty) { << 2 }
+    << 1
+}
+
+fn native_c2_label(a &Assembler, label &string) bool {
+    for i in 0:a.native_c2_labs.len {
+        if a.native_c2_labs[i] == *label { << true }
+    }
+    << false
+}
+
+fn native_arg_home(os int, arch int, index int) int {
+    if os == 2 && arch == 1 {
+        if index == 0 { << 21 } // RCX
+        if index == 1 { << 20 } // RDX
+        if index == 2 { << 22 } // R8
+        << 23 // R9
+    }
+    << arg_reg(index)
+}
+
+fn native_load_arg(a $&Assembler, m &types.Mir, fi int, fr &Frame, value int) {
+    loc := temp_ref_alias_local(m, fi, fr, value)
+    if loc >= 0 {
+        a.load(0, 15, slot_off(fr.local_slot[loc]))
+    } else {
+        emit_load_value(a, m, fi, fr, value, 0)
+    }
+}
+
+// xu-c-2 is explicitly selected by validated object metadata, never by a
+// function name or a guessed argument shape. Stage inputs before assigning
+// native registers so an outgoing argument cannot clobber a later input.
+// Each borrowed array gets a separate, call-scoped C descriptor: len@0,
+// data@8. Capacity and the mutable Xu descriptor never cross the boundary.
+fn emit_native_c2_call(a $&Assembler, m &types.Mir, fi int, fr &Frame, ii int) bool {
+    if a.native_c2_labs.len == 0 { << false }
+    label := types.mir_isval(m, fi, ii)
+    if !native_c2_label(&*a, &label) { << false }
+    if a.os > 2 || (a.arch != 0 && a.arch != 1 && a.arch != 4 && a.arch != 5) {
+        eprintln("xu-c-2 requires a supported hosted 64-bit target")
+        <<< 1
+    }
+    head := types.mir_ic(m, fi, ii)
+    $arg := head
+    $nargs := 0
+    $nspans := 0
+    while arg >= 0 {
+        value := types.mir_marg_v(m, fi, arg)
+        if value >= 0 {
+            ty := types.mir_temp_ty(m, fi, value)
+            if native_i64_span_kind(m, ty) > 0 {
+                nspans += 1
+            } else if ty != 1 && ty != 2 && ty != 8 && ty != 9 && ty != 10 {
+                eprintln("xu-c-2 argument is not an integer or borrowed i64 span")
+                <<< 1
+            }
+        }
+        nargs += 1
+        if nargs > 255 {
+            eprintln("xu-c-2 argument budget exceeded")
+            <<< 1
+        }
+        arg = types.mir_marg_next(m, fi, arg)
+    }
+    $reg_count := 8
+    if a.arch == 1 { reg_count = 6 }
+    $shadow := 0
+    if a.os == 2 && a.arch == 1 { reg_count = 4 shadow = 32 }
+    $stack_args := nargs - reg_count
+    if stack_args < 0 { stack_args = 0 }
+    staging := ((shadow + stack_args * 8 + 15) / 16) * 16
+    descriptors := ((staging + nargs * 8 + 15) / 16) * 16
+    bytes := ((descriptors + nspans * 16 + 15) / 16) * 16
+    emit_vreg_call_fp_splits(a, m, fi, fr, ii, false)
+    rc_spill_across_call(a)
+    if bytes > 0 { a.vm_sub_imm(16, 16, bytes) }
+    arg = head
+    $index := 0
+    $span := 0
+    while arg >= 0 {
+        value := types.mir_marg_v(m, fi, arg)
+        native_load_arg(a, m, fi, fr, value)
+        if value >= 0 && native_i64_span_kind(m, types.mir_temp_ty(m, fi, value)) > 0 {
+            off := descriptors + span * 16
+            a.load(1, 0, -8) // logical length from the private Xu descriptor
+            a.load(0, 0, 0) // data points to forward, contiguous 8-byte ints
+            a.store(16, off, 1)
+            a.store(16, off + 8, 0)
+            a.mov(0, 16)
+            a.vm_add_imm(0, 0, off)
+            span += 1
+        }
+        a.store(16, staging + index * 8, 0)
+        index += 1
+        arg = types.mir_marg_next(m, fi, arg)
+    }
+    // Loading frame inputs may park new caller-saved values. Invalidate those
+    // only after all inputs are staged, before assigning native registers.
+    rc_spill_across_call(a)
+    for i in reg_count:nargs {
+        a.load(0, 16, staging + i * 8)
+        a.store(16, shadow + (i - reg_count) * 8, 0)
+    }
+    $regs := nargs
+    if regs > reg_count { regs = reg_count }
+    for i in 0:regs {
+        a.load(native_arg_home(a.os, a.arch, i), 16, staging + i * 8)
+    }
+    emit_stack_holder_reload(a, m, fi, fr)
+    // Arguments already follow the platform C ABI, including Win64's shadow
+    // area. Do not run the legacy six-register Xu-to-C shuffle a second time.
+    if !a.is_dylib_lab(label + "") {
+        a.call(label) // native linker resolves ordinary object relocations
+    } else {
+        a.lea(1, iat_from_xu_label(label))
+        a.load(1, 1, 0)
+        a.call_reg(1)
+    }
+    if bytes > 0 { a.vm_add_imm(16, 16, bytes) }
+    dest := types.mir_ia(m, fi, ii)
+    if dest >= 0 {
+        a.mov(0, 14)
+        emit_store_scalar_temp(a, m, fi, fr, dest, 0)
+    }
+    emit_vreg_call_fp_splits(a, m, fi, fr, ii, true)
+    << true
+}

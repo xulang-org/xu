@@ -1,0 +1,215 @@
+@embedded/bluetooth
+
+// KE-style event scheduler skeleton.
+//
+// The closed source controller drives everything through a small event
+// kernel (`ke.o`, `ke_task.o`, `ke_msg.o` in libbtdm_app.a, 398 bytes of
+// .text in total).  The kernel owns three things:
+//
+//   1. an event queue   - producers post (id, param) pairs, the task
+//                         consumes them in FIFO order;
+//   2. a task context   - one handler function that receives event ids;
+//   3. timer callbacks  - deadlines evaluated against a tick counter.
+//
+// This module reproduces that skeleton in pure xu so the xu app layer can
+// dispatch work to a controller task context.  It is intentionally *not* a
+// preemptive scheduler: on bare metal ESP32 there is no FreeRTOS, so the
+// controller task is a cooperative loop driven by `ke_run`.
+//
+// xu has no mutable package globals, so every piece of state lives in the
+// `KeTask` value the caller owns.  The event queue is kept as two parallel
+// int arrays instead of an array of structs: xu structs are owning values, so
+// moving an element out of an array is a partial move and is rejected.
+//
+// The full closed source kernel (ke.o / ke_task.o / ke_msg.o) is listed as
+// P2 "not covered" in BTDM_XU_PORT.md; this file is the skeleton that the
+// xu app layer depends on.
+
+pub const KE_QUEUE_MAX = 32
+pub const KE_TIMER_MAX = 8
+
+// A controller task context.
+pub struct KeTask {
+    pub name string
+    pub event_ids []int      // FIFO event ids
+    pub event_params []int   // FIFO event parameters
+    pub timer_ids []int
+    pub timer_deadlines []int
+    pub timer_periods []int
+    pub timer_active []int   // 0 = free, 1 = armed
+    pub handler fn(int, int) int   // (event_id, param) -> status
+    pub timer_handler fn(int) int  // (timer_id) -> status
+    pub in_isr bool
+    pub posted int
+    pub dispatched int
+    pub dropped int
+    pub tick int
+    // Dispatch order log and the result of the last handler call.  They let
+    // a caller (and the self test) verify the FIFO order without having to
+    // capture state inside a callback, which xu does not allow.
+    pub dispatched_ids []int
+    pub last_result int
+}
+
+pub fn ke_task_create(name string, handler fn(int, int) int, timer_handler fn(int) int) KeTask {
+    << KeTask{
+        name: name,
+        event_ids: []int{},
+        event_params: []int{},
+        timer_ids: []int{},
+        timer_deadlines: []int{},
+        timer_periods: []int{},
+        timer_active: []int{},
+        handler: handler,
+        timer_handler: timer_handler,
+        in_isr: false,
+        posted: 0,
+        dispatched: 0,
+        dropped: 0,
+        tick: 0,
+        dispatched_ids: []int{},
+        last_result: 0
+    }
+}
+
+// Post an event to the task queue.  Returns false when the queue is full,
+// mirroring the FreeRTOS `xQueueSend` failure path used by the original
+// `queue_send` OSI wrapper.
+pub fn ke_post_event(t $&KeTask, id int, param int) bool {
+    if t.event_ids.len >= KE_QUEUE_MAX {
+        t.dropped = t.dropped + 1
+        << false
+    }
+    t.event_ids.push(id)
+    t.event_params.push(param)
+    t.posted = t.posted + 1
+    << true
+}
+
+// Post from an interrupt handler.  The xu bare metal model has a single
+// execution context, so the ISR path only records that we are inside an ISR;
+// the actual queueing still happens in FIFO order.
+pub fn ke_post_event_isr(t $&KeTask, id int, param int) bool {
+    t.in_isr = true
+    ok := ke_post_event(t, id, param)
+    t.in_isr = false
+    << ok
+}
+
+// Read an event without moving the owning slice out of its task.
+fn ke_at(src &[]int, i int) int {
+    $local := src
+    << local[i]
+}
+
+// Id of the oldest pending event, or -1 when the queue is empty.
+pub fn ke_peek_event_id(t &KeTask) int {
+    if t.event_ids.len == 0 { << -1 }
+    << ke_at(&t.event_ids, 0)
+}
+
+// Parameter of the oldest pending event, or -1 when the queue is empty.
+pub fn ke_peek_event_param(t &KeTask) int {
+    if t.event_params.len == 0 { << -1 }
+    << ke_at(&t.event_params, 0)
+}
+
+// Drop the oldest event.  Callers must have peeked it first.
+pub fn ke_pop_event(t $&KeTask) bool {
+    if t.event_ids.len == 0 { << false }
+    $ids := []int{}
+    $params := []int{}
+    $i := 1
+    while i < t.event_ids.len {
+        ids.push(ke_at(&t.event_ids, i))
+        params.push(ke_at(&t.event_params, i))
+        i = i + 1
+    }
+    t.event_ids = ids
+    t.event_params = params
+    << true
+}
+
+// Dispatch one event.  Returns the number of events dispatched (0 or 1).
+pub fn ke_run_once(t $&KeTask) int {
+    if t.event_ids.len == 0 { << 0 }
+    id := ke_at(&t.event_ids, 0)
+    param := ke_at(&t.event_params, 0)
+    ke_pop_event(t)
+    $h := t.handler
+    t.last_result = h(id, param)
+    t.dispatched_ids.push(id)
+    t.dispatched = t.dispatched + 1
+    << 1
+}
+
+// Dispatch up to `max_events` events in FIFO order.  Returns the count.
+pub fn ke_run(t $&KeTask, max_events int) int {
+    $n := 0
+    while n < max_events {
+        if ke_run_once(t) == 0 { << n }
+        n = n + 1
+    }
+    << n
+}
+
+// Advance the task tick counter.
+pub fn ke_tick(t $&KeTask) int {
+    t.tick = t.tick + 1
+    << t.tick
+}
+
+// Register a timer.  `delay` is relative to `now`, `period` is the repeat
+// interval in ticks (0 means one shot).  Returns the timer slot index.
+pub fn ke_timer_add(t $&KeTask, now int, id int, delay int, period int) int {
+    $slot := -1
+    $found := false
+    $i := 0
+    while i < t.timer_active.len && !found {
+        if t.timer_active[i] == 0 {
+            slot = i
+            found = true
+        } else {
+            i = i + 1
+        }
+    }
+    if slot < 0 {
+        if t.timer_active.len >= KE_TIMER_MAX { << -1 }
+        slot = t.timer_active.len
+        t.timer_ids.push(id)
+        t.timer_deadlines.push(0)
+        t.timer_periods.push(0)
+        t.timer_active.push(0)
+    }
+    t.timer_ids[slot] = id
+    t.timer_deadlines[slot] = now + delay
+    t.timer_periods[slot] = period
+    t.timer_active[slot] = 1
+    << slot
+}
+
+pub fn ke_timer_cancel(t $&KeTask, slot int) bool {
+    if slot < 0 || slot >= t.timer_active.len { << false }
+    t.timer_active[slot] = 0
+    << true
+}
+
+// Fire every timer whose deadline has passed.  Returns the number of
+// callbacks that ran.
+pub fn ke_timer_poll(t $&KeTask, now int) int {
+    $fired := 0
+    $i := 0
+    while i < t.timer_active.len {
+        if t.timer_active[i] == 1 && now >= t.timer_deadlines[i] {
+            t.timer_deadlines[i] = now + t.timer_periods[i]
+            if t.timer_periods[i] <= 0 {
+                t.timer_active[i] = 0
+            }
+            $h := t.timer_handler
+            h(t.timer_ids[i])
+            fired = fired + 1
+        }
+        i = i + 1
+    }
+    << fired
+}
