@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.16 (development)
+
+Fixes XUN multiline blocks rejecting payload tabs or an odd number of extra leading spaces. Only the required structural prefix is validated; payload bytes and existing closer, dedent, blank-line and chomp behavior are preserved. Fully indented payload lines no longer scan all additional leading whitespace. This is a development build.
+
 ## Xu 0.11.3-dev.15 (development)
 
 Fixes XUN duration scanning so unit separators terminate the numeric scan, and rejects components without digits. Collection nesting is now bounded to 64 levels below the root dictionary across indented, inline, empty and typed-array forms; excess nesting returns a parser error instead of bypassing the limit. Scalar leaf values do not consume another collection level. This is a development build.
