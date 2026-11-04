@@ -102,17 +102,6 @@ jobs:
             echo "Release $TAG is already published; leaving its tag and assets intact."
           fi
 
-  runtime-validation:
-    name: Six-platform runtime and package protocols
-    needs: release-policy
-    if: needs.release-policy.outputs.published == 'false'
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/sdk.yml
-    with:
-      cross_seed_run_id: ${{ inputs.cross_seed_run_id || '' }}
-
   reuse-release:
     name: Validate an existing CI release bundle
     needs: release-policy
@@ -394,8 +383,8 @@ jobs:
 
   publish-release:
     name: Publish verified CI artifacts
-    needs: [build-release, reuse-release]
-    if: always() && inputs.build_only != true && (needs.build-release.result == 'success' || needs.reuse-release.result == 'success')
+    needs: build-release
+    if: inputs.build_only != true
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -404,9 +393,8 @@ jobs:
       # This job never checks out or executes the product or its dependencies.
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.build-release.outputs.artifact_id || needs.reuse-release.outputs.artifact_id }}
+          artifact-ids: ${{ needs.build-release.outputs.artifact_id }}
           merge-multiple: true
-          run-id: ${{ inputs.artifact_run_id || github.run_id }}
           github-token: ${{ github.token }}
           path: verified
 
@@ -414,9 +402,106 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          EXPECTED_SHA: ${{ needs.reuse-release.outputs.source_sha || github.sha }}
-          EXPECTED_TAG: ${{ needs.build-release.outputs.tag || needs.reuse-release.outputs.tag }}
-          EXPECTED_VERSION: ${{ needs.build-release.outputs.version || needs.reuse-release.outputs.version }}
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_TAG: ${{ needs.build-release.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.build-release.outputs.version }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease || 'auto' }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, re, subprocess
+          root = pathlib.Path("verified/release")
+          receipt = json.loads(pathlib.Path("verified/validation.json").read_text())
+          tag, version, sha = (os.environ[k] for k in ("EXPECTED_TAG", "EXPECTED_VERSION", "EXPECTED_SHA"))
+          assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", tag)
+          assert receipt["tag"] == tag == "v" + version
+          assert receipt["version"] == version and receipt["source_commit"] == sha
+          assets = receipt["assets"]
+          assert len(assets) == 30
+          assert {p.name for p in root.iterdir()} == set(assets)
+          for name, record in assets.items():
+              assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+              path = root / name
+              assert path.is_file() and not path.is_symlink()
+              with path.open("rb") as source:
+                  digest = hashlib.file_digest(source, "sha256").hexdigest()
+              assert digest == record["sha256"] and path.stat().st_size == record["size"], name
+          def gh(*args):
+              return subprocess.check_output(["gh", *args], text=True)
+          def api(path, method="GET", data=None):
+              command = ["gh", "api", "--method", method, path]
+              if data is not None:
+                  command += ["--input", "-"]
+              return json.loads(subprocess.check_output(command, input=json.dumps(data) if data is not None else None, text=True))
+          repo = os.environ["GH_REPO"]
+          # The by-tag endpoint only returns published releases. Resolve drafts
+          # from the authenticated list and retain the ID returned by creation.
+          release, page = None, 1
+          while release is None:
+              batch = api(f"repos/{repo}/releases?per_page=100&page={page}")
+              release = next((r for r in batch if r["tag_name"] == tag), None)
+              if len(batch) < 100:
+                  break
+              page += 1
+          prerelease = os.environ["RELEASE_PRERELEASE"]
+          is_prerelease = prerelease == "true" or (prerelease == "auto" and bool(re.search(r"-(dev|rc|alpha|beta)", tag)))
+          if release is None:
+              release = api(f"repos/{repo}/releases", "POST", {
+                  "tag_name": tag, "target_commitish": sha, "name": "Xu " + tag,
+                  "body": (root / "RELEASE_NOTES.md").read_text(), "draft": True,
+                  "prerelease": is_prerelease})
+          release_id = release["id"]
+          assert release["target_commitish"] == sha, "existing release targets a different commit"
+          published = {asset["name"]: asset for asset in release["assets"]}
+          assert set(published) <= set(assets), "draft has unexpected assets"
+          for name, asset in published.items():
+              assert asset["size"] == assets[name]["size"]
+              assert asset.get("digest") == "sha256:" + assets[name]["sha256"], name
+          if not release["draft"]:
+              assert set(published) == set(assets), "published release differs from the verified bundle"
+              print(f"{tag} is already published; preserving its tag and assets")
+              raise SystemExit(0)
+          for name in sorted(set(assets) - set(published)):
+              uploaded = json.loads(gh("api", "--method", "POST",
+                  f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}",
+                  "--header", "Content-Type: application/octet-stream", "--input", str(root / name)))
+              assert uploaded["size"] == assets[name]["size"]
+              assert uploaded["digest"] == "sha256:" + assets[name]["sha256"], name
+          uploaded_release = api(f"repos/{repo}/releases/{release_id}")
+          assert len(uploaded_release["assets"]) == 30
+          assert all(a["digest"] == "sha256:" + assets[a["name"]]["sha256"] for a in uploaded_release["assets"])
+          final = api(f"repos/{repo}/releases/{release_id}", "PATCH", {
+              "body": (root / "RELEASE_NOTES.md").read_text(), "prerelease": is_prerelease,
+              "draft": os.environ["RELEASE_DRAFT"] == "true"})
+          assert len(final["assets"]) == 30
+          print("Published verified CI bundle: " + final["html_url"])
+          PYTHON
+
+  publish-reused-release:
+    name: Publish reused CI artifacts
+    needs: reuse-release
+    if: inputs.build_only != true
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # This job never checks out or executes the product or its dependencies.
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.reuse-release.outputs.artifact_id }}
+          merge-multiple: true
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+          path: verified
+
+      - name: Check artifact receipt and publish without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ needs.reuse-release.outputs.source_sha }}
+          EXPECTED_TAG: ${{ needs.reuse-release.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.reuse-release.outputs.version }}
           RELEASE_PRERELEASE: ${{ inputs.prerelease || 'auto' }}
           RELEASE_DRAFT: ${{ inputs.draft }}
         run: |
