@@ -1,0 +1,369 @@
+@embedded/wifi
+
+// Infrastructure STA management frames, without FCS. The driver must supply
+// a complete MPDU with successful hardware RX status and a verified FCS.
+// Association here is only IEEE 802.11 state 3: it does not imply that WPA's
+// controlled port is authorized, that keys are installed, or that IP works.
+// Layout reference: ESP-IDF wpa_supplicant/src/common/ieee802_11_defs.h and
+// wpa_common.c. Supported security is open or WPA2-PSK with CCMP for both
+// pairwise and group data. WPA1/WEP/SAE/required PMF are deliberately rejected.
+
+pub const STA_IDLE = 0
+pub const STA_READY = 1
+pub const STA_AUTH_WAIT = 2
+pub const STA_AUTHENTICATED = 3
+pub const STA_ASSOC_WAIT = 4
+pub const STA_ASSOCIATED = 5
+pub const STA_REJECTED = 6
+
+pub const STA_SECURITY_OPEN = 0
+pub const STA_SECURITY_WPA2_PSK_CCMP = 2
+
+pub struct StationAp {
+    pub valid bool
+    pub ssid string
+    pub bssid string
+    pub channel int
+    pub capability int
+    pub rates []int // common legacy rates in units of 500kb/s; bit7 = basic
+    pub security int
+    pub rsn string // selected association-request RSN IE, including ID/length
+}
+
+pub struct Station {
+    pub state int
+    pub mac string
+    pub ap StationAp
+    pub sequence int // our management sequence counter, modulo 4096
+    pub status_code int // last matched authentication/association status
+    pub aid int // set only after a successful matched association response
+}
+
+fn sta_ap_invalid() StationAp {
+    << StationAp{valid: false, ssid: "", bssid: "", channel: 0,
+        capability: 0, rates: []int{}, security: -1, rsn: ""}
+}
+
+fn sta_mac_valid(mac &string) bool {
+    if mac.len != 6 || (mac[0] & 1) != 0 { << false }
+    $bits := 0
+    for i in 0:6 { bits = bits | mac[i] }
+    << bits != 0
+}
+
+fn sta_u16(bytes &string, offset int) int {
+    << bytes[offset] | (bytes[offset + 1] << 8)
+}
+
+fn sta_legacy_rate(rate int) bool {
+    r := rate & 127
+    << r == 2 || r == 4 || r == 11 || r == 22 || r == 12 || r == 18 ||
+        r == 24 || r == 36 || r == 48 || r == 72 || r == 96 || r == 108
+}
+
+fn sta_rsn_selector(bytes &string, offset int, kind int) bool {
+    << bytes[offset] == 0 && bytes[offset + 1] == 15 &&
+        bytes[offset + 2] == 172 && bytes[offset + 3] == kind
+}
+
+// Stricter than the general-purpose supplicant parser: require all cipher and
+// AKM fields explicitly, and consume every optional field without truncation.
+fn sta_rsn_supported(frame &string, offset int, length int) bool {
+    if length < 18 { << false }
+    end := offset + length
+    if sta_u16(frame,offset) != 1 || !sta_rsn_selector(frame,offset + 2,4) { << false }
+    $pos := offset + 6
+    pairs := sta_u16(frame,pos)
+    pos += 2
+    if pairs < 1 || pairs > (end - pos) / 4 { << false }
+    $ccmp := false
+    for i in 0:pairs {
+        if sta_rsn_selector(frame,pos,4) { ccmp = true }
+        pos += 4
+    }
+    if !ccmp || end - pos < 2 { << false }
+    akms := sta_u16(frame,pos)
+    pos += 2
+    if akms < 1 || akms > (end - pos) / 4 { << false }
+    $psk := false
+    for i in 0:akms {
+        if sta_rsn_selector(frame,pos,2) { psk = true }
+        pos += 4
+    }
+    if !psk { << false }
+    if pos == end { << true }
+    if end - pos < 2 { << false }
+    capabilities := sta_u16(frame,pos)
+    pos += 2
+    // Management Frame Protection Required needs an implementation of PMF.
+    if (capabilities & 64) != 0 { << false }
+    if pos == end { << true }
+    if end - pos < 2 { << false }
+    pmkids := sta_u16(frame,pos)
+    pos += 2
+    if pmkids > (end - pos) / 16 { << false }
+    pos += pmkids * 16
+    // A management-group cipher may follow the PMKID list. It is unused
+    // because this STA does not advertise PMF; the selector must be complete.
+    << pos == end || end - pos == 4
+}
+
+fn sta_selected_rsn() string {
+    bytes := [48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0,0]
+    $out := make_string(bytes.len)
+    for i in 0:bytes.len { out[i] = bytes[i] }
+    << out
+}
+
+// A missing DS IE is allowed in a beacon, but selecting an AP needs the real
+// receiver channel. A present DS IE must agree with it. Hidden SSIDs need an
+// explicit probe/hidden-network policy and are not silently guessed here.
+pub fn station_ap_from_beacon(frame &string, rx_channel int) StationAp {
+    $out := sta_ap_invalid()
+    observed := beacon_parse_bytes(frame)
+    if !observed.valid || observed.ssid.len == 0 || rx_channel < 1 || rx_channel > 14 ||
+        (observed.channel != 0 && observed.channel != rx_channel) { << out }
+    capability := sta_u16(frame,34)
+    if (capability & 3) != 1 { << out } // infrastructure ESS, not IBSS
+    for i in 0:6 { if frame[10 + i] != frame[16 + i] { << out } }
+    $rates := []int{}
+    $supported_seen := false
+    $extended_seen := false
+    $rsn_seen := false
+    $offset := 36
+    while offset < frame.len {
+        kind := frame[offset]
+        length := frame[offset + 1]
+        offset += 2
+        if kind == 1 || kind == 50 {
+            if length == 0 || (kind == 1 && (supported_seen || length > 8)) ||
+                (kind == 50 && extended_seen) { << out }
+            if kind == 1 { supported_seen = true }
+            else { extended_seen = true }
+            for i in 0:length {
+                rate := frame[offset + i]
+                if !sta_legacy_rate(rate) {
+                    if (rate & 128) != 0 { << out }
+                } else {
+                    $duplicate := false
+                    for j in 0:rates.len {
+                        if (rates[j] & 127) == (rate & 127) { duplicate = true }
+                    }
+                    if duplicate { << out }
+                    rates.push(rate)
+                }
+            }
+        } else if kind == 48 {
+            if rsn_seen || !sta_rsn_supported(frame,offset,length) { << out }
+            rsn_seen = true
+        }
+        offset += length
+    }
+    if !supported_seen || rates.len == 0 || (observed.privacy != rsn_seen) { << out }
+    $ssid_bits := 0
+    for i in 0:observed.ssid.len { ssid_bits = ssid_bits | observed.ssid[i] }
+    if ssid_bits == 0 { << out }
+    $ssid := make_string(observed.ssid.len)
+    for i in 0:observed.ssid.len { ssid[i] = observed.ssid[i] }
+    $bssid := make_string(6)
+    for i in 0:6 { bssid[i] = observed.bssid[i] }
+    out.ssid = ssid
+    out.bssid = bssid
+    out.rates = rates
+    out.channel = rx_channel
+    out.capability = capability
+    out.security = STA_SECURITY_OPEN
+    if rsn_seen { out.security = STA_SECURITY_WPA2_PSK_CCMP
+        out.rsn = sta_selected_rsn() }
+    out.valid = true
+    << out
+}
+
+pub fn station_create(mac string, ap StationAp) Station {
+    $out := Station{state: STA_IDLE, mac: mac, ap: ap, sequence: 0,
+        status_code: -1, aid: 0}
+    if sta_mac_valid(&out.mac) && out.ap.valid && sta_mac_valid(&out.ap.bssid) &&
+        out.ap.ssid.len >= 1 && out.ap.ssid.len <= 32 && out.ap.rates.len >= 1 &&
+        out.ap.rates.len <= 12 && out.ap.channel >= 1 && out.ap.channel <= 14 &&
+        (out.ap.capability & 3) == 1 {
+        if out.ap.security == STA_SECURITY_OPEN {
+            if (out.ap.capability & 16) != 0 || out.ap.rsn.len != 0 { << out }
+        } else if out.ap.security == STA_SECURITY_WPA2_PSK_CCMP {
+            selected := sta_selected_rsn()
+            if (out.ap.capability & 16) == 0 || out.ap.rsn != selected { << out }
+        } else { << out }
+        for i in 0:out.ap.rates.len {
+            if out.ap.rates[i] < 0 || out.ap.rates[i] > 255 ||
+                !sta_legacy_rate(out.ap.rates[i]) { << out }
+        }
+        $same := true
+        for i in 0:6 { if out.mac[i] != out.ap.bssid[i] { same = false } }
+        if !same { out.state = STA_READY }
+    }
+    << out
+}
+
+fn sta_header(sta $&Station, subtype int, length int) string {
+    $out := make_string(length)
+    out[0] = subtype
+    for i in 0:6 {
+        out[4 + i] = sta.ap.bssid[i]
+        out[10 + i] = sta.mac[i]
+        out[16 + i] = sta.ap.bssid[i]
+    }
+    sequence_control := (sta.sequence & 4095) << 4
+    out[22] = sequence_control & 255
+    out[23] = (sequence_control >> 8) & 255
+    sta.sequence = (sta.sequence + 1) & 4095
+    << out
+}
+
+pub fn (sta $&Station) authentication_request() string {
+    if sta.state != STA_READY && sta.state != STA_AUTH_WAIT { << "" }
+    $out := sta_header(sta,0xB0,30)
+    out[26] = 1 // algorithm0 (open system), transaction1, status0
+    sta.state = STA_AUTH_WAIT
+    sta.status_code = -1
+    sta.aid = 0
+    << out
+}
+
+pub fn (sta $&Station) association_request() string {
+    if sta.state != STA_AUTHENTICATED && sta.state != STA_ASSOC_WAIT { << "" }
+    $first_rates := sta.ap.rates.len
+    if first_rates > 8 { first_rates = 8 }
+    extra := sta.ap.rates.len - first_rates
+    $length := 28 + 2 + sta.ap.ssid.len + 2 + first_rates + sta.ap.rsn.len
+    if extra > 0 { length += 2 + extra }
+    $out := sta_header(sta,0,length)
+    // ESS, privacy as negotiated, short preamble/slot only if the AP does.
+    capability := 1 | (sta.ap.capability & 0x430)
+    out[24] = capability & 255
+    out[25] = (capability >> 8) & 255
+    out[26] = 1 // listen interval: every beacon
+    $offset := 28
+    out[offset] = 0
+    out[offset + 1] = sta.ap.ssid.len
+    offset += 2
+    for i in 0:sta.ap.ssid.len { out[offset + i] = sta.ap.ssid[i] }
+    offset += sta.ap.ssid.len
+    out[offset] = 1
+    out[offset + 1] = first_rates
+    offset += 2
+    for i in 0:first_rates { out[offset + i] = sta.ap.rates[i] }
+    offset += first_rates
+    if extra > 0 {
+        out[offset] = 50
+        out[offset + 1] = extra
+        offset += 2
+        for i in 0:extra { out[offset + i] = sta.ap.rates[first_rates + i] }
+        offset += extra
+    }
+    for i in 0:sta.ap.rsn.len { out[offset + i] = sta.ap.rsn[i] }
+    sta.state = STA_ASSOC_WAIT
+    sta.status_code = -1
+    sta.aid = 0
+    << out
+}
+
+fn sta_response_header(sta &Station, frame &string, subtype int) bool {
+    if frame.len < 30 || frame.len > 4096 || frame[0] != subtype ||
+        (frame[1] & 0xC7) != 0 || (frame[22] & 15) != 0 { << false }
+    for i in 0:6 {
+        if frame[4 + i] != sta.mac[i] || frame[10 + i] != sta.ap.bssid[i] ||
+            frame[16 + i] != sta.ap.bssid[i] { << false }
+    }
+    << true
+}
+
+// True means this complete response matched a pending transaction, including
+// explicit AP rejection. False leaves state unchanged. AP sequence-control is
+// its own counter; open authentication transaction sequence must instead be 2.
+pub fn (sta $&Station) receive_management(frame &string) bool {
+    if sta.state == STA_AUTH_WAIT {
+        if !sta_response_header(sta,frame,0xB0) ||
+            sta_u16(frame,24) != 0 || sta_u16(frame,26) != 2 { << false }
+        // Open-system responses may carry optional IEs (for example an AP
+        // vendor IE). Validate their entire extent instead of requiring an
+        // exact 30-byte body; shared-key Challenge Text is not this profile.
+        $offset := 30
+        while offset < frame.len {
+            if frame.len - offset < 2 { << false }
+            kind := frame[offset]
+            length := frame[offset + 1]
+            offset += 2
+            if kind == 16 || length > frame.len - offset { << false }
+            offset += length
+        }
+        sta.status_code = sta_u16(frame,28)
+        if sta.status_code == 0 { sta.state = STA_AUTHENTICATED }
+        else { sta.state = STA_REJECTED }
+        << true
+    }
+    if sta.state != STA_ASSOC_WAIT || !sta_response_header(sta,frame,0x10) { << false }
+    // Validate every IE before acknowledging even a failure response.
+    $offset := 30
+    $rates_seen := false
+    $extended_seen := false
+    while offset < frame.len {
+        if frame.len - offset < 2 { << false }
+        kind := frame[offset]
+        length := frame[offset + 1]
+        offset += 2
+        if length > frame.len - offset { << false }
+        if kind == 1 {
+            if rates_seen || length < 1 || length > 8 { << false }
+            rates_seen = true
+        }
+        if kind == 1 || kind == 50 {
+            if length < 1 { << false }
+            if kind == 50 {
+                if extended_seen { << false }
+                extended_seen = true
+            }
+            for i in 0:length {
+                if (frame[offset + i] & 128) != 0 && !sta_legacy_rate(frame[offset + i]) { << false }
+            }
+        }
+        offset += length
+    }
+    status := sta_u16(frame,26)
+    if status != 0 {
+        sta.status_code = status
+        sta.state = STA_REJECTED
+        sta.aid = 0
+        << true
+    }
+    aid := sta_u16(frame,28)
+    capability := sta_u16(frame,24)
+    if !rates_seen || (aid & 0xC000) != 0xC000 || (aid & 0x3FFF) < 1 ||
+        (aid & 0x3FFF) > 2007 || (capability & 3) != 1 ||
+        (capability & 16) != (sta.ap.capability & 16) { << false }
+    sta.status_code = 0
+    sta.aid = aid & 0x3FFF
+    sta.state = STA_ASSOCIATED
+    << true
+}
+
+// Caller owns timeout/retry scheduling and hardware/key teardown.
+pub fn (sta $&Station) reset_management() {
+    sta.status_code = -1
+    sta.aid = 0
+    if sta.state != STA_IDLE { sta.state = STA_READY }
+}
+
+// Probe Responses carry the same fixed fields and IEs as beacons, but are
+// directed to this station. Validate the original receiver first, then adapt
+// an owned copy for the shared IE parser; the captured MPDU stays unchanged.
+pub fn station_ap_from_probe_response(frame &string, rx_channel int, receiver &string) StationAp {
+    if frame.len < 38 || frame.len > 4096 || !sta_mac_valid(receiver) ||
+        frame[0] != 0x50 || (frame[1] & 0xC7) != 0 || (frame[22] & 15) != 0 {
+        << sta_ap_invalid()
+    }
+    for i in 0:6 { if frame[4 + i] != receiver[i] { << sta_ap_invalid() } }
+    $copy := make_string(frame.len)
+    for i in 0:frame.len { copy[i] = frame[i] }
+    copy[0] = 0x80
+    for i in 4:10 { copy[i] = 255 }
+    << station_ap_from_beacon(&copy,rx_channel)
+}
