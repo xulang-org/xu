@@ -6,6 +6,14 @@
 
 ---
 
+## Xu 0.11.4-dev.2 (development)
+
+- Compiler: keep checked integer loops in registers across reserved arithmetic traps, and admit bounded, call-free byte scans of shared string parameters to ARM64 register allocation.
+- Optimization: turn pure scalar self recursion with one wrapping integer addition per recursive result into an accumulator loop. Non-additive recursion, ownership, references and side effects retain their existing paths. Recognize the CRC bit loop after load commoning and preserve the exact eight-iteration proof.
+- Strings: specialize empty and one-byte `contains`, use a borrowed prefix scan, and expose byte replacement invariants to the checked SIMD emitter. Preserve byte values, independent result ownership and scalar tails.
+
+This is a development build. Performance measurements apply to their recorded workload, compiler and host; no general speedup or timing parity across targets is claimed. Upgrade the compiler, standard library and tools together. Desktop is `1.3.53` and setup is `1.2.44`.
+
 ## Xu 0.11.3
 
 - Compiler: SSA reassociation and periodic-reduction proofs preserve the actual loop backedge; narrow integer normalization follows the physical register width; very small GEMM tiles retain the scalar path when kernel setup would dominate.
