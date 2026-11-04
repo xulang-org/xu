@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.4-dev.1 (development)
+
+ARM64 code generation can restore a caller's stack frame and saved registers before jumping to an eligible sibling function. This allows integer/bool mutual tail recursion to run with bounded stack usage even when parameters occupy frame slots. Admission is limited to in-unit direct calls with at most six register arguments and a matching scalar return; functions with non-scalar locals or temps, address formation, or drop operations retain ordinary calls. Debug, coverage, test, unoptimized, and coroutine-stack-check builds retain the existing framed call path. Other architectures and self calls keep their existing behavior.
+
 ## Xu 0.11.3
 
 - Compiler: SSA reassociation and periodic-reduction proofs preserve the actual loop backedge; narrow integer normalization follows the physical register width; very small GEMM tiles retain the scalar path when kernel setup would dominate.
