@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.3-dev.12 (development)
+
+Windows SDK installers now embed an `asInvoker` application manifest, so current-user installation can start from a normal terminal on ARM64 and on x64 builds using the native PE fallback. Existing GUI installer resources remain intact. SDK installation checks verify the embedded policy through the Windows loader, including on administrator CI runners. This is a development build.
+
 ## Xu 0.11.3-dev.10 (development)
 
 Adds the opt-in `xu-c-2` native ABI for synchronous borrowed i64 spans. `i64_span` and `i64_span_mut` parameters become Xu `&[]int` and `$&[]int`; a call-scoped C view exposes length and contiguous data without transferring array ownership or capacity. The platform adapter handles integer register and stack arguments, including Win64 shadow space. Both native pack tools accept the versioned format; older products reject it instead of interpreting a borrow as an integer. Existing `xu-c-1` archives remain supported. This ABI currently accepts 64-bit `int` scalars and `void`/`int` results; native function values require a Xu wrapper. This is a development build.
