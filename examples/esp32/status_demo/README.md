@@ -1,4 +1,10 @@
-# Xu wireless status on ESP32 CYD
+# Xu wireless status on ESP32 CYD (experimental pure Xu)
+
+> **Not the phone-control delivery path.** For official BT/Wi-Fi static
+> libraries, absolute-mouse MQTT firmware, and the ≤1.5 MiB size gate, use
+> [`../idf_cyd/`](../idf_cyd/). This demo remains an experimental pure-Xu
+> coexistence study; its image (~3.1 MiB) rewrites radio code in Xu and is
+> larger than linking Espressif’s archives.
 
 This application draws two status cards on an ESP32-2432S028 (original
 ESP32, 40 MHz crystal, 4 MiB flash, 320 × 240 LCD). The LCD, touch input,
