@@ -7,7 +7,9 @@
 #include "esp_bt_main.h"
 #include "esp_event.h"
 #include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
 #include "esp_hidd.h"
+#include "esp_hidd_gatts.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
@@ -41,6 +43,7 @@ static bool s_mouse_on = false;
 static bool s_keyboard_on = false;
 static bool s_consumer_on = false;
 static bool s_want_adv = true;
+static bool s_paired = false;
 static uint16_t s_last_x = 0;
 static uint16_t s_last_y = 0;
 static bool s_mouse_down = false;
@@ -60,6 +63,17 @@ static void gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *para
         break;
     case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
         break;
+    case ESP_GAP_BLE_SEC_REQ_EVT:
+        esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+        break;
+    case ESP_GAP_BLE_AUTH_CMPL_EVT:
+        s_paired = param->ble_security.auth_cmpl.success;
+        if (s_paired) {
+            ESP_LOGI(TAG, "pairing complete");
+        } else {
+            ESP_LOGW(TAG, "pairing failed 0x%x", param->ble_security.auth_cmpl.fail_reason);
+        }
+        break;
     case ESP_GAP_BLE_UPDATE_WHITELIST_COMPLETE_EVT:
         break;
     default:
@@ -68,12 +82,14 @@ static void gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *para
 }
 
 static bool start_advertising(void) {
+    static uint8_t hid_service_uuid128[] = {
+        0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00,
+    };
     esp_ble_adv_data_t adv = {0};
+    adv.service_uuid_len = sizeof(hid_service_uuid128);
+    adv.p_service_uuid = hid_service_uuid128;
     adv.set_scan_rsp = false;
     adv.include_name = true;
-    adv.include_txpower = true;
-    adv.min_interval = 0x20;
-    adv.max_interval = 0x40;
     adv.appearance = 0x03C2; /* mouse */
     adv.flag = ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT;
     if (esp_ble_gap_set_device_name(s_name) != ESP_OK) {
@@ -98,6 +114,7 @@ static void hidd_event(void *handler_args, esp_event_base_t base, int32_t id, vo
     switch (id) {
     case ESP_HIDD_START_EVENT:
         s_protocol_ok = true;
+        ESP_LOGI(TAG, "HID started; advertising %s", s_name);
         if (s_want_adv) {
             start_advertising();
         }
@@ -108,6 +125,7 @@ static void hidd_event(void *handler_args, esp_event_base_t base, int32_t id, vo
         break;
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
+        s_paired = false;
         s_mouse_on = s_keyboard_on = s_consumer_on = false;
         s_mouse_down = s_key_down = s_consumer_down = false;
         ESP_LOGI(TAG, "HID disconnected");
@@ -150,6 +168,21 @@ bool hid_abs_start(const char *device_name) {
         return false;
     }
     if (esp_ble_gap_register_callback(gap_event) != ESP_OK) {
+        return false;
+    }
+    /* Headless: bond with "Just Works" so phones accept the HID without a passkey. */
+    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
+    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t key_size = 16;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, 1);
+    /* esp_hidd's BLE transport only starts once it receives GATTS events. */
+    if (esp_ble_gatts_register_callback(esp_hidd_gatts_event_handler) != ESP_OK) {
         return false;
     }
 
@@ -197,6 +230,18 @@ bool hid_abs_keyboard_subscribed(void) {
 }
 bool hid_abs_consumer_subscribed(void) {
     return s_connected;
+}
+
+bool hid_abs_advertising(void) {
+    return s_protocol_ok && s_want_adv && !s_connected;
+}
+bool hid_abs_paired(void) {
+    return s_paired;
+}
+void hid_abs_last_mouse(uint16_t *x, uint16_t *y, bool *down) {
+    *x = s_last_x;
+    *y = s_last_y;
+    *down = s_mouse_down;
 }
 
 bool hid_abs_set_advertising(bool enable) {
