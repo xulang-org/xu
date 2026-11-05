@@ -52,7 +52,9 @@ or subscribed CCCDs.
 or checked `[]int` bytes. The caller must first validate completed DMA,
 hardware RX status and packet length. The parser reports observed SSID,
 BSSID, DS channel, interval and privacy bit; it does not infer a WPA mode.
-The standard ESP32 `WifiDevice` scan/connect/AP APIs currently return failure
-instead of fabricating networks or IP leases. Wi-Fi association, DHCP,
-simultaneous BLE/Wi-Fi, and a complete public radio application are not
-provided by this console example.
+`WifiDevice` requires an explicitly installed backend. The
+`#embedded/chips/esp32/wifi_radio` backend implements polling station
+association, WPA2-PSK/CCMP, DHCP, ARP and ICMP for the fixed ESP32 profile.
+AP mode is not implemented. This UART console does not initialize a radio;
+the [CYD wireless status application](status_demo/README.md) adds a real LCD,
+touch controls and a fixed-profile Wi-Fi station/BLE HID coexistence loop.

@@ -1,0 +1,597 @@
+@embedded/chips/esp32/wifi_radio
+
+#embedded/chips/esp32
+#embedded/chips/esp32/wifi_raw_ccmp
+#embedded/chips/esp32/wifi_rx_layout
+#embedded/wifi
+#embedded/wifi/session
+#embedded/wifi/ipv4
+
+// TIMG0/T0 belongs to this Wi-Fi-only backend for its entire lifetime.
+// APB=80MHz, divider=40000: low counter / 2 is milliseconds modulo 2^31.
+fn clock_start() bool {
+    if (volatile_load(0x3FF5F000) & 0x80000000) != 0 { << false }
+    volatile_store(0x3FF5F000,0x53880000)
+    volatile_store(0x3FF5F018,0)
+    volatile_store(0x3FF5F01C,0)
+    volatile_store(0x3FF5F020,1)
+    volatile_store(0x3FF5F000,0xD3880000)
+    << volatile_load(0x3FF5F000) == 0xD3880000
+}
+fn now_ms() int {
+    volatile_store(0x3FF5F00C,1)
+    << (volatile_load(0x3FF5F004) >> 1) & 0x7FFFFFFF
+}
+fn factory_mac() string {
+    low := volatile_load(0x3FF5A004)
+    high := volatile_load(0x3FF5A008)
+    $mac := make_string(6)
+    mac[0] = (high >> 8) & 255
+    mac[1] = high & 255
+    for i in 0:4 { mac[2 + i] = (low >> (24 - i * 8)) & 255 }
+    $bits := 0
+    for i in 0:6 { bits = bits | mac[i] }
+    if bits == 0 || (mac[0] & 1) != 0 { << "" }
+    << mac
+}
+fn stop_engines() {
+    volatile_store(0x3FF73064,volatile_load(0x3FF73064) & 0xFFFEFFFF)
+    volatile_store(0x3FF73084,volatile_load(0x3FF73084) & 0x7FFFFFFF)
+    volatile_store(0x3FF73D20,volatile_load(0x3FF73D20) & 0x3FFFFFFF)
+    esp32.rom_delay_us(25000)
+}
+fn disconnect(state $&session.State) {
+    if state.ready { stop_engines() }
+    state.linked = false
+    state.status = esp32.WIFI_STATUS_DISCONNECTED
+    state.keys = session.empty_keys()
+    state.handshake = wifi.wpa2_handshake_empty()
+    state.client = ipv4.create("","")
+    state.lease_left = ""
+    state.gateway_mac = ""
+    state.echo_waiting = 0
+    state.rx_cursor = RX_COUNT
+    state.rx_tail = -1
+    state.rx_pending = []string{}
+}
+fn initialize_inner(state $&session.State) bool {
+    if state.ready { << true }
+    if state.status == esp32.WIFI_STATUS_ERROR { << false }
+    state.status = esp32.WIFI_STATUS_ERROR
+    mac := factory_mac()
+    if mac.len != 6 || !clock_start() { << false }
+    esp32.init()
+    if !esp32.bt_power_domain_on() { << false }
+    volatile_store(0x3FF000CC,volatile_load(0x3FF000CC) | 0x7CF)
+    volatile_store(0x3FF000D0,volatile_load(0x3FF000D0) | 7)
+    esp32.rom_delay_us(2)
+    volatile_store(0x3FF000D0,volatile_load(0x3FF000D0) & 0xFFFFFFF8)
+    if !esp32.radio_controller_memory_init() || !calibrate_radio() || !esp32.wifi_phy_calibrate() ||
+        !arena_init() || !mac_prepare() { stop_engines()
+        << false }
+    mac_rx_defaults()
+    tx_defaults(&mac)
+    volatile_store(0x3FF73800,0x30000)
+    volatile_store(0x3FF73804,0x30000)
+    volatile_store(0x3FF73808,0)
+    volatile_store(0x3FF7380C,0)
+    volatile_store(0x3FF73810,0)
+    if volatile_load(0x3FF73814) != 0 { stop_engines()
+        << false }
+    state.mac = mac
+    state.ready = true
+    state.status = esp32.WIFI_STATUS_IDLE
+    << true
+}
+
+fn initialize(state $&session.State) bool {
+    if state.ready { << true }
+    saved_level := esp32.irq_rom_set_level(15)
+    saved_mask := esp32.irq_rom_mask(0 - 1)
+    ok := initialize_inner(state)
+    esp32.irq_rom_unmask(saved_mask)
+    esp32.irq_rom_set_level(saved_level)
+    << ok
+}
+
+fn directed_probe(name &string, mac &string, sequence int) string {
+    if name.len < 1 || name.len > 32 || mac.len != 6 { << "" }
+    $frame := make_string(42 + name.len)
+    frame[0] = 0x40
+    for i in 0:6 { frame[4 + i] = 255
+        frame[10 + i] = mac[i]
+        frame[16 + i] = 255 }
+    frame[22] = (sequence & 15) << 4
+    frame[23] = (sequence >> 4) & 255
+    frame[25] = name.len
+    for i in 0:name.len { frame[26 + i] = name[i] }
+    at := 26 + name.len
+    frame[at] = 1
+    frame[at + 1] = 8
+    rates := [2,4,11,22,12,18,24,36,50,4,48,72,96,108]
+    for i in 0:rates.len { frame[at + 2 + i] = rates[i] }
+    << frame
+}
+fn find_ap(state $&session.State, name &string, began int, timeout_ms int) bool {
+    while session.elapsed(now_ms(),began) < timeout_ms {
+        for channel in 1:12 {
+            if session.elapsed(now_ms(),began) >= timeout_ms { << false }
+            if !esp32.wifi_phy_select(channel) { << false }
+            rom_call6(0x40005D50,0x3FFD7540,channel,0,0,0,0)
+            request := directed_probe(name,&state.mac,state.sequence)
+            state.sequence = (state.sequence + 1) & 4095
+            if !start_receive() || send_frame(state,&request) == TX_FATAL { << false }
+            esp32.rom_delay_us(200000)
+            frames := finish_receive()
+            for i in 0:frames.len {
+                $ap := wifi.station_ap_from_beacon(&frames[i],channel)
+                if !ap.valid { ap = wifi.station_ap_from_probe_response(&frames[i],channel,&state.mac) }
+                if ap.valid && ap.ssid == *name && ap.security == wifi.STA_SECURITY_WPA2_PSK_CCMP {
+                    state.ap_rsn = raw_rsn(&frames[i])
+                    state.channel = channel
+                    state.ap = ap
+                    << true
+                }
+            }
+        }
+    }
+    << false
+}
+fn clone_ap(ap &wifi.StationAp) wifi.StationAp {
+    $rates := []int{}
+    for i in 0:ap.rates.len { rates.push(ap.rates[i]) }
+    << wifi.StationAp{valid: ap.valid, ssid: session.copy(&ap.ssid),
+        bssid: session.copy(&ap.bssid), channel: ap.channel, capability: ap.capability,
+        rates: rates, security: ap.security, rsn: session.copy(&ap.rsn)}
+}
+fn associate(state $&session.State, began int, timeout_ms int) bool {
+    mac := session.copy(&state.mac)
+    // The state retains AP selection; the management owner consumes its own copy.
+    $sta := wifi.station_create(mac,clone_ap(&state.ap))
+    client_filters(&sta.ap.bssid)
+    $pending := ""
+    for phase in 0:2 {
+        $complete := false
+        for retry in 0:5 {
+            if session.elapsed(now_ms(),began) >= timeout_ms { << false }
+            $request := ""
+            if phase == 0 { request = sta.authentication_request() }
+            else { request = sta.association_request() }
+            if request.len == 0 || !start_receive() || send_frame(state,&request) == TX_FATAL { << false }
+            esp32.rom_delay_us(100000)
+            frames := finish_receive()
+            for i in 0:frames.len {
+                sta.receive_management(&frames[i])
+                if sta.state == wifi.STA_ASSOCIATED {
+                    message := eapol_message(&frames[i],&sta.mac,&sta.ap.bssid)
+                    if message.len != 0 { pending = message }
+                }
+            }
+            if sta.state == wifi.STA_REJECTED { << false }
+            if (phase == 0 && sta.state == wifi.STA_AUTHENTICATED) ||
+                (phase == 1 && sta.state == wifi.STA_ASSOCIATED) { complete = true
+                <- }
+        }
+        if !complete { << false }
+    }
+    $outgoing := ""
+    if pending.len != 0 { outgoing = process_eapol(state,&pending) }
+    state.sequence = 512
+    $m4_sent := false
+    for round in 0:240 {
+        if session.elapsed(now_ms(),began) >= timeout_ms || !start_receive() { << false }
+        if outgoing.len != 0 {
+            frame := eapol_frame(&outgoing,&state.mac,&state.ap.bssid,state.sequence)
+            state.sequence = (state.sequence + 1) & 4095
+            if send_frame(state,&frame) == TX_FATAL { << false }
+            if state.handshake.phase == wifi.WPA2_M4_READY { m4_sent = true }
+            outgoing = ""
+        }
+        esp32.rom_delay_us(150000)
+        frames := finish_receive()
+        for i in 0:frames.len {
+            message := eapol_message(&frames[i],&state.mac,&state.ap.bssid)
+            if message.len != 0 { outgoing = process_eapol(state,&message) }
+        }
+        if m4_sent && state.keys.valid && outgoing.len == 0 && round > 15 { << true }
+    }
+    << false
+}
+
+fn retire_tx() {
+    if (volatile_load(0x3FF73D20) & 0xC0000000) != 0 {
+        // Retire only before another submission or DMA recycling. Polling RX
+        // must not cancel the frame that its caller has just queued.
+        esp32.rom_delay_us(25000)
+        volatile_store(0x3FF73D20,volatile_load(0x3FF73D20) & 0x3FFFFFFF)
+        // A PPDU may have started immediately before cancellation. Drain it
+        // before overwriting the descriptor or the shared transmit buffer.
+        esp32.rom_delay_us(25000)
+    }
+}
+fn stream_start(state $&session.State) bool {
+    if state.rx_cursor >= RX_COUNT {
+        volatile_store(0x3FF73064,volatile_load(0x3FF73064) & 0xFFFEFFFF)
+        retire_tx()
+        stop_engines()
+        if !arena_init() { << false }
+        state.rx_cursor = 0
+        state.rx_tail = RX_COUNT - 1
+        volatile_store(0x3FF73088,RX_DESC)
+        volatile_store(0x3FF73C4C,0xFFFFFFFF)
+        volatile_store(0x3FF73084,volatile_load(0x3FF73084) | 0x80000000)
+        volatile_store(0x3FF73064,volatile_load(0x3FF73064) | 0x10000)
+    }
+    << true
+}
+fn rx_index(pointer int) int {
+    if pointer < RX_DESC || pointer > RX_DESC + (RX_COUNT - 1) * 12 || (pointer - RX_DESC) % 12 != 0 { << -1 }
+    << (pointer - RX_DESC) / 12
+}
+fn rx_fault(state $&session.State, code int) bool {
+    state.error = 0x400 + code
+    disconnect(state)
+    << false
+}
+// Append only after copying the complete packet. RX remains enabled; the
+// reload request makes a linked tail visible to the DMA engine.
+fn append_chain(state $&session.State, nodes &[]int, following int) bool {
+    if nodes.len < 1 || nodes.len > RX_COUNT { << rx_fault(state,1) }
+    first := RX_DESC + nodes[0] * 12
+    last := RX_DESC + nodes[nodes.len - 1] * 12
+    for i in 0:nodes.len {
+        index := nodes[i]
+        descriptor := RX_DESC + index * 12
+        buffer := RX_BUFFER + index * RX_STRIDE
+        flags := word(descriptor)
+        if !put(buffer,0xDEADBEEF) || !put(buffer + RX_SIZE,0xDEADBEEF) ||
+            !put(descriptor,((flags | 0x80000000) & 0x9F000FFF) | (RX_SIZE << 12)) { << rx_fault(state,2) }
+    }
+    if !put(last + 8,0) { << rx_fault(state,3) }
+    if following == 0 {
+        // The consumed packet exhausted the old active chain.
+        volatile_store(0x3FF73088,first)
+    } else {
+        if rx_index(following) < 0 || state.rx_tail < 0 || state.rx_tail >= RX_COUNT { << rx_fault(state,4) }
+        previous_tail := RX_DESC + state.rx_tail * 12
+        for i in 0:nodes.len { if previous_tail == RX_DESC + nodes[i] * 12 { << rx_fault(state,5) } }
+        if !put(previous_tail + 8,first) { << rx_fault(state,6) }
+        volatile_store(0x3FF73084,volatile_load(0x3FF73084) | 1)
+        $ready := false
+        for i in 0:2000 {
+            if (volatile_load(0x3FF73084) & 1) == 0 { ready = true
+                <- }
+            esp32.rom_delay_us(1)
+        }
+        if !ready { << rx_fault(state,7) }
+        if volatile_load(0x3FF7308C) == 0x3FF00000 {
+            hardware_last := volatile_load(0x3FF73090)
+            if hardware_last != last {
+                if rx_index(hardware_last) < 0 { << rx_fault(state,8) }
+                resume := word(hardware_last + 8)
+                if rx_index(resume) < 0 { << rx_fault(state,9) }
+                volatile_store(0x3FF73088,resume)
+            }
+        }
+    }
+    state.rx_tail = nodes[nodes.len - 1]
+    if following == 0 { state.rx_cursor = nodes[0] }
+    else { state.rx_cursor = rx_index(following) }
+    << true
+}
+fn stream_frames(state $&session.State) []string {
+    $frames := []string{}
+    // EOF marks a packet end, not each completed DMA buffer. The hardware
+    // last-descriptor snapshot bounds completed chunks, including a packet
+    // split across buffers. Leave an incomplete packet intact for the next poll.
+    boundary := volatile_load(0x3FF73090)
+    if boundary == 0 || boundary == 0x3FF00000 { << frames }
+    if rx_index(boundary) < 0 { rx_fault(state,11)
+        << frames }
+    $consumed := 0
+    while consumed < RX_COUNT {
+        $nodes := []int{}
+        $at := RX_DESC + state.rx_cursor * 12
+        $total := 0
+        $bits := 0
+        $complete := false
+        $hit_boundary := false
+        for count in 0:(RX_COUNT - consumed) {
+            index := rx_index(at)
+            if index < 0 || (bits & (1 << index)) != 0 { rx_fault(state,12)
+                << frames }
+            bits = bits | (1 << index)
+            buffer := RX_BUFFER + index * RX_STRIDE
+            flags := word(at)
+            length := (flags >> 12) & 4095
+            if word(at + 4) != buffer || word(buffer + RX_SIZE) != 0xDEADBEEF || length < 1 || length > RX_SIZE {
+                rx_fault(state,13)
+                << frames }
+            nodes.push(index)
+            total += length
+            hit_boundary = at == boundary
+            if (flags & 0x40000000) != 0 { complete = true
+                <- }
+            if hit_boundary { <- }
+            at = word(at + 8)
+        }
+        if !complete { << frames }
+        following := word(at + 8)
+        // Header + maximum aligned CSI + a bounded MPDU. Unsupported
+        // complete packets are dropped and recycled rather than wedging RX.
+        if total >= 28 && total <= 2652 {
+            $raw := make_string(total)
+            $offset := 0
+            for n in 0:nodes.len {
+                index := nodes[n]
+                length := (word(RX_DESC + index * 12) >> 12) & 4095
+                buffer := RX_BUFFER + index * RX_STRIDE
+                for i in 0:(length + 3) / 4 {
+                    value := word(buffer + i * 4)
+                    for j in 0:4 { if i * 4 + j < length { raw[offset + i * 4 + j] = (value >> (j * 8)) & 255 } }
+                }
+                offset += length
+            }
+            layout := wifi_rx_layout.parse_owned_packet(&raw)
+            state.rx_status = layout.status
+            if layout.valid {
+                state.rx_valid += 1
+                $frame := make_string(layout.frame_length)
+                for i in 0:frame.len { frame[i] = raw[layout.frame_offset + i] }
+                frames.push(frame)
+            }
+        }
+        state.rx_packets += 1
+        consumed += nodes.len
+        if !append_chain(state,&nodes,following) { << frames }
+        if hit_boundary { << frames }
+    }
+    << frames
+}
+// Copy pending arrivals without entering crypto recursively. The caller
+// runs this after writing TX DMA, immediately before enabling transmission.
+fn defer_receive(state $&session.State) bool {
+    received := stream_frames(state)
+    if state.status == esp32.WIFI_STATUS_DISCONNECTED { << false }
+    for i in 0:received.len {
+        if state.rx_pending.len < 4 { state.rx_pending.push(received[i]) }
+    }
+    << true
+}
+fn send_llc(state $&session.State, payload &string, destination &string) int {
+    retire_tx()
+    if !state.ready || !state.keys.valid || !stream_start(state) { << TX_FATAL }
+    frame := prepare_encrypted(state,payload,destination,state.sequence)
+    state.sequence = (state.sequence + 1) & 4095
+    if frame.len == 0 { << TX_FATAL }
+    ok := send_frame(state,&frame)
+    if ok == TX_ACKED { state.tx_packets += 1 }
+    << ok
+}
+
+fn receive_dhcp(state $&session.State, payload &string) bool {
+    client := $&state.client
+    << client.receive_llc(payload)
+}
+fn discover_dhcp(state $&session.State) string {
+    client := $&state.client
+    << client.discover()
+}
+fn request_dhcp(state $&session.State) string {
+    client := $&state.client
+    << client.request()
+}
+
+// Keep the bounded bare-metal stack separate from per-packet owning
+// protocol results: management, CCMP, and IPv4 run in successive frames.
+fn observe_frame(state $&session.State, frame &string) bool {
+    if frame.len >= 36 && frame[0] == 0x80 {
+        beacon := wifi.beacon_parse_bytes(frame)
+        if beacon.valid && beacon.bssid.len == 6 {
+            $same := true
+            for j in 0:6 { if beacon.bssid[j] != state.ap.bssid[j] { same = false } }
+            if same { state.last_receive = now_ms() }
+        }
+    }
+    if frame.len >= 26 && (frame[0] == 0xC0 || frame[0] == 0xA0) {
+        $matched := true
+        for j in 0:6 { if frame[4 + j] != state.mac[j] || frame[10 + j] != state.ap.bssid[j] { matched = false } }
+        if matched { disconnect(state)
+            << false }
+    }
+    message := eapol_message(frame,&state.mac,&state.ap.bssid)
+    if message.len != 0 {
+        response := process_eapol(state,&message)
+        if response.len != 0 {
+            packet := eapol_frame(&response,&state.mac,&state.ap.bssid,state.sequence)
+            state.sequence = (state.sequence + 1) & 4095
+            retire_tx()
+            if !stream_start(state) || send_frame(state,&packet) == TX_FATAL { disconnect(state)
+                << false }
+        }
+    }
+    << true
+}
+fn client_phase(client &ipv4.Client) int { << client.state }
+
+fn receive_payload(state $&session.State, frame &string, payload &string) bool {
+    before := client_phase(&state.client)
+    accepted := receive_dhcp(state,payload)
+    if accepted && client_phase(&state.client) == ipv4.DHCP_LEASED && before != ipv4.DHCP_LEASED {
+        state.linked = true
+        state.status = esp32.WIFI_STATUS_CONNECTED
+        state.lease_left = session.copy(&state.client.lease_seconds)
+        state.lease_clock = now_ms()
+    }
+    if client_phase(&state.client) == ipv4.DHCP_FAILED { disconnect(state)
+        << false }
+    if state.linked {
+        answer := ipv4.arp_response(payload,&state.mac,&state.client.address)
+        if answer.valid && send_llc(state,&answer.payload,&answer.destination) == TX_FATAL {
+            disconnect(state)
+            << false
+        }
+        echo := ipv4.echo_response(payload,&state.client.address)
+        if echo.len != 0 {
+            $destination := make_string(6)
+            $bits := 0
+            for j in 0:6 { destination[j] = frame[16 + j]
+                bits = bits | destination[j] }
+            if bits != 0 && (destination[0] & 1) == 0 && send_llc(state,&echo,&destination) == TX_FATAL {
+                disconnect(state)
+                << false
+            }
+        }
+        reply := ipv4.arp_reply_mac(payload,&state.mac,&state.client.address,&state.client.router)
+        if reply.len == 6 { state.gateway_mac = reply }
+        body := "xu-pure-wifi"
+        if state.echo_waiting != 0 && ipv4.echo_reply_valid(payload,&state.client.address,
+            &state.client.router,0x5855,state.echo_waiting,&body) {
+            state.echo_replies += 1
+            state.echo_waiting = 0
+        }
+    }
+    << true
+}
+fn receive_frame(state $&session.State, frame &string) bool {
+    if !observe_frame(state,frame) { << false }
+    payload := decrypt_payload(state,frame)
+    if payload.len == 0 { << true }
+    state.rx_authenticated += 1
+    state.last_receive = now_ms()
+    << receive_payload(state,frame,&payload)
+}
+
+fn service(state $&session.State, wait_ms int) bool {
+    if !state.ready || !state.keys.valid || wait_ms < 0 || wait_ms > 100 { << false }
+    if !stream_start(state) { disconnect(state)
+        << false }
+    esp32.rom_delay_us(wait_ms * 1000)
+    // Deferred packets precede newly completed packets, preserving CCMP PN
+    // order. A reply may defer more arrivals without recursing into crypto.
+    $frames := []string{}
+    for i in 0:state.rx_pending.len { frames.push(state.rx_pending[i]) }
+    state.rx_pending = []string{}
+    received := stream_frames(state)
+    if state.status == esp32.WIFI_STATUS_DISCONNECTED { << false }
+    for i in 0:received.len { frames.push(received[i]) }
+    for i in 0:frames.len {
+        if !receive_frame(state,&frames[i]) { << false }
+    }
+    if state.linked {
+        now := now_ms()
+        seconds := session.elapsed(now,state.lease_clock) / 1000
+        if seconds > 0 {
+            state.lease_left = session.lease_tick(&state.lease_left,seconds)
+            state.lease_clock = (state.lease_clock + seconds * 1000) & 0x7FFFFFFF
+            if state.lease_left.len != 4 { disconnect(state)
+                << false }
+        }
+        if session.elapsed(now,state.last_receive) > 10000 { disconnect(state)
+            << false }
+    }
+    if !stream_start(state) { disconnect(state)
+        << false }
+    << state.linked
+}
+
+fn connect(state $&session.State, ssid &string, password &string, timeout_ms int) bool {
+    if !state.ready || ssid.len < 1 || ssid.len > 32 || timeout_ms < 1 || timeout_ms > 300000 { << false }
+    disconnect(state)
+    volatile_store(0x3FF73800,0x30000)
+    state.status = esp32.WIFI_STATUS_CONNECTING
+    began := now_ms()
+    state.error = 1
+    if !find_ap(state,ssid,began,timeout_ms) { disconnect(state)
+        << false }
+    state.error = 2
+    pmk := wifi.wpa2_pmk(password,ssid)
+    snonce := fresh_random(32)
+    state.handshake = wifi.wpa2_handshake_start(&pmk,&state.ap.bssid,&state.mac,&snonce,&state.ap.rsn)
+    state.keys = session.fresh_keys()
+    if !state.handshake.valid { disconnect(state)
+        << false }
+    state.error = 3
+    if !associate(state,began,timeout_ms) { disconnect(state)
+        << false }
+    state.error = 4
+    if !wifi_raw_ccmp.prepare() { disconnect(state)
+        << false }
+    state.error = 5
+    xid := fresh_random(4)
+    state.client = ipv4.create(session.copy(&state.mac),xid)
+    state.rx_cursor = RX_COUNT
+    state.rx_tail = -1
+    state.rx_pending = []string{}
+    state.last_receive = now_ms()
+    $sent_state := -1
+    $sent_at := now_ms()
+    broadcast := broadcast_mac()
+    while session.elapsed(now_ms(),began) < timeout_ms {
+        if sent_state != state.client.state || session.elapsed(now_ms(),sent_at) >= 1000 {
+            $payload := ""
+            if state.client.state == ipv4.DHCP_READY || state.client.state == ipv4.DHCP_SELECTING { payload = discover_dhcp(state) }
+            else if state.client.state == ipv4.DHCP_REQUESTING { payload = request_dhcp(state) }
+            if payload.len != 0 && send_llc(state,&payload,&broadcast) == TX_FATAL {
+                disconnect(state)
+                << false }
+            sent_state = state.client.state
+            sent_at = now_ms()
+        }
+        if service(state,20) && state.linked { state.error = 0
+            << true }
+        if state.status == esp32.WIFI_STATUS_DISCONNECTED {
+            << false }
+    }
+
+    disconnect(state)
+    << false
+}
+fn ping_gateway(state $&session.State, timeout_ms int) bool {
+    if !state.linked || timeout_ms < 1 || timeout_ms > 30000 { << false }
+    began := now_ms()
+    $sent_at := (began - 1000) & 0x7FFFFFFF
+    before := state.echo_replies
+    broadcast := broadcast_mac()
+    while state.linked && session.elapsed(now_ms(),began) < timeout_ms {
+        if session.elapsed(now_ms(),sent_at) >= 500 {
+            if state.gateway_mac.len != 6 {
+                request := ipv4.arp_request(&state.mac,&state.client.address,&state.client.router)
+                if send_llc(state,&request,&broadcast) == TX_FATAL { disconnect(state)
+                    << false }
+            } else {
+                state.echo_next = (state.echo_next % 65535) + 1
+                state.echo_waiting = state.echo_next
+                body := "xu-pure-wifi"
+                request := ipv4.echo_request(&state.client.address,&state.client.router,0x5855,state.echo_waiting,&body)
+                destination := session.copy(&state.gateway_mac)
+                if send_llc(state,&request,&destination) == TX_FATAL { disconnect(state)
+                    << false }
+            }
+            sent_at = now_ms()
+        }
+        service(state,20)
+        if state.echo_replies > before { << true }
+    }
+    << false
+}
+pub fn backend() esp32.WifiBackend {
+    << esp32.WifiBackend{initialize: initialize, connect: connect,
+        service: service, disconnect: disconnect, ping_gateway: ping_gateway}
+}
+
+// Submit a bounded gateway probe without blocking BLE host servicing.
+// Success reports submission; gateway_replies counts actual authenticated replies.
+pub fn probe_gateway(state $&session.State) bool {
+    if !session.leased(state) || state.gateway_mac.len != 6 { << false }
+    state.echo_next = (state.echo_next % 65535) + 1
+    state.echo_waiting = state.echo_next
+    body := "xu-pure-wifi"
+    request := ipv4.echo_request(&state.client.address,&state.client.router,0x5855,state.echo_waiting,&body)
+    destination := session.copy(&state.gateway_mac)
+    if send_llc(state,&request,&destination) == TX_FATAL { disconnect(state)
+        << false }
+    << true
+}
+
+pub fn gateway_replies(state &session.State) int { << state.echo_replies }

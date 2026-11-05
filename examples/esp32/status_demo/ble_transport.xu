@@ -1,0 +1,1131 @@
+@main
+
+#embedded/chips/esp32
+#embedded/bluetooth as bt
+
+const AIR_RAM_LE_TIMING = 0
+const IRAM_LL_ENTRY = 0x40094ef0
+const IRAM_BB_ENTRY = 0x40094f58
+const IRAM_TIMER_ENTRY = 0x40094fc8
+
+struct CycleClock {
+    previous int
+    remainder int
+    milliseconds int
+    cycles_per_ms int
+    failed bool
+}
+
+struct HidProbe {
+    // 0 not queued;1 press queued;2 press accepted;3 release queued;
+    // 4 both accepted;5 interrupted. Original boot attempt plus explicitly requested UART retries.
+    step int
+    pressed_at int
+}
+
+struct BondStore {
+    current []int
+    slot int
+    generation int
+    error int
+    pending_ms int
+    next_check int
+}
+
+fn lock_interrupts() int {
+    // _xtos_ints_off returns the old enable mask. Its own PS guard protects
+    // the RMW; nested calls can restore their individual masks exactly.
+    << rom_call6(0x4000BFAC, 0 - 1, 0, 0, 0, 0, 0)
+}
+
+fn restore_interrupts(mask int) int {
+    rom_call6(0x4000BF88, mask, 0, 0, 0, 0, 0)
+    << 0
+}
+
+fn assertion(file int, line int, detail int) int {
+    if esp32.bt_irq_rom_recover_assertion(file, line, detail) { << 0 }
+    esp32.uart_println("[FAIL] BLE")
+    esp32.uart_print_hex(file)
+    esp32.uart_print("[BLE]")
+    esp32.uart_print_hex(line)
+    esp32.uart_print("[BLE]")
+    esp32.uart_print_hex(detail)
+    esp32.uart_println("")
+    esp32.uart_print("[BLE]")
+    esp32.uart_print_hex(volatile_load(0x3FF71210))
+    esp32.uart_print_hex(volatile_load(0x3FF71260))
+    esp32.uart_print_hex(volatile_load(0x3FF71214))
+    esp32.uart_print_hex(volatile_load(0x3FF4E168))
+    esp32.uart_print_hex(volatile_load(0x3FF4E0C4))
+    esp32.uart_println("")
+    esp32.uart_print("[BLE]")
+    esp32.uart_print_hex(volatile_load(0x3FFD73B0))
+    esp32.uart_print_hex(volatile_load(0x3FFD73B4))
+    esp32.uart_print_hex(volatile_load(0x3FFD73C0))
+    esp32.uart_print_hex(volatile_load(0x3FFD73CC))
+    esp32.uart_print_hex(esp32.phy_tracking_count())
+    esp32.uart_println("")
+    while true { }
+    << 1
+}
+
+fn assertion_param(a int, b int, file int, line int) int {
+    assertion(file, line, a)
+    << b
+}
+
+fn eif_read(buffer int, length int, callback int, context int) int {
+    volatile_store(0x3FFD7100, buffer)
+    volatile_store(0x3FFD7104, length)
+    volatile_store(0x3FFD7108, callback)
+    volatile_store(0x3FFD710C, context)
+    volatile_store(0x3FFD7110, volatile_load(0x3FFD7110) + 1)
+    << 0
+}
+
+fn eif_write(buffer int, length int, callback int, context int) int {
+    // One owned native H4 packet at a time. Never truncate or overwrite
+    // an unacknowledged snapshot; every violation is observable by main.
+    if volatile_load(0x3FFD7140) != volatile_load(0x3FFD7154) {
+        volatile_store(0x3FFD7160, 2)
+    }
+    volatile_store(0x3FFD7144, length)
+    volatile_store(0x3FFD7148, buffer)
+    volatile_store(0x3FFD714C, callback)
+    volatile_store(0x3FFD7150, context)
+    volatile_store(0x3FFD7120, buffer)
+    volatile_store(0x3FFD7124, length)
+    volatile_store(0x3FFD7128, callback)
+    volatile_store(0x3FFD712C, context)
+    valid := length >= 3 && length <= 260 && buffer >= 0x3FFB0000 &&
+        buffer <= 0x3FFE0000 - length && callback == 0x4001751C && context == 0x3FFB8140
+    if !valid { volatile_store(0x3FFD7160, 3) }
+    else if length > 64 {
+        if volatile_load(0x3FFD7160) == 0 { volatile_store(0x3FFD7160, 1) }
+    } else { rom_call6(0x4000C2C8, 0x3FFD7200, buffer, length, 0, 0, 0) }
+    volatile_store(0x3FFD7140, volatile_load(0x3FFD7140) + 1)
+    << 0
+}
+
+fn eif_flow_on() int {
+    volatile_store(0x3FFD7130, volatile_load(0x3FFD7130) + 1)
+    << 0
+}
+
+fn eif_flow_off() int {
+    if volatile_load(0x3FFD7104) == 0 { << 1 }
+    << 0
+}
+
+fn deliver_source(expected int, source int) bool {
+    buffer := volatile_load(0x3FFD7100)
+    context := volatile_load(0x3FFD710C)
+    if expected < 1 || expected > 32 || source < 0x3FFD717C || source + expected > 0x3FFD71C0 {
+        esp32.uart_println("[FAIL] BLE")
+        << false
+    }
+    if volatile_load(0x3FFD7104) != expected || volatile_load(0x3FFD7108) != 0x40017620 ||
+        context != 0x3FFB8140 {
+        esp32.uart_println("[FAIL] BLE")
+        << false
+    }
+    in_bss := buffer >= 0x3FFB8000 && buffer + expected <= 0x3FFBFF70
+    in_heap := buffer >= 0x3FFD2000 && buffer + expected <= 0x3FFD7000
+    // ROM em_buf_init creates ten 260-byte ACL TX buffers at EM+B96.
+    // H4 allocates ACL payloads directly there, rather than in a KE heap.
+    // Admit only a payload-stage request at an actual buffer boundary.
+    in_acl_em := source == 0x3FFD7181 && volatile_load8(0x3FFD717C) == 2 &&
+        expected <= 27 && expected == (volatile_load8(0x3FFD717F) |
+            (volatile_load8(0x3FFD7180) << 8)) &&
+        buffer >= 0x3FFB0B96 && buffer < 0x3FFB15BE &&
+        (buffer - 0x3FFB0B96) % 260 == 0
+    if !in_bss && !in_heap && !in_acl_em {
+        esp32.uart_println("[FAIL] BLE")
+        << false
+    }
+    volatile_store(0x3FFD7104, 0)
+    rom_call6(0x4000C2C8, buffer, source, expected, 0, 0, 0)
+    rom_call6(0x40017620, context, 0, 0, 0, 0, 0)
+    << true
+}
+
+fn memory_byte(address int, value int) int {
+    if address < 0x3FFAE000 || address >= 0x3FFE0000 {
+        assertion(address, 2, value)
+    }
+    old := lock_interrupts()
+    volatile_store(0x3FFD73F0, value & 255)
+    rom_call6(0x4000C2C8, address, 0x3FFD73F0, 1, 0, 0, 0)
+    restore_interrupts(old)
+    << 0
+}
+
+fn memory_read_byte(address int) int {
+    if address < 0x3FFAE000 || address >= 0x3FFE0000 { assertion(address, 3, 0) }
+    old := lock_interrupts()
+    rom_call6(0x4000C2C8, 0x3FFD73F0, address, 1, 0, 0, 0)
+    value := volatile_load8(0x3FFD73F0)
+    restore_interrupts(old)
+    << value
+}
+
+fn nvds_get(tag int, length int, output int) int {
+    if tag != 128 || volatile_load(0x3FFD7138) != 32 {
+        memory_byte(length, 0)
+        << 1
+    }
+    if memory_read_byte(length) < 32 { << 4 }
+    if output < 0x3FFAE000 || output + 32 > 0x3FFE0000 { << 4 }
+    rom_call6(0x4000C2C8, output, 0x3FFD7240, 32, 0, 0, 0)
+    memory_byte(length, 32)
+    << 0
+}
+
+fn nvds_put(tag int, length int, data int) int {
+    if tag != 128 || length != 32 || data < 0x3FFAE000 || data + 32 > 0x3FFE0000 { << 5 }
+    rom_call6(0x4000C2C8, 0x3FFD7240, data, 32, 0, 0, 0)
+    volatile_store(0x3FFD7138, 32)
+    << 0
+}
+
+fn seed_rng(seed int) int {
+    // The IDF hardware-RNG srand wrapper ignores the seed. Retain it here
+    // for diagnostics; no deterministic PRNG is substituted for hardware.
+    volatile_store(0x3FFD7118, seed)
+    << 0
+}
+
+fn hardware_random() int {
+    // Used for LL cold initialization only. Security/pairing requires the
+    // RF entropy source to be running; this probe does not claim that.
+    << volatile_load(0x3FF75144)
+}
+
+fn complete_eif_write() bool {
+    if volatile_load(0x3FFD7128) != 0x4001751C || volatile_load(0x3FFD712C) != 0x3FFB8140 {
+        esp32.uart_println("[FAIL] BLE")
+        << false
+    }
+    volatile_store(0x3FFD7154, volatile_load(0x3FFD7140))
+    rom_call6(0x4001751C, 0x3FFB8140, 0, 0, 0, 0, 0)
+    << true
+}
+
+fn calibrate_radio() bool {
+    rom_call6(esp32.ROM_MEMSET, 0x3FFD7400, 0, 0x800, 0, 0, 0)
+    if !esp32.bt_power_domain_on() { << false }
+    esp32.bt_rf_clock_enable()
+    esp32.uart_println("[BLE]")
+    if !esp32.phy_prepare_analog_bus() || !esp32.phy_cal_install_i2c() ||
+        !esp32.phy_cal_pbus_memory_init() || !esp32.phy_cal_rf_bus_init() ||
+        !esp32.phy_cal_pll_40mhz() || !esp32.phy_cal_channel_programmer() ||
+        !esp32.phy_cal_rc_40mhz() || !esp32.phy_cal_txdc_bt() ||
+        !esp32.phy_cal_txiq_bt() || !esp32.phy_cal_txcap_bt() ||
+        !esp32.phy_cal_txpower_bt() || !esp32.phy_cal_shared_tx_calibrate() ||
+        !esp32.phy_cal_bt_gain_memory() ||
+        !esp32.phy_cal_rx_bt() || !esp32.phy_cal_rx_bt_calibrated() ||
+        !esp32.phy_cal_bb_registers_init() || !esp32.phy_cal_shared_gain_memory() ||
+        !esp32.phy_cal_bt_gain_memory() ||
+        !esp32.phy_cal_tx_release() {
+        esp32.uart_println("[FAIL] BLE")
+        esp32.uart_print_hex(esp32.phy_cal_i2c_error())
+        esp32.uart_print_hex(esp32.phy_cal_rx_error())
+        esp32.uart_print_hex(volatile_load(0x3FFD741C))
+        esp32.uart_println("")
+        << false
+    }
+    esp32.uart_println("[BLE]")
+    << true
+}
+
+fn bind_platform() bool {
+    rom_call6(esp32.ROM_MEMSET, 0x3FFD7000, 0, 0x200, 0, 0, 0)
+    volatile_store(0x3FFD7008, rom_callback(lock_interrupts))
+    volatile_store(0x3FFD700C, rom_callback(restore_interrupts))
+    volatile_store(0x3FFD7014, rom_callback(assertion))
+    volatile_store(0x3FFD7018, rom_callback(assertion_param))
+    volatile_store(0x3FFD701C, rom_callback(assertion_param))
+    rom_call6(0x40054288, 0x3FFD7000, 0, 0, 0, 0, 0)
+    if volatile_load(0x3FFB8360) != 0x3FFD7000 { << false }
+    volatile_store(0x3FFD7080, rom_callback(eif_read))
+    volatile_store(0x3FFD7084, rom_callback(eif_write))
+    volatile_store(0x3FFD7088, rom_callback(eif_flow_on))
+    volatile_store(0x3FFD708C, rom_callback(eif_flow_off))
+    volatile_store(0x3FFAFF04, rom_callback(seed_rng))
+    volatile_store(0x3FFAFF08, rom_callback(hardware_random))
+    volatile_store(0x3FFAFEA8, rom_callback(nvds_get))
+    volatile_store(0x3FFAFEB4, rom_callback(nvds_put))
+    << true
+}
+
+fn controller_init() bool {
+    if !esp32.radio_clock_xtal_40mhz() || !esp32.radio_rf_cold_init() { << false }
+    if AIR_RAM_LE_TIMING == 1 {
+        volatile_store(0x3FF5109C, (volatile_load(0x3FF5109C) & 0xFF000000) | 0x625024)
+    }
+    esp32.uart_print("[BLE]")
+    esp32.uart_print_hex(volatile_load(0x3FF5109C))
+    esp32.uart_println("")
+    esp32.uart_println("[BLE]")
+    volatile_store(0x3FFD7780, esp32.PHY_TRACKING_READY)
+    rom_call6(0x4001A318, 0, 0, 0, 0, 0, 0) // KE
+    rom_call6(0x40019D3C, 0, 0x3FFD2000, 0x2000, 0, 0, 0)
+    rom_call6(0x40019D3C, 1, 0x3FFD4000, 0x2000, 0, 0, 0)
+    rom_call6(0x40019D3C, 2, 0x3FFD6000, 0x1000, 0, 0, 0)
+    esp32.uart_println("[BLE]")
+    rom_call6(0x40016DBC, 0, 0, 0, 0, 0, 0) // ECC
+    esp32.uart_println("[BLE]")
+    rom_call6(0x40017878, 0, 0x3FFD7080, 0, 0, 0, 0)
+    rom_call6(0x40018538, 0, 0, 0, 0, 0, 0) // HCI
+    rom_call6(0x40055160, 0, 0, 0, 0, 0, 0) // shared RWBT command task
+    esp32.uart_println("[BLE]")
+    // Real wrapper also applies NVDS tag 31/default FIFO control.
+    rom_call6(0x40054BF4, 0, 0, 0, 0, 0, 0) // EM buffers, LLD, LLC, LLM
+    if !esp32.radio_event_arbiter_init() { << false }
+    if !esp32.radio_rf_readback() { << false }
+    esp32.uart_println("[BLE]")
+    if !esp32.bt_irq_rom_attach() || !esp32.bt_irq_rom_bb_attach() { << false }
+    volatile_store(0x3FFE0654, 0 - 1)
+    << volatile_load(0x3FFD7104) == 1 && volatile_load(0x3FFD7130) == 1
+}
+
+fn wipe(bytes $&[]int) {
+    for i in 0:bytes.len { bytes[i] = 0 }
+}
+
+fn transport_fault(code int) {
+    prior := volatile_load(0x3FFD7160)
+    if prior == 0 || (prior == 1 && code > 1) { volatile_store(0x3FFD7160, code) }
+}
+
+fn clock_create() CycleClock {
+    mhz := esp32.rom_cpu_mhz()
+    << CycleClock{previous: esp32.irq_rom_cycle_count(), remainder: 0,
+        milliseconds: 0, cycles_per_ms: mhz * 1000, failed: mhz < 1 || mhz > 240}
+}
+
+fn clock_now(clock $&CycleClock) int {
+    sample := esp32.irq_rom_cycle_count()
+    low := sample & 0x7FFFFFFF
+    prior := clock.previous & 0x7FFFFFFF
+    $delta := 0
+    if ((sample ^ clock.previous) & 0x80000000) == 0 {
+        if low < prior { clock.failed = true }
+        else { delta = low - prior }
+    } else {
+        if low >= prior { clock.failed = true }
+        else { delta = (0x7FFFFFFF - prior) + low + 1 }
+    }
+    clock.previous = sample
+    if clock.failed || clock.cycles_per_ms < 1 ||
+        delta > 0x7FFFFFFF - clock.cycles_per_ms {
+        clock.failed = true
+        transport_fault(20)
+        << clock.milliseconds
+    }
+    total := clock.remainder + delta
+    advance := total / clock.cycles_per_ms
+    clock.remainder = total % clock.cycles_per_ms
+    if clock.milliseconds > 0x7FFFFFFF - advance {
+        clock.failed = true
+        transport_fault(20)
+    } else { clock.milliseconds += advance }
+    << clock.milliseconds
+}
+
+fn rf_entropy(count int) []int {
+    // This provider is invoked only by PeripheralHost's actual connection
+    // handler, after the RF/clock/IRQ startup gate below was committed.
+    if count != 42 || volatile_load(0x3FFD7174) != 0x524E4731 ||
+        !esp32.phy_tracking_is_ready() || !esp32.phy_cal_rx_bt_calibrated() ||
+        esp32.radio_rf_error() != 0 || esp32.radio_rf_stages() != 7 ||
+        (volatile_load(0x3FF7100C) & 0x400) == 0 {
+        volatile_store(0x3FFD7EF4,1)
+        << []int{} }
+    volatile_store(0x3FFD7EF4,0)
+    $out := bt.hci_zeros(42)
+    $offset := 0
+    $all_zero := true
+    $all_ff := true
+    $first_word := 0
+    $same_word := true
+    $samples := 0
+    while offset < 42 {
+        word := volatile_load(0x3FF75144)
+        if samples == 0 { first_word = word }
+        else if word != first_word { same_word = false }
+        samples += 1
+        for octet in 0:4 {
+            if offset < 42 {
+                value := (word >> (octet * 8)) & 255
+                out[offset] = value
+                if value != 0 { all_zero = false }
+                if value != 255 { all_ff = false }
+                offset += 1
+            }
+        }
+        esp32.rom_delay_us(1)
+    }
+    // Reject an observably stuck RNG port as well as rail-valued samples.
+    // This is a failure check, not a statistical claim of entropy quality.
+    if all_zero || all_ff || same_word {
+        if all_zero { volatile_store(0x3FFD7EF4,2) }
+        else if all_ff { volatile_store(0x3FFD7EF4,3) }
+        else { volatile_store(0x3FFD7EF4,4) }
+        wipe($&out)
+        << []int{} }
+    << out
+}
+
+fn wait_read(expected int, clock $&CycleClock) bool {
+    for poll in 0:2000 {
+        requested := volatile_load(0x3FFD7104)
+        if requested == expected { << true }
+        if requested != 0 { transport_fault(31)
+            << false }
+        rom_call6(0x40019CDC, 0, 0, 0, 0, 0, 0)
+        clock_now(clock)
+        if clock.failed { << false }
+        esp32.rom_delay_us(50)
+    }
+    transport_fault(32)
+    << false
+}
+
+fn clear_h4_stage() {
+    rom_call6(0x4000C44C,0x3FFD717C,0,64,0,0,0)
+}
+
+fn send_h4(frame &[]int, clock $&CycleClock) int {
+    if frame.len < 4 || frame.len > 36 { transport_fault(33)
+        << -1 }
+    for i in 0:frame.len { if frame[i] < 0 || frame[i] > 255 {
+        transport_fault(33)
+        << -1
+    } }
+    $header := 3
+    $payload := frame[3]
+    if frame[0] == 2 {
+        if frame.len < 5 { transport_fault(33)
+            << -1 }
+        header = 4
+        payload = frame[3] | (frame[4] << 8)
+        if payload > 27 { transport_fault(33)
+            << -1 }
+    } else if frame[0] != 1 || payload > 32 { transport_fault(33)
+        << -1 }
+    if frame.len != 1 + header + payload { transport_fault(33)
+        << -1 }
+    if volatile_load(0x3FFD7104) == 0 { << 0 }
+    if volatile_load(0x3FFD7104) != 1 { transport_fault(31)
+        << -1 }
+    for i in 0:frame.len { memory_byte(0x3FFD717C + i, frame[i]) }
+    if !deliver_source(1, 0x3FFD717C) || !wait_read(header, clock) ||
+        !deliver_source(header, 0x3FFD717D) { clear_h4_stage()
+        transport_fault(34)
+        << -1 }
+    if payload > 0 {
+        if !wait_read(payload, clock) || !deliver_source(payload, 0x3FFD717D + header) {
+            clear_h4_stage()
+            transport_fault(34)
+            << -1
+        }
+    }
+    // Clear every staging byte, including LTK parameters. The ROM owns a
+    // separate copied command/ACL buffer by this completion boundary.
+    clear_h4_stage()
+    << 1
+}
+
+fn take_controller_frame() []int {
+    count := volatile_load(0x3FFD7140)
+    if count == volatile_load(0x3FFD7154) { << []int{} }
+    if count != volatile_load(0x3FFD7154) + 1 { transport_fault(2)
+        << []int{} }
+    length := volatile_load(0x3FFD7124)
+    if length > 64 || length < 3 || volatile_load(0x3FFD7144) != length {
+        if length > 64 { transport_fault(1) }
+        else { transport_fault(3) }
+        << []int{}
+    }
+    if volatile_load(0x3FFD7160) != 0 { << []int{} }
+    $frame := bt.hci_zeros(length)
+    for i in 0:length { frame[i] = memory_read_byte(0x3FFD7200 + i) }
+    if volatile_load(0x3FFD7140) != count || volatile_load(0x3FFD7160) != 0 {
+        wipe($&frame)
+        transport_fault(2)
+        << []int{}
+    }
+    // Clear this snapshot before completion can publish the next packet.
+    rom_call6(0x4000C44C,0x3FFD7200,0,64,0,0,0)
+    if !complete_eif_write() { wipe($&frame)
+        transport_fault(3)
+        << []int{}
+    }
+    << frame
+}
+
+fn is_smp_failure_frame(frame &[]int) bool {
+    if frame.len != 11 || frame[0] != 2 || (frame[2] & 0xC0) != 0 { << false }
+    boundary := (frame[2] >> 4) & 3
+    if boundary != 0 && boundary != 2 { << false }
+    // Inspect only a whole L2CAP PDU. Continuation/random bytes are never
+    // interpreted as a signaling header or printed as a failure reason.
+    << frame[3] == 6 && frame[4] == 0 && frame[5] == 2 && frame[6] == 0 &&
+        frame[7] == 6 && frame[8] == 0 && frame[9] == 5
+}
+
+fn trace_h4(frame &[]int, incoming bool) {}
+
+fn feed_host(host $&bt.PeripheralHost, frame &[]int, clock $&CycleClock, probe $&HidProbe) {
+    trace_h4(frame,true)
+    inspect_auth_frame(frame)
+    connected := host.connected
+    encrypted := host.encrypted
+    bonded := host.bond_available
+    now := clock_now(clock)
+    $pending := host.handle_h4(frame, now)
+    wipe($&pending) // The host retains its fixed pending slot until accepted.
+    if frame.len >= 4 && frame[0] == 4 && frame[1] == 0x1A {
+        // Real Data Buffer Overflow invalidates the controller's flow state.
+        transport_fault(40)
+    }
+    if host.connected && !host.closing &&
+        (host.last_error == bt.PERIPHERAL_ERROR_FRAME || host.last_error == bt.PERIPHERAL_ERROR_CREDITS) {
+        $disconnect := host.request_disconnect(host.last_error)
+        wipe($&disconnect)
+    }
+    if !connected && host.connected {
+        esp32.uart_print("[BLE]")
+        esp32.uart_print_hex(host.connection)
+        esp32.uart_println("")
+    }
+    if !encrypted && host.encrypted {
+        esp32.uart_println("[BLE]")
+    }
+    if encrypted && !host.encrypted {
+        esp32.uart_println("[BLE]")
+    }
+    if !bonded && host.bond_available {
+        esp32.uart_println("[BLE]")
+    }
+    if connected && !host.connected {
+        esp32.uart_print("[BLE]")
+        esp32.uart_print_hex(volatile_load(0x3FFD77B0))
+        esp32.uart_print_hex(volatile_load(0x3FFD77B4))
+        esp32.uart_print_hex(volatile_load(0x3FFD77B8))
+        esp32.uart_print_hex(volatile_load(0x3FFD77BC))
+        esp32.uart_println("")
+        esp32.uart_print("[BLE]")
+        esp32.uart_print_hex(volatile_load(0x3FFD77C0))
+        esp32.uart_print_hex(volatile_load(0x3FFD77C4))
+        esp32.uart_print_hex(volatile_load(0x3FFD7798))
+        esp32.uart_println("")
+    }
+    if connected && !host.connected {
+        probe.step = 5
+        esp32.uart_println("[BLE]")
+    }
+    if is_smp_failure_frame(frame) {
+        esp32.uart_print("[BLE]")
+        esp32.uart_print_hex(frame[10])
+        esp32.uart_println("")
+        if host.connected && !host.closing {
+            $disconnect := host.request_disconnect(bt.PERIPHERAL_ERROR_SECURITY)
+            wipe($&disconnect)
+        }
+    }
+    if host.last_error != 0 {
+        esp32.uart_print("[BLE]")
+        esp32.uart_print_hex(host.last_error)
+        esp32.uart_println("")
+    }
+}
+
+fn record_accepted_report(host &bt.PeripheralHost, frame &[]int, clock $&CycleClock, probe $&HidProbe) {
+    if frame.len >= 13 && frame[0] == 2 && frame[7] == 4 && frame[9] == 0x1B {
+        handle := frame[10] | (frame[11] << 8)
+        if handle == bt.ATT_HANDLE_MOUSE_REPORT || handle == bt.ATT_HANDLE_CONSUMER_REPORT {
+            esp32.uart_print("[BLE]")
+            esp32.uart_print_hex(handle)
+            for i in 12:frame.len { esp32.uart_print_hex(frame[i]) }
+            esp32.uart_println("")
+        }
+    }
+    if frame.len != 20 || frame[0] != 2 || frame[7] != 4 || frame[8] != 0 ||
+        frame[9] != 0x1B || (frame[10] | (frame[11] << 8)) != bt.ATT_HANDLE_KEYBOARD_REPORT { << }
+    esp32.uart_print("[BLE]")
+    if host.encrypted { esp32.uart_print_hex(1) } else { esp32.uart_print_hex(0) }
+    for i in 12:20 { esp32.uart_print_hex(frame[i]) }
+    esp32.uart_println("")
+    $release := true
+    $press := frame[14] == 0x73
+    for i in 12:20 {
+        if frame[i] != 0 { release = false }
+        if i != 14 && frame[i] != 0 { press = false }
+    }
+    if probe.step == 1 && press {
+        probe.step = 2
+        probe.pressed_at = clock_now(clock)
+    } else if probe.step == 3 && release {
+        probe.step = 4
+        esp32.uart_println("[BLE]")
+    }
+}
+
+fn commit_host_output(host $&bt.PeripheralHost, frame $&[]int, clock $&CycleClock, probe $&HidProbe) int {
+    if frame.len == 0 { << 0 }
+    sent := send_h4(frame, clock)
+    if sent == 1 {
+        if !host.output_accepted() { wipe(frame)
+            transport_fault(35)
+            << -1 }
+        trace_h4(frame,false)
+        record_accepted_report(host, frame, clock, probe)
+        if is_smp_failure_frame(frame) {
+            esp32.uart_print("[BLE]")
+            esp32.uart_print_hex(frame[10])
+            esp32.uart_println("")
+            $disconnect := host.request_disconnect(bt.PERIPHERAL_ERROR_SECURITY)
+            wipe($&disconnect)
+        }
+    }
+    wipe(frame)
+    << sent
+}
+
+fn boot_command(host $&bt.PeripheralHost, clock $&CycleClock, probe $&HidProbe,
+    opcode int, parameters []int, expected_length int) bool {
+    if host.command_credits < 1 { transport_fault(36)
+        << false }
+    packet := bt.hci_packet_command(opcode, parameters)
+    $wire := bt.hci_encode(&packet)
+    $sent := 0
+    for tries in 0:2000 {
+        sent = send_h4(&wire, clock)
+        if sent != 0 { <- }
+        rom_call6(0x40019CDC, 0, 0, 0, 0, 0, 0)
+        clock_now(clock)
+        esp32.rom_delay_us(50)
+    }
+    wipe($&wire)
+    if sent != 1 { transport_fault(37)
+        << false }
+    // Boot provisioning commands are serialized outside the host queue.
+    // They share the actual command-credit accounting with that queue.
+    host.command_credits -= 1
+    for tries in 0:2000 {
+        rom_call6(0x40019CDC, 0, 0, 0, 0, 0, 0)
+        clock_now(clock)
+        $frame := take_controller_frame()
+        if volatile_load(0x3FFD7160) != 0 || clock.failed { << false }
+        if frame.len > 0 {
+            matched := frame.len >= 7 && frame[0] == 4 && frame[1] == 0x0E &&
+                (frame[4] | (frame[5] << 8)) == opcode
+            ok := matched && frame.len == expected_length && frame[6] == 0
+            $status := 0
+            if matched { status = frame[6] }
+            received_length := frame.len
+            if matched && opcode == 0x1001 && ok { volatile_store(0x3FFD7168, frame[7]) }
+            feed_host(host, &frame, clock, probe)
+            wipe($&frame)
+            if matched {
+                esp32.uart_print("[BLE]")
+                esp32.uart_print_hex(opcode)
+                esp32.uart_print_hex(status)
+                esp32.uart_println("")
+                if received_length != expected_length {
+                    esp32.uart_print("[FAIL] BLE")
+                    esp32.uart_print_hex(expected_length)
+                    esp32.uart_print_hex(received_length)
+                    esp32.uart_println("")
+                }
+                << ok
+            }
+        }
+        esp32.rom_delay_us(50)
+    }
+    transport_fault(38)
+    << false
+}
+
+fn bootstrap_buffers(host $&bt.PeripheralHost, clock $&CycleClock, probe $&HidProbe) bool {
+    for tries in 0:4000 {
+        rom_call6(0x40019CDC, 0, 0, 0, 0, 0, 0)
+        clock_now(clock)
+        $frame := take_controller_frame()
+        if frame.len > 0 { feed_host(host, &frame, clock, probe)
+            wipe($&frame) }
+        $out := host.poll(clock_now(clock))
+        if commit_host_output(host, $&out, clock, probe) < 0 { << false }
+        if volatile_load(0x3FFD7160) != 0 || !host.ready || clock.failed { << false }
+        if host.acl_capacity > 0 && host.acl_mtu >= 27 && host.command_credits > 0 { << true }
+        esp32.rom_delay_us(50)
+    }
+    transport_fault(39)
+    << false
+}
+
+fn configure_advertising(host $&bt.PeripheralHost, clock $&CycleClock, probe $&HidProbe) bool {
+    if !boot_command(host, clock, probe, 0x0C03, []int{}, 7) ||
+        !bootstrap_buffers(host, clock, probe) ||
+        !boot_command(host, clock, probe, 0x1001, []int{}, 15) { << false }
+    // Standard NimBLE startup mask, expressed as octets, not int64 math.
+    if !boot_command(host, clock, probe, 0x0C01, [0x90,0x80,0,2,0,0x80,0,0x20], 7) { << false }
+    // Authenticated Payload Timeout Expired0x57 lives on event-mask page2.
+    if !boot_command(host,clock,probe,0x0C63,[0,0,0x80,0,0,0,0,0],7) { << false }
+    $le_mask := [0x1F,0,0,0,0,0,0,0]
+    if volatile_load(0x3FFD7168) >= 7 { le_mask[0] = 0x3F }
+    if !boot_command(host, clock, probe, 0x2001, le_mask, 7) ||
+        !boot_command(host, clock, probe, 0x2005, [0x52,0x55,0x58,0x32,0x10,0xC2], 7) ||
+        !boot_command(host, clock, probe, 0x2006, [0xA0,0,0xA0,0,0,1,0,0,0,0,0,0,0,7,0], 7) { << false }
+    // Real implemented HID service, complete local name, general discovery.
+    data := [0x16,0x2,0x1,0x6,0x3,0x3,0x12,0x18,0xe,0x9,0x58,0x55,0x2d,0x50,0x55,0x52,0x45,0x2d,0x48,0x49,0x44,0x31,0x34,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0]
+    << boot_command(host, clock, probe, 0x2008, data, 7)
+}
+
+fn stop_radio() {
+    volatile_store(0x3FFD7174, 0)
+    esp32.irq_rom_set_level(15)
+    esp32.irq_rom_mask(0 - 1)
+    clear_h4_stage()
+    rom_call6(0x4000C44C,0x3FFD7200,0,64,0,0,0)
+    volatile_store(0x3FF7100C, volatile_load(0x3FF7100C) & 0xFFFFFBFF)
+}
+
+fn maybe_queue_f24(host $&bt.PeripheralHost, now int, probe $&HidProbe) {
+    if !host.hid_notifications_enabled(bt.ATT_HANDLE_KEYBOARD_REPORT) { << }
+    if probe.step == 0 {
+        if host.queue_hid_notification(bt.ATT_HANDLE_KEYBOARD_REPORT, bt.hogp_build_keyboard(0,0x73)) {
+            probe.step = 1
+        }
+    } else if probe.step == 2 && now - probe.pressed_at >= 100 {
+        if host.queue_hid_notification(bt.ATT_HANDLE_KEYBOARD_REPORT, bt.hogp_build_keyboard(0,0)) {
+            probe.step = 3
+        }
+    }
+}
+
+fn stack_guard_init() {
+    volatile_store(0x3FFD8000,0x51AC0FFE)
+    volatile_store(0x3FFD8004,0x51AC0FFE)
+    volatile_store(0x3FFD8008,0x51AC0FFE)
+    volatile_store(0x3FFD800C,0x51AC0FFE)
+    volatile_store(0x3FFD8010,0x51AC0FFE)
+    volatile_store(0x3FFD8014,0x51AC0FFE)
+    volatile_store(0x3FFD8018,0x51AC0FFE)
+    volatile_store(0x3FFD801C,0x51AC0FFE)
+    volatile_store(0x3FFD8020,0x51AC0FFE)
+    volatile_store(0x3FFD8024,0x51AC0FFE)
+    volatile_store(0x3FFD8028,0x51AC0FFE)
+    volatile_store(0x3FFD802C,0x51AC0FFE)
+    volatile_store(0x3FFD8030,0x51AC0FFE)
+    volatile_store(0x3FFD8034,0x51AC0FFE)
+    volatile_store(0x3FFD8038,0x51AC0FFE)
+    volatile_store(0x3FFD803C,0x51AC0FFE)
+    volatile_store(0x3FFD8040,0x51AC0FFE)
+    volatile_store(0x3FFD8044,0x51AC0FFE)
+    volatile_store(0x3FFD8048,0x51AC0FFE)
+    volatile_store(0x3FFD804C,0x51AC0FFE)
+    volatile_store(0x3FFD8050,0x51AC0FFE)
+    volatile_store(0x3FFD8054,0x51AC0FFE)
+    volatile_store(0x3FFD8058,0x51AC0FFE)
+    volatile_store(0x3FFD805C,0x51AC0FFE)
+    volatile_store(0x3FFD8060,0x51AC0FFE)
+    volatile_store(0x3FFD8064,0x51AC0FFE)
+    volatile_store(0x3FFD8068,0x51AC0FFE)
+    volatile_store(0x3FFD806C,0x51AC0FFE)
+    volatile_store(0x3FFD8070,0x51AC0FFE)
+    volatile_store(0x3FFD8074,0x51AC0FFE)
+    volatile_store(0x3FFD8078,0x51AC0FFE)
+    volatile_store(0x3FFD807C,0x51AC0FFE)
+    volatile_store(0x3FFD8080,0x51AC0FFE)
+    volatile_store(0x3FFD8084,0x51AC0FFE)
+    volatile_store(0x3FFD8088,0x51AC0FFE)
+    volatile_store(0x3FFD808C,0x51AC0FFE)
+    volatile_store(0x3FFD8090,0x51AC0FFE)
+    volatile_store(0x3FFD8094,0x51AC0FFE)
+    volatile_store(0x3FFD8098,0x51AC0FFE)
+    volatile_store(0x3FFD809C,0x51AC0FFE)
+    volatile_store(0x3FFD80A0,0x51AC0FFE)
+    volatile_store(0x3FFD80A4,0x51AC0FFE)
+    volatile_store(0x3FFD80A8,0x51AC0FFE)
+    volatile_store(0x3FFD80AC,0x51AC0FFE)
+    volatile_store(0x3FFD80B0,0x51AC0FFE)
+    volatile_store(0x3FFD80B4,0x51AC0FFE)
+    volatile_store(0x3FFD80B8,0x51AC0FFE)
+    volatile_store(0x3FFD80BC,0x51AC0FFE)
+    volatile_store(0x3FFD80C0,0x51AC0FFE)
+    volatile_store(0x3FFD80C4,0x51AC0FFE)
+    volatile_store(0x3FFD80C8,0x51AC0FFE)
+    volatile_store(0x3FFD80CC,0x51AC0FFE)
+    volatile_store(0x3FFD80D0,0x51AC0FFE)
+    volatile_store(0x3FFD80D4,0x51AC0FFE)
+    volatile_store(0x3FFD80D8,0x51AC0FFE)
+    volatile_store(0x3FFD80DC,0x51AC0FFE)
+    volatile_store(0x3FFD80E0,0x51AC0FFE)
+    volatile_store(0x3FFD80E4,0x51AC0FFE)
+    volatile_store(0x3FFD80E8,0x51AC0FFE)
+    volatile_store(0x3FFD80EC,0x51AC0FFE)
+    volatile_store(0x3FFD80F0,0x51AC0FFE)
+    volatile_store(0x3FFD80F4,0x51AC0FFE)
+    volatile_store(0x3FFD80F8,0x51AC0FFE)
+    volatile_store(0x3FFD80FC,0x51AC0FFE)
+}
+
+fn stack_guard_ok() bool {
+    if volatile_load(0x3FFD8000) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,0)
+        << false }
+    if volatile_load(0x3FFD8004) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,1)
+        << false }
+    if volatile_load(0x3FFD8008) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,2)
+        << false }
+    if volatile_load(0x3FFD800C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,3)
+        << false }
+    if volatile_load(0x3FFD8010) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,4)
+        << false }
+    if volatile_load(0x3FFD8014) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,5)
+        << false }
+    if volatile_load(0x3FFD8018) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,6)
+        << false }
+    if volatile_load(0x3FFD801C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,7)
+        << false }
+    if volatile_load(0x3FFD8020) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,8)
+        << false }
+    if volatile_load(0x3FFD8024) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,9)
+        << false }
+    if volatile_load(0x3FFD8028) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,10)
+        << false }
+    if volatile_load(0x3FFD802C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,11)
+        << false }
+    if volatile_load(0x3FFD8030) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,12)
+        << false }
+    if volatile_load(0x3FFD8034) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,13)
+        << false }
+    if volatile_load(0x3FFD8038) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,14)
+        << false }
+    if volatile_load(0x3FFD803C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,15)
+        << false }
+    if volatile_load(0x3FFD8040) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,16)
+        << false }
+    if volatile_load(0x3FFD8044) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,17)
+        << false }
+    if volatile_load(0x3FFD8048) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,18)
+        << false }
+    if volatile_load(0x3FFD804C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,19)
+        << false }
+    if volatile_load(0x3FFD8050) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,20)
+        << false }
+    if volatile_load(0x3FFD8054) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,21)
+        << false }
+    if volatile_load(0x3FFD8058) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,22)
+        << false }
+    if volatile_load(0x3FFD805C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,23)
+        << false }
+    if volatile_load(0x3FFD8060) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,24)
+        << false }
+    if volatile_load(0x3FFD8064) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,25)
+        << false }
+    if volatile_load(0x3FFD8068) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,26)
+        << false }
+    if volatile_load(0x3FFD806C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,27)
+        << false }
+    if volatile_load(0x3FFD8070) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,28)
+        << false }
+    if volatile_load(0x3FFD8074) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,29)
+        << false }
+    if volatile_load(0x3FFD8078) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,30)
+        << false }
+    if volatile_load(0x3FFD807C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,31)
+        << false }
+    if volatile_load(0x3FFD8080) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,32)
+        << false }
+    if volatile_load(0x3FFD8084) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,33)
+        << false }
+    if volatile_load(0x3FFD8088) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,34)
+        << false }
+    if volatile_load(0x3FFD808C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,35)
+        << false }
+    if volatile_load(0x3FFD8090) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,36)
+        << false }
+    if volatile_load(0x3FFD8094) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,37)
+        << false }
+    if volatile_load(0x3FFD8098) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,38)
+        << false }
+    if volatile_load(0x3FFD809C) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,39)
+        << false }
+    if volatile_load(0x3FFD80A0) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,40)
+        << false }
+    if volatile_load(0x3FFD80A4) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,41)
+        << false }
+    if volatile_load(0x3FFD80A8) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,42)
+        << false }
+    if volatile_load(0x3FFD80AC) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,43)
+        << false }
+    if volatile_load(0x3FFD80B0) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,44)
+        << false }
+    if volatile_load(0x3FFD80B4) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,45)
+        << false }
+    if volatile_load(0x3FFD80B8) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,46)
+        << false }
+    if volatile_load(0x3FFD80BC) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,47)
+        << false }
+    if volatile_load(0x3FFD80C0) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,48)
+        << false }
+    if volatile_load(0x3FFD80C4) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,49)
+        << false }
+    if volatile_load(0x3FFD80C8) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,50)
+        << false }
+    if volatile_load(0x3FFD80CC) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,51)
+        << false }
+    if volatile_load(0x3FFD80D0) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,52)
+        << false }
+    if volatile_load(0x3FFD80D4) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,53)
+        << false }
+    if volatile_load(0x3FFD80D8) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,54)
+        << false }
+    if volatile_load(0x3FFD80DC) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,55)
+        << false }
+    if volatile_load(0x3FFD80E0) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,56)
+        << false }
+    if volatile_load(0x3FFD80E4) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,57)
+        << false }
+    if volatile_load(0x3FFD80E8) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,58)
+        << false }
+    if volatile_load(0x3FFD80EC) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,59)
+        << false }
+    if volatile_load(0x3FFD80F0) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,60)
+        << false }
+    if volatile_load(0x3FFD80F4) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,61)
+        << false }
+    if volatile_load(0x3FFD80F8) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,62)
+        << false }
+    if volatile_load(0x3FFD80FC) != 0x51AC0FFE { volatile_store(0x3FFD7EF8,63)
+        << false }
+    << true
+}
+
+fn request_f24(host &bt.PeripheralHost, probe $&HidProbe) bool {
+    if (probe.step != 4 && probe.step != 5) || !host.hid_notifications_enabled(bt.ATT_HANDLE_KEYBOARD_REPORT) {
+        esp32.uart_println("[BLE]")
+        << false
+    }
+    probe.step = 0
+    esp32.uart_println("[BLE]")
+    << true
+}
+
+fn select_irq_placement(mode int) bool {
+    old := lock_interrupts()
+    $bb := volatile_load(0x3FFD7E88)
+    $ll := volatile_load(0x3FFD7E8C)
+    if mode > 0 { bb = IRAM_BB_ENTRY }
+    if mode > 1 { ll = IRAM_LL_ENTRY }
+    if bb < 0x40080000 || bb >= 0x40400000 || bb % 4 != 0 ||
+        ll < 0x40080000 || ll >= 0x40400000 || ll % 4 != 0 {
+        restore_interrupts(old)
+        << false
+    }
+    volatile_store(0x3FFE0710,bb)
+    volatile_store(0x3FFE0730,ll)
+    volatile_store(0x3FFD77AC,0)
+    volatile_store(0x3FFD77A4,0)
+    volatile_store(0x3FFD7798,0)
+    ok := volatile_load(0x3FFE0710) == bb && volatile_load(0x3FFE0730) == ll
+    restore_interrupts(old)
+    esp32.uart_print("[BLE]")
+    esp32.uart_print_hex(bb)
+    esp32.uart_print_hex(ll)
+    esp32.uart_print_hex(volatile_load(0x3FF510F8))
+    esp32.uart_println("")
+    << ok
+}
+
+fn install_ll_capture() bool {
+    saved := lock_interrupts()
+    if rom_call6(0x40043F64,0,0,0,0,0,0) != 0x3FFAF7BC ||
+        volatile_load(0x3FFAE70C) != 0x3FFAE710 ||
+        volatile_load(0x3FFAE7F0) != 0x40015894 ||
+        volatile_load(0x3FFAF7BC) != 0x400426F0 ||
+        volatile_load(0x3FFAF7C4) != 0x4004291C ||
+        volatile_load(0x3FFAEFC4) != 0x400476A8 || volatile_load(0x3FFAEFF0) != 0x400483E8 || volatile_load(0x3FFAF07C) != 0x4004B4D4 || volatile_load(0x3FFAEFBC) != 0x40046D50 ||
+        volatile_load(0x3FFAF7C0) != 1 || volatile_load(0x3FFAF7C8) != 1 {
+        restore_interrupts(saved)
+        << false
+    }
+    rom_call6(esp32.ROM_MEMSET,0x3FFD7E40,0,64,0,0,0)
+    rom_call6(esp32.ROM_MEMSET,0x3FFD7ED0,0,36,0,0,0)
+    volatile_store(0x3FFD7ED8,1)
+    rom_call6(esp32.ROM_MEMSET,0x3FFD7D00,0,256,0,0,0)
+    volatile_store(0x3FFAF7BC,0x40094c54)
+    volatile_store(0x3FFAF7C4,0x40094cc8)
+    volatile_store(0x3FFAEFC4,0x40094d38)
+    volatile_store(0x3FFAEFF0,0x40094da8)
+    volatile_store(0x3FFAEFBC,0x400950cc)
+    if volatile_load(0x3FFAF7BC) != 0x40094c54 || volatile_load(0x3FFAF7C4) != 0x40094cc8 ||
+        volatile_load(0x3FFAEFC4) != 0x40094d38 || volatile_load(0x3FFAEFF0) != 0x40094da8 || volatile_load(0x3FFAEFBC) != 0x400950cc {
+        volatile_store(0x3FFAF7BC,0x400426F0)
+        volatile_store(0x3FFAF7C4,0x4004291C)
+        volatile_store(0x3FFAEFC4,0x400476A8)
+        volatile_store(0x3FFAEFF0,0x400483E8)
+        volatile_store(0x3FFAEFBC,0x40046D50)
+        restore_interrupts(saved)
+        << false
+    }
+    restore_interrupts(saved)
+    esp32.uart_println("[BLE]")
+    << true
+}
+
+fn initialize_auth_patch() bool {
+    rom_call6(esp32.ROM_MEMSET,0x3FFD7E00,0,64,0,0,0)
+    if !esp32.llc_auth_rom_install(true) { << false }
+    if !esp32.llc_auth_rom_install(false) { << false }
+    if !esp32.llc_auth_rom_install(true) { << false }
+    << install_ll_capture()
+}
+
+fn inspect_auth_frame(frame &[]int) {
+    if frame.len == 11 && frame[0] == 4 && frame[1] == 0x0E &&
+        frame[4] == 0x7B && frame[5] == 0x0C && frame[6] == 0 {
+        volatile_store(0x3FFD7E34,frame[9] | (frame[10] << 8))
+    }
+    if frame.len == 5 && frame[0] == 4 && frame[1] == 0x57 {
+        volatile_store(0x3FFD7E30,volatile_load(0x3FFD7E30) + 1)
+        esp32.uart_println("[BLE]")
+    }
+}
+
+fn request_other_reports(host $&bt.PeripheralHost, command int) {
+    if !host.connected || !host.encrypted || host.closing { << }
+    if command == 109 && host.hid_notifications_enabled(bt.ATT_HANDLE_MOUSE_REPORT) {
+        if !host.queue_hid_notification(bt.ATT_HANDLE_MOUSE_REPORT,bt.hogp_build_mouse(0,1,0,0)) { << }
+        if !host.queue_hid_notification(bt.ATT_HANDLE_MOUSE_REPORT,bt.hogp_build_mouse(0,-1,0,0)) { << }
+    }
+    if command == 99 && host.hid_notifications_enabled(bt.ATT_HANDLE_CONSUMER_REPORT) {
+        if !host.queue_hid_notification(bt.ATT_HANDLE_CONSUMER_REPORT,bt.hogp_build_consumer(bt.HID_CC_MENU)) { << }
+        if !host.queue_hid_notification(bt.ATT_HANDLE_CONSUMER_REPORT,bt.hogp_build_consumer(0)) { << }
+    }
+}
+
+fn bond_stage_wipe() { rom_call6(esp32.ROM_MEMSET,0x3FFD7D00,0,80,0,0,0) }
+
+fn bond_flash_read(slot int) []int {
+    result := rom_call6(0x40095a28,0,slot,0,0,0,0)
+    if result != 0 { esp32.uart_print("[BOND] read error: ")
+        esp32.uart_print_hex(result)
+        esp32.uart_println("")
+        bond_stage_wipe()
+        << []int{} }
+    $record := bt.hci_zeros(64)
+    for word in 0:16 {
+        rom_call6(esp32.ROM_MEMCPY,0x3FFD7D48,0x3FFD7D00 + word * 4,4,0,0,0)
+        value := volatile_load(0x3FFD7D48)
+        for octet in 0:4 { record[word * 4 + octet] = (value >> (octet * 8)) & 255 }
+    }
+    bond_stage_wipe()
+    << record
+}
+
+fn bond_store_load(host $&bt.PeripheralHost) BondStore {
+    // Scratch was RX diagnostic shadow in HID13; no controller has started.
+    bond_stage_wipe()
+    $store := BondStore{current: bt.hci_zeros(64), slot: -1, generation: 0, error: 0, pending_ms: -1, next_check: 0}
+    $first := bond_flash_read(0)
+    $second := bond_flash_read(1)
+    if first.len != 64 || second.len != 64 { store.error = 1 }
+    else {
+        selection := bt.bond_record_select(&first,&second)
+        if selection == -2 { store.error = 2 }
+        if selection == 0 {
+            if host.restore_bond_snapshot(&first) { for i in 0:64 { store.current[i] = first[i] }
+                store.slot = 0
+                store.generation = bt.bond_record_generation(&store.current) }
+            else { store.error = 3 }
+        }
+        if selection == 1 {
+            if host.restore_bond_snapshot(&second) { for i in 0:64 { store.current[i] = second[i] }
+                store.slot = 1
+                store.generation = bt.bond_record_generation(&store.current) }
+            else { store.error = 3 }
+        }
+    }
+    wipe($&first)
+    wipe($&second)
+    esp32.uart_print("[BOND] boot restored/generation/error: ")
+    if host.bond_available { esp32.uart_print_hex(1) } else { esp32.uart_print_hex(0) }
+    esp32.uart_print_hex(store.generation)
+    esp32.uart_print_hex(store.error)
+    esp32.uart_println("")
+    << store
+}
+
+fn bond_flash_write(slot int, record &[]int) int {
+    if !bt.bond_record_valid(record) { << 20 }
+    bond_stage_wipe()
+    for word in 0:16 {
+        i := word * 4
+        value := record[i] | (record[i + 1] << 8) | (record[i + 2] << 16) | (record[i + 3] << 24)
+        volatile_store(0x3FFD7D48,value)
+        rom_call6(esp32.ROM_MEMCPY,0x3FFD7D00 + i,0x3FFD7D48,4,0,0,0)
+    }
+    result := rom_call6(0x40095a28,2,slot,0,0,0,0)
+    bond_stage_wipe()
+    << result
+}
+
+fn bond_store_save(host &bt.PeripheralHost, store $&BondStore) bool {
+    if host.connected || host.closing || store.error != 0 { << false }
+    if !host.bond_available { << true }
+    next := bt.bond_record_next_generation(store.generation)
+    $record := host.bond_snapshot(next)
+    if !bt.bond_record_valid(&record) { wipe($&record)
+        store.error = 4
+        << false }
+    if bt.bond_record_same_payload(&record,&store.current) { wipe($&record)
+        << true }
+    $target := 0
+    if store.slot == 0 { target = 1 }
+    result := bond_flash_write(target,&record)
+    if result != 0 { store.error = result
+        wipe($&record)
+        << false }
+    $readback := bond_flash_read(target)
+    if !bt.bond_record_valid(&readback) || !bt.bond_record_same_payload(&readback,&record) ||
+        bt.bond_record_generation(&readback) != next {
+        store.error = 5
+        wipe($&record)
+        wipe($&readback)
+        << false
+    }
+    wipe($&store.current)
+    store.current = readback
+    store.slot = target
+    store.generation = next
+    wipe($&record)
+    esp32.uart_print("[BOND] durable generation: ")
+    esp32.uart_print_hex(next)
+    esp32.uart_println("")
+    << true
+}
+
+fn maybe_persist_new_bond(host $&bt.PeripheralHost, store $&BondStore, now int) {
+    if !host.connected || !host.encrypted || host.closing || !host.bond_available || store.error != 0 {
+        store.pending_ms = -1
+        <<
+    }
+    if now < store.next_check { << }
+    store.next_check = now + 500
+    $snapshot := host.bond_snapshot(bt.bond_record_next_generation(store.generation))
+    changed := bt.bond_record_valid(&snapshot) && !bt.bond_record_same_payload(&snapshot,&store.current)
+    wipe($&snapshot)
+    if !changed { store.pending_ms = -1
+        << }
+    if store.pending_ms < 0 { store.pending_ms = now }
+    // Wait for key distribution to leave the controller and the central
+    // to finish its pairing work. Flash is written only after actual disconnect.
+    if now - store.pending_ms < 2000 || host.acl_outstanding != 0 { << }
+    $disconnect := host.request_disconnect(0)
+    wipe($&disconnect)
+}
