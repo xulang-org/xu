@@ -116,12 +116,17 @@ contain actual link/encryption/subscription flags, IP and gateway reply count.
 
 The [pure Xu agent](../mqtt_agent/README.md) sends commands and checks results.
 Supported operations are status, advertising start/stop, disconnect, keyboard,
-mouse, consumer reports and release of tracked held reports. See the
+absolute mouse, consumer reports and release of tracked held reports. See the
 [envelope/report contract](../../../src/embedded/bluetooth/control/README.md).
-Reports require the actual encrypted link and relevant CCCD. `queued` confirms
-board acceptance; external HID reception is a separate check. Advertising HCI
-commands and Wi-Fi transmissions run at the event-loop boundary, after MQTT
-parsing returns, so crypto and BLE event processing do not nest beneath it.
+Mouse reports are absolute `0..32767` little-endian X/Y (five bytes). Scale
+pixels with `hogp_scale_axis` and tap by move/press/release at the same point;
+`release.all` keeps that last point so the phone cursor is not dragged to the
+origin. After flashing this Report Map, forget and re-pair the phone so it
+loads the absolute descriptor. Reports require the actual encrypted link and
+relevant CCCD. `queued` confirms board acceptance; external HID reception is a
+separate check. Advertising HCI commands and Wi-Fi transmissions run at the
+event-loop boundary, after MQTT parsing returns, so crypto and BLE event
+processing do not nest beneath it.
 
 The last sixteen operation IDs and their results stay in RAM across MQTT
 reconnects. Same ID/same JSON bytes returns the cached result; changed bytes
