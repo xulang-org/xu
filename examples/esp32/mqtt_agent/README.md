@@ -13,6 +13,10 @@ bin/xu build examples/esp32/mqtt_agent/main.xu -o build/mqtt_agent
 build/mqtt_agent 127.0.0.1 xu/esp32/cyd '{"id":"status-1","op":"status"}'
 build/mqtt_agent 127.0.0.1 xu/esp32/cyd '{"id":"key-down-1","op":"hid.keyboard","report":[0,0,115,0,0,0,0,0]}'
 build/mqtt_agent 127.0.0.1 xu/esp32/cyd '{"id":"key-up-1","op":"hid.keyboard","report":[0,0,0,0,0,0,0,0]}'
+# Absolute center tap on a phone (buttons, Xle, Xhe, Yle, Yhe); 16383 ~= 32767/2.
+build/mqtt_agent 127.0.0.1 xu/esp32/cyd '{"id":"tap-move-1","op":"hid.mouse","report":[0,255,63,255,63]}'
+build/mqtt_agent 127.0.0.1 xu/esp32/cyd '{"id":"tap-down-1","op":"hid.mouse","report":[1,255,63,255,63]}'
+build/mqtt_agent 127.0.0.1 xu/esp32/cyd '{"id":"tap-up-1","op":"hid.mouse","report":[0,255,63,255,63]}'
 ```
 
 Arguments are `BROKER_IPV4 TOPIC_ROOT JSON_COMMAND [PORT]`, default port 1883.
