@@ -1,8 +1,10 @@
 @embedded/chips/esp32
 
-// Wi-Fi configuration API. A real RX/TX/IP backend is not installed yet.
-// Unsupported operations return failure and never fabricate APs, leases,
-// link state, MAC addresses, or signal measurements. No RF MMIO is touched.
+#embedded/wifi/session
+
+// Wi-Fi device facade. The default hooks report unavailable without MMIO.
+// A hardware owner explicitly installs its backend before init/connect.
+// Only a validated backend lease is exposed as a connected IPv4 station.
 
 // Wi-Fi Operating Modes
 pub const WIFI_MODE_NULL   = 0
@@ -63,7 +65,27 @@ pub struct WifiScanResult {
     pub bssid string
 }
 
+pub struct WifiBackend {
+    pub initialize fn($&session.State) bool
+    pub connect fn($&session.State, &string, &string, int) bool
+    pub service fn($&session.State, int) bool
+    pub disconnect fn($&session.State)
+    pub ping_gateway fn($&session.State, int) bool
+}
+fn wifi_default_initialize(state $&session.State) bool { << false }
+fn wifi_default_connect(state $&session.State, ssid &string, password &string, timeout_ms int) bool { << false }
+fn wifi_default_service(state $&session.State, wait_ms int) bool { << false }
+fn wifi_default_disconnect(state $&session.State) {}
+fn wifi_default_ping(state $&session.State, timeout_ms int) bool { << false }
+pub fn wifi_default_backend() WifiBackend {
+    << WifiBackend{initialize: wifi_default_initialize, connect: wifi_default_connect,
+        service: wifi_default_service, disconnect: wifi_default_disconnect,
+        ping_gateway: wifi_default_ping}
+}
+
 pub struct WifiDevice {
+    pub backend WifiBackend
+    pub session session.State
     pub mode int
     pub status int
     pub ssid string
@@ -87,6 +109,7 @@ pub struct WifiDevice {
 
 pub fn wifi_create() WifiDevice {
     << WifiDevice{
+        backend: wifi_default_backend(), session: session.create(),
         mode: WIFI_MODE_NULL,
         status: WIFI_STATUS_IDLE,
         ssid: "",
@@ -120,9 +143,75 @@ fn wifi_unavailable(dev $&WifiDevice) {
 }
 
 pub fn (dev $&WifiDevice) init() bool {
+    if dev.session.ready { wifi_refresh(dev)
+        << true }
     dev.mode = WIFI_MODE_NULL
-    wifi_unavailable(dev)
-    << false
+    $initialize := dev.backend.initialize
+    if !initialize($&dev.session) { wifi_unavailable(dev)
+        << false }
+    dev.status = WIFI_STATUS_IDLE
+    dev.mac = wifi_mac_text(&dev.session.mac)
+    << true
+}
+
+pub fn (dev $&WifiDevice) install_backend(backend WifiBackend) bool {
+    if dev.session.ready || dev.sta_connected || dev.ap_active { << false }
+    dev.backend = backend
+    << true
+}
+
+fn wifi_mac_text(mac &string) string {
+    if mac.len != 6 { << "" }
+    alphabet := "0123456789abcdef"
+    $out := make_string(17)
+    for i in 0:6 {
+        out[i * 3] = alphabet[mac[i] >> 4]
+        out[i * 3 + 1] = alphabet[mac[i] & 15]
+        if i != 5 { out[i * 3 + 2] = 58 }
+    }
+    << out
+}
+
+fn wifi_refresh(dev $&WifiDevice) {
+    state := &dev.session
+    status := state.status
+    mac := wifi_mac_text(&state.mac)
+    channel := state.channel
+    linked := session.leased(state)
+    $ip := "0.0.0.0"
+    $gateway := "0.0.0.0"
+    $netmask := ""
+    if linked {
+        ip = session.ip_text(&state.client.address)
+        gateway = session.ip_text(&state.client.router)
+        netmask = session.ip_text(&state.client.mask)
+    }
+    // End the context borrow before writing the facade snapshot.
+    dev.status = status
+    dev.mac = mac
+    dev.channel = channel
+    dev.sta_connected = linked
+    dev.ip = ip
+    dev.gateway = gateway
+    if linked { dev.netmask = netmask }
+}
+
+// Call regularly from the application loop; this backend has no OS thread.
+pub fn (dev $&WifiDevice) poll(wait_ms int) bool {
+    if !dev.session.ready { wifi_unavailable(dev)
+        << false }
+    $service := dev.backend.service
+    ok := service($&dev.session,wait_ms)
+    wifi_refresh(dev)
+    << ok && dev.sta_connected
+}
+
+pub fn (dev $&WifiDevice) ping_gateway(timeout_ms int) bool {
+    if !dev.sta_connected { << false }
+    $ping := dev.backend.ping_gateway
+    ok := ping($&dev.session,timeout_ms)
+    wifi_refresh(dev)
+    << ok && dev.sta_connected
 }
 
 pub fn (dev $&WifiDevice) set_mode(mode int) {
@@ -150,6 +239,7 @@ pub fn (dev $&WifiDevice) start_ap(ssid string, password string, channel int) bo
 
 // Start Wi-Fi Access Point (SoftAP) with custom IP configuration
 pub fn (dev $&WifiDevice) start_ap_ip(ssid string, password string, channel int, ap_ip string, gateway string) bool {
+    if dev.session.ready { << false }
     dev.mode = WIFI_MODE_AP
     dev.ssid = ssid
     dev.password = password
@@ -163,20 +253,31 @@ pub fn (dev $&WifiDevice) allocate_client_ip() string { << "" }
 
 // Connect to target Wi-Fi AP (Station mode) with dynamic DHCP or static IP
 pub fn (dev $&WifiDevice) connect(ssid string, password string) bool {
+    << dev.connect_timeout(ssid,password,60000)
+}
+
+pub fn (dev $&WifiDevice) connect_timeout(ssid string, password string, timeout_ms int) bool {
+    if !dev.dhcp_enabled || timeout_ms < 1 || timeout_ms > 300000 || ssid.len < 1 || ssid.len > 32 {
+        if !dev.sta_connected { wifi_unavailable(dev) }
+        << false
+    }
     dev.mode = WIFI_MODE_STA
     dev.ssid = ssid
     dev.password = password
-    wifi_unavailable(dev)
-    << false
-}
-
-// Connect with timeout in milliseconds
-pub fn (dev $&WifiDevice) connect_timeout(ssid string, password string, timeout_ms int) bool {
-    << dev.connect(ssid,password)
+    $connect := dev.backend.connect
+    requested_ssid := session.copy(&dev.ssid)
+    requested_password := session.copy(&dev.password)
+    ok := connect($&dev.session,&requested_ssid,&requested_password,timeout_ms)
+    wifi_refresh(dev)
+    if !ok || !dev.sta_connected { wifi_unavailable(dev)
+        << false }
+    << true
 }
 
 // Disconnect from currently connected Wi-Fi network
 pub fn (dev $&WifiDevice) disconnect() {
+    $stop := dev.backend.disconnect
+    stop($&dev.session)
     dev.status = WIFI_STATUS_DISCONNECTED
     dev.sta_connected = false
     dev.ip = "0.0.0.0"
@@ -187,7 +288,9 @@ pub fn (dev $&WifiDevice) disconnect() {
 // Reconnect to previously saved network
 pub fn (dev $&WifiDevice) reconnect() bool {
     if dev.ssid.len > 0 {
-        << dev.connect(dev.ssid, dev.password)
+        ssid := session.copy(&dev.ssid)
+        password := session.copy(&dev.password)
+        << dev.connect(ssid,password)
     }
     << false
 }
@@ -217,7 +320,10 @@ pub fn (dev &WifiDevice) get_dns() string {
     << dev.dns
 }
 
-// Get current RSSI in dBm
+// No calibrated RSSI is supplied by the fixed-profile backend yet.
+pub fn (dev &WifiDevice) has_rssi() bool { << false }
+
+// Legacy getter; check has_rssi() before interpreting this value.
 pub fn (dev &WifiDevice) get_rssi() int {
     << dev.rssi
 }
@@ -229,7 +335,7 @@ pub fn (dev &WifiDevice) get_ssid() string {
 
 // Scan for available 2.4GHz Wi-Fi networks (returns number of detected networks)
 pub fn (dev $&WifiDevice) scan() int {
-    wifi_unavailable(dev)
+    if !dev.session.ready { wifi_unavailable(dev) }
     << -1
 }
 

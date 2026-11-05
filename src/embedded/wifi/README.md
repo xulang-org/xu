@@ -13,7 +13,9 @@ The separate packages keep optional code out of small firmware images:
 - `#embedded/wifi/ccmp`: software CCMP-128 for three-address Data/QoS Data,
   with MIC verification and explicit six-byte PN/replay-floor handling.
 - `#embedded/wifi/ipv4`: DHCP acquisition, matching ARP replies, and validated
-  ICMP Echo probes over authenticated LLC payloads.
+  ARP/ICMP request responses and Echo probes over authenticated LLC payloads.
+- `#embedded/wifi/session`: one owning device context, replay state and
+  width-independent lease countdown, with no hardware access.
 
 The station owner must check peer addresses and complete DMA frame boundaries,
 retain per-key/per-transmitter/per-TID replay state, consume each transmit PN
@@ -29,9 +31,9 @@ stopped receiver and no native keys. `wifi_rx_layout` separately provides a
 bounded, allocation-free decoder for the supported FCS-stripped DMA profile
 and native CSI layout cases.
 
-These codecs do not initialize PHY, service a persistent receive loop, or
-activate the ESP32 `WifiDevice` scan/connect/AP API; that API continues to
-report unavailable. A private Xu integration probe has exercised actual WPA2,
-DHCP, ARP, and gateway Echo exchanges. A complete public station driver,
-reconnection, DHCP renewal, DNS/TCP, and BLE/Wi-Fi coexistence remain outside
-this package.
+The separate opt-in [`wifi_radio` backend](../chips/esp32/wifi_radio/README.md)
+initializes the measured ESP32 PHY/MAC profile and activates `WifiDevice`
+connection, polling, disconnect, reconnect and gateway probes. Its scope and
+radio/memory ownership requirements are explicit. Default hooks, general scan
+and SoftAP remain unavailable. DHCP renewal, DNS/TCP, address-conflict handling,
+group-key rekey and BLE/Wi-Fi coexistence remain outside this profile.

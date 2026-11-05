@@ -8,7 +8,8 @@ layout := wifi_rx_layout.parse_owned_packet(&raw)
 
 `raw` is the complete byte snapshot of one already-completed owned DMA packet,
 including the RX control header, optional CSI, packet vector, MPDU, and word
-padding. Its length must equal the descriptor's completed length. The caller
+padding. Its length must equal the sum of the completed descriptor lengths through
+the packet's EOF descriptor. The caller
 checks descriptor ownership/completion, buffer capacity/identity, and sentinels
 before constructing the snapshot. The helper does no MMIO, imports no driver,
 and allocates no packet storage or copied strings.
@@ -29,8 +30,11 @@ raw.len = round_up_4(frame_offset + frame_length)
 ```
 
 All bytes between the unpadded end and `raw.len` must be zero. Snapshots shorter
-than 28 bytes or longer than 1600 bytes are rejected. Other RX DMA profiles,
-multiple descriptors, A-MPDU deaggregation, and hardware-stripped crypto
+than 28 bytes or longer than 2652 bytes are rejected; the MPDU is separately
+bounded to 1600 bytes. The larger snapshot limit accounts for 28 metadata bytes
+and up to 1024 aligned CSI bytes before the MPDU. A packet may span multiple
+DMA buffers; the caller must copy the complete chain before recycling any
+buffer. Other RX DMA profiles, A-MPDU deaggregation and hardware-stripped crypto
 trailers need their own contracts and are unsupported here.
 
 The first 24 bytes are RX control metadata. CSI's reported length is bits 8..17
