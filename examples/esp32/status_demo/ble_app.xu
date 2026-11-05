@@ -4,6 +4,8 @@
 #embedded/bluetooth as bt
 #embedded/chips/esp32/wifi_radio
 #embedded/display
+#embedded/wifi/tcp
+#embedded/mqtt
 
 fn ble_display(ui $&Dashboard, host &bt.PeripheralHost, advertising bool) {
     if host.connected {
@@ -15,7 +17,7 @@ fn ble_display(ui $&Dashboard, host &bt.PeripheralHost, advertising bool) {
         else if host.encrypted { ui_ble(ui,3,"ENC ON / KEY EXCHANGE") }
         else { ui_ble(ui,3,"ENC OFF / PAIRING") }
     } else if advertising { ui_ble(ui,2,"等待连接") }
-    else { ui_ble(ui,1,"准备中") }
+    else { ui_ble(ui,0,"ADV OFF") }
 }
 
 
@@ -59,6 +61,7 @@ fn coex_health(device &esp32.WifiDevice, host &bt.PeripheralHost) {
     if host.encrypted { esp32.uart_print_hex(1) } else { esp32.uart_print_hex(0) }
     if host.hid_notifications_enabled(bt.ATT_HANDLE_KEYBOARD_REPORT) { esp32.uart_print_hex(1) } else { esp32.uart_print_hex(0) }
     esp32.uart_print_hex(wifi_radio.gateway_replies(&device.session))
+    esp32.uart_print_hex(stack_unmodified_bytes())
     esp32.uart_println("")
 }
 fn coex_guard_ok() bool {
@@ -84,8 +87,15 @@ fn coex_save_bond(host &bt.PeripheralHost, bonds $&BondStore) bool {
     esp32.irq_rom_set_level(level)
     << ok
 }
-fn report_coex_fault() {
+fn report_coex_fault(host &bt.PeripheralHost, clock &CycleClock) {
+    $flags := 0
+    if !stack_guard_ok() { flags = flags | 1 }
+    if !coex_guard_ok() { flags = flags | 2 }
+    if clock.failed { flags = flags | 4 }
+    if !host.ready { flags = flags | 8 }
     esp32.uart_print("[FAIL] coex controller ")
+    esp32.uart_print_hex(flags)
+    esp32.uart_print_hex(volatile_load(0x3FFD7EF8))
     esp32.uart_print_hex(volatile_load(0x3FFD7160))
     esp32.uart_print_hex(esp32.bt_irq_rom_recovery_error())
     esp32.uart_print_hex(esp32.bt_irq_rom_bb_error())
@@ -108,7 +118,18 @@ fn coex_paint#T(device &esp32.WifiDevice, host &bt.PeripheralHost, probe &HidPro
         *painted = true
         esp32.uart_println("[READY] Xu LCD coexistence status") }
 }
-fn coex_loop#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&BondStore, clock $&CycleClock, probe $&HidProbe, ui $&Dashboard, surface $&display.Surface#T) {
+fn coex_update_advertising(host $&bt.PeripheralHost, clock $&CycleClock, probe $&HidProbe, mq $&MqttDemo, advertising $&bool) bool {
+    if !mq.change_advertising || host.command_credits < 1 { << true }
+    if host.connected && mq.allow_advertising { mq.change_advertising = false
+        << true }
+    $args := []int{}
+    if mq.allow_advertising { args.push(1) } else { args.push(0) }
+    if !boot_command(host,clock,probe,0x200A,args,7) { << false }
+    *advertising = mq.allow_advertising
+    mq.change_advertising = false
+    << true
+}
+fn coex_loop#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&BondStore, clock $&CycleClock, probe $&HidProbe, mq $&MqttDemo, socket $&tcp.Client, client $&mqtt.Client, ui $&Dashboard, surface $&display.Surface#T) {
     $touch := touch_state_create()
     $advertising := true
     $painted := false
@@ -123,7 +144,7 @@ fn coex_loop#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&Bond
         if !stack_guard_ok() || !coex_guard_ok() || clock.failed || !host.ready ||
             volatile_load(0x3FFD7160) != 0 || esp32.bt_irq_rom_recovery_error() != 0 ||
             esp32.bt_irq_rom_bb_error() != 0 || esp32.phy_tracking_error() != 0 || esp32.llc_auth_rom_error() != 0 {
-            report_coex_fault()
+            report_coex_fault(host,clock)
             << }
         for packet in 0:32 {
             $incoming := take_controller_frame()
@@ -149,6 +170,16 @@ fn coex_loop#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&Bond
             esp32.uart_println("[FAIL] coex H4")
             << }
         wifi_ok := device.poll(0)
+        mqtt_demo_tick(device,host,mq,advertising,socket,client,now)
+        // Link transmission happens after MQTT parsing returns: CCMP and
+        // controller event processing do not nest under command dispatch.
+        if mq.want_arp { mq.want_arp = false
+            if !wifi_radio.resolve_tcp($&device.session) { mqtt_reset(mq,now) } }
+        if mq.output.len > 0 {
+            if !wifi_radio.send_tcp($&device.session,&mq.output) { mqtt_reset(mq,now) }
+            mq.output = ""
+        }
+        if !coex_update_advertising(host,clock,probe,mq,$&advertising) { << }
         if now - last_probe >= 2000 && device.is_connected() {
             last_probe = now
             if !wifi_radio.probe_gateway($&device.session) {
@@ -170,15 +201,24 @@ fn coex_loop#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&Bond
             if !coex_save_bond(host,bonds) {
                 esp32.uart_println("[FAIL] coex bond save")
                 << }
-            if !boot_command(host,clock,probe,0x200A,[1],7) { << }
+            if mq.allow_advertising {
+                if !boot_command(host,clock,probe,0x200A,[1],7) { << }
+                advertising = true
+            }
             host.needs_advertising = false
-            advertising = true
         }
         coex_paint(device,host,probe,advertising,wifi_ok,$&painted,ui,surface)
         if now - last_health >= 5000 { last_health = now
             coex_health(device,host) }
         esp32.rom_delay_us(1000)
     }
+}
+// Keep owning protocol cleanup on one return path, outside the radio loop.
+fn coex_start#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&BondStore, clock $&CycleClock, probe $&HidProbe, ui $&Dashboard, surface $&display.Surface#T) {
+    $mq := mqtt_demo_create()
+    $socket := tcp.Client{retransmits: 0}
+    $client := mqtt.Client{error: 0,received: 0,published: 0,retransmits: 0}
+    coex_loop(device,host,bonds,clock,probe,$&mq,$&socket,$&client,ui,surface)
 }
 fn run_device#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&BondStore, ui $&Dashboard, surface $&display.Surface#T) {
     if !wifi_boot(device,ui,surface) { ui_wifi(ui,4,"--")
@@ -197,7 +237,7 @@ fn run_device#T(device $&esp32.WifiDevice, host $&bt.PeripheralHost, bonds $&Bon
         stop_radio()
         ui_flush(ui,surface)
         << }
-    coex_loop(device,host,bonds,$&clock,$&probe,ui,surface)
+    coex_start(device,host,bonds,$&clock,$&probe,ui,surface)
     device.disconnect()
     stop_radio()
     ui_wifi(ui,4,"--")
