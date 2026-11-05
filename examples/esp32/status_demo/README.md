@@ -19,10 +19,17 @@ SDK: scanning/retuning happens before BLE starts. Wi-Fi reconnection while
 BLE remains connected and dynamic software priority policies are not
 implemented. Changing networks requires a joint restart.
 
+## Development acceptance
+
+The coexistence application is experimental. External full-MTU ICMP reply
+acceptance remains pending after a host LAN `EHOSTUNREACH`. Successful gateway
+probes do not replace that end-to-end check. DHCP renewal/rebinding, Group
+Rekey, DNS/TCP, SoftAP and WPA3/PMF are not implemented.
+
 ## Build and flash
 
 Use the current Xu compiler and standard library from the same checkout.
-This demo needs the 32-bit string-equality fix in 0.11.4-dev.2 or a matching
+This demo needs the 32-bit string-equality fix in 0.11.4-dev.5 or a matching
 newer SDK/compiler; the builder rejects a version mismatch.
 The builder also needs Python 3 and `xtensa-esp32-elf-nm`, found through
 `XTENSA_NM`, `PATH`, or the local Espressif tools directory. Binutils only
