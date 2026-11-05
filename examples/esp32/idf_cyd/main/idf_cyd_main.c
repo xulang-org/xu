@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -7,9 +8,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "hid_abs.h"
-#include "mqtt_bridge.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
+#include "status_lcd.h"
+#include "xu_host.h"
 
 static const char *TAG = "idf_cyd";
 static EventGroupHandle_t s_wifi;
@@ -21,11 +23,15 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "Wi-Fi disconnected; retry");
+        status_lcd_set_wifi(STATUS_WIFI_CONNECTING, NULL);
         xEventGroupClearBits(s_wifi, WIFI_OK);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = data;
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&event->ip_info.ip));
+        char ip[16];
+        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
+        status_lcd_set_wifi(STATUS_WIFI_UP, ip);
         xEventGroupSetBits(s_wifi, WIFI_OK);
     }
 }
@@ -62,20 +68,24 @@ void app_main(void) {
     }
 
     ESP_LOGI(TAG, "Xu IDF CYD — official BT/Wi-Fi static libs");
+    if (!xu_host_init()) {
+        ESP_LOGE(TAG, "Xu runtime init failed");
+        return;
+    }
+    if (!status_lcd_start()) {
+        ESP_LOGW(TAG, "status screen unavailable; continuing headless");
+    }
+    if (!xu_host_start()) {
+        ESP_LOGE(TAG, "Xu app start failed");
+        return;
+    }
     if (!wifi_start()) {
         ESP_LOGE(TAG, "Wi-Fi failed");
+        status_lcd_set_wifi(STATUS_WIFI_FAILED, NULL);
         return;
     }
     if (!hid_abs_start(CONFIG_XU_HID_NAME)) {
         ESP_LOGE(TAG, "HID start failed");
-        return;
-    }
-    mqtt_bridge_cfg_t mqtt = {
-        .broker_uri = CONFIG_XU_MQTT_URI,
-        .topic_root = CONFIG_XU_MQTT_ROOT,
-    };
-    if (!mqtt_bridge_start(&mqtt)) {
-        ESP_LOGE(TAG, "MQTT start failed");
         return;
     }
     ESP_LOGI(TAG, "ready: MQTT root %s HID %s", CONFIG_XU_MQTT_ROOT, CONFIG_XU_HID_NAME);

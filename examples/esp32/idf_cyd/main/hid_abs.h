@@ -15,6 +15,10 @@ bool hid_abs_mouse_subscribed(void);
 bool hid_abs_keyboard_subscribed(void);
 bool hid_abs_consumer_subscribed(void);
 
+bool hid_abs_advertising(void);
+bool hid_abs_paired(void);
+void hid_abs_last_mouse(uint16_t *x, uint16_t *y, bool *down);
+
 bool hid_abs_set_advertising(bool enable);
 bool hid_abs_disconnect(void);
 

@@ -7,8 +7,25 @@ coexist/PHY as pulled by the IDF build). The pure-Xu coexistence demo under
 
 This port keeps the MQTT command envelope and **absolute** mouse reports
 (`0..32767`) used by the Xu host agent, so taps do not accumulate relative
-offset. The first delivery is UART/headless (no CYD LCD glyph tables) to keep
-the application image under the **1.5 MiB** soft size gate.
+offset. The CYD LCD shows the `status_demo` dashboard: Xu draws it with
+`status_demo/ui.xu` over `#embedded/display`, and C only pushes the pixels
+through ESP-IDF `esp_lcd`.
+
+## Xu application, C host
+
+The MQTT client and command handling are Xu: `xu/app.xu` uses
+`#embedded/mqtt` and `#embedded/bluetooth/control`. The build compiles it with
+the repository's `bin/xu` (`make bin/xu` first) into an Xtensa relocatable
+object (`--target xtensa-esp32-none --emit-obj -o xu_app.o`) that links into
+the `main` component. CMake stages `xu/*.xu` (app, screen backend, compact
+font) together with `status_demo/ui.xu` and compiles them as one program.
+
+C keeps what the official libraries own: Wi-Fi, BLE HID (`hid_abs.c`), the
+LCD panel driver (`status_lcd.c`: init, rectangle fill, one-row pixel span)
+and FreeRTOS. `main/xu_host.c` exposes them to Xu as `c_call6("xu_host_*",
+...)` services (TCP bytes, HID state/reports, Wi-Fi state, logging, LCD
+fill/span), allocates the 64 KiB Xu heap before Wi-Fi/BT start, and runs the
+Xu loop in its own task (started before Wi-Fi so the screen comes up first).
 
 ## Pin and install
 
@@ -59,8 +76,10 @@ Report Map.
 
 ## Size gate
 
-`scripts/build.sh` fails when the application `.bin` exceeds 1572864 bytes
-(1.5 MiB) unless `--size-limit` overrides. The pure-Xu coexistence image that
+`scripts/build.sh` fails when the application `.bin` exceeds 2097152 bytes
+(2 MiB) unless `--size-limit` overrides. `partitions.csv` gives the factory app
+3 MiB of the 4 MiB flash: the C-only build fit the stock 1.5 MiB table, the Xu
+MQTT app plus dashboard (~340 KiB of Xu code) does not.
 rewrote the controller in Xu source was ~3.13 MiB and is not the size target.
 
 ## Host checks without IDF
@@ -71,6 +90,13 @@ python3 scripts/test_idf_cyd_control.py
 
 ## Limits
 
-- LAN anonymous MQTT, no TLS/DNS.
-- Headless first delivery (LCD/touch follow-up can use IDF display drivers).
+- LAN anonymous MQTT, no TLS/DNS. The broker address is fixed at build time;
+  rebuild if the broker host's LAN address changes.
+- Xu talks to C one word at a time through `c_call6` (six int arguments, int
+  result); bytes cross the boundary individually.
+- Status screen is read-only; touch input is not wired yet. It can only draw
+  the CJK glyphs in `status_demo/font.xu`; after changing that font, run
+  `python3 scripts/gen_status_font.py` to regenerate the compact `xu/font.xu`.
+- The first full dashboard frame takes ~3 s (each 16-pixel span crosses
+  `c_call6` five pixels at a time); later updates redraw only changed fields.
 - Classic ESP32 only in this pin; S3/C3 are out of scope here.

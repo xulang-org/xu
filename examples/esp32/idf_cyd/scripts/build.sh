@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$ROOT/../../.." && pwd)"
 PIN="$(tr -d '[:space:]' < "$ROOT/IDF_VERSION")"
-SIZE_LIMIT="${XU_IDF_CYD_SIZE_LIMIT:-1572864}" # 1.5 MiB soft gate
+SIZE_LIMIT="${XU_IDF_CYD_SIZE_LIMIT:-2097152}" # 2 MiB soft gate (3 MiB factory partition)
 
 SSID=""
 PASS=""

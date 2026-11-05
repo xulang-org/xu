@@ -19,7 +19,7 @@ strings, non-ASCII names, malformed JSON and input over 512 bytes are rejected.
 | `advertising.start`, `advertising.stop` | absent or empty |
 | `disconnect`, `release.all` | absent or empty |
 | `hid.keyboard` | eight bytes: modifiers, zero reserved byte, six usages 0..115 |
-| `hid.mouse` | four bytes: buttons 0..7, X, Y, wheel; signed axes encoded as bytes, 128 rejected |
+| `hid.mouse` | four bytes: buttons 0..7, X, Y, wheel; signed axes encoded as bytes, 128 rejected; or five bytes: buttons 0..7, little-endian absolute X, Y in 0..32767 (IDF CYD firmware) |
 | `hid.consumer` | one bitmap byte 0..31, matching the HOGP descriptor |
 
 The application still checks actual encryption, CCCD subscription, controller
