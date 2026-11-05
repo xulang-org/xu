@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.4-dev.3 (development)
+
+Integrates safe framed ARM64 sibling tail calls with the scalar accumulator, checked-arithmetic register allocation, readonly byte-scan, string SIMD and CRC-loop optimizations. Restore saved registers and the current frame before an eligible in-unit integer/bool sibling jump; retain ordinary calls for frame addresses, owners, references, instrumentation, debug modes and coroutine stack checks. Both optimization groups are validated together. This is a development build; upgrade the compiler, standard library and tools together. Desktop is `1.3.54` and setup is `1.2.45`.
+
 ## Xu 0.11.4-dev.2 (development)
 
 - Compiler: keep checked integer loops in registers across reserved arithmetic traps, and admit bounded, call-free byte scans of shared string parameters to ARM64 register allocation.
@@ -13,6 +17,10 @@
 - Strings: specialize empty and one-byte `contains`, use a borrowed prefix scan, and expose byte replacement invariants to the checked SIMD emitter. Preserve byte values, independent result ownership and scalar tails.
 
 This is a development build. Performance measurements apply to their recorded workload, compiler and host; no general speedup or timing parity across targets is claimed. Upgrade the compiler, standard library and tools together. Desktop is `1.3.53` and setup is `1.2.44`.
+
+## Xu 0.11.4-dev.1 (development)
+
+ARM64 code generation can restore a caller's stack frame and saved registers before jumping to an eligible sibling function. This allows integer/bool mutual tail recursion to run with bounded stack usage even when parameters occupy frame slots. Admission is limited to in-unit direct calls with at most six register arguments and a matching scalar return; functions with non-scalar locals or temps, address formation, or drop operations retain ordinary calls. Debug, coverage, test, unoptimized, and coroutine-stack-check builds retain the existing framed call path. Other architectures and self calls keep their existing behavior.
 
 ## Xu 0.11.3
 
