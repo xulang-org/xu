@@ -22,6 +22,8 @@ implemented. Changing networks requires a joint restart.
 ## Build and flash
 
 Use the current Xu compiler and standard library from the same checkout.
+This demo needs the 32-bit string-equality fix in 0.11.4-dev.2 or a matching
+newer SDK/compiler; the builder rejects a version mismatch.
 The builder also needs Python 3 and `xtensa-esp32-elf-nm`, found through
 `XTENSA_NM`, `PATH`, or the local Espressif tools directory. Binutils only
 reads symbol addresses; it does not compile or link firmware.
@@ -36,7 +38,7 @@ From the Xu repository root:
 ```sh
 python3 examples/esp32/status_demo/build_demo.py \
   --xu-root . --network-config /absolute/private/network.json \
-  --out build/esp32-status
+  --mqtt-broker BROKER_LAN_IPV4 --out build/esp32-status
 python3 -m esptool --chip esp32 --port /dev/cu.usbserial-2110 \
   --baud 460800 write_flash 0x10000 build/esp32-status/wireless_status.bin
 ```
@@ -94,6 +96,47 @@ this brief pause.
 Do not erase those sectors or reuse them for another partition. Just Works
 does not provide MITM protection or LE Secure Connections. Flash records
 contain plaintext keys and must remain private.
+
+## MQTT control
+
+The demo connects to a local MQTT 3.1.1 broker over its real Wi-Fi lease.
+Select the broker's LAN IPv4 address with `--mqtt-broker` and optionally
+`--mqtt-port` (1883). Omitting the address leaves MQTT disabled. The board
+subscribes to `xu/esp32/cyd/cmd`, publishes correlated results on
+`xu/esp32/cyd/result` and retains status on `xu/esp32/cyd/status`. Last-will
+payload `0` means the MQTT connection went offline. Periodic online snapshots
+contain actual link/encryption/subscription flags, IP and gateway reply count.
+
+The [pure Xu agent](../mqtt_agent/README.md) sends commands and checks results.
+Supported operations are status, advertising start/stop, disconnect, keyboard,
+mouse, consumer reports and release of tracked held reports. See the
+[envelope/report contract](../../../src/embedded/bluetooth/control/README.md).
+Reports require the actual encrypted link and relevant CCCD. `queued` confirms
+board acceptance; external HID reception is a separate check. Advertising HCI
+commands and Wi-Fi transmissions run at the event-loop boundary, after MQTT
+parsing returns, so crypto and BLE event processing do not nest beneath it.
+
+The last sixteen operation IDs and their results stay in RAM across MQTT
+reconnects. Same ID/same JSON bytes returns the cached result; changed bytes
+returns `id_conflict`. Firmware reset clears this cache. A one-second software
+deadline releases tracked held keys/buttons/media controls; transport loss
+also requests release. Commands delivered as retained subscription snapshots
+are rejected. Live forwarding by a broker clears RETAIN, so the publisher
+must always use non-retained command publications.
+
+The profile uses one CYD identity, a local unauthenticated test broker, clean
+sessions and QoS1. MQTT reconnect does not reset BLE or Wi-Fi keys. It does
+not add Wi-Fi roaming/reconnection while BLE is live. Fixed text is decoded
+from generated Xu instruction constants to preserve the existing 64 KiB heap;
+original source stays readable. Generated sources remain in the private build
+output. The builder still enforces radio memory bounds and the existing 3 MiB
+application partition; bond sectors are unchanged.
+
+Stack margin is limited in this bring-up profile. Enumerated synchronous call
+chains reach about 27 KiB of the 32 KiB stack, and hardware tests have observed
+less than 2 KiB of untouched stack memory. The guard and written-memory
+watermark are diagnostics, not a worst-case bound including nested interrupts.
+Further stack reduction and interrupt-budget validation remain necessary.
 
 ## Wiring
 

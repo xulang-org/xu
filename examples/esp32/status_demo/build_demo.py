@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Build the real Xu LCD wireless demo. Credentials are private build input."""
 from pathlib import Path
-import argparse,json,shutil,subprocess,os,struct,re
+import argparse,json,shutil,subprocess,os,struct,re,ipaddress
+from flash_text import compact_text
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--xu-root',type=Path,required=True)
     ap.add_argument('--network-config',type=Path);ap.add_argument('--out',type=Path,required=True)
+    ap.add_argument('--mqtt-broker',help='IPv4 address of the MQTT 3.1.1 broker')
+    ap.add_argument('--mqtt-port',type=int,default=1883)
     a=ap.parse_args();root=a.xu_root.resolve();out=a.out.resolve();out.mkdir(parents=True,exist_ok=True);out.chmod(0o700)
     demo=Path(__file__).resolve().parent
     env=dict(os.environ,XU_ROOT=str(root),XU_STDLIB_ROOT=str(root/'src'),XUPATH='')
+    if not 1 <= a.mqtt_port <= 65535:ap.error('invalid MQTT port')
+    version=(root/'VERSION').read_text().strip()
+    banner=subprocess.check_output([str(root/'bin/xu'),'--version'],env=env,text=True)
+    if not re.search(r'v'+re.escape(version)+r'(?![0-9A-Za-z.-])',banner):
+        raise RuntimeError('compiler/SDK version mismatch; rebuild bin/xu before building this demo')
     # This IRAM closure contains scalar IRQ/flash workers. It imports neither
     # the IROM Wi-Fi facade nor the heap-owning SMP AES adapter.
     std=out/'iram-stdlib';std.mkdir(exist_ok=True)
@@ -50,10 +58,17 @@ def main():
         for key in ['ssid','password']:
             if not isinstance(n.get(key),str):raise RuntimeError('network config requires ssid/password strings')
             app=app.replace('fn configured_'+key+'() string { << "" }','fn configured_'+key+'() string { << '+json.dumps(n[key],ensure_ascii=False)+' }')
+    if a.mqtt_broker:
+        address=ipaddress.IPv4Address(a.mqtt_broker)
+        if address.is_multicast or address.is_unspecified or address.is_loopback:ap.error('MQTT broker must be a unicast LAN/routed address')
+        body='$ip := make_string(4)\n'+'\n'.join(f'    ip[{i}] = {v}' for i,v in enumerate(address.packed))+'\n    << ip'
+        app=app.replace('fn configured_mqtt_ip() string { << "" }','fn configured_mqtt_ip() string { '+body+' }')
+        app=app.replace('fn configured_mqtt_port() int { << 1883 }',f'fn configured_mqtt_port() int {{ << {a.mqtt_port} }}')
     (out/'main_private.xu').write_text(app);(out/'main_private.xu').chmod(0o600)
-    names=['st7789','font','touch','ui','controls','diagnostics','ble_app']
+    names=['st7789','font','touch','ui','controls','diagnostics','mqtt_app','ble_app']
     for name in names:shutil.copyfile(demo/(name+'.xu'),out/(name+'.xu'))
     sources=[out/'main_private.xu',out/'ble_transport.xu']+[out/(n+'.xu') for n in names]
+    sources.append(compact_text([out/'mqtt_app.xu',out/'ble_app.xu'],'main',out/'fixed_text.xu'))
     elf=out/'wireless_status.elf';image=out/'wireless_status.bin'
     subprocess.run([str(root/'bin/xu'),'build',*[str(p) for p in sources],'--target','xtensa-esp32-none','-o',str(elf)],env=env,check=True)
     subprocess.run(['python3',str(root/'scripts/esp32_image.py'),'pack-multi',str(image),str(elf),str(code),'--radio'],check=True)
