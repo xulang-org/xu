@@ -69,7 +69,7 @@ def check_app_object() -> None:
         data = obj.read_bytes()
     assert data[:4] == b"\x7fELF" and data[4] == 1, "ELF32 object expected"
     assert int.from_bytes(data[18:20], "little") == 94, "EM_XTENSA expected"
-    for sym in (b"xu_rt_init", b"_rom_cb_xu_main_xu_app_main", b"xu_host_hid_mouse", b"xu_host_lcd_span"):
+    for sym in (b"xu_rt_init", b"_rom_cb_xu_main_xu_app_main", b"xu_host_hid_mouse", b"xu_host_lcd_write", b"xu_host_tcp_send"):
         assert sym in data, f"{sym.decode()} missing from xu_app.o"
 
 

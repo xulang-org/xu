@@ -42,11 +42,38 @@ static bool on_flush_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_d
     return woken == pdTRUE;
 }
 
-static bool flush(int x, int y, int w, int h) {
-    if (esp_lcd_panel_draw_bitmap(s_panel, x, y, x + w, y + h, s_buf) != ESP_OK) {
+/* Pending rectangle of coalesced spans in s_buf: origin, row width (0 while
+ * the first row is still growing), completed rows and the current row's
+ * column. Spans that continue the row, or start the next row at the same x,
+ * join it; anything else flushes first. */
+static bool s_open;
+static int s_px, s_py, s_pw, s_prows, s_pcol;
+
+static bool flush_at(int x, int y, int w, int h, const uint16_t *buf) {
+    if (esp_lcd_panel_draw_bitmap(s_panel, x, y, x + w, y + h, buf) != ESP_OK) {
         return false;
     }
     xSemaphoreTake(s_flush_done, portMAX_DELAY);
+    return true;
+}
+
+static bool flush(int x, int y, int w, int h) {
+    return flush_at(x, y, w, h, s_buf);
+}
+
+bool status_lcd_flush(void) {
+    if (!s_open) {
+        return true;
+    }
+    s_open = false;
+    int w = s_pw ? s_pw : s_pcol;
+    int rows = s_prows + (s_pcol == w ? 1 : 0);
+    if (rows > 0 && !flush(s_px, s_py, w, rows)) {
+        return false;
+    }
+    if (s_pcol > 0 && s_pcol < w) {
+        return flush_at(s_px, s_py + s_prows, s_pcol, 1, s_buf + s_prows * w);
+    }
     return true;
 }
 
@@ -56,6 +83,9 @@ static bool in_bounds(int x, int y, int w, int h) {
 
 bool status_lcd_fill(int x, int y, int w, int h, uint16_t color) {
     if (!in_bounds(x, y, w, h)) {
+        return false;
+    }
+    if (!status_lcd_flush()) {
         return false;
     }
     uint16_t wire = __builtin_bswap16(color);
@@ -77,10 +107,37 @@ bool status_lcd_span(int x, int y, const uint16_t *pixels, int count) {
     if (!in_bounds(x, y, count, 1)) {
         return false;
     }
-    for (int i = 0; i < count; i++) {
-        s_buf[i] = __builtin_bswap16(pixels[i]);
+    bool next_row = s_open && x == s_px && y == s_py + s_prows + 1 && s_pcol > 0 &&
+                    (s_pw == 0 || s_pcol == s_pw);
+    bool same_row = s_open && x == s_px + s_pcol && y == s_py + s_prows &&
+                    (s_pw == 0 || s_pcol + count <= s_pw);
+    if (next_row) {
+        int w = s_pw ? s_pw : s_pcol;
+        if ((s_prows + 2) * w > STATUS_LCD_W * BAND_H) {
+            next_row = false;
+        } else {
+            s_pw = w;
+            s_prows++;
+            s_pcol = 0;
+        }
     }
-    return flush(x, y, count, 1);
+    if (!next_row && !same_row) {
+        if (!status_lcd_flush()) {
+            return false;
+        }
+        s_open = true;
+        s_px = x;
+        s_py = y;
+        s_pw = 0;
+        s_prows = 0;
+        s_pcol = 0;
+    }
+    uint16_t *dst = s_buf + s_prows * (s_pw ? s_pw : 0) + s_pcol;
+    for (int i = 0; i < count; i++) {
+        dst[i] = __builtin_bswap16(pixels[i]);
+    }
+    s_pcol += count;
+    return true;
 }
 
 bool status_lcd_start(void) {

@@ -21,11 +21,17 @@ the `main` component. CMake stages `xu/*.xu` (app, screen backend, compact
 font) together with `status_demo/ui.xu` and compiles them as one program.
 
 C keeps what the official libraries own: Wi-Fi, BLE HID (`hid_abs.c`), the
-LCD panel driver (`status_lcd.c`: init, rectangle fill, one-row pixel span)
-and FreeRTOS. `main/xu_host.c` exposes them to Xu as `c_call6("xu_host_*",
-...)` services (TCP bytes, HID state/reports, Wi-Fi state, logging, LCD
-fill/span), allocates the 64 KiB Xu heap before Wi-Fi/BT start, and runs the
-Xu loop in its own task (started before Wi-Fi so the screen comes up first).
+LCD panel driver (`status_lcd.c`: init, rectangle fill, pixel spans coalesced
+into one SPI transfer per rectangle) and FreeRTOS. `main/xu_host.c` exposes
+them to Xu as `c_call6("xu_host_*", ...)` services (TCP send/receive, HID
+state/reports, Wi-Fi state, logging, LCD fill/write/flush), allocates the
+64 KiB Xu heap before Wi-Fi/BT start, and runs the Xu loop in its own task
+(started before Wi-Fi so the screen comes up first).
+
+`c_call6` arguments are int words or borrowed buffers: `&s` / `$&s` for a
+string passes its byte pointer, `&a` for a `[]int` passes a pointer to 8-byte
+little-endian elements. Pass the length as a separate word (read it before
+the borrow); the pointer is valid only for the duration of the call.
 
 ## Pin and install
 
@@ -92,11 +98,9 @@ python3 scripts/test_idf_cyd_control.py
 
 - LAN anonymous MQTT, no TLS/DNS. The broker address is fixed at build time;
   rebuild if the broker host's LAN address changes.
-- Xu talks to C one word at a time through `c_call6` (six int arguments, int
-  result); bytes cross the boundary individually.
 - Status screen is read-only; touch input is not wired yet. It can only draw
   the CJK glyphs in `status_demo/font.xu`; after changing that font, run
   `python3 scripts/gen_status_font.py` to regenerate the compact `xu/font.xu`.
-- The first full dashboard frame takes ~3 s (each 16-pixel span crosses
-  `c_call6` five pixels at a time); later updates redraw only changed fields.
+- The first full dashboard frame takes ~0.8 s, mostly Xu glyph rasterization;
+  later updates redraw only changed fields.
 - Classic ESP32 only in this pin; S3/C3 are out of scope here.
