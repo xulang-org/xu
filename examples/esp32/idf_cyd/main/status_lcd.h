@@ -21,7 +21,9 @@ typedef enum {
  * (status_demo ui.xu over #embedded/display) through these primitives. */
 bool status_lcd_start(void);
 bool status_lcd_fill(int x, int y, int w, int h, uint16_t rgb565);
+/* Spans are coalesced into rectangles; call status_lcd_flush to show them. */
 bool status_lcd_span(int x, int y, const uint16_t *rgb565, int count);
+bool status_lcd_flush(void);
 
 void status_lcd_set_wifi(status_wifi_t state, const char *ip);
 status_wifi_t status_lcd_wifi(char *ip, size_t cap);

@@ -20,7 +20,9 @@
 
 /*
  * Host services for the Xu application object (sources in ../xu). Every function here
- * is called from Xu through c_call6(...): int words in, one int word out.
+ * is called from Xu through c_call6(...): int words in, one int word out. A
+ * borrowed Xu string arrives as its byte pointer and a []int as a pointer to
+ * 8-byte little-endian elements; both are valid only during the call.
  * Xu owns MQTT framing, command parsing and policy; C owns sockets, BLE HID,
  * the LCD and the RTOS.
  */
@@ -32,16 +34,10 @@ extern void xu_rt_init(void *heap);
 extern int _rom_cb_xu_main_xu_app_main(int arg);
 
 #define XU_HEAP_BYTES 65536
-#define TEXT_SLOTS 4
-#define TEXT_CAP 512
 #define RX_CAP 1024
-#define TX_CAP 4096
 
-static char s_text[TEXT_SLOTS][TEXT_CAP + 1];
-static int s_text_len[TEXT_SLOTS];
 static uint8_t s_rx[RX_CAP];
-static uint8_t s_tx[TX_CAP];
-static int s_tx_len;
+static int s_rx_len;
 static int s_sock = -1;
 
 int xu_host_now_ms(void) {
@@ -54,29 +50,8 @@ int xu_host_sleep_ms(int ms) {
     return 0;
 }
 
-int xu_host_text_clear(int slot) {
-    if (slot < 0 || slot >= TEXT_SLOTS) {
-        return 0;
-    }
-    s_text_len[slot] = 0;
-    s_text[slot][0] = 0;
-    return 1;
-}
-
-int xu_host_text_put(int slot, int byte) {
-    if (slot < 0 || slot >= TEXT_SLOTS || s_text_len[slot] >= TEXT_CAP) {
-        return 0;
-    }
-    s_text[slot][s_text_len[slot]++] = (char)byte;
-    s_text[slot][s_text_len[slot]] = 0;
-    return 1;
-}
-
-int xu_host_log(int slot) {
-    if (slot < 0 || slot >= TEXT_SLOTS) {
-        return 0;
-    }
-    ESP_LOGI(TAG, "%s", s_text[slot]);
+int xu_host_log(const char *text, int len) {
+    ESP_LOGI(TAG, "%.*s", len, text);
     return 1;
 }
 
@@ -101,9 +76,13 @@ int xu_host_config_len(int key) {
     return (int)strlen(config_text(key));
 }
 
-int xu_host_config_byte(int key, int index) {
+/* Copies up to cap bytes of config string key into dst; returns bytes copied. */
+int xu_host_config_copy(int key, char *dst, int cap) {
     const char *s = config_text(key);
-    return index >= 0 && index < (int)strlen(s) ? (uint8_t)s[index] : 0;
+    int n = (int)strlen(s);
+    n = n < cap ? n : cap;
+    memcpy(dst, s, n);
+    return n;
 }
 
 int xu_host_tcp_close(void) {
@@ -111,7 +90,7 @@ int xu_host_tcp_close(void) {
         close(s_sock);
         s_sock = -1;
     }
-    s_tx_len = 0;
+    s_rx_len = 0;
     return 1;
 }
 
@@ -171,13 +150,14 @@ int xu_host_tcp_open(void) {
     return 1;
 }
 
-/* >0: bytes now readable via xu_host_rx_byte; 0: nothing yet; -1: closed. */
+/* >0: bytes now readable via xu_host_rx_copy; 0: nothing yet; -1: closed. */
 int xu_host_tcp_recv(void) {
     if (s_sock < 0) {
         return -1;
     }
     int n = recv(s_sock, s_rx, sizeof(s_rx), MSG_DONTWAIT);
     if (n > 0) {
+        s_rx_len = n;
         return n;
     }
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -186,34 +166,28 @@ int xu_host_tcp_recv(void) {
     return -1;
 }
 
-int xu_host_rx_byte(int index) {
-    return index >= 0 && index < RX_CAP ? s_rx[index] : 0;
+/* Copies up to cap bytes of the last xu_host_tcp_recv into dst. */
+int xu_host_rx_copy(uint8_t *dst, int cap) {
+    int n = s_rx_len < cap ? s_rx_len : cap;
+    memcpy(dst, s_rx, n);
+    return n;
 }
 
-int xu_host_tx_put(int byte) {
-    if (s_tx_len >= TX_CAP) {
-        return 0;
-    }
-    s_tx[s_tx_len++] = (uint8_t)byte;
-    return 1;
-}
-
-int xu_host_tcp_flush(void) {
+/* Sends all len bytes, waiting up to 3 s for socket space. */
+int xu_host_tcp_send(const uint8_t *data, int len) {
     int sent = 0;
     int waits = 0;
-    while (s_sock >= 0 && sent < s_tx_len) {
-        int n = send(s_sock, s_tx + sent, s_tx_len - sent, 0);
+    while (s_sock >= 0 && sent < len) {
+        int n = send(s_sock, data + sent, len - sent, 0);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && waits++ < 300) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         if (n <= 0) {
-            s_tx_len = 0;
             return 0;
         }
         sent += n;
     }
-    s_tx_len = 0;
     return s_sock >= 0;
 }
 
@@ -273,22 +247,22 @@ int xu_host_wifi_rssi(void) {
     return esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
 }
 
-/* LCD: stage pixels five per call, then draw one horizontal span. */
+/* LCD: draw pixels[offset .. offset+count) of a Xu []int as one row. */
 #define SPAN_CAP 64
-static uint16_t s_px[SPAN_CAP];
 
-int xu_host_lcd_px(int index, int p0, int p1, int p2, int p3, int p4) {
-    const int p[5] = {p0, p1, p2, p3, p4};
-    for (int i = 0; i < 5; i++) {
-        if (index + i >= 0 && index + i < SPAN_CAP) {
-            s_px[index + i] = (uint16_t)p[i];
-        }
+int xu_host_lcd_write(int x, int y, const int32_t *pixels, int offset, int count) {
+    uint16_t row[SPAN_CAP];
+    if (count <= 0 || count > SPAN_CAP || offset < 0) {
+        return 0;
     }
-    return 1;
+    for (int i = 0; i < count; i++) {
+        row[i] = (uint16_t)pixels[(offset + i) * 2];
+    }
+    return status_lcd_span(x, y, row, count);
 }
 
-int xu_host_lcd_span(int x, int y, int count) {
-    return count > 0 && count <= SPAN_CAP && status_lcd_span(x, y, s_px, count);
+int xu_host_lcd_flush(void) {
+    return status_lcd_flush();
 }
 
 int xu_host_lcd_fill(int x, int y, int w, int h, int color) {
