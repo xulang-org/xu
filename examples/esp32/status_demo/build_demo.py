@@ -51,7 +51,7 @@ def main():
             if not isinstance(n.get(key),str):raise RuntimeError('network config requires ssid/password strings')
             app=app.replace('fn configured_'+key+'() string { << "" }','fn configured_'+key+'() string { << '+json.dumps(n[key],ensure_ascii=False)+' }')
     (out/'main_private.xu').write_text(app);(out/'main_private.xu').chmod(0o600)
-    names=['panel','font','touch','ui','controls','ble_app']
+    names=['st7789','font','touch','ui','controls','diagnostics','ble_app']
     for name in names:shutil.copyfile(demo/(name+'.xu'),out/(name+'.xu'))
     sources=[out/'main_private.xu',out/'ble_transport.xu']+[out/(n+'.xu') for n in names]
     elf=out/'wireless_status.elf';image=out/'wireless_status.bin'
