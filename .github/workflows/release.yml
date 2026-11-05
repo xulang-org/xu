@@ -45,6 +45,14 @@ on:
         description: "Reuse hosted compiler seeds from an earlier recovery run; rebuild and validate every native SDK"
         required: false
         type: string
+      source_sha:
+        description: "Frozen accepted source commit for workflow-only recovery (requires sdk_validation_run_id)"
+        required: false
+        type: string
+      sdk_validation_run_id:
+        description: "Successful six-platform Installed SDK run for exactly source_sha"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -73,7 +81,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SDK_VALIDATION_RUN: ${{ inputs.sdk_validation_run_id }}
         run: |
+          python3 - <<'PYTHON'
+          import os, re
+          source, evidence = os.environ['SOURCE_SHA'], os.environ['SDK_VALIDATION_RUN']
+          assert bool(source) == bool(evidence), 'source_sha and sdk_validation_run_id must be supplied together'
+          if source:
+              assert re.fullmatch(r'[0-9a-f]{40}', source), 'source_sha must be a complete immutable commit'
+              assert evidence.isdecimal(), 'SDK validation run ID must be numeric'
+          PYTHON
           EXPECTED_TAG="v$(cat VERSION)"
           TAG="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
           if [[ "$GITHUB_REF_TYPE" != tag && -z "$REQUESTED_TAG" ]]; then
@@ -105,7 +123,7 @@ jobs:
   runtime-validation:
     name: Six-platform runtime and package protocols
     needs: release-policy
-    if: needs.release-policy.outputs.published == 'false'
+    if: needs.release-policy.outputs.published == 'false' && inputs.sdk_validation_run_id == ''
     permissions:
       contents: read
       actions: read
@@ -113,10 +131,79 @@ jobs:
     with:
       cross_seed_run_id: ${{ inputs.cross_seed_run_id || '' }}
 
+  accepted-sdk-validation:
+    name: Verify frozen six-platform SDK evidence
+    needs: release-policy
+    if: needs.release-policy.outputs.published == 'false' && inputs.sdk_validation_run_id != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require complete successful native acceptance for the frozen source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SDK_VALIDATION_RUN: ${{ inputs.sdk_validation_run_id }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          EXPECTED_TAG: ${{ needs.release-policy.outputs.tag }}
+        run: |
+          python3 - <<'PYTHON'
+          import base64, json, os, re, subprocess
+          repo, source, run_id = (os.environ[k] for k in ('GH_REPO', 'SOURCE_SHA', 'SDK_VALIDATION_RUN'))
+          assert re.fullmatch(r'[0-9a-f]{40}', source) and run_id.isdecimal()
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}'], text=True))
+          accepted = api(f'compare/{source}...main')
+          assert accepted['status'] in ('ahead', 'identical'), 'source is not accepted main history'
+          delta = api(f"compare/{source}...{os.environ['WORKFLOW_SHA']}")
+          assert delta['status'] in ('ahead', 'identical') and delta['total_commits'] <= 100
+          assert len(delta['files']) < 300 and all(f['filename'].startswith('.github/workflows/') for f in delta['files']), 'product source changed; fresh native validation required'
+          version = base64.b64decode(api(f'contents/VERSION?ref={source}')['content']).decode().strip()
+          assert os.environ['EXPECTED_TAG'] == 'v' + version
+          def companion_pins(ref):
+              text = base64.b64decode(api(f'contents/.github/workflows/release.yml?ref={ref}')['content']).decode()
+              pairs = re.findall(r'(?m)^[ \t]+repository:[ \t]+(xulang-org/(?:examples|packages|vscode))[ \t]*\n[ \t]+ref:[ \t]+([0-9a-f]{40})[ \t]*$', text)
+              pins = dict(pairs)
+              assert len(pairs) == 3 and set(pins) == {'xulang-org/examples', 'xulang-org/packages', 'xulang-org/vscode'}, 'companion inputs must remain explicit immutable commits'
+              return pins
+          assert companion_pins(source) == companion_pins(os.environ['WORKFLOW_SHA']), 'companion inputs changed; fresh SDK validation required'
+          run = api(f'actions/runs/{run_id}')
+          assert run['workflow_id'] == api('actions/workflows/sdk.yml')['id']
+          assert run['head_repository']['full_name'] == repo and run['head_sha'] == source
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          jobs = api(f'actions/runs/{run_id}/jobs?per_page=100')['jobs']
+          passed = {j['name'] for j in jobs if j['conclusion'] == 'success'}
+          targets = ('linux-x64', 'linux-arm64', 'macos-x64', 'macos-arm64', 'windows-x64', 'windows-arm64')
+          for target in targets:
+              choices = {f'Install and run ({target}, product)'}
+              if target == 'macos-x64':
+                  choices.add('Native macOS Intel SDK and platform seeds')
+              assert choices & passed, f'missing successful native SDK acceptance: {target}'
+          artifacts = api(f'actions/runs/{run_id}/artifacts?per_page=100')['artifacts']
+          evidence = {}
+          for target in targets:
+              matches = [a for a in artifacts if a['name'] == f'xu-sdk-product-{target}' and not a['expired']]
+              assert len(matches) == 1, f'missing or ambiguous native SDK evidence: {target}'
+              artifact = matches[0]
+              assert artifact['workflow_run']['id'] == int(run_id) and artifact['workflow_run']['head_sha'] == source
+              evidence[target] = artifact['id']
+          receipt = {'source_commit': source, 'sdk_run_id': run_id, 'version': version, 'artifacts': evidence}
+          with open('sdk-validation-evidence.json', 'w') as output:
+              json.dump(receipt, output, indent=2)
+          print('Accepted source, unchanged product tree, six successful native SDK jobs and six evidence artifacts: PASS')
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xu-sdk-validation-evidence-${{ github.run_attempt }}
+          path: sdk-validation-evidence.json
+          if-no-files-found: error
+
   reuse-release:
     name: Validate an existing CI release bundle
-    needs: [release-policy, runtime-validation]
-    if: needs.release-policy.outputs.published == 'false' && inputs.artifact_run_id != ''
+    needs: [release-policy, runtime-validation, accepted-sdk-validation]
+    if: always() && needs.release-policy.outputs.published == 'false' && (needs.runtime-validation.result == 'success' || needs.accepted-sdk-validation.result == 'success') && inputs.artifact_run_id != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -134,6 +221,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           SOURCE_RUN: ${{ inputs.artifact_run_id }}
           EXPECTED_TAG: ${{ needs.release-policy.outputs.tag }}
+          REQUESTED_SOURCE: ${{ inputs.source_sha }}
         run: |
           python3 - <<'PYTHON'
           import base64, json, os, re, subprocess
@@ -146,7 +234,7 @@ jobs:
           assert run["head_branch"] == "main" and run["status"] == "completed"
           jobs = api(f"actions/runs/{run_id}/jobs?per_page=100")["jobs"]
           assert any(j["name"] == "Build and validate release SDKs" and j["conclusion"] == "success" for j in jobs)
-          sha = run["head_sha"]
+          sha = os.environ.get('REQUESTED_SOURCE') or run["head_sha"]
           assert re.fullmatch(r"[0-9a-f]{40}", sha)
           comparison = api(f"compare/{sha}...main")
           assert comparison["status"] in ("ahead", "identical"), "source is not accepted main history"
@@ -160,7 +248,7 @@ jobs:
           matches = [a for a in artifacts if not a["expired"] and re.fullmatch(re.escape("xu-release-bundle-" + tag) + r"-\d+", a["name"])]
           assert matches, "verified release bundle is missing"
           artifact = max(matches, key=lambda a: a["id"])
-          assert artifact["workflow_run"]["id"] == int(run_id) and artifact["workflow_run"]["head_sha"] == sha
+          assert artifact["workflow_run"]["id"] == int(run_id) and artifact["workflow_run"]["head_sha"] == run['head_sha']
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"artifact_id={artifact['id']}\nsource_sha={sha}\ntag={tag}\nversion={version}\n")
           PYTHON
@@ -195,8 +283,8 @@ jobs:
 
   build-release:
     name: Build and validate release SDKs
-    needs: [release-policy, runtime-validation]
-    if: needs.release-policy.outputs.published == 'false' && inputs.artifact_run_id == ''
+    needs: [release-policy, runtime-validation, accepted-sdk-validation]
+    if: always() && needs.release-policy.outputs.published == 'false' && (needs.runtime-validation.result == 'success' || needs.accepted-sdk-validation.result == 'success') && inputs.artifact_run_id == ''
     runs-on: macos-15-intel
     timeout-minutes: 120
     permissions:
@@ -206,11 +294,13 @@ jobs:
       tag: ${{ steps.identity.outputs.tag }}
       version: ${{ steps.identity.outputs.version }}
       artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha || github.sha }}
 
       - name: Validate release version and tag
         id: identity
@@ -234,6 +324,7 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout companion examples
         uses: actions/checkout@v4
@@ -281,6 +372,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Detect host target architecture
+        id: host-target
+        run: |
+          ARCH=$(uname -m | sed 's/x86_64/x64/g')
+          TARGET="macos-$ARCH"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+          echo "Building release bundle on $TARGET ($ARCH)"
+
       - name: Install native Windows draw packaging dependencies
         run: |
           brew install mingw-w64
@@ -291,16 +391,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: bin/xu
-          key: hosted-seed-macos-x64-${{ hashFiles('VERSION') }}
+          key: hosted-seed-${{ steps.host-target.outputs.target }}-${{ hashFiles('VERSION') }}
           restore-keys: |
-            hosted-seed-macos-x64-
+            hosted-seed-${{ steps.host-target.outputs.target }}-
 
       - name: Restore seed from a published product SDK
         if: steps.seed-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           XU_SDK_SEED_VERSION: ${{ vars.XU_SDK_SEED_VERSION || '0.10.12-rc.1' }}
-        run: python3 scripts/restore_product_seed.py --target macos-x64 --destination bin/xu --replace-existing
+        run: python3 scripts/restore_product_seed.py --target ${{ steps.host-target.outputs.target }} --destination bin/xu --replace-existing
 
       - name: Build hosted compiler chain
         run: |
@@ -321,15 +421,18 @@ jobs:
       - name: Test installed host SDK and native setup installer
         run: |
           VERSION=$(cat VERSION)
-          python3 scripts/test_installed_sdk.py --archive "dist/release/xu-v$VERSION-macos-x64.tar.gz" --native-setup
-          python3 scripts/check_sdk_reinstall.py --archive "dist/release/xu-v$VERSION-macos-x64.tar.gz"
-          if [ -f "dist/release/xu-setup-macos-x64" ]; then
-            python3 scripts/test_installed_sdk.py --installer "dist/release/xu-setup-macos-x64"
+          TARGET="${{ steps.host-target.outputs.target }}"
+          python3 scripts/test_installed_sdk.py --archive "dist/release/xu-v$VERSION-$TARGET.tar.gz" --native-setup
+          python3 scripts/check_sdk_reinstall.py --archive "dist/release/xu-v$VERSION-$TARGET.tar.gz"
+          if [ -f "dist/release/xu-setup-$TARGET" ]; then
+            python3 scripts/test_installed_sdk.py --installer "dist/release/xu-setup-$TARGET"
           fi
 
       - name: Verify graphical macOS package fresh install and reinstall
         run: |
-          PKG="dist/release/xu-v$(cat VERSION)-macos-x64.pkg"
+          VERSION=$(cat VERSION)
+          TARGET="${{ steps.host-target.outputs.target }}"
+          PKG="dist/release/xu-v$VERSION-$TARGET.pkg"
           sudo installer -pkg "$PKG" -target /
           sudo touch /usr/local/xu/src/obsolete-install-probe.xu
           sudo chmod 555 /usr/local/xu/src
@@ -394,8 +497,8 @@ jobs:
 
   publish-release:
     name: Publish verified CI artifacts
-    needs: [build-release, reuse-release]
-    if: always() && inputs.build_only != true && (needs.build-release.result == 'success' || needs.reuse-release.result == 'success')
+    needs: build-release
+    if: always() && !cancelled() && needs.build-release.result == 'success' && inputs.build_only != true
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -404,9 +507,8 @@ jobs:
       # This job never checks out or executes the product or its dependencies.
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.build-release.outputs.artifact_id || needs.reuse-release.outputs.artifact_id }}
+          artifact-ids: ${{ needs.build-release.outputs.artifact_id }}
           merge-multiple: true
-          run-id: ${{ inputs.artifact_run_id || github.run_id }}
           github-token: ${{ github.token }}
           path: verified
 
@@ -414,9 +516,106 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          EXPECTED_SHA: ${{ needs.reuse-release.outputs.source_sha || github.sha }}
-          EXPECTED_TAG: ${{ needs.build-release.outputs.tag || needs.reuse-release.outputs.tag }}
-          EXPECTED_VERSION: ${{ needs.build-release.outputs.version || needs.reuse-release.outputs.version }}
+          EXPECTED_SHA: ${{ needs.build-release.outputs.source_sha }}
+          EXPECTED_TAG: ${{ needs.build-release.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.build-release.outputs.version }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease || 'auto' }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, re, subprocess
+          root = pathlib.Path("verified/release")
+          receipt = json.loads(pathlib.Path("verified/validation.json").read_text())
+          tag, version, sha = (os.environ[k] for k in ("EXPECTED_TAG", "EXPECTED_VERSION", "EXPECTED_SHA"))
+          assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", tag)
+          assert receipt["tag"] == tag == "v" + version
+          assert receipt["version"] == version and receipt["source_commit"] == sha
+          assets = receipt["assets"]
+          assert len(assets) == 30
+          assert {p.name for p in root.iterdir()} == set(assets)
+          for name, record in assets.items():
+              assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+              path = root / name
+              assert path.is_file() and not path.is_symlink()
+              with path.open("rb") as source:
+                  digest = hashlib.file_digest(source, "sha256").hexdigest()
+              assert digest == record["sha256"] and path.stat().st_size == record["size"], name
+          def gh(*args):
+              return subprocess.check_output(["gh", *args], text=True)
+          def api(path, method="GET", data=None):
+              command = ["gh", "api", "--method", method, path]
+              if data is not None:
+                  command += ["--input", "-"]
+              return json.loads(subprocess.check_output(command, input=json.dumps(data) if data is not None else None, text=True))
+          repo = os.environ["GH_REPO"]
+          # The by-tag endpoint only returns published releases. Resolve drafts
+          # from the authenticated list and retain the ID returned by creation.
+          release, page = None, 1
+          while release is None:
+              batch = api(f"repos/{repo}/releases?per_page=100&page={page}")
+              release = next((r for r in batch if r["tag_name"] == tag), None)
+              if len(batch) < 100:
+                  break
+              page += 1
+          prerelease = os.environ["RELEASE_PRERELEASE"]
+          is_prerelease = prerelease == "true" or (prerelease == "auto" and bool(re.search(r"-(dev|rc|alpha|beta)", tag)))
+          if release is None:
+              release = api(f"repos/{repo}/releases", "POST", {
+                  "tag_name": tag, "target_commitish": sha, "name": "Xu " + tag,
+                  "body": (root / "RELEASE_NOTES.md").read_text(), "draft": True,
+                  "prerelease": is_prerelease})
+          release_id = release["id"]
+          assert release["target_commitish"] == sha, "existing release targets a different commit"
+          published = {asset["name"]: asset for asset in release["assets"]}
+          assert set(published) <= set(assets), "draft has unexpected assets"
+          for name, asset in published.items():
+              assert asset["size"] == assets[name]["size"]
+              assert asset.get("digest") == "sha256:" + assets[name]["sha256"], name
+          if not release["draft"]:
+              assert set(published) == set(assets), "published release differs from the verified bundle"
+              print(f"{tag} is already published; preserving its tag and assets")
+              raise SystemExit(0)
+          for name in sorted(set(assets) - set(published)):
+              uploaded = json.loads(gh("api", "--method", "POST",
+                  f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}",
+                  "--header", "Content-Type: application/octet-stream", "--input", str(root / name)))
+              assert uploaded["size"] == assets[name]["size"]
+              assert uploaded["digest"] == "sha256:" + assets[name]["sha256"], name
+          uploaded_release = api(f"repos/{repo}/releases/{release_id}")
+          assert len(uploaded_release["assets"]) == 30
+          assert all(a["digest"] == "sha256:" + assets[a["name"]]["sha256"] for a in uploaded_release["assets"])
+          final = api(f"repos/{repo}/releases/{release_id}", "PATCH", {
+              "body": (root / "RELEASE_NOTES.md").read_text(), "prerelease": is_prerelease,
+              "draft": os.environ["RELEASE_DRAFT"] == "true"})
+          assert len(final["assets"]) == 30
+          print("Published verified CI bundle: " + final["html_url"])
+          PYTHON
+
+  publish-reused-release:
+    name: Publish reused CI artifacts
+    needs: reuse-release
+    if: always() && !cancelled() && needs.reuse-release.result == 'success' && inputs.build_only != true
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # This job never checks out or executes the product or its dependencies.
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.reuse-release.outputs.artifact_id }}
+          merge-multiple: true
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+          path: verified
+
+      - name: Check artifact receipt and publish without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ needs.reuse-release.outputs.source_sha }}
+          EXPECTED_TAG: ${{ needs.reuse-release.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.reuse-release.outputs.version }}
           RELEASE_PRERELEASE: ${{ inputs.prerelease || 'auto' }}
           RELEASE_DRAFT: ${{ inputs.draft }}
         run: |
