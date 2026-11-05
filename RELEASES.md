@@ -6,6 +6,12 @@
 
 ---
 
+## Xu 0.11.4-dev.4 (development)
+
+Integrates the reviewed ARM64 tail-call and byte-processing optimizations with XUN duration/depth bounds, multiline indentation and typed-list round trips. Adds the experimental fixed-profile ESP32 Wi-Fi/BLE status application and the original 0.11.2 UI morph source snapshot. Compiler, standard library and tools must be upgraded together. Desktop is `1.3.55` and setup is `1.2.46`.
+
+ESP32 coexistence retains the documented WPA2-PSK/CCMP and single-peer Just Works limits. Final external full-MTU reply acceptance remains pending after a host LAN `EHOSTUNREACH`; previous gateway probes do not complete that acceptance. DHCP renewal, Group Rekey, DNS/TCP, SoftAP and WPA3/PMF remain unavailable. This development integration does not claim a completed hardware release.
+
 ## Xu 0.11.4-dev.3 (development)
 
 Integrates safe framed ARM64 sibling tail calls with the scalar accumulator, checked-arithmetic register allocation, readonly byte-scan, string SIMD and CRC-loop optimizations. Restore saved registers and the current frame before an eligible in-unit integer/bool sibling jump; retain ordinary calls for frame addresses, owners, references, instrumentation, debug modes and coroutine stack checks. Both optimization groups are validated together. This is a development build; upgrade the compiler, standard library and tools together. Desktop is `1.3.54` and setup is `1.2.45`.

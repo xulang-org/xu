@@ -19,6 +19,13 @@ SDK: scanning/retuning happens before BLE starts. Wi-Fi reconnection while
 BLE remains connected and dynamic software priority policies are not
 implemented. Changing networks requires a joint restart.
 
+## Development acceptance
+
+The coexistence application is experimental. External full-MTU ICMP reply
+acceptance remains pending after a host LAN `EHOSTUNREACH`. Successful gateway
+probes do not replace that end-to-end check. DHCP renewal/rebinding, Group
+Rekey, DNS/TCP, SoftAP and WPA3/PMF are not implemented.
+
 ## Build and flash
 
 Use the current Xu compiler and standard library from the same checkout.
