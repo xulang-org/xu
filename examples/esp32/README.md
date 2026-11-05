@@ -1,4 +1,13 @@
-# ESP32 with pure Xu
+# ESP32 examples
+
+**Phone-control delivery** uses ESP-IDF’s official Bluetooth/Wi-Fi static
+libraries: see [`idf_cyd/`](idf_cyd/). That path keeps the MQTT absolute-mouse
+envelope and targets an application image ≤ 1.5 MiB.
+
+The rest of this directory documents the **experimental pure-Xu** Xtensa path
+(no vendor radio archive). Prefer `idf_cyd` for board delivery.
+
+## Pure Xu UART console (experimental)
 
 The `xtensa-esp32-none` target emits ELF32 Xtensa code directly. The image
 packer produces an ESP32 application image without a GCC linker, C HAL, or
