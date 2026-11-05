@@ -48,6 +48,26 @@ Generated sources and binaries stay in the private output directory.
 
 ## Display and controls
 
+The status cards depend on `#embedded/display`'s `Surface#T`, which owns typed
+backend state, logical dimensions, rectangle filling and RGB565 row writes.
+`ui.xu` has no ESP32, GPIO, SPI, controller or radio dependency; its optional
+change observer is connected to board UART diagnostics in `diagnostics.xu`.
+
+`st7789.xu` is this board's adapter. `main.xu` selects it with
+`st7789_surface_create`; another controller supplies the same two callbacks
+and returns a surface with its own backend type. The UI and wireless loop
+accept either type without changing their rendering code. The same cards
+have also been rendered through `#embedded/display/memory` and a recording
+backend on the host. The layout requires at least 320 × 240, and uses the
+surface dimensions to expand the cards on larger displays. Touch calibration
+and hit regions remain specific to this CYD board.
+
+The surface clips writes, validates RGB565 values and returns backend errors.
+The UI stops drawing after an error. A sixteen-pixel scratch row is allocated
+once; hardware rendering needs no full framebuffer or allocation per update.
+See the [display interface](../../../src/embedded/display/README.md) for the
+adapter contract and portable framebuffer example.
+
 - **Wi-Fi:** preparation, connection, actual DHCP IP, gateway test result,
   failure and disconnected state. RSSI is shown as `-- dBm` because the
   backend does not provide a calibrated measurement. Tap the Wi-Fi
