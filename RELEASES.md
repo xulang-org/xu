@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.4-dev.5 (development)
+
+Integrates ESP32 portable display, MQTT/BLE remote control, 16-bit absolute HID pointer reports, Xtensa relocatable `.o` output (`--emit-obj` and `c_call6`) for official ESP-IDF static-library linking, IPv4 UDP multicast (`sys_setsockopt` and `net.listen_multicast_udp`), host content windows (`ui.App.with_content`), and macOS native `.app` bundle Info.plist fragment/resource merging. Compiler, standard library and product tools must be upgraded together (`desktop` `1.3.56`, `setup` `1.2.47`, `examples/esp32` `0.5.0`). This is a development integration build.
+
 ## Xu 0.11.4
 
 - Compiler: eligible ARM64 integer/bool sibling tail calls restore the caller frame before jumping. Pure scalar additive self recursion can use an accumulator loop; checked arithmetic, bounded readonly byte scans, string operations and proved eight-round CRC loops retain their specialized paths. Ownership, address, ABI, debugging and instrumentation exclusions keep their ordinary fallback. No general performance improvement is claimed.

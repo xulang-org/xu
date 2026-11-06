@@ -39,6 +39,7 @@ MIR_CALL_IDS = {
     -133: 158,
     -134: 159,
     -135: 166,
+    -149: 170,
 }
 
 # Allow markdown bold: | **-50** | name |
