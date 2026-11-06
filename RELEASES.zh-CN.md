@@ -6,18 +6,17 @@
 
 ---
 
-## Xu 0.11.4-dev.5（开发版）
-
-集成 ESP32 便携显示组件、MQTT/BLE 远程控制、16 位绝对 HID 指针报文、用于对接官方 ESP-IDF 静态库的 Xtensa 可重定位 `.o` 输出（`--emit-obj` 与 `c_call6`）、IPv4 UDP 多播（`sys_setsockopt` 与 `net.listen_multicast_udp`）、宿主内容窗口（`ui.App.with_content`）以及 macOS 原生 `.app` 包 `Info.plist.fragment` 与插件资源合并支持。请一起升级编译器、标准库和产品工具（`desktop` `1.3.56`、`setup` `1.2.47`、`examples/esp32` `0.5.0`）。本版本为开发集成构建。
-
 ## Xu 0.11.4
 
 - 编译器：满足条件的 ARM64 整数／布尔兄弟尾调用在跳转前恢复调用者栈帧；纯标量加法自递归可转为累加器循环。保留算术检查、有限只读字节扫描、字符串操作和已证明恰好八轮的 CRC 专用路径；所有权、取地址、ABI、调试和插桩限制继续使用普通回退。本版不声明普遍提速。
-- XUN：duration 校验持续推进输入位置，集合嵌套受 `MAX_DEPTH`（64）约束，多行载荷保留缩进，带类型列表在解析与序列化时保留标签并检查继承的标量类型。带类型列表的输出拼写有变化，升级时请更新文本快照；继续接受旧版非空 `!s[...]` 标量输入。
-- ESP32：收录固定 profile 的纯 Xu Wi-Fi/BLE 共存和 CYD 状态应用实验源码。主机局域网返回 `EHOSTUNREACH` 后，完整 MTU 的外部 ICMP 应答验收仍待完成，本版不代表板端应用已通过生产验收。保留 WPA2-PSK/CCMP、单 peer legacy SMP Just Works 限制；尚无 DHCP 续租／重绑定、Group Rekey、DNS/TCP、SoftAP、WPA3/PMF，以及 BLE 保持连接时的 Wi-Fi 重连。切换网络须联合重启。
+- XUN 与标准库：XUN duration 校验持续推进输入位置，集合嵌套受 `MAX_DEPTH`（64）约束，多行载荷保留缩进，带类型列表在解析与序列化时保留标签并检查继承的标量类型（带类型列表输出拼写更新，继续接受旧版非空 `!s[...]` 标量输入）。标准库新增 `sys_setsockopt` / `os.setsockopt` 与 IPv4 UDP 多播（`net.listen_multicast_udp`、`join_group`、`leave_group`）、TOML `[[array]]` 表数组解析及可恢复 `crypto/cipher` CTR 密钥流。
+- 桌面与 UI：`ui.App.with_content` 新增跨 macOS、Windows、Linux 的宿主内容窗口支持；`xu desktop` 支持打包原生内容插件并合并 macOS `Info.plist.fragment` 与应用资源。
+- ESP32：新增便携显示抽象（`embedded/display`）、MQTT/BLE 远程控制（`embedded/mqtt`、`embedded/wifi/tcp`）、16 位绝对 HID 指针报文（`0..32767`、5 字节控制载荷），以及用于链接官方 ESP-IDF 静态库的 Xtensa 可重定位 ELF 对象输出（`--emit-obj`）与 `c_call6` 外部 C 符号桥接（`examples/esp32/idf_cyd`，`0.5.0`）。固定 profile 的纯 Xu Wi-Fi/BLE 共存与状态演示仍作为实验源码提供，保留已记录的 WPA2-PSK/CCMP 与单 peer legacy SMP Just Works 限制。
 - 品牌素材：保留原始 0.11.2 UI morph 源码快照、来源、署名及外部渲染依赖；历史宣传文案不代表当前 SDK 身份。
 
-请一起升级编译器、标准库和产品工具。Desktop 为 `1.3.56`，setup 为 `1.2.47`，native 工具保持 `0.1.3`。后续仍在 Draft 的 MQTT／显示工作及绝对指针、ESP-IDF 跟进不属于本版。SDK 发布不烧录或分发固件。原生验收覆盖 macOS、Linux、Windows 的 ARM64/x64；LoongArch64 和 RISC-V 安装包为交叉构建。横测保留各自实际测量的编译器版本与源码提交。
+请一起升级编译器、标准库和产品工具。Desktop 为 `1.3.57`，setup 为 `1.2.48`，native 工具保持 `0.1.3`。SDK 发布不烧录或分发固件。原生验收覆盖 macOS、Linux、Windows 的 ARM64/x64；LoongArch64 和 RISC-V 安装包为交叉构建。横测保留各自实际测量的编译器版本与源码提交。
+
+## Xu 0.11.4-dev.5（开发版）
 
 ## Xu 0.11.4-dev.4（开发版）
 
