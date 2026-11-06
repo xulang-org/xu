@@ -19,8 +19,14 @@ strings, non-ASCII names, malformed JSON and input over 512 bytes are rejected.
 | `advertising.start`, `advertising.stop` | absent or empty |
 | `disconnect`, `release.all` | absent or empty |
 | `hid.keyboard` | eight bytes: modifiers, zero reserved byte, six usages 0..115 |
-| `hid.mouse` | four bytes: buttons 0..7, X, Y, wheel; signed axes encoded as bytes, 128 rejected |
+| `hid.mouse` | five bytes: buttons 0..7, absolute X low/high, absolute Y low/high; each axis is little-endian `0..32767` |
 | `hid.consumer` | one bitmap byte 0..31, matching the HOGP descriptor |
+
+Absolute mouse coordinates remove relative-pointer drift on phones. Map a
+pixel with `hogp_scale_axis(pixel, span)` so `0` and `span-1` own the HID
+endpoints. A tap is move (`buttons=0`) then press (`buttons=1`) then release
+(`buttons=0`) at the same absolute point. `release.all` must also release at
+the last point; sending `(0,0)` would drag the cursor to the origin.
 
 The application still checks actual encryption, CCCD subscription, controller
 credits and queue capacity. Parsing a valid report establishes none of those
