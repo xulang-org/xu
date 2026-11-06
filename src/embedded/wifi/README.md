@@ -35,5 +35,9 @@ The separate opt-in [`wifi_radio` backend](../chips/esp32/wifi_radio/README.md)
 initializes the measured ESP32 PHY/MAC profile and activates `WifiDevice`
 connection, polling, disconnect, reconnect and gateway probes. Its scope and
 radio/memory ownership requirements are explicit. Default hooks, general scan
-and SoftAP remain unavailable. DHCP renewal, DNS/TCP, address-conflict handling,
+and SoftAP remain unavailable. DHCP renewal, DNS, address-conflict handling,
 group-key rekey and BLE/Wi-Fi coexistence remain outside this profile.
+
+`#embedded/wifi/tcp` adds a bounded cooperative active client over authenticated
+LLC payloads. The CYD demo uses it with `#embedded/mqtt` for BLE command/result
+traffic; generic OS networking remains separate.
