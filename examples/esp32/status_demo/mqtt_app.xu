@@ -1,0 +1,238 @@
+@main
+
+#embedded/chips/esp32
+#embedded/chips/esp32/wifi_radio
+#embedded/wifi/session
+#embedded/wifi/tcp
+#embedded/mqtt
+#embedded/bluetooth as bt
+#embedded/bluetooth/control
+
+struct Operation { id string payload string result string }
+struct MqttDemo {
+    opened bool
+    seen []Operation
+    broker string
+    root string
+    port int
+    last_try int
+    last_arp int
+    last_status int
+    report_at int
+    key_down bool
+    mouse_down bool
+    consumer_down bool
+    announced bool
+    opening bool
+    allow_advertising bool
+    change_advertising bool
+    want_arp bool
+    output string
+}
+fn mqtt_demo_create() MqttDemo {
+    << MqttDemo{opened: false,seen: []Operation{},
+        broker: configured_mqtt_ip(),root: "xu/esp32/cyd",port: configured_mqtt_port(),
+        last_try: -5000,last_arp: -1000,last_status: 0,report_at: 0,key_down: false,
+        mouse_down: false,consumer_down: false,announced: false,opening: false,allow_advertising: true,change_advertising: false,want_arp: false,output: ""}
+}
+fn mqtt_random() string {
+    first := volatile_load(0x3FF75144)
+    esp32.rom_delay_us(1)
+    value := first ^ volatile_load(0x3FF75144)
+    $out := make_string(4)
+    for i in 0:4 { out[i] = (value >> (i * 8)) & 255 }
+    << out
+}
+fn mqtt_bool(value bool) string { if value { << "true" }
+    << "false" }
+fn mqtt_decimal(value int) string {
+    if value <= 0 { << "0" }
+    $left := value
+    $out := ""
+    while left > 0 {
+        $digit := make_string(1)
+        digit[0] = 48 + left % 10
+        out = digit + out
+        left = left / 10
+    }
+    << out
+}
+fn mqtt_status(device &esp32.WifiDevice, host &bt.PeripheralHost, advertising bool, now int) string {
+    $out := "{\"online\":true,\"ip\":\"" + device.get_ip() + "\""
+    out = out + ",\"wifi\":" + mqtt_bool(device.is_connected())
+    out = out + ",\"gateway_replies\":" + mqtt_decimal(wifi_radio.gateway_replies(&device.session))
+    out = out + ",\"ble_connected\":" + mqtt_bool(host.connected)
+    out = out + ",\"encrypted\":" + mqtt_bool(host.encrypted)
+    out = out + ",\"advertising\":" + mqtt_bool(advertising)
+    out = out + ",\"keyboard\":" + mqtt_bool(host.hid_notifications_enabled(bt.ATT_HANDLE_KEYBOARD_REPORT))
+    out = out + ",\"mouse\":" + mqtt_bool(host.hid_notifications_enabled(bt.ATT_HANDLE_MOUSE_REPORT))
+    out = out + ",\"consumer\":" + mqtt_bool(host.hid_notifications_enabled(bt.ATT_HANDLE_CONSUMER_REPORT))
+    out = out + ",\"uptime_ms\":" + mqtt_decimal(now) + "}"
+    << out
+}
+
+fn mqtt_result(id &string, status &string) string {
+    << "{\"id\":\"" + session.copy(id) + "\",\"result\":\"" + session.copy(status) + "\"}"
+}
+fn mqtt_report(host $&bt.PeripheralHost, handle int, report &[]int) bool {
+    if !host.hid_notifications_enabled(handle) { << false }
+    $bytes := []int{}
+    for i in 0:report.len { bytes.push(report[i]) }
+    << host.queue_hid_notification(handle,bytes)
+}
+fn mqtt_release(host $&bt.PeripheralHost, state $&MqttDemo) {
+    if state.key_down {
+        zero := bt.hogp_build_keyboard(0,0)
+        if !host.connected || !host.hid_notifications_enabled(bt.ATT_HANDLE_KEYBOARD_REPORT) || mqtt_report(host,bt.ATT_HANDLE_KEYBOARD_REPORT,&zero) { state.key_down = false }
+    }
+    if state.mouse_down {
+        zero := bt.hogp_build_mouse(0,0,0,0)
+        if !host.connected || !host.hid_notifications_enabled(bt.ATT_HANDLE_MOUSE_REPORT) || mqtt_report(host,bt.ATT_HANDLE_MOUSE_REPORT,&zero) { state.mouse_down = false }
+    }
+    if state.consumer_down {
+        zero := bt.hogp_build_consumer(0)
+        if !host.connected || !host.hid_notifications_enabled(bt.ATT_HANDLE_CONSUMER_REPORT) || mqtt_report(host,bt.ATT_HANDLE_CONSUMER_REPORT,&zero) { state.consumer_down = false }
+    }
+}
+fn mqtt_apply(command &control.Command, host $&bt.PeripheralHost, state $&MqttDemo, advertising bool, now int) string {
+    op := command.op
+    if op == control.STATUS { << "ok" }
+    if op == control.ADVERTISING_START || op == control.ADVERTISING_STOP {
+        enable := op == control.ADVERTISING_START
+        if enable && host.connected { << "busy_connected" }
+        state.allow_advertising = enable
+        if advertising == enable { << "ok" }
+        state.change_advertising = true
+        << "queued"
+    }
+    if op == control.DISCONNECT {
+        if !host.connected { << "already_disconnected" }
+        $out := host.request_disconnect(0)
+        wipe($&out)
+        << "queued"
+    }
+    if op == control.RELEASE_ALL {
+        mqtt_release(host,state)
+        if state.key_down || state.mouse_down || state.consumer_down { << "busy_controller" }
+        << "queued"
+    }
+    $handle := bt.ATT_HANDLE_KEYBOARD_REPORT
+    if op == control.MOUSE { handle = bt.ATT_HANDLE_MOUSE_REPORT }
+    if op == control.CONSUMER { handle = bt.ATT_HANDLE_CONSUMER_REPORT }
+    if !host.hid_notifications_enabled(handle) { << "not_ready" }
+    if !mqtt_report(host,handle,&command.report) { << "busy_controller" }
+    state.report_at = now
+    if op == control.KEYBOARD {
+        $bits := 0
+        for i in 0:command.report.len { bits = bits | command.report[i] }
+        state.key_down = bits != 0
+    } else if op == control.MOUSE { state.mouse_down = command.report[0] != 0 }
+    else { state.consumer_down = command.report[0] != 0 }
+    << "queued"
+}
+fn mqtt_command(device &esp32.WifiDevice, bytes &string, retained bool, host $&bt.PeripheralHost, state $&MqttDemo, advertising bool, now int) string {
+    command := control.parse(bytes)
+    if !command.valid { << mqtt_result(&"",&"invalid_command") }
+    if retained { << mqtt_result(&command.id,&"retained_rejected") }
+    for i in 0:state.seen.len {
+        if state.seen[i].id == command.id {
+            if state.seen[i].payload != *bytes { << mqtt_result(&command.id,&"id_conflict") }
+            << session.copy(&state.seen[i].result)
+        }
+    }
+    status := mqtt_apply(&command,host,state,advertising,now)
+    $result := mqtt_result(&command.id,&status)
+    if command.op == control.STATUS {
+        result = "{\"id\":\"" + session.copy(&command.id) + "\",\"result\":\"ok\",\"state\":" + mqtt_status(device,host,advertising,now) + "}"
+    }
+    if state.seen.len >= 16 {
+        $keep := []Operation{}
+        for i in 1:state.seen.len { keep.push(state.seen[i]) }
+        state.seen = keep
+    }
+    state.seen.push(Operation{id: session.copy(&command.id),payload: session.copy(bytes),result: session.copy(&result)})
+    esp32.uart_print("[MQTT] ")
+    esp32.uart_println(status)
+    << result
+}
+fn mqtt_reset(state $&MqttDemo, now int) {
+    state.opened = false
+    state.output = ""
+    state.want_arp = false
+    state.announced = false
+    state.opening = false
+    state.last_try = now
+    state.report_at = (now - 1000) & 0x7FFFFFFF
+    esp32.uart_println("[MQTT] reconnect")
+}
+fn mqtt_connected_tick(device $&esp32.WifiDevice, host $&bt.PeripheralHost, state $&MqttDemo, advertising bool, socket $&tcp.Client, client $&mqtt.Client, now int) {
+    for i in 0:4 {
+        packet := session.take_tcp($&device.session)
+        if packet.payload.len == 0 { <- }
+        socket.receive(&packet.payload)
+    }
+    if socket.failed() { mqtt_reset(state,now)
+        << }
+    if socket.connected() {
+        received := socket.read()
+        if received.len > 0 && !client.feed(&received,now) { mqtt_reset(state,now)
+            << }
+        if client.failed() { mqtt_reset(state,now)
+            << }
+        if client.can_publish() {
+            message := client.read()
+            if message.valid {
+                result := mqtt_command(device,&message.payload,message.retained,host,state,advertising,now)
+                topic := state.root + "/result"
+                client.publish(&topic,&result,false)
+                state.last_status = (now - 5000) & 0x7FFFFFFF
+            }
+            if !state.announced || session.elapsed(now,state.last_status) >= 5000 {
+                topic := state.root + "/status"
+                body := mqtt_status(device,host,advertising,now)
+                if client.publish(&topic,&body,true) { state.last_status = now }
+                if !state.announced { esp32.uart_println("[READY] MQTT xu/esp32/cyd/cmd")
+                    state.announced = true }
+            }
+        }
+        if socket.writable() {
+            out := client.poll(now)
+            if out.len > 0 { socket.write(&out) }
+        }
+    }
+    if state.output.len == 0 { state.output = socket.poll(now) }
+}
+
+fn mqtt_demo_tick(device $&esp32.WifiDevice, host $&bt.PeripheralHost, state $&MqttDemo, advertising bool, socket $&tcp.Client, client $&mqtt.Client, now int) {
+    if state.broker.len != 4 { << }
+    if session.elapsed(now,state.report_at) >= 1000 { mqtt_release(host,state) }
+    if !device.is_connected() { << }
+    if !state.opened {
+        if session.elapsed(now,state.last_try) < 5000 { << }
+        if !state.opening {
+            seed := mqtt_random()
+            port := 49152 + (((seed[0] << 8) | seed[1]) & 16383)
+            if !wifi_radio.open_tcp($&device.session,port,&state.broker) { state.last_try = now
+                << }
+            state.opening = true
+        }
+        if device.session.tcp.mac.len != 6 {
+            if session.elapsed(now,state.last_arp) >= 1000 {
+                state.want_arp = true
+                state.last_arp = now
+            }
+            <<
+        }
+        seed := mqtt_random()
+        mqtt_start(socket,client,session.copy(&device.session.client.address),session.copy(&state.broker),device.session.tcp.port,state.port,seed,state.root,now)
+        state.opened = true
+    }
+    mqtt_connected_tick(device,host,state,advertising,socket,client,now)
+}
+
+// Protocol owners are borrowed directly, avoiding repeated aggregate copies
+// through array indexing in the radio loop.
+fn mqtt_start(socket $&tcp.Client, client $&mqtt.Client, local string, peer string, port int, remote_port int, seed string, root string, now int) {
+    socket.reset(local,peer,port,remote_port,seed,now)
+    client.reset("XuCyd",root + "/cmd",root + "/status",now)
+}

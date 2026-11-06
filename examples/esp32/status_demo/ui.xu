@@ -1,7 +1,7 @@
 @main
 
-#embedded/chips/esp32
-#embedded/wifi/session
+#embedded/display
+#embedded/display/geometry
 
 const UI_BG = 0x0842
 const UI_SURFACE = 0x18E3
@@ -16,19 +16,26 @@ const UI_RED = 0xF980
 struct Dashboard {
     lines []string
     colors []int
+    pixels []int
+    on_change fn(int, &string)
     dirty int
     job int
     column int
     row int
     ble_state int
     wifi_state int
+    failed bool
 }
 
+fn ui_no_observer(index int, text &string) {}
 fn ui_create() Dashboard {
+    $pixels := []int{}
+    for i in 0:16 { pixels.push(0) }
     << Dashboard{lines: ["待命", "XU-PURE-HID14", "等待连接", "F24: WAIT FOR HOST",
         "待命", "--", "--", "TAP CARD: WIFI TEST", "BOTH"],
         colors: [UI_MUTED,UI_TEXT,UI_MUTED,UI_AMBER,UI_MUTED,UI_TEXT,UI_GREEN,UI_MUTED,UI_BLUE],
-        dirty: 511, job: -1, column: 0, row: 0, ble_state: 0, wifi_state: 0}
+        pixels: pixels, on_change: ui_no_observer,
+        dirty: 511, job: -1, column: 0, row: 0, ble_state: 0, wifi_state: 0, failed: false}
 }
 
 fn ui_set(ui $&Dashboard, index int, text string, color int) {
@@ -38,44 +45,36 @@ fn ui_set(ui $&Dashboard, index int, text string, color int) {
     ui.colors[index] = color
     ui.dirty = ui.dirty | (1 << index)
     if ui.job == index { ui.job = -1 }
-    if index != 5 {
-        esp32.uart_print("[FIELD] ")
-        esp32.uart_print_hex(index)
-        esp32.uart_print(" ")
-        esp32.uart_println(session.copy(&ui.lines[index]))
-    }
+    observe := ui.on_change
+    observe(index,&ui.lines[index])
 }
 
-fn ui_x(index int) int {
-    if index == 0 { << 234 }
-    if index == 4 { << 244 }
-    if index == 8 { << 234 }
+fn ui_x#T(index int, surface &display.Surface#T) int {
+    if index == 0 || index == 8 { << surface.width() - 86 }
+    if index == 4 { << surface.width() - 76 }
     << 64
 }
-fn ui_y(index int) int {
+fn ui_y#T(index int, surface &display.Surface#T) int {
     if index == 0 { << 39 }
     if index == 1 { << 66 }
     if index == 2 { << 83 }
     if index == 3 { << 103 }
-    if index == 4 { << 141 }
-    if index == 5 { << 168 }
-    if index == 6 { << 185 }
-    if index == 7 { << 202 }
+    wifi_top := 38 + (surface.height() - 46) / 2
+    if index == 4 { << wifi_top + 6 }
+    if index == 5 { << wifi_top + 33 }
+    if index == 6 { << wifi_top + 50 }
+    if index == 7 { << wifi_top + 67 }
     << 6
 }
-fn ui_width(index int) int {
+fn ui_width#T(index int, surface &display.Surface#T) int {
     if index == 0 { << 68 }
     if index == 4 { << 58 }
     if index == 8 { << 78 }
-    << 238
+    << surface.width() - 82
 }
 
-// Sixteen pixels per call. The radio event loop runs between chunks.
-fn text_chunk(panel &Panel, text &string, color int, bg int,
-    x int, y int, width int, column int, row int) {
-    $count := 16
-    if width - column < count { count = width - column }
-    if count < 1 { << }
+// Controller-independent glyph rasterization: at most sixteen output pixels.
+fn text_bits(text &string, column int, row int, count int) int {
     $at := 0
     $left := 0
     $code := text_code(text,at)
@@ -89,9 +88,7 @@ fn text_chunk(panel &Panel, text &string, color int, bg int,
         if code >= 128 { glyph_width = 16 }
     }
     $bits := font_bits(code,row)
-    panel.set_window(x + column,y + row,x + column + count - 1,y + row)
-    esp32.gpio_set_high_mask(panel.dc_mask)
-    panel.spi.cs_low()
+    $mask := 0
     for j in 0:count {
         pixel := column + j
         if pixel >= left + glyph_width {
@@ -102,14 +99,21 @@ fn text_chunk(panel &Panel, text &string, color int, bg int,
             if code >= 128 { glyph_width = 16 }
             bits = font_bits(code,row)
         }
-        $value := bg
-        if at < text.len && (bits & (1 << (15 - (pixel - left)))) != 0 { value = color }
-        panel.spi.write_word(value)
+        if at < text.len && (bits & (1 << (15 - (pixel - left)))) != 0 { mask = mask | (1 << j) }
     }
-    panel.spi.cs_high()
+    << mask
+}
+fn fill_pixels(pixels $&[]int, count int, mask int, fg int) {
+    for i in 0:count {
+        $color := UI_SURFACE
+        if (mask & (1 << i)) != 0 { color = fg }
+        pixels[i] = color
+    }
 }
 
-fn ui_tick(panel &Panel, ui $&Dashboard) bool {
+// The scratch row is allocated once. No framebuffer or per-tick allocation.
+fn ui_tick#T(ui $&Dashboard, surface $&display.Surface#T) bool {
+    if ui.failed { << false }
     if ui.job < 0 {
         for i in 0:9 {
             if (ui.dirty & (1 << i)) != 0 {
@@ -123,46 +127,66 @@ fn ui_tick(panel &Panel, ui $&Dashboard) bool {
     }
     if ui.job < 0 { << false }
     job := ui.job
-    text_chunk(panel,&ui.lines[job],ui.colors[job],UI_SURFACE,
-        ui_x(job),ui_y(job),ui_width(job),ui.column,ui.row)
-    ui.column += 16
-    if ui.column >= ui_width(job) { ui.column = 0
+    width := ui_width(job,&*surface)
+    $count := 16
+    if width - ui.column < count { count = width - ui.column }
+    mask := text_bits(&ui.lines[job],ui.column,ui.row,count)
+    color := ui.colors[job]
+    fill_pixels($&ui.pixels,count,mask,color)
+    x := ui_x(job,&*surface) + ui.column
+    y := ui_y(job,&*surface) + ui.row
+    if !surface.write_rgb565(x,y,&ui.pixels,count) {
+        ui.failed = true
+        << false
+    }
+    ui.column += count
+    if ui.column >= width { ui.column = 0
         ui.row += 1 }
     if ui.row >= 16 { ui.job = -1 }
     << true
 }
-fn ui_flush(panel &Panel, ui $&Dashboard) {
-    while ui_tick(panel,ui) {}
+fn ui_flush#T(ui $&Dashboard, surface $&display.Surface#T) bool {
+    while ui_tick(ui,surface) {}
+    << !ui.failed
 }
-fn ui_label(panel &Panel, x int, y int, text string, color int, width int) {
+fn ui_label#T(x int, y int, text string, color int, width int, pixels $&[]int, surface $&display.Surface#T) bool {
     for row in 0:16 {
         $column := 0
         while column < width {
-            text_chunk(panel,&text,color,UI_SURFACE,x,y,width,column,row)
-            column += 16
+            $count := 16
+            if width - column < count { count = width - column }
+            mask := text_bits(&text,column,row,count)
+            fill_pixels(pixels,count,mask,color)
+            if !surface.write_rgb565(x + column,y + row,pixels,count) { << false }
+            column += count
         }
     }
+    << true
 }
-fn ui_frame(panel &Panel, ui $&Dashboard) {
-    panel.clear(UI_BG)
-    panel.fill_rect(0,0,320,29,UI_SURFACE)
-    ui_label(panel,10,6,"XU WIRELESS",UI_TEXT,160)
-    panel.fill_rect(8,33,304,97,UI_SURFACE)
-    panel.fill_rect(8,135,304,97,UI_SURFACE)
-    panel.fill_rect(14,61,292,1,UI_BORDER)
-    panel.fill_rect(14,163,292,1,UI_BORDER)
-    ui_label(panel,16,39,"蓝牙键鼠",UI_TEXT,96)
-    ui_label(panel,128,39,"BLE HID",UI_MUTED,96)
-    ui_label(panel,16,66,"广播:",UI_MUTED,48)
-    ui_label(panel,16,83,"状态:",UI_MUTED,48)
-    ui_label(panel,16,103,"控制:",UI_MUTED,48)
-    ui_label(panel,16,141,"无线网络",UI_TEXT,112)
-    ui_label(panel,144,141,"WI-FI",UI_MUTED,80)
-    ui_label(panel,16,168,"网络:",UI_MUTED,48)
-    ui_label(panel,16,185,"IP:",UI_MUTED,48)
-    ui_label(panel,16,202,"信号:",UI_MUTED,48)
-    ui_flush(panel,ui)
-    esp32.uart_println("[DISPLAY] status cards rendered")
+fn ui_fail(ui $&Dashboard) bool { ui.failed = true
+    << false }
+fn ui_frame#T(ui $&Dashboard, surface $&display.Surface#T) bool {
+    if !surface.valid() || surface.width() < 320 || surface.height() < 240 { << ui_fail(ui) }
+    w := surface.width()
+    h := (surface.height() - 46) / 2
+    wifi_top := 38 + h
+    if !surface.clear(UI_BG) || !surface.fill_rect(0,0,w,29,UI_SURFACE) ||
+        !surface.fill_rect(8,33,w - 16,h,UI_SURFACE) ||
+        !surface.fill_rect(8,wifi_top,w - 16,h,UI_SURFACE) ||
+        !surface.fill_rect(14,61,w - 28,1,UI_BORDER) ||
+        !surface.fill_rect(14,wifi_top + 28,w - 28,1,UI_BORDER) { << ui_fail(ui) }
+    if !ui_label(10,6,"XU WIRELESS",UI_TEXT,160,$&ui.pixels,surface) ||
+        !ui_label(16,39,"蓝牙键鼠",UI_TEXT,96,$&ui.pixels,surface) ||
+        !ui_label(128,39,"BLE HID",UI_MUTED,96,$&ui.pixels,surface) ||
+        !ui_label(16,66,"广播:",UI_MUTED,48,$&ui.pixels,surface) ||
+        !ui_label(16,83,"状态:",UI_MUTED,48,$&ui.pixels,surface) ||
+        !ui_label(16,103,"控制:",UI_MUTED,48,$&ui.pixels,surface) ||
+        !ui_label(16,wifi_top + 6,"无线网络",UI_TEXT,112,$&ui.pixels,surface) ||
+        !ui_label(144,wifi_top + 6,"WI-FI",UI_MUTED,80,$&ui.pixels,surface) ||
+        !ui_label(16,wifi_top + 33,"网络:",UI_MUTED,48,$&ui.pixels,surface) ||
+        !ui_label(16,wifi_top + 50,"IP:",UI_MUTED,48,$&ui.pixels,surface) ||
+        !ui_label(16,wifi_top + 67,"信号:",UI_MUTED,48,$&ui.pixels,surface) { << ui_fail(ui) }
+    << ui_flush(ui,surface)
 }
 fn ui_wifi(ui $&Dashboard, state int, ip string) {
     if state == ui.wifi_state && ui.lines[6] == ip { << }
@@ -172,10 +196,6 @@ fn ui_wifi(ui $&Dashboard, state int, ip string) {
     else if state == 3 { ui_set(ui,4,"已连接",UI_GREEN) }
     else if state == 4 { ui_set(ui,4,"失败",UI_RED) }
     else { ui_set(ui,4,"待命",UI_MUTED) }
-    esp32.uart_print("[DISPLAY] WIFI state=")
-    esp32.uart_print_hex(state)
-    esp32.uart_print(" IP=")
-    esp32.uart_println(session.copy(&ip))
     ui_set(ui,6,ip,UI_GREEN)
 }
 fn ui_ble(ui $&Dashboard, state int, detail string) {
@@ -188,7 +208,4 @@ fn ui_ble(ui $&Dashboard, state int, detail string) {
     else if state == 5 { ui_set(ui,0,"错误",UI_RED) }
     else { ui_set(ui,0,"待命",UI_MUTED) }
     ui_set(ui,2,detail,UI_MUTED)
-    esp32.uart_print("[DISPLAY] BLE state=")
-    esp32.uart_print_hex(state)
-    esp32.uart_println("")
 }

@@ -111,7 +111,7 @@ Requests to its leased address, including unfragmented 1500-byte IPv4 packets. `
 An expired local lease, AP silence, received deauthentication/disassociation,
 or fatal DMA/submission failure revokes the connection. Lease seconds use
 network-order bytes and a wrapping monotonic clock. DHCP renewal/rebinding,
-duplicate-address detection/DECLINE, group-key rekey, DNS and TCP are still
+duplicate-address detection/DECLINE, group-key rekey and DNS are still
 unimplemented. Do not interpret a lease or gateway reply as proof of Internet
 access or a complete network stack. RSSI is unmeasured (`has_rssi()` is false).
 AES and software supplicant code do not promise constant-time execution or
@@ -121,3 +121,11 @@ Board acceptance exercises real WPA2, DHCP, repeated gateway replies,
 persistent reception, fresh-key reconnection and an external computer's Echo
 Requests. Parser/crypto rejection tests and synthetic facade tests are
 separate from that radio evidence.
+
+The CYD example now also drives a bounded
+[TCP active client](../../../wifi/tcp/README.md) and
+[MQTT 3.1.1 client](../../../mqtt/README.md). `open_tcp` selects the local port
+and peer; `resolve_tcp` resolves a LAN neighbor. Authenticated TCP candidates
+enter a four-packet session mailbox. Drain `session.take_tcp` and run codecs
+outside receive processing; submit `send_tcp` only after application parsing
+returns to the event-loop boundary. These APIs do not install OS sockets.
