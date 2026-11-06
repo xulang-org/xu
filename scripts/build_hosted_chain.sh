@@ -347,12 +347,50 @@ PY_BRIDGE
     BRIDGE_SOCKET_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/socket.xu")
     # shellcheck disable=SC2086
     set +u
-    XU_STDLIB_ROOT="$(native_path "$tmp/seed-bridge-src")" \
-        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/socket-poll-bootstrap.xin"
+    if XU_STDLIB_ROOT="$(native_path "$tmp/seed-bridge-src")" \
+        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/socket-poll-bootstrap.xin" >"$tmp/socket-build.log" 2>&1; then
+        socket_build_rc=0
+    else
+        socket_build_rc=$?
+    fi
     set -u
+    cat "$tmp/socket-build.log"
+    if [ "$socket_build_rc" -ne 0 ] && grep -q "os_exec takes exactly 3 arguments" "$tmp/socket-build.log"; then
+        FAILED_STAGE="exec_seed_bridge"
+        python3 - "$tmp/seed-bridge-src" <<'PY_SOCKET_EXEC_BRIDGE'
+from pathlib import Path
+import sys
+
+destination = Path(sys.argv[1])
+wrapper = destination / 'os/exec/mod.xu'
+text = wrapper.read_text(encoding='utf-8')
+call = 'os_exec(path, blob, redir, done, deadline_ns)'
+if text.count(call) != 1:
+    raise SystemExit('unsupported exec cancellation wrapper; refusing seed bridge')
+wrapper.write_text(text.replace(call, 'os_exec(path, blob, redir)'), encoding='utf-8')
+PY_SOCKET_EXEC_BRIDGE
+        BRIDGE_EXEC_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/exec/mod.xu")
+        # shellcheck disable=SC2086
+        set +u
+        XU_STDLIB_ROOT="$(native_path "$tmp/seed-bridge-src")" \
+            "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/socket-poll-bootstrap.xin"
+        set -u
+        if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
+            SEED_MANIFEST_BRIDGE=socket_readiness_wrapper_v2+exec_cancellation_v1
+        else
+            SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+socket_readiness_wrapper_v2+exec_cancellation_v1"
+        fi
+    elif [ "$socket_build_rc" -ne 0 ]; then
+        exit "$socket_build_rc"
+    else
+        if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
+            SEED_MANIFEST_BRIDGE=socket_readiness_wrapper_v2
+        else
+            SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+socket_readiness_wrapper_v2"
+        fi
+    fi
     BRIDGE_SEED=$(pick_bin "$tmp/socket-poll-bootstrap.xin")
     BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
-    SEED_MANIFEST_BRIDGE=socket_readiness_wrapper_v2
     FAILED_STAGE="bridged_seed_to_gen1"
     # shellcheck disable=SC2086
     set +u
