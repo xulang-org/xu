@@ -318,7 +318,7 @@ elif [ "$seed_build_rc" -ne 0 ]; then
     # an intermediate compiler without that wrapper, then restart Gen1 on
     # the complete original source. Never install or compare the bridge as
     # a product generation, and never recover unrelated compiler failures.
-    if ! grep -Eq "undefined name 'sys_(socket_(poll|wait)|fd_peek_read)'" "$tmp/seed-build.log"; then
+    if ! grep -Eq "undefined name 'sys_(socket_(poll|wait)|fd_peek_read|setsockopt)'" "$tmp/seed-build.log"; then
         exit "$seed_build_rc"
     fi
     FAILED_STAGE="socket_seed_bridge"
@@ -337,10 +337,10 @@ text = socket.read_text(encoding="utf-8")
 # declarations only in this disposable stdlib; production Gen1 and later
 # compile the original wrappers with the newly supported intrinsics.
 text, removed = re.subn(
-    r'^pub fn (?:socket_poll|socket_wait|socket_wait_read|fd_wait_read)\([^\n]*\) int \{\n.*?^\}\n',
+    r'^pub fn (?:socket_poll|socket_wait|socket_wait_read|fd_wait_read|setsockopt|setsockopt_int)\([^\n]*\) int \{\n.*?^\}\n',
     '', text, flags=re.MULTILINE | re.DOTALL,
 )
-if removed != 4:
+if removed != 6:
     raise SystemExit('unsupported socket readiness wrapper layout; refusing seed bridge')
 socket.write_text(text, encoding="utf-8")
 PY_BRIDGE

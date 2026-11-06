@@ -39,6 +39,7 @@
 extern "C" {
 const XuContentVTable *xu_webview_plugin_vtable(void) __attribute__((weak));
 const XuContentVTable *xu_draw_plugin_vtable(void) __attribute__((weak));
+const XuContentVTable *xu_app_plugin_vtable(void) __attribute__((weak));
 }
 
 static char g_tmp[1024];

@@ -16,6 +16,8 @@ static XuGtkWindow *extra_find(unsigned id,unsigned generation) {
 static const XuContentVTable *content_kind_vtable(unsigned kind) {
   if(kind==1 && xu_webview_plugin_vtable)return xu_webview_plugin_vtable();
   if(kind==2 && xu_draw_plugin_vtable)return xu_draw_plugin_vtable();
+  // kind 3 is CONTENT_NATIVE: the app's own native/linux/*.cc.
+  if(kind==3 && xu_app_plugin_vtable)return xu_app_plugin_vtable();
   return NULL;
 }
 static void extra_install(XuGtkWindow &w) {
