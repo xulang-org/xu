@@ -101,7 +101,7 @@ check_file() {
         windows-x64)
             echo "$got" | grep -q "PE32+ executable" && echo "$got" | grep -q "x86-64" ;;
         windows-arm64)
-            echo "$got" | grep -q "PE32+ executable" && echo "$got" | grep -qi "Aarch64\|ARM64\|aarch64" ;;
+            echo "$got" | grep -q "PE32+ executable" && echo "$got" | grep -qiE "Aarch64|ARM64|aarch64" ;;
         *)
             return 0 ;;
     esac
