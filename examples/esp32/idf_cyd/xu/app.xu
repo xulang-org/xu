@@ -1,0 +1,210 @@
+@main
+#embedded/mqtt
+#embedded/bluetooth/control
+
+// MQTT client and command handling for idf_cyd, linked into the ESP-IDF app
+// as a relocatable object. C (main/xu_host.c) provides sockets, BLE HID, the
+// LCD panel and the RTOS through c_call6; everything protocol-level lives here.
+
+struct Seen { id string payload string result string }
+struct App {
+    seen []Seen
+    cmd_topic string
+    result_topic string
+    status_topic string
+    opened bool
+    announced bool
+    last_try int
+    last_status int
+    last_id string
+    last_result string
+    polled_at int
+}
+
+// ===== host services =====
+
+fn now_ms() int { << c_call6("xu_host_now_ms",0,0,0,0,0,0) }
+fn sleep_ms(ms int) { c_call6("xu_host_sleep_ms",ms,0,0,0,0,0) }
+fn elapsed(now int, then int) int { << (now - then) & 0x7FFFFFFF }
+
+fn log(s string) {
+    n := s.len
+    c_call6("xu_host_log",&s,n,0,0,0,0)
+}
+fn config(key int) string {
+    n := c_call6("xu_host_config_len",key,0,0,0,0,0)
+    $out := make_string(n)
+    c_call6("xu_host_config_copy",key,$&out,n,0,0,0)
+    << out
+}
+fn hid(what int) bool { << c_call6("xu_host_hid_state",what,0,0,0,0,0) != 0 }
+fn hid_do(what int) bool { << c_call6("xu_host_hid_action",what,0,0,0,0,0) != 0 }
+
+// ===== JSON =====
+
+fn copy(s &string) string {
+    $out := make_string(s.len)
+    for i in 0:s.len { out[i] = s[i] }
+    << out
+}
+fn flag(v bool) string {
+    if v { << "true" }
+    << "false"
+}
+fn state_json() string {
+    $out := "{\"online\":true,\"runtime\":\"xu\",\"wifi\":true"
+    out = out + ",\"ble_connected\":" + flag(hid(1))
+    out = out + ",\"encrypted\":" + flag(hid(2))
+    out = out + ",\"paired\":" + flag(hid(7))
+    out = out + ",\"advertising\":" + flag(hid(6))
+    out = out + ",\"keyboard\":" + flag(hid(3))
+    out = out + ",\"mouse\":" + flag(hid(4))
+    out = out + ",\"consumer\":" + flag(hid(5)) + "}"
+    << out
+}
+fn result_json(id &string, status &string) string {
+    << "{\"id\":\"" + copy(id) + "\",\"result\":\"" + copy(status) + "\"}"
+}
+
+// ===== commands =====
+
+fn queued(ok bool) string {
+    if ok { << "queued" }
+    << "busy_controller"
+}
+fn apply(command &control.Command) string {
+    op := command.op
+    r := &command.report
+    if op == control.STATUS { << "ok" }
+    if op == control.ADVERTISING_START { << queued(hid_do(1)) }
+    if op == control.ADVERTISING_STOP { << queued(hid_do(2)) }
+    if op == control.DISCONNECT {
+        if !hid(1) { << "already_disconnected" }
+        << queued(hid_do(3))
+    }
+    if op == control.RELEASE_ALL { << queued(hid_do(4)) }
+    if op == control.KEYBOARD {
+        if !hid(3) { << "not_ready" }
+        << queued(c_call6("xu_host_hid_keyboard",r[0] | (r[1] << 8),r[2] | (r[3] << 8),r[4] | (r[5] << 8),r[6] | (r[7] << 8),0,0) != 0)
+    }
+    if op == control.MOUSE {
+        if !hid(4) { << "not_ready" }
+        << queued(c_call6("xu_host_hid_mouse",r[0],r[1],r[2],r[3],r[4],0) != 0)
+    }
+    if op == control.CONSUMER {
+        if !hid(5) { << "not_ready" }
+        << queued(c_call6("xu_host_hid_consumer",r[0],0,0,0,0,0) != 0)
+    }
+    << "invalid_command"
+}
+fn handle(app $&App, payload &string, retained bool) string {
+    if retained { << result_json(&"",&"retained_rejected") }
+    if payload.len > 512 { << result_json(&"",&"invalid_command") }
+    command := control.parse(payload)
+    // The CYD contract is the absolute 5-byte mouse report only.
+    if !command.valid || (command.op == control.MOUSE && command.report.len != 5) { << result_json(&"",&"invalid_command") }
+    for i in 0:app.seen.len {
+        if app.seen[i].id == command.id {
+            if app.seen[i].payload != *payload { << result_json(&command.id,&"id_conflict") }
+            << copy(&app.seen[i].result)
+        }
+    }
+    status := apply(&command)
+    $body := result_json(&command.id,&status)
+    if command.op == control.STATUS {
+        body = "{\"id\":\"" + copy(&command.id) + "\",\"result\":\"ok\",\"state\":" + state_json() + "}"
+    } else {
+        app.last_id = copy(&command.id)
+        app.last_result = copy(&status)
+        log("cmd " + copy(&command.id) + " -> " + copy(&status))
+    }
+    if app.seen.len >= 16 {
+        $keep := []Seen{}
+        for i in 1:app.seen.len { keep.push(app.seen[i]) }
+        app.seen = keep
+    }
+    app.seen.push(Seen{id: copy(&command.id),payload: copy(payload),result: copy(&body)})
+    << body
+}
+
+// ===== connection =====
+
+fn send_pending(client $&mqtt.Client, now int) bool {
+    for k in 0:8 {
+        out := client.poll(now)
+        if out.len == 0 { << true }
+        n := out.len
+        if c_call6("xu_host_tcp_send",&out,n,0,0,0,0) == 0 { << false }
+    }
+    << true
+}
+fn session_tick(app $&App, client $&mqtt.Client, now int) bool {
+    n := c_call6("xu_host_tcp_recv",0,0,0,0,0,0)
+    if n < 0 { << false }
+    if n > 0 {
+        $bytes := make_string(n)
+        c_call6("xu_host_rx_copy",$&bytes,n,0,0,0,0)
+        if !client.feed(&bytes,now) { << false }
+    }
+    if client.failed() { << false }
+    if client.can_publish() {
+        message := client.read()
+        if message.valid {
+            result := handle(app,&message.payload,message.retained)
+            client.publish(&app.result_topic,&result,false)
+        }
+        if !app.announced || elapsed(now,app.last_status) >= 30000 {
+            body := state_json()
+            if client.publish(&app.status_topic,&body,true) {
+                app.last_status = now
+                if !app.announced {
+                    app.announced = true
+                    log("MQTT connected; subscribed " + copy(&app.cmd_topic))
+                }
+            }
+        }
+    }
+    << send_pending(client,now)
+}
+
+fn xu_app_main(arg int) int {
+    root := config(0)
+    $app := App{seen: []Seen{},cmd_topic: copy(&root) + "/cmd",result_topic: copy(&root) + "/result",
+        status_topic: copy(&root) + "/status",opened: false,announced: false,last_try: now_ms() - 5000,last_status: 0,
+        last_id: "",last_result: "",polled_at: now_ms()}
+    $client := mqtt.create("XuCyd",copy(&app.cmd_topic),copy(&app.status_topic),now_ms())
+    $dash := ui_create()
+    $surface := screen_surface()
+    screen_start($&dash,&app,$&surface)
+    log("Xu MQTT app started; root " + copy(&root))
+    while true {
+        now := now_ms()
+        wifi_up := c_call6("xu_host_wifi_state",0,0,0,0,0,0) == 1
+        if !app.opened && wifi_up && elapsed(now,app.last_try) >= 5000 {
+            app.last_try = now
+            if c_call6("xu_host_tcp_open",0,0,0,0,0,0) != 0 {
+                client.reset("XuCyd",copy(&app.cmd_topic),copy(&app.status_topic),now)
+                app.opened = true
+                app.announced = false
+                log("TCP connected to broker")
+            } else {
+                log("TCP connect failed; retry in 5 s")
+            }
+        }
+        if app.opened && !session_tick($&app,$&client,now) {
+            c_call6("xu_host_tcp_close",0,0,0,0,0,0)
+            app.opened = false
+            app.announced = false
+            app.last_try = now
+            log("MQTT disconnected")
+        }
+        screen_tick($&dash,$&app,now,$&surface)
+        sleep_ms(10)
+    }
+    << arg
+}
+
+fn main() {
+    entry := rom_callback(xu_app_main)
+    if entry == 0 { << }
+}
