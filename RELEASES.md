@@ -6,18 +6,17 @@
 
 ---
 
-## Xu 0.11.4-dev.5 (development)
-
-Integrates ESP32 portable display, MQTT/BLE remote control, 16-bit absolute HID pointer reports, Xtensa relocatable `.o` output (`--emit-obj` and `c_call6`) for official ESP-IDF static-library linking, IPv4 UDP multicast (`sys_setsockopt` and `net.listen_multicast_udp`), host content windows (`ui.App.with_content`), and macOS native `.app` bundle Info.plist fragment/resource merging. Compiler, standard library and product tools must be upgraded together (`desktop` `1.3.56`, `setup` `1.2.47`, `examples/esp32` `0.5.0`). This is a development integration build.
-
 ## Xu 0.11.4
 
 - Compiler: eligible ARM64 integer/bool sibling tail calls restore the caller frame before jumping. Pure scalar additive self recursion can use an accumulator loop; checked arithmetic, bounded readonly byte scans, string operations and proved eight-round CRC loops retain their specialized paths. Ownership, address, ABI, debugging and instrumentation exclusions keep their ordinary fallback. No general performance improvement is claimed.
-- XUN: duration validation advances through its input, collection nesting is bounded by `MAX_DEPTH` (64), multiline payload indentation is preserved, and typed-list parsing/serialization retains its tag and validates inherited scalar types. Typed-list output spelling changes; update textual snapshots when upgrading. Legacy nonempty `!s[...]` scalar input remains accepted.
-- ESP32: the fixed-profile pure Xu Wi-Fi/BLE coexistence and CYD status application are included as experimental source. External full-MTU ICMP reply acceptance remains pending after a host LAN `EHOSTUNREACH`. This release does not certify the board application for production. Fixed WPA2-PSK/CCMP and single-peer legacy SMP Just Works limits remain; DHCP renewal/rebinding, Group Rekey, DNS/TCP, SoftAP, WPA3/PMF and Wi-Fi reconnection while BLE remains connected are unavailable. Changing networks requires a joint restart.
+- XUN & standard library: XUN duration validation advances through its input, collection nesting is bounded by `MAX_DEPTH` (64), multiline payload indentation is preserved, and typed-list parsing/serialization retains its tag and validates inherited scalar types (typed-list output spelling changes; legacy nonempty `!s[...]` scalar input remains accepted). Standard library adds `sys_setsockopt` / `os.setsockopt` and IPv4 UDP multicast (`net.listen_multicast_udp`, `join_group`, `leave_group`), TOML `[[array]]` table-of-tables parsing, and resumable `crypto/cipher` CTR keystreams.
+- Desktop & UI: `ui.App.with_content` adds host-side content windows across macOS, Windows and Linux; `xu desktop` supports native app content plugins and macOS `Info.plist.fragment` / resource bundle merging.
+- ESP32: adds portable display surfaces (`embedded/display`), MQTT/BLE remote control (`embedded/mqtt`, `embedded/wifi/tcp`), 16-bit absolute HID pointer reports (`0..32767`, 5-byte control payload), and Xtensa relocatable ELF object emission (`--emit-obj`) with `c_call6` external C symbol bridging for linking against official ESP-IDF static libraries (`examples/esp32/idf_cyd`, `0.5.0`). The fixed-profile pure Xu Wi-Fi/BLE coexistence and CYD status application remain experimental source with documented WPA2-PSK/CCMP and single-peer legacy SMP Just Works limits.
 - Brand assets: retain the original 0.11.2 UI morph source snapshot with its provenance, credits and external rendering requirements. The historical creative copy does not identify the current SDK.
 
-Upgrade the compiler, standard library and product tools together. Desktop is `1.3.56`, setup is `1.2.47`, and the native tool remains `0.1.3`. The later draft MQTT/display work and its absolute-pointer/ESP-IDF follow-ups are not part of this release. No firmware is flashed or distributed by this SDK release. Native acceptance covers macOS, Linux and Windows on ARM64/x64; LoongArch64 and RISC-V packages are cross-built. Benchmark results retain their own measured compiler version and source commit.
+Upgrade the compiler, standard library and product tools together. Desktop is `1.3.57`, setup is `1.2.48`, and the native tool remains `0.1.3`. No firmware is flashed or distributed by this SDK release. Native acceptance covers macOS, Linux and Windows on ARM64/x64; LoongArch64 and RISC-V packages are cross-built. Benchmark results retain their own measured compiler version and source commit.
+
+## Xu 0.11.4-dev.5 (development)
 
 ## Xu 0.11.4-dev.4 (development)
 
