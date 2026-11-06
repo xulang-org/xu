@@ -58,12 +58,32 @@ int xu_host_log(const char *text, int len) {
 /* Config strings: 0 MQTT topic root, 1 HID name, 2 Wi-Fi SSID, 3 current IP
  * (snapshotted by xu_host_config_len so the bytes stay consistent). */
 static char s_ip_snap[16];
+static char s_rt_mqtt_uri[96] = CONFIG_XU_MQTT_URI;
+static char s_rt_mqtt_root[64] = CONFIG_XU_MQTT_ROOT;
+static char s_rt_hid_name[32] = CONFIG_XU_HID_NAME;
+static char s_rt_wifi_ssid[64] = CONFIG_XU_WIFI_SSID;
+
+void xu_host_set_runtime_config(const char *mqtt_uri, const char *mqtt_root,
+                                const char *hid_name, const char *wifi_ssid) {
+    if (mqtt_uri && mqtt_uri[0]) {
+        strncpy(s_rt_mqtt_uri, mqtt_uri, sizeof(s_rt_mqtt_uri) - 1);
+    }
+    if (mqtt_root && mqtt_root[0]) {
+        strncpy(s_rt_mqtt_root, mqtt_root, sizeof(s_rt_mqtt_root) - 1);
+    }
+    if (hid_name && hid_name[0]) {
+        strncpy(s_rt_hid_name, hid_name, sizeof(s_rt_hid_name) - 1);
+    }
+    if (wifi_ssid && wifi_ssid[0]) {
+        strncpy(s_rt_wifi_ssid, wifi_ssid, sizeof(s_rt_wifi_ssid) - 1);
+    }
+}
 
 static const char *config_text(int key) {
     switch (key) {
-    case 0: return CONFIG_XU_MQTT_ROOT;
-    case 1: return CONFIG_XU_HID_NAME;
-    case 2: return CONFIG_XU_WIFI_SSID;
+    case 0: return s_rt_mqtt_root;
+    case 1: return s_rt_hid_name;
+    case 2: return s_rt_wifi_ssid;
     case 3: return s_ip_snap;
     default: return "";
     }
@@ -94,10 +114,10 @@ int xu_host_tcp_close(void) {
     return 1;
 }
 
-/* Connect to CONFIG_XU_MQTT_URI (mqtt://host:port) within 5 s; socket stays non-blocking. */
+/* Connect to s_rt_mqtt_uri (mqtt://host:port) within 5 s; socket stays non-blocking. */
 int xu_host_tcp_open(void) {
     xu_host_tcp_close();
-    const char *uri = CONFIG_XU_MQTT_URI;
+    const char *uri = s_rt_mqtt_uri;
     const char *host = strstr(uri, "://");
     host = host ? host + 3 : uri;
     char name[64];
@@ -191,8 +211,9 @@ int xu_host_tcp_send(const uint8_t *data, int len) {
     return s_sock >= 0;
 }
 
-/* HID state: 1 connected, 2 encrypted, 3 keyboard, 4 mouse, 5 consumer, 6 advertising, 7 paired. */
-int xu_host_hid_state(int what) {
+/* HID state: 1 connected, 2 encrypted, 3 keyboard, 4 mouse, 5 consumer, 6 advertising, 7 paired,
+ * 8 connected_count, 9 peer_connected(slot), 10 peer_ready(slot). */
+int xu_host_hid_state(int what, int slot) {
     switch (what) {
     case 1: return hid_abs_connected();
     case 2: return hid_abs_encrypted_ready();
@@ -201,39 +222,56 @@ int xu_host_hid_state(int what) {
     case 5: return hid_abs_consumer_subscribed();
     case 6: return hid_abs_advertising();
     case 7: return hid_abs_paired();
+    case 8: return hid_abs_connected_count();
+    case 9: return hid_abs_peer_connected(slot);
+    case 10: return hid_abs_peer_ready(slot);
     default: return 0;
     }
 }
 
-/* HID actions: 1 advertise on, 2 advertise off, 3 disconnect, 4 release all. */
-int xu_host_hid_action(int what) {
+/* Peer string: kind 0 = BDA, kind 1 = phone name read via GATT 0x2A00. */
+int xu_host_peer_len(int slot, int kind) {
+    const char *s = (kind == 0) ? hid_abs_peer_bda(slot) : hid_abs_peer_name(slot);
+    return (int)strlen(s);
+}
+
+int xu_host_peer_copy(int slot, int kind, char *dst, int cap) {
+    const char *s = (kind == 0) ? hid_abs_peer_bda(slot) : hid_abs_peer_name(slot);
+    int n = (int)strlen(s);
+    n = n < cap ? n : cap;
+    memcpy(dst, s, n);
+    return n;
+}
+
+/* HID actions: 1 advertise on, 2 advertise off, 3 disconnect(target), 4 release all(target). */
+int xu_host_hid_action(int what, int target) {
     switch (what) {
     case 1: return hid_abs_set_advertising(true);
     case 2: return hid_abs_set_advertising(false);
-    case 3: return hid_abs_disconnect();
-    case 4: return hid_abs_release_all();
+    case 3: return hid_abs_disconnect_to(target);
+    case 4: return hid_abs_release_all_to(target);
     default: return 0;
     }
 }
 
-int xu_host_hid_mouse(int b0, int b1, int b2, int b3, int b4) {
+int xu_host_hid_mouse(int b0, int b1, int b2, int b3, int b4, int target) {
     const uint8_t report[5] = {(uint8_t)b0, (uint8_t)b1, (uint8_t)b2, (uint8_t)b3, (uint8_t)b4};
-    return hid_abs_send_mouse(report);
+    return hid_abs_send_mouse_to(target, report);
 }
 
 /* Eight bytes packed little-endian, two per word. */
-int xu_host_hid_keyboard(int w0, int w1, int w2, int w3) {
+int xu_host_hid_keyboard(int w0, int w1, int w2, int w3, int target) {
     const int w[4] = {w0, w1, w2, w3};
     uint8_t report[8];
     for (int i = 0; i < 4; i++) {
         report[i * 2] = (uint8_t)(w[i] & 0xFF);
         report[i * 2 + 1] = (uint8_t)((w[i] >> 8) & 0xFF);
     }
-    return hid_abs_send_keyboard(report);
+    return hid_abs_send_keyboard_to(target, report);
 }
 
-int xu_host_hid_consumer(int mask) {
-    return hid_abs_send_consumer((uint8_t)mask);
+int xu_host_hid_consumer(int mask, int target) {
+    return hid_abs_send_consumer_to(target, (uint8_t)mask);
 }
 
 /* Wi-Fi: 0 connecting, 1 up, 2 failed. */
