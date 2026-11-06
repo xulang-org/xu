@@ -13,7 +13,7 @@
 - ESP32: the fixed-profile pure Xu Wi-Fi/BLE coexistence and CYD status application are included as experimental source. External full-MTU ICMP reply acceptance remains pending after a host LAN `EHOSTUNREACH`. This release does not certify the board application for production. Fixed WPA2-PSK/CCMP and single-peer legacy SMP Just Works limits remain; DHCP renewal/rebinding, Group Rekey, DNS/TCP, SoftAP, WPA3/PMF and Wi-Fi reconnection while BLE remains connected are unavailable. Changing networks requires a joint restart.
 - Brand assets: retain the original 0.11.2 UI morph source snapshot with its provenance, credits and external rendering requirements. The historical creative copy does not identify the current SDK.
 
-Upgrade the compiler, standard library and product tools together. Desktop is `1.3.55`, setup is `1.2.46`, and the native tool remains `0.1.3`. The later draft MQTT/display work and its absolute-pointer/ESP-IDF follow-ups are not part of this release. No firmware is flashed or distributed by this SDK release. Native acceptance covers macOS, Linux and Windows on ARM64/x64; LoongArch64 and RISC-V packages are cross-built. Benchmark results retain their own measured compiler version and source commit.
+Upgrade the compiler, standard library and product tools together. Desktop is `1.3.56`, setup is `1.2.47`, and the native tool remains `0.1.3`. The later draft MQTT/display work and its absolute-pointer/ESP-IDF follow-ups are not part of this release. No firmware is flashed or distributed by this SDK release. Native acceptance covers macOS, Linux and Windows on ARM64/x64; LoongArch64 and RISC-V packages are cross-built. Benchmark results retain their own measured compiler version and source commit.
 
 ## Xu 0.11.4-dev.4 (development)
 

@@ -13,7 +13,7 @@
 - ESP32：收录固定 profile 的纯 Xu Wi-Fi/BLE 共存和 CYD 状态应用实验源码。主机局域网返回 `EHOSTUNREACH` 后，完整 MTU 的外部 ICMP 应答验收仍待完成，本版不代表板端应用已通过生产验收。保留 WPA2-PSK/CCMP、单 peer legacy SMP Just Works 限制；尚无 DHCP 续租／重绑定、Group Rekey、DNS/TCP、SoftAP、WPA3/PMF，以及 BLE 保持连接时的 Wi-Fi 重连。切换网络须联合重启。
 - 品牌素材：保留原始 0.11.2 UI morph 源码快照、来源、署名及外部渲染依赖；历史宣传文案不代表当前 SDK 身份。
 
-请一起升级编译器、标准库和产品工具。Desktop 为 `1.3.55`，setup 为 `1.2.46`，native 工具保持 `0.1.3`。后续仍在 Draft 的 MQTT／显示工作及绝对指针、ESP-IDF 跟进不属于本版。SDK 发布不烧录或分发固件。原生验收覆盖 macOS、Linux、Windows 的 ARM64/x64；LoongArch64 和 RISC-V 安装包为交叉构建。横测保留各自实际测量的编译器版本与源码提交。
+请一起升级编译器、标准库和产品工具。Desktop 为 `1.3.56`，setup 为 `1.2.47`，native 工具保持 `0.1.3`。后续仍在 Draft 的 MQTT／显示工作及绝对指针、ESP-IDF 跟进不属于本版。SDK 发布不烧录或分发固件。原生验收覆盖 macOS、Linux、Windows 的 ARM64/x64；LoongArch64 和 RISC-V 安装包为交叉构建。横测保留各自实际测量的编译器版本与源码提交。
 
 ## Xu 0.11.4-dev.4（开发版）
 
