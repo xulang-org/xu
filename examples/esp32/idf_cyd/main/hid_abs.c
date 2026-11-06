@@ -1,5 +1,6 @@
 #include "hid_abs.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_bt.h"
@@ -7,11 +8,15 @@
 #include "esp_bt_main.h"
 #include "esp_event.h"
 #include "esp_gap_ble_api.h"
+#include "esp_gatt_defs.h"
+#include "esp_gattc_api.h"
 #include "esp_gatts_api.h"
 #include "esp_hidd.h"
 #include "esp_hidd_gatts.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "hid_abs";
@@ -22,6 +27,37 @@ enum {
     HID_RPT_CONSUMER = 3,
     HID_MOUSE_ABS_MAX = 32767,
 };
+
+/* Stage 1 BLE Provisioning GATT Service (0xFF00) attribute indices. */
+enum {
+    PROV_IDX_SVC = 0,
+    PROV_IDX_CFG_CHAR,
+    PROV_IDX_CFG_VAL,
+    PROV_IDX_STS_CHAR,
+    PROV_IDX_STS_VAL,
+    PROV_IDX_STS_CCC,
+    PROV_IDX_NB,
+};
+
+#define PROV_APP_ID 0x55
+
+typedef struct {
+    bool has_bda;
+    bool connected;
+    bool paired;
+    uint16_t conn_id;
+    esp_bd_addr_t bda;
+    esp_ble_addr_type_t addr_type;
+    char bda_str[18];
+    char name[32];
+    uint16_t last_x;
+    uint16_t last_y;
+    bool mouse_down;
+    bool key_down;
+    bool consumer_down;
+    uint16_t gap_start_hdl;
+    uint16_t gap_end_hdl;
+} hid_peer_t;
 
 /* Absolute mouse (no relative wheel) + keyboard + consumer — matches Xu HOGP. */
 static const uint8_t s_report_map[] = {
@@ -36,52 +72,131 @@ static const uint8_t s_report_map[] = {
     0x02, 0x75, 0x03, 0x95, 0x01, 0x81, 0x01, 0xC0,
 };
 
+static bool s_bt_stack_ready = false;
+static bool s_prov_mode = false;
+static char s_prov_name[32] = "XuPlay-Setup";
+static hid_prov_cb_t s_prov_cb = NULL;
+static esp_gatt_if_t s_prov_gatts_if = ESP_GATT_IF_NONE;
+static uint16_t s_prov_handles[PROV_IDX_NB] = {0};
+static bool s_prov_connected = false;
+static uint16_t s_prov_conn_id = 0;
+static char s_prov_rx_buf[384];
+static size_t s_prov_rx_len = 0;
+static char s_prov_status[160] = "{\"state\":\"provisioning\"}";
+
+static const uint16_t s_uuid_pri_svc = ESP_GATT_UUID_PRI_SERVICE;
+static const uint16_t s_uuid_char_decl = ESP_GATT_UUID_CHAR_DECLARE;
+static const uint16_t s_uuid_ccc = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+static const uint16_t s_uuid_prov_svc = 0xFF00;
+static const uint16_t s_uuid_prov_cfg = 0xFF01;
+static const uint16_t s_uuid_prov_sts = 0xFF02;
+static const uint8_t s_prop_write = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
+static const uint8_t s_prop_read_notify = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+static uint16_t s_prov_ccc_val = 0;
+
+static const esp_gatts_attr_db_t s_prov_gatt_db[PROV_IDX_NB] = {
+    [PROV_IDX_SVC] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&s_uuid_pri_svc, ESP_GATT_PERM_READ, sizeof(uint16_t), sizeof(s_uuid_prov_svc), (uint8_t *)&s_uuid_prov_svc}},
+    [PROV_IDX_CFG_CHAR] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&s_uuid_char_decl, ESP_GATT_PERM_READ, 1, 1, (uint8_t *)&s_prop_write}},
+    [PROV_IDX_CFG_VAL] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&s_uuid_prov_cfg, ESP_GATT_PERM_WRITE, 256, 0, NULL}},
+    [PROV_IDX_STS_CHAR] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&s_uuid_char_decl, ESP_GATT_PERM_READ, 1, 1, (uint8_t *)&s_prop_read_notify}},
+    [PROV_IDX_STS_VAL] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&s_uuid_prov_sts, ESP_GATT_PERM_READ, sizeof(s_prov_status), 24, (uint8_t *)s_prov_status}},
+    [PROV_IDX_STS_CCC] = {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&s_uuid_ccc, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t), sizeof(s_prov_ccc_val), (uint8_t *)&s_prov_ccc_val}},
+};
+
 static esp_hidd_dev_t *s_hid = NULL;
-static bool s_connected = false;
+static hid_peer_t s_peers[HID_ABS_MAX_PEERS];
+static esp_gatt_if_t s_hid_gatts_if = ESP_GATT_IF_NONE;
+static esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
+static uint16_t s_mouse_handle = 0;
+static uint16_t s_keyboard_handle = 0;
+static uint16_t s_consumer_handle = 0;
+
 static bool s_protocol_ok = false;
-static bool s_mouse_on = false;
-static bool s_keyboard_on = false;
-static bool s_consumer_on = false;
 static bool s_want_adv = true;
-static bool s_paired = false;
+static bool s_adv_active = false;
 static uint16_t s_last_x = 0;
 static uint16_t s_last_y = 0;
 static bool s_mouse_down = false;
-static bool s_key_down = false;
-static bool s_consumer_down = false;
-static char s_name[32] = "XU-IDF-HID";
+static char s_name[32] = "XuPlay";
 
-static void gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
-    switch (event) {
-    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
-        break;
-    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGW(TAG, "adv start failed %d", param->adv_start_cmpl.status);
+static void format_bda(const esp_bd_addr_t bda, char out[18]) {
+    snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+             bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+}
+
+static int find_peer_by_bda(const esp_bd_addr_t bda) {
+    for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+        if (s_peers[i].has_bda && memcmp(s_peers[i].bda, bda, ESP_BD_ADDR_LEN) == 0) {
+            return i;
         }
-        break;
-    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-        break;
-    case ESP_GAP_BLE_SEC_REQ_EVT:
-        esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
-        break;
-    case ESP_GAP_BLE_AUTH_CMPL_EVT:
-        s_paired = param->ble_security.auth_cmpl.success;
-        if (s_paired) {
-            ESP_LOGI(TAG, "pairing complete");
-        } else {
-            ESP_LOGW(TAG, "pairing failed 0x%x", param->ble_security.auth_cmpl.fail_reason);
-        }
-        break;
-    case ESP_GAP_BLE_UPDATE_WHITELIST_COMPLETE_EVT:
-        break;
-    default:
-        break;
     }
+    return -1;
+}
+
+static int alloc_peer_slot(const esp_bd_addr_t bda) {
+    int existing = find_peer_by_bda(bda);
+    if (existing >= 0) {
+        return existing;
+    }
+    for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+        if (!s_peers[i].has_bda) {
+            return i;
+        }
+    }
+    for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+        if (!s_peers[i].connected) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int resolve_peer_slot(int target) {
+    if (target >= 0 && target < HID_ABS_MAX_PEERS) {
+        return s_peers[target].connected ? target : -1;
+    }
+    for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+        if (s_peers[i].connected) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool start_prov_advertising(void) {
+    static uint8_t prov_service_uuid128[] = {
+        0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00,
+    };
+    esp_ble_adv_data_t adv = {0};
+    adv.service_uuid_len = sizeof(prov_service_uuid128);
+    adv.p_service_uuid = prov_service_uuid128;
+    adv.set_scan_rsp = false;
+    adv.include_name = true;
+    adv.appearance = 0x0000;
+    adv.flag = ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT;
+    if (esp_ble_gap_set_device_name(s_prov_name) != ESP_OK) {
+        return false;
+    }
+    if (esp_ble_gap_config_adv_data(&adv) != ESP_OK) {
+        return false;
+    }
+    esp_ble_adv_params_t params = {0};
+    params.adv_int_min = 0x20;
+    params.adv_int_max = 0x40;
+    params.adv_type = ADV_TYPE_IND;
+    params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    params.channel_map = ADV_CHNL_ALL;
+    params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+    return esp_ble_gap_start_advertising(&params) == ESP_OK;
 }
 
 static bool start_advertising(void) {
+    if (s_prov_mode) {
+        return start_prov_advertising();
+    }
+    if (hid_abs_connected_count() >= HID_ABS_MAX_PEERS) {
+        return true;
+    }
     static uint8_t hid_service_uuid128[] = {
         0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00,
     };
@@ -108,41 +223,299 @@ static bool start_advertising(void) {
     return esp_ble_gap_start_advertising(&params) == ESP_OK;
 }
 
+/* Simple JSON string field extractor for BLE provisioning payload. */
+static void extract_json_str(const char *json, const char *key, char *out, size_t cap) {
+    out[0] = '\0';
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) {
+        return;
+    }
+    p = strchr(p + strlen(pat), ':');
+    if (!p) {
+        return;
+    }
+    while (*p == ':' || *p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p != '"') {
+        return;
+    }
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < cap) {
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+        }
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+}
+
+static void handle_prov_write(const uint8_t *data, uint16_t len) {
+    if (!data || len == 0) {
+        return;
+    }
+    if (s_prov_rx_len + len >= sizeof(s_prov_rx_buf)) {
+        s_prov_rx_len = 0;
+    }
+    memcpy(s_prov_rx_buf + s_prov_rx_len, data, len);
+    s_prov_rx_len += len;
+    s_prov_rx_buf[s_prov_rx_len] = '\0';
+
+    if (!strchr(s_prov_rx_buf, '}')) {
+        return;
+    }
+    char ssid[64] = {0};
+    char pass[64] = {0};
+    char mqtt_uri[96] = {0};
+    char root[64] = {0};
+    char name[32] = {0};
+    extract_json_str(s_prov_rx_buf, "ssid", ssid, sizeof(ssid));
+    extract_json_str(s_prov_rx_buf, "pass", pass, sizeof(pass));
+    extract_json_str(s_prov_rx_buf, "mqtt_uri", mqtt_uri, sizeof(mqtt_uri));
+    extract_json_str(s_prov_rx_buf, "root", root, sizeof(root));
+    extract_json_str(s_prov_rx_buf, "name", name, sizeof(name));
+    s_prov_rx_len = 0;
+
+    if (ssid[0] != '\0' && s_prov_cb) {
+        ESP_LOGI(TAG, "BLE prov rx: ssid=%s mqtt_uri=%s root=%s name=%s", ssid, mqtt_uri, root, name);
+        s_prov_cb(ssid, pass, mqtt_uri, root, name);
+    }
+}
+
+static void gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    switch (event) {
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        s_adv_active = (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS);
+        if (!s_adv_active) {
+            ESP_LOGW(TAG, "adv start failed %d", param->adv_start_cmpl.status);
+        }
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        s_adv_active = false;
+        break;
+    case ESP_GAP_BLE_SEC_REQ_EVT:
+        esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+        break;
+    case ESP_GAP_BLE_AUTH_CMPL_EVT: {
+        if (s_prov_mode) {
+            break;
+        }
+        int slot = find_peer_by_bda(param->ble_security.auth_cmpl.bd_addr);
+        bool ok = param->ble_security.auth_cmpl.success;
+        if (slot >= 0) {
+            s_peers[slot].paired = ok;
+            s_peers[slot].addr_type = param->ble_security.auth_cmpl.addr_type;
+            if (ok && s_gattc_if != ESP_GATT_IF_NONE && s_peers[slot].name[0] == 0) {
+                /* Open GATT client over the existing link to read iPhone's 0x2A00 Device Name. */
+                esp_ble_gattc_open(s_gattc_if, s_peers[slot].bda, s_peers[slot].addr_type, true);
+            }
+        }
+        if (ok) {
+            ESP_LOGI(TAG, "pairing complete (slot %d)", slot);
+        } else {
+            ESP_LOGW(TAG, "pairing failed 0x%x", param->ble_security.auth_cmpl.fail_reason);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* GATT Client callback: reads GAP Device Name (0x2A00) so XuPlay can auto-match AirPlay phone_name. */
+static void gattc_event(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
+    switch (event) {
+    case ESP_GATTC_REG_EVT:
+        if (param->reg.status == ESP_GATT_OK) {
+            s_gattc_if = gattc_if;
+        }
+        break;
+    case ESP_GATTC_OPEN_EVT: {
+        if (param->open.status != ESP_GATT_OK) {
+            break;
+        }
+        esp_bt_uuid_t gap_uuid = {
+            .len = ESP_UUID_LEN_16,
+            .uuid = {.uuid16 = 0x1800},
+        };
+        esp_ble_gattc_search_service(gattc_if, param->open.conn_id, &gap_uuid);
+        break;
+    }
+    case ESP_GATTC_SEARCH_RES_EVT: {
+        for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+            if (s_peers[i].connected && s_peers[i].conn_id == param->search_res.conn_id) {
+                s_peers[i].gap_start_hdl = param->search_res.start_handle;
+                s_peers[i].gap_end_hdl = param->search_res.end_handle;
+            }
+        }
+        break;
+    }
+    case ESP_GATTC_SEARCH_CMPL_EVT: {
+        for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+            if (s_peers[i].connected && s_peers[i].conn_id == param->search_cmpl.conn_id &&
+                s_peers[i].gap_end_hdl > 0) {
+                uint16_t count = 1;
+                esp_gattc_char_elem_t elem;
+                esp_bt_uuid_t name_uuid = {
+                    .len = ESP_UUID_LEN_16,
+                    .uuid = {.uuid16 = ESP_GATT_UUID_GAP_DEVICE_NAME},
+                };
+                if (esp_ble_gattc_get_char_by_uuid(gattc_if, param->search_cmpl.conn_id,
+                                                   s_peers[i].gap_start_hdl, s_peers[i].gap_end_hdl,
+                                                   name_uuid, &elem, &count) == ESP_OK &&
+                    count > 0) {
+                    esp_ble_gattc_read_char(gattc_if, param->search_cmpl.conn_id,
+                                            elem.char_handle, ESP_GATT_AUTH_REQ_NONE);
+                }
+            }
+        }
+        break;
+    }
+    case ESP_GATTC_READ_CHAR_EVT: {
+        if (param->read.status == ESP_GATT_OK && param->read.value_len > 0) {
+            for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+                if (s_peers[i].connected && s_peers[i].conn_id == param->read.conn_id) {
+                    size_t n = param->read.value_len;
+                    if (n >= sizeof(s_peers[i].name)) {
+                        n = sizeof(s_peers[i].name) - 1;
+                    }
+                    memcpy(s_peers[i].name, param->read.value, n);
+                    s_peers[i].name[n] = '\0';
+                    ESP_LOGI(TAG, "slot %d phone name: %s (%s)", i, s_peers[i].name, s_peers[i].bda_str);
+                }
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* Intercepts GATTS events for both Stage 1 (Provisioning 0xFF00) and Stage 2 (Multi-Peer HID 0x1812). */
+static void gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    /* Route Stage 1 BLE Provisioning GATT events first. */
+    if (event == ESP_GATTS_REG_EVT && param->reg.app_id == PROV_APP_ID) {
+        if (param->reg.status == ESP_GATT_OK) {
+            s_prov_gatts_if = gatts_if;
+            esp_ble_gatts_create_attr_tab(s_prov_gatt_db, gatts_if, PROV_IDX_NB, 0);
+        }
+        return;
+    }
+    if (s_prov_gatts_if != ESP_GATT_IF_NONE && gatts_if == s_prov_gatts_if) {
+        switch (event) {
+        case ESP_GATTS_CREAT_ATTR_TAB_EVT:
+            if (param->add_attr_tab.status == ESP_GATT_OK && param->add_attr_tab.num_handle == PROV_IDX_NB) {
+                memcpy(s_prov_handles, param->add_attr_tab.handles, sizeof(s_prov_handles));
+                esp_ble_gatts_start_service(s_prov_handles[PROV_IDX_SVC]);
+                ESP_LOGI(TAG, "BLE Provisioning GATT service started (%s)", s_prov_name);
+                start_prov_advertising();
+            }
+            break;
+        case ESP_GATTS_CONNECT_EVT:
+            s_prov_connected = true;
+            s_prov_conn_id = param->connect.conn_id;
+            s_prov_rx_len = 0;
+            ESP_LOGI(TAG, "BLE Provisioning client connected (conn_id=%u)", s_prov_conn_id);
+            break;
+        case ESP_GATTS_DISCONNECT_EVT:
+            s_prov_connected = false;
+            if (s_prov_mode) {
+                start_prov_advertising();
+            }
+            break;
+        case ESP_GATTS_WRITE_EVT:
+            if (param->write.handle == s_prov_handles[PROV_IDX_CFG_VAL]) {
+                handle_prov_write(param->write.value, param->write.len);
+            }
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+    if (s_prov_mode) {
+        return;
+    }
+
+    esp_hidd_gatts_event_handler(event, gatts_if, param);
+
+    switch (event) {
+    case ESP_GATTS_CREAT_ATTR_TAB_EVT:
+        /* HID service table has 11 base attrs + mouse(4+3) + kbd(4+3) + consumer(4) = 29 handles. */
+        if (param->add_attr_tab.status == ESP_GATT_OK && param->add_attr_tab.num_handle >= 27) {
+            s_hid_gatts_if = gatts_if;
+            s_mouse_handle = param->add_attr_tab.handles[12];
+            s_keyboard_handle = param->add_attr_tab.handles[19];
+            s_consumer_handle = param->add_attr_tab.handles[26];
+            ESP_LOGI(TAG, "HID handles ready (num=%u): mouse=%u kbd=%u consumer=%u",
+                     param->add_attr_tab.num_handle, s_mouse_handle, s_keyboard_handle, s_consumer_handle);
+        }
+        break;
+    case ESP_GATTS_CONNECT_EVT: {
+        if (s_hid_gatts_if != ESP_GATT_IF_NONE && gatts_if != s_hid_gatts_if) {
+            break;
+        }
+        int slot = alloc_peer_slot(param->connect.remote_bda);
+        if (slot >= 0) {
+            s_peers[slot].has_bda = true;
+            s_peers[slot].connected = true;
+            s_peers[slot].conn_id = param->connect.conn_id;
+            memcpy(s_peers[slot].bda, param->connect.remote_bda, ESP_BD_ADDR_LEN);
+            format_bda(param->connect.remote_bda, s_peers[slot].bda_str);
+            s_peers[slot].mouse_down = false;
+            s_peers[slot].key_down = false;
+            s_peers[slot].consumer_down = false;
+            esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
+            ESP_LOGI(TAG, "peer connected: slot=%d conn_id=%u bda=%s (active=%d/%d)",
+                     slot, param->connect.conn_id, s_peers[slot].bda_str,
+                     hid_abs_connected_count(), HID_ABS_MAX_PEERS);
+        }
+        s_adv_active = false;
+        if (s_want_adv && hid_abs_connected_count() < HID_ABS_MAX_PEERS) {
+            start_advertising();
+        }
+        break;
+    }
+    case ESP_GATTS_DISCONNECT_EVT: {
+        if (s_hid_gatts_if != ESP_GATT_IF_NONE && gatts_if != s_hid_gatts_if) {
+            break;
+        }
+        int slot = find_peer_by_bda(param->disconnect.remote_bda);
+        if (slot >= 0) {
+            s_peers[slot].connected = false;
+            s_peers[slot].mouse_down = false;
+            s_peers[slot].key_down = false;
+            s_peers[slot].consumer_down = false;
+            ESP_LOGI(TAG, "peer disconnected: slot=%d bda=%s reason=0x%x (active=%d/%d)",
+                     slot, s_peers[slot].bda_str, param->disconnect.reason,
+                     hid_abs_connected_count(), HID_ABS_MAX_PEERS);
+        }
+        if (s_want_adv && hid_abs_connected_count() < HID_ABS_MAX_PEERS) {
+            start_advertising();
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void hidd_event(void *handler_args, esp_event_base_t base, int32_t id, void *event_data) {
     (void)handler_args;
     (void)base;
+    (void)event_data;
     switch (id) {
     case ESP_HIDD_START_EVENT:
         s_protocol_ok = true;
-        ESP_LOGI(TAG, "HID started; advertising %s", s_name);
+        ESP_LOGI(TAG, "HID started; advertising %s (up to %d phones)", s_name, HID_ABS_MAX_PEERS);
         if (s_want_adv) {
             start_advertising();
         }
-        break;
-    case ESP_HIDD_CONNECT_EVENT:
-        s_connected = true;
-        ESP_LOGI(TAG, "HID connected");
-        break;
-    case ESP_HIDD_DISCONNECT_EVENT:
-        s_connected = false;
-        s_paired = false;
-        s_mouse_on = s_keyboard_on = s_consumer_on = false;
-        s_mouse_down = s_key_down = s_consumer_down = false;
-        ESP_LOGI(TAG, "HID disconnected");
-        if (s_want_adv) {
-            start_advertising();
-        }
-        break;
-    case ESP_HIDD_PROTOCOL_MODE_EVENT: {
-        esp_hidd_event_data_t *d = event_data;
-        ESP_LOGI(TAG, "protocol mode %d", d->protocol_mode.protocol_mode);
-        break;
-    }
-    case ESP_HIDD_CONTROL_EVENT:
-        break;
-    case ESP_HIDD_OUTPUT_EVENT:
-        break;
-    case ESP_HIDD_FEATURE_EVENT:
         break;
     case ESP_HIDD_STOP_EVENT:
         s_protocol_ok = false;
@@ -152,9 +525,9 @@ static void hidd_event(void *handler_args, esp_event_base_t base, int32_t id, vo
     }
 }
 
-bool hid_abs_start(const char *device_name) {
-    if (device_name && device_name[0]) {
-        strncpy(s_name, device_name, sizeof(s_name) - 1);
+static bool ensure_bt_stack(void) {
+    if (s_bt_stack_ready) {
+        return true;
     }
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -181,11 +554,85 @@ bool hid_abs_start(const char *device_name) {
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, 1);
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, 1);
     esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, 1);
-    /* esp_hidd's BLE transport only starts once it receives GATTS events. */
-    if (esp_ble_gatts_register_callback(esp_hidd_gatts_event_handler) != ESP_OK) {
+
+    if (esp_ble_gattc_register_callback(gattc_event) == ESP_OK) {
+        esp_ble_gattc_app_register(0);
+    }
+    if (esp_ble_gatts_register_callback(gatts_event) != ESP_OK) {
         return false;
     }
+    s_bt_stack_ready = true;
+    return true;
+}
 
+bool hid_prov_start(const char *setup_name, hid_prov_cb_t cb) {
+    if (!ensure_bt_stack()) {
+        return false;
+    }
+    if (setup_name && setup_name[0]) {
+        strncpy(s_prov_name, setup_name, sizeof(s_prov_name) - 1);
+    }
+    s_prov_cb = cb;
+    s_prov_mode = true;
+    snprintf(s_prov_status, sizeof(s_prov_status), "{\"state\":\"provisioning\",\"dev\":\"%s\"}", s_prov_name);
+    if (s_prov_gatts_if == ESP_GATT_IF_NONE) {
+        return esp_ble_gatts_app_register(PROV_APP_ID) == ESP_OK;
+    }
+    return start_prov_advertising();
+}
+
+void hid_prov_notify(const char *json_status) {
+    if (!json_status) {
+        return;
+    }
+    strncpy(s_prov_status, json_status, sizeof(s_prov_status) - 1);
+    s_prov_status[sizeof(s_prov_status) - 1] = '\0';
+    if (s_prov_gatts_if != ESP_GATT_IF_NONE && s_prov_handles[PROV_IDX_STS_VAL] != 0) {
+        esp_ble_gatts_set_attr_value(s_prov_handles[PROV_IDX_STS_VAL], strlen(s_prov_status), (const uint8_t *)s_prov_status);
+        if (s_prov_connected) {
+            esp_ble_gatts_send_indicate(s_prov_gatts_if, s_prov_conn_id, s_prov_handles[PROV_IDX_STS_VAL],
+                                        strlen(s_prov_status), (uint8_t *)s_prov_status, false);
+        }
+    }
+}
+
+void hid_prov_stop(void) {
+    if (!s_prov_mode) {
+        return;
+    }
+    s_prov_mode = false;
+    esp_ble_gap_stop_advertising();
+    if (s_prov_gatts_if != ESP_GATT_IF_NONE) {
+        if (s_prov_connected) {
+            esp_ble_gatts_close(s_prov_gatts_if, s_prov_conn_id);
+            s_prov_connected = false;
+        }
+        if (s_prov_handles[PROV_IDX_SVC] != 0) {
+            esp_ble_gatts_stop_service(s_prov_handles[PROV_IDX_SVC]);
+            esp_ble_gatts_delete_service(s_prov_handles[PROV_IDX_SVC]);
+        }
+        esp_ble_gatts_app_unregister(s_prov_gatts_if);
+        s_prov_gatts_if = ESP_GATT_IF_NONE;
+        memset(s_prov_handles, 0, sizeof(s_prov_handles));
+    }
+    ESP_LOGI(TAG, "BLE Provisioning stopped; ready to switch to BLE HID mode");
+}
+
+bool hid_prov_active(void) {
+    return s_prov_mode;
+}
+
+bool hid_abs_start(const char *device_name) {
+    if (s_prov_mode) {
+        hid_prov_stop();
+    }
+    memset(s_peers, 0, sizeof(s_peers));
+    if (device_name && device_name[0]) {
+        strncpy(s_name, device_name, sizeof(s_name) - 1);
+    }
+    if (!ensure_bt_stack()) {
+        return false;
+    }
     static esp_hid_raw_report_map_t report_maps[] = {
         {.data = s_report_map, .len = sizeof(s_report_map)},
     };
@@ -210,34 +657,75 @@ void hid_abs_stop(void) {
         esp_hidd_dev_deinit(s_hid);
         s_hid = NULL;
     }
-    s_connected = false;
+    memset(s_peers, 0, sizeof(s_peers));
     s_protocol_ok = false;
 }
 
+int hid_abs_connected_count(void) {
+    int n = 0;
+    for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+        if (s_peers[i].connected) {
+            n++;
+        }
+    }
+    return n;
+}
+
+bool hid_abs_peer_connected(int slot) {
+    return slot >= 0 && slot < HID_ABS_MAX_PEERS && s_peers[slot].connected;
+}
+
+bool hid_abs_peer_ready(int slot) {
+    return hid_abs_peer_connected(slot) && s_protocol_ok;
+}
+
+const char *hid_abs_peer_bda(int slot) {
+    if (slot < 0 || slot >= HID_ABS_MAX_PEERS || !s_peers[slot].has_bda) {
+        return "";
+    }
+    return s_peers[slot].bda_str;
+}
+
+const char *hid_abs_peer_name(int slot) {
+    if (slot < 0 || slot >= HID_ABS_MAX_PEERS || !s_peers[slot].has_bda) {
+        return "";
+    }
+    return s_peers[slot].name;
+}
+
 bool hid_abs_connected(void) {
-    return s_connected;
+    return hid_abs_connected_count() > 0;
 }
+
 bool hid_abs_encrypted_ready(void) {
-    /* Bluedroid HID notifies after encryption when CCCDs are written; treat
-     * connection + protocol start as ready for this delivery profile. */
-    return s_connected && s_protocol_ok;
+    return hid_abs_connected() && s_protocol_ok;
 }
+
 bool hid_abs_mouse_subscribed(void) {
-    return s_connected;
+    return hid_abs_connected();
 }
+
 bool hid_abs_keyboard_subscribed(void) {
-    return s_connected;
+    return hid_abs_connected();
 }
+
 bool hid_abs_consumer_subscribed(void) {
-    return s_connected;
+    return hid_abs_connected();
 }
 
 bool hid_abs_advertising(void) {
-    return s_protocol_ok && s_want_adv && !s_connected;
+    return s_protocol_ok && s_want_adv && hid_abs_connected_count() < HID_ABS_MAX_PEERS;
 }
+
 bool hid_abs_paired(void) {
-    return s_paired;
+    for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+        if (s_peers[i].connected && s_peers[i].paired) {
+            return true;
+        }
+    }
+    return false;
 }
+
 void hid_abs_last_mouse(uint16_t *x, uint16_t *y, bool *down) {
     *x = s_last_x;
     *y = s_last_y;
@@ -255,26 +743,51 @@ bool hid_abs_set_advertising(bool enable) {
     return esp_ble_gap_stop_advertising() == ESP_OK;
 }
 
-bool hid_abs_disconnect(void) {
-    if (!s_hid || !s_connected) {
+bool hid_abs_disconnect_to(int target) {
+    int slot = resolve_peer_slot(target);
+    if (slot < 0) {
         return false;
     }
-    /* esp_hidd has no direct disconnect on all targets; stopping adv + waiting
-     * for host drop is insufficient. Best-effort: disable advertising. */
-    s_want_adv = false;
-    esp_ble_gap_stop_advertising();
-    return true;
+    if (s_hid_gatts_if != ESP_GATT_IF_NONE) {
+        return esp_ble_gatts_close(s_hid_gatts_if, s_peers[slot].conn_id) == ESP_OK;
+    }
+    return false;
 }
 
-static bool send_input(uint8_t report_id, const uint8_t *data, size_t len) {
-    if (!s_hid || !s_connected) {
+bool hid_abs_disconnect(void) {
+    return hid_abs_disconnect_to(-1);
+}
+
+static uint16_t report_handle_for(uint8_t report_id) {
+    switch (report_id) {
+    case HID_RPT_MOUSE: return s_mouse_handle;
+    case HID_RPT_KEYBOARD: return s_keyboard_handle;
+    case HID_RPT_CONSUMER: return s_consumer_handle;
+    default: return 0;
+    }
+}
+
+static bool send_input_to(int slot, uint8_t report_id, const uint8_t *data, size_t len) {
+    if (slot < 0 || slot >= HID_ABS_MAX_PEERS || !s_peers[slot].connected) {
+        return false;
+    }
+    uint16_t handle = report_handle_for(report_id);
+    if (s_hid_gatts_if != ESP_GATT_IF_NONE && handle != 0) {
+        return esp_ble_gatts_send_indicate(s_hid_gatts_if, s_peers[slot].conn_id,
+                                           handle, len, (uint8_t *)data, false) == ESP_OK;
+    }
+    if (!s_hid) {
         return false;
     }
     return esp_hidd_dev_input_set(s_hid, 0, report_id, (uint8_t *)data, len) == ESP_OK;
 }
 
-bool hid_abs_send_mouse(const uint8_t report[5]) {
+bool hid_abs_send_mouse_to(int target, const uint8_t report[5]) {
     if (!report) {
+        return false;
+    }
+    int slot = resolve_peer_slot(target);
+    if (slot < 0) {
         return false;
     }
     uint16_t x = (uint16_t)report[1] | ((uint16_t)report[2] << 8);
@@ -282,51 +795,89 @@ bool hid_abs_send_mouse(const uint8_t report[5]) {
     if (x > HID_MOUSE_ABS_MAX || y > HID_MOUSE_ABS_MAX || report[0] > 7) {
         return false;
     }
+    /* Pre-position cursor with buttons=0 before pressing at a new coordinate so iOS AssistiveTouch registers taps/drags accurately. */
+    if (report[0] != 0 && !s_peers[slot].mouse_down &&
+        (x != s_peers[slot].last_x || y != s_peers[slot].last_y)) {
+        const uint8_t move_rpt[5] = {0, report[1], report[2], report[3], report[4]};
+        send_input_to(slot, HID_RPT_MOUSE, move_rpt, 5);
+        vTaskDelay(pdMS_TO_TICKS(18));
+    }
+    s_peers[slot].last_x = x;
+    s_peers[slot].last_y = y;
+    s_peers[slot].mouse_down = report[0] != 0;
     s_last_x = x;
     s_last_y = y;
     s_mouse_down = report[0] != 0;
-    s_mouse_on = true;
-    return send_input(HID_RPT_MOUSE, report, 5);
+    return send_input_to(slot, HID_RPT_MOUSE, report, 5);
 }
 
-bool hid_abs_send_keyboard(const uint8_t report[8]) {
+bool hid_abs_send_mouse(const uint8_t report[5]) {
+    return hid_abs_send_mouse_to(-1, report);
+}
+
+bool hid_abs_send_keyboard_to(int target, const uint8_t report[8]) {
     if (!report || report[1] != 0) {
+        return false;
+    }
+    int slot = resolve_peer_slot(target);
+    if (slot < 0) {
         return false;
     }
     uint8_t bits = 0;
     for (int i = 0; i < 8; i++) {
         bits |= report[i];
     }
-    s_key_down = bits != 0;
-    s_keyboard_on = true;
-    return send_input(HID_RPT_KEYBOARD, report, 8);
+    s_peers[slot].key_down = bits != 0;
+    return send_input_to(slot, HID_RPT_KEYBOARD, report, 8);
 }
 
-bool hid_abs_send_consumer(uint8_t mask) {
+bool hid_abs_send_keyboard(const uint8_t report[8]) {
+    return hid_abs_send_keyboard_to(-1, report);
+}
+
+bool hid_abs_send_consumer_to(int target, uint8_t mask) {
     if (mask > 31) {
         return false;
     }
-    s_consumer_down = mask != 0;
-    s_consumer_on = true;
-    return send_input(HID_RPT_CONSUMER, &mask, 1);
+    int slot = resolve_peer_slot(target);
+    if (slot < 0) {
+        return false;
+    }
+    s_peers[slot].consumer_down = mask != 0;
+    return send_input_to(slot, HID_RPT_CONSUMER, &mask, 1);
+}
+
+bool hid_abs_send_consumer(uint8_t mask) {
+    return hid_abs_send_consumer_to(-1, mask);
+}
+
+bool hid_abs_release_all_to(int target) {
+    bool ok = true;
+    int start = (target >= 0 && target < HID_ABS_MAX_PEERS) ? target : 0;
+    int end = (target >= 0 && target < HID_ABS_MAX_PEERS) ? (target + 1) : HID_ABS_MAX_PEERS;
+    for (int i = start; i < end; i++) {
+        if (!s_peers[i].connected) {
+            continue;
+        }
+        if (s_peers[i].mouse_down) {
+            uint8_t zero[5] = {0, (uint8_t)(s_peers[i].last_x & 0xff), (uint8_t)(s_peers[i].last_x >> 8),
+                               (uint8_t)(s_peers[i].last_y & 0xff), (uint8_t)(s_peers[i].last_y >> 8)};
+            ok = hid_abs_send_mouse_to(i, zero) && ok;
+            s_peers[i].mouse_down = false;
+        }
+        if (s_peers[i].key_down) {
+            uint8_t zero[8] = {0};
+            ok = hid_abs_send_keyboard_to(i, zero) && ok;
+            s_peers[i].key_down = false;
+        }
+        if (s_peers[i].consumer_down) {
+            ok = hid_abs_send_consumer_to(i, 0) && ok;
+            s_peers[i].consumer_down = false;
+        }
+    }
+    return ok;
 }
 
 bool hid_abs_release_all(void) {
-    bool ok = true;
-    if (s_mouse_down) {
-        uint8_t zero[5] = {0, (uint8_t)(s_last_x & 0xff), (uint8_t)(s_last_x >> 8),
-                           (uint8_t)(s_last_y & 0xff), (uint8_t)(s_last_y >> 8)};
-        ok = hid_abs_send_mouse(zero) && ok;
-        s_mouse_down = false;
-    }
-    if (s_key_down) {
-        uint8_t zero[8] = {0};
-        ok = hid_abs_send_keyboard(zero) && ok;
-        s_key_down = false;
-    }
-    if (s_consumer_down) {
-        ok = hid_abs_send_consumer(0) && ok;
-        s_consumer_down = false;
-    }
-    return ok;
+    return hid_abs_release_all_to(-1);
 }
