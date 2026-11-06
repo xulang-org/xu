@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.11.4-dev.5（开发版）
+
+集成 ESP32 便携显示组件、MQTT/BLE 远程控制、16 位绝对 HID 指针报文、用于对接官方 ESP-IDF 静态库的 Xtensa 可重定位 `.o` 输出（`--emit-obj` 与 `c_call6`）、IPv4 UDP 多播（`sys_setsockopt` 与 `net.listen_multicast_udp`）、宿主内容窗口（`ui.App.with_content`）以及 macOS 原生 `.app` 包 `Info.plist.fragment` 与插件资源合并支持。请一起升级编译器、标准库和产品工具（`desktop` `1.3.56`、`setup` `1.2.47`、`examples/esp32` `0.5.0`）。本版本为开发集成构建。
+
 ## Xu 0.11.4
 
 - 编译器：满足条件的 ARM64 整数／布尔兄弟尾调用在跳转前恢复调用者栈帧；纯标量加法自递归可转为累加器循环。保留算术检查、有限只读字节扫描、字符串操作和已证明恰好八轮的 CRC 专用路径；所有权、取地址、ABI、调试和插桩限制继续使用普通回退。本版不声明普遍提速。
