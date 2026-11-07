@@ -461,6 +461,9 @@ fn (f $&MFn) lower_expr_inner(p &parser.Parser, c $&Checker, n int) int {
         f.emit(ins)
         << t
     }
+    if k == ast.NK_CLONE {
+        << f.lower_expr_clone(p, c, n)
+    }
     if k == ast.NK_OR_CATCH { // OrCatch
         << f.lower_expr_try_or(p, c, n)
     }
@@ -748,3 +751,427 @@ fn (c &Checker) throw_ok_err_ty(ok_ty int, err_ty int) int {
 // M200: heap-box a value into dynamic `any` (fat `(data*, itable*)`).
 // `n` is the value expression that check marked with ncall=-98. The restored
 // concrete ntype determines both the dynamic tag and payload width.
+
+fn (c &Checker) native_map_scalar_type_id(ty int) int {
+    $t := ty
+    if is_ref_type(t) { t = c.ref_inner_type(t) }
+    mi := map_index(t)
+    if mi < 0 || mi >= c.maps.len { << 0 }
+    if c.maps[mi].key_ty != 1 || c.maps[mi].val_ty != 1 { << 0 }
+    if c.maps[mi].kkind != 0 || c.maps[mi].vkind != 0 || c.maps[mi].vslots != 1 { << 0 }
+    << t
+}
+
+fn (f $&MFn) lower_expr_clone(p &parser.Parser, c $&Checker, n int) int {
+    inner := p.nodes[n].a
+    raw_ty := c.ntype[inner]
+    ty := c.ntype[n]
+    if !is_ref_type(raw_ty) {
+        if !c.type_owning(ty) {
+            << f.lower_expr(p, c, inner)
+        }
+        ik := p.nodes[inner].kind
+        if ik == ast.NK_STR {
+            << f.lower_expr(p, c, inner)
+        }
+        if ty == 3 && f.fresh_string_expr(p, c, inner) {
+            << f.lower_expr(p, c, inner)
+        }
+        if ik == ast.NK_ARRAY_LIT || ik == ast.NK_EMPTY_ARRAY || ik == ast.NK_MAP_INIT || ik == ast.NK_STRUCT_INIT || ik == ast.NK_SLICE || ik == ast.NK_BIN_OP || ik == ast.NK_OR_CATCH || ik == ast.NK_CLONE || ik == ast.NK_RECV || ik == ast.NK_METHOD_CALL {
+            << f.lower_expr(p, c, inner)
+        }
+        if ik == ast.NK_CALL {
+            fi := c.ncall[inner]
+            if fi != -19 && fi != -20 {
+                << f.lower_expr(p, c, inner)
+            }
+        }
+        val := f.lower_expr(p, c, inner)
+        << f.lower_clone_value(p, c, val, ty, 0)
+    }
+    // Operand is a reference: load value through dereference
+    $cur := f.lower_expr(p, c, inner)
+    $cur_ty := raw_ty
+    while is_ref_type(cur_ty) {
+        next_ty := c.ref_inner_type(cur_ty)
+        ns := c.type_slots(next_ty)
+        dest := f.new_temp(next_ty, ns)
+        $lp := mkinstr(MI_LOAD_PTR)
+        if !is_ref_type(next_ty) && cur_ty == raw_ty && f.ref_expr_is_buf(p, &*c, inner, 0) {
+            lp.kind = MI_LOAD_BUF_PTR
+        }
+        lp.a = dest
+        lp.b = cur
+        lp.c = 0
+        lp.d = ns
+        f.emit(lp)
+        cur = dest
+        cur_ty = next_ty
+    }
+    << f.lower_clone_value(p, c, cur, ty, 0)
+}
+
+fn (f $&MFn) lower_clone_value(p &parser.Parser, c $&Checker, val int, ty int, depth int) int {
+    if depth > 16 || !c.type_owning(ty) {
+        << val
+    }
+    if ty == 3 {
+        dest := f.new_temp(3, 3)
+        $cp := mkinstr(MI_STR_CLONE)
+        cp.a = dest
+        cp.b = val
+        f.emit(cp)
+        << dest
+    }
+    if is_struct_type(ty) {
+        ns := c.type_slots(ty)
+        dest := f.new_temp(ty, ns)
+        $cpy := mkinstr(MI_COPY)
+        cpy.a = dest
+        cpy.b = val
+        f.emit(cpy)
+        si := struct_index(ty)
+        if si >= 0 && si < c.structs.len {
+            for i in 0:c.structs[si].fields.len {
+                fty := c.structs[si].fields[i].ty
+                if c.type_owning(fty) {
+                    off := c.structs[si].fields[i].slot
+                    fns := c.type_slots(fty)
+                    fcur := f.new_temp(fty, fns)
+                    $lf := mkinstr(MI_LOAD_FIELD)
+                    lf.a = fcur
+                    lf.b = dest
+                    lf.c = off
+                    lf.d = fns
+                    f.emit(lf)
+                    fcloned := f.lower_clone_value(p, c, fcur, fty, depth + 1)
+                    $sf := mkinstr(MI_STORE_FIELD)
+                    sf.a = fcloned
+                    sf.b = dest
+                    sf.c = off
+                    sf.d = fns
+                    f.emit(sf)
+                }
+            }
+        }
+        << dest
+    }
+    if is_enum_type(ty) {
+        ei := enum_index(ty)
+        if ei < 0 || ei >= c.enums.len || !c.enums[ei].owns {
+            << val
+        }
+        ns := c.type_slots(ty)
+        dest := f.new_temp(ty, ns)
+        $cpy := mkinstr(MI_COPY)
+        cpy.a = dest
+        cpy.b = val
+        f.emit(cpy)
+        tagt := f.new_temp(1, 1)
+        $lt := mkinstr(MI_LOAD_FIELD)
+        lt.a = tagt
+        lt.b = dest
+        lt.c = 0
+        lt.d = 1
+        f.emit(lt)
+        done_bb := f.new_block()
+        for vi in 0:c.enums[ei].variants.len {
+            $has_owning := false
+            for fi in 0:c.enums[ei].variants[vi].fields.len {
+                if c.type_owning(c.enums[ei].variants[vi].fields[fi]) {
+                    has_owning = true
+                }
+            }
+            if has_owning {
+                v_bb := f.new_block()
+                next_bb := f.new_block()
+                eqt := f.new_temp(2, 1)
+                $eq := mkinstr(MI_BIN)
+                eq.a = eqt
+                eq.b = 6 // OP_EQ
+                eq.c = tagt
+                eq.d = f.vconst(vi)
+                f.emit(eq)
+                f.terminate(2, eqt, v_bb, next_bb)
+                f.switch_to(v_bb)
+                $off := 8
+                for fi in 0:c.enums[ei].variants[vi].fields.len {
+                    fty := c.enums[ei].variants[vi].fields[fi]
+                    fns := c.type_slots(fty)
+                    if c.type_owning(fty) {
+                        fcur := f.new_temp(fty, fns)
+                        $lf := mkinstr(MI_LOAD_FIELD)
+                        lf.a = fcur
+                        lf.b = dest
+                        lf.c = off
+                        lf.d = fns
+                        f.emit(lf)
+                        fcl := f.lower_clone_value(p, c, fcur, fty, depth + 1)
+                        $sf := mkinstr(MI_STORE_FIELD)
+                        sf.a = fcl
+                        sf.b = dest
+                        sf.c = off
+                        sf.d = fns
+                        f.emit(sf)
+                    }
+                    off += fns * 8
+                }
+                f.terminate(1, done_bb, -1, -1)
+                f.switch_to(next_bb)
+            }
+        }
+        f.terminate(1, done_bb, -1, -1)
+        f.switch_to(done_bb)
+        << dest
+    }
+    if is_array_type(ty) {
+        fl := c.array_fixed_len_m(ty)
+        if fl > 0 {
+            // Fixed array [N]E
+            ety := c.elem_ty_of_array(ty, f.src_fi)
+            if !c.type_owning(ety) {
+                << val
+            }
+            ns := c.type_slots(ty)
+            dest := f.new_temp(ty, ns)
+            $cpy := mkinstr(MI_COPY)
+            cpy.a = dest
+            cpy.b = val
+            f.emit(cpy)
+            esz := c.type_size_bytes(ety)
+            ens := c.type_slots(ety)
+            for i in 0:fl {
+                fcur := f.new_temp(ety, ens)
+                $lf := mkinstr(MI_LOAD_FIELD)
+                lf.a = fcur
+                lf.b = dest
+                lf.c = i * esz
+                lf.d = ens
+                f.emit(lf)
+                fcl := f.lower_clone_value(p, c, fcur, ety, depth + 1)
+                $sf := mkinstr(MI_STORE_FIELD)
+                sf.a = fcl
+                sf.b = dest
+                sf.c = i * esz
+                sf.d = ens
+                f.emit(sf)
+            }
+            << dest
+        }
+        // Slice []E
+        ety := c.elem_ty_of_array(ty, f.src_fi)
+        if !c.type_owning(ety) || ety == 3 {
+            // Fast path: reuse _rt_array_slice / _rt_array_slice_str
+            slid := f.new_local(ty, 3, false)
+            $st := mkinstr(MI_STORE_LOCAL)
+            st.a = slid
+            st.b = val
+            f.emit(st)
+            ad := f.new_temp(1, 1)
+            $ao := mkinstr(MI_ADDR)
+            ao.a = ad
+            ao.b = slid
+            ao.c = 0
+            f.emit(ao)
+            len_val := f.new_temp(1, 1)
+            $lf := mkinstr(MI_LOAD_FIELD)
+            lf.a = len_val
+            lf.b = val
+            lf.c = 8
+            lf.d = 1
+            f.emit(lf)
+            $esz := c.type_size_bytes(ety)
+            if esz < 1 { esz = 1 }
+            $helper := "_rt_array_slice"
+            if ety == 3 { helper = "_rt_array_slice_str" }
+            first := f.margs.len
+            f.margs.push(MArg{v: ad, next: first + 1})
+            f.margs.push(MArg{v: f.vconst(0), next: first + 2})
+            f.margs.push(MArg{v: len_val, next: -1})
+            dest := f.new_temp(ty, 3)
+            $call := mkinstr(MI_CALL)
+            call.a = dest
+            call.b = 83
+            call.c = first
+            call.d = esz
+            call.sval = helper
+            f.emit(call)
+            << dest
+        }
+        // Deep slice clone via loop
+        len_val := f.new_temp(1, 1)
+        $lf := mkinstr(MI_LOAD_FIELD)
+        lf.a = len_val
+        lf.b = val
+        lf.c = 8
+        lf.d = 1
+        f.emit(lf)
+        dest_lid := f.new_local(ty, 3, false)
+        dest_t := f.new_temp(ty, 3)
+        $alit := mkinstr(MI_ARRAY_LIT)
+        alit.a = dest_t
+        alit.b = -1
+        alit.c = 0
+        alit.d = c.type_size_bytes(ety)
+        f.emit(alit)
+        $st_dest := mkinstr(MI_STORE_LOCAL)
+        st_dest.a = dest_lid
+        st_dest.b = dest_t
+        f.emit(st_dest)
+        dest_addr := f.new_temp(1, 1)
+        $ao_dest := mkinstr(MI_ADDR)
+        ao_dest.a = dest_addr
+        ao_dest.b = dest_lid
+        ao_dest.c = 0
+        f.emit(ao_dest)
+        idx_t := f.new_temp(1, 1)
+        $iz := mkinstr(MI_COPY)
+        iz.a = idx_t
+        iz.b = f.vconst(0)
+        f.emit(iz)
+        cond_bb := f.new_block()
+        body_bb := f.new_block()
+        end_bb := f.new_block()
+        f.terminate(1, cond_bb, -1, -1)
+        f.switch_to(cond_bb)
+        cmp_t := f.new_temp(2, 1)
+        $cmp := mkinstr(MI_BIN)
+        cmp.a = cmp_t
+        cmp.b = 8 // OP_LT
+        cmp.c = idx_t
+        cmp.d = len_val
+        f.emit(cmp)
+        f.terminate(2, cmp_t, body_bb, end_bb)
+        f.switch_to(body_bb)
+        ens := c.type_slots(ety)
+        elem_t := f.new_temp(ety, ens)
+        $li := mkinstr(MI_LOAD_INDEX)
+        li.a = elem_t
+        li.b = val
+        li.c = idx_t
+        li.d = ens
+        f.emit(li)
+        cloned_elem := f.lower_clone_value(p, c, elem_t, ety, depth + 1)
+        $push := mkinstr(MI_ARR_PUSH)
+        push.a = dest_addr
+        push.b = cloned_elem
+        push.c = 1
+        push.d = c.type_size_bytes(ety)
+        f.emit(push)
+        $inc := mkinstr(MI_BIN)
+        inc.a = idx_t
+        inc.b = 1 // OP_ADD
+        inc.c = idx_t
+        inc.d = f.vconst(1)
+        f.emit(inc)
+        f.terminate(1, cond_bb, -1, -1)
+        f.switch_to(end_bb)
+        res := f.new_temp(ty, 3)
+        $ld_res := mkinstr(MI_LOAD_LOCAL)
+        ld_res.a = res
+        ld_res.b = dest_lid
+        f.emit(ld_res)
+        << res
+    }
+    if is_map_type(ty) {
+        mi := map_index(ty)
+        kty := c.maps[mi].key_ty
+        vty := c.maps[mi].val_ty
+        len_val := f.new_temp(1, 1)
+        mi_len := f.margs.len
+        f.margs.push(MArg{v: val, next: -1})
+        $call_len := mkinstr(MI_CALL)
+        call_len.a = len_val
+        call_len.b = 88
+        call_len.c = mi_len
+        call_len.sval = "_rt_map_len"
+        f.emit(call_len)
+
+        dest := f.new_temp(ty, 1)
+        cap_arg := f.margs.len
+        f.margs.push(MArg{v: len_val, next: -1})
+        $ins_new := mkinstr(MI_CALL)
+        ins_new.a = dest
+        ins_new.b = 84
+        ins_new.d = c.maps[mi].kkind + (c.maps[mi].vkind << 8) + (c.maps[mi].vslots << 16)
+        ins_new.sval = "_rt_map_new"
+        ins_new.c = cap_arg
+        f.emit(ins_new)
+
+        slot := f.new_temp(1, 1)
+        $iz := mkinstr(MI_COPY)
+        iz.a = slot
+        iz.b = f.vconst(0)
+        f.emit(iz)
+        kt := f.new_temp(kty, c.type_slots(kty))
+        vt := f.new_temp(vty, c.type_slots(vty))
+        found := f.new_temp(1, 1)
+        cond_bb := f.new_block()
+        body_bb := f.new_block()
+        end_bb := f.new_block()
+        f.terminate(1, cond_bb, -1, -1)
+
+        f.switch_to(cond_bb)
+        mi0 := f.margs.len
+        f.margs.push(MArg{v: val, next: -1})
+        mi1 := f.margs.len
+        f.margs.push(MArg{v: slot, next: -1})
+        mi2 := f.margs.len
+        f.margs.push(MArg{v: kt, next: -1})
+        mi3 := f.margs.len
+        f.margs.push(MArg{v: vt, next: -1})
+        $a0 := f.margs[mi0]
+        a0.next = mi1
+        f.margs[mi0] = a0
+        $a1 := f.margs[mi1]
+        a1.next = mi2
+        f.margs[mi1] = a1
+        $a2 := f.margs[mi2]
+        a2.next = mi3
+        f.margs[mi2] = a2
+        $call_iter := mkinstr(MI_CALL)
+        call_iter.a = found
+        call_iter.b = 92
+        call_iter.c = mi0
+        call_iter.sval = "_rt_map_iter_next"
+        f.emit(call_iter)
+        ge := f.new_temp(2, 1)
+        $cmp_iter := mkinstr(MI_BIN)
+        cmp_iter.a = ge
+        cmp_iter.b = 11 // OP_GE
+        cmp_iter.c = found
+        cmp_iter.d = f.vconst(0)
+        f.emit(cmp_iter)
+        f.terminate(2, ge, body_bb, end_bb)
+
+        f.switch_to(body_bb)
+        $cloned_v := vt
+        if c.type_owning(vty) && vty != 3 {
+            cloned_v = f.lower_clone_value(p, c, vt, vty, depth + 1)
+        }
+        ins_mi0 := f.margs.len
+        f.margs.push(MArg{v: dest, next: -1})
+        ins_mi1 := f.margs.len
+        f.margs.push(MArg{v: kt, next: -1})
+        ins_mi2 := f.margs.len
+        f.margs.push(MArg{v: cloned_v, next: -1})
+        $ip0 := f.margs[ins_mi0]
+        ip0.next = ins_mi1
+        f.margs[ins_mi0] = ip0
+        $ip1 := f.margs[ins_mi1]
+        ip1.next = ins_mi2
+        f.margs[ins_mi1] = ip1
+        $ins_ins := mkinstr(MI_CALL)
+        ins_ins.a = -1
+        ins_ins.b = 86
+        ins_ins.d = c.native_map_scalar_type_id(ty)
+        ins_ins.c = ins_mi0
+        ins_ins.sval = "_rt_map_insert"
+        f.emit(ins_ins)
+        f.terminate(1, cond_bb, -1, -1)
+
+        f.switch_to(end_bb)
+        << dest
+    }
+    << val
+}
