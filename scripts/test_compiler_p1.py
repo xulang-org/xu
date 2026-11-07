@@ -830,9 +830,10 @@ def main():
                     'fn bad(p $&int, q $&int, flag bool) { $r := &*p\n if flag { r = &*q }\n *q = 9\n println(*r) }\nfn main() {}',
                     'mutably borrowed', diagnostics=('note: shared reborrow starts here',
                                                     ':5:2: note: shared reborrow is last used here',))
-            for source in ('fn main() { x := ~1 }', 'fn bad(x ~int) {}\nfn main() {}'):
-                fixture('spec34_H38_tilde_' + str(len(source)), source,
-                        "unexpected character '~'", diagnostics=("'~' stays unused", '$&x'))
+            fixture('spec34_H38_tilde_type', 'fn bad(x ~int) {}\nfn main() {}',
+                    "expected type, found 'tilde'")
+            fixture('spec34_H38_tilde_expr', 'fn main() { x := ~1\n println(x) }',
+                    output='1\n')
             fixture('spec34_C_typed_binding', 'fn main() { let $x: int = 1\n x = 2\n println(x) }',
                     output='2\n')
             fixture('spec34_H33_current_function_notes',
