@@ -1,9 +1,9 @@
 @xu/mir
-// Tensor and Matrix Tile Loop recognition pass.
+// Tensor and Matrix Tile Loop recognition and lowering pass.
 //
 // Layer 3 module: recognizes 3-level affine loop nests (GEMM patterns:
 // C[i*n+j] += A[i*k+p] * B[p*n+j]), proves loop bounds and memory independence,
-// and plans 2D register tiling and cache blocking without target ISA coupling.
+// and lowers the nest into high-performance 2D register-blocked micro-kernels.
 
 pub struct MirTilePlan {
     pub ok bool
@@ -12,12 +12,20 @@ pub struct MirTilePlan {
     pub mid_hdr int
     pub inner_hdr int
     pub outer_exit int
-    pub arr_c int
-    pub arr_a int
-    pub arr_b int
-    pub m_lim int
-    pub n_lim int
-    pub k_lim int
+    pub outer_body int
+    pub c_slot int
+    pub a_slot int
+    pub b_slot int
+    pub i_slot int
+    pub m_slot int
+    pub n_slot int
+    pub k_slot int
+    pub is_m_const bool
+    pub is_n_const bool
+    pub is_k_const bool
+    pub m_const int
+    pub n_const int
+    pub k_const int
 }
 
 pub fn mir_tile_plan_none() MirTilePlan {
@@ -28,42 +36,359 @@ pub fn mir_tile_plan_none() MirTilePlan {
         mid_hdr: -1,
         inner_hdr: -1,
         outer_exit: -1,
-        arr_c: -1,
-        arr_a: -1,
-        arr_b: -1,
-        m_lim: 0,
-        n_lim: 0,
-        k_lim: 0
+        outer_body: -1,
+        c_slot: -1,
+        a_slot: -1,
+        b_slot: -1,
+        i_slot: -1,
+        m_slot: -1,
+        n_slot: -1,
+        k_slot: -1,
+        is_m_const: false,
+        is_n_const: false,
+        is_k_const: false,
+        m_const: 0,
+        n_const: 0,
+        k_const: 0
     }
 }
 
+fn find_local_slot_of_temp(mfn &MFn, bi int, tid int) int {
+    if tid < 0 {
+        << -1
+    }
+    $cur := tid
+    $hops := 0
+    while hops < 5 {
+        $found_mov := false
+        for ii in 0:mfn.instrs.len {
+            if mfn.instrs[ii].kind == MI_COPY && mfn.instrs[ii].a == cur {
+                cur = mfn.instrs[ii].b
+                found_mov = true
+                <-
+            }
+        }
+        if !found_mov {
+            <-
+        }
+        hops += 1
+    }
+    for ii in 0:mfn.instrs.len {
+        if mfn.instrs[ii].kind == MI_LOAD_LOCAL && mfn.instrs[ii].a == cur {
+            << mfn.instrs[ii].b
+        }
+    }
+    << -1
+}
+
+fn emit_instr_to_block(mfn $&MFn, bi int, ins MInstr) int {
+    idx := mfn.instrs.len
+    mfn.instrs.push(ins)
+    if bi >= 0 && bi < mfn.blocks.len {
+        if mfn.blocks[bi].head < 0 {
+            mfn.blocks[bi].head = idx
+            mfn.blocks[bi].tail = idx
+        } else {
+            last_idx := mfn.blocks[bi].tail
+            mfn.instrs[last_idx].next = idx
+            mfn.blocks[bi].tail = idx
+        }
+    }
+    << idx
+}
+
 pub fn opt_tile_plan(mfn $&MFn) MirTilePlan {
-    if mfn.blocks.len < 3 || mfn.instrs.len == 0 {
+    if mfn.blocks.len < 6 || mfn.instrs.len == 0 {
         << mir_tile_plan_none()
     }
 
     $plan := mir_tile_plan_none()
-    // Identify 3-level loop nest candidates: outer_hdr -> mid_hdr -> inner_hdr
+
     for b_out in 0:mfn.blocks.len {
         if mfn.blocks[b_out].tkind != TKIND_BRANCH {
             ->
         }
-        b_mid := mfn.blocks[b_out].tb
+        b_out_body := mfn.blocks[b_out].tb
+        b_out_exit := mfn.blocks[b_out].tc
+        if b_out_body < 0 || b_out_body >= mfn.blocks.len || b_out_exit < 0 {
+            ->
+        }
+        if mfn.blocks[b_out_body].tkind != TKIND_JUMP {
+            ->
+        }
+        b_mid := mfn.blocks[b_out_body].ta
         if b_mid < 0 || b_mid >= mfn.blocks.len || mfn.blocks[b_mid].tkind != TKIND_BRANCH {
             ->
         }
-        b_in := mfn.blocks[b_mid].tb
+        b_mid_body := mfn.blocks[b_mid].tb
+        b_mid_exit := mfn.blocks[b_mid].tc
+        if b_mid_body < 0 || b_mid_body >= mfn.blocks.len || b_mid_exit < 0 {
+            ->
+        }
+        if mfn.blocks[b_mid_body].tkind != TKIND_JUMP {
+            ->
+        }
+        b_in := mfn.blocks[b_mid_body].ta
         if b_in < 0 || b_in >= mfn.blocks.len || mfn.blocks[b_in].tkind != TKIND_BRANCH {
             ->
         }
+        b_in_body := mfn.blocks[b_in].tb
+        b_in_exit := mfn.blocks[b_in].tc
+        if b_in_body < 0 || b_in_body >= mfn.blocks.len || b_in_exit < 0 {
+            ->
+        }
 
-        // Candidate 3-level nested loop detected
+        // Verify inner body has MI_STORE_INDEX and MI_LOAD_INDEX
+        $store_c_ii := -1
+        $curr := mfn.blocks[b_in_body].head
+        while curr >= 0 && curr < mfn.instrs.len {
+            if mfn.instrs[curr].kind == MI_STORE_INDEX {
+                store_c_ii = curr
+                <-
+            }
+            if curr == mfn.blocks[b_in_body].tail {
+                <-
+            }
+            curr = mfn.instrs[curr].next
+        }
+
+        if store_c_ii < 0 {
+            ->
+        }
+
+        // Verify mid body has MI_LOAD_INDEX for array A
+        $load_a_ii := -1
+        $curr2 := mfn.blocks[b_mid_body].head
+        while curr2 >= 0 && curr2 < mfn.instrs.len {
+            if mfn.instrs[curr2].kind == MI_LOAD_INDEX {
+                load_a_ii = curr2
+                <-
+            }
+            if curr2 == mfn.blocks[b_mid_body].tail {
+                <-
+            }
+            curr2 = mfn.instrs[curr2].next
+        }
+
+        if load_a_ii < 0 {
+            ->
+        }
+
+        // Distinguish load_b from load_c
+        c_temp := mfn.instrs[store_c_ii].a
+        c_slot := find_local_slot_of_temp(mfn, 0, c_temp)
+        if c_slot < 0 {
+            ->
+        }
+
+        $load_b_ii := -1
+        $curr3 := mfn.blocks[b_in_body].head
+        while curr3 >= 0 && curr3 < mfn.instrs.len {
+            if mfn.instrs[curr3].kind == MI_LOAD_INDEX && mfn.instrs[curr3].b != c_temp {
+                load_b_ii = curr3
+                <-
+            }
+            if curr3 == mfn.blocks[b_in_body].tail {
+                <-
+            }
+            curr3 = mfn.instrs[curr3].next
+        }
+
+        if load_b_ii < 0 {
+            ->
+        }
+
+        b_temp := mfn.instrs[load_b_ii].b
+        b_slot := find_local_slot_of_temp(mfn, 0, b_temp)
+        if b_slot < 0 {
+            ->
+        }
+
+        a_temp := mfn.instrs[load_a_ii].b
+        a_slot := find_local_slot_of_temp(mfn, 0, a_temp)
+        if a_slot < 0 {
+            ->
+        }
+
+        // Extract bounds from condition branches
+        $m_slot := -1
+        $m_const := 0
+        $is_m_const := false
+        $i_slot := -1
+        cond_out := mfn.blocks[b_out].tail
+        if cond_out >= 0 && cond_out < mfn.instrs.len && mfn.instrs[cond_out].kind == MI_BIN {
+            mb := mfn.instrs[cond_out].d
+            if mb <= -2 {
+                is_m_const = true
+                m_const = mb
+            } else {
+                m_slot = find_local_slot_of_temp(mfn, 0, mb)
+            }
+            i_slot = find_local_slot_of_temp(mfn, 0, mfn.instrs[cond_out].c)
+        }
+
+        $k_slot := -1
+        $k_const := 0
+        $is_k_const := false
+        cond_mid := mfn.blocks[b_mid].tail
+        if cond_mid >= 0 && cond_mid < mfn.instrs.len && mfn.instrs[cond_mid].kind == MI_BIN {
+            kb := mfn.instrs[cond_mid].d
+            if kb <= -2 {
+                is_k_const = true
+                k_const = kb
+            } else {
+                k_slot = find_local_slot_of_temp(mfn, 0, kb)
+            }
+        }
+
+        $n_slot := -1
+        $n_const := 0
+        $is_n_const := false
+        cond_in := mfn.blocks[b_in].tail
+        if cond_in >= 0 && cond_in < mfn.instrs.len && mfn.instrs[cond_in].kind == MI_BIN {
+            nb := mfn.instrs[cond_in].d
+            if nb <= -2 {
+                is_n_const = true
+                n_const = nb
+            } else {
+                n_slot = find_local_slot_of_temp(mfn, 0, nb)
+            }
+        }
+
+        if !is_m_const && m_slot < 0 {
+            ->
+        }
+        if !is_k_const && k_slot < 0 {
+            ->
+        }
+        if !is_n_const && n_slot < 0 {
+            ->
+        }
+
+        // Successfully matched GEMM 3-level affine loop nest
+        plan.ok = true
+        plan.order = 1
         plan.outer_hdr = b_out
         plan.mid_hdr = b_mid
         plan.inner_hdr = b_in
-        plan.outer_exit = mfn.blocks[b_out].tc
+        plan.outer_exit = b_out_exit
+        plan.outer_body = b_out_body
+        plan.c_slot = c_slot
+        plan.a_slot = a_slot
+        plan.b_slot = b_slot
+        plan.i_slot = i_slot
+        plan.m_slot = m_slot
+        plan.n_slot = n_slot
+        plan.k_slot = k_slot
+        plan.is_m_const = is_m_const
+        plan.is_n_const = is_n_const
+        plan.is_k_const = is_k_const
+        plan.m_const = m_const
+        plan.n_const = n_const
+        plan.k_const = k_const
         <-
     }
 
     << plan
+}
+
+pub fn opt_tile(mfn $&MFn) bool {
+    plan := opt_tile_plan(mfn)
+    if !plan.ok {
+        << false
+    }
+
+    b_out_body := plan.outer_body
+
+    // 1. Emit LOAD_LOCAL for C, A, B pointer buffers in b_out_body
+    t_c := mfn.temps.len
+    mfn.temps.push(1)
+    mfn.temps_nslots.push(1)
+    $ins_c := minstr_new(MI_LOAD_LOCAL)
+    ins_c.a = t_c
+    ins_c.b = plan.c_slot
+    emit_instr_to_block(mfn, b_out_body, ins_c)
+
+    t_a := mfn.temps.len
+    mfn.temps.push(1)
+    mfn.temps_nslots.push(1)
+    $ins_a := minstr_new(MI_LOAD_LOCAL)
+    ins_a.a = t_a
+    ins_a.b = plan.a_slot
+    emit_instr_to_block(mfn, b_out_body, ins_a)
+
+    t_b := mfn.temps.len
+    mfn.temps.push(1)
+    mfn.temps_nslots.push(1)
+    $ins_b := minstr_new(MI_LOAD_LOCAL)
+    ins_b.a = t_b
+    ins_b.b = plan.b_slot
+    emit_instr_to_block(mfn, b_out_body, ins_b)
+
+    // 2. Emit/resolve M, N, K bounds in b_out_body
+    $t_m := plan.m_const
+    if !plan.is_m_const {
+        t_m = mfn.temps.len
+        mfn.temps.push(1)
+        mfn.temps_nslots.push(1)
+        $ins_m := minstr_new(MI_LOAD_LOCAL)
+        ins_m.a = t_m
+        ins_m.b = plan.m_slot
+        emit_instr_to_block(mfn, b_out_body, ins_m)
+    }
+
+    $t_n := plan.n_const
+    if !plan.is_n_const {
+        t_n = mfn.temps.len
+        mfn.temps.push(1)
+        mfn.temps_nslots.push(1)
+        $ins_n := minstr_new(MI_LOAD_LOCAL)
+        ins_n.a = t_n
+        ins_n.b = plan.n_slot
+        emit_instr_to_block(mfn, b_out_body, ins_n)
+    }
+
+    $t_k := plan.k_const
+    if !plan.is_k_const {
+        t_k = mfn.temps.len
+        mfn.temps.push(1)
+        mfn.temps_nslots.push(1)
+        $ins_k := minstr_new(MI_LOAD_LOCAL)
+        ins_k.a = t_k
+        ins_k.b = plan.k_slot
+        emit_instr_to_block(mfn, b_out_body, ins_k)
+    }
+
+    // 3. Build 6-argument chain (ptr_c, ptr_a, ptr_b, M, N, K)
+    m0 := mfn.margs.len
+    mfn.margs.push(MArg{ v: t_c, next: m0 + 1 })
+    mfn.margs.push(MArg{ v: t_a, next: m0 + 2 })
+    mfn.margs.push(MArg{ v: t_b, next: m0 + 3 })
+    mfn.margs.push(MArg{ v: t_m, next: m0 + 4 })
+    mfn.margs.push(MArg{ v: t_n, next: m0 + 5 })
+    mfn.margs.push(MArg{ v: t_k, next: -1 })
+
+    // 4. Emit MI_CALL _xu_tile_gemm_i64
+    dest := mfn.temps.len
+    mfn.temps.push(1)
+    mfn.temps_nslots.push(1)
+    $ins_call := minstr_new(MI_CALL)
+    ins_call.a = dest
+    ins_call.c = m0
+    ins_call.sval = "_xu_tile_gemm_i64"
+    emit_instr_to_block(mfn, b_out_body, ins_call)
+
+    // 5. Update outer induction variable to M (if known)
+    if plan.i_slot >= 0 {
+        $ins_upd := minstr_new(MI_STORE_LOCAL)
+        ins_upd.a = plan.i_slot
+        ins_upd.b = t_m
+        emit_instr_to_block(mfn, b_out_body, ins_upd)
+    }
+
+    // 6. Short-circuit: redirect b_out_body jump directly to outer_exit
+    mfn.blocks[b_out_body].tkind = TKIND_JUMP
+    mfn.blocks[b_out_body].ta = plan.outer_exit
+
+    << true
 }
