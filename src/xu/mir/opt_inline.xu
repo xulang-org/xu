@@ -1,0 +1,380 @@
+@xu/mir
+// Function inlining pass for small leaf and control-flow functions.
+//
+// Layer 3 module: eliminates function call prologue/epilogue overhead,
+// breaks function boundaries to enable cross-function constant folding,
+// algebraic simplification, LICM, and dead code elimination.
+
+const INLINE_MAX_INSTRS = 40
+const INLINE_MAX_BLOCKS = 5
+
+fn find_callee(unit &Mir, name string) int {
+    for fi in 0:unit.fns.len {
+        if unit.fns[fi].name == name || unit.fns[fi].label == name || "_" + unit.fns[fi].name == name {
+            << fi
+        }
+    }
+    << -1
+}
+
+fn can_inline_fn(callee &MFn, caller_name string) bool {
+    if callee.is_extern || callee.blocks.len == 0 {
+        << false
+    }
+    if callee.name == caller_name || callee.label == caller_name || "_" + callee.name == caller_name {
+        << false
+    }
+    if callee.instrs.len > INLINE_MAX_INSTRS || callee.blocks.len > INLINE_MAX_BLOCKS {
+        << false
+    }
+    // Prevent recursive calls inside callee
+    for ii in 0:callee.instrs.len {
+        if callee.instrs[ii].kind == MI_CALL {
+            s := callee.instrs[ii].sval
+            if s == callee.name || s == callee.label || s == "_" + callee.name {
+                << false
+            }
+        }
+    }
+    // Verify terminators are standard
+    for bi in 0:callee.blocks.len {
+        tk := callee.blocks[bi].tkind
+        if tk != TKIND_JUMP && tk != TKIND_BRANCH && tk != TKIND_RETURN {
+            << false
+        }
+    }
+    << true
+}
+
+fn remap_operand(v int, temp_offset int, const_map &[]int) int {
+    if v >= 0 {
+        << v + temp_offset
+    }
+    if v <= -2 {
+        cidx := 0 - v - 2
+        if cidx >= 0 && cidx < const_map.len {
+            << const_map[cidx]
+        }
+    }
+    << v
+}
+
+fn emit_to_bb(mfn $&MFn, bi int, ins MInstr) int {
+    idx := mfn.instrs.len
+    mfn.instrs.push(ins)
+    if bi >= 0 && bi < mfn.blocks.len {
+        if mfn.blocks[bi].head < 0 {
+            mfn.blocks[bi].head = idx
+            mfn.blocks[bi].tail = idx
+        } else {
+            last_idx := mfn.blocks[bi].tail
+            mfn.instrs[last_idx].next = idx
+            mfn.blocks[bi].tail = idx
+        }
+    }
+    << idx
+}
+
+pub struct InlineCallee {
+    pub nparams int
+    pub consts []int
+    pub local_names []string
+    pub locals []int
+    pub locals_nslots []int
+    pub locals_owning []bool
+    pub temps []int
+    pub temps_nslots []int
+    pub blocks []MBlock
+    pub instrs []MInstr
+    pub margs []MArg
+}
+
+fn extract_callee(f &MFn) InlineCallee {
+    $c := InlineCallee{
+        nparams: f.nparams,
+        consts: []int{},
+        local_names: []string{},
+        locals: []int{},
+        locals_nslots: []int{},
+        locals_owning: []bool{},
+        temps: []int{},
+        temps_nslots: []int{},
+        blocks: []MBlock{},
+        instrs: []MInstr{},
+        margs: []MArg{}
+    }
+    for i in 0:f.consts.len {
+        c.consts.push(f.consts[i])
+    }
+    for i in 0:f.local_names.len {
+        c.local_names.push(~f.local_names[i])
+    }
+    for i in 0:f.locals.len {
+        c.locals.push(f.locals[i])
+    }
+    for i in 0:f.locals_nslots.len {
+        c.locals_nslots.push(f.locals_nslots[i])
+    }
+    for i in 0:f.locals_owning.len {
+        c.locals_owning.push(f.locals_owning[i])
+    }
+    for i in 0:f.temps.len {
+        c.temps.push(f.temps[i])
+    }
+    for i in 0:f.temps_nslots.len {
+        c.temps_nslots.push(f.temps_nslots[i])
+    }
+    for i in 0:f.blocks.len {
+        c.blocks.push(f.blocks[i])
+    }
+    for i in 0:f.instrs.len {
+        c.instrs.push(f.instrs[i])
+    }
+    for i in 0:f.margs.len {
+        c.margs.push(f.margs[i])
+    }
+    << c
+}
+
+fn inline_call_site(caller $&MFn, bi int, call_ii int, prev_ii int, callee &InlineCallee) bool {
+    // 1. Gather actual arguments from caller marg chain
+    $args := []int{}
+    $mid := caller.instrs[call_ii].c
+    while mid >= 0 && mid < caller.margs.len {
+        args.push(caller.margs[mid].v)
+        mid = caller.margs[mid].next
+    }
+
+    if args.len != callee.nparams {
+        << false
+    }
+
+    dest_temp := caller.instrs[call_ii].a
+    next_ii := caller.instrs[call_ii].next
+
+    // 2. Clone constants into caller
+    $const_map := []int{}
+    for ci in 0:callee.consts.len {
+        new_cid := alloc_const(caller, callee.consts[ci])
+        const_map.push(new_cid)
+    }
+
+    // 3. Allocate slots for callee locals in caller
+    slot_offset := caller.locals.len
+    for li in 0:callee.locals.len {
+        caller.local_names.push(callee.local_names[li])
+        caller.locals.push(callee.locals[li])
+        caller.locals_nslots.push(callee.locals_nslots[li])
+        caller.locals_owning.push(callee.locals_owning[li])
+    }
+
+    // 4. Allocate temps for callee in caller
+    temp_offset := caller.temps.len
+    for ti in 0:callee.temps.len {
+        caller.temps.push(callee.temps[ti])
+        caller.temps_nslots.push(callee.temps_nslots[ti])
+    }
+
+    // 5. Create bb_post to hold instructions after call_ii
+    bb_post := caller.blocks.len
+    $post_block := mblock_new()
+    post_block.head = next_ii
+    post_block.tail = caller.blocks[bi].tail
+    post_block.tkind = caller.blocks[bi].tkind
+    post_block.ta = caller.blocks[bi].ta
+    post_block.tb = caller.blocks[bi].tb
+    post_block.tc = caller.blocks[bi].tc
+    post_block.line = caller.blocks[bi].line
+    caller.blocks.push(post_block)
+
+    // Truncate bb_pre (bi) before call_ii
+    if prev_ii >= 0 {
+        caller.instrs[prev_ii].next = -1
+        caller.blocks[bi].tail = prev_ii
+    } else {
+        caller.blocks[bi].head = -1
+        caller.blocks[bi].tail = -1
+    }
+
+    // 6. Store actual arguments into callee's parameter slots in bb_pre
+    for pi in 0:callee.nparams {
+        $ins_st := minstr_new(MI_STORE_LOCAL)
+        ins_st.a = slot_offset + pi
+        ins_st.b = args[pi]
+        emit_to_bb(caller, bi, ins_st)
+    }
+
+    // 7. Clone callee's basic blocks into caller
+    bb_offset := caller.blocks.len
+    for c_bi in 0:callee.blocks.len {
+        caller.blocks.push(mblock_new())
+    }
+
+    // Connect bb_pre jump to callee entry block
+    caller.blocks[bi].tkind = TKIND_JUMP
+    caller.blocks[bi].ta = bb_offset + 0
+    caller.blocks[bi].tb = -1
+    caller.blocks[bi].tc = -1
+
+    for c_bi in 0:callee.blocks.len {
+        target_bb := bb_offset + c_bi
+
+        // Clone instructions of c_bi
+        $curr := callee.blocks[c_bi].head
+        while curr >= 0 && curr < callee.instrs.len {
+            $ins := callee.instrs[curr]
+            ins.next = -1
+
+            // Remap temps and constants
+            if ins.kind == MI_LOAD_LOCAL {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                ins.b = ins.b + slot_offset
+            } else if ins.kind == MI_STORE_LOCAL {
+                ins.a = ins.a + slot_offset
+                ins.b = remap_operand(ins.b, temp_offset, &const_map)
+            } else if ins.kind == MI_ADDR {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                ins.b = ins.b + slot_offset
+            } else if ins.kind == MI_CALL {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                if ins.c >= 0 {
+                    // Deep copy argument chain
+                    $old_m := ins.c
+                    $new_head := -1
+                    $new_prev := -1
+                    while old_m >= 0 && old_m < callee.margs.len {
+                        m_v := remap_operand(callee.margs[old_m].v, temp_offset, &const_map)
+                        new_m := caller.margs.len
+                        caller.margs.push(MArg{ v: m_v, next: -1 })
+                        if new_head < 0 {
+                            new_head = new_m
+                        } else {
+                            caller.margs[new_prev].next = new_m
+                        }
+                        new_prev = new_m
+                        old_m = callee.margs[old_m].next
+                    }
+                    ins.c = new_head
+                }
+            } else if ins.kind == MI_BIN {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                // ins.b is operator opcode, keep unchanged
+                ins.c = remap_operand(ins.c, temp_offset, &const_map)
+                ins.d = remap_operand(ins.d, temp_offset, &const_map)
+            } else if ins.kind == MI_UN {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                // ins.b is operator opcode, keep unchanged
+                ins.c = remap_operand(ins.c, temp_offset, &const_map)
+            } else if ins.kind == MI_COPY {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                ins.b = remap_operand(ins.b, temp_offset, &const_map)
+            } else if ins.kind == MI_LOAD_INDEX {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                ins.b = remap_operand(ins.b, temp_offset, &const_map)
+                ins.c = remap_operand(ins.c, temp_offset, &const_map)
+            } else if ins.kind == MI_STORE_INDEX {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                ins.b = remap_operand(ins.b, temp_offset, &const_map)
+                ins.c = remap_operand(ins.c, temp_offset, &const_map)
+            } else {
+                ins.a = remap_operand(ins.a, temp_offset, &const_map)
+                ins.b = remap_operand(ins.b, temp_offset, &const_map)
+                ins.c = remap_operand(ins.c, temp_offset, &const_map)
+                ins.d = remap_operand(ins.d, temp_offset, &const_map)
+            }
+
+            emit_to_bb(caller, target_bb, ins)
+
+            if curr == callee.blocks[c_bi].tail {
+                <-
+            }
+            curr = callee.instrs[curr].next
+        }
+
+        // Remap block terminators
+        c_tk := callee.blocks[c_bi].tkind
+        if c_tk == TKIND_JUMP {
+            caller.blocks[target_bb].tkind = TKIND_JUMP
+            caller.blocks[target_bb].ta = bb_offset + callee.blocks[c_bi].ta
+            caller.blocks[target_bb].tb = -1
+            caller.blocks[target_bb].tc = -1
+        } else if c_tk == TKIND_BRANCH {
+            caller.blocks[target_bb].tkind = TKIND_BRANCH
+            caller.blocks[target_bb].ta = remap_operand(callee.blocks[c_bi].ta, temp_offset, &const_map)
+            caller.blocks[target_bb].tb = bb_offset + callee.blocks[c_bi].tb
+            caller.blocks[target_bb].tc = bb_offset + callee.blocks[c_bi].tc
+        } else if c_tk == TKIND_RETURN {
+            // Forward return value to caller's destination temp
+            if dest_temp >= 0 && callee.blocks[c_bi].ta != -1 {
+                ret_val := remap_operand(callee.blocks[c_bi].ta, temp_offset, &const_map)
+                $ins_cp := minstr_new(MI_COPY)
+                ins_cp.a = dest_temp
+                ins_cp.b = ret_val
+                emit_to_bb(caller, target_bb, ins_cp)
+            }
+            // Branch to bb_post join block
+            caller.blocks[target_bb].tkind = TKIND_JUMP
+            caller.blocks[target_bb].ta = bb_post
+            caller.blocks[target_bb].tb = -1
+            caller.blocks[target_bb].tc = -1
+        }
+    }
+
+    << true
+}
+
+pub fn opt_inline(unit $&Mir) bool {
+    if unit.fns.len < 2 {
+        << false
+    }
+
+    $changed := false
+    $round := 0
+
+    while round < 3 {
+        $round_changed := false
+
+        for fi in 0:unit.fns.len {
+            caller_name := unit.fns[fi].name
+
+            // Scan basic blocks for MI_CALL sites
+            $inlined_in_fn := false
+            for bi in 0:unit.fns[fi].blocks.len {
+                if inlined_in_fn {
+                    <-
+                }
+                $curr := unit.fns[fi].blocks[bi].head
+                $prev := -1
+                while curr >= 0 && curr < unit.fns[fi].instrs.len {
+                    if unit.fns[fi].instrs[curr].kind == MI_CALL {
+                        callee_name := unit.fns[fi].instrs[curr].sval
+                        callee_idx := find_callee(unit, callee_name)
+                        if callee_idx >= 0 && callee_idx != fi {
+                            if can_inline_fn(&unit.fns[callee_idx], caller_name) {
+                                callee_info := extract_callee(&unit.fns[callee_idx])
+                                if inline_call_site($&unit.fns[fi], bi, curr, prev, &callee_info) {
+                                    round_changed = true
+                                    changed = true
+                                    inlined_in_fn = true
+                                    <-
+                                }
+                            }
+                        }
+                    }
+                    if curr == unit.fns[fi].blocks[bi].tail {
+                        <-
+                    }
+                    prev = curr
+                    curr = unit.fns[fi].instrs[curr].next
+                }
+            }
+        }
+
+        if !round_changed {
+            <-
+        }
+        round += 1
+    }
+
+    << changed
+}
