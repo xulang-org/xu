@@ -1,0 +1,1849 @@
+@xu/codegen
+// Instruction selection and lowering from MIR to machine code.
+//
+// Layer 4C module: lowers architecture-independent MIR functions into
+// target-specific machine instructions using Target encoders and CodeBuffer.
+
+#xu/mir
+#xu/target
+#xu/mc
+
+fn check_temp_cross_use(u int, use_order int, bi int, def_bb &[]int, def_ins_order &[]int, call_orders &[]int, is_cross $&[]bool) {
+    if u >= 0 && u < def_bb.len && def_bb[u] >= 0 {
+        if def_bb[u] != bi {
+            is_cross[u] = true
+        } else if call_orders.len > 0 && def_ins_order[u] >= 0 {
+            d_order := def_ins_order[u]
+            for ci in 0:call_orders.len {
+                c_ord := call_orders[ci]
+                if c_ord > d_order && c_ord < use_order {
+                    is_cross[u] = true
+                }
+            }
+        }
+    }
+}
+
+fn analyze_cross_bb_temps(f &mir.MFn) []bool {
+    $def_bb := []int{}
+    $def_ins_order := []int{}
+    $is_cross := []bool{}
+    for ti in 0:f.temps.len {
+        def_bb.push(-1)
+        def_ins_order.push(-1)
+        is_cross.push(false)
+    }
+
+    $ins_order := []int{}
+    for _ in 0:f.instrs.len {
+        ins_order.push(-1)
+    }
+    $global_order := 0
+
+    // 1. Record the defining block and instruction index of each temp
+    for bi in 0:f.blocks.len {
+        $curr_ii := f.blocks[bi].head
+        while curr_ii >= 0 && curr_ii < f.instrs.len {
+            ins_order[curr_ii] = global_order
+            global_order += 1
+
+            ins := ~f.instrs[curr_ii]
+            if mir.instr_has_dest(ins.kind) {
+                d := ins.a
+                if d >= 0 && d < def_bb.len {
+                    if def_bb[d] < 0 {
+                        def_bb[d] = bi
+                        def_ins_order[d] = ins_order[curr_ii]
+                    }
+                }
+            }
+            if curr_ii == f.blocks[bi].tail { <- }
+            curr_ii = f.instrs[curr_ii].next
+        }
+    }
+
+    // 2. Scan all usages of temps; if used in a block != def_bb, or across a call, mark as cross
+    for bi in 0:f.blocks.len {
+        $call_orders := []int{}
+        $c_scan := f.blocks[bi].head
+        while c_scan >= 0 && c_scan < f.instrs.len {
+            ins_kind := f.instrs[c_scan].kind
+            if ins_kind == mir.MI_CALL {
+                call_orders.push(ins_order[c_scan])
+            } else if ins_kind == mir.MI_BIN && (f.instrs[c_scan].b == mir.BIN_STR_EQ || f.instrs[c_scan].b == mir.BIN_STR_NE) {
+                call_orders.push(ins_order[c_scan])
+            }
+            if c_scan == f.blocks[bi].tail { <- }
+            c_scan = f.instrs[c_scan].next
+        }
+
+        $curr_ii := f.blocks[bi].head
+        while curr_ii >= 0 && curr_ii < f.instrs.len {
+            ins := ~f.instrs[curr_ii]
+            k := ins.kind
+            u_order := ins_order[curr_ii]
+
+            if k == mir.MI_STORE_LOCAL {
+                check_temp_cross_use(ins.b, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+            } else if k == mir.MI_COPY {
+                check_temp_cross_use(ins.b, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+            } else if k == mir.MI_UN {
+                check_temp_cross_use(ins.c, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+            } else if k == mir.MI_BIN {
+                check_temp_cross_use(ins.c, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+                check_temp_cross_use(ins.d, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+            } else if k == mir.MI_SELECT || k == mir.MI_MADD || k == mir.MI_MSUB {
+                check_temp_cross_use(ins.b, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+                check_temp_cross_use(ins.c, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+                check_temp_cross_use(ins.d, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+            } else if k == mir.MI_CALL {
+                $arg_idx := ins.c
+                while arg_idx >= 0 && arg_idx < f.margs.len {
+                    check_temp_cross_use(f.margs[arg_idx].v, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+                    arg_idx = f.margs[arg_idx].next
+                }
+            } else if k == mir.MI_LOAD_INDEX {
+                check_temp_cross_use(ins.b, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+                check_temp_cross_use(ins.c, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+            } else if k == mir.MI_STORE_INDEX {
+                check_temp_cross_use(ins.a, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+                check_temp_cross_use(ins.b, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+                check_temp_cross_use(ins.c, u_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+            }
+            if curr_ii == f.blocks[bi].tail { <- }
+            curr_ii = ins.next
+        }
+
+        // Also check block terminator
+        if (f.blocks[bi].tkind == mir.TKIND_BRANCH || f.blocks[bi].tkind == mir.TKIND_RETURN) && f.blocks[bi].ta >= 0 {
+            term_order := global_order + 1
+            check_temp_cross_use(f.blocks[bi].ta, term_order, bi, &def_bb, &def_ins_order, &call_orders, $&is_cross)
+        }
+    }
+
+    << is_cross
+}
+
+pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, enable_regalloc bool) {
+    t := target.target_new(target.OS_MACOS, target.ARCH_ARM64)
+    $fr := frame_new(&t)
+
+    $addr_taken := []bool{}
+    for _ in 0:f.locals.len {
+        addr_taken.push(false)
+    }
+    $temp_use_count := []int{}
+    for _ in 0:f.temps.len {
+        temp_use_count.push(0)
+    }
+    for bi in 0:f.blocks.len {
+        $curr_ii := f.blocks[bi].head
+        while curr_ii >= 0 && curr_ii < f.instrs.len {
+            k := f.instrs[curr_ii].kind
+            if k == mir.MI_ADDR {
+                loc := f.instrs[curr_ii].b
+                if loc >= 0 && loc < addr_taken.len {
+                    addr_taken[loc] = true
+                    if loc + 1 < addr_taken.len { addr_taken[loc + 1] = true }
+                    if loc + 2 < addr_taken.len { addr_taken[loc + 2] = true }
+                }
+            } else if k == mir.MI_BIN {
+                c := f.instrs[curr_ii].c
+                d := f.instrs[curr_ii].d
+                if c >= 0 && c < temp_use_count.len { temp_use_count[c] = temp_use_count[c] + 1 }
+                if d >= 0 && d < temp_use_count.len { temp_use_count[d] = temp_use_count[d] + 1 }
+            } else if k == mir.MI_COPY {
+                b := f.instrs[curr_ii].b
+                if b >= 0 && b < temp_use_count.len { temp_use_count[b] = temp_use_count[b] + 1 }
+            } else if k == mir.MI_STORE_LOCAL {
+                b := f.instrs[curr_ii].b
+                if b >= 0 && b < temp_use_count.len { temp_use_count[b] = temp_use_count[b] + 1 }
+            } else if k == mir.MI_SELECT || k == mir.MI_MADD || k == mir.MI_MSUB {
+                b := f.instrs[curr_ii].b
+                c := f.instrs[curr_ii].c
+                d := f.instrs[curr_ii].d
+                if b >= 0 && b < temp_use_count.len { temp_use_count[b] = temp_use_count[b] + 1 }
+                if c >= 0 && c < temp_use_count.len { temp_use_count[c] = temp_use_count[c] + 1 }
+                if d >= 0 && d < temp_use_count.len { temp_use_count[d] = temp_use_count[d] + 1 }
+            }
+            if curr_ii == f.blocks[bi].tail {
+                <-
+            }
+            curr_ii = f.instrs[curr_ii].next
+        }
+        tk := f.blocks[bi].tkind
+        if tk == mir.TKIND_BRANCH || tk == mir.TKIND_RETURN {
+            ta := f.blocks[bi].ta
+            if ta >= 0 && ta < temp_use_count.len {
+                temp_use_count[ta] = temp_use_count[ta] + 1
+            }
+        }
+    }
+
+    $local_used := []bool{}
+    for _ in 0:f.locals.len {
+        local_used.push(false)
+    }
+    for pi in 0:f.nparams {
+        if pi < local_used.len {
+            local_used[pi] = true
+        }
+    }
+    for bi in 0:f.blocks.len {
+        $scan_ii := f.blocks[bi].head
+        while scan_ii >= 0 && scan_ii < f.instrs.len {
+            ins := ~f.instrs[scan_ii]
+            if ins.kind == mir.MI_LOAD_LOCAL {
+                if ins.b >= 0 && ins.b < local_used.len {
+                    local_used[ins.b] = true
+                }
+            } else if ins.kind == mir.MI_STORE_LOCAL {
+                if ins.a >= 0 && ins.a < local_used.len {
+                    local_used[ins.a] = true
+                }
+            } else if ins.kind == mir.MI_ADDR {
+                if ins.b >= 0 && ins.b < local_used.len {
+                    local_used[ins.b] = true
+                }
+            }
+            if scan_ii == f.blocks[bi].tail { <- }
+            scan_ii = f.instrs[scan_ii].next
+        }
+    }
+
+    $skip_instr := []bool{}
+    for _ in 0:f.instrs.len {
+        skip_instr.push(false)
+    }
+
+    $local_regs := []int{}
+    for _ in 0:f.locals.len {
+        local_regs.push(-1)
+    }
+
+    $callee_pool := []int{}
+    callee_pool.push(19)
+    callee_pool.push(20)
+    callee_pool.push(21)
+    callee_pool.push(22)
+    callee_pool.push(23)
+    callee_pool.push(24)
+    callee_pool.push(25)
+    callee_pool.push(26)
+
+    $used_callee := []bool{}
+    for _ in 0:32 {
+        used_callee.push(false)
+    }
+
+    $c_alloc_idx := 0
+    if enable_regalloc {
+        for i in 0:f.locals.len {
+            if local_used[i] && !addr_taken[i] && c_alloc_idx < callee_pool.len {
+                reg := callee_pool[c_alloc_idx]
+                c_alloc_idx += 1
+                local_regs[i] = reg
+                used_callee[reg] = true
+            }
+        }
+    }
+
+    $free_callee_pool := []int{}
+    if enable_regalloc {
+        for r in 19:27 {
+            if !used_callee[r] {
+                free_callee_pool.push(r)
+            }
+        }
+    }
+
+    is_cross_bb := analyze_cross_bb_temps(f)
+
+    $temp_callee_reg := []int{}
+    for _ in 0:f.temps.len {
+        temp_callee_reg.push(-1)
+    }
+
+    $callee_idx := 0
+    if enable_regalloc {
+        for ti in 0:f.temps.len {
+            if is_cross_bb[ti] && callee_idx < free_callee_pool.len {
+                reg := free_callee_pool[callee_idx]
+                callee_idx += 1
+                temp_callee_reg[ti] = reg
+                used_callee[reg] = true
+            }
+        }
+    }
+
+    $max_phys_reg := -1
+    for r in 19:32 {
+        if used_callee[r] && r > max_phys_reg {
+            max_phys_reg = r
+        }
+    }
+
+    $num_saved_pairs := 0
+    if max_phys_reg >= 19 {
+        if max_phys_reg <= 20 {
+            num_saved_pairs = 1
+        } else if max_phys_reg <= 22 {
+            num_saved_pairs = 2
+        } else if max_phys_reg <= 24 {
+            num_saved_pairs = 3
+        } else {
+            num_saved_pairs = 4
+        }
+    }
+
+    // 1. Allocate stack slots for locals and temps
+    $local_offsets := []int{}
+    for i in 0:f.locals.len {
+        if local_regs[i] >= 0 {
+            local_offsets.push(-1)
+        } else {
+            s := fr.alloc_local(8)
+            local_offsets.push(fr.local_slots[s].offset)
+        }
+    }
+
+    $scratch_spill_offsets := []int{}
+    for _ in 0:7 {
+        s := fr.alloc_local(8)
+        scratch_spill_offsets.push(fr.local_slots[s].offset)
+    }
+
+    $temp_offsets := []int{}
+    for i in 0:f.temps.len {
+        if temp_callee_reg[i] >= 0 {
+            temp_offsets.push(-1)
+        } else if is_cross_bb[i] {
+            s := fr.alloc_local(8)
+            temp_offsets.push(fr.local_slots[s].offset)
+        } else {
+            temp_offsets.push(scratch_spill_offsets[i % 7])
+        }
+    }
+
+    fr.finalize_layout()
+    spill_size := fr.total_stack_size
+    callee_saved_size := (1 + num_saved_pairs) * 16
+    total_frame_size := callee_saved_size + spill_size
+
+    for i in 0:local_offsets.len {
+        if local_offsets[i] >= 0 {
+            local_offsets[i] = local_offsets[i] + callee_saved_size
+        }
+    }
+    for i in 0:scratch_spill_offsets.len {
+        scratch_spill_offsets[i] = scratch_spill_offsets[i] + callee_saved_size
+    }
+    for i in 0:temp_offsets.len {
+        if temp_offsets[i] >= 0 {
+            temp_offsets[i] = temp_offsets[i] + callee_saved_size
+        }
+    }
+
+    // 2. Define function entry label
+    syms.define_label(f.label, cb.len())
+
+    // 3. Emit function prologue
+    if total_frame_size <= 504 {
+        target.arm64_stp_pre(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, 0 - total_frame_size)
+    } else {
+        target.arm64_sub_imm(cb, target.REG_ARM64_SP, target.REG_ARM64_SP, total_frame_size)
+        target.arm64_stp_offset(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, 0)
+    }
+    target.arm64_mov_reg(cb, target.REG_ARM64_FP, target.REG_ARM64_SP)
+
+    if num_saved_pairs >= 1 {
+        target.arm64_stp_offset(cb, target.REG_ARM64_X19, target.REG_ARM64_X20, target.REG_ARM64_SP, 16)
+    }
+    if num_saved_pairs >= 2 {
+        target.arm64_stp_offset(cb, target.REG_ARM64_X21, target.REG_ARM64_X22, target.REG_ARM64_SP, 32)
+    }
+    if num_saved_pairs >= 3 {
+        target.arm64_stp_offset(cb, target.REG_ARM64_X23, target.REG_ARM64_X24, target.REG_ARM64_SP, 48)
+    }
+    if num_saved_pairs >= 4 {
+        target.arm64_stp_offset(cb, target.REG_ARM64_X25, target.REG_ARM64_X26, target.REG_ARM64_SP, 64)
+    }
+
+    // Store incoming parameter registers X0..X(nparams-1) to local stack slots / registers
+    for pi in 0:f.nparams {
+        if pi < 8 {
+            if pi < local_regs.len && local_regs[pi] >= 0 {
+                target.arm64_mov_reg(cb, local_regs[pi], pi)
+            } else if pi < local_offsets.len {
+                loc_off := local_offsets[pi]
+                target.arm64_str_imm(cb, pi, target.REG_ARM64_SP, loc_off)
+            }
+        }
+    }
+
+    $temp_local_src := []int{}
+    for _ in 0:f.temps.len {
+        temp_local_src.push(-1)
+    }
+    for t_bi in 0:f.blocks.len {
+        $t_scan := f.blocks[t_bi].head
+        while t_scan >= 0 && t_scan < f.instrs.len {
+            if f.instrs[t_scan].kind == mir.MI_LOAD_LOCAL {
+                dest := f.instrs[t_scan].a
+                loc := f.instrs[t_scan].b
+                if dest >= 0 && dest < temp_local_src.len {
+                    temp_local_src[dest] = loc
+                }
+            }
+            if t_scan == f.blocks[t_bi].tail { <- }
+            t_scan = f.instrs[t_scan].next
+        }
+    }
+
+    // 4. Emit blocks
+    for bi in 0:f.blocks.len {
+        blk_label := f.label + "_bb" + str(bi)
+        syms.define_label(blk_label, cb.len())
+
+        blk := ~f.blocks[bi]
+        $last_cmp_dest := -1
+        $last_cmp_cond := -1
+
+        $temp_reg := []int{}
+        for ti in 0:f.temps.len {
+            temp_reg.push(-1)
+        }
+        $scratch_idx := 0
+        $scratch_pool := []int{}
+        scratch_pool.push(target.REG_ARM64_X9)
+        scratch_pool.push(target.REG_ARM64_X10)
+        scratch_pool.push(target.REG_ARM64_X11)
+        scratch_pool.push(target.REG_ARM64_X12)
+        scratch_pool.push(target.REG_ARM64_X13)
+        scratch_pool.push(target.REG_ARM64_X14)
+        scratch_pool.push(target.REG_ARM64_X15)
+
+        $scratch_owner := []int{}
+        for _ in 0:7 {
+            scratch_owner.push(-1)
+        }
+
+        enable_temp_opt := enable_regalloc
+
+        $fused_mul_valid := false
+        $fused_mul_dest := -1
+        $fused_mul_reg := -1
+        $fused_mul_rn := -1
+        $fused_mul_rm := -1
+
+        // Emit instructions in block
+        $curr_ii := blk.head
+        while curr_ii >= 0 && curr_ii < f.instrs.len {
+            if skip_instr[curr_ii] {
+                if curr_ii == blk.tail { <- }
+                curr_ii = f.instrs[curr_ii].next
+                -> ->
+            }
+            ins := ~f.instrs[curr_ii]
+
+            // If a previous multiply was deferred and this instruction cannot consume it, flush the mul
+            if fused_mul_valid {
+                $is_fused_consumer := false
+                if ins.kind == mir.MI_BIN && (ins.b == mir.BIN_ADD || ins.b == mir.BIN_SUB) {
+                    if ins.c == fused_mul_dest || ins.d == fused_mul_dest {
+                        is_fused_consumer = true
+                    }
+                }
+                if !is_fused_consumer {
+                    target.arm64_mul(cb, fused_mul_reg, fused_mul_rn, fused_mul_rm)
+                    fused_mul_valid = false
+                }
+            }
+
+            if ins.kind == mir.MI_STORE_LOCAL {
+                // a = local slot, b = src value
+                $r_src := target.REG_ARM64_X0
+                if ins.b <= -2 {
+                    cidx := 0 - ins.b - 2
+                    $val := 0
+                    if cidx >= 0 && cidx < f.consts.len {
+                        val = f.consts[cidx]
+                    }
+                    if ins.a >= 0 && ins.a < local_regs.len && local_regs[ins.a] >= 0 {
+                        target.arm64_mov_imm64(cb, local_regs[ins.a], val)
+                        r_src = local_regs[ins.a]
+                    } else {
+                        target.arm64_mov_imm64(cb, target.REG_ARM64_X0, val)
+                    }
+                } else if ins.b >= 0 {
+                    if ins.b < temp_callee_reg.len && temp_callee_reg[ins.b] >= 0 {
+                        r_src = temp_callee_reg[ins.b]
+                    } else if ins.b < temp_reg.len && temp_reg[ins.b] >= 0 {
+                        r_src = temp_reg[ins.b]
+                    } else if ins.b < temp_local_src.len && temp_local_src[ins.b] >= 0 && local_regs[temp_local_src[ins.b]] >= 0 {
+                        r_src = local_regs[temp_local_src[ins.b]]
+                    } else if ins.b < temp_offsets.len && temp_offsets[ins.b] >= 0 {
+                        slot_off := temp_offsets[ins.b]
+                        target.arm64_ldr_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                if ins.a >= 0 && ins.a < local_regs.len && local_regs[ins.a] >= 0 {
+                    r_loc := local_regs[ins.a]
+                    if r_loc != r_src {
+                        target.arm64_mov_reg(cb, r_loc, r_src)
+                    }
+                } else if ins.a >= 0 && ins.a < local_offsets.len {
+                    loc_off := local_offsets[ins.a]
+                    target.arm64_str_imm(cb, r_src, target.REG_ARM64_SP, loc_off)
+                }
+            } else if ins.kind == mir.MI_LOAD_LOCAL {
+                // a = dest temp, b = local slot
+                $loaded_r := target.REG_ARM64_X0
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    loaded_r = temp_callee_reg[ins.a]
+                    if ins.b >= 0 && ins.b < local_regs.len && local_regs[ins.b] >= 0 {
+                        if loaded_r != local_regs[ins.b] {
+                            target.arm64_mov_reg(cb, loaded_r, local_regs[ins.b])
+                        }
+                    } else if ins.b >= 0 && ins.b < local_offsets.len {
+                        loc_off := local_offsets[ins.b]
+                        target.arm64_ldr_imm(cb, loaded_r, target.REG_ARM64_SP, loc_off)
+                    }
+                } else if ins.b >= 0 && ins.b < local_regs.len && local_regs[ins.b] >= 0 {
+                    loaded_r = local_regs[ins.b]
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        temp_reg[ins.a] = loaded_r
+                    }
+                } else if ins.b >= 0 && ins.b < local_offsets.len {
+                    loc_off := local_offsets[ins.b]
+                    if enable_temp_opt {
+                        pool_idx := scratch_idx % 7
+                        scratch_idx += 1
+                        old_owner := scratch_owner[pool_idx]
+                        if old_owner >= 0 && old_owner < temp_reg.len {
+                            if old_owner < temp_offsets.len && temp_offsets[old_owner] >= 0 {
+                                slot_off := temp_offsets[old_owner]
+                                target.arm64_str_imm(cb, scratch_pool[pool_idx], target.REG_ARM64_SP, slot_off)
+                            }
+                            temp_reg[old_owner] = -1
+                        }
+                        loaded_r = scratch_pool[pool_idx]
+                        if ins.a >= 0 && ins.a < temp_reg.len {
+                            scratch_owner[pool_idx] = ins.a
+                            temp_reg[ins.a] = loaded_r
+                        }
+                        target.arm64_ldr_imm(cb, loaded_r, target.REG_ARM64_SP, loc_off)
+                    } else {
+                        target.arm64_ldr_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, loc_off)
+                    }
+                }
+
+                $need_spill := true
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    need_spill = false
+                } else if ins.b >= 0 && ins.b < local_regs.len && local_regs[ins.b] >= 0 {
+                    need_spill = false
+                } else if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] && ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
+                    need_spill = false
+                }
+                if need_spill && ins.a >= 0 && ins.a < temp_offsets.len && temp_offsets[ins.a] >= 0 {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, loaded_r, target.REG_ARM64_SP, slot_off)
+                }
+            } else if ins.kind == mir.MI_COPY {
+                $src_r := target.REG_ARM64_X0
+                if ins.b >= 0 && ins.b < temp_callee_reg.len && temp_callee_reg[ins.b] >= 0 {
+                    src_r = temp_callee_reg[ins.b]
+                } else if enable_temp_opt && ins.b >= 0 && ins.b < temp_reg.len && temp_reg[ins.b] >= 0 {
+                    src_r = temp_reg[ins.b]
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        temp_reg[ins.a] = src_r
+                    }
+                } else {
+                    if ins.b <= -2 {
+                        const_idx := 0 - ins.b - 2
+                        $val := 0
+                        if const_idx >= 0 && const_idx < f.consts.len {
+                            val = f.consts[const_idx]
+                        }
+                        if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                            src_r = temp_callee_reg[ins.a]
+                            target.arm64_mov_imm64(cb, src_r, val)
+                        } else if enable_temp_opt {
+                            pool_idx := scratch_idx % 7
+                            scratch_idx += 1
+                            old_owner := scratch_owner[pool_idx]
+                            if old_owner >= 0 && old_owner < temp_reg.len {
+                                if old_owner < temp_offsets.len && temp_offsets[old_owner] >= 0 {
+                                    slot_off := temp_offsets[old_owner]
+                                    target.arm64_str_imm(cb, scratch_pool[pool_idx], target.REG_ARM64_SP, slot_off)
+                                }
+                                temp_reg[old_owner] = -1
+                            }
+                            src_r = scratch_pool[pool_idx]
+                            if ins.a >= 0 && ins.a < temp_reg.len {
+                                scratch_owner[pool_idx] = ins.a
+                                temp_reg[ins.a] = src_r
+                            }
+                            target.arm64_mov_imm64(cb, src_r, val)
+                        } else {
+                            target.arm64_mov_imm64(cb, target.REG_ARM64_X0, val)
+                        }
+                    } else if ins.b >= 0 && ins.b < temp_offsets.len && temp_offsets[ins.b] >= 0 {
+                        slot_off := temp_offsets[ins.b]
+                        if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                            src_r = temp_callee_reg[ins.a]
+                            target.arm64_ldr_imm(cb, src_r, target.REG_ARM64_SP, slot_off)
+                        } else if enable_temp_opt {
+                            pool_idx := scratch_idx % 7
+                            scratch_idx += 1
+                            old_owner := scratch_owner[pool_idx]
+                            if old_owner >= 0 && old_owner < temp_reg.len {
+                                if old_owner < temp_offsets.len && temp_offsets[old_owner] >= 0 {
+                                    slot_off_ev := temp_offsets[old_owner]
+                                    target.arm64_str_imm(cb, scratch_pool[pool_idx], target.REG_ARM64_SP, slot_off_ev)
+                                }
+                                temp_reg[old_owner] = -1
+                            }
+                            src_r = scratch_pool[pool_idx]
+                            if ins.a >= 0 && ins.a < temp_reg.len {
+                                scratch_owner[pool_idx] = ins.a
+                                temp_reg[ins.a] = src_r
+                            }
+                            target.arm64_ldr_imm(cb, src_r, target.REG_ARM64_SP, slot_off)
+                        } else {
+                            target.arm64_ldr_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, slot_off)
+                        }
+                    }
+                }
+
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    dst_r := temp_callee_reg[ins.a]
+                    if dst_r != src_r {
+                        target.arm64_mov_reg(cb, dst_r, src_r)
+                    }
+                }
+
+                $need_spill := true
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    need_spill = false
+                } else if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] && ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
+                    need_spill = false
+                }
+                if need_spill && ins.a >= 0 && ins.a < temp_offsets.len && temp_offsets[ins.a] >= 0 {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, src_r, target.REG_ARM64_SP, slot_off)
+                }
+            } else if ins.kind == mir.MI_BIN {
+                // a = b op c
+                is_only_branch_cond := (blk.tkind == mir.TKIND_BRANCH && blk.ta == ins.a && ins.a >= 0 && ins.a < temp_use_count.len && temp_use_count[ins.a] <= 1)
+                // Load LHS into r_lhs
+                $r_lhs := target.REG_ARM64_X0
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.arm64_mov_imm64(cb, target.REG_ARM64_X0, f.consts[cidx])
+                } else if ins.c >= 0 {
+                    if ins.c < temp_callee_reg.len && temp_callee_reg[ins.c] >= 0 {
+                        r_lhs = temp_callee_reg[ins.c]
+                    } else if ins.c < temp_reg.len && temp_reg[ins.c] >= 0 {
+                        r_lhs = temp_reg[ins.c]
+                    } else if ins.c < temp_local_src.len && temp_local_src[ins.c] >= 0 && local_regs[temp_local_src[ins.c]] >= 0 {
+                        r_lhs = local_regs[temp_local_src[ins.c]]
+                    } else if ins.c < temp_offsets.len && temp_offsets[ins.c] >= 0 {
+                        slot_off := temp_offsets[ins.c]
+                        target.arm64_ldr_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                // Load RHS into r_rhs
+                $r_rhs := target.REG_ARM64_X1
+                $rhs_imm12 := -1
+                $rhs_and_imms := -1
+                if ins.d <= -2 {
+                    cidx := 0 - ins.d - 2
+                    val := f.consts[cidx]
+                    if (ins.b == mir.BIN_ADD || ins.b == mir.BIN_SUB || ins.b == mir.BIN_EQ || ins.b == mir.BIN_NE || ins.b == mir.BIN_LT || ins.b == mir.BIN_LE || ins.b == mir.BIN_GT || ins.b == mir.BIN_GE) && val >= 0 && val <= 4095 {
+                        rhs_imm12 = val
+                    } else if ins.b == mir.BIN_AND && val > 0 && ((val & (val + 1)) == 0) {
+                        $imms := 0
+                        $tmp := val
+                        while tmp > 1 {
+                            imms += 1
+                            tmp = tmp / 2
+                        }
+                        rhs_and_imms = imms
+                    } else {
+                        target.arm64_mov_imm64(cb, target.REG_ARM64_X1, val)
+                    }
+                } else if ins.d >= 0 {
+                    if ins.d < temp_callee_reg.len && temp_callee_reg[ins.d] >= 0 {
+                        r_rhs = temp_callee_reg[ins.d]
+                    } else if ins.d < temp_reg.len && temp_reg[ins.d] >= 0 {
+                        r_rhs = temp_reg[ins.d]
+                    } else if ins.d < temp_local_src.len && temp_local_src[ins.d] >= 0 && local_regs[temp_local_src[ins.d]] >= 0 {
+                        r_rhs = local_regs[temp_local_src[ins.d]]
+                    } else if ins.d < temp_offsets.len && temp_offsets[ins.d] >= 0 {
+                        slot_off := temp_offsets[ins.d]
+                        target.arm64_ldr_imm(cb, target.REG_ARM64_X1, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                // Check in-place destination optimization (e.g. sum = sum + ..., i = i + 1)
+                $is_in_place_local := false
+                $in_place_reg := -1
+                if ins.next >= 0 && ins.next < f.instrs.len {
+                    next_ins := ~f.instrs[ins.next]
+                    if next_ins.kind == mir.MI_STORE_LOCAL && next_ins.b == ins.a {
+                        loc_idx := next_ins.a
+                        if loc_idx >= 0 && loc_idx < local_regs.len && local_regs[loc_idx] >= 0 {
+                            loc_r := local_regs[loc_idx]
+                            if r_lhs == loc_r {
+                                is_in_place_local = true
+                                in_place_reg = loc_r
+                            }
+                        }
+                    }
+                }
+
+                // Destination register for ALU
+                $r_dest := target.REG_ARM64_X0
+                if is_in_place_local {
+                    r_dest = in_place_reg
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        temp_reg[ins.a] = r_dest
+                    }
+                } else if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    r_dest = temp_callee_reg[ins.a]
+                } else if enable_temp_opt {
+                    pool_idx := scratch_idx % 7
+                    scratch_idx += 1
+                    old_owner := scratch_owner[pool_idx]
+                    if old_owner >= 0 && old_owner < temp_reg.len {
+                        if old_owner < temp_offsets.len {
+                            slot_off_ev := temp_offsets[old_owner]
+                            target.arm64_str_imm(cb, scratch_pool[pool_idx], target.REG_ARM64_SP, slot_off_ev)
+                        }
+                        temp_reg[old_owner] = -1
+                    }
+                    r_dest = scratch_pool[pool_idx]
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        scratch_owner[pool_idx] = ins.a
+                        temp_reg[ins.a] = r_dest
+                    }
+                }
+
+                // Opcode: 1=Add, 2=Sub, 3=Mul, 4=Div, 5=Eq, 6=Ne, 7=Lt, 8=Le, 9=Gt, 10=Ge, 11=And, 12=Or
+                if ins.b == mir.BIN_ADD {
+                    if fused_mul_valid && (ins.c == fused_mul_dest || ins.d == fused_mul_dest) {
+                        $r_acc := r_rhs
+                        if ins.c != fused_mul_dest {
+                            r_acc = r_lhs
+                        }
+                        target.arm64_madd(cb, r_dest, fused_mul_rn, fused_mul_rm, r_acc)
+                        fused_mul_valid = false
+                    } else {
+                        if rhs_imm12 >= 0 {
+                            target.arm64_add_imm(cb, r_dest, r_lhs, rhs_imm12)
+                        } else {
+                            target.arm64_add_reg(cb, r_dest, r_lhs, r_rhs)
+                        }
+                    }
+                } else if ins.b == mir.BIN_SUB {
+                    if fused_mul_valid && ins.d == fused_mul_dest {
+                        // Ra - Rn * Rm
+                        target.arm64_msub(cb, r_dest, fused_mul_rn, fused_mul_rm, r_lhs)
+                        fused_mul_valid = false
+                    } else {
+                        if rhs_imm12 >= 0 {
+                            target.arm64_sub_imm(cb, r_dest, r_lhs, rhs_imm12)
+                        } else {
+                            target.arm64_sub_reg(cb, r_dest, r_lhs, r_rhs)
+                        }
+                    }
+                } else if ins.b == mir.BIN_MUL {
+                    $can_fuse := false
+                    if curr_ii != blk.tail && ins.next >= 0 && ins.next < f.instrs.len {
+                        next_ins := ~f.instrs[ins.next]
+                        if next_ins.kind == mir.MI_BIN && (next_ins.b == mir.BIN_ADD || next_ins.b == mir.BIN_SUB) {
+                            if next_ins.c == ins.a || next_ins.d == ins.a {
+                                if ins.a >= 0 && ins.a < temp_use_count.len && temp_use_count[ins.a] == 1 {
+                                    can_fuse = true
+                                }
+                            }
+                        }
+                    }
+
+                    if can_fuse && r_lhs >= target.REG_ARM64_X9 && r_rhs >= target.REG_ARM64_X9 {
+                        fused_mul_valid = true
+                        fused_mul_dest = ins.a
+                        fused_mul_reg = r_dest
+                        fused_mul_rn = r_lhs
+                        fused_mul_rm = r_rhs
+                    } else {
+                        target.arm64_mul(cb, r_dest, r_lhs, r_rhs)
+                    }
+                } else if ins.b == mir.BIN_DIV {
+                    if ins.d <= -2 && f.consts[0 - ins.d - 2] == 2 {
+                        target.arm64_add_reg_lsr(cb, target.REG_ARM64_X16, r_lhs, r_lhs, 63)
+                        target.arm64_asr_imm(cb, r_dest, target.REG_ARM64_X16, 1)
+                    } else if ins.d <= -2 && f.consts[0 - ins.d - 2] == 10 {
+                        target.arm64_mov_imm64(cb, target.REG_ARM64_X16, 0x6666666666666667)
+                        target.arm64_smulh(cb, r_dest, r_lhs, target.REG_ARM64_X16)
+                        target.arm64_asr_imm(cb, r_dest, r_dest, 2)
+                        target.arm64_add_reg_lsr(cb, r_dest, r_dest, r_lhs, 63)
+                    } else {
+                        target.arm64_sdiv(cb, r_dest, r_lhs, r_rhs)
+                    }
+                } else if ins.b == mir.BIN_MOD {
+                    $peer_div_ii := -1
+                    $scan_peer := ins.next
+                    while scan_peer >= 0 && scan_peer < f.instrs.len {
+                        p_ins := ~f.instrs[scan_peer]
+                        if p_ins.kind == mir.MI_BIN && p_ins.b == mir.BIN_DIV && p_ins.c == ins.c && p_ins.d == ins.d {
+                            peer_div_ii = scan_peer
+                            <-
+                        }
+                        if scan_peer == blk.tail { <- }
+                        scan_peer = p_ins.next
+                    }
+
+                    $q_dest := target.REG_ARM64_X16
+                    if peer_div_ii >= 0 {
+                        p_temp := f.instrs[peer_div_ii].a
+                        if p_temp >= 0 && p_temp < temp_callee_reg.len && temp_callee_reg[p_temp] >= 0 {
+                            q_dest = temp_callee_reg[p_temp]
+                        } else if enable_temp_opt && p_temp >= 0 && p_temp < is_cross_bb.len && !is_cross_bb[p_temp] {
+                            if p_temp < temp_reg.len && temp_reg[p_temp] >= 0 {
+                                q_dest = temp_reg[p_temp]
+                            } else {
+                                $found_s := -1
+                                for si in 0:scratch_pool.len {
+                                    if scratch_owner[si] < 0 {
+                                        found_s = si
+                                        <-
+                                    }
+                                }
+                                if found_s < 0 {
+                                    found_s = scratch_idx % scratch_pool.len
+                                    scratch_idx += 1
+                                    old_owner := scratch_owner[found_s]
+                                    if old_owner >= 0 && old_owner < temp_reg.len {
+                                        temp_reg[old_owner] = -1
+                                    }
+                                }
+                                scratch_owner[found_s] = p_temp
+                                if p_temp >= 0 && p_temp < temp_reg.len {
+                                    temp_reg[p_temp] = scratch_pool[found_s]
+                                }
+                                q_dest = scratch_pool[found_s]
+                            }
+                        }
+                    }
+
+                    if ins.d <= -2 && f.consts[0 - ins.d - 2] == 2 {
+                        target.arm64_add_reg_lsr(cb, target.REG_ARM64_X16, r_lhs, r_lhs, 63)
+                        target.arm64_asr_imm(cb, q_dest, target.REG_ARM64_X16, 1)
+                        target.arm64_msub(cb, r_dest, q_dest, r_rhs, r_lhs)
+                    } else if ins.d <= -2 && f.consts[0 - ins.d - 2] == 10 {
+                        target.arm64_mov_imm64(cb, target.REG_ARM64_X16, 0x6666666666666667)
+                        target.arm64_smulh(cb, q_dest, r_lhs, target.REG_ARM64_X16)
+                        target.arm64_asr_imm(cb, q_dest, q_dest, 2)
+                        target.arm64_add_reg_lsr(cb, q_dest, q_dest, r_lhs, 63)
+                        target.arm64_msub(cb, r_dest, q_dest, r_rhs, r_lhs)
+                    } else {
+                        target.arm64_sdiv(cb, q_dest, r_lhs, r_rhs)
+                        target.arm64_msub(cb, r_dest, q_dest, r_rhs, r_lhs)
+                    }
+
+                    if peer_div_ii >= 0 {
+                        skip_instr[peer_div_ii] = true
+                    }
+                } else if ins.b == mir.BIN_EQ {
+                    if rhs_imm12 >= 0 {
+                        target.arm64_cmp_imm(cb, r_lhs, rhs_imm12)
+                    } else {
+                        target.arm64_cmp_reg(cb, r_lhs, r_rhs)
+                    }
+                    if !is_only_branch_cond {
+                        target.arm64_cset(cb, r_dest, target.ARM64_COND_EQ)
+                    }
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_EQ
+                } else if ins.b == mir.BIN_NE {
+                    if rhs_imm12 >= 0 {
+                        target.arm64_cmp_imm(cb, r_lhs, rhs_imm12)
+                    } else {
+                        target.arm64_cmp_reg(cb, r_lhs, r_rhs)
+                    }
+                    if !is_only_branch_cond {
+                        target.arm64_cset(cb, r_dest, target.ARM64_COND_NE)
+                    }
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_NE
+                } else if ins.b == mir.BIN_STR_EQ {
+                    if r_rhs == target.REG_ARM64_X0 {
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X1, r_rhs)
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X0, r_lhs)
+                    } else {
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X0, r_lhs)
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X1, r_rhs)
+                    }
+                    str_eq_off := syms.lookup_offset("_xu_str_eq")
+                    if str_eq_off >= 0 {
+                        delta := (str_eq_off - cb.len()) / 4
+                        target.arm64_bl(cb, delta)
+                    } else {
+                        target.arm64_bl(cb, 0)
+                        relocs.push(mc.reloc_new(cb.len() - 4, "_xu_str_eq", mc.RELOC_ARM64_CALL26, 0))
+                    }
+                    if enable_temp_opt {
+                        for si in 0:scratch_pool.len {
+                            old_ow := scratch_owner[si]
+                            if old_ow >= 0 && old_ow < temp_reg.len {
+                                temp_reg[old_ow] = -1
+                            }
+                            scratch_owner[si] = -1
+                        }
+                        scratch_idx = 0
+                        r_dest = scratch_pool[0]
+                        scratch_owner[0] = ins.a
+                        if ins.a >= 0 && ins.a < temp_reg.len {
+                            temp_reg[ins.a] = r_dest
+                        }
+                    }
+                    target.arm64_mov_reg(cb, r_dest, target.REG_ARM64_X0)
+                    target.arm64_cmp_imm(cb, r_dest, 1)
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_EQ
+                } else if ins.b == mir.BIN_STR_NE {
+                    if r_rhs == target.REG_ARM64_X0 {
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X1, r_rhs)
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X0, r_lhs)
+                    } else {
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X0, r_lhs)
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X1, r_rhs)
+                    }
+                    str_eq_off := syms.lookup_offset("_xu_str_eq")
+                    if str_eq_off >= 0 {
+                        delta := (str_eq_off - cb.len()) / 4
+                        target.arm64_bl(cb, delta)
+                    } else {
+                        target.arm64_bl(cb, 0)
+                        relocs.push(mc.reloc_new(cb.len() - 4, "_xu_str_eq", mc.RELOC_ARM64_CALL26, 0))
+                    }
+                    if enable_temp_opt {
+                        for si in 0:scratch_pool.len {
+                            old_ow := scratch_owner[si]
+                            if old_ow >= 0 && old_ow < temp_reg.len {
+                                temp_reg[old_ow] = -1
+                            }
+                            scratch_owner[si] = -1
+                        }
+                        scratch_idx = 0
+                        r_dest = scratch_pool[0]
+                        scratch_owner[0] = ins.a
+                        if ins.a >= 0 && ins.a < temp_reg.len {
+                            temp_reg[ins.a] = r_dest
+                        }
+                    }
+                    target.arm64_movz(cb, target.REG_ARM64_X16, 1, 0)
+                    target.arm64_eor_reg(cb, r_dest, target.REG_ARM64_X0, target.REG_ARM64_X16)
+                    target.arm64_cmp_imm(cb, r_dest, 1)
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_EQ
+                } else if ins.b == mir.BIN_LT {
+                    if rhs_imm12 >= 0 {
+                        target.arm64_cmp_imm(cb, r_lhs, rhs_imm12)
+                    } else {
+                        target.arm64_cmp_reg(cb, r_lhs, r_rhs)
+                    }
+                    if !is_only_branch_cond {
+                        target.arm64_cset(cb, r_dest, target.ARM64_COND_LT)
+                    }
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_LT
+                } else if ins.b == mir.BIN_LE {
+                    if rhs_imm12 >= 0 {
+                        target.arm64_cmp_imm(cb, r_lhs, rhs_imm12)
+                    } else {
+                        target.arm64_cmp_reg(cb, r_lhs, r_rhs)
+                    }
+                    if !is_only_branch_cond {
+                        target.arm64_cset(cb, r_dest, target.ARM64_COND_LE)
+                    }
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_LE
+                } else if ins.b == mir.BIN_GT {
+                    if rhs_imm12 >= 0 {
+                        target.arm64_cmp_imm(cb, r_lhs, rhs_imm12)
+                    } else {
+                        target.arm64_cmp_reg(cb, r_lhs, r_rhs)
+                    }
+                    if !is_only_branch_cond {
+                        target.arm64_cset(cb, r_dest, target.ARM64_COND_GT)
+                    }
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_GT
+                } else if ins.b == mir.BIN_GE {
+                    if rhs_imm12 >= 0 {
+                        target.arm64_cmp_imm(cb, r_lhs, rhs_imm12)
+                    } else {
+                        target.arm64_cmp_reg(cb, r_lhs, r_rhs)
+                    }
+                    if !is_only_branch_cond {
+                        target.arm64_cset(cb, r_dest, target.ARM64_COND_GE)
+                    }
+                    last_cmp_dest = ins.a
+                    last_cmp_cond = target.ARM64_COND_GE
+                } else if ins.b == mir.BIN_AND {
+                    if rhs_and_imms >= 0 {
+                        target.arm64_and_imm(cb, r_dest, r_lhs, rhs_and_imms)
+                    } else {
+                        target.arm64_and_reg(cb, r_dest, r_lhs, r_rhs)
+                    }
+                } else if ins.b == mir.BIN_OR {
+                    target.arm64_orr_reg(cb, r_dest, r_lhs, r_rhs)
+                }
+
+                $need_spill := true
+                if is_only_branch_cond || is_in_place_local {
+                    need_spill = false
+                } else if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    need_spill = false
+                } else if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] && ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
+                    need_spill = false
+                }
+                if need_spill && ins.a >= 0 && ins.a < temp_offsets.len && temp_offsets[ins.a] >= 0 {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, r_dest, target.REG_ARM64_SP, slot_off)
+                }
+            } else if ins.kind == mir.MI_SELECT {
+                // a = select(b_cond, c_then, d_else)
+                $r_then := target.REG_ARM64_X16
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.arm64_mov_imm64(cb, r_then, f.consts[cidx])
+                } else if ins.c >= 0 {
+                    if enable_temp_opt && ins.c < temp_reg.len && temp_reg[ins.c] >= 0 {
+                        r_then = temp_reg[ins.c]
+                    } else if ins.c < temp_offsets.len {
+                        slot_off := temp_offsets[ins.c]
+                        target.arm64_ldr_imm(cb, r_then, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                $r_else := target.REG_ARM64_X17
+                if ins.d <= -2 {
+                    cidx := 0 - ins.d - 2
+                    target.arm64_mov_imm64(cb, r_else, f.consts[cidx])
+                } else if ins.d >= 0 {
+                    if enable_temp_opt && ins.d < temp_reg.len && temp_reg[ins.d] >= 0 {
+                        r_else = temp_reg[ins.d]
+                    } else if ins.d < temp_offsets.len {
+                        slot_off := temp_offsets[ins.d]
+                        target.arm64_ldr_imm(cb, r_else, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                $sel_cond := target.ARM64_COND_NE
+                if last_cmp_dest == ins.b && last_cmp_cond >= 0 {
+                    sel_cond = last_cmp_cond
+                } else {
+                    $r_cond := target.REG_ARM64_X10
+                    if ins.b >= 0 {
+                        if enable_temp_opt && ins.b < temp_reg.len && temp_reg[ins.b] >= 0 {
+                            r_cond = temp_reg[ins.b]
+                        } else if ins.b < temp_offsets.len {
+                            slot_off := temp_offsets[ins.b]
+                            target.arm64_ldr_imm(cb, r_cond, target.REG_ARM64_SP, slot_off)
+                        }
+                    }
+                    target.arm64_cmp_imm(cb, r_cond, 0)
+                    sel_cond = target.ARM64_COND_NE
+                }
+
+                $r_dest := target.REG_ARM64_X0
+                if enable_temp_opt {
+                    pool_idx := scratch_idx % 7
+                    scratch_idx += 1
+                    old_owner := scratch_owner[pool_idx]
+                    if old_owner >= 0 && old_owner < temp_reg.len {
+                        if old_owner < temp_offsets.len {
+                            slot_off_ev := temp_offsets[old_owner]
+                            target.arm64_str_imm(cb, scratch_pool[pool_idx], target.REG_ARM64_SP, slot_off_ev)
+                        }
+                        temp_reg[old_owner] = -1
+                    }
+                    r_dest = scratch_pool[pool_idx]
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        scratch_owner[pool_idx] = ins.a
+                        temp_reg[ins.a] = r_dest
+                    }
+                }
+
+                target.arm64_csel(cb, r_dest, r_then, r_else, sel_cond)
+
+                $need_spill := true
+                if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] && ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
+                    need_spill = false
+                }
+                if need_spill && ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, r_dest, target.REG_ARM64_SP, slot_off)
+                }
+            } else if ins.kind == mir.MI_MADD || ins.kind == mir.MI_MSUB {
+                // a = b * c + d (MADD) or a = d - b * c (MSUB)
+                $r_b := target.REG_ARM64_X16
+                if ins.b <= -2 {
+                    cidx := 0 - ins.b - 2
+                    target.arm64_mov_imm64(cb, r_b, f.consts[cidx])
+                } else if ins.b >= 0 {
+                    if ins.b < temp_callee_reg.len && temp_callee_reg[ins.b] >= 0 {
+                        r_b = temp_callee_reg[ins.b]
+                    } else if enable_temp_opt && ins.b < temp_reg.len && temp_reg[ins.b] >= 0 {
+                        r_b = temp_reg[ins.b]
+                    } else if ins.b < temp_offsets.len {
+                        slot_off := temp_offsets[ins.b]
+                        target.arm64_ldr_imm(cb, r_b, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                $r_c := target.REG_ARM64_X17
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.arm64_mov_imm64(cb, r_c, f.consts[cidx])
+                } else if ins.c >= 0 {
+                    if ins.c < temp_callee_reg.len && temp_callee_reg[ins.c] >= 0 {
+                        r_c = temp_callee_reg[ins.c]
+                    } else if enable_temp_opt && ins.c < temp_reg.len && temp_reg[ins.c] >= 0 {
+                        r_c = temp_reg[ins.c]
+                    } else if ins.c < temp_offsets.len {
+                        slot_off := temp_offsets[ins.c]
+                        target.arm64_ldr_imm(cb, r_c, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                $r_acc := target.REG_ARM64_X10
+                if ins.d <= -2 {
+                    cidx := 0 - ins.d - 2
+                    target.arm64_mov_imm64(cb, r_acc, f.consts[cidx])
+                } else if ins.d >= 0 {
+                    if ins.d < temp_callee_reg.len && temp_callee_reg[ins.d] >= 0 {
+                        r_acc = temp_callee_reg[ins.d]
+                    } else if enable_temp_opt && ins.d < temp_reg.len && temp_reg[ins.d] >= 0 {
+                        r_acc = temp_reg[ins.d]
+                    } else if ins.d < temp_offsets.len {
+                        slot_off := temp_offsets[ins.d]
+                        target.arm64_ldr_imm(cb, r_acc, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+
+                $r_dest := target.REG_ARM64_X0
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    r_dest = temp_callee_reg[ins.a]
+                } else if enable_temp_opt {
+                    pool_idx := scratch_idx % 7
+                    scratch_idx += 1
+                    old_owner := scratch_owner[pool_idx]
+                    if old_owner >= 0 && old_owner < temp_reg.len {
+                        if old_owner < temp_offsets.len {
+                            slot_off_ev := temp_offsets[old_owner]
+                            target.arm64_str_imm(cb, scratch_pool[pool_idx], target.REG_ARM64_SP, slot_off_ev)
+                        }
+                        temp_reg[old_owner] = -1
+                    }
+                    r_dest = scratch_pool[pool_idx]
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        scratch_owner[pool_idx] = ins.a
+                        temp_reg[ins.a] = r_dest
+                    }
+                }
+
+                if ins.kind == mir.MI_MADD {
+                    target.arm64_madd(cb, r_dest, r_b, r_c, r_acc)
+                } else {
+                    target.arm64_msub(cb, r_dest, r_b, r_c, r_acc)
+                }
+
+                $need_spill2 := true
+                if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] && ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
+                    need_spill2 = false
+                }
+                if need_spill2 && ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, r_dest, target.REG_ARM64_SP, slot_off)
+                }
+            } else if ins.kind == mir.MI_ADDR {
+                // a = addr(b_local_slot)
+                loc_slot := ins.b
+                if loc_slot >= 0 && loc_slot < local_offsets.len {
+                    loc_off := local_offsets[loc_slot]
+                    $r_dest := target.REG_ARM64_X0
+                    if enable_temp_opt {
+                        pool_idx := scratch_idx % 7
+                        scratch_idx += 1
+                        old_owner := scratch_owner[pool_idx]
+                        if old_owner >= 0 && old_owner < temp_reg.len {
+                            temp_reg[old_owner] = -1
+                        }
+                        r_dest = scratch_pool[pool_idx]
+                        if ins.a >= 0 && ins.a < temp_reg.len {
+                            scratch_owner[pool_idx] = ins.a
+                            temp_reg[ins.a] = r_dest
+                        }
+                    }
+                    target.arm64_add_imm(cb, r_dest, target.REG_ARM64_SP, loc_off)
+                    if ins.a >= 0 && ins.a < temp_offsets.len {
+                        slot_off := temp_offsets[ins.a]
+                        target.arm64_str_imm(cb, r_dest, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+            } else if ins.kind == mir.MI_LOAD_INDEX {
+                // a = load_index(b_base, c_idx)
+                $r_base := target.REG_ARM64_X1
+                if ins.b >= 0 {
+                    if ins.b < temp_callee_reg.len && temp_callee_reg[ins.b] >= 0 {
+                        r_base = temp_callee_reg[ins.b]
+                    } else if ins.b < temp_reg.len && temp_reg[ins.b] >= 0 {
+                        r_base = temp_reg[ins.b]
+                    } else if ins.b < temp_local_src.len && temp_local_src[ins.b] >= 0 && local_regs[temp_local_src[ins.b]] >= 0 {
+                        r_base = local_regs[temp_local_src[ins.b]]
+                    } else if ins.b < temp_offsets.len {
+                        slot_off := temp_offsets[ins.b]
+                        target.arm64_ldr_imm(cb, r_base, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+                $r_idx := target.REG_ARM64_X2
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.arm64_mov_imm64(cb, r_idx, f.consts[cidx])
+                } else if ins.c >= 0 {
+                    if ins.c < temp_callee_reg.len && temp_callee_reg[ins.c] >= 0 {
+                        r_idx = temp_callee_reg[ins.c]
+                    } else if ins.c < temp_reg.len && temp_reg[ins.c] >= 0 {
+                        r_idx = temp_reg[ins.c]
+                    } else if ins.c < temp_local_src.len && temp_local_src[ins.c] >= 0 && local_regs[temp_local_src[ins.c]] >= 0 {
+                        r_idx = local_regs[temp_local_src[ins.c]]
+                    } else if ins.c < temp_offsets.len {
+                        slot_off := temp_offsets[ins.c]
+                        target.arm64_ldr_imm(cb, r_idx, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+                $r_dest := target.REG_ARM64_X0
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    r_dest = temp_callee_reg[ins.a]
+                } else if enable_temp_opt {
+                    pool_idx := scratch_idx % 7
+                    scratch_idx += 1
+                    old_owner := scratch_owner[pool_idx]
+                    if old_owner >= 0 && old_owner < temp_reg.len {
+                        if old_owner < temp_offsets.len {
+                            slot_off_ev := temp_offsets[old_owner]
+                            target.arm64_str_imm(cb, scratch_pool[pool_idx], target.REG_ARM64_SP, slot_off_ev)
+                        }
+                        temp_reg[old_owner] = -1
+                    }
+                    r_dest = scratch_pool[pool_idx]
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        scratch_owner[pool_idx] = ins.a
+                        temp_reg[ins.a] = r_dest
+                    }
+                }
+                target.arm64_ldr_reg_lsl3(cb, r_dest, r_base, r_idx)
+                $need_spill := true
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    need_spill = false
+                } else if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] && ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
+                    need_spill = false
+                }
+                if need_spill && ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, r_dest, target.REG_ARM64_SP, slot_off)
+                }
+            } else if ins.kind == mir.MI_STORE_INDEX {
+                // store_index(a_base, b_idx, c_val)
+                $r_base := target.REG_ARM64_X1
+                if ins.a >= 0 {
+                    if ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                        r_base = temp_callee_reg[ins.a]
+                    } else if ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
+                        r_base = temp_reg[ins.a]
+                    } else if ins.a < temp_local_src.len && temp_local_src[ins.a] >= 0 && local_regs[temp_local_src[ins.a]] >= 0 {
+                        r_base = local_regs[temp_local_src[ins.a]]
+                    } else if ins.a < temp_offsets.len {
+                        slot_off := temp_offsets[ins.a]
+                        target.arm64_ldr_imm(cb, r_base, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+                $r_idx := target.REG_ARM64_X2
+                if ins.b <= -2 {
+                    cidx := 0 - ins.b - 2
+                    target.arm64_mov_imm64(cb, r_idx, f.consts[cidx])
+                } else if ins.b >= 0 {
+                    if ins.b < temp_callee_reg.len && temp_callee_reg[ins.b] >= 0 {
+                        r_idx = temp_callee_reg[ins.b]
+                    } else if ins.b < temp_reg.len && temp_reg[ins.b] >= 0 {
+                        r_idx = temp_reg[ins.b]
+                    } else if ins.b < temp_local_src.len && temp_local_src[ins.b] >= 0 && local_regs[temp_local_src[ins.b]] >= 0 {
+                        r_idx = local_regs[temp_local_src[ins.b]]
+                    } else if ins.b < temp_offsets.len {
+                        slot_off := temp_offsets[ins.b]
+                        target.arm64_ldr_imm(cb, r_idx, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+                $r_val := target.REG_ARM64_X0
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.arm64_mov_imm64(cb, r_val, f.consts[cidx])
+                } else if ins.c >= 0 {
+                    if ins.c < temp_callee_reg.len && temp_callee_reg[ins.c] >= 0 {
+                        r_val = temp_callee_reg[ins.c]
+                    } else if ins.c < temp_reg.len && temp_reg[ins.c] >= 0 {
+                        r_val = temp_reg[ins.c]
+                    } else if ins.c < temp_local_src.len && temp_local_src[ins.c] >= 0 && local_regs[temp_local_src[ins.c]] >= 0 {
+                        r_val = local_regs[temp_local_src[ins.c]]
+                    } else if ins.c < temp_offsets.len {
+                        slot_off := temp_offsets[ins.c]
+                        target.arm64_ldr_imm(cb, r_val, target.REG_ARM64_SP, slot_off)
+                    }
+                }
+                target.arm64_str_reg_lsl3(cb, r_val, r_base, r_idx)
+            } else if ins.kind == mir.MI_CALL {
+                // Pass arguments in X0..X7
+                $arg_idx := ins.c
+                $reg_idx := 0
+                while arg_idx >= 0 && arg_idx < f.margs.len && reg_idx < 8 {
+                    av := f.margs[arg_idx].v
+                    target_reg := reg_idx
+                    if av <= -2 {
+                        cidx := 0 - av - 2
+                        target.arm64_mov_imm64(cb, target_reg, f.consts[cidx])
+                    } else if av >= 0 {
+                        if av < temp_callee_reg.len && temp_callee_reg[av] >= 0 {
+                            src_r := temp_callee_reg[av]
+                            if src_r != target_reg {
+                                target.arm64_mov_reg(cb, target_reg, src_r)
+                            }
+                        } else if av < temp_reg.len && temp_reg[av] >= 0 {
+                            src_r := temp_reg[av]
+                            if src_r != target_reg {
+                                target.arm64_mov_reg(cb, target_reg, src_r)
+                            }
+                        } else if av < temp_local_src.len && temp_local_src[av] >= 0 && local_regs[temp_local_src[av]] >= 0 {
+                            src_r := local_regs[temp_local_src[av]]
+                            if src_r != target_reg {
+                                target.arm64_mov_reg(cb, target_reg, src_r)
+                            }
+                        } else if av < temp_offsets.len && temp_offsets[av] >= 0 {
+                            slot_off := temp_offsets[av]
+                            target.arm64_ldr_imm(cb, target_reg, target.REG_ARM64_SP, slot_off)
+                        }
+                    }
+                    arg_idx = f.margs[arg_idx].next
+                    reg_idx += 1
+                }
+
+                reloc_off := cb.len()
+                target.arm64_bl(cb, 0)
+                relocs.push(mc.reloc_new(reloc_off, ins.sval, mc.RELOC_ARM64_CALL26, 0))
+
+                if enable_temp_opt {
+                    for si in 0:scratch_pool.len {
+                        old_ow := scratch_owner[si]
+                        if old_ow >= 0 && old_ow < temp_reg.len {
+                            temp_reg[old_ow] = -1
+                        }
+                        scratch_owner[si] = -1
+                    }
+                    scratch_idx = 0
+                }
+
+                $need_spill_call := true
+                if ins.a >= 0 && ins.a < temp_callee_reg.len && temp_callee_reg[ins.a] >= 0 {
+                    r_dest := temp_callee_reg[ins.a]
+                    target.arm64_mov_reg(cb, r_dest, target.REG_ARM64_X0)
+                    need_spill_call = false
+                } else if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] {
+                    pool_idx := scratch_idx % 7
+                    scratch_idx += 1
+                    r_dest := scratch_pool[pool_idx]
+                    target.arm64_mov_reg(cb, r_dest, target.REG_ARM64_X0)
+                    if ins.a < temp_reg.len {
+                        scratch_owner[pool_idx] = ins.a
+                        temp_reg[ins.a] = r_dest
+                    }
+                    need_spill_call = false
+                }
+
+                if need_spill_call && ins.a >= 0 && ins.a < temp_offsets.len && temp_offsets[ins.a] >= 0 {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, slot_off)
+                }
+            } else if ins.kind == mir.MI_STR_CONST {
+                s := ~ins.sval
+                slen := s.len
+                raw_bytes := slen + 1
+                rem := raw_bytes % 4
+                $pad := 0
+                if rem != 0 {
+                    pad = 4 - rem
+                }
+                total_data_bytes := raw_bytes + pad
+                branch_words := (total_data_bytes / 4) + 1
+                branch_ins := 0x14000000 | (branch_words & 0x03ffffff)
+                cb.emit_u32_le(branch_ins)
+
+                for si in 0:slen {
+                    cb.emit_u8(s[si])
+                }
+                cb.emit_u8(0)
+                for _ in 0:pad {
+                    cb.emit_u8(0)
+                }
+
+                offset := 0 - total_data_bytes
+                imm21 := offset & 0x1fffff
+                immlo := imm21 & 3
+                immhi := (imm21 / 4) & 0x7ffff
+                adr_opcode := (immlo * 0x20000000) | (immhi * 32) | 0x10000000
+                cb.emit_u32_le(adr_opcode)
+
+                if ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.arm64_str_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, slot_off)
+                }
+            }
+
+            if curr_ii == blk.tail {
+                <-
+            }
+            curr_ii = ins.next
+        }
+
+        if fused_mul_valid {
+            target.arm64_mul(cb, fused_mul_reg, fused_mul_rn, fused_mul_rm)
+            if fused_mul_dest >= 0 && fused_mul_dest < temp_offsets.len {
+                if !enable_temp_opt || (fused_mul_dest < is_cross_bb.len && is_cross_bb[fused_mul_dest]) {
+                    slot_off := temp_offsets[fused_mul_dest]
+                    target.arm64_str_imm(cb, fused_mul_reg, target.REG_ARM64_SP, slot_off)
+                }
+            }
+            fused_mul_valid = false
+        }
+
+        // 5. Emit block terminator
+        if blk.tkind == mir.TKIND_RETURN {
+            // Load return value into X0
+            if blk.ta <= -2 {
+                cidx := 0 - blk.ta - 2
+                target.arm64_mov_imm64(cb, target.REG_ARM64_X0, f.consts[cidx])
+            } else if blk.ta >= 0 {
+                if blk.ta < temp_callee_reg.len && temp_callee_reg[blk.ta] >= 0 {
+                    src_r := temp_callee_reg[blk.ta]
+                    if src_r != target.REG_ARM64_X0 {
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X0, src_r)
+                    }
+                } else if blk.ta < temp_reg.len && temp_reg[blk.ta] >= 0 {
+                    src_r := temp_reg[blk.ta]
+                    if src_r != target.REG_ARM64_X0 {
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X0, src_r)
+                    }
+                } else if blk.ta < temp_local_src.len && temp_local_src[blk.ta] >= 0 && local_regs[temp_local_src[blk.ta]] >= 0 {
+                    src_r := local_regs[temp_local_src[blk.ta]]
+                    if src_r != target.REG_ARM64_X0 {
+                        target.arm64_mov_reg(cb, target.REG_ARM64_X0, src_r)
+                    }
+                } else if blk.ta < temp_offsets.len && temp_offsets[blk.ta] >= 0 {
+                    slot_off := temp_offsets[blk.ta]
+                    target.arm64_ldr_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, slot_off)
+                }
+            }
+
+            // Function Epilogue
+            if num_saved_pairs >= 4 {
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X25, target.REG_ARM64_X26, target.REG_ARM64_SP, 64)
+            }
+            if num_saved_pairs >= 3 {
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X23, target.REG_ARM64_X24, target.REG_ARM64_SP, 48)
+            }
+            if num_saved_pairs >= 2 {
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X21, target.REG_ARM64_X22, target.REG_ARM64_SP, 32)
+            }
+            if num_saved_pairs >= 1 {
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X19, target.REG_ARM64_X20, target.REG_ARM64_SP, 16)
+            }
+
+            if total_frame_size <= 504 {
+                target.arm64_ldp_post(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, total_frame_size)
+            } else {
+                target.arm64_ldp_offset(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, 0)
+                target.arm64_add_imm(cb, target.REG_ARM64_SP, target.REG_ARM64_SP, total_frame_size)
+            }
+            if f.name == "main" {
+                // Exit process with X0
+                target.arm64_mov_imm64(cb, target.REG_ARM64_X16, 0x2000001)
+                target.arm64_svc(cb, 0x80)
+            } else {
+                target.arm64_ret(cb)
+            }
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                target_lbl := f.label + "_bb" + str(blk.ta)
+                reloc_off := cb.len()
+                target.arm64_b(cb, 0)
+                relocs.push(mc.reloc_new(reloc_off, target_lbl, mc.RELOC_ARM64_CALL26, 0))
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            $branch_cond := target.ARM64_COND_NE
+            if last_cmp_dest == blk.ta && last_cmp_cond >= 0 {
+                branch_cond = last_cmp_cond
+            } else {
+                $cond_reg := target.REG_ARM64_X0
+                if blk.ta >= 0 {
+                    if blk.ta < temp_callee_reg.len && temp_callee_reg[blk.ta] >= 0 {
+                        cond_reg = temp_callee_reg[blk.ta]
+                    } else if blk.ta < temp_reg.len && temp_reg[blk.ta] >= 0 {
+                        cond_reg = temp_reg[blk.ta]
+                    } else if blk.ta < temp_local_src.len && temp_local_src[blk.ta] >= 0 && local_regs[temp_local_src[blk.ta]] >= 0 {
+                        cond_reg = local_regs[temp_local_src[blk.ta]]
+                    } else if blk.ta < temp_offsets.len && temp_offsets[blk.ta] >= 0 {
+                        slot_off := temp_offsets[blk.ta]
+                        target.arm64_ldr_imm(cb, target.REG_ARM64_X0, target.REG_ARM64_SP, slot_off)
+                    }
+                    target.arm64_cmp_imm(cb, cond_reg, 0)
+                }
+            }
+            if blk.tb == bi + 1 {
+                inv_cond := branch_cond ^ 1
+                else_lbl := f.label + "_bb" + str(blk.tc)
+                reloc_else := cb.len()
+                target.arm64_b_cond(cb, inv_cond, 0)
+                relocs.push(mc.reloc_new(reloc_else, else_lbl, mc.RELOC_ARM64_COND_BR19, 0))
+            } else if blk.tc == bi + 1 {
+                then_lbl := f.label + "_bb" + str(blk.tb)
+                reloc_then := cb.len()
+                target.arm64_b_cond(cb, branch_cond, 0)
+                relocs.push(mc.reloc_new(reloc_then, then_lbl, mc.RELOC_ARM64_COND_BR19, 0))
+            } else {
+                then_lbl := f.label + "_bb" + str(blk.tb)
+                reloc_then := cb.len()
+                target.arm64_b_cond(cb, branch_cond, 0)
+                relocs.push(mc.reloc_new(reloc_then, then_lbl, mc.RELOC_ARM64_COND_BR19, 0))
+
+                else_lbl := f.label + "_bb" + str(blk.tc)
+                reloc_else := cb.len()
+                target.arm64_b(cb, 0)
+                relocs.push(mc.reloc_new(reloc_else, else_lbl, mc.RELOC_ARM64_CALL26, 0))
+            }
+        }
+    }
+}
+
+pub fn isel_fn_x64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, enable_regalloc bool) {
+    t := target.target_new(target.OS_LINUX, target.ARCH_X64)
+    $fr := frame_new(&t)
+
+    $local_offsets := []int{}
+    for i in 0:f.locals.len {
+        s := fr.alloc_local(8)
+        local_offsets.push(fr.local_slots[s].offset)
+    }
+
+    $temp_offsets := []int{}
+    for i in 0:f.temps.len {
+        s := fr.alloc_local(8)
+        temp_offsets.push(fr.local_slots[s].offset)
+    }
+
+    fr.finalize_layout()
+    stack_size := fr.total_stack_size
+    is_cross_bb := analyze_cross_bb_temps(f)
+
+    syms.define_label(f.label, cb.len())
+
+    // Prologue: push rbp; mov rbp, rsp; sub rsp, stack_size
+    target.x64_push(cb, target.REG_X64_RBP)
+    target.x64_mov_reg(cb, target.REG_X64_RBP, target.REG_X64_RSP)
+    if stack_size > 0 {
+        target.x64_sub_imm32(cb, target.REG_X64_RSP, stack_size)
+    }
+
+    // Parameters in RDI, RSI, RDX, RCX, R8, R9
+    $arg_regs := []int{}
+    arg_regs.push(target.REG_X64_RDI)
+    arg_regs.push(target.REG_X64_RSI)
+    arg_regs.push(target.REG_X64_RDX)
+    arg_regs.push(target.REG_X64_RCX)
+    arg_regs.push(target.REG_X64_R8)
+    arg_regs.push(target.REG_X64_R9)
+    for pi in 0:f.nparams {
+        if pi < arg_regs.len && pi < local_offsets.len {
+            loc_off := local_offsets[pi]
+            target.x64_str_rsp(cb, arg_regs[pi], loc_off)
+        }
+    }
+
+    for bi in 0:f.blocks.len {
+        blk_label := f.label + "_bb" + str(bi)
+        syms.define_label(blk_label, cb.len())
+
+        blk := ~f.blocks[bi]
+
+        $curr_ii := blk.head
+        while curr_ii >= 0 && curr_ii < f.instrs.len {
+            ins := ~f.instrs[curr_ii]
+
+            if ins.kind == mir.MI_STORE_LOCAL {
+                if ins.b <= -2 {
+                    cidx := 0 - ins.b - 2
+                    $val := 0
+                    if cidx >= 0 && cidx < f.consts.len {
+                        val = f.consts[cidx]
+                    }
+                    target.x64_mov_imm64(cb, target.REG_X64_RAX, val)
+                } else if ins.b >= 0 && ins.b < temp_offsets.len {
+                    slot_off := temp_offsets[ins.b]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+
+                if ins.a >= 0 && ins.a < local_offsets.len {
+                    loc_off := local_offsets[ins.a]
+                    target.x64_str_rsp(cb, target.REG_X64_RAX, loc_off)
+                }
+            } else if ins.kind == mir.MI_LOAD_LOCAL {
+                if ins.b >= 0 && ins.b < local_offsets.len {
+                    loc_off := local_offsets[ins.b]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RAX, loc_off)
+                }
+
+                if ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.x64_str_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+            } else if ins.kind == mir.MI_COPY {
+                if ins.b <= -2 {
+                    const_idx := 0 - ins.b - 2
+                    $val := 0
+                    if const_idx >= 0 && const_idx < f.consts.len {
+                        val = f.consts[const_idx]
+                    }
+                    target.x64_mov_imm64(cb, target.REG_X64_RAX, val)
+                } else if ins.b >= 0 && ins.b < temp_offsets.len {
+                    slot_off := temp_offsets[ins.b]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+
+                if ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.x64_str_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+            } else if ins.kind == mir.MI_BIN {
+                // LHS into RAX
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.x64_mov_imm64(cb, target.REG_X64_RAX, f.consts[cidx])
+                } else if ins.c >= 0 && ins.c < temp_offsets.len {
+                    slot_off := temp_offsets[ins.c]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+
+                // RHS into RCX
+                if ins.d <= -2 {
+                    cidx := 0 - ins.d - 2
+                    target.x64_mov_imm64(cb, target.REG_X64_RCX, f.consts[cidx])
+                } else if ins.d >= 0 && ins.d < temp_offsets.len {
+                    slot_off := temp_offsets[ins.d]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RCX, slot_off)
+                }
+
+                if ins.b == mir.BIN_ADD {
+                    target.x64_add_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                } else if ins.b == mir.BIN_SUB {
+                    target.x64_sub_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                } else if ins.b == mir.BIN_MUL {
+                    target.x64_imul_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                } else if ins.b == mir.BIN_EQ || ins.b == mir.BIN_STR_EQ {
+                    target.x64_cmp_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                    target.x64_setcc(cb, target.REG_X64_RAX, target.X64_COND_E)
+                } else if ins.b == mir.BIN_NE || ins.b == mir.BIN_STR_NE {
+                    target.x64_cmp_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                    target.x64_setcc(cb, target.REG_X64_RAX, target.X64_COND_NE)
+                } else if ins.b == mir.BIN_LT {
+                    target.x64_cmp_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                    target.x64_setcc(cb, target.REG_X64_RAX, target.X64_COND_L)
+                } else if ins.b == mir.BIN_LE {
+                    target.x64_cmp_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                    target.x64_setcc(cb, target.REG_X64_RAX, target.X64_COND_LE)
+                } else if ins.b == mir.BIN_GT {
+                    target.x64_cmp_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                    target.x64_setcc(cb, target.REG_X64_RAX, target.X64_COND_G)
+                } else if ins.b == mir.BIN_GE {
+                    target.x64_cmp_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                    target.x64_setcc(cb, target.REG_X64_RAX, target.X64_COND_GE)
+                }
+
+                if ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.x64_str_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+            } else if ins.kind == mir.MI_SELECT {
+                // RAX = else_val
+                if ins.d <= -2 {
+                    cidx := 0 - ins.d - 2
+                    target.x64_mov_imm64(cb, target.REG_X64_RAX, f.consts[cidx])
+                } else if ins.d >= 0 && ins.d < temp_offsets.len {
+                    slot_off := temp_offsets[ins.d]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+                // RCX = then_val
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.x64_mov_imm64(cb, target.REG_X64_RCX, f.consts[cidx])
+                } else if ins.c >= 0 && ins.c < temp_offsets.len {
+                    slot_off := temp_offsets[ins.c]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RCX, slot_off)
+                }
+                // Check cond temp ins.b
+                if ins.b >= 0 && ins.b < temp_offsets.len {
+                    slot_off := temp_offsets[ins.b]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RDX, slot_off)
+                    target.x64_cmp_imm32(cb, target.REG_X64_RDX, 0)
+                }
+                // jz skip (2 bytes short jump: 0x74 0x03), mov rax, rcx (0x48 0x89 0xc8: 3 bytes)
+                cb.emit_u8(0x74)
+                cb.emit_u8(0x03)
+                target.x64_mov_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+                if ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.x64_str_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+            } else if ins.kind == mir.MI_MADD || ins.kind == mir.MI_MSUB {
+                // RAX = b * c
+                if ins.b <= -2 {
+                    cidx := 0 - ins.b - 2
+                    target.x64_mov_imm64(cb, target.REG_X64_RAX, f.consts[cidx])
+                } else if ins.b >= 0 && ins.b < temp_offsets.len {
+                    slot_off := temp_offsets[ins.b]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+                if ins.c <= -2 {
+                    cidx := 0 - ins.c - 2
+                    target.x64_mov_imm64(cb, target.REG_X64_RCX, f.consts[cidx])
+                } else if ins.c >= 0 && ins.c < temp_offsets.len {
+                    slot_off := temp_offsets[ins.c]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RCX, slot_off)
+                }
+                target.x64_imul_reg(cb, target.REG_X64_RAX, target.REG_X64_RCX)
+
+                // RDX = acc (d)
+                if ins.d <= -2 {
+                    cidx := 0 - ins.d - 2
+                    target.x64_mov_imm64(cb, target.REG_X64_RDX, f.consts[cidx])
+                } else if ins.d >= 0 && ins.d < temp_offsets.len {
+                    slot_off := temp_offsets[ins.d]
+                    target.x64_ldr_rsp(cb, target.REG_X64_RDX, slot_off)
+                }
+
+                if ins.kind == mir.MI_MADD {
+                    target.x64_add_reg(cb, target.REG_X64_RAX, target.REG_X64_RDX)
+                } else {
+                    target.x64_sub_reg(cb, target.REG_X64_RDX, target.REG_X64_RAX)
+                    target.x64_mov_reg(cb, target.REG_X64_RAX, target.REG_X64_RDX)
+                }
+                if ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.x64_str_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+            } else if ins.kind == mir.MI_CALL {
+                $arg_idx := ins.c
+                $reg_idx := 0
+                while arg_idx >= 0 && arg_idx < f.margs.len && reg_idx < arg_regs.len {
+                    av := f.margs[arg_idx].v
+                    target_reg := arg_regs[reg_idx]
+                    if av <= -2 {
+                        cidx := 0 - av - 2
+                        target.x64_mov_imm64(cb, target_reg, f.consts[cidx])
+                    } else if av >= 0 && av < temp_offsets.len {
+                        slot_off := temp_offsets[av]
+                        target.x64_ldr_rsp(cb, target_reg, slot_off)
+                    }
+                    arg_idx = f.margs[arg_idx].next
+                    reg_idx += 1
+                }
+
+                reloc_off := cb.len() + 1
+                target.x64_call(cb, 0)
+                relocs.push(mc.reloc_new(reloc_off, ins.sval, mc.RELOC_X64_PC32, 0))
+
+                if ins.a >= 0 && ins.a < temp_offsets.len {
+                    slot_off := temp_offsets[ins.a]
+                    target.x64_str_rsp(cb, target.REG_X64_RAX, slot_off)
+                }
+            }
+
+            if curr_ii == blk.tail {
+                <-
+            }
+            curr_ii = ins.next
+        }
+
+        if blk.tkind == mir.TKIND_RETURN {
+            if blk.ta <= -2 {
+                cidx := 0 - blk.ta - 2
+                target.x64_mov_imm64(cb, target.REG_X64_RAX, f.consts[cidx])
+            } else if blk.ta >= 0 && blk.ta < temp_offsets.len {
+                slot_off := temp_offsets[blk.ta]
+                target.x64_ldr_rsp(cb, target.REG_X64_RAX, slot_off)
+            }
+
+            if stack_size > 0 {
+                target.x64_add_imm32(cb, target.REG_X64_RSP, stack_size)
+            }
+            target.x64_pop(cb, target.REG_X64_RBP)
+
+            if f.name == "main" {
+                // Linux exit(RAX): mov rdi, rax; mov rax, 60; syscall
+                target.x64_mov_reg(cb, target.REG_X64_RDI, target.REG_X64_RAX)
+                target.x64_mov_imm64(cb, target.REG_X64_RAX, 60)
+                target.x64_syscall(cb)
+            } else {
+                target.x64_ret(cb)
+            }
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                target_lbl := f.label + "_bb" + str(blk.ta)
+                reloc_off := cb.len() + 1
+                target.x64_jmp(cb, 0)
+                relocs.push(mc.reloc_new(reloc_off, target_lbl, mc.RELOC_X64_PC32, 0))
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            if blk.ta >= 0 && blk.ta < temp_offsets.len {
+                slot_off := temp_offsets[blk.ta]
+                target.x64_ldr_rsp(cb, target.REG_X64_RAX, slot_off)
+                target.x64_cmp_imm32(cb, target.REG_X64_RAX, 0)
+            }
+            if blk.tc == bi + 1 {
+                then_lbl := f.label + "_bb" + str(blk.tb)
+                reloc_then := cb.len() + 2
+                target.x64_jcc(cb, target.X64_COND_NE, 0)
+                relocs.push(mc.reloc_new(reloc_then, then_lbl, mc.RELOC_X64_PC32, 0))
+            } else if blk.tb == bi + 1 {
+                else_lbl := f.label + "_bb" + str(blk.tc)
+                reloc_else := cb.len() + 2
+                target.x64_jcc(cb, target.X64_COND_E, 0)
+                relocs.push(mc.reloc_new(reloc_else, else_lbl, mc.RELOC_X64_PC32, 0))
+            } else {
+                then_lbl := f.label + "_bb" + str(blk.tb)
+                reloc_then := cb.len() + 2
+                target.x64_jcc(cb, target.X64_COND_NE, 0)
+                relocs.push(mc.reloc_new(reloc_then, then_lbl, mc.RELOC_X64_PC32, 0))
+
+                else_lbl := f.label + "_bb" + str(blk.tc)
+                reloc_else := cb.len() + 1
+                target.x64_jmp(cb, 0)
+                relocs.push(mc.reloc_new(reloc_else, else_lbl, mc.RELOC_X64_PC32, 0))
+            }
+        }
+    }
+}

@@ -62,7 +62,9 @@ def local_reason(name: str) -> str | None:
         return "本机文档或研发材料"
     if name.lower() == "readme.txt":
         return "根目录使用 README.md"
-    if any(part in CACHE_DIRS or part.endswith((".app", ".curves")) for part in path.parts):
+    if path.parts[0] == "target" or (len(path.parts) >= 2 and path.parts[0] == "bootstrap" and path.parts[1] == "target"):
+        return "缓存或生成目录"
+    if any(part in (CACHE_DIRS - {"target"}) or part.endswith((".app", ".curves")) for part in path.parts):
         return "缓存或生成目录"
     if path.suffix.lower() in OUTPUT_SUFFIXES or path.name.endswith("~"):
         return "日志、临时文件或编译产物"
