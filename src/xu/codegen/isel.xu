@@ -211,6 +211,11 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
         }
     }
 
+    $skip_instr := []bool{}
+    for _ in 0:f.instrs.len {
+        skip_instr.push(false)
+    }
+
     $local_regs := []int{}
     for _ in 0:f.locals.len {
         local_regs.push(-1)
@@ -321,33 +326,47 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
     }
 
     fr.finalize_layout()
-    stack_size := fr.total_stack_size
+    spill_size := fr.total_stack_size
+    callee_saved_size := (1 + num_saved_pairs) * 16
+    total_frame_size := callee_saved_size + spill_size
+
+    for i in 0:local_offsets.len {
+        if local_offsets[i] >= 0 {
+            local_offsets[i] = local_offsets[i] + callee_saved_size
+        }
+    }
+    for i in 0:scratch_spill_offsets.len {
+        scratch_spill_offsets[i] = scratch_spill_offsets[i] + callee_saved_size
+    }
+    for i in 0:temp_offsets.len {
+        if temp_offsets[i] >= 0 {
+            temp_offsets[i] = temp_offsets[i] + callee_saved_size
+        }
+    }
 
     // 2. Define function entry label
     syms.define_label(f.label, cb.len())
 
     // 3. Emit function prologue
-    // stp fp, lr, [sp, -16]!
-    target.arm64_stp_pre(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, -16)
-    // mov fp, sp
+    if total_frame_size <= 504 {
+        target.arm64_stp_pre(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, 0 - total_frame_size)
+    } else {
+        target.arm64_sub_imm(cb, target.REG_ARM64_SP, target.REG_ARM64_SP, total_frame_size)
+        target.arm64_stp_offset(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, 0)
+    }
     target.arm64_mov_reg(cb, target.REG_ARM64_FP, target.REG_ARM64_SP)
 
     if num_saved_pairs >= 1 {
-        target.arm64_stp_pre(cb, target.REG_ARM64_X19, target.REG_ARM64_X20, target.REG_ARM64_SP, -16)
+        target.arm64_stp_offset(cb, target.REG_ARM64_X19, target.REG_ARM64_X20, target.REG_ARM64_SP, 16)
     }
     if num_saved_pairs >= 2 {
-        target.arm64_stp_pre(cb, target.REG_ARM64_X21, target.REG_ARM64_X22, target.REG_ARM64_SP, -16)
+        target.arm64_stp_offset(cb, target.REG_ARM64_X21, target.REG_ARM64_X22, target.REG_ARM64_SP, 32)
     }
     if num_saved_pairs >= 3 {
-        target.arm64_stp_pre(cb, target.REG_ARM64_X23, target.REG_ARM64_X24, target.REG_ARM64_SP, -16)
+        target.arm64_stp_offset(cb, target.REG_ARM64_X23, target.REG_ARM64_X24, target.REG_ARM64_SP, 48)
     }
     if num_saved_pairs >= 4 {
-        target.arm64_stp_pre(cb, target.REG_ARM64_X25, target.REG_ARM64_X26, target.REG_ARM64_SP, -16)
-    }
-
-    // sub sp, sp, #stack_size (if stack_size > 0)
-    if stack_size > 0 {
-        target.arm64_sub_imm(cb, target.REG_ARM64_SP, target.REG_ARM64_SP, stack_size)
+        target.arm64_stp_offset(cb, target.REG_ARM64_X25, target.REG_ARM64_X26, target.REG_ARM64_SP, 64)
     }
 
     // Store incoming parameter registers X0..X(nparams-1) to local stack slots / registers
@@ -420,6 +439,11 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
         // Emit instructions in block
         $curr_ii := blk.head
         while curr_ii >= 0 && curr_ii < f.instrs.len {
+            if skip_instr[curr_ii] {
+                if curr_ii == blk.tail { <- }
+                curr_ii = f.instrs[curr_ii].next
+                -> ->
+            }
             ins := ~f.instrs[curr_ii]
 
             // If a previous multiply was deferred and this instruction cannot consume it, flush the mul
@@ -772,19 +796,68 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
                         target.arm64_sdiv(cb, r_dest, r_lhs, r_rhs)
                     }
                 } else if ins.b == mir.BIN_MOD {
+                    $peer_div_ii := -1
+                    $scan_peer := ins.next
+                    while scan_peer >= 0 && scan_peer < f.instrs.len {
+                        p_ins := ~f.instrs[scan_peer]
+                        if p_ins.kind == mir.MI_BIN && p_ins.b == mir.BIN_DIV && p_ins.c == ins.c && p_ins.d == ins.d {
+                            peer_div_ii = scan_peer
+                            <-
+                        }
+                        if scan_peer == blk.tail { <- }
+                        scan_peer = p_ins.next
+                    }
+
+                    $q_dest := target.REG_ARM64_X16
+                    if peer_div_ii >= 0 {
+                        p_temp := f.instrs[peer_div_ii].a
+                        if p_temp >= 0 && p_temp < temp_callee_reg.len && temp_callee_reg[p_temp] >= 0 {
+                            q_dest = temp_callee_reg[p_temp]
+                        } else if enable_temp_opt && p_temp >= 0 && p_temp < is_cross_bb.len && !is_cross_bb[p_temp] {
+                            if p_temp < temp_reg.len && temp_reg[p_temp] >= 0 {
+                                q_dest = temp_reg[p_temp]
+                            } else {
+                                $found_s := -1
+                                for si in 0:scratch_pool.len {
+                                    if scratch_owner[si] < 0 {
+                                        found_s = si
+                                        <-
+                                    }
+                                }
+                                if found_s < 0 {
+                                    found_s = scratch_idx % scratch_pool.len
+                                    scratch_idx += 1
+                                    old_owner := scratch_owner[found_s]
+                                    if old_owner >= 0 && old_owner < temp_reg.len {
+                                        temp_reg[old_owner] = -1
+                                    }
+                                }
+                                scratch_owner[found_s] = p_temp
+                                if p_temp >= 0 && p_temp < temp_reg.len {
+                                    temp_reg[p_temp] = scratch_pool[found_s]
+                                }
+                                q_dest = scratch_pool[found_s]
+                            }
+                        }
+                    }
+
                     if ins.d <= -2 && f.consts[0 - ins.d - 2] == 2 {
                         target.arm64_add_reg_lsr(cb, target.REG_ARM64_X16, r_lhs, r_lhs, 63)
-                        target.arm64_asr_imm(cb, target.REG_ARM64_X16, target.REG_ARM64_X16, 1)
-                        target.arm64_msub(cb, r_dest, target.REG_ARM64_X16, r_rhs, r_lhs)
+                        target.arm64_asr_imm(cb, q_dest, target.REG_ARM64_X16, 1)
+                        target.arm64_msub(cb, r_dest, q_dest, r_rhs, r_lhs)
                     } else if ins.d <= -2 && f.consts[0 - ins.d - 2] == 10 {
                         target.arm64_mov_imm64(cb, target.REG_ARM64_X16, 0x6666666666666667)
-                        target.arm64_smulh(cb, target.REG_ARM64_X16, r_lhs, target.REG_ARM64_X16)
-                        target.arm64_asr_imm(cb, target.REG_ARM64_X16, target.REG_ARM64_X16, 2)
-                        target.arm64_add_reg_lsr(cb, target.REG_ARM64_X16, target.REG_ARM64_X16, r_lhs, 63)
-                        target.arm64_msub(cb, r_dest, target.REG_ARM64_X16, r_rhs, r_lhs)
+                        target.arm64_smulh(cb, q_dest, r_lhs, target.REG_ARM64_X16)
+                        target.arm64_asr_imm(cb, q_dest, q_dest, 2)
+                        target.arm64_add_reg_lsr(cb, q_dest, q_dest, r_lhs, 63)
+                        target.arm64_msub(cb, r_dest, q_dest, r_rhs, r_lhs)
                     } else {
-                        target.arm64_sdiv(cb, target.REG_ARM64_X16, r_lhs, r_rhs)
-                        target.arm64_msub(cb, r_dest, target.REG_ARM64_X16, r_rhs, r_lhs)
+                        target.arm64_sdiv(cb, q_dest, r_lhs, r_rhs)
+                        target.arm64_msub(cb, r_dest, q_dest, r_rhs, r_lhs)
+                    }
+
+                    if peer_div_ii >= 0 {
+                        skip_instr[peer_div_ii] = true
                     }
                 } else if ins.b == mir.BIN_EQ {
                     if rhs_imm12 >= 0 {
@@ -1292,22 +1365,25 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
             }
 
             // Function Epilogue
-            if stack_size > 0 {
-                target.arm64_add_imm(cb, target.REG_ARM64_SP, target.REG_ARM64_SP, stack_size)
-            }
             if num_saved_pairs >= 4 {
-                target.arm64_ldp_post(cb, target.REG_ARM64_X25, target.REG_ARM64_X26, target.REG_ARM64_SP, 16)
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X25, target.REG_ARM64_X26, target.REG_ARM64_SP, 64)
             }
             if num_saved_pairs >= 3 {
-                target.arm64_ldp_post(cb, target.REG_ARM64_X23, target.REG_ARM64_X24, target.REG_ARM64_SP, 16)
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X23, target.REG_ARM64_X24, target.REG_ARM64_SP, 48)
             }
             if num_saved_pairs >= 2 {
-                target.arm64_ldp_post(cb, target.REG_ARM64_X21, target.REG_ARM64_X22, target.REG_ARM64_SP, 16)
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X21, target.REG_ARM64_X22, target.REG_ARM64_SP, 32)
             }
             if num_saved_pairs >= 1 {
-                target.arm64_ldp_post(cb, target.REG_ARM64_X19, target.REG_ARM64_X20, target.REG_ARM64_SP, 16)
+                target.arm64_ldp_offset(cb, target.REG_ARM64_X19, target.REG_ARM64_X20, target.REG_ARM64_SP, 16)
             }
-            target.arm64_ldp_post(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, 16)
+
+            if total_frame_size <= 504 {
+                target.arm64_ldp_post(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, total_frame_size)
+            } else {
+                target.arm64_ldp_offset(cb, target.REG_ARM64_FP, target.REG_ARM64_LR, target.REG_ARM64_SP, 0)
+                target.arm64_add_imm(cb, target.REG_ARM64_SP, target.REG_ARM64_SP, total_frame_size)
+            }
             if f.name == "main" {
                 // Exit process with X0
                 target.arm64_mov_imm64(cb, target.REG_ARM64_X16, 0x2000001)
