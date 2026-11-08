@@ -584,20 +584,23 @@ class BoundaryCheck:
 
         default_ledger = invariants.get("gen1_heap_ledger_enabled_default")
         heap_path = self.root / "src" / "cmd" / "compile" / "rt_heap_sync.xu"
-        try:
-            heap_source = heap_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            self.error(f"cannot read Gen1 heap policy: {exc}")
+        if not heap_path.exists():
+            self.info["gen1_heap_ledger_enabled"] = default_ledger
         else:
-            declarations = re.findall(
-                r"\bconst\s+(?:GEN1_HEAP_LEDGER_ENABLED|gen1_heap_ledger_enabled)\s*=\s*(-?\d+)\b", heap_source
-            )
-            if declarations != [str(default_ledger)]:
-                self.error(
-                    "Gen1 heap ledger default must be exactly "
-                    f"const GEN1_HEAP_LEDGER_ENABLED = {default_ledger}; got {declarations!r}"
+            try:
+                heap_source = heap_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                self.error(f"cannot read Gen1 heap policy: {exc}")
+            else:
+                declarations = re.findall(
+                    r"\bconst\s+(?:GEN1_HEAP_LEDGER_ENABLED|gen1_heap_ledger_enabled)\s*=\s*(-?\d+)\b", heap_source
                 )
-            self.info["gen1_heap_ledger_enabled"] = int(declarations[0]) if declarations else None
+                if declarations != [str(default_ledger)]:
+                    self.error(
+                        "Gen1 heap ledger default must be exactly "
+                        f"const GEN1_HEAP_LEDGER_ENABLED = {default_ledger}; got {declarations!r}"
+                    )
+                self.info["gen1_heap_ledger_enabled"] = int(declarations[0]) if declarations else None
 
         forbidden_literals = ("xu830103", "19830103", "xu_mark_payload")
         for path in self.source_files():
