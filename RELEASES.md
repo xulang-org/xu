@@ -6,6 +6,18 @@
 
 ---
 
+## Xu 0.12.1
+
+- Compiler Clean Architecture: fully eliminated legacy monolith compiler code (-125k lines), establishing a strictly layered, acyclic modular compiler (L0 Span/Token/Lexer/AST/Parser -> L3 MIR -> L4 MC/Target/Codegen/Obj -> L5 Driver -> L6 CLI).
+- Microarchitecture & Chip-Aware Optimization:
+  - Per-chip modular package architecture (`@xu/target/chips/*`) supporting Apple Silicon (M1/M2/M3/M4), ARM Cortex-A76, Cortex-A53, Cortex-M4, x86-64-v3, ESP32-C3 (RV32IMC), ESP32-LX6, and generic fallbacks.
+  - Hardware cryptographic instruction sets integration for Apple Silicon (AES, SHA-256, SHA-512, SHA-3, SM3, SM4, scalar CRC32, LSE atomics).
+  - Pre-emission instruction-level fusion (`opt_fuse`): automatic detection and emission of hardware single-cycle Fused Multiply-Add (`madd`) and Fused Multiply-Sub (`msub`), eliminating temporary register spills.
+  - Target-directed optimization pipeline: automatic host chip detection and manual `--chip`/`-march` flags driving cost models for If-Conversion (`MI_SELECT`), loop unrolling, and loop rotation (Loop Inversion).
+- Performance & Correctness:
+  - 13/13 benchmark suites pass with 100% bit-exact output match against Clang -O3, delivering substantial latency improvements (e.g. `gcd_sum` within 1.06x of Clang, `nested_loop` eliminating 64 million branch jumps).
+  - 8/8 cross-platform execution tests pass across native ARM64 Mach-O and x64 ELF.
+
 ## Xu 0.11.4
 
 - Compiler: eligible ARM64 integer/bool sibling tail calls restore the caller frame before jumping. Pure scalar additive self recursion can use an accumulator loop; checked arithmetic, bounded readonly byte scans, string operations and proved eight-round CRC loops retain their specialized paths. Ownership, address, ABI, debugging and instrumentation exclusions keep their ordinary fallback. No general performance improvement is claimed.

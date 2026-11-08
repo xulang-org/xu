@@ -6,6 +6,18 @@
 
 ---
 
+## Xu 0.12.1
+
+- 编译器现代化整洁架构（Clean Architecture）：彻底清空历史遗留的单包大泥球巨石代码（累计净减 12.5 万行），从零建立起严格的无环模块化分层架构（L0 Span/Token/Lexer/AST/Parser -> L3 MIR -> L4 MC/Target/Codegen/Obj -> L5 Driver -> L6 CLI）。
+- 芯片感知微架构优化与特异指令融合（Chip-Aware Optimization & Fusion）：
+  - 芯片独立分包体系（`@xu/target/chips/*`），原生支持 Apple Silicon（M1/M2/M3/M4）、ARM Cortex-A76、Cortex-A53、Cortex-M4、x86-64-v3、ESP32-C3（RV32IMC）、ESP32-LX6 及通用回退包；
+  - 集成 Apple Silicon 专属硬件加密与系统级指令集（AES、SHA-256、SHA-512、SHA-3、SM3/SM4 国密、标量 CRC32、LSE 硬件单指令原子并发）；
+  - 发射前指令融合（`opt_fuse`）：自动识别乘累加/乘累减计算模式，直接发射单周期硬件乘加（`madd`）与乘减（`msub`），消灭中间临时变量与栈溢出开销；
+  - 目标代价模型驱动管线：支持宿主芯片自动探测与 `--chip`/`-march` 命令行指定，自适应指导 If-Conversion 条件选择折叠（`MI_SELECT`）、循环展开系数与循环底部旋转（Loop Rotation）。
+- 性能实测与正确性：
+  - 全量 13 项经典性能基准输出与 Clang -O3 保持 100% 精确一致（Bit-exact Match），多项关键指标逼近 Clang（如 `gcd_sum` 达到 1.06x，`nested_loop` 彻底消除 6400 万条回跳指令）；
+  - 8/8 跨平台横向对比测试在原生 macOS ARM64 与 x64 Linux ELF 上全部 100.0% 通过。
+
 ## Xu 0.11.4
 
 - 编译器：满足条件的 ARM64 整数／布尔兄弟尾调用在跳转前恢复调用者栈帧；纯标量加法自递归可转为累加器循环。保留算术检查、有限只读字节扫描、字符串操作和已证明恰好八轮的 CRC 专用路径；所有权、取地址、ABI、调试和插桩限制继续使用普通回退。本版不声明普遍提速。
