@@ -473,13 +473,23 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
                 // Load RHS into r_rhs
                 $r_rhs := target.REG_ARM64_X1
                 $rhs_imm12 := -1
+                $rhs_and_imms := -1
                 if ins.d <= -2 {
                     cidx := 0 - ins.d - 2
                     val := f.consts[cidx]
-                    if val >= 0 && val <= 4095 {
+                    if (ins.b == mir.BIN_ADD || ins.b == mir.BIN_SUB) && val >= 0 && val <= 4095 {
                         rhs_imm12 = val
+                    } else if ins.b == mir.BIN_AND && val > 0 && ((val & (val + 1)) == 0) {
+                        $imms := 0
+                        $tmp := val
+                        while tmp > 1 {
+                            imms += 1
+                            tmp = tmp / 2
+                        }
+                        rhs_and_imms = imms
+                    } else {
+                        target.arm64_mov_imm64(cb, target.REG_ARM64_X1, val)
                     }
-                    target.arm64_mov_imm64(cb, target.REG_ARM64_X1, val)
                 } else if ins.d >= 0 {
                     if enable_temp_opt && ins.d < temp_reg.len && temp_reg[ins.d] >= 0 {
                         r_rhs = temp_reg[ins.d]
@@ -489,9 +499,31 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
                     }
                 }
 
-                // Scratch destination register for ALU
+                // Check in-place destination optimization (e.g. sum = sum + ..., i = i + 1)
+                $is_in_place_local := false
+                $in_place_reg := -1
+                if enable_temp_opt && ins.next >= 0 && ins.next < f.instrs.len {
+                    next_ins := ~f.instrs[ins.next]
+                    if next_ins.kind == mir.MI_STORE_LOCAL && next_ins.b == ins.a {
+                        loc_idx := next_ins.a
+                        if loc_idx >= 0 && loc_idx < local_regs.len && local_regs[loc_idx] >= 0 {
+                            loc_r := local_regs[loc_idx]
+                            if r_lhs == loc_r {
+                                is_in_place_local = true
+                                in_place_reg = loc_r
+                            }
+                        }
+                    }
+                }
+
+                // Destination register for ALU
                 $r_dest := target.REG_ARM64_X0
-                if enable_temp_opt {
+                if is_in_place_local {
+                    r_dest = in_place_reg
+                    if ins.a >= 0 && ins.a < temp_reg.len {
+                        temp_reg[ins.a] = r_dest
+                    }
+                } else if enable_temp_opt {
                     pool_idx := scratch_idx % 7
                     scratch_idx += 1
                     old_owner := scratch_owner[pool_idx]
@@ -561,6 +593,9 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
                     }
                 } else if ins.b == mir.BIN_DIV {
                     target.arm64_sdiv(cb, r_dest, r_lhs, r_rhs)
+                } else if ins.b == mir.BIN_MOD {
+                    target.arm64_sdiv(cb, target.REG_ARM64_X16, r_lhs, r_rhs)
+                    target.arm64_msub(cb, r_dest, target.REG_ARM64_X16, r_rhs, r_lhs)
                 } else if ins.b == mir.BIN_EQ {
                     if r_rhs == target.REG_ARM64_X0 {
                         target.arm64_mov_reg(cb, target.REG_ARM64_X1, r_rhs)
@@ -631,13 +666,17 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
                     last_cmp_dest = ins.a
                     last_cmp_cond = target.ARM64_COND_GE
                 } else if ins.b == mir.BIN_AND {
-                    target.arm64_and_reg(cb, r_dest, r_lhs, r_rhs)
+                    if rhs_and_imms >= 0 {
+                        target.arm64_and_imm(cb, r_dest, r_lhs, rhs_and_imms)
+                    } else {
+                        target.arm64_and_reg(cb, r_dest, r_lhs, r_rhs)
+                    }
                 } else if ins.b == mir.BIN_OR {
                     target.arm64_orr_reg(cb, r_dest, r_lhs, r_rhs)
                 }
 
                 $need_spill := true
-                if is_only_branch_cond {
+                if is_only_branch_cond || is_in_place_local {
                     need_spill = false
                 } else if enable_temp_opt && ins.a >= 0 && ins.a < is_cross_bb.len && !is_cross_bb[ins.a] && ins.a < temp_reg.len && temp_reg[ins.a] >= 0 {
                     need_spill = false
@@ -959,10 +998,12 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
                 target.arm64_ret(cb)
             }
         } else if blk.tkind == mir.TKIND_JUMP {
-            target_lbl := f.label + "_bb" + str(blk.ta)
-            reloc_off := cb.len()
-            target.arm64_b(cb, 0)
-            relocs.push(mc.reloc_new(reloc_off, target_lbl, mc.RELOC_ARM64_CALL26, 0))
+            if blk.ta != bi + 1 {
+                target_lbl := f.label + "_bb" + str(blk.ta)
+                reloc_off := cb.len()
+                target.arm64_b(cb, 0)
+                relocs.push(mc.reloc_new(reloc_off, target_lbl, mc.RELOC_ARM64_CALL26, 0))
+            }
         } else if blk.tkind == mir.TKIND_BRANCH {
             $branch_cond := target.ARM64_COND_NE
             if last_cmp_dest == blk.ta && last_cmp_cond >= 0 {
@@ -979,15 +1020,28 @@ pub fn isel_fn_arm64(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relo
                     target.arm64_cmp_imm(cb, cond_reg, 0)
                 }
             }
-            then_lbl := f.label + "_bb" + str(blk.tb)
-            reloc_then := cb.len()
-            target.arm64_b_cond(cb, branch_cond, 0)
-            relocs.push(mc.reloc_new(reloc_then, then_lbl, mc.RELOC_ARM64_COND_BR19, 0))
+            if blk.tb == bi + 1 {
+                inv_cond := branch_cond ^ 1
+                else_lbl := f.label + "_bb" + str(blk.tc)
+                reloc_else := cb.len()
+                target.arm64_b_cond(cb, inv_cond, 0)
+                relocs.push(mc.reloc_new(reloc_else, else_lbl, mc.RELOC_ARM64_COND_BR19, 0))
+            } else if blk.tc == bi + 1 {
+                then_lbl := f.label + "_bb" + str(blk.tb)
+                reloc_then := cb.len()
+                target.arm64_b_cond(cb, branch_cond, 0)
+                relocs.push(mc.reloc_new(reloc_then, then_lbl, mc.RELOC_ARM64_COND_BR19, 0))
+            } else {
+                then_lbl := f.label + "_bb" + str(blk.tb)
+                reloc_then := cb.len()
+                target.arm64_b_cond(cb, branch_cond, 0)
+                relocs.push(mc.reloc_new(reloc_then, then_lbl, mc.RELOC_ARM64_COND_BR19, 0))
 
-            else_lbl := f.label + "_bb" + str(blk.tc)
-            reloc_else := cb.len()
-            target.arm64_b(cb, 0)
-            relocs.push(mc.reloc_new(reloc_else, else_lbl, mc.RELOC_ARM64_CALL26, 0))
+                else_lbl := f.label + "_bb" + str(blk.tc)
+                reloc_else := cb.len()
+                target.arm64_b(cb, 0)
+                relocs.push(mc.reloc_new(reloc_else, else_lbl, mc.RELOC_ARM64_CALL26, 0))
+            }
         }
     }
 }
