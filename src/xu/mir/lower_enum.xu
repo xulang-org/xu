@@ -1,6 +1,16 @@
 @xu/mir
 // Enums: constructors, payload access and match.
+//
+// Representation (shared with TypedProgram.size_of / is_scalar): an enum
+// value is laid out as the checker sizes it, [tag word][payload words],
+// where the tag is the variant index and payload field i sits at
+// TVariant.offsets[i]. An enum without payload fields is one word and is
+// a scalar (the bare tag); any other enum is wide and handled by address.
+// Unused payload words are zero.
+//
+// `match` is a statement and also covers int and string subjects.
 
+#xu/ast
 #xu/parser
 #xu/types
 
@@ -13,9 +23,190 @@ fn (w $&Lw) enum_call(p &parser.Parser, tp &types.TypedProgram, n int, code int)
 }
 
 fn (w $&Lw) enum_method_call(p &parser.Parser, tp &types.TypedProgram, n int, code int) int {
+    if code == -30 {
+        << w.enum_ctor(p, tp, n, p.nodes[n].b)
+    }
     << NOT_HANDLED
 }
 
 fn (w $&Lw) enum_stmt(p &parser.Parser, tp &types.TypedProgram, s int) bool {
+    if p.nodes[s].kind == ast.NK_MATCH {
+        w.lower_match(p, tp, s)
+        << true
+    }
     << false
+}
+
+// Variant construction (`E.V` or `E.V(args)`); n carries the variant index.
+fn (w $&Lw) enum_ctor(p &parser.Parser, tp &types.TypedProgram, n int, args int) int {
+    ty := tp.type_of(n)
+    vidx := tp.local_of(n)
+    if !is_wide(tp, ty) {
+        << w.konst(vidx)
+    }
+    ei := types.enum_index(ty)
+    out := w.scratch(tp, ty)
+    w.zero_mem(out, tp.size_of(ty))
+    w.store_ptr(out, 0, w.konst(vidx), 8)
+    $arg := args
+    $fi := 0
+    while arg >= 0 {
+        if fi < tp.enums[ei].variants[vidx].fields.len {
+            fty := tp.enums[ei].variants[vidx].fields[fi]
+            off := tp.enums[ei].variants[vidx].offsets[fi]
+            v := w.lower_expr(p, tp, arg)
+            w.store_value(tp, out, off, v, fty)
+        }
+        fi += 1
+        arg = p.nodes[arg].next
+    }
+    << out
+}
+
+fn enum_field_needs_clone(fty int) bool {
+    << fty == 3 || types.is_array_type(fty) || types.is_struct_type(fty) || types.is_enum_type(fty)
+}
+
+// Deep copy: copy the whole value, then re-clone the owned payload fields
+// of whichever variant the tag selects.
+fn (w $&Lw) enum_clone_into(tp &types.TypedProgram, dst int, src int, ty int) {
+    w.copy_mem(dst, src, tp.size_of(ty))
+    if !is_wide(tp, ty) {
+        <<
+    }
+    ei := types.enum_index(ty)
+    for vi in 0:tp.enums[ei].variants.len {
+        $owned := false
+        for fi in 0:tp.enums[ei].variants[vi].fields.len {
+            if enum_field_needs_clone(tp.enums[ei].variants[vi].fields[fi]) {
+                owned = true
+            }
+        }
+        if !owned {
+            ->
+        }
+        tag := w.load_ptr(src, 0, 8)
+        then_b := w.new_block()
+        next_b := w.new_block()
+        w.branch(w.bin(BIN_EQ, tag, w.konst(vi)), then_b, next_b)
+        w.f.active_bb = then_b
+        for fi in 0:tp.enums[ei].variants[vi].fields.len {
+            fty := tp.enums[ei].variants[vi].fields[fi]
+            if enum_field_needs_clone(fty) {
+                off := w.konst(tp.enums[ei].variants[vi].offsets[fi])
+                w.clone_into(tp, w.bin(BIN_ADD, dst, off), w.bin(BIN_ADD, src, off), fty)
+            }
+        }
+        w.jump(next_b)
+        w.f.active_bb = next_b
+    }
+}
+
+fn (w $&Lw) lower_match(p &parser.Parser, tp &types.TypedProgram, s int) {
+    subj := p.nodes[s].a
+    sty := tp.deref(tp.type_of(subj))
+    // Subject: an int value, a string address, or an enum tag plus (for
+    // wide enums) the value's address; kept in locals across arm blocks.
+    key := w.new_local(1, 1, "mkey")
+    addr := w.new_local(1, 1, "msub")
+    if sty == 3 {
+        w.store_local(addr, 0, w.base_addr(p, tp, subj))
+    } else if types.is_enum_type(sty) && is_wide(tp, sty) {
+        a := w.lower_addr(p, tp, subj)
+        w.store_local(addr, 0, a)
+        w.store_local(key, 0, w.load_ptr(a, 0, 8))
+    } else {
+        $v := w.lower_expr(p, tp, subj)
+        if w.expr_is_ref(p, tp, subj) {
+            v = w.load_ptr(v, 0, width_of(tp, sty))
+        }
+        w.store_local(key, 0, v)
+    }
+    done_b := w.new_block()
+    $else_arm := -1
+    $ar := p.nodes[s].b
+    while ar >= 0 {
+        ak := p.nodes[ar].kind
+        if ak == ast.NK_ARM_ELSE {
+            if else_arm < 0 {
+                else_arm = ar
+            }
+            ar = p.nodes[ar].next
+            ->
+        }
+        $cond := -1
+        if ak == ast.NK_ARM_ENUM {
+            cond = w.bin(BIN_EQ, w.load_local(key, 0), w.konst(tp.local_of(ar)))
+        } else if ak == ast.NK_ARM_STR {
+            $args := []int{}
+            args.push(w.load_local(addr, 0))
+            args.push(w.lower_str_lit(p.nodes[ar].sval))
+            cond = w.call_core("str_eq", &args)
+        } else if ak == ast.NK_ARM_INT {
+            cond = w.bin(BIN_EQ, w.load_local(key, 0), w.konst(p.nodes[ar].ival))
+        } else if ak == ast.NK_ARM_RANGE {
+            cond = w.match_range(p, ar, w.load_local(key, 0))
+        } else {
+            w.fail(p, ar, "match arm " + types.ast_kind_name(ak) + " is not supported yet")
+            ar = p.nodes[ar].next
+            ->
+        }
+        then_b := w.new_block()
+        next_b := w.new_block()
+        w.branch(cond, then_b, next_b)
+        w.f.active_bb = then_b
+        if ak == ast.NK_ARM_ENUM {
+            w.bind_payload(p, tp, ar, sty, addr)
+        }
+        w.lower_block(p, tp, p.nodes[ar].c)
+        w.jump(done_b)
+        w.f.active_bb = next_b
+        ar = p.nodes[ar].next
+    }
+    if else_arm >= 0 {
+        w.lower_block(p, tp, p.nodes[else_arm].c)
+    }
+    w.jump(done_b)
+    w.f.active_bb = done_b
+}
+
+// Range arm test; `:` is half-open, older spellings keep their meaning.
+fn (w $&Lw) match_range(p &parser.Parser, ar int, v int) int {
+    lo := w.konst(p.nodes[ar].ival)
+    hi := w.konst(p.nodes[ar].d)
+    $lo_op := BIN_GE
+    $hi_op := BIN_LT
+    if p.nodes[ar].sval2 == ">-" || p.nodes[ar].sval2 == ">-<" {
+        lo_op = BIN_GT
+    }
+    if p.nodes[ar].sval2 == ">-" || p.nodes[ar].sval2 == "--" {
+        hi_op = BIN_LE
+    }
+    << w.bin(BIN_AND, w.bin(lo_op, v, lo), w.bin(hi_op, v, hi))
+}
+
+// Copy the payload fields of the matched variant into the arm's bindings.
+fn (w $&Lw) bind_payload(p &parser.Parser, tp &types.TypedProgram, ar int, sty int, addr int) {
+    ei := types.enum_index(sty)
+    vidx := tp.local_of(ar)
+    if ei < 0 || vidx < 0 {
+        <<
+    }
+    $b := p.nodes[ar].a
+    $fi := 0
+    while b >= 0 && fi < tp.enums[ei].variants[vidx].fields.len {
+        lid := tp.local_of(b)
+        if lid >= 0 {
+            fty := tp.enums[ei].variants[vidx].fields[fi]
+            base := w.load_local(addr, 0)
+            fa := w.bin(BIN_ADD, base, w.konst(tp.enums[ei].variants[vidx].offsets[fi]))
+            if is_wide(tp, fty) {
+                w.store_to_local(tp, lid, fa)
+            } else {
+                w.store_to_local(tp, lid, w.load_ptr(fa, 0, width_of(tp, fty)))
+            }
+        }
+        fi += 1
+        b = p.nodes[b].next
+    }
 }
