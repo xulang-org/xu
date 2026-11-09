@@ -50,6 +50,10 @@ struct Lw {
     core_labels []string
     // error word of the most recent throwing call (-1 when none)
     last_err int
+    // hidden okp incoming local of a throwing function (-1 otherwise)
+    okp int
+    // node being lowered as its unboxed value (see err_box)
+    unboxed int
 }
 
 // Hook result for "this feature does not lower the node".
@@ -70,7 +74,9 @@ fn lw_new(name string, label string, fi int, tgt_os int) Lw {
         errors: 0,
         core_names: []string{},
         core_labels: []string{},
-        last_err: -1
+        last_err: -1,
+        okp: -1,
+        unboxed: -1
     }
 }
 
@@ -518,6 +524,9 @@ fn (w $&Lw) bounds_check(idx int, n int) {
 fn (w $&Lw) lower_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
     if n < 0 {
         << w.konst(0)
+    }
+    if n != w.unboxed && w.err_wants_box(tp, n) {
+        << w.err_box(p, tp, n)
     }
     k := p.nodes[n].kind
     if k == ast.NK_INT {
@@ -1014,6 +1023,9 @@ fn (w $&Lw) lower_arg(p &parser.Parser, tp &types.TypedProgram, arg int, pty int
 }
 
 fn (w $&Lw) finish_call(tp &types.TypedProgram, callee int, args []int) int {
+    if fn_throws(tp, callee) {
+        << w.err_finish_call(tp, callee, &args)
+    }
     rty := tp.fns[callee].ret
     label := tp.fns[callee].label
     if rty != 0 && is_wide(tp, rty) {
@@ -1029,25 +1041,48 @@ fn (w $&Lw) finish_call(tp &types.TypedProgram, callee int, args []int) int {
     << w.call(label, &args)
 }
 
+// Call of user function fi with the arguments of call node n.
+fn (w $&Lw) lower_user_call(p &parser.Parser, tp &types.TypedProgram, n int, fi int) int {
+    $args := []int{}
+    $arg := p.nodes[n].a
+    $pi := 0
+    while arg >= 0 {
+        $pty := 1
+        if pi < tp.fns[fi].params.len {
+            pty = tp.fns[fi].params[pi]
+        }
+        args.push(w.lower_arg(p, tp, arg, pty))
+        pi += 1
+        arg = p.nodes[arg].next
+    }
+    << w.finish_call(tp, fi, args)
+}
+
+// Call of user function or method fi from method-call node n.
+fn (w $&Lw) lower_user_method_call(p &parser.Parser, tp &types.TypedProgram, n int, fi int) int {
+    $args := []int{}
+    // `pkg.f(...)` parses as a method call on the package name.
+    if tp.fns[fi].recv >= 0 {
+        args.push(w.base_addr(p, tp, p.nodes[n].a))
+    }
+    $arg := p.nodes[n].b
+    $pi := 0
+    while arg >= 0 {
+        $pty := 1
+        if pi < tp.fns[fi].params.len {
+            pty = tp.fns[fi].params[pi]
+        }
+        args.push(w.lower_arg(p, tp, arg, pty))
+        pi += 1
+        arg = p.nodes[arg].next
+    }
+    << w.finish_call(tp, fi, args)
+}
+
 fn (w $&Lw) lower_call(p &parser.Parser, tp &types.TypedProgram, n int) int {
     code := tp.call_of(n)
     if code >= 0 {
-        if tp.fns[code].may_throw {
-            w.fail(p, n, "calls to throwing functions are not supported yet")
-        }
-        $args := []int{}
-        $arg := p.nodes[n].a
-        $pi := 0
-        while arg >= 0 {
-            $pty := 1
-            if pi < tp.fns[code].params.len {
-                pty = tp.fns[code].params[pi]
-            }
-            args.push(w.lower_arg(p, tp, arg, pty))
-            pi += 1
-            arg = p.nodes[arg].next
-        }
-        << w.finish_call(tp, code, args)
+        << w.lower_user_call(p, tp, n, code)
     }
     if code == -2 || code == -7 {
         $fd := 1
@@ -1140,26 +1175,7 @@ fn (w $&Lw) lower_method_call(p &parser.Parser, tp &types.TypedProgram, n int) i
     code := tp.call_of(n)
     recv := p.nodes[n].a
     if code >= 0 {
-        if tp.fns[code].may_throw {
-            w.fail(p, n, "calls to throwing methods are not supported yet")
-        }
-        $args := []int{}
-        // `pkg.f(...)` parses as a method call on the package name.
-        if tp.fns[code].recv >= 0 {
-            args.push(w.base_addr(p, tp, recv))
-        }
-        $arg := p.nodes[n].b
-        $pi := 0
-        while arg >= 0 {
-            $pty := 1
-            if pi < tp.fns[code].params.len {
-                pty = tp.fns[code].params[pi]
-            }
-            args.push(w.lower_arg(p, tp, arg, pty))
-            pi += 1
-            arg = p.nodes[arg].next
-        }
-        << w.finish_call(tp, code, args)
+        << w.lower_user_method_call(p, tp, n, code)
     }
     if code == -4 {
         d := w.base_addr(p, tp, recv)
@@ -1247,6 +1263,10 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
     }
     if k == ast.NK_RETURN {
         a := p.nodes[s].a
+        if w.okp >= 0 {
+            w.err_return(p, tp, a)
+            <<
+        }
         if a < 0 {
             w.ret(w.konst(0))
             <<
@@ -1527,8 +1547,10 @@ fn lower_fn(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, core_
     w.f.ret = tfn.ret
     w.f.blocks.push(mblock_new())
     w.f.active_bb = 0
-    // Incoming words: [sret] [receiver] params.
-    if tfn.ret != 0 && is_wide(tp, tfn.ret) {
+    // Incoming words: [okp | sret] [receiver] params.
+    if fn_throws(tp, fi) {
+        w.okp = w.new_local(1, 1, "okp")
+    } else if tfn.ret != 0 && is_wide(tp, tfn.ret) {
         w.sret = w.new_local(1, 1, "sret")
     }
     $nin := 0
@@ -1580,6 +1602,7 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, all bo
             core_labels.push(tp.fns[i].label + "")
         }
     }
+    err_collect_boxes(p, tp)
     // Lower on demand from main: a function is lowered once some lowered
     // body calls its label, so unused library code is never required to
     // be lowerable.
