@@ -1,0 +1,469 @@
+@main
+
+#xu/types
+// DWARF v4 debug-info encoding for the hosted ELF64 / Mach-O writers.
+// Ported from bootstrap/crates/xubin/src/dwarf.rs (m33), which is the
+// reference shared with this file. Emits the four sections a debugger needs
+// for source-level line breakpoints and function-name lookups:
+//
+//   .debug_line   - version 4 line-number state machine (address -> line)
+//   .debug_info   - one compile unit + subprogram and stack-local DIEs
+//   .debug_abbrev - static abbreviation table for the three DIE shapes
+//   .debug_str    - NUL-joined string pool (CU, function, and local names)
+//
+// Everything is hand-encoded little-endian with ULEB128/SLEB128. Xu has no
+// dynamic byte concat, so every encoder appends to a local []int byte pool
+// with the push idiom (mirrors elf.xu / macho.xu). write16/write32/write64,
+// align_up and the push helpers live in macho.xu (same module main).
+
+// Address -> source-line rows and per-function records collected during
+// emission (see collect_debug_info in emit.xu). Offsets are code-segment
+// relative (i.e. `label_offset` values, which are segment-relative, not
+// already biased by the segment virtual address).
+struct DLineRow {
+    offset int
+    file   int
+    line   int
+}
+
+struct DFuncRow {
+    name  string
+    file  int
+    line  int
+    start int
+    size  int
+    locals []DLocalRow
+}
+
+struct DLocalRow {
+    name string
+    slot int
+    line int
+    ty   int
+}
+
+struct DTypeIndices {
+    int_idx  int
+    bool_idx int
+    f64_idx  int
+    u8_idx   int
+    i32_idx  int
+    u32_idx  int
+}
+
+struct DebugInfo {
+    files []string
+    rows  []DLineRow
+    funcs []DFuncRow
+}
+
+struct DebugSections {
+    line   []int
+    info   []int
+    abbrev []int
+    str    []int
+}
+
+// DWARF v4 standard line-program opcodes.
+//   LNS_COPY = 1, LNS_ADVANCE_LINE = 3, LNS_SET_FILE = 4
+// Extended line-program opcodes (0x00 prefix):
+//   LNE_END_SEQUENCE = 1, LNE_SET_ADDRESS = 2
+// DIE tags / attributes / forms (hex -> decimal, dwarf.rs):
+//   DW_TAG_COMPILE_UNIT = 0x11 = 17, DW_TAG_SUBPROGRAM = 0x2e = 46
+//   DW_AT_NAME = 3, DW_AT_LOW_PC = 17, DW_AT_HIGH_PC = 18,
+//   DW_AT_STMT_LIST = 16, DW_AT_LANGUAGE = 19, DW_AT_DECL_FILE = 58,
+//   DW_AT_DECL_LINE = 59, DW_AT_EXTERNAL = 63
+//   DW_FORM_ADDR = 1, DW_FORM_DATA2 = 5, DW_FORM_DATA4 = 6,
+//   DW_FORM_DATA1 = 11, DW_FORM_FLAG = 12, DW_FORM_STRP = 14,
+//   DW_FORM_SEC_OFFSET = 23
+//   DW_LANG_C = 0x0002 = 2
+
+// ULEB128 (value >= 0). `>>` is arithmetic but the value is never negative.
+fn d_uleb(buf $&[]int, value int) {
+    $v := value
+    for i in 0:10 {
+        b := v & 127
+        v = v >> 7
+        if v == 0 {
+            buf.push(b)
+            <<
+        }
+        buf.push(b | 128)
+    }
+}
+
+// SLEB128 (signed; line deltas may be negative).
+fn d_sleb(buf $&[]int, value int) {
+    $v := value
+    for i in 0:10 {
+        b := v & 127
+        v = v >> 7
+        sign_set := (b & 64) != 0
+        done := (v == 0 && !sign_set) || (v == -1 && sign_set)
+        if done {
+            buf.push(b)
+            <<
+        }
+        buf.push(b | 128)
+    }
+}
+
+// .debug_line program (mirror dwarf.rs encode_line). `files` is already the
+// non-empty fallback list (see encode_dwarf).
+fn d_encode_line(di &DebugInfo, files []string, code_vaddr int) []int {
+    $header := []int{}
+    header.push(1)   // minimum_instruction_length
+    header.push(1)   // maximum_operations_per_instruction (v4)
+    header.push(1)   // default_is_stmt
+    header.push(251) // line_base = -5
+    header.push(14)  // line_range
+    header.push(13)  // opcode_base
+    // standard_opcode_lengths[1..=12] = [0,1,1,1,1,0,0,0,1,0,0,1]
+    header.push(0)
+    header.push(1)
+    header.push(1)
+    header.push(1)
+    header.push(1)
+    header.push(0)
+    header.push(0)
+    header.push(0)
+    header.push(1)
+    header.push(0)
+    header.push(0)
+    header.push(1)
+    header.push(0) // include_directories: empty (single NUL)
+    for f in 0:files.len {
+        for i in 0:files[f].len {
+            header.push(files[f][i])
+        }
+        header.push(0)
+        d_uleb($&header, 0) // dir index
+        d_uleb($&header, 0) // mtime
+        d_uleb($&header, 0) // size
+    }
+    header.push(0) // end of file names
+
+    $prog := []int{}
+    $cur_line := 1
+    $cur_file := 1
+    // Rows are collected in ascending code offset (emission order), so the
+    // reference's stable sort by offset is already satisfied.
+    for r in 0:di.rows.len {
+        // DW_LNE_set_address(code_vaddr + offset)
+        prog.push(0)
+        d_uleb($&prog, 9)
+        prog.push(2)
+        write64($&prog, code_vaddr + di.rows[r].offset)
+
+        // DW_LNS_set_file (1-based .debug_line file table).
+        file := di.rows[r].file + 1
+        if file != cur_file {
+            prog.push(4)
+            d_uleb($&prog, file)
+            cur_file = file
+        }
+
+        // DW_LNS_advance_line — signed delta, full SLEB128.
+        delta := di.rows[r].line - cur_line
+        if delta != 0 {
+            prog.push(3)
+            d_sleb($&prog, delta)
+            cur_line = cur_line + delta
+        }
+
+        // DW_LNS_copy registers a row without advancing the address.
+        prog.push(1)
+    }
+
+    // DW_LNE_end_sequence
+    prog.push(0)
+    d_uleb($&prog, 1)
+    prog.push(1)
+
+    unit_length := 2 + 4 + header.len + prog.len
+    $out := []int{}
+    write32($&out, unit_length)
+    write16($&out, 4) // version
+    write32($&out, header.len)
+    for i in 0:header.len {
+        out.push(header[i])
+    }
+    for i in 0:prog.len {
+        out.push(prog[i])
+    }
+    << out
+}
+
+// .debug_info (mirror dwarf.rs encode_info). `str_offs` contains the CU name,
+// function names, locals, then base type names.
+fn d_encode_info(di &DebugInfo, code_vaddr int, code_len int, str_offs []int, ty_idx &DTypeIndices) []int {
+    $body := []int{}
+    write16($&body, 4) // version
+    write32($&body, 0) // debug_abbrev_offset
+    body.push(8)          // address_size
+
+    // Compile-unit DIE (abbrev code 1).
+    d_uleb($&body, 1)
+    write32($&body, str_offs[0])             // DW_AT_name (strp)
+    write64($&body, code_vaddr)              // DW_AT_low_pc
+    write64($&body, code_vaddr + code_len)   // DW_AT_high_pc
+    write32($&body, 0)                       // DW_AT_stmt_list (offset 0)
+    write16($&body, 2)                       // DW_AT_language (DW_LANG_C)
+
+    // Base type DIEs (abbrev code 4) and Pointer DIE (abbrev code 5).
+    // In DWARF, offsets for DW_FORM_ref4 are relative to the compilation unit header.
+    // The CU header is 4 bytes (unit_length field), followed by body bytes.
+    int_type_cu_off := 4 + body.len
+    d_uleb($&body, 4)                        // abbrev 4: DW_TAG_base_type
+    write32($&body, str_offs[ty_idx.int_idx])// DW_AT_name ("int")
+    body.push(8)                                // DW_AT_byte_size (8 bytes)
+    body.push(5)                                // DW_AT_encoding (DW_ATE_signed = 5)
+
+    bool_type_cu_off := 4 + body.len
+    d_uleb($&body, 4)                        // abbrev 4: DW_TAG_base_type
+    write32($&body, str_offs[ty_idx.bool_idx]) // DW_AT_name ("bool")
+    body.push(1)                                // DW_AT_byte_size (1 byte)
+    body.push(2)                                // DW_AT_encoding (DW_ATE_boolean = 2)
+
+    f64_type_cu_off := 4 + body.len
+    d_uleb($&body, 4)                        // abbrev 4: DW_TAG_base_type
+    write32($&body, str_offs[ty_idx.f64_idx]) // DW_AT_name ("f64")
+    body.push(8)                                // DW_AT_byte_size (8 bytes)
+    body.push(4)                                // DW_AT_encoding (DW_ATE_float = 4)
+
+    u8_type_cu_off := 4 + body.len
+    d_uleb($&body, 4)                        // abbrev 4: DW_TAG_base_type
+    write32($&body, str_offs[ty_idx.u8_idx]) // DW_AT_name ("u8")
+    body.push(1)                                // DW_AT_byte_size (1 byte)
+    body.push(8)                                // DW_AT_encoding (DW_ATE_unsigned_char = 8)
+
+    i32_type_cu_off := 4 + body.len
+    d_uleb($&body, 4)                        // abbrev 4: DW_TAG_base_type
+    write32($&body, str_offs[ty_idx.i32_idx]) // DW_AT_name ("i32")
+    body.push(4)                                // DW_AT_byte_size (4 bytes)
+    body.push(5)                                // DW_AT_encoding (DW_ATE_signed = 5)
+
+    u32_type_cu_off := 4 + body.len
+    d_uleb($&body, 4)                        // abbrev 4: DW_TAG_base_type
+    write32($&body, str_offs[ty_idx.u32_idx]) // DW_AT_name ("u32")
+    body.push(4)                                // DW_AT_byte_size (4 bytes)
+    body.push(7)                                // DW_AT_encoding (DW_ATE_unsigned = 7)
+
+    ptr_type_cu_off := 4 + body.len
+    d_uleb($&body, 5)                        // abbrev 5: DW_TAG_pointer_type
+    write32($&body, int_type_cu_off)         // DW_AT_type (points to int)
+    body.push(8)                                // DW_AT_byte_size (8 bytes)
+
+    $local_str := 1 + di.funcs.len
+    // Subprogram DIEs (abbrev code 2).
+    for i in 0:di.funcs.len {
+        d_uleb($&body, 2)
+        write32($&body, str_offs[1 + i])     // DW_AT_name
+        write64($&body, code_vaddr + di.funcs[i].start)              // low_pc
+        write64($&body, code_vaddr + di.funcs[i].start + di.funcs[i].size) // high_pc
+        body.push(di.funcs[i].file + 1)         // DW_AT_decl_file (1-based)
+        write32($&body, di.funcs[i].line)    // DW_AT_decl_line
+        body.push(1)                            // DW_AT_external
+        // DW_AT_frame_base: DW_OP_breg29 with 0 offset (x29 / FP)
+        body.push(2)
+        body.push(141)
+        body.push(0)
+        for li in 0:di.funcs[i].locals.len {
+            d_uleb($&body, 3)                // DW_TAG_variable
+            write32($&body, str_offs[local_str])
+            local_str += 1
+            $type_cu_off := int_type_cu_off
+            lty := di.funcs[i].locals[li].ty
+            if lty == 2 {
+                type_cu_off = bool_type_cu_off
+            } else if lty == 4 {
+                type_cu_off = f64_type_cu_off
+            } else if lty == 10 {
+                type_cu_off = u8_type_cu_off
+            } else if lty == 8 {
+                type_cu_off = i32_type_cu_off
+            } else if lty == 9 {
+                type_cu_off = u32_type_cu_off
+            } else if (types.is_ref_type(lty)) {
+                type_cu_off = ptr_type_cu_off
+            }
+            write32($&body, type_cu_off)     // DW_AT_type (DW_FORM_ref4)
+            // DW_OP_fbreg followed by a signed frame-relative byte offset.
+            $expr := []int{}
+            expr.push(145)
+            d_sleb($&expr, -8 * (di.funcs[i].locals[li].slot + 1))
+            d_uleb($&body, expr.len)
+            for ei in 0:expr.len { body.push(expr[ei]) }
+            write32($&body, di.funcs[i].locals[li].line)
+        }
+        body.push(0)                            // end of subprogram children
+    }
+
+    body.push(0) // null DIE terminates the CU's children
+
+    $out := []int{}
+    write32($&out, body.len) // unit_length
+    for i in 0:body.len {
+        out.push(body[i])
+    }
+    << out
+}
+
+// .debug_abbrev (mirror dwarf.rs encode_abbrev): a static two-abbrev table.
+fn d_encode_abbrev() []int {
+    $out := []int{}
+
+    // Abbrev 1: DW_TAG_compile_unit (has children).
+    d_uleb($&out, 1)
+    d_uleb($&out, 17) // DW_TAG_COMPILE_UNIT
+    out.push(1)          // DW_CHILDREN_yes
+    d_uleb($&out, 3)  // DW_AT_NAME
+    d_uleb($&out, 14) // DW_FORM_STRP
+    d_uleb($&out, 17) // DW_AT_LOW_PC
+    d_uleb($&out, 1)  // DW_FORM_ADDR
+    d_uleb($&out, 18) // DW_AT_HIGH_PC
+    d_uleb($&out, 1)  // DW_FORM_ADDR
+    d_uleb($&out, 16) // DW_AT_STMT_LIST
+    d_uleb($&out, 23) // DW_FORM_SEC_OFFSET
+    d_uleb($&out, 19) // DW_AT_LANGUAGE
+    d_uleb($&out, 5)  // DW_FORM_DATA2
+    out.push(0)
+    out.push(0)
+
+    // Abbrev 2: DW_TAG_subprogram (has local-variable children).
+    d_uleb($&out, 2)
+    d_uleb($&out, 46) // DW_TAG_SUBPROGRAM
+    out.push(1)          // DW_CHILDREN_yes
+    d_uleb($&out, 3)  // DW_AT_NAME
+    d_uleb($&out, 14) // DW_FORM_STRP
+    d_uleb($&out, 17) // DW_AT_LOW_PC
+    d_uleb($&out, 1)  // DW_FORM_ADDR
+    d_uleb($&out, 18) // DW_AT_HIGH_PC
+    d_uleb($&out, 1)  // DW_FORM_ADDR
+    d_uleb($&out, 58) // DW_AT_DECL_FILE
+    d_uleb($&out, 11) // DW_FORM_DATA1
+    d_uleb($&out, 59) // DW_AT_DECL_LINE
+    d_uleb($&out, 6)  // DW_FORM_DATA4
+    d_uleb($&out, 63) // DW_AT_EXTERNAL
+    d_uleb($&out, 12) // DW_FORM_FLAG
+    d_uleb($&out, 64) // DW_AT_FRAME_BASE
+    d_uleb($&out, 24) // DW_FORM_EXPRLOC
+    out.push(0)
+    out.push(0)
+
+    // Abbrev 3: DW_TAG_variable with type and a frame-relative location expression.
+    d_uleb($&out, 3)
+    d_uleb($&out, 52) // DW_TAG_VARIABLE
+    out.push(0)          // DW_CHILDREN_no
+    d_uleb($&out, 3)  // DW_AT_NAME
+    d_uleb($&out, 14) // DW_FORM_STRP
+    d_uleb($&out, 73) // DW_AT_TYPE
+    d_uleb($&out, 19) // DW_FORM_REF4
+    d_uleb($&out, 2)  // DW_AT_LOCATION
+    d_uleb($&out, 24) // DW_FORM_EXPRLOC
+    d_uleb($&out, 59) // DW_AT_DECL_LINE
+    d_uleb($&out, 6)  // DW_FORM_DATA4
+    out.push(0)
+    out.push(0)
+
+    // Abbrev 4: DW_TAG_base_type for primitive types.
+    d_uleb($&out, 4)
+    d_uleb($&out, 36) // DW_TAG_BASE_TYPE
+    out.push(0)          // DW_CHILDREN_no
+    d_uleb($&out, 3)  // DW_AT_NAME
+    d_uleb($&out, 14) // DW_FORM_STRP
+    d_uleb($&out, 11) // DW_AT_BYTE_SIZE
+    d_uleb($&out, 11) // DW_FORM_DATA1
+    d_uleb($&out, 62) // DW_AT_ENCODING
+    d_uleb($&out, 11) // DW_FORM_DATA1
+    out.push(0)
+    out.push(0)
+
+    // Abbrev 5: DW_TAG_pointer_type for references.
+    d_uleb($&out, 5)
+    d_uleb($&out, 15) // DW_TAG_POINTER_TYPE
+    out.push(0)          // DW_CHILDREN_no
+    d_uleb($&out, 73) // DW_AT_TYPE
+    d_uleb($&out, 19) // DW_FORM_REF4
+    d_uleb($&out, 11) // DW_AT_BYTE_SIZE
+    d_uleb($&out, 11) // DW_FORM_DATA1
+    out.push(0)
+    out.push(0)
+
+    out.push(0) // end of abbreviation table
+    << out
+}
+
+fn d_pool_push_str(pool $&[]int, s string) {
+    for i in 0:s.len {
+        pool.push(s[i])
+    }
+    pool.push(0)
+}
+
+// Encode all four debug sections. `di.files` falls back to a single
+// "<input>" entry (mirror dwarf.rs) so the CU name is always valid.
+fn encode_dwarf(di &DebugInfo, code_vaddr int, code_len int) DebugSections {
+    $files := []string{}
+    if di.files.len == 0 {
+        files.push("<input>")
+    } else {
+        for i in 0:di.files.len {
+            files.push(di.files[i])
+        }
+    }
+
+    // NUL-joined string pool + offsets: CU name, function names, locals, then types.
+    $str_pool := []int{}
+    $str_offs := []int{}
+    str_offs.push(str_pool.len)
+    for i in 0:files[0].len {
+        str_pool.push(files[0][i])
+    }
+    str_pool.push(0)
+    for fi in 0:di.funcs.len {
+        str_offs.push(str_pool.len)
+        for i in 0:di.funcs[fi].name.len {
+            str_pool.push(di.funcs[fi].name[i])
+        }
+        str_pool.push(0)
+    }
+    for fi in 0:di.funcs.len {
+        for li in 0:di.funcs[fi].locals.len {
+            str_offs.push(str_pool.len)
+            for j in 0:di.funcs[fi].locals[li].name.len {
+                str_pool.push(di.funcs[fi].locals[li].name[j])
+            }
+            str_pool.push(0)
+        }
+    }
+    $ty_idx := DTypeIndices{int_idx: 0, bool_idx: 0, f64_idx: 0, u8_idx: 0, i32_idx: 0, u32_idx: 0}
+    ty_idx.int_idx = str_offs.len
+    str_offs.push(str_pool.len)
+    d_pool_push_str($&str_pool, "int")
+
+    ty_idx.bool_idx = str_offs.len
+    str_offs.push(str_pool.len)
+    d_pool_push_str($&str_pool, "bool")
+
+    ty_idx.f64_idx = str_offs.len
+    str_offs.push(str_pool.len)
+    d_pool_push_str($&str_pool, "f64")
+
+    ty_idx.u8_idx = str_offs.len
+    str_offs.push(str_pool.len)
+    d_pool_push_str($&str_pool, "u8")
+
+    ty_idx.i32_idx = str_offs.len
+    str_offs.push(str_pool.len)
+    d_pool_push_str($&str_pool, "i32")
+
+    ty_idx.u32_idx = str_offs.len
+    str_offs.push(str_pool.len)
+    d_pool_push_str($&str_pool, "u32")
+
+    line := d_encode_line(di, files, code_vaddr)
+    info := d_encode_info(di, code_vaddr, code_len, str_offs, &ty_idx)
+    abbrev := d_encode_abbrev()
+    << DebugSections{line: line, info: info, abbrev: abbrev, str: str_pool}
+}
