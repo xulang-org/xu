@@ -1,0 +1,403 @@
+@xu/codegen
+// Baseline AArch64 instruction selection for typed MIR.
+//
+// Correctness first: every temp has its own frame slot and every local its
+// full width, so no value is ever shared or clobbered. Operands are loaded
+// into scratch registers (x9-x12), the result is stored back. Optimizing
+// selection can replace this per function once it implements the same
+// conventions:
+//   - arguments in x0-x7, the rest at [sp + 8*(i-8)] of the caller's
+//     outgoing area; scalar result in x0
+//   - x28 holds the runtime state block for the whole process
+//   - frame: [fp] saved fp/lr, sp = fp - frame; locals and temps at
+//     [sp + out_area + offset]
+
+#xu/mir
+#xu/mc
+#xu/target
+
+const R_FP = 29
+const R_LR = 30
+const R_SP = 31
+const R_IP0 = 16
+const R_IP1 = 17
+const R_STATE = 28
+
+struct A64Frame {
+    out_area int
+    size int
+    local_off []int
+    temp_off []int
+}
+
+// ===== encoders =====
+
+fn e32(cb $&mc.CodeBuffer, w int) {
+    cb.emit_u32_le(w & 0xffffffff)
+}
+
+fn a64_mov_imm(cb $&mc.CodeBuffer, rd int, v int) {
+    e32(cb, 0xD2800000 | ((v & 0xffff) << 5) | rd)
+    for hw in 1:4 {
+        chunk := (v >> (16 * hw)) & 0xffff
+        if chunk != 0 {
+            e32(cb, 0xF2800000 | (hw << 21) | (chunk << 5) | rd)
+        }
+    }
+}
+
+fn a64_mov(cb $&mc.CodeBuffer, rd int, rm int) {
+    e32(cb, 0xAA0003E0 | (rm << 16) | rd)
+}
+
+// rd = rn + imm (rn/rd may be sp); imm >= 0.
+fn a64_add_imm(cb $&mc.CodeBuffer, rd int, rn int, imm int) {
+    if imm < 4096 {
+        e32(cb, 0x91000000 | (imm << 10) | (rn << 5) | rd)
+        <<
+    }
+    a64_mov_imm(cb, R_IP0, imm)
+    e32(cb, 0x8B206000 | (R_IP0 << 16) | (rn << 5) | rd)
+}
+
+fn a64_sub_sp(cb $&mc.CodeBuffer, imm int) {
+    if imm < 4096 {
+        e32(cb, 0xD1000000 | (imm << 10) | (R_SP << 5) | R_SP)
+        <<
+    }
+    a64_mov_imm(cb, R_IP0, imm)
+    e32(cb, 0xCB206000 | (R_IP0 << 16) | (R_SP << 5) | R_SP)
+}
+
+// Load/store of width 1, 4 or 8 bytes at [rn + off].
+fn a64_mem(cb $&mc.CodeBuffer, store bool, width int, rt int, rn int, off int) {
+    $scaled := off
+    $base_imm := 0xF9400000
+    $base_reg := 0xF8606800
+    if width == 1 {
+        base_imm = 0x39400000
+        base_reg = 0x38606800
+    } else if width == 4 {
+        base_imm = 0xB9400000
+        base_reg = 0xB8606800
+        scaled = off / 4
+    } else {
+        scaled = off / 8
+    }
+    if store {
+        base_imm = base_imm & 0xFFBFFFFF
+        base_reg = base_reg & 0xFFBFFFFF
+    }
+    if off >= 0 && off % width == 0 && scaled < 4096 {
+        e32(cb, base_imm | (scaled << 10) | (rn << 5) | rt)
+        <<
+    }
+    a64_mov_imm(cb, R_IP1, off)
+    e32(cb, base_reg | (R_IP1 << 16) | (rn << 5) | rt)
+}
+
+fn a64_ldr(cb $&mc.CodeBuffer, rt int, rn int, off int) {
+    a64_mem(cb, false, 8, rt, rn, off)
+}
+
+fn a64_str(cb $&mc.CodeBuffer, rt int, rn int, off int) {
+    a64_mem(cb, true, 8, rt, rn, off)
+}
+
+fn a64_rrr(cb $&mc.CodeBuffer, base int, rd int, rn int, rm int) {
+    e32(cb, base | (rm << 16) | (rn << 5) | rd)
+}
+
+fn a64_cmp(cb $&mc.CodeBuffer, rn int, rm int) {
+    e32(cb, 0xEB00001F | (rm << 16) | (rn << 5))
+}
+
+fn a64_cset(cb $&mc.CodeBuffer, rd int, cond int) {
+    e32(cb, 0x9A9F07E0 | ((cond ^ 1) << 12) | rd)
+}
+
+fn a64_branch_reloc(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, word int, label string, kind int) {
+    off := cb.len()
+    e32(cb, word)
+    relocs.push(mc.reloc_new(off, label + "", kind, 0))
+}
+
+// ===== frame =====
+
+fn a64_frame(f &mir.MFn) A64Frame {
+    $max_args := 0
+    for i in 0:f.instrs.len {
+        if f.instrs[i].kind == mir.MI_CALL {
+            $n := 0
+            $a := f.instrs[i].c
+            while a >= 0 {
+                n += 1
+                a = f.margs[a].next
+            }
+            if n > max_args {
+                max_args = n
+            }
+        }
+    }
+    $out_area := 0
+    if max_args > 8 {
+        out_area = (max_args - 8) * 8
+    }
+    $off := out_area
+    $loffs := []int{}
+    for i in 0:f.locals.len {
+        loffs.push(off)
+        $n := 1
+        if i < f.locals_nslots.len && f.locals_nslots[i] > 1 {
+            n = f.locals_nslots[i]
+        }
+        off += n * 8
+    }
+    $toffs := []int{}
+    for i in 0:f.temps.len {
+        toffs.push(off)
+        off += 8
+    }
+    size := (off + 15) / 16 * 16
+    << A64Frame{out_area: out_area, size: size, local_off: loffs, temp_off: toffs}
+}
+
+// Operand (temp or constant) into register rd.
+fn a64_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, rd int, v int) {
+    if v <= -2 {
+        a64_mov_imm(cb, rd, f.consts[0 - v - 2])
+        <<
+    }
+    if v >= 0 && v < fr.temp_off.len {
+        a64_ldr(cb, rd, R_SP, fr.temp_off[v])
+        <<
+    }
+    a64_mov_imm(cb, rd, 0)
+}
+
+fn a64_set_temp(cb $&mc.CodeBuffer, fr &A64Frame, t int, rs int) {
+    if t >= 0 && t < fr.temp_off.len {
+        a64_str(cb, rs, R_SP, fr.temp_off[t])
+    }
+}
+
+fn a64_bin(cb $&mc.CodeBuffer, op int) {
+    // x9 = x9 op x10
+    if op == mir.BIN_ADD { a64_rrr(cb, 0x8B000000, 9, 9, 10) }
+    else if op == mir.BIN_SUB { a64_rrr(cb, 0xCB000000, 9, 9, 10) }
+    else if op == mir.BIN_MUL { a64_rrr(cb, 0x9B007C00, 9, 9, 10) }
+    else if op == mir.BIN_DIV { a64_rrr(cb, 0x9AC00C00, 9, 9, 10) }
+    else if op == mir.BIN_MOD {
+        a64_rrr(cb, 0x9AC00C00, 11, 9, 10)
+        // msub x9, x11, x10, x9
+        e32(cb, 0x9B008000 | (10 << 16) | (9 << 10) | (11 << 5) | 9)
+    }
+    else if op == mir.BIN_AND { a64_rrr(cb, 0x8A000000, 9, 9, 10) }
+    else if op == mir.BIN_OR { a64_rrr(cb, 0xAA000000, 9, 9, 10) }
+    else if op == mir.BIN_XOR { a64_rrr(cb, 0xCA000000, 9, 9, 10) }
+    else if op == mir.BIN_SHL { a64_rrr(cb, 0x9AC02000, 9, 9, 10) }
+    else if op == mir.BIN_SHR { a64_rrr(cb, 0x9AC02800, 9, 9, 10) }
+    else {
+        a64_cmp(cb, 9, 10)
+        $cond := target.ARM64_COND_EQ
+        if op == mir.BIN_NE { cond = target.ARM64_COND_NE }
+        else if op == mir.BIN_LT { cond = target.ARM64_COND_LT }
+        else if op == mir.BIN_LE { cond = target.ARM64_COND_LE }
+        else if op == mir.BIN_GT { cond = target.ARM64_COND_GT }
+        else if op == mir.BIN_GE { cond = target.ARM64_COND_GE }
+        a64_cset(cb, 9, cond)
+    }
+}
+
+struct StrFix {
+    adr_off int
+    bytes string
+}
+
+pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc) {
+    fr := a64_frame(f)
+    syms.define_label(f.label, cb.len())
+    // Prologue.
+    e32(cb, 0xA9BF7BFD)
+    e32(cb, 0x910003FD)
+    if fr.size > 0 {
+        a64_sub_sp(cb, fr.size)
+    }
+    for i in 0:f.nparams {
+        if i < 8 {
+            a64_str(cb, i, R_SP, fr.local_off[i])
+        } else {
+            a64_ldr(cb, 9, R_FP, 16 + (i - 8) * 8)
+            a64_str(cb, 9, R_SP, fr.local_off[i])
+        }
+    }
+    $strs := []StrFix{}
+    epilogue := f.label + "_ret"
+    for bi in 0:f.blocks.len {
+        syms.define_label(f.label + "_bb" + str(bi), cb.len())
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            k := ins.kind
+            if k == mir.MI_LOAD_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                a64_ldr(cb, 9, R_SP, fr.local_off[ins.b] + w * 8)
+                a64_set_temp(cb, &fr, ins.a, 9)
+            } else if k == mir.MI_STORE_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                a64_operand(cb, f, &fr, 9, ins.b)
+                a64_str(cb, 9, R_SP, fr.local_off[ins.a] + w * 8)
+            } else if k == mir.MI_ADDR {
+                a64_add_imm(cb, 9, R_SP, fr.local_off[ins.b])
+                a64_set_temp(cb, &fr, ins.a, 9)
+            } else if k == mir.MI_LOAD_PTR {
+                a64_operand(cb, f, &fr, 10, ins.b)
+                $w := ins.d
+                if w != 1 && w != 4 { w = 8 }
+                a64_mem(cb, false, w, 9, 10, ins.c)
+                a64_set_temp(cb, &fr, ins.a, 9)
+            } else if k == mir.MI_STORE_PTR {
+                a64_operand(cb, f, &fr, 10, ins.a)
+                a64_operand(cb, f, &fr, 9, ins.b)
+                $w := ins.d
+                if w != 1 && w != 4 { w = 8 }
+                a64_mem(cb, true, w, 9, 10, ins.c)
+            } else if k == mir.MI_BIN {
+                a64_operand(cb, f, &fr, 9, ins.c)
+                a64_operand(cb, f, &fr, 10, ins.d)
+                a64_bin(cb, ins.b)
+                a64_set_temp(cb, &fr, ins.a, 9)
+            } else if k == mir.MI_COPY {
+                a64_operand(cb, f, &fr, 9, ins.b)
+                a64_set_temp(cb, &fr, ins.a, 9)
+            } else if k == mir.MI_CALL {
+                $a := ins.c
+                $i := 0
+                while a >= 0 {
+                    if i < 8 {
+                        a64_operand(cb, f, &fr, i, f.margs[a].v)
+                    } else {
+                        a64_operand(cb, f, &fr, 9, f.margs[a].v)
+                        a64_str(cb, 9, R_SP, (i - 8) * 8)
+                    }
+                    i += 1
+                    a = f.margs[a].next
+                }
+                a64_branch_reloc(cb, relocs, 0x94000000, ins.sval, mc.RELOC_ARM64_CALL26)
+                a64_set_temp(cb, &fr, ins.a, 0)
+            } else if k == mir.MI_STR_CONST {
+                strs.push(StrFix{adr_off: cb.len(), bytes: ins.sval + ""})
+                e32(cb, 0x10000000 | 9)
+                a64_set_temp(cb, &fr, ins.a, 9)
+            } else {
+                // Unknown kinds are a lowering bug; trap loudly at run time.
+                e32(cb, 0xD4200000)
+            }
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        if blk.tkind == mir.TKIND_RETURN {
+            a64_operand(cb, f, &fr, 0, blk.ta)
+            a64_branch_reloc(cb, relocs, 0x14000000, epilogue, mc.RELOC_ARM64_CALL26)
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                a64_branch_reloc(cb, relocs, 0x14000000, f.label + "_bb" + str(blk.ta), mc.RELOC_ARM64_CALL26)
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            a64_operand(cb, f, &fr, 9, blk.ta)
+            a64_branch_reloc(cb, relocs, 0xB5000000 | 9, f.label + "_bb" + str(blk.tb), mc.RELOC_ARM64_COND_BR19)
+            if blk.tc != bi + 1 {
+                a64_branch_reloc(cb, relocs, 0x14000000, f.label + "_bb" + str(blk.tc), mc.RELOC_ARM64_CALL26)
+            }
+        } else {
+            // Open block at function end: return 0.
+            a64_mov_imm(cb, 0, 0)
+            a64_branch_reloc(cb, relocs, 0x14000000, epilogue, mc.RELOC_ARM64_CALL26)
+        }
+    }
+    syms.define_label(epilogue, cb.len())
+    e32(cb, 0x910003BF)
+    e32(cb, 0xA8C17BFD)
+    e32(cb, 0xD65F03C0)
+    // String literal pool, patched into the ADR instructions above.
+    for si in 0:strs.len {
+        pos := cb.len()
+        s := strs[si].bytes
+        for bi2 in 0:s.len {
+            cb.emit_u8(s[bi2])
+        }
+        cb.emit_u8(0)
+        while cb.len() % 4 != 0 {
+            cb.emit_u8(0)
+        }
+        at := strs[si].adr_off
+        disp := pos - at
+        word := 0x10000000 | ((disp & 3) << 29) | (((disp >> 2) & 0x7ffff) << 5) | 9
+        cb.patch_u32_le(at, word)
+    }
+}
+
+// Process entry, raw system call and runtime-state accessor shared by all
+// functions. tgt_os uses target.OS_* codes.
+pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string) {
+    linux := tgt_os == target.OS_LINUX
+    // __xu_start: keep argc/argv, map the state block into x28, run main,
+    // exit with its result.
+    syms.define_label("__xu_start", cb.len())
+    if linux {
+        a64_ldr(cb, 19, R_SP, 0)
+        a64_add_imm(cb, 20, R_SP, 8)
+    } else {
+        a64_mov(cb, 19, 0)
+        a64_mov(cb, 20, 1)
+    }
+    a64_mov_imm(cb, 0, 0)
+    a64_mov_imm(cb, 1, 65536)
+    a64_mov_imm(cb, 2, 3)
+    a64_mov_imm(cb, 4, -1)
+    a64_mov_imm(cb, 5, 0)
+    if linux {
+        a64_mov_imm(cb, 3, 34)
+        a64_mov_imm(cb, 8, 222)
+        e32(cb, 0xD4000001)
+    } else {
+        a64_mov_imm(cb, 3, 4098)
+        a64_mov_imm(cb, 16, 197)
+        e32(cb, 0xD4001001)
+    }
+    a64_mov(cb, R_STATE, 0)
+    a64_str(cb, 19, R_STATE, 0)
+    a64_str(cb, 20, R_STATE, 8)
+    a64_branch_reloc(cb, relocs, 0x94000000, main_label, mc.RELOC_ARM64_CALL26)
+    if linux {
+        a64_mov_imm(cb, 8, 94)
+        e32(cb, 0xD4000001)
+    } else {
+        a64_mov_imm(cb, 16, 1)
+        e32(cb, 0xD4001001)
+    }
+    // __xu_syscall(nr, a, b, c, d, e, f) -> result or -errno.
+    syms.define_label("__xu_syscall", cb.len())
+    if linux {
+        a64_mov(cb, 8, 0)
+    } else {
+        a64_mov(cb, 16, 0)
+    }
+    for i in 0:6 {
+        a64_mov(cb, i, i + 1)
+    }
+    if linux {
+        e32(cb, 0xD4000001)
+    } else {
+        e32(cb, 0xD4001001)
+        // b.cc +8 ; neg x0, x0  (carry set means x0 holds errno)
+        e32(cb, 0x54000043)
+        e32(cb, 0xCB0003E0)
+    }
+    e32(cb, 0xD65F03C0)
+    syms.define_label("__xu_globals", cb.len())
+    a64_mov(cb, 0, R_STATE)
+    e32(cb, 0xD65F03C0)
+}

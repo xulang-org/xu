@@ -1,0 +1,288 @@
+@runtime/core
+// Runtime core for the clean-architecture compiler.
+//
+// Everything above the machine is ordinary Xu written on five intrinsics
+// that only this package may call:
+//   rt_syscall(nr, a, b, c, d, e, f)  raw system call; errors are -errno
+//   rt_load(addr, width)              read 1, 4 or 8 bytes
+//   rt_store(addr, width, value)      write 1, 4 or 8 bytes
+//   rt_addr(&x)                       address behind a reference
+//   rt_globals()                      process-wide state block (zeroed)
+//
+// Strings and dynamic arrays share one descriptor: {ptr, len, cap} words.
+// Compiler-generated calls pass descriptors and element buffers as raw
+// addresses (int), so these entry points stay independent of element types.
+//
+// Memory is never returned to the system yet: free is a no-op and the
+// allocator is a bump pointer over large anonymous mappings.
+
+// rt_globals() layout, in words.
+const G_ARGC = 0
+const G_ARGV = 1
+const G_HEAP_CUR = 2
+const G_HEAP_END = 3
+
+const OS_MACOS = 0
+const OS_LINUX = 1
+
+const HEAP_CHUNK = 4194304
+
+fn os_code() int {
+    << xu_target_os()
+}
+
+fn sys_nr_write() int {
+    if os_code() == OS_LINUX { << 64 }
+    << 4
+}
+
+fn sys_nr_exit() int {
+    if os_code() == OS_LINUX { << 94 }
+    << 1
+}
+
+fn sys_nr_mmap() int {
+    if os_code() == OS_LINUX { << 222 }
+    << 197
+}
+
+fn map_anon_flags() int {
+    if os_code() == OS_LINUX { << 34 }
+    << 4098
+}
+
+fn gword(i int) int {
+    << rt_load(rt_globals() + i * 8, 8)
+}
+
+fn set_gword(i int, v int) {
+    rt_store(rt_globals() + i * 8, 8, v)
+}
+
+pub fn exit_process(code int) {
+    rt_syscall(sys_nr_exit(), code, 0, 0, 0, 0, 0)
+}
+
+pub fn write_fd(fd int, ptr int, n int) int {
+    $done := 0
+    while done < n {
+        r := rt_syscall(sys_nr_write(), fd, ptr + done, n - done, 0, 0, 0)
+        if r <= 0 {
+            << done
+        }
+        done += r
+    }
+    << done
+}
+
+fn map_pages(size int) int {
+    r := rt_syscall(sys_nr_mmap(), 0, size, 3, map_anon_flags(), -1, 0)
+    if r < 0 && r > -4096 {
+        fatal_no_memory()
+    }
+    << r
+}
+
+fn fatal_no_memory() {
+    msg := "fatal error: out of memory\n"
+    write_fd(2, str_ptr(&msg), msg.len)
+    exit_process(2)
+}
+
+// Zeroed, 16-byte aligned block of at least size bytes.
+pub fn alloc(size int) int {
+    $n := (size + 15) / 16 * 16
+    if n <= 0 {
+        n = 16
+    }
+    $cur := gword(G_HEAP_CUR)
+    if cur == 0 || cur + n > gword(G_HEAP_END) {
+        $chunk := HEAP_CHUNK
+        if n > chunk {
+            chunk = (n + 16383) / 16384 * 16384
+        }
+        cur = map_pages(chunk)
+        set_gword(G_HEAP_END, cur + chunk)
+    }
+    set_gword(G_HEAP_CUR, cur + n)
+    << cur
+}
+
+pub fn free(ptr int) {
+}
+
+pub fn mem_copy(dst int, src int, n int) {
+    $i := 0
+    while i + 8 <= n {
+        rt_store(dst + i, 8, rt_load(src + i, 8))
+        i += 8
+    }
+    while i < n {
+        rt_store(dst + i, 1, rt_load(src + i, 1))
+        i += 1
+    }
+}
+
+pub fn mem_eq(a int, b int, n int) bool {
+    $i := 0
+    while i < n {
+        if rt_load(a + i, 1) != rt_load(b + i, 1) {
+            << false
+        }
+        i += 1
+    }
+    << true
+}
+
+// ===== descriptors =====
+
+pub fn desc_ptr(d int) int {
+    << rt_load(d, 8)
+}
+
+pub fn desc_len(d int) int {
+    << rt_load(d + 8, 8)
+}
+
+fn str_ptr(s &string) int {
+    << desc_ptr(rt_addr(s))
+}
+
+fn set_desc(d int, ptr int, n int, cap int) {
+    rt_store(d, 8, ptr)
+    rt_store(d + 8, 8, n)
+    rt_store(d + 16, 8, cap)
+}
+
+// Grow descriptor d so it can hold need elements of esize bytes.
+pub fn desc_reserve(d int, need int, esize int) {
+    cap := rt_load(d + 16, 8)
+    if need <= cap {
+        <<
+    }
+    $ncap := cap * 2
+    if ncap < 4 {
+        ncap = 4
+    }
+    if ncap < need {
+        ncap = need
+    }
+    nbuf := alloc(ncap * esize)
+    n := desc_len(d)
+    if n > 0 {
+        mem_copy(nbuf, desc_ptr(d), n * esize)
+    }
+    set_desc(d, nbuf, n, ncap)
+}
+
+// Append the esize bytes at elem to the array described by d.
+pub fn slice_push(d int, elem int, esize int) {
+    n := desc_len(d)
+    desc_reserve(d, n + 1, esize)
+    mem_copy(desc_ptr(d) + n * esize, elem, esize)
+    rt_store(d + 8, 8, n + 1)
+}
+
+// Write a fresh descriptor at out holding a copy of n bytes at src.
+pub fn bytes_new(out int, src int, n int) {
+    buf := alloc(n + 1)
+    if n > 0 {
+        mem_copy(buf, src, n)
+    }
+    set_desc(out, buf, n, n)
+}
+
+// out = a + b (string concatenation).
+pub fn str_concat(out int, a int, b int) {
+    la := desc_len(a)
+    lb := desc_len(b)
+    buf := alloc(la + lb + 1)
+    if la > 0 {
+        mem_copy(buf, desc_ptr(a), la)
+    }
+    if lb > 0 {
+        mem_copy(buf + la, desc_ptr(b), lb)
+    }
+    set_desc(out, buf, la + lb, la + lb)
+}
+
+pub fn str_eq(a int, b int) bool {
+    la := desc_len(a)
+    if la != desc_len(b) {
+        << false
+    }
+    << mem_eq(desc_ptr(a), desc_ptr(b), la)
+}
+
+// out = s[lo:hi] (bytes copied).
+pub fn str_slice(out int, s int, lo int, hi int) {
+    bytes_new(out, desc_ptr(s) + lo, hi - lo)
+}
+
+// out = a[lo:hi] for an array of esize-byte elements (elements copied).
+pub fn slice_slice(out int, a int, lo int, hi int, esize int) {
+    n := hi - lo
+    buf := alloc(n * esize)
+    if n > 0 {
+        mem_copy(buf, desc_ptr(a) + lo * esize, n * esize)
+    }
+    set_desc(out, buf, n, n)
+}
+
+// ===== printing =====
+
+pub fn print_desc(fd int, d int, newline bool) {
+    write_fd(fd, desc_ptr(d), desc_len(d))
+    if newline {
+        $nl := 10
+        write_fd(fd, rt_addr(&nl), 1)
+    }
+}
+
+pub fn print_int(fd int, v int, newline bool) {
+    base := alloc(24)
+    $pos := 24
+    $x := v
+    if x == 0 {
+        pos -= 1
+        rt_store(base + pos, 1, 48)
+    }
+    while x != 0 {
+        $d := x % 10
+        x = x / 10
+        if d < 0 {
+            d = 0 - d
+        }
+        pos -= 1
+        rt_store(base + pos, 1, 48 + d)
+    }
+    if v < 0 {
+        pos -= 1
+        rt_store(base + pos, 1, 45)
+    }
+    write_fd(fd, base + pos, 24 - pos)
+    if newline {
+        $nl := 10
+        write_fd(fd, rt_addr(&nl), 1)
+    }
+}
+
+pub fn print_bool(fd int, b bool, newline bool) {
+    if b {
+        s := "true"
+        print_desc(fd, rt_addr(&s), newline)
+    } else {
+        s := "false"
+        print_desc(fd, rt_addr(&s), newline)
+    }
+}
+
+pub fn index_panic(i int, n int) {
+    msg := "panic: index out of range ["
+    print_desc(2, rt_addr(&msg), false)
+    print_int(2, i, false)
+    mid := "] with length "
+    print_desc(2, rt_addr(&mid), false)
+    print_int(2, n, true)
+    exit_process(2)
+}
