@@ -57,7 +57,7 @@ def registry_ids() -> list[int]:
     if not REG.is_file():
         return []
     ids: list[int] = []
-    for line in REG.read_text().splitlines():
+    for line in REG.read_text(encoding="utf-8").splitlines():
         m = ID_ROW.match(line)
         if not m:
             continue
@@ -71,7 +71,7 @@ def retired_registry_ids() -> set[int]:
     if not REG.is_file():
         return set()
     out: set[int] = set()
-    for line in REG.read_text().splitlines():
+    for line in REG.read_text(encoding="utf-8").splitlines():
         m = ID_ROW.match(line)
         if m and "retired" in line.lower():
             out.add(int(m.group(1)))
@@ -81,7 +81,7 @@ def retired_registry_ids() -> set[int]:
 def scan(paths: list[Path], pattern: re.Pattern[str]) -> set[int]:
     out: set[int] = set()
     for path in paths:
-        for m in pattern.finditer(path.read_text()):
+        for m in pattern.finditer(path.read_text(encoding="utf-8")):
             n = int(m.group(1))
             if n < 0:
                 out.add(n)
@@ -91,7 +91,7 @@ def scan(paths: list[Path], pattern: re.Pattern[str]) -> set[int]:
 def scan_by_file(paths: list[Path], pattern: re.Pattern[str]) -> dict[int, list[Path]]:
     out: dict[int, list[Path]] = {}
     for path in paths:
-        for m in pattern.finditer(path.read_text()):
+        for m in pattern.finditer(path.read_text(encoding="utf-8")):
             n = int(m.group(1))
             if n < 0:
                 out.setdefault(n, []).append(path)

@@ -1506,16 +1506,20 @@ class BoundaryCheck:
                 "printf '%s\\n' \"$GEN1_PARSE\""
             )
             try:
+                sh_env_path = os.environ.get("PATH", "/usr/bin:/bin")
+                sh_bin = Path(shell)
+                if sh_bin.parent.name == "bin" and (sh_bin.parent.parent / "usr" / "bin").is_dir():
+                    sh_env_path = f"{sh_bin.parent.parent / 'usr' / 'bin'}{os.pathsep}{sh_env_path}"
                 proc = subprocess.run(
                     [shell, "-c", command],
                     cwd=self.root,
                     env={
-                        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                        "PATH": sh_env_path,
                         "LC_ALL": "C",
                     },
                     text=True,
                     capture_output=True,
-                    timeout=5,
+                    timeout=45,
                     check=False,
                 )
             except (OSError, subprocess.SubprocessError) as exc:
