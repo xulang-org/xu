@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.12.2-dev.1（开发版）
+
+从 `0.12.0-dev.1` 恢复可自举的产品编译器（`src/cmd/compile`、`src/xu`）。0.12.1 发布的整洁架构编译器会错误编译常见程序（`for` 区间循环、结构体切片字段、字符串拼接与比较、返回结构体），也无法编译自身，导致托管 seed → Gen1 → Gen2 → Gen3 自举链中断。恢复后，自举链重新达到 Gen2/Gen3 逐字节一致的不动点。整洁架构编译器作为实验源码保留在 `src/xunext`，入口为 `src/cmd/xunext`；在它能够自举之前不进入产品自举链。`internal/modulepath` 的前缀匹配恢复为对任意前缀生效。
+
 ## Xu 0.12.1
 
 - 编译器现代化整洁架构（Clean Architecture）：彻底清空历史遗留的单包大泥球巨石代码（累计净减 12.5 万行），从零建立起严格的无环模块化分层架构（L0 Span/Token/Lexer/AST/Parser -> L3 MIR -> L4 MC/Target/Codegen/Obj -> L5 Driver -> L6 CLI）。
