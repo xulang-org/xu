@@ -1,0 +1,260 @@
+@runtime/core
+// sys_event_set(op, handle, fd, interest, token, timeout_ns): a non-owning
+// socket event set on kqueue (macOS) or epoll (Linux), used by net/poller.
+// Ops: create 0, add 1, modify 2, remove 3, wait 4, close 5, wake 6.
+// Interest and result bits: read 1, write 2, error 4, hang-up 8.
+// The ok value is a byte string: create gives the 8-byte handle, wait up to
+// 64 (token, events) pairs of little-endian words; other ops give "".
+// A wake is delivered with token -1. On Linux the handle packs the epoll
+// descriptor (low 32 bits) and a wake eventfd (high 32 bits).
+// Waits block the whole process: tasks are not rescheduled meanwhile.
+
+const ES_MAX = 64
+
+fn es_word_string(out int, v int) {
+    buf := alloc(8)
+    rt_store(buf, 8, v)
+    set_desc(out, buf, 8, 8)
+}
+
+fn es_fail(e int) int {
+    << host_err_msg(host_errno_text(e))
+}
+
+// kevent(kq, changes, nchanges, events, nevents, timeout).
+fn es_kevent(kq int, ch int, nch int, ev int, nev int, ts int) int {
+    << rt_syscall(363, kq, ch, nch, ev, nev, ts)
+}
+
+fn es_kev(at int, ident int, filter int, flags int, fflags int, udata int) {
+    rt_store(at, 8, ident)
+    rt_store(at + 8, 1, filter & 255)
+    rt_store(at + 9, 1, 255)
+    rt_store(at + 10, 1, flags & 255)
+    rt_store(at + 11, 1, (flags >> 8) & 255)
+    rt_store(at + 12, 4, fflags)
+    rt_store(at + 16, 8, 0)
+    rt_store(at + 24, 8, udata)
+}
+
+fn es_close_fd(fd int) int {
+    << rt_syscall(host_nr(6, 57), fd, 0, 0, 0, 0, 0)
+}
+
+pub fn intrin_event_set(out int, op int, handle int, fd int, interest int, token int, timeout int) int {
+    set_desc(out, 0, 0, 0)
+    if op < 0 || op > 6 {
+        << host_err_msg("invalid argument")
+    }
+    if host_linux() {
+        << es_linux(out, op, handle, fd, interest, token, timeout)
+    }
+    << es_darwin(out, op, handle, fd, interest, token, timeout)
+}
+
+fn es_darwin(out int, op int, kq int, fd int, interest int, token int, timeout int) int {
+    if op == 0 {
+        q := rt_syscall(362, 0, 0, 0, 0, 0, 0)
+        if q < 0 {
+            << es_fail(0 - q)
+        }
+        rt_syscall(92, q, 2, 1, 0, 0, 0)
+        ch := alloc(32)
+        // EVFILT_USER with EV_ADD|EV_CLEAR carries wakes.
+        es_kev(ch, 0, -10, 33, 0, -1)
+        r := es_kevent(q, ch, 1, 0, 0, 0)
+        if r < 0 {
+            es_close_fd(q)
+            << es_fail(0 - r)
+        }
+        es_word_string(out, q)
+        << 0
+    }
+    if op >= 1 && op <= 3 {
+        ch := alloc(64)
+        for i in 0:2 {
+            $flags := 2
+            if op != 3 {
+                // EV_ADD|EV_ENABLE or EV_ADD|EV_DISABLE per direction.
+                flags = 9
+                if (interest & (1 << i)) != 0 {
+                    flags = 5
+                }
+            }
+            es_kev(ch + i * 32, fd, -1 - i, flags, 0, token)
+        }
+        r := es_kevent(kq, ch, 2, 0, 0, 0)
+        if r == -2 && op == 3 {
+            << 0
+        }
+        if r < 0 {
+            << es_fail(0 - r)
+        }
+        << 0
+    }
+    if op == 4 {
+        $ts := 0
+        if timeout != 0 {
+            ts = alloc(16)
+            if timeout > 0 {
+                rt_store(ts, 8, timeout / 1000000000)
+                rt_store(ts + 8, 8, timeout % 1000000000)
+            }
+        }
+        evs := alloc(ES_MAX * 32)
+        r := es_kevent(kq, 0, 0, evs, ES_MAX, ts)
+        if r == 0 - EINTR {
+            << 0
+        }
+        if r < 0 {
+            << es_fail(0 - r)
+        }
+        if r == 0 {
+            << 0
+        }
+        buf := alloc(r * 16)
+        for i in 0:r {
+            e := evs + i * 32
+            $bits := 2
+            if rt_load(e + 8, 1) == 255 {
+                bits = 1
+            }
+            hi := rt_load(e + 11, 1)
+            if (hi & 128) != 0 {
+                bits = bits | 8
+            }
+            if (hi & 64) != 0 {
+                bits = bits | 4
+            }
+            rt_store(buf + i * 16, 8, rt_load(e + 24, 8))
+            rt_store(buf + i * 16 + 8, 8, bits)
+        }
+        set_desc(out, buf, r * 16, r * 16)
+        << 0
+    }
+    if op == 5 {
+        r := es_close_fd(kq)
+        if r < 0 {
+            << es_fail(0 - r)
+        }
+        << 0
+    }
+    // wake: NOTE_TRIGGER on the user event.
+    ch := alloc(32)
+    es_kev(ch, 0, -10, 0, 16777216, -1)
+    while true {
+        r := es_kevent(kq, ch, 1, 0, 0, 0)
+        if r != 0 - EINTR {
+            if r < 0 {
+                << es_fail(0 - r)
+            }
+            << 0
+        }
+    }
+    << 0
+}
+
+fn es_linux(out int, op int, handle int, fd int, interest int, token int, timeout int) int {
+    ep := handle & 4294967295
+    wfd := (handle >> 32) & 4294967295
+    if op == 0 {
+        q := rt_syscall(20, 524288, 0, 0, 0, 0, 0)
+        if q < 0 {
+            << es_fail(0 - q)
+        }
+        w := rt_syscall(19, 0, 526336, 0, 0, 0, 0)
+        if w < 0 {
+            es_close_fd(q)
+            << es_fail(0 - w)
+        }
+        ev := alloc(16)
+        rt_store(ev, 4, 1)
+        rt_store(ev + 8, 8, -1)
+        r := rt_syscall(21, q, 1, w, ev, 0, 0)
+        if r < 0 {
+            es_close_fd(q)
+            es_close_fd(w)
+            << es_fail(0 - r)
+        }
+        es_word_string(out, q | (w << 32))
+        << 0
+    }
+    if op >= 1 && op <= 3 {
+        ev := alloc(16)
+        rt_store(ev, 4, (interest & 1) | ((interest & 2) << 1))
+        rt_store(ev + 8, 8, token)
+        $ctl := 1
+        if op == 2 { ctl = 3 }
+        if op == 3 { ctl = 2 }
+        r := rt_syscall(21, ep, ctl, fd, ev, 0, 0)
+        if r == -2 && op == 3 {
+            << 0
+        }
+        if r < 0 {
+            << es_fail(0 - r)
+        }
+        << 0
+    }
+    if op == 4 {
+        $ms := -1
+        if timeout < 0 {
+            ms = 0
+        } else if timeout > 0 {
+            ms = (timeout + 999999) / 1000000
+            if ms > 2147483647 {
+                ms = 2147483647
+            }
+        }
+        evs := alloc(ES_MAX * 16)
+        r := rt_syscall(22, ep, evs, ES_MAX, ms, 0, 0)
+        if r == 0 - EINTR || r == 0 {
+            << 0
+        }
+        if r < 0 {
+            << es_fail(0 - r)
+        }
+        buf := alloc(r * 16)
+        for i in 0:r {
+            e := evs + i * 16
+            tok := rt_load(e + 8, 8)
+            kbits := rt_load(e, 4)
+            $bits := 0
+            if tok == -1 {
+                drain := alloc(8)
+                rt_syscall(63, wfd, drain, 8, 0, 0, 0)
+            } else {
+                if (kbits & 1) != 0 { bits = bits | 1 }
+                if (kbits & 4) != 0 { bits = bits | 2 }
+                if (kbits & 8) != 0 { bits = bits | 4 }
+                if (kbits & 16) != 0 { bits = bits | 8 }
+            }
+            rt_store(buf + i * 16, 8, tok)
+            rt_store(buf + i * 16 + 8, 8, bits)
+        }
+        set_desc(out, buf, r * 16, r * 16)
+        << 0
+    }
+    if op == 5 {
+        r := es_close_fd(ep)
+        r2 := es_close_fd(wfd)
+        if r < 0 {
+            << es_fail(0 - r)
+        }
+        if r2 < 0 {
+            << es_fail(0 - r2)
+        }
+        << 0
+    }
+    one := alloc(8)
+    rt_store(one, 8, 1)
+    while true {
+        r := rt_syscall(64, wfd, one, 8, 0, 0, 0)
+        if r != 0 - EINTR {
+            if r < 0 && r != -11 {
+                << es_fail(0 - r)
+            }
+            << 0
+        }
+    }
+    << 0
+}
