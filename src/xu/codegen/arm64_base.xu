@@ -346,6 +346,109 @@ fn a64_put(cb $&mc.CodeBuffer, fr &A64Frame, ra &RaInfo, t int, rs int) {
     a64_set_temp(cb, fr, t, rs)
 }
 
+fn a64_cond_of(op int) int {
+    if op == mir.BIN_NE { << target.ARM64_COND_NE }
+    if op == mir.BIN_LT { << target.ARM64_COND_LT }
+    if op == mir.BIN_LE { << target.ARM64_COND_LE }
+    if op == mir.BIN_GT { << target.ARM64_COND_GT }
+    if op == mir.BIN_GE { << target.ARM64_COND_GE }
+    << target.ARM64_COND_EQ
+}
+
+fn a64_is_icmp(op int) bool {
+    << op >= mir.BIN_EQ && op <= mir.BIN_GE
+}
+
+// Constant operand v as a 12-bit unsigned immediate, or -1.
+fn a64_imm12(f &mir.MFn, v int) int {
+    if v <= -2 {
+        c := f.consts[0 - v - 2]
+        if c >= 0 && c < 4096 {
+            << c
+        }
+    }
+    << -1
+}
+
+// cmp c, d using the immediate form when d allows it.
+fn a64_cmp_vals(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, c int, d int) {
+    rn := a64_src(cb, f, fr, ra, c, 9)
+    imm := a64_imm12(f, d)
+    if imm >= 0 {
+        e32(cb, 0xF100001F | (imm << 10) | (rn << 5))
+        <<
+    }
+    rm := a64_src(cb, f, fr, ra, d, 10)
+    a64_cmp(cb, rn, rm)
+}
+
+// Integer op with a constant right operand as one instruction; false when
+// no such form applies.
+fn a64_bin_imm(cb $&mc.CodeBuffer, f &mir.MFn, op int, rd int, rn int, d int) bool {
+    imm := a64_imm12(f, d)
+    if imm >= 0 && op == mir.BIN_ADD {
+        e32(cb, 0x91000000 | (imm << 10) | (rn << 5) | rd)
+        << true
+    }
+    if imm >= 0 && op == mir.BIN_SUB {
+        e32(cb, 0xD1000000 | (imm << 10) | (rn << 5) | rd)
+        << true
+    }
+    if d <= -2 && (op == mir.BIN_SHL || op == mir.BIN_SHR) {
+        sh := f.consts[0 - d - 2] & 63
+        if op == mir.BIN_SHR {
+            // asr rd, rn, #sh
+            e32(cb, 0x9340FC00 | (sh << 16) | (rn << 5) | rd)
+        } else {
+            // lsl rd, rn, #sh
+            e32(cb, 0xD3400000 | (((64 - sh) & 63) << 16) | ((63 - sh) << 10) | (rn << 5) | rd)
+        }
+        << true
+    }
+    << false
+}
+
+// For a block ending in t1 = x < 0; t2 = x >= n; t3 = t1 | t2 (tagged
+// "bounds"); branch t3, with each temp read once: the three instruction
+// ids, x and n. Empty otherwise.
+fn a64_bounds_check(f &mir.MFn, bi int, uses &[]int, opt bool) []int {
+    $out := []int{}
+    blk := ~f.blocks[bi]
+    if !opt || blk.tkind != mir.TKIND_BRANCH {
+        << out
+    }
+    $ids := []int{}
+    $ii := blk.head
+    while ii >= 0 {
+        ids.push(ii)
+        ii = f.instrs[ii].next
+    }
+    if ids.len < 3 {
+        << out
+    }
+    i1 := ~f.instrs[ids[ids.len - 3]]
+    i2 := ~f.instrs[ids[ids.len - 2]]
+    i3 := ~f.instrs[ids[ids.len - 1]]
+    if i3.kind != mir.MI_BIN || i3.b != mir.BIN_OR || i3.sval != "bounds" || i3.a != blk.ta {
+        << out
+    }
+    if i1.kind != mir.MI_BIN || i1.b != mir.BIN_LT || i2.kind != mir.MI_BIN || i2.b != mir.BIN_GE {
+        << out
+    }
+    if i3.c != i1.a || i3.d != i2.a || i1.c != i2.c || i1.d > -2 || f.consts[0 - i1.d - 2] != 0 {
+        << out
+    }
+    if i1.a < 0 || i2.a < 0 || i3.a < 0 || uses[i1.a] != 1 || uses[i2.a] != 1 || uses[i3.a] != 1 {
+        << out
+    }
+    out.push(ids[ids.len - 3])
+    out.push(ids[ids.len - 2])
+    out.push(ids[ids.len - 1])
+    out.push(i1.c)
+    out.push(i2.d)
+    << out
+}
+
 struct StrFix {
     adr_off int
     bytes string
@@ -412,12 +515,25 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
     }
     $strs := []StrFix{}
+    $uses := []int{}
+    if opt {
+        uses = temp_use_counts(f)
+    }
     // Local labels use "." so they cannot collide with any function label.
     epilogue := f.label + ".ret"
     for bi in 0:f.blocks.len {
         syms.define_label(f.label + ".bb" + str(bi), cb.len())
+        // A compare feeding only this block's branch becomes cmp + b.cond.
+        $fused := -1
+        // A tagged bounds check (idx < 0 || idx >= len) ending the block
+        // becomes one unsigned compare.
+        bounds := a64_bounds_check(f, bi, &uses, opt)
         $ii := f.blocks[bi].head
         while ii >= 0 {
+            if bounds.len > 0 && (ii == bounds[0] || ii == bounds[1] || ii == bounds[2]) {
+                ii = f.instrs[ii].next
+                ->
+            }
             ins := ~f.instrs[ii]
             k := ins.kind
             if ins.line > 0 && ins.line != last_line {
@@ -425,7 +541,20 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 lines.push(cb.len())
                 lines.push(last_line)
             }
-            if k == mir.MI_LOAD_LOCAL {
+            if opt && k == mir.MI_BIN && ins.next < 0 && a64_is_icmp(ins.b) && f.blocks[bi].tkind == mir.TKIND_BRANCH && f.blocks[bi].ta == ins.a && ins.a >= 0 && uses[ins.a] == 1 {
+                a64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
+                fused = a64_cond_of(ins.b)
+            } else if opt && k == mir.MI_BIN && a64_is_icmp(ins.b) && a64_imm12(f, ins.d) >= 0 {
+                a64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
+                rd := a64_dst(&ra, ins.a, 9)
+                a64_cset(cb, rd, a64_cond_of(ins.b))
+                a64_put(cb, &fr, &ra, ins.a, rd)
+            } else if opt && k == mir.MI_BIN && ins.c > -2 && ins.d <= -2 && (ins.b == mir.BIN_ADD || ins.b == mir.BIN_SUB || ins.b == mir.BIN_SHL || ins.b == mir.BIN_SHR) && (a64_imm12(f, ins.d) >= 0 || ins.b == mir.BIN_SHL || ins.b == mir.BIN_SHR) {
+                rn := a64_src(cb, f, &fr, &ra, ins.c, 9)
+                rd := a64_dst(&ra, ins.a, 9)
+                a64_bin_imm(cb, f, ins.b, rd, rn, ins.d)
+                a64_put(cb, &fr, &ra, ins.a, rd)
+            } else if k == mir.MI_LOAD_LOCAL {
                 lr := ra.local_reg[ins.b]
                 if lr >= 0 {
                     a64_put(cb, &fr, &ra, ins.a, lr)
@@ -523,6 +652,26 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         } else if blk.tkind == mir.TKIND_JUMP {
             if blk.ta != bi + 1 {
                 a64_branch_reloc(cb, relocs, 0x14000000, f.label + ".bb" + str(blk.ta), mc.RELOC_ARM64_CALL26)
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH && bounds.len > 0 {
+            a64_cmp_vals(cb, f, &fr, &ra, bounds[3], bounds[4])
+            // b.hs / b.lo
+            if blk.tb == bi + 1 {
+                a64_branch_reloc(cb, relocs, 0x54000003, f.label + ".bb" + str(blk.tc), mc.RELOC_ARM64_COND_BR19)
+            } else {
+                a64_branch_reloc(cb, relocs, 0x54000002, f.label + ".bb" + str(blk.tb), mc.RELOC_ARM64_COND_BR19)
+                if blk.tc != bi + 1 {
+                    a64_branch_reloc(cb, relocs, 0x14000000, f.label + ".bb" + str(blk.tc), mc.RELOC_ARM64_CALL26)
+                }
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH && fused >= 0 {
+            if blk.tb == bi + 1 {
+                a64_branch_reloc(cb, relocs, 0x54000000 | (fused ^ 1), f.label + ".bb" + str(blk.tc), mc.RELOC_ARM64_COND_BR19)
+            } else {
+                a64_branch_reloc(cb, relocs, 0x54000000 | fused, f.label + ".bb" + str(blk.tb), mc.RELOC_ARM64_COND_BR19)
+                if blk.tc != bi + 1 {
+                    a64_branch_reloc(cb, relocs, 0x14000000, f.label + ".bb" + str(blk.tc), mc.RELOC_ARM64_CALL26)
+                }
             }
         } else if blk.tkind == mir.TKIND_BRANCH {
             rc := a64_src(cb, f, &fr, &ra, blk.ta, 9)
