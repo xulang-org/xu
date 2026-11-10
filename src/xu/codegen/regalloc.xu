@@ -1,110 +1,480 @@
 @xu/codegen
-// Register allocator state and physical register mapping.
+// Register allocation for the typed backends: linear scan over
+// conservative live intervals of temps and of scalar locals whose address
+// is never taken.
 //
-// Layer 4C module: decoupled register allocator managing physical register
-// allocation, spilling, and caller/callee-saved register tracking.
+// Positions number the instructions in block order: instruction k uses
+// its operands at 2k and defines its result at 2k + 1; a call clobbers the
+// caller-saved registers at 2k + 1. A value live in a block's entry or
+// exit covers the whole block. Values that cross a call get callee-saved
+// registers; anything left over keeps its frame slot.
 
-#xu/target
+#xu/mir
 
-pub struct RegBinding {
-    pub vreg int
-    pub preg int
-    pub is_dirty bool
-    pub is_pinned bool
+pub struct RaInfo {
+    pub temp_reg []int
+    pub local_reg []int
+    pub used_callee []int
 }
 
-pub struct RegAlloc {
-    pub target target.Target
-    pub num_pregs int
-    pub bindings []RegBinding
-    pub free_regs []int
-}
-
-pub fn regalloc_new(t &target.Target, num_pregs int) RegAlloc {
-    $free_list := []int{}
-    for i in 0:num_pregs {
-        free_list.push(i)
+// Every value in its frame slot.
+pub fn ra_none(f &mir.MFn) RaInfo {
+    $t := []int{}
+    for _ in 0:f.temps.len {
+        t.push(-1)
     }
-    << RegAlloc{
-        target: ~t,
-        num_pregs: num_pregs,
-        bindings: []RegBinding{},
-        free_regs: free_list
+    $l := []int{}
+    for _ in 0:f.locals.len {
+        l.push(-1)
+    }
+    << RaInfo{temp_reg: t, local_reg: l, used_callee: []int{}}
+}
+
+struct RaScan {
+    nt int
+    start []int
+    end []int
+    home []int
+    first_def []bool
+    is_global []bool
+    calls []int
+}
+
+fn ra_touch(s $&RaScan, v int, pos int, blk int, is_def bool) {
+    if v < 0 || v >= s.start.len {
+        <<
+    }
+    if s.home[v] == -1 {
+        s.home[v] = blk
+        s.first_def[v] = is_def
+    } else if s.home[v] != blk {
+        s.is_global[v] = true
+    }
+    if pos < s.start[v] {
+        s.start[v] = pos
+    }
+    if pos > s.end[v] {
+        s.end[v] = pos
     }
 }
 
-pub fn (ra $&RegAlloc) alloc_reg(vreg int) int {
-    if ra.free_regs.len > 0 {
-        last_idx := ra.free_regs.len - 1
-        preg := ra.free_regs[last_idx]
-        $next_free := []int{}
-        for i in 0:last_idx {
-            next_free.push(ra.free_regs[i])
+fn ra_use(s $&RaScan, v int, pos int, blk int) {
+    if v >= 0 && v < s.nt {
+        ra_touch(s, v, pos, blk, false)
+    }
+}
+
+// The vreg operands an instruction reads, and the one it writes (-1 none).
+fn ra_scan_instr(f &mir.MFn, s $&RaScan, ins &mir.MInstr, pos int, blk int, cand &[]bool) {
+    k := ins.kind
+    nt := s.nt
+    if k == mir.MI_LOAD_LOCAL {
+        if cand[ins.b] {
+            ra_touch(s, nt + ins.b, pos, blk, false)
         }
-        ra.free_regs = next_free
-        ra.bindings.push(RegBinding{
-            vreg: vreg,
-            preg: preg,
-            is_dirty: false,
-            is_pinned: false
-        })
-        << preg
+        ra_touch(s, ins.a, pos + 1, blk, true)
+    } else if k == mir.MI_STORE_LOCAL {
+        ra_use(s, ins.b, pos, blk)
+        if cand[ins.a] {
+            ra_touch(s, nt + ins.a, pos + 1, blk, true)
+        }
+    } else if k == mir.MI_ADDR || k == mir.MI_STR_CONST || k == mir.MI_LOAD_FN_ADDR {
+        ra_touch(s, ins.a, pos + 1, blk, true)
+    } else if k == mir.MI_LOAD_PTR || k == mir.MI_COPY {
+        ra_use(s, ins.b, pos, blk)
+        ra_touch(s, ins.a, pos + 1, blk, true)
+    } else if k == mir.MI_STORE_PTR {
+        ra_use(s, ins.a, pos, blk)
+        ra_use(s, ins.b, pos, blk)
+    } else if k == mir.MI_BIN {
+        ra_use(s, ins.c, pos, blk)
+        ra_use(s, ins.d, pos, blk)
+        ra_touch(s, ins.a, pos + 1, blk, true)
+    } else if k == mir.MI_UN {
+        ra_use(s, ins.c, pos, blk)
+        ra_touch(s, ins.a, pos + 1, blk, true)
+    } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+        if k == mir.MI_CALL_IND {
+            ra_use(s, ins.b, pos, blk)
+        }
+        $a := ins.c
+        while a >= 0 {
+            ra_use(s, f.margs[a].v, pos, blk)
+            a = f.margs[a].next
+        }
+        s.calls.push(pos + 1)
+        ra_touch(s, ins.a, pos + 1, blk, true)
     }
-    // Spill required when free list is empty (-1 signals caller to spill)
+}
+
+fn ra_bit_set(bits $&[]int, base int, i int) {
+    bits[base + (i >> 6)] = bits[base + (i >> 6)] | (1 << (i & 63))
+}
+
+fn ra_bit(bits &[]int, base int, i int) bool {
+    << ((bits[base + (i >> 6)] >> (i & 63)) & 1) != 0
+}
+
+fn ra_gen(f &mir.MFn, s &RaScan, gidx &[]int, ins &mir.MInstr, use_b $&[]int, def_b $&[]int, base int, cand &[]bool) {
+    k := ins.kind
+    nt := s.nt
+    $uses := []int{}
+    $def := -1
+    if k == mir.MI_LOAD_LOCAL {
+        if cand[ins.b] {
+            uses.push(nt + ins.b)
+        }
+        def = ins.a
+    } else if k == mir.MI_STORE_LOCAL {
+        uses.push(ins.b)
+        if cand[ins.a] {
+            def = nt + ins.a
+        }
+    } else if k == mir.MI_ADDR || k == mir.MI_STR_CONST || k == mir.MI_LOAD_FN_ADDR {
+        def = ins.a
+    } else if k == mir.MI_LOAD_PTR || k == mir.MI_COPY {
+        uses.push(ins.b)
+        def = ins.a
+    } else if k == mir.MI_STORE_PTR {
+        uses.push(ins.a)
+        uses.push(ins.b)
+    } else if k == mir.MI_BIN {
+        uses.push(ins.c)
+        uses.push(ins.d)
+        def = ins.a
+    } else if k == mir.MI_UN {
+        uses.push(ins.c)
+        def = ins.a
+    } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+        if k == mir.MI_CALL_IND {
+            uses.push(ins.b)
+        }
+        $a := ins.c
+        while a >= 0 {
+            uses.push(f.margs[a].v)
+            a = f.margs[a].next
+        }
+        def = ins.a
+    }
+    for i in 0:uses.len {
+        u := uses[i]
+        if u >= 0 && u < gidx.len && gidx[u] >= 0 && !ra_bit(def_b, base, gidx[u]) {
+            ra_bit_set(use_b, base, gidx[u])
+        }
+    }
+    if def >= 0 && def < gidx.len && gidx[def] >= 0 {
+        ra_bit_set(def_b, base, gidx[def])
+    }
+}
+
+fn ra_term_use(s $&RaScan, blk &mir.MBlock, pos int, bi int) {
+    if blk.tkind == mir.TKIND_RETURN || blk.tkind == mir.TKIND_BRANCH {
+        ra_use(s, blk.ta, pos, bi)
+    }
+}
+
+// Allocate registers for f. callee lists callee-saved registers, caller
+// the scratch registers a call clobbers.
+pub fn ra_alloc(f &mir.MFn, callee &[]int, caller &[]int) RaInfo {
+    nt := f.temps.len
+    nl := f.locals.len
+    nv := nt + nl
+    $cand := []bool{}
+    for li in 0:nl {
+        cand.push(li >= f.locals_nslots.len || f.locals_nslots[li] <= 1)
+    }
+    for i in 0:f.instrs.len {
+        k := f.instrs[i].kind
+        b := f.instrs[i].b
+        a := f.instrs[i].a
+        c := f.instrs[i].c
+        if k == mir.MI_ADDR && b >= 0 && b < nl {
+            cand[b] = false
+        } else if k == mir.MI_LOAD_LOCAL && c > 0 && b >= 0 && b < nl {
+            cand[b] = false
+        } else if k == mir.MI_STORE_LOCAL && c > 0 && a >= 0 && a < nl {
+            cand[a] = false
+        }
+    }
+    $s := RaScan{nt: nt, start: []int{}, end: []int{}, home: []int{}, first_def: []bool{}, is_global: []bool{}, calls: []int{}}
+    for _ in 0:nv {
+        s.start.push(1 << 60)
+        s.end.push(-1)
+        s.home.push(-1)
+        s.first_def.push(false)
+        s.is_global.push(false)
+    }
+    // Parameters arrive at entry.
+    for i in 0:f.nparams {
+        if i < nl && cand[i] {
+            ra_touch($&s, nt + i, 0, 0, true)
+        }
+    }
+    $bstart := []int{}
+    $bend := []int{}
+    $pos := 0
+    for bi in 0:f.blocks.len {
+        bstart.push(pos)
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            ra_scan_instr(f, $&s, &ins, pos, bi, &cand)
+            pos += 2
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        ra_term_use($&s, &blk, pos, bi)
+        bend.push(pos)
+        pos += 2
+    }
+    // Values used before their first definition in a block are live into it.
+    for v in 0:nv {
+        if s.home[v] >= 0 && !s.first_def[v] {
+            s.is_global[v] = true
+        }
+    }
+    $gidx := []int{}
+    $glist := []int{}
+    for v in 0:nv {
+        if s.is_global[v] {
+            gidx.push(glist.len)
+            glist.push(v)
+        } else {
+            gidx.push(-1)
+        }
+    }
+    if glist.len > 0 {
+        ra_global_live(f, $&s, &gidx, &glist, &bstart, &bend, &cand)
+    }
+    << ra_scan(f, &s, &cand, callee, caller)
+}
+
+// Block-level liveness of the values used outside one block; their
+// intervals grow to cover every block they are live into or out of.
+fn ra_global_live(f &mir.MFn, s $&RaScan, gidx &[]int, glist &[]int, bstart &[]int, bend &[]int, cand &[]bool) {
+    nb := f.blocks.len
+    w := (glist.len + 63) / 64
+    $use_b := []int{}
+    $def_b := []int{}
+    $live_in := []int{}
+    $live_out := []int{}
+    for _ in 0:nb * w {
+        use_b.push(0)
+        def_b.push(0)
+        live_in.push(0)
+        live_out.push(0)
+    }
+    for bi in 0:nb {
+        base := bi * w
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            ra_gen(f, s, gidx, &ins, $&use_b, $&def_b, base, cand)
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        if blk.tkind == mir.TKIND_RETURN || blk.tkind == mir.TKIND_BRANCH {
+            u := blk.ta
+            if u >= 0 && u < gidx.len && gidx[u] >= 0 && !ra_bit(&def_b, base, gidx[u]) {
+                ra_bit_set($&use_b, base, gidx[u])
+            }
+        }
+    }
+    $changed := true
+    while changed {
+        changed = false
+        $bi := nb - 1
+        while bi >= 0 {
+            blk := ~f.blocks[bi]
+            base := bi * w
+            for j in 0:w {
+                $out := 0
+                if blk.tkind == mir.TKIND_JUMP {
+                    out = live_in[blk.ta * w + j]
+                } else if blk.tkind == mir.TKIND_BRANCH {
+                    out = live_in[blk.tb * w + j] | live_in[blk.tc * w + j]
+                }
+                inv := use_b[base + j] | (out & (-1 ^ def_b[base + j]))
+                if out != live_out[base + j] || inv != live_in[base + j] {
+                    live_out[base + j] = out
+                    live_in[base + j] = inv
+                    changed = true
+                }
+            }
+            bi -= 1
+        }
+    }
+    for bi in 0:nb {
+        base := bi * w
+        for g in 0:glist.len {
+            v := glist[g]
+            if ra_bit(&live_in, base, g) && bstart[bi] < s.start[v] {
+                s.start[v] = bstart[bi]
+            }
+            if ra_bit(&live_out, base, g) && bend[bi] + 1 > s.end[v] {
+                s.end[v] = bend[bi] + 1
+            }
+        }
+    }
+}
+
+fn ra_crosses_call(s &RaScan, v int) bool {
+    // calls is sorted; binary search for the first call after start
+    $lo := 0
+    $hi := s.calls.len
+    while lo < hi {
+        mid := (lo + hi) / 2
+        if s.calls[mid] <= s.start[v] {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    << lo < s.calls.len && s.calls[lo] < s.end[v]
+}
+
+fn ra_scan(f &mir.MFn, s &RaScan, cand &[]bool, callee &[]int, caller &[]int) RaInfo {
+    nt := s.nt
+    nv := s.start.len
+    $info := ra_none(f)
+    // Order values by interval start (counting sort over positions).
+    $maxp := 0
+    for v in 0:nv {
+        if s.end[v] >= 0 && s.start[v] > maxp {
+            maxp = s.start[v]
+        }
+    }
+    $count := []int{}
+    for _ in 0:maxp + 2 {
+        count.push(0)
+    }
+    for v in 0:nv {
+        if s.end[v] >= 0 && (v < nt || cand[v - nt]) {
+            count[s.start[v] + 1] += 1
+        }
+    }
+    for p in 1:count.len {
+        count[p] += count[p - 1]
+    }
+    $order := []int{}
+    for _ in 0:count[count.len - 1] {
+        order.push(0)
+    }
+    for v in 0:nv {
+        if s.end[v] >= 0 && (v < nt || cand[v - nt]) {
+            order[count[s.start[v]]] = v
+            count[s.start[v]] += 1
+        }
+    }
+    $reg := []int{}
+    for _ in 0:nv {
+        reg.push(-1)
+    }
+    $active := []int{}
+    $free_callee := []bool{}
+    for _ in 0:callee.len {
+        free_callee.push(true)
+    }
+    $free_caller := []bool{}
+    for _ in 0:caller.len {
+        free_caller.push(true)
+    }
+    $callee_used := []bool{}
+    for _ in 0:callee.len {
+        callee_used.push(false)
+    }
+    for oi in 0:order.len {
+        v := order[oi]
+        st := s.start[v]
+        // Expire intervals that ended before this one starts.
+        $keep := []int{}
+        for ai in 0:active.len {
+            a := active[ai]
+            if s.end[a] < st {
+                ra_release(reg[a], callee, caller, $&free_callee, $&free_caller)
+            } else {
+                keep.push(a)
+            }
+        }
+        active = keep
+        crosses := ra_crosses_call(s, v)
+        $r := -1
+        if !crosses {
+            for i in 0:caller.len {
+                if r < 0 && free_caller[i] {
+                    free_caller[i] = false
+                    r = caller[i]
+                }
+            }
+        }
+        for i in 0:callee.len {
+            if r < 0 && free_callee[i] {
+                free_callee[i] = false
+                callee_used[i] = true
+                r = callee[i]
+            }
+        }
+        if r < 0 {
+            // Take the register of the active value that ends last, when it
+            // ends after this one and suits it.
+            $victim := -1
+            for ai in 0:active.len {
+                a := active[ai]
+                if s.end[a] > s.end[v] && (!crosses || ra_index(callee, reg[a]) >= 0) {
+                    if victim < 0 || s.end[a] > s.end[victim] {
+                        victim = a
+                    }
+                }
+            }
+            if victim >= 0 {
+                r = reg[victim]
+                reg[victim] = -1
+                $keep2 := []int{}
+                for ai in 0:active.len {
+                    if active[ai] != victim {
+                        keep2.push(active[ai])
+                    }
+                }
+                active = keep2
+            }
+        }
+        if r >= 0 {
+            reg[v] = r
+            active.push(v)
+        }
+    }
+    for v in 0:nv {
+        if v < nt {
+            info.temp_reg[v] = reg[v]
+        } else {
+            info.local_reg[v - nt] = reg[v]
+        }
+    }
+    for i in 0:callee.len {
+        if callee_used[i] {
+            info.used_callee.push(callee[i])
+        }
+    }
+    << info
+}
+
+fn ra_index(list &[]int, r int) int {
+    for i in 0:list.len {
+        if list[i] == r {
+            << i
+        }
+    }
     << -1
 }
 
-pub fn (ra $&RegAlloc) free_reg(preg int) {
-    $next_bindings := []RegBinding{}
-    $found := false
-    for i in 0:ra.bindings.len {
-        if ra.bindings[i].preg == preg {
-            found = true
-        } else {
-            next_bindings.push(~ra.bindings[i])
-        }
+fn ra_release(r int, callee &[]int, caller &[]int, free_callee $&[]bool, free_caller $&[]bool) {
+    i := ra_index(callee, r)
+    if i >= 0 {
+        free_callee[i] = true
+        <<
     }
-    ra.bindings = next_bindings
-    if found {
-        ra.free_regs.push(preg)
+    j := ra_index(caller, r)
+    if j >= 0 {
+        free_caller[j] = true
     }
-}
-
-pub struct LocalAlloc {
-    pub local_regs []int
-    pub num_pairs int
-}
-
-pub fn alloc_locals_arm64(nlocals int, enabled bool) LocalAlloc {
-    $reg_map := []int{}
-    if !enabled || nlocals == 0 {
-        for i in 0:nlocals {
-            reg_map.push(-1)
-        }
-        << LocalAlloc{ local_regs: reg_map, num_pairs: 0 }
-    }
-
-    $pool := []int{}
-    pool.push(19)
-    pool.push(20)
-    pool.push(21)
-    pool.push(22)
-    pool.push(23)
-    pool.push(24)
-    pool.push(25)
-    pool.push(26)
-    $used := 0
-    for i in 0:nlocals {
-        if i < pool.len {
-            reg_map.push(pool[i])
-            used += 1
-        } else {
-            reg_map.push(-1)
-        }
-    }
-
-    // Round up pairs (1 or 2 regs -> 1 pair (16B); 3 or 4 regs -> 2 pairs (32B))
-    $pairs := (used + 1) / 2
-    if pairs > 4 { pairs = 4 }
-    << LocalAlloc{ local_regs: reg_map, num_pairs: pairs }
 }
