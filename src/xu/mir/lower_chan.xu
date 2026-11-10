@@ -1,0 +1,268 @@
+@xu/mir
+// Channels, `xu` tasks and select.
+//
+// A channel value is one word: the address of a runtime/core channel
+// record. Elements travel through memory: wide values by address and size,
+// scalars as one 8-byte word. Blocking and scheduling live in
+// runtime/core (chan.xu); `xu f(args)` packs the incoming argument words of
+// f into a heap block and starts f on a new task.
+
+#xu/ast
+#xu/parser
+#xu/types
+
+// Argument words handed to a task (x0-x7 plus eight stack words).
+const XU_ARG_WORDS = 16
+
+fn chan_esize(tp &types.TypedProgram, ty int) int {
+    if is_wide(tp, ty) {
+        << tp.size_of(ty)
+    }
+    << 8
+}
+
+fn (w $&Lw) chan_operand(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    v := w.lower_expr(p, tp, n)
+    if w.expr_is_ref(p, tp, n) && !types.is_chan_type(tp.type_of(n)) {
+        << w.load_ptr(v, 0, 8)
+    }
+    << v
+}
+
+// Address of memory holding value v of type ty (scalars spilled to a word).
+fn (w $&Lw) chan_value_addr(tp &types.TypedProgram, v int, ty int) int {
+    if is_wide(tp, ty) {
+        << v
+    }
+    a := w.scratch_words(1)
+    w.store_ptr(a, 0, v, 8)
+    << a
+}
+
+// Fresh frame memory for one received element of type ty.
+fn (w $&Lw) chan_elem_slot(tp &types.TypedProgram, ty int) int {
+    if is_wide(tp, ty) {
+        << w.scratch(tp, ty)
+    }
+    << w.scratch_words(1)
+}
+
+fn (w $&Lw) chan_elem_value(tp &types.TypedProgram, addr int, ty int) int {
+    if is_wide(tp, ty) {
+        << addr
+    }
+    << w.load_ptr(addr, 0, width_of(tp, ty))
+}
+
+fn (w $&Lw) chan_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    k := p.nodes[n].kind
+    if k == ast.NK_CHAN_INIT {
+        $args := []int{}
+        args.push(w.lower_expr(p, tp, p.nodes[n].b))
+        << w.call_core("chan_new", &args)
+    }
+    if k == ast.NK_RECV {
+        ch := w.chan_operand(p, tp, p.nodes[n].a)
+        ety := tp.type_of(n)
+        dst := w.chan_elem_slot(tp, ety)
+        $args := []int{}
+        args.push(ch)
+        args.push(dst)
+        args.push(w.konst(chan_esize(tp, ety)))
+        w.call_core("chan_recv", &args)
+        << w.chan_elem_value(tp, dst, ety)
+    }
+    << NOT_HANDLED
+}
+
+fn (w $&Lw) chan_call(p &parser.Parser, tp &types.TypedProgram, n int, code int) int {
+    if code == -21 {
+        $args := []int{}
+        args.push(w.chan_operand(p, tp, p.nodes[n].a))
+        w.call_core("chan_close", &args)
+        << w.konst(0)
+    }
+    << NOT_HANDLED
+}
+
+fn (w $&Lw) chan_method_call(p &parser.Parser, tp &types.TypedProgram, n int, code int) int {
+    << NOT_HANDLED
+}
+
+fn (w $&Lw) chan_stmt(p &parser.Parser, tp &types.TypedProgram, s int) bool {
+    k := p.nodes[s].kind
+    if k == ast.NK_SEND {
+        ch := w.chan_operand(p, tp, p.nodes[s].a)
+        vn := p.nodes[s].b
+        vty := tp.deref(tp.type_of(vn))
+        src := w.chan_value_addr(tp, w.lower_expr(p, tp, vn), vty)
+        $args := []int{}
+        args.push(ch)
+        args.push(src)
+        args.push(w.konst(chan_esize(tp, vty)))
+        w.call_core("chan_send", &args)
+        << true
+    }
+    if k == ast.NK_XU {
+        w.lower_xu(p, tp, s)
+        << true
+    }
+    if k == ast.NK_SELECT {
+        w.lower_select(p, tp, s)
+        << true
+    }
+    << false
+}
+
+fn (w $&Lw) fn_addr(label string) int {
+    t := w.new_temp()
+    $ins := minstr_new(MI_LOAD_FN_ADDR)
+    ins.a = t
+    ins.sval = label + ""
+    w.emit(ins)
+    << t
+}
+
+// xu f(args): copy the incoming words of f (wide values included) to the heap
+// so the task does not depend on this frame.
+fn (w $&Lw) lower_xu(p &parser.Parser, tp &types.TypedProgram, s int) {
+    call := p.nodes[s].a
+    $fi := tp.call_of(s)
+    if fi < 0 {
+        fi = tp.call_of(call)
+    }
+    if fi < 0 || fi >= tp.fns.len {
+        w.fail(p, s, "unresolved xu target")
+        <<
+    }
+    tfn := ~tp.fns[fi]
+    $lead := 0
+    $lead_size := 0
+    if tfn.may_throw {
+        lead = 1
+        if tfn.throw_ty > 0 && types.throw_index(tfn.throw_ty) < tp.throws.len {
+            ok := tp.throws[types.throw_index(tfn.throw_ty)].ok_ty
+            if ok != 0 {
+                lead_size = (tp.size_of(ok) + 7) / 8 * 8
+            }
+        }
+    } else if tfn.ret != 0 && is_wide(tp, tfn.ret) {
+        lead = 1
+        lead_size = (tp.size_of(tfn.ret) + 7) / 8 * 8
+    }
+    $extra := lead_size
+    for i in 0:tfn.params.len {
+        if is_wide(tp, tfn.params[i]) {
+            extra += (tp.size_of(tfn.params[i]) + 7) / 8 * 8
+        }
+    }
+    if lead + tfn.params.len > XU_ARG_WORDS {
+        w.fail(p, s, "too many xu arguments")
+        <<
+    }
+    $aargs := []int{}
+    aargs.push(w.konst(XU_ARG_WORDS * 8 + extra))
+    block := w.call_core("alloc", &aargs)
+    $tail := XU_ARG_WORDS * 8
+    if lead == 1 && lead_size > 0 {
+        w.store_ptr(block, 0, w.bin(BIN_ADD, block, w.konst(tail)), 8)
+        tail += lead_size
+    }
+    $arg := p.nodes[call].a
+    $pi := 0
+    while arg >= 0 {
+        $pty := 1
+        if pi < tfn.params.len {
+            pty = tfn.params[pi]
+        }
+        v := w.lower_arg(p, tp, arg, pty)
+        slot := (lead + pi) * 8
+        if is_wide(tp, pty) {
+            dst := w.bin(BIN_ADD, block, w.konst(tail))
+            w.copy_mem(dst, v, tp.size_of(pty))
+            w.store_ptr(block, slot, dst, 8)
+            tail += (tp.size_of(pty) + 7) / 8 * 8
+        } else {
+            w.store_ptr(block, slot, v, 8)
+        }
+        pi += 1
+        arg = p.nodes[arg].next
+    }
+    $args := []int{}
+    args.push(w.fn_addr("__xu_task_entry"))
+    args.push(w.fn_addr(tfn.label))
+    args.push(w.fn_addr(w.core("task_exit")))
+    args.push(block)
+    w.call_core("task_spawn", &args)
+}
+
+// select: evaluate every channel (and sent value) once, then poll the arms
+// in order; without an else arm, yield and poll again until one is ready.
+fn (w $&Lw) lower_select(p &parser.Parser, tp &types.TypedProgram, s int) {
+    $arms := []int{}
+    $chans := []int{}
+    $bufs := []int{}
+    $sizes := []int{}
+    $ar := p.nodes[s].a
+    while ar >= 0 {
+        ak := p.nodes[ar].kind
+        cslot := w.new_local(1, 1, "selch")
+        w.store_local(cslot, 0, w.chan_operand(p, tp, p.nodes[ar].a))
+        if ak == ast.NK_SEL_SEND {
+            vn := p.nodes[ar].b
+            vty := tp.deref(tp.type_of(vn))
+            v := w.lower_expr(p, tp, vn)
+            buf := w.chan_elem_slot(tp, vty)
+            if is_wide(tp, vty) {
+                w.copy_mem(buf, v, tp.size_of(vty))
+            } else {
+                w.store_ptr(buf, 0, v, 8)
+            }
+            bufs.push(buf)
+            sizes.push(chan_esize(tp, vty))
+        } else {
+            ety := w.local_type(tp, tp.local_of(ar))
+            bufs.push(w.chan_elem_slot(tp, ety))
+            sizes.push(chan_esize(tp, ety))
+        }
+        arms.push(ar)
+        chans.push(cslot)
+        ar = p.nodes[ar].next
+    }
+    poll_b := w.new_block()
+    done_b := w.new_block()
+    w.jump(poll_b)
+    w.f.active_bb = poll_b
+    for i in 0:arms.len {
+        a := arms[i]
+        $args := []int{}
+        args.push(w.load_local(chans[i], 0))
+        args.push(bufs[i])
+        args.push(w.konst(sizes[i]))
+        $r := -1
+        if p.nodes[a].kind == ast.NK_SEL_SEND {
+            r = w.call_core("chan_try_send", &args)
+        } else {
+            r = w.call_core("chan_try_recv", &args)
+        }
+        arm_b := w.new_block()
+        next_b := w.new_block()
+        w.branch(r, arm_b, next_b)
+        w.f.active_bb = arm_b
+        if p.nodes[a].kind == ast.NK_SEL_RECV {
+            id := tp.local_of(a)
+            w.store_to_local(tp, id, w.chan_elem_value(tp, bufs[i], w.local_type(tp, id)))
+        }
+        w.lower_block(p, tp, p.nodes[a].c)
+        w.jump(done_b)
+        w.f.active_bb = next_b
+    }
+    if p.nodes[s].ival == 1 || p.nodes[s].c >= 0 {
+        w.lower_block(p, tp, p.nodes[s].c)
+        w.jump(done_b)
+    } else {
+        w.call_noargs(w.core("task_block"))
+        w.jump(poll_b)
+    }
+    w.f.active_bb = done_b
+}

@@ -1,0 +1,374 @@
+@xu/mir
+// Function values, closures and method values (see lower.xu).
+//
+// A function value is two words [code address][env word]. The env word is
+// 0 for a plain function or a closure without captures; otherwise it is
+// passed to the code as one extra word right after the sret/okp word:
+//   - closure with captures: address of a heap copy of its env struct
+//   - value method (`v.m`): address of a heap copy of the receiver
+//   - bound method (`r.m` through a reference or a mutable variable): the
+//     receiver address itself
+// A call through a value tests the env word at run time and passes it only
+// when it is non-zero. A throwing function is reached through a shim
+// (label + ".fv") that supplies okp and panics on an error, since a
+// function type carries no error channel.
+
+#xu/ast
+#xu/parser
+#xu/types
+
+fn fnval_shim_label(label string) string {
+    << label + ".fv"
+}
+
+// Queue key of a shim label: tp.fns.len + function index, or -1.
+fn fnval_shim_key(tp &types.TypedProgram, by_label &LabelIndex, label &string) int {
+    s := *label + ""
+    if s.len < 4 || s[s.len - 3:s.len] != ".fv" {
+        << -1
+    }
+    real := s[0:s.len - 3] + ""
+    fi := by_label.get(&real)
+    if fi < 0 {
+        << -1
+    }
+    << tp.fns.len + fi
+}
+
+fn lower_queued(p &parser.Parser, tp $&types.TypedProgram, q int, tgt_os int, tgt_arch int, debug bool, core_names &[]string, core_labels &[]string, errs $&[]int) MFn {
+    if q >= tp.fns.len {
+        << fnval_shim(tp, q - tp.fns.len, tgt_os, tgt_arch, core_names, core_labels, errs)
+    }
+    << lower_fn(p, tp, q, tgt_os, tgt_arch, debug, core_names, core_labels, errs)
+}
+
+// Shim of throwing function fi: incoming [sret] [receiver] params.
+fn fnval_shim(tp &types.TypedProgram, fi int, tgt_os int, tgt_arch int, core_names &[]string, core_labels &[]string, errs $&[]int) MFn {
+    $w := lw_new(tp.fns[fi].name + ".fv", fnval_shim_label(tp.fns[fi].label), fi, tgt_os, tgt_arch)
+    for i in 0:core_names.len {
+        w.core_names.push(core_names[i] + "")
+        w.core_labels.push(core_labels[i] + "")
+    }
+    rty := tp.fns[fi].ret
+    wide := rty != 0 && is_wide(tp, rty)
+    w.f.ret = rty
+    w.f.blocks.push(mblock_new())
+    w.f.active_bb = 0
+    $nin := tp.fns[fi].params.len
+    if tp.fns[fi].recv >= 0 {
+        nin += 1
+    }
+    if wide {
+        nin += 1
+    }
+    $incoming := []int{}
+    for i in 0:nin {
+        incoming.push(w.new_local(1, 1, "arg" + str(i)))
+    }
+    w.f.nparams = w.f.locals.len
+    $okp := w.konst(0)
+    $first := 0
+    if wide {
+        okp = w.load_local(incoming[0], 0)
+        first = 1
+    } else if rty != 0 {
+        okp = w.scratch_words(1)
+    }
+    $args := []int{}
+    args.push(okp)
+    for i in first:nin {
+        args.push(w.load_local(incoming[i], 0))
+    }
+    e := w.call(tp.fns[fi].label, &args)
+    bad_b := w.new_block()
+    ok_b := w.new_block()
+    w.branch(e, bad_b, ok_b)
+    w.f.active_bb = bad_b
+    $pargs := []int{}
+    pargs.push(e)
+    w.call_core("fnval_error_panic", &pargs)
+    w.ret(w.konst(0))
+    w.f.active_bb = ok_b
+    if rty == 0 || wide {
+        w.ret(w.konst(0))
+    } else {
+        w.ret(w.load_ptr(okp, 0, width_of(tp, rty)))
+    }
+    while w.lbyref.len < w.f.locals.len {
+        w.lbyref.push(false)
+    }
+    errs.push(w.errors)
+    << mfn_copy(&w.f)
+}
+
+// ===== values =====
+
+fn (w $&Lw) fnval_make(code int, env int) int {
+    d := w.scratch_words(2)
+    w.store_ptr(d, 0, code, 8)
+    w.store_ptr(d, 8, env, 8)
+    << d
+}
+
+// Code address of function fi as a value.
+fn (w $&Lw) fnval_code(tp &types.TypedProgram, fi int) int {
+    if fn_throws(tp, fi) {
+        << w.fn_addr(fnval_shim_label(tp.fns[fi].label))
+    }
+    << w.fn_addr(tp.fns[fi].label)
+}
+
+// Node n is a function value this file lowers (not a place).
+fn fnval_owns(p &parser.Parser, tp &types.TypedProgram, n int) bool {
+    k := p.nodes[n].kind
+    code := tp.call_of(n)
+    if k == ast.NK_IDENT {
+        if tp.local_of(n) >= 0 || tp.const_of(n) >= 0 {
+            << false
+        }
+        << code == -90 || code >= 0 && types.is_fn_type(tp.type_of(n))
+    }
+    if k == ast.NK_FIELD {
+        if code == -92 || code == -95 {
+            << true
+        }
+        // `pkg.f` as a value.
+        base := p.nodes[n].a
+        << code >= 0 && types.is_fn_type(tp.type_of(n)) && p.nodes[base].kind == ast.NK_IDENT && tp.local_of(base) < 0 && tp.type_of(base) == 0
+    }
+    << k == ast.NT_FN_LIT
+}
+
+fn (w $&Lw) fnval_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    if !fnval_owns(p, tp, n) {
+        << NOT_HANDLED
+    }
+    k := p.nodes[n].kind
+    code := tp.call_of(n)
+    if k == ast.NK_IDENT && code == -90 {
+        << w.fnval_capture(tp, n)
+    }
+    if k == ast.NT_FN_LIT {
+        << w.fnval_closure(p, tp, n)
+    }
+    if code == -92 || code == -95 {
+        << w.fnval_method(p, tp, n)
+    }
+    << w.fnval_make(w.fnval_code(tp, code), w.konst(0))
+}
+
+// Env struct of the function being lowered (its local 0 is &Env).
+fn (w $&Lw) fnval_env(tp &types.TypedProgram) int {
+    << tp.deref(w.local_type(tp, 0))
+}
+
+fn (w $&Lw) fnval_env_ptr(tp &types.TypedProgram) int {
+    << w.load_local(w.ensure_local(tp, 0), 0)
+}
+
+// Captured name inside a closure body: env field str_of(n).
+fn (w $&Lw) fnval_capture(tp &types.TypedProgram, n int) int {
+    si := types.struct_index(w.fnval_env(tp))
+    fi := tp.str_of(n)
+    off := tp.structs[si].fields[fi].offset
+    fty := tp.structs[si].fields[fi].ty
+    $a := w.fnval_env_ptr(tp)
+    if off != 0 {
+        a = w.bin(BIN_ADD, a, w.konst(off))
+    }
+    if is_wide(tp, fty) {
+        << a
+    }
+    << w.load_ptr(a, 0, width_of(tp, fty))
+}
+
+fn (w $&Lw) fnval_closure(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    fid := tp.call_of(n)
+    if fid < 0 || fid >= tp.fns.len {
+        w.fail(p, n, "unresolved function literal")
+        << w.konst(0)
+    }
+    code := w.fn_addr(tp.fns[fid].label)
+    caps := tp_ints(&tp.clos_caps[fid])
+    if caps.len == 0 {
+        << w.fnval_make(code, w.konst(0))
+    }
+    est := tp.deref(tp.fns[fid].params[0])
+    esi := types.struct_index(est)
+    $sz := tp.size_of(est)
+    if sz < 8 {
+        sz = 8
+    }
+    $aargs := []int{}
+    aargs.push(w.konst(sz))
+    env := w.call_core("alloc", &aargs)
+    for i in 0:caps.len {
+        fty := tp.structs[esi].fields[i].ty
+        wd := width_of(tp, fty)
+        dst := w.bin(BIN_ADD, env, w.konst(tp.structs[esi].fields[i].offset))
+        if caps[i] >= 0 {
+            slot := w.ensure_local(tp, caps[i])
+            w.own_disown(caps[i])
+            if is_wide(tp, fty) {
+                w.copy_mem(dst, w.local_addr(slot), tp.size_of(fty))
+            } else if w.byref(slot) {
+                w.store_ptr(dst, 0, w.load_ptr(w.load_local(slot, 0), 0, wd), wd)
+            } else {
+                w.store_ptr(dst, 0, w.load_local(slot, 0), wd)
+            }
+        } else {
+            // Repacked from the enclosing closure's env: its fields stay
+            // owned there, so wide values are deep-copied.
+            osi := types.struct_index(w.fnval_env(tp))
+            ooff := tp.structs[osi].fields[0 - caps[i] - 2].offset
+            src := w.bin(BIN_ADD, w.fnval_env_ptr(tp), w.konst(ooff))
+            if is_wide(tp, fty) {
+                w.clone_into(tp, dst, src, fty)
+            } else {
+                w.store_ptr(dst, 0, w.load_ptr(src, 0, wd), wd)
+            }
+        }
+    }
+    << w.fnval_make(code, env)
+}
+
+// Method value `obj.m`: -92 copies the receiver to the heap, -95 binds
+// the receiver address.
+fn (w $&Lw) fnval_method(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    obj := p.nodes[n].a
+    $mfi := tp.local_of(n)
+    if tp.call_of(n) == -95 {
+        if mfi >= 0 && mfi < tp.bound_mfi.len {
+            mfi = tp.bound_mfi[mfi]
+        } else {
+            mfi = -1
+        }
+    }
+    if mfi < 0 || mfi >= tp.fns.len {
+        w.fail(p, n, "unresolved method value '" + p.nodes[n].sval + "'")
+        << w.konst(0)
+    }
+    code := w.fnval_code(tp, mfi)
+    if tp.call_of(n) == -95 {
+        << w.fnval_make(code, w.base_addr(p, tp, obj))
+    }
+    sty := tp.deref(tp.deref(tp.type_of(obj)))
+    $sz := tp.size_of(sty)
+    if sz < 8 {
+        sz = 8
+    }
+    $aargs := []int{}
+    aargs.push(w.konst(sz))
+    env := w.call_core("alloc", &aargs)
+    if is_wide(tp, sty) {
+        w.copy_mem(env, w.base_addr(p, tp, obj), tp.size_of(sty))
+    } else {
+        $v := w.lower_expr(p, tp, obj)
+        if w.expr_is_ref(p, tp, obj) {
+            v = w.load_ptr(v, 0, width_of(tp, sty))
+        }
+        w.store_ptr(env, 0, v, width_of(tp, sty))
+    }
+    << w.fnval_make(code, env)
+}
+
+// ===== calls =====
+
+// ncall -80: call through the function value held by local nlocal.
+fn (w $&Lw) fnval_call_local(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    lid := tp.local_of(n)
+    fty := w.local_type(tp, lid)
+    si := types.fn_index(fty)
+    if lid < 0 || si < 0 || si >= tp.sig_params.len {
+        w.fail(p, n, "call through an unresolved function value")
+        << w.konst(0)
+    }
+    params := tp_ints(&tp.sig_params[si])
+    fv := w.local_addr(w.ensure_local(tp, lid))
+    $args := []int{}
+    $arg := p.nodes[n].a
+    $pi := 0
+    while arg >= 0 {
+        $pty := 1
+        if pi < params.len {
+            pty = params[pi]
+        }
+        args.push(w.lower_arg(p, tp, arg, pty))
+        pi += 1
+        arg = p.nodes[arg].next
+    }
+    << w.fnval_invoke(tp, fv, tp.sig_ret[si], &args)
+}
+
+// Call the function value at address fv with argument words args.
+fn (w $&Lw) fnval_invoke(tp &types.TypedProgram, fv int, rty int, args &[]int) int {
+    code := w.load_ptr(fv, 0, 8)
+    env := w.load_ptr(fv, 8, 8)
+    wide := rty != 0 && is_wide(tp, rty)
+    $out := -1
+    $res := -1
+    if wide {
+        out = w.scratch(tp, rty)
+    } else {
+        res = w.new_local(1, 1, "fvr")
+    }
+    env_b := w.new_block()
+    plain_b := w.new_block()
+    done_b := w.new_block()
+    w.branch(env, env_b, plain_b)
+    for pass in 0:2 {
+        $all := []int{}
+        if wide {
+            all.push(out)
+        }
+        if pass == 0 {
+            w.f.active_bb = env_b
+            all.push(env)
+        } else {
+            w.f.active_bb = plain_b
+        }
+        for i in 0:args.len {
+            all.push(args[i])
+        }
+        r := w.call_ind(code, &all)
+        if res >= 0 {
+            w.store_local(res, 0, r)
+        }
+        w.jump(done_b)
+    }
+    w.f.active_bb = done_b
+    if wide {
+        << out
+    }
+    << w.load_local(res, 0)
+}
+
+fn (w $&Lw) call_ind(code int, args &[]int) int {
+    t := w.new_temp()
+    $head := -1
+    if args.len > 0 {
+        head = w.f.margs.len
+        for i in 0:args.len {
+            $nx := -1
+            if i + 1 < args.len {
+                nx = w.f.margs.len + 1
+            }
+            w.f.margs.push(MArg{v: args[i], next: nx})
+        }
+    }
+    $ins := minstr_new(MI_CALL_IND)
+    ins.a = t
+    ins.b = code
+    ins.c = head
+    w.emit(ins)
+    << t
+}
+
+// ===== hooks =====
+
+fn (w $&Lw) fnval_call(p &parser.Parser, tp &types.TypedProgram, n int, code int) int {
+    if code == -80 {
+        << w.fnval_call_local(p, tp, n)
+    }
+    << NOT_HANDLED
+}

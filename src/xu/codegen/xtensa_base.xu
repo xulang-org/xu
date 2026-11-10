@@ -1,0 +1,1148 @@
+@xu/codegen
+// Baseline Xtensa LX6 (ESP32) instruction selection for typed MIR, bare
+// metal, loaded at 0x40070000 (IRAM; Espressif's QEMU esp32 machine boots
+// the ELF directly).
+//
+// The rv32_base.xu model: every temp is an 8-byte frame slot computed as
+// a low/high register pair; f64 arithmetic and 64-bit division call
+// runtime/core softfloat.xu. Call0 ABI:
+//   - argument 0 in a2:a3, 1 in a4:a5, the rest at [sp + 8*(i-2)] of the
+//     caller's outgoing area; result in a2:a3; return address in a0
+//   - frame: [a13] saved a13, [a13+8] a0 (8-byte words), sp = a13 - frame
+//   - a14 holds the runtime state block
+// L32R only reaches backwards, so each function is emitted twice: a dry
+// run collects its constants and strings, which then precede the code.
+
+#xu/mir
+#xu/mc
+
+const XT_A0 = 0
+const XT_SP = 1
+const XT_A2 = 2
+const XT_A3 = 3
+const XT_A4 = 4
+const XT_A5 = 5
+const XT_T4 = 6
+const XT_T5 = 7
+const XT_AL = 8
+const XT_AH = 9
+const XT_BL = 10
+const XT_BH = 11
+const XT_AT = 12
+const XT_FP = 13
+const XT_STATE = 14
+const XT_T6 = 15
+
+// Branch conditions (the r field of BRI8); cond ^ 8 is the inverse.
+const XT_BEQ = 1
+const XT_BNE = 9
+const XT_BLT = 2
+const XT_BGE = 10
+const XT_BLTU = 3
+const XT_BGEU = 11
+// BRI12 zero tests
+const XT_BEQZ = 22
+const XT_BNEZ = 86
+
+const XT_ADD = 8388608    // 0x800000
+const XT_SUB = 12582912   // 0xC00000
+const XT_AND = 1048576    // 0x100000
+const XT_OR = 2097152     // 0x200000
+const XT_XOR = 3145728    // 0x300000
+const XT_MULL = 8519680   // 0x820000
+const XT_MULUH = 10616832 // 0xA20000
+const XT_QUOS = 13762560  // 0xD20000
+const XT_REMS = 15859712  // 0xF20000
+const XT_SRC = 8454144    // 0x810000
+const XT_MOVEQZ = 8585216 // 0x830000
+const XT_MOVNEZ = 9633792 // 0x930000
+
+const XT_L8UI = 2
+const XT_L16UI = 4098
+const XT_L32I = 8194
+const XT_S8I = 16386
+const XT_S16I = 20482
+const XT_S32I = 24578
+
+// ESP32 memory map
+pub const XT_CODE_BASE = 1074200576 // 0x40070000; IRAM ends at 0x400C0000
+pub const XT_CODE_MAX = 327680
+const XT_UART = 1072955392          // 0x3FF40000 UART0
+const XT_HEAP_CUR = 1073405952      // 0x3FFAE000 DRAM: the heap cursor word
+const XT_STACK_TOP = 1073610752     // 0x3FFE0000
+const XT_HEAP_BASE = 1065353216     // 0x3F800000, 4 MiB PSRAM
+const XT_HEAP_END = 1069547520      // 0x3FC00000
+const XT_TIMG0 = 1073082368         // 0x3FF5F000
+const XT_TIMG1 = 1073086464         // 0x3FF60000
+const XT_RTC = 1072988160           // 0x3FF48000
+const XT_WDT_KEY = 1356348065       // 0x50D83AA1
+
+// ===== literal pool =====
+
+struct XtCtx {
+    collect bool
+    long bool
+    pool int
+    lit_kind []int
+    lit_val []int
+    lit_name []string
+    hkeys []int
+    hidx []int
+    labs []int
+    strs []string
+    str_lit []int
+    nstr int
+}
+
+fn xt_ctx_new() XtCtx {
+    $h := []int{}
+    $k := []int{}
+    for _ in 0:256 {
+        h.push(0)
+        k.push(0)
+    }
+    << XtCtx{collect: true, long: false, pool: 0, lit_kind: []int{}, lit_val: []int{}, lit_name: []string{}, hkeys: k, hidx: h, labs: []int{}, strs: []string{}, str_lit: []int{}, nstr: 0}
+}
+
+fn xt_s32(v int) int {
+    << ((v & 4294967295) ^ 2147483648) - 2147483648
+}
+
+fn xt_hash(v int, mask int) int {
+    << ((v ^ (v >> 15)) * 40503) & mask
+}
+
+fn xt_hash_put(x $&XtCtx, v int, idx int) {
+    mask := x.hidx.len - 1
+    $h := xt_hash(v, mask)
+    while x.hidx[h] != 0 {
+        h = (h + 1) & mask
+    }
+    x.hkeys[h] = v
+    x.hidx[h] = idx + 1
+}
+
+// The pool index of value v, added while collecting; -1 if absent.
+fn xt_lit_value(x $&XtCtx, v int) int {
+    mask := x.hidx.len - 1
+    $h := xt_hash(v, mask)
+    while x.hidx[h] != 0 {
+        if x.hkeys[h] == v {
+            << x.hidx[h] - 1
+        }
+        h = (h + 1) & mask
+    }
+    if !x.collect {
+        << -1
+    }
+    idx := x.lit_kind.len
+    x.lit_kind.push(0)
+    x.lit_val.push(v)
+    x.lit_name.push("")
+    if (idx + 1) * 2 > x.hidx.len {
+        $n := x.hidx.len * 2
+        x.hidx = []int{}
+        x.hkeys = []int{}
+        for _ in 0:n {
+            x.hidx.push(0)
+            x.hkeys.push(0)
+        }
+        for i in 0:x.lit_kind.len {
+            if x.lit_kind[i] == 0 {
+                xt_hash_put(x, x.lit_val[i], i)
+            }
+        }
+    } else {
+        xt_hash_put(x, v, idx)
+    }
+    << idx
+}
+
+// The pool index of the absolute address of label.
+fn xt_lit_label(x $&XtCtx, label string) int {
+    for i in 0:x.labs.len {
+        if x.lit_name[x.labs[i]] == label {
+            << x.labs[i]
+        }
+    }
+    if !x.collect {
+        << -1
+    }
+    idx := x.lit_kind.len
+    x.lit_kind.push(1)
+    x.lit_val.push(0)
+    x.lit_name.push(label + "")
+    x.labs.push(idx)
+    << idx
+}
+
+// The pool index of the address of the next string constant.
+fn xt_lit_string(x $&XtCtx, s string) int {
+    if x.collect {
+        idx := x.lit_kind.len
+        x.lit_kind.push(2)
+        x.lit_val.push(x.strs.len)
+        x.lit_name.push("")
+        x.strs.push(s + "")
+        x.str_lit.push(idx)
+        << idx
+    }
+    k := x.nstr
+    x.nstr = k + 1
+    << x.str_lit[k]
+}
+
+// Strings, then the literal words; the code that uses them follows.
+fn xt_emit_pool(cb $&mc.CodeBuffer, x $&XtCtx, relocs $&[]mc.Reloc) {
+    while cb.len() % 4 != 0 {
+        cb.emit_u8(0)
+    }
+    $soff := []int{}
+    for si in 0:x.strs.len {
+        soff.push(cb.len())
+        s := x.strs[si]
+        for bi in 0:s.len {
+            cb.emit_u8(s[bi])
+        }
+        cb.emit_u8(0)
+        while cb.len() % 4 != 0 {
+            cb.emit_u8(0)
+        }
+    }
+    x.pool = cb.len()
+    for i in 0:x.lit_kind.len {
+        k := x.lit_kind[i]
+        if k == 0 {
+            cb.emit_u32_le(x.lit_val[i] & 4294967295)
+        } else if k == 1 {
+            relocs.push(mc.reloc_new(cb.len(), x.lit_name[i], mc.RELOC_ABS32, XT_CODE_BASE))
+            cb.emit_u32_le(0)
+        } else {
+            x.lit_val[i] = XT_CODE_BASE + soff[x.lit_val[i]]
+            cb.emit_u32_le(x.lit_val[i])
+        }
+    }
+    x.collect = false
+}
+
+// ===== encoders =====
+
+fn xt24(cb $&mc.CodeBuffer, w int) {
+    cb.emit_u8(w & 255)
+    cb.emit_u8((w >> 8) & 255)
+    cb.emit_u8((w >> 16) & 255)
+}
+
+fn xt_patch24(cb $&mc.CodeBuffer, pos int, w int) {
+    cb.patch_u8(pos, w & 255)
+    cb.patch_u8(pos + 1, (w >> 8) & 255)
+    cb.patch_u8(pos + 2, (w >> 16) & 255)
+}
+
+fn xt_rrr(cb $&mc.CodeBuffer, op int, r int, s int, t int) {
+    xt24(cb, op | (r << 12) | (s << 8) | (t << 4))
+}
+
+fn xt_mov(cb $&mc.CodeBuffer, rd int, rs int) {
+    xt_rrr(cb, XT_OR, rd, rs, rs)
+}
+
+fn xt_movi(cb $&mc.CodeBuffer, rd int, imm int) {
+    i := imm & 4095
+    xt24(cb, 40962 | (rd << 4) | (((i >> 8) & 15) << 8) | ((i & 255) << 16))
+}
+
+fn xt_addi(cb $&mc.CodeBuffer, rd int, rs int, imm int) {
+    xt24(cb, 49154 | (rd << 4) | (rs << 8) | ((imm & 255) << 16))
+}
+
+fn xt_addmi(cb $&mc.CodeBuffer, rd int, rs int, imm8 int) {
+    xt24(cb, 53250 | (rd << 4) | (rs << 8) | ((imm8 & 255) << 16))
+}
+
+// sh in 1..31
+fn xt_slli(cb $&mc.CodeBuffer, rd int, rs int, sh int) {
+    sa := 32 - sh
+    xt24(cb, 65536 | (((sa >> 4) & 1) << 20) | (rd << 12) | (rs << 8) | ((sa & 15) << 4))
+}
+
+fn xt_srai(cb $&mc.CodeBuffer, rd int, rt int, sh int) {
+    xt24(cb, 2162688 | (((sh >> 4) & 1) << 20) | (rd << 12) | ((sh & 15) << 8) | (rt << 4))
+}
+
+fn xt_extui(cb $&mc.CodeBuffer, rd int, rt int, sh int, bits int) {
+    xt24(cb, ((bits - 1) << 20) | ((4 | ((sh >> 4) & 1)) << 16) | (rd << 12) | ((sh & 15) << 8) | (rt << 4))
+}
+
+fn xt_ssl(cb $&mc.CodeBuffer, s int) {
+    xt24(cb, 4198400 | (s << 8))
+}
+
+fn xt_ssr(cb $&mc.CodeBuffer, s int) {
+    xt24(cb, 4194304 | (s << 8))
+}
+
+fn xt_sll(cb $&mc.CodeBuffer, rd int, s int) {
+    xt24(cb, 10551296 | (rd << 12) | (s << 8))
+}
+
+fn xt_sra(cb $&mc.CodeBuffer, rd int, t int) {
+    xt24(cb, 11599872 | (rd << 12) | (t << 4))
+}
+
+fn xt_ret(cb $&mc.CodeBuffer) {
+    xt24(cb, 128)
+}
+
+fn xt_jx(cb $&mc.CodeBuffer, s int) {
+    xt24(cb, 160 | (s << 8))
+}
+
+fn xt_callx0(cb $&mc.CodeBuffer, s int) {
+    xt24(cb, 192 | (s << 8))
+}
+
+fn xt_trap(cb $&mc.CodeBuffer) {
+    xt24(cb, 0)
+}
+
+fn xt_align4(cb $&mc.CodeBuffer) {
+    while cb.len() % 4 != 0 {
+        cb.emit_u8(0)
+    }
+}
+
+fn xt_l32r(cb $&mc.CodeBuffer, x $&XtCtx, rd int, idx int) {
+    if x.collect || idx < 0 {
+        xt24(cb, 1 | (rd << 4))
+        <<
+    }
+    addr := x.pool + idx * 4
+    off := addr - ((cb.len() + 3) & -4)
+    if off >= -262144 {
+        xt24(cb, 1 | (rd << 4) | (((off >> 2) & 65535) << 8))
+        <<
+    }
+    if x.lit_kind[idx] == 1 {
+        xt_trap(cb)
+        <<
+    }
+    // Out of the pool's reach: an inline literal behind a jump.
+    $pad := 0
+    while (cb.len() + 3 + pad) % 4 != 0 {
+        pad += 1
+    }
+    xt24(cb, 6 | (((pad + 4 - 1) & 262143) << 6))
+    for _ in 0:pad {
+        cb.emit_u8(0)
+    }
+    lit := cb.len()
+    cb.emit_u32_le(x.lit_val[idx] & 4294967295)
+    off2 := lit - ((cb.len() + 3) & -4)
+    xt24(cb, 1 | (rd << 4) | (((off2 >> 2) & 65535) << 8))
+}
+
+fn xt_li(cb $&mc.CodeBuffer, x $&XtCtx, rd int, v int) {
+    sv := xt_s32(v)
+    if sv >= -2048 && sv <= 2047 {
+        xt_movi(cb, rd, sv)
+        <<
+    }
+    xt_l32r(cb, x, rd, xt_lit_value(x, sv))
+}
+
+// rd = rs + imm (AT holds large values; rs must not be AT then).
+fn xt_add_imm(cb $&mc.CodeBuffer, x $&XtCtx, rd int, rs int, imm int) {
+    if imm == 0 {
+        if rd != rs {
+            xt_mov(cb, rd, rs)
+        }
+        <<
+    }
+    if imm >= -128 && imm <= 127 {
+        xt_addi(cb, rd, rs, imm)
+        <<
+    }
+    lo := ((imm & 255) ^ 128) - 128
+    hi := (imm - lo) >> 8
+    if hi >= -128 && hi <= 127 {
+        xt_addmi(cb, rd, rs, hi)
+        if lo != 0 {
+            xt_addi(cb, rd, rd, lo)
+        }
+        <<
+    }
+    xt_li(cb, x, XT_AT, imm)
+    xt_rrr(cb, XT_ADD, rd, rs, XT_AT)
+}
+
+// Load or store of width 1, 2 or 4 bytes at [rs + off].
+fn xt_mem(cb $&mc.CodeBuffer, x $&XtCtx, op int, width int, rt int, rs int, off int) {
+    if off >= 0 && off % width == 0 && off / width <= 255 {
+        xt24(cb, op | (rt << 4) | (rs << 8) | ((off / width) << 16))
+        <<
+    }
+    xt_add_imm(cb, x, XT_AT, rs, off)
+    xt24(cb, op | (rt << 4) | (XT_AT << 8))
+}
+
+fn xt_ldr(cb $&mc.CodeBuffer, x $&XtCtx, rt int, rs int, off int) {
+    xt_mem(cb, x, XT_L32I, 4, rt, rs, off)
+}
+
+fn xt_str(cb $&mc.CodeBuffer, x $&XtCtx, rt int, rs int, off int) {
+    xt_mem(cb, x, XT_S32I, 4, rt, rs, off)
+}
+
+fn xt_ld_pair(cb $&mc.CodeBuffer, x $&XtCtx, lo int, hi int, rs int, off int) {
+    xt_ldr(cb, x, lo, rs, off)
+    xt_ldr(cb, x, hi, rs, off + 4)
+}
+
+fn xt_st_pair(cb $&mc.CodeBuffer, x $&XtCtx, lo int, hi int, rs int, off int) {
+    xt_str(cb, x, lo, rs, off)
+    xt_str(cb, x, hi, rs, off + 4)
+}
+
+// Branches patched once the (nearby) target is known.
+fn xt_b_here(cb $&mc.CodeBuffer) int {
+    pos := cb.len()
+    xt24(cb, 0)
+    << pos
+}
+
+fn xt_b_patch(cb $&mc.CodeBuffer, pos int, cond int, s int, t int, target int) {
+    xt_patch24(cb, pos, 7 | (t << 4) | (s << 8) | (cond << 12) | (((target - (pos + 4)) & 255) << 16))
+}
+
+fn xt_bz_patch(cb $&mc.CodeBuffer, pos int, op int, s int, target int) {
+    xt_patch24(cb, pos, op | (s << 8) | (((target - (pos + 4)) & 4095) << 12))
+}
+
+fn xt_j_patch(cb $&mc.CodeBuffer, pos int, target int) {
+    xt_patch24(cb, pos, 6 | (((target - (pos + 4)) & 262143) << 6))
+}
+
+fn xt_call(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, label string) {
+    relocs.push(mc.reloc_new(cb.len(), label + "", mc.RELOC_XTENSA_CALL, 0))
+    xt24(cb, 5)
+}
+
+fn xt_jump(cb $&mc.CodeBuffer, x $&XtCtx, relocs $&[]mc.Reloc, label string) {
+    if x.long {
+        xt_l32r(cb, x, XT_AT, xt_lit_label(x, label))
+        xt_jx(cb, XT_AT)
+        <<
+    }
+    relocs.push(mc.reloc_new(cb.len(), label + "", mc.RELOC_XTENSA_JUMP, 0))
+    xt24(cb, 6)
+}
+
+// ===== frame =====
+
+fn xt_operand(cb $&mc.CodeBuffer, x $&XtCtx, f &mir.MFn, fr &A64Frame, lo int, hi int, v int) {
+    if v <= -2 {
+        c := f.consts[0 - v - 2]
+        xt_li(cb, x, lo, c)
+        xt_li(cb, x, hi, c >> 32)
+        <<
+    }
+    if v >= 0 && v < fr.temp_off.len {
+        xt_ld_pair(cb, x, lo, hi, XT_SP, fr.temp_off[v])
+        <<
+    }
+    xt_movi(cb, lo, 0)
+    xt_movi(cb, hi, 0)
+}
+
+fn xt_set_temp(cb $&mc.CodeBuffer, x $&XtCtx, fr &A64Frame, t int, lo int, hi int) {
+    if t >= 0 && t < fr.temp_off.len {
+        xt_st_pair(cb, x, lo, hi, XT_SP, fr.temp_off[t])
+    }
+}
+
+// ===== operations: A = A op B =====
+
+fn xt_helper(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, name string, swap bool) {
+    if swap {
+        xt_mov(cb, XT_A2, XT_BL)
+        xt_mov(cb, XT_A3, XT_BH)
+        xt_mov(cb, XT_A4, XT_AL)
+        xt_mov(cb, XT_A5, XT_AH)
+    } else {
+        xt_mov(cb, XT_A2, XT_AL)
+        xt_mov(cb, XT_A3, XT_AH)
+        xt_mov(cb, XT_A4, XT_BL)
+        xt_mov(cb, XT_A5, XT_BH)
+    }
+    xt_call(cb, relocs, "_xu_runtime_core_" + name)
+    xt_mov(cb, XT_AL, XT_A2)
+    xt_mov(cb, XT_AH, XT_A3)
+}
+
+// AL = (x < y) signed 64-bit, or (x >= y) when invert; AH = 0.
+fn xt_lt(cb $&mc.CodeBuffer, xl int, xh int, yl int, yh int, invert bool) {
+    xt_movi(cb, XT_T4, 1)
+    b1 := xt_b_here(cb)
+    xt_movi(cb, XT_T4, 0)
+    b2 := xt_b_here(cb)
+    b3 := xt_b_here(cb)
+    xt_movi(cb, XT_T4, 1)
+    done := cb.len()
+    xt_b_patch(cb, b1, XT_BLT, xh, yh, done)
+    xt_b_patch(cb, b2, XT_BNE, xh, yh, done)
+    xt_b_patch(cb, b3, XT_BGEU, xl, yl, done)
+    if invert {
+        xt_movi(cb, XT_T5, 1)
+        xt_rrr(cb, XT_XOR, XT_T4, XT_T4, XT_T5)
+    }
+    xt_mov(cb, XT_AL, XT_T4)
+    xt_movi(cb, XT_AH, 0)
+}
+
+fn xt_divmod(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, is_mod bool) {
+    xt_srai(cb, XT_T4, XT_AL, 31)
+    s0 := xt_b_here(cb)
+    xt_srai(cb, XT_T5, XT_BL, 31)
+    s1 := xt_b_here(cb)
+    s2 := xt_b_here(cb)
+    xt_movi(cb, XT_T4, -1)
+    s3 := xt_b_here(cb)
+    if is_mod {
+        xt_rrr(cb, XT_REMS, XT_AL, XT_AL, XT_BL)
+    } else {
+        xt_rrr(cb, XT_QUOS, XT_AL, XT_AL, XT_BL)
+    }
+    xt_srai(cb, XT_AH, XT_AL, 31)
+    done := xt_b_here(cb)
+    slow := cb.len()
+    xt_b_patch(cb, s0, XT_BNE, XT_T4, XT_AH, slow)
+    xt_b_patch(cb, s1, XT_BNE, XT_T5, XT_BH, slow)
+    xt_bz_patch(cb, s2, XT_BEQZ, XT_BL, slow)
+    xt_b_patch(cb, s3, XT_BEQ, XT_BL, XT_T4, slow)
+    $name := "sf_div64"
+    if is_mod {
+        name = "sf_mod64"
+    }
+    xt_helper(cb, relocs, name, false)
+    xt_j_patch(cb, done, cb.len())
+}
+
+fn xt_shift(cb $&mc.CodeBuffer, left bool) {
+    xt_extui(cb, XT_T4, XT_BL, 0, 6)
+    xt_movi(cb, XT_T5, 32)
+    big := xt_b_here(cb)
+    if left {
+        xt_ssl(cb, XT_T4)
+        xt_rrr(cb, XT_SRC, XT_AH, XT_AH, XT_AL)
+        xt_sll(cb, XT_AL, XT_AL)
+    } else {
+        xt_ssr(cb, XT_T4)
+        xt_rrr(cb, XT_SRC, XT_AL, XT_AH, XT_AL)
+        xt_sra(cb, XT_AH, XT_AH)
+    }
+    done := xt_b_here(cb)
+    xt_b_patch(cb, big, XT_BGE, XT_T4, XT_T5, cb.len())
+    if left {
+        xt_ssl(cb, XT_T4)
+        xt_sll(cb, XT_AH, XT_AL)
+        xt_movi(cb, XT_AL, 0)
+    } else {
+        xt_ssr(cb, XT_T4)
+        xt_sra(cb, XT_AL, XT_AH)
+        xt_srai(cb, XT_AH, XT_AH, 31)
+    }
+    xt_j_patch(cb, done, cb.len())
+}
+
+fn xt_bin(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, op int) {
+    if op == mir.BIN_ADD {
+        xt_rrr(cb, XT_ADD, XT_T4, XT_AL, XT_BL)
+        xt_rrr(cb, XT_ADD, XT_AH, XT_AH, XT_BH)
+        xt24(cb, 7 | (XT_AL << 4) | (XT_T4 << 8) | (XT_BGEU << 12) | (2 << 16))
+        xt_addi(cb, XT_AH, XT_AH, 1)
+        xt_mov(cb, XT_AL, XT_T4)
+    } else if op == mir.BIN_SUB {
+        xt_rrr(cb, XT_SUB, XT_AH, XT_AH, XT_BH)
+        xt24(cb, 7 | (XT_BL << 4) | (XT_AL << 8) | (XT_BGEU << 12) | (2 << 16))
+        xt_addi(cb, XT_AH, XT_AH, -1)
+        xt_rrr(cb, XT_SUB, XT_AL, XT_AL, XT_BL)
+    } else if op == mir.BIN_MUL {
+        xt_rrr(cb, XT_MULUH, XT_T5, XT_AL, XT_BL)
+        xt_rrr(cb, XT_MULL, XT_T4, XT_AL, XT_BH)
+        xt_rrr(cb, XT_ADD, XT_T5, XT_T5, XT_T4)
+        xt_rrr(cb, XT_MULL, XT_T4, XT_AH, XT_BL)
+        xt_rrr(cb, XT_ADD, XT_AH, XT_T5, XT_T4)
+        xt_rrr(cb, XT_MULL, XT_AL, XT_AL, XT_BL)
+    } else if op == mir.BIN_DIV {
+        xt_divmod(cb, relocs, false)
+    } else if op == mir.BIN_MOD {
+        xt_divmod(cb, relocs, true)
+    } else if op == mir.BIN_AND {
+        xt_rrr(cb, XT_AND, XT_AL, XT_AL, XT_BL)
+        xt_rrr(cb, XT_AND, XT_AH, XT_AH, XT_BH)
+    } else if op == mir.BIN_OR {
+        xt_rrr(cb, XT_OR, XT_AL, XT_AL, XT_BL)
+        xt_rrr(cb, XT_OR, XT_AH, XT_AH, XT_BH)
+    } else if op == mir.BIN_XOR {
+        xt_rrr(cb, XT_XOR, XT_AL, XT_AL, XT_BL)
+        xt_rrr(cb, XT_XOR, XT_AH, XT_AH, XT_BH)
+    } else if op == mir.BIN_SHL {
+        xt_shift(cb, true)
+    } else if op == mir.BIN_SHR {
+        xt_shift(cb, false)
+    } else if op == mir.BIN_EQ || op == mir.BIN_NE {
+        xt_rrr(cb, XT_XOR, XT_AL, XT_AL, XT_BL)
+        xt_rrr(cb, XT_XOR, XT_AH, XT_AH, XT_BH)
+        xt_rrr(cb, XT_OR, XT_AL, XT_AL, XT_AH)
+        xt_movi(cb, XT_T4, 1)
+        xt_movi(cb, XT_T5, 0)
+        if op == mir.BIN_EQ {
+            xt_rrr(cb, XT_MOVEQZ, XT_T5, XT_T4, XT_AL)
+        } else {
+            xt_rrr(cb, XT_MOVNEZ, XT_T5, XT_T4, XT_AL)
+        }
+        xt_mov(cb, XT_AL, XT_T5)
+        xt_movi(cb, XT_AH, 0)
+    } else if op == mir.BIN_LT {
+        xt_lt(cb, XT_AL, XT_AH, XT_BL, XT_BH, false)
+    } else if op == mir.BIN_GE {
+        xt_lt(cb, XT_AL, XT_AH, XT_BL, XT_BH, true)
+    } else if op == mir.BIN_GT {
+        xt_lt(cb, XT_BL, XT_BH, XT_AL, XT_AH, false)
+    } else if op == mir.BIN_LE {
+        xt_lt(cb, XT_BL, XT_BH, XT_AL, XT_AH, true)
+    } else if op == mir.BIN_FADD {
+        xt_helper(cb, relocs, "sf_add", false)
+    } else if op == mir.BIN_FSUB {
+        xt_helper(cb, relocs, "sf_sub", false)
+    } else if op == mir.BIN_FMUL {
+        xt_helper(cb, relocs, "sf_mul", false)
+    } else if op == mir.BIN_FDIV {
+        xt_helper(cb, relocs, "sf_div", false)
+    } else if op == mir.BIN_FEQ || op == mir.BIN_FNE {
+        xt_helper(cb, relocs, "sf_eq", false)
+        if op == mir.BIN_FNE {
+            xt_movi(cb, XT_T4, 1)
+            xt_rrr(cb, XT_XOR, XT_AL, XT_AL, XT_T4)
+        }
+        xt_movi(cb, XT_AH, 0)
+    } else if op == mir.BIN_FLT || op == mir.BIN_FGT {
+        xt_helper(cb, relocs, "sf_lt", op == mir.BIN_FGT)
+        xt_movi(cb, XT_AH, 0)
+    } else if op == mir.BIN_FLE || op == mir.BIN_FGE {
+        xt_helper(cb, relocs, "sf_le", op == mir.BIN_FGE)
+        xt_movi(cb, XT_AH, 0)
+    } else {
+        xt_trap(cb)
+    }
+}
+
+fn xt_arg_lo(i int) int {
+    << 2 + 2 * i
+}
+
+fn xt_body(f &mir.MFn, fr &A64Frame, cb $&mc.CodeBuffer, x $&XtCtx, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int) {
+    syms.define_label(f.label, cb.len())
+    $last_line := f.src_line
+    if last_line > 0 {
+        lines.push(cb.len())
+        lines.push(last_line)
+    }
+    xt_addi(cb, XT_SP, XT_SP, -16)
+    xt_movi(cb, XT_T4, 0)
+    xt_st_pair(cb, x, XT_FP, XT_T4, XT_SP, 0)
+    xt_st_pair(cb, x, XT_A0, XT_T4, XT_SP, 8)
+    xt_mov(cb, XT_FP, XT_SP)
+    if fr.size > 0 {
+        xt_add_imm(cb, x, XT_SP, XT_SP, 0 - fr.size)
+    }
+    for i in 0:f.nparams {
+        if i < 2 {
+            xt_st_pair(cb, x, xt_arg_lo(i), xt_arg_lo(i) + 1, XT_SP, fr.local_off[i])
+        } else {
+            xt_ld_pair(cb, x, XT_AL, XT_AH, XT_FP, 16 + (i - 2) * 8)
+            xt_st_pair(cb, x, XT_AL, XT_AH, XT_SP, fr.local_off[i])
+        }
+    }
+    epilogue := f.label + ".ret"
+    for bi in 0:f.blocks.len {
+        syms.define_label(f.label + ".bb" + str(bi), cb.len())
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            k := ins.kind
+            if ins.line > 0 && ins.line != last_line {
+                last_line = ins.line
+                lines.push(cb.len())
+                lines.push(last_line)
+            }
+            if k == mir.MI_LOAD_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                xt_ld_pair(cb, x, XT_AL, XT_AH, XT_SP, fr.local_off[ins.b] + w * 8)
+                xt_set_temp(cb, x, fr, ins.a, XT_AL, XT_AH)
+            } else if k == mir.MI_STORE_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                xt_operand(cb, x, f, fr, XT_AL, XT_AH, ins.b)
+                xt_st_pair(cb, x, XT_AL, XT_AH, XT_SP, fr.local_off[ins.a] + w * 8)
+            } else if k == mir.MI_ADDR {
+                xt_add_imm(cb, x, XT_AL, XT_SP, fr.local_off[ins.b])
+                xt_movi(cb, XT_AH, 0)
+                xt_set_temp(cb, x, fr, ins.a, XT_AL, XT_AH)
+            } else if k == mir.MI_LOAD_PTR {
+                xt_operand(cb, x, f, fr, XT_BL, XT_BH, ins.b)
+                w := ins.d
+                if w == 1 {
+                    xt_mem(cb, x, XT_L8UI, 1, XT_AL, XT_BL, ins.c)
+                    xt_movi(cb, XT_AH, 0)
+                } else if w == 2 {
+                    xt_mem(cb, x, XT_L16UI, 2, XT_AL, XT_BL, ins.c)
+                    xt_movi(cb, XT_AH, 0)
+                } else if w == 4 {
+                    xt_ldr(cb, x, XT_AL, XT_BL, ins.c)
+                    xt_movi(cb, XT_AH, 0)
+                } else if w == -4 {
+                    xt_ldr(cb, x, XT_AL, XT_BL, ins.c)
+                    xt_srai(cb, XT_AH, XT_AL, 31)
+                } else {
+                    xt_ld_pair(cb, x, XT_AL, XT_AH, XT_BL, ins.c)
+                }
+                xt_set_temp(cb, x, fr, ins.a, XT_AL, XT_AH)
+            } else if k == mir.MI_STORE_PTR {
+                xt_operand(cb, x, f, fr, XT_BL, XT_BH, ins.a)
+                xt_operand(cb, x, f, fr, XT_AL, XT_AH, ins.b)
+                w := ins.d
+                if w == 1 {
+                    xt_mem(cb, x, XT_S8I, 1, XT_AL, XT_BL, ins.c)
+                } else if w == 2 {
+                    xt_mem(cb, x, XT_S16I, 2, XT_AL, XT_BL, ins.c)
+                } else if w == 4 || w == -4 {
+                    xt_str(cb, x, XT_AL, XT_BL, ins.c)
+                } else {
+                    xt_st_pair(cb, x, XT_AL, XT_AH, XT_BL, ins.c)
+                }
+            } else if k == mir.MI_BIN {
+                xt_operand(cb, x, f, fr, XT_AL, XT_AH, ins.c)
+                xt_operand(cb, x, f, fr, XT_BL, XT_BH, ins.d)
+                xt_bin(cb, relocs, ins.b)
+                xt_set_temp(cb, x, fr, ins.a, XT_AL, XT_AH)
+            } else if k == mir.MI_UN {
+                xt_operand(cb, x, f, fr, XT_A2, XT_A3, ins.c)
+                if ins.b == mir.UN_I2F {
+                    xt_call(cb, relocs, "_xu_runtime_core_sf_from_int")
+                } else if ins.b == mir.UN_F2I {
+                    xt_call(cb, relocs, "_xu_runtime_core_sf_to_int")
+                } else {
+                    xt_trap(cb)
+                }
+                xt_set_temp(cb, x, fr, ins.a, XT_A2, XT_A3)
+            } else if k == mir.MI_COPY {
+                xt_operand(cb, x, f, fr, XT_AL, XT_AH, ins.b)
+                xt_set_temp(cb, x, fr, ins.a, XT_AL, XT_AH)
+            } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+                $a := ins.c
+                $i := 0
+                while a >= 0 {
+                    if i < 2 {
+                        xt_operand(cb, x, f, fr, xt_arg_lo(i), xt_arg_lo(i) + 1, f.margs[a].v)
+                    } else {
+                        xt_operand(cb, x, f, fr, XT_AL, XT_AH, f.margs[a].v)
+                        xt_st_pair(cb, x, XT_AL, XT_AH, XT_SP, (i - 2) * 8)
+                    }
+                    i += 1
+                    a = f.margs[a].next
+                }
+                if k == mir.MI_CALL_IND {
+                    xt_operand(cb, x, f, fr, XT_T4, XT_T5, ins.b)
+                    xt_callx0(cb, XT_T4)
+                } else {
+                    xt_call(cb, relocs, ins.sval)
+                }
+                xt_set_temp(cb, x, fr, ins.a, XT_A2, XT_A3)
+            } else if k == mir.MI_STR_CONST {
+                xt_l32r(cb, x, XT_AL, xt_lit_string(x, ins.sval))
+                xt_movi(cb, XT_AH, 0)
+                xt_set_temp(cb, x, fr, ins.a, XT_AL, XT_AH)
+            } else if k == mir.MI_LOAD_FN_ADDR {
+                xt_l32r(cb, x, XT_AL, xt_lit_label(x, ins.sval))
+                xt_movi(cb, XT_AH, 0)
+                xt_set_temp(cb, x, fr, ins.a, XT_AL, XT_AH)
+            } else {
+                xt_trap(cb)
+            }
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        if blk.tkind == mir.TKIND_RETURN {
+            xt_operand(cb, x, f, fr, XT_A2, XT_A3, blk.ta)
+            xt_jump(cb, x, relocs, epilogue)
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                xt_jump(cb, x, relocs, f.label + ".bb" + str(blk.ta))
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            xt_operand(cb, x, f, fr, XT_AL, XT_AH, blk.ta)
+            xt_rrr(cb, XT_OR, XT_AL, XT_AL, XT_AH)
+            skip := xt_b_here(cb)
+            xt_jump(cb, x, relocs, f.label + ".bb" + str(blk.tb))
+            xt_bz_patch(cb, skip, XT_BEQZ, XT_AL, cb.len())
+            if blk.tc != bi + 1 {
+                xt_jump(cb, x, relocs, f.label + ".bb" + str(blk.tc))
+            }
+        } else {
+            xt_movi(cb, XT_A2, 0)
+            xt_movi(cb, XT_A3, 0)
+            xt_jump(cb, x, relocs, epilogue)
+        }
+    }
+    syms.define_label(epilogue, cb.len())
+    xt_mov(cb, XT_SP, XT_FP)
+    xt_ldr(cb, x, XT_FP, XT_SP, 0)
+    xt_ldr(cb, x, XT_A0, XT_SP, 8)
+    xt_addi(cb, XT_SP, XT_SP, 16)
+    xt_ret(cb)
+}
+
+// The literals of a dry run of f; long when J cannot span the function.
+fn xt_collect(f &mir.MFn, fr &A64Frame, long bool) XtCtx {
+    $x := xt_ctx_new()
+    x.long = long
+    $tcb := mc.code_buffer_new()
+    $tsyms := mc.symbol_table_new()
+    $trel := []mc.Reloc{}
+    $tlines := []int{}
+    xt_body(f, fr, $&tcb, $&x, $&tsyms, $&trel, $&tlines)
+    if !long && tcb.len() > 100000 {
+        << xt_collect(f, fr, true)
+    }
+    << x
+}
+
+pub fn isel_fn_xtensa_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int) {
+    fr := frame_layout(f, 2)
+    $x := xt_collect(f, &fr, false)
+    xt_emit_pool(cb, $&x, relocs)
+    xt_body(f, &fr, cb, $&x, syms, relocs, lines)
+}
+
+// ===== runtime stubs =====
+
+// Exception vectors at VECBASE (the image start): every one ends the run
+// with status 134.
+pub fn emit_xtensa_vectors(cb $&mc.CodeBuffer) {
+    for v in 0:16 {
+        while cb.len() < v * 64 {
+            cb.emit_u8(0)
+        }
+        xt_movi(cb, XT_A2, 1)
+        xt_movi(cb, XT_A3, 134)
+        xt24(cb, 20736) // simcall
+        xt24(cb, 6 | ((-4 & 262143) << 6))
+    }
+    while cb.len() < 1024 {
+        cb.emit_u8(0)
+    }
+}
+
+// Jumps to labels inside the stubs (cond 0: j), patched once all are defined.
+struct XtFix {
+    pos int
+    label string
+}
+
+fn xt_j_to(cb $&mc.CodeBuffer, fx $&[]XtFix, label string) {
+    fx.push(XtFix{pos: cb.len(), label: label + ""})
+    xt24(cb, 6)
+}
+
+// Branch to label when (s cond t): the inverse condition skips a j.
+fn xt_bc_to(cb $&mc.CodeBuffer, fx $&[]XtFix, cond int, s int, t int, label string) {
+    xt24(cb, 7 | (t << 4) | (s << 8) | ((cond ^ 8) << 12) | (2 << 16))
+    xt_j_to(cb, fx, label)
+}
+
+fn xt_bz_to(cb $&mc.CodeBuffer, fx $&[]XtFix, zero bool, s int, label string) {
+    $op := XT_BEQZ
+    if zero {
+        op = XT_BNEZ
+    }
+    xt24(cb, op | (s << 8) | (2 << 12))
+    xt_j_to(cb, fx, label)
+}
+
+fn xt_fix_all(cb $&mc.CodeBuffer, syms &mc.SymbolTable, fx &[]XtFix) {
+    for i in 0:fx.len {
+        xt_j_patch(cb, fx[i].pos, syms.lookup_offset(fx[i].label))
+    }
+}
+
+fn xt_on_nr(cb $&mc.CodeBuffer, x $&XtCtx, fx $&[]XtFix, nr int, label string) {
+    xt_li(cb, x, XT_T4, nr)
+    xt_bc_to(cb, fx, XT_BEQ, XT_A2, XT_T4, label)
+}
+
+fn xt_ret_pair(cb $&mc.CodeBuffer, x $&XtCtx, v int) {
+    xt_li(cb, x, XT_A2, v)
+    xt_li(cb, x, XT_A3, v >> 32)
+    xt_ret(cb)
+}
+
+// Zero n bytes at p (both registers advance; 16-byte multiples).
+fn xt_zero_loop(cb $&mc.CodeBuffer, fx $&[]XtFix, syms $&mc.SymbolTable, p int, n int, name string) {
+    xt_movi(cb, XT_T5, 0)
+    syms.define_label(name + "", cb.len())
+    xt_bz_to(cb, fx, true, n, name + "_end")
+    xt_str_small(cb, XT_T5, p, 0)
+    xt_str_small(cb, XT_T5, p, 4)
+    xt_str_small(cb, XT_T5, p, 8)
+    xt_str_small(cb, XT_T5, p, 12)
+    xt_addi(cb, p, p, 16)
+    xt_addi(cb, n, n, -16)
+    xt_j_to(cb, fx, name + "")
+    syms.define_label(name + "_end", cb.len())
+}
+
+fn xt_str_small(cb $&mc.CodeBuffer, rt int, rs int, off int) {
+    xt24(cb, XT_S32I | (rt << 4) | (rs << 8) | ((off / 4) << 16))
+}
+
+fn xt_wdt_off(cb $&mc.CodeBuffer, x $&XtCtx, base int, cfg int, prot int) {
+    xt_li(cb, x, XT_AT, base)
+    xt_li(cb, x, XT_T4, XT_WDT_KEY)
+    xt_str(cb, x, XT_T4, XT_AT, prot)
+    xt_movi(cb, XT_T4, 0)
+    xt_str(cb, x, XT_T4, XT_AT, cfg)
+    xt_str(cb, x, XT_T4, XT_AT, prot)
+}
+
+fn emit_xtensa_task_stubs(cb $&mc.CodeBuffer, x $&XtCtx, syms $&mc.SymbolTable) {
+    // __xu_task_switch(from a2, to a3): only fp, a0, sp and the state
+    // register live across calls.
+    xt_align4(cb)
+    syms.define_label("__xu_task_switch", cb.len())
+    xt_movi(cb, XT_T4, 0)
+    xt_st_pair(cb, x, XT_STATE, XT_T4, XT_A2, 72)
+    xt_st_pair(cb, x, XT_FP, XT_T4, XT_A2, 80)
+    xt_st_pair(cb, x, XT_A0, XT_T4, XT_A2, 88)
+    xt_st_pair(cb, x, XT_SP, XT_T4, XT_A2, 96)
+    xt_ldr(cb, x, XT_STATE, XT_A3, 72)
+    xt_ldr(cb, x, XT_FP, XT_A3, 80)
+    xt_ldr(cb, x, XT_A0, XT_A3, 88)
+    xt_ldr(cb, x, XT_SP, XT_A3, 96)
+    xt_ret(cb)
+    // __xu_task_entry, entered from the switch with a3 = the task record:
+    // [0] task, [8] function, [16] 16 argument words, [24] exit function.
+    xt_align4(cb)
+    syms.define_label("__xu_task_entry", cb.len())
+    xt_addi(cb, XT_SP, XT_SP, -128)
+    xt_str(cb, x, XT_A3, XT_SP, 112)
+    xt_ldr(cb, x, XT_AT, XT_A3, 16)
+    for i in 2:16 {
+        xt_ld_pair(cb, x, XT_AL, XT_AH, XT_AT, i * 8)
+        xt_st_pair(cb, x, XT_AL, XT_AH, XT_SP, (i - 2) * 8)
+    }
+    xt_ld_pair(cb, x, XT_A4, XT_A5, XT_AT, 8)
+    xt_ld_pair(cb, x, XT_A2, XT_A3, XT_AT, 0)
+    xt_ldr(cb, x, XT_T4, XT_SP, 112)
+    xt_ldr(cb, x, XT_T4, XT_T4, 8)
+    xt_callx0(cb, XT_T4)
+    xt_ldr(cb, x, XT_T4, XT_SP, 112)
+    xt_addi(cb, XT_SP, XT_SP, 127)
+    xt_addi(cb, XT_SP, XT_SP, 1)
+    xt_ldr(cb, x, XT_A2, XT_T4, 0)
+    xt_movi(cb, XT_A3, 0)
+    xt_ldr(cb, x, XT_T4, XT_T4, 24)
+    xt_callx0(cb, XT_T4)
+    xt_trap(cb)
+}
+
+fn xt_stubs(cb $&mc.CodeBuffer, x $&XtCtx, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string) {
+    $fx := []XtFix{}
+    xt_align4(cb)
+    syms.define_label("__xu_start", cb.len())
+    xt_li(cb, x, XT_AT, XT_CODE_BASE)
+    xt24(cb, 1304320 | (XT_AT << 4)) // wsr vecbase
+    xt_wdt_off(cb, x, XT_RTC, 140, 164)
+    xt_wdt_off(cb, x, XT_TIMG0, 72, 100)
+    xt_wdt_off(cb, x, XT_TIMG1, 72, 100)
+    xt_li(cb, x, XT_SP, XT_STACK_TOP)
+    // state block (64 KiB) and a zero word for argv and envp, zeroed
+    xt_li(cb, x, XT_STATE, XT_HEAP_BASE)
+    xt_li(cb, x, XT_AL, XT_HEAP_BASE)
+    xt_li(cb, x, XT_AH, 65552)
+    xt_zero_loop(cb, $&fx, syms, XT_AL, XT_AH, "__xu_xt.zero_state")
+    xt_li(cb, x, XT_AT, XT_HEAP_CUR)
+    xt_str(cb, x, XT_AL, XT_AT, 0)
+    xt_li(cb, x, XT_T4, XT_HEAP_BASE + 65536)
+    xt_str(cb, x, XT_T4, XT_STATE, 8)
+    xt_str(cb, x, XT_T4, XT_STATE, 32)
+    xt_movi(cb, XT_FP, 0)
+    xt_call(cb, relocs, main_label)
+    xt_mov(cb, XT_A3, XT_A2)
+    xt_j_to(cb, $&fx, "__xu_xt.exit")
+
+    // __xu_syscall(nr, a, b, c, ...): nr in a2, a in a4, b and c at
+    // [sp] and [sp + 8].
+    xt_align4(cb)
+    syms.define_label("__xu_syscall", cb.len())
+    xt_on_nr(cb, x, $&fx, -5, "__xu_xt.memset")
+    xt_on_nr(cb, x, $&fx, -4, "__xu_xt.memcpy")
+    xt_on_nr(cb, x, $&fx, -2, "__xu_xt.fp")
+    xt_on_nr(cb, x, $&fx, -3, "__xu_xt.start")
+    xt_on_nr(cb, x, $&fx, -1, "__xu_xt.switch")
+    xt_on_nr(cb, x, $&fx, 64, "__xu_xt.write")
+    xt_on_nr(cb, x, $&fx, 222, "__xu_xt.mmap")
+    xt_on_nr(cb, x, $&fx, 93, "__xu_xt.exit_a")
+    xt_on_nr(cb, x, $&fx, 94, "__xu_xt.exit_a")
+    xt_on_nr(cb, x, $&fx, 113, "__xu_xt.zero")
+    xt_on_nr(cb, x, $&fx, 63, "__xu_xt.zero")
+    xt_on_nr(cb, x, $&fx, 215, "__xu_xt.zero")
+    xt_on_nr(cb, x, $&fx, 226, "__xu_xt.zero")
+    xt_on_nr(cb, x, $&fx, 233, "__xu_xt.zero")
+    xt_on_nr(cb, x, $&fx, 172, "__xu_xt.one")
+    xt_ret_pair(cb, x, -38)
+    syms.define_label("__xu_xt.zero", cb.len())
+    xt_ret_pair(cb, x, 0)
+    syms.define_label("__xu_xt.one", cb.len())
+    xt_ret_pair(cb, x, 1)
+
+    // memset(a, b): zero b bytes at a
+    syms.define_label("__xu_xt.memset", cb.len())
+    xt_ldr(cb, x, XT_T4, XT_SP, 0)
+    xt_movi(cb, XT_T5, 0)
+    syms.define_label("__xu_xt.memset_w", cb.len())
+    xt_extui(cb, XT_T6, XT_A4, 0, 2)
+    xt_bz_to(cb, $&fx, false, XT_T6, "__xu_xt.memset_b")
+    xt_movi(cb, XT_T6, 4)
+    xt_bc_to(cb, $&fx, XT_BLT, XT_T4, XT_T6, "__xu_xt.memset_b")
+    xt_str_small(cb, XT_T5, XT_A4, 0)
+    xt_addi(cb, XT_A4, XT_A4, 4)
+    xt_addi(cb, XT_T4, XT_T4, -4)
+    xt_j_to(cb, $&fx, "__xu_xt.memset_w")
+    syms.define_label("__xu_xt.memset_b", cb.len())
+    xt_bz_to(cb, $&fx, true, XT_T4, "__xu_xt.zero")
+    xt24(cb, XT_S8I | (XT_T5 << 4) | (XT_A4 << 8))
+    xt_addi(cb, XT_A4, XT_A4, 1)
+    xt_addi(cb, XT_T4, XT_T4, -1)
+    xt_j_to(cb, $&fx, "__xu_xt.memset_b")
+
+    // memcpy(a, b, c): copy c bytes from b to a, forward
+    syms.define_label("__xu_xt.memcpy", cb.len())
+    xt_ldr(cb, x, XT_T4, XT_SP, 0)
+    xt_ldr(cb, x, XT_AT, XT_SP, 8)
+    xt_rrr(cb, XT_OR, XT_T5, XT_A4, XT_T4)
+    xt_extui(cb, XT_T5, XT_T5, 0, 2)
+    xt_bz_to(cb, $&fx, false, XT_T5, "__xu_xt.memcpy_b")
+    syms.define_label("__xu_xt.memcpy_w", cb.len())
+    xt_movi(cb, XT_T6, 4)
+    xt_bc_to(cb, $&fx, XT_BLT, XT_AT, XT_T6, "__xu_xt.memcpy_b")
+    xt24(cb, XT_L32I | (XT_T5 << 4) | (XT_T4 << 8))
+    xt_str_small(cb, XT_T5, XT_A4, 0)
+    xt_addi(cb, XT_A4, XT_A4, 4)
+    xt_addi(cb, XT_T4, XT_T4, 4)
+    xt_addi(cb, XT_AT, XT_AT, -4)
+    xt_j_to(cb, $&fx, "__xu_xt.memcpy_w")
+    syms.define_label("__xu_xt.memcpy_b", cb.len())
+    xt_bz_to(cb, $&fx, true, XT_AT, "__xu_xt.zero")
+    xt24(cb, XT_L8UI | (XT_T5 << 4) | (XT_T4 << 8))
+    xt24(cb, XT_S8I | (XT_T5 << 4) | (XT_A4 << 8))
+    xt_addi(cb, XT_A4, XT_A4, 1)
+    xt_addi(cb, XT_T4, XT_T4, 1)
+    xt_addi(cb, XT_AT, XT_AT, -1)
+    xt_j_to(cb, $&fx, "__xu_xt.memcpy_b")
+
+    syms.define_label("__xu_xt.fp", cb.len())
+    xt_mov(cb, XT_A2, XT_FP)
+    xt_movi(cb, XT_A3, 0)
+    xt_ret(cb)
+    syms.define_label("__xu_xt.start", cb.len())
+    xt_l32r(cb, x, XT_A2, xt_lit_label(x, "__xu_start"))
+    xt_movi(cb, XT_A3, 0)
+    xt_ret(cb)
+    syms.define_label("__xu_xt.switch", cb.len())
+    xt_mov(cb, XT_A2, XT_A4)
+    xt_ldr(cb, x, XT_A3, XT_SP, 0)
+    xt_j_to(cb, $&fx, "__xu_task_switch")
+
+    // write(fd, buf, n): fds 1 and 2 go to UART0
+    syms.define_label("__xu_xt.write", cb.len())
+    xt_addi(cb, XT_T4, XT_A4, -1)
+    xt_movi(cb, XT_T5, 1)
+    xt_bc_to(cb, $&fx, XT_BLTU, XT_T5, XT_T4, "__xu_xt.badf")
+    xt_ldr(cb, x, XT_T4, XT_SP, 0)
+    xt_ldr(cb, x, XT_A2, XT_SP, 8)
+    xt_mov(cb, XT_T5, XT_A2)
+    xt_movi(cb, XT_A3, 0)
+    xt_li(cb, x, XT_AT, XT_UART)
+    xt_movi(cb, XT_A5, 120)
+    syms.define_label("__xu_xt.write_loop", cb.len())
+    xt_bz_to(cb, $&fx, true, XT_T5, "__xu_xt.ret")
+    syms.define_label("__xu_xt.write_wait", cb.len())
+    xt24(cb, XT_L32I | (XT_T6 << 4) | (XT_AT << 8) | (7 << 16))
+    xt_extui(cb, XT_T6, XT_T6, 16, 8)
+    xt_bc_to(cb, $&fx, XT_BGE, XT_T6, XT_A5, "__xu_xt.write_wait")
+    xt24(cb, XT_L8UI | (XT_T6 << 4) | (XT_T4 << 8))
+    xt_str_small(cb, XT_T6, XT_AT, 0)
+    xt_addi(cb, XT_T4, XT_T4, 1)
+    xt_addi(cb, XT_T5, XT_T5, -1)
+    xt_j_to(cb, $&fx, "__xu_xt.write_loop")
+    syms.define_label("__xu_xt.ret", cb.len())
+    xt_ret(cb)
+    syms.define_label("__xu_xt.badf", cb.len())
+    xt_ret_pair(cb, x, -9)
+
+    // mmap(addr, len, ...): zeroed bump allocation from PSRAM
+    syms.define_label("__xu_xt.mmap", cb.len())
+    xt_li(cb, x, XT_AT, XT_HEAP_CUR)
+    xt_ldr(cb, x, XT_A2, XT_AT, 0)
+    xt_ldr(cb, x, XT_T4, XT_SP, 0)
+    xt_addi(cb, XT_T4, XT_T4, 15)
+    xt_srai(cb, XT_T4, XT_T4, 4)
+    xt_slli(cb, XT_T4, XT_T4, 4)
+    xt_rrr(cb, XT_ADD, XT_A4, XT_A2, XT_T4)
+    xt_li(cb, x, XT_T5, XT_HEAP_END)
+    xt_bc_to(cb, $&fx, XT_BLTU, XT_T5, XT_A4, "__xu_xt.nomem")
+    xt_str(cb, x, XT_A4, XT_AT, 0)
+    xt_mov(cb, XT_A4, XT_A2)
+    xt_zero_loop(cb, $&fx, syms, XT_A4, XT_T4, "__xu_xt.zero_map")
+    xt_movi(cb, XT_A3, 0)
+    xt_ret(cb)
+    syms.define_label("__xu_xt.nomem", cb.len())
+    xt_ret_pair(cb, x, -12)
+
+    // exit(code): semihosting SYS_exit (simcall a2 = 1, a3 = code)
+    syms.define_label("__xu_xt.exit_a", cb.len())
+    xt_mov(cb, XT_A3, XT_A4)
+    syms.define_label("__xu_xt.exit", cb.len())
+    xt_movi(cb, XT_A2, 1)
+    xt24(cb, 20736) // simcall
+    syms.define_label("__xu_xt.hang", cb.len())
+    xt24(cb, 28672) // waiti 0
+    xt_j_to(cb, $&fx, "__xu_xt.hang")
+
+    xt_align4(cb)
+    syms.define_label("__xu_fault", cb.len())
+    xt_movi(cb, XT_A3, 134)
+    xt_j_to(cb, $&fx, "__xu_xt.exit")
+
+    xt_align4(cb)
+    syms.define_label("__xu_globals", cb.len())
+    xt_mov(cb, XT_A2, XT_STATE)
+    xt_movi(cb, XT_A3, 0)
+    xt_ret(cb)
+    emit_xtensa_task_stubs(cb, x, syms)
+    xt_fix_all(cb, syms, &fx)
+}
+
+// Process entry, the emulated system calls and the runtime-state accessor.
+pub fn emit_xtensa_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string) {
+    $x := xt_ctx_new()
+    $tcb := mc.code_buffer_new()
+    $tsyms := mc.symbol_table_new()
+    $trel := []mc.Reloc{}
+    xt_stubs($&tcb, $&x, $&tsyms, $&trel, main_label + "")
+    xt_emit_pool(cb, $&x, relocs)
+    xt_stubs(cb, $&x, syms, relocs, main_label)
+}
