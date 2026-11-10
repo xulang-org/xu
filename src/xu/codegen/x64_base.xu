@@ -310,22 +310,136 @@ fn x64_frame(f &mir.MFn) A64Frame {
     << a64_frame(f)
 }
 
-fn x64_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, rd int, v int) {
+fn x64_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, rd int, v int) {
     if v <= -2 {
         x64_mov_imm(cb, rd, f.consts[0 - v - 2])
         <<
     }
     if v >= 0 && v < fr.temp_off.len {
+        r := ra.temp_reg[v]
+        if r >= 0 {
+            if r != rd {
+                x64_mov(cb, rd, r)
+            }
+            <<
+        }
         x64_ldr(cb, rd, X_RSP, fr.temp_off[v])
         <<
     }
     x64_mov_imm(cb, rd, 0)
 }
 
-fn x64_set_temp(cb $&mc.CodeBuffer, fr &A64Frame, t int, rs int) {
+fn x64_set_temp(cb $&mc.CodeBuffer, fr &A64Frame, ra &RaInfo, t int, rs int) {
     if t >= 0 && t < fr.temp_off.len {
+        r := ra.temp_reg[t]
+        if r >= 0 {
+            if r != rs {
+                x64_mov(cb, r, rs)
+            }
+            <<
+        }
         x64_str(cb, rs, X_RSP, fr.temp_off[t])
     }
+}
+
+// Register holding operand v, or -1 when it is a constant or in memory.
+fn x64_vreg(fr &A64Frame, ra &RaInfo, v int) int {
+    if v >= 0 && v < fr.temp_off.len {
+        << ra.temp_reg[v]
+    }
+    << -1
+}
+
+// xchg a, b
+fn x64_xchg(cb $&mc.CodeBuffer, a int, b int) {
+    x64_op_rr(cb, 0x87, a, b)
+}
+
+// Register-to-register parallel move dst[i] <- src[i]; destinations are
+// distinct, cycles are broken with xchg.
+fn x64_par_move(cb $&mc.CodeBuffer, dst &[]int, src0 &[]int) {
+    $src := []int{}
+    $done := []bool{}
+    for i in 0:dst.len {
+        src.push(src0[i])
+        done.push(false)
+    }
+    $left := dst.len
+    while left > 0 {
+        $progress := false
+        for i in 0:dst.len {
+            if done[i] { -> }
+            $blocked := false
+            for j in 0:dst.len {
+                if j != i && !done[j] && src[j] == dst[i] {
+                    blocked = true
+                }
+            }
+            if !blocked {
+                if src[i] != dst[i] {
+                    x64_mov(cb, dst[i], src[i])
+                }
+                done[i] = true
+                left -= 1
+                progress = true
+            }
+        }
+        if !progress {
+            for i in 0:dst.len {
+                if !done[i] {
+                    d := dst[i]
+                    sr := src[i]
+                    x64_xchg(cb, d, sr)
+                    done[i] = true
+                    left -= 1
+                    for j in 0:dst.len {
+                        if !done[j] {
+                            if src[j] == d { src[j] = sr }
+                            else if src[j] == sr { src[j] = d }
+                        }
+                    }
+                    <-
+                }
+            }
+        }
+    }
+}
+
+// Loads register arguments: values already in registers move in parallel
+// first, then constants and memory operands load into their (now free)
+// argument registers.
+fn x64_load_args(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, vals &[]int) {
+    $dst := []int{}
+    $src := []int{}
+    for i in 0:vals.len {
+        r := x64_vreg(fr, ra, vals[i])
+        if r >= 0 {
+            dst.push(x64_arg_reg(i))
+            src.push(r)
+        }
+    }
+    x64_par_move(cb, &dst, &src)
+    for i in 0:vals.len {
+        if x64_vreg(fr, ra, vals[i]) < 0 {
+            x64_operand(cb, f, fr, ra, x64_arg_reg(i), vals[i])
+        }
+    }
+}
+
+fn x64_ra(f &mir.MFn, opt bool) RaInfo {
+    if !opt {
+        << ra_none(f)
+    }
+    $callee := []int{}
+    callee.push(X_RBX)
+    for r in 12:15 {
+        callee.push(r)
+    }
+    $caller := []int{}
+    for r in 6:12 {
+        caller.push(r)
+    }
+    << ra_alloc(f, &callee, &caller)
 }
 
 // rax = rax op rcx on f64 bit patterns, through xmm0/xmm1.
@@ -501,8 +615,16 @@ fn x64_bin(cb $&mc.CodeBuffer, op int) {
 }
 
 // lines receives (code offset, source line) pairs where the line changes.
-pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int) {
-    fr := x64_frame(f)
+// opt keeps values in registers (ra_alloc); otherwise every value lives in
+// its frame slot.
+pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool) {
+    $fr := x64_frame(f)
+    ra := x64_ra(f, opt)
+    // Saved callee registers sit above the locals and temps.
+    save_off := fr.size
+    if ra.used_callee.len > 0 {
+        fr.size = (fr.size + ra.used_callee.len * 8 + 15) / 16 * 16
+    }
     syms.define_label(f.label, cb.len())
     $last_line := f.src_line
     if last_line > 0 {
@@ -515,12 +637,33 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
     if fr.size > 0 {
         x64_add_rsp(cb, 0 - fr.size)
     }
+    for ci in 0:ra.used_callee.len {
+        x64_str(cb, ra.used_callee[ci], X_RSP, save_off + ci * 8)
+    }
+    // Parameters kept in registers may land in another parameter's
+    // incoming register: spill first, then move in parallel, then load the
+    // stack-passed ones.
+    $pdst := []int{}
+    $psrc := []int{}
     for i in 0:f.nparams {
+        lr := ra.local_reg[i]
         if i < 8 {
-            x64_str(cb, x64_arg_reg(i), X_RSP, fr.local_off[i])
-        } else {
+            if lr >= 0 {
+                pdst.push(lr)
+                psrc.push(x64_arg_reg(i))
+            } else {
+                x64_str(cb, x64_arg_reg(i), X_RSP, fr.local_off[i])
+            }
+        } else if lr < 0 {
             x64_ldr(cb, X_RAX, X_RBP, 16 + (i - 8) * 8)
             x64_str(cb, X_RAX, X_RSP, fr.local_off[i])
+        }
+    }
+    x64_par_move(cb, &pdst, &psrc)
+    for i in 8:f.nparams {
+        lr := ra.local_reg[i]
+        if lr >= 0 {
+            x64_ldr(cb, lr, X_RBP, 16 + (i - 8) * 8)
         }
     }
     $strs := []StrFix{}
@@ -538,62 +681,85 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                 lines.push(last_line)
             }
             if k == mir.MI_LOAD_LOCAL {
-                $w := ins.c
-                if w < 0 { w = 0 }
-                x64_ldr(cb, X_RAX, X_RSP, fr.local_off[ins.b] + w * 8)
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                lr := ra.local_reg[ins.b]
+                if lr >= 0 {
+                    x64_set_temp(cb, &fr, &ra, ins.a, lr)
+                } else {
+                    $w := ins.c
+                    if w < 0 { w = 0 }
+                    x64_ldr(cb, X_RAX, X_RSP, fr.local_off[ins.b] + w * 8)
+                    x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                }
             } else if k == mir.MI_STORE_LOCAL {
-                $w := ins.c
-                if w < 0 { w = 0 }
-                x64_operand(cb, f, &fr, X_RAX, ins.b)
-                x64_str(cb, X_RAX, X_RSP, fr.local_off[ins.a] + w * 8)
+                lr := ra.local_reg[ins.a]
+                if lr >= 0 {
+                    x64_operand(cb, f, &fr, &ra, lr, ins.b)
+                } else {
+                    $w := ins.c
+                    if w < 0 { w = 0 }
+                    x64_operand(cb, f, &fr, &ra, X_RAX, ins.b)
+                    x64_str(cb, X_RAX, X_RSP, fr.local_off[ins.a] + w * 8)
+                }
             } else if k == mir.MI_ADDR {
                 x64_lea(cb, X_RAX, X_RSP, fr.local_off[ins.b])
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_LOAD_PTR {
-                x64_operand(cb, f, &fr, X_RCX, ins.b)
+                x64_operand(cb, f, &fr, &ra, X_RCX, ins.b)
                 $w := ins.d
                 if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
                 x64_load(cb, w, X_RAX, X_RCX, ins.c)
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_STORE_PTR {
-                x64_operand(cb, f, &fr, X_RCX, ins.a)
-                x64_operand(cb, f, &fr, X_RAX, ins.b)
+                x64_operand(cb, f, &fr, &ra, X_RCX, ins.a)
+                x64_operand(cb, f, &fr, &ra, X_RAX, ins.b)
                 $w := ins.d
                 if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
                 x64_store(cb, w, X_RAX, X_RCX, ins.c)
             } else if k == mir.MI_BIN {
-                x64_operand(cb, f, &fr, X_RAX, ins.c)
-                x64_operand(cb, f, &fr, X_RCX, ins.d)
+                x64_operand(cb, f, &fr, &ra, X_RAX, ins.c)
+                x64_operand(cb, f, &fr, &ra, X_RCX, ins.d)
                 x64_bin(cb, ins.b)
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_UN {
-                x64_operand(cb, f, &fr, X_RAX, ins.c)
+                x64_operand(cb, f, &fr, &ra, X_RAX, ins.c)
                 x64_un(cb, ins.b)
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_COPY {
-                x64_operand(cb, f, &fr, X_RAX, ins.b)
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_operand(cb, f, &fr, &ra, X_RAX, ins.b)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
                 $a := ins.c
                 $i := 0
+                $regs := []int{}
                 while a >= 0 {
                     if i < 8 {
-                        x64_operand(cb, f, &fr, x64_arg_reg(i), f.margs[a].v)
+                        if opt {
+                            regs.push(f.margs[a].v)
+                        } else {
+                            x64_operand(cb, f, &fr, &ra, x64_arg_reg(i), f.margs[a].v)
+                        }
                     } else {
-                        x64_operand(cb, f, &fr, X_RAX, f.margs[a].v)
+                        x64_operand(cb, f, &fr, &ra, X_RAX, f.margs[a].v)
                         x64_str(cb, X_RAX, X_RSP, (i - 8) * 8)
                     }
                     i += 1
                     a = f.margs[a].next
                 }
+                if k == mir.MI_CALL_IND && opt {
+                    x64_operand(cb, f, &fr, &ra, X_RAX, ins.b)
+                }
+                if regs.len > 0 {
+                    x64_load_args(cb, f, &fr, &ra, &regs)
+                }
                 if k == mir.MI_CALL_IND {
-                    x64_operand(cb, f, &fr, X_RAX, ins.b)
+                    if !opt {
+                        x64_operand(cb, f, &fr, &ra, X_RAX, ins.b)
+                    }
                     x64_call_reg(cb, X_RAX)
                 } else {
                     x64_call(cb, relocs, ins.sval)
                 }
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_STR_CONST {
                 // lea rax, [rip + pool entry]
                 xb(cb, 0x48)
@@ -601,10 +767,10 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                 xb(cb, 0x05)
                 strs.push(StrFix{adr_off: cb.len(), bytes: ins.sval + ""})
                 cb.emit_u32_le(0)
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_LOAD_FN_ADDR {
                 x64_lea_label(cb, relocs, X_RAX, ins.sval)
-                x64_set_temp(cb, &fr, ins.a, X_RAX)
+                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else {
                 // Unknown kinds are a lowering bug; trap loudly at run time.
                 x64_ud2(cb)
@@ -613,15 +779,19 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
         }
         blk := ~f.blocks[bi]
         if blk.tkind == mir.TKIND_RETURN {
-            x64_operand(cb, f, &fr, X_RAX, blk.ta)
+            x64_operand(cb, f, &fr, &ra, X_RAX, blk.ta)
             x64_jmp(cb, relocs, epilogue)
         } else if blk.tkind == mir.TKIND_JUMP {
             if blk.ta != bi + 1 {
                 x64_jmp(cb, relocs, f.label + ".bb" + str(blk.ta))
             }
         } else if blk.tkind == mir.TKIND_BRANCH {
-            x64_operand(cb, f, &fr, X_RAX, blk.ta)
-            x64_test(cb, X_RAX)
+            $cr := x64_vreg(&fr, &ra, blk.ta)
+            if cr < 0 {
+                x64_operand(cb, f, &fr, &ra, X_RAX, blk.ta)
+                cr = X_RAX
+            }
+            x64_test(cb, cr)
             x64_jcc(cb, relocs, CC_NE, f.label + ".bb" + str(blk.tb))
             if blk.tc != bi + 1 {
                 x64_jmp(cb, relocs, f.label + ".bb" + str(blk.tc))
@@ -633,6 +803,9 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
         }
     }
     syms.define_label(epilogue, cb.len())
+    for ci in 0:ra.used_callee.len {
+        x64_ldr(cb, ra.used_callee[ci], X_RSP, save_off + ci * 8)
+    }
     // leave ; ret
     xb(cb, 0xC9)
     x64_ret(cb)
