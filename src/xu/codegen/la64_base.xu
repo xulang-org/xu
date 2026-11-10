@@ -1,0 +1,569 @@
+@xu/codegen
+// Baseline LoongArch64 (LP64D) instruction selection for typed MIR, Linux.
+//
+// The same model as rv64_base.xu: every temp has its own frame slot,
+// operands go through scratch registers t0-t2 and the result is stored
+// back.
+//   - arguments in a0-a7, the rest at [sp + 8*(i-8)] of the caller's
+//     outgoing area; scalar result in a0
+//   - s8 holds the runtime state block for the whole process
+//   - frame: [fp] saved fp, [fp+8] ra, sp = fp - frame (the arm64 layout)
+// Calls, jumps and addresses use pcaddu12i pairs.
+
+#xu/mir
+#xu/mc
+
+const LA_ZERO = 0
+const LA_RA = 1
+const LA_SP = 3
+const LA_A0 = 4
+const LA_A7 = 11
+const LA_T0 = 12
+const LA_T1 = 13
+const LA_T2 = 14
+const LA_T3 = 15
+const LA_T4 = 16
+const LA_FP = 22
+const LA_S0 = 23
+const LA_STATE = 31
+
+// ===== encoders =====
+
+fn la_3r(cb $&mc.CodeBuffer, op int, rd int, rj int, rk int) {
+    e32(cb, op | (rk << 10) | (rj << 5) | rd)
+}
+
+fn la_ri12(cb $&mc.CodeBuffer, op int, rd int, rj int, imm int) {
+    e32(cb, op | ((imm & 0xfff) << 10) | (rj << 5) | rd)
+}
+
+// beq/bne/blt (op) rj, rd by byte offset from this instruction.
+fn la_br(cb $&mc.CodeBuffer, op int, rj int, rd int, off int) {
+    e32(cb, op | (((off >> 2) & 0xffff) << 10) | (rj << 5) | rd)
+}
+
+fn la_jirl(cb $&mc.CodeBuffer, rd int, rj int) {
+    e32(cb, 0x4c000000 | (rj << 5) | rd)
+}
+
+fn la_addi(cb $&mc.CodeBuffer, rd int, rj int, imm int) {
+    la_ri12(cb, 0x02c00000, rd, rj, imm)
+}
+
+fn la_mv(cb $&mc.CodeBuffer, rd int, rj int) {
+    la_3r(cb, 0x00150000, rd, rj, LA_ZERO)
+}
+
+fn la_ret(cb $&mc.CodeBuffer) {
+    la_jirl(cb, LA_ZERO, LA_RA)
+}
+
+fn la_trap(cb $&mc.CodeBuffer) {
+    e32(cb, 0x002a0000)
+}
+
+fn la_syscall(cb $&mc.CodeBuffer) {
+    e32(cb, 0x002b0000)
+}
+
+fn la_li(cb $&mc.CodeBuffer, rd int, v int) {
+    if v >= -2048 && v < 2048 {
+        la_addi(cb, rd, LA_ZERO, v)
+        <<
+    }
+    // lu12i.w sign-extends bit 31; ori fills the low 12 bits.
+    e32(cb, 0x14000000 | (((v >> 12) & 0xfffff) << 5) | rd)
+    if (v & 0xfff) != 0 {
+        la_ri12(cb, 0x03800000, rd, rd, v & 0xfff)
+    }
+    if v < -2147483648 || v >= 2147483648 {
+        e32(cb, 0x16000000 | (((v >> 32) & 0xfffff) << 5) | rd)
+        la_ri12(cb, 0x03000000, rd, rd, (v >> 52) & 0xfff)
+    }
+}
+
+fn la_add_imm(cb $&mc.CodeBuffer, rd int, rj int, imm int) {
+    if imm >= -2048 && imm < 2048 {
+        la_addi(cb, rd, rj, imm)
+        <<
+    }
+    la_li(cb, LA_T4, imm)
+    la_3r(cb, 0x00108000, rd, rj, LA_T4)
+}
+
+// Load/store of width 1, 2, 4 (zero-extended), -4 (sign-extended) or 8
+// bytes at [rj + off].
+fn la_mem(cb $&mc.CodeBuffer, store bool, width int, rd int, rj int, off int) {
+    $base := rj
+    $o := off
+    if off < -2048 || off >= 2048 {
+        la_li(cb, LA_T4, off)
+        la_3r(cb, 0x00108000, LA_T4, rj, LA_T4)
+        base = LA_T4
+        o = 0
+    }
+    $op := 0x28c00000
+    if store {
+        op = 0x29c00000
+        if width == 1 { op = 0x29000000 }
+        else if width == 2 { op = 0x29400000 }
+        else if width == 4 || width == -4 { op = 0x29800000 }
+    } else {
+        if width == 1 { op = 0x2a000000 }
+        else if width == 2 { op = 0x2a400000 }
+        else if width == 4 { op = 0x2a800000 }
+        else if width == -4 { op = 0x28800000 }
+    }
+    la_ri12(cb, op, rd, base, o)
+}
+
+fn la_ld(cb $&mc.CodeBuffer, rd int, rj int, off int) {
+    la_mem(cb, false, 8, rd, rj, off)
+}
+
+fn la_st(cb $&mc.CodeBuffer, rd int, rj int, off int) {
+    la_mem(cb, true, 8, rd, rj, off)
+}
+
+// pcaddu12i rd, 0 ; jirl/addi.d with a pc-relative relocation to label.
+// Calls link ra through ra; jumps go through t3 without linking.
+fn la_pcrel_pair(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, rd int, label string, call bool) {
+    $kind := mc.RELOC_LOONG_PCREL
+    if call {
+        kind = mc.RELOC_LOONG_CALL
+    }
+    relocs.push(mc.reloc_new(cb.len(), label + "", kind, 0))
+    e32(cb, 0x1c000000 | rd)
+    if call {
+        $link := LA_RA
+        if rd != LA_RA {
+            link = LA_ZERO
+        }
+        la_jirl(cb, link, rd)
+    } else {
+        la_addi(cb, rd, rd, 0)
+    }
+}
+
+fn la_call(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, label string) {
+    la_pcrel_pair(cb, relocs, LA_RA, label, true)
+}
+
+fn la_jump(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, label string) {
+    la_pcrel_pair(cb, relocs, LA_T3, label, true)
+}
+
+// ===== frame =====
+
+fn la_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, rd int, v int) {
+    if v <= -2 {
+        la_li(cb, rd, f.consts[0 - v - 2])
+        <<
+    }
+    if v >= 0 && v < fr.temp_off.len {
+        la_ld(cb, rd, LA_SP, fr.temp_off[v])
+        <<
+    }
+    la_li(cb, rd, 0)
+}
+
+fn la_set_temp(cb $&mc.CodeBuffer, fr &A64Frame, t int, rs int) {
+    if t >= 0 && t < fr.temp_off.len {
+        la_st(cb, rs, LA_SP, fr.temp_off[t])
+    }
+}
+
+// ===== operations: t0 = t0 op t1 =====
+
+fn la_fbin(cb $&mc.CodeBuffer, op int) {
+    // movgr2fr.d fa0, t0 ; movgr2fr.d fa1, t1
+    e32(cb, 0x0114a800 | (LA_T0 << 5) | 0)
+    e32(cb, 0x0114a800 | (LA_T1 << 5) | 1)
+    if op <= mir.BIN_FDIV {
+        $base := 0x01010000
+        if op == mir.BIN_FSUB { base = 0x01030000 }
+        else if op == mir.BIN_FMUL { base = 0x01050000 }
+        else if op == mir.BIN_FDIV { base = 0x01070000 }
+        la_3r(cb, base, 0, 0, 1)
+        // movfr2gr.d t0, fa0
+        e32(cb, 0x0114b800 | (0 << 5) | LA_T0)
+        <<
+    }
+    // fcmp.cond.d fcc0: ordered conditions are false on NaN; ne is CUNE.
+    $cond := 0x4
+    $fj := 0
+    $fk := 1
+    if op == mir.BIN_FNE { cond = 0x18 }
+    else if op == mir.BIN_FLT { cond = 0x2 }
+    else if op == mir.BIN_FLE { cond = 0x6 }
+    else if op == mir.BIN_FGT {
+        cond = 0x2
+        fj = 1
+        fk = 0
+    } else if op == mir.BIN_FGE {
+        cond = 0x6
+        fj = 1
+        fk = 0
+    }
+    e32(cb, 0x0c200000 | (cond << 15) | (fk << 10) | (fj << 5))
+    // movcf2gr t0, fcc0
+    e32(cb, 0x0114dc00 | LA_T0)
+}
+
+fn la_un(cb $&mc.CodeBuffer, op int) {
+    if op == mir.UN_I2F {
+        // movgr2fr.d fa0, t0 ; ffint.d.l fa0, fa0 ; movfr2gr.d t0, fa0
+        e32(cb, 0x0114a800 | (LA_T0 << 5))
+        e32(cb, 0x011d2800)
+        e32(cb, 0x0114b800 | LA_T0)
+    } else if op == mir.UN_F2I {
+        // ftintrz.l.d saturates; NaN must give 0: t0 &= -(fa0 ordered).
+        e32(cb, 0x0114a800 | (LA_T0 << 5))
+        e32(cb, 0x0c200000 | (0x14 << 15))
+        e32(cb, 0x011aa800 | (0 << 5) | 1)
+        e32(cb, 0x0114b800 | (1 << 5) | LA_T0)
+        e32(cb, 0x0114dc00 | LA_T1)
+        la_3r(cb, 0x00118000, LA_T1, LA_ZERO, LA_T1)
+        la_3r(cb, 0x00148000, LA_T0, LA_T0, LA_T1)
+    } else {
+        la_trap(cb)
+    }
+}
+
+// x/0 = 0 and x%0 = x; INT_MIN/-1 wraps and x%-1 = 0 (div.d/mod.d leave
+// both cases undefined).
+fn la_divmod(cb $&mc.CodeBuffer, is_mod bool) {
+    la_br(cb, 0x58000000, LA_T1, LA_ZERO, 28)
+    la_addi(cb, LA_T2, LA_ZERO, -1)
+    la_br(cb, 0x58000000, LA_T1, LA_T2, 12)
+    if is_mod {
+        la_3r(cb, 0x00228000, LA_T0, LA_T0, LA_T1)
+    } else {
+        la_3r(cb, 0x00220000, LA_T0, LA_T0, LA_T1)
+    }
+    la_br(cb, 0x58000000, LA_ZERO, LA_ZERO, 16)
+    if is_mod {
+        la_addi(cb, LA_T0, LA_ZERO, 0)
+    } else {
+        la_3r(cb, 0x00118000, LA_T0, LA_ZERO, LA_T0)
+    }
+    la_br(cb, 0x58000000, LA_ZERO, LA_ZERO, 8)
+    if is_mod {
+        la_addi(cb, LA_T0, LA_T0, 0)
+    } else {
+        la_addi(cb, LA_T0, LA_ZERO, 0)
+    }
+}
+
+fn la_bin(cb $&mc.CodeBuffer, op int) {
+    if op >= mir.BIN_FADD && op <= mir.BIN_FGE {
+        la_fbin(cb, op)
+        <<
+    }
+    if op == mir.BIN_ADD { la_3r(cb, 0x00108000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_SUB { la_3r(cb, 0x00118000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_MUL { la_3r(cb, 0x001d8000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_DIV { la_divmod(cb, false) }
+    else if op == mir.BIN_MOD { la_divmod(cb, true) }
+    else if op == mir.BIN_AND { la_3r(cb, 0x00148000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_OR { la_3r(cb, 0x00150000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_XOR { la_3r(cb, 0x00158000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_SHL { la_3r(cb, 0x00188000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_SHR { la_3r(cb, 0x00198000, LA_T0, LA_T0, LA_T1) }
+    else if op == mir.BIN_EQ || op == mir.BIN_NE {
+        la_3r(cb, 0x00118000, LA_T0, LA_T0, LA_T1)
+        if op == mir.BIN_EQ {
+            la_ri12(cb, 0x02400000, LA_T0, LA_T0, 1)
+        } else {
+            la_3r(cb, 0x00128000, LA_T0, LA_ZERO, LA_T0)
+        }
+    } else if op == mir.BIN_LT {
+        la_3r(cb, 0x00120000, LA_T0, LA_T0, LA_T1)
+    } else if op == mir.BIN_GT {
+        la_3r(cb, 0x00120000, LA_T0, LA_T1, LA_T0)
+    } else if op == mir.BIN_LE {
+        la_3r(cb, 0x00120000, LA_T0, LA_T1, LA_T0)
+        la_ri12(cb, 0x03c00000, LA_T0, LA_T0, 1)
+    } else if op == mir.BIN_GE {
+        la_3r(cb, 0x00120000, LA_T0, LA_T0, LA_T1)
+        la_ri12(cb, 0x03c00000, LA_T0, LA_T0, 1)
+    } else {
+        la_trap(cb)
+    }
+}
+
+// lines receives (code offset, source line) pairs where the line changes.
+pub fn isel_fn_la64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int) {
+    fr := a64_frame(f)
+    syms.define_label(f.label, cb.len())
+    $last_line := f.src_line
+    if last_line > 0 {
+        lines.push(cb.len())
+        lines.push(last_line)
+    }
+    la_addi(cb, LA_SP, LA_SP, -16)
+    la_st(cb, LA_RA, LA_SP, 8)
+    la_st(cb, LA_FP, LA_SP, 0)
+    la_mv(cb, LA_FP, LA_SP)
+    if fr.size > 0 {
+        la_add_imm(cb, LA_SP, LA_SP, 0 - fr.size)
+    }
+    for i in 0:f.nparams {
+        if i < 8 {
+            la_st(cb, LA_A0 + i, LA_SP, fr.local_off[i])
+        } else {
+            la_ld(cb, LA_T0, LA_FP, 16 + (i - 8) * 8)
+            la_st(cb, LA_T0, LA_SP, fr.local_off[i])
+        }
+    }
+    $strs := []StrFix{}
+    epilogue := f.label + ".ret"
+    for bi in 0:f.blocks.len {
+        syms.define_label(f.label + ".bb" + str(bi), cb.len())
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            k := ins.kind
+            if ins.line > 0 && ins.line != last_line {
+                last_line = ins.line
+                lines.push(cb.len())
+                lines.push(last_line)
+            }
+            if k == mir.MI_LOAD_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                la_ld(cb, LA_T0, LA_SP, fr.local_off[ins.b] + w * 8)
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else if k == mir.MI_STORE_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                la_operand(cb, f, &fr, LA_T0, ins.b)
+                la_st(cb, LA_T0, LA_SP, fr.local_off[ins.a] + w * 8)
+            } else if k == mir.MI_ADDR {
+                la_add_imm(cb, LA_T0, LA_SP, fr.local_off[ins.b])
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else if k == mir.MI_LOAD_PTR {
+                la_operand(cb, f, &fr, LA_T1, ins.b)
+                $w := ins.d
+                if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
+                la_mem(cb, false, w, LA_T0, LA_T1, ins.c)
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else if k == mir.MI_STORE_PTR {
+                la_operand(cb, f, &fr, LA_T1, ins.a)
+                la_operand(cb, f, &fr, LA_T0, ins.b)
+                $w := ins.d
+                if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
+                la_mem(cb, true, w, LA_T0, LA_T1, ins.c)
+            } else if k == mir.MI_BIN {
+                la_operand(cb, f, &fr, LA_T0, ins.c)
+                la_operand(cb, f, &fr, LA_T1, ins.d)
+                la_bin(cb, ins.b)
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else if k == mir.MI_UN {
+                la_operand(cb, f, &fr, LA_T0, ins.c)
+                la_un(cb, ins.b)
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else if k == mir.MI_COPY {
+                la_operand(cb, f, &fr, LA_T0, ins.b)
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+                $a := ins.c
+                $i := 0
+                while a >= 0 {
+                    if i < 8 {
+                        la_operand(cb, f, &fr, LA_A0 + i, f.margs[a].v)
+                    } else {
+                        la_operand(cb, f, &fr, LA_T0, f.margs[a].v)
+                        la_st(cb, LA_T0, LA_SP, (i - 8) * 8)
+                    }
+                    i += 1
+                    a = f.margs[a].next
+                }
+                if k == mir.MI_CALL_IND {
+                    la_operand(cb, f, &fr, LA_T3, ins.b)
+                    la_jirl(cb, LA_RA, LA_T3)
+                } else {
+                    la_call(cb, relocs, ins.sval)
+                }
+                la_set_temp(cb, &fr, ins.a, LA_A0)
+            } else if k == mir.MI_STR_CONST {
+                strs.push(StrFix{adr_off: cb.len(), bytes: ins.sval + ""})
+                e32(cb, 0x1c000000 | LA_T0)
+                la_addi(cb, LA_T0, LA_T0, 0)
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else if k == mir.MI_LOAD_FN_ADDR {
+                la_pcrel_pair(cb, relocs, LA_T0, ins.sval, false)
+                la_set_temp(cb, &fr, ins.a, LA_T0)
+            } else {
+                la_trap(cb)
+            }
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        if blk.tkind == mir.TKIND_RETURN {
+            la_operand(cb, f, &fr, LA_A0, blk.ta)
+            la_jump(cb, relocs, epilogue)
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                la_jump(cb, relocs, f.label + ".bb" + str(blk.ta))
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            la_operand(cb, f, &fr, LA_T0, blk.ta)
+            la_br(cb, 0x58000000, LA_T0, LA_ZERO, 12)
+            la_jump(cb, relocs, f.label + ".bb" + str(blk.tb))
+            if blk.tc != bi + 1 {
+                la_jump(cb, relocs, f.label + ".bb" + str(blk.tc))
+            }
+        } else {
+            la_li(cb, LA_A0, 0)
+            la_jump(cb, relocs, epilogue)
+        }
+    }
+    syms.define_label(epilogue, cb.len())
+    la_mv(cb, LA_SP, LA_FP)
+    la_ld(cb, LA_FP, LA_SP, 0)
+    la_ld(cb, LA_RA, LA_SP, 8)
+    la_addi(cb, LA_SP, LA_SP, 16)
+    la_ret(cb)
+    for si in 0:strs.len {
+        pos := cb.len()
+        s := strs[si].bytes
+        for bi2 in 0:s.len {
+            cb.emit_u8(s[bi2])
+        }
+        cb.emit_u8(0)
+        while cb.len() % 4 != 0 {
+            cb.emit_u8(0)
+        }
+        r := mc.reloc_new(strs[si].adr_off, "", mc.RELOC_LOONG_PCREL, 0)
+        mc.apply_reloc(cb, &r, pos)
+    }
+}
+
+// Task record slots (runtime/core chan.xu, named after arm64): 0..7 are
+// s0-s7, 72 the state register s8, then fp at 80, ra at 88, sp at 96.
+fn la_task_reg(i int) int {
+    if i == 9 { << LA_STATE }
+    << LA_S0 + i
+}
+
+fn emit_la64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+    syms.define_label("__xu_task_switch", cb.len())
+    for i in 0:10 {
+        if i != 8 {
+            la_st(cb, la_task_reg(i), LA_A0, i * 8)
+        }
+    }
+    la_st(cb, LA_FP, LA_A0, 80)
+    la_st(cb, LA_RA, LA_A0, 88)
+    la_st(cb, LA_SP, LA_A0, 96)
+    for i in 0:10 {
+        if i != 8 {
+            la_ld(cb, la_task_reg(i), LA_A0 + 1, i * 8)
+        }
+    }
+    la_ld(cb, LA_FP, LA_A0 + 1, 80)
+    la_ld(cb, LA_RA, LA_A0 + 1, 88)
+    la_ld(cb, LA_SP, LA_A0 + 1, 96)
+    la_ret(cb)
+    // __xu_task_entry: s0 = task, s1 = function, s2 = 16 argument words,
+    // s3 = exit function (never returns).
+    syms.define_label("__xu_task_entry", cb.len())
+    la_addi(cb, LA_SP, LA_SP, -64)
+    for i in 0:8 {
+        la_ld(cb, LA_T0, la_task_reg(2), 64 + i * 8)
+        la_st(cb, LA_T0, LA_SP, i * 8)
+    }
+    for i in 0:8 {
+        la_ld(cb, LA_A0 + i, la_task_reg(2), i * 8)
+    }
+    la_jirl(cb, LA_RA, la_task_reg(1))
+    la_addi(cb, LA_SP, LA_SP, 64)
+    la_mv(cb, LA_A0, la_task_reg(0))
+    la_jirl(cb, LA_RA, la_task_reg(3))
+    la_trap(cb)
+}
+
+// Process entry, raw system call and runtime-state accessor (Linux).
+pub fn emit_la64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string) {
+    syms.define_label("__xu_start", cb.len())
+    la_ld(cb, LA_S0, LA_SP, 0)
+    la_addi(cb, LA_S0 + 1, LA_SP, 8)
+    // envp = argv + 8 * (argc + 1)
+    e32(cb, 0x00410000 | (3 << 10) | (LA_S0 << 5) | (LA_S0 + 2))
+    la_3r(cb, 0x00108000, LA_S0 + 2, LA_S0 + 2, LA_S0 + 1)
+    la_addi(cb, LA_S0 + 2, LA_S0 + 2, 8)
+    la_li(cb, LA_A0, 0)
+    la_li(cb, LA_A0 + 1, 65536)
+    la_li(cb, LA_A0 + 2, 3)
+    la_li(cb, LA_A0 + 3, 34)
+    la_li(cb, LA_A0 + 4, -1)
+    la_li(cb, LA_A0 + 5, 0)
+    la_li(cb, LA_A7, 222)
+    la_syscall(cb)
+    la_mv(cb, LA_STATE, LA_A0)
+    la_st(cb, LA_S0, LA_STATE, 0)
+    la_st(cb, LA_S0 + 1, LA_STATE, 8)
+    la_st(cb, LA_S0 + 2, LA_STATE, 32)
+    la_li(cb, LA_FP, 0)
+    la_call(cb, relocs, main_label)
+    la_li(cb, LA_A7, 94)
+    la_syscall(cb)
+    // __xu_syscall(nr, a, b, c, d, e, f): the rv64_base.xu protocol.
+    syms.define_label("__xu_syscall", cb.len())
+    la_li(cb, LA_T0, -5)
+    la_br(cb, 0x5c000000, LA_A0, LA_T0, 52)
+    la_li(cb, LA_T1, 8)
+    la_br(cb, 0x60000000, LA_A0 + 2, LA_T1, 20)
+    la_st(cb, LA_ZERO, LA_A0 + 1, 0)
+    la_addi(cb, LA_A0 + 1, LA_A0 + 1, 8)
+    la_addi(cb, LA_A0 + 2, LA_A0 + 2, -8)
+    la_br(cb, 0x58000000, LA_ZERO, LA_ZERO, -16)
+    la_br(cb, 0x58000000, LA_A0 + 2, LA_ZERO, 20)
+    la_mem(cb, true, 1, LA_ZERO, LA_A0 + 1, 0)
+    la_addi(cb, LA_A0 + 1, LA_A0 + 1, 1)
+    la_addi(cb, LA_A0 + 2, LA_A0 + 2, -1)
+    la_br(cb, 0x58000000, LA_ZERO, LA_ZERO, -16)
+    la_ret(cb)
+    la_li(cb, LA_T0, -4)
+    la_br(cb, 0x5c000000, LA_A0, LA_T0, 68)
+    la_li(cb, LA_T1, 8)
+    la_br(cb, 0x60000000, LA_A0 + 3, LA_T1, 28)
+    la_ld(cb, LA_T2, LA_A0 + 2, 0)
+    la_st(cb, LA_T2, LA_A0 + 1, 0)
+    la_addi(cb, LA_A0 + 1, LA_A0 + 1, 8)
+    la_addi(cb, LA_A0 + 2, LA_A0 + 2, 8)
+    la_addi(cb, LA_A0 + 3, LA_A0 + 3, -8)
+    la_br(cb, 0x58000000, LA_ZERO, LA_ZERO, -24)
+    la_br(cb, 0x58000000, LA_A0 + 3, LA_ZERO, 28)
+    la_mem(cb, false, 1, LA_T2, LA_A0 + 2, 0)
+    la_mem(cb, true, 1, LA_T2, LA_A0 + 1, 0)
+    la_addi(cb, LA_A0 + 1, LA_A0 + 1, 1)
+    la_addi(cb, LA_A0 + 2, LA_A0 + 2, 1)
+    la_addi(cb, LA_A0 + 3, LA_A0 + 3, -1)
+    la_br(cb, 0x58000000, LA_ZERO, LA_ZERO, -24)
+    la_ret(cb)
+    la_li(cb, LA_T0, -2)
+    la_br(cb, 0x5c000000, LA_A0, LA_T0, 12)
+    la_mv(cb, LA_A0, LA_FP)
+    la_ret(cb)
+    la_li(cb, LA_T0, -3)
+    la_br(cb, 0x5c000000, LA_A0, LA_T0, 16)
+    la_pcrel_pair(cb, relocs, LA_A0, "__xu_start", false)
+    la_ret(cb)
+    la_li(cb, LA_T0, -1)
+    la_br(cb, 0x5c000000, LA_A0, LA_T0, 20)
+    la_mv(cb, LA_A0, LA_A0 + 1)
+    la_mv(cb, LA_A0 + 1, LA_A0 + 2)
+    la_jump(cb, relocs, "__xu_task_switch")
+    la_mv(cb, LA_A7, LA_A0)
+    for i in 0:6 {
+        la_mv(cb, LA_A0 + i, LA_A0 + i + 1)
+    }
+    la_syscall(cb)
+    la_ret(cb)
+    syms.define_label("__xu_globals", cb.len())
+    la_mv(cb, LA_A0, LA_STATE)
+    la_ret(cb)
+    emit_la64_task_stubs(cb, syms)
+}
