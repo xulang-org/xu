@@ -1,0 +1,816 @@
+@xu/codegen
+// Baseline RV32IM instruction selection for typed MIR, bare metal (QEMU
+// virt and RV32 boards without an FPU).
+//
+// Values keep the 64-bit model: every temp is an 8-byte frame slot (the
+// arm64_base.xu layout) and is computed as a low/high register pair. f64
+// arithmetic and 64-bit division call runtime/core softfloat.xu.
+//   - arguments 0-3 in a0:a1 .. a6:a7, 4-7 in s2:s3 .. s8:s9, the rest at
+//     [sp + 8*(i-8)] of the caller's outgoing area; result in a0:a1
+//   - frame: [s0] saved s0, [s0+8] ra (8-byte words), sp = s0 - frame
+//   - s11 holds the runtime state block; s1, s10, gp and tp hold task
+//     entry state, and no generated code touches them
+// The runtime stubs emulate the Linux system calls the runtime needs on
+// the board: UART output, a bump heap, the timer and the exit device.
+
+#xu/mir
+#xu/mc
+
+const R32_ZERO = 0
+const R32_RA = 1
+const R32_SP = 2
+const R32_GP = 3
+const R32_TP = 4
+const R32_S0 = 8
+const R32_S1 = 9
+const R32_A0 = 10
+const R32_S10 = 26
+const R32_STATE = 27
+// operand pairs A = (AL, AH), B = (BL, BH); T4/T5 scratch; AT addresses
+const R32_AL = 5
+const R32_AH = 6
+const R32_BL = 7
+const R32_BH = 28
+const R32_T4 = 29
+const R32_T5 = 30
+const R32_AT = 31
+
+// QEMU virt board
+const R32_UART = 268435456       // 0x10000000 NS16550
+const R32_TEST_DEV = 1048576     // 0x00100000 sifive_test
+const R32_MTIME = 33603576       // 0x0200bff8 CLINT mtime, 10 MHz
+const R32_RAM_TOP = 2281701376   // 0x88000000 (128 MiB)
+const R32_HEAP_LIMIT = 2280652800 // 0x87f00000: 1 MiB left for the main stack
+
+// ===== encoders =====
+
+fn r32_sext(v int) int {
+    << ((v & 0xffffffff) ^ 0x80000000) - 0x80000000
+}
+
+fn r32_li(cb $&mc.CodeBuffer, rd int, v0 int) {
+    v := r32_sext(v0)
+    if v >= -2048 && v < 2048 {
+        rv_addi(cb, rd, R32_ZERO, v)
+        <<
+    }
+    hi := (v + 0x800) >> 12
+    lo := v - (hi << 12)
+    e32(cb, ((hi & 0xfffff) << 12) | (rd << 7) | 0x37)
+    if lo != 0 {
+        rv_addi(cb, rd, rd, lo)
+    }
+}
+
+fn r32_rr(cb $&mc.CodeBuffer, f7 int, f3 int, rd int, rs1 int, rs2 int) {
+    rv_r(cb, f7, rs2, rs1, f3, rd, 0x33)
+}
+
+fn r32_add(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 0, 0, rd, a, b) }
+fn r32_sub(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 0x20, 0, rd, a, b) }
+fn r32_sltu(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 0, 3, rd, a, b) }
+fn r32_slt(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 0, 2, rd, a, b) }
+fn r32_and(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 0, 7, rd, a, b) }
+fn r32_or(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 0, 6, rd, a, b) }
+fn r32_xor(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 0, 4, rd, a, b) }
+fn r32_mul(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 1, 0, rd, a, b) }
+fn r32_mulhu(cb $&mc.CodeBuffer, rd int, a int, b int) { r32_rr(cb, 1, 3, rd, a, b) }
+
+fn r32_srai(cb $&mc.CodeBuffer, rd int, rs int, n int) {
+    rv_i(cb, 0x400 | n, rs, 5, rd, 0x13)
+}
+
+fn r32_xori(cb $&mc.CodeBuffer, rd int, rs int, imm int) {
+    rv_i(cb, imm, rs, 4, rd, 0x13)
+}
+
+fn r32_andi(cb $&mc.CodeBuffer, rd int, rs int, imm int) {
+    rv_i(cb, imm, rs, 7, rd, 0x13)
+}
+
+fn r32_sltiu(cb $&mc.CodeBuffer, rd int, rs int, imm int) {
+    rv_i(cb, imm, rs, 3, rd, 0x13)
+}
+
+fn r32_jal(cb $&mc.CodeBuffer, rd int, off int) {
+    e32(cb, r32_j_bits(off) | (rd << 7) | 0x6f)
+}
+
+fn r32_jalr(cb $&mc.CodeBuffer, rd int, rs int) {
+    rv_i(cb, 0, rs, 0, rd, 0x67)
+}
+
+fn r32_b_bits(off int) int {
+    << (((off >> 12) & 1) << 31) | (((off >> 5) & 0x3f) << 25) | (((off >> 1) & 0xf) << 8) | (((off >> 11) & 1) << 7)
+}
+
+fn r32_j_bits(off int) int {
+    << (((off >> 20) & 1) << 31) | (((off >> 1) & 0x3ff) << 21) | (((off >> 11) & 1) << 20) | (((off >> 12) & 0xff) << 12)
+}
+
+// Load (store) a 32-bit word, or width 1/2 zero-extended, at [rn + off].
+fn r32_mem(cb $&mc.CodeBuffer, store bool, width int, rt int, rn int, off int) {
+    $base := rn
+    $o := off
+    if off < -2048 || off >= 2048 {
+        r32_li(cb, R32_AT, off)
+        r32_add(cb, R32_AT, rn, R32_AT)
+        base = R32_AT
+        o = 0
+    }
+    if store {
+        $f3 := 2
+        if width == 1 { f3 = 0 }
+        else if width == 2 { f3 = 1 }
+        rv_s(cb, o, rt, base, f3)
+        <<
+    }
+    $f3 := 2
+    if width == 1 { f3 = 4 }
+    else if width == 2 { f3 = 5 }
+    rv_i(cb, o, base, f3, rt, 0x03)
+}
+
+fn r32_lw(cb $&mc.CodeBuffer, rt int, rn int, off int) {
+    r32_mem(cb, false, 4, rt, rn, off)
+}
+
+fn r32_sw(cb $&mc.CodeBuffer, rt int, rn int, off int) {
+    r32_mem(cb, true, 4, rt, rn, off)
+}
+
+// 8-byte word: lo at off, hi at off + 4.
+fn r32_ld_pair(cb $&mc.CodeBuffer, lo int, hi int, rn int, off int) {
+    r32_lw(cb, lo, rn, off)
+    r32_lw(cb, hi, rn, off + 4)
+}
+
+fn r32_st_pair(cb $&mc.CodeBuffer, lo int, hi int, rn int, off int) {
+    r32_sw(cb, lo, rn, off)
+    r32_sw(cb, hi, rn, off + 4)
+}
+
+fn r32_add_imm(cb $&mc.CodeBuffer, rd int, rs int, imm int) {
+    if imm >= -2048 && imm < 2048 {
+        rv_addi(cb, rd, rs, imm)
+        <<
+    }
+    r32_li(cb, R32_AT, imm)
+    r32_add(cb, rd, rs, R32_AT)
+}
+
+fn r32_call(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, label string) {
+    rv_pcrel_pair(cb, relocs, R32_RA, label, true)
+}
+
+fn r32_jump(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, label string) {
+    rv_pcrel_pair(cb, relocs, R32_BH, label, true)
+}
+
+// Register pair of argument i < 8.
+fn r32_arg_lo(i int) int {
+    if i < 4 { << R32_A0 + 2 * i }
+    << 18 + 2 * (i - 4)
+}
+
+// ===== frame =====
+
+fn r32_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, lo int, hi int, v int) {
+    if v <= -2 {
+        c := f.consts[0 - v - 2]
+        r32_li(cb, lo, c)
+        r32_li(cb, hi, c >> 32)
+        <<
+    }
+    if v >= 0 && v < fr.temp_off.len {
+        r32_ld_pair(cb, lo, hi, R32_SP, fr.temp_off[v])
+        <<
+    }
+    rv_addi(cb, lo, R32_ZERO, 0)
+    rv_addi(cb, hi, R32_ZERO, 0)
+}
+
+fn r32_set_temp(cb $&mc.CodeBuffer, fr &A64Frame, t int, lo int, hi int) {
+    if t >= 0 && t < fr.temp_off.len {
+        r32_st_pair(cb, lo, hi, R32_SP, fr.temp_off[t])
+    }
+}
+
+// ===== operations: A = A op B =====
+
+// AL = (x < y) signed 64-bit, AH = 0.
+fn r32_lt(cb $&mc.CodeBuffer, xl int, xh int, yl int, yh int) {
+    r32_slt(cb, R32_T4, xh, yh)
+    r32_sltu(cb, R32_T5, xl, yl)
+    r32_xor(cb, R32_AT, xh, yh)
+    r32_sltiu(cb, R32_AT, R32_AT, 1)
+    r32_and(cb, R32_T5, R32_T5, R32_AT)
+    r32_xori(cb, R32_AT, R32_AT, 1)
+    r32_and(cb, R32_T4, R32_T4, R32_AT)
+    r32_or(cb, R32_AL, R32_T4, R32_T5)
+    rv_addi(cb, R32_AH, R32_ZERO, 0)
+}
+
+// A and B (B and A when swap) into a0:a1, a2:a3, call, result back
+// into A.
+fn r32_helper(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, name string, swap bool) {
+    $x := R32_AL
+    $xh := R32_AH
+    $y := R32_BL
+    $yh := R32_BH
+    if swap {
+        x = R32_BL
+        xh = R32_BH
+        y = R32_AL
+        yh = R32_AH
+    }
+    rv_mv(cb, R32_A0, x)
+    rv_mv(cb, R32_A0 + 1, xh)
+    rv_mv(cb, R32_A0 + 2, y)
+    rv_mv(cb, R32_A0 + 3, yh)
+    r32_call(cb, relocs, "_xu_runtime_core_" + name)
+    rv_mv(cb, R32_AL, R32_A0)
+    rv_mv(cb, R32_AH, R32_A0 + 1)
+}
+
+// 32-bit operands with a divisor other than 0 and -1 use div/rem;
+// everything else goes to the runtime.
+fn r32_divmod(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, is_mod bool) {
+    r32_srai(cb, R32_T4, R32_AL, 31)
+    rv_b(cb, 1, R32_T4, R32_AH, 36)
+    r32_srai(cb, R32_T4, R32_BL, 31)
+    rv_b(cb, 1, R32_T4, R32_BH, 28)
+    rv_b(cb, 0, R32_BL, R32_ZERO, 24)
+    rv_addi(cb, R32_T4, R32_ZERO, -1)
+    rv_b(cb, 0, R32_BL, R32_T4, 16)
+    if is_mod {
+        r32_rr(cb, 1, 6, R32_AL, R32_AL, R32_BL)
+    } else {
+        r32_rr(cb, 1, 4, R32_AL, R32_AL, R32_BL)
+    }
+    r32_srai(cb, R32_AH, R32_AL, 31)
+    r32_jal(cb, R32_ZERO, 36)
+    $name := "sf_div64"
+    if is_mod {
+        name = "sf_mod64"
+    }
+    r32_helper(cb, relocs, name, false)
+}
+
+fn r32_shift(cb $&mc.CodeBuffer, left bool) {
+    r32_andi(cb, R32_BL, R32_BL, 63)
+    rv_addi(cb, R32_T4, R32_BL, -32)
+    rv_b(cb, 5, R32_T4, R32_ZERO, 32)
+    if left {
+        r32_rr(cb, 0, 1, R32_AH, R32_AH, R32_BL)
+        rv_i(cb, 1, R32_AL, 5, R32_T5, 0x13)
+        r32_xori(cb, R32_BH, R32_BL, 31)
+        r32_rr(cb, 0, 5, R32_T5, R32_T5, R32_BH)
+        r32_or(cb, R32_AH, R32_AH, R32_T5)
+        r32_rr(cb, 0, 1, R32_AL, R32_AL, R32_BL)
+        r32_jal(cb, R32_ZERO, 12)
+        r32_rr(cb, 0, 1, R32_AH, R32_AL, R32_T4)
+        rv_addi(cb, R32_AL, R32_ZERO, 0)
+    } else {
+        r32_rr(cb, 0, 5, R32_AL, R32_AL, R32_BL)
+        rv_i(cb, 1, R32_AH, 1, R32_T5, 0x13)
+        r32_xori(cb, R32_BH, R32_BL, 31)
+        r32_rr(cb, 0, 1, R32_T5, R32_T5, R32_BH)
+        r32_or(cb, R32_AL, R32_AL, R32_T5)
+        r32_rr(cb, 0x20, 5, R32_AH, R32_AH, R32_BL)
+        r32_jal(cb, R32_ZERO, 12)
+        r32_rr(cb, 0x20, 5, R32_AL, R32_AH, R32_T4)
+        r32_srai(cb, R32_AH, R32_AH, 31)
+    }
+}
+
+fn r32_bin(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, op int) {
+    if op == mir.BIN_ADD {
+        r32_add(cb, R32_T4, R32_AL, R32_BL)
+        r32_sltu(cb, R32_T5, R32_T4, R32_AL)
+        r32_add(cb, R32_AH, R32_AH, R32_BH)
+        r32_add(cb, R32_AH, R32_AH, R32_T5)
+        rv_mv(cb, R32_AL, R32_T4)
+    } else if op == mir.BIN_SUB {
+        r32_sltu(cb, R32_T5, R32_AL, R32_BL)
+        r32_sub(cb, R32_AL, R32_AL, R32_BL)
+        r32_sub(cb, R32_AH, R32_AH, R32_BH)
+        r32_sub(cb, R32_AH, R32_AH, R32_T5)
+    } else if op == mir.BIN_MUL {
+        r32_mulhu(cb, R32_T5, R32_AL, R32_BL)
+        r32_mul(cb, R32_T4, R32_AL, R32_BH)
+        r32_add(cb, R32_T5, R32_T5, R32_T4)
+        r32_mul(cb, R32_T4, R32_AH, R32_BL)
+        r32_add(cb, R32_AH, R32_T5, R32_T4)
+        r32_mul(cb, R32_AL, R32_AL, R32_BL)
+    } else if op == mir.BIN_DIV {
+        r32_divmod(cb, relocs, false)
+    } else if op == mir.BIN_MOD {
+        r32_divmod(cb, relocs, true)
+    } else if op == mir.BIN_AND {
+        r32_and(cb, R32_AL, R32_AL, R32_BL)
+        r32_and(cb, R32_AH, R32_AH, R32_BH)
+    } else if op == mir.BIN_OR {
+        r32_or(cb, R32_AL, R32_AL, R32_BL)
+        r32_or(cb, R32_AH, R32_AH, R32_BH)
+    } else if op == mir.BIN_XOR {
+        r32_xor(cb, R32_AL, R32_AL, R32_BL)
+        r32_xor(cb, R32_AH, R32_AH, R32_BH)
+    } else if op == mir.BIN_SHL {
+        r32_shift(cb, true)
+    } else if op == mir.BIN_SHR {
+        r32_shift(cb, false)
+    } else if op == mir.BIN_EQ || op == mir.BIN_NE {
+        r32_xor(cb, R32_AL, R32_AL, R32_BL)
+        r32_xor(cb, R32_AH, R32_AH, R32_BH)
+        r32_or(cb, R32_AL, R32_AL, R32_AH)
+        if op == mir.BIN_EQ {
+            r32_sltiu(cb, R32_AL, R32_AL, 1)
+        } else {
+            r32_sltu(cb, R32_AL, R32_ZERO, R32_AL)
+        }
+        rv_addi(cb, R32_AH, R32_ZERO, 0)
+    } else if op == mir.BIN_LT {
+        r32_lt(cb, R32_AL, R32_AH, R32_BL, R32_BH)
+    } else if op == mir.BIN_GT {
+        r32_lt(cb, R32_BL, R32_BH, R32_AL, R32_AH)
+    } else if op == mir.BIN_LE {
+        r32_lt(cb, R32_BL, R32_BH, R32_AL, R32_AH)
+        r32_xori(cb, R32_AL, R32_AL, 1)
+    } else if op == mir.BIN_GE {
+        r32_lt(cb, R32_AL, R32_AH, R32_BL, R32_BH)
+        r32_xori(cb, R32_AL, R32_AL, 1)
+    } else if op == mir.BIN_FADD {
+        r32_helper(cb, relocs, "sf_add", false)
+    } else if op == mir.BIN_FSUB {
+        r32_helper(cb, relocs, "sf_sub", false)
+    } else if op == mir.BIN_FMUL {
+        r32_helper(cb, relocs, "sf_mul", false)
+    } else if op == mir.BIN_FDIV {
+        r32_helper(cb, relocs, "sf_div", false)
+    } else if op == mir.BIN_FEQ || op == mir.BIN_FNE {
+        r32_helper(cb, relocs, "sf_eq", false)
+        if op == mir.BIN_FNE {
+            r32_xori(cb, R32_AL, R32_AL, 1)
+        }
+        rv_addi(cb, R32_AH, R32_ZERO, 0)
+    } else if op == mir.BIN_FLT || op == mir.BIN_FGT {
+        r32_helper(cb, relocs, "sf_lt", op == mir.BIN_FGT)
+        rv_addi(cb, R32_AH, R32_ZERO, 0)
+    } else if op == mir.BIN_FLE || op == mir.BIN_FGE {
+        r32_helper(cb, relocs, "sf_le", op == mir.BIN_FGE)
+        rv_addi(cb, R32_AH, R32_ZERO, 0)
+    } else {
+        rv_trap(cb)
+    }
+}
+
+pub fn isel_fn_rv32_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int) {
+    fr := a64_frame(f)
+    syms.define_label(f.label, cb.len())
+    $last_line := f.src_line
+    if last_line > 0 {
+        lines.push(cb.len())
+        lines.push(last_line)
+    }
+    rv_addi(cb, R32_SP, R32_SP, -16)
+    r32_st_pair(cb, R32_RA, R32_ZERO, R32_SP, 8)
+    r32_st_pair(cb, R32_S0, R32_ZERO, R32_SP, 0)
+    rv_mv(cb, R32_S0, R32_SP)
+    if fr.size > 0 {
+        r32_add_imm(cb, R32_SP, R32_SP, 0 - fr.size)
+    }
+    for i in 0:f.nparams {
+        if i < 8 {
+            r32_st_pair(cb, r32_arg_lo(i), r32_arg_lo(i) + 1, R32_SP, fr.local_off[i])
+        } else {
+            r32_ld_pair(cb, R32_AL, R32_AH, R32_S0, 16 + (i - 8) * 8)
+            r32_st_pair(cb, R32_AL, R32_AH, R32_SP, fr.local_off[i])
+        }
+    }
+    $strs := []StrFix{}
+    epilogue := f.label + ".ret"
+    for bi in 0:f.blocks.len {
+        syms.define_label(f.label + ".bb" + str(bi), cb.len())
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            k := ins.kind
+            if ins.line > 0 && ins.line != last_line {
+                last_line = ins.line
+                lines.push(cb.len())
+                lines.push(last_line)
+            }
+            if k == mir.MI_LOAD_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                r32_ld_pair(cb, R32_AL, R32_AH, R32_SP, fr.local_off[ins.b] + w * 8)
+                r32_set_temp(cb, &fr, ins.a, R32_AL, R32_AH)
+            } else if k == mir.MI_STORE_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                r32_operand(cb, f, &fr, R32_AL, R32_AH, ins.b)
+                r32_st_pair(cb, R32_AL, R32_AH, R32_SP, fr.local_off[ins.a] + w * 8)
+            } else if k == mir.MI_ADDR {
+                r32_add_imm(cb, R32_AL, R32_SP, fr.local_off[ins.b])
+                r32_set_temp(cb, &fr, ins.a, R32_AL, R32_ZERO)
+            } else if k == mir.MI_LOAD_PTR {
+                r32_operand(cb, f, &fr, R32_BL, R32_BH, ins.b)
+                w := ins.d
+                if w == 1 || w == 2 {
+                    r32_mem(cb, false, w, R32_AL, R32_BL, ins.c)
+                    rv_addi(cb, R32_AH, R32_ZERO, 0)
+                } else if w == 4 {
+                    r32_lw(cb, R32_AL, R32_BL, ins.c)
+                    rv_addi(cb, R32_AH, R32_ZERO, 0)
+                } else if w == -4 {
+                    r32_lw(cb, R32_AL, R32_BL, ins.c)
+                    r32_srai(cb, R32_AH, R32_AL, 31)
+                } else {
+                    r32_ld_pair(cb, R32_AL, R32_AH, R32_BL, ins.c)
+                }
+                r32_set_temp(cb, &fr, ins.a, R32_AL, R32_AH)
+            } else if k == mir.MI_STORE_PTR {
+                r32_operand(cb, f, &fr, R32_BL, R32_BH, ins.a)
+                r32_operand(cb, f, &fr, R32_AL, R32_AH, ins.b)
+                w := ins.d
+                if w == 1 || w == 2 {
+                    r32_mem(cb, true, w, R32_AL, R32_BL, ins.c)
+                } else if w == 4 || w == -4 {
+                    r32_sw(cb, R32_AL, R32_BL, ins.c)
+                } else {
+                    r32_st_pair(cb, R32_AL, R32_AH, R32_BL, ins.c)
+                }
+            } else if k == mir.MI_BIN {
+                r32_operand(cb, f, &fr, R32_AL, R32_AH, ins.c)
+                r32_operand(cb, f, &fr, R32_BL, R32_BH, ins.d)
+                r32_bin(cb, relocs, ins.b)
+                r32_set_temp(cb, &fr, ins.a, R32_AL, R32_AH)
+            } else if k == mir.MI_UN {
+                r32_operand(cb, f, &fr, R32_A0, R32_A0 + 1, ins.c)
+                if ins.b == mir.UN_I2F {
+                    r32_call(cb, relocs, "_xu_runtime_core_sf_from_int")
+                } else if ins.b == mir.UN_F2I {
+                    r32_call(cb, relocs, "_xu_runtime_core_sf_to_int")
+                } else {
+                    rv_trap(cb)
+                }
+                r32_set_temp(cb, &fr, ins.a, R32_A0, R32_A0 + 1)
+            } else if k == mir.MI_COPY {
+                r32_operand(cb, f, &fr, R32_AL, R32_AH, ins.b)
+                r32_set_temp(cb, &fr, ins.a, R32_AL, R32_AH)
+            } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+                $a := ins.c
+                $i := 0
+                while a >= 0 {
+                    if i < 8 {
+                        r32_operand(cb, f, &fr, r32_arg_lo(i), r32_arg_lo(i) + 1, f.margs[a].v)
+                    } else {
+                        r32_operand(cb, f, &fr, R32_AL, R32_AH, f.margs[a].v)
+                        r32_st_pair(cb, R32_AL, R32_AH, R32_SP, (i - 8) * 8)
+                    }
+                    i += 1
+                    a = f.margs[a].next
+                }
+                if k == mir.MI_CALL_IND {
+                    r32_operand(cb, f, &fr, R32_BH, R32_T4, ins.b)
+                    r32_jalr(cb, R32_RA, R32_BH)
+                } else {
+                    r32_call(cb, relocs, ins.sval)
+                }
+                r32_set_temp(cb, &fr, ins.a, R32_A0, R32_A0 + 1)
+            } else if k == mir.MI_STR_CONST {
+                strs.push(StrFix{adr_off: cb.len(), bytes: ins.sval + ""})
+                e32(cb, (R32_AL << 7) | 0x17)
+                rv_addi(cb, R32_AL, R32_AL, 0)
+                r32_set_temp(cb, &fr, ins.a, R32_AL, R32_ZERO)
+            } else if k == mir.MI_LOAD_FN_ADDR {
+                rv_pcrel_pair(cb, relocs, R32_AL, ins.sval, false)
+                r32_set_temp(cb, &fr, ins.a, R32_AL, R32_ZERO)
+            } else {
+                rv_trap(cb)
+            }
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        if blk.tkind == mir.TKIND_RETURN {
+            r32_operand(cb, f, &fr, R32_A0, R32_A0 + 1, blk.ta)
+            r32_jump(cb, relocs, epilogue)
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                r32_jump(cb, relocs, f.label + ".bb" + str(blk.ta))
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            r32_operand(cb, f, &fr, R32_AL, R32_AH, blk.ta)
+            r32_or(cb, R32_AL, R32_AL, R32_AH)
+            rv_b(cb, 0, R32_AL, R32_ZERO, 12)
+            r32_jump(cb, relocs, f.label + ".bb" + str(blk.tb))
+            if blk.tc != bi + 1 {
+                r32_jump(cb, relocs, f.label + ".bb" + str(blk.tc))
+            }
+        } else {
+            rv_addi(cb, R32_A0, R32_ZERO, 0)
+            rv_addi(cb, R32_A0 + 1, R32_ZERO, 0)
+            r32_jump(cb, relocs, epilogue)
+        }
+    }
+    syms.define_label(epilogue, cb.len())
+    rv_mv(cb, R32_SP, R32_S0)
+    r32_lw(cb, R32_S0, R32_SP, 0)
+    r32_lw(cb, R32_RA, R32_SP, 8)
+    rv_addi(cb, R32_SP, R32_SP, 16)
+    rv_ret(cb)
+    for si in 0:strs.len {
+        pos := cb.len()
+        s := strs[si].bytes
+        for bi2 in 0:s.len {
+            cb.emit_u8(s[bi2])
+        }
+        cb.emit_u8(0)
+        while cb.len() % 4 != 0 {
+            cb.emit_u8(0)
+        }
+        r := mc.reloc_new(strs[si].adr_off, "", mc.RELOC_RISCV_PCREL, 0)
+        mc.apply_reloc(cb, &r, pos)
+    }
+}
+
+// ===== runtime stubs =====
+
+// Reset entry at offset 0: boards start at the load address.
+pub fn emit_rv32_reset(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc) {
+    r32_jump(cb, relocs, "__xu_start")
+}
+
+// Branches to labels inside the stubs, patched once all are defined.
+struct R32Fix {
+    pos int
+    word int
+    label string
+    jal bool
+}
+
+fn r32_b_to(cb $&mc.CodeBuffer, fx $&[]R32Fix, f3 int, rs1 int, rs2 int, label string) {
+    fx.push(R32Fix{pos: cb.len(), word: (rs2 << 20) | (rs1 << 15) | (f3 << 12) | 0x63, label: label + "", jal: false})
+    e32(cb, 0)
+}
+
+fn r32_j_to(cb $&mc.CodeBuffer, fx $&[]R32Fix, label string) {
+    fx.push(R32Fix{pos: cb.len(), word: 0x6f, label: label + "", jal: true})
+    e32(cb, 0)
+}
+
+fn r32_patch(cb $&mc.CodeBuffer, syms &mc.SymbolTable, fx &[]R32Fix) {
+    for i in 0:fx.len {
+        off := syms.lookup_offset(fx[i].label) - fx[i].pos
+        if fx[i].jal {
+            cb.patch_u32_le(fx[i].pos, fx[i].word | r32_j_bits(off))
+        } else {
+            cb.patch_u32_le(fx[i].pos, fx[i].word | r32_b_bits(off))
+        }
+    }
+}
+
+// Branch to label when a0 == nr.
+fn r32_on_nr(cb $&mc.CodeBuffer, fx $&[]R32Fix, nr int, label string) {
+    r32_li(cb, R32_T4, nr)
+    r32_b_to(cb, fx, 0, R32_A0, R32_T4, label)
+}
+
+fn r32_ret_pair(cb $&mc.CodeBuffer, v int) {
+    r32_li(cb, R32_A0, v)
+    r32_li(cb, R32_A0 + 1, v >> 32)
+    rv_ret(cb)
+}
+
+fn r32_la(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, rd int, label string) {
+    rv_pcrel_pair(cb, relocs, rd, label, false)
+}
+
+// Task record slots (runtime/core chan.xu): 0 task, 1 function, 2
+// argument block, 3 exit function, 9 the state register; fp at 80, ra at
+// 88, sp at 96. Each slot is an 8-byte word.
+fn r32_task_reg(i int) int {
+    if i == 0 { << R32_S1 }
+    if i == 1 { << R32_S10 }
+    if i == 2 { << R32_GP }
+    if i == 3 { << R32_TP }
+    << R32_STATE
+}
+
+fn emit_rv32_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+    syms.define_label("__xu_task_switch", cb.len())
+    slots := [0, 1, 2, 3, 9]
+    for si in 0:slots.len {
+        r32_st_pair(cb, r32_task_reg(slots[si]), R32_ZERO, R32_A0, slots[si] * 8)
+    }
+    r32_st_pair(cb, R32_S0, R32_ZERO, R32_A0, 80)
+    r32_st_pair(cb, R32_RA, R32_ZERO, R32_A0, 88)
+    r32_st_pair(cb, R32_SP, R32_ZERO, R32_A0, 96)
+    for si in 0:slots.len {
+        r32_lw(cb, r32_task_reg(slots[si]), R32_A0 + 1, slots[si] * 8)
+    }
+    r32_lw(cb, R32_S0, R32_A0 + 1, 80)
+    r32_lw(cb, R32_RA, R32_A0 + 1, 88)
+    r32_lw(cb, R32_SP, R32_A0 + 1, 96)
+    rv_ret(cb)
+    // __xu_task_entry: 16 argument words at the block in gp.
+    syms.define_label("__xu_task_entry", cb.len())
+    rv_addi(cb, R32_SP, R32_SP, -64)
+    for i in 8:16 {
+        r32_ld_pair(cb, R32_AL, R32_AH, R32_GP, i * 8)
+        r32_st_pair(cb, R32_AL, R32_AH, R32_SP, (i - 8) * 8)
+    }
+    for i in 0:8 {
+        r32_ld_pair(cb, r32_arg_lo(i), r32_arg_lo(i) + 1, R32_GP, i * 8)
+    }
+    r32_jalr(cb, R32_RA, R32_S10)
+    rv_addi(cb, R32_SP, R32_SP, 64)
+    rv_mv(cb, R32_A0, R32_S1)
+    rv_addi(cb, R32_A0 + 1, R32_ZERO, 0)
+    r32_jalr(cb, R32_RA, R32_TP)
+    rv_trap(cb)
+}
+
+// Process entry, the emulated system calls and the runtime-state accessor.
+pub fn emit_rv32_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string) {
+    $fx := []R32Fix{}
+    syms.define_label("__xu_start", cb.len())
+    r32_li(cb, R32_SP, R32_RAM_TOP)
+    // heap from the end of the image; the state block (64 KiB) first,
+    // then a zero word for argv and envp
+    r32_la(cb, relocs, R32_AL, "__xu_image_end")
+    rv_addi(cb, R32_AL, R32_AL, 15)
+    r32_andi(cb, R32_AL, R32_AL, -16)
+    rv_mv(cb, R32_STATE, R32_AL)
+    r32_li(cb, R32_T4, 65536)
+    r32_add(cb, R32_AH, R32_AL, R32_T4)
+    r32_sw(cb, R32_AH, R32_STATE, 8)
+    r32_sw(cb, R32_AH, R32_STATE, 32)
+    rv_addi(cb, R32_AH, R32_AH, 16)
+    r32_la(cb, relocs, R32_AT, "__xu_heap_cur")
+    r32_sw(cb, R32_AH, R32_AT, 0)
+    rv_addi(cb, R32_S0, R32_ZERO, 0)
+    r32_call(cb, relocs, main_label)
+    r32_j_to(cb, $&fx, "__xu_rt32.exit")
+
+    // __xu_syscall(nr, a, b, c, ...): nr in a0, a in a2, b in a4, c in a6.
+    syms.define_label("__xu_syscall", cb.len())
+    r32_on_nr(cb, $&fx, -5, "__xu_rt32.memset")
+    r32_on_nr(cb, $&fx, -4, "__xu_rt32.memcpy")
+    r32_on_nr(cb, $&fx, -2, "__xu_rt32.fp")
+    r32_on_nr(cb, $&fx, -3, "__xu_rt32.start")
+    r32_on_nr(cb, $&fx, -1, "__xu_rt32.switch")
+    r32_on_nr(cb, $&fx, 64, "__xu_rt32.write")
+    r32_on_nr(cb, $&fx, 222, "__xu_rt32.mmap")
+    r32_on_nr(cb, $&fx, 113, "__xu_rt32.clock")
+    r32_on_nr(cb, $&fx, 93, "__xu_rt32.exit_a")
+    r32_on_nr(cb, $&fx, 94, "__xu_rt32.exit_a")
+    r32_on_nr(cb, $&fx, 63, "__xu_rt32.zero")
+    r32_on_nr(cb, $&fx, 215, "__xu_rt32.zero")
+    r32_on_nr(cb, $&fx, 226, "__xu_rt32.zero")
+    r32_on_nr(cb, $&fx, 233, "__xu_rt32.zero")
+    r32_on_nr(cb, $&fx, 172, "__xu_rt32.one")
+    r32_ret_pair(cb, -38)
+    syms.define_label("__xu_rt32.zero", cb.len())
+    r32_ret_pair(cb, 0)
+    syms.define_label("__xu_rt32.one", cb.len())
+    r32_ret_pair(cb, 1)
+
+    // memset(a, b): zero b bytes at a (words while aligned)
+    syms.define_label("__xu_rt32.memset", cb.len())
+    syms.define_label("__xu_rt32.memset_w", cb.len())
+    r32_andi(cb, R32_T4, R32_A0 + 2, 3)
+    r32_b_to(cb, $&fx, 1, R32_T4, R32_ZERO, "__xu_rt32.memset_b")
+    r32_li(cb, R32_T4, 4)
+    r32_b_to(cb, $&fx, 4, R32_A0 + 4, R32_T4, "__xu_rt32.memset_b")
+    r32_sw(cb, R32_ZERO, R32_A0 + 2, 0)
+    rv_addi(cb, R32_A0 + 2, R32_A0 + 2, 4)
+    rv_addi(cb, R32_A0 + 4, R32_A0 + 4, -4)
+    r32_j_to(cb, $&fx, "__xu_rt32.memset_w")
+    syms.define_label("__xu_rt32.memset_b", cb.len())
+    r32_b_to(cb, $&fx, 0, R32_A0 + 4, R32_ZERO, "__xu_rt32.zero")
+    r32_mem(cb, true, 1, R32_ZERO, R32_A0 + 2, 0)
+    rv_addi(cb, R32_A0 + 2, R32_A0 + 2, 1)
+    rv_addi(cb, R32_A0 + 4, R32_A0 + 4, -1)
+    r32_j_to(cb, $&fx, "__xu_rt32.memset_b")
+
+    // memcpy(a, b, c): copy c bytes from b to a, forward
+    syms.define_label("__xu_rt32.memcpy", cb.len())
+    r32_or(cb, R32_T4, R32_A0 + 2, R32_A0 + 4)
+    r32_andi(cb, R32_T4, R32_T4, 3)
+    r32_b_to(cb, $&fx, 1, R32_T4, R32_ZERO, "__xu_rt32.memcpy_b")
+    syms.define_label("__xu_rt32.memcpy_w", cb.len())
+    r32_li(cb, R32_T4, 4)
+    r32_b_to(cb, $&fx, 4, R32_A0 + 6, R32_T4, "__xu_rt32.memcpy_b")
+    r32_lw(cb, R32_T5, R32_A0 + 4, 0)
+    r32_sw(cb, R32_T5, R32_A0 + 2, 0)
+    rv_addi(cb, R32_A0 + 2, R32_A0 + 2, 4)
+    rv_addi(cb, R32_A0 + 4, R32_A0 + 4, 4)
+    rv_addi(cb, R32_A0 + 6, R32_A0 + 6, -4)
+    r32_j_to(cb, $&fx, "__xu_rt32.memcpy_w")
+    syms.define_label("__xu_rt32.memcpy_b", cb.len())
+    r32_b_to(cb, $&fx, 0, R32_A0 + 6, R32_ZERO, "__xu_rt32.zero")
+    r32_mem(cb, false, 1, R32_T5, R32_A0 + 4, 0)
+    r32_mem(cb, true, 1, R32_T5, R32_A0 + 2, 0)
+    rv_addi(cb, R32_A0 + 2, R32_A0 + 2, 1)
+    rv_addi(cb, R32_A0 + 4, R32_A0 + 4, 1)
+    rv_addi(cb, R32_A0 + 6, R32_A0 + 6, -1)
+    r32_j_to(cb, $&fx, "__xu_rt32.memcpy_b")
+
+    syms.define_label("__xu_rt32.fp", cb.len())
+    rv_mv(cb, R32_A0, R32_S0)
+    rv_addi(cb, R32_A0 + 1, R32_ZERO, 0)
+    rv_ret(cb)
+    syms.define_label("__xu_rt32.start", cb.len())
+    r32_la(cb, relocs, R32_A0, "__xu_start")
+    rv_addi(cb, R32_A0 + 1, R32_ZERO, 0)
+    rv_ret(cb)
+    syms.define_label("__xu_rt32.switch", cb.len())
+    rv_mv(cb, R32_A0, R32_A0 + 2)
+    rv_mv(cb, R32_A0 + 1, R32_A0 + 4)
+    r32_jump(cb, relocs, "__xu_task_switch")
+
+    // write(fd, buf, n): fds 1 and 2 go to the UART
+    syms.define_label("__xu_rt32.write", cb.len())
+    rv_addi(cb, R32_T4, R32_A0 + 2, -1)
+    r32_sltiu(cb, R32_T4, R32_T4, 2)
+    r32_b_to(cb, $&fx, 1, R32_T4, R32_ZERO, "__xu_rt32.write_ok")
+    r32_ret_pair(cb, -9)
+    syms.define_label("__xu_rt32.write_ok", cb.len())
+    rv_mv(cb, R32_A0, R32_A0 + 6)
+    rv_addi(cb, R32_A0 + 1, R32_ZERO, 0)
+    r32_li(cb, R32_AT, R32_UART)
+    syms.define_label("__xu_rt32.write_loop", cb.len())
+    r32_b_to(cb, $&fx, 0, R32_A0 + 6, R32_ZERO, "__xu_rt32.ret")
+    syms.define_label("__xu_rt32.write_wait", cb.len())
+    r32_mem(cb, false, 1, R32_T4, R32_AT, 5)
+    r32_andi(cb, R32_T4, R32_T4, 32)
+    r32_b_to(cb, $&fx, 0, R32_T4, R32_ZERO, "__xu_rt32.write_wait")
+    r32_mem(cb, false, 1, R32_T5, R32_A0 + 4, 0)
+    r32_mem(cb, true, 1, R32_T5, R32_AT, 0)
+    rv_addi(cb, R32_A0 + 4, R32_A0 + 4, 1)
+    rv_addi(cb, R32_A0 + 6, R32_A0 + 6, -1)
+    r32_j_to(cb, $&fx, "__xu_rt32.write_loop")
+    syms.define_label("__xu_rt32.ret", cb.len())
+    rv_ret(cb)
+
+    // mmap(addr, len, ...): bump allocation; the heap is never reused, so
+    // memory comes back zeroed
+    syms.define_label("__xu_rt32.mmap", cb.len())
+    r32_la(cb, relocs, R32_AT, "__xu_heap_cur")
+    r32_lw(cb, R32_A0, R32_AT, 0)
+    rv_addi(cb, R32_T4, R32_A0 + 4, 15)
+    r32_andi(cb, R32_T4, R32_T4, -16)
+    r32_add(cb, R32_T4, R32_A0, R32_T4)
+    r32_li(cb, R32_T5, R32_HEAP_LIMIT)
+    r32_b_to(cb, $&fx, 6, R32_T5, R32_T4, "__xu_rt32.nomem")
+    r32_sw(cb, R32_T4, R32_AT, 0)
+    rv_addi(cb, R32_A0 + 1, R32_ZERO, 0)
+    rv_ret(cb)
+    syms.define_label("__xu_rt32.nomem", cb.len())
+    r32_ret_pair(cb, -12)
+
+    // clock_gettime(clock, ts): {0, mtime * 100 ns}; callers add the fields
+    syms.define_label("__xu_rt32.clock", cb.len())
+    r32_li(cb, R32_AT, R32_MTIME)
+    syms.define_label("__xu_rt32.clock_rd", cb.len())
+    r32_lw(cb, R32_T5, R32_AT, 4)
+    r32_lw(cb, R32_T4, R32_AT, 0)
+    r32_lw(cb, R32_AL, R32_AT, 4)
+    r32_b_to(cb, $&fx, 1, R32_T5, R32_AL, "__xu_rt32.clock_rd")
+    r32_li(cb, R32_AH, 100)
+    r32_mulhu(cb, R32_BL, R32_T4, R32_AH)
+    r32_mul(cb, R32_T5, R32_T5, R32_AH)
+    r32_add(cb, R32_BL, R32_BL, R32_T5)
+    r32_mul(cb, R32_T4, R32_T4, R32_AH)
+    r32_st_pair(cb, R32_ZERO, R32_ZERO, R32_A0 + 4, 0)
+    r32_st_pair(cb, R32_T4, R32_BL, R32_A0 + 4, 8)
+    r32_ret_pair(cb, 0)
+
+    // exit(code): the sifive_test device ends QEMU with the code
+    syms.define_label("__xu_rt32.exit_a", cb.len())
+    rv_mv(cb, R32_A0, R32_A0 + 2)
+    syms.define_label("__xu_rt32.exit", cb.len())
+    r32_li(cb, R32_T4, 21845)
+    r32_b_to(cb, $&fx, 0, R32_A0, R32_ZERO, "__xu_rt32.exit_w")
+    rv_i(cb, 16, R32_A0, 1, R32_T4, 0x13)
+    r32_li(cb, R32_T5, 13107)
+    r32_or(cb, R32_T4, R32_T4, R32_T5)
+    syms.define_label("__xu_rt32.exit_w", cb.len())
+    r32_li(cb, R32_AT, R32_TEST_DEV)
+    r32_sw(cb, R32_T4, R32_AT, 0)
+    syms.define_label("__xu_rt32.hang", cb.len())
+    e32(cb, 0x10500073) // wfi
+    r32_j_to(cb, $&fx, "__xu_rt32.hang")
+
+    syms.define_label("__xu_globals", cb.len())
+    rv_mv(cb, R32_A0, R32_STATE)
+    rv_addi(cb, R32_A0 + 1, R32_ZERO, 0)
+    rv_ret(cb)
+    emit_rv32_task_stubs(cb, syms)
+    syms.define_label("__xu_heap_cur", cb.len())
+    e32(cb, 0)
+    syms.define_label("__xu_image_end", cb.len())
+    r32_patch(cb, syms, &fx)
+}

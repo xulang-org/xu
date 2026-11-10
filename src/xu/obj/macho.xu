@@ -1,0 +1,275 @@
+@xu/obj
+// Mach-O binary format serializer.
+//
+// Layer 4D module: serializes ObjectFile into Apple Mach-O 64-bit binary format.
+// Completely decoupled from assembler or code generation internals.
+
+#xu/mc
+
+pub const MACHO_MAGIC_64 = 0xfeedfacf
+pub const MACHO_CPU_TYPE_ARM64 = 0x0100000c
+pub const MACHO_CPU_TYPE_X86_64 = 0x01000007
+pub const MACHO_FILETYPE_EXECUTE = 0x2
+pub const MACHO_FILETYPE_OBJECT = 0x1
+
+pub const LC_SEGMENT_64 = 0x19
+pub const LC_LOAD_DYLINKER = 0x0e
+pub const LC_LOAD_DYLIB = 0x0c
+pub const LC_MAIN = 0x80000028
+pub const LC_SYMTAB = 0x2
+pub const LC_DYSYMTAB = 0xb
+
+pub fn macho_write_header(buf $&mc.CodeBuffer, cpu_type int, file_type int, ncmds int, sizeofcmds int) {
+    buf.emit_u32_le(MACHO_MAGIC_64)
+    buf.emit_u32_le(cpu_type)
+    if cpu_type == MACHO_CPU_TYPE_X86_64 {
+        buf.emit_u32_le(3) // CPU_SUBTYPE_X86_64_ALL
+    } else {
+        buf.emit_u32_le(0) // CPU_SUBTYPE_ARM64_ALL
+    }
+    buf.emit_u32_le(file_type)
+    buf.emit_u32_le(ncmds)
+    buf.emit_u32_le(sizeofcmds)
+    buf.emit_u32_le(0x00200085) // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+    buf.emit_u32_le(0) // reserved
+}
+
+fn emit_fixed_string(buf $&mc.CodeBuffer, s string, max_len int) {
+    for i in 0:max_len {
+        if i < s.len {
+            buf.emit_u8(s[i])
+        } else {
+            buf.emit_u8(0)
+        }
+    }
+}
+
+// Function symbols for the executable's symbol table: names and offsets
+// from the first code byte.
+pub struct MachoSyms {
+pub:
+    names []string
+    offs []int
+}
+
+pub fn macho_syms_empty() MachoSyms {
+    << MachoSyms{names: []string{}, offs: []int{}}
+}
+
+// Load commands: PAGEZERO (72), TEXT with one section (152), LINKEDIT
+// (72), SYMTAB (24), DYSYMTAB (80), DYLINKER (32), MAIN (24), DYLIB (56),
+// plus the __DWARF segment with four sections (72 + 4 * 80) when debug
+// sections are present.
+fn macho_cmds_size(debug bool) int {
+    $n := 72 + 152 + 72 + 24 + 80 + 32 + 24 + 56
+    if debug {
+        n += 72 + 4 * 80
+    }
+    << n
+}
+
+fn macho_text_file_offset(debug bool) int {
+    $off := 32 + macho_cmds_size(debug) + 64 // ≥32 bytes pad for macOS codesign
+    rem := off % 16
+    if rem != 0 {
+        off += 16 - rem
+    }
+    << off
+}
+
+// Virtual address of the first code byte.
+pub fn macho_code_vaddr(debug bool) int {
+    << 0x100000000 + macho_text_file_offset(debug)
+}
+
+fn page_up(n int, page int) int {
+    if page <= 0 {
+        << n
+    }
+    << (n + page - 1) / page * page
+}
+
+fn align8(n int) int {
+    << (n + 7) / 8 * 8
+}
+
+fn macho_segment(buf $&mc.CodeBuffer, name string, nsects int, vmaddr int, vmsize int, fileoff int, filesize int, prot int) {
+    buf.emit_u32_le(LC_SEGMENT_64)
+    buf.emit_u32_le(72 + 80 * nsects)
+    emit_fixed_string(buf, name, 16)
+    buf.emit_u64_le(vmaddr)
+    buf.emit_u64_le(vmsize)
+    buf.emit_u64_le(fileoff)
+    buf.emit_u64_le(filesize)
+    buf.emit_u32_le(prot) // maxprot
+    buf.emit_u32_le(prot) // initprot
+    buf.emit_u32_le(nsects)
+    buf.emit_u32_le(0) // flags
+}
+
+fn macho_section(buf $&mc.CodeBuffer, sect string, seg string, addr int, size int, off int, align int, flags int) {
+    emit_fixed_string(buf, sect, 16)
+    emit_fixed_string(buf, seg, 16)
+    buf.emit_u64_le(addr)
+    buf.emit_u64_le(size)
+    buf.emit_u32_le(off)
+    buf.emit_u32_le(align)
+    buf.emit_u32_le(0) // reloff
+    buf.emit_u32_le(0) // nreloc
+    buf.emit_u32_le(flags)
+    buf.emit_u32_le(0)
+    buf.emit_u32_le(0)
+    buf.emit_u32_le(0)
+}
+
+fn pad_to(buf $&mc.CodeBuffer, n int) {
+    while buf.len() < n {
+        buf.emit_u8(0)
+    }
+}
+
+pub fn macho_write_executable(code_bytes &[]int, cpu_type int, entry_offset int) mc.CodeBuffer {
+    dbg := debug_sections_empty()
+    syms := macho_syms_empty()
+    << macho_write_executable_debug(code_bytes, cpu_type, entry_offset, &syms, &dbg)
+}
+
+pub fn macho_write_executable_arm64(code_bytes &[]int, entry_offset int) mc.CodeBuffer {
+    << macho_write_executable(code_bytes, MACHO_CPU_TYPE_ARM64, entry_offset)
+}
+
+// Layout: header and load commands, __TEXT (code), __LINKEDIT (local
+// function symbols; debuggers need a symbol table to load the image), then
+// with debug sections a non-loaded __DWARF segment. dyld checks that every
+// section address lies inside its segment's range, so __DWARF gets a VM
+// range too.
+pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offset int, syms &MachoSyms, dbg &DebugSections) mc.CodeBuffer {
+    $buf := mc.code_buffer_new()
+    debug := dbg.present()
+
+    $page := 16384
+    if cpu_type == MACHO_CPU_TYPE_X86_64 {
+        page = 4096
+    }
+    base := 0x100000000
+    text_off := macho_text_file_offset(debug)
+    text_vmaddr := base + text_off
+    text_seg_size := page_up(text_off + code_bytes.len, page)
+
+    // Symbol and string tables.
+    $strtab := []int{}
+    strtab.push(32)
+    strtab.push(0)
+    $nlist := []int{}
+    for i in 0:syms.names.len {
+        strx := strtab.len
+        strtab.push(95) // '_'
+        for j in 0:syms.names[i].len {
+            strtab.push(syms.names[i][j])
+        }
+        strtab.push(0)
+        for k in 0:4 { nlist.push((strx >> (8 * k)) & 255) }
+        nlist.push(0x0e) // N_SECT, local
+        nlist.push(1)    // __text
+        nlist.push(0)
+        nlist.push(0)
+        v := text_vmaddr + syms.offs[i]
+        for k in 0:8 { nlist.push((v >> (8 * k)) & 255) }
+    }
+    while strtab.len % 8 != 0 {
+        strtab.push(0)
+    }
+    nsyms := syms.names.len
+    le_off := text_seg_size
+    sym_off := le_off
+    str_off := sym_off + nlist.len
+    le_size := nlist.len + strtab.len
+    $le_seg_size := page_up(le_size, page)
+    if le_seg_size == 0 {
+        le_seg_size = page
+    }
+
+    dw_off := le_off + le_seg_size
+    line_off := dw_off
+    info_off := align8(line_off + dbg.line.len)
+    abbrev_off := align8(info_off + dbg.info.len)
+    dstr_off := align8(abbrev_off + dbg.abbrev.len)
+    dw_size := dstr_off + dbg.str.len - dw_off
+    dw_vm := base + dw_off
+
+    $ncmds := 8
+    if debug {
+        ncmds = 9
+    }
+    macho_write_header($&buf, cpu_type, MACHO_FILETYPE_EXECUTE, ncmds, macho_cmds_size(debug))
+
+    macho_segment($&buf, "__PAGEZERO", 0, 0, base, 0, 0, 0)
+    macho_segment($&buf, "__TEXT", 1, base, text_seg_size, 0, text_seg_size, 5)
+    // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    macho_section($&buf, "__text", "__TEXT", text_vmaddr, code_bytes.len, text_off, 4, 0x80000400)
+    macho_segment($&buf, "__LINKEDIT", 0, base + le_off, le_seg_size, le_off, le_size, 1)
+
+    buf.emit_u32_le(LC_SYMTAB)
+    buf.emit_u32_le(24)
+    buf.emit_u32_le(sym_off)
+    buf.emit_u32_le(nsyms)
+    buf.emit_u32_le(str_off)
+    buf.emit_u32_le(strtab.len)
+
+    buf.emit_u32_le(LC_DYSYMTAB)
+    buf.emit_u32_le(80)
+    buf.emit_u32_le(0)     // ilocalsym
+    buf.emit_u32_le(nsyms) // nlocalsym
+    buf.emit_u32_le(nsyms) // iextdefsym
+    buf.emit_u32_le(0)     // nextdefsym
+    buf.emit_u32_le(nsyms) // iundefsym
+    buf.emit_u32_le(0)     // nundefsym
+    for i in 0:12 {
+        buf.emit_u32_le(0)
+    }
+
+    buf.emit_u32_le(LC_LOAD_DYLINKER)
+    buf.emit_u32_le(32)
+    buf.emit_u32_le(12) // offset to name
+    emit_fixed_string($&buf, "/usr/lib/dyld", 20)
+
+    buf.emit_u32_le(LC_LOAD_DYLIB)
+    buf.emit_u32_le(56)
+    buf.emit_u32_le(24) // offset to name
+    buf.emit_u32_le(2) // timestamp
+    buf.emit_u32_le(65536) // current_version
+    buf.emit_u32_le(65536) // compatibility_version
+    emit_fixed_string($&buf, "/usr/lib/libSystem.B.dylib", 32)
+
+    buf.emit_u32_le(LC_MAIN)
+    buf.emit_u32_le(24)
+    buf.emit_u64_le(text_off + entry_offset) // entryoff from __TEXT start
+    buf.emit_u64_le(0) // stacksize
+
+    if debug {
+        macho_segment($&buf, "__DWARF", 4, dw_vm, page_up(dw_size, page), dw_off, dw_size, 0)
+        macho_section($&buf, "__debug_line", "__DWARF", dw_vm, dbg.line.len, line_off, 0, 0)
+        macho_section($&buf, "__debug_info", "__DWARF", dw_vm + (info_off - dw_off), dbg.info.len, info_off, 0, 0)
+        macho_section($&buf, "__debug_abbrev", "__DWARF", dw_vm + (abbrev_off - dw_off), dbg.abbrev.len, abbrev_off, 0, 0)
+        macho_section($&buf, "__debug_str", "__DWARF", dw_vm + (dstr_off - dw_off), dbg.str.len, dstr_off, 0, 0)
+    }
+
+    pad_to($&buf, text_off)
+    buf.emit_bytes(code_bytes)
+    pad_to($&buf, le_off)
+    buf.emit_bytes(&nlist)
+    buf.emit_bytes(&strtab)
+    if debug {
+        pad_to($&buf, line_off)
+        buf.emit_bytes(&dbg.line)
+        pad_to($&buf, info_off)
+        buf.emit_bytes(&dbg.info)
+        pad_to($&buf, abbrev_off)
+        buf.emit_bytes(&dbg.abbrev)
+        pad_to($&buf, dstr_off)
+        buf.emit_bytes(&dbg.str)
+    } else {
+        pad_to($&buf, le_off + le_size)
+    }
+    << buf
+}
