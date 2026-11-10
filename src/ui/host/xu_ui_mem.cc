@@ -1372,6 +1372,21 @@ void xu_ui_emit_close(void) {
   unlock_w(); wake_waiters();
 }
 
+#ifdef __APPLE__
+// A packaged Xu app can run its tasks on the AppKit thread. Yield back to
+// the AppKit loop when a mailbox operation needs the host to make progress.
+static thread_local int (*g_wait_pump)(void *, int (*)(void)) = nullptr;
+static thread_local void *g_wait_state = nullptr;
+static thread_local int (*g_wait_yield)(void) = nullptr;
+
+void xu_ui_mem_set_task_pump(int (*pump)(void *, int (*)(void)),
+                             void *state, int (*yield_task)(void)) {
+  g_wait_pump = pump;
+  g_wait_state = state;
+  g_wait_yield = yield_task;
+}
+#endif
+
 // The predicate is always evaluated outside the wait mutex. A notification
 // epoch bridges that gap: a writer that has already notified prevents parking;
 // a writer still waiting for the mutex notifies after the atomic unlock/wait.
@@ -1383,6 +1398,12 @@ static int wait_for_predicate(Predicate ready, int timeout_ms) {
   if (!timeout_ms) return 0;
   using Clock = std::chrono::steady_clock;
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+#ifdef __APPLE__
+  while (g_wait_pump && g_wait_yield && Clock::now() < deadline) {
+    if (!g_wait_pump(g_wait_state, g_wait_yield)) break;
+    if (ready()) return 1;
+  }
+#endif
   wait_init();
   for (;;) {
     uint64_t observed = g_wait_epoch.load(std::memory_order_acquire);
