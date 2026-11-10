@@ -426,6 +426,122 @@ fn x64_load_args(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, vals 
     }
 }
 
+fn x64_cc_of(op int) int {
+    if op == mir.BIN_NE { << CC_NE }
+    if op == mir.BIN_LT { << CC_L }
+    if op == mir.BIN_LE { << CC_LE }
+    if op == mir.BIN_GT { << CC_G }
+    if op == mir.BIN_GE { << CC_GE }
+    << CC_E
+}
+
+// Constant operand v when it fits a sign-extended imm32, with ok[0] set.
+fn x64_imm32(f &mir.MFn, v int, ok $&[]bool) int {
+    ok[0] = false
+    if v <= -2 {
+        c := f.consts[0 - v - 2]
+        if c >= -2147483648 && c <= 2147483647 {
+            ok[0] = true
+            << c
+        }
+    }
+    << 0
+}
+
+// op r/m64, imm32 (group 1: digit 0 add, 1 or, 4 and, 5 sub, 6 xor, 7 cmp).
+fn x64_alu_imm(cb $&mc.CodeBuffer, digit int, r int, imm int) {
+    x64_rex(cb, true, 0, r, false)
+    if imm >= -128 && imm <= 127 {
+        xb(cb, 0x83)
+        x64_modrm_rr(cb, digit, r)
+        xb(cb, imm)
+    } else {
+        xb(cb, 0x81)
+        x64_modrm_rr(cb, digit, r)
+        cb.emit_u32_le(imm & 0xffffffff)
+    }
+}
+
+// Register holding operand v, loading it into scratch when needed.
+fn x64_src(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, v int, scratch int) int {
+    r := x64_vreg(fr, ra, v)
+    if r >= 0 {
+        << r
+    }
+    x64_operand(cb, f, fr, ra, scratch, v)
+    << scratch
+}
+
+// cmp c, d with an immediate when d allows it.
+fn x64_cmp_vals(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, c int, d int) {
+    rn := x64_src(cb, f, fr, ra, c, X_RAX)
+    $ok := []bool{}
+    ok.push(false)
+    imm := x64_imm32(f, d, $&ok)
+    if ok[0] {
+        x64_alu_imm(cb, 7, rn, imm)
+        <<
+    }
+    rm := x64_src(cb, f, fr, ra, d, X_RCX)
+    x64_op_rr(cb, 0x39, rm, rn)
+}
+
+// Integer add/sub/and/or/xor/mul/shift computed in the destination's
+// register; false when the generic rax/rcx sequence is needed.
+fn x64_bin_direct(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, ins &mir.MInstr) bool {
+    op := ins.b
+    $digit := -1
+    $opc := 0
+    if op == mir.BIN_ADD { digit = 0  opc = 0x01 }
+    else if op == mir.BIN_OR { digit = 1  opc = 0x09 }
+    else if op == mir.BIN_AND { digit = 4  opc = 0x21 }
+    else if op == mir.BIN_SUB { digit = 5  opc = 0x29 }
+    else if op == mir.BIN_XOR { digit = 6  opc = 0x31 }
+    else if op != mir.BIN_MUL && op != mir.BIN_SHL && op != mir.BIN_SHR {
+        << false
+    }
+    $ok := []bool{}
+    ok.push(false)
+    imm := x64_imm32(f, ins.d, $&ok)
+    if (op == mir.BIN_SHL || op == mir.BIN_SHR) && !ok[0] {
+        << false
+    }
+    $rd := x64_vreg(fr, ra, ins.a)
+    if rd < 0 || (!ok[0] && x64_vreg(fr, ra, ins.d) == rd) {
+        rd = X_RAX
+    }
+    $rm := -1
+    if !ok[0] {
+        rm = x64_src(cb, f, fr, ra, ins.d, X_RCX)
+    }
+    x64_operand(cb, f, fr, ra, rd, ins.c)
+    if op == mir.BIN_SHL || op == mir.BIN_SHR {
+        x64_rex(cb, true, 0, rd, false)
+        xb(cb, 0xC1)
+        if op == mir.BIN_SHL { x64_modrm_rr(cb, 4, rd) } else { x64_modrm_rr(cb, 7, rd) }
+        xb(cb, imm & 63)
+    } else if op == mir.BIN_MUL {
+        if ok[0] {
+            // imul rd, rd, imm32
+            x64_rex(cb, true, rd, rd, false)
+            xb(cb, 0x69)
+            x64_modrm_rr(cb, rd, rd)
+            cb.emit_u32_le(imm & 0xffffffff)
+        } else {
+            x64_rex(cb, true, rd, rm, false)
+            xb(cb, 0x0F)
+            xb(cb, 0xAF)
+            x64_modrm_rr(cb, rd, rm)
+        }
+    } else if ok[0] {
+        x64_alu_imm(cb, digit, rd, imm)
+    } else {
+        x64_op_rr(cb, opc, rm, rd)
+    }
+    x64_set_temp(cb, fr, ra, ins.a, rd)
+    << true
+}
+
 fn x64_ra(f &mir.MFn, opt bool) RaInfo {
     if !opt {
         << ra_none(f)
@@ -667,12 +783,23 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
         }
     }
     $strs := []StrFix{}
+    $uses := []int{}
+    if opt {
+        uses = temp_use_counts(f)
+    }
     // Local labels use "." so they cannot collide with any function label.
     epilogue := f.label + ".ret"
     for bi in 0:f.blocks.len {
         syms.define_label(f.label + ".bb" + str(bi), cb.len())
+        // A compare feeding only this block's branch becomes cmp + jcc.
+        $fused := -1
+        bounds := a64_bounds_check(f, bi, &uses, opt)
         $ii := f.blocks[bi].head
         while ii >= 0 {
+            if bounds.len > 0 && (ii == bounds[0] || ii == bounds[1] || ii == bounds[2]) {
+                ii = f.instrs[ii].next
+                ->
+            }
             ins := ~f.instrs[ii]
             k := ins.kind
             if ins.line > 0 && ins.line != last_line {
@@ -680,7 +807,11 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                 lines.push(cb.len())
                 lines.push(last_line)
             }
-            if k == mir.MI_LOAD_LOCAL {
+            if opt && k == mir.MI_BIN && ins.next < 0 && a64_is_icmp(ins.b) && f.blocks[bi].tkind == mir.TKIND_BRANCH && f.blocks[bi].ta == ins.a && ins.a >= 0 && uses[ins.a] == 1 {
+                x64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
+                fused = x64_cc_of(ins.b)
+            } else if opt && k == mir.MI_BIN && x64_bin_direct(cb, f, &fr, &ra, &ins) {
+            } else if k == mir.MI_LOAD_LOCAL {
                 lr := ra.local_reg[ins.b]
                 if lr >= 0 {
                     x64_set_temp(cb, &fr, &ra, ins.a, lr)
@@ -784,6 +915,20 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
         } else if blk.tkind == mir.TKIND_JUMP {
             if blk.ta != bi + 1 {
                 x64_jmp(cb, relocs, f.label + ".bb" + str(blk.ta))
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH && (bounds.len > 0 || fused >= 0) {
+            $cc := fused
+            if bounds.len > 0 {
+                x64_cmp_vals(cb, f, &fr, &ra, bounds[3], bounds[4])
+                cc = CC_AE
+            }
+            if blk.tb == bi + 1 {
+                x64_jcc(cb, relocs, cc ^ 1, f.label + ".bb" + str(blk.tc))
+            } else {
+                x64_jcc(cb, relocs, cc, f.label + ".bb" + str(blk.tb))
+                if blk.tc != bi + 1 {
+                    x64_jmp(cb, relocs, f.label + ".bb" + str(blk.tc))
+                }
             }
         } else if blk.tkind == mir.TKIND_BRANCH {
             $cr := x64_vreg(&fr, &ra, blk.ta)
