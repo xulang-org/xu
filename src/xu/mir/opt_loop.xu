@@ -1,0 +1,760 @@
+@xu/mir
+// Bounds-check removal for innermost counted loops by loop versioning.
+//
+// For a loop whose header tests i < hi, where the local i only changes by
+// one non-negative step at the end of an iteration, an index check a[i]
+// cannot fail when i starts >= 0 and hi <= len(a) at entry, provided the
+// loop cannot change a's descriptor. A guard block evaluates exactly that
+// before the loop and enters either a clone without those checks (with
+// the descriptor reads hoisted into the guard) or the original loop, so a
+// failing check still panics at the same iteration.
+
+struct LoopInfo {
+    header int
+    body []bool
+    blocks []int
+}
+
+struct BceCheck {
+    blk int
+    ok_blk int
+    // Local holding the array (ADDR) or a pointer to its descriptor.
+    desc_local int
+    desc_is_ptr bool
+}
+
+fn loop_succs(f &MFn, b int) []int {
+    $out := []int{}
+    tk := f.blocks[b].tkind
+    if tk == TKIND_JUMP {
+        out.push(f.blocks[b].ta)
+    } else if tk == TKIND_BRANCH {
+        out.push(f.blocks[b].tb)
+        out.push(f.blocks[b].tc)
+    }
+    << out
+}
+
+// Instruction ids of block b in order.
+fn loop_ids(f &MFn, b int) []int {
+    $ids := []int{}
+    $ii := f.blocks[b].head
+    while ii >= 0 {
+        ids.push(ii)
+        ii = f.instrs[ii].next
+    }
+    << ids
+}
+
+// Loop nesting depth of every block (0 outside loops).
+pub fn block_loop_depth(f &MFn) []int {
+    $depth := []int{}
+    for _ in 0:f.blocks.len {
+        depth.push(0)
+    }
+    loops := find_loops(f, false)
+    for li in 0:loops.len {
+        for bi in 0:loops[li].blocks.len {
+            b := loops[li].blocks[bi]
+            depth[b] = depth[b] + 1
+        }
+    }
+    << depth
+}
+
+fn find_inner_loops(f &MFn) []LoopInfo {
+    << find_loops(f, true)
+}
+
+// Natural loops; with inner_only, those with no other loop inside.
+fn find_loops(f &MFn, inner_only bool) []LoopInfo {
+    nb := f.blocks.len
+    $preds := [][]int{}
+    $rpo := []int{}
+    for _ in 0:nb {
+        preds.push([]int{})
+        rpo.push(-1)
+    }
+    for b in 0:nb {
+        ss := loop_succs(f, b)
+        for si in 0:ss.len {
+            s := ss[si]
+            if s >= 0 && s < nb {
+                preds[s].push(b)
+            }
+        }
+    }
+    // Reverse postorder by iterative DFS.
+    $post := []int{}
+    $seen := []bool{}
+    $next_i := []int{}
+    for _ in 0:nb {
+        seen.push(false)
+        next_i.push(0)
+    }
+    $stack := []int{}
+    stack.push(0)
+    $sp := 1
+    seen[0] = true
+    while sp > 0 {
+        b := stack[sp - 1]
+        ss := loop_succs(f, b)
+        if next_i[b] < ss.len {
+            s := ss[next_i[b]]
+            next_i[b] = next_i[b] + 1
+            if s >= 0 && s < nb && !seen[s] {
+                seen[s] = true
+                if sp < stack.len { stack[sp] = s } else { stack.push(s) }
+                sp += 1
+            }
+        } else {
+            post.push(b)
+            sp -= 1
+        }
+    }
+    for i in 0:post.len {
+        rpo[post[i]] = post.len - 1 - i
+    }
+    $loops := []LoopInfo{}
+    $is_header := []bool{}
+    for _ in 0:nb {
+        is_header.push(false)
+    }
+    for h in 0:nb {
+        if rpo[h] < 0 { -> }
+        $latches := []int{}
+        for pi in 0:preds[h].len {
+            p := preds[h][pi]
+            if rpo[p] >= 0 && rpo[p] >= rpo[h] {
+                latches.push(p)
+            }
+        }
+        if latches.len == 0 { -> }
+        is_header[h] = true
+        $body := []bool{}
+        for _ in 0:nb {
+            body.push(false)
+        }
+        body[h] = true
+        $work := []int{}
+        for li in 0:latches.len {
+            if !body[latches[li]] {
+                body[latches[li]] = true
+                work.push(latches[li])
+            }
+        }
+        $wi := 0
+        while wi < work.len {
+            x := work[wi]
+            wi += 1
+            for pi in 0:preds[x].len {
+                p := preds[x][pi]
+                if rpo[p] >= 0 && !body[p] {
+                    body[p] = true
+                    work.push(p)
+                }
+            }
+        }
+        // Natural loop: only the header is entered from outside.
+        $ok := true
+        $list := []int{}
+        for b in 0:nb {
+            if !body[b] { -> }
+            list.push(b)
+            if b == h { -> }
+            for pi in 0:preds[b].len {
+                p := preds[b][pi]
+                if rpo[p] >= 0 && !body[p] {
+                    ok = false
+                }
+            }
+        }
+        if ok && h != 0 {
+            loops.push(LoopInfo{header: h, body: ~body, blocks: ~list})
+        }
+    }
+    if !inner_only {
+        << loops
+    }
+    $inner := []LoopInfo{}
+    for li in 0:loops.len {
+        $nested := false
+        for bi in 0:loops[li].blocks.len {
+            b := loops[li].blocks[bi]
+            if b != loops[li].header && is_header[b] {
+                nested = true
+            }
+        }
+        if !nested {
+            inner.push(~loops[li])
+        }
+    }
+    << inner
+}
+
+// Defining instruction of temp t among the loop's blocks, or -1.
+fn loop_def(f &MFn, lp &LoopInfo, t int) int {
+    if t < 0 {
+        << -1
+    }
+    for bi in 0:lp.blocks.len {
+        $ii := f.blocks[lp.blocks[bi]].head
+        while ii >= 0 {
+            k := f.instrs[ii].kind
+            if fold_defines(k) && f.instrs[ii].a == t {
+                << ii
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+    << -1
+}
+
+// Defining instruction of t inside block b, or -1.
+fn block_def(f &MFn, b int, t int) int {
+    $ii := f.blocks[b].head
+    $found := -1
+    while ii >= 0 {
+        if fold_defines(f.instrs[ii].kind) && f.instrs[ii].a == t {
+            found = ii
+        }
+        ii = f.instrs[ii].next
+    }
+    << found
+}
+
+fn loop_stores_local(f &MFn, lp &LoopInfo, l int) int {
+    $n := 0
+    for bi in 0:lp.blocks.len {
+        $ii := f.blocks[lp.blocks[bi]].head
+        while ii >= 0 {
+            if f.instrs[ii].kind == MI_STORE_LOCAL && f.instrs[ii].a == l {
+                n += 1
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+    << n
+}
+
+fn str_has_suffix(s &string, suf string) bool {
+    if s.len < suf.len {
+        << false
+    }
+    off := s.len - suf.len
+    for i in 0:suf.len {
+        if s[off + i] != suf[i] {
+            << false
+        }
+    }
+    << true
+}
+
+fn is_panic_call(ins &MInstr) bool {
+    << ins.kind == MI_CALL && (str_has_suffix(&ins.sval, "_core_index_panic") || str_has_suffix(&ins.sval, "_core_rt_panic"))
+}
+
+fn add_instr(f $&MFn, b int, ins MInstr) {
+    idx := f.instrs.len
+    f.instrs.push(ins)
+    if f.blocks[b].head < 0 {
+        f.blocks[b].head = idx
+    } else {
+        f.instrs[f.blocks[b].tail].next = idx
+    }
+    f.blocks[b].tail = idx
+}
+
+fn new_instr(kind int, a int, b int, c int, d int, line int) MInstr {
+    $ins := minstr_new(kind)
+    ins.a = a
+    ins.b = b
+    ins.c = c
+    ins.d = d
+    ins.line = line
+    << ins
+}
+
+pub fn opt_bce(f $&MFn) bool {
+    for ii in 0:f.instrs.len {
+        if !fold_known_kind(f.instrs[ii].kind) {
+            << false
+        }
+    }
+    if f.blocks.len < 2 {
+        << false
+    }
+    $addr_taken := []bool{}
+    for _ in 0:f.locals.len {
+        addr_taken.push(false)
+    }
+    for ii in 0:f.instrs.len {
+        if f.instrs[ii].kind == MI_ADDR && f.instrs[ii].b >= 0 && f.instrs[ii].b < addr_taken.len {
+            addr_taken[f.instrs[ii].b] = true
+        }
+    }
+    loops := find_inner_loops(f)
+    nb0 := f.blocks.len
+    // Per original block: the first new block (guard) placed before it and
+    // how many follow it.
+    $ins_at := []int{}
+    $ins_n := []int{}
+    for _ in 0:nb0 {
+        ins_at.push(-1)
+        ins_n.push(0)
+    }
+    $changed := false
+    for li in 0:loops.len {
+        first := f.blocks.len
+        if version_loop(f, &loops[li], &addr_taken) {
+            changed = true
+            lo := loops[li].blocks[0]
+            ins_at[lo] = first
+            ins_n[lo] = f.blocks.len - first
+        }
+    }
+    if changed {
+        place_before_loops(f, nb0, &ins_at, &ins_n)
+    }
+    << changed
+}
+
+// Lays out each guard and clone right before its original loop, so values
+// live across the loop keep short ranges and the fast path falls through.
+fn place_before_loops(f $&MFn, nb0 int, ins_at &[]int, ins_n &[]int) {
+    $order := []int{}
+    for b in 0:nb0 {
+        if ins_at[b] >= 0 {
+            for k in 0:ins_n[b] {
+                order.push(ins_at[b] + k)
+            }
+        }
+        order.push(b)
+    }
+    $pos := []int{}
+    for _ in 0:f.blocks.len {
+        pos.push(-1)
+    }
+    for i in 0:order.len {
+        pos[order[i]] = i
+    }
+    $nbl := []MBlock{}
+    for i in 0:order.len {
+        $blk := ~f.blocks[order[i]]
+        if blk.tkind == TKIND_JUMP {
+            blk.ta = pos[blk.ta]
+        } else if blk.tkind == TKIND_BRANCH {
+            blk.tb = pos[blk.tb]
+            blk.tc = pos[blk.tc]
+        }
+        nbl.push(~blk)
+    }
+    f.blocks = ~nbl
+}
+
+fn version_loop(f $&MFn, lp &LoopInfo, addr_taken &[]bool) bool {
+    h := lp.header
+    hb := ~f.blocks[h]
+    if hb.tkind != TKIND_BRANCH || !in_loop(lp, hb.tb) || in_loop(lp, hb.tc) {
+        << false
+    }
+    $ninstr := 0
+    $has_store_ptr := false
+    for bi in 0:lp.blocks.len {
+        $ii := f.blocks[lp.blocks[bi]].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            ninstr += 1
+            if ins.kind == MI_CALL_IND || (ins.kind == MI_CALL && !is_panic_call(&ins)) {
+                << false
+            }
+            if ins.kind == MI_STORE_PTR {
+                has_store_ptr = true
+            }
+            ii = ins.next
+        }
+    }
+    if ninstr > 400 {
+        << false
+    }
+    // Header: cond = load I < hv.
+    cdef := block_def(f, h, hb.ta)
+    if cdef < 0 || f.instrs[cdef].kind != MI_BIN || f.instrs[cdef].b != BIN_LT {
+        << false
+    }
+    idef := block_def(f, h, f.instrs[cdef].c)
+    if idef < 0 || f.instrs[idef].kind != MI_LOAD_LOCAL || f.instrs[idef].c > 0 {
+        << false
+    }
+    iv := f.instrs[idef].b
+    if iv < 0 || addr_taken[iv] || (iv < f.locals_nslots.len && f.locals_nslots[iv] > 1) {
+        << false
+    }
+    hv := f.instrs[cdef].d
+    $hi_local := -1
+    if hv >= 0 {
+        hdef := block_def(f, h, hv)
+        if hdef < 0 || f.instrs[hdef].kind != MI_LOAD_LOCAL || f.instrs[hdef].c > 0 {
+            << false
+        }
+        hi_local = f.instrs[hdef].b
+        if addr_taken[hi_local] || loop_stores_local(f, lp, hi_local) != 0 {
+            << false
+        }
+    } else if hv == -1 {
+        << false
+    }
+    // The one store to I: I = I + step at the end of a block jumping back.
+    if loop_stores_local(f, lp, iv) != 1 {
+        << false
+    }
+    $step_const := -1
+    $step_local := -1
+    $found_step := false
+    for bi in 0:lp.blocks.len {
+        b := lp.blocks[bi]
+        $ii := f.blocks[b].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            if ins.kind == MI_STORE_LOCAL && ins.a == iv {
+                if f.blocks[b].tkind != TKIND_JUMP || f.blocks[b].ta != h || ins.c > 0 {
+                    << false
+                }
+                vdef := block_def(f, b, ins.b)
+                if vdef < 0 || f.instrs[vdef].kind != MI_BIN || f.instrs[vdef].b != BIN_ADD {
+                    << false
+                }
+                $other := -1
+                ldc := block_def(f, b, f.instrs[vdef].c)
+                ldd := block_def(f, b, f.instrs[vdef].d)
+                if ldc >= 0 && f.instrs[ldc].kind == MI_LOAD_LOCAL && f.instrs[ldc].b == iv {
+                    other = f.instrs[vdef].d
+                } else if ldd >= 0 && f.instrs[ldd].kind == MI_LOAD_LOCAL && f.instrs[ldd].b == iv {
+                    other = f.instrs[vdef].c
+                } else {
+                    << false
+                }
+                if other <= -2 {
+                    if f.consts[0 - other - 2] < 0 {
+                        << false
+                    }
+                    step_const = other
+                } else {
+                    sdef := block_def(f, b, other)
+                    if sdef < 0 || f.instrs[sdef].kind != MI_LOAD_LOCAL || f.instrs[sdef].c > 0 {
+                        << false
+                    }
+                    sl := f.instrs[sdef].b
+                    if sl == iv || addr_taken[sl] || loop_stores_local(f, lp, sl) != 0 {
+                        << false
+                    }
+                    step_local = sl
+                }
+                found_step = true
+            }
+            ii = ins.next
+        }
+    }
+    if !found_step {
+        << false
+    }
+    // Checks indexing with I into a descriptor the loop cannot change.
+    $checks := []BceCheck{}
+    for bi in 0:lp.blocks.len {
+        b := lp.blocks[bi]
+        blk := ~f.blocks[b]
+        if blk.tkind != TKIND_BRANCH || !in_loop(lp, blk.tc) {
+            ->
+        }
+        ids := loop_ids(f, b)
+        if ids.len < 3 { -> }
+        i1 := ~f.instrs[ids[ids.len - 3]]
+        i2 := ~f.instrs[ids[ids.len - 2]]
+        i3 := ~f.instrs[ids[ids.len - 1]]
+        if i3.kind != MI_BIN || i3.b != BIN_OR || i3.sval != "bounds" || i3.a != blk.ta { -> }
+        if i1.kind != MI_BIN || i1.b != BIN_LT || i2.kind != MI_BIN || i2.b != BIN_GE || i1.c != i2.c { -> }
+        xdef := block_def(f, b, i1.c)
+        if xdef < 0 || f.instrs[xdef].kind != MI_LOAD_LOCAL || f.instrs[xdef].b != iv { -> }
+        ndef := block_def(f, b, i2.d)
+        if ndef < 0 || f.instrs[ndef].kind != MI_LOAD_PTR || f.instrs[ndef].c != 8 { -> }
+        ddef := loop_def(f, lp, f.instrs[ndef].b)
+        if ddef < 0 { -> }
+        dk := f.instrs[ddef].kind
+        $ok := false
+        $is_ptr := false
+        dl := f.instrs[ddef].b
+        if dk == MI_ADDR {
+            ok = loop_stores_local(f, lp, dl) == 0 && !store_ptr_into_local(f, lp, dl)
+        } else if dk == MI_LOAD_LOCAL && f.instrs[ddef].c <= 0 {
+            is_ptr = true
+            ok = !has_store_ptr && !addr_taken[dl] && loop_stores_local(f, lp, dl) == 0
+        }
+        if ok {
+            checks.push(BceCheck{blk: b, ok_blk: blk.tc, desc_local: dl, desc_is_ptr: is_ptr})
+        }
+    }
+    if checks.len == 0 {
+        << false
+    }
+    clone_loop(f, lp, &checks, iv, hv, hi_local, step_local)
+    << true
+}
+
+// Whether a store in the loop may write the frame of local l: its base
+// derives from ADDR l, or comes from outside the loop.
+fn store_ptr_into_local(f &MFn, lp &LoopInfo, l int) bool {
+    $derived := []bool{}
+    for _ in 0:f.temps.len {
+        derived.push(false)
+    }
+    $inside := []bool{}
+    for _ in 0:f.temps.len {
+        inside.push(false)
+    }
+    for _ in 0:4 {
+        for bi in 0:lp.blocks.len {
+            $ii := f.blocks[lp.blocks[bi]].head
+            while ii >= 0 {
+                ins := ~f.instrs[ii]
+                if fold_defines(ins.kind) && ins.a >= 0 {
+                    inside[ins.a] = true
+                    if ins.kind == MI_ADDR && ins.b == l {
+                        derived[ins.a] = true
+                    } else if ins.kind == MI_COPY && ins.b >= 0 && derived[ins.b] {
+                        derived[ins.a] = true
+                    } else if ins.kind == MI_BIN && ((ins.c >= 0 && derived[ins.c]) || (ins.d >= 0 && derived[ins.d])) {
+                        derived[ins.a] = true
+                    }
+                }
+                ii = ins.next
+            }
+        }
+    }
+    for bi in 0:lp.blocks.len {
+        $ii := f.blocks[lp.blocks[bi]].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            if ins.kind == MI_STORE_PTR {
+                if ins.a < 0 || !inside[ins.a] || derived[ins.a] {
+                    << true
+                }
+            }
+            ii = ins.next
+        }
+    }
+    << false
+}
+
+fn in_loop(lp &LoopInfo, b int) bool {
+    << b >= 0 && b < lp.body.len && lp.body[b]
+}
+
+fn map_temp(tmap &[]int, v int) int {
+    if v >= 0 && v < tmap.len && tmap[v] >= 0 {
+        << tmap[v]
+    }
+    << v
+}
+
+fn clone_loop(f $&MFn, lp &LoopInfo, checks &[]BceCheck, iv int, hv int, hi_local int, step_local int) {
+    h := lp.header
+    line := f.blocks[h].line
+    // Guard block, then the clone's blocks.
+    g := f.blocks.len
+    f.blocks.push(mblock_new())
+    $bmap := []int{}
+    for b in 0:g {
+        if in_loop(lp, b) {
+            bmap.push(f.blocks.len)
+            f.blocks.push(mblock_new())
+        } else {
+            bmap.push(-1)
+        }
+    }
+    $tmap := []int{}
+    nt0 := f.temps.len
+    for _ in 0:nt0 {
+        tmap.push(-1)
+    }
+    for bi in 0:lp.blocks.len {
+        $ii := f.blocks[lp.blocks[bi]].head
+        while ii >= 0 {
+            if fold_defines(f.instrs[ii].kind) && f.instrs[ii].a >= 0 && f.instrs[ii].a < nt0 && tmap[f.instrs[ii].a] < 0 {
+                tmap[f.instrs[ii].a] = alloc_temp(f)
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+    // Guard: I >= 0, step >= 0 and hi <= len for every checked array; the
+    // descriptor words are read once here.
+    lo := alloc_temp(f)
+    add_instr(f, g, new_instr(MI_LOAD_LOCAL, lo, iv, 0, 0, line))
+    $bad := alloc_temp(f)
+    add_instr(f, g, new_instr(MI_BIN, bad, BIN_LT, lo, alloc_const(f, 0), line))
+    if step_local >= 0 {
+        sv := alloc_temp(f)
+        add_instr(f, g, new_instr(MI_LOAD_LOCAL, sv, step_local, 0, 0, line))
+        sneg := alloc_temp(f)
+        add_instr(f, g, new_instr(MI_BIN, sneg, BIN_LT, sv, alloc_const(f, 0), line))
+        nb := alloc_temp(f)
+        add_instr(f, g, new_instr(MI_BIN, nb, BIN_OR, bad, sneg, line))
+        bad = nb
+    }
+    $hval := hv
+    if hi_local >= 0 {
+        hval = alloc_temp(f)
+        add_instr(f, g, new_instr(MI_LOAD_LOCAL, hval, hi_local, 0, 0, line))
+    }
+    $dlocals := []int{}
+    $dptr := []bool{}
+    $dbase := []int{}
+    $ddata := []int{}
+    $dlen := []int{}
+    for ci in 0:checks.len {
+        $seen := false
+        for di in 0:dlocals.len {
+            if dlocals[di] == checks[ci].desc_local && dptr[di] == checks[ci].desc_is_ptr {
+                seen = true
+            }
+        }
+        if seen { -> }
+        base := alloc_temp(f)
+        if checks[ci].desc_is_ptr {
+            add_instr(f, g, new_instr(MI_LOAD_LOCAL, base, checks[ci].desc_local, 0, 0, line))
+        } else {
+            add_instr(f, g, new_instr(MI_ADDR, base, checks[ci].desc_local, 0, 0, line))
+        }
+        data := alloc_temp(f)
+        add_instr(f, g, new_instr(MI_LOAD_PTR, data, base, 0, 8, line))
+        ln := alloc_temp(f)
+        add_instr(f, g, new_instr(MI_LOAD_PTR, ln, base, 8, 8, line))
+        over := alloc_temp(f)
+        add_instr(f, g, new_instr(MI_BIN, over, BIN_GT, hval, ln, line))
+        nb := alloc_temp(f)
+        add_instr(f, g, new_instr(MI_BIN, nb, BIN_OR, bad, over, line))
+        bad = nb
+        dlocals.push(checks[ci].desc_local)
+        dptr.push(checks[ci].desc_is_ptr)
+        dbase.push(base)
+        ddata.push(data)
+        dlen.push(ln)
+    }
+    f.blocks[g].tkind = TKIND_BRANCH
+    f.blocks[g].ta = bad
+    f.blocks[g].tb = h
+    f.blocks[g].tc = bmap[h]
+    f.blocks[g].line = line
+    // Entries into the loop go through the guard.
+    for b in 0:g {
+        if in_loop(lp, b) { -> }
+        tk := f.blocks[b].tkind
+        if tk == TKIND_JUMP && f.blocks[b].ta == h {
+            f.blocks[b].ta = g
+        } else if tk == TKIND_BRANCH {
+            if f.blocks[b].tb == h { f.blocks[b].tb = g }
+            if f.blocks[b].tc == h { f.blocks[b].tc = g }
+        }
+    }
+    // Which original temps hold a hoisted descriptor base (single-def
+    // temps only, so every use sees that value).
+    $base_of := []int{}
+    $ndefs := []int{}
+    for _ in 0:nt0 {
+        base_of.push(-1)
+        ndefs.push(0)
+    }
+    for ii in 0:f.instrs.len {
+        if fold_defines(f.instrs[ii].kind) && f.instrs[ii].a >= 0 && f.instrs[ii].a < nt0 {
+            ndefs[f.instrs[ii].a] = ndefs[f.instrs[ii].a] + 1
+        }
+    }
+    for bi in 0:lp.blocks.len {
+        $ii := f.blocks[lp.blocks[bi]].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            if (ins.kind == MI_ADDR || ins.kind == MI_LOAD_LOCAL) && ins.a >= 0 && ins.a < nt0 && ins.c <= 0 && ndefs[ins.a] == 1 {
+                for di in 0:dlocals.len {
+                    if dlocals[di] == ins.b && dptr[di] == (ins.kind == MI_LOAD_LOCAL) {
+                        base_of[ins.a] = di
+                    }
+                }
+            }
+            ii = ins.next
+        }
+    }
+    for bi in 0:lp.blocks.len {
+        b := lp.blocks[bi]
+        nbk := bmap[b]
+        $ii := f.blocks[b].head
+        while ii >= 0 {
+            $ins := ~f.instrs[ii]
+            ii = ins.next
+            k := ins.kind
+            $di := -1
+            if (k == MI_ADDR || k == MI_LOAD_LOCAL) && ins.a >= 0 && ins.a < nt0 {
+                di = base_of[ins.a]
+            }
+            if di >= 0 {
+                ins.kind = MI_COPY
+                ins.b = dbase[di]
+            } else if k == MI_LOAD_PTR && ins.b >= 0 && ins.b < nt0 && base_of[ins.b] >= 0 && ins.d == 8 && (ins.c == 0 || ins.c == 8) {
+                bdi := base_of[ins.b]
+                ins.kind = MI_COPY
+                if ins.c == 0 { ins.b = ddata[bdi] } else { ins.b = dlen[bdi] }
+                ins.c = 0
+                ins.d = 0
+            } else if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR || k == MI_CALL_IND {
+                ins.b = map_temp(&tmap, ins.b)
+            } else if k == MI_STORE_PTR {
+                ins.a = map_temp(&tmap, ins.a)
+                ins.b = map_temp(&tmap, ins.b)
+            } else if k == MI_UN {
+                ins.c = map_temp(&tmap, ins.c)
+            } else if k == MI_BIN {
+                ins.c = map_temp(&tmap, ins.c)
+                ins.d = map_temp(&tmap, ins.d)
+            }
+            if k == MI_CALL || k == MI_CALL_IND {
+                $a := ins.c
+                $first := -1
+                $prev := -1
+                while a >= 0 {
+                    ni := f.margs.len
+                    f.margs.push(MArg{v: map_temp(&tmap, f.margs[a].v), next: -1})
+                    if prev < 0 { first = ni } else { f.margs[prev].next = ni }
+                    prev = ni
+                    a = f.margs[a].next
+                }
+                ins.c = first
+            }
+            if fold_defines(ins.kind) && ins.a >= 0 && ins.a < nt0 {
+                ins.a = tmap[ins.a]
+            }
+            ins.next = -1
+            add_instr(f, nbk, ~ins)
+        }
+        ob := ~f.blocks[b]
+        f.blocks[nbk].tkind = ob.tkind
+        f.blocks[nbk].line = ob.line
+        f.blocks[nbk].ta = ob.ta
+        f.blocks[nbk].tb = ob.tb
+        f.blocks[nbk].tc = ob.tc
+        if ob.tkind == TKIND_JUMP {
+            if bmap[ob.ta] >= 0 { f.blocks[nbk].ta = bmap[ob.ta] }
+        } else if ob.tkind == TKIND_BRANCH {
+            f.blocks[nbk].ta = map_temp(&tmap, ob.ta)
+            if bmap[ob.tb] >= 0 { f.blocks[nbk].tb = bmap[ob.tb] }
+            if bmap[ob.tc] >= 0 { f.blocks[nbk].tc = bmap[ob.tc] }
+        } else if ob.tkind == TKIND_RETURN {
+            f.blocks[nbk].ta = map_temp(&tmap, ob.ta)
+        }
+    }
+    // The clone's guarded checks always pass.
+    for ci in 0:checks.len {
+        nbk := bmap[checks[ci].blk]
+        f.blocks[nbk].tkind = TKIND_JUMP
+        f.blocks[nbk].ta = bmap[checks[ci].ok_blk]
+        f.blocks[nbk].tb = -1
+        f.blocks[nbk].tc = -1
+    }
+}
