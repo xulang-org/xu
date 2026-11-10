@@ -275,7 +275,9 @@ fn new_instr(kind int, a int, b int, c int, d int, line int) MInstr {
     << ins
 }
 
-pub fn opt_bce(f $&MFn) bool {
+// With vec, whole loops that fill, copy or sum an array become calls to
+// the backend's vector routines (codegen vec_stubs.xu) on the fast path.
+pub fn opt_bce(f $&MFn, vec bool) bool {
     for ii in 0:f.instrs.len {
         if !fold_known_kind(f.instrs[ii].kind) {
             << false
@@ -306,7 +308,7 @@ pub fn opt_bce(f $&MFn) bool {
     $changed := false
     for li in 0:loops.len {
         first := f.blocks.len
-        if version_loop(f, &loops[li], &addr_taken) {
+        if version_loop(f, &loops[li], &addr_taken, vec) {
             changed = true
             lo := loops[li].blocks[0]
             ins_at[lo] = first
@@ -352,7 +354,7 @@ fn place_before_loops(f $&MFn, nb0 int, ins_at &[]int, ins_n &[]int) {
     f.blocks = ~nbl
 }
 
-fn version_loop(f $&MFn, lp &LoopInfo, addr_taken &[]bool) bool {
+fn version_loop(f $&MFn, lp &LoopInfo, addr_taken &[]bool, vec bool) bool {
     h := lp.header
     hb := ~f.blocks[h]
     if hb.tkind != TKIND_BRANCH || !in_loop(lp, hb.tb) || in_loop(lp, hb.tc) {
@@ -460,6 +462,7 @@ fn version_loop(f $&MFn, lp &LoopInfo, addr_taken &[]bool) bool {
     }
     // Checks indexing with I into a descriptor the loop cannot change.
     $checks := []BceCheck{}
+    $ptr_under_store := false
     for bi in 0:lp.blocks.len {
         b := lp.blocks[bi]
         blk := ~f.blocks[b]
@@ -487,7 +490,10 @@ fn version_loop(f $&MFn, lp &LoopInfo, addr_taken &[]bool) bool {
             ok = loop_stores_local(f, lp, dl) == 0 && !store_ptr_into_local(f, lp, dl)
         } else if dk == MI_LOAD_LOCAL && f.instrs[ddef].c <= 0 {
             is_ptr = true
-            ok = !has_store_ptr && !addr_taken[dl] && loop_stores_local(f, lp, dl) == 0
+            ok = !addr_taken[dl] && loop_stores_local(f, lp, dl) == 0
+            if ok && has_store_ptr {
+                ptr_under_store = true
+            }
         }
         if ok {
             checks.push(BceCheck{blk: b, ok_blk: blk.tc, desc_local: dl, desc_is_ptr: is_ptr})
@@ -496,8 +502,357 @@ fn version_loop(f $&MFn, lp &LoopInfo, addr_taken &[]bool) bool {
     if checks.len == 0 {
         << false
     }
-    clone_loop(f, lp, &checks, iv, hv, hi_local, step_local)
+    $idiom := VecIdiom{kind: 0, dst: -1, src: -1, width: 8, val: -1, val_local: -1, acc: -1}
+    if vec && step_local < 0 && step_const <= -2 && f.consts[0 - step_const - 2] == 1 {
+        idiom = match_idiom(f, lp, &checks, iv, addr_taken)
+    }
+    // A store through a pointer could rewrite a descriptor reached through
+    // a pointer, unless it is the idiom's own element store: one word or
+    // byte at a stride of its width, which no descriptor can overlap.
+    if ptr_under_store && idiom.kind == 0 {
+        $kept := []BceCheck{}
+        for ci in 0:checks.len {
+            if !checks[ci].desc_is_ptr {
+                kept.push(checks[ci])
+            }
+        }
+        if kept.len == 0 {
+            << false
+        }
+        checks = ~kept
+    }
+    clone_loop(f, lp, &checks, iv, hv, hi_local, step_local, &idiom)
     << true
+}
+
+const VEC_FILL = 1
+const VEC_COPY = 2
+const VEC_SUM = 3
+
+// A loop body reduced to one vector operation over checks[dst] / [src].
+struct VecIdiom {
+    kind int
+    dst int
+    src int
+    width int
+    // Fill value: a constant or temp defined before the loop, or a local
+    // the loop does not store (val_local).
+    val int
+    val_local int
+    // Sum accumulator local.
+    acc int
+}
+
+const SYM_UNK = 0
+const SYM_INV = 1
+const SYM_INVL = 2
+const SYM_IV = 3
+const SYM_DESC = 4
+const SYM_DATA = 5
+const SYM_IVS = 6
+const SYM_ADDR = 7
+const SYM_ELEM = 8
+const SYM_ACC = 9
+const SYM_SUM = 10
+
+struct Sym {
+    kind int
+    a int
+    b int
+}
+
+fn sym_of(f &MFn, lp &LoopInfo, syms &[]Sym, defined_in &[]bool, v int) Sym {
+    if v <= -2 {
+        << Sym{kind: SYM_INV, a: v, b: 0}
+    }
+    if v >= 0 && v < defined_in.len && !defined_in[v] {
+        << Sym{kind: SYM_INV, a: v, b: 0}
+    }
+    if v >= 0 && v < syms.len {
+        << syms[v]
+    }
+    << Sym{kind: SYM_UNK, a: 0, b: 0}
+}
+
+fn desc_index(checks &[]BceCheck, l int, is_ptr bool) int {
+    for ci in 0:checks.len {
+        if checks[ci].desc_local == l && checks[ci].desc_is_ptr == is_ptr {
+            << ci
+        }
+    }
+    << -1
+}
+
+// Straight-line loop bodies (only the eliminated checks branch) with one
+// effect besides the induction step: a[i] = v, a[i] = b[i] or s += a[i].
+fn match_idiom(f &MFn, lp &LoopInfo, checks &[]BceCheck, iv int, addr_taken &[]bool) VecIdiom {
+    $none := VecIdiom{kind: 0, dst: -1, src: -1, width: 8, val: -1, val_local: -1, acc: -1}
+    h := lp.header
+    exit_b := f.blocks[h].tc
+    // Walk header.tb ... latch; panic blocks of the checks are skipped.
+    $path := []int{}
+    $b := f.blocks[h].tb
+    for _ in 0:lp.blocks.len + 1 {
+        if b == h { <- }
+        if !in_loop(lp, b) { << none }
+        path.push(b)
+        blk := ~f.blocks[b]
+        $next := -1
+        if blk.tkind == TKIND_JUMP {
+            next = blk.ta
+        } else if blk.tkind == TKIND_BRANCH {
+            for ci in 0:checks.len {
+                if checks[ci].blk == b {
+                    next = checks[ci].ok_blk
+                }
+            }
+        }
+        if next < 0 { << none }
+        b = next
+    }
+    if b != h { << none }
+    // Every other loop block must be a check's panic block.
+    for bi in 0:lp.blocks.len {
+        x := lp.blocks[bi]
+        if x == h { -> }
+        $on := false
+        for pi in 0:path.len {
+            if path[pi] == x { on = true }
+        }
+        for ci in 0:checks.len {
+            if f.blocks[checks[ci].blk].tb == x { on = true }
+        }
+        if !on { << none }
+    }
+    // Loop temps must not be read after the loop.
+    $defined_in := []bool{}
+    for _ in 0:f.temps.len {
+        defined_in.push(false)
+    }
+    for bi in 0:lp.blocks.len {
+        $ii := f.blocks[lp.blocks[bi]].head
+        while ii >= 0 {
+            if fold_defines(f.instrs[ii].kind) && f.instrs[ii].a >= 0 {
+                defined_in[f.instrs[ii].a] = true
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+    ub := fold_use_blocks(f)
+    for t in 0:f.temps.len {
+        if defined_in[t] && ub[t] != -1 && (ub[t] == -2 || !in_loop(lp, ub[t])) {
+            if ub[t] == -2 {
+                // Read in several blocks: all must be in the loop.
+                if !temp_reads_inside(f, lp, t) { << none }
+            } else {
+                << none
+            }
+        }
+    }
+    $syms := []Sym{}
+    for _ in 0:f.temps.len {
+        syms.push(Sym{kind: SYM_UNK, a: 0, b: 0})
+    }
+    $res := ~none
+    $effects := 0
+    $order := []int{}
+    order.push(h)
+    for pi in 0:path.len {
+        order.push(path[pi])
+    }
+    for oi in 0:order.len {
+        $ii := f.blocks[order[oi]].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            ii = ins.next
+            k := ins.kind
+            $r := Sym{kind: SYM_UNK, a: 0, b: 0}
+            if k == MI_LOAD_LOCAL && ins.c <= 0 {
+                l := ins.b
+                if l == iv {
+                    r = Sym{kind: SYM_IV, a: 0, b: 0}
+                } else if desc_index(checks, l, true) >= 0 {
+                    r = Sym{kind: SYM_DESC, a: desc_index(checks, l, true), b: 0}
+                } else if loop_stores_local(f, lp, l) == 0 && !addr_taken[l] {
+                    r = Sym{kind: SYM_INVL, a: l, b: 0}
+                } else if !addr_taken[l] {
+                    r = Sym{kind: SYM_ACC, a: l, b: 0}
+                }
+            } else if k == MI_ADDR {
+                di := desc_index(checks, ins.b, false)
+                if di >= 0 {
+                    r = Sym{kind: SYM_DESC, a: di, b: 0}
+                }
+            } else if k == MI_COPY {
+                r = sym_of(f, lp, &syms, &defined_in, ins.b)
+            } else if k == MI_LOAD_PTR {
+                bs := sym_of(f, lp, &syms, &defined_in, ins.b)
+                if bs.kind == SYM_DESC && ins.c == 0 && ins.d == 8 {
+                    r = Sym{kind: SYM_DATA, a: bs.a, b: 0}
+                } else if bs.kind == SYM_ADDR && ins.c == 0 && (ins.d == 8 || ins.d == 1) && ins.d == bs.b {
+                    r = Sym{kind: SYM_ELEM, a: bs.a, b: ins.d}
+                }
+            } else if k == MI_BIN {
+                x := sym_of(f, lp, &syms, &defined_in, ins.c)
+                y := sym_of(f, lp, &syms, &defined_in, ins.d)
+                if ins.b == BIN_SHL && x.kind == SYM_IV && ins.d <= -2 && f.consts[0 - ins.d - 2] == 3 {
+                    r = Sym{kind: SYM_IVS, a: 8, b: 0}
+                } else if ins.b == BIN_ADD {
+                    $p := ~x
+                    $q := ~y
+                    if q.kind == SYM_DATA || q.kind == SYM_ACC {
+                        p = ~y
+                        q = ~x
+                    }
+                    if p.kind == SYM_DATA && q.kind == SYM_IVS {
+                        r = Sym{kind: SYM_ADDR, a: p.a, b: 8}
+                    } else if p.kind == SYM_DATA && q.kind == SYM_IV {
+                        r = Sym{kind: SYM_ADDR, a: p.a, b: 1}
+                    } else if p.kind == SYM_ACC && q.kind == SYM_ELEM && q.b == 8 {
+                        r = Sym{kind: SYM_SUM, a: p.a, b: q.a}
+                    }
+                }
+            } else if k == MI_STORE_LOCAL {
+                if ins.a == iv {
+                    ->
+                }
+                v := sym_of(f, lp, &syms, &defined_in, ins.b)
+                if v.kind != SYM_SUM || v.a != ins.a || ins.c > 0 || loop_stores_local(f, lp, ins.a) != 1 {
+                    << none
+                }
+                effects += 1
+                res = VecIdiom{kind: VEC_SUM, dst: -1, src: v.b, width: 8, val: -1, val_local: -1, acc: ins.a}
+            } else if k == MI_STORE_PTR {
+                bs := sym_of(f, lp, &syms, &defined_in, ins.a)
+                v := sym_of(f, lp, &syms, &defined_in, ins.b)
+                if bs.kind != SYM_ADDR || ins.c != 0 || ins.d != bs.b {
+                    << none
+                }
+                effects += 1
+                if v.kind == SYM_INV {
+                    res = VecIdiom{kind: VEC_FILL, dst: bs.a, src: -1, width: bs.b, val: v.a, val_local: -1, acc: -1}
+                } else if v.kind == SYM_INVL {
+                    res = VecIdiom{kind: VEC_FILL, dst: bs.a, src: -1, width: bs.b, val: -1, val_local: v.a, acc: -1}
+                } else if v.kind == SYM_ELEM && v.b == bs.b {
+                    res = VecIdiom{kind: VEC_COPY, dst: bs.a, src: v.a, width: bs.b, val: -1, val_local: -1, acc: -1}
+                } else {
+                    << none
+                }
+            } else if k == MI_CALL || k == MI_CALL_IND {
+                << none
+            }
+            if fold_defines(k) && ins.a >= 0 && ins.a < syms.len {
+                syms[ins.a] = ~r
+            }
+        }
+    }
+    if effects != 1 {
+        << none
+    }
+    << res
+}
+
+fn temp_reads_inside(f &MFn, lp &LoopInfo, t int) bool {
+    for b in 0:f.blocks.len {
+        if in_loop(lp, b) { -> }
+        $ii := f.blocks[b].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            k := ins.kind
+            if (k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR || k == MI_CALL_IND) && ins.b == t { << false }
+            if k == MI_STORE_PTR && (ins.a == t || ins.b == t) { << false }
+            if k == MI_UN && ins.c == t { << false }
+            if k == MI_BIN && (ins.c == t || ins.d == t) { << false }
+            if k == MI_CALL || k == MI_CALL_IND {
+                $a := ins.c
+                while a >= 0 {
+                    if f.margs[a].v == t { << false }
+                    a = f.margs[a].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[b].tkind
+        if (tk == TKIND_BRANCH || tk == TKIND_RETURN) && f.blocks[b].ta == t { << false }
+    }
+    << true
+}
+
+fn vec_call(f $&MFn, b int, label string, args &[]int, line int) int {
+    $first := -1
+    $prev := -1
+    for i in 0:args.len {
+        ni := f.margs.len
+        f.margs.push(MArg{v: args[i], next: -1})
+        if prev < 0 { first = ni } else { f.margs[prev].next = ni }
+        prev = ni
+    }
+    d := alloc_temp(f)
+    $ins := minstr_new(MI_CALL)
+    ins.a = d
+    ins.c = first
+    ins.sval = label + ""
+    ins.line = line
+    add_instr(f, b, ~ins)
+    << d
+}
+
+// Fast path for a recognised idiom: one vector call over [lo, hi), then
+// the induction variable (and accumulator) take their final values.
+fn emit_vec_fast(f $&MFn, fb int, id &VecIdiom, iv int, lo int, hval int, ddata &[]int, line int, exit_b int) {
+    diff := alloc_temp(f)
+    add_instr(f, fb, new_instr(MI_BIN, diff, BIN_SUB, hval, lo, line))
+    pos := alloc_temp(f)
+    add_instr(f, fb, new_instr(MI_BIN, pos, BIN_GT, diff, alloc_const(f, 0), line))
+    n := alloc_temp(f)
+    add_instr(f, fb, new_instr(MI_BIN, n, BIN_MUL, diff, pos, line))
+    $off := lo
+    if id.width == 8 {
+        off = alloc_temp(f)
+        add_instr(f, fb, new_instr(MI_BIN, off, BIN_SHL, lo, alloc_const(f, 3), line))
+    }
+    $args := []int{}
+    $suffix := "64"
+    if id.width == 1 { suffix = "8" }
+    if id.kind == VEC_FILL {
+        p := alloc_temp(f)
+        add_instr(f, fb, new_instr(MI_BIN, p, BIN_ADD, ddata[id.dst], off, line))
+        $v := id.val
+        if id.val_local >= 0 {
+            v = alloc_temp(f)
+            add_instr(f, fb, new_instr(MI_LOAD_LOCAL, v, id.val_local, 0, 0, line))
+        }
+        args.push(p)
+        args.push(n)
+        args.push(v)
+        vec_call(f, fb, "__xu_vec_fill" + suffix, &args, line)
+    } else if id.kind == VEC_COPY {
+        p := alloc_temp(f)
+        add_instr(f, fb, new_instr(MI_BIN, p, BIN_ADD, ddata[id.dst], off, line))
+        q := alloc_temp(f)
+        add_instr(f, fb, new_instr(MI_BIN, q, BIN_ADD, ddata[id.src], off, line))
+        args.push(p)
+        args.push(q)
+        args.push(n)
+        vec_call(f, fb, "__xu_vec_copy" + suffix, &args, line)
+    } else {
+        q := alloc_temp(f)
+        add_instr(f, fb, new_instr(MI_BIN, q, BIN_ADD, ddata[id.src], off, line))
+        args.push(q)
+        args.push(n)
+        r := vec_call(f, fb, "__xu_vec_sum64", &args, line)
+        s0 := alloc_temp(f)
+        add_instr(f, fb, new_instr(MI_LOAD_LOCAL, s0, id.acc, 0, 0, line))
+        s1 := alloc_temp(f)
+        add_instr(f, fb, new_instr(MI_BIN, s1, BIN_ADD, s0, r, line))
+        add_instr(f, fb, new_instr(MI_STORE_LOCAL, id.acc, s1, 0, 0, line))
+    }
+    fin := alloc_temp(f)
+    add_instr(f, fb, new_instr(MI_BIN, fin, BIN_ADD, lo, n, line))
+    add_instr(f, fb, new_instr(MI_STORE_LOCAL, iv, fin, 0, 0, line))
+    f.blocks[fb].tkind = TKIND_JUMP
+    f.blocks[fb].ta = exit_b
+    f.blocks[fb].line = line
 }
 
 // Whether a store in the loop may write the frame of local l: its base
@@ -556,7 +911,7 @@ fn map_temp(tmap &[]int, v int) int {
     << v
 }
 
-fn clone_loop(f $&MFn, lp &LoopInfo, checks &[]BceCheck, iv int, hv int, hi_local int, step_local int) {
+fn clone_loop(f $&MFn, lp &LoopInfo, checks &[]BceCheck, iv int, hv int, hi_local int, step_local int, idiom &VecIdiom) {
     h := lp.header
     line := f.blocks[h].line
     // Guard block, then the clone's blocks.
@@ -610,14 +965,18 @@ fn clone_loop(f $&MFn, lp &LoopInfo, checks &[]BceCheck, iv int, hv int, hi_loca
     $dbase := []int{}
     $ddata := []int{}
     $dlen := []int{}
+    $cdata := []int{}
     for ci in 0:checks.len {
-        $seen := false
+        $seen := -1
         for di in 0:dlocals.len {
             if dlocals[di] == checks[ci].desc_local && dptr[di] == checks[ci].desc_is_ptr {
-                seen = true
+                seen = di
             }
         }
-        if seen { -> }
+        if seen >= 0 {
+            cdata.push(ddata[seen])
+            ->
+        }
         base := alloc_temp(f)
         if checks[ci].desc_is_ptr {
             add_instr(f, g, new_instr(MI_LOAD_LOCAL, base, checks[ci].desc_local, 0, 0, line))
@@ -638,12 +997,28 @@ fn clone_loop(f $&MFn, lp &LoopInfo, checks &[]BceCheck, iv int, hv int, hi_loca
         dbase.push(base)
         ddata.push(data)
         dlen.push(ln)
+        cdata.push(data)
     }
     f.blocks[g].tkind = TKIND_BRANCH
     f.blocks[g].ta = bad
     f.blocks[g].tb = h
     f.blocks[g].tc = bmap[h]
     f.blocks[g].line = line
+    if idiom.kind != 0 {
+        // The clone's blocks stay empty and unreachable; fold drops them.
+        emit_vec_fast(f, bmap[h], idiom, iv, lo, hval, &cdata, line, f.blocks[h].tc)
+        for b in 0:g {
+            if in_loop(lp, b) { -> }
+            tk := f.blocks[b].tkind
+            if tk == TKIND_JUMP && f.blocks[b].ta == h {
+                f.blocks[b].ta = g
+            } else if tk == TKIND_BRANCH {
+                if f.blocks[b].tb == h { f.blocks[b].tb = g }
+                if f.blocks[b].tc == h { f.blocks[b].tc = g }
+            }
+        }
+        <<
+    }
     // Entries into the loop go through the guard.
     for b in 0:g {
         if in_loop(lp, b) { -> }
