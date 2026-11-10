@@ -76,6 +76,11 @@ struct Lw {
     // Owned locals in declaration order, innermost scope last; dropped in
     // reverse at scope exit, return, break and continue.
     scope_ids []int
+    // Start in scope_offs of each scope_ids entry's descriptor offsets.
+    scope_ostart []int
+    scope_offs []int
+    // needs_drop memo by struct index: 0 unknown, 1 yes, 2 no.
+    sdrop []int
     // scope_ids length at the entry of each enclosing loop body.
     loop_scope []int
     // Lowering a branch condition or match subject: the checker forgives a
@@ -108,6 +113,9 @@ fn lw_new(name string, label string, fi int, tgt_os int) Lw {
         lowned: []bool{},
         lmoved: []bool{},
         scope_ids: []int{},
+        scope_ostart: []int{},
+        scope_offs: []int{},
+        sdrop: []int{},
         loop_scope: []int{},
         in_cond: 0
     }
@@ -654,12 +662,17 @@ fn (w $&Lw) lower_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
         << w.konst(0)
     }
     if n != w.unboxed && w.err_wants_box(tp, n) {
+        w.disown_root(p, tp, n)
         << w.err_box(p, tp, n)
     }
     if n != w.unboxed && w.iface_wants_box(tp, n) {
+        w.disown_root(p, tp, n)
         << w.iface_box(p, tp, n)
     }
     k := p.nodes[n].kind
+    if k == ast.NK_TYPE_AS {
+        w.disown_root(p, tp, p.nodes[n].a)
+    }
     if n != w.noclone && w.wants_clone(p, tp, n) {
         prev := w.noclone
         w.noclone = n
@@ -832,25 +845,6 @@ fn (w $&Lw) drop_fresh_str(p &parser.Parser, tp &types.TypedProgram, e int, d in
     }
 }
 
-// e is a string concat/slice tree that reads local id directly (as an
-// operand or slice source), so the local was not moved before e.
-fn (w &Lw) str_reads_local(p &parser.Parser, tp &types.TypedProgram, e int, id int) bool {
-    if e < 0 {
-        << false
-    }
-    k := p.nodes[e].kind
-    if k == ast.NK_IDENT {
-        << tp.local_of(e) == id && tp.clone_of(e) == 0
-    }
-    if k == ast.NK_BIN_OP && p.nodes[e].ival == ast.OP_ADD {
-        << w.str_reads_local(p, tp, p.nodes[e].a, id) || w.str_reads_local(p, tp, p.nodes[e].b, id)
-    }
-    if k == ast.NK_SLICE {
-        << w.str_reads_local(p, tp, p.nodes[e].a, id)
-    }
-    << false
-}
-
 // ===== string local ownership =====
 
 fn (w &Lw) owns(id int) bool {
@@ -864,15 +858,104 @@ fn (w $&Lw) own_grow(id int) {
     }
 }
 
-// Local id now holds an owned string, dropped when its scope ends.
+// Values of type ty own heap buffers that drop_into frees: strings,
+// dynamic arrays (the buffer only; elements are not dropped) and structs
+// without a user drop holding such fields.
+fn (w $&Lw) needs_drop(tp &types.TypedProgram, ty int) bool {
+    if ty == 3 {
+        << true
+    }
+    if types.is_array_type(ty) {
+        << tp.arrays[types.array_index(ty)].fixed_len == 0
+    }
+    if !types.is_struct_type(ty) {
+        << false
+    }
+    si := types.struct_index(ty)
+    while w.sdrop.len <= si {
+        w.sdrop.push(0)
+    }
+    if w.sdrop[si] == 0 {
+        w.sdrop[si] = 2
+        if !tp.structs[si].has_drop {
+            for i in 0:tp.structs[si].fields.len {
+                if w.needs_drop(tp, tp.structs[si].fields[i].ty) {
+                    w.sdrop[si] = 1
+                }
+            }
+        }
+    }
+    << w.sdrop[si] == 1
+}
+
+// Offsets of the [ptr, len, cap] descriptors a value of type ty at base
+// owns (each freed with str_free).
+fn (w $&Lw) drop_offsets(tp &types.TypedProgram, ty int, base int) {
+    if types.is_struct_type(ty) {
+        si := types.struct_index(ty)
+        for i in 0:tp.structs[si].fields.len {
+            fty := tp.structs[si].fields[i].ty
+            if w.needs_drop(tp, fty) {
+                w.drop_offsets(tp, fty, base + tp.structs[si].fields[i].offset)
+            }
+        }
+        <<
+    }
+    w.scope_offs.push(base)
+}
+
+// Free the buffers owned by the value of type ty at address a.
+fn (w $&Lw) drop_value(tp &types.TypedProgram, a int, ty int) {
+    if types.is_struct_type(ty) {
+        si := types.struct_index(ty)
+        for i in 0:tp.structs[si].fields.len {
+            fty := tp.structs[si].fields[i].ty
+            if w.needs_drop(tp, fty) {
+                w.drop_value(tp, w.bin(BIN_ADD, a, w.konst(tp.structs[si].fields[i].offset)), fty)
+            }
+        }
+        <<
+    }
+    $args := []int{}
+    args.push(a)
+    w.call_core("str_free", &args)
+}
+
+// Local id now holds an owned value, dropped when its scope ends.
 fn (w $&Lw) own_declare(tp &types.TypedProgram, id int) {
-    if id < 0 || w.local_type(tp, id) != 3 {
+    if id < 0 || !w.needs_drop(tp, w.local_type(tp, id)) {
+        <<
+    }
+    if w.lslot.len > id && w.lslot[id] >= 0 && w.byref(w.lslot[id]) {
         <<
     }
     w.own_grow(id)
     w.lowned[id] = true
     w.lmoved[id] = false
     w.scope_ids.push(id)
+    w.scope_ostart.push(w.scope_offs.len)
+    w.drop_offsets(tp, w.local_type(tp, id), 0)
+}
+
+// Close the scopes above mark (their drops are already emitted).
+fn (w $&Lw) scope_truncate(mark int) {
+    if w.scope_ids.len > mark {
+        w.scope_offs = w.scope_offs[0:w.scope_ostart[mark]]
+        w.scope_ids = w.scope_ids[0:mark]
+        w.scope_ostart = w.scope_ostart[0:mark]
+    }
+}
+
+// A part of the local under place n may be consumed (boxing, `as`), which
+// moves are not tracked for; the local is never dropped.
+fn (w $&Lw) disown_root(p &parser.Parser, tp &types.TypedProgram, n int) {
+    $x := n
+    while x >= 0 && (p.nodes[x].kind == ast.NK_FIELD || p.nodes[x].kind == ast.NK_INDEX || p.nodes[x].kind == ast.NK_TYPE_AS) {
+        x = p.nodes[x].a
+    }
+    if x >= 0 && x != n && p.nodes[x].kind == ast.NK_IDENT {
+        w.own_disown(tp.local_of(x))
+    }
 }
 
 // The buffer of local id escaped where moves are not tracked; never drop it.
@@ -890,28 +973,40 @@ fn (w $&Lw) drop_owned_from(mark int) {
         if w.lowned[id] && !w.lmoved[id] {
             slot := w.lslot[id]
             if slot >= 0 {
-                $args := []int{}
-                args.push(w.local_addr(slot))
-                w.call_core("str_free", &args)
+                $end := w.scope_offs.len
+                if i + 1 < w.scope_ids.len {
+                    end = w.scope_ostart[i + 1]
+                }
+                base := w.local_addr(slot)
+                for j in w.scope_ostart[i]:end {
+                    $args := []int{}
+                    off := w.scope_offs[j]
+                    if off == 0 {
+                        args.push(base)
+                    } else {
+                        args.push(w.bin(BIN_ADD, base, w.konst(off)))
+                    }
+                    w.call_core("str_free", &args)
+                }
             }
         }
         i -= 1
     }
 }
 
-// The string value of e may be stored into a new owner as is: it is a
-// fresh buffer, a literal, a user call result, a checker clone, or a
-// local move (lower_ident clones views).
-fn (w &Lw) str_transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bool {
+// The value of e may be stored into a new owner as is: it is fresh (a
+// literal, constructor, slice copy or user call result), a checker clone,
+// or a local move (lower_ident clones views).
+fn (w &Lw) transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bool {
     if e < 0 || tp.const_of(e) >= 0 || w.fresh_str(p, tp, e) {
         << true
     }
     k := p.nodes[e].kind
     c := tp.clone_of(e)
-    if c == 1 || (c == 2 && k == ast.NK_IDENT) {
+    if (c == 1 && w.wants_clone(p, tp, e)) || (c == 2 && k == ast.NK_IDENT) {
         << true
     }
-    if k == ast.NK_STR || k == ast.NK_TERNARY {
+    if k == ast.NK_STR || k == ast.NK_TERNARY || k == ast.NK_STRUCT_INIT || k == ast.NK_ARRAY_LIT || k == ast.NK_EMPTY_ARRAY || k == ast.NK_CLONE || k == ast.NK_SLICE {
         << true
     }
     if (k == ast.NK_CALL || k == ast.NK_METHOD_CALL) && (tp.call_of(e) >= 0 || tp.call_of(e) == -80) {
@@ -920,14 +1015,18 @@ fn (w &Lw) str_transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bo
     << false
 }
 
-// String value v of e as a buffer the consumer owns.
-fn (w $&Lw) own_str(p &parser.Parser, tp &types.TypedProgram, e int, v int) int {
-    if w.str_transfer_safe(p, tp, e) {
+// Value v of e, of type ty, as a value whose buffers the consumer owns.
+fn (w $&Lw) own_val(p &parser.Parser, tp &types.TypedProgram, e int, v int, ty int) int {
+    if !w.needs_drop(tp, ty) || w.transfer_safe(p, tp, e) {
         << v
     }
-    out := w.scratch_words(3)
-    w.clone_into(tp, out, v, 3)
+    out := w.scratch(tp, ty)
+    w.clone_into(tp, out, v, ty)
     << out
+}
+
+fn (w $&Lw) own_str(p &parser.Parser, tp &types.TypedProgram, e int, v int) int {
+    << w.own_val(p, tp, e, v, 3)
 }
 
 fn (w $&Lw) lower_str_lit(s string) int {
@@ -948,12 +1047,12 @@ fn (w $&Lw) lower_ident(p &parser.Parser, tp &types.TypedProgram, n int) int {
     if id >= 0 {
         slot := w.ensure_local(tp, id)
         ty := w.local_type(tp, id)
-        if ty == 3 && tp.clone_of(n) == 2 && !w.byref(slot) {
+        if tp.clone_of(n) == 2 && w.needs_drop(tp, ty) {
             if w.owns(id) && w.in_cond == 0 {
                 w.lmoved[id] = true
             } else {
-                out := w.scratch_words(3)
-                w.clone_into(tp, out, w.local_addr(slot), 3)
+                out := w.scratch(tp, ty)
+                w.clone_into(tp, out, w.local_addr(slot), ty)
                 << out
             }
         }
@@ -1066,8 +1165,8 @@ fn (w $&Lw) lower_ternary(p &parser.Parser, tp &types.TypedProgram, n int) int {
     w.branch(cond, then_b, else_b)
     w.f.active_bb = then_b
     $tv := w.lower_expr(p, tp, p.nodes[n].b)
-    if ty == 3 {
-        tv = w.own_str(p, tp, p.nodes[n].b, tv)
+    if ty != 0 {
+        tv = w.own_val(p, tp, p.nodes[n].b, tv, ty)
     }
     if wide {
         w.copy_mem(w.addr_local(res), tv, tp.size_of(ty))
@@ -1077,8 +1176,8 @@ fn (w $&Lw) lower_ternary(p &parser.Parser, tp &types.TypedProgram, n int) int {
     w.jump(done_b)
     w.f.active_bb = else_b
     $ev := w.lower_expr(p, tp, p.nodes[n].c)
-    if ty == 3 {
-        ev = w.own_str(p, tp, p.nodes[n].c, ev)
+    if ty != 0 {
+        ev = w.own_val(p, tp, p.nodes[n].c, ev, ty)
     }
     if wide {
         w.copy_mem(w.addr_local(res), ev, tp.size_of(ty))
@@ -1280,7 +1379,8 @@ fn (w $&Lw) lower_struct_init(p &parser.Parser, tp &types.TypedProgram, n int) i
             w.fail(p, fld, "unknown field '" + fname + "'")
         } else {
             fty := tp.structs[si].fields[fi].ty
-            v := w.lower_expr(p, tp, p.nodes[fld].a)
+            fe := p.nodes[fld].a
+            v := w.own_val(p, tp, fe, w.lower_expr(p, tp, fe), fty)
             w.store_value(tp, out, tp.structs[si].fields[fi].offset, v, fty)
         }
         fld = p.nodes[fld].next
@@ -1381,11 +1481,7 @@ fn (w $&Lw) lower_arg(p &parser.Parser, tp &types.TypedProgram, arg int, pty int
     if plain && types.is_ref_type(tp.type_of(arg)) && w.expr_is_ref(p, tp, arg) {
         << w.load_ptr(w.lower_expr(p, tp, arg), 0, width_of(tp, pty))
     }
-    v := w.lower_expr(p, tp, arg)
-    if pty == 3 {
-        << w.own_str(p, tp, arg, v)
-    }
-    << v
+    << w.own_val(p, tp, arg, w.lower_expr(p, tp, arg), pty)
 }
 
 fn (w $&Lw) finish_call(tp &types.TypedProgram, callee int, args []int) int {
@@ -1708,7 +1804,7 @@ fn (w $&Lw) lower_block(p &parser.Parser, tp &types.TypedProgram, head int) {
         if w.open() {
             w.drop_owned_from(mark)
         }
-        w.scope_ids = w.scope_ids[0:mark]
+        w.scope_truncate(mark)
     }
     // Moves on a path that ended do not reach the code after the block;
     // the checker clones conditional moves of outer strings instead.
@@ -1737,8 +1833,8 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
         id := tp.local_of(s)
         e := p.nodes[s].a
         $v := w.lower_expr(p, tp, e)
-        if id >= 0 && w.local_type(tp, id) == 3 {
-            v = w.own_str(p, tp, e, v)
+        if id >= 0 {
+            v = w.own_val(p, tp, e, v, w.local_type(tp, id))
         }
         if id < 0 {
             w.fail(p, s, "unresolved binding '" + p.nodes[s].sval + "'")
@@ -1769,8 +1865,8 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
             <<
         }
         $v := w.lower_expr(p, tp, a)
-        if w.ret_ty == 3 {
-            v = w.own_str(p, tp, a, v)
+        if w.ret_ty != 0 && !types.is_ref_type(w.ret_ty) {
+            v = w.own_val(p, tp, a, v, w.ret_ty)
         }
         if w.sret >= 0 {
             dst := w.load_local(w.sret, 0)
@@ -2001,21 +2097,16 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
             w.drop_fresh_str(p, tp, p.nodes[s].b, rhs)
             <<
         }
-        $v := w.lower_expr(p, tp, p.nodes[s].b)
-        if lty == 3 {
-            v = w.own_str(p, tp, p.nodes[s].b, v)
-        }
+        $v := w.own_val(p, tp, p.nodes[s].b, w.lower_expr(p, tp, p.nodes[s].b), lty)
         if aop > ast.AS_ASSIGN {
             old := w.lower_ident(p, tp, target)
             v = w.checked_bin(assign_op_code(lty, aop), old, v, lty)
         }
-        if lty == 3 && aop == ast.AS_ASSIGN && w.owns(id) && !w.lmoved[id] {
-            $fargs := []int{}
-            fargs.push(w.local_addr(w.ensure_local(tp, id)))
-            w.call_core("str_free", &fargs)
+        if aop == ast.AS_ASSIGN && w.owns(id) && !w.lmoved[id] {
+            w.drop_value(tp, w.local_addr(w.ensure_local(tp, id)), lty)
         }
         w.store_to_local(tp, id, v)
-        if lty == 3 && w.owns(id) {
+        if w.owns(id) {
             w.lmoved[id] = false
         }
         <<
@@ -2048,7 +2139,7 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
         w.drop_fresh_str(p, tp, p.nodes[s].b, rhs)
         <<
     }
-    $v := w.lower_expr(p, tp, p.nodes[s].b)
+    $v := w.own_val(p, tp, p.nodes[s].b, w.lower_expr(p, tp, p.nodes[s].b), tty)
     if is_wide(tp, tty) {
         w.copy_mem(addr, v, tp.size_of(tty))
         <<
