@@ -191,7 +191,7 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
             else:
                 pending.append((kind, roff, lab))
 
-    undef: set[str] = set(HOST_SYMS)
+    undef: set[str] = set()
     for _kind, _roff, lab in pending:
         if lab not in local or lab in HOST_SYMS:
             undef.add(lab)

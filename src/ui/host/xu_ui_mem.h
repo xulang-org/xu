@@ -60,6 +60,11 @@ char *xu_ui_mem_take(const char *name, unsigned *out_len);
  * Returns 1 if nonempty, 0 on timeout, -1 on bad args.
  * Writers (set/append/clear) wake waiters. */
 int xu_ui_mem_wait_nonempty(const char *name, int timeout_ms);
+#ifdef __APPLE__
+/* Let mailbox waits on the AppKit thread yield to the packaged Xu runtime. */
+void xu_ui_mem_set_task_pump(int (*pump)(void *, int (*)(void)),
+                             void *state, int (*yield_task)(void));
+#endif
 
 /* Wait until slot `name` body differs from `old_body` (NULL/"" = empty), or timeout.
  * Returns 1 if changed, 0 on timeout, -1 on bad args. */
