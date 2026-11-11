@@ -53,6 +53,13 @@ static BOOL g_quitting = FALSE;
 static char g_last_title[512];
 static char g_last_size[64];
 static UINT_PTR g_timer = 0;
+typedef int (*XuYieldTask)(void);
+typedef int (*XuTaskPump)(void *, XuYieldTask);
+static XuTaskPump g_task_pump = NULL;
+static void *g_task_state = NULL;
+static XuYieldTask g_task_yield = NULL;
+static UINT_PTR g_task_timer = 0;
+static BOOL g_task_pumping = FALSE;
 static XuContentPlugin *g_content = NULL;
 static const XuContentVTable *g_content_vt = NULL;
 static XuContentHost g_content_host;
@@ -1243,6 +1250,7 @@ static void do_quit(void) {
   if(xu_ui_window_count() || !desktop_files_idle())return;
   g_quitting=TRUE;xu_ui_windows_shutdown();xu_ui_emit_close();
   if(g_hwnd && g_timer){KillTimer(g_hwnd,g_timer);g_timer=0;}
+  if(g_hwnd && g_task_timer){KillTimer(g_hwnd,g_task_timer);g_task_timer=0;}
   tray_remove();xu_ui_host_set_kick(NULL);
   if(g_hwnd){HWND window=g_hwnd;g_hwnd=NULL;DestroyWindow(window);}
   append_shell_event("exit");PostQuitMessage(0);
@@ -1900,7 +1908,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     drain_cmds();
     return 0;
   case WM_TIMER:
-    if (wParam == 1) drain_cmds();
+    if (wParam == 1) {
+      drain_cmds();
+    } else if (wParam == 2 && g_task_pump && !g_task_pumping) {
+      g_task_pumping = TRUE;
+      g_task_pump(g_task_state, g_task_yield);
+      g_task_pumping = FALSE;
+    }
     return 0;
   case WM_PAINT: {
     PAINTSTRUCT ps;
@@ -2200,6 +2214,7 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
     xu_ui_mem_set("xu_host_ready.txt", "ready\n");
   }
   g_timer = SetTimer(g_hwnd, 1, 200, NULL);
+  if (g_task_pump) g_task_timer = SetTimer(g_hwnd, 2, 10, NULL);
 
   MSG msg;
   while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -2208,6 +2223,8 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
     DispatchMessageW(&msg);
   }
 
+  if (g_hwnd && g_timer) { KillTimer(g_hwnd, g_timer); g_timer = 0; }
+  if (g_hwnd && g_task_timer) { KillTimer(g_hwnd, g_task_timer); g_task_timer = 0; }
   delete g_mask;
   g_mask = NULL;
   g_mask_active = FALSE;
@@ -2215,6 +2232,34 @@ static int xu_ui_host_run_impl(const char *tmp_dir) {
   CoUninitialize();
   host_trace("exit 0");
   return 0;
+}
+
+static int xu_ui_host_run_cooperative_impl(const char *tmp_dir, XuTaskPump pump,
+                                           void *state, XuYieldTask yield_task) {
+  g_task_pump = pump;
+  g_task_state = state;
+  g_task_yield = yield_task;
+  g_task_timer = 0;
+  g_task_pumping = FALSE;
+  xu_ui_mem_set_task_pump(pump, state, yield_task);
+  int ret = xu_ui_host_run_impl(tmp_dir);
+  xu_ui_mem_set_task_pump(NULL, NULL, NULL);
+  g_task_pump = NULL;
+  g_task_state = NULL;
+  g_task_yield = NULL;
+  g_task_timer = 0;
+  g_task_pumping = FALSE;
+  return ret;
+}
+
+#if defined(XU_UI_STATIC)
+extern "C" int xu_ui_host_run_cooperative(const char *tmp_dir, XuTaskPump pump,
+                                          void *state, XuYieldTask yield_task) {
+#else
+extern "C" __declspec(dllexport) int xu_ui_host_run_cooperative(const char *tmp_dir, XuTaskPump pump,
+                                                                void *state, XuYieldTask yield_task) {
+#endif
+  return xu_ui_host_run_cooperative_impl(tmp_dir, pump, state, yield_task);
 }
 
 // In-process entry (statically linked via libxu_ui_host.a). tmp_dir may be NULL → env/TEMP.
