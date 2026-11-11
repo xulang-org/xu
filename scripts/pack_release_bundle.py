@@ -248,7 +248,7 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
         built_tool = ensure_tool_built(xu_bin, target, tool_name, src_dir, cache_dir)
         dest_name = f"{tool_name}.exe" if is_windows else tool_name
         shutil.copy2(built_tool, bin_dir / dest_name)
-        if is_windows and tool_name == "xu-setup":
+        if is_windows and tool_name in ("xu-setup", "xu-update"):
             embed_invoker_manifest(bin_dir / dest_name)
         (bin_dir / dest_name).chmod(0o755)
 
