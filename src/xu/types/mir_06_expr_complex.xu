@@ -1,0 +1,1177 @@
+@xu/types
+
+#xu/ast
+#xu/parser
+
+fn (f $&MFn) lower_expr_call(p &parser.Parser, c $&Checker, n int) int {
+    if c.ncall[n] == -83 { // may-throw auto-propagate (§5.7)
+        ok_ty := c.ntype[n]
+        $res := -1
+        if c.nconst[n] < 0 {
+            throw_ty := c.throw_ok_err_ty(ok_ty, interface_type(c.errors_iface))
+            if !is_throw_type(throw_ty) {
+                eprintln("internal: hosted throw type missing")
+                << 0
+            }
+            c.ntype[n] = throw_ty
+            res = f.lower_call(p, c, n, c.nconst[n])
+            c.ntype[n] = ok_ty
+        } else {
+            res = f.lower_call(p, c, n, c.nconst[n])
+        }
+        tag := f.new_temp(1, 1)
+        $lf := mkinstr(MI_LOAD_FIELD)
+        lf.a = tag
+        lf.b = res
+        lf.c = 0
+        lf.d = 1
+        f.emit(lf)
+        dest := f.new_temp(ok_ty, c.type_slots(ok_ty))
+        err_bb := f.new_block()
+        ok_bb := f.new_block()
+        f.terminate(2, tag, err_bb, ok_bb)
+        f.switch_to(err_bb)
+        f.emit_drops_all()
+        f.terminate(3, res, 0, 0)
+        f.switch_to(ok_bb)
+        $lf2 := mkinstr(MI_LOAD_FIELD)
+        lf2.a = dest
+        lf2.b = res
+        lf2.c = 8
+        lf2.d = c.type_slots(ok_ty)
+        f.emit(lf2)
+        << dest
+    }
+    if c.ncall[n] == -21 {
+        // close(ch) → ChanClose
+        ch := f.lower_expr(p, c, p.nodes[n].a)
+        $ins := mkinstr(MI_CHAN_CLOSE)
+        ins.a = ch
+        f.emit(ins)
+        << f.vconst(0)
+    }
+    << f.lower_call(p, c, n, -1)
+}
+
+fn (f $&MFn) lower_expr_try_or(p &parser.Parser, c $&Checker, n int) int {
+    k := p.nodes[n].kind
+    if k == ast.NK_OR_CATCH { // OrCatch: call or (err) { } (§5.7)
+        call := p.nodes[n].a
+        res := f.lower_expr(p, c, call)
+        f.mark_move_of(p, c, call)
+        ok_ty := c.ntype[n]
+        call_ty := c.ntype[call]
+        // Non-throwing calls: `or` is a dead fallback (checker allows it).
+        // Do not index c.throws[call_ty-300] — that was an index OOB.
+        if !is_throw_type(call_ty) {
+            << res
+        }
+        ri := throw_index(call_ty)
+        if ri < 0 || ri >= c.throws.len {
+            << res
+        }
+        tag := f.new_temp(1, 1)
+        $lf := mkinstr(MI_LOAD_FIELD)
+        lf.a = tag
+        lf.b = res
+        lf.c = 0
+        lf.d = 1
+        f.emit(lf)
+        dest := f.new_temp(ok_ty, c.type_slots(ok_ty))
+        err_bb := f.new_block()
+        ok_bb := f.new_block()
+        join_bb := f.new_block()
+        f.terminate(2, tag, err_bb, ok_bb)
+        f.switch_to(err_bb)
+        f.push_scope()
+        err_id := c.nlocal[n]
+        err_ty := c.throws[ri].err_ty
+        err_payload := f.new_temp(err_ty, c.type_slots(err_ty))
+        $lf_err := mkinstr(MI_LOAD_FIELD)
+        lf_err.a = err_payload
+        lf_err.b = res
+        lf_err.c = 8
+        lf_err.d = c.type_slots(err_ty)
+        f.emit(lf_err)
+        $st := mkinstr(MI_STORE_LOCAL)
+        st.a = err_id
+        st.b = err_payload
+        f.emit(st)
+        f.scope_add(err_id)
+        $s := p.nodes[n].c
+        while s >= 0 {
+            f.lower_stmt(p, c, s)
+            s = p.nodes[s].next
+        }
+        f.pop_scope_with_drops()
+        if f.live_and_open() {
+            f.terminate(1, join_bb, -1, -1)
+        }
+        f.switch_to(ok_bb)
+        $lf_ok := mkinstr(MI_LOAD_FIELD)
+        lf_ok.a = dest
+        lf_ok.b = res
+        lf_ok.c = 8
+        lf_ok.d = c.type_slots(ok_ty)
+        f.emit(lf_ok)
+        f.terminate(1, join_bb, -1, -1)
+        f.switch_to(join_bb)
+        << dest
+    }
+    << -1
+}
+
+fn (f $&MFn) lower_expr_fnlit(p &parser.Parser, c $&Checker, n int) int {
+    fid := c.ncall[n]
+    env_sty := c.clos_env[fid]
+    if env_sty < 0 {
+        // Zero-capture: fat fn with env=0 via shim (direct ABI body).
+        t := f.new_temp(c.ntype[n], c.type_slots(c.ntype[n]))
+        $ins := mkinstr(MI_LOAD_FN_ADDR)
+        ins.a = t
+        // Keep the legacy marker; the emitter resolves the shim label from
+        // `sval`, avoiding checker/MIR index-domain coupling.
+        ins.b = 0
+        // See lower_expr_ident: borrow a local descriptor, never a nested
+        // field of the hosted checker's large function slice.
+        real_label := c.fns[fid].label + ""
+        shim := mir_fnval_real_to_shim(&real_label)
+        ins.sval = shim
+        f.emit(ins)
+        << t
+    }
+    label := c.fns[fid].label + ""
+    // Capturing: build Env struct temp then MakeClosure (real body label).
+    si := struct_index(env_sty)
+    ns := c.structs[si].nslots
+    env_t := f.new_temp(env_sty, ns)
+    for i in 0:c.clos_caps[fid].len {
+        oid := c.clos_caps[fid][i]
+        fty := c.structs[si].fields[i].ty
+        $count := c.type_slots(fty)
+        $vt := f.new_temp(fty, count)
+        if oid < 0 {
+            // M111: pack from enclosing closure env.field (-(field+2)).
+            field := 0 - (oid + 2)
+            env_ptr := f.new_temp(1, 1)
+            $pl := mkinstr(MI_LOAD_LOCAL)
+            pl.a = env_ptr
+            pl.b = 0
+            f.emit(pl)
+            env_ty := f.locals[0]
+            osi := struct_index(c.ref_inner_type(env_ty))
+            slot := c.structs[osi].fields[field].slot
+            $lf := mkinstr(MI_LOAD_PTR)
+            lf.a = vt
+            lf.b = env_ptr
+            lf.c = slot
+            lf.d = count
+            f.emit(lf)
+            if fty == 3 {
+                cloned := f.new_temp(3, 3)
+                $cp := mkinstr(MI_STR_CLONE)
+                cp.a = cloned
+                cp.b = vt
+                f.emit(cp)
+                vt = cloned
+                count = 3
+            }
+        } else {
+            $ld := mkinstr(MI_LOAD_LOCAL)
+            ld.a = vt
+            ld.b = oid
+            f.emit(ld)
+            if oid >= 0 && oid < f.locals_owning.len && f.locals_owning[oid] {
+                f.moved[oid] = true
+            }
+        }
+        $sf := mkinstr(MI_STORE_FIELD)
+        sf.a = vt
+        sf.b = env_t
+        sf.c = c.structs[si].fields[i].slot
+        sf.d = count
+        f.emit(sf)
+    }
+    dest := f.new_temp(c.ntype[n], c.type_slots(c.ntype[n]))
+    $mc := mkinstr(MI_MAKE_CLOSURE)
+    mc.a = dest
+    mc.b = env_t
+    mc.c = si
+    mc.sval = label
+    f.emit(mc)
+    << dest
+}
+
+fn (f $&MFn) lower_expr_box(p &parser.Parser, c $&Checker, n int, k int) int {
+    is_call := k == 5 || k == 8
+    $box_any := false
+    $box_iface := 0
+    if is_temp_type(c.nbox[n]) || is_any_type(c.nbox[n]) {
+        box_any = true
+    }
+    if is_interface_type(c.nbox[n]) {
+        box_iface = c.nbox[n]
+    }
+    if !is_call && c.ncall[n] == -98 {
+        box_any = true
+    }
+    if !is_call && c.ncall[n] == -93 && box_iface == 0 {
+        if is_interface_type(c.ntype[n]) {
+            box_iface = c.ntype[n]
+        } else if n >= 0 && n < c.ntype.len && is_struct_type(c.ntype[n]) {
+            // `>> UserErr{...}` tags the StructInit ncall=-93 but leaves
+            // ntype as the concrete struct. Without this, lower_expr skips
+            // boxing and the throw slot stores a multi-slot struct into the
+            // 2-slot Error fat pointer (product SIGSEGV vs bootstrap).
+            if c.errors_iface >= 0 {
+                box_iface = interface_type(c.errors_iface)
+            } else if n < c.nstr.len && c.nstr[n] >= 0 {
+                box_iface = interface_type(c.nstr[n])
+            }
+        }
+    }
+    if !box_any && box_iface == 0 {
+        << -1
+    }
+    saved_call := c.ncall[n]
+    saved_box := c.nbox[n]
+    if !is_call {
+        if c.ncall[n] == -98 || c.ncall[n] == -93 {
+            c.ncall[n] = -1
+        }
+    }
+    c.nbox[n] = 0
+    src := f.lower_expr(p, c, n)
+    c.ncall[n] = saved_call
+    c.nbox[n] = saved_box
+    if box_any {
+        << f.wrap_box_any(p, c, n, src)
+    }
+    << f.wrap_box_interface(p, c, n, src, box_iface)
+}
+
+fn (f $&MFn) lower_expr(p &parser.Parser, c $&Checker, n int) int {
+    saved_line := f.cur_line
+    saved_col := f.cur_col
+    if n >= 0 && n < p.nodes.len {
+        f.cur_line = p.nodes[n].line
+        f.cur_col = p.nodes[n].col
+    }
+    result := f.lower_expr_inner(p, c, n)
+    f.cur_line = saved_line
+    f.cur_col = saved_col
+    << result
+}
+
+fn (f $&MFn) lower_expr_inner(p &parser.Parser, c $&Checker, n int) int {
+    k := p.nodes[n].kind
+    boxed := f.lower_expr_box(p, c, n, k)
+    if boxed >= 0 {
+        << boxed
+    }
+    if k == ast.NK_INT { // Int
+        << f.vconst(p.nodes[n].ival)
+    }
+    if k == ast.NK_FLOAT { // Float: materialize bits as typed f64 temp
+        t := f.new_temp(4, 1)
+        $cpy := mkinstr(MI_COPY)
+        cpy.a = t
+        cpy.b = f.vconst(p.nodes[n].ival)
+        f.emit(cpy)
+        << t
+    }
+    if k == ast.NK_CAST { // Cast
+        e := f.lower_expr(p, c, p.nodes[n].a)
+        to := c.ntype[n]
+        t := f.new_temp(to, 1)
+        $ins := mkinstr(MI_UN)
+        ins.a = t
+        if to == 4 { ins.b = 3 } else if to == 1 && c.ntype[p.nodes[n].a] == 4 { ins.b = 4 } else { ins.b = 5 } // 3=scvtf 4=fcvtzs 5=int wrap
+        ins.c = e
+        f.emit(ins)
+        << t
+    }
+    if k == ast.NK_BOOL { // Bool
+        << f.vconst(p.nodes[n].ival)
+    }
+    if k == ast.NK_STR { // Str literal
+        t := f.new_temp(3, 3)
+        $ins := mkinstr(MI_STR_CONST)
+        ins.a = t
+        ins.b = c.nstr[n]
+        f.emit(ins)
+        << t
+    }
+    if k == ast.NK_BORROW || c.nshared[n] == -1 { // Borrow local/field/element: represented by its address.
+        target0 := c.borrow_target(p, n)
+        if p.nodes[target0].kind == ast.NK_UN_OP && p.nodes[target0].ival == 3 {
+            // `&*r` of a shared ref: copy the pointer.
+            << f.lower_expr(p, c, p.nodes[target0].a)
+        }
+        // A checked direct borrow of a local retains its pointee and
+        // mutability. The addressed object remains in its frame slot;
+        // unrelated scalar Temps can use the general register allocator.
+        borrow_ty := c.ntype[n]
+        if is_direct_ref_type(borrow_ty) && p.nodes[target0].kind == ast.NK_IDENT {
+            lid := c.nlocal[target0]
+            if lid >= 0 && lid < f.locals.len && !(f.receiver && lid == 0) && !is_ref_type(f.locals[lid]) && c.ref_inner_type(borrow_ty) == f.locals[lid] {
+                t := f.new_temp(borrow_ty, 1)
+                $ad := mkinstr(MI_ADDR)
+                ad.a = t
+                ad.b = lid
+                ad.c = 0
+                f.emit(ad)
+                << t
+            }
+        }
+        // M166: nested `&r` (r already a ref) is AddrOf of the pointer slot.
+        if is_indirect_ref_type(c.ntype[n]) {
+            target := target0
+            if p.nodes[target].kind == ast.NK_IDENT {
+                lid := c.nlocal[target]
+                t := f.new_temp(1, 1)
+                $ad := mkinstr(MI_ADDR)
+                ad.a = t
+                ad.b = lid
+                ad.c = 0
+                f.emit(ad)
+                << t
+            }
+        }
+        target := target0
+        // MS4 / MS8: `&xs[i]` / `&m[k]` — ElemAddr or `_rt_map_val_ptr` at the borrow site.
+        if chain_has_index(p, target) {
+            if c.borrow_chain_is_map(p, target) {
+                << f.lower_map_elem_addr(p, c, target)
+            }
+            buf := f.chain_index_is_buf(p, &*c, target)
+            << f.lower_chain_addr(p, c, target, buf)
+        }
+        << f.lower_addr(p, c, target)
+    }
+    if k == ast.NK_IDENT { // Ident
+        << f.lower_expr_ident(p, c, n)
+    }
+
+    if k == ast.NK_ARRAY_LIT || k == ast.NK_EMPTY_ARRAY || k == ast.NK_INDEX || k == ast.NK_SLICE { // ArrayLit / Index / Slice
+        << f.lower_expr_array(p, c, n)
+    }
+    if k == ast.NK_MAP_INIT { // map[K]V{}
+        << f.lower_map_init(p, c, n)
+    }
+    if k == ast.NK_STRUCT_INIT { // StructInit
+        << f.lower_expr_struct_init(p, c, n)
+    }
+    if k == ast.NK_FIELD { // Field read — or module.Const (M9) / Color.Red (M15) / method value (M110)
+        << f.lower_expr_field(p, c, n)
+    }
+    if k == ast.NK_FIELD { // Field read
+        << f.lower_expr_field(p, c, n)
+    }
+    if k == ast.NK_CALL { // Call
+        << f.lower_expr_call(p, c, n)
+    }
+    if k == ast.NK_CHAN_INIT { // ChanInit (M17)
+        ci := c.nlocal[n]
+        capv := f.lower_expr(p, c, p.nodes[n].b)
+        dest := f.new_temp(c.ntype[n], 1)
+        $ins := mkinstr(MI_CHAN_NEW)
+        ins.a = dest
+        ins.b = c.chans[ci].elem_slots
+        ins.c = capv
+        f.emit(ins)
+        << dest
+    }
+    if k == ast.NK_RECV { // Recv (M17)
+        ch := f.lower_expr(p, c, p.nodes[n].a)
+        ci := c.nlocal[n]
+        elem := c.chans[ci].elem_ty
+        dest := f.new_temp(elem, c.chans[ci].elem_slots)
+        $ins := mkinstr(MI_CHAN_RECV)
+        ins.a = dest
+        ins.b = ch
+        ins.c = c.chans[ci].elem_slots
+        f.emit(ins)
+        << dest
+    }
+    if k == ast.NK_METHOD_CALL { // MethodCall
+        if c.ncall[n] == -83 { // may-throw auto-propagate (§5.7)
+            res := f.lower_call(p, c, n, c.nconst[n])
+            ok_ty := c.ntype[n]
+            tag := f.new_temp(1, 1)
+            $lf := mkinstr(MI_LOAD_FIELD)
+            lf.a = tag
+            lf.b = res
+            lf.c = 0
+            lf.d = 1
+            f.emit(lf)
+            dest := f.new_temp(ok_ty, c.type_slots(ok_ty))
+            err_bb := f.new_block()
+            ok_bb := f.new_block()
+            f.terminate(2, tag, err_bb, ok_bb)
+            f.switch_to(err_bb)
+            f.emit_drops_all()
+            f.terminate(3, res, 0, 0)
+            f.switch_to(ok_bb)
+            $lf2 := mkinstr(MI_LOAD_FIELD)
+            lf2.a = dest
+            lf2.b = res
+            lf2.c = 8
+            lf2.d = c.type_slots(ok_ty)
+            f.emit(lf2)
+            << dest
+        }
+        << f.lower_expr_method(p, c, n)
+    }
+    if k == ast.NK_BIN_OP { // BinOp
+        << f.lower_expr_binop(p, c, n)
+    }
+    if k == ast.NK_UN_OP { // UnOp
+        if p.nodes[n].ival == 3 { // Deref → LoadPtr (not Instr Un)
+            inner := p.nodes[n].a
+            ptr := f.lower_expr(p, c, inner)
+            ty := c.ntype[n]
+            ns := c.type_slots(ty)
+            dest := f.new_temp(ty, ns)
+            $lp := mkinstr(MI_LOAD_PTR)
+            if f.ref_expr_is_buf(p, &*c, inner, 0) {
+                lp.kind = MI_LOAD_BUF_PTR
+            }
+            lp.a = dest
+            lp.b = ptr
+            lp.c = 0
+            lp.d = ns
+            f.emit(lp)
+            if ty == 3 {
+                cloned := f.new_temp(3, 3)
+                $cp := mkinstr(MI_STR_CLONE)
+                cp.a = cloned
+                cp.b = dest
+                f.emit(cp)
+                << cloned
+            }
+            << dest
+        }
+        e := f.lower_expr(p, c, p.nodes[n].a)
+        t := f.new_temp(c.ntype[n], c.type_slots(c.ntype[n]))
+        $ins := mkinstr(MI_UN)
+        ins.a = t
+        ins.b = p.nodes[n].ival
+        ins.c = e
+        f.emit(ins)
+        << t
+    }
+    if k == ast.NK_CLONE {
+        << f.lower_expr_clone(p, c, n)
+    }
+    if k == ast.NK_OR_CATCH { // OrCatch
+        << f.lower_expr_try_or(p, c, n)
+    }
+    if k == ast.NT_FN_LIT { // NTFnLit
+        << f.lower_expr_fnlit(p, c, n)
+    }
+    if k == ast.NK_TYPE_IS { // NTypeIs (M147)
+        iface := f.lower_expr(p, c, p.nodes[n].a)
+        dest := f.new_temp(2, 1)
+        $ins := mkinstr(MI_INTERFACE_IS)
+        ins.a = dest
+        ins.b = iface
+        ins.c = c.nlocal[n] // box discriminant
+        f.emit(ins)
+        << dest
+    }
+    if k == ast.NK_TYPE_AS { // NTypeAs (M147): dest = concrete T
+        inner := p.nodes[n].a
+        $iface := -1
+        // Checker.nstr=1: `any` keep, or struct@ Copy keep. Do not zero/move.
+        keep := n >= 0 && n < c.nstr.len && c.nstr[n] == 1
+        if keep {
+            iface = f.lower_expr(p, c, inner)
+        }
+        // MS6 C: `($&e) as T` / `r as T` / `(*r) as T` for $&any.
+        if p.nodes[inner].kind == ast.NK_BORROW && p.nodes[inner].ival == 1 {
+            tgt := p.nodes[inner].a
+            if p.nodes[tgt].kind == ast.NK_IDENT {
+                oid := c.nlocal[tgt]
+                // Prefer MFn locals (per-fn); Checker.ltype is only the last fn.
+                $oty := -1
+                if oid >= 0 && oid < f.locals.len {
+                    oty = f.locals[oid]
+                } else if oid >= 0 && oid < c.ltype.len {
+                    oty = c.ltype[oid]
+                }
+                if !keep && oty >= 0 && is_linear_dynamic(oty) {
+                    iface = f.lower_expr(p, c, tgt)
+                    f.zero_field_slots(oid, 0, 2)
+                    if f.locals_owning[oid] {
+                        f.moved[oid] = true
+                    }
+                }
+            }
+        }
+        if iface < 0 && p.nodes[inner].kind == ast.NK_IDENT {
+            rid := c.nlocal[inner]
+            $rty := -1
+            if rid >= 0 && rid < f.locals.len {
+                rty = f.locals[rid]
+            } else if rid >= 0 && rid < c.ltype.len {
+                rty = c.ltype[rid]
+            }
+            if !keep && rty >= 0 && is_mut_ref_type(rty) {
+                pty := c.ref_inner_type(rty)
+                if is_linear_dynamic(pty) {
+                    ptr := f.lower_expr(p, c, inner)
+                    iface = f.new_temp(pty, 2)
+                    $lp := mkinstr(MI_LOAD_PTR)
+                    lp.a = iface
+                    lp.b = ptr
+                    lp.c = 0
+                    lp.d = 2
+                    f.emit(lp)
+                    z := f.vconst(0)
+                    zt := f.typed_value(z, 1)
+                    for i in 0:2 {
+                        $sp := mkinstr(MI_STORE_PTR)
+                        sp.a = zt
+                        sp.b = ptr
+                        sp.c = i * 8
+                        sp.d = 1
+                        f.emit(sp)
+                    }
+                    if rid < c.laref.len && c.laref[rid] >= 0 {
+                        oid := c.laref[rid]
+                        if oid < f.moved.len && f.locals_owning[oid] {
+                            f.moved[oid] = true
+                        }
+                    }
+                }
+            }
+        }
+        if iface < 0 && p.nodes[inner].kind == ast.NK_UN_OP && p.nodes[inner].ival == 3 {
+            rnode := p.nodes[inner].a
+            if p.nodes[rnode].kind == ast.NK_IDENT {
+                rid := c.nlocal[rnode]
+                $rty := -1
+                if rid >= 0 && rid < f.locals.len {
+                    rty = f.locals[rid]
+                } else if rid >= 0 && rid < c.ltype.len {
+                    rty = c.ltype[rid]
+                }
+                if !keep && rty >= 0 && is_mut_ref_type(rty) {
+                    pty := c.ref_inner_type(rty)
+                    if is_linear_dynamic(pty) {
+                        ptr := f.lower_expr(p, c, rnode)
+                        iface = f.new_temp(pty, 2)
+                        $lp := mkinstr(MI_LOAD_PTR)
+                        lp.a = iface
+                        lp.b = ptr
+                        lp.c = 0
+                        lp.d = 2
+                        f.emit(lp)
+                        z := f.vconst(0)
+                        zt := f.typed_value(z, 1)
+                        for i in 0:2 {
+                            $sp := mkinstr(MI_STORE_PTR)
+                            sp.a = zt
+                            sp.b = ptr
+                            sp.c = i * 8
+                            sp.d = 1
+                            f.emit(sp)
+                        }
+                        if rid < c.laref.len && c.laref[rid] >= 0 {
+                            oid := c.laref[rid]
+                            if oid < f.moved.len && f.locals_owning[oid] {
+                                f.moved[oid] = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if iface < 0 {
+            iface = f.lower_expr(p, c, inner)
+            if !keep {
+                f.zero_as_place(p, c, inner)
+                f.mark_move_of(p, c, inner)
+            }
+        }
+        cty := c.ntype[n]
+        dest := f.new_temp(cty, c.type_slots(cty))
+        $ins := mkinstr(MI_INTERFACE_AS)
+        ins.a = dest
+        ins.b = iface
+        ins.c = c.nlocal[n] // type_id discriminant
+        ins.d = cty // concrete type tag for nslots / drop
+        if keep {
+            ins.sval = "keep"
+        }
+        f.emit(ins)
+        << dest
+    }
+    << -1 // unreachable: check.xu rejects everything else
+}
+
+// L2c-amp: for `+` string concatenation, a `&string` operand is read
+// through its borrow pointer into an owned string value: the lowered
+// operand is a 1-slot pointer temp, and LoadPtr (instr 17) copies the
+// (ptr,len,cap) descriptor triple out of the referenced slots.
+fn (f $&MFn) deref_str_operand(p &parser.Parser, c $&Checker, n int, v int) int {
+    raw_ty := c.ntype[n]
+    if !(is_ref_type(raw_ty) && c.ref_inner_type(raw_ty) == 3) {
+        << v
+    }
+    desc := f.new_temp(3, 3)
+    $lp := mkinstr(MI_LOAD_PTR)
+    if f.ref_expr_is_buf(p, &*c, n, 0) {
+        lp.kind = MI_LOAD_BUF_PTR
+    }
+    lp.a = desc
+    lp.b = v
+    lp.c = 0
+    lp.d = 3
+    f.emit(lp)
+    << desc
+}
+
+// M163/M166: load printable pointee through `&T` / `&&T` for println/eprintln.
+fn (f $&MFn) deref_print_operand(p &parser.Parser, c $&Checker, n int, v0 int) int {
+    $v := v0
+    $raw_ty := c.ntype[n]
+    for peel in 0:2 {
+        if !is_ref_type(raw_ty) {
+            << v
+        }
+        inner := c.ref_inner_type(raw_ty)
+        $slots := 1
+        if !is_ref_type(inner) && inner == 3 {
+            slots = 3
+        }
+        if !is_ref_type(inner) && !(inner == 1 || inner == 2 || inner == 3 || inner == 4) {
+            << v
+        }
+        dest := f.new_temp(inner, slots)
+        $lp := mkinstr(MI_LOAD_PTR)
+        // Direct shared borrows of dynamic-array/map elements still point
+        // into ascending buffer storage. User-call borrows normalize that
+        // descriptor in lower_borrow_arg; builtins and print lower the raw
+        // reference instead, so use its checked place provenance here.
+        if peel == 0 && f.ref_expr_is_buf(p, &*c, n, 0) {
+            lp.kind = MI_LOAD_BUF_PTR
+        }
+        lp.a = dest
+        lp.b = v
+        lp.c = 0
+        lp.d = slots
+        f.emit(lp)
+        v = dest
+        raw_ty = inner
+        if !is_ref_type(raw_ty) {
+            << v
+        }
+    }
+    << v
+}
+
+// `&&` / `||`: evaluate lhs; branch. The result is stored into a dedicated
+// local so that SSA promotion can synthesize a proper single-def Phi node
+// rather than leaving a multi-def temporary that violates strict SSA.
+fn (f $&MFn) lower_short_circuit(p &parser.Parser, c $&Checker, n int, op int) int {
+    loc := f.new_local(2, 1, false)
+    l := f.lower_expr(p, c, p.nodes[n].a)
+    $st1 := mkinstr(MI_STORE_LOCAL)
+    st1.a = loc
+    st1.b = l
+    f.emit(st1)
+    // RHS calls can consume an owner only on the evaluated path. Reconcile
+    // that move with the skipped path before the boolean result rejoins,
+    // just as statement branches do. LHS moves have already happened.
+    $outer := []int{}
+    for i in 0:f.scope_ids.len { outer.push(f.scope_ids[i]) }
+    $pre := []bool{}
+    for i in 0:f.moved.len { pre.push(f.moved[i]) }
+    $pre_fc := []int{}
+    for i in 0:f.fcons.len { pre_fc.push(f.fcons[i]) }
+    $pads := []int{}
+    $cons_off := []int{}
+    $cons_ids := []int{}
+    $cons_fc := []int{}
+    rhs_bb := f.new_block()
+    skip_bb := f.new_block()
+    join_bb := f.new_block()
+    // For &&: lhs false -> skip rhs. For ||: lhs true -> skip rhs.
+    if op == 12 {
+        f.terminate(2, l, rhs_bb, skip_bb)
+    } else {
+        f.terminate(2, l, skip_bb, rhs_bb)
+    }
+    f.switch_to(rhs_bb)
+    f.push_scope()
+    r := f.lower_expr(p, c, p.nodes[n].b)
+    $st2 := mkinstr(MI_STORE_LOCAL)
+    st2.a = loc
+    st2.b = r
+    f.emit(st2)
+    f.pop_scope_with_drops()
+    f.as_push_pad(&outer, &pre, &pre_fc, $&pads, $&cons_off, $&cons_ids, $&cons_fc)
+    f.switch_to(skip_bb)
+    f.as_restore_outer(&outer, &pre, &pre_fc)
+    f.as_push_pad(&outer, &pre, &pre_fc, $&pads, $&cons_off, $&cons_ids, $&cons_fc)
+    f.as_finish_pads(join_bb, &outer, &pre, &pre_fc, pads, cons_off, cons_ids, cons_fc, c)
+    dest := f.new_temp(2, 1)
+    $ld := mkinstr(MI_LOAD_LOCAL)
+    ld.a = dest
+    ld.b = loc
+    f.emit(ld)
+    << dest
+}
+
+// Compare method name without moving `p.nodes[n].sval` (M2b).
+fn method_is(p &parser.Parser, n int, name string) bool {
+    m := p.nodes[n].sval + ""
+    if m.len != name.len {
+        << false
+    }
+    for i in 0:name.len {
+        if m[i] != name[i] {
+            << false
+        }
+    }
+    << true
+}
+
+fn (c &Checker) throw_ok_err_ty(ok_ty int, err_ty int) int {
+    for i in 0:c.throws.len {
+        if c.throws[i].ok_ty == ok_ty && c.throws[i].err_ty == err_ty {
+            << throw_type(i)
+        }
+    }
+    << 0
+}
+
+// M200: heap-box a value into dynamic `any` (fat `(data*, itable*)`).
+// `n` is the value expression that check marked with ncall=-98. The restored
+// concrete ntype determines both the dynamic tag and payload width.
+
+fn (c &Checker) native_map_scalar_type_id(ty int) int {
+    $t := ty
+    if is_ref_type(t) { t = c.ref_inner_type(t) }
+    mi := map_index(t)
+    if mi < 0 || mi >= c.maps.len { << 0 }
+    if c.maps[mi].key_ty != 1 || c.maps[mi].val_ty != 1 { << 0 }
+    if c.maps[mi].kkind != 0 || c.maps[mi].vkind != 0 || c.maps[mi].vslots != 1 { << 0 }
+    << t
+}
+
+fn (f $&MFn) lower_expr_clone(p &parser.Parser, c $&Checker, n int) int {
+    inner := p.nodes[n].a
+    raw_ty := c.ntype[inner]
+    ty := c.ntype[n]
+    if !is_ref_type(raw_ty) {
+        if !c.type_owning(ty) {
+            << f.lower_expr(p, c, inner)
+        }
+        ik := p.nodes[inner].kind
+        if ik == ast.NK_STR {
+            << f.lower_expr(p, c, inner)
+        }
+        if ty == 3 && f.fresh_string_expr(p, c, inner) {
+            << f.lower_expr(p, c, inner)
+        }
+        if ik == ast.NK_ARRAY_LIT || ik == ast.NK_EMPTY_ARRAY || ik == ast.NK_MAP_INIT || ik == ast.NK_STRUCT_INIT || ik == ast.NK_SLICE || ik == ast.NK_BIN_OP || ik == ast.NK_OR_CATCH || ik == ast.NK_CLONE || ik == ast.NK_RECV || ik == ast.NK_METHOD_CALL {
+            << f.lower_expr(p, c, inner)
+        }
+        if ik == ast.NK_CALL {
+            fi := c.ncall[inner]
+            if fi != -19 && fi != -20 {
+                << f.lower_expr(p, c, inner)
+            }
+        }
+        val := f.lower_expr(p, c, inner)
+        << f.lower_clone_value(p, c, val, ty, 0)
+    }
+    // Operand is a reference: load value through dereference
+    $cur := f.lower_expr(p, c, inner)
+    $cur_ty := raw_ty
+    while is_ref_type(cur_ty) {
+        next_ty := c.ref_inner_type(cur_ty)
+        ns := c.type_slots(next_ty)
+        dest := f.new_temp(next_ty, ns)
+        $lp := mkinstr(MI_LOAD_PTR)
+        if !is_ref_type(next_ty) && cur_ty == raw_ty && f.ref_expr_is_buf(p, &*c, inner, 0) {
+            lp.kind = MI_LOAD_BUF_PTR
+        }
+        lp.a = dest
+        lp.b = cur
+        lp.c = 0
+        lp.d = ns
+        f.emit(lp)
+        cur = dest
+        cur_ty = next_ty
+    }
+    << f.lower_clone_value(p, c, cur, ty, 0)
+}
+
+fn (f $&MFn) lower_clone_value(p &parser.Parser, c $&Checker, val int, ty int, depth int) int {
+    if depth > 16 || !c.type_owning(ty) {
+        << val
+    }
+    if ty == 3 {
+        dest := f.new_temp(3, 3)
+        $cp := mkinstr(MI_STR_CLONE)
+        cp.a = dest
+        cp.b = val
+        f.emit(cp)
+        << dest
+    }
+    if is_struct_type(ty) {
+        ns := c.type_slots(ty)
+        dest := f.new_temp(ty, ns)
+        $cpy := mkinstr(MI_COPY)
+        cpy.a = dest
+        cpy.b = val
+        f.emit(cpy)
+        si := struct_index(ty)
+        if si >= 0 && si < c.structs.len {
+            for i in 0:c.structs[si].fields.len {
+                fty := c.structs[si].fields[i].ty
+                if c.type_owning(fty) {
+                    off := c.structs[si].fields[i].slot
+                    fns := c.type_slots(fty)
+                    fcur := f.new_temp(fty, fns)
+                    $lf := mkinstr(MI_LOAD_FIELD)
+                    lf.a = fcur
+                    lf.b = dest
+                    lf.c = off
+                    lf.d = fns
+                    f.emit(lf)
+                    fcloned := f.lower_clone_value(p, c, fcur, fty, depth + 1)
+                    $sf := mkinstr(MI_STORE_FIELD)
+                    sf.a = fcloned
+                    sf.b = dest
+                    sf.c = off
+                    sf.d = fns
+                    f.emit(sf)
+                }
+            }
+        }
+        << dest
+    }
+    if is_enum_type(ty) {
+        ei := enum_index(ty)
+        if ei < 0 || ei >= c.enums.len || !c.enums[ei].owns {
+            << val
+        }
+        ns := c.type_slots(ty)
+        dest := f.new_temp(ty, ns)
+        $cpy := mkinstr(MI_COPY)
+        cpy.a = dest
+        cpy.b = val
+        f.emit(cpy)
+        tagt := f.new_temp(1, 1)
+        $lt := mkinstr(MI_LOAD_FIELD)
+        lt.a = tagt
+        lt.b = dest
+        lt.c = 0
+        lt.d = 1
+        f.emit(lt)
+        done_bb := f.new_block()
+        for vi in 0:c.enums[ei].variants.len {
+            $has_owning := false
+            for fi in 0:c.enums[ei].variants[vi].fields.len {
+                if c.type_owning(c.enums[ei].variants[vi].fields[fi]) {
+                    has_owning = true
+                }
+            }
+            if has_owning {
+                v_bb := f.new_block()
+                next_bb := f.new_block()
+                eqt := f.new_temp(2, 1)
+                $eq := mkinstr(MI_BIN)
+                eq.a = eqt
+                eq.b = 6 // OP_EQ
+                eq.c = tagt
+                eq.d = f.vconst(vi)
+                f.emit(eq)
+                f.terminate(2, eqt, v_bb, next_bb)
+                f.switch_to(v_bb)
+                $off := 8
+                for fi in 0:c.enums[ei].variants[vi].fields.len {
+                    fty := c.enums[ei].variants[vi].fields[fi]
+                    fns := c.type_slots(fty)
+                    if c.type_owning(fty) {
+                        fcur := f.new_temp(fty, fns)
+                        $lf := mkinstr(MI_LOAD_FIELD)
+                        lf.a = fcur
+                        lf.b = dest
+                        lf.c = off
+                        lf.d = fns
+                        f.emit(lf)
+                        fcl := f.lower_clone_value(p, c, fcur, fty, depth + 1)
+                        $sf := mkinstr(MI_STORE_FIELD)
+                        sf.a = fcl
+                        sf.b = dest
+                        sf.c = off
+                        sf.d = fns
+                        f.emit(sf)
+                    }
+                    off += fns * 8
+                }
+                f.terminate(1, done_bb, -1, -1)
+                f.switch_to(next_bb)
+            }
+        }
+        f.terminate(1, done_bb, -1, -1)
+        f.switch_to(done_bb)
+        << dest
+    }
+    if is_array_type(ty) {
+        fl := c.array_fixed_len_m(ty)
+        if fl > 0 {
+            // Fixed array [N]E
+            ety := c.elem_ty_of_array(ty, f.src_fi)
+            if !c.type_owning(ety) {
+                << val
+            }
+            ns := c.type_slots(ty)
+            dest := f.new_temp(ty, ns)
+            $cpy := mkinstr(MI_COPY)
+            cpy.a = dest
+            cpy.b = val
+            f.emit(cpy)
+            esz := c.type_size_bytes(ety)
+            ens := c.type_slots(ety)
+            for i in 0:fl {
+                fcur := f.new_temp(ety, ens)
+                $lf := mkinstr(MI_LOAD_FIELD)
+                lf.a = fcur
+                lf.b = dest
+                lf.c = i * esz
+                lf.d = ens
+                f.emit(lf)
+                fcl := f.lower_clone_value(p, c, fcur, ety, depth + 1)
+                $sf := mkinstr(MI_STORE_FIELD)
+                sf.a = fcl
+                sf.b = dest
+                sf.c = i * esz
+                sf.d = ens
+                f.emit(sf)
+            }
+            << dest
+        }
+        // Slice []E
+        ety := c.elem_ty_of_array(ty, f.src_fi)
+        if !c.type_owning(ety) || ety == 3 {
+            // Fast path: reuse _rt_array_slice / _rt_array_slice_str
+            slid := f.new_local(ty, 3, false)
+            $st := mkinstr(MI_STORE_LOCAL)
+            st.a = slid
+            st.b = val
+            f.emit(st)
+            ad := f.new_temp(1, 1)
+            $ao := mkinstr(MI_ADDR)
+            ao.a = ad
+            ao.b = slid
+            ao.c = 0
+            f.emit(ao)
+            len_val := f.new_temp(1, 1)
+            $lf := mkinstr(MI_LOAD_FIELD)
+            lf.a = len_val
+            lf.b = val
+            lf.c = 8
+            lf.d = 1
+            f.emit(lf)
+            $esz := c.type_size_bytes(ety)
+            if esz < 1 { esz = 1 }
+            $helper := "_rt_array_slice"
+            if ety == 3 { helper = "_rt_array_slice_str" }
+            first := f.margs.len
+            f.margs.push(MArg{v: ad, next: first + 1})
+            f.margs.push(MArg{v: f.vconst(0), next: first + 2})
+            f.margs.push(MArg{v: len_val, next: -1})
+            dest := f.new_temp(ty, 3)
+            $call := mkinstr(MI_CALL)
+            call.a = dest
+            call.b = 83
+            call.c = first
+            call.d = esz
+            call.sval = helper
+            f.emit(call)
+            << dest
+        }
+        // Deep slice clone via loop
+        len_val := f.new_temp(1, 1)
+        $lf := mkinstr(MI_LOAD_FIELD)
+        lf.a = len_val
+        lf.b = val
+        lf.c = 8
+        lf.d = 1
+        f.emit(lf)
+        dest_lid := f.new_local(ty, 3, false)
+        dest_t := f.new_temp(ty, 3)
+        $alit := mkinstr(MI_ARRAY_LIT)
+        alit.a = dest_t
+        alit.b = -1
+        alit.c = 0
+        alit.d = c.type_size_bytes(ety)
+        f.emit(alit)
+        $st_dest := mkinstr(MI_STORE_LOCAL)
+        st_dest.a = dest_lid
+        st_dest.b = dest_t
+        f.emit(st_dest)
+        dest_addr := f.new_temp(1, 1)
+        $ao_dest := mkinstr(MI_ADDR)
+        ao_dest.a = dest_addr
+        ao_dest.b = dest_lid
+        ao_dest.c = 0
+        f.emit(ao_dest)
+        idx_t := f.new_temp(1, 1)
+        $iz := mkinstr(MI_COPY)
+        iz.a = idx_t
+        iz.b = f.vconst(0)
+        f.emit(iz)
+        cond_bb := f.new_block()
+        body_bb := f.new_block()
+        end_bb := f.new_block()
+        f.terminate(1, cond_bb, -1, -1)
+        f.switch_to(cond_bb)
+        cmp_t := f.new_temp(2, 1)
+        $cmp := mkinstr(MI_BIN)
+        cmp.a = cmp_t
+        cmp.b = 8 // OP_LT
+        cmp.c = idx_t
+        cmp.d = len_val
+        f.emit(cmp)
+        f.terminate(2, cmp_t, body_bb, end_bb)
+        f.switch_to(body_bb)
+        ens := c.type_slots(ety)
+        elem_t := f.new_temp(ety, ens)
+        $li := mkinstr(MI_LOAD_INDEX)
+        li.a = elem_t
+        li.b = val
+        li.c = idx_t
+        li.d = ens
+        f.emit(li)
+        cloned_elem := f.lower_clone_value(p, c, elem_t, ety, depth + 1)
+        $push := mkinstr(MI_ARR_PUSH)
+        push.a = dest_addr
+        push.b = cloned_elem
+        push.c = 1
+        push.d = c.type_size_bytes(ety)
+        f.emit(push)
+        $inc := mkinstr(MI_BIN)
+        inc.a = idx_t
+        inc.b = 1 // OP_ADD
+        inc.c = idx_t
+        inc.d = f.vconst(1)
+        f.emit(inc)
+        f.terminate(1, cond_bb, -1, -1)
+        f.switch_to(end_bb)
+        res := f.new_temp(ty, 3)
+        $ld_res := mkinstr(MI_LOAD_LOCAL)
+        ld_res.a = res
+        ld_res.b = dest_lid
+        f.emit(ld_res)
+        << res
+    }
+    if is_map_type(ty) {
+        mi := map_index(ty)
+        kty := c.maps[mi].key_ty
+        vty := c.maps[mi].val_ty
+        len_val := f.new_temp(1, 1)
+        mi_len := f.margs.len
+        f.margs.push(MArg{v: val, next: -1})
+        $call_len := mkinstr(MI_CALL)
+        call_len.a = len_val
+        call_len.b = 88
+        call_len.c = mi_len
+        call_len.sval = "_rt_map_len"
+        f.emit(call_len)
+
+        dest := f.new_temp(ty, 1)
+        cap_arg := f.margs.len
+        f.margs.push(MArg{v: len_val, next: -1})
+        $ins_new := mkinstr(MI_CALL)
+        ins_new.a = dest
+        ins_new.b = 84
+        ins_new.d = c.maps[mi].kkind + (c.maps[mi].vkind << 8) + (c.maps[mi].vslots << 16)
+        ins_new.sval = "_rt_map_new"
+        ins_new.c = cap_arg
+        f.emit(ins_new)
+
+        slot := f.new_temp(1, 1)
+        $iz := mkinstr(MI_COPY)
+        iz.a = slot
+        iz.b = f.vconst(0)
+        f.emit(iz)
+        kt := f.new_temp(kty, c.type_slots(kty))
+        vt := f.new_temp(vty, c.type_slots(vty))
+        found := f.new_temp(1, 1)
+        cond_bb := f.new_block()
+        body_bb := f.new_block()
+        end_bb := f.new_block()
+        f.terminate(1, cond_bb, -1, -1)
+
+        f.switch_to(cond_bb)
+        mi0 := f.margs.len
+        f.margs.push(MArg{v: val, next: -1})
+        mi1 := f.margs.len
+        f.margs.push(MArg{v: slot, next: -1})
+        mi2 := f.margs.len
+        f.margs.push(MArg{v: kt, next: -1})
+        mi3 := f.margs.len
+        f.margs.push(MArg{v: vt, next: -1})
+        $a0 := f.margs[mi0]
+        a0.next = mi1
+        f.margs[mi0] = a0
+        $a1 := f.margs[mi1]
+        a1.next = mi2
+        f.margs[mi1] = a1
+        $a2 := f.margs[mi2]
+        a2.next = mi3
+        f.margs[mi2] = a2
+        $call_iter := mkinstr(MI_CALL)
+        call_iter.a = found
+        call_iter.b = 92
+        call_iter.c = mi0
+        call_iter.sval = "_rt_map_iter_next"
+        f.emit(call_iter)
+        ge := f.new_temp(2, 1)
+        $cmp_iter := mkinstr(MI_BIN)
+        cmp_iter.a = ge
+        cmp_iter.b = 11 // OP_GE
+        cmp_iter.c = found
+        cmp_iter.d = f.vconst(0)
+        f.emit(cmp_iter)
+        f.terminate(2, ge, body_bb, end_bb)
+
+        f.switch_to(body_bb)
+        $cloned_v := vt
+        if c.type_owning(vty) && vty != 3 {
+            cloned_v = f.lower_clone_value(p, c, vt, vty, depth + 1)
+        }
+        ins_mi0 := f.margs.len
+        f.margs.push(MArg{v: dest, next: -1})
+        ins_mi1 := f.margs.len
+        f.margs.push(MArg{v: kt, next: -1})
+        ins_mi2 := f.margs.len
+        f.margs.push(MArg{v: cloned_v, next: -1})
+        $ip0 := f.margs[ins_mi0]
+        ip0.next = ins_mi1
+        f.margs[ins_mi0] = ip0
+        $ip1 := f.margs[ins_mi1]
+        ip1.next = ins_mi2
+        f.margs[ins_mi1] = ip1
+        $ins_ins := mkinstr(MI_CALL)
+        ins_ins.a = -1
+        ins_ins.b = 86
+        ins_ins.d = c.native_map_scalar_type_id(ty)
+        ins_ins.c = ins_mi0
+        ins_ins.sval = "_rt_map_insert"
+        f.emit(ins_ins)
+        f.terminate(1, cond_bb, -1, -1)
+
+        f.switch_to(end_bb)
+        << dest
+    }
+    << val
+}

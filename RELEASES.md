@@ -6,6 +6,14 @@
 
 ---
 
+## Xu 0.12.2-seed.1 (bootstrap seed prerelease)
+
+Dedicated seed release of the restored self-hosting compiler, frozen before integrating PR #197. Use this explicitly pinned version to build the next compiler generation. It retains the old product compiler and matching standard library and tools; it does not include the new compiler implementation from PR #197. This is a bootstrap prerelease, not a stable product release. Platform acceptance and artifact hashes are recorded with the GitHub Release.
+
+## Xu 0.12.2-dev.1 (development)
+
+Restores the self-hosting product compiler (`src/cmd/compile`, `src/xu`) from `0.12.0-dev.1`. The clean-architecture compiler shipped in 0.12.1 miscompiles common programs (`for` range loops, slice fields, string concatenation and comparison, struct returns) and cannot build itself, so the hosted seed → Gen1 → Gen2 → Gen3 chain is blocked. With the restored compiler the chain reaches a byte-identical Gen2/Gen3 fixed point again. Development of the clean-architecture compiler continues on its own branch and is not part of the product chain until it can self-host. `internal/modulepath` prefix matching is restored for every prefix.
+
 ## Xu 0.12.1
 
 - Compiler Clean Architecture: fully eliminated legacy monolith compiler code (-125k lines), establishing a strictly layered, acyclic modular compiler (L0 Span/Token/Lexer/AST/Parser -> L3 MIR -> L4 MC/Target/Codegen/Obj -> L5 Driver -> L6 CLI).

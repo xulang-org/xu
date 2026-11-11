@@ -1,0 +1,1476 @@
+@main
+
+#xu/types
+
+fn emit_start(a $&Assembler, m &types.Mir, need_env int, need_args int) {
+    a.align_data(8)
+    a.data_label("_rt_entry_argc")
+    rt_emit_zeros(a, 8)
+    a.data_label("_rt_entry_argv")
+    rt_emit_zeros(a, 8)
+    if a.os == 1 && (a.arch == 0 || a.arch == 1) {
+        a.data_label("_rt_host_worker_start")
+        rt_emit_zeros(a, 8)
+    }
+    a.label("_start")
+    if a.os == 0 {
+        // macOS LC_MAIN: argc in A0, argv in A1 (already in place).
+        // dyld calls x64 LC_MAIN with RSP mod 16 == 8. Establish the
+        // normal function frame before runtime/libSystem calls, whose
+        // aligned SIMD stack stores otherwise fault in posix_spawn.
+        if a.arch == 1 { a.prologue(32) }
+        // rt_heap_mu is pre-initialized as a data constant (Darwin magic
+        // sig), so nothing to do here.
+    } else if a.os == 1 {
+        // Linux kernel entry: [sp] = argc, argv = sp + ptr_size.
+        a.load(18, 16, 0)
+        a.mov(19, 16)
+        a.vm_add_imm(19, 19, ptr_bytes(a.arch))
+    } else {
+        // Win64 entry is a function (RSP ≡ 8). Give x64 `_start` a real frame
+        // so the first `call` is ABI-legal (16-byte aligned, shadow space).
+        // ARM64 Windows `_start` must stay frameless: 0.1.7's working ARM64
+        // compiler was packed that way; a host prologue here has crashed
+        // native ARM64 `up`/`build` before.
+        // Do NOT mrs x18,tpidr_el0 here: the loader already sets X18 to the
+        // TEB. Overwriting it (or an illegal sysreg encoding) makes WoA die
+        // before any output — including `--xu`.
+        if a.arch == 1 {
+            a.prologue(32)
+        }
+    }
+    // Save C argc/argv. collect_args clobbers A0/A1.
+    if a.os == 0 || a.os == 1 {
+        a.lea(0, "_rt_entry_argc")
+        a.store(0, 0, 18)
+        a.lea(0, "_rt_entry_argv")
+        a.store(0, 0, 19)
+    }
+    // Unix: heap-copy argv only if the program uses args(). Windows always
+    // collects.
+    if a.os == 2 || need_args == 1 {
+        a.call("_rt_collect_args")
+    }
+    if a.os == 0 {
+        if need_env == 1 {
+            a.call("_rt_collect_env")
+        }
+    } else if a.os == 1 {
+        if need_env == 1 {
+            a.load(18, 16, 0)
+            a.mov(19, 16)
+            a.vm_add_imm(19, 19, ptr_bytes(a.arch))
+            a.call("_rt_collect_env")
+        }
+        a.load(18, 16, 0)
+        a.mov(19, 16)
+        a.vm_add_imm(19, 19, ptr_bytes(a.arch))
+        a.call("_rt_init_auxv")
+    } else {
+        if need_env == 1 {
+            a.call("_rt_collect_env")
+        }
+        a.call("_rt_win_sysinfo")
+    }
+    if a.os == 1 && (a.arch == 0 || a.arch == 1) {
+        // A statically linked desktop host enters from libc, not the kernel.
+        // C ABI: argc, argv, envp, page_size, arm64_hwcap. setenv may have
+        // relocated environ, so argv+(argc+1) is not a valid envp here.
+        a.jmp("_rt_start_run_main")
+        // Hosted entry additionally supplies a C thread factory. Raw clone
+        // workers inherit libc TLS and cannot safely call the native host.
+        // Keep the five-argument entry for callers that do not use C workers.
+        a.label("xu_app_start_hosted")
+        a.lea(0, "_rt_host_worker_start")
+        a.store(0, 0, 23)
+        a.label("xu_app_start")
+        a.prologue(64)
+        a.vm_mov_imm64(0, 4294967295)
+        a.iand(18, 18, 0)
+        a.store(15, -8, 18)
+        a.store(15, -16, 19)
+        a.store(15, -24, 20)
+        a.store(15, -32, 21)
+        a.store(15, -40, 22)
+        a.lea(0, "_rt_entry_argc")
+        a.store(0, 0, 18)
+        a.lea(0, "_rt_entry_argv")
+        a.store(0, 0, 19)
+        if need_args == 1 {
+            a.call("_rt_collect_args")
+        }
+        if need_env == 1 {
+            a.load(18, 15, -24)
+            a.call("_rt_collect_envp")
+        }
+        a.load(1, 15, -32)
+        a.vm_cmp_imm(1, 0)
+        a.jgt("_rt_start_c_pagesize")
+        a.vm_mov_imm(1, 4096)
+        a.label("_rt_start_c_pagesize")
+        a.lea(0, "_rt_pagesize_slot")
+        a.store(0, 0, 1)
+        if a.arch == 0 {
+            a.load(1, 15, -40)
+            a.lea(0, "_rt_cpu_arm64_hwcap")
+            a.store(0, 0, 1)
+        }
+        a.label("_rt_start_run_main")
+    }
+    // Both kernel and hosted entries converge here before application main.
+    if a.xacp {
+        a.call("_rt_xacp_preflight")
+    }
+    a.call("_xu_main")
+    // Void main: zero Ret so the last call's return is not the process exit code.
+    $main_void := false
+    for i in 0:m.fns.len {
+        if types.mir_fn_is_extern(m, i) { -> }
+        if types.mir_fn_label(m, i) == "_xu_main" && types.mir_fn_ret(m, i) == 0 {
+            main_void = true
+        }
+    }
+    if main_void {
+        a.vm_mov_imm(14, 0)
+    }
+    // Preserve the main exit code while optional diagnostics run.  Hosted
+    // Gen1 mirrors bootstrap's XU_HEAP_STATS hook; `_rt_heap_stats` itself is
+    // a no-op unless the exact XU_HEAP_STATS=1 environment entry exists.
+    if a.cover {
+        a.mov(9, 14) // save exit code in S1 across the dump call
+        a.call("_rt_dump_cover")
+        a.mov(14, 9)
+    }
+    if a.os != 3 && gen1_heap_ledger_on() {
+        a.mov(9, 14)
+        a.call("_rt_heap_stats")
+        a.mov(14, 9)
+    }
+    // exit code = main's <<; A0 = Ret (same phys reg on arm64)
+    a.mov(18, 14)
+    a.vm_exit()
+    <<
+}
+
+// Windows IAT slots for kernel32 imports (discovered by PE writer).
+fn emit_windows_iat(a $&Assembler, use_alloc int, use_write int, use_file int, use_thread int, use_extra int) {
+    // PE Import Address Table must be 8-byte aligned (WoA rejects otherwise).
+    a.align_data(8)
+    if use_alloc == 1 {
+        a.data_label("_iat_VirtualAlloc")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_VirtualFree")
+        rt_emit_zeros(a, 8)
+    }
+    if use_write == 1 {
+        a.data_label("_iat_GetStdHandle")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_WriteFile")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_CreateFileA")
+        rt_emit_zeros(a, 8)
+    }
+    if use_file == 1 || use_file == 2 {
+        a.data_label("_iat_GetFileType")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_PeekNamedPipe")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_GetLastError")
+        rt_emit_zeros(a, 8)
+        if (use_extra & 2048) == 0 {
+            a.data_label("_iat_WaitForSingleObject")
+            rt_emit_zeros(a, 8)
+        }
+        if use_write == 0 {
+            a.data_label("_iat_GetStdHandle")
+            rt_emit_zeros(a, 8)
+        }
+        if use_write == 0 {
+            a.data_label("_iat_CreateFileA")
+            rt_emit_zeros(a, 8)
+        }
+        a.data_label("_iat_ReadFile")
+        rt_emit_zeros(a, 8)
+        if use_write == 0 {
+            a.data_label("_iat_WriteFile")
+            rt_emit_zeros(a, 8)
+        }
+        a.data_label("_iat_CloseHandle")
+        rt_emit_zeros(a, 8)
+    }
+    if use_file == 2 {
+        a.data_label("_iat_FindFirstFileA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_FindNextFileA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_FindClose")
+        rt_emit_zeros(a, 8)
+    }
+    a.data_label("_iat_GetCommandLineA")
+    rt_emit_zeros(a, 8)
+    a.data_label("_iat_ExitProcess")
+    rt_emit_zeros(a, 8)
+    if use_thread == 1 {
+        a.data_label("_iat_CreateThread")
+        rt_emit_zeros(a, 8)
+        if use_file == 0 {
+            a.data_label("_iat_CloseHandle")
+            rt_emit_zeros(a, 8)
+        }
+        a.data_label("_iat_AcquireSRWLockExclusive")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_ReleaseSRWLockExclusive")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_SleepConditionVariableSRW")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_WakeConditionVariable")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_WakeAllConditionVariable")
+        rt_emit_zeros(a, 8)
+    }
+    // The hosted scheduler's idle path yields with Sleep(1) whenever the
+    // thread runtime is present.  Keep this slot coupled to the thread
+    // imports (or an explicit sleep_ns use); otherwise Gen1 emits a call to
+    // an unbound `_iat_Sleep` label for otherwise atomic-only programs that
+    // still pull in the sync runtime.
+    if use_thread == 1 || (use_extra & 2) == 2 {
+        a.data_label("_iat_Sleep")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 1) == 1 {
+        a.data_label("_iat_QueryPerformanceCounter")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_QueryPerformanceFrequency")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 16384) == 16384 {
+        a.data_label("_iat_GetSystemTimeAsFileTime")
+        rt_emit_zeros(a, 8)
+    }
+    // Entry always collects the environment and page size.
+    a.data_label("_iat_GetEnvironmentStringsA")
+    rt_emit_zeros(a, 8)
+    // `_rt_heap_stats` obtains a temporary environment block and releases it
+    // after scanning for XU_HEAP_STATS=1.
+    a.data_label("_iat_FreeEnvironmentStringsA")
+    rt_emit_zeros(a, 8)
+    a.data_label("_iat_GetSystemInfo")
+    rt_emit_zeros(a, 8)
+    if a.arch == 0 {
+        a.data_label("_iat_IsProcessorFeaturePresent")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 8) == 8 {
+        a.data_label("_iat_GetCurrentProcessId")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 16) == 16 {
+        a.data_label("_iat_GetComputerNameA")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 32) == 32 {
+        a.data_label("_iat_GetCurrentDirectoryA")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 64) == 64 {
+        a.data_label("_iat_GetTempPathA")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 128) == 128 {
+        a.data_label("_iat_GetFileAttributesExA")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 256) == 256 {
+        a.data_label("_iat_CreateDirectoryA")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 512) == 512 {
+        a.data_label("_iat_MoveFileExA")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 1024) == 1024 {
+        a.data_label("_iat_DeleteFileA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_RemoveDirectoryA")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 2048) == 2048 {
+        a.data_label("_iat_SetHandleInformation")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_CreateProcessA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_WaitForSingleObject")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_GetExitCodeProcess")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_TerminateProcess")
+        rt_emit_zeros(a, 8)
+        // CloseHandle may already be present via file/thread IAT.
+        if use_file == 0 && use_thread == 0 {
+            a.data_label("_iat_CloseHandle")
+            rt_emit_zeros(a, 8)
+        }
+        if use_write == 0 {
+            if use_file == 0 {
+                a.data_label("_iat_GetStdHandle")
+                rt_emit_zeros(a, 8)
+            }
+            if use_file == 0 {
+                a.data_label("_iat_CreateFileA")
+                rt_emit_zeros(a, 8)
+            }
+        }
+    }
+    if (use_extra & 4096) == 4096 {
+        a.data_label("_iat_LoadLibraryA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_GetProcAddress")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_FreeLibrary")
+        rt_emit_zeros(a, 8)
+    }
+    if (use_extra & 8192) == 8192 {
+        a.data_label("_iat_SetFileAttributesA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_SetCurrentDirectoryA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_SetFilePointerEx")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_CreatePipe")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_CreateSymbolicLinkA")
+        rt_emit_zeros(a, 8)
+        a.data_label("_iat_DeviceIoControl")
+        rt_emit_zeros(a, 8)
+        if use_write == 0 && use_file == 0 {
+            a.data_label("_iat_CreateFileA")
+            rt_emit_zeros(a, 8)
+        }
+        if use_file == 0 && use_thread == 0 && (use_extra & 2048) != 2048 {
+            a.data_label("_iat_CloseHandle")
+            rt_emit_zeros(a, 8)
+        }
+    }
+    rt_emit_zeros(a, 8) // IAT null terminator
+    <<
+}
+
+fn emit_macos_time_iat(a $&Assembler, use_now bool, use_sleep bool) {
+    if use_now {
+        a.data_label("_iat_clock_gettime")
+        rt_emit_zeros(a, 8)
+    }
+    if use_sleep {
+        a.data_label("_iat_nanosleep")
+        rt_emit_zeros(a, 8)
+    }
+    <<
+}
+
+fn emit_macos_sysinfo_iat(a $&Assembler, use_host_name bool, use_cwd bool, use_os_system bool, use_pipe bool, use_iface bool) {
+    // Entry always collects the environment via dyld.
+    a.data_label("_iat__NSGetEnviron")
+    rt_emit_zeros(a, 8)
+    if use_host_name {
+        a.data_label("_iat_gethostname")
+        rt_emit_zeros(a, 8)
+    }
+    if use_cwd {
+        a.data_label("_iat_getcwd")
+        rt_emit_zeros(a, 8)
+    }
+    if use_pipe {
+        a.data_label("_iat_pipe")
+        rt_emit_zeros(a, 8)
+    }
+    // Keep interface imports present for imported `os.interface_data` calls;
+    // Gen1's root-unit helper scan cannot always observe that nested MIR.
+    a.data_label("_iat_getifaddrs")
+    rt_emit_zeros(a, 8)
+    a.data_label("_iat_freeifaddrs")
+    rt_emit_zeros(a, 8)
+    if use_os_system {
+        a.data_label("_iat_system")
+        rt_emit_zeros(a, 8)
+    }
+    <<
+}
+
+fn emit_macos_exec_iat(a $&Assembler) {
+    a.data_label("_iat_fork")
+    rt_emit_zeros(a, 8)
+    a.data_label("_iat_execve")
+    rt_emit_zeros(a, 8)
+    a.data_label("_iat_wait4")
+    rt_emit_zeros(a, 8)
+    a.data_label("_iat___error")
+    rt_emit_zeros(a, 8)
+    a.data_label("_iat_dup2")
+    rt_emit_zeros(a, 8)
+    <<
+}
+
+fn sysinfo_label(ib int) string {
+    if ib == 45 { << "_rt_getpid" }
+    if ib == 46 { << "_rt_getppid" }
+    if ib == 47 { << "_rt_getuid" }
+    if ib == 48 { << "_rt_getgid" }
+    if ib == 49 { << "_rt_geteuid" }
+    if ib == 50 { << "_rt_getegid" }
+    if ib == 51 { << "_rt_pagesize" }
+    if ib == 52 { << "_rt_host_name" }
+    if ib == 53 { << "_rt_cwd" }
+    if ib == 56 { << "_rt_tmp_dir" }
+    << ""
+}
+
+// M109: `_xu_foo` → `_xu_fnval_foo` shim (ignore A0, shift A1..→A0.., jmp).
+// Capturing closures already take env in A0 — skip the shifting shim.
+fn emit_fnval_shim(a $&Assembler, m &types.Mir, fi int) {
+    real := types.mir_fn_label(m, fi)
+    if real.len > 12 {
+        // `_xu_closure_` prefix
+        $is_clos := true
+        pref := "_xu_closure_"
+        for i in 0:pref.len {
+            if real[i] != pref[i] {
+                is_clos = false
+            }
+        }
+        if is_clos && types.mir_fn_nparams(m, fi) > 0 && types.is_ref_type(types.mir_local_ty(m, fi, 0)) {
+            <<
+        }
+    }
+    shim := types.mir_fnval_real_to_shim(&real)
+    if a.arch == 7 {
+        a.align_code(4)
+    }
+    a.label(shim)
+    n := types.mir_fn_nparams(m, fi)
+    if n <= 5 {
+        for i in 0:n {
+            a.mov(arg_reg(i), arg_reg(i + 1))
+        }
+    }
+    if a.arch == 7 {
+        a.xtbe_tail_call(real)
+        // Named scalar callbacks use a separate thin windowed entry. Never
+        // hand a Xu fat-function descriptor or call0 body directly to ROM.
+        $scalar := types.mir_fn_ret(m, fi) == 1 && n <= 6 && !types.mir_fn_receiver(m, fi)
+        for i in 0:n {
+            if types.mir_local_ty(m, fi, i) != 1 { scalar = false }
+        }
+        if scalar {
+            a.align_code(4)
+            a.label("_rom_cb" + real)
+            a.xt_emit24(0x008136) // entry a1,64
+            // Windowed parents address their base save area through this
+            // window's a1. Spill them while ENTRY's a1 is still stable,
+            // before a call0 Xu body changes it with its own stack frames.
+            // The assist preserves a0..a7, including all scalar arguments.
+            a.xt_call_windowed("_xu_rom_window_spill8", 2)
+            // ENTRY's top 16 bytes belong to the incoming base-save area;
+            // offsets 32..47 are this window's CALL8 extra-save slots.
+            // Keep private words at 0/4 and mask before changing their SP.
+            a.xt_rsil(8, 15)
+            a.xt_s32i(0, 1, 0)
+            a.xt_s32i(8, 1, 4)
+            // The spilled parent's base save area occupies [sp-16, sp).
+            // A call0 prologue would otherwise save its a14 at sp-16 and
+            // overwrite that parent's a0. Keep 16 bytes untouched plus
+            // a separate 48-byte extra-save area even before the body's
+            // first instruction, then restore ENTRY's stack pointer.
+            a.xt_addi(1, 1, -64)
+            a.xt_addi(8, 1, 48)
+            a.xt_addi(9, 1, -12)
+            a.xt_s32i(8, 9, 0)
+            a.xt_l32i(8, 1, 68)
+            a.xt_wsr(8, 230)
+            a.xt_rsync()
+            a.xt_lea_abs(8, real)
+            a.xt_callx0(8)
+            a.xt_rsil(8, 15)
+            a.xt_addi(1, 1, 64)
+            a.xt_l32i(8, 1, 4)
+            a.xt_wsr(8, 230)
+            a.xt_rsync()
+            a.xt_l32i(0, 1, 0)
+            a.xt_emit16(0xF01D) // retw.n
+        }
+    } else {
+        a.jmp(real)
+    }
+    <<
+}
+
+struct EmitRA {
+    uses_s int
+    call_s int
+    pin_safe int
+    push_loop int
+    addr_loc int
+    big_c int
+}
+
+struct EmitWalk {
+    straight int
+    scalar_skip int
+    sc_p int
+    sc_v int
+    leaf []int
+    wb []int
+}
+
+fn emit_function_setup_ra(a $&Assembler, m &types.Mir, fi int) EmitRA {
+    $ra := EmitRA{uses_s: 0, call_s: 0, pin_safe: 0, push_loop: 0, addr_loc: -1, big_c: 0}
+    a.rc_const_vr = -1
+    a.rc_const_val = 0
+    a.rc_push_loc = -1
+    a.rc_push_dirty = 0
+    a.rc_kernel = 0
+    a.rc_fwd_ht = false
+    a.rc_alu_fwd_fn = 0
+    if a.rc_on {
+        if !fn_has_one_slot_ref(m, fi) {
+            if fn_is_small_indexed_kernel(m, fi) {
+                a.rc_kernel = 1
+            } else if fn_has_assign_diamond(m, fi) && fn_has_i64_loadindex(m, fi) {
+                a.rc_kernel = 2
+            }
+        }
+        if a.arch == 0 && a.rc_kernel == 0 && fn_has_one_slot_array_ref(m, fi) && (fn_is_small_indexed_kernel(m, fi) || fn_is_f64_index_acc_kernel(m, fi)) && fn_has_natural_loop(m, fi) == 1 {
+            a.rc_fwd_ht = true
+        }
+    } else {
+        if isel_ror32_has_window(m, fi) {
+            a.rc_alu_fwd_fn = 1
+        } else if fn_calls_index_kernel(&*a, m, fi) {
+            a.rc_alu_fwd_fn = 1
+        }
+    }
+    ra.uses_s = fn_uses_s_scratch(m, fi)
+    ra.call_s = fn_needs_call_s(m, fi)
+    ra.pin_safe = fn_s_pin_safe(m, fi)
+    ra.push_loop = fn_has_push8_self_loop(m, fi)
+    // S-pool pins live in S0–S3 so V2–V5 stay scratch (inlined push_str,
+    // field mem). x64 has no spare GPRs for that pool: S0 aliases V2, S2/S3
+    // collapse to RAX. Enabling s_pool there skips spilling V2–V5 across
+    // calls, and the inlined probe then clobbers induction (`push_str` loops
+    // stop after two grows). ARM64 only.
+    if a.rc_on && a.arch == 0 && ra.pin_safe == 1 {
+        if ra.call_s == 1 || fn_needs_wb_s(m, fi) == 1 {
+            a.rc_s_pool = true
+        } else if types.mir_nfn_live(m) < 256 && fn_has_natural_loop(m, fi) == 1 {
+            $idx_hot := false
+            for bi in 0:types.mir_nblocks(m, fi) {
+                if block_has_index(m, fi, bi) {
+                    idx_hot = true
+                }
+            }
+            if !idx_hot {
+                a.rc_s_pool = true
+            }
+        }
+    }
+    if a.rc_on && a.arch == 0 && ra.push_loop == 1 {
+        a.rc_s_pool = true
+    }
+    if a.rc_on && a.arch == 0 && (a.rc_kernel != 0 || a.rc_fwd_ht) {
+        a.rc_s_pool = true
+    }
+    $ncall_pins := 0
+    if a.rc_on && ra.call_s == 1 && ra.pin_safe == 1 {
+        extra0 := collect_call_locals(m, fi)
+        ncall_pins = extra0.len
+    }
+    ra.addr_loc = fn_loop_addr_local(m, fi)
+    ra.big_c = fn_large_const(m, fi)
+    $extra_s := ncall_pins
+    if ra.big_c > 4095 {
+        extra_s += 1
+    }
+    if ra.addr_loc >= 0 {
+        extra_s += 1
+    }
+    if a.arch == 0 {
+        if ra.uses_s == 1 {
+            if a.rc_kernel == 1 {
+                a.cs_pairs = 2
+            } else {
+                a.cs_pairs = 3
+            }
+        } else if a.rc_s_pool && extra_s > 0 {
+            if extra_s <= 2 {
+                a.cs_pairs = 1
+            } else if extra_s <= 4 {
+                a.cs_pairs = 2
+            } else {
+                a.cs_pairs = 3
+            }
+        } else if a.rc_s_pool && (fn_ncalls(m, fi) > 0 || ra.uses_s > 0 || extra_s > 0) {
+            a.cs_pairs = 2
+        } else {
+            a.cs_pairs = 0
+        }
+        if fn_is_self_recursive(m, fi) && ra.uses_s == 0 && a.rc_s_pool {
+            a.cs_pairs = 1
+        }
+    } else if a.arch == 1 {
+        if types.mir_fn_nparams(m, fi) <= 6 && fn_ncalls(m, fi) == 0 && ra.uses_s == 0 && extra_s == 0 && fn_uses_s_scratch(m, fi) == 0 && fn_is_straight(m, fi) == 1 {
+            a.cs_pairs = 0
+        } else {
+            a.cs_pairs = 3
+        }
+    } else if a.arch == 2 {
+        a.cs_pairs = 3
+    }
+    << ra
+}
+
+fn emit_function_bind_params(a $&Assembler, m &types.Mir, fi int, fr &Frame, use_vregs bool) {
+    if a.has_int64_pairs() {
+        sbase := stack_arg_base(a.arch, a.cs_pairs)
+        $reg_idx := 0
+        $stk_off := 0
+        for i in 0:types.mir_fn_nparams(m, fi) {
+            loc_slot := frame_local_slot_at(m, fi, i, true)
+            ty := types.mir_local_ty(m, fi, i)
+            if i == 0 && types.mir_fn_receiver(m, fi) {
+                if reg_idx < 4 {
+                    src_reg := reg_idx
+                    a.t_store_offset(src_reg, 7, slot_off(loc_slot))
+                    a.t_mov_imm32(12, 0)
+                    a.t_store_offset(12, 7, slot_off(loc_slot) + 4)
+                    reg_idx += 1
+                } else {
+                    a.t_load_offset(12, 7, sbase + stk_off)
+                    a.t_store_offset(12, 7, slot_off(loc_slot))
+                    a.t_mov_imm32(12, 0)
+                    a.t_store_offset(12, 7, slot_off(loc_slot) + 4)
+                    stk_off += 4
+                }
+            } else if !abi_pass_by_value(ty) {
+                $src_phys := 0
+                if reg_idx < 4 {
+                    src_phys = reg_idx
+                    reg_idx += 1
+                } else {
+                    a.t_load_offset(12, 7, sbase + stk_off)
+                    src_phys = 12
+                    stk_off += 4
+                }
+                for j in 0:types.mir_local_nslots(m, fi, i) {
+                    a.t_load_offset(14, src_phys, -j * 8)
+                    a.t_store_offset(14, 7, slot_off(loc_slot) - j * 8)
+                    a.t_mov_imm32(14, 0)
+                    a.t_store_offset(14, 7, slot_off(loc_slot) - j * 8 + 4)
+                }
+            } else if ty == 1 {
+                if (reg_idx & 1) != 0 { reg_idx += 1 }
+                if reg_idx == 0 {
+                    a.t_store64_offset(0, 1, 7, slot_off(loc_slot))
+                    reg_idx = 2
+                } else if reg_idx == 2 {
+                    a.t_store64_offset(2, 3, 7, slot_off(loc_slot))
+                    reg_idx = 4
+                } else {
+                    if (stk_off & 7) != 0 { stk_off += 4 }
+                    a.t_load64_offset(12, 14, 7, sbase + stk_off)
+                    a.t_store64_offset(12, 14, 7, slot_off(loc_slot))
+                    stk_off += 8
+                }
+            } else {
+                if reg_idx < 4 {
+                    src_reg := reg_idx
+                    a.t_store_offset(src_reg, 7, slot_off(loc_slot))
+                    a.t_mov_imm32(12, 0)
+                    a.t_store_offset(12, 7, slot_off(loc_slot) + 4)
+                    reg_idx += 1
+                } else {
+                    a.t_load_offset(12, 7, sbase + stk_off)
+                    a.t_store_offset(12, 7, slot_off(loc_slot))
+                    a.t_mov_imm32(12, 0)
+                    a.t_store_offset(12, 7, slot_off(loc_slot) + 4)
+                    stk_off += 4
+                }
+            }
+        }
+        <<
+    }
+    sbase := stack_arg_base(a.arch, a.cs_pairs)
+    for i in 0:types.mir_fn_nparams(m, fi) {
+        $src := 0
+        if i < 6 {
+            src = arg_reg(i)
+        } else {
+            a.load(0, 15, sbase + (i - 6) * 8)
+            src = 0
+        }
+        ty := types.mir_local_ty(m, fi, i)
+        if use_vregs {
+            param_home := vreg_self_param_home(m, fi, fr, a.arch, i)
+            if param_home >= 0 {
+                a.mov(param_home, src)
+            }
+        }
+        loc_slot := frame_local_slot_at(m, fi, i, true)
+        if i == 0 && types.mir_fn_receiver(m, fi) {
+            a.store(15, slot_off(loc_slot), src)
+        } else if abi_pass_by_value(ty) {
+            a.store(15, slot_off(loc_slot), src)
+        } else {
+            if i < 6 {
+                for j in 0:types.mir_local_nslots(m, fi, i) {
+                    a.load(0, arg_reg(i), -j * 8)
+                    a.store(15, slot_off(loc_slot) - j * 8, 0)
+                }
+            } else {
+                for j in 0:types.mir_local_nslots(m, fi, i) {
+                    a.load(1, src, -j * 8)
+                    a.store(15, slot_off(loc_slot) - j * 8, 1)
+                }
+            }
+        }
+    }
+}
+
+// Self-loop analysis clones an MFn and owns several slice descriptors. Keep
+// those temporaries out of emit_function's already-large frame; crossing the
+// frozen Gen1 frame limit corrupts unrelated Frame slice headers in Gen2.
+fn emit_function_collect_self_loop_pins(a $&Assembler, m &types.Mir, fi int, nblk int, wb $&[]int, leaf $&[]int) {
+    if !a.rc_on { << }
+    $skip_idx_pins := false
+    if fn_has_one_slot_ref(m, fi) && fn_index_writes_only(m, fi) {
+        if nblk > 16 || types.mir_nlocals(m, fi) > 12 || fn_has_direct_user_call(m, fi) {
+            skip_idx_pins = true
+        }
+    }
+    for bi in 0:nblk {
+        tkind := types.mir_btkind(m, fi, bi)
+        $self_loop := false
+        if tkind == 1 && types.mir_bta(m, fi, bi) == bi {
+            self_loop = true
+        }
+        if tkind == 2 && (types.mir_btb(m, fi, bi) == bi || types.mir_btc(m, fi, bi) == bi) {
+            self_loop = true
+        }
+        if !self_loop { -> }
+        if mir_block_has_chan_xu(m, fi, bi) != 0 { -> }
+        $wb_ok := true
+        $leaf_ok := true
+        nloc := types.mir_nlocals(m, fi)
+        $load_n := []int{}
+        for _ in 0:nloc { load_n.push(0) }
+        $fpin := types.mir_cfg_clone_fn(m, fi, true)
+        $ii := fpin.blocks[bi].head
+        for _ in 0:fpin.instrs.len {
+            if ii < 0 {
+                <-
+            } else {
+                ik := types.mfn_ikind(&fpin.instrs, ii)
+                if mir_wb_kind_ok(ik) == 0 {
+                    wb_ok = false
+                    leaf_ok = false
+                }
+                if ik == types.MI_CALL {
+                    ck := types.mfn_ib(&fpin.instrs, ii)
+                    sval := types.mfn_isval(&fpin.instrs, ii)
+                    if ck == 1 && sval == "_xu_math_sqrt" {
+                        // Hosted 64-bit backends lower this to fsqrt with no `bl`.
+                    } else if ck == 1 {
+                        leaf_ok = false
+                        if sval != fpin.label { wb_ok = false }
+                    } else {
+                        leaf_ok = false
+                    }
+                } else if mir_fp_leaf_kind_ok(ik) == 0 {
+                    leaf_ok = false
+                }
+                if ik == types.MI_LOAD_LOCAL {
+                    loc := types.mfn_ib(&fpin.instrs, ii)
+                    if loc >= 0 && loc < load_n.len {
+                        load_n[loc] = load_n[loc] + 1
+                    }
+                }
+                ii = types.mfn_inext(&fpin.instrs, ii)
+            }
+        }
+        for li in 0:load_n.len {
+            if load_n[li] > 1 { leaf_ok = false }
+        }
+        if !skip_idx_pins {
+            self_loop_write_pins(m, fi, bi, $&a.rc_pins, bi * 4)
+        }
+        if wb_ok { wb[bi] = 1 }
+        if wb_ok && leaf_ok { leaf[bi] = 1 }
+    }
+}
+
+fn emit_function_setup_walk(a $&Assembler, m &types.Mir, fi int, ra &EmitRA, use_vregs bool) EmitWalk {
+    nblk := types.mir_nblocks(m, fi)
+    rc_init_m192b(a, nblk)
+    pin_n := nblk * 4
+    $pins := []int{}
+    for _ in 0:pin_n { pins.push(-1) }
+    a.rc_pins = pins
+    $wb := []int{}
+    $leaf := []int{}
+    for _ in 0:nblk {
+        wb.push(0)
+        leaf.push(0)
+    }
+    a.rc_fp_only = false
+    // GPR vreg left the SIMD pool free: collect full f64 loop pins anyway.
+    if a.rc_fp_hold && !a.rc_on && (a.arch == 0 || a.arch == 1) {
+        a.rc_fp_only = true
+        a.rc_loop_hot = natural_loop_hot_blocks(m, fi)
+    }
+    // Fixed homes and the legacy FP cache own the same SIMD register pool.
+    // A rejected mixed-memory plan must also keep its frame fallback.
+    if a.ra_level >= 1 && !a.rc_on && !use_vregs && !a.rc_fp_only && (a.arch == 0 || a.arch == 1) {
+        a.rc_loop_hot = natural_loop_hot_blocks(m, fi)
+        if !fn_is_f64_field_rmw_kernel(m, fi) && !fn_is_f64_scalar_loop_kernel(m, fi) && !fn_is_f64_index_acc_kernel(m, fi) && f64_loop_fp_only_admit(m, fi) {
+            a.rc_fp_only = true
+            f64_loop_fp_only_mark_self_hot(m, fi, $&a.rc_loop_hot)
+        }
+    }
+    $fpn := 0
+    if rc_fp_on(&*a) { fpn = nblk * rc_fp_homes() }
+    $fp_blk := []int{}
+    for _ in 0:fpn { fp_blk.push(-1) }
+    a.rc_fp_blk = fp_blk
+    if a.rc_on { rc_count_preds(a, m, fi) }
+    emit_function_collect_self_loop_pins(a, m, fi, nblk, $&wb, $&leaf)
+    if a.rc_on {
+        $loop_hot := natural_loop_hot_blocks(m, fi)
+        if a.rc_fp_only {
+            f64_loop_fp_only_mark_self_hot(m, fi, $&loop_hot)
+        }
+        collect_f64_loop_pins(a, m, fi, &leaf, &wb)
+        // FP loop residency is independent of the conservative GPR one-slot
+        // suppression below. A function may contain an indexed outer store
+        // while its inner scalar loop still has a valid loop-carried f64.
+        if fn_has_natural_loop(m, fi) == 0 {
+            for hi in 0:loop_hot.len { loop_hot[hi] = 0 }
+        }
+        if fn_has_one_slot_ref(m, fi) && fn_index_writes_only(m, fi) && !fn_is_f64_index_acc_kernel(m, fi) {
+            for hi in 0:loop_hot.len { loop_hot[hi] = 0 }
+        }
+        natural_loop_apply_pins(m, fi, $&a.rc_pins, &loop_hot)
+        if a.rc_ls && a.rc_pins.len >= nblk * 4 {
+            ls := ls_hot_locals(m, fi)
+            ls_apply_pins(m, fi, $&a.rc_pins, &ls)
+        }
+        if ra.call_s == 1 && ra.pin_safe == 1 && a.rc_pins.len >= nblk * 4 {
+            extra := collect_call_locals(m, fi)
+            merge_call_pins($&a.rc_pins, nblk, &extra)
+        }
+        if ra.push_loop == 1 && a.rc_pins.len >= nblk * 4 {
+            for bi in 0:nblk {
+                if block_push8_local(m, fi, bi) < 0 { -> }
+                for p in 1:4 {
+                    if a.rc_pins[bi * 4 + p] < 0 { a.rc_pins[bi * 4 + p] = -2 }
+                }
+            }
+        }
+        // Calls reload the coroutine stack-check holder into S0. Keep the
+        // legacy cache out of that home, just as the fixed-home planner does;
+        // otherwise a live local is silently replaced by the G marker.
+        if a.stack_check && a.rc_s_pool && a.arch == 0 && a.rc_pins.len >= nblk * 4 {
+            for bi in 0:nblk {
+                a.rc_pins[bi * 4] = -2
+            }
+        }
+        // All pin-producing passes (natural-loop, load/store, call-safe and
+        // push-loop) must have run before this fail-closed check.  Earlier
+        // placement validated a pre-LS layout, then LS could replace one of
+        // the four S homes and reintroduce a stale LoadLocal on `_ht`.
+        if a.rc_fwd_ht && !fwd_hot_pins_cover_written_loads(m, fi, &a.rc_pins, &loop_hot) {
+            // More loop-carried locals than the four S homes can cover: use
+            // ordinary block entries so every LoadLocal is refreshed.
+            a.rc_fwd_ht = false
+        }
+        a.rc_loop_hot = loop_hot
+    } else if a.rc_fp_only && a.rc_fp_hold {
+        collect_f64_loop_pins(a, m, fi, &leaf, &wb)
+    } else if a.rc_fp_only {
+        f64_loop_fp_only_collect_pin(a, m, fi)
+    }
+    if a.rc_fwd_ht && !fwd_hot_fp_layout_consistent(&*a) {
+        // Preserve the cold-exit metadata invariant for mixed integer/f64
+        // loops; ordinary block entry reloads are the conservative fallback.
+        a.rc_fwd_ht = false
+    }
+    if a.rc_on && a.rc_s_pool && a.arch == 0 && pin_n > 0 {
+        for p in 0:4 {
+            loc := a.rc_pins[p]
+            if loc < 0 { -> }
+            if loc >= types.mir_fn_nparams(m, fi) { -> }
+            ty := types.mir_local_ty(m, fi, loc)
+            $by_ptr_recv := false
+            if loc == 0 && types.mir_fn_receiver(m, fi) {
+                if m.fns[fi].receiver_mut || types.is_ref_type(ty) { by_ptr_recv = true }
+            }
+            if !by_ptr_recv && !abi_pass_by_value(ty) { -> }
+            vr := rc_pin_vr(&*a, p)
+            if loc < 6 { a.mov(vr, arg_reg(loc)) }
+        }
+    }
+    straight := fn_is_straight(m, fi)
+    $scalar_skip := false
+    if a.rc_on && types.mir_nfn_live(m) < 256 && fn_is_scalar_leaf_skip(m, fi) { scalar_skip = true }
+    $sc_p := -1
+    $sc_v := 0
+    $sa_p := -1
+    a.rc_addr_local = -1
+    a.rc_addr_vr = -1
+    a.rc_addr_alias = -1
+    if a.rc_on && a.rc_s_pool && a.arch == 0 && straight == 0 && a.rc_pins.len >= nblk * 4 {
+        if ra.big_c > 4095 {
+            sc_p = fn_spare_s_pin(&*a, &a.rc_pins, nblk)
+            if sc_p >= 0 {
+                sc_v = ra.big_c
+                a.vm_mov_imm64(8 + sc_p, sc_v)
+            } else {
+                sc_p = -1
+            }
+        }
+        if ra.addr_loc >= 0 {
+            if sc_p >= 0 {
+                for bi in 0:nblk {
+                    if a.rc_pins[bi * 4 + sc_p] < 0 { a.rc_pins[bi * 4 + sc_p] = -2 }
+                }
+            }
+            sa_p = fn_spare_s_pin(&*a, &a.rc_pins, nblk)
+            if sc_p >= 0 {
+                for bi in 0:nblk {
+                    if a.rc_pins[bi * 4 + sc_p] == -2 { a.rc_pins[bi * 4 + sc_p] = -1 }
+                }
+            }
+            if sa_p >= 0 {
+                loc_slot := frame_local_slot_at(m, fi, ra.addr_loc, true)
+                if is_frame_slot(loc_slot) {
+                    a.rc_addr_local = ra.addr_loc
+                    a.rc_addr_vr = 8 + sa_p
+                    a.mov(a.rc_addr_vr, 15)
+                    a.vm_sub_imm(a.rc_addr_vr, a.rc_addr_vr, -slot_off(loc_slot))
+                }
+            }
+        }
+    }
+    $ss := 0
+    if scalar_skip { ss = 1 }
+    << EmitWalk{straight: straight, scalar_skip: ss, sc_p: sc_p, sc_v: sc_v, leaf: leaf, wb: wb}
+}
+
+fn emit_function_entry(a $&Assembler, m &types.Mir, fi int, fr &Frame, use_vregs bool, guard &X64EntryGuard) int {
+    rc_arr_invalidate(a)
+    if use_vregs {
+        if a.rc_alu_fwd_fn != 2 {
+            a.rc_alu_fwd_fn = 0
+        }
+        if a.arch == 0 {
+            pairs := frame_vreg_callee_pairs(fr, a.arch)
+            if pairs > a.cs_pairs { a.cs_pairs = pairs }
+        } else if a.arch == 1 {
+            if frame_has_x64_callee_vreg(fr) {
+                a.cs_pairs = 3
+            } else if types.mir_fn_nparams(m, fi) <= 6 && fn_ncalls(m, fi) == 0 && fn_uses_s_scratch(m, fi) == 0 {
+                a.cs_pairs = 0
+            }
+        }
+        for i in 0:types.mir_fn_nparams(m, fi) {
+            param_home := vreg_self_param_home(m, fi, fr, a.arch, i)
+            if param_home >= 8 {
+                need := (param_home - 8) / 2 + 1
+                if need > a.cs_pairs { a.cs_pairs = need }
+            }
+        }
+        if a.arch == 1 && x64_selective_callee_save_ok(m, fi) {
+            $mask := frame_x64_callee_mask(fr)
+            for i in 0:types.mir_fn_nparams(m, fi) {
+                param_home := vreg_self_param_home(m, fi, fr, a.arch, i)
+                if param_home == 8 { mask = mask | 1 }
+                if param_home == 9 { mask = mask | 16 }
+            }
+            a.cs_pairs = x64_cs_encode(mask)
+        }
+    }
+    if a.arch == 2 {
+        $mask := fn_thumb_scratch_callee_mask(m, fi, fr)
+        if use_vregs {
+            mask = mask | frame_thumb_callee_mask(fr)
+        } else if a.rc_on || fn_uses_s_scratch(m, fi) != 0 {
+            mask = mask | 0x0370
+        }
+        a.cs_pairs = thumb_cs_encode(mask)
+    }
+    // Index emission switches from caller scratch to S4/S5 as soon as this
+    // function saves any S registers. Fixed homes can create that S frame in
+    // a leaf whose original scratch query needed no saves. Include those
+    // backend clobbers in the ABI before emitting its prologue.
+    if a.arch == 0 && a.cs_pairs > 0 && a.cs_pairs < 3 {
+        for ii in 0:types.mir_nins(m, fi) {
+            scratch := regplan_instr_reserved_homes(m, fi, ii, a.arch)
+            if (scratch & ((1 << 12) | (1 << 13))) != 0 {
+                a.cs_pairs = 3
+                <-
+            }
+        }
+    }
+    if a.arch == 7 {
+        a.align_code(4)
+    }
+    a.label(types.mir_fn_label(m, fi))
+    // Record the code offset immediately after defining the function label.
+    // Numeric ARM64 function-value fixups use this stable MIR-index mapping
+    // and therefore do not retain a string descriptor until link/fixup time.
+    if a.lib == 0 && fi >= 0 && fi < a.lib_exp_off.len {
+        a.lib_exp_off[fi] = a.code.len
+    }
+    a.oob_lbl = types.mir_fn_label(m, fi) + "_oob"
+    a.oob_need = 0
+    // Do not register oob_lbl here. ARM64 bcond encodes an already-defined
+    // nearby label as a backward B.cond; an up-front registration would send
+    // bounds-check jumps into the prologue instead of `_rt_oob`. The label is
+    // defined after the function body when oob_need == 1, and forward jumps
+    // go through delayed hash fixups (now correct after the djb2 repair).
+    frame_validate(fr, m, fi)
+    frame_size := fr.size
+    sret_slot := fr.sret_slot
+    if frame_size > 131072 {
+        eprintln("warning: large stack frame (" + str(frame_size) + " bytes) in '" + m.fns[fi].name + "'")
+    }
+    emit_x64_entry_guard(a, m, fi, guard)
+    emit_arm64_identity_guard(a, m, fi)
+    if a.stack_check && a.arch != 2 && !fn_is_resource_drop(m, fi) && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && !fn_is_zero_frame_leaf(m, fi, fr, &*a) && (fn_non_tail_calls(m, fi, fr, &*a) > 0 || frame_size > 0) {
+        // `_rt_run_g` keeps the current G in a callee-saved register. The
+        // caller reloads that register from its hidden frame slot before each
+        // user call, so synchronous host calls carry a zero marker instead of
+        // an arbitrary host register value.
+        hold := td_stack_holder_home(a.arch)
+        stack_ok := types.mir_fn_label(m, fi) + "_stack_ok"
+        a.vm_cbz(hold, stack_ok + "")
+        if a.arch == 1 {
+            // x64: preserve incoming sret (reg 0) and callee-saved registers (RBX=2, R13=4).
+            // Reg 14 (RAX) and Reg 1 (R11) are caller-saved scratch registers at function entry.
+            a.load(14, hold, RT_G_STACK_OFFSET)
+            a.vm_cbz(14, stack_ok + "")
+            a.vm_mov_imm64(1, frame_size + 64)
+            a.add(14, 14, 1)
+            a.cmp(16, 14)
+            a.jlt("_rt_stack_overflow")
+            a.load(14, hold, RT_G_STACK_OFFSET)
+            a.load(14, 14, 0)
+            a.vm_mov_imm64(1, RT_G_STACK_COOKIE)
+            a.cmp(14, 1)
+            a.jne("_rt_stack_overflow")
+        } else {
+            // V1/V2 are caller scratch on ARM64, Loong and RV64. Preserve
+            // incoming sret (ARM64 V0/x8), arguments, and every S register
+            // until the prologue saves them. SP cannot be used as an ARM64
+            // shifted-register CMP operand, so copy it into V2 first.
+            a.load(1, hold, RT_G_STACK_OFFSET)
+            a.vm_cbz(1, stack_ok + "")
+            a.vm_mov_imm64(2, frame_size + 128)
+            a.add(1, 1, 2)
+            a.mov(2, 16)
+            a.cmp(2, 1)
+            a.jlt("_rt_stack_overflow")
+            a.load(1, hold, RT_G_STACK_OFFSET)
+            a.load(1, 1, 0)
+            a.vm_mov_imm64(2, RT_G_STACK_COOKIE)
+            a.cmp(1, 2)
+            a.jne("_rt_stack_overflow")
+        }
+        a.label(stack_ok)
+    }
+    if !fn_is_zero_frame_leaf(m, fi, fr, &*a) {
+        a.prologue(frame_size)
+    }
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_nblocks(m, fi) > 0 && types.mir_fn_label(m, fi) != "_xu_main" && !fn_is_zero_frame_leaf(m, fi, fr, &*a) && (fn_non_tail_calls(m, fi, fr, &*a) > 0 || frame_size > 0) {
+        hold := td_stack_holder_home(a.arch)
+        a.store(15, -frame_size, hold)
+    }
+    // Callee-saved homes can contain the caller's live values. The retired
+    // velocity-forwarding emitter returns before using its old S4 sentinel;
+    // there is no scratch initialization to perform at ordinary entry.
+    if sret_slot >= 0 { a.store(15, slot_off(sret_slot), 0) }
+    emit_function_bind_params(a, m, fi, fr, use_vregs)
+    if a.stack_check && a.arch == 2 && !fn_is_resource_drop(m, fi) && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || frame_size > 0) {
+        // Thumb-2: incoming parameter registers r0..r3 are bound above.
+        // Running stack check after binding prevents clobbering r2/r3.
+        hold := td_stack_holder_home(a.arch)
+        stack_ok := types.mir_fn_label(m, fi) + "_stack_ok"
+        a.vm_cbz(hold, stack_ok + "")
+        a.load(0, hold, RT_G_STACK_OFFSET)
+        a.vm_mov_imm64(1, frame_size + 64)
+        a.add(0, 0, 1)
+        a.mov(4, 16)
+        a.cmp(4, 0)
+        a.jlt("_rt_stack_overflow")
+        a.load(0, hold, RT_G_STACK_OFFSET)
+        a.load(1, 0, 0)
+        a.vm_mov_imm64(2, RT_G_STACK_COOKIE)
+        a.cmp(1, 2)
+        a.jne("_rt_stack_overflow")
+        a.label(stack_ok)
+    }
+    << frame_size
+}
+
+// Resource drop hooks use S1/R15 as their data pointer. That is a different
+// ABI from the coroutine holder, so the hosted stack guard must not interpret
+// the object pointer as a G pointer at hook entry.
+fn fn_is_resource_drop(m &types.Mir, fi int) bool {
+    if fi < 0 || fi >= m.fns.len { << false }
+    label := types.mir_fn_label(m, fi)
+    if label == "" { << false }
+    for si in 0:m.structs.len {
+        if m.structs[si].drop_label.len > 0 && m.structs[si].drop_label == label { << true }
+    }
+    << false
+}
+
+// Checks whether a specific call instruction in a block is an eligible sibling tail call.
+fn mir_call_is_tail_call(m &types.Mir, fi int, fr &Frame, a &Assembler, bi int, ii int) bool {
+    if bi < 0 || bi >= types.mir_nblocks(m, fi) { << false }
+    if types.mir_btkind(m, fi, bi) != 3 { << false }
+    if types.mir_ikind(m, fi, ii) != types.MI_CALL { << false }
+    if types.mir_ib(m, fi, ii) != 1 { << false }
+    if a.cover || a.test { << false }
+    if a_has_int64_pairs(a) { << false }
+    if types.mir_fn_label(m, fi) == "_xu_main" { << false }
+    if fn_is_resource_drop(m, fi) { << false }
+    if types.mir_fn_ret_nslots(m, fi) > 1 { << false }
+
+    $cur := types.mir_inext(m, fi, ii)
+    while cur >= 0 {
+        if types.mir_ikind(m, fi, cur) != types.MI_NOP {
+            << false
+        }
+        cur = types.mir_inext(m, fi, cur)
+    }
+
+    ia := types.mir_ia(m, fi, ii)
+    ta := types.mir_bta(m, fi, bi)
+    if ia < 0 {
+        if ta != -1 { << false }
+    } else {
+        if ta != ia { << false }
+    }
+
+    $nargs := 0
+    $ai := types.mir_ic(m, fi, ii)
+    while ai >= 0 {
+        nargs += 1
+        ai = types.mir_marg_next(m, fi, ai)
+    }
+    if nargs > 6 { << false }
+
+    target_lab := types.mir_isval(m, fi, ii) + ""
+    if target_lab.len == 0 { << false }
+    if a.is_dylib_lab(target_lab + "") { << false }
+    if target_lab == types.mir_fn_label(m, fi) { << false }
+
+    << true
+}
+
+fn framed_tail_scalar(ty int, nslots int) bool {
+    // Only Copy integer/bool words: no hidden pointers, owners or FP ABI.
+    << nslots == 1 && (ty == 1 || ty == 2)
+}
+
+// Called only after mir_call_is_tail_call and final-MIR call ABI admission.
+// A tail-position call alone does not prove the current frame may die: even
+// an integer temp can contain a lowered AddrOf or an erased borrowed pointer.
+fn mir_call_can_restore_frame(m &types.Mir, fi int, fr &Frame, a &Assembler, ii int, target string) bool {
+    if a.arch != 0 || a.os == 3 || a.ra_level < 1 { << false }
+    if a.debug || a.cover || a.test || a.stack_check { << false }
+    if fr.sret_slot >= 0 || types.mir_fn_receiver(m, fi) { << false }
+    ret := types.mir_fn_ret(m, fi)
+    if !framed_tail_scalar(ret, types.mir_fn_ret_nslots(m, fi)) { << false }
+    dest := types.mir_ia(m, fi, ii)
+    if dest < 0 || types.mir_temp_ty(m, fi, dest) != ret { << false }
+    // Runtime/native remaps have separate conventions. The ordinary call
+    // verifier has checked the signature of every in-unit direct call.
+    if !fn_label_in_unit(m, target) { << false }
+    for li in 0:types.mir_nlocals(m, fi) {
+        if !framed_tail_scalar(types.mir_local_ty(m, fi, li), types.mir_local_nslots(m, fi, li)) {
+            << false
+        }
+    }
+    for ti in 0:types.mir_ntemps(m, fi) {
+        if !framed_tail_scalar(types.mir_temp_ty(m, fi, ti), types.mir_temp_nslots(m, fi, ti)) {
+            << false
+        }
+    }
+    for ins in 0:types.mir_nins(m, fi) {
+        k := types.mir_ikind(m, fi, ins)
+        if k == types.MI_ADDR || k == types.MI_ELEM_ADDR {
+            << false
+        }
+        if k == types.MI_DROP || k == types.MI_DROP_FIELD || k == types.MI_DROP_PTR_FIELD || k == types.MI_DROP_BUF_FIELD {
+            << false
+        }
+    }
+    << true
+}
+
+// Counts the number of non-tail calls in the function.
+// If this count is 0, every call in the function is an eligible sibling tail call.
+fn fn_non_tail_calls(m &types.Mir, fi int, fr &Frame, a &Assembler) int {
+    $non_tail := 0
+    nb := types.mir_nblocks(m, fi)
+    for bi in 0:nb {
+        $ii := types.mir_bhead(m, fi, bi)
+        for _ in 0:types.mir_nins(m, fi) {
+            if ii < 0 { <- }
+            ik := types.mir_ikind(m, fi, ii)
+            if ik == types.MI_CALL {
+                if !mir_call_is_tail_call(m, fi, fr, a, bi, ii) {
+                    non_tail += 1
+                }
+            } else if ik == types.MI_XU || ik == types.MI_INTERFACE_METHOD || ik == types.MI_ARR_PUSH || ik == types.MI_ARR_PUSH4 {
+                non_tail += 1
+            }
+            ii = types.mir_inext(m, fi, ii)
+        }
+    }
+    << non_tail
+}
+
+// Zero-frame leaf elimination extended to pure sibling-tail-calling functions.
+fn fn_is_zero_frame_leaf(m &types.Mir, fi int, fr &Frame, a &Assembler) bool {
+    if fr.size != 0 { << false }
+    if a.cs_pairs != 0 { << false }
+    if fn_non_tail_calls(m, fi, fr, a) != 0 { << false }
+    if types.mir_fn_label(m, fi) == "_xu_main" { << false }
+    if fn_is_resource_drop(m, fi) { << false }
+    if a.cover || a.test { << false }
+    << true
+}
+
+fn emit_function(a $&Assembler, m &types.Mir, fi int, ct &CoverTable, calls &types.MirCallIndex) {
+    // Frame.layout walks locals, temps, and linked MIR instructions before
+    // the allocator is consulted.  Run the allocation-free shape preflight
+    // first so malformed producer metadata cannot become an unchecked slice
+    // access or an allocation storm.  Empty CFG tombstones are accepted by
+    // the same contract used at optimizer commit time.
+    if !vreg_mir_shape_ok(m, fi) {
+        eprintln("internal compiler error: malformed MIR shape")
+        <<< 1
+    }
+    // The shape pass proves local indexes and linked-list ownership.  Calls
+    // additionally cross the function/signature and fixed ABI register
+    // windows; validate those fields before Frame.layout or any emitter can
+    // dereference a missing argument.  This indexed check avoids cloning the
+    // large MFn and is shared by legacy and fixed-home emission paths.
+    if !types.mir_verify_emission_calls_indexed(m, fi, calls) {
+        eprintln("internal compiler error: malformed MIR call ABI in '" + m.fns[fi].name + "'")
+        <<< 1
+    }
+    // StoreIndex overwrites an array element and must drop any old owning
+    // value before the bytes are replaced.  Its legacy Gen1 record carries no
+    // explicit `drop_old` bit, so validate the concrete array/type metadata
+    // before Frame.layout and reject an unmodelled type rather than emitting
+    // a silent leak (or an unchecked drop walk).
+    if !emit_store_index_shape_ok(m, fi) {
+        eprintln("internal compiler error: malformed StoreIndex owning-element metadata in '" + m.fns[fi].name + "'")
+        <<< 1
+    }
+
+    // Whole-function scalar fixed homes cover reachable CFGs and direct
+    // scalar calls. Keep the legacy RegCache disabled for an admitted
+    // function because both allocators own V2+; all other functions retain
+    // the existing RA/cache behavior.
+    old_rc_on := a.rc_on
+    old_s_pool := a.rc_s_pool
+    force_frame_index := regplan_string_index_frame(m, fi) && !(a.arch == 0 && regplan_readonly_string_scan(m, fi))
+    $try_vregs := false
+    $generic_vregs := false
+    if env_get("XU_RA_REJ") == "1" { eprintln("emit_fn: " + types.mir_fn_label(m, fi) + " ra=" + str(a.ra_level) + " arch=" + str(a.arch)) }
+    // Fixed-home allocation follows the requested RA tier directly. The
+    // legacy product_rc_mir_safe predicate only governs RegCache fallback and
+    // must not silently disable the independent vreg allocator (or x64).
+    if force_frame_index {
+        // Mixed string descriptor/index functions stay on the conservative
+        // frame path until their multi-word forwarding proof is complete.
+        a.rc_on = false
+        a.rc_s_pool = false
+    } else if a.ra_level >= 1 && !a_has_int64_pairs(&*a) && (a.arch == 0 || a.arch == 1 || a.arch == 2) {
+        // Mixed f64 pointer kernels need whole-CFG liveness: the legacy
+        // cache loses values across repeated inner-loop pointer loads.
+        // Keep general admission closed while using the verified planner
+        // for bounded field-memory, scalar-FP/index and FP reduction shapes. Array
+        // descriptors remain frame-backed; scalar homes are verified across
+        // the whole CFG before either shape can own the register pools.
+        try_vregs = regplan_try_vreg(&*a, m, fi)
+        if !try_vregs {
+            generic_vregs = regplan_try_generic(&*a, m, fi)
+            try_vregs = generic_vregs
+        }
+    }
+    $park_temps := 0
+    if a.rc_on {
+        park_temps = 1
+    }
+    // Fixed-home RA is independent of the legacy RegCache.  Pure scalar
+    // functions admitted to that path still have promoted LocalId metadata;
+    // let the frame layout omit locals whose MIR references disappeared even
+    // when product_rc_mir_safe deliberately left rc_on disabled.  Keep
+    // aggregate/reference locals on the conservative frame-backed path: their
+    // drop/address semantics are not covered by frame_local_is_used's scalar
+    // proof.
+    if try_vregs {
+        $scalar_locals := true
+        for li in 0:types.mir_nlocals(m, fi) {
+            if types.mir_local_nslots(m, fi, li) != 1 || !vreg_scalar_type(types.mir_local_ty(m, fi, li)) {
+                scalar_locals = false
+            }
+        }
+        if scalar_locals {
+            park_temps = 1
+        }
+    }
+    // Compute fixed homes once for the accepted path. The old path ran the full liveness,
+    // interference and coloring plan four times (probe, callee pairs and two
+    // layouts), dominating compiler self-emission. The encoded temp slots are
+    // the allocation plan and are shared by entry + block emission.
+    $selections := []int{}
+    if a.arch == 0 && !a.cover && !a.test && !force_frame_index && (!a.rc_on || try_vregs) {
+        selections = select_pair_collect(m, fi)
+    }
+    fallback_park_temps := park_temps
+    if selections.len != 0 { park_temps = 0 }
+    $fr := Frame{local_slot: []int{}, temp_slot: []int{}, fp_split: []int{}, select_pairs: selections, sret_slot: -1, size: 0, plan_reason: 0, plan_instr: -1}
+    $reserve_home := -1
+    if a.stack_check && !fn_is_resource_drop(m, fi) { reserve_home = td_stack_holder_home(a.arch) }
+    fr.layout(m, fi, park_temps, a.arch, try_vregs, reserve_home)
+    $plan_reason := fr.plan_reason
+    $plan_instr := fr.plan_instr
+    frame_validate(&fr, m, fi)
+    // A corrupt binding is always an error; it must never be laundered by a
+    // profitability fallback. Rejected legal selections rebuild the ordinary
+    // allocation, removing their scratch reservations and interference too.
+    if !select_pair_verify_frame(&fr, m, fi, a.arch) {
+        eprintln("internal compiler error: selected pair failed binding/resource checks")
+        <<< 1
+    }
+    $ordinary := Frame{local_slot: []int{}, temp_slot: []int{}, fp_split: []int{}, select_pairs: []int{}, sret_slot: -1, size: 0, plan_reason: 0, plan_instr: -1}
+    if fr.select_pairs.len != 0 {
+        ordinary.layout(m, fi, fallback_park_temps, a.arch, try_vregs, reserve_home)
+        frame_validate(&ordinary, m, fi)
+        if !select_pair_profitable(&fr) || !select_pair_pressure_ok(&fr, &ordinary, m, fi, a.arch) {
+            fr.select_pairs = []int{}
+            fr.local_slot = []int{}
+            fr.temp_slot = []int{}
+            fr.fp_split = []int{}
+            fr.sret_slot = -1
+            fr.size = 0
+            fr.layout(m, fi, fallback_park_temps, a.arch, try_vregs, reserve_home)
+            plan_reason = fr.plan_reason
+            plan_instr = fr.plan_instr
+            frame_validate(&fr, m, fi)
+        }
+    }
+    has_vreg := frame_has_vregs(&fr)
+    a.rc_ror32_facts = []int{}
+    if (a.arch == 0 || a.arch == 1) && isel_ror32_has_window(m, fi) {
+        a.rc_ror32_facts = isel_ror32_facts(m, fi)
+    }
+
+    if try_vregs && !has_vreg {
+        // A rejected plan is not a proof that the legacy mixed-memory
+        // cache is safe. Retain frame storage for this function instead.
+        a.rc_on = false
+        if generic_vregs {
+            // An unsuccessful opportunity retains the already-proven legacy
+            // path. It must not turn a cache function into a frame function.
+            a.rc_on = old_rc_on
+        }
+        // The first layout may have omitted cache-backed temp slots. Build
+        // ordinary spill storage without rerunning the allocation planner.
+        fr.local_slot = []int{}
+        fr.temp_slot = []int{}
+        fr.fp_split = []int{}
+        fr.sret_slot = -1
+        fr.size = 0
+        $fallback_park := 0
+        if a.rc_on { fallback_park = 1 }
+        fr.layout(m, fi, fallback_park, a.arch, false, reserve_home)
+        frame_validate(&fr, m, fi)
+    }
+    if a.stack_check && !fn_is_resource_drop(m, fi) && types.mir_fn_label(m, fi) != "_xu_main" && types.mir_nblocks(m, fi) > 0 && (fn_ncalls(m, fi) > 0 || fr.size > 0) {
+        // Reserve one hidden word below the ordinary frame for the current G.
+        // It lets every user call reload the runtime holder without exposing
+        // a hidden source-level parameter or trusting a caller's scratch S reg.
+        fr.size += 16
+    }
+    a.rc_fp_hold = false
+    a.rc_vreg_mask = 0
+    if has_vreg {
+        // `Assembler` is reused across functions. Clear the previous
+        // function's cache metadata, then give GPR parks to fixed homes.
+        // f64 FieldRMW / scalar / index-acc keep SIMD pins when this plan
+        // did not take an FP home (rc_fp_hold).
+        a.rc_fp_only = false
+        rc_flush(a)
+        // Fixed homes own the GPR park window. Do not keep RegCache pins
+        // in that window: sharing S0–S3 with a vreg plan dropped one
+        // induction step. f64 kernels with no FP home still take rc_fp_hold.
+        a.rc_on = false
+        a.rc_s_pool = false
+        a.rc_vreg_mask = 0
+        a.rc_alu_fwd_fn = 0
+        if !frame_plan_uses_fp(&fr) {
+            if fn_is_f64_field_rmw_kernel(m, fi) || fn_is_f64_scalar_loop_kernel(m, fi) || fn_is_f64_index_acc_kernel(m, fi) {
+                a.rc_fp_hold = true
+            }
+        }
+    }
+    if !select_pair_verify_frame(&fr, m, fi, a.arch) {
+        eprintln("internal compiler error: selected pair failed binding/resource checks")
+        <<< 1
+    }
+    ra := emit_function_setup_ra(a, m, fi)
+    emit_ip0_prepare(a, m, fi, &fr)
+    code_start := a.code.len
+    entry_guard := match_x64_entry_guard(&*a, m, fi, has_vreg)
+    entry_frame_size := emit_function_entry(a, m, fi, &fr, has_vreg, &entry_guard)
+    walk := emit_function_setup_walk(a, m, fi, &ra, has_vreg)
+    // Timings report actual allocator admission, including frame-backed
+    // scalar spills in a partial plan. Do not count aggregate descriptors
+    // or dead temps as register pressure.
+    $scalar_spills := 0
+    if has_vreg {
+        for ti in 0:fr.temp_slot.len {
+            if is_frame_slot(fr.temp_slot[ti]) && vreg_temp_eligible(m, fi, ti) {
+                scalar_spills += 1
+            }
+        }
+    }
+    ra_note_fn(a, try_vregs, has_vreg, a.rc_on, scalar_spills)
+    if fr.size != entry_frame_size {
+        eprintln("internal compiler error: inconsistent frame layout")
+        <<< 1
+    }
+    $entry_first := -1
+    if entry_guard.body >= 0 && x64_selective_callee_save_ok(m, fi) {
+        entry_first = entry_guard.body
+    } else if entry_guard.body >= 0 {
+        a.be_jmp(types.mir_fn_label(m, fi) + "_bb" + str(entry_guard.body))
+    }
+    emit_function_emit_blocks(a, m, fi, &fr, ct, &walk, generic_vregs && has_vreg, entry_first)
+    if a.oob_need == 1 {
+        a.label(a.oob_lbl + "")
+        a.call("_rt_oob")
+    }
+    regplan_report_fn(&*a, m, fi, &fr, try_vregs, has_vreg, plan_reason, plan_instr, code_start)
+    a.rc_on = old_rc_on
+    a.rc_s_pool = old_s_pool
+    if a.arch == 0 || a.arch == 1 || a.arch == 2 { a.cs_pairs = 3 }
+    <<
+}
+
+// M184: ArrIndex / StoreIndex / ElemAddr — split from emit_instr (W3).
