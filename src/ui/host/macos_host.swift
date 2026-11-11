@@ -2040,6 +2040,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 /// `tmpDir` is the UI temp directory (title/size/cmd files); empty/`:xu:` → mem mailbox.
 @_cdecl("xu_ui_host_run")
 public func xu_ui_host_run(_ tmpDir: UnsafePointer<CChar>?) -> Int32 {
+  return xuUiRun(tmpDir, taskPump: nil)
+}
+
+public typealias XuYieldTask = @convention(c) () -> Int32
+public typealias XuTaskPump = @convention(c) (UnsafeMutableRawPointer?, XuYieldTask?) -> Int32
+
+@_silgen_name("xu_ui_mem_set_task_pump")
+private func xu_ui_mem_set_task_pump(_ pump: XuTaskPump?, _ state: UnsafeMutableRawPointer?, _ yieldTask: XuYieldTask?)
+
+@_cdecl("xu_ui_host_run_cooperative")
+public func xu_ui_host_run_cooperative(
+  _ tmpDir: UnsafePointer<CChar>?,
+  _ pump: XuTaskPump?,
+  _ state: UnsafeMutableRawPointer?,
+  _ yieldTask: XuYieldTask?
+) -> Int32 {
+  xu_ui_mem_set_task_pump(pump, state, yieldTask)
+  defer { xu_ui_mem_set_task_pump(nil, nil, nil) }
+  return xuUiRun(tmpDir, taskPump: { _ = pump?(state, yieldTask) })
+}
+
+private func xuUiRun(_ tmpDir: UnsafePointer<CChar>?, taskPump: (() -> Void)?) -> Int32 {
   xu_ui_emit_start()
   var tmp = tmpDir.map { String(cString: $0) }
     ?? ProcessInfo.processInfo.environment["XU_UI_TMP"]
@@ -2087,6 +2109,14 @@ public func xu_ui_host_run(_ tmpDir: UnsafePointer<CChar>?) -> Int32 {
   root.host = delegate
   delegate.rootView = root
   app.delegate = delegate
+  // The Xu scheduler runs on this thread. Resume it between AppKit events.
+  let timer = taskPump.map { pump in
+    let timer = Timer(timeInterval: 0.01, repeats: true) { _ in pump() }
+    RunLoop.main.add(timer, forMode: .common)
+    RunLoop.main.add(timer, forMode: .modalPanel)
+    return timer
+  }
+  defer { timer?.invalidate() }
   app.run()
   return 0
 }
