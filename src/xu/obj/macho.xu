@@ -18,6 +18,8 @@ pub const LC_LOAD_DYLIB = 0x0c
 pub const LC_MAIN = 0x80000028
 pub const LC_SYMTAB = 0x2
 pub const LC_DYSYMTAB = 0xb
+const LC_DYLD_INFO_ONLY = 0x80000022
+const MACHO_CLOCK_SYMBOL = "_clock_gettime"
 
 pub fn macho_write_header(buf $&mc.CodeBuffer, cpu_type int, file_type int, ncmds int, sizeofcmds int) {
     buf.emit_u32_le(MACHO_MAGIC_64)
@@ -30,7 +32,7 @@ pub fn macho_write_header(buf $&mc.CodeBuffer, cpu_type int, file_type int, ncmd
     buf.emit_u32_le(file_type)
     buf.emit_u32_le(ncmds)
     buf.emit_u32_le(sizeofcmds)
-    buf.emit_u32_le(0x00200085) // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+    buf.emit_u32_le(0x00200084) // MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
     buf.emit_u32_le(0) // reserved
 }
 
@@ -56,12 +58,13 @@ pub fn macho_syms_empty() MachoSyms {
     << MachoSyms{names: []string{}, offs: []int{}}
 }
 
-// Load commands: PAGEZERO (72), TEXT with one section (152), LINKEDIT
-// (72), SYMTAB (24), DYSYMTAB (80), DYLINKER (32), MAIN (24), DYLIB (56),
+// Load commands: PAGEZERO (72), TEXT and DATA with one section each
+// (152 each), LINKEDIT (72), SYMTAB (24), DYSYMTAB (80), DYLD_INFO (48),
+// DYLINKER (32), MAIN (24), DYLIB (56),
 // plus the __DWARF segment with four sections (72 + 4 * 80) when debug
 // sections are present.
 fn macho_cmds_size(debug bool) int {
-    $n := 72 + 152 + 72 + 24 + 80 + 32 + 24 + 56
+    $n := 72 + 152 + 152 + 72 + 24 + 80 + 48 + 32 + 24 + 56
     if debug {
         n += 72 + 4 * 80
     }
@@ -87,6 +90,32 @@ fn page_up(n int, page int) int {
         << n
     }
     << (n + page - 1) / page * page
+}
+
+fn macho_page_size(cpu_type int) int {
+    if cpu_type == MACHO_CPU_TYPE_X86_64 {
+        << 4096
+    }
+    << 16384
+}
+
+// Code relocations address the first data word relative to __text.
+pub fn macho_clock_slot_offset(code_len int, cpu_type int, debug bool) int {
+    text_off := macho_text_file_offset(debug)
+    << page_up(text_off + code_len, macho_page_size(cpu_type)) - text_off
+}
+
+fn macho_clock_bind() mc.CodeBuffer {
+    $bind := mc.code_buffer_new()
+    bind.emit_u8(0x11) // SET_DYLIB_ORDINAL_IMM, libSystem (1)
+    bind.emit_u8(0x40) // SET_SYMBOL_TRAILING_FLAGS_IMM
+    emit_fixed_string($&bind, MACHO_CLOCK_SYMBOL, MACHO_CLOCK_SYMBOL.len + 1)
+    bind.emit_u8(0x51) // SET_TYPE_IMM, pointer
+    bind.emit_u8(0x72) // SET_SEGMENT_AND_OFFSET_ULEB, __DATA (2)
+    bind.emit_u8(0)    // Offset of the clock pointer.
+    bind.emit_u8(0x90) // DO_BIND
+    bind.emit_u8(0)    // DONE
+    << bind
 }
 
 fn align8(n int) int {
@@ -138,7 +167,8 @@ pub fn macho_write_executable_arm64(code_bytes &[]int, entry_offset int) mc.Code
     << macho_write_executable(code_bytes, MACHO_CPU_TYPE_ARM64, entry_offset)
 }
 
-// Layout: header and load commands, __TEXT (code), __LINKEDIT (local
+// Layout: header and load commands, __TEXT (code), __DATA (clock pointer),
+// __LINKEDIT (dyld bind and local
 // function symbols; debuggers need a symbol table to load the image), then
 // with debug sections a non-loaded __DWARF segment. dyld checks that every
 // section address lies inside its segment's range, so __DWARF gets a VM
@@ -147,14 +177,12 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
     $buf := mc.code_buffer_new()
     debug := dbg.present()
 
-    $page := 16384
-    if cpu_type == MACHO_CPU_TYPE_X86_64 {
-        page = 4096
-    }
+    page := macho_page_size(cpu_type)
     base := 0x100000000
     text_off := macho_text_file_offset(debug)
     text_vmaddr := base + text_off
-    text_seg_size := page_up(text_off + code_bytes.len, page)
+    data_off := text_off + macho_clock_slot_offset(code_bytes.len, cpu_type, debug)
+    bind := macho_clock_bind()
 
     // Symbol and string tables.
     $strtab := []int{}
@@ -176,14 +204,23 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
         v := text_vmaddr + syms.offs[i]
         for k in 0:8 { nlist.push((v >> (8 * k)) & 255) }
     }
+    clock_strx := strtab.len
+    for i in 0:MACHO_CLOCK_SYMBOL.len { strtab.push(MACHO_CLOCK_SYMBOL[i]) }
+    strtab.push(0)
+    for k in 0:4 { nlist.push((clock_strx >> (8 * k)) & 255) }
+    nlist.push(0x01) // N_UNDF | N_EXT
+    nlist.push(0)    // NO_SECT
+    nlist.push(0)    // REFERENCE_FLAG_UNDEFINED_NON_LAZY
+    nlist.push(1)    // libSystem ordinal in n_desc
+    for k in 0:8 { nlist.push(0) }
     while strtab.len % 8 != 0 {
         strtab.push(0)
     }
-    nsyms := syms.names.len
-    le_off := text_seg_size
-    sym_off := le_off
+    nlocals := syms.names.len
+    le_off := data_off + page
+    sym_off := align8(le_off + bind.bytes.len)
     str_off := sym_off + nlist.len
-    le_size := nlist.len + strtab.len
+    le_size := str_off + strtab.len - le_off
     $le_seg_size := page_up(le_size, page)
     if le_seg_size == 0 {
         le_seg_size = page
@@ -197,36 +234,46 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
     dw_size := dstr_off + dbg.str.len - dw_off
     dw_vm := base + dw_off
 
-    $ncmds := 8
+    $ncmds := 10
     if debug {
-        ncmds = 9
+        ncmds += 1
     }
     macho_write_header($&buf, cpu_type, MACHO_FILETYPE_EXECUTE, ncmds, macho_cmds_size(debug))
 
     macho_segment($&buf, "__PAGEZERO", 0, 0, base, 0, 0, 0)
-    macho_segment($&buf, "__TEXT", 1, base, text_seg_size, 0, text_seg_size, 5)
+    macho_segment($&buf, "__TEXT", 1, base, data_off, 0, data_off, 5)
     // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
     macho_section($&buf, "__text", "__TEXT", text_vmaddr, code_bytes.len, text_off, 4, 0x80000400)
+    macho_segment($&buf, "__DATA", 1, base + data_off, page, data_off, page, 3)
+    macho_section($&buf, "__data", "__DATA", base + data_off, 8, data_off, 3, 0)
     macho_segment($&buf, "__LINKEDIT", 0, base + le_off, le_seg_size, le_off, le_size, 1)
 
     buf.emit_u32_le(LC_SYMTAB)
     buf.emit_u32_le(24)
     buf.emit_u32_le(sym_off)
-    buf.emit_u32_le(nsyms)
+    buf.emit_u32_le(nlocals + 1)
     buf.emit_u32_le(str_off)
     buf.emit_u32_le(strtab.len)
 
     buf.emit_u32_le(LC_DYSYMTAB)
     buf.emit_u32_le(80)
     buf.emit_u32_le(0)     // ilocalsym
-    buf.emit_u32_le(nsyms) // nlocalsym
-    buf.emit_u32_le(nsyms) // iextdefsym
-    buf.emit_u32_le(0)     // nextdefsym
-    buf.emit_u32_le(nsyms) // iundefsym
-    buf.emit_u32_le(0)     // nundefsym
+    buf.emit_u32_le(nlocals) // nlocalsym
+    buf.emit_u32_le(nlocals) // iextdefsym
+    buf.emit_u32_le(0)       // nextdefsym
+    buf.emit_u32_le(nlocals) // iundefsym
+    buf.emit_u32_le(1)       // nundefsym
     for i in 0:12 {
         buf.emit_u32_le(0)
     }
+
+    buf.emit_u32_le(LC_DYLD_INFO_ONLY)
+    buf.emit_u32_le(48)
+    buf.emit_u32_le(0) // rebase_off
+    buf.emit_u32_le(0) // rebase_size
+    buf.emit_u32_le(le_off)
+    buf.emit_u32_le(bind.bytes.len)
+    for i in 0:6 { buf.emit_u32_le(0) } // weak bind, lazy bind, export
 
     buf.emit_u32_le(LC_LOAD_DYLINKER)
     buf.emit_u32_le(32)
@@ -257,6 +304,8 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
     pad_to($&buf, text_off)
     buf.emit_bytes(code_bytes)
     pad_to($&buf, le_off)
+    buf.emit_bytes(&bind.bytes)
+    pad_to($&buf, sym_off)
     buf.emit_bytes(&nlist)
     buf.emit_bytes(&strtab)
     if debug {
