@@ -148,6 +148,44 @@ import Darwin
     print("installed-sdk: native-input-clock PASS")
 
 
+def linux_application_object(xu, target, work, env):
+    machine = {"linux-arm64": 183, "linux-x64": 62}.get(target)
+    if machine is None:
+        return
+    env = env.copy()
+    env.pop("XU_UI_PACK", None)
+    project = work / "Linux application object"
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#os
+fn main() {
+    args := os.argv()
+    println(args[1])
+    println(os.getenv("XU_APP_ENTRY_PROBE"))
+}
+''')
+    run([xu, "build", "main.xu", "--emit-obj", "-o", "app.xuobj"], cwd=project, env=env)
+    run([xu, "_elf_o", "app.xuobj", "app.o"], cwd=project, env=env)
+    header = (project / "app.o").read_bytes()[:20]
+    assert header[:6] == b"\x7fELF\x02\x01" and header[16:18] == b"\x01\x00", header
+    assert int.from_bytes(header[18:20], "little") == machine, header
+    cc = shutil.which("cc", path=env["PATH"])
+    if cc:
+        (project / "host.c").write_text('''#include <stdlib.h>
+extern char **environ;
+void xu_app_start(int argc, char **argv, char **envp, long page_size, unsigned long hwcap);
+int main(int argc, char **argv) {
+    if (setenv("XU_APP_ENTRY_PROBE", "C host environment", 1) != 0) return 1;
+    xu_app_start(argc, argv, environ, 4096, 0);
+    return 1;
+}
+''')
+        run([cc, "-fPIE", "-pie", "host.c", "app.o", "-o", "app"], cwd=project, env=env)
+        actual = run([str(project / "app"), "argument with spaces"], cwd=project, env=env).splitlines()
+        assert actual == ["argument with spaces", "C host environment"], actual
+    print("installed-sdk: linux-application-object PASS")
+
+
 def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
     prefix = work / "installed Xu SDK"
     project = work / "user project with spaces"
@@ -240,6 +278,7 @@ fn main() int {
         assert match, (doctor.returncode, doctor.stdout, doctor.stderr)
         assert Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
     macos_input_clock(prefix, project, clean)
+    linux_application_object(xu, manifest["target"], work, clean)
     # Exercise the actual desktop entry and sibling Doctor invocation. The small
     # project deliberately has no icon, so it stops before external GUI builds.
     desktop = subprocess.run([xu, "build", str(project), "--desktop", "--no-webview",
