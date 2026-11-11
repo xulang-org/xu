@@ -1372,7 +1372,7 @@ void xu_ui_emit_close(void) {
   unlock_w(); wake_waiters();
 }
 
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__linux__)
 // A packaged Xu app can run its tasks on the host UI thread. Yield back to
 // the host loop when a mailbox operation needs the host to make progress.
 static thread_local int (*g_wait_pump)(void *, int (*)(void)) = nullptr;
@@ -1398,7 +1398,7 @@ static int wait_for_predicate(Predicate ready, int timeout_ms) {
   if (!timeout_ms) return 0;
   using Clock = std::chrono::steady_clock;
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__linux__)
   while (g_wait_pump && g_wait_yield && Clock::now() < deadline) {
     if (!g_wait_pump(g_wait_state, g_wait_yield)) break;
     if (ready()) return 1;
