@@ -1,0 +1,679 @@
+@runtime/core
+// Runtime core for the clean-architecture compiler.
+//
+// Everything above the machine is ordinary Xu written on five intrinsics
+// that only this package may call:
+//   rt_syscall(nr, a, b, c, d, e, f)  raw system call; errors are -errno
+//   rt_load(addr, width)              read 1, 4 or 8 bytes
+//   rt_store(addr, width, value)      write 1, 4 or 8 bytes
+//   rt_addr(&x)                       address behind a reference
+//   rt_globals()                      process-wide state block (zeroed)
+//
+// Strings and dynamic arrays share one descriptor: {ptr, len, cap} words.
+// Compiler-generated calls pass descriptors and element buffers as raw
+// addresses (int), so these entry points stay independent of element types.
+//
+// Heap blocks carry a 16-byte header: the size class (or, for a block with
+// its own mapping, minus the mapping size) and a live/freed tag. Freed
+// blocks go on a per-class free list. In a debug build (or with
+// XU_DEBUG_FREE set) freed memory is poisoned and never reused, so dangling
+// uses read 0xdb bytes, and a second free is fatal.
+
+// rt_globals() layout, in words.
+const G_ARGC = 0
+const G_ARGV = 1
+const G_HEAP_CUR = 2
+const G_HEAP_END = 3
+// Slots 4 and 5 are written by the backend's entry and syscall stubs.
+const G_ENVP = 4
+// Second result register of the last macOS system call (fork, pipe).
+const G_SYS_R1 = 5
+const G_SCHED = 6
+// Set by testing's soft failures (T.fail); read by the test runner.
+const G_TEST_SOFT = 7
+// 0 until first checked, then 1 (off) or 2 (debug build or XU_DEBUG_FREE).
+const G_DEBUG_FREE = 8
+// Windows: out-parameter scratch word for kernel32 calls (host_win.xu).
+const G_WIN_IO = 9
+// Free-list heads, one word per size class.
+const G_FREE = 16
+// Windows: 12 argument words for pointer calls, then the cache of exports
+// resolved at run time (host_win.xu).
+const G_WIN_ARGS = 48
+const G_WIN_FN = 64
+
+const OS_MACOS = 0
+const OS_LINUX = 1
+const OS_WINDOWS = 2
+const OS_NONE = 3
+const OS_WASI = 4
+
+const ARCH_X64 = 1
+const ARCH_RISCV64 = 4
+const ARCH_LOONG64 = 5
+const ARCH_WASM = 7
+
+const HEAP_CHUNK = 4194304
+
+// The system call layer: WASI runs the Linux paths, emulated in host_wasi.xu.
+fn os_code() int {
+    os := xu_target_os()
+    // WASI and bare metal run the Linux paths on emulated system calls.
+    if os == OS_WASI || os == OS_NONE {
+        << OS_LINUX
+    }
+    << os
+}
+
+// Linux system call numbers in this runtime are the generic (arm64) ones;
+// the x64 syscall stub translates them. Struct layouts and some open(2)
+// flags still differ by architecture.
+fn arch_x64() bool {
+    << xu_target_arch() == ARCH_X64
+}
+
+fn sys_nr_write() int {
+    if os_code() == OS_LINUX { << 64 }
+    << 4
+}
+
+fn sys_nr_exit() int {
+    if os_code() == OS_LINUX { << 94 }
+    << 1
+}
+
+fn sys_nr_mmap() int {
+    if os_code() == OS_LINUX { << 222 }
+    << 197
+}
+
+fn map_anon_flags() int {
+    if os_code() == OS_LINUX { << 34 }
+    << 4098
+}
+
+fn gword(i int) int {
+    << rt_load(rt_globals() + i * 8, 8)
+}
+
+fn set_gword(i int, v int) {
+    rt_store(rt_globals() + i * 8, 8, v)
+}
+
+pub fn exit_process(code int) {
+    if host_win() {
+        win_call(W_EXIT_PROCESS, code, 0, 0, 0, 0, 0)
+    }
+    rt_syscall(sys_nr_exit(), code, 0, 0, 0, 0, 0)
+}
+
+pub fn write_fd(fd int, ptr int, n int) int {
+    $done := 0
+    while done < n {
+        $r := 0
+        if host_win() {
+            r = win_write(fd, ptr + done, n - done)
+        } else {
+            r = rt_syscall(sys_nr_write(), fd, ptr + done, n - done, 0, 0, 0)
+        }
+        if r <= 0 {
+            << done
+        }
+        done += r
+    }
+    << done
+}
+
+fn map_pages(size int) int {
+    if host_win() {
+        // MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+        p := win_call(W_VIRTUAL_ALLOC, 0, size, 0x3000, 4, 0, 0)
+        if p == 0 {
+            fatal_no_memory()
+        }
+        << p
+    }
+    r := rt_syscall(sys_nr_mmap(), 0, size, 3, map_anon_flags(), -1, 0)
+    if r < 0 && r > -4096 {
+        fatal_no_memory()
+    }
+    << r
+}
+
+fn fatal_no_memory() {
+    msg := "fatal error: out of memory\n"
+    write_fd(2, str_ptr(&msg), msg.len)
+    exit_process(2)
+}
+
+// Class c holds blocks of 16 << c bytes; larger requests are mapped alone.
+const NCLASS = 20
+const TAG_LIVE = 0x58554c495645
+const TAG_FREED = 0x585546524545
+
+// Zeroed, 16-byte aligned block of at least size bytes.
+pub fn alloc(size int) int {
+    $n := size
+    if n <= 0 {
+        n = 16
+    }
+    $c := 0
+    while (16 << c) < n {
+        c += 1
+    }
+    if c >= NCLASS {
+        << alloc_big(n)
+    }
+    g := rt_globals()
+    slot := g + (G_FREE + c) * 8
+    head := rt_load(slot, 8)
+    if head != 0 {
+        rt_store(slot, 8, rt_load(head, 8))
+        rt_store(head - 8, 8, TAG_LIVE)
+        mem_zero(head, (n + 15) / 16 * 16)
+        << head
+    }
+    need := 16 + (16 << c)
+    cur := rt_load(g + G_HEAP_CUR * 8, 8)
+    $p := 0
+    if cur != 0 && cur + need <= rt_load(g + G_HEAP_END * 8, 8) {
+        rt_store(g + G_HEAP_CUR * 8, 8, cur + need)
+        p = cur + 16
+    } else {
+        p = heap_carve(need) + 16
+    }
+    rt_store(p - 16, 8, c)
+    rt_store(p - 8, 8, TAG_LIVE)
+    << p
+}
+
+fn heap_carve(n int) int {
+    $cur := gword(G_HEAP_CUR)
+    if cur == 0 || cur + n > gword(G_HEAP_END) {
+        $chunk := HEAP_CHUNK
+        if xu_target_os() == OS_NONE {
+            chunk = 262144
+        }
+        if n > chunk {
+            chunk = (n + 16383) / 16384 * 16384
+        }
+        cur = map_pages(chunk)
+        set_gword(G_HEAP_END, cur + chunk)
+    }
+    set_gword(G_HEAP_CUR, cur + n)
+    << cur
+}
+
+fn alloc_big(n int) int {
+    total := (n + 16 + 16383) / 16384 * 16384
+    m := map_pages(total)
+    rt_store(m, 8, 0 - total)
+    rt_store(m + 8, 8, TAG_LIVE)
+    << m + 16
+}
+
+// Returns block p from alloc to the heap. p must be live: freeing it
+// twice, or freeing a pointer alloc did not return, is fatal.
+pub fn free(p int) {
+    if p == 0 {
+        <<
+    }
+    if rt_load(p - 8, 8) != TAG_LIVE {
+        free_fatal(p)
+    }
+    c := rt_load(p - 16, 8)
+    rt_store(p - 8, 8, TAG_FREED)
+    if debug_free() {
+        $size := 16 << c
+        if c < 0 {
+            size = 0 - c - 16
+        }
+        mem_poison(p, size)
+        <<
+    }
+    if c < 0 {
+        if host_win() {
+            // MEM_RELEASE
+            win_call(W_VIRTUAL_FREE, p - 16, 0, 0x8000, 0, 0, 0)
+        } else {
+            rt_syscall(sys_nr_munmap(), p - 16, 0 - c, 0, 0, 0, 0)
+        }
+        <<
+    }
+    rt_store(p, 8, gword(G_FREE + c))
+    set_gword(G_FREE + c, p)
+}
+
+// Frees p if it is a live alloc block; buffers that never came from alloc
+// are left alone. Under XU_DEBUG_FREE a second free is still fatal.
+fn free_owned(p int) {
+    if p == 0 {
+        <<
+    }
+    tag := rt_load(p - 8, 8)
+    if tag == TAG_LIVE {
+        free(p)
+    } else if tag == TAG_FREED && debug_free() {
+        free_fatal(p)
+    }
+}
+
+fn debug_free() bool {
+    $d := gword(G_DEBUG_FREE)
+    if d == 0 {
+        d = 1
+        if env_set("XU_DEBUG_FREE") {
+            d = 2
+        }
+        set_gword(G_DEBUG_FREE, d)
+    }
+    << d == 2
+}
+
+// Called first by main in a debug build.
+pub fn debug_free_enable() {
+    set_gword(G_DEBUG_FREE, 2)
+}
+
+fn free_fatal(p int) {
+    $msg := "fatal error: free of a block that is not live (double free?)"
+    if rt_load(p - 8, 8) != TAG_FREED {
+        msg = "fatal error: free of a pointer alloc did not return"
+    }
+    print_desc(2, rt_addr(&msg), true)
+    backtrace(2)
+    exit_process(2)
+}
+
+fn mem_poison(p int, n int) {
+    $i := 0
+    while i + 8 <= n {
+        rt_store(p + i, 8, -2604246222170760229)
+        i += 8
+    }
+}
+
+fn sys_nr_munmap() int {
+    if os_code() == OS_LINUX { << 215 }
+    << 73
+}
+
+pub fn mem_zero(p int, n int) {
+    if n > 0 {
+        rt_syscall(-5, p, n, 0, 0, 0, 0)
+    }
+}
+
+pub fn mem_copy(dst int, src int, n int) {
+    if n > 0 {
+        rt_syscall(-4, dst, src, n, 0, 0, 0)
+    }
+}
+
+pub fn mem_eq(a int, b int, n int) bool {
+    $i := 0
+    while i + 8 <= n {
+        if rt_load(a + i, 8) != rt_load(b + i, 8) {
+            << false
+        }
+        i += 8
+    }
+    while i < n {
+        if rt_load(a + i, 1) != rt_load(b + i, 1) {
+            << false
+        }
+        i += 1
+    }
+    << true
+}
+
+// ===== descriptors =====
+
+pub fn desc_ptr(d int) int {
+    << rt_load(d, 8)
+}
+
+pub fn desc_len(d int) int {
+    << rt_load(d + 8, 8)
+}
+
+fn str_ptr(s &string) int {
+    << desc_ptr(rt_addr(s))
+}
+
+fn set_desc(d int, ptr int, n int, cap int) {
+    rt_store(d, 8, ptr)
+    rt_store(d + 8, 8, n)
+    rt_store(d + 16, 8, cap)
+}
+
+// Grow descriptor d so it can hold need elements of esize bytes.
+pub fn desc_reserve(d int, need int, esize int) {
+    cap := rt_load(d + 16, 8)
+    if need <= cap {
+        <<
+    }
+    $ncap := cap * 2
+    if ncap < 4 {
+        ncap = 4
+    }
+    if ncap < need {
+        ncap = need
+    }
+    nbuf := alloc(ncap * esize)
+    old := desc_ptr(d)
+    n := desc_len(d)
+    if n > 0 {
+        mem_copy(nbuf, old, n * esize)
+    }
+    set_desc(d, nbuf, n, ncap)
+    if cap > 0 {
+        free_owned(old)
+    }
+}
+
+// Append the esize bytes at elem to the array described by d.
+pub fn slice_push(d int, elem int, esize int) {
+    n := rt_load(d + 8, 8)
+    if n >= rt_load(d + 16, 8) {
+        desc_reserve(d, n + 1, esize)
+    }
+    if esize == 8 {
+        rt_store(rt_load(d, 8) + n * 8, 8, rt_load(elem, 8))
+    } else {
+        mem_copy(rt_load(d, 8) + n * esize, elem, esize)
+    }
+    rt_store(d + 8, 8, n + 1)
+}
+
+// Write a fresh descriptor at out holding a copy of n bytes at src.
+pub fn bytes_new(out int, src int, n int) {
+    buf := alloc(n + 1)
+    if n > 0 {
+        mem_copy(buf, src, n)
+    }
+    set_desc(out, buf, n, n)
+}
+
+// out = a + b (string concatenation).
+pub fn str_concat(out int, a int, b int) {
+    la := desc_len(a)
+    lb := desc_len(b)
+    buf := alloc(la + lb + 1)
+    if la > 0 {
+        mem_copy(buf, desc_ptr(a), la)
+    }
+    if lb > 0 {
+        mem_copy(buf + la, desc_ptr(b), lb)
+    }
+    set_desc(out, buf, la + lb, la + lb)
+}
+
+// Append string b to the string descriptor at d. A heap buffer with room
+// is extended in place; otherwise d moves to a buffer with doubled
+// capacity. One spare byte keeps the bytes NUL-terminated.
+pub fn str_push(d int, b int) {
+    lb := desc_len(b)
+    if lb == 0 {
+        <<
+    }
+    la := desc_len(d)
+    ptr := desc_ptr(d)
+    cap := rt_load(d + 16, 8)
+    if cap <= la + lb || ptr == 0 || rt_load(ptr - 8, 8) != TAG_LIVE {
+        $ncap := cap * 2
+        if ncap < la + lb + 1 {
+            ncap = la + lb + 1
+        }
+        if ncap < 16 {
+            ncap = 16
+        }
+        nbuf := alloc(ncap)
+        if la > 0 {
+            mem_copy(nbuf, ptr, la)
+        }
+        set_desc(d, nbuf, la, ncap)
+        if cap > 0 {
+            free_owned(ptr)
+        }
+    }
+    mem_copy(desc_ptr(d) + la, desc_ptr(b), lb)
+    rt_store(d + 8, 8, la + lb)
+}
+
+// Free the buffer of the owned string at d (literals have cap 0).
+pub fn str_free(d int) {
+    if rt_load(d + 16, 8) > 0 {
+        free_owned(desc_ptr(d))
+    }
+}
+
+pub fn str_eq(a int, b int) bool {
+    la := desc_len(a)
+    if la != desc_len(b) {
+        << false
+    }
+    << mem_eq(desc_ptr(a), desc_ptr(b), la)
+}
+
+// Bytewise a < b.
+pub fn str_less(a int, b int) bool {
+    la := desc_len(a)
+    lb := desc_len(b)
+    $lim := la
+    if lb < lim {
+        lim = lb
+    }
+    pa := desc_ptr(a)
+    pb := desc_ptr(b)
+    for i in 0:lim {
+        ca := rt_load(pa + i, 1)
+        cb := rt_load(pb + i, 1)
+        if ca != cb {
+            << ca < cb
+        }
+    }
+    << la < lb
+}
+
+// out = s[lo:hi] (bytes copied).
+pub fn str_slice(out int, s int, lo int, hi int) {
+    slice_check(lo, hi, desc_len(s))
+    bytes_new(out, desc_ptr(s) + lo, hi - lo)
+}
+
+// out = a[lo:hi] for an array of esize-byte elements (elements copied).
+pub fn slice_slice(out int, a int, lo int, hi int, esize int) {
+    slice_check(lo, hi, desc_len(a))
+    n := hi - lo
+    buf := alloc(n * esize)
+    if n > 0 {
+        mem_copy(buf, desc_ptr(a) + lo * esize, n * esize)
+    }
+    set_desc(out, buf, n, n)
+}
+
+// out = s.bytes(): one int per byte.
+pub fn str_bytes(out int, s int) {
+    n := desc_len(s)
+    buf := alloc(n * 8 + 8)
+    src := desc_ptr(s)
+    for i in 0:n {
+        rt_store(buf + i * 8, 8, rt_load(src + i, 1))
+    }
+    set_desc(out, buf, n, n)
+}
+
+// out = s.runes(): code points of strict UTF-8; invalid input panics.
+pub fn str_runes(out int, s int) {
+    n := desc_len(s)
+    buf := alloc(n * 8 + 8)
+    src := desc_ptr(s)
+    $i := 0
+    $k := 0
+    while i < n {
+        b0 := rt_load(src + i, 1)
+        $need := 0
+        $cp := b0
+        $min := 0
+        if b0 < 128 {
+            need = 0
+        } else if b0 >= 194 && b0 < 224 {
+            need = 1
+            cp = b0 & 31
+            min = 128
+        } else if b0 >= 224 && b0 < 240 {
+            need = 2
+            cp = b0 & 15
+            min = 2048
+        } else if b0 >= 240 && b0 < 245 {
+            need = 3
+            cp = b0 & 7
+            min = 65536
+        } else {
+            rt_panic(5)
+        }
+        if i + need >= n && need > 0 {
+            rt_panic(5)
+        }
+        for j in 1:need + 1 {
+            c := rt_load(src + i + j, 1)
+            if (c & 192) != 128 {
+                rt_panic(5)
+            }
+            cp = (cp << 6) | (c & 63)
+        }
+        if cp < min || cp > 1114111 || (cp >= 55296 && cp < 57344) {
+            rt_panic(5)
+        }
+        rt_store(buf + k * 8, 8, cp)
+        k += 1
+        i += need + 1
+    }
+    set_desc(out, buf, k, k)
+}
+
+// ===== printing =====
+
+pub fn print_desc(fd int, d int, newline bool) {
+    write_fd(fd, desc_ptr(d), desc_len(d))
+    if newline {
+        $nl := 10
+        write_fd(fd, rt_addr(&nl), 1)
+    }
+}
+
+pub fn print_int(fd int, v int, newline bool) {
+    base := alloc(24)
+    $pos := 24
+    $x := v
+    if x == 0 {
+        pos -= 1
+        rt_store(base + pos, 1, 48)
+    }
+    while x != 0 {
+        $d := x % 10
+        x = x / 10
+        if d < 0 {
+            d = 0 - d
+        }
+        pos -= 1
+        rt_store(base + pos, 1, 48 + d)
+    }
+    if v < 0 {
+        pos -= 1
+        rt_store(base + pos, 1, 45)
+    }
+    write_fd(fd, base + pos, 24 - pos)
+    if newline {
+        $nl := 10
+        write_fd(fd, rt_addr(&nl), 1)
+    }
+}
+
+pub fn print_bool(fd int, b bool, newline bool) {
+    if b {
+        s := "true"
+        print_desc(fd, rt_addr(&s), newline)
+    } else {
+        s := "false"
+        print_desc(fd, rt_addr(&s), newline)
+    }
+}
+
+pub fn index_panic(i int, n int) {
+    rt_panic(1)
+}
+
+// Runtime check failures: 1 index, 2 slice, 3 division by zero,
+// 4 division overflow, 5 invalid utf-8. Messages and exit code match the product compiler.
+pub fn rt_panic(kind int) {
+    if kind == 1 {
+        msg := "index out of bounds"
+        print_desc(2, rt_addr(&msg), true)
+    } else if kind == 2 {
+        msg := "slice out of bounds"
+        print_desc(2, rt_addr(&msg), true)
+    } else if kind == 3 {
+        msg := "division by zero"
+        print_desc(2, rt_addr(&msg), true)
+    } else if kind == 4 {
+        msg := "division overflow"
+        print_desc(2, rt_addr(&msg), true)
+    } else {
+        msg := "invalid utf-8"
+        print_desc(2, rt_addr(&msg), true)
+    }
+    if env_set("XU_BACKTRACE") {
+        backtrace(2)
+    }
+    exit_process(1)
+}
+
+pub fn slice_check(lo int, hi int, n int) {
+    if lo < 0 || hi < lo || hi > n {
+        rt_panic(2)
+    }
+}
+
+pub fn test_soft_fail() {
+    set_gword(G_TEST_SOFT, 1)
+}
+
+// Whether environment variable name is present.
+fn env_set(name string) bool {
+    win_init_args()
+    envp := gword(G_ENVP)
+    if envp == 0 {
+        << false
+    }
+    $i := 0
+    while rt_load(envp + i * 8, 8) != 0 {
+        s := rt_load(envp + i * 8, 8)
+        $j := 0
+        while j < name.len && rt_load(s + j, 1) == name[j] {
+            j += 1
+        }
+        if j == name.len && rt_load(s + j, 1) == 61 {
+            << true
+        }
+        i += 1
+    }
+    << false
+}
+
+// Return addresses up the frame-pointer chain, as offsets from __xu_start
+// (resolve with the map written by XU_SYMMAP at build time).
+pub fn backtrace(fd int) {
+    base := rt_syscall(-3, 0, 0, 0, 0, 0, 0)
+    $fp := rt_syscall(-2, 0, 0, 0, 0, 0, 0)
+    head := "backtrace (offsets from __xu_start):"
+    print_desc(fd, rt_addr(&head), true)
+    $depth := 0
+    while fp != 0 && depth < 32 {
+        lr := rt_load(fp + 8, 8)
+        print_int(fd, lr - base, true)
+        fp = rt_load(fp, 8)
+        depth += 1
+    }
+}

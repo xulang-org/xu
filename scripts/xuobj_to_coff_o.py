@@ -22,6 +22,7 @@ FK_RIP32 = 1
 HOST_SYMS = frozenset(
     {
         "xu_ui_host_run",
+        "xu_ui_host_run_cooperative",
         "xu_ui_mem_try_write",
         "xu_ui_mem_try_read_len",
         "xu_ui_mem_try_read_copy",
@@ -158,7 +159,7 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
     if "_start" in local:
         defined.append(("xu_app_start", 1, local["_start"][0]))
 
-    undef: set[str] = set(HOST_SYMS)
+    undef: set[str] = set()
     for _kind, _roff, lab in pending:
         if lab in HOST_SYMS:
             undef.add(lab)

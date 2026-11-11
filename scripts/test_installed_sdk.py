@@ -263,12 +263,16 @@ fn main() int {
     for arguments in (["argument with spaces", 'quote"value\\'], ["", ""], ['space and \\', 'two\\\\"quotes']):
         actual = run([xu, "run", "args.xu", "--", *arguments], cwd=project, env=active).splitlines()
         assert actual == arguments, (arguments, actual)
+    arguments = ["-O0", "-O2"]
+    actual = run([xu, "run", "args.xu", "-O3", "--", *arguments], cwd=project, env=active).splitlines()
+    assert actual == arguments, (arguments, actual)
     # Exercise optimized compilation and child execution in the installed CLI.
     # All input is created in the user's temporary project, independent of tests/.
     (project / "loop.xu").write_text('@main\nfn main() int {\n    $total := 0\n    $i := 0\n    while i < 32768 {\n        total = total + i\n        i = i + 1\n    }\n    println(total)\n    << 0\n}\n')
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
+        assert run([xu, "run", "loop.xu", level], cwd=project, env=active).strip() == "536854528"
     # Native map adapters must preserve the coroutine context when calling
     # ordinary Xu hashing and growth policy functions with entry stack guards.
     (project / "map_worker.xu").write_text('''@main
@@ -295,9 +299,8 @@ fn main() {
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "map_worker.xu", level, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "65024"
-    # Aggregate container borrows cross an ascending-buffer / descending-frame
-    # ABI boundary. Verify shared calls, mutable methods, function values and
-    # exceptional writeback without corrupting adjacent packed records.
+    # Verify shared calls, mutable methods, function values and mutation on
+    # error paths without corrupting adjacent packed records.
     (project / "borrow_record.xu").write_text('''@main
 #errors
 struct Record { value int
@@ -377,26 +380,40 @@ fn main() int {
         run([xu, "build", "borrow_record.xu", level, "-o", str(program)], cwd=project, env=active)
         actual = run([str(program)], cwd=project, env=active).splitlines()
         assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81", "40", "3", "183", "71", "40", "8", "1", "2", "5", "6"], actual
-    # A frame view cannot be returned as a borrowed container identity.
-    # Keep this expected-error entry point out of the main smoke project.
-    # Desktop builds discover sibling Xu sources, so leaving another @main
-    # here makes the later tooltip smoke fail with a duplicate main instead
-    # of exercising the installed UI modules.
-    borrow_project = work / "borrow escape project"
+    # Returned element borrows alias their original storage while the owner
+    # is live. Keep these entry points separate from the desktop smoke app.
+    borrow_project = work / "borrow lifetime project"
     borrow_project.mkdir()
+    (borrow_project / "borrow_element.xu").write_text('''@main
+struct Record { value int
+ guard int }
+fn identity(r $&Record) $&Record { << r }
+fn main() {
+    $records := [Record{value: 1, guard: 101}, Record{value: 2, guard: 202}]
+    i := 1
+    r := identity($&records[i])
+    r.value = 3
+    println(r.guard)
+    println(records[i].value)
+    println(records[0].value)
+}
+''')
+    actual = run([xu, "run", "borrow_element.xu", "-O2"], cwd=borrow_project, env=active).splitlines()
+    assert actual == ["202", "3", "1"], actual
     (borrow_project / "borrow_escape.xu").write_text('''@main
 fn identity(s &string) &string { << s }
-fn main() int {
+fn escape(source &string) &string {
     words := ["one", "two"]
-    i := 1
-    r := identity(&words[i])
-    println(r.len)
-    << 0
+    << identity(&words[1])
+}
+fn main() {
+    source := "source"
+    println(escape(&source).len)
 }
 ''')
     rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=borrow_project,
                               env=active, text=True, capture_output=True, timeout=90)
-    assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
+    assert rejected.returncode != 0 and "cannot return a reference to local data" in rejected.stderr, (rejected.stdout, rejected.stderr)
     # Passive help has deterministic hover delay, dismissal and edge placement.
     # An ordinary build must remain a plain executable even with UI imports;
     # no native GUI host, brand icon, or external GUI toolchain is needed.

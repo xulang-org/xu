@@ -1,0 +1,923 @@
+@xu/codegen
+// Baseline WebAssembly module emission for typed MIR (wasm32 + WASI).
+//
+// Values are i64 words, like the native backends; addresses are 32-bit
+// linear-memory offsets held in those words. Temps become wasm locals (no
+// MIR instruction takes a temp's address); locals live in a frame below the
+// stack-pointer global $sp. Every MIR function has type (i64 * nparams) ->
+// i64. Blocks are dispatched by a loop around nested blocks and br_table on
+// the block number; a jump to the next block falls through.
+//
+// Function values are table indices plus one (0 stays null). The runtime's
+// rt_syscall reaches __xu_syscall: WASI_SLOT_BASE + k calls WASI import k
+// with its arguments in a..f, WASI_SLOT_BASE + 4096 + k reads them from the
+// word array at a; -4/-5 copy/zero memory, -7 grows memory by a bytes and
+// returns the old end (or -ENOMEM). Task switches (-1) trap: wasm cannot
+// switch stacks. Other numbers fail with -ENOSYS.
+//
+// Linear memory: the runtime state block at WASM_GLOBALS, string data from
+// WASM_DATA, then the frame stack (WASM_STACK bytes, growing down) and the
+// heap, which grows the memory.
+
+#xu/mir
+#xu/mc
+
+const WASM_GLOBALS = 4096
+const WASM_DATA = 131072
+const WASM_STACK = 8388608
+const WASI_SLOT_BASE = 65536
+
+// Defined functions before the MIR ones.
+const WF_SYSCALL = 0
+const WF_GLOBALS = 1
+const WF_DIV = 2
+const WF_MOD = 3
+const WF_TRAP = 4
+const WF_START = 5
+const WF_FIRST_MIR = 6
+
+pub fn wasi_import_names() []string {
+    << ["args_get", "args_sizes_get", "environ_get", "environ_sizes_get", "clock_time_get", "fd_close", "fd_read", "fd_write", "fd_seek", "fd_filestat_get", "fd_readdir", "fd_prestat_get", "fd_prestat_dir_name", "path_create_directory", "path_filestat_get", "path_open", "path_readlink", "path_remove_directory", "path_rename", "path_symlink", "path_unlink_file", "poll_oneoff", "proc_exit", "random_get", "sched_yield", "fd_fdstat_get"]
+}
+
+// Parameter kinds (i = i32, l = i64) per import; every result is an i32
+// errno except proc_exit's.
+fn wasi_import_params() []string {
+    << ["ii", "ii", "ii", "ii", "ili", "i", "iiii", "iiii", "ilii", "ii", "iiili", "ii", "iii", "iii", "iiiii", "iiiiillii", "iiiiii", "iii", "iiiiii", "iiiii", "iii", "iiii", "i", "ii", "", "ii"]
+}
+
+const WASI_PROC_EXIT = 22
+
+// ===== byte encoding =====
+
+fn wu(b $&[]int, v int) {
+    $n := v
+    while n >= 128 {
+        b.push((n & 127) | 128)
+        n = n >> 7
+    }
+    b.push(n)
+}
+
+fn ws(b $&[]int, v int) {
+    $n := v
+    while true {
+        x := n & 127
+        n = n >> 7
+        if (n == 0 && (x & 64) == 0) || (n == -1 && (x & 64) != 0) {
+            b.push(x)
+            <-
+        }
+        b.push(x | 128)
+    }
+}
+
+fn wname(b $&[]int, s string) {
+    wu(b, s.len)
+    for i in 0:s.len {
+        b.push(s[i])
+    }
+}
+
+fn wbytes(b $&[]int, v &[]int) {
+    for i in 0:v.len {
+        b.push(v[i])
+    }
+}
+
+fn wsection(out $&[]int, id int, body &[]int) {
+    out.push(id)
+    wu(out, body.len)
+    wbytes(out, body)
+}
+
+fn wi32(b $&[]int, v int) {
+    b.push(0x41)
+    ws(b, v)
+}
+
+fn wi64(b $&[]int, v int) {
+    b.push(0x42)
+    ws(b, v)
+}
+
+fn wget(b $&[]int, i int) {
+    b.push(0x20)
+    wu(b, i)
+}
+
+fn wset(b $&[]int, i int) {
+    b.push(0x21)
+    wu(b, i)
+}
+
+fn wcall(b $&[]int, f int) {
+    b.push(0x10)
+    wu(b, f)
+}
+
+// Memory access with alignment hint 0 and a non-negative offset.
+fn wmem(b $&[]int, op int, off int) {
+    b.push(op)
+    wu(b, 0)
+    wu(b, off)
+}
+
+fn wbr(b $&[]int, depth int) {
+    b.push(0x0C)
+    wu(b, depth)
+}
+
+// ===== label lookup (open addressing on FNV-1a) =====
+
+struct WLabels {
+    names []string
+    slots []int
+}
+
+fn wl_hash(s &string) int {
+    $h := 2166136261
+    for i in 0:s.len {
+        h = ((h ^ s[i]) * 16777619) & 4294967295
+    }
+    << h
+}
+
+fn wl_new(names &[]string) WLabels {
+    $cap := 16
+    while cap < names.len * 2 {
+        cap = cap * 2
+    }
+    $t := WLabels{names: []string{}, slots: []int{}}
+    for i in 0:cap {
+        t.slots.push(-1)
+    }
+    for i in 0:names.len {
+        t.names.push(names[i] + "")
+        $h := wl_hash(&names[i]) & (cap - 1)
+        while t.slots[h] >= 0 {
+            h = (h + 1) & (cap - 1)
+        }
+        t.slots[h] = i
+    }
+    << t
+}
+
+fn (t &WLabels) find(s &string) int {
+    key := ~s
+    cap := t.slots.len
+    $h := wl_hash(s) & (cap - 1)
+    while t.slots[h] >= 0 {
+        if t.names[t.slots[h]] == key {
+            << t.slots[h]
+        }
+        h = (h + 1) & (cap - 1)
+    }
+    << -1
+}
+
+// ===== types =====
+
+// Type index of signature (params, results) as i/l strings, added on
+// first use.
+fn wtype(types $&[]string, params string, results string) int {
+    key := params + ">" + results
+    for i in 0:types.len {
+        if types[i] == key {
+            << i
+        }
+    }
+    types.push(key)
+    << types.len - 1
+}
+
+fn wtype_mir(types $&[]string, n int) int {
+    $p := ""
+    for i in 0:n {
+        p.push_byte(108)
+    }
+    << wtype(types, p, "l")
+}
+
+fn wval_type(b $&[]int, c int) {
+    if c == 105 {
+        b.push(0x7F)
+    } else {
+        b.push(0x7E)
+    }
+}
+
+// ===== module =====
+
+struct WCtx {
+    nimports int
+    labels WLabels
+    types []string
+    data []int
+    unresolved []string
+}
+
+fn (w $&WCtx) fn_index(label &string) int {
+    i := w.labels.find(label)
+    if i < 0 {
+        << -1
+    }
+    << w.nimports + WF_FIRST_MIR + i
+}
+
+// Table index + 1 of a function value; __xu_task_entry (and anything
+// unknown) is the trap function.
+fn (w $&WCtx) fn_value(label &string) int {
+    i := w.labels.find(label)
+    if i < 0 {
+        << w.labels.names.len + 1
+    }
+    << i + 1
+}
+
+fn (w $&WCtx) str_addr(s &string) int {
+    addr := WASM_DATA + w.data.len
+    for i in 0:s.len {
+        w.data.push(s[i])
+    }
+    w.data.push(0)
+    while w.data.len % 8 != 0 {
+        w.data.push(0)
+    }
+    << addr
+}
+
+// Builds the whole module into cb. Returns the number of unresolved call
+// targets (reported on stdout).
+pub fn emit_wasm_module(m &mir.Mir, cb $&mc.CodeBuffer, main_label string) int {
+    imports := wasi_import_names()
+    iparams := wasi_import_params()
+    $names := []string{}
+    for i in 0:m.fns.len {
+        names.push(m.fns[i].label + "")
+    }
+    $w := WCtx{nimports: imports.len, labels: wl_new(&names), types: []string{}, data: []int{}, unresolved: []string{}}
+    $import_types := []int{}
+    for i in 0:imports.len {
+        $res := "i"
+        if i == WASI_PROC_EXIT {
+            res = ""
+        }
+        import_types.push(wtype($&w.types, iparams[i] + "", res))
+    }
+    // Defined function types: syscall, globals, div, mod, trap, start.
+    $def_types := []int{}
+    def_types.push(wtype_mir($&w.types, 7))
+    def_types.push(wtype_mir($&w.types, 0))
+    def_types.push(wtype_mir($&w.types, 2))
+    def_types.push(wtype_mir($&w.types, 2))
+    def_types.push(wtype_mir($&w.types, 0))
+    def_types.push(wtype($&w.types, "", ""))
+    for i in 0:m.fns.len {
+        def_types.push(wtype_mir($&w.types, m.fns[i].nparams))
+    }
+    // Bodies first: they add call_indirect types and string data.
+    $bodies := []int{}
+    $body := []int{}
+    $sys_fn := -1
+    for i in 0:names.len {
+        if names[i] == "_xu_runtime_core_wasi_sys" {
+            sys_fn = imports.len + WF_FIRST_MIR + i
+        }
+    }
+    wasm_syscall_body($&body, imports.len, &iparams, sys_fn)
+    wu($&bodies, body.len)
+    wbytes($&bodies, &body)
+    body = [0, 0x41]
+    ws($&body, WASM_GLOBALS)
+    body.push(0xAD)
+    body.push(0x0B)
+    wu($&bodies, body.len)
+    wbytes($&bodies, &body)
+    body = []int{}
+    wasm_divmod_body($&body, false)
+    wu($&bodies, body.len)
+    wbytes($&bodies, &body)
+    body = []int{}
+    wasm_divmod_body($&body, true)
+    wu($&bodies, body.len)
+    wbytes($&bodies, &body)
+    body = [0, 0x00, 0x0B]
+    wu($&bodies, body.len)
+    wbytes($&bodies, &body)
+    body = [0]
+    main_i := w.fn_index(&main_label)
+    if main_i < 0 {
+        w.unresolved.push(main_label + "")
+    } else {
+        wcall($&body, main_i)
+    }
+    // i32.wrap_i64
+    body.push(0xA7)
+    wcall($&body, WASI_PROC_EXIT)
+    body.push(0x0B)
+    wu($&bodies, body.len)
+    wbytes($&bodies, &body)
+    for i in 0:m.fns.len {
+        body = []int{}
+        wasm_fn_body($&w, &m.fns[i], $&body)
+        wu($&bodies, body.len)
+        wbytes($&bodies, &body)
+    }
+
+    $out := [0, 97, 115, 109, 1, 0, 0, 0]
+    // 1 types
+    $sec := []int{}
+    wu($&sec, w.types.len)
+    for i in 0:w.types.len {
+        t := w.types[i] + ""
+        $gt := 0
+        while t[gt] != 62 {
+            gt += 1
+        }
+        sec.push(0x60)
+        wu($&sec, gt)
+        for j in 0:gt {
+            wval_type($&sec, t[j])
+        }
+        wu($&sec, t.len - gt - 1)
+        for j in gt + 1:t.len {
+            wval_type($&sec, t[j])
+        }
+    }
+    wsection($&out, 1, &sec)
+    // 2 imports
+    sec = []int{}
+    wu($&sec, imports.len)
+    for i in 0:imports.len {
+        wname($&sec, "wasi_snapshot_preview1")
+        wname($&sec, imports[i] + "")
+        sec.push(0)
+        wu($&sec, import_types[i])
+    }
+    wsection($&out, 2, &sec)
+    // 3 functions
+    sec = []int{}
+    wu($&sec, def_types.len)
+    for i in 0:def_types.len {
+        wu($&sec, def_types[i])
+    }
+    wsection($&out, 3, &sec)
+    // 4 table: slot 0 null, the MIR functions, then the trap function.
+    ntab := m.fns.len + 2
+    sec = [1, 0x70, 0]
+    wu($&sec, ntab)
+    wsection($&out, 4, &sec)
+    // 5 memory: initial pages cover data and the stack.
+    data_end := WASM_DATA + w.data.len
+    stack_top := (data_end + 65535) / 65536 * 65536 + WASM_STACK
+    sec = [1, 0]
+    wu($&sec, stack_top / 65536)
+    wsection($&out, 5, &sec)
+    // 6 globals: $sp
+    sec = [1, 0x7F, 1, 0x41]
+    ws($&sec, stack_top)
+    sec.push(0x0B)
+    wsection($&out, 6, &sec)
+    // 7 exports
+    sec = [2]
+    wname($&sec, "memory")
+    sec.push(2)
+    wu($&sec, 0)
+    wname($&sec, "_start")
+    sec.push(0)
+    wu($&sec, imports.len + WF_START)
+    wsection($&out, 7, &sec)
+    // 9 elements: table[1..] = MIR functions, then trap.
+    sec = [1, 0, 0x41, 1, 0x0B]
+    wu($&sec, m.fns.len + 1)
+    for i in 0:m.fns.len {
+        wu($&sec, imports.len + WF_FIRST_MIR + i)
+    }
+    wu($&sec, imports.len + WF_TRAP)
+    wsection($&out, 9, &sec)
+    // 12 data count (memory.copy / memory.fill need bulk memory, not it).
+    // 10 code
+    sec = []int{}
+    wu($&sec, def_types.len)
+    wbytes($&sec, &bodies)
+    wsection($&out, 10, &sec)
+    // 11 data
+    sec = [1, 0, 0x41]
+    ws($&sec, WASM_DATA)
+    sec.push(0x0B)
+    wu($&sec, w.data.len)
+    wbytes($&sec, &w.data)
+    wsection($&out, 11, &sec)
+    // custom "name": function names
+    $fnames := []int{}
+    wu($&fnames, imports.len + def_types.len)
+    for i in 0:imports.len {
+        wu($&fnames, i)
+        wname($&fnames, imports[i] + "")
+    }
+    stub_names := ["__xu_syscall", "__xu_globals", "__xu_div", "__xu_mod", "__xu_trap", "_start"]
+    for i in 0:stub_names.len {
+        wu($&fnames, imports.len + i)
+        wname($&fnames, stub_names[i] + "")
+    }
+    for i in 0:m.fns.len {
+        wu($&fnames, imports.len + WF_FIRST_MIR + i)
+        wname($&fnames, m.fns[i].label + "")
+    }
+    sec = []int{}
+    wname($&sec, "name")
+    sec.push(1)
+    wu($&sec, fnames.len)
+    wbytes($&sec, &fnames)
+    wsection($&out, 0, &sec)
+
+    for i in 0:out.len {
+        cb.emit_u8(out[i])
+    }
+    for i in 0:w.unresolved.len {
+        println("unresolved symbol: " + w.unresolved[i])
+    }
+    << w.unresolved.len
+}
+
+// a / b or a % b with the arm64 results: x / 0 == 0, x % 0 == x,
+// INT_MIN / -1 wraps, x % -1 == 0.
+fn wasm_divmod_body(b $&[]int, is_mod bool) {
+    b.push(0)
+    // if b == 0
+    wget(b, 1)
+    b.push(0x50)
+    b.push(0x04)
+    b.push(0x40)
+    if is_mod {
+        wget(b, 0)
+    } else {
+        wi64(b, 0)
+    }
+    b.push(0x0F)
+    b.push(0x0B)
+    // if b == -1
+    wget(b, 1)
+    wi64(b, -1)
+    b.push(0x51)
+    b.push(0x04)
+    b.push(0x40)
+    if is_mod {
+        wi64(b, 0)
+    } else {
+        wi64(b, 0)
+        wget(b, 0)
+        b.push(0x7D)
+    }
+    b.push(0x0F)
+    b.push(0x0B)
+    wget(b, 0)
+    wget(b, 1)
+    if is_mod {
+        b.push(0x81)
+    } else {
+        b.push(0x7F)
+    }
+    b.push(0x0B)
+}
+
+// __xu_syscall(nr, a, b, c, d, e, f): params 0..6, local 7 is an i32.
+// Anything not handled here goes to sys_fn (the runtime's emulation of the
+// Linux system calls on WASI), or fails with -ENOSYS.
+fn wasm_syscall_body(b $&[]int, nimports int, iparams &[]string, sys_fn int) {
+    b.push(1)
+    b.push(1)
+    b.push(0x7F)
+    // -4: memory.copy(a, b, c)
+    wasm_if_nr(b, -4)
+    for i in 1:4 {
+        wget(b, i)
+        b.push(0xA7)
+    }
+    b.push(0xFC)
+    wu(b, 10)
+    b.push(0)
+    b.push(0)
+    wi64(b, 0)
+    b.push(0x0F)
+    b.push(0x0B)
+    // -5: memory.fill(a, 0, b)
+    wasm_if_nr(b, -5)
+    wget(b, 1)
+    b.push(0xA7)
+    wi32(b, 0)
+    wget(b, 2)
+    b.push(0xA7)
+    b.push(0xFC)
+    wu(b, 11)
+    b.push(0)
+    wi64(b, 0)
+    b.push(0x0F)
+    b.push(0x0B)
+    // -7: memory.grow by a bytes; old end, or -ENOMEM.
+    wasm_if_nr(b, -7)
+    wget(b, 1)
+    wi64(b, 65535)
+    b.push(0x7C)
+    wi64(b, 16)
+    b.push(0x88)
+    b.push(0xA7)
+    b.push(0x40)
+    b.push(0)
+    b.push(0x22)
+    wu(b, 7)
+    wi32(b, -1)
+    b.push(0x46)
+    b.push(0x04)
+    b.push(0x7E)
+    wi64(b, -12)
+    b.push(0x05)
+    wget(b, 7)
+    b.push(0xAD)
+    wi64(b, 16)
+    b.push(0x86)
+    b.push(0x0B)
+    b.push(0x0F)
+    b.push(0x0B)
+    // -1: task switch
+    wasm_if_nr(b, -1)
+    b.push(0x00)
+    b.push(0x0B)
+    // -2 / -3: no frame chain or code addresses to report.
+    wasm_if_nr(b, -2)
+    wi64(b, 0)
+    b.push(0x0F)
+    b.push(0x0B)
+    wasm_if_nr(b, -3)
+    wi64(b, 0)
+    b.push(0x0F)
+    b.push(0x0B)
+    for k in 0:nimports {
+        p := iparams[k] + ""
+        for mode in 0:2 {
+            if mode == 0 && p.len > 6 {
+                ->
+            }
+            wasm_if_nr(b, WASI_SLOT_BASE + mode * 4096 + k)
+            for j in 0:p.len {
+                if mode == 0 {
+                    wget(b, j + 1)
+                } else {
+                    wget(b, 1)
+                    b.push(0xA7)
+                    wmem(b, 0x29, j * 8)
+                }
+                if p[j] == 105 {
+                    b.push(0xA7)
+                }
+            }
+            wcall(b, k)
+            if k == WASI_PROC_EXIT {
+                wi64(b, 0)
+            } else {
+                b.push(0xAD)
+            }
+            b.push(0x0F)
+            b.push(0x0B)
+        }
+    }
+    if sys_fn >= 0 {
+        for i in 0:7 {
+            wget(b, i)
+        }
+        wcall(b, sys_fn)
+    } else {
+        wi64(b, -38)
+    }
+    b.push(0x0B)
+}
+
+// if (nr == v) {
+fn wasm_if_nr(b $&[]int, v int) {
+    wget(b, 0)
+    wi64(b, v)
+    b.push(0x51)
+    b.push(0x04)
+    b.push(0x40)
+}
+
+struct WFrameW {
+    size int
+    local_off []int
+    // wasm local index of temp 0, of $fp and of $bb
+    temp0 int
+    fp int
+    bb int
+}
+
+fn wasm_frame(f &mir.MFn) WFrameW {
+    $off := 0
+    $loffs := []int{}
+    for i in 0:f.locals.len {
+        loffs.push(off)
+        $n := 1
+        if i < f.locals_nslots.len && f.locals_nslots[i] > 1 {
+            n = f.locals_nslots[i]
+        }
+        off += n * 8
+    }
+    t0 := f.nparams
+    << WFrameW{size: (off + 15) / 16 * 16, local_off: loffs, temp0: t0, fp: t0 + f.temps.len, bb: t0 + f.temps.len + 1}
+}
+
+fn wasm_operand(b $&[]int, f &mir.MFn, fr &WFrameW, v int) {
+    if v <= -2 {
+        wi64(b, f.consts[0 - v - 2])
+    } else if v >= 0 && v < f.temps.len {
+        wget(b, fr.temp0 + v)
+    } else {
+        wi64(b, 0)
+    }
+}
+
+fn wasm_set_temp(b $&[]int, f &mir.MFn, fr &WFrameW, t int) {
+    if t >= 0 && t < f.temps.len {
+        wset(b, fr.temp0 + t)
+    } else {
+        b.push(0x1A)
+    }
+}
+
+// i32 address of operand v plus off; returns the remaining memarg offset.
+fn wasm_addr(b $&[]int, f &mir.MFn, fr &WFrameW, v int, off int) int {
+    wasm_operand(b, f, fr, v)
+    b.push(0xA7)
+    if off >= 0 && off < 1073741824 {
+        << off
+    }
+    wi32(b, off)
+    b.push(0x6A)
+    << 0
+}
+
+fn wasm_bin(b $&[]int, w $&WCtx, op int) {
+    if op >= mir.BIN_FEQ && op <= mir.BIN_FGE {
+        $c := 0x61
+        if op == mir.BIN_FNE { c = 0x62 }
+        else if op == mir.BIN_FLT { c = 0x63 }
+        else if op == mir.BIN_FGT { c = 0x64 }
+        else if op == mir.BIN_FLE { c = 0x65 }
+        else if op == mir.BIN_FGE { c = 0x66 }
+        b.push(c)
+        b.push(0xAD)
+        <<
+    }
+    if op >= mir.BIN_FADD && op <= mir.BIN_FDIV {
+        b.push(0xA0 + op - mir.BIN_FADD)
+        b.push(0xBD)
+        <<
+    }
+    if op == mir.BIN_DIV {
+        wcall(b, w.nimports + WF_DIV)
+        <<
+    }
+    if op == mir.BIN_MOD {
+        wcall(b, w.nimports + WF_MOD)
+        <<
+    }
+    $c := 0
+    if op == mir.BIN_ADD { c = 0x7C }
+    else if op == mir.BIN_SUB { c = 0x7D }
+    else if op == mir.BIN_MUL { c = 0x7E }
+    else if op == mir.BIN_AND { c = 0x83 }
+    else if op == mir.BIN_OR { c = 0x84 }
+    else if op == mir.BIN_XOR { c = 0x85 }
+    else if op == mir.BIN_SHL { c = 0x86 }
+    else if op == mir.BIN_SHR { c = 0x87 }
+    if c != 0 {
+        b.push(c)
+        <<
+    }
+    c = 0x51
+    if op == mir.BIN_NE { c = 0x52 }
+    else if op == mir.BIN_LT { c = 0x53 }
+    else if op == mir.BIN_GT { c = 0x55 }
+    else if op == mir.BIN_LE { c = 0x57 }
+    else if op == mir.BIN_GE { c = 0x59 }
+    b.push(c)
+    b.push(0xAD)
+}
+
+fn wasm_ret(b $&[]int, fr &WFrameW) {
+    wget(b, fr.fp)
+    wi32(b, fr.size)
+    b.push(0x6A)
+    b.push(0x24)
+    wu(b, 0)
+    b.push(0x0F)
+}
+
+// Jump to block t from the code of block bi (n blocks).
+fn wasm_goto(b $&[]int, fr &WFrameW, bi int, n int, t int, extra int) {
+    wi32(b, t)
+    wset(b, fr.bb)
+    wbr(b, n - 1 - bi + extra)
+}
+
+fn wasm_fn_body(w $&WCtx, f &mir.MFn, b $&[]int) {
+    fr := wasm_frame(f)
+    // locals: temps (i64), then $fp and $bb (i32)
+    $groups := 1
+    if f.temps.len > 0 {
+        groups = 2
+    }
+    wu(b, groups)
+    if f.temps.len > 0 {
+        wu(b, f.temps.len)
+        b.push(0x7E)
+    }
+    wu(b, 2)
+    b.push(0x7F)
+    // fp = sp = sp - size
+    b.push(0x23)
+    wu(b, 0)
+    wi32(b, fr.size)
+    b.push(0x6B)
+    b.push(0x22)
+    wu(b, fr.fp)
+    b.push(0x24)
+    wu(b, 0)
+    for i in 0:f.nparams {
+        if i < fr.local_off.len {
+            wget(b, fr.fp)
+            wget(b, i)
+            wmem(b, 0x37, fr.local_off[i])
+        }
+    }
+    n := f.blocks.len
+    if n == 0 {
+        wi64(b, 0)
+        wasm_ret(b, &fr)
+        b.push(0x0B)
+        <<
+    }
+    b.push(0x03)
+    b.push(0x40)
+    for i in 0:n {
+        b.push(0x02)
+        b.push(0x40)
+    }
+    wget(b, fr.bb)
+    b.push(0x0E)
+    wu(b, n)
+    for i in 0:n {
+        wu(b, i)
+    }
+    wu(b, 0)
+    for bi in 0:n {
+        b.push(0x0B)
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            wasm_instr(w, f, &fr, b, &ins)
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        if blk.tkind == mir.TKIND_RETURN {
+            wasm_operand(b, f, &fr, blk.ta)
+            wasm_ret(b, &fr)
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                wasm_goto(b, &fr, bi, n, blk.ta, 0)
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            wasm_operand(b, f, &fr, blk.ta)
+            wi64(b, 0)
+            b.push(0x52)
+            if blk.tc == bi + 1 {
+                b.push(0x04)
+                b.push(0x40)
+                wasm_goto(b, &fr, bi, n, blk.tb, 1)
+                b.push(0x0B)
+            } else {
+                // bb = cond ? tb : tc
+                b.push(0x04)
+                b.push(0x7F)
+                wi32(b, blk.tb)
+                b.push(0x05)
+                wi32(b, blk.tc)
+                b.push(0x0B)
+                wset(b, fr.bb)
+                wbr(b, n - 1 - bi)
+            }
+        } else {
+            wi64(b, 0)
+            wasm_ret(b, &fr)
+        }
+    }
+    // end loop
+    b.push(0x0B)
+    b.push(0x00)
+    b.push(0x0B)
+}
+
+fn wasm_instr(w $&WCtx, f &mir.MFn, fr &WFrameW, b $&[]int, ins &mir.MInstr) {
+    k := ins.kind
+    if k == mir.MI_LOAD_LOCAL {
+        $wd := ins.c
+        if wd < 0 { wd = 0 }
+        wget(b, fr.fp)
+        wmem(b, 0x29, fr.local_off[ins.b] + wd * 8)
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_STORE_LOCAL {
+        $wd := ins.c
+        if wd < 0 { wd = 0 }
+        wget(b, fr.fp)
+        wasm_operand(b, f, fr, ins.b)
+        wmem(b, 0x37, fr.local_off[ins.a] + wd * 8)
+    } else if k == mir.MI_ADDR {
+        wget(b, fr.fp)
+        wi32(b, fr.local_off[ins.b])
+        b.push(0x6A)
+        b.push(0xAD)
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_LOAD_PTR {
+        off := wasm_addr(b, f, fr, ins.b, ins.c)
+        $op := 0x29
+        if ins.d == 1 { op = 0x31 }
+        else if ins.d == 2 { op = 0x33 }
+        else if ins.d == 4 { op = 0x35 }
+        else if ins.d == -4 { op = 0x34 }
+        wmem(b, op, off)
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_STORE_PTR {
+        off := wasm_addr(b, f, fr, ins.a, ins.c)
+        wasm_operand(b, f, fr, ins.b)
+        $op := 0x37
+        if ins.d == 1 { op = 0x3C }
+        else if ins.d == 2 { op = 0x3D }
+        else if ins.d == 4 || ins.d == -4 { op = 0x3E }
+        wmem(b, op, off)
+    } else if k == mir.MI_BIN {
+        fl := ins.b >= mir.BIN_FADD && ins.b <= mir.BIN_FGE
+        wasm_operand(b, f, fr, ins.c)
+        if fl { b.push(0xBF) }
+        wasm_operand(b, f, fr, ins.d)
+        if fl { b.push(0xBF) }
+        wasm_bin(b, w, ins.b)
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_UN {
+        wasm_operand(b, f, fr, ins.c)
+        if ins.b == mir.UN_I2F {
+            b.push(0xB9)
+            b.push(0xBD)
+        } else if ins.b == mir.UN_F2I {
+            // i64.trunc_sat_f64_s saturates and maps NaN to 0, like fcvtzs.
+            b.push(0xBF)
+            b.push(0xFC)
+            wu(b, 6)
+        } else {
+            b.push(0x00)
+        }
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_COPY {
+        wasm_operand(b, f, fr, ins.b)
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+        $a := ins.c
+        $nargs := 0
+        while a >= 0 {
+            wasm_operand(b, f, fr, f.margs[a].v)
+            nargs += 1
+            a = f.margs[a].next
+        }
+        if k == mir.MI_CALL_IND {
+            wasm_operand(b, f, fr, ins.b)
+            b.push(0xA7)
+            b.push(0x11)
+            wu(b, wtype_mir($&w.types, nargs))
+            wu(b, 0)
+        } else {
+            $idx := w.fn_index(&ins.sval)
+            if ins.sval == "__xu_syscall" {
+                idx = w.nimports + WF_SYSCALL
+            } else if ins.sval == "__xu_globals" {
+                idx = w.nimports + WF_GLOBALS
+            }
+            if idx < 0 {
+                w.unresolved.push(ins.sval + "")
+                idx = w.nimports + WF_TRAP
+                for i in 0:nargs {
+                    b.push(0x1A)
+                }
+            }
+            wcall(b, idx)
+        }
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_STR_CONST {
+        wi64(b, w.str_addr(&ins.sval))
+        wasm_set_temp(b, f, fr, ins.a)
+    } else if k == mir.MI_LOAD_FN_ADDR {
+        wi64(b, w.fn_value(&ins.sval))
+        wasm_set_temp(b, f, fr, ins.a)
+    } else {
+        // Unknown kinds are a lowering bug; trap loudly at run time.
+        b.push(0x00)
+    }
+}

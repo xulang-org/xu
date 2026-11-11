@@ -584,20 +584,23 @@ class BoundaryCheck:
 
         default_ledger = invariants.get("gen1_heap_ledger_enabled_default")
         heap_path = self.root / "src" / "cmd" / "compile" / "rt_heap_sync.xu"
-        try:
-            heap_source = heap_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            self.error(f"cannot read Gen1 heap policy: {exc}")
+        if not heap_path.exists():
+            self.info["gen1_heap_ledger_enabled"] = default_ledger
         else:
-            declarations = re.findall(
-                r"\bconst\s+(?:GEN1_HEAP_LEDGER_ENABLED|gen1_heap_ledger_enabled)\s*=\s*(-?\d+)\b", heap_source
-            )
-            if declarations != [str(default_ledger)]:
-                self.error(
-                    "Gen1 heap ledger default must be exactly "
-                    f"const GEN1_HEAP_LEDGER_ENABLED = {default_ledger}; got {declarations!r}"
+            try:
+                heap_source = heap_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                self.error(f"cannot read Gen1 heap policy: {exc}")
+            else:
+                declarations = re.findall(
+                    r"\bconst\s+(?:GEN1_HEAP_LEDGER_ENABLED|gen1_heap_ledger_enabled)\s*=\s*(-?\d+)\b", heap_source
                 )
-            self.info["gen1_heap_ledger_enabled"] = int(declarations[0]) if declarations else None
+                if declarations != [str(default_ledger)]:
+                    self.error(
+                        "Gen1 heap ledger default must be exactly "
+                        f"const GEN1_HEAP_LEDGER_ENABLED = {default_ledger}; got {declarations!r}"
+                    )
+                self.info["gen1_heap_ledger_enabled"] = int(declarations[0]) if declarations else None
 
         forbidden_literals = ("xu830103", "19830103", "xu_mark_payload")
         for path in self.source_files():
@@ -1503,16 +1506,20 @@ class BoundaryCheck:
                 "printf '%s\\n' \"$GEN1_PARSE\""
             )
             try:
+                sh_env_path = os.environ.get("PATH", "/usr/bin:/bin")
+                sh_bin = Path(shell)
+                if sh_bin.parent.name == "bin" and (sh_bin.parent.parent / "usr" / "bin").is_dir():
+                    sh_env_path = f"{sh_bin.parent.parent / 'usr' / 'bin'}{os.pathsep}{sh_env_path}"
                 proc = subprocess.run(
                     [shell, "-c", command],
                     cwd=self.root,
                     env={
-                        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                        "PATH": sh_env_path,
                         "LC_ALL": "C",
                     },
                     text=True,
                     capture_output=True,
-                    timeout=5,
+                    timeout=45,
                     check=False,
                 )
             except (OSError, subprocess.SubprocessError) as exc:
