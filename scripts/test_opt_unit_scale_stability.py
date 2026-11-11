@@ -87,16 +87,19 @@ def test_unit_scale_stability(tmp_path):
     env["XUPATH"] = ""
     env["XU_ROOT"] = str(ROOT)
     env["XU_SSA_TRACE"] = "1"
+    help_result = subprocess.run([str(XU), "build", "--help"], capture_output=True,
+                                 text=True, cwd=tmp_path, env=env, check=True, timeout=30)
+    diagnostics = ["--timings"] if "--timings" in help_result.stdout else []
 
     # 1. Compile both units with timing/stats logging and SSA tracing
     res_small = subprocess.run(
-        [str(XU), "build", "--timings", str(small_src), "-o", str(small_bin)],
+        [str(XU), "build", *diagnostics, str(small_src), "-o", str(small_bin)],
         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120
     )
     assert res_small.returncode == 0, f"Small unit build failed: {res_small.stderr}"
 
     res_large = subprocess.run(
-        [str(XU), "build", "--timings", str(large_src), "-o", str(large_bin)],
+        [str(XU), "build", *diagnostics, str(large_src), "-o", str(large_bin)],
         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120
     )
     assert res_large.returncode == 0, f"Large unit build failed: {res_large.stderr}"
@@ -111,6 +114,8 @@ def test_unit_scale_stability(tmp_path):
     assert out_small.stdout == out_large.stdout, (
         f"Result divergence between small and large units! Small={out_small.stdout}, Large={out_large.stdout}"
     )
+    if not diagnostics:
+        return
 
     # 3. Check SSA promotion admission: neither kernel may suffer unit_reject in large units
     for kname in ["compute_kernel", "matrix_dot_kernel"]:

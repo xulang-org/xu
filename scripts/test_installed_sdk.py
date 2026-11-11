@@ -319,6 +319,8 @@ fn main() int {
         run([xu, "build", "loop.xu", *flags, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
         assert run([xu, "run", "loop.xu", *flags], cwd=project, env=active).strip() == "536854528"
+        tested = run([xu, "test", "loop.xu", *flags], cwd=project, env=active)
+        assert "536854528" in tested and "ok (all tests passed)" in tested, tested
     # Native map adapters must preserve the coroutine context when calling
     # ordinary Xu hashing and growth policy functions with entry stack guards.
     (project / "map_worker.xu").write_text('''@main
