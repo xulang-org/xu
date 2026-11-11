@@ -157,10 +157,14 @@ def ensure_compiler_built(xu_bin: Path, target: str, cache_dir: Path) -> None:
         sources = [main] + [p for p in sorted(main.parent.glob("*.xu")) if p != main]
         print(f"  [cross-compile] Building xu for {target}...")
         result = subprocess.run([str(xu_bin), "build", *map(str, sources), "--target", target, "-o", str(output)],
-                                cwd=REPO_ROOT, env=build_environment(), capture_output=True)
+                                cwd=REPO_ROOT, env=build_environment(), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
         if result.returncode:
             output.unlink(missing_ok=True)
-            raise RuntimeError(f"Failed to build xu for {target}: {result.stderr.decode(errors='replace')}")
+            raise RuntimeError(
+                f"Failed to build xu for {target} (exit {result.returncode}):\n"
+                f"{result.stdout.decode(errors='replace')}"
+            )
     validate_binary(output, target)
 
 
@@ -200,10 +204,13 @@ def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, c
                    "--xu", str(xu_bin), "-o", str(cached_tool)]
         else:
             print("    [note] mingw cross-compiler unavailable; using direct native PE compiler for xu-setup")
-    run_res = subprocess.run(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=build_environment())
+    run_res = subprocess.run(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=build_environment())
     if run_res.returncode != 0:
         cached_tool.unlink(missing_ok=True)
-        raise RuntimeError(f"Failed to build {tool_name} for {target}: {run_res.stderr.decode(errors='replace')}")
+        raise RuntimeError(
+            f"Failed to build {tool_name} for {target} (exit {run_res.returncode}):\n"
+            f"{run_res.stdout.decode(errors='replace')}"
+        )
 
     # Windows may emit .exe; promote to the unsuffixed tool name.
     exe_file = Path(f"{cached_tool}.exe")
@@ -241,7 +248,7 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
         built_tool = ensure_tool_built(xu_bin, target, tool_name, src_dir, cache_dir)
         dest_name = f"{tool_name}.exe" if is_windows else tool_name
         shutil.copy2(built_tool, bin_dir / dest_name)
-        if is_windows and tool_name == "xu-setup":
+        if is_windows and tool_name in ("xu-setup", "xu-update"):
             embed_invoker_manifest(bin_dir / dest_name)
         (bin_dir / dest_name).chmod(0o755)
 

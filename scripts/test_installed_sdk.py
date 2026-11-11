@@ -16,8 +16,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 
-def windows_setup_manifest(binary: Path):
-    """Use the Windows loader to check the actual installer, including on admin CI."""
+def check_windows_invoker_manifest(binary: Path):
+    """Check the SDK tool's execution level using the Windows loader."""
     if os.name != "nt":
         return
     import ctypes
@@ -39,7 +39,7 @@ def windows_setup_manifest(binary: Path):
     try:
         resource = kernel.FindResourceW(module, 1, 24)
         if not resource:
-            raise RuntimeError(f"installer has no embedded application manifest: {binary}")
+            raise RuntimeError(f"executable has no embedded application manifest: {binary}")
         pointer = kernel.LockResource(kernel.LoadResource(module, resource))
         size = kernel.SizeofResource(module, resource)
         if not pointer or not size:
@@ -47,7 +47,7 @@ def windows_setup_manifest(binary: Path):
         root = ET.fromstring(ctypes.string_at(pointer, size))
         level = root.find('.//{urn:schemas-microsoft-com:asm.v3}requestedExecutionLevel')
         if level is None or level.get("level") != "asInvoker" or level.get("uiAccess") != "false":
-            raise RuntimeError(f"installer does not declare current-user execution: {binary}")
+            raise RuntimeError(f"executable does not declare current-user execution: {binary}")
     finally:
         kernel.FreeLibrary(module)
 
@@ -199,7 +199,7 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
     env.update(XU_SKIP_EDITOR_INSTALL="1", XUPATH=str(extra), XU_CACHE=str(work / "package cache"))
 
     if installer:
-        windows_setup_manifest(installer)
+        check_windows_invoker_manifest(installer)
         run([str(installer), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
         manifest_file = prefix / "bundle.json"
         manifest = json.loads(manifest_file.read_text()) if manifest_file.is_file() else {"version": "", "target": "host", "lane": "product"}
@@ -217,7 +217,7 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
         manifest = json.loads((bundle / "bundle.json").read_text())
         if os.name == "nt":
             for setup in (bundle / "xu-setup.exe", bundle / "bin/xu-setup.exe"):
-                windows_setup_manifest(setup)
+                check_windows_invoker_manifest(setup)
         if native_setup:
             setup = bundle / ("xu-setup.exe" if os.name == "nt" else "xu-setup")
             run([str(setup), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
@@ -225,6 +225,8 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
             run(["pwsh", "-NoProfile", "-File", str(bundle / "install.ps1"), "-Prefix", str(prefix), "-NoModifyPath"], cwd=project, env=env)
         else:
             run(["bash", str(bundle / "install.sh"), "--prefix", str(prefix), "--no-modify-path", "--yes"], cwd=project, env=env)
+    if os.name == "nt":
+        check_windows_invoker_manifest(prefix / "bin/xu-update.exe")
     active = activate(prefix, project, env)
     entries = active["XUPATH"].split(os.pathsep)
     assert entries.count(str(extra)) == 1, entries
