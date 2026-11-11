@@ -60,7 +60,7 @@ char *xu_ui_mem_take(const char *name, unsigned *out_len);
  * Returns 1 if nonempty, 0 on timeout, -1 on bad args.
  * Writers (set/append/clear) wake waiters. */
 int xu_ui_mem_wait_nonempty(const char *name, int timeout_ms);
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__linux__)
 /* Let mailbox waits on the UI thread yield to the packaged Xu runtime. */
 void xu_ui_mem_set_task_pump(int (*pump)(void *, int (*)(void)),
                              void *state, int (*yield_task)(void));

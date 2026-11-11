@@ -1512,6 +1512,32 @@ extern "C" int xu_ui_host_run(const char *tmp_dir) {
   return status;
 }
 
+using XuYieldTask = int (*)(void);
+using XuTaskPump = int (*)(void *, XuYieldTask);
+
+struct XuLinuxTaskPump {
+  XuTaskPump pump;
+  void *state;
+  XuYieldTask yield_task;
+};
+
+extern "C" int xu_ui_host_run_cooperative(const char *tmp_dir, XuTaskPump pump,
+                                          void *state, XuYieldTask yield_task) {
+  if (!pump || !yield_task) return xu_ui_host_run(tmp_dir);
+  XuLinuxTaskPump task{pump, state, yield_task};
+  xu_ui_mem_set_task_pump(pump, state, yield_task);
+  // GLib dispatches this source on the same thread as the GTK events.
+  guint timer = g_timeout_add(10, [](gpointer data) -> gboolean {
+    const auto &task = *static_cast<XuLinuxTaskPump *>(data);
+    task.pump(task.state, task.yield_task);
+    return G_SOURCE_CONTINUE;
+  }, &task);
+  int status = xu_ui_host_run(tmp_dir);
+  g_source_remove(timer);
+  xu_ui_mem_set_task_pump(NULL, NULL, NULL);
+  return status;
+}
+
 #if !defined(XU_UI_STATIC)
 int main(int argc, char **argv) {
   (void)argc;
