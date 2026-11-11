@@ -13,6 +13,7 @@
 - Windows ARM64 支持原生可执行文件和 COFF 应用对象。Windows socket 就绪检查拒绝非 socket 句柄，环境变量查找支持大小写混用。
 - Windows 安装器和更新器声明以当前用户权限执行，支持当前用户安装和重装。打包失败时会记录编译器输出和退出码。
 - 项目构建可解析本地包依赖，并支持 `-O0` 至 `-O3` 优化选项。
+- `xu get` 和 `xu install` 支持安装固定版本的依赖并校验锁文件和校验和。`--offline` 和 `--frozen` 使用本地依赖数据。
 - Linux x64 和 ARM64 支持应用对象和原生桌面打包。
 - `xu build` 和 `xu run` 支持显式启用 XACP 启动、发现和本地回环 TCP。Linux 和 macOS 上启用 XACP 的程序支持进程输出捕获。
 - SDK 覆盖 macOS、Linux 和 Windows 的 ARM64 与 x64 平台。Linux LoongArch64 和 RISC-V SDK 通过交叉构建提供。

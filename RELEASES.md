@@ -13,6 +13,7 @@ The product compiler lowers checked programs to typed MIR and self-hosts from th
 - Windows ARM64 supports native executables and COFF application objects. Windows socket readiness rejects non-socket handles, and environment lookups handle mixed-case names.
 - The Windows installer and updater declare current-user execution for per-user installation and reinstall. Packaging failures include the compiler's output and exit status.
 - Project builds resolve local package requirements and accept the `-O0` through `-O3` optimization flags.
+- `xu get` and `xu install` restore pinned package installation with lockfiles and checksum verification. `--offline` and `--frozen` use local dependency data.
 - Linux x64 and ARM64 support application objects and native desktop packaging.
 - `xu build` and `xu run` support opt-in XACP startup, discovery and loopback TCP. XACP-enabled programs on Linux and macOS support process output capture.
 - The SDK targets macOS, Linux and Windows on ARM64 and x64. Linux LoongArch64 and RISC-V SDKs are cross-built.
