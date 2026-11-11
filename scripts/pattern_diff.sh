@@ -25,6 +25,7 @@ opts=("$@")
 [ "${#opts[@]}" -eq 0 ] && opts=(default --no-opt)
 
 export XU_STDLIB_ROOT="$PWD/src" XUPATH=""
+build_help=$("$xu" build --help)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 timeout_run() { perl -e 'alarm shift; exec @ARGV' "$@"; }
@@ -57,7 +58,10 @@ for f in "${files[@]}"; do
         on="$work/on.bin"
         off="$work/off.bin"
         rm -f "$on" "$off"
-        if ! (cd "$dir" && XU_PATTERNS_OFF= "$xu" build "$@" --timings "$src" -o "$on") >"$work/on.log" 2>&1; then
+        if ! (cd "$dir"
+            if [[ "$build_help" == *--timings* ]]; then set -- "$@" --timings; fi
+            XU_PATTERNS_OFF= "$xu" build "$@" "$src" -o "$on"
+        ) >"$work/on.log" 2>&1; then
             skipped=$((skipped + 1))
             continue
         fi
