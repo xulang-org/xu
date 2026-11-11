@@ -502,10 +502,10 @@ def main():
             out = tmp / name
             src.write_text('@main\n' + source)
             if baseline:
-                run([baseline, 'build', '-O0', *extra, src, '-o', tmp / (name + '.baseline')],
+                run([baseline, 'build', '--no-opt', *extra, src, '-o', tmp / (name + '.baseline')],
                     env=env, expected=1 if error else 0)
                 comparisons += 1
-            result = run([xu, 'build', '-O0', *extra, src, '-o', out], env=env, expected=1 if error else 0, contains=error)
+            result = run([xu, 'build', '--no-opt', *extra, src, '-o', out], env=env, expected=1 if error else 0, contains=error)
             for diagnostic in diagnostics:
                 assert diagnostic in result.stderr, (name, diagnostic, result.stderr)
             if error:
@@ -952,7 +952,7 @@ fn (p $&Item) change() { p.value = 2 }
             shutil.copy2(source, tmp / source.name)
         sources = [tmp / source.name for source in sources]
         executable = tmp / 'probe'
-        run([xu, 'build', '-O0', probe, entry, *sources, '-o', executable], env=env, timeout=600)
+        run([xu, 'build', '--no-opt', probe, entry, *sources, '-o', executable], env=env, timeout=600)
         run([executable, 'store'], env=env, expected=1, contains='malformed StoreIndex owning-element metadata')
         print('PASS invalid_storeindex', flush=True)
         run([executable, 'i12'], env=env, expected=1, contains='12-bit range')
@@ -1051,9 +1051,9 @@ fn main() { gate := chan int{cap: 1}
     gate <- 1
     println(<-out)
 }'''
-        for opt in ('-O0', '-O2'):
-            fixture('spawn_enum_host' + opt, spawn, output='spawn enum payload\n', extra=(opt,))
-            fixture('spawn_enum_rv' + opt, spawn, output='spawn enum payload\n', extra=(opt, '--target', 'linux-riscv64'), runner=('qemu-riscv64',))
+        for opt, flags in (('_default', ()), ('_no_opt', ('--no-opt',))):
+            fixture('spawn_enum_host' + opt, spawn, output='spawn enum payload\n', extra=flags)
+            fixture('spawn_enum_rv' + opt, spawn, output='spawn enum payload\n', extra=(*flags, '--target', 'linux-riscv64'), runner=('qemu-riscv64',))
         atomic = '''fn main() { $value := 0
     atomic_store($&value, 42)
     println(atomic_load($&value))
@@ -1129,16 +1129,16 @@ fn main() { ch := chan int{cap: 0}
     }
     println(total)
 }"""
-        for opt in ('-O0', '-O2'):
-            fixture('thumb_spawn_pair' + opt, thumb_spawn, output='8589934595\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
-            fixture('thumb_channel_fifo' + opt, thumb_fifo, output='4294967297\n-4294967299\n0\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
-            fixture('thumb_channel_select' + opt, thumb_select, output='1\n2\n-4294967299\n3\n0\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
-            fixture('thumb_select_status_pair' + opt, thumb_status, output='80\n', extra=(opt, '--target', 'linux-arm32'), runner=('qemu-arm',))
+        for opt, flags in (('_default', ()), ('_no_opt', ('--no-opt',))):
+            fixture('thumb_spawn_pair' + opt, thumb_spawn, output='8589934595\n', extra=(*flags, '--target', 'linux-arm32'), runner=('qemu-arm',))
+            fixture('thumb_channel_fifo' + opt, thumb_fifo, output='4294967297\n-4294967299\n0\n', extra=(*flags, '--target', 'linux-arm32'), runner=('qemu-arm',))
+            fixture('thumb_channel_select' + opt, thumb_select, output='1\n2\n-4294967299\n3\n0\n', extra=(*flags, '--target', 'linux-arm32'), runner=('qemu-arm',))
+            fixture('thumb_select_status_pair' + opt, thumb_status, output='80\n', extra=(*flags, '--target', 'linux-arm32'), runner=('qemu-arm',))
             for capacity in (4294967297, 613566757):
-                out = fixture('thumb_capacity_bound_' + str(capacity) + opt, f'fn main() {{ ch := chan int{{cap: {capacity}}}\n close(ch)\n}}', extra=(opt, '--target', 'linux-arm32'))
+                out = fixture('thumb_capacity_bound_' + str(capacity) + opt, f'fn main() {{ ch := chan int{{cap: {capacity}}}\n close(ch)\n}}', extra=(*flags, '--target', 'linux-arm32'))
                 run(['qemu-arm', out], env=env, expected=1)
                 print('PASS thumb_capacity_bound_execution', capacity, opt, flush=True)
-        fixture('thumb_channel_contention', 'fn worker(ch chan int) { for i in 0:100 { ch <- 4294967297 } }\nfn main() { ch := chan int{cap: 0}\n for i in 0:8 { xu worker(ch) }\n $sum := 0\n for i in 0:800 { sum += <-ch }\n println(sum)\n}', output='3435973837600\n', extra=('-O2', '--target', 'linux-arm32'), runner=('qemu-arm',))
+        fixture('thumb_channel_contention', 'fn worker(ch chan int) { for i in 0:100 { ch <- 4294967297 } }\nfn main() { ch := chan int{cap: 0}\n for i in 0:8 { xu worker(ch) }\n $sum := 0\n for i in 0:800 { sum += <-ch }\n println(sum)\n}', output='3435973837600\n', extra=('--target', 'linux-arm32'), runner=('qemu-arm',))
         stack_overflow = """fn recurse(n int) int {
     if n == 0 { << 0 }
     << n + recurse(n - 1)
@@ -1161,12 +1161,12 @@ fn main() { out := chan int{cap: 0}
     println(<-out)
 }"""
         for target, emulator in (('linux-arm64', 'qemu-aarch64'), ('linux-loongarch64', 'qemu-loongarch64'), ('linux-riscv64', 'qemu-riscv64')):
-            for opt in ('-O0', '-O2'):
-                out = fixture('stack_guard_' + target + opt, stack_overflow, extra=(opt, '--target', target))
+            for opt, flags in (('_default', ()), ('_no_opt', ('--no-opt',))):
+                out = fixture('stack_guard_' + target + opt, stack_overflow, extra=(*flags, '--target', target))
                 run([emulator, out], env=env, expected=1, contains='coroutine stack overflow')
                 print('PASS stack_overflow_execution', target, opt, flush=True)
-                fixture('stack_args_' + target + opt, spawn, output='spawn enum payload\n', extra=(opt, '--target', target), runner=(emulator,))
-                fixture('stack_sret_' + target + opt, stack_sret, output='83\n', extra=(opt, '--target', target), runner=(emulator,))
+                fixture('stack_args_' + target + opt, spawn, output='spawn enum payload\n', extra=(*flags, '--target', target), runner=(emulator,))
+                fixture('stack_sret_' + target + opt, stack_sret, output='83\n', extra=(*flags, '--target', target), runner=(emulator,))
         for target in ('riscv32imac-none', 'thumbv7em-none'):
             fixture('freestanding_reject_' + target, channel.replace('4294967297', '1'), 'require a suspendable scheduler', extra=('--target', target))
         nonblocking = """fn main() { ch := chan int{cap: 2}
@@ -1192,8 +1192,8 @@ fn main() { out := chan int{cap: 0}
             for target, runner in (('host', ()), ('linux-arm64', ('qemu-aarch64',)),
                                    ('linux-arm32', ('qemu-arm',)), ('linux-loongarch64', ('qemu-loongarch64',)),
                                    ('linux-riscv64', ('qemu-riscv64',))):
-                for opt in ('-O0', '-O2'):
-                    extra = (opt,) if target == 'host' else (opt, '--target', target)
+                for opt, flags in (('_default', ()), ('_no_opt', ('--no-opt',))):
+                    extra = flags if target == 'host' else (*flags, '--target', target)
                     fixture('spec34_E20_F26_C14_backend_' + label + '_' + target + opt,
                             phase_b, output='6\n6\n', extra=extra, runner=runner)
         wasm = fixture('casts.wasm', '''pub fn signed(x int) int { << int(i32(x)) }

@@ -1,0 +1,402 @@
+@runtime/core
+// Channels and `xu` tasks: cooperative green threads on one OS thread.
+//
+// Every task runs on its own mapped stack; switching saves and restores the
+// callee-saved registers (x19-x28, fp, lr, sp, d8-d15) through the
+// TASK_SWITCH pseudo system call handled by the backend's __xu_syscall stub.
+// x28 (the runtime state block) is identical in every task. The T_* slots
+// are named after arm64 registers; x64 maps them to rbx, r12-r15, rbp and
+// the resume address (see codegen/x64_base.xu).
+//
+// Blocking operations poll: a task that cannot proceed yields to the next
+// task in a round-robin queue. Every completed channel operation, spawn or
+// task exit starts a new epoch; when every live task has failed to proceed
+// within one epoch the program is deadlocked.
+//
+// Channel elements are copied by size (scalars as one 8-byte word). The
+// element buffer is allocated by the first operation, which knows the size.
+
+// rt_syscall number that switches tasks: (from task, to task).
+const SYS_TASK_SWITCH = -1
+
+const TASK_STACK = 1048576
+
+// Task record. The register context comes first (see __xu_task_switch).
+const T_X19 = 0
+const T_X20 = 8
+const T_X21 = 16
+const T_X22 = 24
+const T_X28 = 72
+const T_FP = 80
+const T_LR = 88
+const T_SP = 96
+const T_NEXT = 176
+const T_EPOCH = 184
+const T_STACK = 192
+const T_SIZE = 208
+
+// Scheduler record, reached through G_SCHED.
+const S_CUR = 0
+const S_HEAD = 8
+const S_TAIL = 16
+const S_NTASKS = 24
+const S_EPOCH = 32
+const S_NBLOCKED = 40
+const S_FREE = 48
+const S_DRAIN = 56
+const S_SIZE = 64
+
+// Channel record.
+const C_CAP = 0
+const C_ESIZE = 8
+const C_BUF = 16
+const C_HEAD = 24
+const C_COUNT = 32
+const C_CLOSED = 40
+const C_RWAIT = 48
+const C_SENT = 56
+const C_RECVD = 64
+const C_SIZE = 72
+
+fn ld(addr int) int {
+    << rt_load(addr, 8)
+}
+
+fn st(addr int, v int) {
+    rt_store(addr, 8, v)
+}
+
+fn sched() int {
+    $s := gword(G_SCHED)
+    if s != 0 {
+        << s
+    }
+    s = alloc(S_SIZE)
+    st(s + S_CUR, alloc(T_SIZE))
+    st(s + S_NTASKS, 1)
+    set_gword(G_SCHED, s)
+    << s
+}
+
+fn progress() {
+    s := sched()
+    st(s + S_EPOCH, ld(s + S_EPOCH) + 1)
+    st(s + S_NBLOCKED, 0)
+}
+
+fn queue_push(s int, t int) {
+    st(t + T_NEXT, 0)
+    tail := ld(s + S_TAIL)
+    if tail == 0 {
+        st(s + S_HEAD, t)
+    } else {
+        st(tail + T_NEXT, t)
+    }
+    st(s + S_TAIL, t)
+}
+
+fn queue_pop(s int) int {
+    t := ld(s + S_HEAD)
+    if t != 0 {
+        nx := ld(t + T_NEXT)
+        st(s + S_HEAD, nx)
+        if nx == 0 {
+            st(s + S_TAIL, 0)
+        }
+        st(t + T_NEXT, 0)
+    }
+    << t
+}
+
+fn switch_to(from int, to int) {
+    if from == to {
+        <<
+    }
+    if xu_target_arch() == ARCH_WASM {
+        msg := "fatal error: tasks cannot switch on wasm32 (no stack switching)\n"
+        write_fd(2, str_ptr(&msg), msg.len)
+        exit_process(2)
+    }
+    st(sched() + S_CUR, to)
+    rt_syscall(SYS_TASK_SWITCH, from, to, 0, 0, 0, 0)
+}
+
+fn fatal_deadlock() {
+    msg := "fatal error: all tasks are asleep - deadlock!\n"
+    write_fd(2, str_ptr(&msg), msg.len)
+    exit_process(2)
+}
+
+// The current task cannot proceed: let the others run.
+pub fn task_block() {
+    s := sched()
+    t := ld(s + S_CUR)
+    mark := ld(s + S_EPOCH) + 1
+    if ld(t + T_EPOCH) != mark {
+        st(t + T_EPOCH, mark)
+        st(s + S_NBLOCKED, ld(s + S_NBLOCKED) + 1)
+    }
+    if ld(s + S_NBLOCKED) >= ld(s + S_NTASKS) && ld(s + S_DRAIN) == 0 {
+        fatal_deadlock()
+    }
+    queue_push(s, t)
+    switch_to(t, queue_pop(s))
+}
+
+// Bare-metal boards have a few MiB of RAM in all.
+fn task_stack() int {
+    if xu_target_os() == OS_NONE {
+        << 65536
+    }
+    << TASK_STACK
+}
+
+// Start fn_addr on a new task. block holds 16 argument words (x0-x7 then
+// the stack words); entry is __xu_task_entry and exit_addr task_exit.
+pub fn task_spawn(entry int, fn_addr int, exit_addr int, block int) {
+    s := sched()
+    $t := ld(s + S_FREE)
+    if t != 0 {
+        st(s + S_FREE, ld(t + T_NEXT))
+    } else {
+        t = alloc(T_SIZE)
+        st(t + T_STACK, map_pages(task_stack()))
+    }
+    words := T_SIZE / 8
+    for i in 0:words {
+        if i * 8 != T_STACK {
+            st(t + i * 8, 0)
+        }
+    }
+    st(t + T_X19, t)
+    st(t + T_X20, fn_addr)
+    st(t + T_X21, block)
+    st(t + T_X22, exit_addr)
+    st(t + T_X28, rt_globals())
+    st(t + T_LR, entry)
+    st(t + T_SP, ld(t + T_STACK) + task_stack())
+    st(s + S_NTASKS, ld(s + S_NTASKS) + 1)
+    queue_push(s, t)
+    progress()
+}
+
+// Whether other tasks exist that could run while this one waits.
+pub fn task_others() bool {
+    s := gword(G_SCHED)
+    << s != 0 && ld(s + S_NTASKS) > 1
+}
+
+pub fn sched_epoch() int {
+    << ld(sched() + S_EPOCH)
+}
+
+// Let the other tasks run without counting this task as blocked (it is
+// waiting for time or I/O, not for another task). Once main has returned
+// it does count: a task only waiting on the outside world must not keep
+// the process alive, as a thread would be killed at exit.
+pub fn task_yield() {
+    s := sched()
+    t := ld(s + S_CUR)
+    if ld(s + S_DRAIN) != 0 {
+        mark := ld(s + S_EPOCH) + 1
+        if ld(t + T_EPOCH) != mark {
+            st(t + T_EPOCH, mark)
+            st(s + S_NBLOCKED, ld(s + S_NBLOCKED) + 1)
+        }
+    }
+    queue_push(s, t)
+    switch_to(t, queue_pop(s))
+}
+
+// A value is buffered or the channel is closed.
+pub fn chan_ready(ch int) bool {
+    << ch != 0 && (ld(ch + C_COUNT) > 0 || ld(ch + C_CLOSED) != 0)
+}
+
+// Called when main returns: other tasks run to completion first, until they
+// have all exited or none of them can make progress.
+pub fn task_drain() {
+    s := gword(G_SCHED)
+    if s == 0 {
+        <<
+    }
+    st(s + S_DRAIN, 1)
+    while ld(s + S_NTASKS) > 1 {
+        t := ld(s + S_CUR)
+        mark := ld(s + S_EPOCH) + 1
+        if ld(t + T_EPOCH) != mark {
+            st(t + T_EPOCH, mark)
+            st(s + S_NBLOCKED, ld(s + S_NBLOCKED) + 1)
+        }
+        if ld(s + S_NBLOCKED) >= ld(s + S_NTASKS) {
+            <<
+        }
+        queue_push(s, t)
+        switch_to(t, queue_pop(s))
+    }
+}
+
+// Called by __xu_task_entry when the task function returns.
+pub fn task_exit(t int) {
+    s := sched()
+    st(s + S_NTASKS, ld(s + S_NTASKS) - 1)
+    progress()
+    st(t + T_NEXT, ld(s + S_FREE))
+    st(s + S_FREE, t)
+    nx := queue_pop(s)
+    if nx == 0 {
+        exit_process(0)
+    }
+    st(s + S_CUR, nx)
+    rt_syscall(SYS_TASK_SWITCH, t, nx, 0, 0, 0, 0)
+}
+
+// ===== channels =====
+
+pub fn chan_new(cap int) int {
+    ch := alloc(C_SIZE)
+    $c := cap
+    if c < 0 {
+        c = 0
+    }
+    st(ch + C_CAP, c)
+    << ch
+}
+
+fn chan_slots(ch int) int {
+    c := ld(ch + C_CAP)
+    if c < 1 {
+        << 1
+    }
+    << c
+}
+
+fn chan_buf(ch int, esize int) int {
+    $buf := ld(ch + C_BUF)
+    if buf == 0 {
+        buf = alloc(chan_slots(ch) * esize)
+        st(ch + C_BUF, buf)
+        st(ch + C_ESIZE, esize)
+    }
+    << buf
+}
+
+fn chan_put(ch int, src int, esize int) {
+    buf := chan_buf(ch, esize)
+    n := chan_slots(ch)
+    count := ld(ch + C_COUNT)
+    $at := ld(ch + C_HEAD) + count
+    if at >= n {
+        at -= n
+    }
+    mem_copy(buf + at * esize, src, esize)
+    st(ch + C_COUNT, count + 1)
+    st(ch + C_SENT, ld(ch + C_SENT) + 1)
+    progress()
+}
+
+fn chan_take(ch int, dst int, esize int) {
+    buf := chan_buf(ch, esize)
+    head := ld(ch + C_HEAD)
+    mem_copy(dst, buf + head * esize, esize)
+    $nh := head + 1
+    if nh >= chan_slots(ch) {
+        nh = 0
+    }
+    st(ch + C_HEAD, nh)
+    st(ch + C_COUNT, ld(ch + C_COUNT) - 1)
+    st(ch + C_RECVD, ld(ch + C_RECVD) + 1)
+    progress()
+}
+
+fn panic_send_closed() {
+    msg := "panic: send on closed channel\n"
+    write_fd(2, str_ptr(&msg), msg.len)
+    exit_process(1)
+}
+
+// 1 when the value was sent, 0 when the send would block.
+pub fn chan_try_send(ch int, src int, esize int) int {
+    if ch == 0 {
+        << 0
+    }
+    if ld(ch + C_CLOSED) != 0 {
+        panic_send_closed()
+    }
+    count := ld(ch + C_COUNT)
+    if ld(ch + C_CAP) == 0 {
+        if count != 0 || ld(ch + C_RWAIT) == 0 {
+            << 0
+        }
+    } else if count >= ld(ch + C_CAP) {
+        << 0
+    }
+    chan_put(ch, src, esize)
+    << 1
+}
+
+// 1 with a value, 2 when the channel is closed and drained (dst zeroed),
+// 0 when the receive would block.
+pub fn chan_try_recv(ch int, dst int, esize int) int {
+    if ch == 0 {
+        << 0
+    }
+    if ld(ch + C_COUNT) > 0 {
+        chan_take(ch, dst, esize)
+        << 1
+    }
+    if ld(ch + C_CLOSED) != 0 {
+        for i in 0:esize {
+            rt_store(dst + i, 1, 0)
+        }
+        << 2
+    }
+    << 0
+}
+
+// Unbuffered sends complete once a receiver has taken the value.
+pub fn chan_send(ch int, src int, esize int) {
+    while true {
+        if ch != 0 {
+            if ld(ch + C_CLOSED) != 0 {
+                panic_send_closed()
+            }
+            if ld(ch + C_COUNT) < chan_slots(ch) {
+                chan_put(ch, src, esize)
+                if ld(ch + C_CAP) == 0 {
+                    mine := ld(ch + C_SENT)
+                    while ld(ch + C_RECVD) < mine && ld(ch + C_CLOSED) == 0 {
+                        task_block()
+                    }
+                }
+                <<
+            }
+        }
+        task_block()
+    }
+}
+
+// Receive into dst; false when the channel is closed and drained.
+pub fn chan_recv(ch int, dst int, esize int) bool {
+    if ch != 0 {
+        st(ch + C_RWAIT, ld(ch + C_RWAIT) + 1)
+        progress()
+    }
+    while true {
+        r := chan_try_recv(ch, dst, esize)
+        if r != 0 {
+            st(ch + C_RWAIT, ld(ch + C_RWAIT) - 1)
+            << r == 1
+        }
+        task_block()
+    }
+    << false
+}
+
+pub fn chan_close(ch int) {
+    if ch == 0 {
+        <<
+    }
+    st(ch + C_CLOSED, 1)
+    progress()
+}

@@ -25,7 +25,16 @@ if [ "$#" -lt 1 ]; then
 fi
 
 SEED_INPUT=$1
-DEST=${2:-bin/xu}
+HOST_IS_WINDOWS=0
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Windows_NT) HOST_IS_WINDOWS=1 ;; esac
+if [ "${OS:-}" = "Windows_NT" ]; then HOST_IS_WINDOWS=1; fi
+if [ "$HOST_IS_WINDOWS" = 1 ]; then
+    CHAIN_BIN_EXT=".exe"
+else
+    CHAIN_BIN_EXT=".xin"
+fi
+
+DEST=${2:-bin/xu$CHAIN_BIN_EXT}
 if [ "$CANDIDATE_ONLY" = 1 ] && [ "$#" -lt 2 ]; then
     echo "build_hosted_chain: --candidate-only requires an explicit artifact destination" >&2
     exit 1
@@ -70,8 +79,13 @@ trap cleanup EXIT
 export LC_ALL=C
 export XUPATH=""
 native_path() {
-    python3 -c 'from pathlib import Path; import sys; sys.stdout.write(Path(sys.argv[1]).resolve().as_posix())' "$1"
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s\n' "$1"
+    fi
 }
+SEED="$(native_path "$SEED")"
 export XU_STDLIB_ROOT="$(native_path "$ROOT/src")"
 export XU_CACHE="$tmp/xu-cache"
 # Keep legacy hosted binaries that still fall back from XU_CACHE to HOME from
@@ -79,11 +93,13 @@ export XU_CACHE="$tmp/xu-cache"
 # deterministic instead of accidentally succeeding from ~/.xu/pkg.
 export HOME="$tmp/home"
 export USERPROFILE="$HOME"
-mkdir -p "$XU_CACHE" "$HOME"
+mkdir -p "$XU_CACHE" "$HOME" "$tmp/empty_xupath"
+export XUPATH="$(native_path "$tmp/empty_xupath")"
 export XU_CACHE="$(native_path "$XU_CACHE")"
 export HOME="$(native_path "$HOME")"
 export USERPROFILE="$HOME"
-unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED
+tmp_native=$(native_path "$tmp")
+unset XUOS XUARCH XU_BOOT_EXTRA XU_HEAP_STATS XU_SEED XU_ROOT
 
 # Keep the product chain on the compiler's versioned defaults.  The explicit
 # acceptance profile is available for deterministic vreg/SSA gates and must
@@ -97,7 +113,7 @@ case "$HOSTED_PROFILE" in
         HOSTED_ARGS=()
         ;;
     acceptance)
-        HOSTED_ARGS=(-O1 --ra=1)
+        HOSTED_ARGS=(--ra=1)
         ;;
     *)
         echo "build_hosted_chain: unknown HOSTED_PROFILE=$HOSTED_PROFILE (want product or acceptance)" >&2
@@ -166,6 +182,17 @@ is_product_destination() {
 }
 
 pick_bin() {
+    base="${1%.*}"
+    if [ "$HOST_IS_WINDOWS" = 1 ]; then
+        if [ -f "${base}.exe" ]; then
+            echo "${base}.exe"
+            return 0
+        fi
+        if [ -f "${1}.exe" ]; then
+            echo "${1}.exe"
+            return 0
+        fi
+    fi
     if [ -x "$1" ]; then
         echo "$1"
         return 0
@@ -231,7 +258,8 @@ fi
 FAILED_STAGE="seed_to_gen1"
 # Adapt the published seed privately; provenance still identifies the original.
 ORIGINAL_SEED=$SEED
-SEED=$(python3 scripts/seed_phase_c_bridge.py --seed "$SEED" --destination "$tmp/phase-c-seed")
+SEED=$(python3 scripts/seed_phase_c_bridge.py --seed "$(native_path "$SEED")" --destination "$tmp/phase-c-seed")
+SEED=$(native_path "$SEED")
 SEED_SYNTAX_BRIDGE=none
 BRIDGE_SYNTAX_SEED_SHA256=SKIPPED
 if [ "$SEED" != "$ORIGINAL_SEED" ]; then
@@ -246,7 +274,7 @@ BRIDGE_SEED_SHA256=SKIPPED
 BRIDGE_CONST_SOURCE_SHA256=SKIPPED
 # shellcheck disable=SC2086
 set +u
-if "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin" >"$tmp/seed-build.log" 2>&1; then
+if "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT" >"$tmp/seed-build.log" 2>&1; then
     seed_build_rc=0
 else
     seed_build_rc=$?
@@ -257,16 +285,16 @@ if [ "$seed_build_rc" -ne 0 ] && grep -Eq "const '[A-Z_][A-Z0-9_]*' must be snak
     FAILED_STAGE="const_naming_seed_bridge"
     set +u
     python3 scripts/seed_const_bridge.py --seed "$SEED" \
-        --destination "$tmp/const-bridge" --output "$tmp/const-bootstrap.xin" -- "${HOSTED_ARGS[@]}"
+        --destination "$tmp/const-bridge" --output "$tmp_native/const-bootstrap$CHAIN_BIN_EXT" -- "${HOSTED_ARGS[@]}"
     set -u
-    BRIDGE_SEED=$(pick_bin "$tmp/const-bootstrap.xin")
+    BRIDGE_SEED=$(pick_bin "$tmp/const-bootstrap$CHAIN_BIN_EXT")
     BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
     BRIDGE_CONST_SOURCE_SHA256=$(cat "$tmp/const-bridge/source.sha256")
     SEED_MANIFEST_BRIDGE=const_naming_v1
     FAILED_STAGE="bridged_seed_to_gen1"
     # The transition artifact is not counted as Gen1 and is never installed.
     set +u
-    if "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin" >"$tmp/const-build.log" 2>&1; then
+    if "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT" >"$tmp/const-build.log" 2>&1; then
         seed_build_rc=0
     else
         seed_build_rc=$?
@@ -300,9 +328,9 @@ PY_EXEC_BRIDGE
     BRIDGE_EXEC_SHA256=$(sha256_file "$tmp/exec-bridge-src/os/exec/mod.xu")
     set +u
     XU_STDLIB_ROOT="$(native_path "$tmp/exec-bridge-src")" \
-        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/exec-bootstrap.xin"
+        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/exec-bootstrap$CHAIN_BIN_EXT"
     set -u
-    BRIDGE_SEED=$(pick_bin "$tmp/exec-bootstrap.xin")
+    BRIDGE_SEED=$(pick_bin "$tmp/exec-bootstrap$CHAIN_BIN_EXT")
     BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
     if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
         SEED_MANIFEST_BRIDGE=exec_cancellation_v1
@@ -311,7 +339,7 @@ PY_EXEC_BRIDGE
     fi
     FAILED_STAGE="bridged_seed_to_gen1"
     set +u
-    "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin"
+    "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT"
     set -u
 elif [ "$seed_build_rc" -ne 0 ]; then
     # Older hosted SDKs cannot type-check the new, unused os wrapper. Build
@@ -348,7 +376,7 @@ PY_BRIDGE
     # shellcheck disable=SC2086
     set +u
     if XU_STDLIB_ROOT="$(native_path "$tmp/seed-bridge-src")" \
-        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/socket-poll-bootstrap.xin" >"$tmp/socket-build.log" 2>&1; then
+        "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/socket-poll-bootstrap$CHAIN_BIN_EXT" >"$tmp/socket-build.log" 2>&1; then
         socket_build_rc=0
     else
         socket_build_rc=$?
@@ -373,7 +401,7 @@ PY_SOCKET_EXEC_BRIDGE
         # shellcheck disable=SC2086
         set +u
         XU_STDLIB_ROOT="$(native_path "$tmp/seed-bridge-src")" \
-            "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/socket-poll-bootstrap.xin"
+            "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/socket-poll-bootstrap$CHAIN_BIN_EXT"
         set -u
         if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
             SEED_MANIFEST_BRIDGE=socket_readiness_wrapper_v2+exec_cancellation_v1
@@ -389,30 +417,30 @@ PY_SOCKET_EXEC_BRIDGE
             SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+socket_readiness_wrapper_v2"
         fi
     fi
-    BRIDGE_SEED=$(pick_bin "$tmp/socket-poll-bootstrap.xin")
+    BRIDGE_SEED=$(pick_bin "$tmp/socket-poll-bootstrap$CHAIN_BIN_EXT")
     BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
     FAILED_STAGE="bridged_seed_to_gen1"
     # shellcheck disable=SC2086
     set +u
-    "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen1.xin"
+    "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT"
     set -u
 fi
 export XU_STDLIB_ROOT="$(native_path "$ROOT/src")"
-G1=$(pick_bin "$tmp/gen1.xin")
+G1=$(pick_bin "$tmp/gen1$CHAIN_BIN_EXT")
 echo "build_hosted_chain: gen1=$G1"
 # shellcheck disable=SC2086
 FAILED_STAGE="gen1_to_gen2"
 set +u
-"$G1" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen2.xin"
+"$G1" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen2$CHAIN_BIN_EXT"
 set -u
-G2=$(pick_bin "$tmp/gen2.xin")
+G2=$(pick_bin "$tmp/gen2$CHAIN_BIN_EXT")
 echo "build_hosted_chain: gen2=$G2"
 # shellcheck disable=SC2086
 FAILED_STAGE="gen2_to_gen3"
 set +u
-"$G2" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen3.xin"
+"$G2" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen3$CHAIN_BIN_EXT"
 set -u
-G3=$(pick_bin "$tmp/gen3.xin")
+G3=$(pick_bin "$tmp/gen3$CHAIN_BIN_EXT")
 echo "build_hosted_chain: gen3=$G3"
 FAILED_STAGE="fixed_point_cmp"
 CONFIRMED="$G3"
@@ -427,9 +455,9 @@ else
     GEN2_GEN3_CMP=DIFFERENT
     FAILED_STAGE="gen3_to_gen4"
     set +u
-    "$G3" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp/gen4.xin"
+    "$G3" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen4$CHAIN_BIN_EXT"
     set -u
-    G4=$(pick_bin "$tmp/gen4.xin")
+    G4=$(pick_bin "$tmp/gen4$CHAIN_BIN_EXT")
     echo "build_hosted_chain: gen4=$G4"
     FAILED_STAGE="fixed_point_cmp"
     cmp "$G3" "$G4"

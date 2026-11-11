@@ -1,0 +1,857 @@
+@xu/codegen
+// Baseline Thumb-2 (ARMv7E-M) instruction selection for typed MIR, bare
+// metal on the Arm MPS2 AN386 board (Cortex-M4, as emulated by QEMU).
+//
+// The rv32_base.xu model: every temp is an 8-byte frame slot computed as
+// a low/high register pair; f64 arithmetic and 64-bit division call
+// runtime/core softfloat.xu.
+//   - argument 0 in r0:r1, 1 in r2:r3, the rest at [sp + 8*(i-2)] of the
+//     caller's outgoing area; result in r0:r1
+//   - frame: [r11] saved r11, [r11+8] lr (8-byte words), sp = r11 - frame
+//   - r10 holds the runtime state block
+// Code addresses carry the Thumb bit. The image starts with the vector
+// table and is linked at address 0.
+
+#xu/mir
+#xu/mc
+
+const TH_R0 = 0
+const TH_R1 = 1
+const TH_R2 = 2
+const TH_R3 = 3
+const TH_AL = 4
+const TH_AH = 5
+const TH_BL = 6
+const TH_BH = 7
+const TH_T5 = 8
+const TH_AT = 9
+const TH_STATE = 10
+const TH_FP = 11
+const TH_T4 = 12
+const TH_SP = 13
+const TH_LR = 14
+
+const TH_EQ = 0
+const TH_NE = 1
+const TH_GE = 10
+const TH_LT = 11
+const TH_HI = 8
+
+// MPS2 AN386 memory map
+const TH_UART = 1073758208      // 0x40004000 CMSDK APB UART0
+const TH_STACK_TOP = 541065216  // 0x20400000, end of SSRAM2/3
+const TH_HEAP_CUR = 536870912   // 0x20000000: the heap cursor word
+const TH_SEMI_BLOCK = 536870920 // 0x20000008: semihosting parameters
+const TH_HEAP_BASE = 553648128  // 0x21000000, 16 MiB PSRAM
+const TH_HEAP_END = 570425344   // 0x22000000
+
+// ===== encoders =====
+
+fn t16(cb $&mc.CodeBuffer, h int) {
+    cb.emit_u8(h & 255)
+    cb.emit_u8((h >> 8) & 255)
+}
+
+fn t32(cb $&mc.CodeBuffer, w int) {
+    t16(cb, (w >> 16) & 0xffff)
+    t16(cb, w & 0xffff)
+}
+
+// Three-register data processing (add.w, and.w, ...): base | rn, rd, rm.
+fn th_rrr(cb $&mc.CodeBuffer, base int, rd int, rn int, rm int) {
+    t32(cb, base | (rn << 16) | (rd << 8) | rm)
+}
+
+fn th_li(cb $&mc.CodeBuffer, rd int, v int) {
+    t32(cb, mc.thumb_mov16_word(0xF2400000, rd, v & 0xffff))
+    hi := (v >> 16) & 0xffff
+    if hi != 0 {
+        t32(cb, mc.thumb_mov16_word(0xF2C00000, rd, hi))
+    }
+}
+
+fn th_mov(cb $&mc.CodeBuffer, rd int, rm int) {
+    t16(cb, 0x4600 | ((rd >> 3) << 7) | (rm << 3) | (rd & 7))
+}
+
+fn th_movz(cb $&mc.CodeBuffer, rd int) {
+    t32(cb, 0xF04F0000 | (rd << 8))
+}
+
+// Shift by an immediate: kind 0 lsl, 1 lsr, 2 asr.
+fn th_shi(cb $&mc.CodeBuffer, kind int, rd int, rm int, n int) {
+    t32(cb, 0xEA4F0000 | (((n >> 2) & 7) << 12) | (rd << 8) | ((n & 3) << 6) | (kind << 4) | rm)
+}
+
+fn th_bx_lr(cb $&mc.CodeBuffer) {
+    t16(cb, 0x4770)
+}
+
+fn th_blx(cb $&mc.CodeBuffer, rm int) {
+    t16(cb, 0x4780 | (rm << 3))
+}
+
+fn th_trap(cb $&mc.CodeBuffer) {
+    t16(cb, 0xDE00)
+}
+
+fn th_imm12(imm int) int {
+    << (((imm >> 11) & 1) << 26) | (((imm >> 8) & 7) << 12) | (imm & 0xff)
+}
+
+// rd = rn + imm for any imm (uses AT for large values).
+fn th_add_imm(cb $&mc.CodeBuffer, rd int, rn int, imm int) {
+    if imm >= 0 && imm < 4096 {
+        t32(cb, 0xF2000000 | (rn << 16) | (rd << 8) | th_imm12(imm))
+        <<
+    }
+    if imm < 0 && imm > -4096 {
+        t32(cb, 0xF2A00000 | (rn << 16) | (rd << 8) | th_imm12(0 - imm))
+        <<
+    }
+    th_li(cb, TH_AT, imm)
+    th_rrr(cb, 0xEB000000, rd, rn, TH_AT)
+}
+
+// Load/store of a 32-bit word, or width 1/2 zero-extended, at [rn + off].
+fn th_mem(cb $&mc.CodeBuffer, store bool, width int, rt int, rn int, off int) {
+    $base := rn
+    $o := off
+    if off < 0 || off >= 4096 {
+        th_li(cb, TH_AT, off)
+        th_rrr(cb, 0xEB000000, TH_AT, rn, TH_AT)
+        base = TH_AT
+        o = 0
+    }
+    $op := 0xF8D00000
+    if store {
+        op = 0xF8C00000
+        if width == 1 { op = 0xF8800000 }
+        else if width == 2 { op = 0xF8A00000 }
+    } else {
+        if width == 1 { op = 0xF8900000 }
+        else if width == 2 { op = 0xF8B00000 }
+    }
+    t32(cb, op | (base << 16) | (rt << 12) | o)
+}
+
+fn th_ldr(cb $&mc.CodeBuffer, rt int, rn int, off int) {
+    th_mem(cb, false, 4, rt, rn, off)
+}
+
+fn th_str(cb $&mc.CodeBuffer, rt int, rn int, off int) {
+    th_mem(cb, true, 4, rt, rn, off)
+}
+
+fn th_ld_pair(cb $&mc.CodeBuffer, lo int, hi int, rn int, off int) {
+    th_ldr(cb, lo, rn, off)
+    th_ldr(cb, hi, rn, off + 4)
+}
+
+fn th_st_pair(cb $&mc.CodeBuffer, lo int, hi int, rn int, off int) {
+    th_str(cb, lo, rn, off)
+    th_str(cb, hi, rn, off + 4)
+}
+
+fn th_call(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, label string) {
+    relocs.push(mc.reloc_new(cb.len(), label + "", mc.RELOC_THUMB_CALL, 0))
+    t32(cb, 0)
+}
+
+fn th_jump(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, label string) {
+    relocs.push(mc.reloc_new(cb.len(), label + "", mc.RELOC_THUMB_JUMP, 0))
+    t32(cb, 0)
+}
+
+// rd = address of label (+ addend) via movw/movt/add rd, pc.
+fn th_adr(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, rd int, label string, addend int) {
+    relocs.push(mc.reloc_new(cb.len(), label + "", mc.RELOC_THUMB_PCREL, addend))
+    t32(cb, mc.thumb_mov16_word(0xF2400000, rd, 0))
+    t32(cb, mc.thumb_mov16_word(0xF2C00000, rd, 0))
+    t16(cb, 0x4478 | ((rd >> 3) << 7) | (rd & 7))
+}
+
+// Short conditional (cond >= 0) or unconditional branch, patched once the
+// target is known; within +-256 (+-2048) bytes.
+fn th_b_here(cb $&mc.CodeBuffer) int {
+    pos := cb.len()
+    t16(cb, 0)
+    << pos
+}
+
+fn th_b_patch(cb $&mc.CodeBuffer, pos int, cond int, target int) {
+    off := (target - (pos + 4)) >> 1
+    $h := 0xE000 | (off & 0x7ff)
+    if cond >= 0 {
+        h = 0xD000 | (cond << 8) | (off & 0xff)
+    }
+    cb.patch_u8(pos, h & 255)
+    cb.patch_u8(pos + 1, (h >> 8) & 255)
+}
+
+// AL = flags satisfy cond, AH = 0.
+fn th_setcc(cb $&mc.CodeBuffer, cond int) {
+    $mask := 12
+    if (cond & 1) != 0 {
+        mask = 4
+    }
+    t16(cb, 0xBF00 | (cond << 4) | mask)
+    t16(cb, 0x2000 | (TH_AL << 8) | 1)
+    t16(cb, 0x2000 | (TH_AL << 8))
+    th_movz(cb, TH_AH)
+}
+
+// ===== frame =====
+
+fn th_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, lo int, hi int, v int) {
+    if v <= -2 {
+        c := f.consts[0 - v - 2]
+        th_li(cb, lo, c)
+        th_li(cb, hi, c >> 32)
+        <<
+    }
+    if v >= 0 && v < fr.temp_off.len {
+        th_ld_pair(cb, lo, hi, TH_SP, fr.temp_off[v])
+        <<
+    }
+    th_movz(cb, lo)
+    th_movz(cb, hi)
+}
+
+fn th_set_temp(cb $&mc.CodeBuffer, fr &A64Frame, t int, lo int, hi int) {
+    if t >= 0 && t < fr.temp_off.len {
+        th_st_pair(cb, lo, hi, TH_SP, fr.temp_off[t])
+    }
+}
+
+// ===== operations: A = A op B =====
+
+fn th_helper(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, name string, swap bool) {
+    $x := TH_AL
+    $xh := TH_AH
+    $y := TH_BL
+    $yh := TH_BH
+    if swap {
+        x = TH_BL
+        xh = TH_BH
+        y = TH_AL
+        yh = TH_AH
+    }
+    th_mov(cb, TH_R0, x)
+    th_mov(cb, TH_R1, xh)
+    th_mov(cb, TH_R2, y)
+    th_mov(cb, TH_R3, yh)
+    th_call(cb, relocs, "_xu_runtime_core_" + name)
+    th_mov(cb, TH_AL, TH_R0)
+    th_mov(cb, TH_AH, TH_R1)
+}
+
+// AL = (x < y) (cond LT) or (x >= y) (GE), signed 64-bit.
+fn th_cmp64(cb $&mc.CodeBuffer, xl int, xh int, yl int, yh int, cond int) {
+    th_rrr(cb, 0xEBB00F00, 0, xl, yl)
+    th_rrr(cb, 0xEB700000, TH_T4, xh, yh)
+    th_setcc(cb, cond)
+}
+
+fn th_divmod(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, is_mod bool) {
+    $slow := []int{}
+    th_shi(cb, 2, TH_T4, TH_AL, 31)
+    th_rrr(cb, 0xEBB00F00, 0, TH_T4, TH_AH)
+    slow.push(th_b_here(cb))
+    th_shi(cb, 2, TH_T4, TH_BL, 31)
+    th_rrr(cb, 0xEBB00F00, 0, TH_T4, TH_BH)
+    slow.push(th_b_here(cb))
+    t32(cb, 0xF1B00F00 | (TH_BL << 16))
+    $zero := th_b_here(cb)
+    t32(cb, 0xF1100F00 | (TH_BL << 16) | 1)
+    $neg1 := th_b_here(cb)
+    th_rrr(cb, 0xFB90F0F0, TH_T4, TH_AL, TH_BL)
+    if is_mod {
+        t32(cb, 0xFB000010 | (TH_T4 << 16) | (TH_AL << 12) | (TH_AL << 8) | TH_BL)
+    } else {
+        th_mov(cb, TH_AL, TH_T4)
+    }
+    th_shi(cb, 2, TH_AH, TH_AL, 31)
+    done := th_b_here(cb)
+    here := cb.len()
+    th_b_patch(cb, slow[0], TH_NE, here)
+    th_b_patch(cb, slow[1], TH_NE, here)
+    th_b_patch(cb, zero, TH_EQ, here)
+    th_b_patch(cb, neg1, TH_EQ, here)
+    $name := "sf_div64"
+    if is_mod {
+        name = "sf_mod64"
+    }
+    th_helper(cb, relocs, name, false)
+    th_b_patch(cb, done, -1, cb.len())
+}
+
+fn th_shift(cb $&mc.CodeBuffer, left bool) {
+    t32(cb, 0xF0000000 | (TH_BL << 16) | (TH_BL << 8) | 63)
+    t32(cb, 0xF1B00000 | (TH_BL << 16) | (TH_T4 << 8) | 32)
+    big := th_b_here(cb)
+    if left {
+        th_rrr(cb, 0xFA00F000, TH_AH, TH_AH, TH_BL)
+        th_shi(cb, 1, TH_T5, TH_AL, 1)
+        t32(cb, 0xF0800000 | (TH_BL << 16) | (TH_BH << 8) | 31)
+        th_rrr(cb, 0xFA20F000, TH_T5, TH_T5, TH_BH)
+        th_rrr(cb, 0xEA400000, TH_AH, TH_AH, TH_T5)
+        th_rrr(cb, 0xFA00F000, TH_AL, TH_AL, TH_BL)
+    } else {
+        th_rrr(cb, 0xFA20F000, TH_AL, TH_AL, TH_BL)
+        th_shi(cb, 0, TH_T5, TH_AH, 1)
+        t32(cb, 0xF0800000 | (TH_BL << 16) | (TH_BH << 8) | 31)
+        th_rrr(cb, 0xFA00F000, TH_T5, TH_T5, TH_BH)
+        th_rrr(cb, 0xEA400000, TH_AL, TH_AL, TH_T5)
+        th_rrr(cb, 0xFA40F000, TH_AH, TH_AH, TH_BL)
+    }
+    done := th_b_here(cb)
+    th_b_patch(cb, big, TH_GE, cb.len())
+    if left {
+        th_rrr(cb, 0xFA00F000, TH_AH, TH_AL, TH_T4)
+        th_movz(cb, TH_AL)
+    } else {
+        th_rrr(cb, 0xFA40F000, TH_AL, TH_AH, TH_T4)
+        th_shi(cb, 2, TH_AH, TH_AH, 31)
+    }
+    th_b_patch(cb, done, -1, cb.len())
+}
+
+fn th_bin(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, op int) {
+    if op == mir.BIN_ADD {
+        th_rrr(cb, 0xEB100000, TH_AL, TH_AL, TH_BL)
+        th_rrr(cb, 0xEB400000, TH_AH, TH_AH, TH_BH)
+    } else if op == mir.BIN_SUB {
+        th_rrr(cb, 0xEBB00000, TH_AL, TH_AL, TH_BL)
+        th_rrr(cb, 0xEB600000, TH_AH, TH_AH, TH_BH)
+    } else if op == mir.BIN_MUL {
+        t32(cb, 0xFBA00000 | (TH_AL << 16) | (TH_T4 << 12) | (TH_T5 << 8) | TH_BL)
+        t32(cb, 0xFB000000 | (TH_AL << 16) | (TH_T5 << 12) | (TH_T5 << 8) | TH_BH)
+        t32(cb, 0xFB000000 | (TH_AH << 16) | (TH_T5 << 12) | (TH_T5 << 8) | TH_BL)
+        th_mov(cb, TH_AL, TH_T4)
+        th_mov(cb, TH_AH, TH_T5)
+    } else if op == mir.BIN_DIV {
+        th_divmod(cb, relocs, false)
+    } else if op == mir.BIN_MOD {
+        th_divmod(cb, relocs, true)
+    } else if op == mir.BIN_AND {
+        th_rrr(cb, 0xEA000000, TH_AL, TH_AL, TH_BL)
+        th_rrr(cb, 0xEA000000, TH_AH, TH_AH, TH_BH)
+    } else if op == mir.BIN_OR {
+        th_rrr(cb, 0xEA400000, TH_AL, TH_AL, TH_BL)
+        th_rrr(cb, 0xEA400000, TH_AH, TH_AH, TH_BH)
+    } else if op == mir.BIN_XOR {
+        th_rrr(cb, 0xEA800000, TH_AL, TH_AL, TH_BL)
+        th_rrr(cb, 0xEA800000, TH_AH, TH_AH, TH_BH)
+    } else if op == mir.BIN_SHL {
+        th_shift(cb, true)
+    } else if op == mir.BIN_SHR {
+        th_shift(cb, false)
+    } else if op == mir.BIN_EQ || op == mir.BIN_NE {
+        th_rrr(cb, 0xEA800000, TH_AL, TH_AL, TH_BL)
+        th_rrr(cb, 0xEA800000, TH_AH, TH_AH, TH_BH)
+        th_rrr(cb, 0xEA500000, TH_AL, TH_AL, TH_AH)
+        if op == mir.BIN_EQ {
+            th_setcc(cb, TH_EQ)
+        } else {
+            th_setcc(cb, TH_NE)
+        }
+    } else if op == mir.BIN_LT {
+        th_cmp64(cb, TH_AL, TH_AH, TH_BL, TH_BH, TH_LT)
+    } else if op == mir.BIN_GE {
+        th_cmp64(cb, TH_AL, TH_AH, TH_BL, TH_BH, TH_GE)
+    } else if op == mir.BIN_GT {
+        th_cmp64(cb, TH_BL, TH_BH, TH_AL, TH_AH, TH_LT)
+    } else if op == mir.BIN_LE {
+        th_cmp64(cb, TH_BL, TH_BH, TH_AL, TH_AH, TH_GE)
+    } else if op == mir.BIN_FADD {
+        th_helper(cb, relocs, "sf_add", false)
+    } else if op == mir.BIN_FSUB {
+        th_helper(cb, relocs, "sf_sub", false)
+    } else if op == mir.BIN_FMUL {
+        th_helper(cb, relocs, "sf_mul", false)
+    } else if op == mir.BIN_FDIV {
+        th_helper(cb, relocs, "sf_div", false)
+    } else if op == mir.BIN_FEQ || op == mir.BIN_FNE {
+        th_helper(cb, relocs, "sf_eq", false)
+        if op == mir.BIN_FNE {
+            t32(cb, 0xF0800000 | (TH_AL << 16) | (TH_AL << 8) | 1)
+        }
+        th_movz(cb, TH_AH)
+    } else if op == mir.BIN_FLT || op == mir.BIN_FGT {
+        th_helper(cb, relocs, "sf_lt", op == mir.BIN_FGT)
+        th_movz(cb, TH_AH)
+    } else if op == mir.BIN_FLE || op == mir.BIN_FGE {
+        th_helper(cb, relocs, "sf_le", op == mir.BIN_FGE)
+        th_movz(cb, TH_AH)
+    } else {
+        th_trap(cb)
+    }
+}
+
+fn th_arg_lo(i int) int {
+    << 2 * i
+}
+
+pub fn isel_fn_thumb_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int) {
+    fr := frame_layout(f, 2)
+    syms.define_label(f.label, cb.len())
+    $last_line := f.src_line
+    if last_line > 0 {
+        lines.push(cb.len())
+        lines.push(last_line)
+    }
+    th_add_imm(cb, TH_SP, TH_SP, -16)
+    th_movz(cb, TH_T4)
+    th_st_pair(cb, TH_LR, TH_T4, TH_SP, 8)
+    th_st_pair(cb, TH_FP, TH_T4, TH_SP, 0)
+    th_mov(cb, TH_FP, TH_SP)
+    if fr.size > 0 {
+        th_add_imm(cb, TH_SP, TH_SP, 0 - fr.size)
+    }
+    for i in 0:f.nparams {
+        if i < 2 {
+            th_st_pair(cb, th_arg_lo(i), th_arg_lo(i) + 1, TH_SP, fr.local_off[i])
+        } else {
+            th_ld_pair(cb, TH_AL, TH_AH, TH_FP, 16 + (i - 2) * 8)
+            th_st_pair(cb, TH_AL, TH_AH, TH_SP, fr.local_off[i])
+        }
+    }
+    $strs := []StrFix{}
+    epilogue := f.label + ".ret"
+    for bi in 0:f.blocks.len {
+        syms.define_label(f.label + ".bb" + str(bi), cb.len())
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            k := ins.kind
+            if ins.line > 0 && ins.line != last_line {
+                last_line = ins.line
+                lines.push(cb.len())
+                lines.push(last_line)
+            }
+            if k == mir.MI_LOAD_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                th_ld_pair(cb, TH_AL, TH_AH, TH_SP, fr.local_off[ins.b] + w * 8)
+                th_set_temp(cb, &fr, ins.a, TH_AL, TH_AH)
+            } else if k == mir.MI_STORE_LOCAL {
+                $w := ins.c
+                if w < 0 { w = 0 }
+                th_operand(cb, f, &fr, TH_AL, TH_AH, ins.b)
+                th_st_pair(cb, TH_AL, TH_AH, TH_SP, fr.local_off[ins.a] + w * 8)
+            } else if k == mir.MI_ADDR {
+                th_add_imm(cb, TH_AL, TH_SP, fr.local_off[ins.b])
+                th_movz(cb, TH_AH)
+                th_set_temp(cb, &fr, ins.a, TH_AL, TH_AH)
+            } else if k == mir.MI_LOAD_PTR {
+                th_operand(cb, f, &fr, TH_BL, TH_BH, ins.b)
+                w := ins.d
+                if w == 1 || w == 2 || w == 4 {
+                    th_mem(cb, false, w, TH_AL, TH_BL, ins.c)
+                    th_movz(cb, TH_AH)
+                } else if w == -4 {
+                    th_ldr(cb, TH_AL, TH_BL, ins.c)
+                    th_shi(cb, 2, TH_AH, TH_AL, 31)
+                } else {
+                    th_ld_pair(cb, TH_AL, TH_AH, TH_BL, ins.c)
+                }
+                th_set_temp(cb, &fr, ins.a, TH_AL, TH_AH)
+            } else if k == mir.MI_STORE_PTR {
+                th_operand(cb, f, &fr, TH_BL, TH_BH, ins.a)
+                th_operand(cb, f, &fr, TH_AL, TH_AH, ins.b)
+                w := ins.d
+                if w == 1 || w == 2 {
+                    th_mem(cb, true, w, TH_AL, TH_BL, ins.c)
+                } else if w == 4 || w == -4 {
+                    th_str(cb, TH_AL, TH_BL, ins.c)
+                } else {
+                    th_st_pair(cb, TH_AL, TH_AH, TH_BL, ins.c)
+                }
+            } else if k == mir.MI_BIN {
+                th_operand(cb, f, &fr, TH_AL, TH_AH, ins.c)
+                th_operand(cb, f, &fr, TH_BL, TH_BH, ins.d)
+                th_bin(cb, relocs, ins.b)
+                th_set_temp(cb, &fr, ins.a, TH_AL, TH_AH)
+            } else if k == mir.MI_UN {
+                th_operand(cb, f, &fr, TH_R0, TH_R1, ins.c)
+                if ins.b == mir.UN_I2F {
+                    th_call(cb, relocs, "_xu_runtime_core_sf_from_int")
+                } else if ins.b == mir.UN_F2I {
+                    th_call(cb, relocs, "_xu_runtime_core_sf_to_int")
+                } else {
+                    th_trap(cb)
+                }
+                th_set_temp(cb, &fr, ins.a, TH_R0, TH_R1)
+            } else if k == mir.MI_COPY {
+                th_operand(cb, f, &fr, TH_AL, TH_AH, ins.b)
+                th_set_temp(cb, &fr, ins.a, TH_AL, TH_AH)
+            } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+                $a := ins.c
+                $i := 0
+                while a >= 0 {
+                    if i < 2 {
+                        th_operand(cb, f, &fr, th_arg_lo(i), th_arg_lo(i) + 1, f.margs[a].v)
+                    } else {
+                        th_operand(cb, f, &fr, TH_AL, TH_AH, f.margs[a].v)
+                        th_st_pair(cb, TH_AL, TH_AH, TH_SP, (i - 2) * 8)
+                    }
+                    i += 1
+                    a = f.margs[a].next
+                }
+                if k == mir.MI_CALL_IND {
+                    th_operand(cb, f, &fr, TH_T4, TH_T5, ins.b)
+                    th_blx(cb, TH_T4)
+                } else {
+                    th_call(cb, relocs, ins.sval)
+                }
+                th_set_temp(cb, &fr, ins.a, TH_R0, TH_R1)
+            } else if k == mir.MI_STR_CONST {
+                strs.push(StrFix{adr_off: cb.len(), bytes: ins.sval + ""})
+                t32(cb, mc.thumb_mov16_word(0xF2400000, TH_AL, 0))
+                t32(cb, mc.thumb_mov16_word(0xF2C00000, TH_AL, 0))
+                t16(cb, 0x4478 | TH_AL)
+                th_movz(cb, TH_AH)
+                th_set_temp(cb, &fr, ins.a, TH_AL, TH_AH)
+            } else if k == mir.MI_LOAD_FN_ADDR {
+                th_adr(cb, relocs, TH_AL, ins.sval, 1)
+                th_movz(cb, TH_AH)
+                th_set_temp(cb, &fr, ins.a, TH_AL, TH_AH)
+            } else {
+                th_trap(cb)
+            }
+            ii = ins.next
+        }
+        blk := ~f.blocks[bi]
+        if blk.tkind == mir.TKIND_RETURN {
+            th_operand(cb, f, &fr, TH_R0, TH_R1, blk.ta)
+            th_jump(cb, relocs, epilogue)
+        } else if blk.tkind == mir.TKIND_JUMP {
+            if blk.ta != bi + 1 {
+                th_jump(cb, relocs, f.label + ".bb" + str(blk.ta))
+            }
+        } else if blk.tkind == mir.TKIND_BRANCH {
+            th_operand(cb, f, &fr, TH_AL, TH_AH, blk.ta)
+            th_rrr(cb, 0xEA500000, TH_AL, TH_AL, TH_AH)
+            skip := th_b_here(cb)
+            th_jump(cb, relocs, f.label + ".bb" + str(blk.tb))
+            th_b_patch(cb, skip, TH_EQ, cb.len())
+            if blk.tc != bi + 1 {
+                th_jump(cb, relocs, f.label + ".bb" + str(blk.tc))
+            }
+        } else {
+            th_movz(cb, TH_R0)
+            th_movz(cb, TH_R1)
+            th_jump(cb, relocs, epilogue)
+        }
+    }
+    syms.define_label(epilogue, cb.len())
+    th_mov(cb, TH_SP, TH_FP)
+    th_ldr(cb, TH_FP, TH_SP, 0)
+    th_ldr(cb, TH_LR, TH_SP, 8)
+    th_add_imm(cb, TH_SP, TH_SP, 16)
+    th_bx_lr(cb)
+    for si in 0:strs.len {
+        pos := cb.len()
+        s := strs[si].bytes
+        for bi2 in 0:s.len {
+            cb.emit_u8(s[bi2])
+        }
+        cb.emit_u8(0)
+        while cb.len() % 4 != 0 {
+            cb.emit_u8(0)
+        }
+        r := mc.reloc_new(strs[si].adr_off, "", mc.RELOC_THUMB_PCREL, 0)
+        mc.apply_reloc(cb, &r, pos)
+    }
+}
+
+// ===== runtime stubs =====
+
+// Vector table at address 0: the initial stack pointer, reset, then every
+// exception to __xu_fault.
+pub fn emit_thumb_vectors(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc) {
+    cb.emit_u32_le(TH_STACK_TOP)
+    relocs.push(mc.reloc_new(cb.len(), "__xu_start", mc.RELOC_ABS32, 1))
+    cb.emit_u32_le(0)
+    for _ in 2:16 {
+        relocs.push(mc.reloc_new(cb.len(), "__xu_fault", mc.RELOC_ABS32, 1))
+        cb.emit_u32_le(0)
+    }
+}
+
+// Wide branches to labels inside the stubs (cond < 0: b.w), patched once
+// all are defined.
+struct ThFix {
+    pos int
+    cond int
+    label string
+}
+
+fn th_bw_to(cb $&mc.CodeBuffer, fx $&[]ThFix, cond int, label string) {
+    fx.push(ThFix{pos: cb.len(), cond: cond, label: label + ""})
+    t32(cb, 0)
+}
+
+fn th_fix_all(cb $&mc.CodeBuffer, syms &mc.SymbolTable, fx &[]ThFix) {
+    for i in 0:fx.len {
+        off := syms.lookup_offset(fx[i].label) - (fx[i].pos + 4)
+        if fx[i].cond < 0 {
+            mc.thumb_patch32(cb, fx[i].pos, mc.thumb_b_word(off, false))
+        } else {
+            s := (off >> 20) & 1
+            hw1 := 0xF000 | (s << 10) | (fx[i].cond << 6) | ((off >> 12) & 0x3f)
+            hw2 := 0x8000 | (((off >> 18) & 1) << 13) | (((off >> 19) & 1) << 11) | ((off >> 1) & 0x7ff)
+            mc.thumb_patch32(cb, fx[i].pos, (hw1 << 16) | hw2)
+        }
+    }
+}
+
+fn th_on_nr(cb $&mc.CodeBuffer, fx $&[]ThFix, nr int, label string) {
+    th_li(cb, TH_T4, nr)
+    th_rrr(cb, 0xEBB00F00, 0, TH_R0, TH_T4)
+    th_bw_to(cb, fx, TH_EQ, label)
+}
+
+fn th_ret_pair(cb $&mc.CodeBuffer, v int) {
+    th_li(cb, TH_R0, v)
+    th_li(cb, TH_R1, v >> 32)
+    th_bx_lr(cb)
+}
+
+// Zero n bytes at p (both registers advance; 16-byte multiples).
+fn th_zero_loop(cb $&mc.CodeBuffer, fx $&[]ThFix, syms $&mc.SymbolTable, p int, n int, name string) {
+    th_movz(cb, TH_T5)
+    syms.define_label(name + "", cb.len())
+    t32(cb, 0xF1B00F00 | (n << 16))
+    th_bw_to(cb, fx, TH_EQ, name + "_end")
+    th_str(cb, TH_T5, p, 0)
+    th_str(cb, TH_T5, p, 4)
+    th_str(cb, TH_T5, p, 8)
+    th_str(cb, TH_T5, p, 12)
+    th_add_imm(cb, p, p, 16)
+    th_add_imm(cb, n, n, -16)
+    th_bw_to(cb, fx, -1, name + "")
+    syms.define_label(name + "_end", cb.len())
+}
+
+fn emit_thumb_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+    // __xu_task_switch(from r0, to r1): only fp, lr, sp and the state
+    // register live across calls.
+    syms.define_label("__xu_task_switch", cb.len())
+    th_movz(cb, TH_T4)
+    th_st_pair(cb, TH_STATE, TH_T4, TH_R0, 72)
+    th_st_pair(cb, TH_FP, TH_T4, TH_R0, 80)
+    th_st_pair(cb, TH_LR, TH_T4, TH_R0, 88)
+    th_mov(cb, TH_T5, TH_SP)
+    th_st_pair(cb, TH_T5, TH_T4, TH_R0, 96)
+    th_ldr(cb, TH_STATE, TH_R1, 72)
+    th_ldr(cb, TH_FP, TH_R1, 80)
+    th_ldr(cb, TH_LR, TH_R1, 88)
+    th_ldr(cb, TH_T5, TH_R1, 96)
+    th_mov(cb, TH_SP, TH_T5)
+    th_bx_lr(cb)
+    // __xu_task_entry, entered from the switch with r1 = the task record:
+    // [0] task, [8] function, [16] 16 argument words, [24] exit function.
+    syms.define_label("__xu_task_entry", cb.len())
+    th_add_imm(cb, TH_SP, TH_SP, -120)
+    th_str(cb, TH_R1, TH_SP, 112)
+    th_ldr(cb, TH_AT, TH_R1, 16)
+    for i in 2:16 {
+        th_ld_pair(cb, TH_AL, TH_AH, TH_AT, i * 8)
+        th_st_pair(cb, TH_AL, TH_AH, TH_SP, (i - 2) * 8)
+    }
+    th_ld_pair(cb, TH_R2, TH_R3, TH_AT, 8)
+    th_ld_pair(cb, TH_R0, TH_R1, TH_AT, 0)
+    th_ldr(cb, TH_T4, TH_SP, 112)
+    th_ldr(cb, TH_T4, TH_T4, 8)
+    th_blx(cb, TH_T4)
+    th_ldr(cb, TH_T4, TH_SP, 112)
+    th_add_imm(cb, TH_SP, TH_SP, 120)
+    th_ldr(cb, TH_R0, TH_T4, 0)
+    th_movz(cb, TH_R1)
+    th_ldr(cb, TH_T4, TH_T4, 24)
+    th_blx(cb, TH_T4)
+    th_trap(cb)
+}
+
+// Process entry, the emulated system calls and the runtime-state accessor.
+pub fn emit_thumb_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string) {
+    $fx := []ThFix{}
+    syms.define_label("__xu_start", cb.len())
+    // UART0: baud divisor, then enable transmit
+    th_li(cb, TH_AT, TH_UART)
+    th_li(cb, TH_T4, 16)
+    th_str(cb, TH_T4, TH_AT, 16)
+    th_li(cb, TH_T4, 1)
+    th_str(cb, TH_T4, TH_AT, 8)
+    // state block (64 KiB) and a zero word for argv and envp, zeroed
+    th_li(cb, TH_STATE, TH_HEAP_BASE)
+    th_li(cb, TH_AL, TH_HEAP_BASE)
+    th_li(cb, TH_AH, 65552)
+    th_zero_loop(cb, $&fx, syms, TH_AL, TH_AH, "__xu_th.zero_state")
+    th_li(cb, TH_AT, TH_HEAP_CUR)
+    th_str(cb, TH_AL, TH_AT, 0)
+    th_li(cb, TH_T4, TH_HEAP_BASE + 65536)
+    th_str(cb, TH_T4, TH_STATE, 8)
+    th_str(cb, TH_T4, TH_STATE, 32)
+    th_movz(cb, TH_FP)
+    th_call(cb, relocs, main_label)
+    th_bw_to(cb, $&fx, -1, "__xu_th.exit")
+
+    // __xu_syscall(nr, a, b, c, ...): nr in r0, a in r2, b and c at
+    // [sp] and [sp + 8].
+    syms.define_label("__xu_syscall", cb.len())
+    th_on_nr(cb, $&fx, -5, "__xu_th.memset")
+    th_on_nr(cb, $&fx, -4, "__xu_th.memcpy")
+    th_on_nr(cb, $&fx, -2, "__xu_th.fp")
+    th_on_nr(cb, $&fx, -3, "__xu_th.start")
+    th_on_nr(cb, $&fx, -1, "__xu_th.switch")
+    th_on_nr(cb, $&fx, 64, "__xu_th.write")
+    th_on_nr(cb, $&fx, 222, "__xu_th.mmap")
+    th_on_nr(cb, $&fx, 93, "__xu_th.exit_a")
+    th_on_nr(cb, $&fx, 94, "__xu_th.exit_a")
+    th_on_nr(cb, $&fx, 113, "__xu_th.zero")
+    th_on_nr(cb, $&fx, 63, "__xu_th.zero")
+    th_on_nr(cb, $&fx, 215, "__xu_th.zero")
+    th_on_nr(cb, $&fx, 226, "__xu_th.zero")
+    th_on_nr(cb, $&fx, 233, "__xu_th.zero")
+    th_on_nr(cb, $&fx, 172, "__xu_th.one")
+    th_ret_pair(cb, -38)
+    syms.define_label("__xu_th.zero", cb.len())
+    th_ret_pair(cb, 0)
+    syms.define_label("__xu_th.one", cb.len())
+    th_ret_pair(cb, 1)
+
+    // memset(a, b): zero b bytes at a
+    syms.define_label("__xu_th.memset", cb.len())
+    th_ldr(cb, TH_T4, TH_SP, 0)
+    th_movz(cb, TH_T5)
+    syms.define_label("__xu_th.memset_w", cb.len())
+    t32(cb, 0xF0100F03 | (TH_R2 << 16))
+    th_bw_to(cb, $&fx, TH_NE, "__xu_th.memset_b")
+    t32(cb, 0xF1B00F00 | (TH_T4 << 16) | 4)
+    th_bw_to(cb, $&fx, TH_LT, "__xu_th.memset_b")
+    th_str(cb, TH_T5, TH_R2, 0)
+    th_add_imm(cb, TH_R2, TH_R2, 4)
+    th_add_imm(cb, TH_T4, TH_T4, -4)
+    th_bw_to(cb, $&fx, -1, "__xu_th.memset_w")
+    syms.define_label("__xu_th.memset_b", cb.len())
+    t32(cb, 0xF1B00F00 | (TH_T4 << 16))
+    th_bw_to(cb, $&fx, TH_EQ, "__xu_th.zero")
+    th_mem(cb, true, 1, TH_T5, TH_R2, 0)
+    th_add_imm(cb, TH_R2, TH_R2, 1)
+    th_add_imm(cb, TH_T4, TH_T4, -1)
+    th_bw_to(cb, $&fx, -1, "__xu_th.memset_b")
+
+    // memcpy(a, b, c): copy c bytes from b to a, forward
+    syms.define_label("__xu_th.memcpy", cb.len())
+    th_ldr(cb, TH_T4, TH_SP, 0)
+    th_ldr(cb, TH_AT, TH_SP, 8)
+    th_rrr(cb, 0xEA400000, TH_T5, TH_R2, TH_T4)
+    t32(cb, 0xF0100F03 | (TH_T5 << 16))
+    th_bw_to(cb, $&fx, TH_NE, "__xu_th.memcpy_b")
+    syms.define_label("__xu_th.memcpy_w", cb.len())
+    t32(cb, 0xF1B00F00 | (TH_AT << 16) | 4)
+    th_bw_to(cb, $&fx, TH_LT, "__xu_th.memcpy_b")
+    th_ldr(cb, TH_T5, TH_T4, 0)
+    th_str(cb, TH_T5, TH_R2, 0)
+    th_add_imm(cb, TH_R2, TH_R2, 4)
+    th_add_imm(cb, TH_T4, TH_T4, 4)
+    t32(cb, 0xF1A00000 | (TH_AT << 16) | (TH_AT << 8) | 4)
+    th_bw_to(cb, $&fx, -1, "__xu_th.memcpy_w")
+    syms.define_label("__xu_th.memcpy_b", cb.len())
+    t32(cb, 0xF1B00F00 | (TH_AT << 16))
+    th_bw_to(cb, $&fx, TH_EQ, "__xu_th.zero")
+    th_mem(cb, false, 1, TH_T5, TH_T4, 0)
+    th_mem(cb, true, 1, TH_T5, TH_R2, 0)
+    th_add_imm(cb, TH_R2, TH_R2, 1)
+    th_add_imm(cb, TH_T4, TH_T4, 1)
+    t32(cb, 0xF1A00000 | (TH_AT << 16) | (TH_AT << 8) | 1)
+    th_bw_to(cb, $&fx, -1, "__xu_th.memcpy_b")
+
+    syms.define_label("__xu_th.fp", cb.len())
+    th_mov(cb, TH_R0, TH_FP)
+    th_movz(cb, TH_R1)
+    th_bx_lr(cb)
+    syms.define_label("__xu_th.start", cb.len())
+    th_adr(cb, relocs, TH_R0, "__xu_start", 1)
+    th_movz(cb, TH_R1)
+    th_bx_lr(cb)
+    syms.define_label("__xu_th.switch", cb.len())
+    th_mov(cb, TH_R0, TH_R2)
+    th_ldr(cb, TH_R1, TH_SP, 0)
+    th_jump(cb, relocs, "__xu_task_switch")
+
+    // write(fd, buf, n): fds 1 and 2 go to UART0
+    syms.define_label("__xu_th.write", cb.len())
+    t32(cb, 0xF1A00000 | (TH_R2 << 16) | (TH_T4 << 8) | 1)
+    t32(cb, 0xF1B00F00 | (TH_T4 << 16) | 1)
+    th_bw_to(cb, $&fx, TH_HI, "__xu_th.badf")
+    th_ldr(cb, TH_T4, TH_SP, 0)
+    th_ldr(cb, TH_R0, TH_SP, 8)
+    th_mov(cb, TH_T5, TH_R0)
+    th_movz(cb, TH_R1)
+    th_li(cb, TH_AT, TH_UART)
+    syms.define_label("__xu_th.write_loop", cb.len())
+    t32(cb, 0xF1B00F00 | (TH_T5 << 16))
+    th_bw_to(cb, $&fx, TH_EQ, "__xu_th.ret")
+    syms.define_label("__xu_th.write_wait", cb.len())
+    th_ldr(cb, TH_R3, TH_AT, 4)
+    t32(cb, 0xF0100F01 | (TH_R3 << 16))
+    th_bw_to(cb, $&fx, TH_NE, "__xu_th.write_wait")
+    th_mem(cb, false, 1, TH_R3, TH_T4, 0)
+    th_str(cb, TH_R3, TH_AT, 0)
+    th_add_imm(cb, TH_T4, TH_T4, 1)
+    th_add_imm(cb, TH_T5, TH_T5, -1)
+    th_bw_to(cb, $&fx, -1, "__xu_th.write_loop")
+    syms.define_label("__xu_th.ret", cb.len())
+    th_bx_lr(cb)
+    syms.define_label("__xu_th.badf", cb.len())
+    th_ret_pair(cb, -9)
+
+    // mmap(addr, len, ...): zeroed bump allocation from PSRAM
+    syms.define_label("__xu_th.mmap", cb.len())
+    th_li(cb, TH_AT, TH_HEAP_CUR)
+    th_ldr(cb, TH_R0, TH_AT, 0)
+    th_ldr(cb, TH_T4, TH_SP, 0)
+    th_add_imm(cb, TH_T4, TH_T4, 15)
+    t32(cb, 0xF0200000 | (TH_T4 << 16) | (TH_T4 << 8) | 15)
+    th_rrr(cb, 0xEB000000, TH_R2, TH_R0, TH_T4)
+    th_li(cb, TH_T5, TH_HEAP_END)
+    th_rrr(cb, 0xEBB00F00, 0, TH_R2, TH_T5)
+    th_bw_to(cb, $&fx, TH_HI, "__xu_th.nomem")
+    th_str(cb, TH_R2, TH_AT, 0)
+    th_mov(cb, TH_R2, TH_R0)
+    th_zero_loop(cb, $&fx, syms, TH_R2, TH_T4, "__xu_th.zero_map")
+    th_movz(cb, TH_R1)
+    th_bx_lr(cb)
+    syms.define_label("__xu_th.nomem", cb.len())
+    th_ret_pair(cb, -12)
+
+    // exit(code): semihosting SYS_EXIT_EXTENDED (ADP_Stopped_ApplicationExit)
+    syms.define_label("__xu_th.exit_a", cb.len())
+    th_mov(cb, TH_R0, TH_R2)
+    syms.define_label("__xu_th.exit", cb.len())
+    th_li(cb, TH_R1, TH_SEMI_BLOCK)
+    th_li(cb, TH_T4, 131110)
+    th_str(cb, TH_T4, TH_R1, 0)
+    th_str(cb, TH_R0, TH_R1, 4)
+    th_li(cb, TH_R0, 32)
+    t16(cb, 0xBEAB)
+    syms.define_label("__xu_th.hang", cb.len())
+    t16(cb, 0xBF30) // wfi
+    th_bw_to(cb, $&fx, -1, "__xu_th.hang")
+
+    // Faults end the run with status 134.
+    syms.define_label("__xu_fault", cb.len())
+    th_li(cb, TH_R0, 134)
+    th_bw_to(cb, $&fx, -1, "__xu_th.exit")
+
+    syms.define_label("__xu_globals", cb.len())
+    th_mov(cb, TH_R0, TH_STATE)
+    th_movz(cb, TH_R1)
+    th_bx_lr(cb)
+    emit_thumb_task_stubs(cb, syms)
+    th_fix_all(cb, syms, &fx)
+}

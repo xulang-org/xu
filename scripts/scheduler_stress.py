@@ -16,7 +16,7 @@ also runs that production fixture, the multi-waiter/recycle channel fixtures,
 and the scheduler quadrants in ``tests/scheduler``.  A compiler capability
 skip is represented explicitly in the JSON report; an unknown build failure
 still fails the gate.  The current Gen1 optimiser limitation for the
-multi-sender fixture is therefore visible as a SKIP with an O0 fallback,
+multi-sender fixture is therefore visible as a SKIP with a no-opt fallback,
 never as a silent pass.
 
 This file intentionally uses only the Python standard library so it can run
@@ -117,19 +117,11 @@ CASES: dict[str, Case] = {
 }
 
 
-# ``-O1`` is the normal product profile.  RA-only profiles are useful when a
-# failure is sensitive to register-cache pressure, while ``--no-regcache``
+# Exercise the default product profile and its unoptimized mode.
 # separates allocator effects from scheduler effects.
 PROFILE_FLAGS: dict[str, tuple[str, ...]] = {
-    "O0": ("-O0",),
-    "O1": ("-O1",),
-    "O2": ("-O2",),
-    "O3": ("-O3",),
-    "no-regcache": ("-O1", "--no-regcache"),
-    "ra0": ("-O1", "--ra=0"),
-    "ra1": ("-O1", "--ra=1"),
-    "ra2": ("-O1", "--ra=2"),
-    "ra3": ("-O1", "--ra=3"),
+    "default": (),
+    "no-opt": ("--no-opt",),
 }
 
 
@@ -174,11 +166,11 @@ CAPABILITY_CATALOG: dict[str, dict[str, object]] = {
 # This is the one currently verified Gen1 capability gap in the channel
 # matrix.  The product compiler (the hosted/self-hosted Gen1 CLI) rejects the
 # multi-sender fixture at optimised profiles with the deterministic diagnostic
-# below, while O0 compiles and runs.  We classify *only* this exact
+# below, while --no-opt compiles and runs.  We classify *only* this exact
 # compiler/profile/diagnostic tuple as SKIP.  Any other build error, including
 # a changed diagnostic after a compiler fix, remains a hard BUILD_FAILURE.
 KNOWN_BUILD_SKIP_PROFILES = frozenset(
-    {"O1", "O2", "O3", "no-regcache", "ra0", "ra1", "ra2", "ra3"}
+    {"default"}
 )
 KNOWN_BUILD_SKIP_CASE = "chan_multi_sender_unbuffered"
 KNOWN_BUILD_SKIP_DIAGNOSTIC = "index out of bounds"
@@ -494,13 +486,13 @@ def _known_build_skip(
         "code": "gen1_chan_multi_sender_optimized_compile",
         "reason": (
             "Gen1 hosted compiler currently rejects the multi-sender channel "
-            "fixture at this optimised profile; run the fixture with O0 until "
+            "fixture at this optimised profile; run the fixture with --no-opt until "
             "the compiler diagnostic is fixed."
         ),
         "diagnostic": KNOWN_BUILD_SKIP_DIAGNOSTIC,
         "compile_mode": compile_mode,
         "profile": profile,
-        "fallback_profiles": ["O0"],
+        "fallback_profiles": ["no-opt"],
     }
 
 
@@ -702,8 +694,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--profiles",
-        default=os.environ.get("XU_SCHED_PROFILES", "O1"),
-        help="comma-separated profiles, or 'all' (default: O1)",
+        default=os.environ.get("XU_SCHED_PROFILES", "default"),
+        help="comma-separated profiles, or 'all' (default: default)",
     )
     parser.add_argument(
         "--case",
