@@ -198,6 +198,14 @@ static std::string read_tmp_all(XuWebViewPlugin *p, const char *name) {
   return std::string(buf);
 }
 
+#include "xu_webview_bridge.inc"
+
+static std::string load_bridge_js(XuWebViewPlugin *p) {
+  std::string js = read_tmp_all(p, "xu_ui_bridge.js");
+  if (!js.empty()) return js;
+  return kXuBridgeJs;
+}
+
 static std::string xu_ipc_invoke(XuWebViewPlugin *p, const std::string &body) {
   (void)p;
   char *raw = xu_ui_invoke_sync(body.c_str());
@@ -362,9 +370,7 @@ static void xu_scheme_cb(WebKitURISchemeRequest *request, gpointer data) {
       return;
     }
     if (path.find("/__xu/bridge.js") != std::string::npos) {
-      std::string js = read_tmp_all(p, "xu_ui_bridge.js");
-      xu_scheme_finish(request, js.empty() ? 404 : 200, "application/javascript; charset=utf-8",
-                       js.empty() ? "/* no bridge */\n" : js);
+      xu_scheme_finish(request, 200, "application/javascript; charset=utf-8", load_bridge_js(p));
       return;
     }
     if (path.rfind("/brand/", 0) == 0 || path == "/favicon.ico") {
@@ -494,7 +500,7 @@ static void wv_install(XuWebViewPlugin *p) {
   webkit_web_view_set_background_color(web, &clear);
 
   {
-    std::string bridge = read_tmp_all(p, "xu_ui_bridge.js");
+    std::string bridge = load_bridge_js(p);
     std::string src = "/*__XU_BRIDGE__*/\n" + bridge +
                       "\n(function(){if(window.__XU_CTX__===undefined)window.__XU_CTX__=true;"
                       "if(!window.__XU_CTX_HOOK__){window.__XU_CTX_HOOK__=true;"
