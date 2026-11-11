@@ -307,8 +307,8 @@ class BoundaryCheck:
         """Validate the named optimization profiles and their generation use.
 
         The product chain intentionally follows compiler defaults (currently
-        O1 with an automatic RA tier), while the deterministic vreg acceptance
-        lane pins ``-O1 --ra=1``.  Keeping these as named profiles prevents a
+        optimization with automatic register allocation), while the deterministic vreg acceptance
+        lane pins ``--ra=1``.  Keeping these as named profiles prevents a
         documentation-only flag change from silently making hosted generations
         different lowering policies.
         """
@@ -710,8 +710,8 @@ class BoundaryCheck:
         """Ensure executable self-host lanes consume the manifest profiles.
 
         ``build_hosted_chain.sh`` deliberately leaves the product profile's
-        argument array empty (the compiler's default O1/RA-auto policy), while
-        its acceptance profile pins ``-O1 --ra=1``.  Both hosted hops must use
+        argument array empty (the compiler's default optimization and register allocation), while
+        its acceptance profile pins ``--ra=1``.  Both hosted hops must use
         one and the same array; otherwise Gen3/Gen4 byte equality could be a
         false comparison across optimization policies.
         """
@@ -725,7 +725,7 @@ class BoundaryCheck:
             return
         product_args = product.get("args")
         acceptance_args = acceptance.get("args")
-        if product_args != [] or acceptance_args != ["-O1", "--ra=1"]:
+        if product_args != [] or acceptance_args != ["--ra=1"]:
             return
 
         chain_path = self.path(
@@ -746,7 +746,7 @@ class BoundaryCheck:
             (r"product\)", "product profile case"),
             (r"acceptance\)", "acceptance profile case"),
             (r"HOSTED_ARGS=\(\)", "empty product args"),
-            (r"HOSTED_ARGS=\(-O1\s+--ra=1\)", "pinned acceptance args"),
+            (r"HOSTED_ARGS=\(--ra=1\)", "pinned acceptance args"),
             (r"hosted_profile=\$HOSTED_PROFILE", "profile provenance output"),
         )
         for pattern, label in required_markers:

@@ -3,7 +3,7 @@
 #
 # The fixtures exercise three ownership boundaries that used to leak in both
 # lowering paths: a discarded str(int), fresh concat operands/results, and a
-# concat moved into an array.  Run both unoptimised and O1 MIR so the contract
+# concat moved into an array.  Run both unoptimized and default builds so the contract
 # covers the optimizer's StoreLocal/Drop rewrites as well as the raw lowering.
 set -euo pipefail
 
@@ -36,7 +36,7 @@ while [ "$#" -gt 0 ]; do
         -h|--help)
             echo "usage: test_string_temp_lifetime.sh [--gen1=PATH|--gen1 PATH]"
             echo "  XU runs strict heap-ledger checks."
-            echo "  --gen1 or XU_GEN1 optionally runs Gen1 O0/O1 parity."
+            echo "  --gen1 or XU_GEN1 optionally runs Gen1 default/no-opt parity."
             exit 0
             ;;
         *)
@@ -76,7 +76,9 @@ compile_fixture() {
     local base="$TMP/${name}_${opt}"
     local stderr_file="$TMP/${name}_${opt}.compile.stderr"
     local stdout_file="$TMP/${name}_${opt}.compile.stdout"
-    XU_GEN1_HEAP_LEDGER=1 run_with_timeout "$BUILD_TIMEOUT" "$ROOT/scripts/run_product_compiler.sh" "$XU" build "$source" "-$opt" -o "$base" \
+    set --
+    if [ "$opt" = no-opt ]; then set -- --no-opt; fi
+    XU_GEN1_HEAP_LEDGER=1 run_with_timeout "$BUILD_TIMEOUT" "$ROOT/scripts/run_product_compiler.sh" "$XU" build "$source" "$@" -o "$base" \
         >"$stdout_file" 2>"$stderr_file"
 
     local binary
@@ -149,7 +151,7 @@ print(
 PY
 }
 
-for opt in O0 O1; do
+for opt in default no-opt; do
     for name in string_temp_discard string_concat_discard string_push_temp string_temp_lifetime string_alias_preserve; do
         binary=$(compile_fixture "$opt" "$name")
         out_file="$TMP/${name}_${opt}.out"
@@ -174,10 +176,10 @@ for opt in O0 O1; do
     done
 done
 
-echo "string temporary lifetime: PASS (product O0/O1 strict ledger)"
+echo "string temporary lifetime: PASS (product default/no-opt strict ledger)"
 
 # Gen1 keeps the heap-ledger capability disabled by default.  When a caller
-# supplies a product/Gen1 compiler, still exercise both optimization levels
+# supplies a product/Gen1 compiler, still exercise both optimization modes
 # and compare observable output; strict accounting remains the product
 # contract above and is never enabled by mutating the shared source tree.
 if [ -n "$GEN1" ]; then
@@ -185,12 +187,14 @@ if [ -n "$GEN1" ]; then
         echo "string temporary lifetime: Gen1 compiler is not executable: $GEN1" >&2
         exit 1
     fi
-    for opt in O0 O1; do
+    for opt in default no-opt; do
+        set --
+        if [ "$opt" = no-opt ]; then set -- --no-opt; fi
         for name in string_temp_discard string_concat_discard string_push_temp string_temp_lifetime string_alias_preserve; do
             source="$ROOT/tests/fixtures/$name/main.xu"
             base="$TMP/gen1_${name}_${opt}"
             compile_err="$TMP/gen1_${name}_${opt}.compile.stderr"
-            if ! run_with_timeout "$BUILD_TIMEOUT" "$ROOT/scripts/run_product_compiler.sh" "$GEN1" build "-$opt" "$source" -o "$base" \
+            if ! run_with_timeout "$BUILD_TIMEOUT" "$ROOT/scripts/run_product_compiler.sh" "$GEN1" build "$@" "$source" -o "$base" \
                 >"$TMP/gen1_${name}_${opt}.compile.stdout" 2>"$compile_err"; then
                 echo "string temporary lifetime: Gen1 $name/$opt compile failed" >&2
                 sed -n '1,120p' "$compile_err" >&2 || true
