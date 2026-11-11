@@ -324,13 +324,12 @@ static void hook_exit_process(void) {
       if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
       nm = (IMAGE_IMPORT_BY_NAME *)((char *)base + (DWORD)orig->u1.AddressOfData);
       if (!nm || strcmp(nm->Name, "ExitProcess") != 0) continue;
-      g_real_ExitProcess = (ExitProcessFn)(uintptr_t)thunk->u1.Function;
+      if (!g_real_ExitProcess) g_real_ExitProcess = (ExitProcessFn)(uintptr_t)thunk->u1.Function;
       if (!VirtualProtect(&thunk->u1.Function, sizeof(void *), PAGE_READWRITE, &old))
-        return;
+        continue;
       thunk->u1.Function = (ULONGLONG)(uintptr_t)hooked_ExitProcess;
       VirtualProtect(&thunk->u1.Function, sizeof(void *), old, &old);
       log_line("hooked ExitProcess");
-      return;
     }
   }
 }
@@ -405,71 +404,12 @@ int WINAPI WinMain(HINSTANCE a, HINSTANCE b, LPSTR c, int d) {
   hook_exit_process();
   {
     extern void xu_force_cxx_string_syms(void);
-    extern void _rt_collect_args(void);
-    extern void _rt_xu_mark(void);
-    extern void _rt_collect_env(void);
-    extern void _rt_win_sysinfo(void);
-    extern int _xu_main(void);
-    char *cmdline;
-    int rc;
+    extern void xu_app_start(int argc, char **argv);
     log_line("before xu_force_cxx_string_syms");
     xu_force_cxx_string_syms();
     log_line("after xu_force_cxx_string_syms");
-    cmdline = GetCommandLineA();
-    log_line("GetCommandLineA ok");
-#if defined(__aarch64__) || defined(_M_ARM64)
-    __asm__ __volatile__(
-      "mov x0, %[cl]\n\t"
-      "bl _rt_collect_args\n\t"
-      :
-      : [cl] "r" (cmdline)
-      : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
-#else
-    __asm__ __volatile__(
-      "mov %[cl], %%rdi\n\t"
-      "call _rt_collect_args\n\t"
-      :
-      : [cl] "r" (cmdline)
-      : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
-        "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
-#endif
-    log_line("after _rt_collect_args");
-    _rt_xu_mark();
-    log_line("after _rt_xu_mark");
-    _rt_collect_env();
-    log_line("after _rt_collect_env");
-    _rt_win_sysinfo();
-    log_line("after _rt_win_sysinfo");
-    log_line("calling _xu_main");
-#if defined(__aarch64__) || defined(_M_ARM64)
-    __asm__ __volatile__(
-      "bl _xu_main\n\t"
-      "mov %w[rc], w0\n\t"
-      : [rc] "=r" (rc)
-      :
-      : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
-#else
-    __asm__ __volatile__(
-      "push %%rbp\n\t"
-      "mov %%rsp, %%rbp\n\t"
-      "and $~15, %%rsp\n\t"
-      "sub $32, %%rsp\n\t"
-      "call _xu_main\n\t"
-      "mov %%rbp, %%rsp\n\t"
-      "pop %%rbp\n\t"
-      "mov %%eax, %[rc]\n\t"
-      : [rc] "=r" (rc)
-      :
-      : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
-        "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
-#endif
-    {
-      char m[64];
-      snprintf(m, sizeof(m), "_xu_main returned %d", rc);
-      log_line(m);
-    }
-    if (g_real_ExitProcess) g_real_ExitProcess((UINT)rc);
-    else ExitProcess((UINT)rc);
+    log_line("calling xu_app_start");
+    xu_app_start(0, NULL);
   }
   return 0;
 }
