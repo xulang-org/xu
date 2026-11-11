@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Optimization-level / register-allocation differential matrix over the
+# Optimization differential matrix over the
 # fixture corpus (T0.2 in OVERALL_OPTIMIZATION_PLAN_2026-09.md).
 #
 # The Gen3 == Gen4 fixed point cannot detect a deterministic miscompile and a
@@ -9,15 +9,15 @@
 #
 #   PASS      every mode matches the golden output
 #   FAIL      every mode fails the same fixture (a corpus/compiler problem
-#             independent of the mode)
+#             independent of optimization)
 #   DIVERGE   the verdict depends on the mode (an optimization/RA bug; the
 #             historical `matmul -O2 prints 0` and `array_index_rw 0,99,0,99`
 #             classes)
 #
 # Usage:
-#   scripts/run_fixture_matrix.sh --xu=bin/xu                 # full corpus x 5 modes
-#   scripts/run_fixture_matrix.sh --xu=bin/xu --quick         # RA/opt-sensitive subset
-#   scripts/run_fixture_matrix.sh --xu=bin/xu --modes='-O0,-O1,-O3,--no-regcache,--ra=0'
+#   scripts/run_fixture_matrix.sh --xu=bin/xu                 # full corpus in both modes
+#   scripts/run_fixture_matrix.sh --xu=bin/xu --quick         # optimization-sensitive subset
+#   scripts/run_fixture_matrix.sh --xu=bin/xu --modes='default,--no-opt'
 #   scripts/run_fixture_matrix.sh --xu=bin/xu --only='^(matmul|nbody|copy_)' --skip-net
 #   scripts/run_fixture_matrix.sh --xu=bin/xu --out=/tmp/matrix   # keep per-mode logs
 #
@@ -31,7 +31,7 @@ cd "$ROOT"
 LANE=product
 
 XU_INPUT=""
-MODES="-O0,-O1,-O2,-O3,--no-regcache"
+MODES="default,--no-opt"
 ONLY=""
 QUICK=0
 SKIP_NET=0
@@ -114,7 +114,9 @@ for mode in "${MODE_LIST[@]}"; do
     set +e
     # Hosted compilers use build; the frozen oracle uses its file-first CLI.
     # The extra compiler flags are the only thing changing between modes.
-    XU_FIXTURE_EXTRA_ARGS="$mode" ./scripts/run_fixtures.sh "${args[@]}" >"$log" 2>&1
+    flags=$mode
+    if [ "$mode" = default ]; then flags=""; fi
+    XU_FIXTURE_EXTRA_ARGS="$flags" ./scripts/run_fixtures.sh "${args[@]}" >"$log" 2>&1
     rc=$?
     set -e
     summary=$(grep -E '^fixtures\[' "$log" | tail -1 || true)

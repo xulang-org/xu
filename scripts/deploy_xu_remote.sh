@@ -14,8 +14,7 @@ CONFIG_FILE=${XU_SERVER_CONFIG:-$ROOT_DIR/server.md}
 ARTIFACT=${XU_SERVER_ARTIFACT:-$ROOT_DIR/dist/xu-server/xu-server-linux-x64}
 SOURCE=${XU_SERVER_SOURCE:-}
 COMPILER=${XU_COMPILER:-${XU:-}}
-OPT_LEVEL=${XU_SERVER_OPT_LEVEL:-}
-NO_REGCACHE=${XU_SERVER_NO_REGCACHE:-0}
+NO_OPT=${XU_SERVER_NO_OPT:-0}
 HEALTH_TIMEOUT=${XU_SERVER_HEALTH_TIMEOUT:-5}
 
 SERVER_HOST=${XU_SERVER_HOST:-}
@@ -55,8 +54,8 @@ Options:
   --artifact PATH    Local Linux artifact path
   --source PATH      Xu server source passed to the local build adapter
   --compiler PATH    Xu compiler used for the linux-x64 build
-  --opt O0|O1|O2|O3 Optimization level
-  --no-regcache      Disable register caching for the server build
+
+  --no-opt      Disable Xu optimization for the server build
   --timeout SECONDS  SSH/curl timeout (default 5)
   -h, --help         Show this help
 
@@ -270,8 +269,7 @@ build_linux_artifact() {
     local -a args=(build-linux --output "$ARTIFACT")
     [ -n "$SOURCE" ] && args+=(--source "$SOURCE")
     [ -n "$COMPILER" ] && args+=(--compiler "$COMPILER")
-    [ -n "$OPT_LEVEL" ] && args+=(--opt "$OPT_LEVEL")
-    [ "$NO_REGCACHE" = 1 ] && args+=(--no-regcache)
+    [ "$NO_OPT" = 1 ] && args+=(--no-opt)
     "$LOCAL_DEPLOY" "${args[@]}"
 }
 
@@ -488,8 +486,7 @@ parse_options() {
             --artifact) [ "$#" -ge 2 ] || die "--artifact needs a path"; ARTIFACT=$2; shift 2 ;;
             --source) [ "$#" -ge 2 ] || die "--source needs a path"; SOURCE=$2; shift 2 ;;
             --compiler) [ "$#" -ge 2 ] || die "--compiler needs a path"; COMPILER=$2; shift 2 ;;
-            --opt) [ "$#" -ge 2 ] || die "--opt needs O0, O1, O2, or O3"; OPT_LEVEL=$2; shift 2 ;;
-            --no-regcache) NO_REGCACHE=1; shift ;;
+            --no-opt) NO_OPT=1; shift ;;
             --timeout) [ "$#" -ge 2 ] || die "--timeout needs seconds"; HEALTH_TIMEOUT=$2; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
@@ -505,8 +502,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; exit 0 ;;
     esac
-    case "$OPT_LEVEL" in ''|O0|O1|O2|O3) ;; *) die "--opt must be O0, O1, O2, or O3" ;; esac
-    case "$NO_REGCACHE" in 0|1) ;; *) die "XU_SERVER_NO_REGCACHE must be 0 or 1" ;; esac
+    case "$NO_OPT" in 0|1) ;; *) die "XU_SERVER_NO_OPT must be 0 or 1" ;; esac
     case "$HEALTH_TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a positive integer" ;; esac
     [ "$HEALTH_TIMEOUT" -gt 0 ] || die "--timeout must be positive"
 

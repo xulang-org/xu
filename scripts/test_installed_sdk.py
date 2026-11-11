@@ -304,16 +304,21 @@ fn main() int {
     for arguments in (["argument with spaces", 'quote"value\\'], ["", ""], ['space and \\', 'two\\\\"quotes']):
         actual = run([xu, "run", "args.xu", "--", *arguments], cwd=project, env=active).splitlines()
         assert actual == arguments, (arguments, actual)
-    arguments = ["-O0", "-O2"]
-    actual = run([xu, "run", "args.xu", "-O3", "--", *arguments], cwd=project, env=active).splitlines()
+    arguments = ["--no-opt", "--release"]
+    actual = run([xu, "run", "args.xu", "--no-opt", "--", *arguments], cwd=project, env=active).splitlines()
     assert actual == arguments, (arguments, actual)
+    for command in ("build", "run", "test"):
+        for level in range(4):
+            obsolete = subprocess.run([xu, command, "args.xu", f"-O{level}"], cwd=project,
+                                      env=active, capture_output=True, text=True, timeout=15)
+            assert obsolete.returncode == 1 and "unsupported" in obsolete.stderr, obsolete
     # Exercise optimized compilation and child execution in the installed CLI.
     # All input is created in the user's temporary project, independent of tests/.
     (project / "loop.xu").write_text('@main\nfn main() int {\n    $total := 0\n    $i := 0\n    while i < 32768 {\n        total = total + i\n        i = i + 1\n    }\n    println(total)\n    << 0\n}\n')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "loop.xu", *flags, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
-        assert run([xu, "run", "loop.xu", level], cwd=project, env=active).strip() == "536854528"
+        assert run([xu, "run", "loop.xu", *flags], cwd=project, env=active).strip() == "536854528"
     # Native map adapters must preserve the coroutine context when calling
     # ordinary Xu hashing and growth policy functions with entry stack guards.
     (project / "map_worker.xu").write_text('''@main
@@ -337,8 +342,8 @@ fn main() {
     println(<-done)
 }
 ''')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "map_worker.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "map_worker.xu", *flags, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "65024"
     # Verify shared calls, mutable methods, function values and mutation on
     # error paths without corrupting adjacent packed records.
@@ -417,8 +422,8 @@ fn main() int {
  << 0
 }
 ''')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "borrow_record.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "borrow_record.xu", *flags, "-o", str(program)], cwd=project, env=active)
         actual = run([str(program)], cwd=project, env=active).splitlines()
         assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81", "40", "3", "183", "71", "40", "8", "1", "2", "5", "6"], actual
     # Returned element borrows alias their original storage while the owner
@@ -439,7 +444,7 @@ fn main() {
     println(records[0].value)
 }
 ''')
-    actual = run([xu, "run", "borrow_element.xu", "-O2"], cwd=borrow_project, env=active).splitlines()
+    actual = run([xu, "run", "borrow_element.xu"], cwd=borrow_project, env=active).splitlines()
     assert actual == ["202", "3", "1"], actual
     (borrow_project / "borrow_escape.xu").write_text('''@main
 fn identity(s &string) &string { << s }
@@ -541,7 +546,7 @@ fn verify() int {
 fn main() int { << verify() or (err) { eprintln(err.msg())
     << 1 } }
 ''')
-    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
+    run([xu, "build", "tooltip_state.xu", "-o", str(program)], cwd=tooltip_project, env=active)
     tooltip_output = run([str(program)], cwd=project, env=active).strip()
     assert tooltip_output == "tooltip state and placement PASS", tooltip_output
     # Canonical bundled modules resolve from their installed manifest root.
