@@ -48,7 +48,7 @@ SUITES: tuple[Suite, ...] = (
     Suite(
         "performance",
         "横向能力套件",
-        "Xu 与 Clang、rustc 的 O1/O2/O3 整程序 wall/CPU/RSS/体积/编译时间；另含 Go、Swift 参照。scripts/bench_crosslang.py",
+        "默认优化的 Xu 与 Clang、rustc 的 O1/O2/O3 整程序 wall/CPU/RSS/体积/编译时间；另含 Go、Swift 参照。scripts/bench_crosslang.py",
     ),
     Suite(
         "game",
@@ -58,22 +58,22 @@ SUITES: tuple[Suite, ...] = (
     Suite(
         "optimizer",
         "优化器正确性与回归",
-        "Xu O0–O3、--no-regcache 与 MIR/RA 拆分；锁 stdout、超时、墙钟/CPU 和 O2/O3 对 O1 门禁。scripts/bench_opt_levels.py --check",
+        "默认优化与 --no-opt 的 stdout、超时及墙钟与 CPU 对比。scripts/bench_opt_levels.py --check",
     ),
     Suite(
         "nbody_residency",
         "nbody 寄存器驻留与回归",
-        "产品编译器的 FieldRMW/GPR/FP 驻留、能量金标及 O2/O3 对 O1 的配对 CPU 门禁。scripts/test_nbody_residency.sh",
+        "产品编译器的 nbody 能量金标及默认优化和 --no-opt 的配对 CPU 检查。scripts/test_nbody_residency.sh",
     ),
     Suite(
         "opt_full",
         "优化器全量快照",
-        "O0–O3 运行+资源+编译 + Xu --timings 摘要。scripts/bench_opt_full.sh",
+        "默认优化和 --no-opt 的运行、资源及编译摘要。scripts/bench_opt_full.sh",
     ),
     Suite(
         "runtime",
-        "运行时 O0 与默认优化对拍",
-        "xu-bench/tests/bench/*.xu 由产品 bin/xu 使用 O0 与默认优化各编各跑，stdout 必须一致。scripts/bench_runtime.sh",
+        "默认优化与 --no-opt 的运行时对拍",
+        "xu-bench/tests/bench/*.xu 由产品 bin/xu 分别用 --no-opt 与默认优化编译和运行，stdout 必须一致。scripts/bench_runtime.sh",
     ),
     Suite(
         "compile",
@@ -88,7 +88,7 @@ SUITES: tuple[Suite, ...] = (
     Suite(
         "programs",
         "程序行为对照",
-        "tests/gen1/programs 在产品 xu 的 O0 与默认优化下 stdout/退出码一致。scripts/programs_cross_check.sh",
+        "tests/gen1/programs 在产品 xu 的 --no-opt 与默认优化下 stdout/退出码一致。scripts/programs_cross_check.sh",
     ),
     Suite(
         "safety",
@@ -282,7 +282,7 @@ def command_for(
         cmd = [sys.executable, str(ROOT / "scripts/run_companion.py"), "bench", "scripts/bench_runtime.sh"]
         if not quick:
             cmd.append("--check")
-        return cmd, "product O0 vs default runtime"
+        return cmd, "product no-opt vs default runtime"
 
     if suite.name == "compile":
         return [sys.executable, str(ROOT / "scripts/run_companion.py"), "bench", "scripts/bench_compile.sh"], "self-compile wall"
@@ -302,7 +302,7 @@ def command_for(
         return [
             "./scripts/programs_cross_check.sh",
             f"--xu={xu}",
-        ], "programs product O0 vs default"
+        ], "programs product no-opt vs default"
 
     if suite.name == "safety":
         cmd = ["./scripts/safety_test.sh", f"--xu={xu}"]
@@ -413,7 +413,7 @@ def write_index(
             "- A failure is scoped to its row: later rows still ran so the report distinguishes performance, correctness, safety, portability, and self-hosting failures.",
             "- `performance` is the language-capability cross suite (Xu/Clang/rustc O-levels; Go and Swift as reference lanes).",
             "- `game` is the Benchmarks Game subset (same algorithm, official small-N golden stdout).",
-            "- `optimizer` is a release gate: an O2/O3 regression relative to O1 is a failing result, not a sampling warning.",
+            "- `optimizer` checks stdout, timeouts, and excess wall time for both Xu build modes.",
             "- The portability script labels an unavailable execution environment as `compile+file only`; that is a degraded observation, not proof of execution on that target.",
             "- Default with no `--suites` is the full global set (`all`). Use `--suites=cross` for only the two horizontal benches, `--suites=gates` for correctness gates without the long benches.",
             "",

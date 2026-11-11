@@ -6,6 +6,18 @@
 
 ---
 
+## Xu 0.12.2
+
+The product compiler lowers checked programs to typed MIR and self-hosts from the published `v0.12.2-seed.1` compiler. Upgrade the compiler, standard library and SDK tools together.
+
+- Windows ARM64 supports native executables and COFF application objects. Windows socket readiness rejects non-socket handles, and environment lookups handle mixed-case names.
+- The Windows installer and updater declare current-user execution for per-user installation and reinstall. Packaging failures include the compiler's output and exit status.
+- Project builds resolve local package requirements. Builds optimize by default. Use `--no-opt` to disable optimization. Numeric `-O` flags have been removed.
+- `xu get` and `xu install` restore pinned package installation with lockfiles and checksum verification. `--offline` and `--frozen` use local dependency data.
+- Linux x64 and ARM64 support application objects and native desktop packaging.
+- `xu build` and `xu run` support opt-in XACP startup, discovery and loopback TCP. XACP-enabled programs on Linux and macOS support process output capture.
+- The SDK targets macOS, Linux and Windows on ARM64 and x64. Linux LoongArch64 and RISC-V SDKs are cross-built.
+
 ## Xu 0.12.2-seed.1 (bootstrap seed prerelease)
 
 Dedicated seed release of the restored self-hosting compiler, frozen before integrating PR #197. Use this explicitly pinned version to build the next compiler generation. It retains the old product compiler and matching standard library and tools; it does not include the new compiler implementation from PR #197. This is a bootstrap prerelease, not a stable product release. Platform acceptance and artifact hashes are recorded with the GitHub Release.

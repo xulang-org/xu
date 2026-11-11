@@ -105,7 +105,14 @@ def settings_checks(app):
 def blocked_stdio(app, drip=False):
     child = launch(app)
     try:
-        send_pipe(child, LARGE_HELLO)
+        try:
+            send_pipe(child, LARGE_HELLO)
+        except BrokenPipeError as error:
+            code = child.wait(timeout=5)
+            raise AssertionError(
+                f"XACP exited while receiving the request (exit {code}); "
+                f"stdout={child.stdout.read(4096)!r}, stderr={child.stderr.read(4096)!r}"
+            ) from error
         started = time.monotonic()
         prefix = b""
         if drip:

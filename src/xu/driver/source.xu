@@ -1,0 +1,344 @@
+@xu/driver
+
+#encoding/xun
+#errors
+#internal/modulepath
+#internal/semver
+#os
+#os/exec
+#path/filepath
+#xu/ast
+#xu/lexer
+#xu/parser
+#xu/pkgmgr
+#xu/target
+#xu/token
+#xu/types
+
+struct SourceInput {
+    path string
+    name string
+}
+
+struct SourceRoot {
+    dir string
+    module_name string
+}
+
+fn sdk_sources(dir &string) string {
+    candidate := dir + "/src"
+    if os.is_dir(candidate + "/runtime/core") {
+        << abs_path(&candidate)
+    }
+    << ""
+}
+
+fn stdlib_root() string {
+    fallback := "src"
+    explicit := os.getenv("XU_STDLIB_ROOT")
+    if explicit.len > 0 {
+        << abs_path(&explicit)
+    }
+    root := os.getenv("XU_ROOT")
+    if root.len > 0 {
+        path := root + "/src"
+        << abs_path(&path)
+    }
+    argv := os.argv()
+    if argv.len > 0 {
+        executable := exec.look_path(~argv[0]) or (err) {
+            << abs_path(&fallback)
+        }
+        bin_dir := filepath.dir(&executable)
+        adjacent := sdk_sources(&bin_dir)
+        if adjacent.len > 0 {
+            << adjacent
+        }
+        bin_name := filepath.base(&bin_dir)
+        if bin_name == "bin" {
+            sdk_dir := filepath.dir(&bin_dir)
+            installed := sdk_sources(&sdk_dir)
+            if installed.len > 0 {
+                << installed
+            }
+        }
+        platform_dir := filepath.dir(&bin_dir)
+        if filepath.base(&platform_dir) == "platform" {
+            bin := filepath.dir(&platform_dir)
+            if filepath.base(&bin) == "bin" {
+                sdk_dir := filepath.dir(&bin)
+                installed := sdk_sources(&sdk_dir)
+                if installed.len > 0 {
+                    << installed
+                }
+            }
+        }
+    }
+    << abs_path(&fallback)
+}
+
+fn read_project_module(dir &string, required bool, requirements $&ProjectRequirements) string {
+    path := dir + "/xu.xun"
+    if !required {
+        os.stat(~path) or (err) { << "" }
+    }
+    body := os.read(~path) or (err) {
+        >> errors.new(path + ": " + err.msg())
+    }
+    doc := xun.parse(&body)
+    if !doc.ok() {
+        >> errors.new(path + ":" + str(doc.error_line()) + ": " + doc.error())
+    }
+    root := doc.root()
+    module_name := doc.as_str(doc.get(root, "module"))
+    if !modulepath.valid_module(&module_name) {
+        >> errors.new(path + ": expected a valid xu.xun 'module'")
+    }
+    version_node := doc.get(root, "version")
+    version := doc.as_str(version_node)
+    if version_node >= 0 {
+        tagged := "v" + version
+        if !semver.valid(&tagged) {
+            >> errors.new(path + ": invalid xu.xun 'version'")
+        }
+    }
+    if modulepath.is_external(&module_name) && !modulepath.version_matches(&module_name, &version) {
+        >> errors.new(path + ": external module version must match its major path")
+    }
+    for i in 0:doc.count(root) {
+        node := doc.at(root, i)
+        key := doc.key(node)
+        if key == "module" || key == "version" || key == "xu" {
+            ->
+        }
+        if key == "require" {
+            read_local_requirements(&doc, node, dir, &path, $&requirements.local) or >>
+            ->
+        }
+        if key == "native" {
+            read_native_imports(&doc, node, &path, $&requirements.native_imports) or >>
+            ->
+        }
+        >> errors.new(path + ": unknown xu.xun key '" + key + "'")
+    }
+    << module_name
+}
+
+fn append_root(roots $&[]SourceRoot, dir &string, module_name &string) {
+    for i in 0:roots.len {
+        if str_eq(&roots[i].dir, dir) {
+            if module_name.len > 0 {
+                roots[i].module_name = ~module_name
+            }
+            <<
+        }
+    }
+    roots.push(SourceRoot{dir: ~dir, module_name: ~module_name})
+}
+
+fn add_input_roots(roots $&[]SourceRoot, dir &string, directory_input bool, requirements $&ProjectRequirements) int {
+    if directory_input {
+        for i in 0:roots.len {
+            if str_eq(&roots[i].dir, dir) && roots[i].module_name.len > 0 {
+                << 0
+            }
+        }
+        module_name := read_project_module(dir, true, requirements) or >>
+        append_root(roots, dir, &module_name)
+        << 0
+    }
+    for i in 0:roots.len {
+        if str_eq(&roots[i].dir, dir) {
+            << 0
+        }
+    }
+    empty := ""
+    append_root(roots, dir, &empty)
+    $current := ~dir
+    while true {
+        for i in 0:roots.len {
+            if roots[i].module_name.len > 0 && str_eq(&roots[i].dir, &current) {
+                << 0
+            }
+        }
+        module_name := read_project_module(&current, false, requirements) or >>
+        if module_name.len > 0 {
+            append_root(roots, &current, &module_name)
+            << 0
+        }
+        parent := filepath.dir(&current)
+        next := host_slashes(parent)
+        if next == current {
+            << 0
+        }
+        current = next
+    }
+    << 0
+}
+
+fn queue_source(name &string, work $&[]SourceInput, seen $&types.StrMap) {
+    path := abs_path(name)
+    if seen.lookup(&path) < 0 {
+        seen.put(~path, 1)
+        work.push(SourceInput{path: path, name: ~name})
+    }
+}
+
+fn queue_files(paths &[]string, work $&[]SourceInput, seen $&types.StrMap) {
+    for i in 0:paths.len {
+        name := ~paths[i]
+        queue_source(&name, work, seen)
+    }
+}
+
+fn find_import(imp &string, stdlib &string, roots &[]SourceRoot, deps &[]LocalDependency, native_imports &types.StrMap, paths $&[]string) bool {
+    if pkgmgr.resolve_package_files(imp, stdlib, paths) {
+        << true
+    }
+    if native_imports.lookup(imp) >= 0 {
+        >> errors.new("native dependency '" + imp + "' is unavailable in xu-next")
+    }
+    required := find_local_dependency(imp, deps, paths) or >>
+    if required {
+        << true
+    }
+    external := modulepath.is_external(imp)
+    for i in 0:roots.len {
+        dir := ~roots[i].dir
+        module_name := ~roots[i].module_name
+        if module_name.len > 0 {
+            if str_eq(&module_name, imp) && pkgmgr.collect_sources(&dir, paths) {
+                << true
+            }
+            prefix := module_name + "/"
+            if str_starts_with(imp, prefix + "") {
+                rel := imp[prefix.len:imp.len]
+                if pkgmgr.resolve_package_files(&rel, &dir, paths) {
+                    << true
+                }
+            }
+        }
+        if !external && pkgmgr.resolve_package_files(imp, &dir, paths) {
+            << true
+        }
+    }
+    << false
+}
+
+fn parse_source(input &SourceInput) parser.Parser {
+    src := os.read(~input.path) or (err) {
+        eprintln(input.name + ": " + err.msg())
+        <<< 1
+    }
+    << parse_source_text(src, &input.name)
+}
+
+fn parse_source_text(src string, name &string) parser.Parser {
+    $tokens := []token.Token{}
+    lexer.lex(src, $&tokens, ~name)
+    $ast_tokens := []ast.Token{}
+    for i in 0:tokens.len {
+        t := &tokens[i]
+        ast_tokens.push(ast.Token{kind: t.kind, line: t.line, col: t.col, ival: t.ival, sval: ~t.sval})
+    }
+    $parsed := parser.new_parser(ast_tokens)
+    parsed.file_name = ~name
+    parsed.parse_module()
+    << parsed
+}
+
+fn load_unit(files &[]string, count int, code int, link_core bool, xacp_port int, program $&parser.Parser) int {
+    $work := []SourceInput{}
+    $roots := []SourceRoot{}
+    $requirements := ProjectRequirements{local: []LocalRequirement{}, native_imports: types.new_strmap()}
+    $seen_files := types.new_strmap()
+    $seen_pkgs := types.new_strmap()
+    for i in 0:count {
+        input := ~files[i]
+        if input.len == 0 {
+            >> errors.new("empty source path")
+        }
+        path := abs_path(&input)
+        if os.is_dir(~path) {
+            add_input_roots($&roots, &path, true, $&requirements) or >>
+            $members := []string{}
+            if !pkgmgr.collect_sources(&input, $&members) {
+                >> errors.new(input + ": no readable .xu sources")
+            }
+            queue_files(&members, $&work, $&seen_files)
+        } else {
+            dir := filepath.dir(&path)
+            normalized := host_slashes(dir)
+            add_input_roots($&roots, &normalized, false, $&requirements) or >>
+            queue_source(&input, $&work, $&seen_files)
+        }
+    }
+
+    dependencies := resolve_local_dependencies($&requirements) or >>
+    empty := ""
+    xupath := os.getenv("XUPATH")
+    extra_roots := filepath.split_list(&xupath)
+    for i in 0:extra_roots.len {
+        path := ~extra_roots[i]
+        if path.len > 0 {
+            dir := abs_path(&path)
+            append_root($&roots, &dir, &empty)
+        }
+    }
+
+    stdlib := stdlib_root()
+    if link_core {
+        core := "runtime/core"
+        $paths := []string{}
+        if !pkgmgr.resolve_package_files(&core, &stdlib, $&paths) {
+            >> errors.new(stdlib + ": missing runtime/core (set XU_STDLIB_ROOT to the SDK src directory)")
+        }
+        seen_pkgs.put(~core, 1)
+        queue_files(&paths, $&work, $&seen_files)
+    }
+    if xacp_port >= 0 {
+        module_name := "xacp"
+        $paths := []string{}
+        if !pkgmgr.resolve_package_files(&module_name, &stdlib, $&paths) {
+            >> errors.new(stdlib + ": missing xacp")
+        }
+        seen_pkgs.put(~module_name, 1)
+        queue_files(&paths, $&work, $&seen_files)
+    }
+
+    os_name := target.target_os_name(target.target_os(code))
+    arch_name := target.target_arch_name(target.target_arch(code))
+    $i := 0
+    while i < work.len {
+        input := &work[i]
+        parsed := parse_source(input)
+        if parser.compile_tags_match(&parsed.compile_tags, os_name, arch_name) {
+            program.merge_from(&parsed)
+            program.file_names.push(~input.name)
+            for j in 0:parsed.imports.len {
+                imp := ~parsed.imports[j]
+                if seen_pkgs.lookup(&imp) < 0 {
+                    seen_pkgs.put(~imp, 1)
+                    $paths := []string{}
+                    found := find_import(&imp, &stdlib, &roots, &dependencies, &requirements.native_imports, $&paths) or >>
+                    if found {
+                        queue_files(&paths, $&work, $&seen_files)
+                    }
+                }
+            }
+        }
+        i += 1
+        runtime := "runtime"
+        if i == work.len && seen_pkgs.lookup(&runtime) < 0 && needs_runtime_algo(&*program) {
+            seen_pkgs.put(~runtime, 1)
+            $paths := []string{}
+            if pkgmgr.resolve_package_files(&runtime, &stdlib, $&paths) {
+                queue_files(&paths, $&work, $&seen_files)
+            }
+        }
+    }
+    if xacp_port >= 0 {
+        insert_xacp_startup(program, xacp_port)
+    }
+    << work.len
+}

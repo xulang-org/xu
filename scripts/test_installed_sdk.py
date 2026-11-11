@@ -16,8 +16,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 
-def windows_setup_manifest(binary: Path):
-    """Use the Windows loader to check the actual installer, including on admin CI."""
+def check_windows_invoker_manifest(binary: Path):
+    """Check the SDK tool's execution level using the Windows loader."""
     if os.name != "nt":
         return
     import ctypes
@@ -39,7 +39,7 @@ def windows_setup_manifest(binary: Path):
     try:
         resource = kernel.FindResourceW(module, 1, 24)
         if not resource:
-            raise RuntimeError(f"installer has no embedded application manifest: {binary}")
+            raise RuntimeError(f"executable has no embedded application manifest: {binary}")
         pointer = kernel.LockResource(kernel.LoadResource(module, resource))
         size = kernel.SizeofResource(module, resource)
         if not pointer or not size:
@@ -47,7 +47,7 @@ def windows_setup_manifest(binary: Path):
         root = ET.fromstring(ctypes.string_at(pointer, size))
         level = root.find('.//{urn:schemas-microsoft-com:asm.v3}requestedExecutionLevel')
         if level is None or level.get("level") != "asInvoker" or level.get("uiAccess") != "false":
-            raise RuntimeError(f"installer does not declare current-user execution: {binary}")
+            raise RuntimeError(f"executable does not declare current-user execution: {binary}")
     finally:
         kernel.FreeLibrary(module)
 
@@ -148,6 +148,44 @@ import Darwin
     print("installed-sdk: native-input-clock PASS")
 
 
+def linux_application_object(xu, target, work, env):
+    machine = {"linux-arm64": 183, "linux-x64": 62}.get(target)
+    if machine is None:
+        return
+    env = env.copy()
+    env.pop("XU_UI_PACK", None)
+    project = work / "Linux application object"
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#os
+fn main() {
+    args := os.argv()
+    println(args[1])
+    println(os.getenv("XU_APP_ENTRY_PROBE"))
+}
+''')
+    run([xu, "build", "main.xu", "--emit-obj", "-o", "app.xuobj"], cwd=project, env=env)
+    run([xu, "_elf_o", "app.xuobj", "app.o"], cwd=project, env=env)
+    header = (project / "app.o").read_bytes()[:20]
+    assert header[:6] == b"\x7fELF\x02\x01" and header[16:18] == b"\x01\x00", header
+    assert int.from_bytes(header[18:20], "little") == machine, header
+    cc = shutil.which("cc", path=env["PATH"])
+    if cc:
+        (project / "host.c").write_text('''#include <stdlib.h>
+extern char **environ;
+void xu_app_start(int argc, char **argv, char **envp, long page_size, unsigned long hwcap);
+int main(int argc, char **argv) {
+    if (setenv("XU_APP_ENTRY_PROBE", "C host environment", 1) != 0) return 1;
+    xu_app_start(argc, argv, environ, 4096, 0);
+    return 1;
+}
+''')
+        run([cc, "-fPIE", "-pie", "host.c", "app.o", "-o", "app"], cwd=project, env=env)
+        actual = run([str(project / "app"), "argument with spaces"], cwd=project, env=env).splitlines()
+        assert actual == ["argument with spaces", "C host environment"], actual
+    print("installed-sdk: linux-application-object PASS")
+
+
 def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
     prefix = work / "installed Xu SDK"
     project = work / "user project with spaces"
@@ -161,7 +199,7 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
     env.update(XU_SKIP_EDITOR_INSTALL="1", XUPATH=str(extra), XU_CACHE=str(work / "package cache"))
 
     if installer:
-        windows_setup_manifest(installer)
+        check_windows_invoker_manifest(installer)
         run([str(installer), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
         manifest_file = prefix / "bundle.json"
         manifest = json.loads(manifest_file.read_text()) if manifest_file.is_file() else {"version": "", "target": "host", "lane": "product"}
@@ -179,7 +217,7 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
         manifest = json.loads((bundle / "bundle.json").read_text())
         if os.name == "nt":
             for setup in (bundle / "xu-setup.exe", bundle / "bin/xu-setup.exe"):
-                windows_setup_manifest(setup)
+                check_windows_invoker_manifest(setup)
         if native_setup:
             setup = bundle / ("xu-setup.exe" if os.name == "nt" else "xu-setup")
             run([str(setup), "--prefix", str(prefix), "--yes", "--no-modify-path"], cwd=project, env=env)
@@ -187,6 +225,8 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
             run(["pwsh", "-NoProfile", "-File", str(bundle / "install.ps1"), "-Prefix", str(prefix), "-NoModifyPath"], cwd=project, env=env)
         else:
             run(["bash", str(bundle / "install.sh"), "--prefix", str(prefix), "--no-modify-path", "--yes"], cwd=project, env=env)
+    if os.name == "nt":
+        check_windows_invoker_manifest(prefix / "bin/xu-update.exe")
     active = activate(prefix, project, env)
     entries = active["XUPATH"].split(os.pathsep)
     assert entries.count(str(extra)) == 1, entries
@@ -238,6 +278,7 @@ fn main() int {
         assert match, (doctor.returncode, doctor.stdout, doctor.stderr)
         assert Path(match.group(1).strip()).resolve() == prefix.resolve(), doctor.stdout
     macos_input_clock(prefix, project, clean)
+    linux_application_object(xu, manifest["target"], work, clean)
     # Exercise the actual desktop entry and sibling Doctor invocation. The small
     # project deliberately has no icon, so it stops before external GUI builds.
     desktop = subprocess.run([xu, "build", str(project), "--desktop", "--no-webview",
@@ -263,12 +304,23 @@ fn main() int {
     for arguments in (["argument with spaces", 'quote"value\\'], ["", ""], ['space and \\', 'two\\\\"quotes']):
         actual = run([xu, "run", "args.xu", "--", *arguments], cwd=project, env=active).splitlines()
         assert actual == arguments, (arguments, actual)
+    arguments = ["--no-opt", "--release"]
+    actual = run([xu, "run", "args.xu", "--no-opt", "--", *arguments], cwd=project, env=active).splitlines()
+    assert actual == arguments, (arguments, actual)
+    for command in ("build", "run", "test"):
+        for level in range(4):
+            obsolete = subprocess.run([xu, command, "args.xu", f"-O{level}"], cwd=project,
+                                      env=active, capture_output=True, text=True, timeout=15)
+            assert obsolete.returncode == 1 and "unsupported" in obsolete.stderr, obsolete
     # Exercise optimized compilation and child execution in the installed CLI.
     # All input is created in the user's temporary project, independent of tests/.
     (project / "loop.xu").write_text('@main\nfn main() int {\n    $total := 0\n    $i := 0\n    while i < 32768 {\n        total = total + i\n        i = i + 1\n    }\n    println(total)\n    << 0\n}\n')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "loop.xu", *flags, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
+        assert run([xu, "run", "loop.xu", *flags], cwd=project, env=active).strip() == "536854528"
+        tested = run([xu, "test", "loop.xu", *flags], cwd=project, env=active)
+        assert "536854528" in tested and "ok (all tests passed)" in tested, tested
     # Native map adapters must preserve the coroutine context when calling
     # ordinary Xu hashing and growth policy functions with entry stack guards.
     (project / "map_worker.xu").write_text('''@main
@@ -292,12 +344,11 @@ fn main() {
     println(<-done)
 }
 ''')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "map_worker.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "map_worker.xu", *flags, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "65024"
-    # Aggregate container borrows cross an ascending-buffer / descending-frame
-    # ABI boundary. Verify shared calls, mutable methods, function values and
-    # exceptional writeback without corrupting adjacent packed records.
+    # Verify shared calls, mutable methods, function values and mutation on
+    # error paths without corrupting adjacent packed records.
     (project / "borrow_record.xu").write_text('''@main
 #errors
 struct Record { value int
@@ -373,30 +424,44 @@ fn main() int {
  << 0
 }
 ''')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "borrow_record.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "borrow_record.xu", *flags, "-o", str(program)], cwd=project, env=active)
         actual = run([str(program)], cwd=project, env=active).splitlines()
         assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81", "40", "3", "183", "71", "40", "8", "1", "2", "5", "6"], actual
-    # A frame view cannot be returned as a borrowed container identity.
-    # Keep this expected-error entry point out of the main smoke project.
-    # Desktop builds discover sibling Xu sources, so leaving another @main
-    # here makes the later tooltip smoke fail with a duplicate main instead
-    # of exercising the installed UI modules.
-    borrow_project = work / "borrow escape project"
+    # Returned element borrows alias their original storage while the owner
+    # is live. Keep these entry points separate from the desktop smoke app.
+    borrow_project = work / "borrow lifetime project"
     borrow_project.mkdir()
+    (borrow_project / "borrow_element.xu").write_text('''@main
+struct Record { value int
+ guard int }
+fn identity(r $&Record) $&Record { << r }
+fn main() {
+    $records := [Record{value: 1, guard: 101}, Record{value: 2, guard: 202}]
+    i := 1
+    r := identity($&records[i])
+    r.value = 3
+    println(r.guard)
+    println(records[i].value)
+    println(records[0].value)
+}
+''')
+    actual = run([xu, "run", "borrow_element.xu"], cwd=borrow_project, env=active).splitlines()
+    assert actual == ["202", "3", "1"], actual
     (borrow_project / "borrow_escape.xu").write_text('''@main
 fn identity(s &string) &string { << s }
-fn main() int {
+fn escape(source &string) &string {
     words := ["one", "two"]
-    i := 1
-    r := identity(&words[i])
-    println(r.len)
-    << 0
+    << identity(&words[1])
+}
+fn main() {
+    source := "source"
+    println(escape(&source).len)
 }
 ''')
     rejected = subprocess.run([xu, "build", "borrow_escape.xu", "-o", str(program)], cwd=borrow_project,
                               env=active, text=True, capture_output=True, timeout=90)
-    assert rejected.returncode != 0 and "container aggregate borrow cannot escape" in rejected.stderr, (rejected.stdout, rejected.stderr)
+    assert rejected.returncode != 0 and "cannot return a reference to local data" in rejected.stderr, (rejected.stdout, rejected.stderr)
     # Passive help has deterministic hover delay, dismissal and edge placement.
     # An ordinary build must remain a plain executable even with UI imports;
     # no native GUI host, brand icon, or external GUI toolchain is needed.
@@ -483,7 +548,7 @@ fn verify() int {
 fn main() int { << verify() or (err) { eprintln(err.msg())
     << 1 } }
 ''')
-    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
+    run([xu, "build", "tooltip_state.xu", "-o", str(program)], cwd=tooltip_project, env=active)
     tooltip_output = run([str(program)], cwd=project, env=active).strip()
     assert tooltip_output == "tooltip state and placement PASS", tooltip_output
     # Canonical bundled modules resolve from their installed manifest root.
