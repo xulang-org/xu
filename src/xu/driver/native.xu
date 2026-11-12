@@ -1,0 +1,430 @@
+@xu/driver
+
+#crypto/sha256
+#xu/codegen
+#xu/mc
+#errors
+#internal/modulepath
+#os
+#os/exec
+#strconv
+#strings
+#xu/obj
+#xu/parser
+#xu/target
+#xu/types
+
+// Marshaler exports have one pointer argument and return scalar word bits.
+struct NativeExport {
+    label string
+    symbol string
+    params []int
+    result int
+}
+
+struct NativeUnit {
+    labels []string
+    archives []string
+    exports []NativeExport
+}
+
+fn native_unit() NativeUnit {
+    << NativeUnit{labels: []string{}, archives: []string{}, exports: []NativeExport{}}
+}
+
+struct NativeReader {
+    data string
+    pos int
+}
+
+fn (r $&NativeReader) take(size int) string {
+    if size < 0 || r.pos < 0 || size > r.data.len - r.pos {
+        >> errors.new("truncated native library")
+    }
+    start := r.pos
+    r.pos += size
+    << r.data[start:r.pos]
+}
+
+fn (r $&NativeReader) number(size int) int {
+    bytes := r.take(size) or >>
+    $value := 0
+    for i in 0:size { value = value | ((bytes[i] & 255) << (i * 8)) }
+    if value < 0 { >> errors.new("native library integer overflow") }
+    << value
+}
+
+fn (r $&NativeReader) name() string {
+    size := r.number(2) or >>
+    << r.take(size) or >>
+}
+
+fn native_archive(data &string, code int) string {
+    if str_starts_with(data, "!<arch>\n") { << ~data }
+    $r := NativeReader{data: ~data, pos: 0}
+    magic := r.take(7) or >>
+    version := r.number(2) or >>
+    flags := r.number(2) or >>
+    if magic != ("XULIB" + string_from_byte(1) + string_from_byte(0)) || (version != 1 && version != 2) || flags != 0 {
+        >> errors.new("expected a native archive or XULIB v1/v2 container")
+    }
+    size := r.number(4) or >>
+    r.take(size) or >> // Container description; XUOBJ is the typed contract.
+    count := r.number(4) or >>
+    if count > 1024 { >> errors.new("too many native library slices") }
+    wanted := target.target_name(code)
+    $selected := ""
+    $selected_offset := 0
+    for i in 0:count {
+        name := r.name() or >>
+        kind_size := r.number(1) or >>
+        kind := r.take(kind_size) or >>
+        offset := r.number(8) or >>
+        length := r.number(8) or >>
+        digest := r.take(32) or >>
+        if offset > data.len || length > data.len - offset {
+            >> errors.new("native slice is out of bounds")
+        }
+        if name == wanted {
+            if selected.len > 0 || (kind != "ar" && kind != "archive") {
+                >> errors.new("invalid or duplicate native target slice")
+            }
+            selected = data[offset:offset + length]
+            selected_offset = offset
+            actual := sha256.sum256_bytes(~selected)
+            if actual != digest { >> errors.new("native slice SHA-256 mismatch") }
+        }
+    }
+    if selected.len == 0 { >> errors.new("native library has no slice for " + wanted) }
+    if selected_offset < r.pos || !str_starts_with(&selected, "!<arch>\n") {
+        >> errors.new("invalid native archive slice")
+    }
+    << selected
+}
+
+fn native_metadata(archive &string) string {
+    $pos := 8
+    $metadata := ""
+    while pos < archive.len {
+        if archive.len - pos < 60 || archive[pos + 58:pos + 60] != "`\n" {
+            >> errors.new("invalid native archive member")
+        }
+        size_text := archive[pos + 48:pos + 58]
+        trimmed := strings.trim_space(&size_text)
+        size := strconv.atoi(&trimmed) or >>
+        start := pos + 60
+        if size < 0 || size > archive.len - start {
+            >> errors.new("native archive member is out of bounds")
+        }
+        $name := archive[pos:pos + 16]
+        if str_starts_with(&name, "#1/") {
+            digits := name[3:name.len]
+            trimmed_name := strings.trim_space(&digits)
+            name_size := strconv.atoi(&trimmed_name) or >>
+            if name_size < 0 || name_size > size { >> errors.new("invalid archive member name") }
+            name = archive[start:start + name_size]
+        }
+        // XUNATIVE's metadata object is xu.o; never interpret arbitrary
+        // payload bytes in unrelated C objects as declarations.
+        if str_starts_with(&name, "xu.o") {
+            body := archive[start:start + size]
+            at := strings.index_of(&body, "XUOBJ")
+            if at >= 0 {
+                if metadata.len > 0 { >> errors.new("duplicate native metadata") }
+                metadata = body[at:body.len]
+            }
+        }
+        pos = start + size + size % 2
+    }
+    if metadata.len == 0 { >> errors.new("native archive has no XUOBJ metadata") }
+    << metadata
+}
+
+fn native_ident(name &string) bool {
+    if name.len == 0 { << false }
+    for i in 0:name.len {
+        c := name[i]
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 ||
+            (i > 0 && c >= 48 && c <= 57)) { << false }
+    }
+    << true
+}
+
+fn load_native(path &string, module_name &string, code int, program $&parser.Parser, unit $&NativeUnit) int {
+    os_code := target.target_os(code)
+    arch := target.target_arch(code)
+    if (os_code != target.OS_MACOS && os_code != target.OS_LINUX && os_code != target.OS_WINDOWS) ||
+        (arch != target.ARCH_ARM64 && arch != target.ARCH_X64 &&
+         !(os_code == target.OS_LINUX && (arch == target.ARCH_RISCV64 || arch == target.ARCH_LOONG64))) {
+        >> errors.new("native imports require a supported 64-bit hosted target")
+    }
+    data := os.read(~path) or >>
+    archive := native_archive(&data, code) or >>
+    metadata := native_metadata(&archive) or >>
+    $r := NativeReader{data: metadata, pos: 0}
+    magic := r.take(8) or >>
+    wire_os := r.number(1) or >>
+    wire_arch := r.number(1) or >>
+    flags := r.number(2) or >>
+    module := r.name() or >>
+    abi := magic[5] & 255
+    if magic[0:5] != "XUOBJ" || (abi != 1 && abi != 2) || magic[6] != 0 || magic[7] != 0 || flags != 0 || wire_os != os_code + 1 ||
+        wire_arch != arch + 1 || module != module_name + "" || !modulepath.valid_path(&module) {
+        >> errors.new("native metadata module, ABI or target mismatch")
+    }
+    count := r.number(4) or >>
+    if count == 0 || count > 65535 { >> errors.new("invalid native export count") }
+    $source := "@\"" + module + "\"\n"
+    $names := types.new_strmap()
+    for i in 0:count {
+        name := r.name() or >>
+        label := r.name() or >>
+        ret := r.number(1) or >>
+        params := r.number(1) or >>
+        if !native_ident(&name) || names.lookup(&name) >= 0 || !native_type_ok(ret, abi, true) {
+            >> errors.new("invalid native export name, duplicate declaration or ABI result")
+        }
+        names.put(~name, 1)
+        $mangled := strings.replace_all(&module, "/", "_")
+        if modulepath.is_external(&module) { mangled = modulepath.symbol(&module) }
+        expected := "_xu_" + mangled + "_" + name
+        if label.len == 0 { >> errors.new("native export has an empty symbol") }
+        for ch in 0:label.len {
+            if label[ch] == 0 || label[ch] == 10 || label[ch] == 13 {
+                >> errors.new("invalid character in native export symbol")
+            }
+        }
+        $types := []int{}
+        source.push_str("pub fn " + name + "(")
+        for pi in 0:params {
+            typ := r.number(1) or >>
+            if !native_type_ok(typ, abi, false) { >> errors.new("invalid native parameter type for ABI") }
+            types.push(typ)
+            if pi > 0 { source.push_str(", ") }
+            source.push_str("a" + str(pi) + " " + native_xu_type(typ))
+        }
+        source.push_str(")")
+        if ret == 0 { source.push_str(" {}\n") }
+        else { source.push_str(" " + native_xu_type(ret) + " { << " + native_zero(ret) + " }\n") }
+        for j in 0:unit.labels.len {
+            if unit.labels[j] == expected { >> errors.new("duplicate native export label") }
+        }
+        unit.labels.push(~expected)
+        unit.exports.push(NativeExport{label: expected, symbol: label, params: types, result: ret})
+    }
+    for i in 0:4 {
+        if (r.number(4) or >>) != 0 { >> errors.new("native metadata must not contain Xu code or relocations") }
+    }
+    file_name := "<native:" + module + ">"
+    parsed := parse_source_text(source, &file_name)
+    program.merge_from(&parsed)
+    program.file_names.push(file_name)
+    unit.archives.push(archive)
+    << 0
+}
+
+fn native_type_ok(code int, abi int, result bool) bool {
+    if result && code == 0 { << true }
+    if abi == 2 { << code == 1 || (!result && (code == 11 || code == 12)) }
+    << code == 1 || code == 2 || code == 4 || code == 8 || code == 9 || code == 10
+}
+
+fn native_xu_type(code int) string {
+    if code == 2 { << "bool" }
+    if code == 4 { << "f64" }
+    if code == 8 { << "i32" }
+    if code == 9 { << "u32" }
+    if code == 10 { << "u8" }
+    if code == 11 { << "&[]int" }
+    if code == 12 { << "\$&[]int" }
+    << "int"
+}
+
+fn native_zero(code int) string {
+    if code == 2 { << "false" }
+    if code == 4 { << "0.0" }
+    if code == 1 { << "0" }
+    << native_xu_type(code) + "(0)"
+}
+
+fn native_bridge_symbol(i int, os int) string {
+    $prefix := ""
+    if os == target.OS_MACOS { prefix = "_" }
+    << prefix + "xu_native_bridge_" + str(i)
+}
+
+fn emit_native_adapters(unit &NativeUnit, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, code int) {
+    for i in 0:unit.exports.len {
+        e := &unit.exports[i]
+        codegen.emit_native_adapter(cb, syms, relocs, ~e.label,
+            native_bridge_symbol(i, target.target_os(code)), e.params.len, target.target_arch(code), target.target_os(code))
+    }
+}
+
+fn native_symbol(unit &NativeUnit, label &string, os int) bool {
+    for i in 0:unit.exports.len { if native_bridge_symbol(i, os) == label + "" { << true } }
+    << false
+}
+
+fn native_c_type(code int) string {
+    if code == 0 { << "void" }
+    if code == 2 { << "_Bool" }
+    if code == 4 { << "double" }
+    if code == 8 { << "int" }
+    if code == 9 { << "unsigned int" }
+    if code == 10 { << "unsigned char" }
+    if code == 11 { << "const NativeReadSpan *" }
+    if code == 12 { << "const NativeWriteSpan *" }
+    << "long long"
+}
+
+fn native_c_quote(value &string) string {
+    $out := "\""
+    for i in 0:value.len {
+        c := value[i]
+        if c == 34 || c == 92 { out.push_str("\\") }
+        out.push_str(string_from_byte(c))
+    }
+    << out + "\""
+}
+
+fn native_marshaler(unit &NativeUnit) string {
+    $out := "typedef unsigned long long NativeWord;\ntypedef long long NativeInt;\ntypedef union { NativeWord word; double real; } NativeFloat;\ntypedef struct { NativeWord data; NativeInt len, cap; } NativeArray;\ntypedef struct { NativeInt len; const NativeInt *data; } NativeReadSpan;\ntypedef struct { NativeInt len; NativeInt *data; } NativeWriteSpan;\n"
+    for i in 0:unit.exports.len {
+        e := &unit.exports[i]
+        name := "native_c_" + str(i)
+        out.push_str("extern " + native_c_type(e.result) + " " + name + "(")
+        if e.params.len == 0 { out.push_str("void") }
+        for pi in 0:e.params.len {
+            if pi > 0 { out.push_str(",") }
+            out.push_str(native_c_type(e.params[pi]))
+        }
+        out.push_str(") __asm__(" + native_c_quote(&e.symbol) + ");\n")
+        out.push_str("NativeWord xu_native_bridge_" + str(i) + "(const NativeWord *a) {\n")
+        for pi in 0:e.params.len {
+            typ := e.params[pi]
+            idx := str(pi)
+            if typ == 4 { out.push_str("NativeFloat f" + idx + "; f" + idx + ".word=a[" + idx + "];\n") }
+            if typ == 11 || typ == 12 {
+                out.push_str("const NativeArray *d" + idx + "=(const NativeArray *)(a[" + idx + "]);\n")
+                $span := "NativeReadSpan"
+                $ptr := "const NativeInt *"
+                if typ == 12 { span = "NativeWriteSpan"
+                    ptr = "NativeInt *" }
+                out.push_str(span + " s" + idx + "={d" + idx + "->len,(" + ptr + ")d" + idx + "->data};\n")
+            }
+        }
+        if e.result == 4 { out.push_str("NativeFloat r; r.real=") }
+        else if e.result != 0 { out.push_str(native_c_type(e.result) + " r=") }
+        out.push_str(name + "(")
+        for pi in 0:e.params.len {
+            if pi > 0 { out.push_str(",") }
+            idx := str(pi)
+            typ := e.params[pi]
+            if typ == 4 { out.push_str("f" + idx + ".real") }
+            else if typ == 11 || typ == 12 { out.push_str("&s" + idx) }
+            else { out.push_str("(" + native_c_type(typ) + ")a[" + idx + "]") }
+        }
+        out.push_str(");\n")
+        if e.result == 0 { out.push_str("return 0;") }
+        else if e.result == 4 { out.push_str("return r.word;") }
+        else if e.result == 2 { out.push_str("return r != 0;") }
+        else { out.push_str("return (NativeWord)r;") }
+        out.push_str("\n}\n")
+    }
+    << out
+}
+
+fn link_native(code_bytes &mc.CodeBuffer, calls &[]mc.Reloc, syms &mc.SymbolTable, unit &NativeUnit, output &string, code int, debug &obj.DebugSections, entry_offset int) int {
+    dir := os.mkdir_temp("", "xu-native-*") or >>
+    result := link_native_in(&dir, code_bytes, calls, syms, unit, output, code, debug, entry_offset) or (err) {
+        os.remove_all(~dir) or (cleanup) {}
+        >> err
+    }
+    os.remove_all(~dir) or >>
+    << result
+}
+
+fn link_native_in(dir &string, code_bytes &mc.CodeBuffer, calls &[]mc.Reloc, syms &mc.SymbolTable, unit &NativeUnit, output &string, code int, debug &obj.DebugSections, entry_offset int) int {
+    os_code := target.target_os(code)
+    app := dir + "/app.S"
+    shim := dir + "/main.c"
+    bridge := dir + "/bridge.c"
+    os.write(~bridge, native_marshaler(unit)) or >>
+    $assembly := native_assembly(code_bytes, calls, syms, unit, entry_offset, os_code, target.target_arch(code))
+    if debug.present() { assembly.push_str(native_debug_asm(debug, entry_offset, os_code)) }
+    os.write(~app, assembly) or >>
+    $entry := "extern void xu_app_start(int, char **);\nint main(int argc, char **argv) { xu_app_start(argc, argv); return 0; }\n"
+    if os_code == target.OS_LINUX {
+        entry = "extern void xu_app_start(int, char **, char **);\nint main(int argc, char **argv, char **envp) { xu_app_start(argc, argv, envp); return 0; }\n"
+    }
+    os.write(~shim, entry) or >>
+    $args := []string{}
+    arch := target.target_arch(code)
+    $triple := "aarch64-linux-gnu"
+    if arch == target.ARCH_X64 { triple = "x86_64-linux-gnu" }
+    if arch == target.ARCH_RISCV64 { triple = "riscv64-linux-gnu" }
+    if arch == target.ARCH_LOONG64 { triple = "loongarch64-linux-gnu" }
+    if os_code == target.OS_MACOS {
+        triple = "arm64-apple-macos11"
+        if arch == target.ARCH_X64 { triple = "x86_64-apple-macos11" }
+    }
+    if os_code == target.OS_WINDOWS {
+        triple = "aarch64-w64-windows-gnu"
+        if arch == target.ARCH_X64 { triple = "x86_64-w64-windows-gnu" }
+    }
+    $cc := os.getenv("XU_NATIVE_CC")
+    if cc.len == 0 { cc = "clang" }
+    if !strings.contains(&cc, "gcc") { args.push("--target=" + triple) }
+    if os_code == target.OS_MACOS {
+        $sdk := os.getenv("SDKROOT")
+        if sdk.len == 0 {
+            if target.target_host().os != target.OS_MACOS {
+                >> errors.new("macOS native linking requires SDKROOT on a non-macOS host")
+            }
+            query := exec.command("xcrun", "--sdk", "macosx", "--show-sdk-path")
+            raw := query.output() or >>
+            sdk = strings.trim_space(&raw)
+            if sdk.len == 0 { >> errors.new("xcrun returned an empty macOS SDK path") }
+        }
+        args.push("-isysroot")
+        args.push(sdk)
+    }
+    sources := [app, shim, bridge]
+    if debug.present() {
+        // Keep objects alive until dsymutil consumes the Mach-O debug map.
+        // A combined clang compile/link deletes its temporary objects first.
+        $objects := []string{}
+        for i in 0:sources.len {
+            object := dir + "/part-" + str(i) + ".o"
+            $compile := exec.command(~cc)
+            for ai in 0:args.len { compile.args.push(~args[ai]) }
+            if i > 0 { compile.args.push("-g") }
+            compile.args.push("-c")
+            compile.args.push(~sources[i])
+            compile.args.push("-o")
+            compile.args.push(~object)
+            compile.run() or >>
+            objects.push(object)
+        }
+        for i in 0:objects.len { args.push(~objects[i]) }
+    } else {
+        for i in 0:sources.len { args.push(~sources[i]) }
+    }
+    for i in 0:unit.archives.len {
+        path := dir + "/native-" + str(i) + ".a"
+        os.write(~path, ~unit.archives[i]) or >>
+        args.push(path)
+    }
+    if os_code == target.OS_WINDOWS { args.push("-lkernel32") }
+    args.push("-o")
+    args.push(~output)
+    $cmd := exec.command(cc)
+    for i in 0:args.len { cmd.args.push(~args[i]) }
+    cmd.run() or >>
+    if debug.present() && os_code == target.OS_MACOS {
+        $symbols := exec.command("dsymutil", ~output)
+        symbols.run() or >>
+    }
+    << 0
+}
