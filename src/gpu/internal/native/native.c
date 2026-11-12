@@ -47,12 +47,22 @@ static bool on_main(void) {
 static bool load_sdl(void) {
     if (!on_main()) return false;
     if (loaded) return true;
-    const char *override = getenv("XU_GPU_SDL_LIBRARY");
 #ifdef _WIN32
-    HMODULE library = LoadLibraryA(override && *override ? override : "SDL3.dll");
+    DWORD capacity = GetEnvironmentVariableW(L"XU_GPU_SDL_LIBRARY", NULL, 0);
+    wchar_t *path = capacity ? calloc(capacity, sizeof(*path)) : NULL;
+    if (capacity && !path) { fail("GPU library path allocation failed"); return false; }
+    if (path) {
+        DWORD length = GetEnvironmentVariableW(L"XU_GPU_SDL_LIBRARY", path, capacity);
+        if (!length || length >= capacity) {
+            free(path); fail("GPU library path changed while loading"); return false;
+        }
+    }
+    HMODULE library = LoadLibraryW(path ? path : L"SDL3.dll");
+    free(path);
 #define FIND(name) GetProcAddress(library, #name)
 #define UNLOAD() FreeLibrary(library)
 #else
+    const char *override = getenv("XU_GPU_SDL_LIBRARY");
     void *library = NULL;
     if (override && *override) library = dlopen(override, RTLD_NOW | RTLD_LOCAL);
 #ifdef __APPLE__
