@@ -308,15 +308,17 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 ---
 
-## GPU device transfers (development)
+## Standard GPU resources (development)
 
-SDK `0.12.3-dev.3` adds the optional [`#gpu`](src/gpu/README.md) device layer:
-windowless devices, buffers, asynchronous byte uploads, GPU copies, fences and
-readback. Its source backend builds on import using the same SDK's `xu-native`
-and a C compiler; SDL headers and application native declarations are not
-required. The SDL runtime is loaded only on device open. `#gpu/layout` remains
-independent of C tools and SDL. Device execution currently covers Metal on
-macOS arm64; rendering/compute pipelines and other GPU hardware are later work.
+SDK `0.12.3-dev.4` provides optional [`#gpu`](src/gpu/README.md) devices,
+buffers, textures/mips, samplers, shaders, configurable graphics pipelines,
+command encoders, render passes and asynchronous transfers/readback. Import
+compiles the private source backend with the same SDK's `xu-native`; consumers
+need no SDL headers or application native mapping. SDL loads only on device open.
+This provides an offscreen graphics foundation; scene and PBR policy belongs
+to engines. Real GPU evidence currently covers macOS arm64 Metal. Presentation,
+compute and advanced render features remain pending; Vulkan/D3D12 require
+execution validation. See the linked GPU contracts for exact limits.
 
 ## GPU texture layouts (development)
 
@@ -365,9 +367,10 @@ Mutable views permit writes to existing elements only. SDK `0.12.3-dev.3` adds
 `xu_u8_span` / `xu_u8_span_mut` with the same descriptor layout and one-byte
 elements. Their lifetime and ownership rules match the i64 views.
 
-Other `xu-c-2` parameters/results use `xu_int`, with `void` also allowed as a
-result. Floating and narrow C signatures, returned spans, callbacks and
-asynchronous retention are outside this protocol. Wrap a native call in an
+SDK `0.12.3-dev.4` also accepts the existing C1 scalar types in C2: `int`,
+`bool`, `f64`, `i32`, `u32` and `u8`, with `void` allowed as a result. Mixed
+scalar/span calls and floating results use the typed C marshaler. Returned
+spans, callbacks and asynchronous retention remain outside this protocol. Wrap a native call in an
 ordinary Xu function when a function value is needed. The distinct XUOBJ and
 XULIB version 2 formats make older products reject these libraries;
 `xu-c-1` scalar libraries remain supported by the new SDK. Native linking

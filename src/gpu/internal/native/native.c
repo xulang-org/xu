@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "xu_native.h"
 #include "sdl_abi.h"
+#include "sdl_render_abi.h"
+#include <math.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +31,11 @@
 #define DECLARE(name) static __typeof__(name) *p_##name;
 FUNCTIONS(DECLARE)
 static bool loaded;
+#ifdef _WIN32
+static HMODULE sdl_library;
+#else
+static void *sdl_library;
+#endif
 static _Thread_local char error_text[1024];
 static xu_int fail(const char *message) {
     snprintf(error_text, sizeof(error_text), "%s", message ? message : "GPU operation failed");
@@ -82,12 +89,15 @@ static bool load_sdl(void) {
     if (!p_##name) { fail("SDL 3 GPU runtime is missing " #name); UNLOAD(); return false; }
     FUNCTIONS(LOAD)
     p_SDL_SetMainReady();
+    sdl_library = library;
     loaded = true; // Process-lifetime loader; device/subsystem references are separate.
     return true;
 }
 typedef struct Buffer {
     xu_int id;
-    Uint32 size;
+    Uint32 size, usage;
+    xu_uint refs;
+    bool closed;
     SDL_GPUBuffer *gpu;
     struct Buffer *next;
 } Buffer;
@@ -99,11 +109,15 @@ typedef struct Transfer {
     SDL_GPUFence *fence;
     struct Transfer *next;
 } Transfer;
+typedef struct Resource Resource;
+typedef struct Encoder Encoder;
 typedef struct Device {
     xu_int id;
     SDL_GPUDevice *gpu;
     Buffer *buffers;
     Transfer *transfers;
+    Resource *resources;
+    Encoder *encoders;
     struct Device *next;
 } Device;
 static Device *devices;
@@ -118,7 +132,7 @@ static Device *device(xu_int id) {
     fail("closed or invalid GPU device"); return NULL;
 }
 static Buffer *buffer(Device *d, xu_int id) {
-    for (Buffer *b = d->buffers; b; b = b->next) if (b->id == id) return b;
+    for (Buffer *b = d->buffers; b; b = b->next) if (b->id == id && !b->closed) return b;
     fail("closed, foreign or invalid GPU buffer"); return NULL;
 }
 static Transfer *transfer(Device *d, xu_int id) {
@@ -186,14 +200,15 @@ xu_int API(open)(xu_int backend, xu_int debug, xu_int formats) {
     d->next = devices; devices = d;
     return d->id;
 }
+static bool close_graphics(Device *d);
 xu_int API(close)(xu_int id) {
     if (!on_main()) return -1;
     Device **link = &devices;
     while (*link && (*link)->id != id) link = &(*link)->next;
     if (!*link) return 0;
     Device *d = *link;
-    bool ok = p_SDL_WaitForGPUIdle(d->gpu);
-    if (!ok) sdl_fail();
+    bool ok = close_graphics(d);
+    if (!p_SDL_WaitForGPUIdle(d->gpu)) { sdl_fail(); ok = false; }
     while (d->transfers) { Transfer *t = d->transfers; d->transfers = t->next; free_transfer(d, t); }
     while (d->buffers) { Buffer *b = d->buffers; d->buffers = b->next; p_SDL_ReleaseGPUBuffer(d->gpu, b->gpu); free(b); }
     p_SDL_DestroyGPUDevice(d->gpu);
@@ -218,7 +233,7 @@ xu_int API(buffer_new)(xu_int owner, xu_int size, xu_int usage) {
         return fail("invalid GPU buffer size, alignment or usage");
     Buffer *b = calloc(1, sizeof(*b));
     if (!b) return fail("GPU buffer allocation failed");
-    b->id = identifier(); b->size = (Uint32)size;
+    b->id = identifier(); b->size = (Uint32)size; b->usage = (Uint32)usage;
     if (b->id < 0) { free(b); return -1; }
     SDL_GPUBufferCreateInfo info = {(Uint32)usage, (Uint32)size, 0};
     b->gpu = p_SDL_CreateGPUBuffer(d->gpu, &info);
@@ -234,7 +249,10 @@ xu_int API(buffer_close)(xu_int owner, xu_int id) {
     Buffer **link = &d->buffers;
     while (*link && (*link)->id != id) link = &(*link)->next;
     if (!*link) return 0;
-    Buffer *b = *link; *link = b->next;
+    Buffer *b = *link;
+    b->closed = true;
+    if (b->refs) return 0;
+    *link = b->next;
     // SDL defers release until already-submitted work stops using the buffer.
     p_SDL_ReleaseGPUBuffer(d->gpu, b->gpu); free(b);
     return 0;
@@ -316,12 +334,14 @@ xu_int API(transfer_close)(xu_int owner, xu_int id) {
     Transfer *t = *link; *link = t->next; free_transfer(d, t);
     return 0;
 }
+static xu_int graphics_stats(Device *d, xu_int field);
 xu_int API(stats)(xu_int owner, xu_int field) {
     Device *d = device(owner); if (!d) return -1;
+    if (field >= 4) return graphics_stats(d, field);
     xu_int total = 0;
-    if (field < 0 || field > 3) return fail("invalid GPU accounting field");
+    if (field < 0 || field > 10) return fail("invalid GPU accounting field");
     for (Buffer *b = d->buffers; b; b = b->next) {
-        xu_int add = field == 0 ? 1 : field == 1 ? b->size : 0;
+        xu_int add = b->closed ? 0 : field == 0 ? 1 : field == 1 ? b->size : 0;
         if (add > LLONG_MAX - total) return fail("GPU accounting overflow"); total += add;
     }
     for (Transfer *t = d->transfers; t; t = t->next) {
@@ -330,3 +350,5 @@ xu_int API(stats)(xu_int owner, xu_int field) {
     }
     return total;
 }
+
+#include "render.h"

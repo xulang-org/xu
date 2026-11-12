@@ -24,8 +24,8 @@ typedef unsigned long long xu_uint;
  * only; read-only spans also prohibit writing through aliases to the data.
  * A zero-length span may have a null data pointer. Lengths count 8-byte ints.
  * Keep this stable layout independent of the compiler's private descriptors.
- * Other xu-c-2 arguments/results are xu_int (or a void result); narrow and
- * floating C signatures remain outside this version's supported contract.
+ * xu-c-2 also supports xu-c-1 scalar arguments/results (int, bool, f64,
+ * i32, u32, u8 and a void result). Spans remain argument-only.
  */
 typedef struct { xu_int len; const xu_int *data; } xu_i64_span;
 typedef struct { xu_int len; xu_int *data; } xu_i64_span_mut;

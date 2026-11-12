@@ -265,12 +265,20 @@ def native_byte_spans(xu: str, target: str, project: Path, env):
     """Check byte-span descriptors and COW on each native installed SDK."""
     project.mkdir()
     (project / "native.json").write_text(json.dumps({"module": "sdk_bytes", "abi": "xu-c-2", "exports": [
-        {"name": "copy", "params": ["u8_span", "u8_span_mut", "int"], "ret": "int"}]}))
+        {"name": "copy", "params": ["u8_span", "u8_span_mut", "int"], "ret": "int"},
+        {"name": "mixed", "params": ["u8_span"] + ["f64"] * 9 + ["i64_span", "bool", "i32", "u32", "u8", "u8_span_mut"], "ret": "f64"}]}))
     (project / "native.c").write_text('''#include "xu_native.h"
 xu_int XU_NATIVE_SYMBOL(xu_sdk_bytes_copy)(const xu_u8_span *src, const xu_u8_span_mut *dst, xu_int bias) {
     if (!src || !dst || src->len != dst->len || src->len < 0) return -1;
     for (xu_int i = 0; i < src->len; ++i) dst->data[i] = (unsigned char)(src->data[i] + bias);
     return src->len;
+}
+double XU_NATIVE_SYMBOL(xu_sdk_bytes_mixed)(const xu_u8_span *src, double a, double b, double c, double d, double e,
+    double f, double g, double h, double i, const xu_i64_span *ints, _Bool flag, int narrow, unsigned int positive,
+    unsigned char byte, const xu_u8_span_mut *dst) {
+    if (src->len != 4 || ints->len != 1 || dst->len != 1 || !flag || narrow != -7 || positive != 4000000000u || byte != 255) return -1;
+    dst->data[0] = src->data[2];
+    return a + b + c + d + e + f + g + h + i + ints->data[0];
 }
 ''')
     (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nnative:\n  sdk_bytes: file:./bytes.a\n')
@@ -296,14 +304,19 @@ fn main() int {
     empty := []u8{}
     $destination := []u8{}
     assert(sdk_bytes.copy(&empty,$&destination,0)==0)
-    println("Native byte spans: packed bytes, borrowed fields, COW and empty views")
+    ints := [10]
+    $mixed_output := [u8(73)]
+    mixed_snapshot := ~mixed_output
+    result := sdk_bytes.mixed(&source.data,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,&ints,true,i32(-7),u32(4000000000),u8(255),$&mixed_output)
+    assert(result==55.0 && mixed_output[0]==u8(128) && mixed_snapshot[0]==u8(73))
+    println("Native byte spans: packed bytes, borrowed fields, COW and empty views; mixed scalar ABI")
     << 0
 }
 ''')
     program = project / ("native bytes.exe" if os.name == "nt" else "native bytes")
     for level in ("-O0", "-O2", "-O3"):
         run([xu, "build", "main.xu", level, "-o", str(program)], cwd=project, env=env)
-        assert run([str(program)], cwd=project, env=env).strip() == "Native byte spans: packed bytes, borrowed fields, COW and empty views"
+        assert run([str(program)], cwd=project, env=env).strip() == "Native byte spans: packed bytes, borrowed fields, COW and empty views; mixed scalar ABI"
     print("installed-sdk: native-byte-spans PASS (-O0/-O2/-O3)")
 
 

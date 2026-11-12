@@ -53,6 +53,8 @@ TYPE_CODES = {
     "u8": 10,
     "i64_span": 11,
     "i64_span_mut": 12,
+    "u8_span": 13,
+    "u8_span_mut": 14,
 }
 
 
@@ -65,10 +67,10 @@ def abi_version(manifest: dict) -> int:
 
 def abi_type(name: str, version: int, *, result: bool = False) -> int:
     code = type_code(name)
-    if code in (11, 12) and (version != 2 or result):
-        raise SystemExit("i64 spans require xu-c-2 and are borrowed parameters only")
-    if version == 2 and code not in (0, 1, 11, 12):
-        raise SystemExit("xu-c-2 currently supports 64-bit int scalars and borrowed i64 spans")
+    if code == 0 and not result:
+        raise SystemExit("void is only permitted as a native result")
+    if code in (11, 12, 13, 14) and (version != 2 or result):
+        raise SystemExit("borrowed spans require xu-c-2 and are parameters only")
     return code
 
 
