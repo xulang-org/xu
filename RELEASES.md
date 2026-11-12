@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.12.3-dev.4 (development)
+
+Adds standard GPU textures/mips, samplers, vertex/fragment shaders, configurable graphics pipelines, command encoders and render passes with resource retention, depth, indexed/instanced draws and pixel readback. C2 accepts existing C1 scalar signatures alongside borrowed spans, including mixed floating calls/results. Offscreen hardware acceptance covers macOS arm64 Metal; Vulkan/D3D12 execution, presentation, compute and advanced render features remain pending. See [GPU contracts](src/gpu/README.md). This is an unpublished development build, not a release.
+
 ## Xu 0.12.2-dev.1 (development)
 
 Restores the self-hosting product compiler (`src/cmd/compile`, `src/xu`) from `0.12.0-dev.1`. The clean-architecture compiler shipped in 0.12.1 miscompiles common programs (`for` range loops, slice fields, string concatenation and comparison, struct returns) and cannot build itself, so the hosted seed → Gen1 → Gen2 → Gen3 chain is blocked. With the restored compiler the chain reaches a byte-identical Gen2/Gen3 fixed point again. Development of the clean-architecture compiler continues on its own branch and is not part of the product chain until it can self-host. `internal/modulepath` prefix matching is restored for every prefix.
