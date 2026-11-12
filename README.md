@@ -308,6 +308,17 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 ---
 
+## GPU texture layouts (development)
+
+The `0.12.3-dev.2` standard library adds [`#gpu/layout`](src/gpu/layout/README.md)
+for checked 2D mip and transfer-buffer layouts. It describes 20 uncompressed
+and block-compressed formats, with explicit row and mip offset alignments.
+Invalid inputs and signed-64-bit byte overflow return errors; no GPU, window,
+SDL, or pixel allocation is needed. UI image upload uses the same layout code.
+Format metadata does not imply device support or physical allocation size.
+Device capabilities, allocation, commands and synchronization remain separate;
+scene, material and application-budget policies belong to their consumers.
+
 ## Native executable builds (development)
 
 The `0.12.3-dev.1` development compiler resolves `native:` dependencies from
