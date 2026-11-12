@@ -308,6 +308,16 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 ---
 
+## GPU device transfers (development)
+
+SDK `0.12.3-dev.3` adds the optional [`#gpu`](src/gpu/README.md) device layer:
+windowless devices, buffers, asynchronous byte uploads, GPU copies, fences and
+readback. Its source backend builds on import using the same SDK's `xu-native`
+and a C compiler; SDL headers and application native declarations are not
+required. The SDL runtime is loaded only on device open. `#gpu/layout` remains
+independent of C tools and SDL. Device execution currently covers Metal on
+macOS arm64; rendering/compute pipelines and other GPU hardware are later work.
+
 ## GPU texture layouts (development)
 
 The `0.12.3-dev.2` standard library adds [`#gpu/layout`](src/gpu/layout/README.md)
@@ -341,7 +351,7 @@ of the game engine.
 Host acceptance covers macOS arm64. The presence of foreign target adapters
 or archive slices does not establish execution on those targets.
 
-## Borrowed native i64 spans (development)
+## Borrowed native spans (development)
 
 The `0.12.3-dev.1` development SDK supports opt-in `"abi": "xu-c-2"` native manifests.
 `i64_span` and `i64_span_mut` parameters are checked as `&[]int` and
@@ -350,7 +360,10 @@ The `0.12.3-dev.1` development SDK supports opt-in `"abi": "xu-c-2"` native mani
 then the data pointer at byte 8. The compiler creates a temporary descriptor
 for each call. Native code must finish all access before returning and must
 not retain either pointer, resize the array, or modify the descriptor.
-Mutable views permit writes to existing elements only.
+Mutable views permit writes to existing elements only. SDK `0.12.3-dev.3` adds
+`u8_span` / `u8_span_mut` for `&[]u8` / `$&[]u8`, using
+`xu_u8_span` / `xu_u8_span_mut` with the same descriptor layout and one-byte
+elements. Their lifetime and ownership rules match the i64 views.
 
 Other `xu-c-2` parameters/results use `xu_int`, with `void` also allowed as a
 result. Floating and narrow C signatures, returned spans, callbacks and

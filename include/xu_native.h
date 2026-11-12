@@ -29,16 +29,21 @@ typedef unsigned long long xu_uint;
  */
 typedef struct { xu_int len; const xu_int *data; } xu_i64_span;
 typedef struct { xu_int len; xu_int *data; } xu_i64_span_mut;
+/* Byte spans have the same descriptor layout, with one-byte elements. */
+typedef struct { xu_int len; const unsigned char *data; } xu_u8_span;
+typedef struct { xu_int len; unsigned char *data; } xu_u8_span_mut;
 
 #if defined(__cplusplus)
 static_assert(sizeof(xu_int) == 8, "Xu integers require 64 bits");
 #if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
 static_assert(sizeof(xu_i64_span) == 16, "xu-c-2 descriptor size mismatch");
+static_assert(sizeof(xu_u8_span) == 16, "xu-c-2 byte descriptor size mismatch");
 #endif
 #else
 _Static_assert(sizeof(xu_int) == 8, "Xu integers require 64 bits");
 #if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
 _Static_assert(sizeof(xu_i64_span) == 16, "xu-c-2 descriptor size mismatch");
+_Static_assert(sizeof(xu_u8_span) == 16, "xu-c-2 byte descriptor size mismatch");
 #endif
 #endif
 
