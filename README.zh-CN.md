@@ -74,7 +74,7 @@ fn main() int {
 普通值的共享借用写 `&x`，可写借用写 `$&x`，对应引用类型为 `$&T`。
 复用引用直接写 `r`，显式再借用写 `&*r`；普通值自动借用尚未实现。
 
-当前借用与可变绑定规则见[借用指南](docs/language/borrowing.md)。
+当前借用与可变绑定规则见[借用指南](https://xulang.org/zh/docs/lang/memory/)。
 
 ---
 
@@ -163,99 +163,14 @@ xu build main.xu -o myapp
 ./myapp
 ```
 
-### 常用开发命令速查
+### 官方文档
 
-#### 项目与依赖
+- [快速上手](https://xulang.org/zh/docs/start/)
+- [CLI 参考](https://xulang.org/zh/docs/cli/)，包括优化、测试和 XACP
+- [标准库与扩展包 API](https://xulang.org/zh/api/)
+- [原生模块和借用 span](https://xulang.org/zh/docs/native/)
 
-| 命令 | 说明 |
-| :--- | :--- |
-| `xu init [module]` | 在当前目录创建 `xu.xun`，缺少 `main.xu` 时同时生成入口示例 |
-| `xu get <module>@<version>` | 添加或升级精确版本依赖，安装到 `vendor/` 并更新 `xu.lock` |
-| `xu install [dir]` | 安装指定项目 `xu.xun` 中已有的依赖 |
-| `xu build . --frozen -o myapp` | 使用现有锁文件和本地依赖执行冻结、离线构建 |
-| `xu env [var...]` | 查看工具链、标准库、依赖缓存与目标平台的有效配置 |
-
-在含有 `xu.xun` 的项目中，执行 `xu get github.com/xulang-org/packages@v0.1.1`
-即可添加官方扩展模块。依赖需要显式版本；`--offline` 使用本地缓存或 vendor，
-`--frozen` 拒绝依赖变化。
-
-#### 构建、运行与验证
-
-| 命令 | 说明 |
-| :--- | :--- |
-| `xu run <file.xu> -- <args...>` | 编译并启动本机程序，`--` 后的参数传给程序 |
-| `xu build <file.xu> -o <bin>` | AOT 编译为原生可执行文件；项目目录也可作为输入 |
-| `xu debug <file.xu> -b file.xu:行号 --run` | 带 DWARF 构建并进入 LLDB/GDB 交互会话；可用 `-e` 预置调试器命令 |
-| `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
-| `xu test test.example.xu` | 构建并运行测试入口 |
-| `xu test test.example.xu --no-opt` | 关闭优化后运行测试 |
-| `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
-| `xu build <file.xu> --target wasm32-wasi -o app.wasm` | 生成面向 WASI 运行时的 WebAssembly 模块 |
-| `xu build <file.xu> --xacp --xacp-port 4321 -o app` | 嵌入 XACP 启动发现元数据 |
-| `./app --xacp-help` | 输出生成程序的机器可读 XACP 摘要 |
-| `xu xacp inspect ./app` | 检查启用 XACP 程序的发现信息与安全摘要 |
-| `xu xacp run ./app -- args...` | 使用明确的 AI/用户参数边界运行程序 |
-| `xu xacp record ./app -- > output.log` | 将有界 stdout 流式输出，由用户自行保存 |
-| `xu build <AppDir> --desktop` | 打包桌面应用；需要对应宿主 UI SDK 与工具链 |
-| `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
-| `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
-
-测试与基准函数必须位于 `@main` 的 `test.<name>.xu` 文件中，不得带参数、类型参数或声明返回类型。例如将以下内容保存为 `test.example.xu`：
-
-```xu
-@main
-
-fn test_addition() {
-    assert(1 + 1 == 2)
-}
-
-fn main() {
-    test_addition()
-}
-```
-
-0.12.2 的 `xu test` 会构建临时程序并执行其 `main` 函数。构建、运行和测试默认开启优化，可用 `--no-opt` 关闭。
-
-```sh
-xu test test.example.xu
-```
-
-
-Windows socket 就绪与并发 HTTP 回归可从仓库根运行 `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64`（或 `windows-x64`）。它检查空闲监听器与无效 socket，再在 O0–O3 各运行三次并发回环请求；构建和执行均有超时限制。
-
-使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](https://github.com/xulang-org/examples/tree/main/examples/xacp)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
-
-`#xacp` 是传输无关的标准库层，用于宿主注册一个真实的
-`ui/widgets.Screen`。adapter 提供有界的 `ui.tree`、由原生资源承载的
-`ui.screenshot`、经过校验的 `ui.input`/`ui.act`，以及流式录制。调用这些
-API 时必须携带拥有对应权限位的 session；`start_recorder` 会保持请求直到
-`finish_recorder` 或 `abort_recorder`。屏幕句柄、canvas generation、节点数、
-帧字节数、文本长度和录制预算都会在进入 widget 前检查。源码开发宿主可以
-在 hello 握手前调用 `enable_development` 获得 `PERM_ALL`，但这不会关闭
-schema、生命周期、原生资源释放或内存上限。截图返回拥有所有权的
-`draw.Surface`，宿主交给自己的资源层后必须显式 dispose。
-
-0.9.4 还提供 `XU_VERIFY=1` 逐 pass MIR 验证、`XU_DUMP_MIR=<函数名>`
-与 `XU_PATTERNS_OFF=all` 模式对拍诊断。完整选项见[命令行参考](https://xulang.org/zh/docs/cli/)。
-
-#### 开发工具与工具链管理
-
-| 命令 | 说明 |
-| :--- | :--- |
-| `xu fmt <file.xu> -w` | 原地格式化源码；省略 `-w` 时输出到终端 |
-| `xu doc <dir> --public` | 提取公开声明，生成 Markdown API 文档；`--serve` 启动本地文档服务 |
-| `xu map <dir> -o flow.md` | 生成 Mermaid 源码流程图；`--graph` 输出结构化图数据 |
-| `xu doctor` | 检查宿主工具链；`--desktop --webview` 检查桌面与 WebView 依赖 |
-| `xu native <command> [options]` | 编译、归档 C 模块，打包、检视或提取 `.xulib` 平台切片 |
-| `xu lsp` | 启动标准输入/输出上的 LSP 服务，供 VS Code、Cursor、Neovim 等编辑器调用 |
-| `xu setup -y` | 静默安装并配置工具链环境 |
-| `xu up --check` | 仅检查官方发布版本；`xu up` 与 `xu update` 为同义命令 |
-| `xu update --version 0.9.4` | 安装指定版本的官方工具链 |
-| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | 从本地 SDK 归档安装，无需联网 |
-| `xu --version` | 显示实际编译器版本及宿主目标 |
-| `xu help <command>` | 查看子命令帮助，也可使用 `<command> --help` |
-
-自更新由独立工具 `xu-update`（`src/cmd/update`）执行，HTTPS、gzip、tar、ZIP 和文件操作使用 Xu 标准库。可通过 `make xu-update` 构建，发布 SDK 默认包含此工具。`xu-setup` 共用 `internal/sdk` 下载与解包代码。下载时实时显示已下载量；服务器提供总大小时同时显示百分比，安装向导也会更新进度条。 安装向导使用 `ui/layout` 与 `ui/widgets` 的标准组件，自动识别安装位置，支持键盘操作和失败重试。默认沿用 PATH 中现有 SDK，首次安装使用 `~/.xu`。Windows 可选择当前用户或所有用户，系统安装会请求管理员授权；命令行仍支持 `--prefix DIR`。
+文档和 API 源码统一维护在 [xulang-org/xulang-org](https://github.com/xulang-org/xulang-org)。
 
 ---
 
@@ -293,20 +208,6 @@ Xu 是一门开放透明、面向未来的现代系统编程语言。如果你�
 - 📚 **完整文档**：查阅详尽的语法手册与进阶示例，请访问 [xulang.org 官方网站](https://xulang.org)。
 
 ---
-
-## 原生 i64 借用 span（开发版）
-
-`0.11.3-dev.10` SDK 新增显式选择的 `"abi": "xu-c-2"` 原生清单。
-参数 `i64_span`、`i64_span_mut` 对应 Xu `&[]int`、`$&[]int`，C 入口分别接收
-`include/xu_native.h` 定义的 `const xu_i64_span *`、`const xu_i64_span_mut *`。
-临时描述符的长度位于字节 0，数据指针位于字节 8，仅在调用期间有效。
-原生代码必须在返回前完成访问，不能保留指针、改变数组大小或改写描述符；
-可写视图只允许修改已有元素。
-
-其他参数和返回值使用 `xu_int`，返回值另允许 `void`。本协议不包含浮点或窄整数
-C 签名、返回 span、回调及异步保留；需要函数值时使用普通 Xu 包装函数。
-独立的 XUOBJ/XULIB 第 2 版格式使旧产品明确拒绝新库；新 SDK 继续兼容 `xu-c-1`
-标量库。原生链接维持已有平台范围，外国目标对象发射不代表目标真机执行或 GPU 可用。
 
 ## 开源协议
 

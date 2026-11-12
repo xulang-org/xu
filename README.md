@@ -78,7 +78,7 @@ shared borrow or `$&x` for a writable borrow, whose reference type is `$&T`.
 Reuse reference names as `r`, or write `&*r` for an explicit reborrow.
 Automatic borrowing from ordinary values is not implemented.
 
-See [Borrowing and mutable bindings](docs/language/borrowing.md) for the current rules.
+See [Borrowing and mutable bindings](https://xulang.org/docs/lang/memory/) for the current rules.
 
 ---
 
@@ -168,109 +168,14 @@ xu build main.xu -o myapp
 ./myapp
 ```
 
-### CLI Command Quick Reference
+### Documentation
 
-#### Projects and Dependencies
+- [Getting started](https://xulang.org/docs/start/)
+- [CLI reference](https://xulang.org/docs/cli/), including optimization, testing, and XACP
+- [Standard library and package API](https://xulang.org/api/)
+- [Native modules and borrowed spans](https://xulang.org/docs/native/)
 
-| Command | Description |
-| :--- | :--- |
-| `xu init [module]` | Create `xu.xun` in the current directory and a starter `main.xu` when missing |
-| `xu get <module>@<version>` | Add or upgrade an exact dependency, install into `vendor/`, and update `xu.lock` |
-| `xu install [dir]` | Install dependencies already declared in the project's `xu.xun` |
-| `xu build . --frozen -o myapp` | Build offline using the existing lockfile and local dependencies |
-| `xu env [var...]` | Inspect effective toolchain, standard-library, cache, and target settings |
-
-In a project with `xu.xun`, run `xu get github.com/xulang-org/packages@v0.1.1`
-to add or update the root module under `require:` and install its dependency
-graph into `vendor/`. An explicit version is required; `@latest`, version ranges,
-and package subpath discovery are not supported. `--offline` uses verified local
-cache/vendor data. Failed resolution or installation preserves the project's
-manifest, lock file, and vendor directory. `--frozen` rejects dependency changes.
-
-#### Building, Running, and Verification
-
-| Command | Description |
-| :--- | :--- |
-| `xu run <file.xu> -- <args...>` | Compile and launch a native program, forwarding arguments after `--` |
-| `xu build <file.xu> -o <bin>` | AOT compile a native executable; project directories are also accepted |
-| `xu debug <file.xu> -b file.xu:LINE --run` | Build with DWARF and enter an interactive LLDB/GDB session; `-e` queues debugger commands |
-| `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
-| `xu test test.example.xu` | Build and run the test entry point |
-| `xu test test.example.xu --no-opt` | Run tests with optimization disabled |
-| `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
-| `xu build <file.xu> --target wasm32-wasi -o app.wasm` | Emit a WebAssembly module for a WASI runtime |
-| `xu build <file.xu> --xacp --xacp-port 4321 -o app` | Embed XACP startup discovery metadata |
-| `./app --xacp-help` | Print the generated program's machine-readable XACP summary |
-| `xu xacp inspect ./app` | Inspect an XACP-enabled program's discovery and safety summary |
-| `xu xacp run ./app -- args...` | Run it with an explicit AI/user argument boundary |
-| `xu xacp record ./app -- > output.log` | Stream bounded stdout for user-owned recording |
-| `xu build <AppDir> --desktop` | Package a desktop application using the required host UI SDK and tools |
-| `xu build <AppDir> --desktop --webview` | Explicitly include the WebView host plugin in a desktop application |
-| `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
-| `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
-
-`xu build` always compiles a plain executable unless `--desktop` is explicitly supplied. Importing `ui` or `ui/webview`, or adding a `www/` directory, does not enable desktop packaging or WebView. Desktop packaging also requires an explicit `--webview` to include the WebView host plugin; otherwise it uses the Draw-only host.
-
-Tests and benchmarks must be declared in `test.<name>.xu` files in `@main`, with no parameters, type parameters, or declared return type. For example, save this as `test.example.xu`:
-
-```xu
-@main
-
-fn test_addition() {
-    assert(1 + 1 == 2)
-}
-
-fn main() {
-    test_addition()
-}
-```
-
-In 0.12.2, `xu test` builds a temporary executable and runs its `main` function. Build, run, and test commands optimize by default. Pass `--no-opt` to disable optimization.
-
-```sh
-xu test test.example.xu
-```
-
-
-For Windows socket readiness and concurrent HTTP regressions, run `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64` (or `windows-x64`) from the repository root. It checks idle and invalid sockets, then runs concurrent loopback requests three times at each of O0–O3, with bounded build and execution deadlines.
-
-Build the launcher with `make xu-xacp`; see the [runnable XACP example](https://github.com/xulang-org/examples/tree/main/examples/xacp). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
-
-`#xacp` is the transport-neutral standard-library layer for hosts that register
-a live `ui/widgets.Screen`. Its adapter exposes bounded `ui.tree`, native-owned
-`ui.screenshot`, validated `ui.input`/`ui.act`, and a streaming recorder. Use
-`xacp.ui_tree`, `xacp.ui_screenshot`, `xacp.ui_input`, and `xacp.ui_act` only
-through a session with the required permission bits; `xacp.start_recorder`
-keeps the request alive until `finish_recorder` or `abort_recorder`. Screen
-handles, canvas generations, node counts, frame bytes, text lengths, and record
-budgets are checked before the operation reaches the widget. Development hosts
-may call `enable_development` before the hello handshake to grant `PERM_ALL`;
-this does not disable schema, lifecycle, native-resource disposal, or memory
-limits. A screenshot returns an owning `draw.Surface`, which the caller must
-dispose after handing its metadata/resource to the host.
-
-0.9.4 also provides per-pass MIR verification with `XU_VERIFY=1`,
-`XU_DUMP_MIR=<function>`, and differential pattern diagnostics with
-`XU_PATTERNS_OFF=all`. See the [CLI reference](https://xulang.org/docs/cli/) for full options.
-
-#### Development Tools and Toolchain Management
-
-| Command | Description |
-| :--- | :--- |
-| `xu fmt <file.xu> -w` | Format source in place; omit `-w` to print to stdout |
-| `xu doc <dir> --public` | Generate Markdown for public declarations; `--serve` starts a local documentation server |
-| `xu map <dir> -o flow.md` | Generate a Mermaid source flowchart; `--graph` emits structured graph data |
-| `xu doctor` | Check host tools; `--desktop --webview` checks desktop and WebView dependencies |
-| `xu native <command> [options]` | Compile/archive C modules and pack, inspect, or extract `.xulib` slices |
-| `xu lsp` | Start the stdio LSP server for VS Code, Cursor, Neovim, and other editors |
-| `xu setup -y` | Install and configure the toolchain without interactive prompts |
-| `xu up --check` | Check official releases; `xu up` and `xu update` are aliases |
-| `xu update --version 0.9.4` | Install a specific official toolchain release |
-| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | Install a local SDK archive without network access |
-| `xu --version` | Show the actual compiler version and host target |
-| `xu help <command>` | Show subcommand help; `<command> --help` also works |
-
-Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using Xu standard libraries for HTTPS, gzip, tar, ZIP, and file operations. Build it with `make xu-update`; release SDKs include it. `xu-setup` uses the same `internal/sdk` download and extraction code. Downloads show transferred bytes and, when the total size is known, a percentage; the setup wizard also updates its progress bar. The wizard uses standard `ui/layout` and `ui/widgets` components, with automatic SDK detection, keyboard navigation, and retry on failure. The existing SDK selected by PATH is reused; a new installation defaults to `~/.xu`. Windows offers current-user and all-users scopes; the system scope requests administrator elevation. Use `--prefix DIR` to override the destination from the CLI.
+The documentation and API source live in [xulang-org/xulang-org](https://github.com/xulang-org/xulang-org).
 
 ---
 
@@ -308,26 +213,6 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 - 📚 **Comprehensive Documentation**: Read guides, syntax specifications, and tutorials at [xulang.org](https://xulang.org).
 
 ---
-
-## Borrowed native i64 spans (development)
-
-The `0.11.3-dev.10` SDK adds opt-in `"abi": "xu-c-2"` native manifests.
-`i64_span` and `i64_span_mut` parameters are checked as `&[]int` and
-`$&[]int`. C entry points take `const xu_i64_span *` and
-`const xu_i64_span_mut *` from `include/xu_native.h`: length is at byte 0,
-then the data pointer at byte 8. The compiler creates a temporary descriptor
-for each call. Native code must finish all access before returning and must
-not retain either pointer, resize the array, or modify the descriptor.
-Mutable views permit writes to existing elements only.
-
-Other `xu-c-2` parameters/results use `xu_int`, with `void` also allowed as a
-result. Floating and narrow C signatures, returned spans, callbacks and
-asynchronous retention are outside this protocol. Wrap a native call in an
-ordinary Xu function when a function value is needed. The distinct XUOBJ and
-XULIB version 2 formats make older products reject these libraries;
-`xu-c-1` scalar libraries remain supported by the new SDK. Native linking
-keeps the existing platform limits; foreign object emission does not establish
-native execution or GPU availability.
 
 ## License
 
