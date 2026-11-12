@@ -17,13 +17,13 @@
   <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?label=Release&color=0284c7" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
   <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
-  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-72%20Workloads-amber" alt="Benchmarks"></a>
   <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
 <p align="center">
   <a href="https://xulang.org">🌐 <b>Online Playground (No Install)</b></a> &nbsp;•&nbsp;
-  <a href="https://xulang.org/benchmarks">⚡ <b>47-Task Benchmark Dashboard</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>72-Workload Benchmark Dashboard</b></a> &nbsp;•&nbsp;
   <a href="#-zero-friction-quick-start">🚀 <b>30s Quick Start</b></a> &nbsp;•&nbsp;
   <a href="RELEASES.md">📋 <b>Release Notes</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/xulang-org/xu/releases">📦 <b>Download Installers</b></a>
@@ -195,11 +195,10 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu build <file.xu> -o <bin>` | AOT compile a native executable; project directories are also accepted |
 | `xu debug <file.xu> -b file.xu:LINE --run` | Build with DWARF and enter an interactive LLDB/GDB session; `-e` queues debugger commands |
 | `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
-| `xu parse <file.xu>` | Parse source and print file, function, and declaration statistics |
-| `xu test test.example.xu -v` | Build a harness for `fn test_*` tests with detailed results; filter with `-run <REGEXP>` |
-| `xu test test.example.xu -bench <REGEXP>` | Build a harness for matching `fn bench_*` benchmark functions |
+| `xu test test.example.xu -v` | Build and run the test harness with per-test results |
+| `xu test test.example.xu --no-opt` | Run tests with optimization disabled |
 | `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
-| `xu build <file.xu> --target wasm32 -o app.wasm` | Emit a WebAssembly module |
+| `xu build <file.xu> --target wasm32-wasi -o app.wasm` | Emit a WebAssembly module for a WASI runtime |
 | `xu build <file.xu> --xacp --xacp-port 4321 -o app` | Embed XACP startup discovery metadata |
 | `./app --xacp-help` | Print the generated program's machine-readable XACP summary |
 | `xu xacp inspect ./app` | Inspect an XACP-enabled program's discovery and safety summary |
@@ -222,14 +221,12 @@ fn test_addition() {
 }
 ```
 
-`xu test` currently emits a harness executable; launch it separately to execute the tests. On macOS/Linux:
+`xu test` builds and runs a temporary harness. Build, run, and test commands optimize by default. Pass `--no-opt` to disable optimization.
 
 ```sh
-xu test test.example.xu -v -o test-example
-./test-example
+xu test test.example.xu -v
 ```
 
-On Windows, the output gains an `.exe` suffix; run `./test-example.exe`. Use `-count N` when building to repeat the test suite. The current parser accepts 1–1000; the CLI help still displays 1–100.
 
 For Windows socket readiness and concurrent HTTP regressions, run `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64` (or `windows-x64`) from the repository root. It checks idle and invalid sockets, then runs concurrent loopback requests three times at each of O0–O3, with bounded build and execution deadlines.
 
@@ -282,14 +279,14 @@ The published SDK is the baseline for this roadmap. See [Status & Limitations](h
 - [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication; 100/100 multi-task select concurrency gate closed
 - [x] **Cryptographic Suite Completeness**: SM2/SM3/SM4/SM9 full-suite conformance; SM9 pairing stack frame reduced by 71.5% with zero compile warnings
 - [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
-- [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V / ARM32, WASM, and bare-metal targets
+- [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM, and bare-metal targets
 - [x] **SDK Installation and Self-Updates**: Windows wizard, macOS PKG, cross-platform single-file Setup, and `xu up/update`
 - [x] **Reproducible Module Dependencies**: `init/get/install`, MVS, locks/vendor, proxies, offline/frozen builds, and a trusted-key checksum client
 - [x] **LSP and Editor Integration**: `xu-lsp` and VS Code/Cursor extensions; diagnostics, completion, definitions, hover, symbols, references, rename, and formatting
 - [x] **Generics and SSA Optimization Foundations**: Monomorphization without the four-type-parameter cap, scalar SSA promotion, ARM64 SSA loop kernels, and loop rotation
 - [x] **Compiler Diagnostics and Verification**: Per-pass MIR verification, MIR dumps, pattern-hit counters, and named-pattern controls
 - [x] **Infrastructure Packages**: The separate packages module provides 29 extensions including MySQL, Postgres, Redis, ClickHouse, Kafka, and SQLite
-- [x] **Traceable Cross-Language Benchmarks**: 47 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
+- [x] **Traceable Cross-Language Benchmarks**: 72 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
 - [x] **Integrated Interactive Source Debugger**: `xu debug` drives DWARF source breakpoints, call stacks, and typed local variable inspection via LLDB/GDB with non-interactive batch mode
 - [x] **Further Optimizer Expansion**: Deeper SSA scalar promotion with struct-record admission proofs, TVM-inspired tile planning, low-bit LUT-GEMM, and pipelined operator fusion
 - [ ] **Complete Target-Machine Runtime Validation**: Native SDK installation gates cover macOS ARM64/x64, Linux ARM64/x64, and Windows x64/ARM64. Extend library, networking, concurrency, and desktop runtime checks on each target; LoongArch64 and RISC-V SDKs are cross-built.
@@ -303,7 +300,7 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 - ⭐ **Star the Repo**: If Xu resonates with your engineering philosophy, give us a **Star** on [GitHub](https://github.com/xulang-org/xu)—it fuels our development!
 - 💬 **Feedback & Discussions**: Have feature requests or suggestions? Open a discussion or ticket on [GitHub Issues](https://github.com/xulang-org/xu/issues).
-- 📊 **Benchmark Insights**: Explore deep CPU and memory benchmarks across 47 tasks at [xulang.org/benchmarks](https://xulang.org/benchmarks).
+- 📊 **Benchmark Insights**: Explore deep CPU and memory benchmarks across 72 workloads at [xulang.org/benchmarks](https://xulang.org/benchmarks).
 - 📚 **Comprehensive Documentation**: Read guides, syntax specifications, and tutorials at [xulang.org](https://xulang.org).
 
 ---

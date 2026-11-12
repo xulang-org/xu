@@ -17,13 +17,13 @@
   <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?label=Release&color=0284c7" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
   <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
-  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-72%20Workloads-amber" alt="Benchmarks"></a>
   <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
 <p align="center">
   <a href="https://xulang.org">🌐 <b>在线 Playground（免安装试玩）</b></a> &nbsp;•&nbsp;
-  <a href="https://xulang.org/benchmarks">⚡ <b>47 项跨语言横测看板</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>72 项跨语言横测看板</b></a> &nbsp;•&nbsp;
   <a href="#-零阻力快速上手-quick-start">🚀 <b>30 秒上手</b></a> &nbsp;•&nbsp;
   <a href="RELEASES.zh-CN.md">📋 <b>版本说明</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/xulang-org/xu/releases">📦 <b>下载安装包</b></a>
@@ -187,11 +187,10 @@ xu build main.xu -o myapp
 | `xu build <file.xu> -o <bin>` | AOT 编译为原生可执行文件；项目目录也可作为输入 |
 | `xu debug <file.xu> -b file.xu:行号 --run` | 带 DWARF 构建并进入 LLDB/GDB 交互会话；可用 `-e` 预置调试器命令 |
 | `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
-| `xu parse <file.xu>` | 解析源码，输出文件、函数与声明统计 |
-| `xu test test.example.xu -v` | 构建 `fn test_*` 测试程序并启用详细结果；可用 `-run <REGEXP>` 过滤 |
-| `xu test test.example.xu -bench <REGEXP>` | 构建匹配 `fn bench_*` 基准函数的测试程序 |
+| `xu test test.example.xu -v` | 构建并运行测试程序，显示每项结果 |
+| `xu test test.example.xu --no-opt` | 关闭优化后运行测试 |
 | `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
-| `xu build <file.xu> --target wasm32 -o app.wasm` | 生成 WebAssembly 模块 |
+| `xu build <file.xu> --target wasm32-wasi -o app.wasm` | 生成面向 WASI 运行时的 WebAssembly 模块 |
 | `xu build <file.xu> --xacp --xacp-port 4321 -o app` | 嵌入 XACP 启动发现元数据 |
 | `./app --xacp-help` | 输出生成程序的机器可读 XACP 摘要 |
 | `xu xacp inspect ./app` | 检查启用 XACP 程序的发现信息与安全摘要 |
@@ -211,14 +210,12 @@ fn test_addition() {
 }
 ```
 
-`xu test` 当前生成测试可执行文件，需另行启动才能执行测试。在 macOS/Linux 上：
+`xu test` 会构建并运行临时测试程序。构建、运行和测试默认开启优化，可用 `--no-opt` 关闭。
 
 ```sh
-xu test test.example.xu -v -o test-example
-./test-example
+xu test test.example.xu -v
 ```
 
-Windows 输出带 `.exe` 后缀，运行 `./test-example.exe`。构建时使用 `-count N` 可重复执行测试套件；当前解析器接受 1–1000，CLI 帮助仍显示 1–100。
 
 Windows socket 就绪与并发 HTTP 回归可从仓库根运行 `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64`（或 `windows-x64`）。它检查空闲监听器与无效 socket，再在 O0–O3 各运行三次并发回环请求；构建和执行均有超时限制。
 
@@ -267,14 +264,14 @@ schema、生命周期、原生资源释放或内存上限。截图返回拥有�
 - [x] **原生协程与管道并发**：`xu` 关键字轻量调度 + 强类型 `chan` 信道机制；100/100 轮多任务并发 select 门禁收口
 - [x] **国密算法完整性与工程收口**：SM2/SM3/SM4/SM9 算法全量通过；SM9 双线性对栈帧压降 71.5% 且零编译告警
 - [x] **极简符号流控制**：`<<` 返回、`>>` 抛错与 `or (err) { ... }` 强制就地处理
-- [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V / ARM32、WASM 及裸机目标
+- [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V、WASM 及裸机目标
 - [x] **SDK 安装与自更新**：Windows 安装向导、macOS PKG、跨平台单文件 Setup 与 `xu up/update`
 - [x] **可复现模块依赖**：`init/get/install`、MVS、锁文件/vendor、代理、离线/冻结构建与固定公钥校验客户端
 - [x] **LSP 与编辑器集成**：`xu-lsp`、VS Code/Cursor 扩展；诊断、补全、定义、悬停、大纲、引用、重命名与格式化
 - [x] **泛型与 SSA 优化基础**：泛型单态化、移除 4 类型参数限制、标量 SSA 提升、ARM64 SSA 循环内核与循环旋转
 - [x] **编译器诊断与验证**：逐 pass MIR 验证、MIR 导出、模式命中统计与具名模式开关
 - [x] **主流基础设施生态包**：独立 packages 模块提供 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等 29 个扩展包
-- [x] **可追溯的跨语言横测**：47 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
+- [x] **可追溯的跨语言横测**：72 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
 - [x] **集成交互式源代码调试器**：`xu debug` 支持 DWARF 源码断点、调用栈与 LLDB/GDB 强类型局部变量检视及自动化批处理模式
 - [x] **优化器进一步扩展**：结构体 Record SSA 标量提升准入证明闭环、TVM 风格 Tile 切块规划、低比特 LUT-GEMM 与算子流水线融合
 - [ ] **完整目标机运行验收**：原生 SDK 安装门禁覆盖 macOS ARM64/x64、Linux ARM64/x64 与 Windows x64/ARM64；继续补齐各目标的库、网络、并发和桌面运行检查。LoongArch64 与 RISC-V SDK 通过交叉编译交付。
