@@ -17,13 +17,13 @@
   <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?label=Release&color=0284c7" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
   <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
-  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-72%20Workloads-amber" alt="Benchmarks"></a>
   <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
 <p align="center">
   <a href="https://xulang.org">🌐 <b>Online Playground (No Install)</b></a> &nbsp;•&nbsp;
-  <a href="https://xulang.org/benchmarks">⚡ <b>47-Task Benchmark Dashboard</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>72-Workload Benchmark Dashboard</b></a> &nbsp;•&nbsp;
   <a href="#-zero-friction-quick-start">🚀 <b>30s Quick Start</b></a> &nbsp;•&nbsp;
   <a href="RELEASES.md">📋 <b>Release Notes</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/xulang-org/xu/releases">📦 <b>Download Installers</b></a>
@@ -78,7 +78,7 @@ shared borrow or `$&x` for a writable borrow, whose reference type is `$&T`.
 Reuse reference names as `r`, or write `&*r` for an explicit reborrow.
 Automatic borrowing from ordinary values is not implemented.
 
-See [Borrowing and mutable bindings](docs/language/borrowing.md) for the current rules.
+See [Borrowing and mutable bindings](https://xulang.org/docs/lang/memory/) for the current rules.
 
 ---
 
@@ -168,108 +168,14 @@ xu build main.xu -o myapp
 ./myapp
 ```
 
-### CLI Command Quick Reference
+### Documentation
 
-#### Projects and Dependencies
+- [Getting started](https://xulang.org/docs/start/)
+- [CLI reference](https://xulang.org/docs/cli/), including optimization, testing, and XACP
+- [Standard library and package API](https://xulang.org/api/)
+- [Native modules and borrowed spans](https://xulang.org/docs/native/)
 
-| Command | Description |
-| :--- | :--- |
-| `xu init [module]` | Create `xu.xun` in the current directory and a starter `main.xu` when missing |
-| `xu get <module>@<version>` | Add or upgrade an exact dependency, install into `vendor/`, and update `xu.lock` |
-| `xu install [dir]` | Install dependencies already declared in the project's `xu.xun` |
-| `xu build . --frozen -o myapp` | Build offline using the existing lockfile and local dependencies |
-| `xu env [var...]` | Inspect effective toolchain, standard-library, cache, and target settings |
-
-In a project with `xu.xun`, run `xu get github.com/xulang-org/packages@v0.1.1`
-to add or update the root module under `require:` and install its dependency
-graph into `vendor/`. An explicit version is required; `@latest`, version ranges,
-and package subpath discovery are not supported. `--offline` uses verified local
-cache/vendor data. Failed resolution or installation preserves the project's
-manifest, lock file, and vendor directory. `--frozen` rejects dependency changes.
-
-#### Building, Running, and Verification
-
-| Command | Description |
-| :--- | :--- |
-| `xu run <file.xu> -- <args...>` | Compile and launch a native program, forwarding arguments after `--` |
-| `xu build <file.xu> -o <bin>` | AOT compile a native executable; project directories are also accepted |
-| `xu debug <file.xu> -b file.xu:LINE --run` | Build with DWARF and enter an interactive LLDB/GDB session; `-e` queues debugger commands |
-| `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
-| `xu parse <file.xu>` | Parse source and print file, function, and declaration statistics |
-| `xu test test.example.xu -v` | Build a harness for `fn test_*` tests with detailed results; filter with `-run <REGEXP>` |
-| `xu test test.example.xu -bench <REGEXP>` | Build a harness for matching `fn bench_*` benchmark functions |
-| `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
-| `xu build <file.xu> --target wasm32 -o app.wasm` | Emit a WebAssembly module |
-| `xu build <file.xu> --xacp --xacp-port 4321 -o app` | Embed XACP startup discovery metadata |
-| `./app --xacp-help` | Print the generated program's machine-readable XACP summary |
-| `xu xacp inspect ./app` | Inspect an XACP-enabled program's discovery and safety summary |
-| `xu xacp run ./app -- args...` | Run it with an explicit AI/user argument boundary |
-| `xu xacp record ./app -- > output.log` | Stream bounded stdout for user-owned recording |
-| `xu build <AppDir> --desktop` | Package a desktop application using the required host UI SDK and tools |
-| `xu build <AppDir> --desktop --webview` | Explicitly include the WebView host plugin in a desktop application |
-| `xu build <file.xu> --debug -o app` | Emit DWARF line information; `--debug-build` also disables optimization |
-| `xu build <file.xu> --timings -o app` | Report phase timings, optimization counters, pattern hits, and register-allocation modes |
-
-`xu build` always compiles a plain executable unless `--desktop` is explicitly supplied. Importing `ui` or `ui/webview`, or adding a `www/` directory, does not enable desktop packaging or WebView. Desktop packaging also requires an explicit `--webview` to include the WebView host plugin; otherwise it uses the Draw-only host.
-
-Tests and benchmarks must be declared in `test.<name>.xu` files in `@main`, with no parameters, type parameters, or declared return type. For example, save this as `test.example.xu`:
-
-```xu
-@main
-
-fn test_addition() {
-    assert(1 + 1 == 2)
-}
-```
-
-`xu test` currently emits a harness executable; launch it separately to execute the tests. On macOS/Linux:
-
-```sh
-xu test test.example.xu -v -o test-example
-./test-example
-```
-
-On Windows, the output gains an `.exe` suffix; run `./test-example.exe`. Use `-count N` when building to repeat the test suite. The current parser accepts 1–1000; the CLI help still displays 1–100.
-
-For Windows socket readiness and concurrent HTTP regressions, run `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64` (or `windows-x64`) from the repository root. It checks idle and invalid sockets, then runs concurrent loopback requests three times at each of O0–O3, with bounded build and execution deadlines.
-
-Build the launcher with `make xu-xacp`; see the [runnable XACP example](https://github.com/xulang-org/examples/tree/main/examples/xacp). Use `xu xacp control <program>` with framed stdin/stdout; a validated hello enables development permissions. Control mode owns stdio and skips business main. For loopback TCP, build with `--xacp-port PORT`, start `<program> --xacp-tcp`, then pipe frames through `xu xacp connect PORT`. Port 0 disables TCP. Both control modes skip business main; the first control flag before `--` wins. `debug` inspects then runs; `record` captures up to 1 MiB stdout on Unix.
-
-`#xacp` is the transport-neutral standard-library layer for hosts that register
-a live `ui/widgets.Screen`. Its adapter exposes bounded `ui.tree`, native-owned
-`ui.screenshot`, validated `ui.input`/`ui.act`, and a streaming recorder. Use
-`xacp.ui_tree`, `xacp.ui_screenshot`, `xacp.ui_input`, and `xacp.ui_act` only
-through a session with the required permission bits; `xacp.start_recorder`
-keeps the request alive until `finish_recorder` or `abort_recorder`. Screen
-handles, canvas generations, node counts, frame bytes, text lengths, and record
-budgets are checked before the operation reaches the widget. Development hosts
-may call `enable_development` before the hello handshake to grant `PERM_ALL`;
-this does not disable schema, lifecycle, native-resource disposal, or memory
-limits. A screenshot returns an owning `draw.Surface`, which the caller must
-dispose after handing its metadata/resource to the host.
-
-0.9.4 also provides per-pass MIR verification with `XU_VERIFY=1`,
-`XU_DUMP_MIR=<function>`, and differential pattern diagnostics with
-`XU_PATTERNS_OFF=all`. See the [CLI reference](https://xulang.org/docs/cli/) for full options.
-
-#### Development Tools and Toolchain Management
-
-| Command | Description |
-| :--- | :--- |
-| `xu fmt <file.xu> -w` | Format source in place; omit `-w` to print to stdout |
-| `xu doc <dir> --public` | Generate Markdown for public declarations; `--serve` starts a local documentation server |
-| `xu map <dir> -o flow.md` | Generate a Mermaid source flowchart; `--graph` emits structured graph data |
-| `xu doctor` | Check host tools; `--desktop --webview` checks desktop and WebView dependencies |
-| `xu native <command> [options]` | Compile/archive C modules and pack, inspect, or extract `.xulib` slices |
-| `xu lsp` | Start the stdio LSP server for VS Code, Cursor, Neovim, and other editors |
-| `xu setup -y` | Install and configure the toolchain without interactive prompts |
-| `xu up --check` | Check official releases; `xu up` and `xu update` are aliases |
-| `xu update --version 0.9.4` | Install a specific official toolchain release |
-| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | Install a local SDK archive without network access |
-| `xu --version` | Show the actual compiler version and host target |
-| `xu help <command>` | Show subcommand help; `<command> --help` also works |
-
-Self-updates run through the sibling `xu-update` tool (`src/cmd/update`), using Xu standard libraries for HTTPS, gzip, tar, ZIP, and file operations. Build it with `make xu-update`; release SDKs include it. `xu-setup` uses the same `internal/sdk` download and extraction code. Downloads show transferred bytes and, when the total size is known, a percentage; the setup wizard also updates its progress bar. The wizard uses standard `ui/layout` and `ui/widgets` components, with automatic SDK detection, keyboard navigation, and retry on failure. The existing SDK selected by PATH is reused; a new installation defaults to `~/.xu`. Windows offers current-user and all-users scopes; the system scope requests administrator elevation. Use `--prefix DIR` to override the destination from the CLI.
+The documentation and API source live in [xulang-org/xulang-org](https://github.com/xulang-org/xulang-org).
 
 ---
 
@@ -282,14 +188,14 @@ The published SDK is the baseline for this roadmap. See [Status & Limitations](h
 - [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication; 100/100 multi-task select concurrency gate closed
 - [x] **Cryptographic Suite Completeness**: SM2/SM3/SM4/SM9 full-suite conformance; SM9 pairing stack frame reduced by 71.5% with zero compile warnings
 - [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
-- [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V / ARM32, WASM, and bare-metal targets
+- [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM, and bare-metal targets
 - [x] **SDK Installation and Self-Updates**: Windows wizard, macOS PKG, cross-platform single-file Setup, and `xu up/update`
 - [x] **Reproducible Module Dependencies**: `init/get/install`, MVS, locks/vendor, proxies, offline/frozen builds, and a trusted-key checksum client
 - [x] **LSP and Editor Integration**: `xu-lsp` and VS Code/Cursor extensions; diagnostics, completion, definitions, hover, symbols, references, rename, and formatting
 - [x] **Generics and SSA Optimization Foundations**: Monomorphization without the four-type-parameter cap, scalar SSA promotion, ARM64 SSA loop kernels, and loop rotation
 - [x] **Compiler Diagnostics and Verification**: Per-pass MIR verification, MIR dumps, pattern-hit counters, and named-pattern controls
 - [x] **Infrastructure Packages**: The separate packages module provides 29 extensions including MySQL, Postgres, Redis, ClickHouse, Kafka, and SQLite
-- [x] **Traceable Cross-Language Benchmarks**: 47 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
+- [x] **Traceable Cross-Language Benchmarks**: 72 workloads on six ARM64/x86-64 platforms, retaining measured compiler versions, provenance, and output verification
 - [x] **Integrated Interactive Source Debugger**: `xu debug` drives DWARF source breakpoints, call stacks, and typed local variable inspection via LLDB/GDB with non-interactive batch mode
 - [x] **Further Optimizer Expansion**: Deeper SSA scalar promotion with struct-record admission proofs, TVM-inspired tile planning, low-bit LUT-GEMM, and pipelined operator fusion
 - [ ] **Complete Target-Machine Runtime Validation**: Native SDK installation gates cover macOS ARM64/x64, Linux ARM64/x64, and Windows x64/ARM64. Extend library, networking, concurrency, and desktop runtime checks on each target; LoongArch64 and RISC-V SDKs are cross-built.
@@ -303,30 +209,10 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 - ⭐ **Star the Repo**: If Xu resonates with your engineering philosophy, give us a **Star** on [GitHub](https://github.com/xulang-org/xu)—it fuels our development!
 - 💬 **Feedback & Discussions**: Have feature requests or suggestions? Open a discussion or ticket on [GitHub Issues](https://github.com/xulang-org/xu/issues).
-- 📊 **Benchmark Insights**: Explore deep CPU and memory benchmarks across 47 tasks at [xulang.org/benchmarks](https://xulang.org/benchmarks).
+- 📊 **Benchmark Insights**: Explore deep CPU and memory benchmarks across 72 workloads at [xulang.org/benchmarks](https://xulang.org/benchmarks).
 - 📚 **Comprehensive Documentation**: Read guides, syntax specifications, and tutorials at [xulang.org](https://xulang.org).
 
 ---
-
-## Borrowed native i64 spans (development)
-
-The `0.11.3-dev.10` SDK adds opt-in `"abi": "xu-c-2"` native manifests.
-`i64_span` and `i64_span_mut` parameters are checked as `&[]int` and
-`$&[]int`. C entry points take `const xu_i64_span *` and
-`const xu_i64_span_mut *` from `include/xu_native.h`: length is at byte 0,
-then the data pointer at byte 8. The compiler creates a temporary descriptor
-for each call. Native code must finish all access before returning and must
-not retain either pointer, resize the array, or modify the descriptor.
-Mutable views permit writes to existing elements only.
-
-Other `xu-c-2` parameters/results use `xu_int`, with `void` also allowed as a
-result. Floating and narrow C signatures, returned spans, callbacks and
-asynchronous retention are outside this protocol. Wrap a native call in an
-ordinary Xu function when a function value is needed. The distinct XUOBJ and
-XULIB version 2 formats make older products reject these libraries;
-`xu-c-1` scalar libraries remain supported by the new SDK. Native linking
-keeps the existing platform limits; foreign object emission does not establish
-native execution or GPU availability.
 
 ## License
 
