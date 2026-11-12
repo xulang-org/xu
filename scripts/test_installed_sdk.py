@@ -186,6 +186,56 @@ int main(int argc, char **argv) {
     print("installed-sdk: linux-application-object PASS")
 
 
+def gpu_layout(xu: str, project: Path, env):
+    """Exercise the installed layout API without a window or SDL runtime."""
+    project.mkdir()
+    (project / "gpu_layout.xu").write_text('''@main
+#gpu/layout
+fn rejects(format int, width int, height int, levels int, row int, offset int) bool {
+    layout.texture_2d(format, width, height, levels, row, offset) or (err) { << true }
+    << false
+}
+fn check() int {
+    tight := layout.texture_2d(layout.RGBA8_SRGB, 3, 5, 0, 1, 1) or >>
+    assert(tight.level_count() == 3 && tight.total_bytes() == 72)
+    base := tight.level(0) or >>
+    assert(base.width == 3 && base.height == 5 && base.row_bytes == 12)
+    $copy := base
+    copy.row_bytes = 99
+    assert((tight.level(0) or >>).row_bytes == 12)
+    transfer := layout.texture_2d(layout.RGBA8_UNORM, 3, 5, 0, 256, 512) or >>
+    assert(transfer.total_bytes() == 2304)
+    assert((transfer.level(1) or >>).offset == 1536)
+    assert((transfer.level(2) or >>).row_pitch == 256)
+    blocks := layout.texture_2d(layout.BC1_RGBA_UNORM, 3, 5, 0, 1, 1) or >>
+    assert(blocks.total_bytes() == 32 && (blocks.level(0) or >>).block_rows == 2)
+    largest := layout.texture_2d(layout.R8_UNORM, 9223372036854775807, 1, 1, 1, 1) or >>
+    assert(largest.total_bytes() == 9223372036854775807)
+    assert((layout.mip_count_2d(9223372036854775807, 1) or >>) == 63)
+    assert(rejects(layout.R8_UNORM, 9223372036854775807, 1, 1, 2, 1))
+    assert(rejects(layout.RGBA32_FLOAT, 9223372036854775807, 1, 1, 1, 1))
+    assert(rejects(999, 1, 1, 1, 1, 1) && rejects(layout.R8_UNORM, 0, 1, 1, 1, 1))
+    assert(rejects(layout.R8_UNORM, 1, 1, 2, 1, 1) && rejects(layout.R8_UNORM, 1, 1, 1, 3, 1))
+    for format in 1:21 {
+        info := layout.format_info(format) or >>
+        assert(info.block_bytes > 0 && info.depth == (format == layout.DEPTH32_FLOAT))
+    }
+    println("GPU layout: 72/2304/32 bytes; checked int64; no device")
+    << 0
+}
+fn main() int {
+    << check() or (err) { eprintln(err.msg())
+        << 1 }
+}
+''')
+    isolated = env | {"SDL_VIDEODRIVER": "nonexistent", "XU_GAME_SDL_LIBRARY": "nonexistent"}
+    program = project / ("gpu layout.exe" if os.name == "nt" else "gpu layout")
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "gpu_layout.xu", level, "-o", str(program)], cwd=project, env=isolated)
+        assert run([str(program)], cwd=project, env=isolated).strip() == "GPU layout: 72/2304/32 bytes; checked int64; no device"
+    print("installed-sdk: gpu-layout PASS (-O0/-O2/-O3; no device)")
+
+
 def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
     prefix = work / "installed Xu SDK"
     project = work / "user project with spaces"
@@ -270,6 +320,7 @@ fn main() int {
     clean.pop("XU_STDLIB_ROOT", None)
     clean.pop("XU_ROOT", None)
     assert run([xu, "run", "main.xu"], cwd=project, env=clean).splitlines() == ["INSTALLED", "42"]
+    gpu_layout(xu, work / "GPU layout project", clean)
     # SDK root discovery is independent of external GUI toolchain availability.
     # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK
     # before probing those host dependencies. Exercise direct PATH and CLI use.
