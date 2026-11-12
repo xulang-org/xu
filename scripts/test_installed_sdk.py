@@ -235,6 +235,12 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
     xu = shutil.which("xu", path=active["PATH"])
     assert xu and Path(xu).parent == prefix / "bin", xu
     assert manifest["version"] in run([xu, "--version"], cwd=project, env=active)
+    if manifest["target"] == "linux-x64":
+        compiler_wasm = work / "xu.wasm"
+        run([xu, "build", str(prefix / "src/cmd/compile"), "--target", "wasm32-wasi",
+             "-o", str(compiler_wasm)], cwd=project, env=active)
+        with compiler_wasm.open("rb") as module:
+            assert module.read(8) == b"\x00asm\x01\x00\x00\x00"
     (project / "main.xu").write_text('''@main
 #strings
 #sdk_probe
