@@ -308,9 +308,31 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 ---
 
+## Native executable builds (development)
+
+The `0.12.3-dev.1` development compiler resolves `native:` dependencies from
+module manifests, checks their module identity, target slice and integrity,
+and links used native exports through generated C ABI adapters. It selects
+companion tools beside the chosen compiler before searching `PATH`.
+Native builds require a C compiler (`clang` by default, or `XU_NATIVE_CC`).
+Build native executables directly; `--emit-obj` with native imports is rejected
+because a standalone application object cannot carry the C marshaler.
+macOS builds use `SDKROOT` when set, otherwise the SDK reported by `xcrun`.
+On macOS, debug builds retain Xu source information alongside the C bridge in a dSYM.
+
+Resource owners invoke their `drop` hook before releasing owned fields.
+Dynamic arrays containing resource owners invoke each element's hook before
+releasing the array storage. Moves transfer cleanup responsibility; ordinary
+borrowed expressions do not release their owners. These compiler semantics
+are shared by native handles and standard-library resources, independently
+of the game engine.
+
+Host acceptance covers macOS arm64. The presence of foreign target adapters
+or archive slices does not establish execution on those targets.
+
 ## Borrowed native i64 spans (development)
 
-The `0.11.3-dev.10` SDK adds opt-in `"abi": "xu-c-2"` native manifests.
+The `0.12.3-dev.1` development SDK supports opt-in `"abi": "xu-c-2"` native manifests.
 `i64_span` and `i64_span_mut` parameters are checked as `&[]int` and
 `$&[]int`. C entry points take `const xu_i64_span *` and
 `const xu_i64_span_mut *` from `include/xu_native.h`: length is at byte 0,
