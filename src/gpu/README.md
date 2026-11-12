@@ -1,16 +1,19 @@
-# GPU device and transfers
+# GPU resources and command recording
 
-`#gpu` is an optional, source-backed standard-library device layer, introduced
-in SDK **0.12.3-dev.3**. This first slice provides windowless devices, buffers,
-asynchronous upload/copy/download, completion fences and readback. Rendering,
-compute dispatch, textures, shaders, pipelines and presentation are subsequent
-slices; their names are not placeholder APIs in this package.
+`#gpu` is the optional device layer of the Xu standard library. SDK
+**0.12.3-dev.4** provides windowless devices, buffers, 2D textures/mips,
+samplers, vertex/fragment shaders, graphics pipelines, command encoders,
+render passes, asynchronous transfers, fences and exact byte readback.
+Scene graphs, cameras, materials, PBR and rendering budgets belong to engines.
+Compute dispatch, window presentation, cube/3D textures, storage bindings,
+multiple render targets, multisampling and stencil are not implemented here.
+
+## Device and ownership
 
 ```xu
 #gpu
 
-options := gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}
-$device := gpu.open(options) or >>
+$device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or >>
 $buffer := device.buffer(4, gpu.BUFFER_VERTEX) or >>
 input := [u8(0), u8(127), u8(128), u8(255)]
 $uploaded := device.upload(&buffer, 0, &input) or >>
@@ -21,55 +24,130 @@ result.read($&output) or >>
 assert(output[3] == u8(255))
 ```
 
-Resource owners use `drop` or explicit `close()`. Keep devices, their resources
-and all borrows on the application main thread. A device opens no window but
-initializes a balanced SDL video reference; a platform display/video driver
-may still be required. It does not own other users' SDL subsystem references.
-Closing a device waits for its GPU work and invalidates all children. IDs are
-private and never reused within the process. Driver resources referenced by
-submitted work are released when safe, even if their CPU owners close earlier.
+All resource owners support automatic `drop` and explicit idempotent `close`;
+render passes use `end`. Keep devices, resources and borrows on the application
+main thread. Private IDs are never reused within a process. Closing a device
+cancels its unsubmitted encoders, waits for submitted GPU work, releases its
+children and invalidates all remaining owners/views. A device opens no window,
+but holds a balanced SDL video reference; a display/video driver may still be
+required. Other SDL users keep their own references.
 
-Transfers submit before returning. Upload copies `&[]u8` into owned staging
-before returning and retains no Xu pointer. Copy requires distinct buffers.
-Buffer sizes, offsets and transfer lengths are positive/in-bounds multiples
-of four bytes (offset zero is allowed). Buffer sizes fit an unsigned 32-bit
-descriptor; actual device allocation may fail below that representation limit.
-Zero-length transfers are errors. Buffer usage flags can be combined where
-the backend permits; VERTEX and INDEX cannot be combined.
+`CommandEncoder` retains resources referenced by recorded commands. Closing a
+bound buffer, texture, sampler or pipeline invalidates its CPU owner, while the
+recorded draw can still use it. Submission/cancellation releases these command
+references; SDL defers physical destruction until submitted work finishes.
+Shaders may close after pipeline creation. A new binding with a closed/foreign
+owner is always rejected. `TextureSlice` and `DepthAttachment` are non-owning
+identities, invalid after their texture/device closes.
 
-`Fence` and `Readback` expose `ready()` and blocking `wait()`. Completion is
-monotonic after a successful query/wait. Readback is separate from the original
-buffer owner; `read($&[]u8)` requires completion and an exact-size destination.
-Failure leaves its values unchanged. Repeated reads/waits are allowed until
-close. Upload/copy fences can be closed without waiting. `Stats` reports live
-buffer/submission owners and logical buffer/staging bytes, including completed
-submissions still owned by callers; it does not report physical GPU memory.
+## Textures and transfers
 
-Options request AUTO, METAL, VULKAN or D3D12; unavailable backends return errors.
-`shader_formats=0` permits all known formats when choosing a backend; explicit
-SPIRV/DXBC/DXIL/MSL/METALLIB flags constrain that selection. `shader_formats()`
-reports the selected device's formats, not a bundled shader compiler. These
-are Xu constants; the private backend maps them to SDL values.
+Texture format IDs come from [`#gpu/layout`](layout/README.md), independently
+of platform enums. `Texture2DDesc` specifies format, dimensions, levels and
+SAMPLED/COLOR_TARGET/DEPTH_TARGET usage. `supports_texture_2d` queries the actual
+device for a valid format/usage combination; invalid combinations throw.
+Creation checks support again and may still fail to allocate. The SDL portable
+2D dimension limit is 16384; it is not a GPU memory budget. `levels=0` selects
+the full chain. Depth32 targets currently require one level. Each `level_layout`
+uses the shared pure Xu layout with tight rows. `size_bytes` counts logical
+texels/blocks, not driver allocation overhead.
 
-Importing `#gpu` compiles its private C backend with the chosen SDK's sibling
-`xu-native` and a compatible Clang toolchain. SDK source includes its small, private
-SDL ABI subset; consumers do not need SDL development headers or application
-`native:` declarations. `XU_NATIVE_CC` selects the C compiler. Link/runtime SDK
-requirements are the same as other native executable builds. This slice supports
-64-bit hosted macOS/Linux/Windows executables; native imports cannot currently
-be emitted as standalone application objects (`--emit-obj`). The SDL 3.2+
-runtime is loaded only by `open`; `XU_GPU_SDL_LIBRARY` selects an explicit
-library path and disables fallback searching. Missing libraries, devices and
-unsupported options return errors. The loader library is cached for process
-lifetime. [`#gpu/layout`](layout/README.md) stays pure Xu and needs neither C
-tools nor SDL.
+`upload_texture` and `download_texture` transfer an entire tightly packed mip,
+including compressed blocks, with exact lengths. Depth transfers are currently
+unsupported. `generate_mips` requires a sampled, uncompressed color target and
+multiple levels. Texture transfer staging must fit uint32; no four-byte length
+rule is imposed on texture rows. SDL accepts tight row/layer strides and may
+internally repack them for D3D12 alignment. No Xu pointer survives a native call.
 
-Device runtime acceptance currently covers macOS arm64 Metal. Installed-SDK
-checks exercise backend compilation, byte-span ABI and missing-runtime errors
-without pretending the CI hosts provide GPU hardware. GPU backends on other
-platforms require their own execution evidence.
+Buffer transfers require in-bounds multiples of four bytes, positive sizes and
+uint32 buffer sizes. Offset zero is allowed. VERTEX and INDEX buffer usage cannot
+be combined. `copy` requires distinct buffers. Transfers submit before returning;
+upload copies the input into owned staging synchronously. Submission order is
+GPU timeline order; encoders only enter that order when submitted.
 
-The resource/timeline contracts follow the SDL definitions for
-[buffer release](https://wiki.libsdl.org/SDL3/SDL_ReleaseGPUBuffer),
-[buffer copy](https://wiki.libsdl.org/SDL3/SDL_CopyGPUBufferToBuffer) and
-[fence completion](https://wiki.libsdl.org/SDL3/SDL_QueryGPUFence).
+`Fence` and `Readback` expose `ready` and blocking `wait`. Completion is monotonic
+after successful query/wait. `Readback.read($&[]u8)` requires completion and an
+exact-size destination, leaving values unchanged on failure. Repeated reads and
+waits are allowed. Closing a fence does not wait. Readback owns staging separately
+from its source resource.
+
+## Shaders and pipelines
+
+Options request AUTO/METAL/VULKAN/D3D12; unavailable backends throw. Zero shader
+formats permits all known formats when choosing a device. Explicit
+SPIRV/DXBC/DXIL/MSL/METALLIB flags constrain that choice; `shader_formats` reports
+the selected subset. No shader compiler or automatic source translation is
+bundled. Supply device-compatible code and the entrypoint in `ShaderDesc`.
+MSL source is copied and terminated internally; callers provide no NUL byte.
+Binary formats receive basic container checks, then the driver validates code.
+
+`ShaderDesc` declares stage, sampler count (0...16) and exact uniform byte sizes
+(up to four slots, each 16...16384 bytes in multiples of 16). Shader declarations,
+resource slots and std140-compatible uniform contents must agree with this
+metadata. This is the shader author's contract; the API does not reflect or
+sandbox shader code. Storage resource bindings are not yet exposed.
+Follow SDL's [shader resource conventions](https://wiki.libsdl.org/SDL3/SDL_CreateGPUShader)
+for each format, including Metal's reversed vertex-buffer slot numbering.
+
+`pipeline_defaults(format)` initializes a pipeline descriptor with no vertex
+inputs, blending or depth. Add explicit vertex buffer layouts and attributes;
+slots/locations are unique and in 0...15, strides are four-byte aligned in
+4...2048 bytes, attributes fit their stride. Input rates support vertices and
+instances. Public vertex formats include float/float2/float3/float4, uint vectors
+and normalized u8x4. Primitive topology, culling, winding, depth compare/write
+and straight/premultiplied alpha blend are explicit. One color target and an
+optional Depth32 target must match the render pass. Depth writes require a
+depth test. `sampler_defaults()` returns linear/clamp sampling; filters, address
+modes and finite LOD clamps (0...1000) are configurable.
+
+## Command state
+
+Acquire `device.command_encoder()`, call `begin_render(color, depth)`, set the
+pipeline, bind resources, draw, end the pass, then submit to receive a fence.
+Color attachments use `texture.view(mip)` with LOAD/CLEAR/DISCARD and
+STORE/DONT_STORE. `gpu.no_depth()` omits depth; `depth_attachment` specifies mip
+zero and a [0,1] clear value. Attachment extents must match. Clear components
+are finite floats, permitting HDR values. Contents discarded or never written
+are undefined, as are shader reads of uninitialized resources.
+
+An encoder permits one active pass at a time and multiple sequential passes.
+Submitting with an active pass fails without consuming the encoder. A driver
+submission failure may consume it; close/drop remains safe. Ending a pass is
+idempotent. Closing/dropping an encoder ends any active pass and cancels all its
+commands. Ending a pass after parent cancellation/device closure is harmless;
+further commands on it throw.
+
+Set the pipeline before binding buffers, samplers or uniform data. Every pipeline
+change resets required bindings. Draws reject missing bindings, wrong usages,
+foreign/closed identities, incompatible targets and invalid ranges before calling
+SDL. Sampling an active attachment is rejected even at another mip. Vertex and
+instance ranges and index byte ranges are checked; index *values* and shader
+memory accesses remain the author's responsibility. Index offsets align to their
+2/4-byte element size. Viewport/scissor rectangles use integer attachment pixels
+and must fit its extent. Uniform calls synchronously copy exactly the declared
+byte size; draws never retain a borrowed Xu array.
+
+`Stats` reports live buffer/texture/sampler/shader/pipeline/encoder/pass owners,
+logical buffer/texture/staging bytes and owned submissions. Closed resources
+retained by commands and physical driver allocations are excluded. Completed
+submissions remain counted until closed. It is not a physical VRAM meter.
+
+## Build and evidence
+
+Importing `#gpu` compiles its private C backend using the selected SDK's sibling
+`xu-native` and compatible Clang toolchain (`XU_NATIVE_CC` may select it). The SDK
+contains a small private SDL ABI declaration subset, so applications need no SDL
+headers or `native:` mapping. Native executable builds support 64-bit hosted
+macOS/Linux/Windows; `--emit-obj` with native imports is currently unsupported.
+SDL 3.2+ is loaded only by device creation; rendering symbols load on first use.
+`XU_GPU_SDL_LIBRARY` selects an explicit path and disables fallback. Missing
+libraries/symbols/devices/options throw. The library stays loaded for process life.
+The pure `#gpu/layout` needs neither C tools nor SDL.
+
+Actual hardware validation covers macOS arm64 Metal, including exact odd-sized
+pixel readback, compressed mip transfers, sampled indexed/instanced rendering,
+uniforms, depth load/store, alpha blending, cancellation and early owner release.
+Installed-SDK checks cover backend compilation, mixed scalar/byte-span ABI and
+missing-runtime errors; they do not establish GPU hardware availability on CI or
+Vulkan/D3D12 execution. Engine renderers can adopt this layer as their required
+capabilities become available.
