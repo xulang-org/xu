@@ -52,7 +52,7 @@ reports the selected device's formats, not a bundled shader compiler. These
 are Xu constants; the private backend maps them to SDL values.
 
 Importing `#gpu` compiles its private C backend with the chosen SDK's sibling
-`xu-native` and a platform C compiler. SDK source includes its small, private
+`xu-native` and a compatible Clang toolchain. SDK source includes its small, private
 SDL ABI subset; consumers do not need SDL development headers or application
 `native:` declarations. `XU_NATIVE_CC` selects the C compiler. Link/runtime SDK
 requirements are the same as other native executable builds. This slice supports

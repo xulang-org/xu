@@ -278,14 +278,21 @@ xu_int XU_NATIVE_SYMBOL(xu_sdk_bytes_copy)(const xu_u8_span *src, const xu_u8_sp
          "-o", "bytes.a", "native.c"], cwd=project, env=env)
     (project / "main.xu").write_text('''@main
 #sdk_bytes
-struct Bytes { data []u8 }
+struct Bytes { guard int
+ data []u8
+ tail u8 }
 fn main() int {
-    source := Bytes{data: [u8(0),u8(127),u8(128),u8(255)]}
+    source := Bytes{guard: 91,data: [u8(0),u8(127),u8(128),u8(255)],tail: u8(17)}
     $output := [u8(73),u8(73),u8(73),u8(73)]
     snapshot := ~output
     assert(sdk_bytes.copy(&source.data,$&output,129)==4)
     assert(output[0]==u8(129) && output[1]==u8(0) && output[2]==u8(1) && output[3]==u8(128))
     assert(snapshot[0]==u8(73) && snapshot[3]==u8(73) && source.data[3]==u8(255))
+    $holder := Bytes{guard: 123,data: [u8(73),u8(73),u8(73),u8(73)],tail: u8(19)}
+    retained := ~holder
+    assert(sdk_bytes.copy(&source.data,$&holder.data,129)==4)
+    assert(holder.data[0]==u8(129) && holder.data[3]==u8(128) && retained.data[0]==u8(73))
+    assert(holder.guard==123 && holder.tail==u8(19) && source.guard==91 && source.tail==u8(17))
     empty := []u8{}
     $destination := []u8{}
     assert(sdk_bytes.copy(&empty,$&destination,0)==0)
