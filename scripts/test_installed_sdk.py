@@ -236,6 +236,70 @@ fn main() int {
     print("installed-sdk: gpu-layout PASS (-O0/-O2/-O3; no device)")
 
 
+def gpu_device_import(xu: str, project: Path, env):
+    """Compile the source-backed GPU package without a GPU runtime."""
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#gpu
+#strings
+fn check() int {
+    gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or (err) {
+        message := err.msg()
+        assert(strings.contains(&message, "SDL 3 GPU runtime unavailable"))
+        println("GPU device: source backend, explicit missing-runtime error")
+        << 0
+    }
+    << 1
+}
+fn main() int { << check() or (err) { eprintln(err.msg())
+    << 1 } }
+''')
+    isolated = env | {"XU_GPU_SDL_LIBRARY": str(project / "missing SDL runtime")}
+    program = project / ("GPU device.exe" if os.name == "nt" else "GPU device")
+    run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=isolated)
+    assert run([str(program)], cwd=project, env=isolated).strip() == "GPU device: source backend, explicit missing-runtime error"
+    print("installed-sdk: gpu-device-import PASS (no SDL headers or runtime; no application native declaration)")
+
+
+def native_byte_spans(xu: str, target: str, project: Path, env):
+    """Check byte-span descriptors and COW on each native installed SDK."""
+    project.mkdir()
+    (project / "native.json").write_text(json.dumps({"module": "sdk_bytes", "abi": "xu-c-2", "exports": [
+        {"name": "copy", "params": ["u8_span", "u8_span_mut", "int"], "ret": "int"}]}))
+    (project / "native.c").write_text('''#include "xu_native.h"
+xu_int XU_NATIVE_SYMBOL(xu_sdk_bytes_copy)(const xu_u8_span *src, const xu_u8_span_mut *dst, xu_int bias) {
+    if (!src || !dst || src->len != dst->len || src->len < 0) return -1;
+    for (xu_int i = 0; i < src->len; ++i) dst->data[i] = (unsigned char)(src->data[i] + bias);
+    return src->len;
+}
+''')
+    (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nnative:\n  sdk_bytes: file:./bytes.a\n')
+    run([xu, "native", "compile", "--manifest", "native.json", "--target", target,
+         "-o", "bytes.a", "native.c"], cwd=project, env=env)
+    (project / "main.xu").write_text('''@main
+#sdk_bytes
+struct Bytes { data []u8 }
+fn main() int {
+    source := Bytes{data: [u8(0),u8(127),u8(128),u8(255)]}
+    $output := [u8(73),u8(73),u8(73),u8(73)]
+    snapshot := ~output
+    assert(sdk_bytes.copy(&source.data,$&output,129)==4)
+    assert(output[0]==u8(129) && output[1]==u8(0) && output[2]==u8(1) && output[3]==u8(128))
+    assert(snapshot[0]==u8(73) && snapshot[3]==u8(73) && source.data[3]==u8(255))
+    empty := []u8{}
+    $destination := []u8{}
+    assert(sdk_bytes.copy(&empty,$&destination,0)==0)
+    println("Native byte spans: packed bytes, borrowed fields, COW and empty views")
+    << 0
+}
+''')
+    program = project / ("native bytes.exe" if os.name == "nt" else "native bytes")
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "main.xu", level, "-o", str(program)], cwd=project, env=env)
+        assert run([str(program)], cwd=project, env=env).strip() == "Native byte spans: packed bytes, borrowed fields, COW and empty views"
+    print("installed-sdk: native-byte-spans PASS (-O0/-O2/-O3)")
+
+
 def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
     prefix = work / "installed Xu SDK"
     project = work / "user project with spaces"
@@ -321,6 +385,8 @@ fn main() int {
     clean.pop("XU_ROOT", None)
     assert run([xu, "run", "main.xu"], cwd=project, env=clean).splitlines() == ["INSTALLED", "42"]
     gpu_layout(xu, work / "GPU layout project", clean)
+    gpu_device_import(xu, work / "GPU device project", clean)
+    native_byte_spans(xu, manifest["target"], work / "native byte spans", clean)
     # SDK root discovery is independent of external GUI toolchain availability.
     # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK
     # before probing those host dependencies. Exercise direct PATH and CLI use.
