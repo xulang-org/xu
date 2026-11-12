@@ -187,7 +187,7 @@ xu build main.xu -o myapp
 | `xu build <file.xu> -o <bin>` | AOT 编译为原生可执行文件；项目目录也可作为输入 |
 | `xu debug <file.xu> -b file.xu:行号 --run` | 带 DWARF 构建并进入 LLDB/GDB 交互会话；可用 `-e` 预置调试器命令 |
 | `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
-| `xu test test.example.xu -v` | 构建并运行测试程序，显示每项结果 |
+| `xu test test.example.xu` | 构建并运行测试入口 |
 | `xu test test.example.xu --no-opt` | 关闭优化后运行测试 |
 | `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
 | `xu build <file.xu> --target wasm32-wasi -o app.wasm` | 生成面向 WASI 运行时的 WebAssembly 模块 |
@@ -208,12 +208,16 @@ xu build main.xu -o myapp
 fn test_addition() {
     assert(1 + 1 == 2)
 }
+
+fn main() {
+    test_addition()
+}
 ```
 
-`xu test` 会构建并运行临时测试程序。构建、运行和测试默认开启优化，可用 `--no-opt` 关闭。
+0.12.2 的 `xu test` 会构建临时程序并执行其 `main` 函数。构建、运行和测试默认开启优化，可用 `--no-opt` 关闭。
 
 ```sh
-xu test test.example.xu -v
+xu test test.example.xu
 ```
 
 

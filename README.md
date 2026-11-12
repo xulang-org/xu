@@ -195,7 +195,7 @@ manifest, lock file, and vendor directory. `--frozen` rejects dependency changes
 | `xu build <file.xu> -o <bin>` | AOT compile a native executable; project directories are also accepted |
 | `xu debug <file.xu> -b file.xu:LINE --run` | Build with DWARF and enter an interactive LLDB/GDB session; `-e` queues debugger commands |
 | `xu check <file.xu>` | Parse and check types, ownership, and borrows without emitting machine code |
-| `xu test test.example.xu -v` | Build and run the test harness with per-test results |
+| `xu test test.example.xu` | Build and run the test entry point |
 | `xu test test.example.xu --no-opt` | Run tests with optimization disabled |
 | `xu build <file.xu> --target linux-x64 -o app` | Cross-compile for an explicit target, such as Linux x64 |
 | `xu build <file.xu> --target wasm32-wasi -o app.wasm` | Emit a WebAssembly module for a WASI runtime |
@@ -219,12 +219,16 @@ Tests and benchmarks must be declared in `test.<name>.xu` files in `@main`, with
 fn test_addition() {
     assert(1 + 1 == 2)
 }
+
+fn main() {
+    test_addition()
+}
 ```
 
-`xu test` builds and runs a temporary harness. Build, run, and test commands optimize by default. Pass `--no-opt` to disable optimization.
+In 0.12.2, `xu test` builds a temporary executable and runs its `main` function. Build, run, and test commands optimize by default. Pass `--no-opt` to disable optimization.
 
 ```sh
-xu test test.example.xu -v
+xu test test.example.xu
 ```
 
 
