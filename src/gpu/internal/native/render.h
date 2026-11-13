@@ -24,7 +24,11 @@ static bool load_render(void) {
     render_loaded = true;
     return true;
 }
-enum { TEXTURE = 1, SAMPLER, SHADER, PIPELINE };
+#define COMPUTE_FUNCTIONS(X) \
+ X(SDL_CreateGPUComputePipeline) X(SDL_ReleaseGPUComputePipeline) X(SDL_BeginGPUComputePass) X(SDL_EndGPUComputePass) \
+ X(SDL_BindGPUComputePipeline) X(SDL_BindGPUComputeStorageBuffers) X(SDL_PushGPUComputeUniformData) X(SDL_DispatchGPUCompute)
+COMPUTE_FUNCTIONS(DECLARE)
+enum { TEXTURE = 1, SAMPLER, SHADER, PIPELINE, COMPUTE_PIPELINE };
 /* These are SDL portable limits, not engine budgets (SDL_gpu.c/sysgpu.h).
  * All backends share 16 vertex inputs, 16 samplers and 4 uniform slots. */
 enum { VERTEX_SLOTS = 16, SAMPLER_SLOTS = 16, UNIFORM_SLOTS = 4, MAX_TEXTURE_2D = 16384 };
@@ -42,6 +46,7 @@ struct Resource {
     SDL_GPUVertexBufferDescription vertices[VERTEX_SLOTS];
     Uint32 vertex_count;
     int color_format, depth_format;
+    Uint32 read_buffers, write_buffers;
     struct Resource *next;
 };
 typedef struct Ref { void *pointer; bool buffer; struct Ref *next; } Ref;
@@ -49,12 +54,16 @@ struct Encoder {
     xu_int id, pass_id;
     SDL_GPUCommandBuffer *command;
     SDL_GPURenderPass *pass;
+    SDL_GPUComputePass *compute;
     Ref *refs;
     Resource *color, *depth, *pipeline;
     Uint32 width, height;
     Buffer *vertices[VERTEX_SLOTS], *index;
     Uint32 offsets[VERTEX_SLOTS], index_offset, index_size;
     unsigned samplers[2], uniforms[2];
+    Buffer *writes[8];
+    Uint32 write_count;
+    unsigned compute_reads;
     struct Encoder *next;
 };
 static Resource *resource(Device *d, xu_int id, int kind) {
@@ -75,7 +84,8 @@ static void free_resource(Device *d, Resource *r) {
         if (r->kind == TEXTURE) p_SDL_ReleaseGPUTexture(d->gpu, r->gpu);
         else if (r->kind == SAMPLER) p_SDL_ReleaseGPUSampler(d->gpu, r->gpu);
         else if (r->kind == SHADER) p_SDL_ReleaseGPUShader(d->gpu, r->gpu);
-        else p_SDL_ReleaseGPUGraphicsPipeline(d->gpu, r->gpu);
+        else if (r->kind == PIPELINE) p_SDL_ReleaseGPUGraphicsPipeline(d->gpu, r->gpu);
+        else p_SDL_ReleaseGPUComputePipeline(d->gpu, r->gpu);
     }
     free(r);
 }
@@ -108,6 +118,7 @@ static Encoder *encoder(Device *d, xu_int id, bool is_pass) {
 static bool free_encoder(Device *d, Encoder *e, bool cancel) {
     bool ok = true;
     if (e->pass) p_SDL_EndGPURenderPass(e->pass);
+    if (e->compute) p_SDL_EndGPUComputePass(e->compute);
     if (cancel && !p_SDL_CancelGPUCommandBuffer(e->command)) { sdl_fail(); ok = false; }
     while (e->refs) {
         Ref *r = e->refs; e->refs = r->next;
@@ -127,7 +138,7 @@ static bool close_graphics(Device *d) {
     return ok;
 }
 static xu_int graphics_stats(Device *d, xu_int field) {
-    if (field < 4 || field > 10) return fail("invalid GPU accounting field");
+    if (field < 4 || field > 12) return fail("invalid GPU accounting field");
     xu_int total = 0;
     for (Resource *r = d->resources; r; r = r->next) {
         xu_int add = 0;
@@ -135,11 +146,13 @@ static xu_int graphics_stats(Device *d, xu_int field) {
             if (field == 4 && r->kind == TEXTURE) add = 1;
             if (field == 5 && r->kind == TEXTURE) add = r->bytes;
             if (field >= 6 && field <= 8 && r->kind == field - 4) add = 1;
+            if (field == 11 && r->kind == COMPUTE_PIPELINE) add = 1;
         }
         if (add > LLONG_MAX - total) return fail("GPU accounting overflow");
         total += add;
     }
-    for (Encoder *e = d->encoders; e; e = e->next) if (field == 9 || (field == 10 && e->pass)) ++total;
+    for (Encoder *e = d->encoders; e; e = e->next)
+        if (field == 9 || (field == 10 && e->pass) || (field == 12 && e->compute)) ++total;
     return total;
 }
 xu_int API(resource_close)(xu_int owner, xu_int id) {
@@ -256,33 +269,49 @@ xu_int API(sampler_new)(xu_int owner, const xu_i64_span *desc, double min_lod, d
     if (!r->gpu) { sdl_fail(); free(r); return -1; }
     return add_resource(d, r);
 }
+typedef struct { char *name; unsigned char *text; const unsigned char *bytes; } ShaderSource;
+static void free_shader_source(ShaderSource *source) { free(source->name); free(source->text); }
+static bool prepare_shader_source(xu_int owner, xu_int format, const xu_i64_span *sizes,
+                                  const xu_u8_span *entry, const xu_u8_span *code, ShaderSource *source) {
+    if (format < 1 || format > 16 || (format & (format - 1)) || !(format & API(shader_formats)(owner)) ||
+        !sizes || sizes->len < 0 || sizes->len > UNIFORM_SLOTS || (sizes->len && !sizes->data) ||
+        !entry || entry->len < 1 || entry->len > 1024 || !entry->data ||
+        !code || code->len < 1 || code->len > UINT32_MAX || !code->data) {
+        fail("invalid GPU shader format, bindings, entrypoint or code"); return false;
+    }
+    for (xu_int i = 0; i < entry->len; ++i) if (!entry->data[i]) { fail("GPU shader entrypoint contains NUL"); return false; }
+    for (xu_int i = 0; i < sizes->len; ++i) if (sizes->data[i] < 16 || sizes->data[i] > 16384 || sizes->data[i] % 16) {
+        fail("GPU uniform size must be 16-byte aligned and in 16...16384"); return false;
+    }
+    if ((format == 1 && (code->len < 20 || code->len % 4 || memcmp(code->data, "\x03\x02\x23\x07", 4))) ||
+        ((format == 2 || format == 4) && (code->len < 32 || memcmp(code->data, "DXBC", 4))) ||
+        (format == 16 && (code->len < 16 || memcmp(code->data, "MTLB", 4)))) {
+        fail("invalid GPU shader container"); return false;
+    }
+    if (format == 8 && memchr(code->data, 0, (size_t)code->len)) { fail("MSL source must not contain NUL"); return false; }
+    source->name = calloc((size_t)entry->len + 1, 1);
+    source->text = format == 8 ? calloc((size_t)code->len + 1, 1) : NULL;
+    if (!source->name || (format == 8 && !source->text)) {
+        free_shader_source(source); fail("GPU shader source allocation failed"); return false;
+    }
+    memcpy(source->name, entry->data, (size_t)entry->len);
+    if (source->text) memcpy(source->text, code->data, (size_t)code->len);
+    source->bytes = source->text ? source->text : code->data;
+    return true;
+}
 xu_int API(shader_new)(xu_int owner, xu_int stage, xu_int format, xu_int samplers, const xu_i64_span *sizes,
                         const xu_u8_span *entry, const xu_u8_span *code) {
     Device *d = device(owner); if (!d || !load_render()) return -1;
-    if (stage < 0 || stage > 1 || format < 1 || format > 16 || (format & (format - 1)) ||
-        !(format & API(shader_formats)(owner)) || samplers < 0 || samplers > SAMPLER_SLOTS ||
-        !sizes || sizes->len < 0 || sizes->len > UNIFORM_SLOTS || (sizes->len && !sizes->data) ||
-        !entry || entry->len < 1 || entry->len > 1024 || !entry->data ||
-        !code || code->len < 1 || code->len > UINT32_MAX || !code->data)
-        return fail("invalid GPU shader stage, format, bindings, entrypoint or code");
-    for (xu_int i = 0; i < entry->len; ++i) if (!entry->data[i]) return fail("GPU shader entrypoint contains NUL");
-    for (xu_int i = 0; i < sizes->len; ++i) if (sizes->data[i] < 16 || sizes->data[i] > 16384 || sizes->data[i] % 16)
-        return fail("GPU uniform size must be 16-byte aligned and in 16...16384");
-    if ((format == 1 && (code->len < 20 || code->len % 4 || memcmp(code->data, "\x03\x02\x23\x07", 4))) ||
-        ((format == 2 || format == 4) && (code->len < 32 || memcmp(code->data, "DXBC", 4))) ||
-        (format == 16 && (code->len < 16 || memcmp(code->data, "MTLB", 4)))) return fail("invalid GPU shader container");
-    if (format == 8 && memchr(code->data, 0, (size_t)code->len)) return fail("MSL source must not contain NUL");
-    Resource *r = allocate_resource(SHADER); if (!r) return -1;
-    char *name = calloc((size_t)entry->len + 1, 1);
-    unsigned char *text = format == 8 ? calloc((size_t)code->len + 1, 1) : NULL;
-    if (!name || (format == 8 && !text)) { free(name); free(text); free(r); return fail("GPU shader source allocation failed"); }
-    memcpy(name, entry->data, (size_t)entry->len);
-    if (text) memcpy(text, code->data, (size_t)code->len);
+    if (stage < 0 || stage > 1 || samplers < 0 || samplers > SAMPLER_SLOTS) return fail("invalid GPU shader stage or sampler count");
+    ShaderSource source = {0};
+    if (!prepare_shader_source(owner, format, sizes, entry, code, &source)) return -1;
+    Resource *r = allocate_resource(SHADER);
+    if (!r) { free_shader_source(&source); return -1; }
     r->stage = (int)stage; r->bindings[stage].samplers = (Uint32)samplers; r->bindings[stage].count = (Uint32)sizes->len;
     for (xu_int i = 0; i < sizes->len; ++i) r->bindings[stage].sizes[i] = (Uint32)sizes->data[i];
-    SDL_GPUShaderCreateInfo info = {(size_t)code->len, text ? text : code->data, name,
+    SDL_GPUShaderCreateInfo info = {(size_t)code->len, source.bytes, source.name,
         (Uint32)format << 1, (SDL_GPUShaderStage)stage, (Uint32)samplers, 0, 0, (Uint32)sizes->len, 0};
-    r->gpu = p_SDL_CreateGPUShader(d->gpu, &info); free(name); free(text);
+    r->gpu = p_SDL_CreateGPUShader(d->gpu, &info); free_shader_source(&source);
     if (!r->gpu) { sdl_fail(); free(r); return -1; }
     return add_resource(d, r);
 }
@@ -374,7 +403,7 @@ xu_int API(encoder_close)(xu_int owner, xu_int id) {
 xu_int API(encoder_submit)(xu_int owner, xu_int id) {
     Device *d = device(owner); if (!d) return -1;
     Encoder *e = encoder(d, id, false); if (!e) return -1;
-    if (e->pass) return fail("end the GPU render pass before submitting its encoder");
+    if (e->pass || e->compute) return fail("end the GPU pass before submitting its encoder");
     Transfer *t = new_transfer(d, 0, false, false); if (!t) return -1;
     t->fence = p_SDL_SubmitGPUCommandBufferAndAcquireFence(e->command);
     if (!t->fence) { sdl_fail(); free_transfer(d, t); free_encoder(d, e, false); return -1; }
@@ -385,7 +414,7 @@ xu_int API(encoder_submit)(xu_int owner, xu_int id) {
 xu_int API(pass_begin)(xu_int owner, xu_int id, const xu_i64_span *desc, double red, double green, double blue, double alpha, double clear_depth) {
     Device *d = device(owner); if (!d) return -1;
     Encoder *e = encoder(d, id, false); if (!e) return -1;
-    if (e->pass || !desc || desc->len != 7 || !desc->data || !isfinite(red) || !isfinite(green) || !isfinite(blue) || !isfinite(alpha) ||
+    if (e->pass || e->compute || !desc || desc->len != 7 || !desc->data || !isfinite(red) || !isfinite(green) || !isfinite(blue) || !isfinite(alpha) ||
         !isfinite(clear_depth) || clear_depth < 0 || clear_depth > 1 || fabs(red) > 3.4e38 || fabs(green) > 3.4e38 || fabs(blue) > 3.4e38 || fabs(alpha) > 3.4e38)
         return fail("invalid GPU render pass state, descriptor or clear values");
     const xu_int *v = desc->data;

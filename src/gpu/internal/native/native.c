@@ -2,6 +2,7 @@
 #include "xu_native.h"
 #include "sdl_abi.h"
 #include "sdl_render_abi.h"
+#include "sdl_compute_abi.h"
 #include <math.h>
 #include <limits.h>
 #include <stdio.h>
@@ -352,3 +353,4 @@ xu_int API(stats)(xu_int owner, xu_int field) {
 }
 
 #include "render.h"
+#include "compute.h"
