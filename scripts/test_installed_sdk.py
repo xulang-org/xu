@@ -244,6 +244,29 @@ def gpu_device_import(xu: str, project: Path, env):
 #strings
 // Compile the public compute surface on every SDK target. This path is not
 // executed without a real device; the runtime test below rejects missing SDL.
+fn invalid_texture_reference() bool {
+    reference := gpu.TextureRef{}
+    reference.validate() or(err){ << true }
+    << false
+}
+fn invalid_device_reference() bool {
+    reference := gpu.DeviceRef{}
+    reference.validate() or(err){ << true }
+    << false
+}
+fn reference_api(device &gpu.Device, pass &gpu.RenderPass, texture &gpu.Texture, sampler &gpu.Sampler, buffer &gpu.Buffer) int {
+    owner := device.reference()
+    owner.validate() or >>
+    owner.validate_buffer(buffer.reference()) or >>
+    owner.validate_texture(texture.reference()) or >>
+    owner.validate_sampler(sampler.reference()) or >>
+    assert(owner.same(device.reference()))
+    assert(buffer.reference().size_bytes() == buffer.size_bytes())
+    pass.vertex_buffer_ref(0,buffer.reference(),0) or >>
+    pass.index_buffer_ref(buffer.reference(),0,gpu.INDEX32) or >>
+    pass.sampler_ref(gpu.FRAGMENT,0,texture.reference(),sampler.reference()) or >>
+    << 0
+}
 fn compute_api(device &gpu.Device) int {
     desc := gpu.ComputePipelineDesc{format: gpu.SHADER_MSL, entrypoint: "main", read_buffers: 1,
         write_buffers: 1, uniform_sizes: [16], threads_x: 64, threads_y: 1, threads_z: 1}
@@ -268,6 +291,7 @@ fn compute_api(device &gpu.Device) int {
     << 0
 }
 fn check() int {
+    assert(invalid_texture_reference() && invalid_device_reference())
     $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or (err) {
         message := err.msg()
         assert(strings.contains(&message, "SDL 3 runtime unavailable"))

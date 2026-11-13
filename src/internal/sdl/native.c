@@ -391,3 +391,14 @@ xu_int API(stats)(xu_int owner, xu_int field) {
 #include "compute.h"
 
 #include "surface.h"
+
+/* Only inspect live owner metadata; never dereference stale external pointers.
+ * Closed resources retained by recorded commands are still invalid references. */
+xu_int API(reference_validate)(xu_int owner, xu_int id, xu_int kind) {
+    Device *d=device(owner);
+    if (!d) return -1;
+    if (kind==0) return buffer(d,id) ? 0 : -1;
+    if (kind==1) return resource(d,id,TEXTURE) ? 0 : -1;
+    if (kind==2) return resource(d,id,SAMPLER) ? 0 : -1;
+    return fail("invalid GPU reference kind");
+}

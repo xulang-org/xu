@@ -242,3 +242,7 @@ Installed-SDK checks cover backend compilation, mixed scalar/byte-span ABI and
 missing-runtime errors; they do not establish GPU hardware availability on CI or
 Vulkan/D3D12 execution. Engine renderers can adopt this layer as their required
 capabilities become available.
+
+`Device.reference`, `Buffer.reference`, `Texture.reference` and `Sampler.reference` return copyable non-owning typed identities. They do not extend resource lifetime or expose native handles. `validate` rejects closed owners/resources; `DeviceRef.validate_buffer/texture/sampler` additionally rejects foreign devices. `DeviceRef.same` only compares nonzero identities, not liveness. Zero/default references are invalid.
+
+Retained draw descriptions can bind `BufferRef` and `TextureRef`/`SamplerRef` through `RenderPass.vertex_buffer_ref`, `index_buffer_ref` and `sampler_ref`. Every binding revalidates liveness and ownership before retaining commands. Closing an owner invalidates future weak-reference uses even while prior commands retain its physical allocation; already recorded work keeps the existing completion lifetime. Application budgets and scene/material data stay outside this package.
