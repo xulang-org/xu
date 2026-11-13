@@ -261,6 +261,139 @@ fn main() int { << check() or (err) { eprintln(err.msg())
     print("installed-sdk: gpu-device-import PASS (no SDL headers or runtime; no application native declaration)")
 
 
+def binary_floats(xu: str, project: Path, env):
+    # Exercise tight byte storage and IEEE conversions without native tools.
+    import random
+    import struct
+    project.mkdir()
+    rng = random.Random(0xB17F10A7)
+    patterns = [0, 1, 0x8000000000000000, 0x8000000000000001,
+                0x7ff0000000000000, 0xfff0000000000000, 0x7ff0000000000001,
+                0xfff0000000000001, 0x7fffffffffffffff, 0x7fefffffffffffff]
+    patterns += [rng.getrandbits(64) for _ in range(128)]
+    # Midpoint and its adjacent binary64 values around every binary32 exponent.
+    for exponent in range(1, 255):
+        a = struct.unpack('<f', struct.pack('<I', exponent << 23))[0]
+        b = struct.unpack('<f', struct.pack('<I', (exponent << 23) + 1))[0]
+        midpoint = struct.unpack('<Q', struct.pack('<d', (a + b) * 0.5))[0]
+        patterns += [midpoint - 1, midpoint, midpoint + 1]
+    for value in (2.0 ** -150, 2.0 ** -149, 2.0 ** -126, 2.0 ** 128 - 2.0 ** 103):
+        word = struct.unpack('<Q', struct.pack('<d', value))[0]
+        patterns += [word - 1, word, word + 1]
+    expected = []
+    for word in patterns:
+        fraction = word & ((1 << 52) - 1)
+        if (word >> 52) & 2047 == 2047 and fraction:
+            result = ((word >> 32) & 0x80000000) | 0x7fc00000 | (fraction >> 29)
+        else:
+            try:
+                value = struct.unpack('<d', struct.pack('<Q', word))[0]
+                result = struct.unpack('<I', struct.pack('<f', value))[0]
+            except OverflowError:
+                result = ((word >> 32) & 0x80000000) | 0x7f800000
+        expected.append(result)
+
+    def literal(word):
+        if word == 1 << 63:
+            return '(1 << 63)'
+        return str(word if word < 1 << 63 else word - (1 << 64))
+
+    source = '''@main
+#encoding/binary
+#math
+fn zeros(n int) []u8 { $out:=[]u8{}
+    for i in 0:n { out.push(u8(73)) }
+    << out }
+fn rejects_write(data $&[]u8, kind int, off int) bool {
+    for once in 0:1 {
+        if kind==0 { binary.little_endian().put_f32(data,off,0.5) or(err) { << true }
+        } else if kind==1 { binary.big_endian().put_f64(data,off,0.5) or(err) { << true }
+        } else { binary.big_endian().put_u32_bytes(data,off,255) or(err) { << true } }
+    }
+    << false
+}
+fn rejects_read(data &[]u8, kind int, off int) bool {
+    if kind==0 { binary.little_endian().get_f32(data,off) or(err) { << true }
+    } else { binary.big_endian().get_f64(data,off) or(err) { << true } }
+    << false
+}
+fn check() int {
+    le:=binary.little_endian()
+    be:=binary.big_endian()
+    patterns:=PATTERNS
+    expected:=EXPECTED
+    $little:=zeros(10)
+    $big:=zeros(10)
+    retained:=~little
+    assert(math.float64_bits(0.5)==4602678819172646912 && math.float32_bits(0.5)==1056964608)
+    assert(math.float64_from_bits(4602678819172646912)+0.5==1.0)
+    assert(math.float32_from_bits(1065353216)==1.0)
+    assert(math.signbit(math.float64_from_bits((1<<63)|9221120237041090561)))
+    assert(math.float64_bits(math.abs(-0.0))==0 && math.float64_bits(math.copysign(-0.0,1.0))==0)
+    assert(math.float64_bits(math.copysign(1.0,math.float64_from_bits((1<<63)|9221120237041090561)))==((1<<63)|4607182418800017408))
+    for i in 0:patterns.len {
+        raw:=patterns[i]
+        value:=math.float64_from_bits(raw)
+        assert(math.float64_bits(value)==raw && math.float32_bits(value)==expected[i])
+        assert(math.signbit(value)==(raw<0))
+        assert(math.float64_bits(math.abs(value))==(raw&9223372036854775807))
+        assert(math.float64_bits(math.copysign(value,-0.0))==(raw|(1<<63)))
+        le.put_f64($&little,1,value) or >>
+        be.put_f64($&big,1,value) or >>
+        for lane in 0:8 { want:=(raw>>(lane*8))&255
+            assert(int(little[1+lane])==want && int(big[8-lane])==want) }
+        assert(little[0]==u8(73) && little[9]==u8(73) && big[0]==u8(73) && big[9]==u8(73))
+        lv:=le.get_f64(&little,1) or >>
+        bv:=be.get_f64(&big,1) or >>
+        assert(math.float64_bits(lv)==raw && math.float64_bits(bv)==raw)
+        le.put_f32($&little,1,value) or >>
+        be.put_f32($&big,1,value) or >>
+        for lane in 0:4 { want:=(expected[i]>>(lane*8))&255
+            assert(int(little[1+lane])==want && int(big[4-lane])==want) }
+    }
+    for i in 0:retained.len { assert(retained[i]==u8(73)) }
+    words:=[0,1,2147483648,2147483649,8388607,8388608,2139095040,4286578688,2139095041,4290847557]
+    for raw in words {
+        value:=math.float32_from_bits(raw)
+        $quiet:=raw
+        if (raw&2139095040)==2139095040 && (raw&8388607)!=0 { quiet=raw|4194304 }
+        assert(math.float32_bits(value)==quiet)
+        le.put_u32_bytes($&little,1,raw) or >>
+        decoded:=le.get_f32(&little,1) or >>
+        assert(math.float64_bits(decoded)==math.float64_bits(value))
+    }
+    le.put_u16_bytes($&little,1,65535) or >>
+    signed16:=le.get_i16_bytes(&little,1) or >>
+    assert(signed16==(0-1))
+    be.put_i32_bytes($&big,1,0-2147483648) or >>
+    signed32:=be.get_i32_bytes(&big,1) or >>
+    assert(signed32==(0-2147483648))
+    snapshot:=~big
+    for kind in 0:3 { for off in [0-1,7,9,10,9223372036854775807] {
+        assert(rejects_write($&big,kind,off))
+        for i in 0:big.len { assert(big[i]==snapshot[i]) }
+    } }
+    for kind in 0:2 { for off in [0-1,7,9,10,9223372036854775807] { assert(rejects_read(&big,kind,off)) } }
+    $empty:=[]u8{}
+    assert(rejects_write($&empty,0,0) && rejects_read(&empty,1,0))
+    println("Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity")
+    << 0
+}
+fn main() int { << check() or(err) { eprintln(err.msg())
+    << 1 } }
+'''
+    source = source.replace('PATTERNS', '[' + ','.join(literal(v) for v in patterns) + ']')
+    source = source.replace('EXPECTED', '[' + ','.join(str(v) for v in expected) + ']')
+    (project / 'main.xu').write_text(source)
+    program = project / ('binary floats.exe' if os.name == 'nt' else 'binary floats')
+    isolated = env | {'XU_NATIVE_CC': str(project / 'missing C compiler'),
+                      'XU_GPU_SDL_LIBRARY': str(project / 'missing SDL runtime')}
+    for level in ('-O0', '-O2', '-O3'):
+        run([xu, 'build', 'main.xu', level, '-o', str(program)], cwd=project, env=isolated)
+        assert run([str(program)], cwd=project, env=isolated).strip() == 'Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity'
+    print(f'installed-sdk: binary-floats PASS ({len(patterns)} references; O0/O2/O3; no native tools)')
+
+
 def native_byte_spans(xu: str, target: str, project: Path, env):
     """Check byte-span descriptors and COW on each native installed SDK."""
     project.mkdir()
@@ -404,6 +537,7 @@ fn main() int {
     clean.pop("XU_STDLIB_ROOT", None)
     clean.pop("XU_ROOT", None)
     assert run([xu, "run", "main.xu"], cwd=project, env=clean).splitlines() == ["INSTALLED", "42"]
+    binary_floats(xu, work / "binary floats project", clean)
     gpu_layout(xu, work / "GPU layout project", clean)
     gpu_device_import(xu, work / "GPU device project", clean)
     native_byte_spans(xu, manifest["target"], work / "native byte spans", clean)

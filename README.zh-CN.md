@@ -293,6 +293,14 @@ Xu 是一门开放透明、面向未来的现代系统编程语言。如果你�
 
 ---
 
+## 二进制浮点存储（开发版）
+
+`0.12.3-dev.5` 增加 [`#math` IEEE 位转换](src/math/README.md) 和
+[`#encoding/binary` 紧密字节整数/浮点存储](src/encoding/binary/README.md)。
+GPU 动态顶点/uniform、文件与网络格式可直接用 `[]u8` 按显式大小端编码 binary32/64，
+无需 C 工具。接口说明负零、NaN 载荷策略、舍入到最近偶数和失败不部分写入的合同。
+UI 浮点传输共用 binary64 转换；`abs/copysign/signbit` 正确处理负零与 NaN 符号位。
+
 ## 标准 GPU 资源（开发版）
 
 `0.12.3-dev.4` 在标准库 [`#gpu`](src/gpu/README.md) 中提供设备、缓冲区、
