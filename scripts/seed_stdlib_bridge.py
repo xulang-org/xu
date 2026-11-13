@@ -27,11 +27,14 @@ def source_digest(source: Path) -> str:
 
 def prepare(seed: Path, source: Path, destination: Path) -> dict:
     version_output = subprocess.check_output([str(seed), '--version'], text=True)
-    match = re.search(r'Xu Compiler Toolchain v(\d+\.\d+\.\d+)(?:\s|$)', version_output)
-    if not match:
-        raise ValueError('Math migration requires a published hosted SDK seed')
-    version = match.group(1)
+    # Published seeds can carry prerelease identities and terminal colors.
+    plain = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', version_output)
+    match = re.search(r'Xu Compiler Toolchain v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)', plain)
     digest = hashlib.sha256(seed.read_bytes()).hexdigest()
+    if not match:
+        raise ValueError('Unrecognized hosted SDK seed identity: sha256=' + digest + ' output=' + repr(plain))
+    version = match.group(1)
+    print('seed_stdlib_bridge: original seed version=' + version + ' sha256=' + digest, flush=True)
     candidates = [seed.parent / '.xu-seed-sources' / digest, seed.parent.parent]
     sdk = next((p for p in candidates if (p / 'VERSION').is_file()
                 and (p / 'VERSION').read_text().strip() == version
