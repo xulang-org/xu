@@ -309,7 +309,7 @@ if [ "$seed_build_rc" -ne 0 ] && grep -Eq "const '[A-Z_][A-Z0-9_]*' must be snak
 fi
 if [ "$seed_build_rc" -ne 0 ] && grep -Eq "runtime/core/[^:]+:[0-9]+:[0-9]+: error: undefined name 'rt_(load|store|addr|syscall|globals)'" "$tmp/seed-build.log"; then
     # The frozen frontend cannot preflight source-backed runtime primitives.
-    # Compile a disposable current compiler with the original SDK's math,
+    # Compile a disposable current compiler with the original SDK's math and string storage,
     # then restart Gen1 on the full original closure. Never skip the gate.
     FAILED_STAGE="math_runtime_seed_bridge"
     set +u
