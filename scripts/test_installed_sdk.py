@@ -216,7 +216,18 @@ fn main() int { << run() or(err){ eprintln(err.msg())
     program=project / ("deflate.exe" if os.name=="nt" else "deflate")
     for level in ("-O0","-O2","-O3"):
         run([xu,"build","main.xu",level,"-o",str(program)],cwd=project,env=env)
-        run([str(program),*[str(path) for path in paths]],cwd=project,env=env)
+        command=[str(program),*[str(path) for path in paths]]
+        if sys.platform.startswith("linux"):
+            # Bound address space for the consumer only, not the compiler.
+            # The former per-byte immutable copies exceed this budget well
+            # before the literal-heavy payload completes.
+            import resource
+            def memory_budget():
+                resource.setrlimit(resource.RLIMIT_AS,(512*1024*1024,512*1024*1024))
+            subprocess.run(command,cwd=project,env=env,stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE,check=True,timeout=60,preexec_fn=memory_budget)
+        else:
+            run(command,cwd=project,env=env)
         for path,plain in zip(paths,samples):
             encoded=Path(str(path)+".deflate").read_bytes()
             assert zlib.decompress(encoded,wbits=-15)==plain,(level,path)
