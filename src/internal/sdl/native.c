@@ -3,6 +3,7 @@
 #include "sdl_abi.h"
 #include "sdl_render_abi.h"
 #include "sdl_compute_abi.h"
+#include "sdl_window_abi.h"
 #include <math.h>
 #include <limits.h>
 #include <stdio.h>
@@ -20,17 +21,19 @@
 #endif
 #endif
 
-#define API(name) XU_NATIVE_SYMBOL(xu_gpu_internal_native_##name)
+#define API(name) XU_NATIVE_SYMBOL(xu_internal_sdl_##name)
 #define FUNCTIONS(X) \
-    X(SDL_SetMainReady) X(SDL_IsMainThread) X(SDL_InitSubSystem) X(SDL_QuitSubSystem) X(SDL_GetError) \
+    X(SDL_SetMainReady) X(SDL_IsMainThread) X(SDL_InitSubSystem) X(SDL_QuitSubSystem) X(SDL_GetError)
+#define GPU_FUNCTIONS(X) \
     X(SDL_CreateGPUDevice) X(SDL_DestroyGPUDevice) X(SDL_GetGPUDeviceDriver) X(SDL_GetGPUShaderFormats) \
     X(SDL_CreateGPUBuffer) X(SDL_ReleaseGPUBuffer) X(SDL_CreateGPUTransferBuffer) X(SDL_ReleaseGPUTransferBuffer) \
     X(SDL_MapGPUTransferBuffer) X(SDL_UnmapGPUTransferBuffer) X(SDL_AcquireGPUCommandBuffer) X(SDL_CancelGPUCommandBuffer) \
     X(SDL_BeginGPUCopyPass) X(SDL_EndGPUCopyPass) X(SDL_UploadToGPUBuffer) X(SDL_CopyGPUBufferToBuffer) \
     X(SDL_DownloadFromGPUBuffer) X(SDL_SubmitGPUCommandBufferAndAcquireFence) X(SDL_QueryGPUFence) \
-    X(SDL_WaitForGPUFences) X(SDL_ReleaseGPUFence) X(SDL_WaitForGPUIdle)
+    X(SDL_WaitForGPUFences) X(SDL_ReleaseGPUFence) X(SDL_WaitForGPUIdle) X(SDL_SubmitGPUCommandBuffer)
 #define DECLARE(name) static __typeof__(name) *p_##name;
 FUNCTIONS(DECLARE)
+GPU_FUNCTIONS(DECLARE)
 static bool loaded;
 #ifdef _WIN32
 static HMODULE sdl_library;
@@ -39,30 +42,38 @@ static void *sdl_library;
 #endif
 static _Thread_local char error_text[1024];
 static xu_int fail(const char *message) {
-    snprintf(error_text, sizeof(error_text), "%s", message ? message : "GPU operation failed");
+    snprintf(error_text, sizeof(error_text), "%s", message ? message : "SDL operation failed");
     return -1;
 }
 static xu_int sdl_fail(void) { return fail(p_SDL_GetError()); }
+static void retain_error(bool *ok, char first[1024]) {
+    if (*ok) memcpy(first,error_text,1024);
+    *ok=false;
+}
+static bool cleanup_result(bool ok, const char first[1024]) {
+    if (!ok) memcpy(error_text,first,1024);
+    return ok;
+}
 static bool on_main(void) {
 #ifdef __APPLE__
-    if (!pthread_main_np()) { fail("GPU operations require the application main thread"); return false; }
+    if (!pthread_main_np()) { fail("SDL operations require the application main thread"); return false; }
 #elif defined(__linux__)
-    if (syscall(SYS_gettid) != getpid()) { fail("GPU operations require the application main thread"); return false; }
+    if (syscall(SYS_gettid) != getpid()) { fail("SDL operations require the application main thread"); return false; }
 #endif
-    if (loaded && !p_SDL_IsMainThread()) { fail("GPU operations require the application main thread"); return false; }
+    if (loaded && !p_SDL_IsMainThread()) { fail("SDL operations require the application main thread"); return false; }
     return true;
 }
 static bool load_sdl(void) {
     if (!on_main()) return false;
     if (loaded) return true;
 #ifdef _WIN32
-    DWORD capacity = GetEnvironmentVariableW(L"XU_GPU_SDL_LIBRARY", NULL, 0);
+    DWORD capacity = GetEnvironmentVariableW(L"XU_SDL_LIBRARY", NULL, 0);
     wchar_t *path = capacity ? calloc(capacity, sizeof(*path)) : NULL;
-    if (capacity && !path) { fail("GPU library path allocation failed"); return false; }
+    if (capacity && !path) { fail("SDL library path allocation failed"); return false; }
     if (path) {
-        DWORD length = GetEnvironmentVariableW(L"XU_GPU_SDL_LIBRARY", path, capacity);
+        DWORD length = GetEnvironmentVariableW(L"XU_SDL_LIBRARY", path, capacity);
         if (!length || length >= capacity) {
-            free(path); fail("GPU library path changed while loading"); return false;
+            free(path); fail("SDL library path changed while loading"); return false;
         }
     }
     HMODULE library = LoadLibraryW(path ? path : L"SDL3.dll");
@@ -70,7 +81,7 @@ static bool load_sdl(void) {
 #define FIND(name) GetProcAddress(library, #name)
 #define UNLOAD() FreeLibrary(library)
 #else
-    const char *override = getenv("XU_GPU_SDL_LIBRARY");
+    const char *override = getenv("XU_SDL_LIBRARY");
     void *library = NULL;
     if (override && *override) library = dlopen(override, RTLD_NOW | RTLD_LOCAL);
 #ifdef __APPLE__
@@ -85,15 +96,38 @@ static bool load_sdl(void) {
 #define FIND(name) dlsym(library, #name)
 #define UNLOAD() dlclose(library)
 #endif
-    if (!library) { fail("SDL 3 GPU runtime unavailable; install SDL3 or set XU_GPU_SDL_LIBRARY"); return false; }
+    if (!library) { fail("SDL 3 runtime unavailable; install SDL3 or set XU_SDL_LIBRARY"); return false; }
 #define LOAD(name) p_##name = (__typeof__(name) *)FIND(name); \
-    if (!p_##name) { fail("SDL 3 GPU runtime is missing " #name); UNLOAD(); return false; }
+    if (!p_##name) { fail("SDL 3 runtime is missing " #name); UNLOAD(); return false; }
     FUNCTIONS(LOAD)
     p_SDL_SetMainReady();
     sdl_library = library;
     loaded = true; // Process-lifetime loader; device/subsystem references are separate.
     return true;
 }
+static bool gpu_loaded;
+static bool load_gpu(void) {
+    if (!load_sdl()) return false;
+    if (gpu_loaded) return true;
+#ifdef _WIN32
+#define GPU_FIND(name) GetProcAddress(sdl_library, #name)
+#else
+#define GPU_FIND(name) dlsym(sdl_library, #name)
+#endif
+#define LOAD_GPU(name) p_##name = (__typeof__(name) *)GPU_FIND(name); \
+    if (!p_##name) { fail("SDL 3 GPU runtime is missing " #name); return false; }
+    GPU_FUNCTIONS(LOAD_GPU)
+    gpu_loaded = true;
+    return true;
+}
+static xu_uint next_id = 1;
+static xu_int identifier(void) {
+    if (next_id > LLONG_MAX) return fail("SDL resource identity space exhausted");
+    return (xu_int)next_id++;
+}
+
+#include "window.h"
+
 typedef struct Buffer {
     xu_int id;
     Uint32 size, usage;
@@ -112,6 +146,7 @@ typedef struct Transfer {
 } Transfer;
 typedef struct Resource Resource;
 typedef struct Encoder Encoder;
+typedef struct Surface Surface;
 typedef struct Device {
     xu_int id;
     SDL_GPUDevice *gpu;
@@ -119,14 +154,10 @@ typedef struct Device {
     Transfer *transfers;
     Resource *resources;
     Encoder *encoders;
+    Surface *surfaces;
     struct Device *next;
 } Device;
 static Device *devices;
-static xu_uint next_id = 1;
-static xu_int identifier(void) {
-    if (next_id > LLONG_MAX) return fail("GPU resource identity space exhausted");
-    return (xu_int)next_id++;
-}
 static Device *device(xu_int id) {
     if (!on_main()) return NULL;
     for (Device *d = devices; d; d = d->next) if (d->id == id) return d;
@@ -188,7 +219,7 @@ xu_int API(error_byte)(xu_int i) {
 xu_int API(open)(xu_int backend, xu_int debug, xu_int formats) {
     if (backend < 0 || backend > 3 || debug < 0 || debug > 1 || formats < 0 || formats > 31)
         return fail("invalid GPU device options");
-    if (!load_sdl()) return -1;
+    if (!load_gpu()) return -1;
     Device *d = calloc(1, sizeof(*d));
     if (!d) return fail("GPU device allocation failed");
     d->id = identifier();
@@ -202,20 +233,23 @@ xu_int API(open)(xu_int backend, xu_int debug, xu_int formats) {
     return d->id;
 }
 static bool close_graphics(Device *d);
+static bool close_surfaces(Device *d);
 xu_int API(close)(xu_int id) {
     if (!on_main()) return -1;
     Device **link = &devices;
     while (*link && (*link)->id != id) link = &(*link)->next;
     if (!*link) return 0;
     Device *d = *link;
-    bool ok = close_graphics(d);
-    if (!p_SDL_WaitForGPUIdle(d->gpu)) { sdl_fail(); ok = false; }
+    bool ok=true; char first[1024];
+    if (!close_graphics(d)) retain_error(&ok,first);
+    if (!p_SDL_WaitForGPUIdle(d->gpu)) { sdl_fail(); retain_error(&ok,first); }
+    if (!close_surfaces(d)) retain_error(&ok,first);
     while (d->transfers) { Transfer *t = d->transfers; d->transfers = t->next; free_transfer(d, t); }
     while (d->buffers) { Buffer *b = d->buffers; d->buffers = b->next; p_SDL_ReleaseGPUBuffer(d->gpu, b->gpu); free(b); }
     p_SDL_DestroyGPUDevice(d->gpu);
     p_SDL_QuitSubSystem(0x20u);
     *link = d->next; free(d);
-    return ok ? 0 : -1;
+    return cleanup_result(ok,first) ? 0 : -1;
 }
 xu_int API(backend)(xu_int id) {
     Device *d = device(id); if (!d) return -1;
@@ -354,3 +388,5 @@ xu_int API(stats)(xu_int owner, xu_int field) {
 
 #include "render.h"
 #include "compute.h"
+
+#include "surface.h"
