@@ -1,12 +1,12 @@
 # GPU resources and command recording
 
 `#gpu` is the optional device layer of the Xu standard library. SDK
-**0.12.3-dev.6** provides windowless devices, buffers, 2D textures/mips,
+**0.12.3-dev.7** provides windowless devices, buffers, 2D textures/mips,
 samplers, vertex/fragment shaders, graphics pipelines, command encoders,
-render/compute passes, buffer compute pipelines, asynchronous transfers,
+render/compute passes, buffer compute pipelines, window surfaces/frames, asynchronous transfers,
 fences and exact byte readback.
 Scene graphs, cameras, materials, PBR and rendering budgets belong to engines.
-Window presentation, cube/3D textures, storage texture bindings,
+HDR presentation, cube/3D textures, storage texture bindings,
 multiple render targets, multisampling and stencil are not implemented here.
 
 ## Device and ownership
@@ -171,6 +171,58 @@ invalid bindings/states and 128 cancellation/drop cycles. Failure injection
 covers all 13 native allocation steps in the exercised transaction and 11 driver failure paths with cleanup
 and retry; injected results are not additional hardware/platform evidence.
 
+## Window presentation
+
+Create a separate [`#window`](../window/README.md) owner, then call
+`device.surface(&window, SurfaceOptions{present_mode: PRESENT_VSYNC})`.
+A window has at most one presentation binding, including across devices.
+`Surface.format()` reports the negotiated `gpu/layout` format. Presentation is
+currently SDR; VSYNC/IMMEDIATE/MAILBOX are explicit modes, with actual support
+queried by `supports_present_mode`. `set_present_mode` requires no acquired frame
+and can block for reconfiguration. An unsupported mode throws.
+
+`surface.acquire()` may wait for in-flight frames. Check `frame.has_image()`:
+success with no image is normal, including some minimized-window states. A
+minimized window may still produce a valid image. Width/height are actual pixels
+and format describes that image; logical window size is a separate snapshot.
+One frame may be acquired per surface at a time.
+
+Use `frame.begin_render(load, clear, depth)` to obtain the existing `RenderPass`.
+A first pass requires CLEAR or DISCARD; subsequent passes may LOAD. Swapchain
+color always STOREs. Optional depth must match the acquired pixel dimensions.
+`frame.begin_compute` shares the frame command buffer, with the same compute
+bindings and synchronization contract as offscreen work. End all passes and
+complete at least one color render pass, then `frame.present()` returns a fence.
+Pipeline/buffer/texture ownership retention is unchanged. No owning texture/view
+or independent encoder is exported for a swapchain image.
+
+Acquired images are write-only and cannot be sampled/read back or used by a
+different command buffer. [SDL forbids cancelling after acquisition](https://wiki.libsdl.org/SDL3/SDL_CancelGPUCommandBuffer).
+Consequently `Frame.close/drop` ends an active pass, clears opaque black and
+submits without allocating a fence. A successful close may visibly present
+black. If clear or submit fails, cleanup still consumes the command and reports
+the first error; contents after a driver failure are not guaranteed. An ordinary
+offscreen encoder continues to cancel normally. Submission failures can consume
+a frame; close/drop remains idempotent on stale IDs.
+
+Surface closure safely consumes an acquired frame, waits for GPU work and
+unclaims the window. Closing the window or device invalidates its surfaces,
+frames and passes in that order before physical destruction. Devices and
+windows keep independent balanced SDL video references. `surface_count` and
+`frame_count` count live bindings and unsubmitted acquired images; frames also
+count as encoders. Swapchain allocations are not reported as owning textures or
+physical VRAM. Metadata accessors cache acquisition dimensions; operations
+validate current parent/resource identities.
+
+The window and GPU packages share one private `internal/sdl` backend and loader.
+`XU_SDL_LIBRARY` replaces the unpublished GPU-specific environment variable; no
+compatibility alias remains. Importing GPU still opens no window; importing
+window creates no GPU device. The pure layout package remains independent.
+Actual presentation has been visually checked on macOS arm64 Metal with a
+red/blue split window; native lifecycle tests cover resize, minimized acquisition,
+restoration, parent-close ordering and repeated frame abandonment. SDK import
+checks only compile these APIs and execute missing-runtime diagnostics.
+
 ## Build and evidence
 
 Importing `#gpu` compiles its private C backend using the selected SDK's sibling
@@ -178,8 +230,8 @@ Importing `#gpu` compiles its private C backend using the selected SDK's sibling
 contains a small private SDL ABI declaration subset, so applications need no SDL
 headers or `native:` mapping. Native executable builds support 64-bit hosted
 macOS/Linux/Windows; `--emit-obj` with native imports is currently unsupported.
-SDL 3.2+ is loaded only by device creation; rendering symbols load on first use.
-`XU_GPU_SDL_LIBRARY` selects an explicit path and disables fallback. Missing
+SDL 3.2+ is loaded only by device/window creation; rendering symbols load on first use.
+`XU_SDL_LIBRARY` selects an explicit path and disables fallback. Missing
 libraries/symbols/devices/options throw. The library stays loaded for process life.
 The pure `#gpu/layout` needs neither C tools nor SDL.
 

@@ -270,7 +270,7 @@ fn compute_api(device &gpu.Device) int {
 fn check() int {
     $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or (err) {
         message := err.msg()
-        assert(strings.contains(&message, "SDL 3 GPU runtime unavailable"))
+        assert(strings.contains(&message, "SDL 3 runtime unavailable"))
         println("GPU device: source backend, explicit missing-runtime error")
         << 0
     }
@@ -280,11 +280,70 @@ fn check() int {
 fn main() int { << check() or (err) { eprintln(err.msg())
     << 1 } }
 ''')
-    isolated = env | {"XU_GPU_SDL_LIBRARY": str(project / "missing SDL runtime")}
+    isolated = env | {"XU_SDL_LIBRARY": str(project / "missing SDL runtime")}
     program = project / ("GPU device.exe" if os.name == "nt" else "GPU device")
     run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=isolated)
     assert run([str(program)], cwd=project, env=isolated).strip() == "GPU device: source backend, explicit missing-runtime error"
     print("installed-sdk: gpu-device-import PASS (compute API compile, no SDL headers/runtime or application native declaration)")
+
+
+def window_surface_import(xu: str, project: Path, env):
+    """Compile window/surface APIs and run only explicit missing-SDL handling."""
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#window
+#gpu
+#strings
+fn surface_api(target &window.Window) int {
+    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO,debug: false,shader_formats: 0}) or >>
+    $surface := device.surface(target,gpu.SurfaceOptions{present_mode: gpu.PRESENT_VSYNC}) or >>
+    surface.supports_present_mode(gpu.PRESENT_VSYNC) or >>
+    surface.set_present_mode(gpu.PRESENT_VSYNC) or >>
+    $frame := surface.acquire() or >>
+    if frame.has_image() {
+        assert(frame.width()>0 && frame.height()>0)
+        frame.format()
+        writes := []gpu.StorageBufferWrite{}
+        $compute := frame.begin_compute(&writes) or >>
+        compute.end() or >>
+        $pass := frame.begin_render(gpu.CLEAR,gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0},gpu.no_depth()) or >>
+        pass.end() or >>
+        $fence := frame.present() or >>
+        fence.close() or >>
+    }
+    frame.close() or >>
+    surface.close() or >>
+    << 0
+}
+fn check() int {
+    options := window.Options{title: "SDK window",width: 64,height: 64,resizable: false,high_pixel_density: true,hidden: true}
+    $target := window.open(&options) or (err) {
+        message := err.msg()
+        assert(strings.contains(&message,"SDL 3 runtime unavailable"))
+        println("Window: shared source backend, explicit missing-runtime error")
+        << 0
+    }
+    surface_api(&target) or >>
+    state := target.state() or >>
+    assert(state.width==64)
+    target.resize(32,32) or >>
+    target.show() or >>
+    target.hide() or >>
+    target.minimize() or >>
+    target.restore() or >>
+    window.pump() or >>
+    target.close() or >>
+    window.live_count() or >>
+    << 1
+}
+fn main() int { << check() or (err) { eprintln(err.msg())
+    << 1 } }
+''')
+    isolated = env | {"XU_SDL_LIBRARY": str(project / "missing shared SDL runtime")}
+    program = project / ("Window surface.exe" if os.name == "nt" else "Window surface")
+    run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=isolated)
+    assert run([str(program)], cwd=project, env=isolated).strip() == "Window: shared source backend, explicit missing-runtime error"
+    print("installed-sdk: window-surface-import PASS (API compile/shared backend/missing runtime; no GPU execution)")
 
 
 def binary_floats(xu: str, project: Path, env):
@@ -422,7 +481,7 @@ fn main() int { << check() or(err) { eprintln(err.msg())
     (project / 'main.xu').write_text(source)
     program = project / ('binary floats.exe' if os.name == 'nt' else 'binary floats')
     isolated = env | {'XU_NATIVE_CC': str(project / 'missing C compiler'),
-                      'XU_GPU_SDL_LIBRARY': str(project / 'missing SDL runtime')}
+                      'XU_SDL_LIBRARY': str(project / 'missing SDL runtime')}
     for level in ('-O0', '-O2', '-O3'):
         run([xu, 'build', 'main.xu', 'runtime_probe.xu', level, '-o', str(program)], cwd=project, env=isolated)
         assert run([str(program)], cwd=project, env=isolated).strip() == 'Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity'
@@ -575,6 +634,7 @@ fn main() int {
     binary_floats(xu, work / "binary floats project", clean)
     gpu_layout(xu, work / "GPU layout project", clean)
     gpu_device_import(xu, work / "GPU device project", clean)
+    window_surface_import(xu, work / "Window surface project", clean)
     native_byte_spans(xu, manifest["target"], work / "native byte spans", clean)
     # SDK root discovery is independent of external GUI toolchain availability.
     # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK

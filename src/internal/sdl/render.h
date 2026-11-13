@@ -28,6 +28,11 @@ static bool load_render(void) {
  X(SDL_CreateGPUComputePipeline) X(SDL_ReleaseGPUComputePipeline) X(SDL_BeginGPUComputePass) X(SDL_EndGPUComputePass) \
  X(SDL_BindGPUComputePipeline) X(SDL_BindGPUComputeStorageBuffers) X(SDL_PushGPUComputeUniformData) X(SDL_DispatchGPUCompute)
 COMPUTE_FUNCTIONS(DECLARE)
+#define SURFACE_FUNCTIONS(X) \
+ X(SDL_ClaimWindowForGPUDevice) X(SDL_ReleaseWindowFromGPUDevice) X(SDL_WindowSupportsGPUPresentMode) \
+ X(SDL_SetGPUSwapchainParameters) X(SDL_GetGPUSwapchainTextureFormat) X(SDL_WaitAndAcquireGPUSwapchainTexture)
+SURFACE_FUNCTIONS(DECLARE)
+struct Surface { xu_int id, frame; Device *owner; WindowRecord *window; int format; struct Surface *next; };
 enum { TEXTURE = 1, SAMPLER, SHADER, PIPELINE, COMPUTE_PIPELINE };
 /* These are SDL portable limits, not engine budgets (SDL_gpu.c/sysgpu.h).
  * All backends share 16 vertex inputs, 16 samplers and 4 uniform slots. */
@@ -55,6 +60,9 @@ struct Encoder {
     SDL_GPUCommandBuffer *command;
     SDL_GPURenderPass *pass;
     SDL_GPUComputePass *compute;
+    Surface *surface;
+    Resource present_target;
+    unsigned present_passes;
     Ref *refs;
     Resource *color, *depth, *pipeline;
     Uint32 width, height;
@@ -115,11 +123,16 @@ static Encoder *encoder(Device *d, xu_int id, bool is_pass) {
         if (is_pass ? (e->pass && e->pass_id == id) : e->id == id) return e;
     fail(is_pass ? "closed or invalid GPU render pass" : "closed or invalid GPU command encoder"); return NULL;
 }
+static bool abandon_surface(Encoder *e);
+static void surface_encoder_released(Encoder *e);
 static bool free_encoder(Device *d, Encoder *e, bool cancel) {
     bool ok = true;
-    if (e->pass) p_SDL_EndGPURenderPass(e->pass);
-    if (e->compute) p_SDL_EndGPUComputePass(e->compute);
-    if (cancel && !p_SDL_CancelGPUCommandBuffer(e->command)) { sdl_fail(); ok = false; }
+    if (e->pass) { p_SDL_EndGPURenderPass(e->pass); e->pass=NULL; }
+    if (e->compute) { p_SDL_EndGPUComputePass(e->compute); e->compute=NULL; }
+    if (cancel) {
+        if (e->surface) ok=abandon_surface(e);
+        else if (!p_SDL_CancelGPUCommandBuffer(e->command)) { sdl_fail(); ok=false; }
+    }
     while (e->refs) {
         Ref *r = e->refs; e->refs = r->next;
         if (r->buffer) --((Buffer *)r->pointer)->refs; else --((Resource *)r->pointer)->refs;
@@ -128,17 +141,18 @@ static bool free_encoder(Device *d, Encoder *e, bool cancel) {
     Encoder **link = &d->encoders;
     while (*link && *link != e) link = &(*link)->next;
     if (*link) *link = e->next;
+    if (e->surface) surface_encoder_released(e);
     free(e); collect_resources(d);
     return ok;
 }
 static bool close_graphics(Device *d) {
-    bool ok = true;
-    while (d->encoders) if (!free_encoder(d, d->encoders, true)) ok = false;
-    while (d->resources) { Resource *r = d->resources; d->resources = r->next; free_resource(d, r); }
-    return ok;
+    bool ok=true; char first[1024];
+    while (d->encoders) if (!free_encoder(d,d->encoders,true)) retain_error(&ok,first);
+    while (d->resources) { Resource *r=d->resources; d->resources=r->next; free_resource(d,r); }
+    return cleanup_result(ok,first);
 }
 static xu_int graphics_stats(Device *d, xu_int field) {
-    if (field < 4 || field > 12) return fail("invalid GPU accounting field");
+    if (field < 4 || field > 14) return fail("invalid GPU accounting field");
     xu_int total = 0;
     for (Resource *r = d->resources; r; r = r->next) {
         xu_int add = 0;
@@ -152,7 +166,8 @@ static xu_int graphics_stats(Device *d, xu_int field) {
         total += add;
     }
     for (Encoder *e = d->encoders; e; e = e->next)
-        if (field == 9 || (field == 10 && e->pass) || (field == 12 && e->compute)) ++total;
+        if (field == 9 || (field == 10 && e->pass) || (field == 12 && e->compute) || (field == 14 && e->surface)) ++total;
+    if (field==13) for (Surface *s=d->surfaces; s; s=s->next) ++total;
     return total;
 }
 xu_int API(resource_close)(xu_int owner, xu_int id) {
@@ -411,31 +426,38 @@ xu_int API(encoder_submit)(xu_int owner, xu_int id) {
 }
 /* desc: color ID, mip, load, store, depth ID(0=none), depth load, store.
  * Depth attachment is level zero for the SDL 3.2 baseline ABI. */
-xu_int API(pass_begin)(xu_int owner, xu_int id, const xu_i64_span *desc, double red, double green, double blue, double alpha, double clear_depth) {
-    Device *d = device(owner); if (!d) return -1;
-    Encoder *e = encoder(d, id, false); if (!e) return -1;
-    if (e->pass || e->compute || !desc || desc->len != 7 || !desc->data || !isfinite(red) || !isfinite(green) || !isfinite(blue) || !isfinite(alpha) ||
-        !isfinite(clear_depth) || clear_depth < 0 || clear_depth > 1 || fabs(red) > 3.4e38 || fabs(green) > 3.4e38 || fabs(blue) > 3.4e38 || fabs(alpha) > 3.4e38)
-        return fail("invalid GPU render pass state, descriptor or clear values");
-    const xu_int *v = desc->data;
-    Resource *color = resource(d, v[0], TEXTURE); if (!color) return -1;
-    Resource *depth = v[4] ? resource(d, v[4], TEXTURE) : NULL; if (v[4] && !depth) return -1;
-    if (!(color->usage & 2) || v[1] < 0 || v[1] >= color->levels || v[2] < 0 || v[2] > 2 || v[3] < 0 || v[3] > 1 ||
-        v[5] < 0 || v[5] > 2 || v[6] < 0 || v[6] > 1) return fail("invalid GPU render attachment usage, mip or operations");
-    Uint32 width = mip_extent(color->width, (Uint32)v[1]), height = mip_extent(color->height, (Uint32)v[1]);
-    if (depth && (!(depth->usage & 4) || depth->width != width || depth->height != height)) return fail("GPU depth attachment extent or usage mismatch");
-    xu_int pass_id = identifier(); if (pass_id < 0) return -1;
-    if (!retain(e, color, false) || (depth && !retain(e, depth, false))) return -1;
-    SDL_GPUColorTargetInfo target = {0}; target.texture = color->gpu; target.mip_level = (Uint32)v[1];
-    target.load_op = (SDL_GPULoadOp)v[2]; target.store_op = (SDL_GPUStoreOp)v[3]; target.clear_color = (SDL_FColor){(float)red, (float)green, (float)blue, (float)alpha};
-    SDL_GPUDepthStencilTargetInfo z = {0};
-    if (depth) { z.texture = depth->gpu; z.clear_depth = (float)clear_depth; z.load_op = (SDL_GPULoadOp)v[5]; z.store_op = (SDL_GPUStoreOp)v[6]; }
-    e->pass = p_SDL_BeginGPURenderPass(e->command, &target, 1, depth ? &z : NULL);
+static xu_int begin_render_pass(Encoder *e, Resource *color, xu_int mip, xu_int load, xu_int store,
+                                Resource *depth, xu_int depth_load, xu_int depth_store,
+                                double red, double green, double blue, double alpha, double clear_depth) {
+    if (e->pass || e->compute || !isfinite(red) || !isfinite(green) || !isfinite(blue) || !isfinite(alpha) ||
+        !isfinite(clear_depth) || clear_depth<0 || clear_depth>1 || fabs(red)>3.4e38 || fabs(green)>3.4e38 || fabs(blue)>3.4e38 || fabs(alpha)>3.4e38)
+        return fail("invalid GPU render pass state or clear values");
+    if (!(color->usage&2) || mip<0 || mip>=color->levels || load<0 || load>2 || store<0 || store>1 ||
+        depth_load<0 || depth_load>2 || depth_store<0 || depth_store>1) return fail("invalid GPU render attachment usage, mip or operations");
+    Uint32 width=mip_extent(color->width,(Uint32)mip), height=mip_extent(color->height,(Uint32)mip);
+    if (depth && (!(depth->usage&4) || depth->width!=width || depth->height!=height)) return fail("GPU depth attachment extent or usage mismatch");
+    xu_int pass_id=identifier(); if (pass_id<0) return -1;
+    if ((color!=&e->present_target && !retain(e,color,false)) || (depth && !retain(e,depth,false))) return -1;
+    SDL_GPUColorTargetInfo target={0}; target.texture=color->gpu; target.mip_level=(Uint32)mip;
+    target.load_op=(SDL_GPULoadOp)load; target.store_op=(SDL_GPUStoreOp)store;
+    target.clear_color=(SDL_FColor){(float)red,(float)green,(float)blue,(float)alpha};
+    SDL_GPUDepthStencilTargetInfo z={0};
+    if (depth) { z.texture=depth->gpu; z.clear_depth=(float)clear_depth; z.load_op=(SDL_GPULoadOp)depth_load; z.store_op=(SDL_GPUStoreOp)depth_store; }
+    e->pass=p_SDL_BeginGPURenderPass(e->command,&target,1,depth ? &z : NULL);
     if (!e->pass) return sdl_fail();
-    e->pass_id = pass_id; e->color = color; e->depth = depth; e->pipeline = NULL; e->width = width; e->height = height;
-    memset(e->vertices, 0, sizeof(e->vertices)); e->index = NULL;
-    memset(e->samplers, 0, sizeof(e->samplers)); memset(e->uniforms, 0, sizeof(e->uniforms));
+    e->pass_id=pass_id; e->color=color; e->depth=depth; e->pipeline=NULL; e->width=width; e->height=height;
+    memset(e->vertices,0,sizeof(e->vertices)); e->index=NULL;
+    memset(e->samplers,0,sizeof(e->samplers)); memset(e->uniforms,0,sizeof(e->uniforms));
     return pass_id;
+}
+xu_int API(pass_begin)(xu_int owner, xu_int id, const xu_i64_span *desc, double red, double green, double blue, double alpha, double clear_depth) {
+    Device *d=device(owner); if (!d) return -1;
+    Encoder *e=encoder(d,id,false); if (!e) return -1;
+    if (e->surface || !desc || desc->len!=7 || !desc->data) return fail("invalid GPU offscreen render descriptor or encoder");
+    const xu_int *v=desc->data;
+    Resource *color=resource(d,v[0],TEXTURE); if (!color) return -1;
+    Resource *depth=v[4] ? resource(d,v[4],TEXTURE) : NULL; if (v[4] && !depth) return -1;
+    return begin_render_pass(e,color,v[1],v[2],v[3],depth,v[5],v[6],red,green,blue,alpha,clear_depth);
 }
 xu_int API(pass_end)(xu_int owner, xu_int id) {
     if (!on_main()) return -1;
