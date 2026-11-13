@@ -202,7 +202,7 @@ fn main() { let $x: int = 1
     for target, runner in (('host', ()), ('linux-arm64', ('qemu-aarch64',)),
                            ('linux-arm32', ('qemu-arm',)), ('linux-loongarch64', ('qemu-loongarch64',)),
                            ('linux-riscv64', ('qemu-riscv64',))):
-        for opt in ('-O0', '-O2'):
-            extra = (opt,) if target == 'host' else (opt, '--target', target)
+        for opt, flags in (('_default', ()), ('_no_opt', ('--no-opt',))):
+            extra = flags if target == 'host' else (*flags, '--target', target)
             fixture('spec34_C_backend_' + target + opt, source,
                     output='9\n9\n2\nxu!\n4\n4\n5\narray!\n9\n7\n', extra=extra, runner=runner)

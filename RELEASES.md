@@ -6,6 +6,14 @@
 
 ---
 
+## Xu 0.12.3
+
+- Restores typed-MIR inlining, integer tail recursion and periodic loop folding. String repetition allocates its output once. Hardware AES, ARM64 SHA-256, bit operations and hex encoding use native instructions where supported. Linux and macOS I/O waiters share each idle poll round.
+- Fixes implicit shared borrows in bindings and assignments, restores native linking and resource cleanup, and bounds DEFLATE compressor output growth.
+- Adds explicit-endian binary32/binary64 storage and bit conversions, and a WASI host for compiler tooling.
+- Adds standard-library GPU render and compute passes, validated non-owning resource references, window surfaces and per-window input events. Native GPU support depends on the platform backend.
+- Upgrade the compiler, standard library and SDK tools together.
+
 ## Xu 0.12.3-dev.8 (development)
 
 Adds pure portable `window/events` data and per-window input queues for keyboard, fractional pointer/wheel and owned UTF-8 text/IME editing. Window supports text activation/caret area and relative/grab pointer controls. Focus loss and bounded-queue/text/allocation failures clear cached held input; an explicit reset event reports lost input, with repeat suppression until a fresh key press. Events retain window routing, physical versus logical keys and modifiers without exposing SDL event pointers. Input actions and gameplay remain in engines. SDK acceptance checks pure event data without C/SDL and compiles input APIs; other-platform real OS input and custom IME candidates/touch/gamepad remain unverified or pending. This is an unpublished development build. See [window](src/window/README.md).
@@ -25,6 +33,22 @@ Adds safe IEEE binary64 bit reinterpretation, binary32 conversion with ties-to-e
 ## Xu 0.12.3-dev.4 (development)
 
 Adds standard GPU textures/mips, samplers, vertex/fragment shaders, configurable graphics pipelines, command encoders and render passes with resource retention, depth, indexed/instanced draws and pixel readback. C2 accepts existing C1 scalar signatures alongside borrowed spans, including mixed floating calls/results. Offscreen hardware acceptance covers macOS arm64 Metal; Vulkan/D3D12 execution, presentation, compute and advanced render features remain pending. See [GPU contracts](src/gpu/README.md). This is an unpublished development build, not a release.
+
+## Xu 0.12.2
+
+The product compiler lowers checked programs to typed MIR and self-hosts from the published `v0.12.2-seed.1` compiler. Upgrade the compiler, standard library and SDK tools together.
+
+- Windows ARM64 supports native executables and COFF application objects. Windows socket readiness rejects non-socket handles, and environment lookups handle mixed-case names.
+- The Windows installer and updater declare current-user execution for per-user installation and reinstall. Packaging failures include the compiler's output and exit status.
+- Project builds resolve local package requirements. Builds optimize by default. Use `--no-opt` to disable optimization. Numeric `-O` flags have been removed.
+- `xu get` and `xu install` restore pinned package installation with lockfiles and checksum verification. `--offline` and `--frozen` use local dependency data.
+- Linux x64 and ARM64 support application objects and native desktop packaging.
+- `xu build` and `xu run` support opt-in XACP startup, discovery and loopback TCP. XACP-enabled programs on Linux and macOS support process output capture.
+- The SDK targets macOS, Linux and Windows on ARM64 and x64. Linux LoongArch64 and RISC-V SDKs are cross-built.
+
+## Xu 0.12.2-seed.1 (bootstrap seed prerelease)
+
+Dedicated seed release of the restored self-hosting compiler, frozen before integrating PR #197. Use this explicitly pinned version to build the next compiler generation. It retains the old product compiler and matching standard library and tools; it does not include the new compiler implementation from PR #197. This is a bootstrap prerelease, not a stable product release. Platform acceptance and artifact hashes are recorded with the GitHub Release.
 
 ## Xu 0.12.2-dev.1 (development)
 

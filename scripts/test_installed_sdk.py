@@ -214,8 +214,8 @@ fn main() int { << run() or(err){ eprintln(err.msg())
         path.write_bytes(data)
         paths.append(path)
     program=project / ("deflate.exe" if os.name=="nt" else "deflate")
-    for level in ("-O0","-O2","-O3"):
-        run([xu,"build","main.xu",level,"-o",str(program)],cwd=project,env=env)
+    for flags in ((), ("--no-opt",)):
+        run([xu,"build","main.xu",*flags,"-o",str(program)],cwd=project,env=env)
         command=[str(program),*[str(path) for path in paths]]
         if sys.platform.startswith("linux"):
             # Bound address space for the consumer only, not the compiler.
@@ -234,7 +234,7 @@ fn main() int { << run() or(err){ eprintln(err.msg())
             assert len(encoded)<=len(plain)+((len(plain)+65534)//65535)*5+5,(level,path,len(encoded))
         assert Path(str(paths[0])+".deflate").read_bytes()==bytes([1,0,0,255,255])
         assert len(Path(str(paths[4])+".deflate").read_bytes())<5000
-    print("installed-sdk: deflate-output PASS (-O0/-O2/-O3; literal-heavy, stored fallback, ring history, Python zlib oracle)")
+    print("installed-sdk: deflate-output PASS (default and --no-opt; literal-heavy, stored fallback, ring history, Python zlib oracle)")
 
 
 def gpu_layout(xu: str, project: Path, env):
@@ -281,10 +281,10 @@ fn main() int {
 ''')
     isolated = env | {"SDL_VIDEODRIVER": "nonexistent", "XU_GAME_SDL_LIBRARY": "nonexistent"}
     program = project / ("gpu layout.exe" if os.name == "nt" else "gpu layout")
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "gpu_layout.xu", level, "-o", str(program)], cwd=project, env=isolated)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "gpu_layout.xu", *flags, "-o", str(program)], cwd=project, env=isolated)
         assert run([str(program)], cwd=project, env=isolated).strip() == "GPU layout: 72/2304/32 bytes; checked int64; no device"
-    print("installed-sdk: gpu-layout PASS (-O0/-O2/-O3; no device)")
+    print("installed-sdk: gpu-layout PASS (default and --no-opt; no device)")
 
 
 def gpu_device_import(xu: str, project: Path, env):
@@ -369,10 +369,10 @@ def window_event_data(xu: str, project: Path, env):
     isolated = env | {"XU_NATIVE_CC": str(project / "missing compiler"),
                       "XU_SDL_LIBRARY": str(project / "missing SDL runtime")}
     program = project / ("Window events.exe" if os.name == "nt" else "Window events")
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "main.xu", level, "-o", str(program)], cwd=project, env=isolated)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "main.xu", *flags, "-o", str(program)], cwd=project, env=isolated)
         assert run([str(program)], cwd=project, env=isolated).strip() == "Window events: pure owned portable data"
-    print("installed-sdk: window-event-data PASS (O0/O2/O3; no native compiler or SDL)")
+    print("installed-sdk: window-event-data PASS (default and --no-opt; no native compiler or SDL)")
 
 
 def window_surface_import(xu: str, project: Path, env):
@@ -585,10 +585,10 @@ fn main() int { << check() or(err) { eprintln(err.msg())
     program = project / ('binary floats.exe' if os.name == 'nt' else 'binary floats')
     isolated = env | {'XU_NATIVE_CC': str(project / 'missing C compiler'),
                       'XU_SDL_LIBRARY': str(project / 'missing SDL runtime')}
-    for level in ('-O0', '-O2', '-O3'):
-        run([xu, 'build', 'main.xu', 'runtime_probe.xu', level, '-o', str(program)], cwd=project, env=isolated)
+    for flags in ((), ('--no-opt',)):
+        run([xu, 'build', 'main.xu', 'runtime_probe.xu', *flags, '-o', str(program)], cwd=project, env=isolated)
         assert run([str(program)], cwd=project, env=isolated).strip() == 'Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity'
-    print(f'installed-sdk: binary-floats PASS ({len(patterns)} references; O0/O2/O3; no native tools)')
+    print(f'installed-sdk: binary-floats PASS ({len(patterns)} references; default and --no-opt; no native tools)')
 
 
 def native_byte_spans(xu: str, target: str, project: Path, env):
@@ -644,10 +644,10 @@ fn main() int {
 }
 ''')
     program = project / ("native bytes.exe" if os.name == "nt" else "native bytes")
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "main.xu", level, "-o", str(program)], cwd=project, env=env)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "main.xu", *flags, "-o", str(program)], cwd=project, env=env)
         assert run([str(program)], cwd=project, env=env).strip() == "Native byte spans: packed bytes, borrowed fields, COW and empty views; mixed scalar ABI"
-    print("installed-sdk: native-byte-spans PASS (-O0/-O2/-O3)")
+    print("installed-sdk: native-byte-spans PASS (default and --no-opt)")
 
 
 def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
@@ -781,16 +781,23 @@ fn main() int {
     for arguments in (["argument with spaces", 'quote"value\\'], ["", ""], ['space and \\', 'two\\\\"quotes']):
         actual = run([xu, "run", "args.xu", "--", *arguments], cwd=project, env=active).splitlines()
         assert actual == arguments, (arguments, actual)
-    arguments = ["-O0", "-O2"]
-    actual = run([xu, "run", "args.xu", "-O3", "--", *arguments], cwd=project, env=active).splitlines()
+    arguments = ["--no-opt", "--release"]
+    actual = run([xu, "run", "args.xu", "--no-opt", "--", *arguments], cwd=project, env=active).splitlines()
     assert actual == arguments, (arguments, actual)
+    for command in ("build", "run", "test"):
+        for level in range(4):
+            obsolete = subprocess.run([xu, command, "args.xu", f"-O{level}"], cwd=project,
+                                      env=active, capture_output=True, text=True, timeout=15)
+            assert obsolete.returncode == 1 and "unsupported" in obsolete.stderr, obsolete
     # Exercise optimized compilation and child execution in the installed CLI.
     # All input is created in the user's temporary project, independent of tests/.
     (project / "loop.xu").write_text('@main\nfn main() int {\n    $total := 0\n    $i := 0\n    while i < 32768 {\n        total = total + i\n        i = i + 1\n    }\n    println(total)\n    << 0\n}\n')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "loop.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "loop.xu", *flags, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "536854528"
-        assert run([xu, "run", "loop.xu", level], cwd=project, env=active).strip() == "536854528"
+        assert run([xu, "run", "loop.xu", *flags], cwd=project, env=active).strip() == "536854528"
+        tested = run([xu, "test", "loop.xu", *flags], cwd=project, env=active)
+        assert "536854528" in tested and "ok (all tests passed)" in tested, tested
     # Native map adapters must preserve the coroutine context when calling
     # ordinary Xu hashing and growth policy functions with entry stack guards.
     (project / "map_worker.xu").write_text('''@main
@@ -814,8 +821,8 @@ fn main() {
     println(<-done)
 }
 ''')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "map_worker.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "map_worker.xu", *flags, "-o", str(program)], cwd=project, env=active)
         assert run([str(program)], cwd=project, env=active).strip() == "65024"
     # Verify shared calls, mutable methods, function values and mutation on
     # error paths without corrupting adjacent packed records.
@@ -894,8 +901,8 @@ fn main() int {
  << 0
 }
 ''')
-    for level in ("-O0", "-O2", "-O3"):
-        run([xu, "build", "borrow_record.xu", level, "-o", str(program)], cwd=project, env=active)
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "borrow_record.xu", *flags, "-o", str(program)], cwd=project, env=active)
         actual = run([str(program)], cwd=project, env=active).splitlines()
         assert actual == ["205", "9", "expected", "232", "1", "100", "old", "63", "1", "3", "12", "31", "11", "64", "0", "81", "40", "3", "183", "71", "40", "8", "1", "2", "5", "6"], actual
     # Returned element borrows alias their original storage while the owner
@@ -916,7 +923,7 @@ fn main() {
     println(records[0].value)
 }
 ''')
-    actual = run([xu, "run", "borrow_element.xu", "-O2"], cwd=borrow_project, env=active).splitlines()
+    actual = run([xu, "run", "borrow_element.xu"], cwd=borrow_project, env=active).splitlines()
     assert actual == ["202", "3", "1"], actual
     (borrow_project / "borrow_escape.xu").write_text('''@main
 fn identity(s &string) &string { << s }
@@ -1018,7 +1025,7 @@ fn verify() int {
 fn main() int { << verify() or (err) { eprintln(err.msg())
     << 1 } }
 ''')
-    run([xu, "build", "tooltip_state.xu", "-O2", "-o", str(program)], cwd=tooltip_project, env=active)
+    run([xu, "build", "tooltip_state.xu", "-o", str(program)], cwd=tooltip_project, env=active)
     tooltip_output = run([str(program)], cwd=project, env=active).strip()
     assert tooltip_output == "tooltip state and placement PASS", tooltip_output
     # Canonical bundled modules resolve from their installed manifest root.

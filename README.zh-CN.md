@@ -17,13 +17,13 @@
   <a href="https://github.com/xulang-org/xu/releases"><img src="https://img.shields.io/github/v/release/xulang-org/xu?label=Release&color=0284c7" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald.svg" alt="License"></a>
   <a href="https://xulang.org"><img src="https://img.shields.io/badge/Docs-xulang.org-rose" alt="Docs"></a>
-  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-47%20Tasks-amber" alt="Benchmarks"></a>
+  <a href="https://xulang.org/benchmarks"><img src="https://img.shields.io/badge/Benchmarks-72%20Workloads-amber" alt="Benchmarks"></a>
   <a href="https://github.com/xulang-org/xu/actions/workflows/sdk.yml"><img src="https://github.com/xulang-org/xu/actions/workflows/sdk.yml/badge.svg" alt="SDK CI"></a>
 </p>
 
 <p align="center">
   <a href="https://xulang.org">🌐 <b>在线 Playground（免安装试玩）</b></a> &nbsp;•&nbsp;
-  <a href="https://xulang.org/benchmarks">⚡ <b>47 项跨语言横测看板</b></a> &nbsp;•&nbsp;
+  <a href="https://xulang.org/benchmarks">⚡ <b>72 项跨语言横测看板</b></a> &nbsp;•&nbsp;
   <a href="#-零阻力快速上手-quick-start">🚀 <b>30 秒上手</b></a> &nbsp;•&nbsp;
   <a href="RELEASES.zh-CN.md">📋 <b>版本说明</b></a> &nbsp;•&nbsp;
   <a href="https://github.com/xulang-org/xu/releases">📦 <b>下载安装包</b></a>
@@ -74,7 +74,7 @@ fn main() int {
 普通值的共享借用写 `&x`，可写借用写 `$&x`，对应引用类型为 `$&T`。
 复用引用直接写 `r`，显式再借用写 `&*r`；普通值自动借用尚未实现。
 
-当前借用与可变绑定规则见[借用指南](docs/language/borrowing.md)。
+当前借用与可变绑定规则见[借用指南](https://xulang.org/zh/docs/lang/memory/)。
 
 ---
 
@@ -163,98 +163,14 @@ xu build main.xu -o myapp
 ./myapp
 ```
 
-### 常用开发命令速查
+### 官方文档
 
-#### 项目与依赖
+- [快速上手](https://xulang.org/zh/docs/start/)
+- [CLI 参考](https://xulang.org/zh/docs/cli/)，包括优化、测试和 XACP
+- [标准库与扩展包 API](https://xulang.org/zh/api/)
+- [原生模块和借用 span](https://xulang.org/zh/docs/native/)
 
-| 命令 | 说明 |
-| :--- | :--- |
-| `xu init [module]` | 在当前目录创建 `xu.xun`，缺少 `main.xu` 时同时生成入口示例 |
-| `xu get <module>@<version>` | 添加或升级精确版本依赖，安装到 `vendor/` 并更新 `xu.lock` |
-| `xu install [dir]` | 安装指定项目 `xu.xun` 中已有的依赖 |
-| `xu build . --frozen -o myapp` | 使用现有锁文件和本地依赖执行冻结、离线构建 |
-| `xu env [var...]` | 查看工具链、标准库、依赖缓存与目标平台的有效配置 |
-
-在含有 `xu.xun` 的项目中，执行 `xu get github.com/xulang-org/packages@v0.1.1`
-即可添加官方扩展模块。依赖需要显式版本；`--offline` 使用本地缓存或 vendor，
-`--frozen` 拒绝依赖变化。
-
-#### 构建、运行与验证
-
-| 命令 | 说明 |
-| :--- | :--- |
-| `xu run <file.xu> -- <args...>` | 编译并启动本机程序，`--` 后的参数传给程序 |
-| `xu build <file.xu> -o <bin>` | AOT 编译为原生可执行文件；项目目录也可作为输入 |
-| `xu debug <file.xu> -b file.xu:行号 --run` | 带 DWARF 构建并进入 LLDB/GDB 交互会话；可用 `-e` 预置调试器命令 |
-| `xu check <file.xu>` | 仅执行解析、类型与所有权/借用检查，不生成机器码 |
-| `xu parse <file.xu>` | 解析源码，输出文件、函数与声明统计 |
-| `xu test test.example.xu -v` | 构建 `fn test_*` 测试程序并启用详细结果；可用 `-run <REGEXP>` 过滤 |
-| `xu test test.example.xu -bench <REGEXP>` | 构建匹配 `fn bench_*` 基准函数的测试程序 |
-| `xu build <file.xu> --target linux-x64 -o app` | 指定目标平台交叉编译，例如 Linux x64 |
-| `xu build <file.xu> --target wasm32 -o app.wasm` | 生成 WebAssembly 模块 |
-| `xu build <file.xu> --xacp --xacp-port 4321 -o app` | 嵌入 XACP 启动发现元数据 |
-| `./app --xacp-help` | 输出生成程序的机器可读 XACP 摘要 |
-| `xu xacp inspect ./app` | 检查启用 XACP 程序的发现信息与安全摘要 |
-| `xu xacp run ./app -- args...` | 使用明确的 AI/用户参数边界运行程序 |
-| `xu xacp record ./app -- > output.log` | 将有界 stdout 流式输出，由用户自行保存 |
-| `xu build <AppDir> --desktop` | 打包桌面应用；需要对应宿主 UI SDK 与工具链 |
-| `xu build <file.xu> --debug -o app` | 生成 DWARF 行号信息；`--debug-build` 同时关闭优化 |
-| `xu build <file.xu> --timings -o app` | 查看编译阶段耗时、优化统计、后端模式命中及寄存器分配模式 |
-
-测试与基准函数必须位于 `@main` 的 `test.<name>.xu` 文件中，不得带参数、类型参数或声明返回类型。例如将以下内容保存为 `test.example.xu`：
-
-```xu
-@main
-
-fn test_addition() {
-    assert(1 + 1 == 2)
-}
-```
-
-`xu test` 当前生成测试可执行文件，需另行启动才能执行测试。在 macOS/Linux 上：
-
-```sh
-xu test test.example.xu -v -o test-example
-./test-example
-```
-
-Windows 输出带 `.exe` 后缀，运行 `./test-example.exe`。构建时使用 `-count N` 可重复执行测试套件；当前解析器接受 1–1000，CLI 帮助仍显示 1–100。
-
-Windows socket 就绪与并发 HTTP 回归可从仓库根运行 `python scripts/test_windows_socket_poll.py --compiler bin/xu.exe --target windows-arm64`（或 `windows-x64`）。它检查空闲监听器与无效 socket，再在 O0–O3 各运行三次并发回环请求；构建和执行均有超时限制。
-
-使用 `make xu-xacp` 构建工具，参见[可运行的 XACP 样例](https://github.com/xulang-org/examples/tree/main/examples/xacp)。使用 `xu xacp control <program>` 收发 stdin/stdout 帧；合法 hello 后开启 development 权限。控制模式独占 stdio、不运行业务 main，TCP 使用编译时 `--xacp-port PORT`，以 `<program> --xacp-tcp` 监听本机，再通过 `xu xacp connect PORT` 收发帧。端口 0 禁用 TCP；两个控制模式均不运行业务 main，`--` 前首个控制标志优先。`debug` 先发现再运行；`record` 在 Unix 上录制最多 1 MiB stdout。
-
-`#xacp` 是传输无关的标准库层，用于宿主注册一个真实的
-`ui/widgets.Screen`。adapter 提供有界的 `ui.tree`、由原生资源承载的
-`ui.screenshot`、经过校验的 `ui.input`/`ui.act`，以及流式录制。调用这些
-API 时必须携带拥有对应权限位的 session；`start_recorder` 会保持请求直到
-`finish_recorder` 或 `abort_recorder`。屏幕句柄、canvas generation、节点数、
-帧字节数、文本长度和录制预算都会在进入 widget 前检查。源码开发宿主可以
-在 hello 握手前调用 `enable_development` 获得 `PERM_ALL`，但这不会关闭
-schema、生命周期、原生资源释放或内存上限。截图返回拥有所有权的
-`draw.Surface`，宿主交给自己的资源层后必须显式 dispose。
-
-0.9.4 还提供 `XU_VERIFY=1` 逐 pass MIR 验证、`XU_DUMP_MIR=<函数名>`
-与 `XU_PATTERNS_OFF=all` 模式对拍诊断。完整选项见[命令行参考](https://xulang.org/zh/docs/cli/)。
-
-#### 开发工具与工具链管理
-
-| 命令 | 说明 |
-| :--- | :--- |
-| `xu fmt <file.xu> -w` | 原地格式化源码；省略 `-w` 时输出到终端 |
-| `xu doc <dir> --public` | 提取公开声明，生成 Markdown API 文档；`--serve` 启动本地文档服务 |
-| `xu map <dir> -o flow.md` | 生成 Mermaid 源码流程图；`--graph` 输出结构化图数据 |
-| `xu doctor` | 检查宿主工具链；`--desktop --webview` 检查桌面与 WebView 依赖 |
-| `xu native <command> [options]` | 编译、归档 C 模块，打包、检视或提取 `.xulib` 平台切片 |
-| `xu lsp` | 启动标准输入/输出上的 LSP 服务，供 VS Code、Cursor、Neovim 等编辑器调用 |
-| `xu setup -y` | 静默安装并配置工具链环境 |
-| `xu up --check` | 仅检查官方发布版本；`xu up` 与 `xu update` 为同义命令 |
-| `xu update --version 0.9.4` | 安装指定版本的官方工具链 |
-| `xu update --version 0.9.4 --archive release.tar.gz --prefix DIR` | 从本地 SDK 归档安装，无需联网 |
-| `xu --version` | 显示实际编译器版本及宿主目标 |
-| `xu help <command>` | 查看子命令帮助，也可使用 `<command> --help` |
-
-自更新由独立工具 `xu-update`（`src/cmd/update`）执行，HTTPS、gzip、tar、ZIP 和文件操作使用 Xu 标准库。可通过 `make xu-update` 构建，发布 SDK 默认包含此工具。`xu-setup` 共用 `internal/sdk` 下载与解包代码。下载时实时显示已下载量；服务器提供总大小时同时显示百分比，安装向导也会更新进度条。 安装向导使用 `ui/layout` 与 `ui/widgets` 的标准组件，自动识别安装位置，支持键盘操作和失败重试。默认沿用 PATH 中现有 SDK，首次安装使用 `~/.xu`。Windows 可选择当前用户或所有用户，系统安装会请求管理员授权；命令行仍支持 `--prefix DIR`。
+文档和 API 源码统一维护在 [xulang-org/xulang-org](https://github.com/xulang-org/xulang-org)。
 
 ---
 
@@ -267,14 +183,14 @@ schema、生命周期、原生资源释放或内存上限。截图返回拥有�
 - [x] **原生协程与管道并发**：`xu` 关键字轻量调度 + 强类型 `chan` 信道机制；100/100 轮多任务并发 select 门禁收口
 - [x] **国密算法完整性与工程收口**：SM2/SM3/SM4/SM9 算法全量通过；SM9 双线性对栈帧压降 71.5% 且零编译告警
 - [x] **极简符号流控制**：`<<` 返回、`>>` 抛错与 `or (err) { ... }` 强制就地处理
-- [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V / ARM32、WASM 及裸机目标
+- [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V、WASM 及裸机目标
 - [x] **SDK 安装与自更新**：Windows 安装向导、macOS PKG、跨平台单文件 Setup 与 `xu up/update`
 - [x] **可复现模块依赖**：`init/get/install`、MVS、锁文件/vendor、代理、离线/冻结构建与固定公钥校验客户端
 - [x] **LSP 与编辑器集成**：`xu-lsp`、VS Code/Cursor 扩展；诊断、补全、定义、悬停、大纲、引用、重命名与格式化
 - [x] **泛型与 SSA 优化基础**：泛型单态化、移除 4 类型参数限制、标量 SSA 提升、ARM64 SSA 循环内核与循环旋转
 - [x] **编译器诊断与验证**：逐 pass MIR 验证、MIR 导出、模式命中统计与具名模式开关
 - [x] **主流基础设施生态包**：独立 packages 模块提供 MySQL、Postgres、Redis、ClickHouse、Kafka、SQLite 等 29 个扩展包
-- [x] **可追溯的跨语言横测**：47 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
+- [x] **可追溯的跨语言横测**：72 项负载、六个 ARM64/x86-64 平台，保留实际编译器版本、来源与输出校验
 - [x] **集成交互式源代码调试器**：`xu debug` 支持 DWARF 源码断点、调用栈与 LLDB/GDB 强类型局部变量检视及自动化批处理模式
 - [x] **优化器进一步扩展**：结构体 Record SSA 标量提升准入证明闭环、TVM 风格 Tile 切块规划、低比特 LUT-GEMM 与算子流水线融合
 - [ ] **完整目标机运行验收**：原生 SDK 安装门禁覆盖 macOS ARM64/x64、Linux ARM64/x64 与 Windows x64/ARM64；继续补齐各目标的库、网络、并发和桌面运行检查。LoongArch64 与 RISC-V SDK 通过交叉编译交付。
@@ -292,64 +208,6 @@ Xu 是一门开放透明、面向未来的现代系统编程语言。如果你�
 - 📚 **完整文档**：查阅详尽的语法手册与进阶示例，请访问 [xulang.org 官方网站](https://xulang.org)。
 
 ---
-
-## 二进制浮点存储（开发版）
-
-`0.12.3-dev.5` 增加 [`#math` IEEE 位转换](src/math/README.md) 和
-[`#encoding/binary` 紧密字节整数/浮点存储](src/encoding/binary/README.md)。
-GPU 动态顶点/uniform、文件与网络格式可直接用 `[]u8` 按显式大小端编码 binary32/64，
-无需 C 工具。接口说明负零、NaN 载荷策略、舍入到最近偶数和失败不部分写入的合同。
-UI 浮点传输共用 binary64 转换；`abs/copysign/signbit` 正确处理负零与 NaN 符号位。
-
-## 标准 GPU 资源（开发版）
-
-`0.12.3-dev.8` 在标准库 [`#gpu`](src/gpu/README.md) 中提供设备、缓冲区、
-纹理/mip、采样器、Shader、图形/缓冲区计算管线、命令编码器、渲染/计算 Pass、窗口 Surface/Frame 和异步传输/读回。
-导入时使用同一 SDK 的 `xu-native` 编译私有后端，应用无需 SDL 头文件或原生绑定；
-创建设备或窗口时才加载 SDL 运行库。场景、材质和 PBR 策略属于引擎层。
-独立窗口及有界键鼠/文本队列由 [`#window`](src/window/README.md) 提供；[`#window/events`](src/window/events/README.md) 是无 C/SDL 依赖的纯事件数据。真实 GPU 验收目前覆盖 macOS arm64 Metal；HDR 呈现、storage 纹理和高级渲染能力
-仍待实现，Vulkan/D3D12 仍需目标平台执行验证。具体边界见上述 GPU 说明。
-
-## GPU 纹理布局（开发版）
-
-`0.12.3-dev.2` 标准库新增 [`#gpu/layout`](src/gpu/layout/README.md)，
-受检计算 2D mip 链与传输缓冲布局，描述 20 种非压缩或块压缩格式，
-显式指定行与 mip 起始偏移的对齐。非法输入及有符号 64 位字节数溢出
-返回错误；无需 GPU、窗口、SDL 或像素分配。UI 图片上传共用这套计算。
-格式元数据不代表设备支持或物理分配大小。设备能力、分配、命令与同步
-仍由独立服务负责；场景、材质与应用预算由消费者决定。
-
-## 原生可执行程序构建（开发版）
-
-`0.12.3-dev.1` 开发版从模块清单解析 `native:` 文件依赖，校验模块身份、
-目标切片与完整性，并生成 C ABI 适配代码和链接可执行程序。子命令优先使用
-所选编译器同目录的配套工具，再按需查找 `PATH`。
-原生构建要求 C 编译器，默认 `clang`，可通过 `XU_NATIVE_CC` 选择。
-含原生导入时直接构建可执行程序；`--emit-obj` 会明确拒绝，独立应用对象
-尚不能携带 C 调用适配代码。macOS 优先使用 `SDKROOT`，否则查询 `xcrun`；
-调试构建在 dSYM 中同时保留 Xu 源码位置和 C 桥接信息。
-
-资源所有者先执行 `drop` 钩子，再释放拥有的字段；含资源的动态数组逐个
-析构元素后释放存储。移动转移析构责任，普通借用表达式不释放原所有者。
-这些编译器语义同时用于原生句柄和标准库资源，与游戏引擎解耦。
-本次宿主验收为 macOS arm64；外国目标适配器或归档切片不代表目标机执行通过。
-
-## 原生借用 span（开发版）
-
-`0.12.3-dev.1` 开发 SDK 支持显式选择的 `"abi": "xu-c-2"` 原生清单。
-参数 `i64_span`、`i64_span_mut` 对应 Xu `&[]int`、`$&[]int`，C 入口分别接收
-`include/xu_native.h` 定义的 `const xu_i64_span *`、`const xu_i64_span_mut *`。
-临时描述符的长度位于字节 0，数据指针位于字节 8，仅在调用期间有效。
-原生代码必须在返回前完成访问，不能保留指针、改变数组大小或改写描述符；
-可写视图只允许修改已有元素。`0.12.3-dev.3` 新增 `u8_span` / `u8_span_mut`，
-对应 `&[]u8` / `$&[]u8` 和 C `xu_u8_span` / `xu_u8_span_mut`；
-描述符布局相同，元素宽度为一字节，沿用相同的生命周期与所有权规则。
-
-`0.12.3-dev.4` 在 C2 中支持既有 C1 标量 `int`、`bool`、`f64`、`i32`、`u32`、`u8`，
-返回值另允许 `void`；标量/span 混合调用及浮点返回值通过有类型的 C 封送层适配。
-本协议不包含返回 span、回调及异步保留；需要函数值时使用普通 Xu 包装函数。
-独立的 XUOBJ/XULIB 第 2 版格式使旧产品明确拒绝新库；新 SDK 继续兼容 `xu-c-1`
-标量库。原生链接维持已有平台范围，外国目标对象发射不代表目标真机执行或 GPU 可用。
 
 ## 开源协议
 

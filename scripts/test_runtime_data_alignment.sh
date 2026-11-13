@@ -107,7 +107,7 @@ PY
 
 if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
     BIN="$TMP/channel.xin"
-    "$PRODUCT_COMPILER_RUNNER" "$XU" build "$FIXTURE" --target macos-arm64 -O1 -o "$BIN"
+    "$PRODUCT_COMPILER_RUNNER" "$XU" build "$FIXTURE" --target macos-arm64 -o "$BIN"
     chmod +x "$BIN"
     python3 - "$BIN" <<'PY'
 import subprocess

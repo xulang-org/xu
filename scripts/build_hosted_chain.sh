@@ -113,7 +113,7 @@ case "$HOSTED_PROFILE" in
         HOSTED_ARGS=()
         ;;
     acceptance)
-        HOSTED_ARGS=(-O1 --ra=1)
+        HOSTED_ARGS=(--ra=1)
         ;;
     *)
         echo "build_hosted_chain: unknown HOSTED_PROFILE=$HOSTED_PROFILE (want product or acceptance)" >&2
