@@ -156,19 +156,19 @@ def main() -> int:
         directory = Path(temporary)
         source = directory / "main.xu"
         source.write_text(SOURCE, encoding="utf-8", newline="\n")
-        for opt in ("-O0", "-O1", "-O2", "-O3"):
-            binary = directory / (opt[1:] + ".exe")
+        for mode, flags in (("default", ()), ("no-opt", ("--no-opt",))):
+            binary = directory / (mode + ".exe")
             subprocess.run([str(args.compiler.resolve()), "build", str(source), "--target", args.target,
-                            opt, "-o", str(binary)], cwd=root, env=env, check=True, timeout=120)
+                            *flags, "-o", str(binary)], cwd=root, env=env, check=True, timeout=120)
             for repeat in range(3):
                 with socket.socket() as reservation:
                     reservation.bind(("127.0.0.1", 0))
                     address = "127.0.0.1:" + str(reservation.getsockname()[1])
                 result = subprocess.run([str(binary), address], env=env, capture_output=True, timeout=15)
                 if result.returncode != 0 or result.stdout != expected or result.stderr:
-                    raise RuntimeError(f"{args.target} {opt} run {repeat}: exit {result.returncode}; "
+                    raise RuntimeError(f"{args.target} {mode} run {repeat}: exit {result.returncode}; "
                                        f"stdout={result.stdout!r}; stderr={result.stderr!r}")
-            print(f"{args.target} {opt}: 3/3 passed", flush=True)
+            print(f"{args.target} {mode}: 3/3 passed", flush=True)
     return 0
 
 

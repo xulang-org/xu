@@ -22,7 +22,7 @@
 #   scripts/run_fixtures.sh --only='^(parse_int|starts_with)'  # name regex
 #
 # XU_FIXTURE_EXTRA_ARGS (space-separated) is prepended to every compile
-# invocation. run_fixture_matrix.sh sets it per mode (-O0/-O1/.../--no-regcache)
+# invocation. run_fixture_matrix.sh sets it per mode (default or --no-opt)
 # so the optimization profile actually reaches the compiler.
 #
 # The same corpus must eventually pass on both ends. Until Gen1 catches up,

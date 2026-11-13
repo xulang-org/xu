@@ -2,7 +2,7 @@
 # Differential test for backend loop patterns (src/cmd/compile/emit_pattern.xu).
 #
 # Usage:
-#   scripts/pattern_diff.sh <xu> <dir-or-file>... [-- -O1 -O2 ...]
+#   scripts/pattern_diff.sh <xu> <dir-or-file>... [-- default --no-opt]
 #
 # Every program is built with all patterns on and with XU_PATTERNS_OFF=all
 # (the generic per-instruction emitter), run, and must produce identical
@@ -12,7 +12,7 @@
 set -u
 cd "$(dirname "$0")/.."
 if [ "$#" -lt 2 ]; then
-    echo "usage: scripts/pattern_diff.sh <xu> <dir-or-file>... [-- -O1 -O2]" >&2
+    echo "usage: scripts/pattern_diff.sh <xu> <dir-or-file>... [-- default --no-opt]" >&2
     exit 2
 fi
 xu=$1
@@ -22,9 +22,10 @@ inputs=()
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do inputs+=("$1"); shift; done
 [ "$#" -gt 0 ] && shift
 opts=("$@")
-[ "${#opts[@]}" -eq 0 ] && opts=(-O1 -O2 -O3)
+[ "${#opts[@]}" -eq 0 ] && opts=(default --no-opt)
 
 export XU_STDLIB_ROOT="$PWD/src" XUPATH=""
+build_help=$("$xu" build --help)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 timeout_run() { perl -e 'alarm shift; exec @ARGV' "$@"; }
@@ -51,16 +52,21 @@ for f in "${files[@]}"; do
     dir=$(cd "$(dirname "$f")" && pwd)
     src="$dir/$(basename "$f")"
     for o in "${opts[@]}"; do
+        set --
+        if [ "$o" != default ]; then set -- "$o"; fi
         total=$((total + 1))
         on="$work/on.bin"
         off="$work/off.bin"
         rm -f "$on" "$off"
-        if ! (cd "$dir" && XU_PATTERNS_OFF= "$xu" build "$o" --timings "$src" -o "$on") >"$work/on.log" 2>&1; then
+        if ! (cd "$dir"
+            if [[ "$build_help" == *--timings* ]]; then set -- "$@" --timings; fi
+            XU_PATTERNS_OFF= "$xu" build "$@" "$src" -o "$on"
+        ) >"$work/on.log" 2>&1; then
             skipped=$((skipped + 1))
             continue
         fi
         grep '^pattern-hits:' "$work/on.log" | tr ' ' '\n' | grep '=' >> "$work/hits"
-        if ! (cd "$dir" && XU_PATTERNS_OFF=all "$xu" build "$o" "$src" -o "$off") >"$work/off.log" 2>&1; then
+        if ! (cd "$dir" && XU_PATTERNS_OFF=all "$xu" build "$@" "$src" -o "$off") >"$work/off.log" 2>&1; then
             echo "FAIL build (patterns off): $f $o"
             fails=$((fails + 1))
             continue

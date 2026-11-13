@@ -24,8 +24,7 @@ COMPILER_INPUT=${XU_COMPILER:-${XU_SEED:-${XU:-}}}
 TARGET=${XU_SERVER_TARGET:-}
 HEALTH_URL=${XU_SERVER_HEALTH_URL:-$HEALTH_URL_DEFAULT}
 HEALTH_TIMEOUT=${XU_SERVER_HEALTH_TIMEOUT:-5}
-OPT_LEVEL=${XU_SERVER_OPT_LEVEL:-}
-NO_REGCACHE=${XU_SERVER_NO_REGCACHE:-0}
+NO_OPT=${XU_SERVER_NO_OPT:-0}
 
 usage() {
     cat <<'EOF'
@@ -46,8 +45,8 @@ Options:
   --compiler PATH         Hosted Xu compiler (or set XU_COMPILER/XU_SEED/XU)
   --lane product   Select compiler lane (default product)
   --target TARGET         Build target (default host for build-local, linux-x64 for build-linux)
-  --opt O0|O1|O2|O3      Select optimization level (default compiler setting)
-  --no-regcache          Disable register caching (diagnostic/safe-codegen mode)
+
+  --no-opt          Disable Xu optimization
   --timeout SECONDS       Health request timeout (default 5)
   -h, --help              Show this help
 
@@ -139,11 +138,8 @@ compile_target() {
     echo "  compiler: $compiler"
     echo "  target: $target"
     echo "  output: $output"
-    if [ -n "$OPT_LEVEL" ]; then
-        build_opts+=("-$OPT_LEVEL")
-    fi
-    if [ "$NO_REGCACHE" = 1 ]; then
-        build_opts+=("--no-regcache")
+    if [ "$NO_OPT" = 1 ]; then
+        build_opts+=("--no-opt")
     fi
     if [ "${#build_opts[@]}" -gt 0 ]; then
         run_compiler "$compiler" build "$SOURCE" --target "$target" "${build_opts[@]}" -o "$output"
@@ -313,11 +309,8 @@ parse_options() {
             --target)
                 [ "$#" -ge 2 ] || die "--target needs a value"
                 TARGET=$2; shift 2 ;;
-            --opt)
-                [ "$#" -ge 2 ] || die "--opt needs O0, O1, O2, or O3"
-                OPT_LEVEL=$2; shift 2 ;;
-            --no-regcache)
-                NO_REGCACHE=1; shift ;;
+            --no-opt)
+                NO_OPT=1; shift ;;
             --timeout)
                 [ "$#" -ge 2 ] || die "--timeout needs seconds"
                 HEALTH_TIMEOUT=$2; shift 2 ;;
@@ -348,13 +341,9 @@ main() {
         product) ;;
         *) die "lane must be product (got $LANE)" ;;
     esac
-    case "$OPT_LEVEL" in
-        ""|O0|O1|O2|O3) ;;
-        *) die "--opt must be O0, O1, O2, or O3" ;;
-    esac
-    case "$NO_REGCACHE" in
+    case "$NO_OPT" in
         0|1) ;;
-        *) die "XU_SERVER_NO_REGCACHE must be 0 or 1" ;;
+        *) die "XU_SERVER_NO_OPT must be 0 or 1" ;;
     esac
 
     # Source/output options are repository-relative by convention. Resolve
