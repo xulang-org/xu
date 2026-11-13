@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build a disposable compiler before importing the source-backed math runtime.
+"""Build a disposable compiler before importing source-backed runtime primitives.
 
 An older published seed may preflight ordinary imports with a frontend that
-cannot check runtime/core primitives. Its SHA-bound SDK math sources are enough
-to compile the current compiler once. The caller must then restart Gen1 against
-the complete, unchanged current stdlib and require the normal fixed point. This
-transition artifact is never installed or counted as a product generation.
+cannot check runtime/core primitives. Use its SHA-bound SDK sources for math
+and the string storage helper to compile the current compiler once. The caller
+must then restart Gen1 against the complete, unchanged current stdlib and require
+the normal fixed point. This transition artifact is never installed or counted
+as a product generation.
 """
 import argparse
 import hashlib
@@ -15,6 +16,9 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+
+
+RUNTIME_IMPORT = re.compile(r'^\s*(?:\w+\s+)?#runtime/core\b', re.MULTILINE)
 
 
 def source_digest(source: Path) -> str:
@@ -48,15 +52,23 @@ def prepare(seed: Path, source: Path, destination: Path) -> dict:
     if not (old_math / 'mod.xu').is_file():
         raise ValueError('Published SDK is missing its math source')
     for path in old_math.rglob('*.xu'):
-        if re.search(r'^\s*(?:\w+\s+)?#runtime/core\b', path.read_text(), re.MULTILINE):
+        if RUNTIME_IMPORT.search(path.read_text()):
             raise ValueError('Published math already imports runtime/core; refusing unrelated recovery')
     shutil.copytree(source / 'src', destination / 'src')
     shutil.copy2(source / 'VERSION', destination / 'VERSION')
     shutil.rmtree(destination / 'src/math')
     shutil.copytree(old_math, destination / 'src/math')
-    return {'transition': 'math_runtime_v1', 'published_version': version,
-            'published_seed_sha256': digest, 'math_source_sha256': source_digest(old_math),
-            'transition_source_sha256': source_digest(destination / 'src')}
+    record = {'transition': 'math_runtime_v1', 'published_version': version,
+              'published_seed_sha256': digest, 'math_source_sha256': source_digest(old_math)}
+    storage = destination / 'src/strings/storage.xu'
+    if storage.is_file() and RUNTIME_IMPORT.search(storage.read_text()):
+        old_storage = sdk / 'src/strings/storage.xu'
+        if not old_storage.is_file() or RUNTIME_IMPORT.search(old_storage.read_text()):
+            raise ValueError('Published SDK is missing a seed-compatible string storage helper')
+        shutil.copy2(old_storage, storage)
+        record['string_storage_source_sha256'] = hashlib.sha256(old_storage.read_bytes()).hexdigest()
+    record['transition_source_sha256'] = source_digest(destination / 'src')
+    return record
 
 
 def main() -> None:
