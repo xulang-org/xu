@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.12.3-dev.8 (development)
+
+Adds pure portable `window/events` data and per-window input queues for keyboard, fractional pointer/wheel and owned UTF-8 text/IME editing. Window supports text activation/caret area and relative/grab pointer controls. Focus loss and bounded-queue/text/allocation failures clear cached held input; an explicit reset event reports lost input, with repeat suppression until a fresh key press. Events retain window routing, physical versus logical keys and modifiers without exposing SDL event pointers. Input actions and gameplay remain in engines. SDK acceptance checks pure event data without C/SDL and compiles input APIs; other-platform real OS input and custom IME candidates/touch/gamepad remain unverified or pending. This is an unpublished development build. See [window](src/window/README.md).
+
 ## Xu 0.12.3-dev.7 (development)
 
 Adds independent window lifecycle/state and typed GPU surfaces/frames for SDR presentation. Render and compute passes share the acquired frame command, retained resources and fences. Acquired images never escape as ordinary textures; abandonment clears black and submits because acquired swapchain commands cannot be cancelled. Surface/window/device closure safely invalidates descendants and preserves the first cleanup error. The packages share one private SDL backend and `XU_SDL_LIBRARY`, replacing the unpublished GPU-specific override. Window input streams, HDR presentation and Vulkan/D3D12 hardware execution remain pending. This is an unpublished development build. See [window](src/window/README.md) and [GPU contracts](src/gpu/README.md).

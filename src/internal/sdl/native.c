@@ -127,6 +127,7 @@ static xu_int identifier(void) {
 }
 
 #include "window.h"
+#include "input.h"
 
 typedef struct Buffer {
     xu_int id;

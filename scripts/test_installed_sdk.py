@@ -287,11 +287,25 @@ fn main() int { << check() or (err) { eprintln(err.msg())
     print("installed-sdk: gpu-device-import PASS (compute API compile, no SDL headers/runtime or application native declaration)")
 
 
+def window_event_data(xu: str, project: Path, env):
+    """Pure portable event data must not pull in the window source backend."""
+    project.mkdir()
+    (project / "main.xu").write_text('@main\n#window/events\nfn main() int {\n    $event := events.empty()\n    assert(event.kind==events.EVENT_NONE && event.text=="")\n    event.kind=events.EVENT_KEY_DOWN\n    event.physical_key=events.KEY_A\n    event.logical_key=228\n    event.modifiers=events.MOD_LEFT_SHIFT | events.MOD_RIGHT_CTRL\n    event.x=12.5\n    event.text="你好🎮"\n    assert(event.physical_key==4 && event.logical_key==228 && event.modifiers==9)\n    assert(event.x==12.5 && event.text=="你好🎮")\n    event.kind=events.EVENT_INPUT_RESET\n    event.reset_reason=events.RESET_QUEUE_FULL\n    assert(event.reset_reason==1 && events.QUEUE_CAPACITY==256)\n    println("Window events: pure owned portable data")\n    << 0\n}\n')
+    isolated = env | {"XU_NATIVE_CC": str(project / "missing compiler"),
+                      "XU_SDL_LIBRARY": str(project / "missing SDL runtime")}
+    program = project / ("Window events.exe" if os.name == "nt" else "Window events")
+    for level in ("-O0", "-O2", "-O3"):
+        run([xu, "build", "main.xu", level, "-o", str(program)], cwd=project, env=isolated)
+        assert run([str(program)], cwd=project, env=isolated).strip() == "Window events: pure owned portable data"
+    print("installed-sdk: window-event-data PASS (O0/O2/O3; no native compiler or SDL)")
+
+
 def window_surface_import(xu: str, project: Path, env):
     """Compile window/surface APIs and run only explicit missing-SDL handling."""
     project.mkdir()
     (project / "main.xu").write_text('''@main
 #window
+#window/events
 #gpu
 #strings
 fn surface_api(target &window.Window) int {
@@ -332,6 +346,20 @@ fn check() int {
     target.minimize() or >>
     target.restore() or >>
     window.pump() or >>
+    event := target.poll() or >>
+    if event.kind==events.EVENT_INPUT_RESET { assert(event.reset_reason>0) }
+    target.pending_events() or >>
+    target.key_down(events.KEY_A) or >>
+    target.pointer_state() or >>
+    target.start_text_input() or >>
+    target.text_input_active() or >>
+    target.text_input_area(0,0,32,24,4) or >>
+    target.clear_text_input_area() or >>
+    target.stop_text_input() or >>
+    target.set_relative_pointer(false) or >>
+    target.relative_pointer() or >>
+    target.set_pointer_grab(false) or >>
+    target.pointer_grab() or >>
     target.close() or >>
     window.live_count() or >>
     << 1
@@ -343,7 +371,7 @@ fn main() int { << check() or (err) { eprintln(err.msg())
     program = project / ("Window surface.exe" if os.name == "nt" else "Window surface")
     run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=isolated)
     assert run([str(program)], cwd=project, env=isolated).strip() == "Window: shared source backend, explicit missing-runtime error"
-    print("installed-sdk: window-surface-import PASS (API compile/shared backend/missing runtime; no GPU execution)")
+    print("installed-sdk: window-surface-import PASS (input/surface API compile/shared backend/missing runtime; no GPU execution)")
 
 
 def binary_floats(xu: str, project: Path, env):
@@ -634,6 +662,7 @@ fn main() int {
     binary_floats(xu, work / "binary floats project", clean)
     gpu_layout(xu, work / "GPU layout project", clean)
     gpu_device_import(xu, work / "GPU device project", clean)
+    window_event_data(xu, work / "Window event data project", clean)
     window_surface_import(xu, work / "Window surface project", clean)
     native_byte_spans(xu, manifest["target"], work / "native byte spans", clean)
     # SDK root discovery is independent of external GUI toolchain availability.

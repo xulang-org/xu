@@ -1,7 +1,7 @@
 # GPU resources and command recording
 
 `#gpu` is the optional device layer of the Xu standard library. SDK
-**0.12.3-dev.7** provides windowless devices, buffers, 2D textures/mips,
+**0.12.3-dev.8** provides windowless devices, buffers, 2D textures/mips,
 samplers, vertex/fragment shaders, graphics pipelines, command encoders,
 render/compute passes, buffer compute pipelines, window surfaces/frames, asynchronous transfers,
 fences and exact byte readback.
