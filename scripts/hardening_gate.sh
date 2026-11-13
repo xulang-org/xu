@@ -394,7 +394,7 @@ else
     sched_timeout="${XU_SCHED_GATE_TIMEOUT:-3}"
 fi
 run python3 scripts/scheduler_stress.py \
-    --lane="$SCHEDULER_LANE" --xu="$XU_COMPILER_PATH" --matrix --profiles=O1 \
+    --lane="$SCHEDULER_LANE" --xu="$XU_COMPILER_PATH" --matrix --profiles=default \
     --iterations="$sched_iterations" --timeout="$sched_timeout" \
     --json="$tmp_dir/scheduler.json"
 

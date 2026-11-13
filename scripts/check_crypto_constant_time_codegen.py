@@ -121,8 +121,9 @@ def compile_argv(compiler: Path, lane: str, target: str, opt: str, xuobj: Path) 
     """Compile through the isolated product wrapper."""
     if lane != "product":
         raise ValueError(f"crypto codegen: invalid compiler lane {lane!r}")
+    flags = ["--no-opt"] if opt == "no-opt" else []
     return [str(PRODUCT_COMPILER_RUNNER), str(compiler), "build", str(FIXTURE),
-            "--target", target, f"-{opt}", "--emit-obj", "-o", str(xuobj)]
+            "--target", target, *flags, "--emit-obj", "-o", str(xuobj)]
 
 
 def fail(message: str) -> None:
@@ -235,7 +236,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="xu-ct-codegen-") as temp_name:
         temp = Path(temp_name)
         for target in ("linux-x64", "linux-arm64"):
-            for opt in ("O0", "O1", "O2", "O3"):
+            for opt in ("default", "no-opt"):
                 xuobj = temp / f"{target}-{opt}.xuobj"
                 elf = temp / f"{target}-{opt}.o"
                 run(compile_argv(xu, lane, target, opt, xuobj))
@@ -245,7 +246,7 @@ def main() -> int:
                 audit_object(objdump, target, opt, elf)
                 print(f"PASS {target}/{opt}")
     evidence = "product evidence"
-    print(f"crypto constant-time codegen: PASS (x64/ARM64 O0-O3; lane={lane}; {evidence})")
+    print(f"crypto constant-time codegen: PASS (x64/ARM64 default and no-opt; lane={lane}; {evidence})")
     return 0
 
 
