@@ -24,21 +24,26 @@ typedef unsigned long long xu_uint;
  * only; read-only spans also prohibit writing through aliases to the data.
  * A zero-length span may have a null data pointer. Lengths count 8-byte ints.
  * Keep this stable layout independent of the compiler's private descriptors.
- * Other xu-c-2 arguments/results are xu_int (or a void result); narrow and
- * floating C signatures remain outside this version's supported contract.
+ * xu-c-2 also supports xu-c-1 scalar arguments/results (int, bool, f64,
+ * i32, u32, u8 and a void result). Spans remain argument-only.
  */
 typedef struct { xu_int len; const xu_int *data; } xu_i64_span;
 typedef struct { xu_int len; xu_int *data; } xu_i64_span_mut;
+/* Byte spans have the same descriptor layout, with one-byte elements. */
+typedef struct { xu_int len; const unsigned char *data; } xu_u8_span;
+typedef struct { xu_int len; unsigned char *data; } xu_u8_span_mut;
 
 #if defined(__cplusplus)
 static_assert(sizeof(xu_int) == 8, "Xu integers require 64 bits");
 #if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
 static_assert(sizeof(xu_i64_span) == 16, "xu-c-2 descriptor size mismatch");
+static_assert(sizeof(xu_u8_span) == 16, "xu-c-2 byte descriptor size mismatch");
 #endif
 #else
 _Static_assert(sizeof(xu_int) == 8, "Xu integers require 64 bits");
 #if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
 _Static_assert(sizeof(xu_i64_span) == 16, "xu-c-2 descriptor size mismatch");
+_Static_assert(sizeof(xu_u8_span) == 16, "xu-c-2 byte descriptor size mismatch");
 #endif
 #endif
 

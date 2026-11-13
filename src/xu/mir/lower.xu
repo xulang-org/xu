@@ -82,6 +82,8 @@ struct Lw {
     // Start in scope_offs of each scope_ids entry's descriptor offsets.
     scope_ostart []int
     scope_offs []int
+    // Empty label frees a descriptor; otherwise invoke typed resource glue.
+    scope_drop_labels []string
     // needs_drop memo by struct index: 0 unknown, 1 yes, 2 no.
     sdrop []int
     // scope_ids length at the entry of each enclosing loop body.
@@ -120,6 +122,7 @@ fn lw_new(name string, label string, fi int, tgt_os int, tgt_arch int) Lw {
         scope_ids: []int{},
         scope_ostart: []int{},
         scope_offs: []int{},
+        scope_drop_labels: []string{},
         sdrop: []int{},
         loop_scope: []int{},
         in_cond: 0
@@ -472,7 +475,7 @@ fn assign_bin_code(aop int) int {
 // The expression evaluates to a reference (pointer) value.
 fn (w $&Lw) expr_is_ref(p &parser.Parser, tp &types.TypedProgram, n int) bool {
     k := p.nodes[n].kind
-    if k == ast.NK_BORROW {
+    if k == ast.NK_BORROW || tp.borrows_place(n) {
         << true
     }
     if k == ast.NK_IDENT {
@@ -519,6 +522,13 @@ fn (w $&Lw) lower_addr(p &parser.Parser, tp &types.TypedProgram, n int) int {
         << w.lower_expr(p, tp, p.nodes[n].a)
     }
     if (k == ast.NK_FIELD && tp.call_of(n) != -30 && tp.const_of(n) < 0 && !fnval_owns(p, tp, n)) || k == ast.NK_INDEX {
+        if k == ast.NK_FIELD && p.nodes[n].sval == "len" && tp.call_of(n) != -96 {
+            base := p.nodes[n].a
+            bty := tp.deref(tp.deref(w.place_type(p, tp, base)))
+            if bty == 3 || types.is_array_type(bty) {
+                << w.bin(BIN_ADD, w.base_addr(p, tp, base), w.konst(8))
+            }
+        }
         << w.lower_place_addr(p, tp, n)
     }
     ty := tp.type_of(n)
@@ -673,6 +683,9 @@ fn (w $&Lw) wrap_int(v int, ty int) int {
 fn (w $&Lw) lower_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
     if n < 0 {
         << w.konst(0)
+    }
+    if tp.borrows_place(n) {
+        << w.lower_addr(p, tp, n)
     }
     if n != w.unboxed && w.err_wants_box(tp, n) {
         w.disown_root(p, tp, n)
@@ -871,9 +884,8 @@ fn (w $&Lw) own_grow(id int) {
     }
 }
 
-// Values of type ty own heap buffers that drop_into frees: strings,
-// dynamic arrays (the buffer only; elements are not dropped) and structs
-// without a user drop holding such fields.
+// Strings, dynamic arrays and structs with owned fields need cleanup.
+// Resource owners also run their hooks, including resource array elements.
 fn (w $&Lw) needs_drop(tp &types.TypedProgram, ty int) bool {
     if ty == 3 {
         << true
@@ -890,20 +902,22 @@ fn (w $&Lw) needs_drop(tp &types.TypedProgram, ty int) bool {
     }
     if w.sdrop[si] == 0 {
         w.sdrop[si] = 2
-        if !tp.structs[si].has_drop {
-            for i in 0:tp.structs[si].fields.len {
-                if w.needs_drop(tp, tp.structs[si].fields[i].ty) {
-                    w.sdrop[si] = 1
-                }
-            }
+        if tp.structs[si].has_drop { w.sdrop[si] = 1 }
+        for i in 0:tp.structs[si].fields.len {
+            if w.needs_drop(tp, tp.structs[si].fields[i].ty) { w.sdrop[si] = 1 }
         }
     }
     << w.sdrop[si] == 1
 }
 
-// Offsets of the [ptr, len, cap] descriptors a value of type ty at base
-// owns (each freed with str_free).
+// Cleanup offsets and labels for the value at base: either a buffer
+// descriptor freed with str_free, or the address passed to resource glue.
 fn (w $&Lw) drop_offsets(tp &types.TypedProgram, ty int, base int) {
+    if resource_drop_type(tp, ty) {
+        w.scope_offs.push(base)
+        w.scope_drop_labels.push(resource_drop_label(ty))
+        <<
+    }
     if types.is_struct_type(ty) {
         si := types.struct_index(ty)
         for i in 0:tp.structs[si].fields.len {
@@ -915,10 +929,16 @@ fn (w $&Lw) drop_offsets(tp &types.TypedProgram, ty int, base int) {
         <<
     }
     w.scope_offs.push(base)
+    w.scope_drop_labels.push("")
 }
 
 // Free the buffers owned by the value of type ty at address a.
 fn (w $&Lw) drop_value(tp &types.TypedProgram, a int, ty int) {
+    if resource_drop_type(tp, ty) {
+        args := [a]
+        w.call(resource_drop_label(ty), &args)
+        <<
+    }
     if types.is_struct_type(ty) {
         si := types.struct_index(ty)
         for i in 0:tp.structs[si].fields.len {
@@ -953,6 +973,7 @@ fn (w $&Lw) own_declare(tp &types.TypedProgram, id int) {
 // Close the scopes above mark (their drops are already emitted).
 fn (w $&Lw) scope_truncate(mark int) {
     if w.scope_ids.len > mark {
+        w.scope_drop_labels = w.scope_drop_labels[0:w.scope_ostart[mark]]
         w.scope_offs = w.scope_offs[0:w.scope_ostart[mark]]
         w.scope_ids = w.scope_ids[0:mark]
         w.scope_ostart = w.scope_ostart[0:mark]
@@ -1015,7 +1036,8 @@ fn (w $&Lw) drop_owned_from(mark int) {
                     } else {
                         args.push(w.bin(BIN_ADD, base, w.konst(off)))
                     }
-                    w.call_core("str_free", &args)
+                    if w.scope_drop_labels[j].len == 0 { w.call_core("str_free", &args) }
+                    else { w.call(w.scope_drop_labels[j] + "", &args) }
                 }
             }
         }
@@ -1031,6 +1053,7 @@ fn (w &Lw) transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bool {
         << true
     }
     k := p.nodes[e].kind
+    if k == ast.NK_OR_CATCH { << w.transfer_safe(p, tp, p.nodes[e].a) }
     c := tp.clone_of(e)
     if (c == 1 && w.wants_clone(p, tp, e)) || (c == 2 && k == ast.NK_IDENT) {
         << true
@@ -1038,7 +1061,7 @@ fn (w &Lw) transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bool {
     if k == ast.NK_STR || k == ast.NK_TERNARY || k == ast.NK_STRUCT_INIT || k == ast.NK_ARRAY_LIT || k == ast.NK_EMPTY_ARRAY || k == ast.NK_CLONE || k == ast.NK_SLICE {
         << true
     }
-    if (k == ast.NK_CALL || k == ast.NK_METHOD_CALL) && (tp.call_of(e) >= 0 || tp.call_of(e) == -80) {
+    if (k == ast.NK_CALL || k == ast.NK_METHOD_CALL) && (tp.call_of(e) >= 0 || tp.call_of(e) == -80 || tp.call_of(e) == -83) {
         << true
     }
     << false
@@ -1717,7 +1740,7 @@ fn (w $&Lw) lower_call(p &parser.Parser, tp &types.TypedProgram, n int) int {
     }
     if code == -106 {
         $none := []int{}
-        w.call_core("test_soft_fail", &none)
+        w.call_core("record_test_failure", &none)
         << w.konst(0)
     }
     if code == -108 {
@@ -1884,7 +1907,10 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
     if k == ast.NK_EXPR_STMT {
         e := p.nodes[s].a
         v := w.lower_expr(p, tp, e)
-        w.drop_fresh_str(p, tp, e, v)
+        if resource_drop_type(tp, tp.type_of(e)) && w.transfer_safe(p, tp, e) {
+            w.drop_value(tp, v, tp.type_of(e))
+        }
+        else { w.drop_fresh_str(p, tp, e, v) }
         <<
     }
     if k == ast.NK_RETURN {
@@ -2173,6 +2199,7 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
         <<
     }
     $v := w.own_val(p, tp, p.nodes[s].b, w.lower_expr(p, tp, p.nodes[s].b), tty)
+    if aop == ast.AS_ASSIGN && resource_drop_type(tp, tty) { w.drop_value(tp, addr, tty) }
     if is_wide(tp, tty) {
         w.copy_mem(addr, v, tp.size_of(tty))
         <<
@@ -2219,11 +2246,13 @@ fn lower_fn(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_a
         incoming.push(w.new_local(1, 1, "arg" + str(i)))
     }
     w.f.nparams = w.f.locals.len
+    w.f.scalar_params = w.okp < 0 && w.sret < 0 && tfn.recv < 0
     while w.lbyref.len < w.f.locals.len {
         w.lbyref.push(false)
     }
     for i in 0:nin {
         ty := w.local_type(tp, i)
+        if ty != 1 { w.f.scalar_params = false }
         while w.lslot.len <= i {
             w.lslot.push(-1)
         }
@@ -2273,16 +2302,21 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
     // Lower on demand from main: a function is lowered once some lowered
     // body calls its label, so unused library code is never required to
     // be lowerable.
-    $by_label := label_index_new(tp.fns.len * 2 + 16)
+    resource_types := resource_drop_types(tp)
+    $by_label := label_index_new(tp.fns.len * 2 + resource_types.len * 2 + 16)
     for fi in 0:tp.fns.len {
         if tp.fns[fi].is_template || tp.fns[fi].is_extern || tp.fns[fi].decl < 0 {
             ->
         }
         by_label.put(tp.fns[fi].label, fi)
     }
-    // Queue keys: function index, or tp.fns.len + index for its fn-value shim.
+    // Queue keys: user function, fn-value shim, then typed resource glue.
+    for ri in 0:resource_types.len {
+        label := resource_drop_label(resource_types[ri])
+        by_label.put(&label, tp.fns.len * 2 + ri)
+    }
     $queued := []bool{}
-    for fi in 0:tp.fns.len * 2 {
+    for fi in 0:tp.fns.len * 2 + resource_types.len {
         queued.push(false)
     }
     $queue := []int{}
@@ -2327,7 +2361,12 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
     while qi < queue.len {
         fi := queue[qi]
         qi += 1
-        $f := lower_queued(p, tp, fi, tgt_os, tgt_arch, debug, &core_names, &core_labels, $&errs)
+        $f := mfn_new("", "")
+        if fi >= tp.fns.len * 2 {
+            f = lower_resource_drop(tp, resource_types[fi - tp.fns.len * 2], tgt_os, tgt_arch, &core_names, &core_labels)
+        } else {
+            f = lower_queued(p, tp, fi, tgt_os, tgt_arch, debug, &core_names, &core_labels, $&errs)
+        }
         for ii in 0:f.instrs.len {
             if f.instrs[ii].kind == MI_CALL || f.instrs[ii].kind == MI_LOAD_FN_ADDR {
                 $callee := by_label.get(f.instrs[ii].sval)
@@ -2372,6 +2411,7 @@ fn mfn_copy(f &MFn) MFn {
     out.ret = f.ret
     out.ret_nslots = f.ret_nslots
     out.nparams = f.nparams
+    out.scalar_params = f.scalar_params
     out.receiver = f.receiver
     out.is_extern = f.is_extern
     out.is_pub = f.is_pub

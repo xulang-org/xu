@@ -272,6 +272,7 @@ BRIDGE_SOCKET_SHA256=SKIPPED
 BRIDGE_EXEC_SHA256=SKIPPED
 BRIDGE_SEED_SHA256=SKIPPED
 BRIDGE_CONST_SOURCE_SHA256=SKIPPED
+BRIDGE_MATH_SOURCE_SHA256=SKIPPED
 # shellcheck disable=SC2086
 set +u
 if "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT" >"$tmp/seed-build.log" 2>&1; then
@@ -304,6 +305,36 @@ if [ "$seed_build_rc" -ne 0 ] && grep -Eq "const '[A-Z_][A-Z0-9_]*' must be snak
     cp "$tmp/const-build.log" "$tmp/seed-build.log"
     # The naming transition can still predate the exec ABI. Compose only
     # recognized transitions, retaining the original seed's provenance.
+    SEED=$BRIDGE_SEED
+fi
+if [ "$seed_build_rc" -ne 0 ] && grep -Eq "runtime/core/[^:]+:[0-9]+:[0-9]+: error: undefined name 'rt_(load|store|addr|syscall|globals)'" "$tmp/seed-build.log"; then
+    # The frozen frontend cannot preflight source-backed runtime primitives.
+    # Compile a disposable current compiler with the original SDK's math and string storage,
+    # then restart Gen1 on the full original closure. Never skip the gate.
+    FAILED_STAGE="math_runtime_seed_bridge"
+    set +u
+    python3 scripts/seed_stdlib_bridge.py --seed "$ORIGINAL_SEED" --compiler "$SEED" \
+        --source "$ROOT" --destination "$tmp/math-bridge" \
+        --output "$tmp_native/math-bootstrap$CHAIN_BIN_EXT" -- "${HOSTED_ARGS[@]}"
+    set -u
+    BRIDGE_SEED=$(pick_bin "$tmp/math-bootstrap$CHAIN_BIN_EXT")
+    BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
+    BRIDGE_MATH_SOURCE_SHA256=$(cat "$tmp/math-bridge/source.sha256")
+    if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
+        SEED_MANIFEST_BRIDGE=math_runtime_v1
+    else
+        SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+math_runtime_v1"
+    fi
+    FAILED_STAGE="bridged_seed_to_gen1"
+    set +u
+    if "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT" >"$tmp/math-build.log" 2>&1; then
+        seed_build_rc=0
+    else
+        seed_build_rc=$?
+    fi
+    set -u
+    cat "$tmp/math-build.log"
+    cp "$tmp/math-build.log" "$tmp/seed-build.log"
     SEED=$BRIDGE_SEED
 fi
 if [ "$seed_build_rc" -ne 0 ] && grep -q "os_exec takes exactly 3 arguments" "$tmp/seed-build.log"; then
@@ -541,6 +572,7 @@ bridge_socket_sha256=$BRIDGE_SOCKET_SHA256
 bridge_exec_sha256=$BRIDGE_EXEC_SHA256
 bridge_seed_sha256=$BRIDGE_SEED_SHA256
 bridge_const_source_sha256=$BRIDGE_CONST_SOURCE_SHA256
+bridge_math_source_sha256=$BRIDGE_MATH_SOURCE_SHA256
 source_seed_files=$SOURCE_SEED_FILES
 source_seed_sha256=$SOURCE_SEED_SHA256
 source_closure_files=$SOURCE_CLOSURE_FILES
