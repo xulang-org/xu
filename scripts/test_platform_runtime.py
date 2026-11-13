@@ -103,6 +103,20 @@ fn gcd(a int, b int) int {
     << gcd(b, a % b)
 }
 
+fn implicit_borrow_values() bool {
+    first := 23
+    counter := Counter{value: 42}
+    let $ref: &int = first
+    if *ref != 23 { << false }
+    ref = counter.value
+    if *ref != 42 { << false }
+    values := [4, 5]
+    ref = values[1]
+    if *ref != 5 { << false }
+    ref = values.len
+    << *ref == 2
+}
+
 fn main() int {
     $counter := Counter{value: 3}
     $sum := 5
@@ -123,6 +137,7 @@ fn main() int {
     }
     if sum != 29 { << 2 }
     if gcd(1071, 462) != 21 { << 16 }
+    if !implicit_borrow_values() { << 20 }
 
     if bits.len(0) != 0 || bits.leading_zeros(0) != 64 || bits.trailing_zeros(0) != 64 { << 3 }
     if bits.ones_count(-1) != 64 || bits.reverse(1) != (1 << 63) { << 4 }
