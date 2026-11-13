@@ -320,14 +320,14 @@ negative zero and NaN sign bits correctly.
 
 ## Standard GPU resources (development)
 
-SDK `0.12.3-dev.4` provides optional [`#gpu`](src/gpu/README.md) devices,
+SDK `0.12.3-dev.6` provides optional [`#gpu`](src/gpu/README.md) devices,
 buffers, textures/mips, samplers, shaders, configurable graphics pipelines,
-command encoders, render passes and asynchronous transfers/readback. Import
+command encoders, render/compute passes, buffer compute pipelines and asynchronous transfers/readback. Import
 compiles the private source backend with the same SDK's `xu-native`; consumers
 need no SDL headers or application native mapping. SDL loads only on device open.
 This provides an offscreen graphics foundation; scene and PBR policy belongs
 to engines. Real GPU evidence currently covers macOS arm64 Metal. Presentation,
-compute and advanced render features remain pending; Vulkan/D3D12 require
+storage textures and advanced render features remain pending; Vulkan/D3D12 require
 execution validation. See the linked GPU contracts for exact limits.
 
 ## GPU texture layouts (development)

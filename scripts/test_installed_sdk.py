@@ -242,13 +242,39 @@ def gpu_device_import(xu: str, project: Path, env):
     (project / "main.xu").write_text('''@main
 #gpu
 #strings
+// Compile the public compute surface on every SDK target. This path is not
+// executed without a real device; the runtime test below rejects missing SDL.
+fn compute_api(device &gpu.Device) int {
+    desc := gpu.ComputePipelineDesc{format: gpu.SHADER_MSL, entrypoint: "main", read_buffers: 1,
+        write_buffers: 1, uniform_sizes: [16], threads_x: 64, threads_y: 1, threads_z: 1}
+    code := [u8(1)]
+    $pipeline := device.compute_pipeline(&desc, &code) or >>
+    $buffer := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
+    $output := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
+    writes := [gpu.write_buffer(&output, false)]
+    $encoder := device.command_encoder() or >>
+    $pass := encoder.begin_compute(&writes) or >>
+    pass.pipeline(&pipeline) or >>
+    pass.read_buffer(0, &buffer) or >>
+    values := [u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),
+        u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0)]
+    pass.uniform(0, &values) or >>
+    pass.dispatch(1, 1, 1) or >>
+    pass.end() or >>
+    $fence := encoder.submit() or >>
+    fence.wait() or >>
+    stats := device.stats() or >>
+    assert(stats.compute_pass_count == 0 && stats.compute_pipeline_count == 1)
+    << 0
+}
 fn check() int {
-    gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or (err) {
+    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or (err) {
         message := err.msg()
         assert(strings.contains(&message, "SDL 3 GPU runtime unavailable"))
         println("GPU device: source backend, explicit missing-runtime error")
         << 0
     }
+    compute_api(&device) or >>
     << 1
 }
 fn main() int { << check() or (err) { eprintln(err.msg())
@@ -258,7 +284,7 @@ fn main() int { << check() or (err) { eprintln(err.msg())
     program = project / ("GPU device.exe" if os.name == "nt" else "GPU device")
     run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=isolated)
     assert run([str(program)], cwd=project, env=isolated).strip() == "GPU device: source backend, explicit missing-runtime error"
-    print("installed-sdk: gpu-device-import PASS (no SDL headers or runtime; no application native declaration)")
+    print("installed-sdk: gpu-device-import PASS (compute API compile, no SDL headers/runtime or application native declaration)")
 
 
 def binary_floats(xu: str, project: Path, env):
