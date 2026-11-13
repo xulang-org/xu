@@ -186,6 +186,46 @@ int main(int argc, char **argv) {
     print("installed-sdk: linux-application-object PASS")
 
 
+def deflate_output(xu: str, project: Path, env):
+    """Literal-heavy output must grow linearly; Python zlib is the wire oracle."""
+    import random
+    import zlib
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#compress/flate
+#os
+fn run() int {
+    args := os.args()
+    for i in 1:args.len {
+        raw := os.read(args[i]+"") or >>
+        encoded := flate.deflate(&raw)
+        write_file(args[i]+".deflate",encoded) or >>
+    }
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }
+''')
+    samples = [b"", b"hello hello hello", bytes(range(256))*1024,
+               random.Random(1951).randbytes(262144), b"ABCD"*100000]
+    paths=[]
+    for i,data in enumerate(samples):
+        path=project / ("payload "+str(i)+".bin")
+        path.write_bytes(data)
+        paths.append(path)
+    program=project / ("deflate.exe" if os.name=="nt" else "deflate")
+    for level in ("-O0","-O2","-O3"):
+        run([xu,"build","main.xu",level,"-o",str(program)],cwd=project,env=env)
+        run([str(program),*[str(path) for path in paths]],cwd=project,env=env)
+        for path,plain in zip(paths,samples):
+            encoded=Path(str(path)+".deflate").read_bytes()
+            assert zlib.decompress(encoded,wbits=-15)==plain,(level,path)
+            assert len(encoded)<=len(plain)+((len(plain)+65534)//65535)*5+5,(level,path,len(encoded))
+        assert Path(str(paths[0])+".deflate").read_bytes()==bytes([1,0,0,255,255])
+        assert len(Path(str(paths[4])+".deflate").read_bytes())<5000
+    print("installed-sdk: deflate-output PASS (-O0/-O2/-O3; literal-heavy, stored fallback, ring history, Python zlib oracle)")
+
+
 def gpu_layout(xu: str, project: Path, env):
     """Exercise the installed layout API without a window or SDL runtime."""
     project.mkdir()
@@ -684,6 +724,7 @@ fn main() int {
     clean.pop("XU_ROOT", None)
     assert run([xu, "run", "main.xu"], cwd=project, env=clean).splitlines() == ["INSTALLED", "42"]
     binary_floats(xu, work / "binary floats project", clean)
+    deflate_output(xu, work / "DEFLATE output project", clean)
     gpu_layout(xu, work / "GPU layout project", clean)
     gpu_device_import(xu, work / "GPU device project", clean)
     window_event_data(xu, work / "Window event data project", clean)
