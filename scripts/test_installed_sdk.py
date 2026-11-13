@@ -298,9 +298,14 @@ def binary_floats(xu: str, project: Path, env):
             return '(1 << 63)'
         return str(word if word < 1 << 63 else word - (1 << 64))
 
+    (project / 'runtime_probe.xu').write_text('''@runtime/core
+pub fn failure_flag_for_acceptance() int { << gword(G_TEST_SOFT) }
+''')
     source = '''@main
 #encoding/binary
 #math
+#testing
+core #runtime/core
 fn zeros(n int) []u8 { $out:=[]u8{}
     for i in 0:n { out.push(u8(73)) }
     << out }
@@ -376,6 +381,10 @@ fn check() int {
     for kind in 0:2 { for off in [0-1,7,9,10,9223372036854775807] { assert(rejects_read(&big,kind,off)) } }
     $empty:=[]u8{}
     assert(rejects_write($&empty,0,0) && rejects_read(&empty,1,0))
+    assert(core.failure_flag_for_acceptance()==0)
+    $test_state:=testing.t()
+    test_state.fail()
+    assert(test_state.failed() && core.failure_flag_for_acceptance()==1)
     println("Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity")
     << 0
 }
@@ -389,7 +398,7 @@ fn main() int { << check() or(err) { eprintln(err.msg())
     isolated = env | {'XU_NATIVE_CC': str(project / 'missing C compiler'),
                       'XU_GPU_SDL_LIBRARY': str(project / 'missing SDL runtime')}
     for level in ('-O0', '-O2', '-O3'):
-        run([xu, 'build', 'main.xu', level, '-o', str(program)], cwd=project, env=isolated)
+        run([xu, 'build', 'main.xu', 'runtime_probe.xu', level, '-o', str(program)], cwd=project, env=isolated)
         assert run([str(program)], cwd=project, env=isolated).strip() == 'Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity'
     print(f'installed-sdk: binary-floats PASS ({len(patterns)} references; O0/O2/O3; no native tools)')
 
