@@ -308,6 +308,16 @@ Xu is an open-source, forward-looking systems programming language. If you belie
 
 ---
 
+## Binary floating-point storage (development)
+
+SDK `0.12.3-dev.5` adds [`#math` IEEE bit conversion](src/math/README.md) and
+[`#encoding/binary` tight-byte integer/float storage](src/encoding/binary/README.md).
+Dynamic GPU vertices/uniforms, files and network formats can encode binary32 or
+binary64 with explicit byte order using `[]u8`, without C tools. Negative zero,
+NaN payload policy, ties-to-even rounding and failure atomicity are documented.
+UI wire scalars reuse the binary64 mechanism; `abs/copysign/signbit` now handle
+negative zero and NaN sign bits correctly.
+
 ## Standard GPU resources (development)
 
 SDK `0.12.3-dev.4` provides optional [`#gpu`](src/gpu/README.md) devices,

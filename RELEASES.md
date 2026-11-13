@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.12.3-dev.5 (development)
+
+Adds safe IEEE binary64 bit reinterpretation, binary32 conversion with ties-to-even rounding, and explicit-endian integer/float storage in tight u8 arrays. Corrects abs/copysign/signbit for negative zero and NaN sign bits. UI wire scalars share the standard conversion while retaining canonical positive zero and finite-only decoding. Existing []int binary APIs are unchanged; no C/GPU dependency or binary32 numeric type is added. This is an unpublished development build.
+
 ## Xu 0.12.3-dev.4 (development)
 
 Adds standard GPU textures/mips, samplers, vertex/fragment shaders, configurable graphics pipelines, command encoders and render passes with resource retention, depth, indexed/instanced draws and pixel readback. C2 accepts existing C1 scalar signatures alongside borrowed spans, including mixed floating calls/results. Offscreen hardware acceptance covers macOS arm64 Metal; Vulkan/D3D12 execution, presentation, compute and advanced render features remain pending. See [GPU contracts](src/gpu/README.md). This is an unpublished development build, not a release.
