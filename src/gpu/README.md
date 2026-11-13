@@ -1,11 +1,12 @@
 # GPU resources and command recording
 
 `#gpu` is the optional device layer of the Xu standard library. SDK
-**0.12.3-dev.4** provides windowless devices, buffers, 2D textures/mips,
+**0.12.3-dev.6** provides windowless devices, buffers, 2D textures/mips,
 samplers, vertex/fragment shaders, graphics pipelines, command encoders,
-render passes, asynchronous transfers, fences and exact byte readback.
+render/compute passes, buffer compute pipelines, asynchronous transfers,
+fences and exact byte readback.
 Scene graphs, cameras, materials, PBR and rendering budgets belong to engines.
-Compute dispatch, window presentation, cube/3D textures, storage bindings,
+Window presentation, cube/3D textures, storage texture bindings,
 multiple render targets, multisampling and stencil are not implemented here.
 
 ## Device and ownership
@@ -127,10 +128,48 @@ memory accesses remain the author's responsibility. Index offsets align to their
 and must fit its extent. Uniform calls synchronously copy exactly the declared
 byte size; draws never retain a borrowed Xu array.
 
-`Stats` reports live buffer/texture/sampler/shader/pipeline/encoder/pass owners,
+`Stats` reports live buffer/texture/sampler/shader/graphics and compute pipeline/encoder/pass owners,
 logical buffer/texture/staging bytes and owned submissions. Closed resources
 retained by commands and physical driver allocations are excluded. Completed
 submissions remain counted until closed. It is not a physical VRAM meter.
+
+## Buffer compute
+
+`ComputePipelineDesc` supplies shader format/entrypoint, read/write buffer counts,
+exact uniform sizes and local thread dimensions. Buffer counts are 0...8 each;
+uniform slots follow the graphics limits above. Local dimensions are positive,
+x/y at most 1024, z at most 64, and their product at most 1024. These portable
+interface limits do not guarantee device support; pipeline creation can still
+fail. Dimensions and resource metadata must match the compiled shader.
+Sampler and storage texture bindings are not yet exposed for compute.
+
+Begin a pass with `encoder.begin_compute(&writes)`, where each write slot uses
+`gpu.write_buffer(&buffer, cycle)`. Write buffers require COMPUTE_STORAGE_WRITE;
+duplicate write targets are rejected. `cycle=true` permits SDL to replace an
+in-use backing allocation, discarding previous contents. Use false to preserve
+data needed by a subsequent pass. Pipeline write counts must match the pass.
+Set a compute pipeline, bind every declared `read_buffer(slot, &buffer)` and
+`uniform(slot, &bytes)`, then `dispatch(groups_x, groups_y, groups_z)` and `end`.
+Read buffers require COMPUTE_STORAGE_READ and cannot alias a write binding.
+Changing pipelines resets required read/uniform bindings. Dispatch dimensions
+are 1...65535 groups per axis; shader bounds checks remain the author's contract.
+
+Render and compute passes cannot overlap on an encoder. Multiple sequential
+passes share submission order and retained resources. There is no implicit
+barrier between dispatches within one compute pass: end the pass before a
+dependent dispatch in a new pass. See the [SDL synchronization contract](https://wiki.libsdl.org/SDL3/SDL_BeginGPUComputePass).
+Shader resource indices follow [SDL's compute conventions](https://wiki.libsdl.org/SDL3/SDL_CreateGPUComputePipeline):
+with buffer-only compute, SPIR-V uses sets 0/1/2 for read/write/uniform bindings;
+HLSL uses t/space0, u/space1 and b/space2; Metal buffer indices place uniforms
+first, then read buffers, then write buffers.
+
+Compute owners support the same close/drop and early-release behavior as
+graphics owners. `compute_pipeline_count` and `compute_pass_count` are separate
+from graphics pipeline/render-pass counts. Real Metal acceptance checks 1027
+exact uint32 results across dependent passes, render/compute transitions,
+invalid bindings/states and 128 cancellation/drop cycles. Failure injection
+covers all 13 native allocation steps in the exercised transaction and 11 driver failure paths with cleanup
+and retry; injected results are not additional hardware/platform evidence.
 
 ## Build and evidence
 

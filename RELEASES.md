@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.12.3-dev.6 (development)
+
+Adds buffer compute pipelines/passes, explicit read/write bindings, uniform data and dispatch on the standard GPU encoder. Compute and render passes share retained resources and fence submission; dependent dispatches use separate passes. Validates binding counts, usages, aliases, workgroup dimensions and closed/foreign owners. Shader metadata and indexing remain the author's contract. Metal hardware checks cover exact chained results, early owner closure, cancellation and cleanup/retry after injected failures; Vulkan/D3D12 execution, storage textures and presentation remain pending. This is an unpublished development build. See [GPU contracts](src/gpu/README.md).
+
 ## Xu 0.12.3-dev.5 (development)
 
 Adds safe IEEE binary64 bit reinterpretation, binary32 conversion with ties-to-even rounding, and explicit-endian integer/float storage in tight u8 arrays. Corrects abs/copysign/signbit for negative zero and NaN sign bits. UI wire scalars share the standard conversion while retaining canonical positive zero and finite-only decoding. Existing []int binary APIs are unchanged; no C/GPU dependency or binary32 numeric type is added. This is an unpublished development build.
