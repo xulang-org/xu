@@ -133,6 +133,7 @@ fn main() { $x := 2
                 'also borrowed', diagnostics=('automatic read-only borrow',))
     fixture('spec34_C_F25_return_local', 'fn bad(p &int) &int { x := 1\n << x }\nfn main() {}', 'cannot return')
     fixture('spec34_C_F25_temporary_rejected', 'fn read(p &int) {}\nfn main() { read(1 + 2) }', 'automatic read-only borrow requires an ordinary place')
+    fixture('spec34_C_F25_fixed_len', 'fn read(p &int) {}\nfn main() { xs := [2]int{1, 2}\n read(xs.len) }', 'automatic read-only borrow requires an ordinary place')
     fixture('spec34_C_F25_field_conflict', 'struct Item { value int }\nfn view(p &int) &int { << p }\nfn main() { $x := Item{value: 1}\n s := view(x.value)\n x.value = 2\n println(*s) }', 'because it is borrowed')
     fixture('spec34_C_F25_index_conflict', 'fn view(p &int) &int { << p }\nfn main() { $xs := [1]\n s := view(xs[0])\n xs.push(2)\n println(*s) }', 'element is borrowed')
     fixture('spec34_C_F25_index_boundary', 'fn read(p &int) {}\nfn main() { xs := [1]\n read(xs[0 + 0]) }', 'element borrow index must be a variable or integer literal')
