@@ -303,11 +303,11 @@ UI 浮点传输共用 binary64 转换；`abs/copysign/signbit` 正确处理负�
 
 ## 标准 GPU 资源（开发版）
 
-`0.12.3-dev.7` 在标准库 [`#gpu`](src/gpu/README.md) 中提供设备、缓冲区、
+`0.12.3-dev.8` 在标准库 [`#gpu`](src/gpu/README.md) 中提供设备、缓冲区、
 纹理/mip、采样器、Shader、图形/缓冲区计算管线、命令编码器、渲染/计算 Pass、窗口 Surface/Frame 和异步传输/读回。
 导入时使用同一 SDK 的 `xu-native` 编译私有后端，应用无需 SDL 头文件或原生绑定；
 创建设备或窗口时才加载 SDL 运行库。场景、材质和 PBR 策略属于引擎层。
-独立窗口生命周期由 [`#window`](src/window/README.md) 提供。真实 GPU 验收目前覆盖 macOS arm64 Metal；HDR 呈现、storage 纹理和高级渲染能力
+独立窗口及有界键鼠/文本队列由 [`#window`](src/window/README.md) 提供；[`#window/events`](src/window/events/README.md) 是无 C/SDL 依赖的纯事件数据。真实 GPU 验收目前覆盖 macOS arm64 Metal；HDR 呈现、storage 纹理和高级渲染能力
 仍待实现，Vulkan/D3D12 仍需目标平台执行验证。具体边界见上述 GPU 说明。
 
 ## GPU 纹理布局（开发版）
