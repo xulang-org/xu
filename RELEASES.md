@@ -6,6 +6,10 @@
 
 ---
 
+## Xu 0.12.3-dev.7 (development)
+
+Adds independent window lifecycle/state and typed GPU surfaces/frames for SDR presentation. Render and compute passes share the acquired frame command, retained resources and fences. Acquired images never escape as ordinary textures; abandonment clears black and submits because acquired swapchain commands cannot be cancelled. Surface/window/device closure safely invalidates descendants and preserves the first cleanup error. The packages share one private SDL backend and `XU_SDL_LIBRARY`, replacing the unpublished GPU-specific override. Window input streams, HDR presentation and Vulkan/D3D12 hardware execution remain pending. This is an unpublished development build. See [window](src/window/README.md) and [GPU contracts](src/gpu/README.md).
+
 ## Xu 0.12.3-dev.6 (development)
 
 Adds buffer compute pipelines/passes, explicit read/write bindings, uniform data and dispatch on the standard GPU encoder. Compute and render passes share retained resources and fence submission; dependent dispatches use separate passes. Validates binding counts, usages, aliases, workgroup dimensions and closed/foreign owners. Shader metadata and indexing remain the author's contract. Metal hardware checks cover exact chained results, early owner closure, cancellation and cleanup/retry after injected failures; Vulkan/D3D12 execution, storage textures and presentation remain pending. This is an unpublished development build. See [GPU contracts](src/gpu/README.md).
