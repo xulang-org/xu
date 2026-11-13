@@ -83,6 +83,7 @@ OPTIMIZED_CODE = r'''@main
 #crypto/sha256
 #encoding/hex
 #math/bits
+#strings
 
 struct Counter {
     value int
@@ -140,6 +141,13 @@ fn main() int {
     recovered := cipher.decrypt(&encrypted) or (err) { << 14 }
     if recovered != plain { << 15 }
     if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" { << 17 }
+    source := "abcd"
+    view := source[1:3]
+    $once := strings.repeat(&view, 1)
+    once[0] = 120
+    if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
+    empty := ""
+    if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
     println("optimized code passed")
     << 0
 }
