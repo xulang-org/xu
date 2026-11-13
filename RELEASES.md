@@ -6,6 +6,34 @@
 
 ---
 
+## Xu 0.12.3
+
+- Restores typed-MIR inlining, integer tail recursion and periodic loop folding. String repetition allocates its output once. Hardware AES, ARM64 SHA-256, bit operations and hex encoding use native instructions where supported. Linux and macOS I/O waiters share each idle poll round.
+- Fixes implicit shared borrows in bindings and assignments, restores native linking and resource cleanup, and bounds DEFLATE compressor output growth.
+- Adds explicit-endian binary32/binary64 storage and bit conversions, and a WASI host for compiler tooling.
+- Adds standard-library GPU render and compute passes, validated non-owning resource references, window surfaces and per-window input events. Native GPU support depends on the platform backend.
+- Upgrade the compiler, standard library and SDK tools together.
+
+## Xu 0.12.3-dev.8 (development)
+
+Adds pure portable `window/events` data and per-window input queues for keyboard, fractional pointer/wheel and owned UTF-8 text/IME editing. Window supports text activation/caret area and relative/grab pointer controls. Focus loss and bounded-queue/text/allocation failures clear cached held input; an explicit reset event reports lost input, with repeat suppression until a fresh key press. Events retain window routing, physical versus logical keys and modifiers without exposing SDL event pointers. Input actions and gameplay remain in engines. SDK acceptance checks pure event data without C/SDL and compiles input APIs; other-platform real OS input and custom IME candidates/touch/gamepad remain unverified or pending. This is an unpublished development build. See [window](src/window/README.md).
+
+## Xu 0.12.3-dev.7 (development)
+
+Adds independent window lifecycle/state and typed GPU surfaces/frames for SDR presentation. Render and compute passes share the acquired frame command, retained resources and fences. Acquired images never escape as ordinary textures; abandonment clears black and submits because acquired swapchain commands cannot be cancelled. Surface/window/device closure safely invalidates descendants and preserves the first cleanup error. The packages share one private SDL backend and `XU_SDL_LIBRARY`, replacing the unpublished GPU-specific override. Window input streams, HDR presentation and Vulkan/D3D12 hardware execution remain pending. This is an unpublished development build. See [window](src/window/README.md) and [GPU contracts](src/gpu/README.md).
+
+## Xu 0.12.3-dev.6 (development)
+
+Adds buffer compute pipelines/passes, explicit read/write bindings, uniform data and dispatch on the standard GPU encoder. Compute and render passes share retained resources and fence submission; dependent dispatches use separate passes. Validates binding counts, usages, aliases, workgroup dimensions and closed/foreign owners. Shader metadata and indexing remain the author's contract. Metal hardware checks cover exact chained results, early owner closure, cancellation and cleanup/retry after injected failures; Vulkan/D3D12 execution, storage textures and presentation remain pending. This is an unpublished development build. See [GPU contracts](src/gpu/README.md).
+
+## Xu 0.12.3-dev.5 (development)
+
+Adds safe IEEE binary64 bit reinterpretation, binary32 conversion with ties-to-even rounding, and explicit-endian integer/float storage in tight u8 arrays. Corrects abs/copysign/signbit for negative zero and NaN sign bits. UI wire scalars share the standard conversion while retaining canonical positive zero and finite-only decoding. Existing []int binary APIs are unchanged; no C/GPU dependency or binary32 numeric type is added. This is an unpublished development build.
+
+## Xu 0.12.3-dev.4 (development)
+
+Adds standard GPU textures/mips, samplers, vertex/fragment shaders, configurable graphics pipelines, command encoders and render passes with resource retention, depth, indexed/instanced draws and pixel readback. C2 accepts existing C1 scalar signatures alongside borrowed spans, including mixed floating calls/results. Offscreen hardware acceptance covers macOS arm64 Metal; Vulkan/D3D12 execution, presentation, compute and advanced render features remain pending. See [GPU contracts](src/gpu/README.md). This is an unpublished development build, not a release.
+
 ## Xu 0.12.2
 
 The product compiler lowers checked programs to typed MIR and self-hosts from the published `v0.12.2-seed.1` compiler. Upgrade the compiler, standard library and SDK tools together.

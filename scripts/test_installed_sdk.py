@@ -186,6 +186,470 @@ int main(int argc, char **argv) {
     print("installed-sdk: linux-application-object PASS")
 
 
+def deflate_output(xu: str, project: Path, env):
+    """Literal-heavy output must grow linearly; Python zlib is the wire oracle."""
+    import random
+    import zlib
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#compress/flate
+#os
+fn run() int {
+    args := os.args()
+    for i in 1:args.len {
+        raw := os.read(args[i]+"") or >>
+        encoded := flate.deflate(&raw)
+        write_file(args[i]+".deflate",encoded) or >>
+    }
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }
+''')
+    samples = [b"", b"hello hello hello", bytes(range(256))*1024,
+               random.Random(1951).randbytes(262144), b"ABCD"*100000]
+    paths=[]
+    for i,data in enumerate(samples):
+        path=project / ("payload "+str(i)+".bin")
+        path.write_bytes(data)
+        paths.append(path)
+    program=project / ("deflate.exe" if os.name=="nt" else "deflate")
+    for flags in ((), ("--no-opt",)):
+        run([xu,"build","main.xu",*flags,"-o",str(program)],cwd=project,env=env)
+        command=[str(program),*[str(path) for path in paths]]
+        if sys.platform.startswith("linux"):
+            # Bound address space for the consumer only, not the compiler.
+            # The former per-byte immutable copies exceed this budget well
+            # before the literal-heavy payload completes.
+            import resource
+            def memory_budget():
+                resource.setrlimit(resource.RLIMIT_AS,(512*1024*1024,512*1024*1024))
+            subprocess.run(command,cwd=project,env=env,stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE,check=True,timeout=60,preexec_fn=memory_budget)
+        else:
+            run(command,cwd=project,env=env)
+        for path,plain in zip(paths,samples):
+            encoded=Path(str(path)+".deflate").read_bytes()
+            assert zlib.decompress(encoded,wbits=-15)==plain,(level,path)
+            assert len(encoded)<=len(plain)+((len(plain)+65534)//65535)*5+5,(level,path,len(encoded))
+        assert Path(str(paths[0])+".deflate").read_bytes()==bytes([1,0,0,255,255])
+        assert len(Path(str(paths[4])+".deflate").read_bytes())<5000
+    print("installed-sdk: deflate-output PASS (default and --no-opt; literal-heavy, stored fallback, ring history, Python zlib oracle)")
+
+
+def gpu_layout(xu: str, project: Path, env):
+    """Exercise the installed layout API without a window or SDL runtime."""
+    project.mkdir()
+    (project / "gpu_layout.xu").write_text('''@main
+#gpu/layout
+fn rejects(format int, width int, height int, levels int, row int, offset int) bool {
+    layout.texture_2d(format, width, height, levels, row, offset) or (err) { << true }
+    << false
+}
+fn check() int {
+    tight := layout.texture_2d(layout.RGBA8_SRGB, 3, 5, 0, 1, 1) or >>
+    assert(tight.level_count() == 3 && tight.total_bytes() == 72)
+    base := tight.level(0) or >>
+    assert(base.width == 3 && base.height == 5 && base.row_bytes == 12)
+    $copy := base
+    copy.row_bytes = 99
+    assert((tight.level(0) or >>).row_bytes == 12)
+    transfer := layout.texture_2d(layout.RGBA8_UNORM, 3, 5, 0, 256, 512) or >>
+    assert(transfer.total_bytes() == 2304)
+    assert((transfer.level(1) or >>).offset == 1536)
+    assert((transfer.level(2) or >>).row_pitch == 256)
+    blocks := layout.texture_2d(layout.BC1_RGBA_UNORM, 3, 5, 0, 1, 1) or >>
+    assert(blocks.total_bytes() == 32 && (blocks.level(0) or >>).block_rows == 2)
+    largest := layout.texture_2d(layout.R8_UNORM, 9223372036854775807, 1, 1, 1, 1) or >>
+    assert(largest.total_bytes() == 9223372036854775807)
+    assert((layout.mip_count_2d(9223372036854775807, 1) or >>) == 63)
+    assert(rejects(layout.R8_UNORM, 9223372036854775807, 1, 1, 2, 1))
+    assert(rejects(layout.RGBA32_FLOAT, 9223372036854775807, 1, 1, 1, 1))
+    assert(rejects(999, 1, 1, 1, 1, 1) && rejects(layout.R8_UNORM, 0, 1, 1, 1, 1))
+    assert(rejects(layout.R8_UNORM, 1, 1, 2, 1, 1) && rejects(layout.R8_UNORM, 1, 1, 1, 3, 1))
+    for format in 1:21 {
+        info := layout.format_info(format) or >>
+        assert(info.block_bytes > 0 && info.depth == (format == layout.DEPTH32_FLOAT))
+    }
+    println("GPU layout: 72/2304/32 bytes; checked int64; no device")
+    << 0
+}
+fn main() int {
+    << check() or (err) { eprintln(err.msg())
+        << 1 }
+}
+''')
+    isolated = env | {"SDL_VIDEODRIVER": "nonexistent", "XU_GAME_SDL_LIBRARY": "nonexistent"}
+    program = project / ("gpu layout.exe" if os.name == "nt" else "gpu layout")
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "gpu_layout.xu", *flags, "-o", str(program)], cwd=project, env=isolated)
+        assert run([str(program)], cwd=project, env=isolated).strip() == "GPU layout: 72/2304/32 bytes; checked int64; no device"
+    print("installed-sdk: gpu-layout PASS (default and --no-opt; no device)")
+
+
+def gpu_device_import(xu: str, project: Path, env):
+    """Compile the source-backed GPU package without a GPU runtime."""
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#gpu
+#strings
+// Compile the public compute surface on every SDK target. This path is not
+// executed without a real device; the runtime test below rejects missing SDL.
+fn invalid_texture_reference() bool {
+    reference := gpu.TextureRef{}
+    reference.validate() or(err){ << true }
+    << false
+}
+fn invalid_device_reference() bool {
+    reference := gpu.DeviceRef{}
+    reference.validate() or(err){ << true }
+    << false
+}
+fn reference_api(device &gpu.Device, pass &gpu.RenderPass, texture &gpu.Texture, sampler &gpu.Sampler, buffer &gpu.Buffer) int {
+    owner := device.reference()
+    owner.validate() or >>
+    owner.validate_buffer(buffer.reference()) or >>
+    owner.validate_texture(texture.reference()) or >>
+    owner.validate_sampler(sampler.reference()) or >>
+    assert(owner.same(device.reference()))
+    assert(buffer.reference().size_bytes() == buffer.size_bytes())
+    pass.vertex_buffer_ref(0,buffer.reference(),0) or >>
+    pass.index_buffer_ref(buffer.reference(),0,gpu.INDEX32) or >>
+    pass.sampler_ref(gpu.FRAGMENT,0,texture.reference(),sampler.reference()) or >>
+    << 0
+}
+fn compute_api(device &gpu.Device) int {
+    desc := gpu.ComputePipelineDesc{format: gpu.SHADER_MSL, entrypoint: "main", read_buffers: 1,
+        write_buffers: 1, uniform_sizes: [16], threads_x: 64, threads_y: 1, threads_z: 1}
+    code := [u8(1)]
+    $pipeline := device.compute_pipeline(&desc, &code) or >>
+    $buffer := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
+    $output := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
+    writes := [gpu.write_buffer(&output, false)]
+    $encoder := device.command_encoder() or >>
+    $pass := encoder.begin_compute(&writes) or >>
+    pass.pipeline(&pipeline) or >>
+    pass.read_buffer(0, &buffer) or >>
+    values := [u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),
+        u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0)]
+    pass.uniform(0, &values) or >>
+    pass.dispatch(1, 1, 1) or >>
+    pass.end() or >>
+    $fence := encoder.submit() or >>
+    fence.wait() or >>
+    stats := device.stats() or >>
+    assert(stats.compute_pass_count == 0 && stats.compute_pipeline_count == 1)
+    << 0
+}
+fn check() int {
+    assert(invalid_texture_reference() && invalid_device_reference())
+    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or (err) {
+        message := err.msg()
+        assert(strings.contains(&message, "SDL 3 runtime unavailable"))
+        println("GPU device: source backend, explicit missing-runtime error")
+        << 0
+    }
+    compute_api(&device) or >>
+    << 1
+}
+fn main() int { << check() or (err) { eprintln(err.msg())
+    << 1 } }
+''')
+    isolated = env | {"XU_SDL_LIBRARY": str(project / "missing SDL runtime")}
+    program = project / ("GPU device.exe" if os.name == "nt" else "GPU device")
+    run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=isolated)
+    assert run([str(program)], cwd=project, env=isolated).strip() == "GPU device: source backend, explicit missing-runtime error"
+    print("installed-sdk: gpu-device-import PASS (compute API compile, no SDL headers/runtime or application native declaration)")
+
+
+def window_event_data(xu: str, project: Path, env):
+    """Pure portable event data must not pull in the window source backend."""
+    project.mkdir()
+    (project / "main.xu").write_text('@main\n#window/events\nfn main() int {\n    $event := events.empty()\n    assert(event.kind==events.EVENT_NONE && event.text=="")\n    event.kind=events.EVENT_KEY_DOWN\n    event.physical_key=events.KEY_A\n    event.logical_key=228\n    event.modifiers=events.MOD_LEFT_SHIFT | events.MOD_RIGHT_CTRL\n    event.x=12.5\n    event.text="你好🎮"\n    assert(event.physical_key==4 && event.logical_key==228 && event.modifiers==9)\n    assert(event.x==12.5 && event.text=="你好🎮")\n    event.kind=events.EVENT_INPUT_RESET\n    event.reset_reason=events.RESET_QUEUE_FULL\n    assert(event.reset_reason==1 && events.QUEUE_CAPACITY==256)\n    println("Window events: pure owned portable data")\n    << 0\n}\n')
+    isolated = env | {"XU_NATIVE_CC": str(project / "missing compiler"),
+                      "XU_SDL_LIBRARY": str(project / "missing SDL runtime")}
+    program = project / ("Window events.exe" if os.name == "nt" else "Window events")
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "main.xu", *flags, "-o", str(program)], cwd=project, env=isolated)
+        assert run([str(program)], cwd=project, env=isolated).strip() == "Window events: pure owned portable data"
+    print("installed-sdk: window-event-data PASS (default and --no-opt; no native compiler or SDL)")
+
+
+def window_surface_import(xu: str, project: Path, env):
+    """Compile window/surface APIs and run only explicit missing-SDL handling."""
+    project.mkdir()
+    (project / "main.xu").write_text('''@main
+#window
+#window/events
+#gpu
+#strings
+fn surface_api(target &window.Window) int {
+    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO,debug: false,shader_formats: 0}) or >>
+    $surface := device.surface(target,gpu.SurfaceOptions{present_mode: gpu.PRESENT_VSYNC}) or >>
+    surface.supports_present_mode(gpu.PRESENT_VSYNC) or >>
+    surface.set_present_mode(gpu.PRESENT_VSYNC) or >>
+    $frame := surface.acquire() or >>
+    if frame.has_image() {
+        assert(frame.width()>0 && frame.height()>0)
+        frame.format()
+        writes := []gpu.StorageBufferWrite{}
+        $compute := frame.begin_compute(&writes) or >>
+        compute.end() or >>
+        $pass := frame.begin_render(gpu.CLEAR,gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0},gpu.no_depth()) or >>
+        pass.end() or >>
+        $fence := frame.present() or >>
+        fence.close() or >>
+    }
+    frame.close() or >>
+    surface.close() or >>
+    << 0
+}
+fn check() int {
+    options := window.Options{title: "SDK window",width: 64,height: 64,resizable: false,high_pixel_density: true,hidden: true}
+    $target := window.open(&options) or (err) {
+        message := err.msg()
+        assert(strings.contains(&message,"SDL 3 runtime unavailable"))
+        println("Window: shared source backend, explicit missing-runtime error")
+        << 0
+    }
+    surface_api(&target) or >>
+    state := target.state() or >>
+    assert(state.width==64)
+    target.resize(32,32) or >>
+    target.show() or >>
+    target.hide() or >>
+    target.minimize() or >>
+    target.restore() or >>
+    window.pump() or >>
+    event := target.poll() or >>
+    if event.kind==events.EVENT_INPUT_RESET { assert(event.reset_reason>0) }
+    target.pending_events() or >>
+    target.key_down(events.KEY_A) or >>
+    target.pointer_state() or >>
+    target.start_text_input() or >>
+    target.text_input_active() or >>
+    target.text_input_area(0,0,32,24,4) or >>
+    target.clear_text_input_area() or >>
+    target.stop_text_input() or >>
+    target.set_relative_pointer(false) or >>
+    target.relative_pointer() or >>
+    target.set_pointer_grab(false) or >>
+    target.pointer_grab() or >>
+    target.close() or >>
+    window.live_count() or >>
+    << 1
+}
+fn main() int { << check() or (err) { eprintln(err.msg())
+    << 1 } }
+''')
+    isolated = env | {"XU_SDL_LIBRARY": str(project / "missing shared SDL runtime")}
+    program = project / ("Window surface.exe" if os.name == "nt" else "Window surface")
+    run([xu, "build", "main.xu", "-o", str(program)], cwd=project, env=isolated)
+    assert run([str(program)], cwd=project, env=isolated).strip() == "Window: shared source backend, explicit missing-runtime error"
+    print("installed-sdk: window-surface-import PASS (input/surface API compile/shared backend/missing runtime; no GPU execution)")
+
+
+def binary_floats(xu: str, project: Path, env):
+    # Exercise tight byte storage and IEEE conversions without native tools.
+    import random
+    import struct
+    project.mkdir()
+    rng = random.Random(0xB17F10A7)
+    patterns = [0, 1, 0x8000000000000000, 0x8000000000000001,
+                0x7ff0000000000000, 0xfff0000000000000, 0x7ff0000000000001,
+                0xfff0000000000001, 0x7fffffffffffffff, 0x7fefffffffffffff]
+    patterns += [rng.getrandbits(64) for _ in range(128)]
+    # Midpoint and its adjacent binary64 values around every binary32 exponent.
+    for exponent in range(1, 255):
+        a = struct.unpack('<f', struct.pack('<I', exponent << 23))[0]
+        b = struct.unpack('<f', struct.pack('<I', (exponent << 23) + 1))[0]
+        midpoint = struct.unpack('<Q', struct.pack('<d', (a + b) * 0.5))[0]
+        patterns += [midpoint - 1, midpoint, midpoint + 1]
+    for value in (2.0 ** -150, 2.0 ** -149, 2.0 ** -126, 2.0 ** 128 - 2.0 ** 103):
+        word = struct.unpack('<Q', struct.pack('<d', value))[0]
+        patterns += [word - 1, word, word + 1]
+    expected = []
+    for word in patterns:
+        fraction = word & ((1 << 52) - 1)
+        if (word >> 52) & 2047 == 2047 and fraction:
+            result = ((word >> 32) & 0x80000000) | 0x7fc00000 | (fraction >> 29)
+        else:
+            try:
+                value = struct.unpack('<d', struct.pack('<Q', word))[0]
+                result = struct.unpack('<I', struct.pack('<f', value))[0]
+            except OverflowError:
+                result = ((word >> 32) & 0x80000000) | 0x7f800000
+        expected.append(result)
+
+    def literal(word):
+        if word == 1 << 63:
+            return '(1 << 63)'
+        return str(word if word < 1 << 63 else word - (1 << 64))
+
+    (project / 'runtime_probe.xu').write_text('''@runtime/core
+pub fn failure_flag_for_acceptance() int { << gword(G_TEST_SOFT) }
+''')
+    source = '''@main
+#encoding/binary
+#math
+#testing
+core #runtime/core
+fn zeros(n int) []u8 { $out:=[]u8{}
+    for i in 0:n { out.push(u8(73)) }
+    << out }
+fn rejects_write(data $&[]u8, kind int, off int) bool {
+    for once in 0:1 {
+        if kind==0 { binary.little_endian().put_f32(data,off,0.5) or(err) { << true }
+        } else if kind==1 { binary.big_endian().put_f64(data,off,0.5) or(err) { << true }
+        } else { binary.big_endian().put_u32_bytes(data,off,255) or(err) { << true } }
+    }
+    << false
+}
+fn rejects_read(data &[]u8, kind int, off int) bool {
+    if kind==0 { binary.little_endian().get_f32(data,off) or(err) { << true }
+    } else { binary.big_endian().get_f64(data,off) or(err) { << true } }
+    << false
+}
+fn check() int {
+    le:=binary.little_endian()
+    be:=binary.big_endian()
+    patterns:=PATTERNS
+    expected:=EXPECTED
+    $little:=zeros(10)
+    $big:=zeros(10)
+    retained:=~little
+    assert(math.float64_bits(0.5)==4602678819172646912 && math.float32_bits(0.5)==1056964608)
+    assert(math.float64_from_bits(4602678819172646912)+0.5==1.0)
+    assert(math.float32_from_bits(1065353216)==1.0)
+    assert(math.signbit(math.float64_from_bits((1<<63)|9221120237041090561)))
+    assert(math.float64_bits(math.abs(-0.0))==0 && math.float64_bits(math.copysign(-0.0,1.0))==0)
+    assert(math.float64_bits(math.copysign(1.0,math.float64_from_bits((1<<63)|9221120237041090561)))==((1<<63)|4607182418800017408))
+    for i in 0:patterns.len {
+        raw:=patterns[i]
+        value:=math.float64_from_bits(raw)
+        assert(math.float64_bits(value)==raw && math.float32_bits(value)==expected[i])
+        assert(math.signbit(value)==(raw<0))
+        assert(math.float64_bits(math.abs(value))==(raw&9223372036854775807))
+        assert(math.float64_bits(math.copysign(value,-0.0))==(raw|(1<<63)))
+        le.put_f64($&little,1,value) or >>
+        be.put_f64($&big,1,value) or >>
+        for lane in 0:8 { want:=(raw>>(lane*8))&255
+            assert(int(little[1+lane])==want && int(big[8-lane])==want) }
+        assert(little[0]==u8(73) && little[9]==u8(73) && big[0]==u8(73) && big[9]==u8(73))
+        lv:=le.get_f64(&little,1) or >>
+        bv:=be.get_f64(&big,1) or >>
+        assert(math.float64_bits(lv)==raw && math.float64_bits(bv)==raw)
+        le.put_f32($&little,1,value) or >>
+        be.put_f32($&big,1,value) or >>
+        for lane in 0:4 { want:=(expected[i]>>(lane*8))&255
+            assert(int(little[1+lane])==want && int(big[4-lane])==want) }
+    }
+    for i in 0:retained.len { assert(retained[i]==u8(73)) }
+    words:=[0,1,2147483648,2147483649,8388607,8388608,2139095040,4286578688,2139095041,4290847557]
+    for raw in words {
+        value:=math.float32_from_bits(raw)
+        $quiet:=raw
+        if (raw&2139095040)==2139095040 && (raw&8388607)!=0 { quiet=raw|4194304 }
+        assert(math.float32_bits(value)==quiet)
+        le.put_u32_bytes($&little,1,raw) or >>
+        decoded:=le.get_f32(&little,1) or >>
+        assert(math.float64_bits(decoded)==math.float64_bits(value))
+    }
+    le.put_u16_bytes($&little,1,65535) or >>
+    signed16:=le.get_i16_bytes(&little,1) or >>
+    assert(signed16==(0-1))
+    be.put_i32_bytes($&big,1,0-2147483648) or >>
+    signed32:=be.get_i32_bytes(&big,1) or >>
+    assert(signed32==(0-2147483648))
+    snapshot:=~big
+    for kind in 0:3 { for off in [0-1,7,9,10,9223372036854775807] {
+        assert(rejects_write($&big,kind,off))
+        for i in 0:big.len { assert(big[i]==snapshot[i]) }
+    } }
+    for kind in 0:2 { for off in [0-1,7,9,10,9223372036854775807] { assert(rejects_read(&big,kind,off)) } }
+    $empty:=[]u8{}
+    assert(rejects_write($&empty,0,0) && rejects_read(&empty,1,0))
+    assert(core.failure_flag_for_acceptance()==0)
+    $test_state:=testing.t()
+    test_state.fail()
+    assert(test_state.failed() && core.failure_flag_for_acceptance()==1)
+    println("Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity")
+    << 0
+}
+fn main() int { << check() or(err) { eprintln(err.msg())
+    << 1 } }
+'''
+    source = source.replace('PATTERNS', '[' + ','.join(literal(v) for v in patterns) + ']')
+    source = source.replace('EXPECTED', '[' + ','.join(str(v) for v in expected) + ']')
+    (project / 'main.xu').write_text(source)
+    program = project / ('binary floats.exe' if os.name == 'nt' else 'binary floats')
+    isolated = env | {'XU_NATIVE_CC': str(project / 'missing C compiler'),
+                      'XU_SDL_LIBRARY': str(project / 'missing SDL runtime')}
+    for flags in ((), ('--no-opt',)):
+        run([xu, 'build', 'main.xu', 'runtime_probe.xu', *flags, '-o', str(program)], cwd=project, env=isolated)
+        assert run([str(program)], cwd=project, env=isolated).strip() == 'Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity'
+    print(f'installed-sdk: binary-floats PASS ({len(patterns)} references; default and --no-opt; no native tools)')
+
+
+def native_byte_spans(xu: str, target: str, project: Path, env):
+    """Check byte-span descriptors and COW on each native installed SDK."""
+    project.mkdir()
+    (project / "native.json").write_text(json.dumps({"module": "sdk_bytes", "abi": "xu-c-2", "exports": [
+        {"name": "copy", "params": ["u8_span", "u8_span_mut", "int"], "ret": "int"},
+        {"name": "mixed", "params": ["u8_span"] + ["f64"] * 9 + ["i64_span", "bool", "i32", "u32", "u8", "u8_span_mut"], "ret": "f64"}]}))
+    (project / "native.c").write_text('''#include "xu_native.h"
+xu_int XU_NATIVE_SYMBOL(xu_sdk_bytes_copy)(const xu_u8_span *src, const xu_u8_span_mut *dst, xu_int bias) {
+    if (!src || !dst || src->len != dst->len || src->len < 0) return -1;
+    for (xu_int i = 0; i < src->len; ++i) dst->data[i] = (unsigned char)(src->data[i] + bias);
+    return src->len;
+}
+double XU_NATIVE_SYMBOL(xu_sdk_bytes_mixed)(const xu_u8_span *src, double a, double b, double c, double d, double e,
+    double f, double g, double h, double i, const xu_i64_span *ints, _Bool flag, int narrow, unsigned int positive,
+    unsigned char byte, const xu_u8_span_mut *dst) {
+    if (src->len != 4 || ints->len != 1 || dst->len != 1 || !flag || narrow != -7 || positive != 4000000000u || byte != 255) return -1;
+    dst->data[0] = src->data[2];
+    return a + b + c + d + e + f + g + h + i + ints->data[0];
+}
+''')
+    (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nnative:\n  sdk_bytes: file:./bytes.a\n')
+    run([xu, "native", "compile", "--manifest", "native.json", "--target", target,
+         "-o", "bytes.a", "native.c"], cwd=project, env=env)
+    (project / "main.xu").write_text('''@main
+#sdk_bytes
+struct Bytes { guard int
+ data []u8
+ tail u8 }
+fn main() int {
+    source := Bytes{guard: 91,data: [u8(0),u8(127),u8(128),u8(255)],tail: u8(17)}
+    $output := [u8(73),u8(73),u8(73),u8(73)]
+    snapshot := ~output
+    assert(sdk_bytes.copy(&source.data,$&output,129)==4)
+    assert(output[0]==u8(129) && output[1]==u8(0) && output[2]==u8(1) && output[3]==u8(128))
+    assert(snapshot[0]==u8(73) && snapshot[3]==u8(73) && source.data[3]==u8(255))
+    $holder := Bytes{guard: 123,data: [u8(73),u8(73),u8(73),u8(73)],tail: u8(19)}
+    retained := ~holder
+    assert(sdk_bytes.copy(&source.data,$&holder.data,129)==4)
+    assert(holder.data[0]==u8(129) && holder.data[3]==u8(128) && retained.data[0]==u8(73))
+    assert(holder.guard==123 && holder.tail==u8(19) && source.guard==91 && source.tail==u8(17))
+    empty := []u8{}
+    $destination := []u8{}
+    assert(sdk_bytes.copy(&empty,$&destination,0)==0)
+    ints := [10]
+    $mixed_output := [u8(73)]
+    mixed_snapshot := ~mixed_output
+    result := sdk_bytes.mixed(&source.data,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,&ints,true,i32(-7),u32(4000000000),u8(255),$&mixed_output)
+    assert(result==55.0 && mixed_output[0]==u8(128) && mixed_snapshot[0]==u8(73))
+    println("Native byte spans: packed bytes, borrowed fields, COW and empty views; mixed scalar ABI")
+    << 0
+}
+''')
+    program = project / ("native bytes.exe" if os.name == "nt" else "native bytes")
+    for flags in ((), ("--no-opt",)):
+        run([xu, "build", "main.xu", *flags, "-o", str(program)], cwd=project, env=env)
+        assert run([str(program)], cwd=project, env=env).strip() == "Native byte spans: packed bytes, borrowed fields, COW and empty views; mixed scalar ABI"
+    print("installed-sdk: native-byte-spans PASS (default and --no-opt)")
+
+
 def smoke(archive: Path | None, work: Path, native_setup: bool = False, installer: Path | None = None):
     prefix = work / "installed Xu SDK"
     project = work / "user project with spaces"
@@ -235,6 +699,12 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
     xu = shutil.which("xu", path=active["PATH"])
     assert xu and Path(xu).parent == prefix / "bin", xu
     assert manifest["version"] in run([xu, "--version"], cwd=project, env=active)
+    if manifest["target"] == "linux-x64":
+        compiler_wasm = work / "xu.wasm"
+        run([xu, "build", str(prefix / "src/cmd/compile"), "--target", "wasm32-wasi",
+             "-o", str(compiler_wasm)], cwd=project, env=active)
+        with compiler_wasm.open("rb") as module:
+            assert module.read(8) == b"\x00asm\x01\x00\x00\x00"
     (project / "main.xu").write_text('''@main
 #strings
 #sdk_probe
@@ -264,6 +734,13 @@ fn main() int {
     clean.pop("XU_STDLIB_ROOT", None)
     clean.pop("XU_ROOT", None)
     assert run([xu, "run", "main.xu"], cwd=project, env=clean).splitlines() == ["INSTALLED", "42"]
+    binary_floats(xu, work / "binary floats project", clean)
+    deflate_output(xu, work / "DEFLATE output project", clean)
+    gpu_layout(xu, work / "GPU layout project", clean)
+    gpu_device_import(xu, work / "GPU device project", clean)
+    window_event_data(xu, work / "Window event data project", clean)
+    window_surface_import(xu, work / "Window surface project", clean)
+    native_byte_spans(xu, manifest["target"], work / "native byte spans", clean)
     # SDK root discovery is independent of external GUI toolchain availability.
     # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK
     # before probing those host dependencies. Exercise direct PATH and CLI use.
