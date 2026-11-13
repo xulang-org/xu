@@ -1,0 +1,470 @@
+@xu/mir
+// Scalar replacement of address-taken locals in typed MIR.
+//
+// Wide locals (structs, fixed arrays, descriptors) are reached through
+// t = addr l and loads/stores at [t + offset], which keeps them in the
+// frame. A local is direct when every address of it is only ever the base
+// of a full-word load or store at an aligned offset inside the local, so
+// no pointer to it can exist anywhere else: then each access names one
+// fixed word, and the local can become one ordinary one-word local per
+// word, which opt_locals and the register allocator handle like any scalar.
+//
+// Address temps: a temp defined exactly once, by addr l, or by a copy of
+// an address temp, or by add of an address temp and a constant, holds
+// &l + a known byte offset (nested fields and constant array indexes
+// lower to such adds).
+//
+// Escape rules (anything else leaves the local alone):
+// - the function holds only kinds fold_known_kind accepts;
+// - a temp defined by addr l has exactly one definition;
+// - an address temp of l is only used as the base operand of MI_LOAD_PTR
+//   or MI_STORE_PTR of width 8 whose total byte offset is 8k with
+//   0 <= k < nslots(l), or as the operand of a copy / constant add that
+//   defines another address temp;
+// - any other use of an address temp (store value, other arithmetic,
+//   comparison, call or indirect-call operand, branch condition, return
+//   value, narrow or misaligned access, a copy or add into a temp with
+//   several definitions) escapes l;
+// - l is not an incoming parameter and not marked owning.
+// An access through an address temp or MI_LOAD_LOCAL / MI_STORE_LOCAL
+// that reaches outside its local's words (which could touch a neighbour
+// through the frame layout) makes the whole function ineligible.
+//
+// Holders: a split word (or any one-word, never address-taken local)
+// that is only ever assigned one fixed address &l + off is itself an
+// address of l: its loads are address temps and its stores go away when
+// l is split. This catches the descriptor a fixed array index builds
+// ({data, len, cap} in a .tmp) and references to locals kept in locals.
+// Rounds repeat (at most 4) while a round stored an address into a split
+// word, since that word can only be seen as a holder in the next round.
+//
+// The driver runs it after opt_bce and opt_periodic, for arm64 / x64 only.
+
+fn addr_esc(taddr &[]int, esc $&[]bool, v int) {
+    if v >= 0 && v < taddr.len && taddr[v] >= 0 {
+        esc[taddr[v]] = true
+    }
+}
+
+fn addr_is(taddr &[]int, v int) bool {
+    << v >= 0 && v < taddr.len && taddr[v] >= 0
+}
+
+// Word k of split local l.
+fn addr_word_local(l int, k int, wbase &[]int) int {
+    if k == 0 {
+        << l
+    }
+    << wbase[l] + k - 1
+}
+
+pub fn opt_addr(f $&MFn) bool {
+    $changed := false
+    $hint := []bool{}
+    hint.push(false)
+    for _ in 0:4 {
+        hint[0] = false
+        r := addr_round(f, $&hint)
+        if !r {
+            <-
+        }
+        changed = true
+        if !hint[0] {
+            <-
+        }
+    }
+    << changed
+}
+
+// One round of opt_addr. hint[0] is set when an address of a local left
+// alone was stored into a split word: the next round may find that word
+// to be a holder.
+fn addr_round(f $&MFn, hint $&[]bool) bool {
+    nl := f.locals.len
+    nt := f.temps.len
+    if nl == 0 || f.blocks.len == 0 || f.locals_nslots.len < nl || f.local_names.len < nl {
+        << false
+    }
+    $has_addr := false
+    for ii in 0:f.instrs.len {
+        k := f.instrs[ii].kind
+        if !fold_known_kind(k) {
+            << false
+        }
+        if k == MI_ADDR {
+            has_addr = true
+        }
+    }
+    if !has_addr {
+        << false
+    }
+    // Definitions per temp; taddr[t] = l and toff[t] = byte offset when t
+    // is an address temp of l.
+    $ndef := []int{}
+    $taddr := []int{}
+    $toff := []int{}
+    for _ in 0:nt {
+        ndef.push(0)
+        taddr.push(0 - 1)
+        toff.push(0)
+    }
+    $esc := []bool{}
+    $taken := []bool{}
+    for l in 0:nl {
+        $e := l < f.nparams
+        if l < f.locals_owning.len && f.locals_owning[l] {
+            e = true
+        }
+        esc.push(e)
+        taken.push(false)
+    }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            k := f.instrs[ii].kind
+            a := f.instrs[ii].a
+            if k == MI_ADDR {
+                b := f.instrs[ii].b
+                if b < 0 || b >= nl {
+                    << false
+                }
+                taken[b] = true
+                if a < 0 || a >= nt {
+                    esc[b] = true
+                }
+            }
+            if fold_defines(k) && a >= 0 && a < nt {
+                ndef[a] = ndef[a] + 1
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+    // Holders: one-word locals that are not parameters, never
+    // address-taken, and stored at least once, where every store that is
+    // not dead stores an address temp of the same (local, offset). Reading one yields
+    // that address (or, before any store, an undefined value, which MIR
+    // never reads), so its loads are address temps too.
+    $hok := []bool{}
+    $hset := []bool{}
+    $hold := []int{}
+    $hoff := []int{}
+    for l in 0:nl {
+        $ok := l >= f.nparams && f.locals_nslots[l] == 1 && !taken[l]
+        if l < f.locals_owning.len && f.locals_owning[l] {
+            ok = false
+        }
+        hok.push(ok)
+        hset.push(false)
+        hold.push(0 - 1)
+        hoff.push(0)
+    }
+    // A store to a one-word local that the same block stores again before
+    // any load of it is dead (only loads read a local that is never
+    // address-taken), so it does not count against a holder; struct
+    // literals zero a word before storing the field.
+    $deadst := []bool{}
+    for _ in 0:f.instrs.len {
+        deadst.push(false)
+    }
+    $lastst := []int{}
+    $lastblk := []int{}
+    for _ in 0:nl {
+        lastst.push(0 - 1)
+        lastblk.push(0 - 1)
+    }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            if ins.kind == MI_LOAD_LOCAL && ins.b >= 0 && ins.b < nl {
+                lastblk[ins.b] = 0 - 1
+            } else if ins.kind == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl {
+                if lastblk[ins.a] == bi {
+                    deadst[lastst[ins.a]] = true
+                }
+                lastblk[ins.a] = bi
+                lastst[ins.a] = ii
+            }
+            ii = ins.next
+        }
+    }
+    // Address temps: addr first, then copies, constant adds and loads of
+    // holders until nothing new is found (definitions need not come in
+    // block order).
+    $outer := true
+    $round := 0
+    while outer {
+    outer = false
+    $again := true
+    while again {
+        again = false
+        for bi in 0:f.blocks.len {
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                k := ins.kind
+                a := ins.a
+                if a >= 0 && a < nt && taddr[a] < 0 && ndef[a] == 1 {
+                    if k == MI_ADDR {
+                        if round == 0 {
+                            taddr[a] = ins.b
+                            again = true
+                        }
+                    } else if k == MI_LOAD_LOCAL && ins.b >= 0 && ins.b < nl && hset[ins.b] {
+                        taddr[a] = hold[ins.b]
+                        toff[a] = hoff[ins.b]
+                        again = true
+                    } else if k == MI_COPY && addr_is(&taddr, ins.b) {
+                        taddr[a] = taddr[ins.b]
+                        toff[a] = toff[ins.b]
+                        again = true
+                    } else if k == MI_BIN && ins.b == BIN_ADD {
+                        if addr_is(&taddr, ins.c) && ins.d <= 0 - 2 {
+                            taddr[a] = taddr[ins.c]
+                            toff[a] = toff[ins.c] + f.consts[0 - ins.d - 2]
+                            again = true
+                        } else if addr_is(&taddr, ins.d) && ins.c <= 0 - 2 {
+                            taddr[a] = taddr[ins.d]
+                            toff[a] = toff[ins.d] + f.consts[0 - ins.c - 2]
+                            again = true
+                        }
+                    }
+                }
+                ii = ins.next
+            }
+        }
+        round += 1
+    }
+    // New holders, given the address temps known so far.
+    for l in 0:nl {
+        if hok[l] && !hset[l] {
+            hold[l] = 0 - 1
+        }
+    }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            m := ins.a
+            if ins.kind == MI_STORE_LOCAL && m >= 0 && m < nl && hok[m] && !hset[m] && hold[m] != 0 - 2 && !deadst[ii] {
+                if !addr_is(&taddr, ins.b) {
+                    hold[m] = 0 - 2
+                } else if hold[m] == 0 - 1 {
+                    hold[m] = taddr[ins.b]
+                    hoff[m] = toff[ins.b]
+                } else if hold[m] != taddr[ins.b] || hoff[m] != toff[ins.b] {
+                    hold[m] = 0 - 2
+                }
+            }
+            ii = ins.next
+        }
+    }
+    for l in 0:nl {
+        if hok[l] && !hset[l] && hold[l] >= 0 {
+            hset[l] = true
+            outer = true
+        }
+    }
+    }
+    // An addr into a temp defined more than once escapes.
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            if ins.kind == MI_ADDR && ins.a >= 0 && ins.a < nt && ndef[ins.a] != 1 {
+                esc[ins.b] = true
+            }
+            ii = ins.next
+        }
+    }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if k == MI_LOAD_LOCAL {
+                if ins.b < 0 || ins.b >= nl || ins.c >= f.locals_nslots[ins.b] {
+                    << false
+                }
+                // A holder read into a temp that is not an address temp.
+                if hset[ins.b] && !addr_is(&taddr, ins.a) {
+                    esc[hold[ins.b]] = true
+                }
+            } else if k == MI_STORE_LOCAL {
+                if ins.a < 0 || ins.a >= nl || ins.c >= f.locals_nslots[ins.a] {
+                    << false
+                }
+                // A holder's live stores store its own address; a dead one
+                // may store anything.
+                if !hset[ins.a] || !addr_is(&taddr, ins.b) || taddr[ins.b] != hold[ins.a] {
+                    addr_esc(&taddr, $&esc, ins.b)
+                }
+            } else if k == MI_LOAD_PTR || k == MI_STORE_PTR {
+                $base := ins.b
+                if k == MI_STORE_PTR {
+                    base = ins.a
+                    addr_esc(&taddr, $&esc, ins.b)
+                }
+                if addr_is(&taddr, base) {
+                    l := taddr[base]
+                    off := toff[base] + ins.c
+                    w := ins.d
+                    $nb := 8
+                    if w == 1 {
+                        nb = 1
+                    } else if w == 4 || w == 0 - 4 {
+                        nb = 4
+                    }
+                    if off < 0 || off + nb > f.locals_nslots[l] * 8 {
+                        << false
+                    }
+                    if w != 8 || off % 8 != 0 {
+                        esc[l] = true
+                    }
+                }
+            } else if k == MI_COPY {
+                if !addr_is(&taddr, ins.a) {
+                    addr_esc(&taddr, $&esc, ins.b)
+                }
+            } else if k == MI_BIN {
+                if !addr_is(&taddr, ins.a) {
+                    addr_esc(&taddr, $&esc, ins.c)
+                    addr_esc(&taddr, $&esc, ins.d)
+                }
+            } else if k == MI_UN {
+                addr_esc(&taddr, $&esc, ins.c)
+            } else if k == MI_CALL_IND {
+                addr_esc(&taddr, $&esc, ins.b)
+            }
+            if k == MI_CALL || k == MI_CALL_IND {
+                $ai := ins.c
+                while ai >= 0 {
+                    addr_esc(&taddr, $&esc, f.margs[ai].v)
+                    ai = f.margs[ai].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[bi].tkind
+        if tk == TKIND_BRANCH || tk == TKIND_RETURN {
+            addr_esc(&taddr, $&esc, f.blocks[bi].ta)
+        }
+    }
+    // Split: word 0 stays in l (now one word), words 1.. get new locals.
+    $wbase := []int{}
+    $nsplit := 0
+    for l in 0:nl {
+        wbase.push(0 - 1)
+        if esc[l] || (!taken[l] && f.locals_nslots[l] <= 1) {
+            esc[l] = true
+            ->
+        }
+        nsplit += 1
+        n := f.locals_nslots[l]
+        if n > 1 {
+            wbase[l] = f.locals.len
+            for k in 1:n {
+                f.locals.push(1)
+                f.locals_nslots.push(1)
+                f.locals_owning.push(false)
+                f.local_names.push("." + f.local_names[l] + "." + str(k))
+            }
+            f.locals_nslots[l] = 1
+        }
+    }
+    if nsplit == 0 {
+        << false
+    }
+    $linked := []bool{}
+    for _ in 0:f.instrs.len {
+        linked.push(false)
+    }
+    for bi in 0:f.blocks.len {
+        $prev := 0 - 1
+        $ii := f.blocks[bi].head
+        f.blocks[bi].head = 0 - 1
+        while ii >= 0 {
+            nx := f.instrs[ii].next
+            k := f.instrs[ii].kind
+            $drop := false
+            if k == MI_ADDR || k == MI_COPY || k == MI_BIN {
+                // Definitions of address temps of a split local.
+                a := f.instrs[ii].a
+                drop = addr_is(&taddr, a) && !esc[taddr[a]]
+            } else if k == MI_LOAD_PTR || k == MI_STORE_PTR {
+                $base := f.instrs[ii].b
+                if k == MI_STORE_PTR {
+                    base = f.instrs[ii].a
+                }
+                if addr_is(&taddr, base) && !esc[taddr[base]] {
+                    if k == MI_STORE_PTR && addr_is(&taddr, f.instrs[ii].b) {
+                        hint[0] = true
+                    }
+                    l := taddr[base]
+                    nlw := addr_word_local(l, (toff[base] + f.instrs[ii].c) / 8, &wbase)
+                    if k == MI_LOAD_PTR {
+                        f.instrs[ii].kind = MI_LOAD_LOCAL
+                        f.instrs[ii].b = nlw
+                    } else {
+                        f.instrs[ii].kind = MI_STORE_LOCAL
+                        f.instrs[ii].a = nlw
+                    }
+                    f.instrs[ii].c = 0
+                    f.instrs[ii].d = 0 - 1
+                }
+            } else if k == MI_LOAD_LOCAL {
+                l := f.instrs[ii].b
+                a := f.instrs[ii].a
+                if hset[l] {
+                    drop = addr_is(&taddr, a) && !esc[taddr[a]]
+                } else if !esc[l] {
+                    $w := f.instrs[ii].c
+                    if w < 0 {
+                        w = 0
+                    }
+                    f.instrs[ii].b = addr_word_local(l, w, &wbase)
+                    f.instrs[ii].c = 0
+                }
+            } else if k == MI_STORE_LOCAL {
+                l := f.instrs[ii].a
+                if hset[l] {
+                    drop = !esc[hold[l]]
+                } else if !esc[l] {
+                    if addr_is(&taddr, f.instrs[ii].b) {
+                        hint[0] = true
+                    }
+                    $w := f.instrs[ii].c
+                    if w < 0 {
+                        w = 0
+                    }
+                    f.instrs[ii].a = addr_word_local(l, w, &wbase)
+                    f.instrs[ii].c = 0
+                }
+            }
+            if drop {
+                f.instrs[ii].kind = MI_NOP
+            } else {
+                linked[ii] = true
+                if prev < 0 {
+                    f.blocks[bi].head = ii
+                } else {
+                    f.instrs[prev].next = ii
+                }
+                prev = ii
+            }
+            ii = nx
+        }
+        if prev >= 0 {
+            f.instrs[prev].next = 0 - 1
+        }
+        f.blocks[bi].tail = prev
+    }
+    // Instructions no block reaches still count in the register
+    // allocator's address-taken scan and the frame's call scan.
+    for ii in 0:f.instrs.len {
+        if !linked[ii] {
+            f.instrs[ii].kind = MI_NOP
+        }
+    }
+    << true
+}
