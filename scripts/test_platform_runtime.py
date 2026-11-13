@@ -78,6 +78,97 @@ fn main() int {
 }
 '''
 
+OPTIMIZED_CODE = r'''@main
+#crypto/aes
+#crypto/sha256
+#encoding/hex
+#math/bits
+#strings
+
+struct Counter {
+    value int
+}
+
+fn (c $&Counter) add(n int) {
+    c.value += n
+}
+
+fn rejects_invalid_hex() bool {
+    _ := hex.decode_string("0123456789ABCDEFg123456789abcdef") or (err) { << true }
+    << false
+}
+
+fn gcd(a int, b int) int {
+    if b == 0 { << a }
+    << gcd(b, a % b)
+}
+
+fn implicit_borrow_values() bool {
+    first := 23
+    counter := Counter{value: 42}
+    let $ref: &int = first
+    if *ref != 23 { << false }
+    ref = counter.value
+    if *ref != 42 { << false }
+    values := [4, 5]
+    ref = values[1]
+    if *ref != 5 { << false }
+    ref = values.len
+    << *ref == 2
+}
+
+fn main() int {
+    $counter := Counter{value: 3}
+    $sum := 5
+    $i := 3
+    while i < 35 {
+        sum += i & 7
+        i += 1
+    }
+    counter.add(sum)
+    if i != 35 || counter.value != 120 { << 1 }
+
+    // The later read uses the incremented i and cannot be folded as above.
+    i = 0
+    sum = 0
+    while i < 9 {
+        i += 1
+        sum += i & 7
+    }
+    if sum != 29 { << 2 }
+    if gcd(1071, 462) != 21 { << 16 }
+    if !implicit_borrow_values() { << 20 }
+
+    if bits.len(0) != 0 || bits.leading_zeros(0) != 64 || bits.trailing_zeros(0) != 64 { << 3 }
+    if bits.ones_count(-1) != 64 || bits.reverse(1) != (1 << 63) { << 4 }
+    if bits.rotate_left(1, -1) != (1 << 63) || bits.rotate_right(1, 64) != 1 { << 5 }
+
+    // Exercise a SIMD block plus a scalar tail, mixed case and bad bytes.
+    bytes := hex.decode_string("0123456789ABCDEF0123456789abcdefF0") or (err) { << 6 }
+    if hex.encode_to_string(bytes + "") != "0123456789abcdef0123456789abcdeff0" { << 7 }
+    if !rejects_invalid_hex() { << 8 }
+
+    key := hex.decode_string("000102030405060708090a0b0c0d0e0f") or (err) { << 9 }
+    plain := hex.decode_string("00112233445566778899aabbccddeeff") or (err) { << 10 }
+    cipher := aes.new_cipher(&key) or (err) { << 11 }
+    encrypted := cipher.encrypt(&plain) or (err) { << 12 }
+    if hex.encode_to_string(encrypted + "") != "69c4e0d86a7b0430d8cdb78070b4c55a" { << 13 }
+    recovered := cipher.decrypt(&encrypted) or (err) { << 14 }
+    if recovered != plain { << 15 }
+    if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" { << 17 }
+    source := "abcd"
+    view := source[1:3]
+    $once := strings.repeat(&view, 1)
+    once[0] = 120
+    if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
+    empty := ""
+    if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
+    println("optimized code passed")
+    << 0
+}
+'''
+
+
 CONCURRENCY = r'''@main
 fn worker(ch chan string, value int) {
     $values := map[string]int{}
@@ -252,11 +343,11 @@ def main() -> int:
         work = Path(temporary)
         env.update(XU_CACHE=str(work / "cache"), HOME=str(work), USERPROFILE=str(work))
 
-        def build(name: str, source: str) -> Path:
+        def build(name: str, source: str, *flags: str) -> Path:
             path = work / f"{name}.xu"
             path.write_text(source, encoding="utf-8", newline="\n")
             binary = work / (name + (".exe" if os.name == "nt" else ""))
-            subprocess.run([compiler, "build", str(path), "--target", args.target, "-o", str(binary)],
+            subprocess.run([compiler, "build", *flags, str(path), "--target", args.target, "-o", str(binary)],
                            cwd=work, env=env, check=True, timeout=180)
             return binary
 
@@ -265,6 +356,9 @@ def main() -> int:
             print(f"PASS {name}/{args.target} (executed)", flush=True)
 
         run("library", build("library", LIBRARY), expected="library passed")
+        run("optimized_code", build("optimized_code", OPTIMIZED_CODE), expected="optimized code passed")
+        run("optimized_code/no-opt", build("unoptimized_code", OPTIMIZED_CODE, "--no-opt"),
+            expected="optimized code passed")
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")
