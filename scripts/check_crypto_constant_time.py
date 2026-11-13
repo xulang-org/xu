@@ -73,6 +73,13 @@ HW_DISPATCH_LABELS = {
     "_xu_crypto_sha512_sha512_hw_compress_block",
 }
 HW_REFERENCE_FILES = {
+    "src/xu/codegen/aes.xu": {
+        "_xu_crypto_aes_aes_hw_supported", "_xu_crypto_aes_aes_hw_block_enc",
+        "_xu_crypto_aes_aes_hw_block_dec", "_xu_crypto_aes_aes_hw_drk",
+    },
+    "src/xu/codegen/sha256.xu": {
+        "_xu_crypto_sha256_sha256_hw_supported", "_xu_crypto_sha256_sha256_hw_compress_block",
+    },
     "src/xu/types/mir_09_opt_inline.xu": HW_INLINE_PREFIXES,
     "src/xu/types/mir_10_opt_cfg.xu": HW_INLINE_PREFIXES,
     "src/cmd/compile/emit_instr_call_user_net.xu": HW_DISPATCH_LABELS,
