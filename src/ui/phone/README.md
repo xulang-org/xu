@@ -51,6 +51,7 @@ light/dark appearance and destructive-action confirmation.
 | `Touch.begin`, `target`, `event`, `pressed`, `step_at`, `animating` | Register in paint order, dispatch actions and step momentum |
 | `Touch.scroll_region`, `offset`, `block_scroll`, `set_edge_back` | Bounded scrolling, modal suspension and left-edge swipe back |
 | `Touch.swipe_down`, `swipe_back` | Sheet header dismissal and left-edge back navigation before pointer-up |
+| `TextField`, `text_field`, `text_field_height` | 48-point mobile text input with native IME preedit, caret, clear button and inline errors |
 | `set_back_enabled`, `set_dark_appearance`, `set_overlay` | Native Back ownership and system-bar appearance |
 
 Record one complete frame with `Canvas.begin()` and `Canvas.present()`. Labels
@@ -80,7 +81,10 @@ xcrun simctl launch booted org.xulang.phonedesign
 
 Use `--target android-arm64` for the Android project. Build prerequisites and
 signing are in `../host/phone/README.md`. The example's records live only in the
-current process; this is stated in Settings and Detail view. Full native soft-keyboard
-input (`TextInput`), per-control screen reader semantics and exact native glyph shaping
-are not provided by this Canvas profile. Components require a viewport of at least
-240 by 240 logical pixels.
+current process; this is stated in Settings and Detail view. Settings also
+includes a `TextField` draft note card backed by native iOS `UITextInput` and
+Android `InputConnection` sessions (`48`-point input and clear target, preedit
+underline, inline validation, and `IME -> sheet -> route -> app background` Back
+dismissal). Per-control screen reader semantics and hardware/offscreen glyph
+rasterization are not provided by this Canvas profile. Components require a
+viewport of at least 240 by 240 logical pixels.

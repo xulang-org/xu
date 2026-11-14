@@ -57,16 +57,16 @@ application lifecycle. See [the Phone UI design guide](../../phone/README.md).
 `xu_target_os()` retains the Darwin/Linux runtime ABI; use `phone.platform()` for
 the application platform.
 
-This initial profile supports shapes, transforms, clipping, paths, images and
-display lists. Text uses system fonts, font weights, alignment and bounded single-line ellipsis.
-Its layout metrics remain estimated;
-full shaping, wrapped text, native IME, accessibility semantics per control,
+This profile supports shapes, transforms, clipping, paths, images, display lists,
+single-line text layout/caret/hit queries, and native soft-keyboard IME sessions
+(`TextInput` via iOS `UITextInput` and Android `InputConnection`, `xu_phone_key`,
+and `xu_phone_text_input_*`). Text uses system fonts, font weights, alignment,
+bounded single-line ellipsis, and grapheme-clustered proportional/CJK layout
+metrics for caret placement and selection. Accessibility semantics per control,
 offscreen surfaces, multiple windows, embedded WebView controls, desktop menus,
-tray icons and desktop dialogs are not implemented. Unsupported asynchronous
-services complete with `REQUEST_UNSUPPORTED`; native text sessions report
-`XUTI_NATIVE_UNAVAILABLE`. These boundaries apply even when an application
-imports the broader desktop UI API. Legacy string drawing commands are not the
-Phone frame API.
+tray icons and desktop dialogs are not implemented; unsupported asynchronous
+services complete with `REQUEST_UNSUPPORTED`. Legacy string drawing commands
+are not the Phone frame API.
 
 The mobile runtime translates its supported memory, clock, file descriptor and
 sleep calls to public libc APIs. It emits no private iOS `svc` syscall path.
