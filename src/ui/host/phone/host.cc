@@ -9,7 +9,9 @@
 #include "../xu_ui_images.h"
 #include "../xu_ui_display_list.h"
 #include <algorithm>
+#include <atomic>
 #include <climits>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +28,8 @@ static bool input_enabled, redraw, reduced_motion;
 static uint64_t active_input_id = 0;
 static std::string last_frame, last_insets;
 static XuContentHost content{};
+static std::atomic<xu_phone_clipboard_read_fn> g_clipboard_read{nullptr};
+static std::atomic<xu_phone_clipboard_write_fn> g_clipboard_write{nullptr};
 static void event(const char *line) { xu_ui_mem_append("xu_ui_shell_event.txt", line, 1); }
 static std::string number(double n) { char b[64]; snprintf(b, sizeof(b), "%.17g", n); return b; }
 static std::string quote(const char *s, unsigned n) {
@@ -67,9 +71,9 @@ static double codepoint_width_factor(unsigned cp) {
     case 'f': case 'r': case 't': case '-': case '/': case '\\':
       return 0.42;
     case 'm': case 'w':
-      return 0.82;
-    case 'M': case 'W':
       return 0.84;
+    case 'M': case 'W':
+      return 0.90;
     default:
       break;
   }
@@ -81,50 +85,160 @@ static double codepoint_width_factor(unsigned cp) {
       (cp >= 0xffe0 && cp <= 0xffee) || cp >= 0x1f000) return 1.0;
   return 0.58;
 }
+static bool codepoint_is_cjk_break(unsigned cp) {
+  return (cp >= 0x2e80 && cp <= 0x9fff) || (cp >= 0xac00 && cp <= 0xd7af) ||
+         (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xff00 && cp <= 0xff60) ||
+         (cp >= 0xffe0 && cp <= 0xffee) || cp >= 0x1f000;
+}
 // Canvas text renders via WebView 2D canvas and queries grapheme clusters using
-// matched proportional/CJK advance estimates so caret placement and hit testing work cleanly.
+// matched proportional/CJK advance estimates so caret placement, multiline wrapping,
+// and hit testing work consistently across single-line and wrapped layouts.
 struct Text {
-  struct Cluster { unsigned start, length; double x0, x1; };
+  struct Cluster { unsigned start, length, line; double x0, x1, y0, y1; };
+  struct Line { unsigned start, end, cluster_start, cluster_end; double width, origin_x, y; };
   std::string value, family;
-  double size, line, width, weight, italic, align, total_width, origin_x;
+  double size, line, width, weight, italic, align, total_width, total_height, origin_x;
+  bool multiline;
+  std::vector<Line> lines;
   std::vector<Cluster> clusters;
 };
 static void *text_create(const char *family, unsigned family_len, const char *s, unsigned n,
                          const double *options, double *metrics, unsigned *cost) {
   double sz = (options && std::isfinite(options[0]) && options[0] > 0) ? options[0] : 12.0;
-  double ln = (options && std::isfinite(options[5]) && options[5] > 0) ? options[5] : sz * 1.2;
+  double explicit_lh = (options && std::isfinite(options[5]) && options[5] > 0) ? options[5] : 0.0;
+  bool has_nl = s && n && (memchr(s, '\n', n) != nullptr || memchr(s, '\r', n) != nullptr);
+  bool multiline = (explicit_lh > 0.0) || has_nl;
+  double ln = explicit_lh > 0.0 ? explicit_lh : (has_nl ? sz * 1.4 : sz * 1.2);
+  double wrap_w = (options && std::isfinite(options[1]) && options[1] > 0) ? options[1] : 0.0;
   auto *t = new Text{std::string(s ? s : "", n), std::string(family ? family : "", family_len),
-                     sz, ln, options ? options[1] : 0.0, options ? options[2] : 400.0,
-                     options ? options[3] : 0.0, options ? options[4] : 0.0, 0.0, 0.0, {}};
+                     sz, ln, wrap_w, options ? options[2] : 400.0,
+                     options ? options[3] : 0.0, options ? options[4] : 0.0, 0.0, ln, 0.0, multiline, {}, {}};
+  struct Raw { unsigned start, len, cp; double w; bool is_nl, is_space, is_break; };
+  std::vector<Raw> raw;
+  double weight_scale = t->weight >= 600.0 ? 1.03 : 1.0;
   std::vector<unsigned> stops;
   if (n && s && xu_ui_grapheme::boundaries(s, n, &stops) && stops.size() >= 2) {
-    double cursor = 0.0;
-    double weight_scale = t->weight >= 600.0 ? 1.03 : 1.0;
-    t->clusters.reserve(stops.size() - 1u);
+    raw.reserve(stops.size() - 1u);
     for (size_t i = 0; i + 1 < stops.size(); ++i) {
       unsigned start = stops[i], len = stops[i + 1] - stops[i];
       unsigned adv = 0;
       unsigned cp = decode_utf8(s, n, start, &adv);
-      double w = codepoint_width_factor(cp) * t->size * weight_scale;
-      t->clusters.push_back(Text::Cluster{start, len, cursor, cursor + w});
-      cursor += w;
+      bool is_nl = (s[start] == '\n' || s[start] == '\r');
+      bool is_space = !is_nl && (cp == ' ' || cp == '\t');
+      double w = is_nl ? 0.0 : (codepoint_width_factor(cp) * t->size * weight_scale);
+      raw.push_back(Raw{start, len, cp, w, is_nl, is_space, is_space || codepoint_is_cjk_break(cp)});
     }
-    t->total_width = cursor;
   } else if (n && s) {
-    unsigned glyphs = 0;
-    for (unsigned i = 0; i < n; ++i) if (((unsigned char)s[i] & 0xc0) != 0x80) ++glyphs;
-    t->total_width = glyphs * t->size * 0.6;
-  }
-  if (t->width > 0) {
-    if (t->align == 1.0) t->origin_x = std::max(0.0, (t->width - t->total_width) * 0.5);
-    else if (t->align == 2.0) t->origin_x = std::max(0.0, t->width - t->total_width);
-    if (t->origin_x > 0.0) {
-      for (auto &c : t->clusters) { c.x0 += t->origin_x; c.x1 += t->origin_x; }
+    for (unsigned i = 0; i < n;) {
+      unsigned adv = 0;
+      unsigned cp = decode_utf8(s, n, i, &adv);
+      if (!adv) break;
+      bool is_nl = (cp == '\n' || cp == '\r');
+      bool is_space = !is_nl && (cp == ' ' || cp == '\t');
+      double w = is_nl ? 0.0 : (codepoint_width_factor(cp) * t->size * weight_scale);
+      raw.push_back(Raw{i, adv, cp, w, is_nl, is_space, is_space || codepoint_is_cjk_break(cp)});
+      i += adv;
     }
+  }
+  auto line_origin = [&](double line_w) -> double {
+    if (t->width <= 0.0) return 0.0;
+    if (t->align == 1.0) return std::max(0.0, (t->width - line_w) * 0.5);
+    if (t->align == 2.0) return std::max(0.0, t->width - line_w);
+    return 0.0;
+  };
+  t->clusters.reserve(raw.size());
+  if (!t->multiline || raw.empty()) {
+    double cursor = 0.0;
+    for (const auto &rc : raw) {
+      t->clusters.push_back(Text::Cluster{rc.start, rc.len, 0u, cursor, cursor + rc.w, 0.0, t->line});
+      cursor += rc.w;
+    }
+    double ox = line_origin(cursor);
+    if (ox > 0.0) {
+      for (auto &c : t->clusters) { c.x0 += ox; c.x1 += ox; }
+    }
+    t->origin_x = ox;
+    t->total_width = cursor;
+    t->total_height = t->line;
+    t->lines.push_back(Text::Line{0u, n, 0u, (unsigned)t->clusters.size(), cursor, ox, 0.0});
+  } else {
+    size_t pos = 0;
+    bool ended_with_nl = false;
+    while (pos < raw.size()) {
+      unsigned line_idx = (unsigned)t->lines.size();
+      double line_y = (double)line_idx * t->line;
+      size_t start_idx = pos;
+      double cur_w = 0.0;
+      ptrdiff_t last_break = -1;
+      bool hit_nl = false;
+      bool wrapped = false;
+      while (pos < raw.size()) {
+        if (raw[pos].is_nl) {
+          hit_nl = true;
+          ++pos;
+          break;
+        }
+        if (t->width > 0.0 && cur_w + raw[pos].w > t->width && pos > start_idx) {
+          if (last_break >= (ptrdiff_t)start_idx) pos = (size_t)last_break + 1;
+          wrapped = true;
+          break;
+        }
+        cur_w += raw[pos].w;
+        if (raw[pos].is_break) last_break = (ptrdiff_t)pos;
+        ++pos;
+      }
+      size_t end_idx = pos;
+      // Preserve continuation leading spaces as zero-width clusters if soft-wrapped right after space.
+      unsigned cstart = (unsigned)t->clusters.size();
+      double visible_w = 0.0;
+      size_t vis_end = end_idx;
+      if (hit_nl && vis_end > start_idx && raw[vis_end - 1].is_nl) --vis_end;
+      if (wrapped) {
+        while (vis_end > start_idx && raw[vis_end - 1].is_space) --vis_end;
+      }
+      for (size_t j = start_idx; j < vis_end; ++j) visible_w += raw[j].w;
+      double ox = line_origin(visible_w);
+      double cx = ox;
+      for (size_t j = start_idx; j < end_idx; ++j) {
+        double adv_w = (j < vis_end) ? raw[j].w : 0.0;
+        t->clusters.push_back(Text::Cluster{raw[j].start, raw[j].len, line_idx, cx, cx + adv_w, line_y, line_y + t->line});
+        cx += adv_w;
+      }
+      unsigned cend = (unsigned)t->clusters.size();
+      unsigned byte_start = raw[start_idx].start;
+      unsigned byte_end = raw[end_idx - 1].start + raw[end_idx - 1].len;
+      t->lines.push_back(Text::Line{byte_start, byte_end, cstart, cend, visible_w, ox, line_y});
+      ended_with_nl = hit_nl && (pos == raw.size());
+      if (wrapped) {
+        while (pos < raw.size() && raw[pos].is_space) {
+          t->clusters.push_back(Text::Cluster{raw[pos].start, raw[pos].len, line_idx, cx, cx, line_y, line_y + t->line});
+          t->lines.back().cluster_end = (unsigned)t->clusters.size();
+          t->lines.back().end = raw[pos].start + raw[pos].len;
+          ++pos;
+        }
+      }
+    }
+    if (ended_with_nl || t->lines.empty()) {
+      unsigned line_idx = (unsigned)t->lines.size();
+      double line_y = (double)line_idx * t->line;
+      double ox = line_origin(0.0);
+      unsigned cs = (unsigned)t->clusters.size();
+      t->lines.push_back(Text::Line{n, n, cs, cs, 0.0, ox, line_y});
+    }
+    double max_w = 0.0;
+    double min_ox = t->lines.empty() ? 0.0 : t->lines[0].origin_x;
+    for (const auto &ln_info : t->lines) {
+      max_w = std::max(max_w, ln_info.width);
+      min_ox = std::min(min_ox, ln_info.origin_x);
+    }
+    t->total_width = max_w;
+    t->origin_x = min_ox;
+    t->total_height = (double)t->lines.size() * t->line;
   }
   double w = t->width > 0 ? std::min(t->total_width, t->width) : t->total_width;
-  metrics[0] = w; metrics[1] = t->line; metrics[2] = t->size * 0.8; metrics[3] = 1;
-  metrics[4] = t->origin_x; metrics[5] = 0; metrics[6] = w; metrics[7] = t->line;
+  double h = t->total_height;
+  metrics[0] = w; metrics[1] = h; metrics[2] = t->size * 0.8; metrics[3] = (double)t->lines.size();
+  metrics[4] = t->origin_x; metrics[5] = 0; metrics[6] = w; metrics[7] = h;
   *cost = (unsigned)(sizeof(Text) + n + family_len + t->clusters.size() * sizeof(Text::Cluster));
   return t;
 }
@@ -133,21 +247,38 @@ static int text_query_native(void *pointer, unsigned mode, unsigned index, unsig
                              double x, double y, double *out) {
   if (!pointer || !out || mode > 1 || trailing > 1) return 0;
   auto *t = (const Text *)pointer;
-  if (t->clusters.empty()) {
+  if (t->clusters.empty() || t->lines.empty()) {
+    double h = t->lines.empty() ? t->line : t->total_height;
     out[0] = 0; out[1] = 0; out[2] = (mode == 1 && trailing) ? 1 : 0;
-    out[3] = (mode == 1 || (x >= 0.0 && x <= std::max(t->width, 1.0) && y >= 0.0 && y <= t->line)) ? 1 : 0;
+    out[3] = (mode == 1 || (x >= 0.0 && x <= std::max(t->width, 1.0) && y >= 0.0 && y <= h)) ? 1 : 0;
     out[4] = t->origin_x; out[5] = 0; out[6] = t->line;
     return 1;
   }
   if (mode == 0) {
-    bool inside = y >= 0.0 && y <= t->line && x >= t->origin_x && x <= t->origin_x + t->total_width;
-    const Text::Cluster *chosen = &t->clusters.back();
+    size_t line_idx = 0;
+    if (y > 0.0 && t->lines.size() > 1) {
+      size_t cand = (size_t)std::floor(y / t->line);
+      line_idx = std::min(cand, t->lines.size() - 1u);
+    }
+    const auto &ln = t->lines[line_idx];
+    bool inside_y = y >= 0.0 && y <= t->total_height;
+    bool inside = inside_y && x >= ln.origin_x && x <= ln.origin_x + ln.width;
+    if (ln.cluster_start >= ln.cluster_end) {
+      out[0] = ln.start; out[1] = 0; out[2] = 0;
+      out[3] = inside_y && x >= ln.origin_x && x <= ln.origin_x + std::max(t->width, 1.0) ? 1 : 0;
+      out[4] = ln.origin_x; out[5] = ln.y; out[6] = t->line;
+      return 1;
+    }
+    unsigned cstart = ln.cluster_start;
+    unsigned cend = ln.cluster_end;
+    const Text::Cluster *chosen = &t->clusters[cend - 1u];
     unsigned tr = 1;
     double caret_x = chosen->x1;
-    if (x <= t->clusters.front().x0) {
-      chosen = &t->clusters.front(); tr = 0; caret_x = chosen->x0;
-    } else if (x < t->clusters.back().x1) {
-      for (const auto &c : t->clusters) {
+    if (x <= t->clusters[cstart].x0) {
+      chosen = &t->clusters[cstart]; tr = 0; caret_x = chosen->x0;
+    } else if (x < t->clusters[cend - 1u].x1) {
+      for (unsigned ci = cstart; ci < cend; ++ci) {
+        const auto &c = t->clusters[ci];
         if (x <= c.x1) {
           chosen = &c;
           double mid = (c.x0 + c.x1) * 0.5;
@@ -158,20 +289,22 @@ static int text_query_native(void *pointer, unsigned mode, unsigned index, unsig
       }
     }
     out[0] = chosen->start; out[1] = chosen->length; out[2] = tr;
-    out[3] = inside ? 1 : 0; out[4] = caret_x; out[5] = 0; out[6] = t->line;
+    out[3] = inside ? 1 : 0; out[4] = caret_x; out[5] = chosen->y0; out[6] = t->line;
     return 1;
   }
   const auto &last = t->clusters.back();
   unsigned end_byte = last.start + last.length;
   if (index >= end_byte) {
+    const auto &last_ln = t->lines.back();
     out[0] = end_byte; out[1] = 0; out[2] = trailing ? 1 : 0; out[3] = 1;
-    out[4] = last.x1; out[5] = 0; out[6] = t->line;
+    out[4] = (last_ln.cluster_start == last_ln.cluster_end) ? last_ln.origin_x : last.x1;
+    out[5] = last_ln.y; out[6] = t->line;
     return 1;
   }
   for (const auto &c : t->clusters) {
     if (index < c.start + c.length) {
       out[0] = c.start; out[1] = c.length; out[2] = trailing ? 1 : 0; out[3] = 1;
-      out[4] = trailing ? c.x1 : c.x0; out[5] = 0; out[6] = t->line;
+      out[4] = trailing ? c.x1 : c.x0; out[5] = c.y0; out[6] = t->line;
       return 1;
     }
   }
@@ -200,7 +333,7 @@ static std::string frame(const XuUiFrameLease *lease, unsigned depth) {
       auto *native=text?(Text *)xu_ui_text_native(text):nullptr;
       out+=','+(native?quote(native->value.data(),native->value.size()):"\"\"");
       out+=','+number(native?native->size:12);
-      if(native)out+=",["+number(native->width)+','+number(native->weight)+','+number(native->italic)+','+number(native->align)+','+quote(native->family.data(),native->family.size())+']';
+      if(native)out+=",["+number(native->width)+','+number(native->weight)+','+number(native->italic)+','+number(native->align)+','+quote(native->family.data(),native->family.size())+','+number(native->line)+','+(native->multiline?"1":"0")+']';
     } else if(c.opcode==XDF_PATH) {
       const auto *p=(const unsigned char *)c.text;
       unsigned flags=xdf_u32(p), n=xdf_u32(p+8), dashes=xdf_u32(p+12), pos=48+dashes*8;
@@ -538,59 +671,114 @@ extern "C" int xu_phone_back() {
   if(xu_ui_mem_get("phone_back_enabled",enabled,sizeof(enabled))!=1 || enabled[0]!='1')return 0;
   event("navigate_back");return 1;
 }
+extern "C" void xu_phone_haptic(int kind) {
+  if (kind < XU_HAPTIC_SELECTION || kind > XU_HAPTIC_ERROR) return;
+  xu_ui_mem_set("phone_haptic", std::to_string(kind).c_str());
+}
+extern "C" int xu_phone_haptic_take() {
+  unsigned len = 0;
+  char *raw = xu_ui_mem_take("phone_haptic", &len);
+  if (!raw) return 0;
+  int kind = 0;
+  if (len == 1 && raw[0] >= '1' && raw[0] <= '4') kind = raw[0] - '0';
+  free(raw);
+  return kind;
+}
+extern "C" void xu_phone_set_clipboard(xu_phone_clipboard_read_fn read_fn, xu_phone_clipboard_write_fn write_fn) {
+  g_clipboard_read.store(read_fn, std::memory_order_release);
+  g_clipboard_write.store(write_fn, std::memory_order_release);
+}
 extern "C" void xu_phone_redraw() { std::lock_guard<std::mutex> guard(host_lock);redraw=true; }
 extern "C" char *xu_phone_poll() {
-  std::lock_guard<std::mutex> guard(host_lock);
+  struct PendingClipboard { uint64_t id; unsigned kind; std::string text; };
+  std::vector<PendingClipboard> clipboard_ops;
   std::string next;
-  if(!generation) {
-    unsigned meta[6]{};
-    if(xu_ui_window_info(1,0,meta,nullptr,0) && meta[4]==2 && xu_ui_window_claim(1,meta[1])) {
-      generation=meta[1]; xu_draw_text_init();
-      content.window_id=1;content.canvas_id=1;content.canvas_generation=generation;content.append_shell_event=event;
-      xu_ui_window_ready(1,generation);
-      xu_ui_window_event(1,generation,"window_ready");
-      xu_ui_canvas_event(&content,true);
-      xu_ui_canvas_metrics(&content,width,height,(unsigned)(width*scale),(unsigned)(height*scale),scale,scale);
-      event("ready");
-    }
-  }
-  std::string commands=xu_ui_take_commands(":xu:");
-  size_t start=0;
-  while(start<commands.size()) {
-    auto end=commands.find('\n',start);if(end==std::string::npos)end=commands.size();
-    std::string line=commands.substr(start,end-start);start=end+1;
-    unsigned identity[2]{};const char *command=line.c_str();
-    if(xu_ui_scoped_command(command,identity,&command) && (identity[0]!=1||identity[1]!=generation))continue;
-    if(!strncmp(command,"content.",8))command+=8;
-    else if(!strncmp(command,"shell.",6))command+=6;
-    if(!strncmp(command,"__draw_frame\t",13)) {
-      auto ticket=strtoull(command+13,nullptr,10);
-      auto *lease=xu_ui_draw_acquire_for(ticket,1,generation);
-      if(lease){next=frame(lease);xu_ui_frame_release(lease);}
-    } else if(!strncmp(command,"input_enabled\t",14))input_enabled=strcmp(command+14,"0")!=0;
-    else if(!strncmp(command,"__request\t",10)) {
-      uint64_t id=0;
-      if(xu_request_id(command+10,&id)) {
-        char *wire=xu_ui_request_take(id,1,generation);
-        if(wire){free(wire);xu_ui_request_complete(id,XU_REQUEST_UNSUPPORTED,"unavailable on Phone",20);}
-      }
-    } else if(!strncmp(command,"__text_input\t",13)) {
-      uint64_t id=0;
-      if(xu_request_id(command+13,&id)) {
-        if(active_input_id && active_input_id!=id) xu_ui_text_input_stop(active_input_id,1,generation,XUTI_STOPPED);
-        if(xu_ui_text_input_activate(id,1,generation)) active_input_id=id;
-        else if(active_input_id==id) active_input_id=0;
+  {
+    std::lock_guard<std::mutex> guard(host_lock);
+    if(!generation) {
+      unsigned meta[6]{};
+      if(xu_ui_window_info(1,0,meta,nullptr,0) && meta[4]==2 && xu_ui_window_claim(1,meta[1])) {
+        generation=meta[1]; xu_draw_text_init();
+        content.window_id=1;content.canvas_id=1;content.canvas_generation=generation;content.append_shell_event=event;
+        xu_ui_window_ready(1,generation);
+        xu_ui_window_event(1,generation,"window_ready");
+        xu_ui_canvas_event(&content,true);
+        xu_ui_canvas_metrics(&content,width,height,(unsigned)(width*scale),(unsigned)(height*scale),scale,scale);
+        event("ready");
       }
     }
-    else if(!strcmp(command,"close")||!strcmp(command,"quit_app")){active_input_id=0;xu_phone_stop();}
-    else if(!strcmp(command,"motion_preferences"))event(("canvas_preferences\t1\t1\t"+std::to_string(generation)+(reduced_motion?"\t1":"\t0")).c_str());
-    else if(!strncmp(command,"__window_open\t1\t",16)||!strncmp(command,"__window_bind\t1\t",16)||!strncmp(command,"cursor\t",7)||!strncmp(command,"pan_enabled\t",12)||!strcmp(command,"show")){}
-    else if(!line.empty())xu_ui_window_event(1,generation,"command_unsupported");
+    std::string commands=xu_ui_take_commands(":xu:");
+    size_t start=0;
+    while(start<commands.size()) {
+      auto end=commands.find('\n',start);if(end==std::string::npos)end=commands.size();
+      std::string line=commands.substr(start,end-start);start=end+1;
+      unsigned identity[2]{};const char *command=line.c_str();
+      if(xu_ui_scoped_command(command,identity,&command) && (identity[0]!=1||identity[1]!=generation))continue;
+      if(!strncmp(command,"content.",8))command+=8;
+      else if(!strncmp(command,"shell.",6))command+=6;
+      if(!strncmp(command,"__draw_frame\t",13)) {
+        auto ticket=strtoull(command+13,nullptr,10);
+        auto *lease=xu_ui_draw_acquire_for(ticket,1,generation);
+        if(lease){next=frame(lease);xu_ui_frame_release(lease);}
+      } else if(!strncmp(command,"input_enabled\t",14))input_enabled=strcmp(command+14,"0")!=0;
+      else if(!strncmp(command,"__request\t",10)) {
+        uint64_t cid=0; unsigned ckind=0; std::string ctext;
+        if(xu_request_clipboard_take(command,1,generation,&cid,&ckind,&ctext)) {
+          if(ckind) clipboard_ops.push_back(PendingClipboard{cid,ckind,std::move(ctext)});
+        } else {
+          uint64_t id=0;
+          if(xu_request_id(command+10,&id)) {
+            char *wire=xu_ui_request_take(id,1,generation);
+            if(wire){free(wire);xu_ui_request_complete(id,XU_REQUEST_UNSUPPORTED,"unavailable on Phone",20);}
+          }
+        }
+      } else if(!strncmp(command,"__text_input\t",13)) {
+        uint64_t id=0;
+        if(xu_request_id(command+13,&id)) {
+          if(active_input_id && active_input_id!=id) xu_ui_text_input_stop(active_input_id,1,generation,XUTI_STOPPED);
+          if(xu_ui_text_input_activate(id,1,generation)) active_input_id=id;
+          else if(active_input_id==id) active_input_id=0;
+        }
+      }
+      else if(!strcmp(command,"close")||!strcmp(command,"quit_app")){active_input_id=0;xu_phone_stop();}
+      else if(!strcmp(command,"motion_preferences"))event(("canvas_preferences\t1\t1\t"+std::to_string(generation)+(reduced_motion?"\t1":"\t0")).c_str());
+      else if(!strncmp(command,"__window_open\t1\t",16)||!strncmp(command,"__window_bind\t1\t",16)||!strncmp(command,"cursor\t",7)||!strncmp(command,"pan_enabled\t",12)||!strcmp(command,"show")){}
+      else if(!line.empty())xu_ui_window_event(1,generation,"command_unsupported");
+    }
+    xu_ui_text_input_poll();
+    if(active_input_id && !xu_ui_text_input_active(active_input_id)) active_input_id=0;
+    if(!next.empty())last_frame=next;
+    else if(redraw)next=last_frame;
+    redraw=false;
   }
-  xu_ui_text_input_poll();
-  if(active_input_id && !xu_ui_text_input_active(active_input_id)) active_input_id=0;
-  if(!next.empty())last_frame=next;
-  else if(redraw)next=last_frame;
-  redraw=false;
+  for (const auto &op : clipboard_ops) {
+    if (op.kind == XU_REQUEST_CLIPBOARD_WRITE) {
+      auto write_fn = g_clipboard_write.load(std::memory_order_acquire);
+      if (!write_fn) {
+        xu_ui_request_complete(op.id, XU_REQUEST_UNSUPPORTED, "unavailable on Phone", 20);
+      } else {
+        int rc = write_fn(op.text.data(), (unsigned)op.text.size());
+        if (rc > 0) xu_ui_request_complete(op.id, XU_REQUEST_COMPLETED, "", 0);
+        else if (rc < 0) xu_ui_request_complete(op.id, XU_REQUEST_UNSUPPORTED, "unavailable on Phone", 20);
+        else xu_ui_request_complete(op.id, XU_REQUEST_FAILED, "clipboard write failed", 22);
+      }
+    } else if (op.kind == XU_REQUEST_CLIPBOARD_READ) {
+      auto read_fn = g_clipboard_read.load(std::memory_order_acquire);
+      if (!read_fn) {
+        xu_ui_request_complete(op.id, XU_REQUEST_UNSUPPORTED, "unavailable on Phone", 20);
+      } else {
+        std::string buf(XU_UI_REQUEST_MAX_TEXT, '\0');
+        unsigned out_len = 0;
+        int rc = read_fn(&buf[0], XU_UI_REQUEST_MAX_TEXT, &out_len);
+        if (rc > 0 && out_len <= XU_UI_REQUEST_MAX_TEXT) {
+          xu_ui_request_complete(op.id, XU_REQUEST_COMPLETED, buf.data(), out_len);
+        } else if (rc < 0) {
+          xu_ui_request_complete(op.id, XU_REQUEST_UNSUPPORTED, "unavailable on Phone", 20);
+        } else {
+          xu_ui_request_complete(op.id, XU_REQUEST_FAILED, "clipboard read failed", 21);
+        }
+      }
+    }
+  }
   return next.empty()?nullptr:strdup(next.c_str());
 }
