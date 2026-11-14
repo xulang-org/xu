@@ -679,6 +679,10 @@ def smoke(archive: Path | None, work: Path, native_setup: bool = False, installe
                 source.extractall(extract, filter="data")
         bundle, = (p for p in extract.iterdir() if p.is_dir())
         manifest = json.loads((bundle / "bundle.json").read_text())
+        for script_name in ("install.ps1", "install.sh", "uninstall.ps1", "uninstall.sh"):
+            script_path = bundle / script_name
+            if script_path.is_file():
+                script_path.read_bytes().decode("ascii")
         if os.name == "nt":
             for setup in (bundle / "xu-setup.exe", bundle / "bin/xu-setup.exe"):
                 check_windows_invoker_manifest(setup)
