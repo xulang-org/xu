@@ -20,12 +20,13 @@ light/dark appearance and destructive-action confirmation.
   640 points wide use a navigation rail and two body panes, preserving vertical
   space. `scaffold_with()` assigns geometry; it does not stretch a desktop toolbar.
 - Use Paper / Obsidian / Cinnabar tokens (`background`, `surface`, `elevated`,
-  `subtle`, `border`, `ink`, `muted`, `accent`, `accent_pressed`, `subtle_pressed`,
-  `accent_tint`, `on_accent`, `positive`, `danger`, `danger_soft`, `focus`, `scrim`)
-  from `light_theme()` or `dark_theme()`. Weight, alignment and single-line
-  ellipsis (`Canvas.label`) work alongside wrapped multiline layout
-  (`Canvas.paragraph()`, `measure_paragraph()`, explicit `line_height >= 1.4x`)
-  for dynamic card height without clipping or overlap.
+  `subtle`, `subtle_pressed`, `ink`, `muted`, `border`, `control_border`,
+  `accent`, `accent_hover`, `accent_pressed`, `accent_tint`, `on_accent`,
+  `positive`, `positive_soft`, `warning`, `warning_soft`, `danger`, `danger_soft`,
+  `info`, `info_soft`, `focus`, `scrim`) from `light_theme()` or `dark_theme()`.
+  Weight, alignment and single-line ellipsis (`Canvas.label`) work alongside wrapped
+  multiline layout (`Canvas.paragraph()`, `measure_paragraph()`, explicit
+  `line_height >= 1.4x`) for dynamic card height without clipping or overlap.
 - A press is visible before activation. Release must match its initial target.
   Movement over 8 points cancels activation; vertical dragging scrolls with
   axis lock and inertial fling (`Touch.step_at()`, iOS bouncy overscroll vs
@@ -48,10 +49,11 @@ light/dark appearance and destructive-action confirmation.
 | --- | --- |
 | `host_insets()`, `reduced_motion()` | OS safe-area/IME insets and accessibility reduced-motion state |
 | `scaffold(w, h)`, `scaffold_with(w, h, safe)` | Edge-to-edge header, body, navigation and primary-action rectangles |
-| `tab_bounds`, `sheet_bounds_with`, `snackbar_bounds`, `intersection` | Shared paint/hit geometry |
+| `tab_bounds`, `sheet_bounds_with`, `snackbar_bounds`, `dialog_bounds`, `dialog_button_bounds`, `segmented_item_bounds`, `slider_value_at`, `intersection` | Shared paint/hit geometry (`switch_width/height`, `slider_thumb`, `progress_height`, `dialog_radius`) |
 | `RouteStack`, `Snackbar` | Single-source detail stack (`push`/`pop`/`can_pop`) and transient feedback strip |
 | `Canvas` / `canvas(context)` | Frame recording plus temporary text-layout ownership |
 | `Canvas.label`, `paragraph`, `measure_paragraph`, `card`, `button`, `chip`, `row`, `icon` | Single-line & wrapped multiline typography, danger tone and component appearance |
+| `Canvas.toggle_switch`, `switch_row`, `check_row`, `radio_row`, `progress_bar`, `badge`, `badge_count`, `divider`, `empty_state`, `segmented`, `slider`, `confirm_dialog`, `scrim` | Reusable mobile primitives aligned with Paper/Obsidian/Cinnabar tokens (`BADGE_*` semantic tones, `48`-point hit rows) |
 | `Canvas.navigation`, `sheet`, `scrollbar`, `refresh_indicator`, `snackbar` | Bottom navigation / rail, modal sheets, edge indicator, pull-to-refresh cue and toast |
 | `Touch` / `touch(identity)` | Canvas-generation-scoped press, kinetic fling, overscroll, pull-to-refresh and edge swipe state |
 | `Touch.begin`, `target`, `event`, `pressed`, `step_at`, `animating` | Register in paint order, dispatch actions and step momentum |
