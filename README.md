@@ -179,6 +179,26 @@ The documentation and API source live in [xulang-org/xulang-org](https://github.
 
 ---
 
+## Phone applications (development)
+
+Based on Xu 0.12.3, the Phone development toolchain adds native ARM64 iOS,
+iOS Simulator and Android application generation:
+
+```sh
+xu build app/ --phone --target ios-simulator-arm64 --bundle-id org.example.app -o build/ios
+xu build app/ --phone --target android-arm64 --bundle-id org.example.app -o build/android
+```
+
+Each output contains a platform build script and a compiled Xu application object.
+The `#ui/phone` design layer includes touch targets, bottom navigation, adaptive
+scaffolds, cards, grouped rows and bottom sheets. The UI profile renders Draw frames in a local system WebView Canvas;
+full native IME and desktop service parity remain outside this profile.
+See [Phone prerequisites and boundaries](src/ui/host/phone/README.md) and the
+[mobile design gallery](examples/phone_gallery/README.md). This feature is not in the
+original 0.12.3 release binary.
+
+---
+
 ## 🗺️ Project Roadmap
 
 The published SDK is the baseline for this roadmap. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
