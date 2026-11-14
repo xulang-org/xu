@@ -86,3 +86,9 @@ HTML 从组件自己的 `xu://app/` 文档入口加载，重载保留正确来�
 原生子表面位于 Canvas 上方。Screen 在重叠的弹出菜单、Tooltip、Toast 或 Modal 显示期间暂时隐藏网页，关闭后恢复页面状态。Canvas 旋转、全局透明度、离屏 Surface 与截图不自动包含网页；Screen.snapshot 对可见原生 WebView 明确报错。网页内部 Tab 继续使用 DOM 焦点顺序，Ctrl+Tab / Ctrl+Shift+Tab 返回 Screen 的焦点链。打包须链接 WebView 插件。
 
 原生文字布局与绘制帧中的文字引用按稳定 ID 动态登记，不按 1024 个对象分配固定槽位。释放应用句柄不会撤销绘制帧或输入会话保留的布局；关闭画布会撤销匹配 generation 的应用句柄。保留原有文本长度、坐标与字节预算检查（全局布局 32 MiB、单布局 4 MiB），这些是资源预算，不是控件数量配额。未完成的 ID 预约按期限惰性清理，分配失败返回明确错误。
+
+## Phone
+
+`xu build --phone` adds ARM64 iOS, iOS Simulator and Android application generation.
+The native Xu worker uses the shared mailbox; the mobile shell renders Draw frames
+in a local Canvas. See [Phone prerequisites, commands and UI boundaries](phone/README.md).

@@ -12,7 +12,7 @@ XU       := $(BIN)/xu$(EXE_SUFFIX)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help memsafe all xu xu-desktop xu-fmt xu-doctor xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-xacp xu-platform tools \
+.PHONY: help memsafe all xu xu-desktop xu-phone xu-fmt xu-doctor xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-xacp xu-platform tools \
 	server-build-local server-build-linux server-check-linux server-start server-health server-smoke-local server-unit \
 	server-remote-check server-remote-deploy server-remote-status server-remote-health server-remote-smoke \
 	server-remote-restart server-remote-stop server-remote-rollback \
@@ -36,6 +36,7 @@ help:
 	@echo "  make xu-platform     cross product xu → $(BIN)/platform/<os>-<arch>/ (needs $(XU); XU_SKIP_CROSS=1 / XU_PLATFORM_TARGETS=…)"
 	@echo "  product compiler consumers use scripts/run_product_compiler.sh (XUPATH/cache isolated)"
 	@echo "  make xu-desktop      desktop pack → $(BIN)/xu-desktop"
+	@echo "  make xu-phone        iOS / Android project generator → $(BIN)/xu-phone"
 	@echo "  make xu-doctor       desktop toolchain check → $(BIN)/xu-doctor"
 	@echo "  make xu-fmt          formatter → $(BIN)/xu-fmt"
 	@echo "  make xu-map          source path map → $(BIN)/xu-map"
@@ -45,7 +46,7 @@ help:
 	@echo "  make xu-lsp          language server → $(BIN)/xu-lsp"
 	@echo "  make xu-native       native C module tool → $(BIN)/xu-native"
 	@echo "  make xu-xacp         XACP inspect/run/debug/record tool → $(BIN)/xu-xacp"
-	@echo "  make tools           xu-desktop + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup + xu-update + xu-lsp + xu-native + xu-xacp (needs $(XU))"
+	@echo "  make tools           xu-desktop + xu-phone + xu-fmt + xu-doctor + xu-map + xu-doc + xu-setup + xu-update + xu-lsp + xu-native + xu-xacp (needs $(XU))"
 	@echo "  make server-build-local  build xu-examples/examples/11_http_server for this host"
 	@echo "  make server-build-linux  cross-build Xu HTTP server for linux-x64"
 	@echo "  make server-check-linux  build + verify linux-x64 ELF"
@@ -108,6 +109,7 @@ packages-test:
 
 # Rebuild when compiler or imported src/xu packages change.
 COMPILE_XU := $(wildcard src/cmd/compile/*.xu)
+PHONE_XU := $(wildcard src/cmd/phone/*.xu)
 DESKTOP_XU := $(wildcard src/cmd/desktop/*.xu)
 DOCTOR_XU  := $(wildcard src/cmd/doctor/*.xu)
 FMT_XU     := $(wildcard src/cmd/fmt/*.xu)
@@ -133,6 +135,7 @@ SELFHOST_POLICY := scripts/gen1_sources.sh scripts/xu_host_seed.sh scripts/build
 	scripts/pack_developer_xu.sh scripts/deploy_xu_server.sh scripts/deploy_xu_remote.sh scripts/pack_macos_ui_app.py \
 	scripts/pack_macos_ui_oneexe.py scripts/pack_linux_ui_oneexe.py scripts/pack_windows_ui_oneexe.py \
 	scripts/companion_repos.py scripts/run_companion.py
+XU_PHONE := $(BIN)/xu-phone$(EXE_SUFFIX)
 XU_DESKTOP := $(BIN)/xu-desktop$(EXE_SUFFIX)
 XU_DOCTOR  := $(BIN)/xu-doctor$(EXE_SUFFIX)
 XU_FMT     := $(BIN)/xu-fmt$(EXE_SUFFIX)
@@ -180,8 +183,9 @@ product-selfhost: $(XU)
 xu-platform: $(XU)
 	./scripts/build_platform_xu.sh $(XU) $(BIN)/platform
 
-tools: xu-doctor xu-desktop xu-fmt xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-xacp
+tools: xu-doctor xu-desktop xu-phone xu-fmt xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-xacp
 
+xu-phone: $(XU_PHONE)
 xu-desktop: $(XU_DESKTOP)
 xu-doctor: $(XU_DOCTOR)
 xu-fmt: $(XU_FMT)
@@ -211,6 +215,9 @@ endef
 
 $(XU_DOCTOR): $(XU) src/cmd/doctor/xu.xun $(DOCTOR_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-doctor)
+
+$(XU_PHONE): $(XU) src/cmd/phone/xu.xun $(PHONE_XU) $(XU_PKG_XU) | $(BIN)
+	$(call build_product_tool,xu-phone)
 
 $(XU_DESKTOP): $(XU) $(XU_DOCTOR) src/cmd/desktop/xu.xun $(DESKTOP_XU) $(XU_PKG_XU) | $(BIN)
 	$(call build_product_tool,xu-desktop)
