@@ -1,7 +1,96 @@
 #include <jni.h>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <string>
 #include "phone/phone.h"
+
+static JavaVM *g_vm = nullptr;
+static std::mutex g_host_mutex;
+static jobject g_activity = nullptr;
+static jmethodID g_clip_read = nullptr;
+static jmethodID g_clip_write = nullptr;
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+  g_vm = vm;
+  return JNI_VERSION_1_6;
+}
+
+static JNIEnv *current_env(bool *attached) {
+  *attached = false;
+  if (!g_vm) return nullptr;
+  JNIEnv *env = nullptr;
+  jint st = g_vm->GetEnv((void **)&env, JNI_VERSION_1_6);
+  if (st == JNI_OK) return env;
+  if (st == JNI_EDETACHED && g_vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+    *attached = true;
+    return env;
+  }
+  return nullptr;
+}
+
+static int android_clipboard_read(char *out, unsigned cap, unsigned *out_len) {
+  if (!out_len) return 0;
+  bool attached = false;
+  JNIEnv *env = current_env(&attached);
+  jobject act = nullptr;
+  jmethodID mid = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_host_mutex);
+    if (env && g_activity && g_clip_read) {
+      act = env->NewLocalRef(g_activity);
+      mid = g_clip_read;
+    }
+  }
+  int rc = 0;
+  if (env && act && mid) {
+    jbyteArray arr = (jbyteArray)env->CallObjectMethod(act, mid);
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    } else if (arr) {
+      jsize len = env->GetArrayLength(arr);
+      if (len >= 0 && (unsigned)len <= cap) {
+        if (len > 0 && out) env->GetByteArrayRegion(arr, 0, len, reinterpret_cast<jbyte *>(out));
+        *out_len = (unsigned)len;
+        rc = 1;
+      }
+      env->DeleteLocalRef(arr);
+    }
+  }
+  if (env && act) env->DeleteLocalRef(act);
+  if (attached && g_vm) g_vm->DetachCurrentThread();
+  return rc;
+}
+
+static int android_clipboard_write(const char *utf8, unsigned len) {
+  bool attached = false;
+  JNIEnv *env = current_env(&attached);
+  jobject act = nullptr;
+  jmethodID mid = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_host_mutex);
+    if (env && g_activity && g_clip_write) {
+      act = env->NewLocalRef(g_activity);
+      mid = g_clip_write;
+    }
+  }
+  int rc = 0;
+  if (env && act && mid) {
+    jbyteArray arr = env->NewByteArray((jsize)len);
+    if (arr) {
+      if (len > 0 && utf8) env->SetByteArrayRegion(arr, 0, (jsize)len, reinterpret_cast<const jbyte *>(utf8));
+      jboolean ok = env->CallBooleanMethod(act, mid, arr);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      else rc = ok ? 1 : 0;
+      env->DeleteLocalRef(arr);
+    } else if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    }
+  }
+  if (env && act) env->DeleteLocalRef(act);
+  if (attached && g_vm) g_vm->DetachCurrentThread();
+  return rc;
+}
 
 static std::string copy_utf8(JNIEnv *env, jbyteArray arr) {
   if (!arr) return {};
@@ -82,4 +171,24 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_xulang_phone_MainActivity_dark(JN
 
 extern "C" JNIEXPORT jboolean JNICALL Java_org_xulang_phone_MainActivity_overlay(JNIEnv *,jclass) {
   return xu_phone_overlay()?JNI_TRUE:JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_attachHost(JNIEnv *env,jclass cls,jobject activity) {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  if (g_activity) { env->DeleteGlobalRef(g_activity); g_activity = nullptr; }
+  g_clip_read = nullptr;
+  g_clip_write = nullptr;
+  if (activity) {
+    g_activity = env->NewGlobalRef(activity);
+    g_clip_read = env->GetMethodID(cls, "hostClipboardRead", "()[B");
+    g_clip_write = env->GetMethodID(cls, "hostClipboardWrite", "([B)Z");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); g_clip_read = nullptr; g_clip_write = nullptr; }
+    xu_phone_set_clipboard(android_clipboard_read, android_clipboard_write);
+  } else {
+    xu_phone_set_clipboard(nullptr, nullptr);
+  }
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_org_xulang_phone_MainActivity_hapticTake(JNIEnv *,jclass) {
+  return xu_phone_haptic_take();
 }

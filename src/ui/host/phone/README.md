@@ -58,15 +58,19 @@ application lifecycle. See [the Phone UI design guide](../../phone/README.md).
 the application platform.
 
 This profile supports shapes, transforms, clipping, paths, images, display lists,
-single-line text layout/caret/hit queries, and native soft-keyboard IME sessions
-(`TextInput` via iOS `UITextInput` and Android `InputConnection`, `xu_phone_key`,
-and `xu_phone_text_input_*`). Text uses system fonts, font weights, alignment,
-bounded single-line ellipsis, and grapheme-clustered proportional/CJK layout
-metrics for caret placement and selection. Accessibility semantics per control,
-offscreen surfaces, multiple windows, embedded WebView controls, desktop menus,
-tray icons and desktop dialogs are not implemented; unsupported asynchronous
-services complete with `REQUEST_UNSUPPORTED`. Legacy string drawing commands
-are not the Phone frame API.
+single-line and wrapped multiline text layout/caret/hit queries, lightweight
+haptic cues (`xu_phone_haptic` / `xu_phone_haptic_take`), host clipboard read/write
+via `#ui/requests` (`xu_phone_set_clipboard` backed by `UIPasteboard` on iOS and
+`ClipboardManager` on Android), and native soft-keyboard IME sessions (`TextInput`
+via iOS `UITextInput` and Android `InputConnection`, `xu_phone_key`, and
+`xu_phone_text_input_*`). Text uses system fonts, font weights, alignment,
+bounded single-line ellipsis or word/CJK multiline wrapping (`line_height`), and
+grapheme-clustered proportional/CJK layout metrics for caret placement and
+selection. Accessibility semantics per control, offscreen surfaces, multiple
+windows, embedded WebView controls, desktop menus, tray icons and desktop dialogs
+are not implemented; unsupported asynchronous services (other than clipboard)
+complete with `REQUEST_UNSUPPORTED`. Legacy string drawing commands are not the
+Phone frame API.
 
 The mobile runtime translates its supported memory, clock, file descriptor and
 sleep calls to public libc APIs. It emits no private iOS `svc` syscall path.

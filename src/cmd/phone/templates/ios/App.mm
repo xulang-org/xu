@@ -1,6 +1,37 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#include <string.h>
 #include "native/host/phone/phone.h"
+
+static int xu_ios_clipboard_read(char *out, unsigned cap, unsigned *out_len) {
+  @autoreleasepool {
+    if (!out_len) return 0;
+    UIPasteboard *pb = UIPasteboard.generalPasteboard;
+    if (!pb) return 0;
+    NSString *s = pb.string;
+    if (!s) {
+      if (pb.hasStrings) return 0;
+      *out_len = 0;
+      return 1;
+    }
+    NSData *utf8 = [s dataUsingEncoding:NSUTF8StringEncoding];
+    if (!utf8 || utf8.length > cap) return 0;
+    if (utf8.length > 0 && out) memcpy(out, utf8.bytes, utf8.length);
+    *out_len = (unsigned)utf8.length;
+    return 1;
+  }
+}
+
+static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
+  @autoreleasepool {
+    UIPasteboard *pb = UIPasteboard.generalPasteboard;
+    if (!pb) return 0;
+    NSString *s = len ? [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding] : @"";
+    if (!s) return 0;
+    pb.string = s;
+    return 1;
+  }
+}
 
 @interface XuTextPosition : UITextPosition
 @property (nonatomic, assign) NSUInteger offset;
@@ -390,9 +421,26 @@
   [self syncMotion];
 }
 - (void)dealloc {
+  xu_phone_set_clipboard(nullptr, nullptr);
   [NSNotificationCenter.defaultCenter removeObserver:self];
 }
+- (void)performHaptic:(int)kind {
+  if (kind == XU_HAPTIC_SELECTION) {
+    UISelectionFeedbackGenerator *gen = [UISelectionFeedbackGenerator new];
+    [gen prepare];
+    [gen selectionChanged];
+  } else if (kind == XU_HAPTIC_IMPACT) {
+    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [gen prepare];
+    [gen impactOccurred];
+  } else if (kind == XU_HAPTIC_SUCCESS || kind == XU_HAPTIC_ERROR) {
+    UINotificationFeedbackGenerator *gen = [UINotificationFeedbackGenerator new];
+    [gen prepare];
+    [gen notificationOccurred:(kind == XU_HAPTIC_SUCCESS ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError)];
+  }
+}
 - (void)loadView {
+  xu_phone_set_clipboard(xu_ios_clipboard_read, xu_ios_clipboard_write);
   self.view = [UIView new];
   self.view.backgroundColor = [UIColor colorWithRed:246.0/255 green:243.0/255 blue:239.0/255 alpha:1];
   WKWebViewConfiguration *config = [WKWebViewConfiguration new];
@@ -479,6 +527,8 @@
     [self setNeedsStatusBarAppearanceUpdate];
   }
   [self syncTextInput];
+  int haptic = xu_phone_haptic_take();
+  if (haptic > 0) [self performHaptic:haptic];
   if (self.evaluating) return;
   char *frame = xu_phone_poll(); if (!frame) return;
   NSString *json = [[NSString alloc] initWithUTF8String:frame]; free(frame);
