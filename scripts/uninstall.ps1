@@ -1,4 +1,4 @@
-# Xu Programming Language — Windows Uninstaller
+# Xu Programming Language - Windows Uninstaller
 param (
     [string]$Prefix = "$HOME\.xu"
 )

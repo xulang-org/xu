@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Xu Programming Language — Cross-platform Development Environment Installer
+# Xu Programming Language - Cross-platform Development Environment Installer
 # Supports offline installation (from unpacked bundle) and online installation (curl | bash).
 set -euo pipefail
 
@@ -83,7 +83,7 @@ INSTALL_DIR="${XU_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 PREFIX_EXPLICIT=0
 if [[ -n "${XU_INSTALL_DIR:-}" ]]; then PREFIX_EXPLICIT=1; fi
 DOWNLOAD_BASE_URL="${XU_DOWNLOAD_URL:-https://github.com/xulang-org/xu/releases/download}"
-FALLBACK_VERSION="0.10.7"
+FALLBACK_VERSION="0.12.3"
 TARGET_VERSION="${XU_VERSION:-}"
 MODIFY_PATH=1
 AUTO_YES=0
@@ -601,15 +601,15 @@ if [[ -x "$INSTALL_DIR/bin/xu-doctor" ]]; then
     echo
 fi
 
-printf "\n${GREEN}${BOLD}🎉 Xu development environment installed successfully!${NC}\n\n"
+printf "\n${GREEN}${BOLD}Xu development environment installed successfully!${NC}\n\n"
 cat << EOF
 Installed components:
-  • Core compiler & toolchain: $INSTALL_DIR/bin (xu, xu-setup, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop, xu-update, xu-lsp, xu-native, xu-xacp)
-  • Standard library (src):    $INSTALL_DIR/src
-  • External driver modules:   $INSTALL_DIR/packages (redis, mysql, postgres, sqlite, etcd, etc.)
-  • Native C headers:          $INSTALL_DIR/include
-  • VS Code extension:         $INSTALL_DIR/editors/vscode
-  • Official examples:         $INSTALL_DIR/examples
+  - Core compiler & toolchain: $INSTALL_DIR/bin (xu, xu-setup, xu-doctor, xu-fmt, xu-doc, xu-map, xu-desktop, xu-update, xu-lsp, xu-native, xu-xacp)
+  - Standard library (src):    $INSTALL_DIR/src
+  - External driver modules:   $INSTALL_DIR/packages (redis, mysql, postgres, sqlite, etcd, etc.)
+  - Native C headers:          $INSTALL_DIR/include
+  - VS Code extension:         $INSTALL_DIR/editors/vscode
+  - Official examples:         $INSTALL_DIR/examples
 
 To get started:
   1. Reload your shell environment:
