@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Xu Programming Language — Uninstaller
+# Xu Programming Language - Uninstaller
 set -euo pipefail
 
 INSTALL_DIR="${XU_INSTALL_DIR:-$HOME/.xu}"
