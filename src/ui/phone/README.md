@@ -23,12 +23,18 @@ light/dark appearance and destructive-action confirmation.
   `subtle`, `border`, `ink`, `muted`, `accent`, `accent_pressed`, `subtle_pressed`,
   `accent_tint`, `on_accent`, `positive`, `danger`, `danger_soft`, `focus`, `scrim`)
   from `light_theme()` or `dark_theme()`. Weight, alignment and single-line
-  ellipsis work for Canvas text; layout does not depend on estimated shaping metrics.
+  ellipsis (`Canvas.label`) work alongside wrapped multiline layout
+  (`Canvas.paragraph()`, `measure_paragraph()`, explicit `line_height >= 1.4x`)
+  for dynamic card height without clipping or overlap.
 - A press is visible before activation. Release must match its initial target.
   Movement over 8 points cancels activation; vertical dragging scrolls with
   axis lock and inertial fling (`Touch.step_at()`, iOS bouncy overscroll vs
   Android clamping). Tapping a moving scroll halts momentum without triggering
   the item beneath the finger. Focus loss and rotation cancel active presses.
+  Pulling past `refresh_threshold()` (`64` points) at `scroll == 0` when
+  `Touch.set_refresh_enabled(true)` triggers an explicit refresh cycle (`take_refresh()`),
+  and light `haptic()` cues (`HAPTIC_SELECTION`, `HAPTIC_IMPACT`, `HAPTIC_SUCCESS`,
+  `HAPTIC_ERROR`) reinforce key transitions without replacing visible status.
 - `RouteStack` manages push/pop depth and left-edge `Touch.swipe_back()`.
   `Snackbar` provides auto-dismissing feedback (`snackbar_bounds()`).
   A bottom sheet blocks background targets, lifts above `ime_bottom`, accepts
@@ -45,14 +51,14 @@ light/dark appearance and destructive-action confirmation.
 | `tab_bounds`, `sheet_bounds_with`, `snackbar_bounds`, `intersection` | Shared paint/hit geometry |
 | `RouteStack`, `Snackbar` | Single-source detail stack (`push`/`pop`/`can_pop`) and transient feedback strip |
 | `Canvas` / `canvas(context)` | Frame recording plus temporary text-layout ownership |
-| `Canvas.label`, `card`, `button`, `button_tone`, `chip`, `row`, `icon` | Mobile typography, danger tone and component appearance |
-| `Canvas.navigation`, `sheet`, `scrollbar`, `snackbar` | Bottom navigation / rail, modal sheets, edge indicator and toast |
-| `Touch` / `touch(identity)` | Canvas-generation-scoped press, kinetic fling, overscroll and edge swipe state |
+| `Canvas.label`, `paragraph`, `measure_paragraph`, `card`, `button`, `chip`, `row`, `icon` | Single-line & wrapped multiline typography, danger tone and component appearance |
+| `Canvas.navigation`, `sheet`, `scrollbar`, `refresh_indicator`, `snackbar` | Bottom navigation / rail, modal sheets, edge indicator, pull-to-refresh cue and toast |
+| `Touch` / `touch(identity)` | Canvas-generation-scoped press, kinetic fling, overscroll, pull-to-refresh and edge swipe state |
 | `Touch.begin`, `target`, `event`, `pressed`, `step_at`, `animating` | Register in paint order, dispatch actions and step momentum |
-| `Touch.scroll_region`, `offset`, `block_scroll`, `set_edge_back` | Bounded scrolling, modal suspension and left-edge swipe back |
+| `Touch.scroll_region`, `offset`, `block_scroll`, `set_edge_back`, `set_refresh_enabled` | Bounded scrolling, modal suspension, pull-to-refresh and left-edge swipe back |
 | `Touch.swipe_down`, `swipe_back` | Sheet header dismissal and left-edge back navigation before pointer-up |
 | `TextField`, `text_field`, `text_field_height` | 48-point mobile text input with native IME preedit, caret, clear button and inline errors |
-| `set_back_enabled`, `set_dark_appearance`, `set_overlay` | Native Back ownership and system-bar appearance |
+| `set_back_enabled`, `set_dark_appearance`, `set_overlay`, `haptic` | Native Back ownership, system-bar appearance and haptic cues |
 
 Record one complete frame with `Canvas.begin()` and `Canvas.present()`. Labels
 remain alive until the frame is admitted; then its lease retains them. Dispose

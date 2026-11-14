@@ -51,6 +51,8 @@ public final class MainActivity extends Activity {
     @Override public void onBackPressed() { backRequested(); }
     private static native boolean dark();
     private static native boolean overlay();
+    private static native void attachHost(MainActivity activity);
+    private static native int hapticTake();
     private Boolean overlayMode;
     private WebView web;
     private FrameLayout root;
@@ -406,6 +408,8 @@ public final class MainActivity extends Activity {
                 String frame=poll();
                 if(frame!=null) { evaluating=true; web.evaluateJavascript("xuFrame("+frame+")", value->evaluating=false); }
             }
+            int haptic=hapticTake();
+            if(haptic>0)performHaptic(haptic);
             handler.postDelayed(this,16);
         }
     };
@@ -419,6 +423,49 @@ public final class MainActivity extends Activity {
                 else if(kind==0)resize(v.getDouble(4),v.getDouble(5),v.getDouble(6));
                 else input(kind,v.getDouble(1),v.getDouble(2),v.getInt(3));
             } catch(Exception ignored) { }
+        }
+    }
+    private void performHaptic(int kind) {
+        if(root==null)return;
+        int code=android.view.HapticFeedbackConstants.CLOCK_TICK;
+        if(kind==2) {
+            code=android.view.HapticFeedbackConstants.VIRTUAL_KEY;
+        } else if(kind==3) {
+            code=android.os.Build.VERSION.SDK_INT>=30
+                ? android.view.HapticFeedbackConstants.CONFIRM
+                : android.view.HapticFeedbackConstants.VIRTUAL_KEY;
+        } else if(kind==4) {
+            code=android.os.Build.VERSION.SDK_INT>=30
+                ? android.view.HapticFeedbackConstants.REJECT
+                : android.view.HapticFeedbackConstants.LONG_PRESS;
+        }
+        root.performHapticFeedback(code,android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
+    }
+    public byte[] hostClipboardRead() {
+        try {
+            android.content.ClipboardManager cm=
+                (android.content.ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+            if(cm==null)return null;
+            if(!cm.hasPrimaryClip())return new byte[0];
+            android.content.ClipData clip=cm.getPrimaryClip();
+            if(clip==null || clip.getItemCount()==0)return new byte[0];
+            CharSequence seq=clip.getItemAt(0).coerceToText(this);
+            if(seq==null)return new byte[0];
+            return seq.toString().getBytes(StandardCharsets.UTF_8);
+        } catch(Throwable ignored) {
+            return null;
+        }
+    }
+    public boolean hostClipboardWrite(byte[] utf8) {
+        try {
+            android.content.ClipboardManager cm=
+                (android.content.ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+            if(cm==null)return false;
+            String text=utf8!=null?new String(utf8,StandardCharsets.UTF_8):"";
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("xu",text));
+            return true;
+        } catch(Throwable ignored) {
+            return false;
         }
     }
     private void syncReducedMotion() {
@@ -503,6 +550,7 @@ public final class MainActivity extends Activity {
         });
         setContentView(root);
         root.requestApplyInsets();
+        attachHost(this);
         syncReducedMotion();
         try(java.io.InputStream in=getAssets().open("canvas.html")) {
             java.io.ByteArrayOutputStream bytes=new java.io.ByteArrayOutputStream();
@@ -513,5 +561,5 @@ public final class MainActivity extends Activity {
     }
     @Override public void onResume() { super.onResume(); web.onResume(); syncReducedMotion(); if(root!=null)root.requestApplyInsets(); active(true); running=true; handler.post(tick); }
     @Override public void onPause() { running=false; handler.removeCallbacks(tick); active(false); web.onPause(); super.onPause(); }
-    @Override public void onDestroy() { running=false; handler.removeCallbacks(tick); web.removeJavascriptInterface("XuPhone"); web.destroy(); super.onDestroy(); }
+    @Override public void onDestroy() { running=false; handler.removeCallbacks(tick); attachHost(null); web.removeJavascriptInterface("XuPhone"); web.destroy(); super.onDestroy(); }
 }
