@@ -91,7 +91,17 @@ struct Lw {
     // Lowering a branch condition or match subject: the checker forgives a
     // string move there when the branch returns, though the local lives on.
     in_cond int
+    // Run-time drop flag slot of a local (-1: its moved state is tracked
+    // statically in lmoved). See dyn_ids.
     ldrop_flag []int
+    // Locals whose moved state differs between the paths that reach a join
+    // (moved or re-assigned inside a loop or a conditional arm). A flag
+    // word records at run time whether such a local still owns its value.
+    // dyn_ids is fixed for one lowering pass; dyn_found collects the locals
+    // this pass discovers, and lower_fn repeats the pass when it grew.
+    dyn_ids []int
+    dyn_found []int
+    block_depth int
 }
 
 // Hook result for "this feature does not lower the node".
@@ -127,7 +137,10 @@ fn lw_new(name string, label string, fi int, tgt_os int, tgt_arch int) Lw {
         sdrop: []int{},
         loop_scope: []int{},
         in_cond: 0,
-        ldrop_flag: []int{}
+        ldrop_flag: []int{},
+        dyn_ids: []int{},
+        dyn_found: []int{},
+        block_depth: 0
     }
 }
 
@@ -887,19 +900,33 @@ fn (w $&Lw) own_grow(id int) {
     }
 }
 
-fn (w $&Lw) init_flag_at_entry(flag_slot int) {
-    idx := w.f.instrs.len
-    $ins := minstr_new(MI_STORE_LOCAL)
-    ins.a = flag_slot
-    ins.b = w.konst(1)
-    ins.c = 0
-    ins.line = 0
-    ins.next = w.f.blocks[0].head
-    w.f.instrs.push(ins)
-    w.f.blocks[0].head = idx
-    if w.f.blocks[0].tail < 0 {
-        w.f.blocks[0].tail = idx
+// Drop flag slot of local id, or -1.
+fn (w &Lw) flag_of(id int) int {
+    if id >= 0 && id < w.ldrop_flag.len {
+        << w.ldrop_flag[id]
     }
+    << -1
+}
+
+// Local id needs a drop flag; the current pass cannot add one after the
+// fact (earlier drops of the local are already emitted), so it is recorded
+// for the next pass.
+fn (w $&Lw) note_dynamic(id int) {
+    for i in 0:w.dyn_found.len {
+        if w.dyn_found[i] == id {
+            <<
+        }
+    }
+    w.dyn_found.push(id)
+}
+
+fn (w &Lw) is_dynamic(id int) bool {
+    for i in 0:w.dyn_ids.len {
+        if w.dyn_ids[i] == id {
+            << true
+        }
+    }
+    << false
 }
 
 // Strings, dynamic arrays and structs with owned fields need cleanup.
@@ -999,6 +1026,12 @@ fn (w $&Lw) own_declare(tp &types.TypedProgram, id int) {
     w.own_grow(id)
     w.lowned[id] = true
     w.lmoved[id] = false
+    w.ldrop_flag[id] = -1
+    if w.is_dynamic(id) {
+        flag := w.new_local(1, 1, "drop_flag")
+        w.ldrop_flag[id] = flag
+        w.store_local(flag, 0, w.konst(1))
+    }
     w.scope_ids.push(id)
     w.scope_ostart.push(w.scope_offs.len)
     w.drop_offsets(tp, w.local_type(tp, id), 0)
@@ -1049,55 +1082,49 @@ fn (w $&Lw) own_disown(id int) {
     }
 }
 
+// Calls that free the value of the owned local at scope_ids[i].
+fn (w $&Lw) emit_scope_drops(i int) {
+    id := w.scope_ids[i]
+    slot := w.lslot[id]
+    $end := w.scope_offs.len
+    if i + 1 < w.scope_ids.len {
+        end = w.scope_ostart[i + 1]
+    }
+    base := w.local_addr(slot)
+    for j in w.scope_ostart[i]:end {
+        $args := []int{}
+        off := w.scope_offs[j]
+        if off == 0 {
+            args.push(base)
+        } else {
+            args.push(w.bin(BIN_ADD, base, w.konst(off)))
+        }
+        if w.scope_drop_labels[j].len == 0 {
+            w.call_core("str_free", &args)
+        } else {
+            w.call(w.scope_drop_labels[j] + "", &args)
+        }
+    }
+}
+
 // Free owned, unmoved locals declared at scope_ids[mark:], innermost first.
+// A local with a drop flag is freed when the flag is still set.
 fn (w $&Lw) drop_owned_from(mark int) {
     $i := w.scope_ids.len - 1
     while i >= mark {
         id := w.scope_ids[i]
-        if w.lowned[id] && !w.lmoved[id] {
-            slot := w.lslot[id]
-            if slot >= 0 {
-                $end := w.scope_offs.len
-                if i + 1 < w.scope_ids.len {
-                    end = w.scope_ostart[i + 1]
-                }
-                base := w.local_addr(slot)
-                $flag := -1
-                if id < w.ldrop_flag.len {
-                    flag = w.ldrop_flag[id]
-                }
-                if flag >= 0 {
-                    fval := w.load_local(flag, 0)
-                    then_b := w.new_block()
-                    next_b := w.new_block()
-                    w.branch(w.bin(BIN_NE, fval, w.konst(0)), then_b, next_b)
-                    w.f.active_bb = then_b
-                    for j in w.scope_ostart[i]:end {
-                        $args := []int{}
-                        off := w.scope_offs[j]
-                        if off == 0 {
-                            args.push(base)
-                        } else {
-                            args.push(w.bin(BIN_ADD, base, w.konst(off)))
-                        }
-                        if w.scope_drop_labels[j].len == 0 { w.call_core("str_free", &args) }
-                        else { w.call(w.scope_drop_labels[j] + "", &args) }
-                    }
-                    w.jump(next_b)
-                    w.f.active_bb = next_b
-                } else {
-                    for j in w.scope_ostart[i]:end {
-                        $args := []int{}
-                        off := w.scope_offs[j]
-                        if off == 0 {
-                            args.push(base)
-                        } else {
-                            args.push(w.bin(BIN_ADD, base, w.konst(off)))
-                        }
-                        if w.scope_drop_labels[j].len == 0 { w.call_core("str_free", &args) }
-                        else { w.call(w.scope_drop_labels[j] + "", &args) }
-                    }
-                }
+        if w.lowned[id] && w.lslot[id] >= 0 {
+            flag := w.flag_of(id)
+            if flag >= 0 {
+                then_b := w.new_block()
+                next_b := w.new_block()
+                w.branch(w.load_local(flag, 0), then_b, next_b)
+                w.f.active_bb = then_b
+                w.emit_scope_drops(i)
+                w.jump(next_b)
+                w.f.active_bb = next_b
+            } else if !w.lmoved[id] {
+                w.emit_scope_drops(i)
             }
         }
         i -= 1
@@ -1160,20 +1187,15 @@ fn (w $&Lw) lower_ident(p &parser.Parser, tp &types.TypedProgram, n int) int {
         ty := w.local_type(tp, id)
         if tp.clone_of(n) == 2 && w.needs_drop(tp, ty) {
             if w.owns(id) && w.in_cond == 0 {
-                if w.outside_loop(id) {
-                    $flag := -1
-                    if id < w.ldrop_flag.len {
-                        flag = w.ldrop_flag[id]
-                    }
-                    if flag < 0 {
-                        flag = w.new_local(1, 1, "drop_flag")
-                        while w.ldrop_flag.len <= id {
-                            w.ldrop_flag.push(-1)
-                        }
-                        w.ldrop_flag[id] = flag
-                        w.init_flag_at_entry(flag)
-                    }
+                flag := w.flag_of(id)
+                if flag >= 0 {
                     w.store_local(flag, 0, w.konst(0))
+                } else if w.outside_loop(id) {
+                    // Moved inside a loop it was declared outside of: code
+                    // after the loop cannot tell statically. Leak it in
+                    // this pass; the next pass gives it a drop flag.
+                    w.note_dynamic(id)
+                    w.own_disown(id)
                 } else {
                     w.lmoved[id] = true
                 }
@@ -1924,6 +1946,7 @@ fn (w $&Lw) lower_method_call(p &parser.Parser, tp &types.TypedProgram, n int) i
 fn (w $&Lw) lower_block(p &parser.Parser, tp &types.TypedProgram, head int) {
     mark := w.scope_ids.len
     moved := w.lmoved[0:w.lmoved.len]
+    w.block_depth += 1
     $s := head
     while s >= 0 {
         w.ensure_open()
@@ -1936,11 +1959,25 @@ fn (w $&Lw) lower_block(p &parser.Parser, tp &types.TypedProgram, head int) {
         }
         w.scope_truncate(mark)
     }
-    // Moves on a path that ended do not reach the code after the block;
-    // the checker clones conditional moves of outer strings instead.
+    w.block_depth -= 1
     if !w.open() {
+        // Moves on a path that ended do not reach the code after the block.
         for i in 0:moved.len {
             w.lmoved[i] = moved[i]
+        }
+        <<
+    }
+    if w.block_depth == 0 {
+        <<
+    }
+    // A nested block is a conditional arm or a loop body. When it falls
+    // through having moved or re-assigned an outer local, the code after
+    // it is also reached by paths that did not, so the static state is
+    // wrong for one of them: track that local with a drop flag.
+    for i in 0:mark {
+        id := w.scope_ids[i]
+        if id < moved.len && w.lmoved[id] != moved[id] && w.lowned[id] && w.flag_of(id) < 0 {
+            w.note_dynamic(id)
         }
     }
 }
@@ -2238,12 +2275,27 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
             old := w.lower_ident(p, tp, target)
             v = w.checked_bin(assign_op_code(lty, aop), old, v, lty)
         }
-        if aop == ast.AS_ASSIGN && w.owns(id) && !w.lmoved[id] {
-            w.drop_value(tp, w.local_addr(w.ensure_local(tp, id)), lty)
+        flag := w.flag_of(id)
+        if aop == ast.AS_ASSIGN && w.owns(id) {
+            if flag >= 0 {
+                then_b := w.new_block()
+                next_b := w.new_block()
+                w.branch(w.load_local(flag, 0), then_b, next_b)
+                w.f.active_bb = then_b
+                w.drop_value(tp, w.local_addr(w.ensure_local(tp, id)), lty)
+                w.jump(next_b)
+                w.f.active_bb = next_b
+            } else if !w.lmoved[id] {
+                w.drop_value(tp, w.local_addr(w.ensure_local(tp, id)), lty)
+            }
         }
         w.store_to_local(tp, id, v)
         if w.owns(id) {
-            w.lmoved[id] = false
+            if flag >= 0 {
+                w.store_local(flag, 0, w.konst(1))
+            } else {
+                w.lmoved[id] = false
+            }
         }
         <<
     }
@@ -2292,9 +2344,50 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
 
 // ===== functions =====
 
+// Lower function fi. A pass that finds locals needing a drop flag (see
+// Lw.dyn_ids) is repeated with those locals flagged from their declaration,
+// because the drops it already emitted for them were unconditional.
 fn lower_fn(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_arch int, debug bool, core_names &[]string, core_labels &[]string, errs $&[]int) MFn {
+    $dyn := []int{}
+    $pass := 0
+    while true {
+        $found := []int{}
+        $perrs := []int{}
+        f := lower_fn_pass(p, tp, fi, tgt_os, tgt_arch, debug, core_names, core_labels, &dyn, $&found, $&perrs)
+        $nerr := 0
+        for i in 0:perrs.len {
+            nerr += perrs[i]
+        }
+        $grew := false
+        for i in 0:found.len {
+            $known := false
+            for j in 0:dyn.len {
+                if dyn[j] == found[i] {
+                    known = true
+                }
+            }
+            if !known {
+                dyn.push(found[i])
+                grew = true
+            }
+        }
+        pass += 1
+        // A pass with errors has reported them; a third repeat means the
+        // set did not settle, and the locals it left unflagged are leaked.
+        if !grew || nerr > 0 || pass >= 4 {
+            errs.push(nerr)
+            << f
+        }
+    }
+    << mfn_new("", "")
+}
+
+fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_arch int, debug bool, core_names &[]string, core_labels &[]string, dyn &[]int, found $&[]int, errs $&[]int) MFn {
     tp.use_fn(fi)
     $w := lw_new(tp.fns[fi].name, tp.fns[fi].label, fi, tgt_os, tgt_arch)
+    for i in 0:dyn.len {
+        w.dyn_ids.push(dyn[i])
+    }
     for i in 0:core_names.len {
         w.core_names.push(core_names[i] + "")
         w.core_labels.push(core_labels[i] + "")
@@ -2360,6 +2453,9 @@ fn lower_fn(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_a
     w.ret(w.konst(0))
     while w.lbyref.len < w.f.locals.len {
         w.lbyref.push(false)
+    }
+    for i in 0:w.dyn_found.len {
+        found.push(w.dyn_found[i])
     }
     errs.push(w.errors)
     << mfn_copy(&w.f)
