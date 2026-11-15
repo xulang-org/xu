@@ -1,0 +1,682 @@
+@xu/mir
+// Inlining of small functions for typed MIR.
+//
+// A call to a small, non-recursive function whose locals are never
+// address-taken is replaced by a copy of its body: the callee's locals and
+// temps become fresh ones of the caller, the arguments are stored into the
+// copies of its incoming locals, and each return stores the result into a
+// local read where the call was. A call whose result the caller returns
+// at once turns the callee's returns into the caller's, so a mutually
+// recursive pair becomes a self tail call that opt_tail can turn into a
+// loop. Functions with a hidden result or error word are left alone.
+//
+// Native entries (native_entries[i], the list opt_inline gets: stdlib
+// functions whose bodies the arm64 / x64 backend replaces by hardware
+// AES / SHA-256 / hex code) take part in neither role: their MIR bodies
+// are software stubs (an empty hex_hw_encode, an aes_hw_supported that
+// returns false), so copying one into a caller would drop the hardware
+// path or the call's effect, and rewriting one as a caller is wasted.
+//
+// Arguments are stored into fresh copies of the callee's incoming locals
+// 0..nparams-1, which lower_fn creates first, one word each, for every
+// function; with no hidden .okp / .sret word they are the call's
+// arguments in order. That is all the splice needs, so unlike opt_tail it
+// does not require scalar_params (bool, f64, reference and receiver words
+// are copied like ints); wide by-value parameters are excluded because
+// their copy takes an address.
+//
+// A function changed in a round is not inlined into later callers of the
+// same round; the driver cleans up between rounds.
+//
+// What gets inlined: a single-block callee of at most INL_TINY
+// instructions that never stores to its parameters, anywhere; its
+// instructions are spliced in place of the call with the arguments
+// substituted, so the caller's blocks stay as they are. A callee of at
+// most INL_MAX_INSTRS at a call inside a loop, or one that calls the caller
+// back (breaking mutual recursion), is copied block by block; only those
+// callers need the scalar passes again.
+
+const INL_TINY = 8
+const INL_LEAF = 16
+const INL_MAX_INSTRS = 30
+const INL_MAX_BLOCKS = 10
+const INL_MAX_GROWTH = 200
+
+struct InlOut {
+    base int
+    nblk int
+    cont int
+}
+
+// Linked instruction count of f, or -1 when f cannot be inlined.
+fn inl_size(f &MFn) int {
+    if f.is_extern || f.blocks.len == 0 || f.blocks.len > INL_MAX_BLOCKS || f.label == "_xu_main" {
+        << 0 - 1
+    }
+    if f.nparams > f.locals.len || f.nparams > f.local_names.len || f.nparams > f.locals_nslots.len {
+        << 0 - 1
+    }
+    for i in 0:f.nparams {
+        if f.local_names[i] == ".okp" || f.local_names[i] == ".sret" || f.locals_nslots[i] != 1 {
+            << 0 - 1
+        }
+    }
+    $n := 0
+    for bi in 0:f.blocks.len {
+        tk := f.blocks[bi].tkind
+        if tk != TKIND_JUMP && tk != TKIND_BRANCH && tk != TKIND_RETURN {
+            << 0 - 1
+        }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            k := f.instrs[ii].kind
+            if !fold_known_kind(k) || k == MI_ADDR || k == MI_NOP {
+                << 0 - 1
+            }
+            if k == MI_CALL && f.instrs[ii].sval == f.label {
+                << 0 - 1
+            }
+            n += 1
+            if n > INL_MAX_INSTRS {
+                << 0 - 1
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+    << n
+}
+
+fn inl_argc(f &MFn, call int) int {
+    $n := 0
+    $a := f.instrs[call].c
+    while a >= 0 {
+        n += 1
+        a = f.margs[a].next
+    }
+    << n
+}
+
+// A callee operand as the caller sees it.
+fn inl_val(f $&MFn, g &MFn, v int, tbase int) int {
+    if v >= 0 {
+        << tbase + v
+    }
+    if v <= 0 - 2 {
+        << alloc_const(f, g.consts[0 - v - 2])
+    }
+    << v
+}
+
+fn inl_dst(a int, tbase int) int {
+    if a >= 0 {
+        << tbase + a
+    }
+    << a
+}
+
+fn inl_args(f $&MFn, g &MFn, first int, tbase int) int {
+    $vals := []int{}
+    $a := first
+    while a >= 0 {
+        vals.push(inl_val(f, g, g.margs[a].v, tbase))
+        a = g.margs[a].next
+    }
+    if vals.len == 0 {
+        << 0 - 1
+    }
+    head := f.margs.len
+    for i in 0:vals.len {
+        $nx := 0 - 1
+        if i + 1 < vals.len {
+            nx = head + i + 1
+        }
+        f.margs.push(MArg{v: vals[i], next: nx})
+    }
+    << head
+}
+
+fn inl_emit(f $&MFn, b int, kind int, a int, bb int, c int, line int) {
+    $ins := minstr_new(kind)
+    ins.a = a
+    ins.b = bb
+    ins.c = c
+    ins.line = line
+    emit_to_bb(f, b, ins)
+}
+
+fn inl_new_local(f $&MFn, ty int, nslots int, owning bool, name string) int {
+    id := f.locals.len
+    f.locals.push(ty)
+    f.locals_nslots.push(nslots)
+    f.locals_owning.push(owning)
+    f.local_names.push(name)
+    << id
+}
+
+// Replaces the call instruction `call` of block b (prev is the instruction
+// before it, or -1) by a copy of g. With tail, b returns the call's result
+// and the copy returns in its place.
+fn inl_site(f $&MFn, g &MFn, b int, prev int, call int, tail bool) InlOut {
+    t := f.instrs[call].a
+    first := f.instrs[call].c
+    line := f.instrs[call].line
+    tbase := f.temps.len
+    for _ in 0:g.temps.len {
+        alloc_temp(f)
+    }
+    lbase := f.locals.len
+    for i in 0:g.locals.len {
+        inl_new_local(f, g.locals[i], g.locals_nslots[i], g.locals_owning[i], "." + g.local_names[i])
+    }
+    $ret_local := 0 - 1
+    $cont := 0 - 1
+    if !tail {
+        // The rest of b moves to a new block that starts by reading the
+        // result; the call instruction itself becomes that read.
+        ret_local = inl_new_local(f, 1, 1, false, ".ret")
+        cont = f.blocks.len
+        f.blocks.push(mblock_new())
+        f.blocks[cont].head = call
+        f.blocks[cont].tail = f.blocks[b].tail
+        f.blocks[cont].tkind = f.blocks[b].tkind
+        f.blocks[cont].ta = f.blocks[b].ta
+        f.blocks[cont].tb = f.blocks[b].tb
+        f.blocks[cont].tc = f.blocks[b].tc
+        f.blocks[cont].line = f.blocks[b].line
+        f.instrs[call].kind = MI_LOAD_LOCAL
+        f.instrs[call].a = t
+        f.instrs[call].b = ret_local
+        f.instrs[call].c = 0
+        f.instrs[call].d = 0 - 1
+        f.instrs[call].sval = ""
+    }
+    if prev >= 0 {
+        f.instrs[prev].next = 0 - 1
+        f.blocks[b].tail = prev
+    } else {
+        f.blocks[b].head = 0 - 1
+        f.blocks[b].tail = 0 - 1
+    }
+    $a := first
+    $pi := 0
+    while a >= 0 {
+        inl_emit(f, b, MI_STORE_LOCAL, lbase + pi, f.margs[a].v, 0, line)
+        pi += 1
+        a = f.margs[a].next
+    }
+    base := f.blocks.len
+    for _ in 0:g.blocks.len {
+        f.blocks.push(mblock_new())
+    }
+    f.blocks[b].tkind = TKIND_JUMP
+    f.blocks[b].ta = base
+    f.blocks[b].tb = 0 - 1
+    f.blocks[b].tc = 0 - 1
+    for j in 0:g.blocks.len {
+        nbi := base + j
+        f.blocks[nbi].line = g.blocks[j].line
+        $ii := g.blocks[j].head
+        while ii >= 0 {
+            src := ~g.instrs[ii]
+            k := src.kind
+            $ins := minstr_new(k)
+            ins.line = src.line
+            ins.col = src.col
+            ins.file = src.file
+            ins.sval = src.sval + ""
+            if k == MI_COPY {
+                ins.a = inl_dst(src.a, tbase)
+                ins.b = inl_val(f, g, src.b, tbase)
+            } else if k == MI_LOAD_LOCAL {
+                ins.a = inl_dst(src.a, tbase)
+                ins.b = lbase + src.b
+                ins.c = src.c
+            } else if k == MI_STORE_LOCAL {
+                ins.a = lbase + src.a
+                ins.b = inl_val(f, g, src.b, tbase)
+                ins.c = src.c
+            } else if k == MI_LOAD_PTR {
+                ins.a = inl_dst(src.a, tbase)
+                ins.b = inl_val(f, g, src.b, tbase)
+                ins.c = src.c
+                ins.d = src.d
+            } else if k == MI_STORE_PTR {
+                ins.a = inl_val(f, g, src.a, tbase)
+                ins.b = inl_val(f, g, src.b, tbase)
+                ins.c = src.c
+                ins.d = src.d
+            } else if k == MI_BIN {
+                ins.a = inl_dst(src.a, tbase)
+                ins.b = src.b
+                ins.c = inl_val(f, g, src.c, tbase)
+                ins.d = inl_val(f, g, src.d, tbase)
+            } else if k == MI_UN {
+                ins.a = inl_dst(src.a, tbase)
+                ins.b = src.b
+                ins.c = inl_val(f, g, src.c, tbase)
+            } else if k == MI_SELECT {
+                ins.a = inl_dst(src.a, tbase)
+                ins.b = inl_val(f, g, src.b, tbase)
+                ins.c = inl_val(f, g, src.c, tbase)
+                ins.d = inl_val(f, g, src.d, tbase)
+            } else if k == MI_CALL {
+                ins.a = inl_dst(src.a, tbase)
+                ins.c = inl_args(f, g, src.c, tbase)
+            } else if k == MI_CALL_IND {
+                ins.a = inl_dst(src.a, tbase)
+                ins.b = inl_val(f, g, src.b, tbase)
+                ins.c = inl_args(f, g, src.c, tbase)
+            } else {
+                ins.a = inl_dst(src.a, tbase)
+            }
+            emit_to_bb(f, nbi, ins)
+            ii = src.next
+        }
+        tk := g.blocks[j].tkind
+        if tk == TKIND_JUMP {
+            f.blocks[nbi].tkind = TKIND_JUMP
+            f.blocks[nbi].ta = base + g.blocks[j].ta
+        } else if tk == TKIND_BRANCH {
+            f.blocks[nbi].tkind = TKIND_BRANCH
+            f.blocks[nbi].ta = inl_val(f, g, g.blocks[j].ta, tbase)
+            f.blocks[nbi].tb = base + g.blocks[j].tb
+            f.blocks[nbi].tc = base + g.blocks[j].tc
+        } else {
+            v := inl_val(f, g, g.blocks[j].ta, tbase)
+            if tail {
+                f.blocks[nbi].tkind = TKIND_RETURN
+                f.blocks[nbi].ta = v
+            } else {
+                inl_emit(f, nbi, MI_STORE_LOCAL, ret_local, v, 0, g.blocks[j].line)
+                f.blocks[nbi].tkind = TKIND_JUMP
+                f.blocks[nbi].ta = cont
+            }
+        }
+    }
+    << InlOut{base: base, nblk: g.blocks.len, cont: cont}
+}
+
+// Whether f can be spliced: one block, small (or pure leaf up to INL_LEAF),
+// parameters only read.
+fn inl_spliceable(f &MFn, size int) bool {
+    if size < 0 || size > INL_LEAF || f.blocks.len != 1 || f.blocks[0].tkind != TKIND_RETURN {
+        << false
+    }
+    need_pure := size > INL_TINY
+    if need_pure && f.nparams > 4 {
+        << false
+    }
+    $ii := f.blocks[0].head
+    while ii >= 0 {
+        k := f.instrs[ii].kind
+        if need_pure && (k == MI_CALL || k == MI_CALL_IND || k == MI_STORE_PTR) {
+            << false
+        }
+        if k == MI_STORE_LOCAL && f.instrs[ii].a < f.nparams {
+            << false
+        }
+        if k == MI_LOAD_LOCAL && f.instrs[ii].b < f.nparams && f.instrs[ii].c > 0 {
+            << false
+        }
+        ii = f.instrs[ii].next
+    }
+    << true
+}
+
+// A callee operand during a splice: sub[t] is the caller operand standing
+// for callee temp t (an argument), or -1.
+fn inl_sval(f $&MFn, g &MFn, v int, tbase int, sub &[]int) int {
+    if v >= 0 {
+        if sub[v] != 0 - 1 {
+            << sub[v]
+        }
+        << tbase + v
+    }
+    if v <= 0 - 2 {
+        << alloc_const(f, g.consts[0 - v - 2])
+    }
+    << v
+}
+
+fn inl_sargs(f $&MFn, g &MFn, first int, tbase int, sub &[]int) int {
+    $vals := []int{}
+    $a := first
+    while a >= 0 {
+        vals.push(inl_sval(f, g, g.margs[a].v, tbase, sub))
+        a = g.margs[a].next
+    }
+    if vals.len == 0 {
+        << 0 - 1
+    }
+    head := f.margs.len
+    for i in 0:vals.len {
+        $nx := 0 - 1
+        if i + 1 < vals.len {
+            nx = head + i + 1
+        }
+        f.margs.push(MArg{v: vals[i], next: nx})
+    }
+    << head
+}
+
+// Splices the single block of g in front of the call instruction `call`
+// of block b, which becomes a copy of the returned value.
+fn inl_splice(f $&MFn, g &MFn, b int, prev int, call int) {
+    t := f.instrs[call].a
+    $args := []int{}
+    $a := f.instrs[call].c
+    while a >= 0 {
+        args.push(f.margs[a].v)
+        a = f.margs[a].next
+    }
+    tbase := f.temps.len
+    $sub := []int{}
+    for _ in 0:g.temps.len {
+        alloc_temp(f)
+        sub.push(0 - 1)
+    }
+    // Only the callee's own locals need copies; parameters are read
+    // straight from the arguments.
+    lbase := f.locals.len - g.nparams
+    for i in g.nparams:g.locals.len {
+        inl_new_local(f, g.locals[i], g.locals_nslots[i], g.locals_owning[i], "." + g.local_names[i])
+    }
+    $last := prev
+    $ii := g.blocks[0].head
+    while ii >= 0 {
+        src := ~g.instrs[ii]
+        k := src.kind
+        if k == MI_LOAD_LOCAL && src.b < g.nparams {
+            if src.a >= 0 && src.b < args.len {
+                sub[src.a] = args[src.b]
+            }
+            ii = src.next
+            ->
+        }
+        $ins := minstr_new(k)
+        ins.line = f.instrs[call].line
+        ins.col = f.instrs[call].col
+        ins.file = f.instrs[call].file
+        ins.sval = src.sval + ""
+        if k == MI_COPY {
+            ins.a = inl_dst(src.a, tbase)
+            ins.b = inl_sval(f, g, src.b, tbase, &sub)
+        } else if k == MI_LOAD_LOCAL {
+            ins.a = inl_dst(src.a, tbase)
+            ins.b = lbase + src.b
+            ins.c = src.c
+        } else if k == MI_STORE_LOCAL {
+            ins.a = lbase + src.a
+            ins.b = inl_sval(f, g, src.b, tbase, &sub)
+            ins.c = src.c
+        } else if k == MI_LOAD_PTR {
+            ins.a = inl_dst(src.a, tbase)
+            ins.b = inl_sval(f, g, src.b, tbase, &sub)
+            ins.c = src.c
+            ins.d = src.d
+        } else if k == MI_STORE_PTR {
+            ins.a = inl_sval(f, g, src.a, tbase, &sub)
+            ins.b = inl_sval(f, g, src.b, tbase, &sub)
+            ins.c = src.c
+            ins.d = src.d
+        } else if k == MI_BIN {
+            ins.a = inl_dst(src.a, tbase)
+            ins.b = src.b
+            ins.c = inl_sval(f, g, src.c, tbase, &sub)
+            ins.d = inl_sval(f, g, src.d, tbase, &sub)
+        } else if k == MI_UN {
+            ins.a = inl_dst(src.a, tbase)
+            ins.b = src.b
+            ins.c = inl_sval(f, g, src.c, tbase, &sub)
+        } else if k == MI_SELECT {
+            ins.a = inl_dst(src.a, tbase)
+            ins.b = inl_sval(f, g, src.b, tbase, &sub)
+            ins.c = inl_sval(f, g, src.c, tbase, &sub)
+            ins.d = inl_sval(f, g, src.d, tbase, &sub)
+        } else if k == MI_CALL {
+            ins.a = inl_dst(src.a, tbase)
+            ins.c = inl_sargs(f, g, src.c, tbase, &sub)
+        } else if k == MI_CALL_IND {
+            ins.a = inl_dst(src.a, tbase)
+            ins.b = inl_sval(f, g, src.b, tbase, &sub)
+            ins.c = inl_sargs(f, g, src.c, tbase, &sub)
+        } else {
+            ins.a = inl_dst(src.a, tbase)
+        }
+        idx := f.instrs.len
+        f.instrs.push(ins)
+        if last >= 0 {
+            f.instrs[last].next = idx
+        } else {
+            f.blocks[b].head = idx
+        }
+        last = idx
+        ii = src.next
+    }
+    if last >= 0 {
+        f.instrs[last].next = call
+    } else {
+        f.blocks[b].head = call
+    }
+    v := inl_sval(f, g, g.blocks[0].ta, tbase, &sub)
+    f.instrs[call].kind = MI_COPY
+    f.instrs[call].a = t
+    f.instrs[call].b = v
+    f.instrs[call].c = 0 - 1
+    f.instrs[call].d = 0 - 1
+    f.instrs[call].sval = ""
+}
+
+// Lays the blocks out in `order` (a permutation that keeps block 0 first).
+fn inl_reorder(f $&MFn, order &[]int) {
+    if order.len != f.blocks.len || order.len == 0 || order[0] != 0 {
+        <<
+    }
+    $pos := []int{}
+    for _ in 0:f.blocks.len {
+        pos.push(0 - 1)
+    }
+    for ni in 0:order.len {
+        if order[ni] < 0 || order[ni] >= pos.len || pos[order[ni]] != 0 - 1 {
+            <<
+        }
+        pos[order[ni]] = ni
+    }
+    $nbl := []MBlock{}
+    for ni in 0:order.len {
+        $blk := ~f.blocks[order[ni]]
+        if blk.tkind == TKIND_JUMP {
+            blk.ta = pos[blk.ta]
+        } else if blk.tkind == TKIND_BRANCH {
+            blk.tb = pos[blk.tb]
+            blk.tc = pos[blk.tc]
+        }
+        nbl.push(~blk)
+    }
+    f.blocks = ~nbl
+}
+
+// Whether g calls the function labelled `label`.
+fn inl_calls(g &MFn, label &string) bool {
+    for bi in 0:g.blocks.len {
+        $ii := g.blocks[bi].head
+        while ii >= 0 {
+            if g.instrs[ii].kind == MI_CALL && g.instrs[ii].sval == *label {
+                << true
+            }
+            ii = g.instrs[ii].next
+        }
+    }
+    << false
+}
+
+// For each block, whether a backward jump spans it in layout order: a
+// cheap stand-in for "inside a loop" that only steers what gets inlined.
+fn inl_in_loop(f &MFn) []int {
+    $delta := []int{}
+    for _ in 0:f.blocks.len + 1 {
+        delta.push(0)
+    }
+    for bi in 0:f.blocks.len {
+        tk := f.blocks[bi].tkind
+        $h := 0 - 1
+        if tk == TKIND_JUMP && f.blocks[bi].ta <= bi {
+            h = f.blocks[bi].ta
+        } else if tk == TKIND_BRANCH {
+            if f.blocks[bi].tb <= bi {
+                h = f.blocks[bi].tb
+            }
+            if f.blocks[bi].tc <= bi && (h < 0 || f.blocks[bi].tc < h) {
+                h = f.blocks[bi].tc
+            }
+        }
+        if h >= 0 {
+            delta[h] = delta[h] + 1
+            delta[bi + 1] = delta[bi + 1] - 1
+        }
+    }
+    $res := []int{}
+    $cur := 0
+    for bi in 0:f.blocks.len {
+        cur += delta[bi]
+        res.push(cur)
+    }
+    << res
+}
+
+// Returns 0 when nothing was inlined into function fi, 1 when calls were
+// only spliced, 2 when its blocks changed.
+fn inl_caller(unit $&Mir, fi int, li &LabelIndex, size &[]int, splice &[]bool, changed &[]bool, cache $&[]MFn, cache_at $&[]int, loops bool) int {
+    for ii in 0:unit.fns[fi].instrs.len {
+        if !fold_known_kind(unit.fns[fi].instrs[ii].kind) {
+            << 0
+        }
+    }
+    nb0 := unit.fns[fi].blocks.len
+    $uses := []int{}
+    $depth := []int{}
+    $order := []int{}
+    $growth := 0
+    $did := false
+    $spliced := false
+    for bi in 0:nb0 {
+        order.push(bi)
+        $cur := bi
+        $prev := 0 - 1
+        $ii := unit.fns[fi].blocks[cur].head
+        while ii >= 0 {
+            nx := unit.fns[fi].instrs[ii].next
+            $gi := 0 - 1
+            if unit.fns[fi].instrs[ii].kind == MI_CALL {
+                gi = li.get(&unit.fns[fi].instrs[ii].sval)
+            }
+            $take := gi >= 0 && gi != fi
+            if take {
+                take = size[gi] >= 0 && !changed[gi] && growth + size[gi] <= INL_MAX_GROWTH
+            }
+            if take {
+                take = inl_argc(&unit.fns[fi], ii) == unit.fns[gi].nparams
+            }
+            if take && splice[gi] {
+                if cache_at[gi] < 0 {
+                    cache_at[gi] = cache.len
+                    cache.push(mfn_copy(&unit.fns[gi]))
+                }
+                ci := cache_at[gi]
+                inl_splice($&unit.fns[fi], &cache[ci], cur, prev, ii)
+                growth += size[gi]
+                spliced = true
+                take = false
+            }
+            if take {
+                if loops && depth.len == 0 {
+                    depth = inl_in_loop(&unit.fns[fi])
+                }
+                if bi >= depth.len || depth[bi] == 0 {
+                    take = inl_calls(&unit.fns[gi], &unit.fns[fi].label)
+                }
+            }
+            if take {
+                if uses.len == 0 {
+                    uses = tail_uses(&unit.fns[fi])
+                }
+                t := unit.fns[fi].instrs[ii].a
+                $tail := false
+                if nx < 0 && unit.fns[fi].blocks[cur].tkind == TKIND_RETURN && unit.fns[fi].blocks[cur].ta == t && t >= 0 && t < uses.len {
+                    tail = uses[t] == 1
+                }
+                if cache_at[gi] < 0 {
+                    cache_at[gi] = cache.len
+                    cache.push(mfn_copy(&unit.fns[gi]))
+                }
+                ci := cache_at[gi]
+                out := inl_site($&unit.fns[fi], &cache[ci], cur, prev, ii, tail)
+                for j in 0:out.nblk {
+                    order.push(out.base + j)
+                }
+                growth += size[gi]
+                did = true
+                if out.cont < 0 {
+                    <-
+                }
+                order.push(out.cont)
+                cur = out.cont
+            }
+            prev = ii
+            ii = nx
+        }
+    }
+    if did {
+        inl_reorder($&unit.fns[fi], &order)
+        << 2
+    }
+    if spliced {
+        << 1
+    }
+    << 0
+}
+
+// One inlining round over the unit. changed[i] is 0 when function i was
+// left alone, 1 when calls were spliced into it, 2 when its blocks changed
+// (it then needs the scalar passes again). With loops, calls inside loops
+// are inlined too; otherwise only spliceable callees and callees that call
+// the caller back. Returns how many were touched.
+pub fn opt_inline_typed(unit $&Mir, native_entries &[]bool, changed $&[]int, loops bool) int {
+    $li := label_index_new(unit.fns.len)
+    $size := []int{}
+    $splice := []bool{}
+    $touched := []bool{}
+    while changed.len < unit.fns.len {
+        changed.push(0)
+    }
+    for fi in 0:unit.fns.len {
+        changed[fi] = 0
+        touched.push(false)
+        li.put(&unit.fns[fi].label, fi)
+        $sz := inl_size(&unit.fns[fi])
+        if fi < native_entries.len && native_entries[fi] {
+            sz = 0 - 1
+        }
+        size.push(sz)
+        splice.push(inl_spliceable(&unit.fns[fi], sz))
+    }
+    // Copies of the callees inlined this round, made on first use.
+    $cache := []MFn{}
+    $cache_at := []int{}
+    for _ in 0:unit.fns.len {
+        cache_at.push(0 - 1)
+    }
+    $n := 0
+    for fi in 0:unit.fns.len {
+        if unit.fns[fi].is_extern || (fi < native_entries.len && native_entries[fi]) {
+            ->
+        }
+        r := inl_caller(unit, fi, &li, &size, &splice, &touched, $&cache, $&cache_at, loops)
+        if r > 0 {
+            changed[fi] = r
+            touched[fi] = true
+            n += 1
+        }
+    }
+    << n
+}

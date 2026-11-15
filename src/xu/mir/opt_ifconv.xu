@@ -1,0 +1,1370 @@
+@xu/mir
+// If-conversion for typed MIR: small branch diamonds and triangles whose
+// arms only compute pure values and store them into scalar locals become
+// straight-line code ending in MI_SELECT.
+//
+//   B: ...; br c, T, E            B: ...; <T's code>; <E's code>
+//   T: ...; store l, vT; jump J      s = select c, vT, vE; store l, s
+//   E: ...; store l, vE; jump J      jump J
+//
+// Triangles (br c, T, J and br c, J, E) take the missing side's value from
+// a load of l hoisted with the arm code. Requirements, all checked here:
+//   - each arm has B as its only predecessor and jumps to the same join J
+//     (J is not B and not an arm);
+//   - an arm holds only MI_COPY, MI_LOAD_LOCAL of candidate locals,
+//     MI_BIN with an integer op that cannot trap (add, sub, mul, mulh, and,
+//     or, xor, shl, shr, integer comparisons; no division or remainder, no
+//     float ops, no tagged bounds compares), MI_UN int<->f64 conversions,
+//     MI_SELECT, and MI_STORE_LOCAL to candidate locals: one-word locals
+//     whose address is never taken and that are only accessed at word 0,
+//     so a load of one reads a frame slot or register and cannot fault;
+//   - every temp an arm defines is defined exactly once in the function
+//     and read only inside that arm, so running it on the other path
+//     changes nothing observable;
+//   - an arm stores a local at most once and never loads a local after
+//     storing it (the stores are deferred to after all hoisted code, so
+//     every hoisted load sees the value the local had at the branch);
+//   - at most IFCONV_MAX_OPS computing instructions (MI_BIN, MI_UN,
+//     MI_SELECT) and IFCONV_MAX_INSTRS instructions in all per arm.
+// Identical pure instructions of the two arms are hoisted once. When the
+// branch condition is a compare ending B that nothing else reads and one
+// select results, the compare moves next to the select so a backend can
+// fuse them (cmp + csel).
+//
+// Branches into panic blocks (bounds checks) never qualify: the panic arm
+// calls. Only the targets whose backend implements MI_SELECT run this pass.
+
+const IFCONV_MAX_OPS = 4
+const IFCONV_MAX_INSTRS = 8
+const IFCONV_MAX_STORES = 4
+
+fn ifc_safe_bin(op int) bool {
+    << op == BIN_ADD || op == BIN_SUB || op == BIN_MUL || op == BIN_AND ||
+       op == BIN_OR || op == BIN_XOR || op == BIN_SHL || op == BIN_SHR ||
+       op == BIN_MULH || op == BIN_ROTR32 || op == BIN_ROTR64 || (op >= BIN_EQ && op <= BIN_GE)
+}
+
+fn ifc_has(list &[]int, v int) bool {
+    for i in 0:list.len {
+        if list[i] == v {
+            << true
+        }
+    }
+    << false
+}
+
+struct IfcShape {
+    ok bool
+    tarm int
+    earm int
+    j int
+}
+
+pub struct IfcWork {
+    nb int
+    nl int
+    nt int
+    cand []bool
+    npred []int
+    touched []bool
+    ndef []int
+    ub []int
+    defi []int
+    storei []int
+    uses []int
+}
+
+pub fn ifc_work_new() IfcWork {
+    << IfcWork{
+        nb: 0,
+        nl: 0,
+        nt: 0,
+        cand: []bool{},
+        npred: []int{},
+        touched: []bool{},
+        ndef: []int{},
+        ub: []int{},
+        defi: []int{},
+        storei: []int{},
+        uses: []int{}
+    }
+}
+
+// Classifies one arm instruction: -1 invalid, 0 store, 1 load, 2 pure (0 ops), 3 pure (1 op).
+fn ifc_arm_step(f &MFn, ins &MInstr) int {
+    k := ins.kind
+    nl := f.locals.len
+    nt := f.temps.len
+    if k == MI_STORE_LOCAL {
+        if ins.a < 0 || ins.a >= nl || f.locals_nslots[ins.a] != 1 || ins.c > 0 {
+            << -1
+        }
+        << 0
+    }
+    if ins.a < 0 || ins.a >= nt {
+        << -1
+    }
+    if k == MI_LOAD_LOCAL {
+        if ins.b < 0 || ins.b >= nl || f.locals_nslots[ins.b] != 1 || ins.c > 0 {
+            << -1
+        }
+        << 1
+    }
+    if k == MI_BIN {
+        if !ifc_safe_bin(ins.b) || ins.sval.len > 0 {
+            << -1
+        }
+        << 3
+    }
+    if k == MI_UN {
+        if ins.b != UN_I2F && ins.b != UN_F2I {
+            << -1
+        }
+        << 3
+    }
+    if k == MI_SELECT {
+        << 3
+    }
+    if k == MI_COPY {
+        << 2
+    }
+    << -1
+}
+
+// Zero-allocation necessary check that block x could qualify as an if-conv arm.
+fn ifc_arm_quick(f &MFn, x int) bool {
+    $ops := 0
+    $n := 0
+    $nstores := 0
+    $ii := f.blocks[x].head
+    while ii >= 0 {
+        ins := &f.instrs[ii]
+        n += 1
+        if n > IFCONV_MAX_INSTRS {
+            << false
+        }
+        step := ifc_arm_step(f, ins)
+        if step < 0 {
+            << false
+        }
+        if step == 0 {
+            nstores += 1
+            if nstores > IFCONV_MAX_STORES {
+                << false
+            }
+        } else if step == 3 {
+            ops += 1
+        }
+        ii = ins.next
+    }
+    << ops <= IFCONV_MAX_OPS
+}
+
+// Checks that block x can run unconditionally; sl/sv receive the locals it
+// stores and the stored values, in order.
+fn ifc_arm(f &MFn, x int, w &IfcWork, sl $&[]int, sv $&[]int) bool {
+    $ops := 0
+    $n := 0
+    $ii := f.blocks[x].head
+    while ii >= 0 {
+        ins := &f.instrs[ii]
+        n += 1
+        if n > IFCONV_MAX_INSTRS {
+            << false
+        }
+        step := ifc_arm_step(f, ins)
+        if step < 0 {
+            << false
+        }
+        if step == 0 {
+            if !w.cand[ins.a] || ifc_has(sl, ins.a) || sl.len >= IFCONV_MAX_STORES {
+                << false
+            }
+            sl.push(ins.a)
+            sv.push(ins.b)
+        } else {
+            if w.ndef[ins.a] != 1 || (w.ub[ins.a] != x && w.ub[ins.a] != -1) {
+                << false
+            }
+            if step == 1 {
+                // Read after a store in the same arm.
+                if !w.cand[ins.b] || ifc_has(sl, ins.b) {
+                    << false
+                }
+            } else if step == 3 {
+                ops += 1
+            }
+        }
+        ii = ins.next
+    }
+    << ops <= IFCONV_MAX_OPS
+}
+
+fn ifc_record_use(w $&IfcWork, v int, bi int) {
+    if v >= 0 && v < w.nt {
+        w.uses[v] = w.uses[v] + 1
+        if w.ub[v] == -1 {
+            w.ub[v] = bi
+        } else if w.ub[v] != bi {
+            w.ub[v] = -2
+        }
+    }
+}
+
+// Single-pass collection of ndef, use-blocks (ub), single-def/single-store
+// instruction indices (defi/storei), and per-temp read counts (uses).
+fn ifc_collect_info(f &MFn, w $&IfcWork) {
+    nt := f.temps.len
+    nl := f.locals.len
+    w.nt = nt
+    w.nl = nl
+    mir_fill_int($&w.ndef, nt, 0)
+    mir_fill_int($&w.ub, nt, -1)
+    mir_fill_int($&w.defi, nt, -1)
+    mir_fill_int($&w.storei, nl, -1)
+    mir_fill_int($&w.uses, nt, 0)
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if fold_defines(k) && ins.a >= 0 && ins.a < nt {
+                t := ins.a
+                w.ndef[t] = w.ndef[t] + 1
+                if w.ndef[t] == 1 {
+                    w.defi[t] = ii
+                } else {
+                    w.defi[t] = -1
+                }
+            } else if k == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl {
+                l := ins.a
+                if w.storei[l] == -1 {
+                    w.storei[l] = ii
+                } else {
+                    w.storei[l] = -2
+                }
+            }
+            if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR || k == MI_CALL_IND {
+                ifc_record_use(w, ins.b, bi)
+            } else if k == MI_STORE_PTR {
+                ifc_record_use(w, ins.a, bi)
+                ifc_record_use(w, ins.b, bi)
+            } else if k == MI_UN {
+                ifc_record_use(w, ins.c, bi)
+            } else if k == MI_BIN {
+                ifc_record_use(w, ins.c, bi)
+                ifc_record_use(w, ins.d, bi)
+            } else if k == MI_SELECT {
+                ifc_record_use(w, ins.b, bi)
+                ifc_record_use(w, ins.c, bi)
+                ifc_record_use(w, ins.d, bi)
+            }
+            if k == MI_CALL || k == MI_CALL_IND {
+                $a := ins.c
+                while a >= 0 {
+                    ifc_record_use(w, f.margs[a].v, bi)
+                    a = f.margs[a].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[bi].tkind
+        if tk == TKIND_BRANCH || tk == TKIND_RETURN {
+            ifc_record_use(w, f.blocks[bi].ta, bi)
+        }
+    }
+}
+
+fn ifc_sub(from &[]int, to &[]int, v int) int {
+    for i in 0:from.len {
+        if from[i] == v {
+            << to[i]
+        }
+    }
+    << v
+}
+
+fn ifc_same(x &MInstr, y &MInstr) bool {
+    if x.kind != y.kind || x.b != y.b {
+        << false
+    }
+    if x.kind == MI_COPY {
+        << true
+    }
+    if x.kind == MI_LOAD_LOCAL || x.kind == MI_UN {
+        << x.c == y.c
+    }
+    << x.c == y.c && x.d == y.d
+}
+
+fn ifc_new(f $&MFn, kind int, a int, b int, c int, d int) int {
+    $ins := minstr_new(kind)
+    ins.a = a
+    ins.b = b
+    ins.c = c
+    ins.d = d
+    idx := f.instrs.len
+    f.instrs.push(ins)
+    << idx
+}
+
+// The value local l has at the branch: the dst of a load of l hoisted
+// from an arm (ids[from:]) or of a new one appended to ids. B's own loads
+// of l (ids[:from]) may precede a store to l in B, so they do not count.
+fn ifc_load(f $&MFn, ids $&[]int, from int, l int) int {
+    for i in from:ids.len {
+        ins := ~f.instrs[ids[i]]
+        if ins.kind == MI_LOAD_LOCAL && ins.b == l && ins.c <= 0 {
+            << ins.a
+        }
+    }
+    t := alloc_temp(f)
+    ids.push(ifc_new(f, MI_LOAD_LOCAL, t, l, 0, -1))
+    << t
+}
+
+// Zero-allocation CFG shape match for diamond or triangle at block bi.
+fn ifc_cfg_shape(f &MFn, bi int, honor_keep bool) IfcShape {
+    blk := &f.blocks[bi]
+    c := blk.ta
+    t := blk.tb
+    e := blk.tc
+    if blk.tkind != TKIND_BRANCH || c < 0 || t == e || t <= 0 || e <= 0 || t == bi || e == bi {
+        << IfcShape{ok: false, tarm: -1, earm: -1, j: -1}
+    }
+    if honor_keep && blk.keep_branch {
+        << IfcShape{ok: false, tarm: -1, earm: -1, j: -1}
+    }
+    $tarm := -1
+    $earm := -1
+    $j := -1
+    tb := &f.blocks[t]
+    eb := &f.blocks[e]
+    if tb.tkind == TKIND_JUMP && eb.tkind == TKIND_JUMP && tb.ta == eb.ta && tb.ta != t && tb.ta != e {
+        tarm = t
+        earm = e
+        j = tb.ta
+    } else if tb.tkind == TKIND_JUMP && tb.ta == e {
+        tarm = t
+        j = e
+    } else if eb.tkind == TKIND_JUMP && eb.ta == t {
+        earm = e
+        j = t
+    } else {
+        << IfcShape{ok: false, tarm: -1, earm: -1, j: -1}
+    }
+    if j < 0 || j == bi || j == tarm || j == earm {
+        << IfcShape{ok: false, tarm: -1, earm: -1, j: -1}
+    }
+    << IfcShape{ok: true, tarm: tarm, earm: earm, j: j}
+}
+
+fn ifc_has_cand(f &MFn) bool {
+    for bi in 0:f.blocks.len {
+        sh := ifc_cfg_shape(f, bi, true)
+        if !sh.ok {
+            ->
+        }
+        if (sh.tarm < 0 || ifc_arm_quick(f, sh.tarm)) && (sh.earm < 0 || ifc_arm_quick(f, sh.earm)) {
+            << true
+        }
+    }
+    << false
+}
+
+fn ifc_has_cand_pred(f &MFn, w &IfcWork) bool {
+    for bi in 0:f.blocks.len {
+        sh := ifc_cfg_shape(f, bi, true)
+        if !sh.ok {
+            ->
+        }
+        if sh.tarm >= 0 && (w.npred[sh.tarm] != 1 || !ifc_arm_quick(f, sh.tarm)) {
+            ->
+        }
+        if sh.earm >= 0 && (w.npred[sh.earm] != 1 || !ifc_arm_quick(f, sh.earm)) {
+            ->
+        }
+        << true
+    }
+    << false
+}
+
+// The arms and join of the diamond or triangle ending block bi when both
+// arms qualify; sh.ok is false otherwise.
+fn ifc_shape(f &MFn, bi int, w &IfcWork, tl $&[]int, tv $&[]int, el $&[]int, ev $&[]int, honor_keep bool) IfcShape {
+    sh := ifc_cfg_shape(f, bi, honor_keep)
+    if !sh.ok {
+        << sh
+    }
+    if sh.tarm >= 0 && (w.npred[sh.tarm] != 1 || !ifc_arm(f, sh.tarm, w, tl, tv)) {
+        << IfcShape{ok: false, tarm: -1, earm: -1, j: -1}
+    }
+    if sh.earm >= 0 && (w.npred[sh.earm] != 1 || !ifc_arm(f, sh.earm, w, el, ev)) {
+        << IfcShape{ok: false, tarm: -1, earm: -1, j: -1}
+    }
+    << sh
+}
+
+// Select chains: the join ends in another convertible branch whose
+// condition reads a local this one would select. Converting both would
+// put the first condition on the second condition's critical path, which
+// branch prediction otherwise hides; only the last link is converted
+// (keep_branch marks the others).
+fn ifc_feeds_next(f &MFn, j int, tl &[]int, el &[]int, w &IfcWork) bool {
+    j_sh := ifc_cfg_shape(f, j, false)
+    if !j_sh.ok {
+        << false
+    }
+    if j_sh.tarm >= 0 && (w.npred[j_sh.tarm] != 1 || !ifc_arm_quick(f, j_sh.tarm)) {
+        << false
+    }
+    if j_sh.earm >= 0 && (w.npred[j_sh.earm] != 1 || !ifc_arm_quick(f, j_sh.earm)) {
+        << false
+    }
+    $tainted := []int{}
+    $tlocs := []int{}
+    for i in 0:tl.len {
+        tlocs.push(tl[i])
+    }
+    for i in 0:el.len {
+        tlocs.push(el[i])
+    }
+    $ii := f.blocks[j].head
+    while ii >= 0 {
+        ins := &f.instrs[ii]
+        k := ins.kind
+        if k == MI_LOAD_LOCAL {
+            if ifc_has(&tlocs, ins.b) {
+                tainted.push(ins.a)
+            }
+        } else if k == MI_STORE_LOCAL {
+            if ifc_has(&tainted, ins.b) {
+                tlocs.push(ins.a)
+            }
+        } else if k == MI_COPY {
+            if ifc_has(&tainted, ins.b) {
+                tainted.push(ins.a)
+            }
+        } else if k == MI_BIN || k == MI_SELECT {
+            if ifc_has(&tainted, ins.c) || ifc_has(&tainted, ins.d) || (k == MI_SELECT && ifc_has(&tainted, ins.b)) {
+                tainted.push(ins.a)
+            }
+        } else if k == MI_UN {
+            if ifc_has(&tainted, ins.c) {
+                tainted.push(ins.a)
+            }
+        }
+        ii = ins.next
+    }
+    if !ifc_has(&tainted, f.blocks[j].ta) {
+        << false
+    }
+    $a := []int{}
+    $b := []int{}
+    $c := []int{}
+    $d := []int{}
+    sh := ifc_shape(f, j, w, $&a, $&b, $&c, $&d, false)
+    << sh.ok
+}
+
+// The condition depends on a memory load whose address depends on a local
+// this branch would select (a binary search step): branches let the next
+// load start early, a select serializes the load latency. Follows temps
+// defined once and locals stored once, a bounded number of steps.
+fn ifc_load_dep(f &MFn, c int, tl &[]int, el &[]int, w &IfcWork) bool {
+    if c < 0 || c >= w.nt || w.defi[c] < 0 {
+        << false
+    }
+    $work := []int{}
+    $under := []bool{}
+    work.push(c)
+    under.push(false)
+    $wi := 0
+    while wi < work.len {
+        v := work[wi]
+        u := under[wi]
+        wi += 1
+        if v < 0 || v >= w.nt || w.defi[v] < 0 {
+            ->
+        }
+        di := w.defi[v]
+        ins := &f.instrs[di]
+        k := ins.kind
+        if k == MI_LOAD_PTR {
+            if work.len < 64 {
+                work.push(ins.b)
+                under.push(true)
+            }
+        } else if k == MI_LOAD_LOCAL {
+            l := ins.b
+            if u && (ifc_has(tl, l) || ifc_has(el, l)) {
+                << true
+            }
+            if l >= 0 && l < w.nl && w.storei[l] >= 0 && work.len < 64 {
+                work.push(f.instrs[w.storei[l]].b)
+                under.push(u)
+            }
+        } else if k == MI_COPY {
+            if work.len < 64 {
+                work.push(ins.b)
+                under.push(u)
+            }
+        } else if k == MI_BIN {
+            if work.len < 64 {
+                work.push(ins.c)
+                under.push(u)
+            }
+            if work.len < 64 {
+                work.push(ins.d)
+                under.push(u)
+            }
+        } else if k == MI_UN {
+            if work.len < 64 {
+                work.push(ins.c)
+                under.push(u)
+            }
+        } else if k == MI_SELECT {
+            if work.len < 64 {
+                work.push(ins.b)
+                under.push(u)
+            }
+            if work.len < 64 {
+                work.push(ins.c)
+                under.push(u)
+            }
+            if work.len < 64 {
+                work.push(ins.d)
+                under.push(u)
+            }
+        }
+    }
+    << false
+}
+
+fn ifc_try(f $&MFn, bi int, w $&IfcWork) bool {
+    if w.touched[bi] {
+        << false
+    }
+    cfg := ifc_cfg_shape(f, bi, true)
+    if !cfg.ok {
+        << false
+    }
+    blk := ~f.blocks[bi]
+    c := blk.ta
+    t := blk.tb
+    e := blk.tc
+    if w.touched[t] || w.touched[e] || w.touched[cfg.j] {
+        << false
+    }
+    if cfg.tarm >= 0 && (w.npred[cfg.tarm] != 1 || !ifc_arm_quick(f, cfg.tarm)) {
+        << false
+    }
+    if cfg.earm >= 0 && (w.npred[cfg.earm] != 1 || !ifc_arm_quick(f, cfg.earm)) {
+        << false
+    }
+    $tl := []int{}
+    $tv := []int{}
+    $el := []int{}
+    $ev := []int{}
+    sh := ifc_shape(f, bi, w, $&tl, $&tv, $&el, $&ev, true)
+    if !sh.ok {
+        << false
+    }
+    tarm := sh.tarm
+    earm := sh.earm
+    j := sh.j
+    // Profitability: a predicted branch lets the core run ahead; a select
+    // makes everything after it wait for the condition.
+    // The decision is recorded: once the next link is converted this one
+    // would no longer look like part of a chain.
+    if ifc_feeds_next(f, j, &tl, &el, w) || ifc_load_dep(f, c, &tl, &el, w) {
+        f.blocks[bi].keep_branch = true
+        << false
+    }
+    // B's own instructions.
+    $ids := []int{}
+    $ii := blk.head
+    while ii >= 0 {
+        ids.push(ii)
+        ii = f.instrs[ii].next
+    }
+    nb := ids.len
+    // Hoist the arms' pure code; an instruction equal to one already
+    // hoisted is dropped and its temp renamed.
+    $from := []int{}
+    $to := []int{}
+    for side in 0:2 {
+        $x := tarm
+        if side == 1 {
+            x = earm
+        }
+        if x < 0 {
+            ->
+        }
+        $jj := f.blocks[x].head
+        while jj >= 0 {
+            nx := f.instrs[jj].next
+            if f.instrs[jj].kind != MI_STORE_LOCAL {
+                $ins := ~f.instrs[jj]
+                k := ins.kind
+                if k == MI_COPY {
+                    ins.b = ifc_sub(&from, &to, ins.b)
+                } else if k == MI_BIN || k == MI_SELECT {
+                    if k == MI_SELECT {
+                        ins.b = ifc_sub(&from, &to, ins.b)
+                    }
+                    ins.c = ifc_sub(&from, &to, ins.c)
+                    ins.d = ifc_sub(&from, &to, ins.d)
+                } else if k == MI_UN {
+                    ins.c = ifc_sub(&from, &to, ins.c)
+                }
+                $dup := -1
+                for h in nb:ids.len {
+                    hi := ids[h]
+                    if dup < 0 && ifc_same(&f.instrs[hi], &ins) {
+                        dup = f.instrs[hi].a
+                    }
+                }
+                if dup >= 0 {
+                    from.push(ins.a)
+                    to.push(dup)
+                    f.instrs[jj].kind = MI_NOP
+                } else {
+                    ins.next = -1
+                    f.instrs[jj] = ~ins
+                    ids.push(jj)
+                }
+            } else {
+                f.instrs[jj].kind = MI_NOP
+            }
+            jj = nx
+        }
+    }
+    // One select per stored local, in the order the arms store them.
+    $locs := []int{}
+    $vts := []int{}
+    $ves := []int{}
+    for i in 0:tl.len {
+        locs.push(tl[i])
+    }
+    for i in 0:el.len {
+        if !ifc_has(&locs, el[i]) {
+            locs.push(el[i])
+        }
+    }
+    for i in 0:locs.len {
+        l := locs[i]
+        $vt := -1
+        $ve := -1
+        for p in 0:tl.len {
+            if tl[p] == l {
+                vt = ifc_sub(&from, &to, tv[p])
+            }
+        }
+        for p in 0:el.len {
+            if el[p] == l {
+                ve = ifc_sub(&from, &to, ev[p])
+            }
+        }
+        if vt == -1 {
+            vt = ifc_load(f, $&ids, nb, l)
+        }
+        if ve == -1 {
+            ve = ifc_load(f, $&ids, nb, l)
+        }
+        vts.push(vt)
+        ves.push(ve)
+    }
+    $nsel := 0
+    for i in 0:locs.len {
+        if vts[i] != ves[i] {
+            nsel += 1
+        }
+    }
+    // A compare ending B that only the branch reads moves next to the
+    // select.
+    if nsel == 1 && nb > 0 && ids.len > nb {
+        last := ~f.instrs[ids[nb - 1]]
+        if last.kind == MI_BIN && last.a == c && last.b >= BIN_EQ && last.b <= BIN_GE && c < w.nt && w.uses[c] == 1 {
+            $moved := []int{}
+            for p in 0:nb - 1 {
+                moved.push(ids[p])
+            }
+            for p in nb:ids.len {
+                moved.push(ids[p])
+            }
+            moved.push(ids[nb - 1])
+            ids = ~moved
+        }
+    }
+    for i in 0:locs.len {
+        $v := vts[i]
+        if vts[i] != ves[i] {
+            v = alloc_temp(f)
+            ids.push(ifc_new(f, MI_SELECT, v, c, vts[i], ves[i]))
+        }
+        ids.push(ifc_new(f, MI_STORE_LOCAL, locs[i], v, 0, -1))
+    }
+    // Relink B and retarget it to the join.
+    for p in 0:ids.len {
+        if p + 1 < ids.len {
+            f.instrs[ids[p]].next = ids[p + 1]
+        } else {
+            f.instrs[ids[p]].next = -1
+        }
+    }
+    if ids.len > 0 {
+        f.blocks[bi].head = ids[0]
+        f.blocks[bi].tail = ids[ids.len - 1]
+    }
+    f.blocks[bi].tkind = TKIND_JUMP
+    f.blocks[bi].ta = j
+    f.blocks[bi].tb = -1
+    f.blocks[bi].tc = -1
+    for side in 0:2 {
+        $x := tarm
+        if side == 1 {
+            x = earm
+        }
+        if x >= 0 {
+            f.blocks[x].head = -1
+            f.blocks[x].tail = -1
+            f.blocks[x].tkind = TKIND_OPEN
+            f.blocks[x].ta = -1
+            f.blocks[x].tb = -1
+            f.blocks[x].tc = -1
+        }
+    }
+    w.touched[bi] = true
+    w.touched[t] = true
+    w.touched[e] = true
+    w.touched[j] = true
+    << true
+}
+
+// Returns how many branches it converted, reusing workspace w across functions.
+pub fn opt_ifconv_with(f $&MFn, w $&IfcWork) int {
+    if f.blocks.len < 3 || !ifc_has_cand(f) {
+        << 0
+    }
+    $cand_ready := false
+    $count := 0
+    for iter in 0:16 {
+        if iter > 0 && !ifc_has_cand(f) {
+            <-
+        }
+        nb := f.blocks.len
+        w.nb = nb
+        mir_fill_int($&w.npred, nb, 0)
+        for bi in 0:f.blocks.len {
+            tk := f.blocks[bi].tkind
+            if tk == TKIND_JUMP {
+                w.npred[f.blocks[bi].ta] = w.npred[f.blocks[bi].ta] + 1
+            } else if tk == TKIND_BRANCH {
+                w.npred[f.blocks[bi].tb] = w.npred[f.blocks[bi].tb] + 1
+                w.npred[f.blocks[bi].tc] = w.npred[f.blocks[bi].tc] + 1
+            }
+        }
+        if !ifc_has_cand_pred(f, w) {
+            <-
+        }
+        if !cand_ready {
+            for ii in 0:f.instrs.len {
+                if !fold_known_kind(f.instrs[ii].kind) {
+                    << 0
+                }
+            }
+            nl := f.locals.len
+            w.nl = nl
+            $clim := w.cand.len
+            if nl < clim {
+                clim = nl
+            }
+            for l in 0:clim {
+                w.cand[l] = f.locals_nslots[l] == 1
+            }
+            while w.cand.len < nl {
+                w.cand.push(f.locals_nslots[w.cand.len] == 1)
+            }
+            // Conservative: any instruction ever emitted, reachable or not.
+            for ii in 0:f.instrs.len {
+                ins := &f.instrs[ii]
+                k := ins.kind
+                if k == MI_ADDR && ins.b >= 0 && ins.b < nl {
+                    w.cand[ins.b] = false
+                } else if k == MI_LOAD_LOCAL && ins.b >= 0 && ins.b < nl && ins.c > 0 {
+                    w.cand[ins.b] = false
+                } else if k == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl && ins.c > 0 {
+                    w.cand[ins.a] = false
+                }
+            }
+            cand_ready = true
+        }
+        mir_fill_bool($&w.touched, nb, false)
+        ifc_collect_info(f, w)
+        $hit := false
+        for bi in 0:f.blocks.len {
+            if f.blocks[bi].tkind == TKIND_BRANCH && ifc_try(f, bi, w) {
+                hit = true
+                count += 1
+            }
+        }
+        if !hit {
+            <-
+        }
+    }
+    << count
+}
+
+// Returns how many branches it converted.
+pub fn opt_ifconv(f $&MFn) int {
+    $w := ifc_work_new()
+    << opt_ifconv_with(f, $&w)
+}
+
+// ===== Dense Switch -> Aligned Constant Lookup Table =====
+
+fn lut_emit_at(f $&MFn, bi int, line int, kind int, a int, b int, c int, d int) int {
+    idx := ifc_new(f, kind, a, b, c, d)
+    f.instrs[idx].line = line
+    mir_append_instr(f, bi, idx)
+    << idx
+}
+
+fn lut_last_active(f &MFn, bi int) int {
+    $last := -1
+    $ii := f.blocks[bi].head
+    while ii >= 0 {
+        if f.instrs[ii].kind != MI_NOP {
+            last = ii
+        }
+        ii = f.instrs[ii].next
+    }
+    << last
+}
+
+fn lut_extract_eq_case(f &MFn, ins &MInstr, out_is_ne $&bool, out_sel $&int, out_cv $&int) bool {
+    if ins.kind != MI_BIN || (ins.b != BIN_EQ && ins.b != BIN_NE) {
+        << false
+    }
+    *out_is_ne = ins.b == BIN_NE
+    if ins.c >= 0 && ins.c < f.temps.len && ins.d <= -2 {
+        cidx := 0 - ins.d - 2
+        if cidx >= 0 && cidx < f.consts.len {
+            *out_sel = ins.c
+            *out_cv = f.consts[cidx]
+            << true
+        }
+    } else if ins.d >= 0 && ins.d < f.temps.len && ins.c <= -2 {
+        cidx := 0 - ins.c - 2
+        if cidx >= 0 && cidx < f.consts.len {
+            *out_sel = ins.d
+            *out_cv = f.consts[cidx]
+            << true
+        }
+    }
+    << false
+}
+
+// arm modes: 1 = ret const, 2 = store local const + jump, 3 = accum local op const + jump, 4 = nop jump (identity 0 for mode 3)
+fn lut_match_arm(f &MFn, w &IfcWork, bi int, out_mode $&int, out_merge $&int, out_loc $&int, out_op $&int, out_val $&int) bool {
+    blk := &f.blocks[bi]
+    $ins_ids := []int{}
+    $ii := blk.head
+    while ii >= 0 {
+        if f.instrs[ii].kind != MI_NOP {
+            ins_ids.push(ii)
+            if ins_ids.len > 3 {
+                << false
+            }
+        }
+        ii = f.instrs[ii].next
+    }
+    if blk.tkind == TKIND_RETURN {
+        if ins_ids.len != 0 || blk.ta > -2 {
+            << false
+        }
+        cidx := 0 - blk.ta - 2
+        if cidx < 0 || cidx >= f.consts.len {
+            << false
+        }
+        *out_mode = 1
+        *out_merge = -1
+        *out_loc = -1
+        *out_op = 0
+        *out_val = f.consts[cidx]
+        << true
+    }
+    if blk.tkind != TKIND_JUMP || blk.ta == bi {
+        << false
+    }
+    if ins_ids.len == 0 {
+        *out_mode = 4
+        *out_merge = blk.ta
+        *out_loc = -1
+        *out_op = 0
+        *out_val = 0
+        << true
+    }
+    if ins_ids.len == 1 {
+        id0 := ins_ids[0]
+        si := &f.instrs[id0]
+        if si.kind != MI_STORE_LOCAL || si.c != 0 || si.a < 0 || si.a >= f.locals_nslots.len || f.locals_nslots[si.a] != 1 {
+            << false
+        }
+        if si.b > -2 {
+            << false
+        }
+        cidx := 0 - si.b - 2
+        if cidx < 0 || cidx >= f.consts.len {
+            << false
+        }
+        *out_mode = 2
+        *out_merge = blk.ta
+        *out_loc = si.a
+        *out_op = 0
+        *out_val = f.consts[cidx]
+        << true
+    }
+    if ins_ids.len == 3 {
+        id0 := ins_ids[0]
+        id1 := ins_ids[1]
+        id2 := ins_ids[2]
+        ld := &f.instrs[id0]
+        bn := &f.instrs[id1]
+        st := &f.instrs[id2]
+        if ld.kind != MI_LOAD_LOCAL || ld.c != 0 || ld.a < 0 || ld.a >= w.uses.len {
+            << false
+        }
+        loc := ld.b
+        if loc < 0 || loc >= f.locals_nslots.len || f.locals_nslots[loc] != 1 {
+            << false
+        }
+        if w.ndef[ld.a] != 1 || w.uses[ld.a] != 1 {
+            << false
+        }
+        if bn.kind != MI_BIN || bn.a < 0 || bn.a >= w.uses.len || w.ndef[bn.a] != 1 || w.uses[bn.a] != 1 {
+            << false
+        }
+        op := bn.b
+        if op != BIN_ADD && op != BIN_SUB && op != BIN_XOR && op != BIN_OR {
+            << false
+        }
+        $cv := 0
+        if bn.c == ld.a && bn.d <= -2 && (0 - bn.d - 2) < f.consts.len {
+            cv = f.consts[0 - bn.d - 2]
+        } else if (op == BIN_ADD || op == BIN_XOR || op == BIN_OR) && bn.d == ld.a && bn.c <= -2 && (0 - bn.c - 2) < f.consts.len {
+            cv = f.consts[0 - bn.c - 2]
+        } else {
+            << false
+        }
+        if st.kind != MI_STORE_LOCAL || st.a != loc || st.b != bn.a || st.c != 0 {
+            << false
+        }
+        *out_mode = 3
+        *out_merge = blk.ta
+        *out_loc = loc
+        *out_op = op
+        *out_val = cv
+        << true
+    }
+    << false
+}
+
+fn lut_try_once(f $&MFn, w $&IfcWork) bool {
+    nb := f.blocks.len
+    if nb < 6 {
+        << false
+    }
+    $reach := []bool{}
+    $preds := []int{}
+    $q := []int{}
+    for _ in 0:nb {
+        reach.push(false)
+        preds.push(0)
+    }
+    reach[0] = true
+    q.push(0)
+    $qh := 0
+    while qh < q.len {
+        b := q[qh]
+        qh += 1
+        tk := f.blocks[b].tkind
+        if tk == TKIND_JUMP {
+            s := f.blocks[b].ta
+            if s >= 0 && s < nb {
+                preds[s] = preds[s] + 1
+                if !reach[s] {
+                    reach[s] = true
+                    q.push(s)
+                }
+            }
+        } else if tk == TKIND_BRANCH {
+            sb := f.blocks[b].tb
+            sc := f.blocks[b].tc
+            if sb >= 0 && sb < nb {
+                preds[sb] = preds[sb] + 1
+                if !reach[sb] {
+                    reach[sb] = true
+                    q.push(sb)
+                }
+            }
+            if sc >= 0 && sc < nb {
+                preds[sc] = preds[sc] + 1
+                if !reach[sc] {
+                    reach[sc] = true
+                    q.push(sc)
+                }
+            }
+        }
+    }
+    ifc_collect_info(f, w)
+    nt := f.temps.len
+
+    for start_b in 0:nb {
+        if !reach[start_b] || f.blocks[start_b].tkind != TKIND_BRANCH {
+            ->
+        }
+        cmp0_ii := lut_last_active(f, start_b)
+        if cmp0_ii < 0 {
+            ->
+        }
+        ins0 := ~f.instrs[cmp0_ii]
+        if ins0.a != f.blocks[start_b].ta || ins0.a < 0 || ins0.a >= nt || w.ndef[ins0.a] != 1 || w.uses[ins0.a] != 1 {
+            ->
+        }
+        $is_ne0 := false
+        $sel := -1
+        $c0 := 0
+        if !lut_extract_eq_case(f, &ins0, $&is_ne0, $&sel, $&c0) {
+            ->
+        }
+        if sel < 0 || sel >= nt || w.ndef[sel] != 1 {
+            ->
+        }
+        $arm0 := f.blocks[start_b].tb
+        $nxt0 := f.blocks[start_b].tc
+        if is_ne0 {
+            arm0 = f.blocks[start_b].tc
+            nxt0 = f.blocks[start_b].tb
+        }
+        if arm0 < 0 || arm0 >= nb || nxt0 < 0 || nxt0 >= nb || arm0 == start_b || nxt0 == start_b || arm0 == nxt0 {
+            ->
+        }
+        if preds[arm0] != 1 || preds[nxt0] != 1 {
+            ->
+        }
+
+        $seen := []bool{}
+        for _ in 0:nb {
+            seen.push(false)
+        }
+        seen[start_b] = true
+        seen[arm0] = true
+        $case_vals := []int{}
+        case_vals.push(c0)
+        $case_arms := []int{}
+        case_arms.push(arm0)
+        $cur_b := nxt0
+        while cur_b >= 0 && cur_b < nb && !seen[cur_b] && preds[cur_b] == 1 && case_vals.len < 256 {
+            cb_tk := f.blocks[cur_b].tkind
+            if cb_tk != TKIND_BRANCH {
+                <-
+            }
+            cb_ta := f.blocks[cur_b].ta
+            cb_tb := f.blocks[cur_b].tb
+            cb_tc := f.blocks[cur_b].tc
+            $only_ii := -1
+            $multi := false
+            $cii := f.blocks[cur_b].head
+            while cii >= 0 {
+                if f.instrs[cii].kind != MI_NOP {
+                    if only_ii >= 0 {
+                        multi = true
+                        <-
+                    }
+                    only_ii = cii
+                }
+                cii = f.instrs[cii].next
+            }
+            if multi || only_ii < 0 {
+                <-
+            }
+            cin := ~f.instrs[only_ii]
+            if cin.a != cb_ta || cin.a < 0 || cin.a >= nt || w.ndef[cin.a] != 1 || w.uses[cin.a] != 1 {
+                <-
+            }
+            $is_nec := false
+            $selc := -1
+            $cv := 0
+            if !lut_extract_eq_case(f, &cin, $&is_nec, $&selc, $&cv) || selc != sel {
+                <-
+            }
+            $armc := cb_tb
+            $nxtc := cb_tc
+            if is_nec {
+                armc = cb_tc
+                nxtc = cb_tb
+            }
+            if armc < 0 || armc >= nb || nxtc < 0 || nxtc >= nb || seen[armc] || seen[nxtc] || armc == cur_b || nxtc == cur_b || armc == nxtc {
+                <-
+            }
+            if preds[armc] != 1 || preds[nxtc] != 1 {
+                <-
+            }
+            seen[cur_b] = true
+            seen[armc] = true
+            case_vals.push(cv)
+            case_arms.push(armc)
+            cur_b = nxtc
+        }
+        if case_vals.len < 6 {
+            ->
+        }
+        def_b := cur_b
+        if def_b < 0 || def_b >= nb || seen[def_b] {
+            ->
+        }
+
+        // Compute [lo..hi] bounds without signed overflow.
+        $lo := case_vals[0]
+        $hi := case_vals[0]
+        for ci in 1:case_vals.len {
+            v := case_vals[ci]
+            if v < lo { lo = v }
+            if v > hi { hi = v }
+        }
+        if lo < -4611686018427387904 || hi > 4611686018427387904 {
+            ->
+        }
+        span := hi - lo + 1
+        if span < 6 || span > 256 {
+            ->
+        }
+
+        // Match case arms.
+        $base_mode := -1
+        $base_merge := -1
+        $base_loc := -1
+        $base_op := 0
+        $case_res := []int{}
+        $arms_ok := true
+        for ci in 0:case_arms.len {
+            $m := 0
+            $mg := -1
+            $lc := -1
+            $op := 0
+            $val := 0
+            if !lut_match_arm(f, w, case_arms[ci], $&m, $&mg, $&lc, $&op, $&val) {
+                arms_ok = false
+                <-
+            }
+            if ci == 0 {
+                if m == 4 {
+                    arms_ok = false
+                    <-
+                }
+                base_mode = m
+                base_merge = mg
+                base_loc = lc
+                base_op = op
+            } else if m == 4 && base_mode == 3 && mg == base_merge {
+                // empty arm -> +0 / ^0 / |0 identity
+            } else if m != base_mode || mg != base_merge || lc != base_loc || op != base_op {
+                arms_ok = false
+                <-
+            }
+            case_res.push(val)
+        }
+        if !arms_ok {
+            ->
+        }
+
+        // Deduplicate case values cleanly (earlier arm wins).
+        $filled := []bool{}
+        $slot_vals := []int{}
+        for _ in 0:span {
+            filled.push(false)
+            slot_vals.push(0)
+        }
+        $distinct_cnt := 0
+        for ci in 0:case_vals.len {
+            idx := case_vals[ci] - lo
+            if !filled[idx] {
+                filled[idx] = true
+                slot_vals[idx] = case_res[ci]
+                distinct_cnt += 1
+            }
+        }
+        if distinct_cnt * 2 < span {
+            ->
+        }
+
+        // Check default block.
+        $uniform_def := false
+        $def_val := 0
+        if preds[def_b] == 1 {
+            $dm := 0
+            $dmg := -1
+            $dlc := -1
+            $dop := 0
+            $dval := 0
+            if lut_match_arm(f, w, def_b, $&dm, $&dmg, $&dlc, $&dop, $&dval) {
+                if (dm == base_mode && dmg == base_merge && dlc == base_loc && dop == base_op) ||
+                   (dm == 4 && base_mode == 3 && dmg == base_merge) {
+                    uniform_def = true
+                    def_val = dval
+                }
+            }
+        }
+        if !uniform_def && distinct_cnt != span {
+            ->
+        }
+
+        // Detect proven unsigned upper bound when sel = and x, mask.
+        $sel_mask := -1
+        if w.defi[sel] >= 0 {
+            sd_ii := w.defi[sel]
+            sdef := &f.instrs[sd_ii]
+            if sdef.kind == MI_BIN && sdef.b == BIN_AND {
+                if sdef.d <= -2 && (0 - sdef.d - 2) < f.consts.len {
+                    mv := f.consts[0 - sdef.d - 2]
+                    if mv >= 0 && mv <= 255 {
+                        sel_mask = mv
+                    }
+                } else if sdef.c <= -2 && (0 - sdef.c - 2) < f.consts.len {
+                    mv := f.consts[0 - sdef.c - 2]
+                    if mv >= 0 && mv <= 255 {
+                        sel_mask = mv
+                    }
+                }
+            }
+        }
+        $masked_ok := uniform_def && lo == 0 && sel_mask >= 0 && sel_mask <= span
+
+        // Build lookup table values.
+        $tbl_len := span
+        if uniform_def {
+            if masked_ok {
+                tbl_len = sel_mask + 1
+                if tbl_len < span {
+                    tbl_len = span
+                }
+            } else {
+                tbl_len = span + 1
+            }
+        }
+        $bytes := []int{}
+        for k in 0:tbl_len {
+            $v := def_val
+            if k < span && filled[k] {
+                v = slot_vals[k]
+            }
+            for bi in 0:8 {
+                bytes.push((v >> (bi * 8)) & 255)
+            }
+        }
+        tbl_str := string_from_bytes(bytes)
+
+        sline := f.blocks[start_b].line
+        f.instrs[cmp0_ii].kind = MI_NOP
+
+        $emit_b := start_b
+        $idx_t := -1
+        if uniform_def {
+            if masked_ok {
+                idx_t = sel
+            } else {
+                t_lt := alloc_temp(f)
+                lut_emit_at(f, start_b, sline, MI_BIN, t_lt, BIN_LT, sel, alloc_const(f, lo))
+                t_gt := alloc_temp(f)
+                lut_emit_at(f, start_b, sline, MI_BIN, t_gt, BIN_GT, sel, alloc_const(f, hi))
+                t_oob := alloc_temp(f)
+                lut_emit_at(f, start_b, sline, MI_BIN, t_oob, BIN_OR, t_lt, t_gt)
+                $t_sub := sel
+                if lo != 0 {
+                    t_sub = alloc_temp(f)
+                    lut_emit_at(f, start_b, sline, MI_BIN, t_sub, BIN_SUB, sel, alloc_const(f, lo))
+                }
+                idx_t = alloc_temp(f)
+                lut_emit_at(f, start_b, sline, MI_SELECT, idx_t, t_oob, alloc_const(f, span), t_sub)
+            }
+        } else {
+            lut_b := f.blocks.len
+            $lb := mblock_new()
+            lb.line = sline
+            f.blocks.push(lb)
+            t_lt := alloc_temp(f)
+            lut_emit_at(f, start_b, sline, MI_BIN, t_lt, BIN_LT, sel, alloc_const(f, lo))
+            t_gt := alloc_temp(f)
+            lut_emit_at(f, start_b, sline, MI_BIN, t_gt, BIN_GT, sel, alloc_const(f, hi))
+            t_oob := alloc_temp(f)
+            lut_emit_at(f, start_b, sline, MI_BIN, t_oob, BIN_OR, t_lt, t_gt)
+            f.blocks[start_b].tkind = TKIND_BRANCH
+            f.blocks[start_b].ta = t_oob
+            f.blocks[start_b].tb = def_b
+            f.blocks[start_b].tc = lut_b
+            emit_b = lut_b
+            if lo == 0 {
+                idx_t = sel
+            } else {
+                idx_t = alloc_temp(f)
+                lut_emit_at(f, emit_b, sline, MI_BIN, idx_t, BIN_SUB, sel, alloc_const(f, lo))
+            }
+        }
+
+        t_tbl := alloc_temp(f)
+        tbl_ii := lut_emit_at(f, emit_b, sline, MI_STR_CONST, t_tbl, 0, 0, 8)
+        f.instrs[tbl_ii].sval = tbl_str
+        t_off := alloc_temp(f)
+        lut_emit_at(f, emit_b, sline, MI_BIN, t_off, BIN_SHL, idx_t, alloc_const(f, 3))
+        t_ptr := alloc_temp(f)
+        lut_emit_at(f, emit_b, sline, MI_BIN, t_ptr, BIN_ADD, t_tbl, t_off)
+        t_val := alloc_temp(f)
+        lut_emit_at(f, emit_b, sline, MI_LOAD_PTR, t_val, t_ptr, 0, 8)
+
+        if base_mode == 1 {
+            f.blocks[emit_b].tkind = TKIND_RETURN
+            f.blocks[emit_b].ta = t_val
+            f.blocks[emit_b].tb = -1
+            f.blocks[emit_b].tc = -1
+        } else if base_mode == 2 {
+            lut_emit_at(f, emit_b, sline, MI_STORE_LOCAL, base_loc, t_val, 0, -1)
+            f.blocks[emit_b].tkind = TKIND_JUMP
+            f.blocks[emit_b].ta = base_merge
+            f.blocks[emit_b].tb = -1
+            f.blocks[emit_b].tc = -1
+        } else {
+            t_old := alloc_temp(f)
+            lut_emit_at(f, emit_b, sline, MI_LOAD_LOCAL, t_old, base_loc, 0, -1)
+            t_res := alloc_temp(f)
+            lut_emit_at(f, emit_b, sline, MI_BIN, t_res, base_op, t_old, t_val)
+            lut_emit_at(f, emit_b, sline, MI_STORE_LOCAL, base_loc, t_res, 0, -1)
+            f.blocks[emit_b].tkind = TKIND_JUMP
+            f.blocks[emit_b].ta = base_merge
+            f.blocks[emit_b].tb = -1
+            f.blocks[emit_b].tc = -1
+        }
+        << true
+    }
+    << false
+}
+
+pub fn opt_switch_lut_with(f $&MFn, w $&IfcWork) bool {
+    if f.blocks.len < 6 {
+        << false
+    }
+    $changed := false
+    for _ in 0:8 {
+        if !lut_try_once(f, w) {
+            <-
+        }
+        changed = true
+    }
+    << changed
+}
+
+pub fn opt_switch_lut(f $&MFn) bool {
+    $w := ifc_work_new()
+    << opt_switch_lut_with(f, $&w)
+}

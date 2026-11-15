@@ -1,0 +1,349 @@
+@xu/mir
+// Tail-recursion elimination for typed MIR.
+//
+// A block ending in
+//     t = call self(args); ret t
+// stores args into the incoming locals and jumps back to the body, so the
+// recursion runs in one frame. The accumulator form
+//     t = call self(args); r = op x, t; ret r
+// with op one of add, mul, and, or, xor (wrapping word arithmetic, so the
+// operations may be regrouped) keeps a running value in a new local: the
+// site folds x into it before jumping, and every remaining return yields
+// op(acc, value).
+//
+// Only functions whose locals are never address-taken qualify: a pointer
+// into the frame could outlive the iteration that made it. The function
+// must have scalar_params (every incoming word is an int parameter, with
+// no hidden sret / okp / receiver word) and incoming word i must be local
+// i, so storing the call's arguments into locals 0..nparams-1 is exactly
+// what a fresh call would see; this is opt_tre's precondition. The name
+// checks for .okp / .sret below are kept as a second guard. Narrow-integer
+// results are left alone, as their wrap follows the op.
+//
+// The loop header is never block 0: a new entry block jumps to it, as in
+// opt_tre, so the register allocator sees the incoming values defined
+// outside the loop and the back edge as an ordinary edge.
+
+struct TailSite {
+    blk int
+    call int
+    bin int
+    other int
+    prev int
+}
+
+fn tail_acc_op(op int) bool {
+    << op == BIN_ADD || op == BIN_MUL || op == BIN_AND || op == BIN_OR || op == BIN_XOR
+}
+
+fn tail_identity(op int) int {
+    if op == BIN_MUL { << 1 }
+    if op == BIN_AND { << 0 - 1 }
+    << 0
+}
+
+fn tail_use(uses $&[]int, v int) {
+    if v >= 0 && v < uses.len {
+        uses[v] = uses[v] + 1
+    }
+}
+
+// Number of reads of each temp.
+fn tail_uses(f &MFn) []int {
+    $uses := []int{}
+    for _ in 0:f.temps.len {
+        uses.push(0)
+    }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := ~f.instrs[ii]
+            k := ins.kind
+            if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR {
+                tail_use($&uses, ins.b)
+            } else if k == MI_STORE_PTR {
+                tail_use($&uses, ins.a)
+                tail_use($&uses, ins.b)
+            } else if k == MI_UN {
+                tail_use($&uses, ins.c)
+            } else if k == MI_BIN {
+                tail_use($&uses, ins.c)
+                tail_use($&uses, ins.d)
+            } else if k == MI_SELECT {
+                tail_use($&uses, ins.b)
+                tail_use($&uses, ins.c)
+                tail_use($&uses, ins.d)
+            } else if k == MI_CALL || k == MI_CALL_IND {
+                if k == MI_CALL_IND {
+                    tail_use($&uses, ins.b)
+                }
+                $a := ins.c
+                while a >= 0 {
+                    tail_use($&uses, f.margs[a].v)
+                    a = f.margs[a].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[bi].tkind
+        if tk == TKIND_BRANCH || tk == TKIND_RETURN {
+            tail_use($&uses, f.blocks[bi].ta)
+        }
+    }
+    << uses
+}
+
+fn tail_self_call(f &MFn, ii int) bool {
+    if ii < 0 {
+        << false
+    }
+    if f.instrs[ii].kind != MI_CALL || f.instrs[ii].sval != f.label {
+        << false
+    }
+    $n := 0
+    $a := f.instrs[ii].c
+    while a >= 0 {
+        n += 1
+        a = f.margs[a].next
+    }
+    << n == f.nparams
+}
+
+// Moves block `from` to index `to` (to < from), keeping the others in order.
+fn tail_move_block(f $&MFn, from int, to int) {
+    $order := []int{}
+    for bi in 0:f.blocks.len {
+        if bi == to {
+            order.push(from)
+        }
+        if bi != from {
+            order.push(bi)
+        }
+    }
+    $pos := []int{}
+    for _ in 0:f.blocks.len {
+        pos.push(0)
+    }
+    for ni in 0:order.len {
+        pos[order[ni]] = ni
+    }
+    $nbl := []MBlock{}
+    for ni in 0:order.len {
+        $blk := ~f.blocks[order[ni]]
+        if blk.tkind == TKIND_JUMP {
+            blk.ta = pos[blk.ta]
+        } else if blk.tkind == TKIND_BRANCH {
+            blk.tb = pos[blk.tb]
+            blk.tc = pos[blk.tc]
+        }
+        nbl.push(~blk)
+    }
+    f.blocks = ~nbl
+}
+
+fn tail_emit(f $&MFn, b int, kind int, a int, bb int, c int, d int) {
+    $ins := minstr_new(kind)
+    ins.a = a
+    ins.b = bb
+    ins.c = c
+    ins.d = d
+    ins.line = f.blocks[b].line
+    emit_to_bb(f, b, ins)
+}
+
+pub fn opt_tail(f $&MFn) bool {
+    if f.is_extern || f.blocks.len == 0 || f.label.len == 0 {
+        << false
+    }
+    if !f.scalar_params || f.param_locals.len != f.nparams {
+        << false
+    }
+    for i in 0:f.nparams {
+        if f.param_locals[i] != i {
+            << false
+        }
+    }
+    for ii in 0:f.instrs.len {
+        k := f.instrs[ii].kind
+        if !fold_known_kind(k) || k == MI_ADDR {
+            << false
+        }
+    }
+    if f.nparams > f.local_names.len {
+        << false
+    }
+    for i in 0:f.nparams {
+        if f.local_names[i] == ".okp" || f.local_names[i] == ".sret" {
+            << false
+        }
+    }
+    // Never re-run on a function that already owns an accumulator: blocks[0]
+    // initializes .acc, and moving it into the new loop header would reset .acc
+    // on every iteration.
+    for i in 0:f.local_names.len {
+        if f.local_names[i] == ".acc" {
+            << false
+        }
+    }
+    uses := tail_uses(f)
+    $sites := []TailSite{}
+    $acc_op := 0
+    for bi in 0:f.blocks.len {
+        if f.blocks[bi].tkind != TKIND_RETURN {
+            ->
+        }
+        r := f.blocks[bi].ta
+        if r < 0 || uses[r] != 1 {
+            ->
+        }
+        // The last three instructions of the block.
+        $i3 := -1
+        $i2 := -1
+        $i1 := -1
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            i3 = i2
+            i2 = i1
+            i1 = ii
+            ii = f.instrs[ii].next
+        }
+        if i1 < 0 {
+            ->
+        }
+        if tail_self_call(f, i1) && f.instrs[i1].a == r {
+            sites.push(TailSite{blk: bi, call: i1, bin: -1, other: -1, prev: i2})
+            ->
+        }
+        if f.instrs[i1].kind != MI_BIN || f.instrs[i1].a != r || !tail_acc_op(f.instrs[i1].b) {
+            ->
+        }
+        // i32 / u32 / u8 results: the regrouped value would skip the wrap
+        // the lowering puts after each op.
+        if f.ret == 8 || f.ret == 9 || f.ret == 10 {
+            ->
+        }
+        if !tail_self_call(f, i2) {
+            ->
+        }
+        t := f.instrs[i2].a
+        if t < 0 || uses[t] != 1 {
+            ->
+        }
+        $x := -1
+        if f.instrs[i1].c == t && f.instrs[i1].d != t {
+            x = f.instrs[i1].d
+        } else if f.instrs[i1].d == t && f.instrs[i1].c != t {
+            x = f.instrs[i1].c
+        } else {
+            ->
+        }
+        if acc_op == 0 {
+            acc_op = f.instrs[i1].b
+        }
+        if f.instrs[i1].b != acc_op {
+            ->
+        }
+        sites.push(TailSite{blk: bi, call: i2, bin: i1, other: x, prev: i3})
+    }
+    if sites.len == 0 {
+        << false
+    }
+    $is_site := []bool{}
+    for _ in 0:f.blocks.len + 1 {
+        is_site.push(false)
+    }
+    for si in 0:sites.len {
+        is_site[sites[si].blk] = true
+    }
+    // The body moves to a new block 1 in both forms; block 0 only enters
+    // the loop (and, in the accumulator form, starts the accumulator, so
+    // a back edge does not reset it).
+    $acc := -1
+    nb := f.blocks.len
+    f.blocks.push(~f.blocks[0])
+    // Jumps already aimed at block 0 (back edges an earlier run made for
+    // plain self tail calls) continue the loop: they go to the body, not
+    // to the block that enters the loop and resets the accumulator.
+    for bi in 1:f.blocks.len {
+        if f.blocks[bi].tkind == TKIND_JUMP {
+            if f.blocks[bi].ta == 0 {
+                f.blocks[bi].ta = nb
+            }
+        } else if f.blocks[bi].tkind == TKIND_BRANCH {
+            if f.blocks[bi].tb == 0 {
+                f.blocks[bi].tb = nb
+            }
+            if f.blocks[bi].tc == 0 {
+                f.blocks[bi].tc = nb
+            }
+        }
+    }
+    f.blocks[0].head = -1
+    f.blocks[0].tail = -1
+    f.blocks[0].tkind = TKIND_JUMP
+    f.blocks[0].ta = nb
+    f.blocks[0].tb = -1
+    f.blocks[0].tc = -1
+    is_site[nb] = is_site[0]
+    is_site[0] = false
+    for si in 0:sites.len {
+        if sites[si].blk == 0 {
+            sites[si].blk = nb
+        }
+    }
+    if acc_op != 0 {
+        acc = f.locals.len
+        f.locals.push(1)
+        f.locals_nslots.push(1)
+        f.locals_owning.push(false)
+        f.local_names.push(".acc")
+        tail_emit(f, 0, MI_STORE_LOCAL, acc, alloc_const(f, tail_identity(acc_op)), 0, -1)
+        // Every other return yields op(acc, value).
+        for bi in 1:f.blocks.len {
+            if f.blocks[bi].tkind != TKIND_RETURN || is_site[bi] {
+                ->
+            }
+            v := f.blocks[bi].ta
+            ta := alloc_temp(f)
+            tail_emit(f, bi, MI_LOAD_LOCAL, ta, acc, 0, -1)
+            tr := alloc_temp(f)
+            tail_emit(f, bi, MI_BIN, tr, acc_op, ta, v)
+            f.blocks[bi].ta = tr
+        }
+    }
+    header := nb
+    for si in 0:sites.len {
+        b := sites[si].blk
+        call := sites[si].call
+        prev := sites[si].prev
+        if prev >= 0 {
+            f.instrs[prev].next = -1
+            f.blocks[b].tail = prev
+        } else {
+            f.blocks[b].head = -1
+            f.blocks[b].tail = -1
+        }
+        if sites[si].bin >= 0 {
+            ta := alloc_temp(f)
+            tail_emit(f, b, MI_LOAD_LOCAL, ta, acc, 0, -1)
+            tn := alloc_temp(f)
+            tail_emit(f, b, MI_BIN, tn, acc_op, ta, sites[si].other)
+            tail_emit(f, b, MI_STORE_LOCAL, acc, tn, 0, -1)
+        }
+        $a := f.instrs[call].c
+        $i := 0
+        while a >= 0 {
+            tail_emit(f, b, MI_STORE_LOCAL, i, f.margs[a].v, 0, -1)
+            i += 1
+            a = f.margs[a].next
+        }
+        f.blocks[b].tkind = TKIND_JUMP
+        f.blocks[b].ta = header
+        f.blocks[b].tb = -1
+        f.blocks[b].tc = -1
+    }
+    if header > 1 {
+        tail_move_block(f, header, 1)
+    }
+    << true
+}

@@ -1,4 +1,4 @@
-# Xu Programming Language — Windows Development Environment Installer
+# Xu Programming Language - Windows Development Environment Installer
 # Supports offline installation (from unpacked bundle) and online installation (irm | iex).
 
 [CmdletBinding()]
@@ -88,7 +88,7 @@ if ($IsLocalScript -and $ScriptDir) {
 }
 
 # Resolve version
-$FallbackVersion = "0.10.7"
+$FallbackVersion = "0.12.3"
 if (-not $Version) {
     if ($SourceDir -and (Test-Path "$SourceDir\VERSION")) {
         $Version = (Get-Content "$SourceDir\VERSION" -Raw).Trim()
@@ -385,7 +385,7 @@ Write-Host "Xu environment activated: `$XuEnvDir" -ForegroundColor Green
     # Ensure uninstall.ps1 ALWAYS exists
     $UninstallScriptPath = "$Prefix\uninstall.ps1"
     $UninstallScriptContent = @"
-# Xu Programming Language — Windows Uninstaller
+# Xu Programming Language - Windows Uninstaller
 param (
     [string]`$TargetPrefix = "$Prefix"
 )
@@ -446,15 +446,15 @@ Write-Host "Xu has been uninstalled successfully." -ForegroundColor Green
         Write-Color "[OK] Updated XU_ROOT, XUPATH and PATH." -Color Green
     }
 
-    Write-Color "`n🎉 Xu development environment (Windows) installed successfully!`n" -Color Green
+    Write-Color "`nXu development environment (Windows) installed successfully!`n" -Color Green
     Write-Host @"
 Installed components:
-  • Core compiler & toolchain: $Prefix\bin (xu.exe, xu-doctor.exe, xu-fmt.exe, etc.)
-  • Standard library (src):    $Prefix\src
-  • External driver modules:   $Prefix\packages (redis, mysql, postgres, sqlite, etc.)
-  • Native C headers:          $Prefix\include
-  • VS Code extension:         $Prefix\editors\vscode
-  • Official examples:         $Prefix\examples
+  - Core compiler & toolchain: $Prefix\bin (xu.exe, xu-doctor.exe, xu-fmt.exe, etc.)
+  - Standard library (src):    $Prefix\src
+  - External driver modules:   $Prefix\packages (redis, mysql, postgres, sqlite, etc.)
+  - Native C headers:          $Prefix\include
+  - VS Code extension:         $Prefix\editors\vscode
+  - Official examples:         $Prefix\examples
 
 To get started:
   1. Restart PowerShell or activate in current session:
