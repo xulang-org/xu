@@ -1,7 +1,7 @@
 # Phone applications
 
-Phone packaging extends the Xu 0.12.3 compiler with native ARM64 application
-objects and system-owned iOS / Android application shells. The Xu application,
+The Xu 0.12.4 phone toolchain generates native ARM64 application objects and
+system-owned iOS and Android application shells. The Xu application,
 heap and cooperative tasks execute as machine code on a libc worker thread.
 Drawing runs in a local Canvas inside WKWebView / Android WebView. No Xu/WASM
 interpreter, remote page or JavaScript implementation of application logic is
