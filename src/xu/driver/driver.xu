@@ -679,7 +679,7 @@ pub fn run_env(args &[]string) int {
 }
 
 fn compiler_version() string {
-    << "0.12.4-dev.2"
+    << "0.12.4-dev.3"
 }
 
 pub fn print_version() int {
@@ -1649,6 +1649,24 @@ pub fn run_build(files &[]string, files_count int, out_file string, target_code 
     << run_build_with_chip(files, files_count, out_file, target_code, target.CHIP_NATIVE, is_debug, is_debug, is_debug, is_verbose)
 }
 
+// Scalar passes over one function, for arm64 / x64 only. Local value
+// forwarding only pays off after tail-recursion elimination or
+// block-level inlining rewrote the function (locals_too forces it), so
+// it does not run otherwise.
+fn opt_scalar(f $&mir.MFn, do_tail bool, do_locals bool, locals_too bool, fold_w $&mir.FoldWork) {
+    mir.opt_fold_with(f, fold_w)
+    $again := locals_too
+    if do_tail && mir.opt_tail(f) {
+        again = true
+    }
+    if again {
+        if do_locals {
+            mir.opt_locals(f)
+        }
+        mir.opt_fold_with(f, fold_w)
+    }
+}
+
 // is_debug: a debug build (unoptimized, runtime memory checks on).
 // no_opt: disable optimization only.
 // dwarf: emit DWARF line tables, functions and locals (-g).
@@ -1848,17 +1866,90 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
                              (tgt_arch == target.ARCH_ARM64 && codegen.sha256_hw_entry(label))))
     }
     if use_ra {
+        // Every pass added after 0.12.3 runs only for arm64 / x64, the
+        // backends it was written and tested for; the other backends see
+        // the MIR they always did: leaf inlining, scalar cleanup (with tail
+        // recursion elimination), two rounds of typed inlining with cleanup
+        // after each, then the loop passes. XU_NO_TAIL=1 / XU_NO_INLINE=1 /
+        // XU_NO_LOCALS=1 switch a stage off to locate a miscompile;
+        // XU_INLINE_LOOPS=1 also inlines calls inside loops. XU_NO_SROA=1
+        // skips scalar replacement of local aggregates, XU_NO_DIVC=1
+        // division by constants (BIN_MULH exists only in these backends),
+        // XU_NO_IFCONV=1 if-conversion (likewise for MI_SELECT).
+        opt64 := tgt_arch == target.ARCH_ARM64 || tgt_arch == target.ARCH_X64
+        do_tail := opt64 && os.getenv("XU_NO_TAIL") != "1"
+        do_inline := opt64 && os.getenv("XU_NO_INLINE") != "1"
+        do_locals := os.getenv("XU_NO_LOCALS") != "1"
+        do_sroa := opt64 && os.getenv("XU_NO_SROA") != "1"
+        do_divc := opt64 && os.getenv("XU_NO_DIVC") != "1"
+        do_ifconv := opt64 && os.getenv("XU_NO_IFCONV") != "1"
         mir.opt_inline($&mir_unit, &native_entries)
+        $fold_w := mir.fold_work_new()
         for fi in 0:mir_unit.fns.len {
-            mir.opt_fold($&mir_unit.fns[fi])
+            if opt64 {
+                opt_scalar($&mir_unit.fns[fi], do_tail, do_locals, false, $&fold_w)
+            } else {
+                mir.opt_fold_with($&mir_unit.fns[fi], $&fold_w)
+            }
+        }
+        if do_inline {
+            inline_loops := os.getenv("XU_INLINE_LOOPS") == "1"
+            $inl_changed := []int{}
+            for _ in 0:2 {
+                if mir.opt_inline_typed($&mir_unit, &native_entries, $&inl_changed, inline_loops) == 0 {
+                    <-
+                }
+                for fi in 0:mir_unit.fns.len {
+                    if inl_changed[fi] == 2 {
+                        opt_scalar($&mir_unit.fns[fi], do_tail, do_locals, true, $&fold_w)
+                    }
+                }
+            }
+        }
+        for fi in 0:mir_unit.fns.len {
             if mir.opt_periodic($&mir_unit.fns[fi]) {
-                mir.opt_fold($&mir_unit.fns[fi])
+                mir.opt_fold_with($&mir_unit.fns[fi], $&fold_w)
             }
-            if mir.opt_bce($&mir_unit.fns[fi], tgt_arch == target.ARCH_ARM64 || tgt_arch == target.ARCH_X64) {
-                mir.opt_fold($&mir_unit.fns[fi])
+            if mir.opt_bce($&mir_unit.fns[fi], opt64) {
+                mir.opt_fold_with($&mir_unit.fns[fi], $&fold_w)
             }
-            if (tgt_arch == target.ARCH_ARM64 || tgt_arch == target.ARCH_X64) && mir.opt_tre($&mir_unit.fns[fi]) {
-                mir.opt_fold($&mir_unit.fns[fi])
+            // Scalar replacement after opt_bce, which matches array
+            // descriptors read through addr. Its one-word locals go
+            // straight to the register allocator: rerunning opt_locals and
+            // opt_fold on changed functions cost ~10% of a self-build and
+            // won nothing measurable.
+            if do_sroa {
+                mir.opt_addr($&mir_unit.fns[fi])
+            }
+            // Usually finds nothing after opt_tail; kept for XU_NO_TAIL=1.
+            if opt64 && mir.opt_tre($&mir_unit.fns[fi]) {
+                mir.opt_fold_with($&mir_unit.fns[fi], $&fold_w)
+            }
+            if mir.opt_divc($&mir_unit.fns[fi], do_divc) {
+                mir.opt_fold_with($&mir_unit.fns[fi], $&fold_w)
+            }
+        }
+        // If-conversion last, after opt_bce (which must still see the
+        // original loop shapes). Two rounds: block merging after the first
+        // exposes the enclosing diamond of a nested if.
+        if do_ifconv {
+            $ifc_w := mir.ifc_work_new()
+            for fi in 0:mir_unit.fns.len {
+                for _ in 0:2 {
+                    if mir.opt_ifconv_with($&mir_unit.fns[fi], $&ifc_w) == 0 {
+                        <-
+                    }
+                    mir.opt_fold_with($&mir_unit.fns[fi], $&fold_w)
+                }
+            }
+        }
+    }
+    // XU_DUMP_MIR=<label substring> prints the final MIR of matching functions.
+    dump_mir := os.getenv("XU_DUMP_MIR")
+    if dump_mir.len > 0 {
+        for fi in 0:mir_unit.fns.len {
+            if dump_mir == "*" || str_contains(&mir_unit.fns[fi].label, dump_mir) {
+                mir.mir_dump(&mir_unit.fns[fi])
             }
         }
     }
