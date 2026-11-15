@@ -10,7 +10,7 @@
 
 - Extends typed-MIR optimization with global value numbering, loop-invariant code motion, loop bounds-check elimination, and forwarding values from stores to loads across loop iterations. Set `XU_DUMP_MIR` to a function label substring or `*` to inspect the optimized MIR.
 - Improves ARM64 and x64 code generation for constant division, conditional selection, integer rotates, and floating-point square roots.
-- Adds the `xu phone` tool and the `#ui/phone` kit for iOS and Android. The native hosts provide edge-to-edge insets, text input via the system IME, clipboard access, and haptics. Mobile packaging requires the platform toolchain. Physical-device and app-store acceptance require separate validation. See [phone host setup](src/ui/host/phone/README.md).
+- Adds iOS and Android project generation through `xu build --phone` and the `#ui/phone` kit. The native hosts provide edge-to-edge insets, text input via the system IME, clipboard access, and haptics. Mobile packaging requires the platform toolchain. Physical-device and app-store acceptance require separate validation. See [phone host setup](src/ui/host/phone/README.md).
 - Aligns desktop and phone controls with XUUI design tokens and fixes non-ASCII text in installer and uninstaller scripts.
 - Upgrade the compiler, standard library and SDK tools together.
 
