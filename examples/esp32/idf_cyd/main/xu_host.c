@@ -8,6 +8,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -15,6 +16,8 @@
 #include "hid_abs.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "status_lcd.h"
 
@@ -254,6 +257,37 @@ int xu_host_hid_action(int what, int target) {
     }
 }
 
+/* Clear the stored network settings and reboot into BLE provisioning mode.
+ * The restart is delayed so the MQTT result for this command still leaves. */
+static void wifi_reset_reboot(void *arg) {
+    (void)arg;
+    ESP_LOGW(TAG, "wifi.reset: rebooting into BLE provisioning mode");
+    esp_restart();
+}
+
+int xu_host_wifi_reset(void) {
+    nvs_handle_t h;
+    if (nvs_open("xu_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, "ssid");
+        nvs_erase_key(h, "pass");
+        nvs_erase_key(h, "mqtt_uri");
+        nvs_erase_key(h, "mqtt_root");
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    esp_timer_handle_t timer = NULL;
+    esp_timer_create_args_t args = {
+        .callback = wifi_reset_reboot,
+        .name = "xu_wifi_reset",
+    };
+    if (esp_timer_create(&args, &timer) == ESP_OK) {
+        esp_timer_start_once(timer, 700 * 1000);
+    } else {
+        esp_restart();
+    }
+    return 1;
+}
+
 int xu_host_hid_mouse(int b0, int b1, int b2, int b3, int b4, int target) {
     const uint8_t report[5] = {(uint8_t)b0, (uint8_t)b1, (uint8_t)b2, (uint8_t)b3, (uint8_t)b4};
     return hid_abs_send_mouse_to(target, report);
@@ -272,6 +306,10 @@ int xu_host_hid_keyboard(int w0, int w1, int w2, int w3, int target) {
 
 int xu_host_hid_consumer(int mask, int target) {
     return hid_abs_send_consumer_to(target, (uint8_t)mask);
+}
+
+int xu_host_hid_screen_size(int w, int h, int target) {
+    return hid_abs_set_screen_size(target, w, h) ? 1 : 0;
 }
 
 /* Wi-Fi: 0 connecting, 1 up, 2 failed. */

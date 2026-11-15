@@ -25,7 +25,7 @@ static char s_ssid[64] = CONFIG_XU_WIFI_SSID;
 static char s_pass[64] = CONFIG_XU_WIFI_PASSWORD;
 static char s_mqtt_uri[96] = CONFIG_XU_MQTT_URI;
 static char s_mqtt_root[64] = CONFIG_XU_MQTT_ROOT;
-static char s_hid_name[32] = CONFIG_XU_HID_NAME;
+static char s_hid_name[32] = "XU-CYD-02";
 static char s_last_ip[16] = "";
 static bool s_wifi_started = false;
 
@@ -45,6 +45,9 @@ static void load_nvs_config(void) {
     nvs_get_str(h, "mqtt_root", s_mqtt_root, &len);
     len = sizeof(s_hid_name);
     nvs_get_str(h, "hid_name", s_hid_name, &len);
+    if (strcmp(s_hid_name, "XU-IDF-HID") == 0) {
+        strncpy(s_hid_name, "XU-CYD-02", sizeof(s_hid_name) - 1);
+    }
     nvs_close(h);
 }
 
