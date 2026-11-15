@@ -50,26 +50,105 @@ typedef struct {
     esp_ble_addr_type_t addr_type;
     char bda_str[18];
     char name[32];
+    int32_t cur_px;
+    int32_t cur_py;
+    bool homed;
     uint16_t last_x;
     uint16_t last_y;
     bool mouse_down;
+    uint32_t last_down_tick;
+    uint32_t last_act_tick;
     bool key_down;
     bool consumer_down;
+    uint16_t ccc_mouse;
+    uint16_t ccc_boot_mouse;
+    uint16_t ccc_keyboard;
+    uint16_t ccc_consumer;
     uint16_t gap_start_hdl;
     uint16_t gap_end_hdl;
+    int32_t screen_w;
+    int32_t screen_h;
+    int32_t max_w;
+    int32_t max_h;
 } hid_peer_t;
 
-/* Absolute mouse (no relative wheel) + keyboard + consumer — matches Xu HOGP. */
+/* Standard Relative mouse (4 bytes: buttons, dx, dy, wheel) + keyboard + consumer — fully compliant with Apple iOS/iPadOS AssistiveTouch and CoreOS. */
 static const uint8_t s_report_map[] = {
-    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01,
-    0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x75, 0x05, 0x95, 0x01,
-    0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16, 0x00, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10,
-    0x95, 0x02, 0x81, 0x02, 0xC0, 0xC0, 0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x02, 0x05, 0x07,
-    0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01,
-    0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x73, 0x05, 0x07, 0x19, 0x00,
-    0x29, 0x73, 0x81, 0x00, 0xC0, 0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, 0x09, 0xE9, 0x09,
-    0xEA, 0x09, 0xE2, 0x09, 0x30, 0x09, 0x40, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x05, 0x81,
-    0x02, 0x75, 0x03, 0x95, 0x01, 0x81, 0x01, 0xC0,
+    // Report ID 1: Standard Relative Mouse (4 bytes: buttons, dx, dy, wheel)
+    0x05, 0x01,                    // Usage Page (Generic Desktop)
+    0x09, 0x02,                    // Usage (Mouse)
+    0xA1, 0x01,                    // Collection (Application)
+    0x85, 0x01,                    //   Report ID (1)
+    0x09, 0x01,                    //   Usage (Pointer)
+    0xA1, 0x00,                    //   Collection (Physical)
+    0x05, 0x09,                    //     Usage Page (Button)
+    0x19, 0x01,                    //     Usage Minimum (Button 1)
+    0x29, 0x03,                    //     Usage Maximum (Button 3)
+    0x15, 0x00,                    //     Logical Minimum (0)
+    0x25, 0x01,                    //     Logical Maximum (1)
+    0x75, 0x01,                    //     Report Size (1)
+    0x95, 0x03,                    //     Report Count (3)
+    0x81, 0x02,                    //     Input (Data, Variable, Absolute)
+    0x75, 0x05,                    //     Report Size (5)
+    0x95, 0x01,                    //     Report Count (1)
+    0x81, 0x03,                    //     Input (Constant, Variable, Absolute) - 5-bit padding
+    0x05, 0x01,                    //     Usage Page (Generic Desktop)
+    0x09, 0x30,                    //     Usage (X)
+    0x09, 0x31,                    //     Usage (Y)
+    0x09, 0x38,                    //     Usage (Wheel)
+    0x15, 0x81,                    //     Logical Minimum (-127)
+    0x25, 0x7F,                    //     Logical Maximum (127)
+    0x75, 0x08,                    //     Report Size (8)
+    0x95, 0x03,                    //     Report Count (3)
+    0x81, 0x06,                    //     Input (Data, Variable, Relative)
+    0xC0,                          //   End Collection
+    0xC0,                          // End Collection
+
+    // Report ID 2: Keyboard (8 bytes)
+    0x05, 0x01,                    // Usage Page (Generic Desktop)
+    0x09, 0x06,                    // Usage (Keyboard)
+    0xA1, 0x01,                    // Collection (Application)
+    0x85, 0x02,                    //   Report ID (2)
+    0x05, 0x07,                    //   Usage Page (Key Codes)
+    0x19, 0xE0,                    //   Usage Minimum (224)
+    0x29, 0xE7,                    //   Usage Maximum (231)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x01,                    //   Logical Maximum (1)
+    0x75, 0x01,                    //   Report Size (1)
+    0x95, 0x08,                    //   Report Count (8)
+    0x81, 0x02,                    //   Input (Data, Variable, Absolute)
+    0x95, 0x01,                    //   Report Count (1)
+    0x75, 0x08,                    //   Report Size (8)
+    0x81, 0x03,                    //   Input (Constant, Variable, Absolute) - Reserved byte
+    0x95, 0x06,                    //   Report Count (6)
+    0x75, 0x08,                    //   Report Size (8)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x73,                    //   Logical Maximum (115)
+    0x05, 0x07,                    //   Usage Page (Key Codes)
+    0x19, 0x00,                    //   Usage Minimum (0)
+    0x29, 0x73,                    //   Usage Maximum (115)
+    0x81, 0x00,                    //   Input (Data, Array, Absolute)
+    0xC0,                          // End Collection
+
+    // Report ID 3: Consumer (1 byte)
+    0x05, 0x0C,                    // Usage Page (Consumer)
+    0x09, 0x01,                    // Usage (Consumer Control)
+    0xA1, 0x01,                    // Collection (Application)
+    0x85, 0x03,                    //   Report ID (3)
+    0x09, 0xE9,                    //   Usage (Volume Increment)
+    0x09, 0xEA,                    //   Usage (Volume Decrement)
+    0x09, 0xE2,                    //   Usage (Mute)
+    0x09, 0x30,                    //   Usage (Power)
+    0x09, 0x40,                    //   Usage (Menu / Home)
+    0x15, 0x00,                    //   Logical Minimum (0)
+    0x25, 0x01,                    //   Logical Maximum (1)
+    0x75, 0x01,                    //   Report Size (1)
+    0x95, 0x05,                    //   Report Count (5)
+    0x81, 0x02,                    //   Input (Data, Variable, Absolute)
+    0x75, 0x03,                    //   Report Size (3)
+    0x95, 0x01,                    //   Report Count (1)
+    0x81, 0x03,                    //   Input (Constant, Variable, Absolute) - 3-bit padding
+    0xC0,                          // End Collection
 };
 
 static bool s_bt_stack_ready = false;
@@ -108,7 +187,9 @@ static hid_peer_t s_peers[HID_ABS_MAX_PEERS];
 static esp_gatt_if_t s_hid_gatts_if = ESP_GATT_IF_NONE;
 static esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
 static uint16_t s_mouse_handle = 0;
+static uint16_t s_boot_mouse_handle = 0;
 static uint16_t s_keyboard_handle = 0;
+static uint16_t s_boot_kb_handle = 0;
 static uint16_t s_consumer_handle = 0;
 
 static bool s_protocol_ok = false;
@@ -308,9 +389,21 @@ static void gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *para
         if (slot >= 0) {
             s_peers[slot].paired = ok;
             s_peers[slot].addr_type = param->ble_security.auth_cmpl.addr_type;
-            if (ok && s_gattc_if != ESP_GATT_IF_NONE && s_peers[slot].name[0] == 0) {
-                /* Open GATT client over the existing link to read iPhone's 0x2A00 Device Name. */
-                esp_ble_gattc_open(s_gattc_if, s_peers[slot].bda, s_peers[slot].addr_type, true);
+            if (ok) {
+                /* Request 15ms connection interval after encryption (Apple Accessory Design Guidelines) */
+                esp_ble_conn_update_params_t conn_params = {
+                    .min_int = 0x0c, // 12 * 1.25ms = 15 ms
+                    .max_int = 0x0c, // 15 ms
+                    .latency = 0,
+                    .timeout = 400,  // 400 * 10ms = 4000 ms
+                };
+                memcpy(conn_params.bda, param->ble_security.auth_cmpl.bd_addr, ESP_BD_ADDR_LEN);
+                esp_ble_gap_update_conn_params(&conn_params);
+
+                if (s_gattc_if != ESP_GATT_IF_NONE && s_peers[slot].name[0] == 0) {
+                    /* Open GATT client over the existing link to read iPhone's 0x2A00 Device Name. */
+                    esp_ble_gattc_open(s_gattc_if, s_peers[slot].bda, s_peers[slot].addr_type, true);
+                }
             }
         }
         if (ok) {
@@ -388,6 +481,9 @@ static void gattc_event(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_
                 }
             }
         }
+        /* The GATT client channel shares the ACL link with the HID service on
+         * classic Bluetooth, so it must stay open: closing it tears down the
+         * phone's own link (reason 0x16). */
         break;
     }
     default:
@@ -446,16 +542,47 @@ static void gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_
 
     switch (event) {
     case ESP_GATTS_CREAT_ATTR_TAB_EVT:
-        /* HID service table has 11 base attrs + mouse(4+3) + kbd(4+3) + consumer(4) = 29 handles. */
-        if (param->add_attr_tab.status == ESP_GATT_OK && param->add_attr_tab.num_handle >= 27) {
+        /* HID service table has 11 base attrs + mouse(4) + kbd(4) + consumer(4) = 23 handles. */
+        if (param->add_attr_tab.status == ESP_GATT_OK && param->add_attr_tab.num_handle >= 23) {
             s_hid_gatts_if = gatts_if;
             s_mouse_handle = param->add_attr_tab.handles[12];
-            s_keyboard_handle = param->add_attr_tab.handles[19];
-            s_consumer_handle = param->add_attr_tab.handles[26];
+            s_keyboard_handle = param->add_attr_tab.handles[16];
+            s_consumer_handle = param->add_attr_tab.handles[20];
             ESP_LOGI(TAG, "HID handles ready (num=%u): mouse=%u kbd=%u consumer=%u",
                      param->add_attr_tab.num_handle, s_mouse_handle, s_keyboard_handle, s_consumer_handle);
+            for (int h = 0; h < param->add_attr_tab.num_handle; h++) {
+                ESP_LOGI(TAG, "  handle[%d] = %u", h, param->add_attr_tab.handles[h]);
+            }
         }
         break;
+    case ESP_GATTS_WRITE_EVT: {
+        if (s_hid_gatts_if != ESP_GATT_IF_NONE && gatts_if == s_hid_gatts_if) {
+            int slot = -1;
+            for (int i = 0; i < HID_ABS_MAX_PEERS; i++) {
+                if (s_peers[i].connected && s_peers[i].conn_id == param->write.conn_id) {
+                    slot = i;
+                    break;
+                }
+            }
+            uint16_t val = (param->write.len >= 2) ? ((uint16_t)param->write.value[0] | ((uint16_t)param->write.value[1] << 8)) :
+                           (param->write.len == 1 ? param->write.value[0] : 0);
+            ESP_LOGI(TAG, "GATTS WRITE: slot=%d conn=%u hdl=%u len=%u val=0x%04x",
+                     slot, param->write.conn_id, param->write.handle, param->write.len, val);
+            if (slot >= 0) {
+                if (param->write.handle == s_mouse_handle + 1) {
+                    s_peers[slot].ccc_mouse = val;
+                    ESP_LOGI(TAG, "slot %d (%s) CCC mouse -> 0x%04x", slot, s_peers[slot].bda_str, val);
+                } else if (param->write.handle == s_keyboard_handle + 1) {
+                    s_peers[slot].ccc_keyboard = val;
+                    ESP_LOGI(TAG, "slot %d (%s) CCC kbd -> 0x%04x", slot, s_peers[slot].bda_str, val);
+                } else if (param->write.handle == s_consumer_handle + 1) {
+                    s_peers[slot].ccc_consumer = val;
+                    ESP_LOGI(TAG, "slot %d (%s) CCC consumer -> 0x%04x", slot, s_peers[slot].bda_str, val);
+                }
+            }
+        }
+        break;
+    }
     case ESP_GATTS_CONNECT_EVT: {
         if (s_hid_gatts_if != ESP_GATT_IF_NONE && gatts_if != s_hid_gatts_if) {
             break;
@@ -470,7 +597,21 @@ static void gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_
             s_peers[slot].mouse_down = false;
             s_peers[slot].key_down = false;
             s_peers[slot].consumer_down = false;
+            s_peers[slot].homed = false;
+            s_peers[slot].cur_px = 0;
+            s_peers[slot].cur_py = 0;
             esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
+
+            /* Request 15ms connection interval as recommended by Apple Accessory Design Guidelines for HID */
+            esp_ble_conn_update_params_t conn_params = {
+                .min_int = 0x0c, // 12 * 1.25ms = 15 ms
+                .max_int = 0x0c, // 15 ms
+                .latency = 0,
+                .timeout = 400,  // 400 * 10ms = 4000 ms
+            };
+            memcpy(conn_params.bda, param->connect.remote_bda, ESP_BD_ADDR_LEN);
+            esp_ble_gap_update_conn_params(&conn_params);
+
             ESP_LOGI(TAG, "peer connected: slot=%d conn_id=%u bda=%s (active=%d/%d)",
                      slot, param->connect.conn_id, s_peers[slot].bda_str,
                      hid_abs_connected_count(), HID_ABS_MAX_PEERS);
@@ -491,6 +632,9 @@ static void gatts_event(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_
             s_peers[slot].mouse_down = false;
             s_peers[slot].key_down = false;
             s_peers[slot].consumer_down = false;
+            s_peers[slot].homed = false;
+            s_peers[slot].cur_px = 0;
+            s_peers[slot].cur_py = 0;
             ESP_LOGI(TAG, "peer disconnected: slot=%d bda=%s reason=0x%x (active=%d/%d)",
                      slot, s_peers[slot].bda_str, param->disconnect.reason,
                      hid_abs_connected_count(), HID_ABS_MAX_PEERS);
@@ -773,13 +917,86 @@ static bool send_input_to(int slot, uint8_t report_id, const uint8_t *data, size
     }
     uint16_t handle = report_handle_for(report_id);
     if (s_hid_gatts_if != ESP_GATT_IF_NONE && handle != 0) {
-        return esp_ble_gatts_send_indicate(s_hid_gatts_if, s_peers[slot].conn_id,
-                                           handle, len, (uint8_t *)data, false) == ESP_OK;
+        esp_err_t err = ESP_FAIL;
+        for (int retry = 0; retry < 10; retry++) {
+            err = esp_ble_gatts_send_indicate(s_hid_gatts_if, s_peers[slot].conn_id,
+                                              handle, len, (uint8_t *)data, false);
+            if (err == ESP_OK) {
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        ESP_LOGW(TAG, "send_indicate timeout: slot=%d conn=%u hdl=%u len=%u res=%d",
+                 slot, s_peers[slot].conn_id, handle, (unsigned)len, err);
+        return false;
     }
     if (!s_hid) {
         return false;
     }
-    return esp_hidd_dev_input_set(s_hid, 0, report_id, (uint8_t *)data, len) == ESP_OK;
+    esp_err_t err = esp_hidd_dev_input_set(s_hid, 0, report_id, (uint8_t *)data, len);
+    return err == ESP_OK;
+}
+
+static bool send_mouse_rel_to(int slot, uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel) {
+    if (slot < 0 || slot >= HID_ABS_MAX_PEERS || !s_peers[slot].connected) {
+        return false;
+    }
+    uint8_t rpt[4] = {buttons, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel};
+    return send_input_to(slot, HID_RPT_MOUSE, rpt, 4);
+}
+
+static void home_cursor_to(int slot) {
+    if (slot < 0 || slot >= HID_ABS_MAX_PEERS || !s_peers[slot].connected) {
+        return;
+    }
+    ESP_LOGI(TAG, "homing cursor slot %d to (0,0)", slot);
+    /* 6 packets of (-80, -80) with 20ms delay = -480 counts.
+     * Guarantees clamping to (0,0) from any position on screen without GATT buffer overflow. */
+    for (int i = 0; i < 6; i++) {
+        send_mouse_rel_to(slot, 0, -80, -80, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    vTaskDelay(pdMS_TO_TICKS(25));
+    /* Tiny nudge (+2, +2) to release iOS AssistiveTouch edge-lock/docking */
+    send_mouse_rel_to(slot, 0, 2, 2, 0);
+    vTaskDelay(pdMS_TO_TICKS(15));
+    s_peers[slot].cur_px = 2;
+    s_peers[slot].cur_py = 2;
+    s_peers[slot].homed = true;
+}
+
+static void calc_calibrated_bounds(int w, int h, int32_t *out_w, int32_t *out_h) {
+    if (w <= 0 || h <= 0) {
+        w = 1080;
+        h = 1920;
+    }
+    /* Dynamic screen bounds calibrated directly from AirPlay video resolution (w, h):
+     * AssistiveTouch step-24 physical sensitivity:
+     * - Horizontal: max_w = (w * 5) / 24   (iPhone 13 mini 888 -> 185, iPhone 8 1080 -> 225)
+     * - Vertical:   max_h = (h * 39) / 128  (1920 portrait lines -> 585)
+     * Adapts dynamically to any AirPlay stream resolution (w, h) without hardcoded device IDs. */
+    int32_t max_w = ((int32_t)w * 5) / 24;
+    int32_t max_h = ((int32_t)h * 39) / 128;
+    if (max_w < 50) max_w = 50;
+    if (max_h < 150) max_h = 150;
+    *out_w = max_w;
+    *out_h = max_h;
+}
+
+bool hid_abs_set_screen_size(int target, int w, int h) {
+    int slot = resolve_peer_slot(target);
+    if (slot < 0 || w <= 0 || h <= 0) {
+        return false;
+    }
+    s_peers[slot].screen_w = w;
+    s_peers[slot].screen_h = h;
+    int32_t max_w = 0, max_h = 0;
+    calc_calibrated_bounds(w, h, &max_w, &max_h);
+    s_peers[slot].max_w = max_w;
+    s_peers[slot].max_h = max_h;
+    ESP_LOGI(TAG, "slot %d screen size set to %dx%d (calibrated max_w=%d, max_h=%d)",
+             slot, w, h, (int)max_w, (int)max_h);
+    return true;
 }
 
 bool hid_abs_send_mouse_to(int target, const uint8_t report[5]) {
@@ -790,25 +1007,96 @@ bool hid_abs_send_mouse_to(int target, const uint8_t report[5]) {
     if (slot < 0) {
         return false;
     }
+    uint8_t btn = report[0] & 7;
     uint16_t x = (uint16_t)report[1] | ((uint16_t)report[2] << 8);
     uint16_t y = (uint16_t)report[3] | ((uint16_t)report[4] << 8);
-    if (x > HID_MOUSE_ABS_MAX || y > HID_MOUSE_ABS_MAX || report[0] > 7) {
+    if (x > HID_MOUSE_ABS_MAX || y > HID_MOUSE_ABS_MAX) {
         return false;
     }
-    /* Pre-position cursor with buttons=0 before pressing at a new coordinate so iOS AssistiveTouch registers taps/drags accurately. */
-    if (report[0] != 0 && !s_peers[slot].mouse_down &&
-        (x != s_peers[slot].last_x || y != s_peers[slot].last_y)) {
-        const uint8_t move_rpt[5] = {0, report[1], report[2], report[3], report[4]};
-        send_input_to(slot, HID_RPT_MOUSE, move_rpt, 5);
-        vTaskDelay(pdMS_TO_TICKS(18));
+
+    /* Dynamic screen points calibration based on AirPlay video stream dimensions */
+    int32_t max_w = s_peers[slot].max_w;
+    int32_t max_h = s_peers[slot].max_h;
+    if (max_w <= 0 || max_h <= 0) {
+        int32_t sw = s_peers[slot].screen_w;
+        int32_t sh = s_peers[slot].screen_h;
+        calc_calibrated_bounds(sw, sh, &max_w, &max_h);
+        s_peers[slot].max_w = max_w;
+        s_peers[slot].max_h = max_h;
     }
+
+    int32_t target_px = ((int32_t)x * max_w) / 32767;
+    int32_t target_py = ((int32_t)y * max_h) / 32767;
+
+    uint32_t now = (uint32_t)xTaskGetTickCount();
+    /* Re-home if idle > 1500ms to eliminate accumulated drift and recover from external touches */
+    if (s_peers[slot].homed && (now - s_peers[slot].last_act_tick > pdMS_TO_TICKS(1500))) {
+        s_peers[slot].homed = false;
+    }
+    s_peers[slot].last_act_tick = now;
+
+    ESP_LOGI(TAG, "mouse slot=%d btn=%d in=(%u,%u) target=(%d,%d) cur=(%d,%d) homed=%d",
+             slot, btn, x, y, (int)target_px, (int)target_py, (int)s_peers[slot].cur_px, (int)s_peers[slot].cur_py, s_peers[slot].homed);
+
+    /* Home cursor to (0,0) upon initial connection, idle expiration, explicit (0,0),
+     * or at the start of any new discrete click to ensure 0 cumulative drift. */
+    bool starting_new_press = (btn != 0 && !s_peers[slot].mouse_down);
+    if (!s_peers[slot].homed || starting_new_press || (x == 0 && y == 0 && btn == 0)) {
+        home_cursor_to(slot);
+        if (x == 0 && y == 0 && btn == 0) {
+            s_last_x = 0;
+            s_last_y = 0;
+            return true;
+        }
+    }
+
+    /* Move incrementally from current cursor to target coordinate.
+     * Step size 24 with 20ms pacing stays strictly linear and eliminates ballistic pointer acceleration. */
+    int32_t d_px = target_px - s_peers[slot].cur_px;
+    int32_t d_py = target_py - s_peers[slot].cur_py;
+    int steps_sent = 0;
+
+    while (d_px != 0 || d_py != 0) {
+        int8_t step_x = (d_px > 24) ? 24 : ((d_px < -24) ? -24 : (int8_t)d_px);
+        int8_t step_y = (d_py > 24) ? 24 : ((d_py < -24) ? -24 : (int8_t)d_py);
+
+        bool ok = send_mouse_rel_to(slot, s_peers[slot].mouse_down ? btn : 0, step_x, step_y, 0);
+        if (!ok) {
+            ESP_LOGW(TAG, "send_mouse_rel_to fail slot=%d dx=%d dy=%d", slot, step_x, step_y);
+            vTaskDelay(pdMS_TO_TICKS(15));
+            continue;
+        }
+        d_px -= step_x;
+        d_py -= step_y;
+        s_peers[slot].cur_px += step_x;
+        s_peers[slot].cur_py += step_y;
+        steps_sent++;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGI(TAG, "mouse moved: steps=%d cur=(%d,%d) target=(%d,%d)",
+             steps_sent, (int)s_peers[slot].cur_px, (int)s_peers[slot].cur_py, (int)target_px, (int)target_py);
+
+    /* Handle button down / up transitions with proper debouncing for AssistiveTouch */
+    if (btn != 0 && !s_peers[slot].mouse_down) {
+        send_mouse_rel_to(slot, btn, 0, 0, 0);
+        s_peers[slot].last_down_tick = (uint32_t)xTaskGetTickCount();
+        s_peers[slot].mouse_down = true;
+    } else if (btn == 0 && s_peers[slot].mouse_down) {
+        uint32_t now = (uint32_t)xTaskGetTickCount();
+        uint32_t elapsed_ticks = now - s_peers[slot].last_down_tick;
+        if (elapsed_ticks < 10) {
+            vTaskDelay(10 - elapsed_ticks);
+        }
+        send_mouse_rel_to(slot, 0, 0, 0, 0);
+        s_peers[slot].mouse_down = false;
+    }
+
     s_peers[slot].last_x = x;
     s_peers[slot].last_y = y;
-    s_peers[slot].mouse_down = report[0] != 0;
     s_last_x = x;
     s_last_y = y;
-    s_mouse_down = report[0] != 0;
-    return send_input_to(slot, HID_RPT_MOUSE, report, 5);
+    s_mouse_down = (btn != 0);
+    return true;
 }
 
 bool hid_abs_send_mouse(const uint8_t report[5]) {
@@ -860,9 +1148,7 @@ bool hid_abs_release_all_to(int target) {
             continue;
         }
         if (s_peers[i].mouse_down) {
-            uint8_t zero[5] = {0, (uint8_t)(s_peers[i].last_x & 0xff), (uint8_t)(s_peers[i].last_x >> 8),
-                               (uint8_t)(s_peers[i].last_y & 0xff), (uint8_t)(s_peers[i].last_y >> 8)};
-            ok = hid_abs_send_mouse_to(i, zero) && ok;
+            send_mouse_rel_to(i, 0, 0, 0, 0);
             s_peers[i].mouse_down = false;
         }
         if (s_peers[i].key_down) {

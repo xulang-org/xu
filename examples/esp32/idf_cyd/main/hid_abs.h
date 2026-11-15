@@ -43,6 +43,7 @@ const char *hid_abs_peer_name(int slot);
 
 bool hid_abs_disconnect_to(int target);
 bool hid_abs_release_all_to(int target);
+bool hid_abs_set_screen_size(int target, int w, int h);
 bool hid_abs_send_mouse_to(int target, const uint8_t report[5]);
 bool hid_abs_send_keyboard_to(int target, const uint8_t report[8]);
 bool hid_abs_send_consumer_to(int target, uint8_t mask);

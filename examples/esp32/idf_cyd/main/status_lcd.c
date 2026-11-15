@@ -53,7 +53,14 @@ static bool flush_at(int x, int y, int w, int h, const uint16_t *buf) {
     if (esp_lcd_panel_draw_bitmap(s_panel, x, y, x + w, y + h, buf) != ESP_OK) {
         return false;
     }
-    xSemaphoreTake(s_flush_done, portMAX_DELAY);
+    /* The panel signals the finished transfer from its ISR. Waiting forever
+     * here would stall the whole Xu task when that interrupt is missed: the
+     * MQTT keepalive stops, the broker drops the node and it never reconnects.
+     * Skip one frame instead of hanging. */
+    if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(200)) != pdTRUE) {
+        ESP_LOGW(TAG, "panel flush timed out; dropping frame");
+        return false;
+    }
     return true;
 }
 
