@@ -1,0 +1,1556 @@
+@xu/mir
+// Dominator-tree Global Value Numbering (GVN), local forwarding, slice-header
+// preservation, exact store->load forwarding, and branch-edge bounds/null
+// check elimination for typed MIR.
+
+const GVN_MAX_BLOCKS = 1024
+const GVN_MAX_INSTRS = 8192
+const GVN_BUCKETS = 1024
+const GVN_CONST_HT = 4096
+const GVN_CONST_MASK = 4095
+
+struct GvnExpr {
+    bucket int
+    prev int
+    kind int
+    op int
+    arg1 int
+    arg2 int
+    vid int
+}
+
+struct GvnHdr {
+    desc_vid int
+    off int
+    val_vid int
+    epoch int
+}
+
+struct GvnExact {
+    ptr_vid int
+    off int
+    width int
+    val_vid int
+    epoch int
+}
+
+struct GvnRel {
+    a int
+    b int
+}
+
+struct GvnDfsFrame {
+    b int
+    depth int
+    next_ch int
+    tk int
+    sn int
+    sl int
+    sq int
+    saved_expr_len int
+    saved_t_len int
+    saved_vrep_len int
+    saved_buf_len int
+    saved_sd_len int
+    saved_loc_len int
+    saved_hdr_len int
+    saved_exact_len int
+    saved_gen_epoch int
+    saved_elem_epoch int
+    saved_exact_epoch int
+    saved_nn_len int
+    saved_lt_len int
+    saved_neq_len int
+}
+
+fn gvn_is_noreturn(label &string) bool {
+    << *label == "_xu_runtime_core_rt_panic" ||
+       *label == "_xu_runtime_core_index_panic" ||
+       *label == "_xu_runtime_core_exit_process" ||
+       *label == "_xu_runtime_core_intrin_assert_fail" ||
+       *label == "_xu_runtime_core_intrin_fatal" ||
+       *label == "_xu_runtime_core_fatal_no_memory"
+}
+
+fn gvn_norm_width(w int) int {
+    if w == 1 || w == 2 || w == 4 || w == -4 {
+        << w
+    }
+    << 8
+}
+
+fn gvn_width_ok_for_const(w int, cval int) bool {
+    nw := gvn_norm_width(w)
+    if nw == 8 { << true }
+    if nw == 1 { << cval >= 0 && cval <= 255 }
+    if nw == 2 { << cval >= 0 && cval <= 65535 }
+    if nw == 4 { << cval >= 0 && cval <= 4294967295 }
+    if nw == -4 { << cval >= -2147483648 && cval <= 2147483647 }
+    << false
+}
+
+fn gvn_is_comm_bin(op int) bool {
+    << op == BIN_ADD || op == BIN_MUL || op == BIN_AND || op == BIN_OR ||
+       op == BIN_XOR || op == BIN_EQ || op == BIN_NE ||
+       op == BIN_FADD || op == BIN_FMUL || op == BIN_FEQ || op == BIN_FNE
+}
+
+fn gvn_hash(kind int, op int, a1 int, a2 int, mask int) int {
+    $h := kind * 1315423911 ^ op * 2654435761 ^ a1 * 2246822519 ^ a2 * 3266489917
+    if h < 0 { h = 0 - h }
+    << h & mask
+}
+
+fn gvn_intersect(idom &[]int, rpo_idx &[]int, b1 int, b2 int) int {
+    $f1 := b1
+    $f2 := b2
+    while f1 != f2 {
+        while rpo_idx[f1] > rpo_idx[f2] {
+            f1 = idom[f1]
+        }
+        while rpo_idx[f2] > rpo_idx[f1] {
+            f2 = idom[f2]
+        }
+    }
+    << f1
+}
+
+pub struct GvnWork {
+    nb int
+    nt int
+    nl int
+    nc int
+    vid_top int
+    pred_top int
+    is_panic []bool
+    seen []bool
+    next_i []int
+    rpo_idx []int
+    pred_head []int
+    pred_from []int
+    pred_next []int
+    n_eff_preds []int
+    idom []int
+    dom_first []int
+    dom_last []int
+    dom_next []int
+    in_dom []bool
+    stack []int
+    post []int
+    rpo []int
+    ndef []int
+    tdef []int
+    const_canon []int
+    const_zero int
+    const_ht_gen []int
+    const_ht_val []int
+    const_ht_canon []int
+    const_gen int
+    bucket_mask int
+    l_cand []bool
+    l_stores []int
+    l_store_blk []int
+    local_blk []int
+    temp_vn []int
+    t_undo []int
+    t_top int
+    vid_rep []int
+    vrep_undo_vid []int
+    vrep_undo_rep []int
+    vrep_top int
+    buf_owner []int
+    buf_undo []int
+    buf_top int
+    is_slice_desc []bool
+    sd_undo []int
+    sd_top int
+    local_vid []int
+    loc_undo_l []int
+    loc_undo_v []int
+    loc_undo_b []int
+    loc_top int
+    exprs []GvnExpr
+    expr_top int
+    buckets []int
+    hdrs []GvnHdr
+    hdr_top int
+    exacts []GvnExact
+    exact_top int
+    gen_epoch int
+    elem_epoch int
+    exact_epoch int
+    nonneg []int
+    nn_top int
+    lt_list []GvnRel
+    lt_top int
+    neq_list []GvnRel
+    neq_top int
+    dfs_frames []GvnDfsFrame
+    dfs_top int
+    changed bool
+}
+
+pub fn gvn_work_new() GvnWork {
+    $buckets := []int{}
+    for _ in 0:GVN_BUCKETS {
+        buckets.push(-1)
+    }
+    $const_ht_gen := []int{}
+    $const_ht_val := []int{}
+    $const_ht_canon := []int{}
+    for _ in 0:GVN_CONST_HT {
+        const_ht_gen.push(0)
+        const_ht_val.push(0)
+        const_ht_canon.push(0)
+    }
+    << GvnWork{
+        nb: 0,
+        nt: 0,
+        nl: 0,
+        nc: 0,
+        vid_top: 0,
+        pred_top: 0,
+        is_panic: []bool{},
+        seen: []bool{},
+        next_i: []int{},
+        rpo_idx: []int{},
+        pred_head: []int{},
+        pred_from: []int{},
+        pred_next: []int{},
+        n_eff_preds: []int{},
+        idom: []int{},
+        dom_first: []int{},
+        dom_last: []int{},
+        dom_next: []int{},
+        in_dom: []bool{},
+        stack: []int{},
+        post: []int{},
+        rpo: []int{},
+        ndef: []int{},
+        tdef: []int{},
+        const_canon: []int{},
+        const_zero: -1,
+        const_ht_gen: ~const_ht_gen,
+        const_ht_val: ~const_ht_val,
+        const_ht_canon: ~const_ht_canon,
+        const_gen: 0,
+        bucket_mask: 63,
+        l_cand: []bool{},
+        l_stores: []int{},
+        l_store_blk: []int{},
+        local_blk: []int{},
+        temp_vn: []int{},
+        t_undo: []int{},
+        t_top: 0,
+        vid_rep: []int{},
+        vrep_undo_vid: []int{},
+        vrep_undo_rep: []int{},
+        vrep_top: 0,
+        buf_owner: []int{},
+        buf_undo: []int{},
+        buf_top: 0,
+        is_slice_desc: []bool{},
+        sd_undo: []int{},
+        sd_top: 0,
+        local_vid: []int{},
+        loc_undo_l: []int{},
+        loc_undo_v: []int{},
+        loc_undo_b: []int{},
+        loc_top: 0,
+        exprs: []GvnExpr{},
+        expr_top: 0,
+        buckets: ~buckets,
+        hdrs: []GvnHdr{},
+        hdr_top: 0,
+        exacts: []GvnExact{},
+        exact_top: 0,
+        gen_epoch: 0,
+        elem_epoch: 0,
+        exact_epoch: 0,
+        nonneg: []int{},
+        nn_top: 0,
+        lt_list: []GvnRel{},
+        lt_top: 0,
+        neq_list: []GvnRel{},
+        neq_top: 0,
+        dfs_frames: []GvnDfsFrame{},
+        dfs_top: 0,
+        changed: false
+    }
+}
+
+fn gvn_fill_int(a $&[]int, n int, v int) {
+    $old := a.len
+    if old > n { old = n }
+    for i in 0:old {
+        a[i] = v
+    }
+    while a.len < n {
+        a.push(v)
+    }
+}
+
+fn gvn_fill_bool(a $&[]bool, n int, v bool) {
+    $old := a.len
+    if old > n { old = n }
+    for i in 0:old {
+        a[i] = v
+    }
+    while a.len < n {
+        a.push(v)
+    }
+}
+
+fn gvn_ensure_int(a $&[]int, n int, v int) {
+    while a.len < n {
+        a.push(v)
+    }
+}
+
+fn gvn_add_pred(w $&GvnWork, from int, to int) {
+    eidx := w.pred_top
+    if eidx < w.pred_from.len {
+        w.pred_from[eidx] = from
+        w.pred_next[eidx] = w.pred_head[to]
+    } else {
+        w.pred_from.push(from)
+        w.pred_next.push(w.pred_head[to])
+    }
+    w.pred_top = eidx + 1
+    w.pred_head[to] = eidx
+    w.n_eff_preds[to] = w.n_eff_preds[to] + 1
+}
+
+fn gvn_vid_of(w &GvnWork, v int) int {
+    if v <= -2 {
+        ci := 0 - v - 2
+        if ci >= 0 && ci < w.nc {
+            << w.const_canon[ci]
+        }
+        << v
+    }
+    if v >= 0 && v < w.nt {
+        << w.temp_vn[v]
+    }
+    << -1
+}
+
+fn gvn_rep_of(w &GvnWork, f &MFn, v int) int {
+    if v <= -2 {
+        << v
+    }
+    if v >= 0 && v < w.nt {
+        vid := w.temp_vn[v]
+        if vid <= -2 {
+            << vid
+        }
+        if vid >= 0 && vid < w.vid_top {
+            r := w.vid_rep[vid]
+            if r <= -2 || r >= 0 {
+                << r
+            }
+        }
+    }
+    << v
+}
+
+fn gvn_rep_ptr(w &GvnWork, f &MFn, v int) int {
+    r := gvn_rep_of(w, f, v)
+    if r >= 0 {
+        << r
+    }
+    << v
+}
+
+fn gvn_push_hdr(w $&GvnWork, v GvnHdr) {
+    if w.hdr_top < w.hdrs.len { w.hdrs[w.hdr_top] = v } else { w.hdrs.push(v) }
+    w.hdr_top = w.hdr_top + 1
+}
+
+fn gvn_push_exact(w $&GvnWork, v GvnExact) {
+    if w.exact_top < w.exacts.len { w.exacts[w.exact_top] = v } else { w.exacts.push(v) }
+    w.exact_top = w.exact_top + 1
+}
+
+fn gvn_bind_temp(w $&GvnWork, t int, vid int) {
+    if t >= 0 && t < w.nt && w.ndef[t] == 1 && w.temp_vn[t] == -1 {
+        w.temp_vn[t] = vid
+        if w.t_top < w.t_undo.len { w.t_undo[w.t_top] = t } else { w.t_undo.push(t) }
+        w.t_top = w.t_top + 1
+    }
+}
+
+fn gvn_fresh_vid(w $&GvnWork, rep_t int) int {
+    vid := w.vid_top
+    if vid < w.vid_rep.len {
+        w.vid_rep[vid] = rep_t
+        w.is_slice_desc[vid] = false
+    } else {
+        w.vid_rep.push(rep_t)
+        w.is_slice_desc.push(false)
+    }
+    w.vid_top = vid + 1
+    << vid
+}
+
+fn gvn_set_vid_rep(w $&GvnWork, vid int, rep_t int) {
+    if vid >= 0 && vid < w.vid_top && w.vid_rep[vid] != rep_t {
+        if w.vrep_top < w.vrep_undo_vid.len {
+            w.vrep_undo_vid[w.vrep_top] = vid
+            w.vrep_undo_rep[w.vrep_top] = w.vid_rep[vid]
+        } else {
+            w.vrep_undo_vid.push(vid)
+            w.vrep_undo_rep.push(w.vid_rep[vid])
+        }
+        w.vrep_top = w.vrep_top + 1
+        w.vid_rep[vid] = rep_t
+    }
+}
+
+fn gvn_set_local(w $&GvnWork, l int, vid int, blk int) {
+    if l >= 0 && l < w.nl && (w.local_vid[l] != vid || w.local_blk[l] != blk) {
+        if w.loc_top < w.loc_undo_l.len {
+            w.loc_undo_l[w.loc_top] = l
+            w.loc_undo_v[w.loc_top] = w.local_vid[l]
+            w.loc_undo_b[w.loc_top] = w.local_blk[l]
+        } else {
+            w.loc_undo_l.push(l)
+            w.loc_undo_v.push(w.local_vid[l])
+            w.loc_undo_b.push(w.local_blk[l])
+        }
+        w.loc_top = w.loc_top + 1
+        w.local_vid[l] = vid
+        w.local_blk[l] = blk
+    }
+}
+
+fn gvn_set_buf_owner(w $&GvnWork, t int, owner_vid int) {
+    if t >= 0 && t < w.nt && w.ndef[t] == 1 && w.buf_owner[t] < 0 && owner_vid >= 0 {
+        w.buf_owner[t] = owner_vid
+        if w.buf_top < w.buf_undo.len { w.buf_undo[w.buf_top] = t } else { w.buf_undo.push(t) }
+        w.buf_top = w.buf_top + 1
+    }
+}
+
+fn gvn_mark_slice_desc(w $&GvnWork, vid int) {
+    if vid >= 0 && vid < w.vid_top && !w.is_slice_desc[vid] {
+        w.is_slice_desc[vid] = true
+        if w.sd_top < w.sd_undo.len { w.sd_undo[w.sd_top] = vid } else { w.sd_undo.push(vid) }
+        w.sd_top = w.sd_top + 1
+    }
+}
+
+fn gvn_is_const_zero(w &GvnWork, f &MFn, vid int) bool {
+    if vid <= -2 {
+        ci := 0 - vid - 2
+        if ci >= 0 && ci < f.consts.len {
+            << f.consts[ci] == 0
+        }
+    }
+    << false
+}
+
+fn gvn_is_nonneg(w &GvnWork, f &MFn, vid int) bool {
+    if vid <= -2 {
+        ci := 0 - vid - 2
+        if ci >= 0 && ci < f.consts.len {
+            << f.consts[ci] >= 0
+        }
+        << false
+    }
+    if vid < 0 { << false }
+    $i := w.nn_top - 1
+    while i >= 0 {
+        if w.nonneg[i] == vid { << true }
+        i -= 1
+    }
+    << false
+}
+
+fn gvn_is_lt(w &GvnWork, f &MFn, a int, b int) bool {
+    if a == -1 || b == -1 { << false }
+    if a <= -2 && b <= -2 {
+        ca := f.consts[0 - a - 2]
+        cb := f.consts[0 - b - 2]
+        << ca < cb
+    }
+    $has_const := a <= -2
+    $aconst := 0
+    if has_const {
+        aconst = f.consts[0 - a - 2]
+    }
+    $i := w.lt_top - 1
+    while i >= 0 {
+        ra := w.lt_list[i].a
+        rb := w.lt_list[i].b
+        if ra == a && rb == b { << true }
+        if has_const && rb == b && ra <= -2 && aconst >= 0 {
+            rc := f.consts[0 - ra - 2]
+            if aconst <= rc { << true }
+        }
+        i -= 1
+    }
+    << false
+}
+
+fn gvn_is_neq(w &GvnWork, f &MFn, a int, b int) bool {
+    if a == -1 || b == -1 { << false }
+    if a <= -2 && b <= -2 {
+        << f.consts[0 - a - 2] != f.consts[0 - b - 2]
+    }
+    $i := w.neq_top - 1
+    while i >= 0 {
+        ra := w.neq_list[i].a
+        rb := w.neq_list[i].b
+        if (ra == a && rb == b) || (ra == b && rb == a) { << true }
+        i -= 1
+    }
+    << false
+}
+
+fn gvn_find_expr(w &GvnWork, kind int, op int, a1 int, a2 int) int {
+    b := gvn_hash(kind, op, a1, a2, w.bucket_mask)
+    $idx := w.buckets[b]
+    while idx >= 0 {
+        if w.exprs[idx].kind == kind && w.exprs[idx].op == op &&
+           w.exprs[idx].arg1 == a1 && w.exprs[idx].arg2 == a2 {
+            << w.exprs[idx].vid
+        }
+        idx = w.exprs[idx].prev
+    }
+    << -1
+}
+
+fn gvn_push_expr(w $&GvnWork, kind int, op int, a1 int, a2 int, vid int) {
+    b := gvn_hash(kind, op, a1, a2, w.bucket_mask)
+    idx := w.expr_top
+    e := GvnExpr{
+        bucket: b,
+        prev: w.buckets[b],
+        kind: kind,
+        op: op,
+        arg1: a1,
+        arg2: a2,
+        vid: vid
+    }
+    if idx < w.exprs.len { w.exprs[idx] = e } else { w.exprs.push(e) }
+    w.expr_top = idx + 1
+    w.buckets[b] = idx
+}
+
+fn gvn_find_hdr(w &GvnWork, desc_vid int, off int) int {
+    $i := w.hdr_top - 1
+    while i >= 0 {
+        if w.hdrs[i].epoch == w.gen_epoch &&
+           w.hdrs[i].desc_vid == desc_vid &&
+           w.hdrs[i].off == off {
+            << w.hdrs[i].val_vid
+        }
+        i -= 1
+    }
+    << -1
+}
+
+fn gvn_find_exact(w &GvnWork, ptr_vid int, off int, wbytes int) int {
+    nw := gvn_norm_width(wbytes)
+    $i := w.exact_top - 1
+    while i >= 0 {
+        if w.exacts[i].epoch != w.exact_epoch {
+            <-
+        }
+        if w.exacts[i].ptr_vid == ptr_vid &&
+           w.exacts[i].off == off &&
+           w.exacts[i].width == nw {
+            << w.exacts[i].val_vid
+        }
+        i -= 1
+    }
+    << -1
+}
+
+fn gvn_assume_cond(w $&GvnWork, f &MFn, v int, want_true bool, depth int) {
+    if depth >= 4 || v < 0 || v >= w.nt {
+        <<
+    }
+    ii := w.tdef[v]
+    if ii < 0 {
+        <<
+    }
+    k := f.instrs[ii].kind
+    if k == MI_COPY {
+        gvn_assume_cond(w, f, f.instrs[ii].b, want_true, depth + 1)
+        <<
+    }
+    if k != MI_BIN {
+        <<
+    }
+    op := f.instrs[ii].b
+    if !want_true && op == BIN_OR {
+        gvn_assume_cond(w, f, f.instrs[ii].c, false, depth + 1)
+        gvn_assume_cond(w, f, f.instrs[ii].d, false, depth + 1)
+        <<
+    }
+    vc := gvn_vid_of(w, f.instrs[ii].c)
+    vd := gvn_vid_of(w, f.instrs[ii].d)
+    if vc == -1 || vd == -1 {
+        <<
+    }
+    if want_true {
+        if op == BIN_LT {
+            gvn_add_lt(w, vc, vd)
+            if gvn_is_const_zero(w, f, vc) {
+                gvn_add_nn(w, vd)
+            }
+        } else if op == BIN_GT {
+            gvn_add_lt(w, vd, vc)
+            if gvn_is_const_zero(w, f, vd) {
+                gvn_add_nn(w, vc)
+            }
+        } else if op == BIN_GE && gvn_is_const_zero(w, f, vd) {
+            gvn_add_nn(w, vc)
+        } else if op == BIN_LE && gvn_is_const_zero(w, f, vc) {
+            gvn_add_nn(w, vd)
+        } else if op == BIN_NE {
+            gvn_add_neq(w, vc, vd)
+        }
+    } else {
+        if op == BIN_LT && gvn_is_const_zero(w, f, vd) {
+            gvn_add_nn(w, vc)
+        } else if op == BIN_GE {
+            gvn_add_lt(w, vc, vd)
+            // A bounds check uses ge(idx, load8 [desc+8]): mark desc as slice.
+            if f.instrs[ii].d >= 0 && f.instrs[ii].d < w.nt {
+                lii := w.tdef[f.instrs[ii].d]
+                if lii >= 0 && f.instrs[lii].kind == MI_LOAD_PTR && f.instrs[lii].c == 8 && gvn_norm_width(f.instrs[lii].d) == 8 {
+                    dvid := gvn_vid_of(w, f.instrs[lii].b)
+                    gvn_mark_slice_desc(w, dvid)
+                }
+            }
+        } else if op == BIN_LE {
+            gvn_add_lt(w, vd, vc)
+        } else if op == BIN_EQ {
+            gvn_add_neq(w, vc, vd)
+        }
+    }
+}
+
+fn gvn_add_nn(w $&GvnWork, v int) {
+    if w.nn_top < w.nonneg.len { w.nonneg[w.nn_top] = v } else { w.nonneg.push(v) }
+    w.nn_top = w.nn_top + 1
+}
+
+fn gvn_add_lt(w $&GvnWork, a int, b int) {
+    r := GvnRel{a: a, b: b}
+    if w.lt_top < w.lt_list.len { w.lt_list[w.lt_top] = r } else { w.lt_list.push(r) }
+    w.lt_top = w.lt_top + 1
+}
+
+fn gvn_add_neq(w $&GvnWork, a int, b int) {
+    r := GvnRel{a: a, b: b}
+    if w.neq_top < w.neq_list.len { w.neq_list[w.neq_top] = r } else { w.neq_list.push(r) }
+    w.neq_top = w.neq_top + 1
+}
+
+fn gvn_get_zero(w $&GvnWork, f $&MFn) int {
+    if w.const_zero > -2 {
+        w.const_zero = alloc_const(f, 0)
+        ci := 0 - w.const_zero - 2
+        while w.nc <= ci {
+            c := 0 - w.nc - 2
+            if w.nc < w.const_canon.len {
+                w.const_canon[w.nc] = c
+            } else {
+                w.const_canon.push(c)
+            }
+            w.nc = w.nc + 1
+        }
+    }
+    << w.const_zero
+}
+
+// Visits a single block in dominator-tree GVN and returns its terminator kind.
+fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
+    // At merge blocks (more than one reachable non-panic predecessor), only
+    // locals never written or written solely by a single store strictly
+    // dominating this block stay valid.
+    if b > 0 && w.n_eff_preds[b] > 1 {
+        for l in 0:w.nl {
+            if w.local_vid[l] != -1 {
+                keep := w.l_stores[l] == 0 ||
+                        (w.l_stores[l] == 1 && w.l_store_blk[l] >= 0 &&
+                         w.l_store_blk[l] != b && w.in_dom[w.l_store_blk[l]])
+                if !keep {
+                    gvn_set_local(w, l, -1, -1)
+                }
+            }
+        }
+        w.gen_epoch = w.gen_epoch + 1
+        w.elem_epoch = w.elem_epoch + 1
+        w.exact_epoch = w.exact_epoch + 1
+    }
+
+    $ii := f.blocks[b].head
+    while ii >= 0 {
+        k := f.instrs[ii].kind
+        $ia := f.instrs[ii].a
+        $ib := f.instrs[ii].b
+        $ic := f.instrs[ii].c
+        $id := f.instrs[ii].d
+        next_ii := f.instrs[ii].next
+        $rewritten := false
+
+        if k == MI_COPY {
+            nb := gvn_rep_of(w, f, ib)
+            if nb != ib {
+                f.instrs[ii].b = nb
+                ib = nb
+                w.changed = true
+            }
+            vid := gvn_vid_of(w, ib)
+            if vid != -1 && ia >= 0 && w.ndef[ia] == 1 {
+                gvn_bind_temp(w, ia, vid)
+            } else if ia >= 0 && w.ndef[ia] == 1 {
+                nv := gvn_fresh_vid(w, ia)
+                gvn_bind_temp(w, ia, nv)
+            }
+            if ib >= 0 && ib < w.nt && w.buf_owner[ib] >= 0 {
+                gvn_set_buf_owner(w, ia, w.buf_owner[ib])
+            }
+        } else if k == MI_LOAD_LOCAL {
+            l := ib
+            if ic == 0 && l >= 0 && l < w.nl && w.l_cand[l] {
+                if w.local_vid[l] != -1 {
+                    lvid := w.local_vid[l]
+                    rep := gvn_rep_of_vid(w, lvid)
+                    if rep != -1 && rep != ia {
+                        // Rewrite only constants, zero-store locals, or same-block defs;
+                        // replacing cross-block loads of mutable locals pins an ancestor temp
+                        // across branches/loops and breaks regalloc coalescing.
+                        can_rewrite := rep <= -2 || w.l_stores[l] == 0 || w.local_blk[l] == b
+                        if can_rewrite {
+                            f.instrs[ii].kind = MI_COPY
+                            f.instrs[ii].b = rep
+                            f.instrs[ii].c = -1
+                            f.instrs[ii].d = -1
+                            w.changed = true
+                            rewritten = true
+                            gvn_bind_temp(w, ia, lvid)
+                        } else if ia >= 0 && w.ndef[ia] == 1 {
+                            gvn_bind_temp(w, ia, lvid)
+                            if rep >= 0 && rep < w.nt && w.buf_owner[rep] >= 0 {
+                                gvn_set_buf_owner(w, ia, w.buf_owner[rep])
+                            }
+                            if lvid >= 0 {
+                                gvn_set_vid_rep(w, lvid, ia)
+                            }
+                            gvn_set_local(w, l, lvid, b)
+                            rewritten = true
+                        }
+                    }
+                }
+                if !rewritten && ia >= 0 && w.ndef[ia] == 1 {
+                    nv := gvn_fresh_vid(w, ia)
+                    gvn_bind_temp(w, ia, nv)
+                    gvn_set_local(w, l, nv, b)
+                }
+            } else if ia >= 0 && w.ndef[ia] == 1 {
+                nv := gvn_fresh_vid(w, ia)
+                gvn_bind_temp(w, ia, nv)
+            }
+        } else if k == MI_STORE_LOCAL {
+            nb := gvn_rep_of(w, f, ib)
+            if nb != ib {
+                f.instrs[ii].b = nb
+                ib = nb
+                w.changed = true
+            }
+            l := ia
+            if ic == 0 && l >= 0 && l < w.nl && w.l_cand[l] {
+                vid := gvn_vid_of(w, ib)
+                gvn_set_local(w, l, vid, b)
+            }
+        } else if k == MI_ADDR {
+            // Keep MI_ADDR intra-block only and un-rewritten: rematerializing SP+imm
+            // is cheaper than cross-block spills and preserves MI_ADDR in opt_loop.
+            if ia >= 0 && w.ndef[ia] == 1 {
+                hit := gvn_find_expr(w, MI_ADDR, b, ib, 0)
+                if hit >= 0 {
+                    gvn_bind_temp(w, ia, hit)
+                } else {
+                    nv := gvn_fresh_vid(w, ia)
+                    gvn_bind_temp(w, ia, nv)
+                    gvn_push_expr(w, MI_ADDR, b, ib, 0, nv)
+                }
+            }
+        } else if k == MI_LOAD_PTR {
+            nb := gvn_rep_ptr(w, f, ib)
+            if nb != ib {
+                f.instrs[ii].b = nb
+                ib = nb
+                w.changed = true
+            }
+            bvid := gvn_vid_of(w, ib)
+            nw := gvn_norm_width(id)
+            if bvid != -1 && ia >= 0 && w.ndef[ia] == 1 {
+                $hit := -1
+                if nw == 8 && (ic == 0 || ic == 8) {
+                    hit = gvn_find_hdr(w, bvid, ic)
+                }
+                if hit == -1 {
+                    hit = gvn_find_exact(w, bvid, ic, nw)
+                }
+                if hit != -1 {
+                    rep := gvn_rep_of_vid(w, hit)
+                    if rep != -1 && rep != ia {
+                        f.instrs[ii].kind = MI_COPY
+                        f.instrs[ii].b = rep
+                        f.instrs[ii].c = -1
+                        f.instrs[ii].d = -1
+                        w.changed = true
+                        rewritten = true
+                        gvn_bind_temp(w, ia, hit)
+                        if nw == 8 && ic == 0 && bvid >= 0 {
+                            gvn_set_buf_owner(w, ia, bvid)
+                        }
+                    }
+                }
+                if !rewritten {
+                    nv := gvn_fresh_vid(w, ia)
+                    gvn_bind_temp(w, ia, nv)
+                    if nw == 8 && (ic == 0 || ic == 8) && bvid >= 0 {
+                        gvn_push_hdr(w, GvnHdr{
+                            desc_vid: bvid,
+                            off: ic,
+                            val_vid: nv,
+                            epoch: w.gen_epoch
+                        })
+                        if ic == 0 {
+                            gvn_set_buf_owner(w, ia, bvid)
+                        }
+                    }
+                    gvn_push_exact(w, GvnExact{
+                        ptr_vid: bvid,
+                        off: ic,
+                        width: nw,
+                        val_vid: nv,
+                        epoch: w.exact_epoch
+                    })
+                }
+            }
+        } else if k == MI_STORE_PTR {
+            na := gvn_rep_ptr(w, f, ia)
+            if na != ia {
+                f.instrs[ii].a = na
+                ia = na
+                w.changed = true
+            }
+            nb := gvn_rep_of(w, f, ib)
+            if nb != ib {
+                f.instrs[ii].b = nb
+                ib = nb
+                w.changed = true
+            }
+            $owner := -1
+            if ia >= 0 && ia < w.nt {
+                o := w.buf_owner[ia]
+                if o >= 0 && o < w.vid_top && w.is_slice_desc[o] {
+                    owner = o
+                }
+            }
+            old_g := w.gen_epoch
+            w.gen_epoch = w.gen_epoch + 1
+            w.elem_epoch = w.elem_epoch + 1
+            w.exact_epoch = w.exact_epoch + 1
+            if owner >= 0 {
+                // Backing-buffer stores cannot overwrite that slice's own {data, len} header.
+                nh := w.hdr_top
+                for hi in 0:nh {
+                    if w.hdrs[hi].epoch == old_g && w.hdrs[hi].desc_vid == owner {
+                        gvn_push_hdr(w, GvnHdr{
+                            desc_vid: w.hdrs[hi].desc_vid,
+                            off: w.hdrs[hi].off,
+                            val_vid: w.hdrs[hi].val_vid,
+                            epoch: w.gen_epoch
+                        })
+                    }
+                }
+            }
+            pvid := gvn_vid_of(w, ia)
+            vvid := gvn_vid_of(w, ib)
+            nw := gvn_norm_width(id)
+            if pvid != -1 && vvid != -1 {
+                $ok_fwd := nw == 8
+                if !ok_fwd && vvid <= -2 {
+                    ok_fwd = gvn_width_ok_for_const(nw, f.consts[0 - vvid - 2])
+                }
+                if ok_fwd {
+                    gvn_push_exact(w, GvnExact{
+                        ptr_vid: pvid,
+                        off: ic,
+                        width: nw,
+                        val_vid: vvid,
+                        epoch: w.exact_epoch
+                    })
+                }
+            }
+        } else if k == MI_UN {
+            nc := gvn_rep_of(w, f, ic)
+            if nc != ic {
+                f.instrs[ii].c = nc
+                ic = nc
+                w.changed = true
+            }
+            vc := gvn_vid_of(w, ic)
+            if vc != -1 && ia >= 0 && w.ndef[ia] == 1 {
+                hit := gvn_find_expr(w, MI_UN, ib, vc, 0)
+                if hit >= 0 {
+                    rep := w.vid_rep[hit]
+                    f.instrs[ii].kind = MI_COPY
+                    f.instrs[ii].b = rep
+                    f.instrs[ii].c = -1
+                    f.instrs[ii].d = -1
+                    w.changed = true
+                    gvn_bind_temp(w, ia, hit)
+                } else {
+                    nv := gvn_fresh_vid(w, ia)
+                    gvn_bind_temp(w, ia, nv)
+                    gvn_push_expr(w, MI_UN, ib, vc, 0, nv)
+                }
+            }
+        } else if k == MI_BIN {
+            nc := gvn_rep_of(w, f, ic)
+            if nc != ic {
+                f.instrs[ii].c = nc
+                ic = nc
+                w.changed = true
+            }
+            nd := gvn_rep_of(w, f, id)
+            if nd != id {
+                f.instrs[ii].d = nd
+                id = nd
+                w.changed = true
+            }
+            op := ib
+            vc := gvn_vid_of(w, ic)
+            vd := gvn_vid_of(w, id)
+            if vc != -1 && vd != -1 && ia >= 0 && w.ndef[ia] == 1 {
+                $folded_zero := false
+                if op == BIN_LT && gvn_is_const_zero(w, f, vd) && gvn_is_nonneg(w, f, vc) {
+                    folded_zero = true
+                } else if op == BIN_GE && gvn_is_lt(w, f, vc, vd) {
+                    folded_zero = true
+                } else if op == BIN_EQ && gvn_is_neq(w, f, vc, vd) {
+                    folded_zero = true
+                } else if op == BIN_OR && gvn_is_const_zero(w, f, vc) && gvn_is_const_zero(w, f, vd) {
+                    folded_zero = true
+                }
+                if folded_zero {
+                    cz := gvn_get_zero(w, f)
+                    f.instrs[ii].kind = MI_COPY
+                    f.instrs[ii].b = cz
+                    f.instrs[ii].c = -1
+                    f.instrs[ii].d = -1
+                    w.changed = true
+                    rewritten = true
+                    gvn_bind_temp(w, ia, cz)
+                } else if op == BIN_OR && (gvn_is_const_zero(w, f, vc) || gvn_is_const_zero(w, f, vd)) {
+                    $keep_op := ic
+                    $keep_vid := vc
+                    if gvn_is_const_zero(w, f, vc) {
+                        keep_op = id
+                        keep_vid = vd
+                    }
+                    f.instrs[ii].kind = MI_COPY
+                    f.instrs[ii].b = keep_op
+                    f.instrs[ii].c = -1
+                    f.instrs[ii].d = -1
+                    w.changed = true
+                    rewritten = true
+                    gvn_bind_temp(w, ia, keep_vid)
+                } else {
+                    $k1 := vc
+                    $k2 := vd
+                    if gvn_is_comm_bin(op) && k1 > k2 {
+                        k1 = vd
+                        k2 = vc
+                    }
+                    hit := gvn_find_expr(w, MI_BIN, op, k1, k2)
+                    if hit != -1 {
+                        rep := gvn_rep_of_vid(w, hit)
+                        if rep != -1 && rep != ia {
+                            f.instrs[ii].kind = MI_COPY
+                            f.instrs[ii].b = rep
+                            f.instrs[ii].c = -1
+                            f.instrs[ii].d = -1
+                            w.changed = true
+                            rewritten = true
+                            gvn_bind_temp(w, ia, hit)
+                        }
+                    }
+                    if !rewritten {
+                        nv := gvn_fresh_vid(w, ia)
+                        gvn_bind_temp(w, ia, nv)
+                        gvn_push_expr(w, MI_BIN, op, k1, k2, nv)
+                        if op == BIN_ADD {
+                            if ic >= 0 && ic < w.nt && w.buf_owner[ic] >= 0 {
+                                gvn_set_buf_owner(w, ia, w.buf_owner[ic])
+                            } else if id >= 0 && id < w.nt && w.buf_owner[id] >= 0 {
+                                gvn_set_buf_owner(w, ia, w.buf_owner[id])
+                            }
+                        }
+                    }
+                }
+            }
+        } else if k == MI_SELECT {
+            nb := gvn_rep_of(w, f, ib)
+            if nb != ib {
+                f.instrs[ii].b = nb
+                ib = nb
+                w.changed = true
+            }
+            nc := gvn_rep_of(w, f, ic)
+            if nc != ic {
+                f.instrs[ii].c = nc
+                ic = nc
+                w.changed = true
+            }
+            nd := gvn_rep_of(w, f, id)
+            if nd != id {
+                f.instrs[ii].d = nd
+                id = nd
+                w.changed = true
+            }
+            vb := gvn_vid_of(w, ib)
+            vc := gvn_vid_of(w, ic)
+            vd := gvn_vid_of(w, id)
+            if vb != -1 && vc != -1 && vd != -1 && ia >= 0 && w.ndef[ia] == 1 {
+                hit := gvn_find_expr(w, MI_SELECT, vb, vc, vd)
+                if hit >= 0 {
+                    rep := w.vid_rep[hit]
+                    f.instrs[ii].kind = MI_COPY
+                    f.instrs[ii].b = rep
+                    f.instrs[ii].c = -1
+                    f.instrs[ii].d = -1
+                    w.changed = true
+                    gvn_bind_temp(w, ia, hit)
+                } else {
+                    nv := gvn_fresh_vid(w, ia)
+                    gvn_bind_temp(w, ia, nv)
+                    gvn_push_expr(w, MI_SELECT, vb, vc, vd, nv)
+                }
+            }
+        } else if k == MI_CALL || k == MI_CALL_IND {
+            if k == MI_CALL_IND {
+                nb := gvn_rep_ptr(w, f, ib)
+                if nb != ib {
+                    f.instrs[ii].b = nb
+                    ib = nb
+                    w.changed = true
+                }
+            }
+            $a := ic
+            while a >= 0 {
+                nv := gvn_rep_of(w, f, f.margs[a].v)
+                if nv != f.margs[a].v {
+                    f.margs[a].v = nv
+                    w.changed = true
+                }
+                a = f.margs[a].next
+            }
+            if ia >= 0 && w.ndef[ia] == 1 {
+                nv := gvn_fresh_vid(w, ia)
+                gvn_bind_temp(w, ia, nv)
+            }
+            if k == MI_CALL_IND || !gvn_is_noreturn(&f.instrs[ii].sval) {
+                w.gen_epoch = w.gen_epoch + 1
+                w.elem_epoch = w.elem_epoch + 1
+                w.exact_epoch = w.exact_epoch + 1
+            }
+        } else {
+            if fold_defines(k) && ia >= 0 && w.ndef[ia] == 1 {
+                nv := gvn_fresh_vid(w, ia)
+                gvn_bind_temp(w, ia, nv)
+            }
+        }
+        ii = next_ii
+    }
+
+    tk := f.blocks[b].tkind
+    if tk == TKIND_BRANCH || tk == TKIND_RETURN {
+        nta := gvn_rep_of(w, f, f.blocks[b].ta)
+        if nta != f.blocks[b].ta {
+            f.blocks[b].ta = nta
+            w.changed = true
+        }
+    }
+    << tk
+}
+
+fn gvn_enter_block(w $&GvnWork, f $&MFn, b int, depth int) bool {
+    if w.is_panic[b] || depth > 512 {
+        << false
+    }
+    w.in_dom[b] = true
+    saved_expr_len := w.expr_top
+    saved_t_len := w.t_top
+    saved_vrep_len := w.vrep_top
+    saved_buf_len := w.buf_top
+    saved_sd_len := w.sd_top
+    saved_loc_len := w.loc_top
+    saved_hdr_len := w.hdr_top
+    saved_exact_len := w.exact_top
+    saved_gen_epoch := w.gen_epoch
+    saved_elem_epoch := w.elem_epoch
+    saved_exact_epoch := w.exact_epoch
+    saved_nn_len := w.nn_top
+    saved_lt_len := w.lt_top
+    saved_neq_len := w.neq_top
+
+    tk := gvn_visit_block(w, f, b)
+
+    fr := GvnDfsFrame{
+        b: b,
+        depth: depth,
+        next_ch: w.dom_first[b],
+        tk: tk,
+        sn: w.nn_top,
+        sl: w.lt_top,
+        sq: w.neq_top,
+        saved_expr_len: saved_expr_len,
+        saved_t_len: saved_t_len,
+        saved_vrep_len: saved_vrep_len,
+        saved_buf_len: saved_buf_len,
+        saved_sd_len: saved_sd_len,
+        saved_loc_len: saved_loc_len,
+        saved_hdr_len: saved_hdr_len,
+        saved_exact_len: saved_exact_len,
+        saved_gen_epoch: saved_gen_epoch,
+        saved_elem_epoch: saved_elem_epoch,
+        saved_exact_epoch: saved_exact_epoch,
+        saved_nn_len: saved_nn_len,
+        saved_lt_len: saved_lt_len,
+        saved_neq_len: saved_neq_len
+    }
+    if w.dfs_top < w.dfs_frames.len {
+        w.dfs_frames[w.dfs_top] = ~fr
+    } else {
+        w.dfs_frames.push(~fr)
+    }
+    w.dfs_top = w.dfs_top + 1
+    << true
+}
+
+fn gvn_leave_block(w $&GvnWork, fi int) {
+    b := w.dfs_frames[fi].b
+    saved_expr_len := w.dfs_frames[fi].saved_expr_len
+    saved_t_len := w.dfs_frames[fi].saved_t_len
+    saved_vrep_len := w.dfs_frames[fi].saved_vrep_len
+    saved_buf_len := w.dfs_frames[fi].saved_buf_len
+    saved_sd_len := w.dfs_frames[fi].saved_sd_len
+    saved_loc_len := w.dfs_frames[fi].saved_loc_len
+
+    while w.expr_top > saved_expr_len {
+        etop := w.expr_top - 1
+        w.expr_top = etop
+        eb := w.exprs[etop].bucket
+        ep := w.exprs[etop].prev
+        w.buckets[eb] = ep
+    }
+    while w.t_top > saved_t_len {
+        w.t_top = w.t_top - 1
+        t := w.t_undo[w.t_top]
+        w.temp_vn[t] = -1
+    }
+    while w.vrep_top > saved_vrep_len {
+        w.vrep_top = w.vrep_top - 1
+        vv := w.vrep_undo_vid[w.vrep_top]
+        w.vid_rep[vv] = w.vrep_undo_rep[w.vrep_top]
+    }
+    while w.buf_top > saved_buf_len {
+        w.buf_top = w.buf_top - 1
+        t := w.buf_undo[w.buf_top]
+        w.buf_owner[t] = -1
+    }
+    while w.sd_top > saved_sd_len {
+        w.sd_top = w.sd_top - 1
+        v := w.sd_undo[w.sd_top]
+        w.is_slice_desc[v] = false
+    }
+    while w.loc_top > saved_loc_len {
+        w.loc_top = w.loc_top - 1
+        l := w.loc_undo_l[w.loc_top]
+        w.local_vid[l] = w.loc_undo_v[w.loc_top]
+        w.local_blk[l] = w.loc_undo_b[w.loc_top]
+    }
+    w.hdr_top = w.dfs_frames[fi].saved_hdr_len
+    w.exact_top = w.dfs_frames[fi].saved_exact_len
+    w.gen_epoch = w.dfs_frames[fi].saved_gen_epoch
+    w.elem_epoch = w.dfs_frames[fi].saved_elem_epoch
+    w.exact_epoch = w.dfs_frames[fi].saved_exact_epoch
+    w.nn_top = w.dfs_frames[fi].saved_nn_len
+    w.lt_top = w.dfs_frames[fi].saved_lt_len
+    w.neq_top = w.dfs_frames[fi].saved_neq_len
+    w.in_dom[b] = false
+}
+
+// Iterative dominator-tree GVN walk keeps call-stack depth O(1) across targets.
+fn gvn_dfs(w $&GvnWork, f $&MFn, root int) {
+    if !gvn_enter_block(w, f, root, 0) {
+        <<
+    }
+    while w.dfs_top > 0 {
+        fi := w.dfs_top - 1
+        ch := w.dfs_frames[fi].next_ch
+        if ch >= 0 {
+            w.dfs_frames[fi].next_ch = w.dom_next[ch]
+            b := w.dfs_frames[fi].b
+            cdepth := w.dfs_frames[fi].depth + 1
+            if !w.is_panic[ch] && cdepth <= 512 {
+                tk := w.dfs_frames[fi].tk
+                if tk == TKIND_BRANCH && f.blocks[b].tb != f.blocks[b].tc && w.n_eff_preds[ch] == 1 {
+                    if ch == f.blocks[b].tb {
+                        gvn_assume_cond(w, f, f.blocks[b].ta, true, 0)
+                    } else if ch == f.blocks[b].tc {
+                        gvn_assume_cond(w, f, f.blocks[b].ta, false, 0)
+                    }
+                }
+                if !gvn_enter_block(w, f, ch, cdepth) {
+                    w.nn_top = w.dfs_frames[fi].sn
+                    w.lt_top = w.dfs_frames[fi].sl
+                    w.neq_top = w.dfs_frames[fi].sq
+                }
+            }
+        } else {
+            gvn_leave_block(w, fi)
+            w.dfs_top = w.dfs_top - 1
+            if w.dfs_top > 0 {
+                pfi := w.dfs_top - 1
+                w.nn_top = w.dfs_frames[pfi].sn
+                w.lt_top = w.dfs_frames[pfi].sl
+                w.neq_top = w.dfs_frames[pfi].sq
+            }
+        }
+    }
+}
+
+fn gvn_rep_of_vid(w &GvnWork, vid int) int {
+    if vid <= -2 {
+        << vid
+    }
+    if vid >= 0 && vid < w.vid_top {
+        << w.vid_rep[vid]
+    }
+    << -1
+}
+
+pub fn opt_gvn_with(f $&MFn, w $&GvnWork) bool {
+    nb := f.blocks.len
+    nt := f.temps.len
+    nl := f.locals.len
+    if nb == 0 || nb > GVN_MAX_BLOCKS || f.instrs.len > GVN_MAX_INSTRS || f.instrs.len < 4 {
+        << false
+    }
+    for ii in 0:f.instrs.len {
+        if !fold_known_kind(f.instrs[ii].kind) {
+            << false
+        }
+    }
+
+    w.nb = nb
+    w.nt = nt
+    w.nl = nl
+    w.nc = f.consts.len
+    w.vid_top = 0
+    w.pred_top = 0
+    w.const_zero = -1
+    w.t_top = 0
+    w.vrep_top = 0
+    w.buf_top = 0
+    w.sd_top = 0
+    w.loc_top = 0
+    w.expr_top = 0
+    w.hdr_top = 0
+    w.exact_top = 0
+    w.gen_epoch = 0
+    w.elem_epoch = 0
+    w.exact_epoch = 0
+    w.nn_top = 0
+    w.lt_top = 0
+    w.neq_top = 0
+    w.dfs_top = 0
+    w.changed = false
+
+    gvn_fill_bool($&w.is_panic, nb, false)
+    gvn_fill_bool($&w.in_dom, nb, false)
+    gvn_fill_int($&w.dom_first, nb, -1)
+
+    if nb == 1 {
+        gvn_fill_int($&w.rpo_idx, 1, 0)
+        gvn_fill_int($&w.n_eff_preds, 1, 0)
+    } else {
+        for bi in 1:nb {
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                if f.instrs[ii].kind == MI_CALL && gvn_is_noreturn(&f.instrs[ii].sval) {
+                    w.is_panic[bi] = true
+                    <-
+                }
+                ii = f.instrs[ii].next
+            }
+        }
+
+        // RPO over reachable effective CFG (pruning edges out of panic blocks).
+        gvn_fill_bool($&w.seen, nb, false)
+        gvn_fill_int($&w.next_i, nb, 0)
+        gvn_fill_int($&w.rpo_idx, nb, -1)
+        gvn_fill_int($&w.pred_head, nb, -1)
+        gvn_fill_int($&w.n_eff_preds, nb, 0)
+        gvn_fill_int($&w.idom, nb, -1)
+        gvn_fill_int($&w.dom_last, nb, -1)
+        gvn_fill_int($&w.dom_next, nb, -1)
+        gvn_ensure_int($&w.stack, nb, 0)
+        gvn_ensure_int($&w.post, nb, 0)
+        gvn_ensure_int($&w.rpo, nb, 0)
+
+        w.stack[0] = 0
+        $sp := 1
+        $post_top := 0
+        w.seen[0] = true
+        while sp > 0 {
+            b := w.stack[sp - 1]
+            $s0 := -1
+            $s1 := -1
+            $ns := 0
+            if !w.is_panic[b] {
+                tk := f.blocks[b].tkind
+                if tk == TKIND_JUMP {
+                    s := f.blocks[b].ta
+                    if s >= 0 && s < nb {
+                        s0 = s
+                        ns = 1
+                    }
+                } else if tk == TKIND_BRANCH {
+                    tb := f.blocks[b].tb
+                    tc := f.blocks[b].tc
+                    if tb >= 0 && tb < nb {
+                        s0 = tb
+                        ns = 1
+                    }
+                    if tc >= 0 && tc < nb && tc != tb {
+                        if ns == 0 { s0 = tc } else { s1 = tc }
+                        ns += 1
+                    }
+                }
+            }
+            if w.next_i[b] < ns {
+                $s := s0
+                if w.next_i[b] == 1 { s = s1 }
+                w.next_i[b] = w.next_i[b] + 1
+                if !w.seen[s] {
+                    w.seen[s] = true
+                    w.stack[sp] = s
+                    sp += 1
+                }
+            } else {
+                w.post[post_top] = b
+                post_top += 1
+                sp -= 1
+            }
+        }
+
+        nr := post_top
+        if nr == 0 {
+            << false
+        }
+        for ri in 0:nr {
+            b := w.post[nr - 1 - ri]
+            w.rpo[ri] = b
+            w.rpo_idx[b] = ri
+        }
+
+        $has_multi_pred := false
+        for ri in 0:nr {
+            b := w.rpo[ri]
+            if w.is_panic[b] { -> }
+            tk := f.blocks[b].tkind
+            if tk == TKIND_JUMP {
+                s := f.blocks[b].ta
+                if s >= 0 && s < nb && w.rpo_idx[s] >= 0 {
+                    gvn_add_pred(w, b, s)
+                    if w.n_eff_preds[s] > 1 { has_multi_pred = true }
+                }
+            } else if tk == TKIND_BRANCH {
+                tb := f.blocks[b].tb
+                tc := f.blocks[b].tc
+                if tb >= 0 && tb < nb && w.rpo_idx[tb] >= 0 {
+                    gvn_add_pred(w, b, tb)
+                    if w.n_eff_preds[tb] > 1 { has_multi_pred = true }
+                }
+                if tc >= 0 && tc < nb && tc != tb && w.rpo_idx[tc] >= 0 {
+                    gvn_add_pred(w, b, tc)
+                    if w.n_eff_preds[tc] > 1 { has_multi_pred = true }
+                }
+            }
+        }
+
+        w.idom[0] = 0
+        if !has_multi_pred {
+            for ri in 1:nr {
+                b := w.rpo[ri]
+                pi := w.pred_head[b]
+                if pi >= 0 {
+                    w.idom[b] = w.pred_from[pi]
+                }
+            }
+        } else {
+            $dom_changed := true
+            while dom_changed {
+                dom_changed = false
+                for ri in 1:nr {
+                    b := w.rpo[ri]
+                    $new_idom := -1
+                    $pi := w.pred_head[b]
+                    while pi >= 0 {
+                        p := w.pred_from[pi]
+                        if w.idom[p] != -1 {
+                            if new_idom == -1 {
+                                new_idom = p
+                            } else {
+                                new_idom = gvn_intersect(&w.idom, &w.rpo_idx, p, new_idom)
+                            }
+                        }
+                        pi = w.pred_next[pi]
+                    }
+                    if new_idom != -1 && w.idom[b] != new_idom {
+                        w.idom[b] = new_idom
+                        dom_changed = true
+                    }
+                }
+            }
+        }
+
+        for ri in 1:nr {
+            b := w.rpo[ri]
+            p := w.idom[b]
+            if p >= 0 && p < nb && !w.is_panic[b] {
+                if w.dom_first[p] < 0 {
+                    w.dom_first[p] = b
+                } else {
+                    w.dom_next[w.dom_last[p]] = b
+                }
+                w.dom_last[p] = b
+            }
+        }
+    }
+
+    // Scalar local metadata and single-def SSA info.
+    gvn_fill_int($&w.ndef, nt, 0)
+    gvn_fill_int($&w.tdef, nt, -1)
+    gvn_fill_int($&w.temp_vn, nt, -1)
+    gvn_fill_int($&w.buf_owner, nt, -1)
+
+    gvn_fill_bool($&w.l_cand, nl, true)
+    n_nslots := f.locals_nslots.len
+    $lim_l := nl
+    if n_nslots < lim_l { lim_l = n_nslots }
+    for l in 0:lim_l {
+        if f.locals_nslots[l] != 1 {
+            w.l_cand[l] = false
+        }
+    }
+    gvn_fill_int($&w.l_stores, nl, 0)
+    gvn_fill_int($&w.l_store_blk, nl, -1)
+    gvn_fill_int($&w.local_vid, nl, -1)
+    gvn_fill_int($&w.local_blk, nl, -1)
+
+    for bi in 0:nb {
+        if w.rpo_idx[bi] < 0 { -> }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if fold_defines(k) && ins.a >= 0 && ins.a < nt {
+                w.ndef[ins.a] = w.ndef[ins.a] + 1
+                w.tdef[ins.a] = ii
+            }
+            if k == MI_ADDR && ins.b >= 0 && ins.b < nl {
+                w.l_cand[ins.b] = false
+            } else if k == MI_LOAD_LOCAL && ins.b >= 0 && ins.b < nl && ins.c != 0 {
+                w.l_cand[ins.b] = false
+            } else if k == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl {
+                if ins.c != 0 {
+                    w.l_cand[ins.a] = false
+                } else {
+                    w.l_stores[ins.a] = w.l_stores[ins.a] + 1
+                    w.l_store_blk[ins.a] = bi
+                }
+            }
+            ii = ins.next
+        }
+    }
+    for t in 0:nt {
+        if w.ndef[t] != 1 {
+            w.tdef[t] = -1
+        }
+    }
+
+    nc := w.nc
+    gvn_ensure_int($&w.const_canon, nc, 0)
+    if nc <= 16 {
+        for ci in 0:nc {
+            v := f.consts[ci]
+            $canon := 0 - ci - 2
+            for cj in 0:ci {
+                if f.consts[cj] == v {
+                    canon = 0 - cj - 2
+                    <-
+                }
+            }
+            w.const_canon[ci] = canon
+            if v == 0 && w.const_zero > -2 {
+                w.const_zero = canon
+            }
+        }
+    } else {
+        w.const_gen = w.const_gen + 1
+        gen := w.const_gen
+        for ci in 0:nc {
+            v := f.consts[ci]
+            $canon := 0 - ci - 2
+            $h := (v ^ (v >> 32)) * 2654435761
+            $slot := h & GVN_CONST_MASK
+            $probe := 0
+            while probe < 64 {
+                if w.const_ht_gen[slot] != gen {
+                    w.const_ht_gen[slot] = gen
+                    w.const_ht_val[slot] = v
+                    w.const_ht_canon[slot] = canon
+                    <-
+                }
+                if w.const_ht_val[slot] == v {
+                    canon = w.const_ht_canon[slot]
+                    <-
+                }
+                slot = (slot + 1) & GVN_CONST_MASK
+                probe += 1
+            }
+            w.const_canon[ci] = canon
+            if v == 0 && w.const_zero > -2 {
+                w.const_zero = canon
+            }
+        }
+    }
+
+    $bmask := 63
+    if f.instrs.len > 32 { bmask = 255 }
+    if f.instrs.len > 128 { bmask = 1023 }
+    w.bucket_mask = bmask
+
+    gvn_dfs(w, f, 0)
+    << w.changed
+}
+
+pub fn opt_gvn(f $&MFn) bool {
+    $w := gvn_work_new()
+    << opt_gvn_with(f, $&w)
+}
