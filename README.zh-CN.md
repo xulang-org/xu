@@ -174,9 +174,9 @@ xu build main.xu -o myapp
 
 ---
 
-## Phone 应用（开发版）
+## Phone 应用
 
-Phone 工具链基于 Xu 0.12.3，新增 ARM64 iOS 真机、iOS 模拟器与 Android 应用生成：
+Xu 0.12.4 可生成面向 ARM64 iOS 真机、iOS 模拟器与 Android 的应用项目。
 
 ```sh
 xu build app/ --phone --target ios-simulator-arm64 --bundle-id org.example.app -o build/ios
@@ -185,9 +185,8 @@ xu build app/ --phone --target android-arm64 --bundle-id org.example.app -o buil
 
 生成目录包含平台构建脚本和已编译的 Xu 原生应用对象。`#ui/phone` 提供触摸热区、底部导航、
 自适应页面骨架、卡片列表、深浅主题与底部弹层。UI 通过系统 WebView 中的
-本地 Canvas 绘制 Draw 帧；完整原生 IME 与桌面服务尚未适配。依赖、签名和能力范围见
+本地 Canvas 绘制 Draw 帧，并支持通过系统输入法输入文本。依赖、签名和能力范围见
 [Phone 使用说明](src/ui/host/phone/README.md)及[手机界面示例](examples/phone_gallery/README.md)。
-此能力需要新的开发版工具链，原始 0.12.3 正式二进制不包含该功能。
 
 ---
 
