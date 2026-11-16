@@ -102,6 +102,9 @@ struct Lw {
     dyn_ids []int
     dyn_found []int
     block_depth int
+    // Set while lowering the body of a clone glue function, so its own
+    // type is cloned inline once instead of calling itself.
+    in_clone_glue bool
 }
 
 // Hook result for "this feature does not lower the node".
@@ -140,7 +143,8 @@ fn lw_new(name string, label string, fi int, tgt_os int, tgt_arch int) Lw {
         ldrop_flag: []int{},
         dyn_ids: []int{},
         dyn_found: []int{},
-        block_depth: 0
+        block_depth: 0,
+        in_clone_glue: false
     }
 }
 
@@ -938,10 +942,14 @@ fn (w $&Lw) needs_drop(tp &types.TypedProgram, ty int) bool {
     if types.is_array_type(ty) {
         << tp.arrays[types.array_index(ty)].fixed_len == 0
     }
-    // Maps and interface boxes are one-word values that own_val and
-    // clone_into copy by word, so two holders can share one record. They
-    // are not dropped automatically until every copy is a move or a deep
-    // clone; dropping them here frees a record another holder still uses.
+    // A map owns its record, keys and values; copies are deep clones
+    // (clone_into) and moves transfer the handle.
+    if types.is_map_type(ty) {
+        << true
+    }
+    // Interface boxes are one-word values that are still copied by word in
+    // places, so two holders can share one box: they are not dropped
+    // automatically.
     if types.is_enum_type(ty) {
         if !is_wide(tp, ty) { << false }
         ei := types.enum_index(ty)
@@ -1168,7 +1176,7 @@ fn (w &Lw) builtin_fresh(p &parser.Parser, tp &types.TypedProgram, e int) bool {
     if k != ast.NK_CALL && k != ast.NK_METHOD_CALL {
         << false
     }
-    if code == -75 || code == -76 || code == -88 {
+    if code == -75 || code == -76 || code == -87 || code == -88 {
         << true
     }
     if intrin_wide_name(code).len > 0 {
@@ -1183,9 +1191,21 @@ fn (w $&Lw) own_val(p &parser.Parser, tp &types.TypedProgram, e int, v int, ty i
     if !w.needs_drop(tp, ty) || w.transfer_safe(p, tp, e) {
         << v
     }
+    << w.clone_value(tp, v, ty)
+}
+
+// Deep copy of value v of type ty: an address for wide values, the value
+// itself for one-word owners such as maps.
+fn (w $&Lw) clone_value(tp &types.TypedProgram, v int, ty int) int {
     out := w.scratch(tp, ty)
-    w.clone_into(tp, out, v, ty)
-    << out
+    if is_wide(tp, ty) {
+        w.clone_into(tp, out, v, ty)
+        << out
+    }
+    src := w.scratch_words(1)
+    w.store_ptr(src, 0, v, 8)
+    w.clone_into(tp, out, src, ty)
+    << w.load_ptr(out, 0, 8)
 }
 
 fn (w $&Lw) own_str(p &parser.Parser, tp &types.TypedProgram, e int, v int) int {
@@ -1227,7 +1247,10 @@ fn (w $&Lw) lower_ident(p &parser.Parser, tp &types.TypedProgram, n int) int {
             } else {
                 out := w.scratch(tp, ty)
                 w.clone_into(tp, out, w.local_addr(slot), ty)
-                << out
+                if is_wide(tp, ty) {
+                    << out
+                }
+                << w.load_ptr(out, 0, width_of(tp, ty))
             }
         }
         if is_wide(tp, ty) {
@@ -1457,11 +1480,14 @@ fn (w $&Lw) lower_slice(p &parser.Parser, tp &types.TypedProgram, n int) int {
 fn (w $&Lw) lower_clone(p &parser.Parser, tp &types.TypedProgram, n int) int {
     ty := tp.deref(tp.type_of(n))
     if !is_wide(tp, ty) {
+        $v := w.lower_expr(p, tp, n)
         if w.expr_is_ref(p, tp, n) {
-            ptr := w.lower_expr(p, tp, n)
-            << w.load_ptr(ptr, 0, width_of(tp, ty))
+            v = w.load_ptr(v, 0, width_of(tp, ty))
         }
-        << w.lower_expr(p, tp, n)
+        if w.needs_drop(tp, ty) {
+            << w.clone_value(tp, v, ty)
+        }
+        << v
     }
     src := w.base_addr(p, tp, n)
     out := w.scratch(tp, ty)
@@ -1479,6 +1505,18 @@ fn (w $&Lw) clone_into(tp &types.TypedProgram, dst int, src int, ty int) {
         w.call_core("bytes_new", &args)
         <<
     }
+    // Containers of owners clone through a glue function, so a recursive
+    // type (a struct holding an array of itself) stays finite.
+    if !w.in_clone_glue && w.uses_clone_glue(tp, ty) {
+        args := [dst, src]
+        w.call(clone_glue_label(ty), &args)
+        <<
+    }
+    w.in_clone_glue = false
+    if types.is_map_type(ty) {
+        w.map_clone_into(tp, dst, src, ty)
+        <<
+    }
     if types.is_array_type(ty) && tp.arrays[types.array_index(ty)].fixed_len == 0 {
         ety := tp.elem_of(ty)
         $args := []int{}
@@ -1488,7 +1526,7 @@ fn (w $&Lw) clone_into(tp &types.TypedProgram, dst int, src int, ty int) {
         args.push(w.load_ptr(src, 8, 8))
         args.push(w.konst(tp.size_of(ety)))
         w.call_core("slice_slice", &args)
-        if is_wide(tp, ety) {
+        if w.needs_drop(tp, ety) {
             w.clone_elems(tp, dst, ety)
         }
         <<
@@ -1502,7 +1540,7 @@ fn (w $&Lw) clone_into(tp &types.TypedProgram, dst int, src int, ty int) {
         si := types.struct_index(ty)
         for i in 0:tp.structs[si].fields.len {
             fty := tp.structs[si].fields[i].ty
-            if fty == 3 || types.is_array_type(fty) || types.is_struct_type(fty) || types.is_enum_type(fty) {
+            if w.needs_drop(tp, fty) {
                 off := tp.structs[si].fields[i].offset
                 fd := w.bin(BIN_ADD, dst, w.konst(off))
                 fs := w.bin(BIN_ADD, src, w.konst(off))
@@ -1531,7 +1569,11 @@ fn (w $&Lw) clone_elems(tp &types.TypedProgram, d int, ety int) {
     ea := w.bin(BIN_ADD, data, w.bin(BIN_MUL, iv2, w.konst(esize)))
     tmp := w.scratch(tp, ety)
     w.clone_into(tp, tmp, ea, ety)
-    w.copy_mem(ea, tmp, esize)
+    if is_wide(tp, ety) {
+        w.copy_mem(ea, tmp, esize)
+    } else {
+        w.store_ptr(ea, 0, w.load_ptr(tmp, 0, 8), 8)
+    }
     w.store_local(i, 0, w.bin(BIN_ADD, iv2, w.konst(1)))
     w.jump(cond_b)
     w.f.active_bb = done_b
@@ -2471,6 +2513,10 @@ fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, 
                 w.f.local_names[incoming[i]] = tfn.local_names[i] + ""
             }
             w.f.param_locals.push(incoming[i])
+            // A one-word owner (a map) passed by value belongs to the callee.
+            if !types.is_ref_type(ty) && w.needs_drop(tp, ty) {
+                w.own_declare(tp, i)
+            }
         }
     }
     if debug && w.f.label == "_xu_main" {
@@ -2506,7 +2552,9 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
     // body calls its label, so unused library code is never required to
     // be lowerable.
     resource_types := resource_drop_types(tp)
-    $by_label := label_index_new(tp.fns.len * 2 + resource_types.len * 2 + 16)
+    clone_types := clone_glue_types(tp)
+    nglue := resource_types.len + clone_types.len
+    $by_label := label_index_new(tp.fns.len * 2 + nglue * 2 + 16)
     for fi in 0:tp.fns.len {
         if tp.fns[fi].is_template || tp.fns[fi].is_extern || tp.fns[fi].decl < 0 {
             ->
@@ -2518,8 +2566,12 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
         label := resource_drop_label(resource_types[ri])
         by_label.put(&label, tp.fns.len * 2 + ri)
     }
+    for ci in 0:clone_types.len {
+        label := clone_glue_label(clone_types[ci])
+        by_label.put(&label, tp.fns.len * 2 + resource_types.len + ci)
+    }
     $queued := []bool{}
-    for fi in 0:tp.fns.len * 2 + resource_types.len {
+    for fi in 0:tp.fns.len * 2 + nglue {
         queued.push(false)
     }
     $queue := []int{}
@@ -2565,7 +2617,9 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
         fi := queue[qi]
         qi += 1
         $f := mfn_new("", "")
-        if fi >= tp.fns.len * 2 {
+        if fi >= tp.fns.len * 2 + resource_types.len {
+            f = lower_clone_glue(tp, clone_types[fi - tp.fns.len * 2 - resource_types.len], tgt_os, tgt_arch, &core_names, &core_labels)
+        } else if fi >= tp.fns.len * 2 {
             f = lower_resource_drop(tp, resource_types[fi - tp.fns.len * 2], tgt_os, tgt_arch, &core_names, &core_labels)
         } else {
             f = lower_queued(p, tp, fi, tgt_os, tgt_arch, debug, &core_names, &core_labels, $&errs)
