@@ -1,0 +1,221 @@
+@runtime/core
+// C FFI runtime: symbol resolution and the C call.
+//
+// A C call goes through a call block that compiler-generated code fills
+// from its ABI classification (codegen emits the matching register loader
+// as pseudo system call -6):
+//   words 0..7    integer argument registers (arm64 x0-x7; x64 SysV rdi,
+//                 rsi, rdx, rcx, r8, r9; Win64 rcx, rdx, r8, r9)
+//   words 8..15   floating argument registers (d0-d7 / xmm0-xmm7)
+//   word 16       bytes of stack arguments (a multiple of 16)
+//   word 17       address of the stack argument words
+//   word 18       arm64 x8 (indirect result); x64 al (vector registers used)
+//   words 19, 20  integer results (x0, x1 / rax, rdx)
+//   words 21..24  floating results (d0-d3 / xmm0, xmm1)
+// Symbols are resolved with the platform loader (dlopen/dlsym imported by
+// the executable on Unix; LoadLibraryA/GetProcAddress on Windows) on first
+// use and cached per extern.
+
+const FFI_BLOCK_WORDS = 25
+const G_FFI_CACHE = 13
+const G_FFI_CAP = 14
+// 1 once a C symbol was resolved: stdio buffers are flushed at exit.
+const G_FFI_USED = 15
+
+pub fn ffi_call(fp int, block int) {
+    rt_syscall(-6, fp, block, 0, 0, 0, 0)
+}
+
+// Calls fp(a, b) with two integer arguments; returns the integer result.
+fn ffi_call2(fp int, a int, b int) int {
+    blk := alloc(FFI_BLOCK_WORDS * 8)
+    rt_store(blk, 8, a)
+    rt_store(blk + 8, 8, b)
+    ffi_call(fp, blk)
+    r := rt_load(blk + 19 * 8, 8)
+    free(blk)
+    << r
+}
+
+fn ffi_fatal(msg string) {
+    write_fd(2, str_ptr(&msg), msg.len)
+    exit_process(1)
+}
+
+// Loader entry points: dlopen, dlsym, dlerror (Unix executables that use
+// the FFI import them; 0 in a static executable).
+fn ffi_loader(i int) int {
+    got := rt_syscall(-7, 0, 0, 0, 0, 0, 0)
+    if got == 0 { << 0 }
+    << rt_load(got + i * 8, 8)
+}
+
+fn ffi_cstr_len(p int) int {
+    $n := 0
+    while rt_load(p + n, 1) != 0 { n += 1 }
+    << n
+}
+
+fn ffi_cstr_text(p int) string {
+    if p == 0 { << "" }
+    n := ffi_cstr_len(p)
+    $s := ""
+    for i in 0:n { s.push_str(string_from_byte(rt_load(p + i, 1))) }
+    << s
+}
+
+fn ffi_open_lib(name string) int {
+    c := host_cstr(str_ptr_desc(&name))
+    $h := 0
+    if host_win() {
+        h = win_call(W_LOAD_LIBRARY, c, 0, 0, 0, 0, 0)
+    } else {
+        dlopen := ffi_loader(0)
+        if dlopen == 0 { ffi_fatal("xu: C libraries need a dynamically linked executable\n") }
+        // RTLD_NOW | RTLD_GLOBAL (Linux 0x102, macOS 0x0a)
+        $flags := 258
+        if xu_target_os() == OS_MACOS { flags = 10 }
+        h = ffi_call2(dlopen, c, flags)
+    }
+    free(c)
+    << h
+}
+
+fn str_ptr_desc(s &string) int {
+    << rt_addr(s)
+}
+
+fn ffi_has_dot(name &string) bool {
+    for i in 0:name.len {
+        if name[i] == 46 || name[i] == 47 || name[i] == 92 { << true }
+    }
+    << false
+}
+
+// Library spellings tried for a link name: as written when it has a dot or
+// a path; otherwise the platform's conventional file names.
+fn ffi_lib_candidates(name &string) []string {
+    $out := []string{}
+    if ffi_has_dot(name) {
+        out.push(*name + "")
+        << out
+    }
+    os := xu_target_os()
+    if host_win() {
+        out.push(*name + ".dll")
+        out.push("lib" + *name + ".dll")
+    } else if os == OS_MACOS {
+        out.push("lib" + *name + ".dylib")
+        out.push("/usr/lib/lib" + *name + ".dylib")
+        out.push("/opt/homebrew/lib/lib" + *name + ".dylib")
+        out.push("/usr/local/lib/lib" + *name + ".dylib")
+        out.push("/System/Library/Frameworks/" + *name + ".framework/" + *name)
+        out.push("/Library/Frameworks/" + *name + ".framework/" + *name)
+    } else {
+        out.push("lib" + *name + ".so")
+        for v in 0:10 { out.push("lib" + *name + ".so." + str(v)) }
+    }
+    << out
+}
+
+fn ffi_dlsym(h int, sym int) int {
+    if host_win() {
+        << win_call(W_GET_PROC_ADDRESS, h, sym, 0, 0, 0, 0)
+    }
+    dlsym := ffi_loader(1)
+    if dlsym == 0 { ffi_fatal("xu: C symbols need a dynamically linked executable\n") }
+    << ffi_call2(dlsym, h, sym)
+}
+
+// Address of C symbol sym (NUL-terminated), searched in libs (comma
+// separated link names, possibly empty), cached in slot idx.
+pub fn ffi_sym(idx int, sym int, libs int) int {
+    $cache := gword(G_FFI_CACHE)
+    if cache != 0 && idx < gword(G_FFI_CAP) {
+        f := rt_load(cache + idx * 8, 8)
+        if f != 0 { << f }
+    }
+    if cache == 0 || idx >= gword(G_FFI_CAP) {
+        $cap := 64
+        while cap <= idx { cap = cap * 2 }
+        grown := alloc(cap * 8)
+        mem_zero(grown, cap * 8)
+        if cache != 0 {
+            mem_copy(grown, cache, gword(G_FFI_CAP) * 8)
+            free(cache)
+        }
+        set_gword(G_FFI_CACHE, grown)
+        set_gword(G_FFI_CAP, cap)
+        cache = grown
+    }
+    $f := 0
+    lib_text := ffi_cstr_text(libs)
+    $start := 0
+    $tried := ""
+    for i in 0:lib_text.len + 1 {
+        if f == 0 && (i == lib_text.len || lib_text[i] == 44) {
+            if i > start {
+                name := lib_text[start:i]
+                cands := ffi_lib_candidates(&name)
+                $h := 0
+                for ci in 0:cands.len {
+                    if h == 0 { h = ffi_open_lib(cands[ci] + "") }
+                }
+                if h != 0 { f = ffi_dlsym(h, sym) }
+                if h == 0 { tried.push_str(" " + name + "(not found)") }
+            }
+            start = i + 1
+        }
+    }
+    if f == 0 && lib_text.len == 0 {
+        $deflt := 0
+        if xu_target_os() == OS_MACOS { deflt = -2 }
+        if host_win() {
+            // The process image, then the C runtime.
+            f = ffi_dlsym(win_call(W_LOAD_LIBRARY, 0, 0, 0, 0, 0, 0), sym)
+            if f == 0 {
+                crt := "msvcrt.dll"
+                f = ffi_dlsym(ffi_open_lib(crt), sym)
+            }
+        } else {
+            f = ffi_dlsym(deflt, sym)
+        }
+    }
+    if f == 0 {
+        ffi_fatal("xu: cannot resolve C symbol " + ffi_cstr_text(sym) + tried + "\n")
+    }
+    rt_store(cache + idx * 8, 8, f)
+    set_gword(G_FFI_USED, 1)
+    << f
+}
+
+// Flush C stdio at process exit (Xu exits with the raw system call).
+pub fn ffi_flush() {
+    if gword(G_FFI_USED) == 0 { << }
+    set_gword(G_FFI_USED, 0)
+    name := "fflush"
+    c := host_cstr(rt_addr(&name))
+    $f := 0
+    if host_win() {
+        crt := "msvcrt.dll"
+        f = ffi_dlsym(ffi_open_lib(crt), c)
+    } else {
+        $deflt := 0
+        if xu_target_os() == OS_MACOS { deflt = -2 }
+        f = ffi_dlsym(deflt, c)
+    }
+    free(c)
+    if f != 0 { ffi_call2(f, 0, 0) }
+}
+
+// NUL-terminated heap copy of the string with descriptor d (freed with free).
+pub fn ffi_cstr(d int) int {
+    << host_cstr(d)
+}
+
+// out (a string descriptor) = copy of the C string p; NULL gives "".
+pub fn ffi_string_from(out int, p int) {
+    $n := 0
+    if p != 0 { n = ffi_cstr_len(p) }
+    bytes_new(out, p, n)
+}
