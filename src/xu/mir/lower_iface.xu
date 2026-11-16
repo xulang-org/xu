@@ -10,10 +10,15 @@
 // is therefore a valid interface word for the same struct.
 //
 // `as` on a mismatching type id panics (the checker has no `or` form for it).
+//
+// When the payload is a heap box the type id word also has DYN_BOXED set;
+// the box counts its holders (BOX_HDR) and type tests ignore the bit.
 
 #xu/ast
 #xu/parser
 #xu/types
+const DYN_BOXED = 1099511627776
+const DYN_TID_MASK = 1099511627775
 
 fn is_dyn_box_type(t int) bool {
     << types.is_temp_type(t) || types.is_any_type(t)
@@ -38,6 +43,17 @@ fn (w $&Lw) iface_box(p &parser.Parser, tp &types.TypedProgram, n int) int {
         if !is_wide(tp, ty) {
             v = w.load_ptr(v, 0, width_of(tp, ty))
         }
+        // The box owns a copy of a borrowed value.
+        if w.needs_drop(tp, ty) && !types.is_interface_type(ty) {
+            v = w.clone_value(tp, v, ty)
+        }
+    } else if types.is_interface_type(ty) {
+        // The temp shares the interface box unless the source moves out.
+        if !w.transfer_safe(p, tp, n) {
+            w.box_retain(v)
+        }
+    } else {
+        v = w.own_val(p, tp, n, v, ty)
     }
     << w.dyn_pack(tp, v, ty)
 }
@@ -51,7 +67,7 @@ fn (w $&Lw) dyn_pack(tp &types.TypedProgram, v int, ty int) int {
         done_b := w.new_block()
         w.branch(v, some_b, done_b)
         w.f.active_bb = some_b
-        w.store_ptr(out, 0, w.load_ptr(v, 0, 8), 8)
+        w.store_ptr(out, 0, w.bin(BIN_OR, w.load_ptr(v, 0, 8), w.konst(DYN_BOXED)), 8)
         w.store_ptr(out, 8, w.bin(BIN_ADD, v, w.konst(BOX_HDR)), 8)
         w.jump(done_b)
         w.f.active_bb = done_b
@@ -77,6 +93,7 @@ fn (w $&Lw) dyn_pack(tp &types.TypedProgram, v int, ty int) int {
     if sz > 0 {
         w.copy_mem(payload, v, sz)
     }
+    w.store_ptr(out, 0, w.konst(tid | DYN_BOXED), 8)
     w.store_ptr(out, 8, payload, 8)
     << out
 }
@@ -89,7 +106,7 @@ fn (w $&Lw) dyn_type_test(p &parser.Parser, tp &types.TypedProgram, n int) int {
     d := w.base_addr(p, tp, a)
     tid := tp.local_of(n)
     tag := w.load_ptr(d, 0, 8)
-    hit := w.bin(BIN_EQ, tag, w.konst(tid))
+    hit := w.bin(BIN_EQ, w.bin(BIN_AND, tag, w.konst(DYN_TID_MASK)), w.konst(tid))
     if p.nodes[n].kind == ast.NK_TYPE_IS {
         << hit
     }
@@ -105,7 +122,55 @@ fn (w $&Lw) dyn_type_test(p &parser.Parser, tp &types.TypedProgram, n int) int {
         w.clone_into(tp, out, payload, ty)
         << out
     }
-    << payload
+    // `as` consumes a temp. The sole holder takes the value out of the box
+    // and frees the box; a shared box keeps its value and the taker gets a
+    // copy.
+    if p.nodes[a].kind == ast.NK_IDENT && tp.local_of(a) >= 0 && w.owns(tp.local_of(a)) {
+        w.mark_moved(tp.local_of(a))
+    }
+    out := w.scratch(tp, ty)
+    bslot := w.new_local(1, 1, "dbx")
+    w.store_local(bslot, 0, w.bin(BIN_SUB, payload, w.konst(BOX_HDR)))
+    shared_b := w.new_block()
+    sole_b := w.new_block()
+    done_b := w.new_block()
+    w.branch(w.load_ptr(w.load_local(bslot, 0), BOX_RC, 8), shared_b, sole_b)
+    w.f.active_bb = shared_b
+    w.clone_into(tp, out, w.bin(BIN_ADD, w.load_local(bslot, 0), w.konst(BOX_HDR)), ty)
+    b := w.load_local(bslot, 0)
+    w.store_ptr(b, BOX_RC, w.bin(BIN_SUB, w.load_ptr(b, BOX_RC, 8), w.konst(1)), 8)
+    w.jump(done_b)
+    w.f.active_bb = sole_b
+    w.copy_mem(out, w.bin(BIN_ADD, w.load_local(bslot, 0), w.konst(BOX_HDR)), tp.size_of(ty))
+    $fargs := []int{}
+    fargs.push(w.load_local(bslot, 0))
+    w.call_core("free_owned", &fargs)
+    w.jump(done_b)
+    w.f.active_bb = done_b
+    << out
+}
+
+// Drop the temp/any value at address d: give up its box, if any.
+fn (w $&Lw) dyn_drop(tp &types.TypedProgram, d int) {
+    own_b := w.new_block()
+    done_b := w.new_block()
+    w.branch(w.bin(BIN_AND, w.load_ptr(d, 0, 8), w.konst(DYN_BOXED)), own_b, done_b)
+    w.f.active_bb = own_b
+    w.box_release(tp, w.bin(BIN_SUB, w.load_ptr(d, 8, 8), w.konst(BOX_HDR)))
+    w.jump(done_b)
+    w.f.active_bb = done_b
+}
+
+// dst = copy of the temp/any value at src, sharing its box.
+fn (w $&Lw) dyn_clone_into(dst int, src int) {
+    w.copy_mem(dst, src, 16)
+    own_b := w.new_block()
+    done_b := w.new_block()
+    w.branch(w.bin(BIN_AND, w.load_ptr(src, 0, 8), w.konst(DYN_BOXED)), own_b, done_b)
+    w.f.active_bb = own_b
+    w.box_retain(w.bin(BIN_SUB, w.load_ptr(src, 8, 8), w.konst(BOX_HDR)))
+    w.jump(done_b)
+    w.f.active_bb = done_b
 }
 
 // Fail the program with "type assert failed" unless hit is set.
