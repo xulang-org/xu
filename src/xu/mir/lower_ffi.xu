@@ -6,7 +6,9 @@
 // through the per-extern cache (core.ffi_sym) and calls core.ffi_call,
 // which the backend implements as a register loader. Supported ABIs:
 // AAPCS64 (Linux, and Apple's packed stack arguments and all-stack
-// variadics) and x86-64 System V (Linux, macOS).
+// variadics), x86-64 System V (Linux, macOS) and Win64 (one register or
+// stack slot per argument by position; aggregates of 1, 2, 4 or 8 bytes by
+// value, others by reference).
 //
 // Values cross as Xu stores them: integers fully extended in a word, f32
 // as single bits, c_ptr as an address, @repr("C") structs in their C
@@ -34,13 +36,17 @@ struct FfiCc {
     emit bool
     apple bool
     x64 bool
+    win bool
+    npos int
 }
 
 fn ffi_cc_new(tgt_os int, tgt_arch int, emit bool, blk int, stk int) FfiCc {
     $x64 := tgt_arch == 1
+    win := x64 && tgt_os == 2
     $max := 8
     if x64 { max = 6 }
-    << FfiCc{ngr: 0, nfr: 0, nstack: 0, max_gr: max, blk: blk, stk: stk, emit: emit, apple: tgt_os == 0 && !x64, x64: x64}
+    if win { max = 4 }
+    << FfiCc{ngr: 0, nfr: 0, nstack: 0, max_gr: max, blk: blk, stk: stk, emit: emit, apple: tgt_os == 0 && !x64, x64: x64, win: win, npos: 0}
 }
 
 fn ffi_align(n int, a int) int {
@@ -86,6 +92,15 @@ fn (w $&Lw) ffi_gr(cc $&FfiCc, v int) {
 // An integer argument; on the stack it takes `width` bytes (Apple arm64
 // packs narrow stack arguments by their natural size).
 fn (w $&Lw) ffi_gr_w(cc $&FfiCc, v int, width int) {
+    if cc.win {
+        if cc.npos < 4 {
+            if cc.emit { w.store_ptr(cc.blk, cc.npos * 8, v, 8) }
+        } else {
+            w.ffi_stack_word(cc, v, 8)
+        }
+        cc.npos += 1
+        <<
+    }
     if cc.ngr < cc.max_gr {
         if cc.emit { w.store_ptr(cc.blk, cc.ngr * 8, v, 8) }
         cc.ngr += 1
@@ -95,6 +110,15 @@ fn (w $&Lw) ffi_gr_w(cc $&FfiCc, v int, width int) {
 }
 
 fn (w $&Lw) ffi_fr(cc $&FfiCc, v int, width int) {
+    if cc.win {
+        if cc.npos < 4 {
+            if cc.emit { w.store_ptr(cc.blk, FB_FPR + cc.npos * 8, v, width) }
+        } else {
+            w.ffi_stack_word(cc, v, width)
+        }
+        cc.npos += 1
+        <<
+    }
     if cc.nfr < 8 {
         if cc.emit { w.store_ptr(cc.blk, FB_FPR + cc.nfr * 8, v, width) }
         cc.nfr += 1
@@ -146,6 +170,11 @@ fn (w $&Lw) ffi_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, v int, vararg bo
         }
         if vararg && cc.apple {
             w.ffi_stack_word(cc, fv, 8)
+        } else if vararg && cc.win {
+            // Win64 variadics: the value in both the integer and the vector
+            // register of its slot.
+            if cc.npos < 4 && cc.emit { w.store_ptr(cc.blk, FB_FPR + cc.npos * 8, fv, 8) }
+            w.ffi_gr_w(cc, fv, 8)
         } else {
             w.ffi_fr(cc, fv, width)
         }
@@ -161,6 +190,26 @@ fn (w $&Lw) ffi_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, v int, vararg bo
 fn (w $&Lw) ffi_struct_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, addr int) {
     size := tp.size_of(ty)
     al := struct_align(tp, ty)
+    if cc.win {
+        if size == 1 || size == 2 || size == 4 || size == 8 {
+            $word := w.konst(0)
+            if cc.emit {
+                tmp := w.scratch_words(1)
+                w.zero_mem(tmp, 8)
+                w.copy_mem(tmp, addr, size)
+                word = w.load_ptr(tmp, 0, 8)
+            }
+            w.ffi_gr(cc, word)
+            <<
+        }
+        $copy := addr
+        if cc.emit {
+            copy = w.scratch_words((size + 7) / 8)
+            w.copy_mem(copy, addr, size)
+        }
+        w.ffi_gr(cc, copy)
+        <<
+    }
     if cc.x64 {
         if size > 16 {
             w.ffi_stack_mem(cc, addr, size, al)
@@ -307,7 +356,7 @@ fn (w $&Lw) ffi_str_ptr(s string) int {
 
 // Call node n of extern "C" function fi (ffi = its NK_FFI node).
 fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi int, ffi int) int {
-    if w.tgt_os == 2 || (w.tgt_arch != 0 && w.tgt_arch != 1) {
+    if (w.tgt_arch != 0 && w.tgt_arch != 1) || (w.tgt_os == 2 && w.tgt_arch != 1) {
         w.fail(p, n, "extern \"C\" calls are not supported on this target yet")
         << w.konst(0)
     }
@@ -360,10 +409,17 @@ fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi i
     }
     rty := tp.fns[fi].ret
     ret_cstr := parts.len > 0 && parts[0] == "cstr"
-    sret := rty != 0 && !ret_cstr && types.is_struct_type(rty) && tp.size_of(rty) > 16
+    $sret := rty != 0 && !ret_cstr && types.is_struct_type(rty) && tp.size_of(rty) > 16
+    if w.tgt_os == 2 && rty != 0 && !ret_cstr && types.is_struct_type(rty) {
+        rsz := tp.size_of(rty)
+        sret = rsz != 1 && rsz != 2 && rsz != 4 && rsz != 8
+    }
     // Pass 1 sizes the stack area; pass 2 fills the block.
     $probe := ffi_cc_new(w.tgt_os, w.tgt_arch, false, 0, 0)
-    if sret && w.tgt_arch == 1 { probe.ngr = 1 }
+    if sret && w.tgt_arch == 1 {
+        probe.ngr = 1
+        probe.npos = 1
+    }
     for i in first:vals.len {
         w.ffi_arg(tp, $&probe, tys[i], vals[i], i >= fixed)
     }
@@ -425,6 +481,10 @@ fn (w $&Lw) ffi_result(tp &types.TypedProgram, rty int, ret_cstr bool, sret bool
     if types.is_struct_type(rty) {
         if sret { << out }
         size := tp.size_of(rty)
+        if w.tgt_os == 2 {
+            w.copy_mem(out, w.bin(BIN_ADD, blk, w.konst(FB_RET)), size)
+            << out
+        }
         if w.tgt_arch == 1 {
             $cls := []bool{}
             w.ffi_x64_classes(tp, rty, $&cls)
@@ -535,6 +595,22 @@ fn lower_ffi_adapter(tp &types.TypedProgram, fi int, label &string, tgt_os int, 
 
 // Read one incoming C scalar of Xu type ty (callee side of ffi_arg).
 fn (w $&Lw) ffi_take(tp &types.TypedProgram, cc $&FfiCc, ty int) int {
+    if cc.win {
+        pos := cc.npos
+        cc.npos += 1
+        $width := 8
+        if ty == 14 { width = 4 }
+        $raw := 0
+        if pos < 4 {
+            if types.is_float_type(ty) { << w.load_ptr(cc.blk, FB_FPR + pos * 8, width) }
+            raw = w.load_ptr(cc.blk, pos * 8, 8)
+        } else {
+            if types.is_float_type(ty) { << w.load_ptr(cc.stk, (pos - 4) * 8, width) }
+            raw = w.load_ptr(cc.stk, (pos - 4) * 8, 8)
+        }
+        if ty == 2 { << w.bin(BIN_NE, w.bin(BIN_AND, raw, w.konst(255)), w.konst(0)) }
+        << w.wrap_int(raw, ty)
+    }
     if types.is_float_type(ty) {
         $width := 8
         if ty == 14 { width = 4 }
