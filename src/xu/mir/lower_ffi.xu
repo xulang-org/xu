@@ -1,0 +1,570 @@
+@xu/mir
+// C FFI calls (extern "C" functions).
+//
+// A call site fills a runtime/core call block (see core ffi.xu) from a
+// compile-time classification of the C arguments, resolves the symbol
+// through the per-extern cache (core.ffi_sym) and calls core.ffi_call,
+// which the backend implements as a register loader. Supported ABIs:
+// AAPCS64 (Linux, and Apple's packed stack arguments and all-stack
+// variadics) and x86-64 System V (Linux, macOS).
+//
+// Values cross as Xu stores them: integers fully extended in a word, f32
+// as single bits, c_ptr as an address, @repr("C") structs in their C
+// layout, &T / &[]T as the address of the value / the first element.
+// `cstr` arguments are NUL-terminated heap copies freed after the call.
+
+#xu/ast
+#xu/parser
+#xu/types
+
+const FB_FPR = 64
+const FB_NSTACK = 128
+const FB_STACK = 136
+const FB_X8 = 144
+const FB_RET = 152
+const FB_FRET = 168
+
+struct FfiCc {
+    ngr int
+    nfr int
+    nstack int
+    max_gr int
+    blk int
+    stk int
+    emit bool
+    apple bool
+    x64 bool
+}
+
+fn ffi_cc_new(tgt_os int, tgt_arch int, emit bool, blk int, stk int) FfiCc {
+    $x64 := tgt_arch == 1
+    $max := 8
+    if x64 { max = 6 }
+    << FfiCc{ngr: 0, nfr: 0, nstack: 0, max_gr: max, blk: blk, stk: stk, emit: emit, apple: tgt_os == 0 && !x64, x64: x64}
+}
+
+fn ffi_align(n int, a int) int {
+    << (n + a - 1) / a * a
+}
+
+// Scalar leaves of a C aggregate: byte offsets and Xu types.
+fn ffi_leaves(tp &types.TypedProgram, ty int, base int, offs $&[]int, tys $&[]int) {
+    if types.is_struct_type(ty) {
+        si := types.struct_index(ty)
+        for i in 0:tp.structs[si].fields.len {
+            ffi_leaves(tp, tp.structs[si].fields[i].ty, base + tp.structs[si].fields[i].offset, offs, tys)
+        }
+        <<
+    }
+    if types.is_array_type(ty) {
+        ai := types.array_index(ty)
+        for i in 0:tp.arrays[ai].fixed_len {
+            ffi_leaves(tp, tp.arrays[ai].elem_ty, base + i * tp.arrays[ai].elem_bytes, offs, tys)
+        }
+        <<
+    }
+    offs.push(base)
+    tys.push(ty)
+}
+
+// Homogeneous floating aggregate: member count (1..4), else 0.
+fn ffi_hfa(tp &types.TypedProgram, ty int) int {
+    $offs := []int{}
+    $tys := []int{}
+    ffi_leaves(tp, ty, 0, $&offs, $&tys)
+    if tys.len < 1 || tys.len > 4 || !types.is_float_type(tys[0]) { << 0 }
+    for i in 0:tys.len {
+        if tys[i] != tys[0] { << 0 }
+    }
+    << tys.len
+}
+
+fn (w $&Lw) ffi_gr(cc $&FfiCc, v int) {
+    if cc.ngr < cc.max_gr {
+        if cc.emit { w.store_ptr(cc.blk, cc.ngr * 8, v, 8) }
+        cc.ngr += 1
+        <<
+    }
+    w.ffi_stack_word(cc, v, 8)
+}
+
+fn (w $&Lw) ffi_fr(cc $&FfiCc, v int, width int) {
+    if cc.nfr < 8 {
+        if cc.emit { w.store_ptr(cc.blk, FB_FPR + cc.nfr * 8, v, width) }
+        cc.nfr += 1
+        <<
+    }
+    w.ffi_stack_word(cc, v, width)
+}
+
+// A scalar of `width` bytes on the stack: Apple arm64 packs by natural
+// alignment; the other ABIs use 8-byte slots.
+fn (w $&Lw) ffi_stack_word(cc $&FfiCc, v int, width int) {
+    $size := 8
+    if cc.apple { size = width }
+    cc.nstack = ffi_align(cc.nstack, size)
+    if cc.emit { w.store_ptr(cc.stk, cc.nstack, v, width) }
+    cc.nstack += size
+}
+
+fn (w $&Lw) ffi_stack_mem(cc $&FfiCc, src int, size int, align int) {
+    $a := align
+    if !cc.apple && a < 8 { a = 8 }
+    cc.nstack = ffi_align(cc.nstack, a)
+    if cc.emit { w.copy_mem(w.bin(BIN_ADD, cc.stk, w.konst(cc.nstack)), src, size) }
+    $sz := size
+    if !cc.apple { sz = ffi_align(size, 8) }
+    cc.nstack += sz
+}
+
+fn struct_align(tp &types.TypedProgram, ty int) int {
+    << tp.structs[types.struct_index(ty)].align
+}
+
+// One C argument of Xu type ty with MIR value v (a word, or the address of
+// a struct). vararg: in the variadic tail.
+fn (w $&Lw) ffi_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, v int, vararg bool) {
+    if types.is_struct_type(ty) {
+        w.ffi_struct_arg(tp, cc, ty, v)
+        <<
+    }
+    if types.is_float_type(ty) {
+        $fv := v
+        $width := 8
+        if ty == 14 {
+            if vararg {
+                if cc.emit { fv = w.float_un(UN_F32_LOAD, v) }
+            } else {
+                width = 4
+            }
+        }
+        if vararg && cc.apple {
+            w.ffi_stack_word(cc, fv, 8)
+        } else {
+            w.ffi_fr(cc, fv, width)
+        }
+        <<
+    }
+    if vararg && cc.apple {
+        w.ffi_stack_word(cc, v, 8)
+        <<
+    }
+    w.ffi_gr(cc, v)
+}
+
+fn (w $&Lw) ffi_struct_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, addr int) {
+    size := tp.size_of(ty)
+    al := struct_align(tp, ty)
+    if cc.x64 {
+        if size > 16 {
+            w.ffi_stack_mem(cc, addr, size, al)
+            <<
+        }
+        $cls := []bool{}
+        w.ffi_x64_classes(tp, ty, $&cls)
+        $ng := 0
+        $nf := 0
+        for i in 0:cls.len {
+            if cls[i] { nf += 1 } else { ng += 1 }
+        }
+        if cc.ngr + ng > cc.max_gr || cc.nfr + nf > 8 {
+            w.ffi_stack_mem(cc, addr, size, al)
+            <<
+        }
+        $tmp := addr
+        if cc.emit {
+            tmp = w.scratch_words(2)
+            w.zero_mem(tmp, 16)
+            w.copy_mem(tmp, addr, size)
+        }
+        for i in 0:cls.len {
+            $word := w.konst(0)
+            if cc.emit { word = w.load_ptr(tmp, i * 8, 8) }
+            if cls[i] { w.ffi_fr(cc, word, 8) } else { w.ffi_gr(cc, word) }
+        }
+        <<
+    }
+    hfa := ffi_hfa(tp, ty)
+    if hfa > 0 {
+        if cc.nfr + hfa <= 8 {
+            $offs := []int{}
+            $tys := []int{}
+            ffi_leaves(tp, ty, 0, $&offs, $&tys)
+            $width := 8
+            if tys[0] == 14 { width = 4 }
+            for i in 0:hfa {
+                $word := w.konst(0)
+                if cc.emit { word = w.load_ptr(addr, offs[i], width) }
+                w.ffi_fr(cc, word, width)
+            }
+            <<
+        }
+        cc.nfr = 8
+        w.ffi_stack_mem(cc, addr, size, al)
+        <<
+    }
+    if size > 16 {
+        // Passed by reference to a caller-owned copy.
+        $copy := addr
+        if cc.emit {
+            copy = w.scratch_words((size + 7) / 8)
+            w.copy_mem(copy, addr, size)
+        }
+        w.ffi_gr(cc, copy)
+        <<
+    }
+    words := (size + 7) / 8
+    if cc.ngr + words > cc.max_gr {
+        cc.ngr = cc.max_gr
+        w.ffi_stack_mem(cc, addr, size, al)
+        <<
+    }
+    $tmp := addr
+    if cc.emit {
+        tmp = w.scratch_words(2)
+        w.zero_mem(tmp, 16)
+        w.copy_mem(tmp, addr, size)
+    }
+    for i in 0:words {
+        $word := w.konst(0)
+        if cc.emit { word = w.load_ptr(tmp, i * 8, 8) }
+        w.ffi_gr(cc, word)
+    }
+}
+
+// x86-64 SysV eightbyte classes of a struct of at most 16 bytes: true =
+// SSE (every leaf in the eightbyte is floating), false = INTEGER.
+fn (w &Lw) ffi_x64_classes(tp &types.TypedProgram, ty int, cls $&[]bool) {
+    size := tp.size_of(ty)
+    $offs := []int{}
+    $tys := []int{}
+    ffi_leaves(tp, ty, 0, $&offs, $&tys)
+    for e in 0:(size + 7) / 8 {
+        $sse := true
+        for i in 0:offs.len {
+            if offs[i] >= e * 8 && offs[i] < e * 8 + 8 && !types.is_float_type(tys[i]) { sse = false }
+        }
+        cls.push(sse)
+    }
+}
+
+// Value of a C argument expression for an extern parameter of type pty.
+// Records cstr copies and fresh strings to release after the call.
+fn (w $&Lw) ffi_arg_value(p &parser.Parser, tp &types.TypedProgram, arg int, pty int, cstr bool, frees $&[]int, fresh $&[]int, fresh_nodes $&[]int) int {
+    if cstr || (pty == 3) {
+        $d := 0
+        if tp.type_of(arg) == 3 {
+            d = w.lower_expr(p, tp, arg)
+            if w.fresh_str(p, tp, arg) {
+                fresh.push(d)
+                fresh_nodes.push(arg)
+            }
+        } else {
+            d = w.lower_arg(p, tp, arg, pty)
+        }
+        $args := []int{}
+        args.push(d)
+        c := w.call_core("ffi_cstr", &args)
+        frees.push(c)
+        << c
+    }
+    if types.is_fn_type(pty) {
+        fi := tp.call_of(arg)
+        if p.nodes[arg].kind != ast.NK_IDENT || tp.local_of(arg) >= 0 || fi < 0 || fi >= tp.fns.len || fn_throws(tp, fi) {
+            w.fail(p, arg, "a C callback must name a non-throwing top-level function")
+            << w.konst(0)
+        }
+        << w.fn_addr(FFI_THUNK_PREFIX + tp.fns[fi].label)
+    }
+    if types.is_ref_type(pty) {
+        a := w.lower_arg(p, tp, arg, pty)
+        inner := tp.deref(pty)
+        if types.is_array_type(inner) && fixed_len_of(tp, inner) == 0 {
+            << w.load_ptr(a, 0, 8)
+        }
+        << a
+    }
+    if types.is_struct_type(pty) {
+        << w.lower_expr(p, tp, arg)
+    }
+    << w.lower_arg(p, tp, arg, pty)
+}
+
+fn (w $&Lw) ffi_str_ptr(s string) int {
+    t := w.new_temp()
+    $ins := minstr_new(MI_STR_CONST)
+    ins.a = t
+    ins.sval = s + string_from_byte(0)
+    w.emit(ins)
+    << t
+}
+
+// Call node n of extern "C" function fi (ffi = its NK_FFI node).
+fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi int, ffi int) int {
+    if w.tgt_os == 2 || (w.tgt_arch != 0 && w.tgt_arch != 1) {
+        w.fail(p, n, "extern \"C\" calls are not supported on this target yet")
+        << w.konst(0)
+    }
+    flags := p.nodes[ffi].ival
+    variadic := (flags & ast.FFI_VARIADIC) != 0
+    dynamic := (flags & ast.FFI_DYNAMIC) != 0
+    spells := p.nodes[ffi].sval2
+    // spells: "<ret>|<p1>|<p2>..." with "cstr" marking C strings.
+    $parts := []string{}
+    $start := 0
+    for i in 0:spells.len + 1 {
+        if i == spells.len || spells[i] == 124 {
+            parts.push(spells[start:i])
+            start = i + 1
+        }
+    }
+    $fixed := tp.fns[fi].params.len
+    if variadic { fixed -= 1 }
+    // Lower the arguments first, left to right.
+    $vals := []int{}
+    $tys := []int{}
+    $frees := []int{}
+    $fresh := []int{}
+    $fresh_nodes := []int{}
+    $arg := p.nodes[n].a
+    $ai := 0
+    while arg >= 0 {
+        $pty := 0
+        $cstr := false
+        if ai < fixed {
+            pty = tp.fns[fi].params[ai]
+            cstr = ai + 1 < parts.len && parts[ai + 1] == "cstr"
+        } else {
+            pty = tp.type_of(arg)
+            if types.is_ref_type(pty) && tp.deref(pty) == 3 { pty = 3 }
+        }
+        v := w.ffi_arg_value(p, tp, arg, pty, cstr, $&frees, $&fresh, $&fresh_nodes)
+        vals.push(v)
+        $cty := pty
+        if cstr || pty == 3 || types.is_ref_type(pty) || types.is_fn_type(pty) { cty = 6 }
+        tys.push(cty)
+        ai += 1
+        arg = p.nodes[arg].next
+    }
+    $first := 0
+    $fp := w.konst(0)
+    if dynamic {
+        fp = vals[0]
+        first = 1
+    }
+    rty := tp.fns[fi].ret
+    ret_cstr := parts.len > 0 && parts[0] == "cstr"
+    sret := rty != 0 && !ret_cstr && types.is_struct_type(rty) && tp.size_of(rty) > 16
+    // Pass 1 sizes the stack area; pass 2 fills the block.
+    $probe := ffi_cc_new(w.tgt_os, w.tgt_arch, false, 0, 0)
+    if sret && w.tgt_arch == 1 { probe.ngr = 1 }
+    for i in first:vals.len {
+        w.ffi_arg(tp, $&probe, tys[i], vals[i], i >= fixed)
+    }
+    blk := w.scratch_words(25)
+    w.zero_mem(blk, 200)
+    stack_bytes := ffi_align(probe.nstack, 16)
+    $stk := w.konst(0)
+    if stack_bytes > 0 { stk = w.scratch_words(stack_bytes / 8) }
+    $cc := ffi_cc_new(w.tgt_os, w.tgt_arch, true, blk, stk)
+    $out := -1
+    if rty != 0 && (types.is_struct_type(rty) || ret_cstr) { out = w.scratch(tp, rty) }
+    if sret {
+        if w.tgt_arch == 1 {
+            w.ffi_gr($&cc, out)
+        } else {
+            w.store_ptr(blk, FB_X8, out, 8)
+        }
+    }
+    for i in first:vals.len {
+        w.ffi_arg(tp, $&cc, tys[i], vals[i], i >= fixed)
+    }
+    w.store_ptr(blk, FB_NSTACK, w.konst(stack_bytes), 8)
+    w.store_ptr(blk, FB_STACK, stk, 8)
+    if w.tgt_arch == 1 { w.store_ptr(blk, FB_X8, w.konst(cc.nfr), 8) }
+    if !dynamic {
+        $libs := ""
+        meta := p.nodes[ffi].b
+        if meta >= 0 { libs = p.nodes[meta].sval + "" }
+        $sargs := []int{}
+        sargs.push(w.konst(fi))
+        sargs.push(w.ffi_str_ptr(p.nodes[ffi].sval + ""))
+        sargs.push(w.ffi_str_ptr(libs))
+        fp = w.call_core("ffi_sym", &sargs)
+    }
+    $cargs := []int{}
+    cargs.push(fp)
+    cargs.push(blk)
+    w.call_core("ffi_call", &cargs)
+    for i in 0:frees.len {
+        $fa := []int{}
+        fa.push(frees[i])
+        w.call_core("free", &fa)
+    }
+    for i in 0:fresh.len {
+        w.drop_fresh_str(p, tp, fresh_nodes[i], fresh[i])
+    }
+    << w.ffi_result(tp, rty, ret_cstr, sret, blk, out)
+}
+
+fn (w $&Lw) ffi_result(tp &types.TypedProgram, rty int, ret_cstr bool, sret bool, blk int, out int) int {
+    if rty == 0 { << w.konst(0) }
+    if ret_cstr {
+        $args := []int{}
+        args.push(out)
+        args.push(w.load_ptr(blk, FB_RET, 8))
+        w.call_core("ffi_string_from", &args)
+        << out
+    }
+    if types.is_struct_type(rty) {
+        if sret { << out }
+        size := tp.size_of(rty)
+        if w.tgt_arch == 1 {
+            $cls := []bool{}
+            w.ffi_x64_classes(tp, rty, $&cls)
+            $ng := 0
+            $nf := 0
+            tmp := w.scratch_words(2)
+            for i in 0:cls.len {
+                $word := 0
+                if cls[i] {
+                    word = w.load_ptr(blk, FB_FRET + nf * 8, 8)
+                    nf += 1
+                } else {
+                    word = w.load_ptr(blk, FB_RET + ng * 8, 8)
+                    ng += 1
+                }
+                w.store_ptr(tmp, i * 8, word, 8)
+            }
+            w.copy_mem(out, tmp, size)
+            << out
+        }
+        hfa := ffi_hfa(tp, rty)
+        if hfa > 0 {
+            $offs := []int{}
+            $tys := []int{}
+            ffi_leaves(tp, rty, 0, $&offs, $&tys)
+            $width := 8
+            if tys[0] == 14 { width = 4 }
+            for i in 0:hfa {
+                w.store_ptr(out, offs[i], w.load_ptr(blk, FB_FRET + i * 8, width), width)
+            }
+            << out
+        }
+        w.copy_mem(out, w.bin(BIN_ADD, blk, w.konst(FB_RET)), size)
+        << out
+    }
+    if rty == 4 { << w.load_ptr(blk, FB_FRET, 8) }
+    if rty == 14 { << w.load_ptr(blk, FB_FRET, 4) }
+    r := w.load_ptr(blk, FB_RET, 8)
+    // Narrow results: the callee leaves the upper bits unspecified.
+    if rty == 2 { << w.bin(BIN_NE, w.bin(BIN_AND, r, w.konst(255)), w.konst(0)) }
+    if rty == 8 { << w.wrap_int(r, 8) }
+    if rty == 7 || rty == 10 || rty == 11 || rty == 12 || rty == 9 { << w.wrap_int(r, rty) }
+    << r
+}
+
+// ===== C callbacks =====
+//
+// A named Xu function passed for an extern `fn(...)` parameter becomes the
+// address of a thunk: a C-ABI entry the backend emits per target function,
+// which saves the C callee-saved registers, spills the argument registers
+// into a call block and calls the adapter below, then returns the result
+// registers the adapter stored in the block. The C call has to come back on
+// the calling thread (the runtime state register is callee-saved in C).
+
+const FFI_THUNK_PREFIX = "__xu_ffi_thunk."
+const FFI_ADAPTER_PREFIX = "__xu_ffi_adapter."
+
+// Queue the adapter of thunk label `label` once; returns the target
+// function's queue key so it is lowered too.
+fn ffi_thunk_request(tp &types.TypedProgram, by_label &LabelIndex, label &string, tgt_os int, tgt_arch int, core_names &[]string, core_labels &[]string, out $&Mir) int {
+    target := label[FFI_THUNK_PREFIX.len:label.len]
+    fi := by_label.get(&target)
+    if fi < 0 { << -1 }
+    for i in 0:out.ffi_thunks.len {
+        if out.ffi_thunks[i] == *label { << fi }
+    }
+    adapter := FFI_ADAPTER_PREFIX + target
+    out.ffi_thunks.push(*label + "")
+    out.ffi_adapters.push(adapter + "")
+    out.fns.push(lower_ffi_adapter(tp, fi, &adapter, tgt_os, tgt_arch, core_names, core_labels))
+    << fi
+}
+
+// Adapter of Xu function fi: one incoming word, the call block address.
+fn lower_ffi_adapter(tp &types.TypedProgram, fi int, label &string, tgt_os int, tgt_arch int, core_names &[]string, core_labels &[]string) MFn {
+    $w := lw_new(tp.fns[fi].name + ".c", *label + "", fi, tgt_os, tgt_arch)
+    for i in 0:core_names.len {
+        w.core_names.push(core_names[i] + "")
+        w.core_labels.push(core_labels[i] + "")
+    }
+    w.f.ret = 0
+    w.f.blocks.push(mblock_new())
+    w.f.active_bb = 0
+    inb := w.new_local(1, 1, "blk")
+    w.f.nparams = w.f.locals.len
+    blk := w.load_local(inb, 0)
+    stk := w.load_ptr(blk, FB_STACK, 8)
+    $cc := ffi_cc_new(tgt_os, tgt_arch, true, blk, stk)
+    $args := []int{}
+    for i in 0:tp.fns[fi].params.len {
+        args.push(w.ffi_take(tp, $&cc, tp.fns[fi].params[i]))
+    }
+    r := w.call(tp.fns[fi].label, &args)
+    rty := tp.fns[fi].ret
+    if types.is_float_type(rty) {
+        $width := 8
+        if rty == 14 { width = 4 }
+        w.store_ptr(blk, FB_FRET, r, width)
+    } else if rty != 0 {
+        w.store_ptr(blk, FB_RET, r, 8)
+    }
+    w.ret(w.konst(0))
+    while w.lbyref.len < w.f.locals.len {
+        w.lbyref.push(false)
+    }
+    << mfn_copy(&w.f)
+}
+
+// Read one incoming C scalar of Xu type ty (callee side of ffi_arg).
+fn (w $&Lw) ffi_take(tp &types.TypedProgram, cc $&FfiCc, ty int) int {
+    if types.is_float_type(ty) {
+        $width := 8
+        if ty == 14 { width = 4 }
+        if cc.nfr < 8 {
+            cc.nfr += 1
+            << w.load_ptr(cc.blk, FB_FPR + (cc.nfr - 1) * 8, width)
+        }
+        << w.ffi_take_stack(cc, width)
+    }
+    $raw := 0
+    if cc.ngr < cc.max_gr {
+        cc.ngr += 1
+        raw = w.load_ptr(cc.blk, (cc.ngr - 1) * 8, 8)
+    } else {
+        $width := 8
+        sz := tp.size_of(ty)
+        if sz < 8 { width = sz }
+        raw = w.ffi_take_stack(cc, width)
+    }
+    // The C caller may leave the bits above a narrow value unspecified.
+    if ty == 2 { << w.bin(BIN_NE, w.bin(BIN_AND, raw, w.konst(255)), w.konst(0)) }
+    << w.wrap_int(raw, ty)
+}
+
+fn (w $&Lw) ffi_take_stack(cc $&FfiCc, width int) int {
+    $size := 8
+    if cc.apple { size = width }
+    cc.nstack = ffi_align(cc.nstack, size)
+    off := cc.nstack
+    cc.nstack += size
+    $wd := width
+    if wd == 1 || wd == 2 { wd = 0 - wd }
+    << w.load_ptr(cc.stk, off, wd)
+}
+
+fn ffi_is_thunk(label &string) bool {
+    if label.len <= FFI_THUNK_PREFIX.len { << false }
+    << label[0:FFI_THUNK_PREFIX.len] == FFI_THUNK_PREFIX
+}
