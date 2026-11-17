@@ -1,0 +1,525 @@
+@internal/sdl
+// Per-window event queue and SDL_FilterEvents callback (former events.h).
+// Input polling helpers that need extra SDL symbols live in input.xu.
+
+#ffi
+#math
+
+extern "C" fn sdl_get_window_from_event(fn_ptr c_ptr, event c_ptr) c_ptr = dynamic
+
+fn coordinate_bits(v f64) int {
+    << math.float64_bits(v)
+}
+
+fn finite_coord(v f64) bool {
+    << !math.is_nan(v) && !math.is_inf(v)
+}
+
+fn portable_modifiers(native int) int {
+    // SDL_Keymod bits -> portable bit indices 0..12 (events.h).
+    masks := [0x1, 0x2, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000, 0x4]
+    $result := 0
+    for i in 0:13 {
+        if (native & masks[i]) != 0 { result = result | (1 << i) }
+    }
+    << result
+}
+
+fn physical_key(native int) int {
+    if native >= 4 && native < EVENT_KEY_COUNT { << native }
+    << 0
+}
+
+fn logical_key(native int, physical int) int {
+    $named := 0
+    if (native & 0x40000000) != 0 {
+        named = physical_key(native & ~0x40000000)
+    } else if native == 0x20000001 {
+        named = 43
+    } else if native == 0x20000004 {
+        named = 227
+    } else if native == 0x20000005 {
+        named = 231
+    } else if native != 0 && (native < 32 || native == 127) {
+        named = physical
+    } else if native <= 0x10ffff && !(native >= 0xd800 && native <= 0xdfff) {
+        << native
+    }
+    if named != 0 { << 0x110000 + named }
+    << 0
+}
+
+fn cstr_to_string(p c_ptr) string {
+    unsafe {
+        if ffi.is_null(p) { << "" }
+        << ffi.string_from(p)
+    }
+}
+
+// Input blob at WR_INPUT: head, count, text_bytes, desync, buttons, modifiers,
+// x_bits, y_bits, keys[EVENT_KEY_COUNT], then EVENT_CAPACITY * event slots.
+const IN_HEAD = 0
+const IN_COUNT = 8
+const IN_TEXT_BYTES = 16
+const IN_DESYNC = 24
+const IN_BUTTONS = 32
+const IN_MODIFIERS = 40
+const IN_X = 48
+const IN_Y = 56
+const IN_KEYS = 64
+const IN_EVENTS = 296 // IN_KEYS + EVENT_KEY_COUNT
+const EV_STRIDE = 184 // 22 i64 words + text pointer
+
+fn input_base(w c_ptr) c_ptr {
+    unsafe { << ffi.offset(w, WR_INPUT) }
+}
+
+fn clear_window_events(w c_ptr) {
+    unsafe {
+        inp := input_base(w)
+        count := ffi.read_i64(inp, IN_COUNT)
+        head := ffi.read_i64(inp, IN_HEAD)
+        $i := 0
+        while i < count {
+            slot := event_slot(inp, (head + i) % EVENT_CAPACITY)
+            text := ffi.read_ptr(slot, 176)
+            if !ffi.is_null(text) { ffi.free(text) }
+            for b in 0:EV_STRIDE { ffi.write_u8(slot, b, u8(0)) }
+            i += 1
+        }
+        ffi.write_i64(inp, IN_HEAD, 0)
+        ffi.write_i64(inp, IN_COUNT, 0)
+        ffi.write_i64(inp, IN_TEXT_BYTES, 0)
+    }
+}
+
+fn event_slot(inp c_ptr, index int) c_ptr {
+    unsafe { << ffi.offset(inp, IN_EVENTS + index * EV_STRIDE) }
+}
+
+fn filter_window_events(userdata c_ptr, event c_ptr) i32 {
+    << filter_window_events_impl(userdata, event)
+}
+
+fn filter_window_events_impl(_userdata c_ptr, event c_ptr) i32 {
+    unsafe {
+        if ffi.is_null(event) { << 1 }
+        ty := ffi.read_u32(event, 0)
+        if ty == u32(SDL_EVENT_QUIT) {
+            ts := ffi.read_i64(event, 8)
+            $w := windows_head()
+            while !ffi.is_null(w) {
+                if ffi.read_i64(w, WR_CLOSED) == 0 {
+                    if ffi.read_i64(w, WR_CLOSE_REQ) == 0 {
+                        collect_close(w, ts)
+                    }
+                    ffi.write_i64(w, WR_CLOSE_REQ, 1)
+                }
+                w = ffi.read_ptr(w, WR_NEXT)
+            }
+            << 1
+        }
+        if ty >= u32(SDL_EVENT_USER) { << 1 }
+        target := sdl_get_window_from_event(sym(SYM_GET_WINDOW_FROM_EVENT), event)
+        $w := windows_head()
+        while !ffi.is_null(w) {
+            window_event := ty >= u32(SDL_EVENT_WINDOW_FIRST) && ty <= u32(SDL_EVENT_WINDOW_LAST)
+            finger_event := ty >= u32(SDL_EVENT_FINGER_DOWN) && ty <= u32(SDL_EVENT_FINGER_CANCELED)
+            event_id := ffi.read_u32(w, WR_EVENT_ID)
+            $window_id := ffi.read_u32(event, 16)
+            if finger_event {
+                window_id = ffi.read_u32(event, 52)
+            }
+            native := ffi.read_ptr(w, WR_NATIVE)
+            if (window_event && event_id == window_id) || (finger_event && event_id == window_id) || (!ffi.is_null(target) && target == native) {
+                if ffi.read_i64(w, WR_CLOSED) == 0 {
+                    if ty == u32(SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                        ffi.write_i64(w, WR_CLOSE_REQ, 1)
+                    }
+                    collect_event(w, event)
+                }
+                << 0
+            }
+            w = ffi.read_ptr(w, WR_NEXT)
+        }
+        << 1
+    }
+}
+
+fn collect_simple(w c_ptr, kind int) {
+    collect_simple_ts(w, kind, 0)
+}
+
+fn collect_close(w c_ptr, ts int) {
+    collect_simple_ts(w, W_CLOSE, ts)
+}
+
+fn collect_simple_ts(w c_ptr, kind int, ts int) {
+    unsafe {
+        inp := input_base(w)
+        if ffi.read_i64(inp, IN_DESYNC) != 0 { << }
+        id := ffi.read_i64(w, WR_ID)
+        if kind == W_CLOSE || kind == W_FOCUS_LOST {
+            clear_input_keys(inp)
+        }
+        queue_words(inp, id, kind, ts, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "")
+    }
+}
+
+fn clear_input_keys(inp c_ptr) {
+    unsafe {
+        for i in 0:EVENT_KEY_COUNT { ffi.write_u8(inp, IN_KEYS + i, u8(0)) }
+        ffi.write_i64(inp, IN_BUTTONS, 0)
+        ffi.write_i64(inp, IN_MODIFIERS, 0)
+        ffi.write_i64(inp, IN_X, 0)
+        ffi.write_i64(inp, IN_Y, 0)
+    }
+}
+
+fn collect_event(w c_ptr, event c_ptr) {
+    unsafe {
+        inp := input_base(w)
+        if ffi.read_i64(inp, IN_DESYNC) != 0 { << }
+        id := ffi.read_i64(w, WR_ID)
+        ty := ffi.read_u32(event, 0)
+        ts := ffi.read_i64(event, 8)
+        if ts < 0 {
+            reset_window_input(inp, id, RESET_INVALID)
+            <<
+        }
+        if ty == u32(SDL_EVENT_QUIT) || ty == u32(SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+            collect_simple_ts(w, W_CLOSE, ts)
+            <<
+        }
+        if ty == u32(SDL_EVENT_WINDOW_FOCUS_GAINED) {
+            collect_simple_ts(w, W_FOCUS_GAINED, ts)
+            <<
+        }
+        if ty == u32(SDL_EVENT_WINDOW_FOCUS_LOST) {
+            collect_simple_ts(w, W_FOCUS_LOST, ts)
+            <<
+        }
+        if ty == u32(SDL_EVENT_WINDOW_RESIZED) || ty == u32(SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+            $kind := W_RESIZED
+            if ty == u32(SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) { kind = W_PIXEL_SIZE }
+            d1 := int(ffi.read_i32(event, 20))
+            d2 := int(ffi.read_i32(event, 24))
+            queue_words(inp, id, kind, ts, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, d1, d2, 0, 0, 0, 0, "")
+            <<
+        }
+        if ty == u32(SDL_EVENT_KEY_DOWN) || ty == u32(SDL_EVENT_KEY_UP) {
+            $kind := W_KEY_DOWN
+            if ty == u32(SDL_EVENT_KEY_UP) { kind = W_KEY_UP }
+            which := int(ffi.read_u32(event, 20))
+            phys := physical_key(int(ffi.read_i32(event, 24)))
+            key := int(ffi.read_u32(event, 28))
+            mods := portable_modifiers(int(ffi.read_u16(event, 32)))
+            repeat := int(ffi.read_u8(event, 37))
+            logical := logical_key(key, phys)
+            if repeat != 0 && (phys == 0 || ffi.read_u8(inp, IN_KEYS + phys) == u8(0)) { << }
+            if phys != 0 {
+                $down := u8(0)
+                if kind == W_KEY_DOWN { down = u8(1) }
+                ffi.write_u8(inp, IN_KEYS + phys, down)
+            }
+            ffi.write_i64(inp, IN_MODIFIERS, mods)
+            queue_words(inp, id, kind, ts, which, phys, logical, mods, repeat, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "")
+            <<
+        }
+        if ty == u32(SDL_EVENT_MOUSE_MOTION) {
+            which := int(ffi.read_u32(event, 20))
+            state := int(ffi.read_u32(event, 24))
+            x := f64(ffi.read_f32(event, 28))
+            y := f64(ffi.read_f32(event, 32))
+            xrel := f64(ffi.read_f32(event, 36))
+            yrel := f64(ffi.read_f32(event, 40))
+            if !finite_coord(x) || !finite_coord(y) || !finite_coord(xrel) || !finite_coord(yrel) {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            mods := ffi.read_i64(inp, IN_MODIFIERS)
+            ffi.write_i64(inp, IN_X, coordinate_bits(x))
+            ffi.write_i64(inp, IN_Y, coordinate_bits(y))
+            ffi.write_i64(inp, IN_BUTTONS, state)
+            queue_words(inp, id, W_POINTER_MOVE, ts, which, 0, 0, mods, 0, 0, 0,
+                coordinate_bits(x), coordinate_bits(y), coordinate_bits(xrel), coordinate_bits(yrel),
+                0, 0, 0, 0, state, 0, "")
+            <<
+        }
+        if ty == u32(SDL_EVENT_MOUSE_BUTTON_DOWN) || ty == u32(SDL_EVENT_MOUSE_BUTTON_UP) {
+            button := int(ffi.read_u8(event, 24))
+            if button < 1 || button > 32 {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            $kind := W_POINTER_DOWN
+            if ty == u32(SDL_EVENT_MOUSE_BUTTON_UP) { kind = W_POINTER_UP }
+            which := int(ffi.read_u32(event, 20))
+            clicks := int(ffi.read_u8(event, 26))
+            x := f64(ffi.read_f32(event, 28))
+            y := f64(ffi.read_f32(event, 32))
+            if !finite_coord(x) || !finite_coord(y) {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            $buttons := ffi.read_i64(inp, IN_BUTTONS)
+            if kind == W_POINTER_DOWN {
+                buttons = buttons | (1 << (button - 1))
+            } else {
+                buttons = buttons & ~(1 << (button - 1))
+            }
+            mods := ffi.read_i64(inp, IN_MODIFIERS)
+            ffi.write_i64(inp, IN_BUTTONS, buttons)
+            ffi.write_i64(inp, IN_X, coordinate_bits(x))
+            ffi.write_i64(inp, IN_Y, coordinate_bits(y))
+            queue_words(inp, id, kind, ts, which, 0, 0, mods, 0, button, clicks,
+                coordinate_bits(x), coordinate_bits(y), 0, 0, 0, 0, 0, 0, buttons, 0, "")
+            <<
+        }
+        if ty == u32(SDL_EVENT_MOUSE_WHEEL) {
+            direction := int(ffi.read_i32(event, 32))
+            if direction < 0 || direction > 1 {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            $sign := 1.0
+            if direction != 0 { sign = 0.0 - 1.0 }
+            which := int(ffi.read_u32(event, 20))
+            wx := f64(ffi.read_f32(event, 24))
+            wy := f64(ffi.read_f32(event, 28))
+            mx := f64(ffi.read_f32(event, 36))
+            my := f64(ffi.read_f32(event, 40))
+            dx := sign * wx
+            dy := sign * wy
+            if !finite_coord(mx) || !finite_coord(my) || !finite_coord(dx) || !finite_coord(dy) {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            mods := ffi.read_i64(inp, IN_MODIFIERS)
+            ffi.write_i64(inp, IN_X, coordinate_bits(mx))
+            ffi.write_i64(inp, IN_Y, coordinate_bits(my))
+            queue_words(inp, id, W_WHEEL, ts, which, 0, 0, mods, 0, 0, 0,
+                coordinate_bits(mx), coordinate_bits(my), coordinate_bits(dx), coordinate_bits(dy),
+                0, 0, 0, 0, 0, 0, "")
+            <<
+        }
+        if ty == u32(SDL_EVENT_TEXT_INPUT) {
+            text := cstr_to_string(ffi.read_ptr(event, 24))
+            if ffi.is_null(ffi.read_ptr(event, 24)) {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            queue_words(inp, id, W_TEXT, ts, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, text)
+            <<
+        }
+        if ty == u32(SDL_EVENT_TEXT_EDITING) {
+            text_ptr := ffi.read_ptr(event, 24)
+            if ffi.is_null(text_ptr) {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            text := cstr_to_string(text_ptr)
+            start := int(ffi.read_i32(event, 32))
+            length := int(ffi.read_i32(event, 36))
+            if start < -1 || length < -1 {
+                reset_window_input(inp, id, RESET_INVALID)
+                <<
+            }
+            queue_words(inp, id, W_EDIT, ts, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, start, length, 0, 0, text)
+            <<
+        }
+        if ty == u32(SDL_EVENT_FINGER_DOWN) || ty == u32(SDL_EVENT_FINGER_UP) || ty == u32(SDL_EVENT_FINGER_MOTION) {
+            $kind := W_TOUCH_MOVE
+            if ty == u32(SDL_EVENT_FINGER_DOWN) { kind = W_TOUCH_DOWN }
+            else if ty == u32(SDL_EVENT_FINGER_UP) { kind = W_TOUCH_UP }
+            touch_id := int(ffi.read_i64(event, 16))
+            raw_finger := int(ffi.read_i64(event, 24)) & 0x7fffffffffffffff
+            $finger := raw_finger
+            if finger <= 0 { finger = 1 }
+            buf := ffi.calloc(8)
+            $ww := 1
+            $hh := 1
+            if !ffi.is_null(buf) {
+                native := ffi.read_ptr(w, WR_NATIVE)
+                if sdl_get_window_size(sym(SYM_GET_WINDOW_SIZE), native, buf, ffi.offset(buf, 4)) != u8(0) {
+                    ww = int(ffi.read_i32(buf, 0))
+                    hh = int(ffi.read_i32(buf, 4))
+                }
+                ffi.free(buf)
+            }
+            if ww <= 0 { ww = 1 }
+            if hh <= 0 { hh = 1 }
+            fx := math.float32_from_bits(int(ffi.read_u32(event, 32)))
+            fy := math.float32_from_bits(int(ffi.read_u32(event, 36)))
+            fdx := math.float32_from_bits(int(ffi.read_u32(event, 40)))
+            fdy := math.float32_from_bits(int(ffi.read_u32(event, 44)))
+            px := fx * f64(ww)
+            py := fy * f64(hh)
+            pdx := fdx * f64(ww)
+            pdy := fdy * f64(hh)
+            queue_words(inp, id, kind, ts, touch_id, 0, 0, 0, 0, 0, 0, coordinate_bits(px), coordinate_bits(py), coordinate_bits(pdx), coordinate_bits(pdy), 0, 0, 0, 0, 0, finger, "")
+            <<
+        }
+    }
+}
+
+// words[0]=kind [1]=id [2]=ts [3..17]=fields [18]=text_len [19]=buttons/state [20]=reset reason [21]=touch_id
+fn queue_words(inp c_ptr, id int, kind int, ts int, a3 int, a4 int, a5 int, a6 int, a7 int, a8 int, a9 int, a10 int, a11 int, a12 int, a13 int, a14 int, a15 int, a16 int, a17 int, a19 int, a21 int, text string) {
+    unsafe {
+        if ffi.read_i64(inp, IN_DESYNC) != 0 { << }
+        count := ffi.read_i64(inp, IN_COUNT)
+        if count == EVENT_CAPACITY {
+            reset_window_input(inp, id, RESET_QUEUE)
+            <<
+        }
+        $text_ptr := ffi.null()
+        $text_len := 0
+        if text.len > 0 {
+            if text.len > EVENT_TEXT_LIMIT || text.len > EVENT_TEXT_BUDGET - ffi.read_i64(inp, IN_TEXT_BYTES) {
+                reset_window_input(inp, id, RESET_TEXT)
+                <<
+            }
+            text_ptr = ffi.cstring(&text)
+            if ffi.is_null(text_ptr) {
+                reset_window_input(inp, id, RESET_ALLOC)
+                <<
+            }
+            text_len = text.len
+        }
+        head := ffi.read_i64(inp, IN_HEAD)
+        slot := event_slot(inp, (head + count) % EVENT_CAPACITY)
+        ffi.write_i64(slot, 0, kind)
+        ffi.write_i64(slot, 8, id)
+        ffi.write_i64(slot, 16, ts)
+        ffi.write_i64(slot, 24, a3)
+        ffi.write_i64(slot, 32, a4)
+        ffi.write_i64(slot, 40, a5)
+        ffi.write_i64(slot, 48, a6)
+        ffi.write_i64(slot, 56, a7)
+        ffi.write_i64(slot, 64, a8)
+        ffi.write_i64(slot, 72, a9)
+        ffi.write_i64(slot, 80, a10)
+        ffi.write_i64(slot, 88, a11)
+        ffi.write_i64(slot, 96, a12)
+        ffi.write_i64(slot, 104, a13)
+        ffi.write_i64(slot, 112, a14)
+        ffi.write_i64(slot, 120, a15)
+        ffi.write_i64(slot, 128, a16)
+        ffi.write_i64(slot, 136, a17)
+        ffi.write_i64(slot, 144, text_len)
+        ffi.write_i64(slot, 152, a19)
+        ffi.write_i64(slot, 160, 0)
+        ffi.write_i64(slot, 168, a21)
+        ffi.write_ptr(slot, 176, text_ptr)
+        ffi.write_i64(inp, IN_TEXT_BYTES, ffi.read_i64(inp, IN_TEXT_BYTES) + text_len)
+        ffi.write_i64(inp, IN_COUNT, count + 1)
+    }
+}
+
+fn reset_window_input(inp c_ptr, id int, reason int) {
+    // Clear queued events then emit a single RESET.
+    unsafe {
+        // Manual clear without needing the window pointer.
+        count := ffi.read_i64(inp, IN_COUNT)
+        head := ffi.read_i64(inp, IN_HEAD)
+        $i := 0
+        while i < count {
+            slot := event_slot(inp, (head + i) % EVENT_CAPACITY)
+            text := ffi.read_ptr(slot, 176)
+            if !ffi.is_null(text) { ffi.free(text) }
+            for b in 0:EV_STRIDE { ffi.write_u8(slot, b, u8(0)) }
+            i += 1
+        }
+        ffi.write_i64(inp, IN_HEAD, 0)
+        ffi.write_i64(inp, IN_COUNT, 0)
+        ffi.write_i64(inp, IN_TEXT_BYTES, 0)
+        clear_input_keys(inp)
+        ffi.write_i64(inp, IN_DESYNC, 1)
+        slot := event_slot(inp, 0)
+        ffi.write_i64(slot, 0, W_RESET)
+        ffi.write_i64(slot, 8, id)
+        ffi.write_i64(slot, 160, reason)
+        ffi.write_i64(slot, 168, 0)
+        ffi.write_i64(inp, IN_COUNT, 1)
+    }
+}
+
+pub fn window_event_peek(id int, output $&[]int) int {
+    w := window_record(id)
+    if ffi.is_null(w) { << -1 }
+    if output.len != EVENT_WORDS { << fail("event requires 22 output words") }
+    unsafe {
+        for i in 0:EVENT_WORDS { output[i] = 0 }
+        inp := input_base(w)
+        if ffi.read_i64(inp, IN_COUNT) == 0 { << 0 }
+        head := ffi.read_i64(inp, IN_HEAD)
+        slot := event_slot(inp, head)
+        for i in 0:EVENT_WORDS { output[i] = ffi.read_i64(slot, i * 8) }
+        << 1
+    }
+}
+
+pub fn window_event_read(id int, text $&[]u8) int {
+    w := window_record(id)
+    if ffi.is_null(w) { << -1 }
+    unsafe {
+        inp := input_base(w)
+        count := ffi.read_i64(inp, IN_COUNT)
+        if count == 0 { << fail("window event queue is empty") }
+        head := ffi.read_i64(inp, IN_HEAD)
+        slot := event_slot(inp, head)
+        length := ffi.read_i64(slot, 18 * 8)
+        if text.len != length { << fail("event text requires exact output size") }
+        src := ffi.read_ptr(slot, 176)
+        if length > 0 {
+            if ffi.is_null(src) { << fail("event text requires exact output size") }
+            for i in 0:length { text[i] = ffi.read_u8(src, i) }
+        }
+        if ffi.read_i64(slot, 0) == W_RESET { ffi.write_i64(inp, IN_DESYNC, 0) }
+        ffi.write_i64(inp, IN_TEXT_BYTES, ffi.read_i64(inp, IN_TEXT_BYTES) - length)
+        if !ffi.is_null(src) { ffi.free(src) }
+        for b in 0:EV_STRIDE { ffi.write_u8(slot, b, u8(0)) }
+        ffi.write_i64(inp, IN_HEAD, (head + 1) % EVENT_CAPACITY)
+        ffi.write_i64(inp, IN_COUNT, count - 1)
+        << 0
+    }
+}
+
+pub fn window_input_reset(id int) int {
+    w := window_record(id)
+    if ffi.is_null(w) { << -1 }
+    unsafe {
+        reset_window_input(input_base(w), id, RESET_INVALID)
+        << 0
+    }
+}
+
+pub fn window_event_count(id int) int {
+    w := window_record(id)
+    if ffi.is_null(w) { << -1 }
+    unsafe { << ffi.read_i64(input_base(w), IN_COUNT) }
+}
+
+pub fn window_key_down(id int, key int) int {
+    w := window_record(id)
+    if ffi.is_null(w) { << -1 }
+    if key < 0 || key >= EVENT_KEY_COUNT { << fail("physical key is outside the portable key range") }
+    unsafe {
+        if ffi.read_u8(input_base(w), IN_KEYS + key) != u8(0) { << 1 }
+        << 0
+    }
+}
+
+pub fn window_pointer(id int, output $&[]int) int {
+    w := window_record(id)
+    if ffi.is_null(w) { << -1 }
+    if output.len != 4 { << fail("pointer state requires four output words") }
+    unsafe {
+        inp := input_base(w)
+        output[0] = ffi.read_i64(inp, IN_X)
+        output[1] = ffi.read_i64(inp, IN_Y)
+        output[2] = ffi.read_i64(inp, IN_BUTTONS)
+        output[3] = ffi.read_i64(inp, IN_MODIFIERS)
+        << 0
+    }
+}
