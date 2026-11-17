@@ -1,0 +1,350 @@
+@internal/sdl
+// Process-wide SDL loader: library handle, resolved symbols, error text,
+// identity counter, and the window/device list heads. State lives in a
+// calloc'd blob hung from #ffi process slot 0 (Xu has no package globals).
+
+#ffi
+#os
+
+const SLOT_SDL = 0
+
+// Blob layout (bytes).
+const OFF_LIBRARY = 0
+const OFF_LOADED = 8
+const OFF_WINDOW_LOADED = 16
+const OFF_INPUT_LOADED = 24
+const OFF_NEXT_ID = 32
+const OFF_WINDOWS = 40
+const OFF_DEVICES = 48
+const OFF_ERROR = 56
+const ERROR_CAP = 1024
+const OFF_SYMS = 1080 // OFF_ERROR + ERROR_CAP
+const BLOB_SIZE = 1792 // OFF_SYMS + SYM_COUNT * 8 (89)
+
+extern "C" fn sdl_set_main_ready(fn_ptr c_ptr) = dynamic
+extern "C" fn sdl_is_main_thread(fn_ptr c_ptr) u8 = dynamic
+extern "C" fn sdl_init_subsystem(fn_ptr c_ptr, flags u32) u8 = dynamic
+extern "C" fn sdl_quit_subsystem(fn_ptr c_ptr, flags u32) = dynamic
+extern "C" fn sdl_get_error(fn_ptr c_ptr) c_ptr = dynamic
+
+fn blob() c_ptr {
+    unsafe {
+        $p := ffi.process_get(SLOT_SDL)
+        if !ffi.is_null(p) { << p }
+        p = ffi.calloc(BLOB_SIZE)
+        if ffi.is_null(p) { << ffi.null() }
+        ffi.write_i64(p, OFF_NEXT_ID, 1)
+        ffi.process_set(SLOT_SDL, p)
+        << p
+    }
+}
+
+fn fail(message string) int {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << -1 }
+        $n := message.len
+        if n >= ERROR_CAP { n = ERROR_CAP - 1 }
+        for i in 0:n { ffi.write_u8(p, OFF_ERROR + i, u8(message[i])) }
+        ffi.write_u8(p, OFF_ERROR + n, u8(0))
+        // Clear the rest so error_len stops at the first NUL.
+        for i in n + 1:ERROR_CAP { ffi.write_u8(p, OFF_ERROR + i, u8(0)) }
+    }
+    << -1
+}
+
+fn sdl_fail() int {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << -1 }
+        fn_ptr := sym(SYM_GET_ERROR)
+        if ffi.is_null(fn_ptr) { << fail("SDL_GetError unresolved") }
+        msg := ffi.string_from(sdl_get_error(fn_ptr))
+        << fail(msg)
+    }
+}
+
+fn sym(i int) c_ptr {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) || i < 0 || i >= SYM_COUNT { << ffi.null() }
+        << ffi.read_ptr(p, OFF_SYMS + i * 8)
+    }
+}
+
+fn set_sym(i int, v c_ptr) {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) || i < 0 || i >= SYM_COUNT { << }
+        ffi.write_ptr(p, OFF_SYMS + i * 8, v)
+    }
+}
+
+pub fn error_len() int {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << 0 }
+        $n := 0
+        while n < ERROR_CAP {
+            if ffi.read_u8(p, OFF_ERROR + n) == u8(0) { << n }
+            n += 1
+        }
+        << ERROR_CAP
+    }
+}
+
+pub fn error_byte(i int) int {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) || i < 0 { << 0 }
+        n := error_len()
+        if i >= n { << 0 }
+        << int(ffi.read_u8(p, OFF_ERROR + i))
+    }
+}
+
+fn identifier() int {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << fail("SDL state allocation failed") }
+        id := ffi.read_i64(p, OFF_NEXT_ID)
+        if id < 1 { << fail("SDL resource identity space exhausted") }
+        ffi.write_i64(p, OFF_NEXT_ID, id + 1)
+        << id
+    }
+}
+
+fn on_main() bool {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << false }
+        if ffi.read_i64(p, OFF_LOADED) != 0 {
+            fn_ptr := sym(SYM_IS_MAIN_THREAD)
+            if ffi.is_null(fn_ptr) {
+                fail("SDL operations require the application main thread")
+                << false
+            }
+            if sdl_is_main_thread(fn_ptr) == u8(0) {
+                fail("SDL operations require the application main thread")
+                << false
+            }
+            << true
+        }
+    }
+    if !host_is_main_thread() {
+        fail("SDL operations require the application main thread")
+        << false
+    }
+    << true
+}
+
+fn load_sdl() bool {
+    if !on_main() { << false }
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) {
+            fail("SDL state allocation failed")
+            << false
+        }
+        if ffi.read_i64(p, OFF_LOADED) != 0 { << true }
+        library := open_sdl_library()
+        if ffi.is_null(library) {
+            fail("SDL 3 runtime unavailable; install SDL3 or set XU_SDL_LIBRARY")
+            << false
+        }
+        for i in 0:5 {
+            name := sym_name(i)
+            f := ffi.dlsym(library, &name)
+            if ffi.is_null(f) {
+                fail("SDL 3 runtime is missing " + name)
+                ffi.dlclose(library)
+                << false
+            }
+            set_sym(i, f)
+        }
+        sdl_set_main_ready(sym(SYM_SET_MAIN_READY))
+        ffi.write_ptr(p, OFF_LIBRARY, library)
+        ffi.write_i64(p, OFF_LOADED, 1)
+        << true
+    }
+}
+
+fn open_sdl_library() c_ptr {
+    unsafe {
+        override := os.getenv("XU_SDL_LIBRARY")
+        if override.len > 0 {
+            << ffi.dlopen_local(&override)
+        }
+        os_code := xu_target_os()
+        if os_code == 0 {
+            names := ["libSDL3.dylib", "/opt/homebrew/lib/libSDL3.dylib", "/usr/local/lib/libSDL3.dylib"]
+            for i in 0:names.len {
+                n := names[i]
+                h := ffi.dlopen_local(&n)
+                if !ffi.is_null(h) { << h }
+            }
+        } else if os_code == 2 {
+            win := "SDL3.dll"
+            << ffi.dlopen_local(&win)
+        } else {
+            names := ["libSDL3.so.0", "libSDL3.so"]
+            for i in 0:names.len {
+                n := names[i]
+                h := ffi.dlopen_local(&n)
+                if !ffi.is_null(h) { << h }
+            }
+        }
+        << ffi.null()
+    }
+}
+
+fn load_window_syms() bool {
+    if !load_sdl() { << false }
+    unsafe {
+        p := blob()
+        if ffi.read_i64(p, OFF_WINDOW_LOADED) != 0 { << true }
+        library := ffi.read_ptr(p, OFF_LIBRARY)
+        for i in 5:19 {
+            name := sym_name(i)
+            f := ffi.dlsym(library, &name)
+            if ffi.is_null(f) {
+                fail("SDL runtime is missing " + name)
+                << false
+            }
+            set_sym(i, f)
+        }
+        ffi.write_i64(p, OFF_WINDOW_LOADED, 1)
+        << true
+    }
+}
+
+fn load_input_syms() bool {
+    if !load_window_syms() { << false }
+    unsafe {
+        p := blob()
+        if ffi.read_i64(p, OFF_INPUT_LOADED) != 0 { << true }
+        library := ffi.read_ptr(p, OFF_LIBRARY)
+        for i in 19:SYM_INPUT_END {
+            name := sym_name(i)
+            f := ffi.dlsym(library, &name)
+            if ffi.is_null(f) {
+                fail("SDL runtime is missing " + name)
+                << false
+            }
+            set_sym(i, f)
+        }
+        ffi.write_i64(p, OFF_INPUT_LOADED, 1)
+        << true
+    }
+}
+
+fn load_gpu_syms() bool {
+    if !load_sdl() { << false }
+    unsafe {
+        if !ffi.is_null(sym(SYM_CREATE_GPU_DEVICE)) { << true }
+        p := blob()
+        library := ffi.read_ptr(p, OFF_LIBRARY)
+        for i in SYM_CREATE_GPU_DEVICE:SYM_GPU_END {
+            name := sym_name(i)
+            f := ffi.dlsym(library, &name)
+            if ffi.is_null(f) {
+                fail("SDL 3 GPU runtime is missing " + name)
+                << false
+            }
+            set_sym(i, f)
+        }
+        << true
+    }
+}
+
+fn load_range_syms(from int, until int, _label string) bool {
+    unsafe {
+        if !ffi.is_null(sym(from)) { << true }
+        if !load_gpu_syms() { << false }
+        p := blob()
+        library := ffi.read_ptr(p, OFF_LIBRARY)
+        for i in from:until {
+            name := sym_name(i)
+            f := ffi.dlsym(library, &name)
+            if ffi.is_null(f) {
+                fail("SDL GPU runtime is missing " + name)
+                << false
+            }
+            set_sym(i, f)
+        }
+        << true
+    }
+}
+
+fn load_render_syms() bool { << load_range_syms(SYM_GPU_END, SYM_RENDER_END, "render") }
+fn load_compute_syms() bool { << load_range_syms(SYM_RENDER_END, SYM_COMPUTE_END, "compute") }
+fn load_surface_syms() bool {
+    unsafe {
+        if !ffi.is_null(sym(SYM_CLAIM_WINDOW_FOR_GPU_DEVICE)) { << true }
+        if !load_gpu_syms() { << false }
+        p := blob()
+        library := ffi.read_ptr(p, OFF_LIBRARY)
+        for i in SYM_COMPUTE_END:SYM_SURFACE_END {
+            name := sym_name(i)
+            f := ffi.dlsym(library, &name)
+            if ffi.is_null(f) {
+                fail("SDL runtime is missing " + name)
+                << false
+            }
+            set_sym(i, f)
+        }
+        << true
+    }
+}
+
+fn windows_head() c_ptr {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << ffi.null() }
+        << ffi.read_ptr(p, OFF_WINDOWS)
+    }
+}
+
+fn set_windows_head(h c_ptr) {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << }
+        ffi.write_ptr(p, OFF_WINDOWS, h)
+    }
+}
+
+fn devices_head() c_ptr {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << ffi.null() }
+        << ffi.read_ptr(p, OFF_DEVICES)
+    }
+}
+
+fn set_devices_head(h c_ptr) {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << }
+        ffi.write_ptr(p, OFF_DEVICES, h)
+    }
+}
+
+fn error_save() c_ptr {
+    unsafe {
+        p := blob()
+        if ffi.is_null(p) { << ffi.null() }
+        buf := ffi.malloc(ERROR_CAP)
+        if ffi.is_null(buf) { << ffi.null() }
+        ffi.memcpy(buf, ffi.offset(p, OFF_ERROR), ERROR_CAP)
+        << buf
+    }
+}
+
+fn error_restore(saved c_ptr) {
+    unsafe {
+        if ffi.is_null(saved) { << }
+        p := blob()
+        if !ffi.is_null(p) { ffi.memcpy(ffi.offset(p, OFF_ERROR), saved, ERROR_CAP) }
+        ffi.free(saved)
+    }
+}
