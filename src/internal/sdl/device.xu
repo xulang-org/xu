@@ -1,0 +1,654 @@
+@internal/sdl
+// GPU device, buffer and transfer path (former native.c GPU section).
+
+#ffi
+
+extern "C" fn sdl_create_gpu_device(fn_ptr c_ptr, formats u32, debug u8, driver c_ptr) c_ptr = dynamic
+extern "C" fn sdl_destroy_gpu_device(fn_ptr c_ptr, device c_ptr) = dynamic
+extern "C" fn sdl_get_gpu_device_driver(fn_ptr c_ptr, device c_ptr) c_ptr = dynamic
+extern "C" fn sdl_get_gpu_shader_formats(fn_ptr c_ptr, device c_ptr) u32 = dynamic
+extern "C" fn sdl_create_gpu_buffer(fn_ptr c_ptr, device c_ptr, info c_ptr) c_ptr = dynamic
+extern "C" fn sdl_release_gpu_buffer(fn_ptr c_ptr, device c_ptr, buffer c_ptr) = dynamic
+extern "C" fn sdl_create_gpu_transfer_buffer(fn_ptr c_ptr, device c_ptr, info c_ptr) c_ptr = dynamic
+extern "C" fn sdl_release_gpu_transfer_buffer(fn_ptr c_ptr, device c_ptr, buffer c_ptr) = dynamic
+extern "C" fn sdl_map_gpu_transfer_buffer(fn_ptr c_ptr, device c_ptr, buffer c_ptr, cycle u8) c_ptr = dynamic
+extern "C" fn sdl_unmap_gpu_transfer_buffer(fn_ptr c_ptr, device c_ptr, buffer c_ptr) = dynamic
+extern "C" fn sdl_acquire_gpu_command_buffer(fn_ptr c_ptr, device c_ptr) c_ptr = dynamic
+extern "C" fn sdl_cancel_gpu_command_buffer(fn_ptr c_ptr, command c_ptr) u8 = dynamic
+extern "C" fn sdl_begin_gpu_copy_pass(fn_ptr c_ptr, command c_ptr) c_ptr = dynamic
+extern "C" fn sdl_end_gpu_copy_pass(fn_ptr c_ptr, copy c_ptr) = dynamic
+extern "C" fn sdl_upload_to_gpu_buffer(fn_ptr c_ptr, copy c_ptr, src c_ptr, dst c_ptr, cycle u8) = dynamic
+extern "C" fn sdl_copy_gpu_buffer_to_buffer(fn_ptr c_ptr, copy c_ptr, src c_ptr, dst c_ptr, size u32, cycle u8) = dynamic
+extern "C" fn sdl_download_from_gpu_buffer(fn_ptr c_ptr, copy c_ptr, src c_ptr, dst c_ptr) = dynamic
+extern "C" fn sdl_submit_gpu_command_buffer_and_acquire_fence(fn_ptr c_ptr, command c_ptr) c_ptr = dynamic
+extern "C" fn sdl_query_gpu_fence(fn_ptr c_ptr, device c_ptr, fence c_ptr) u8 = dynamic
+extern "C" fn sdl_wait_for_gpu_fences(fn_ptr c_ptr, device c_ptr, wait_all u8, fences c_ptr, count u32) u8 = dynamic
+extern "C" fn sdl_release_gpu_fence(fn_ptr c_ptr, device c_ptr, fence c_ptr) = dynamic
+extern "C" fn sdl_wait_for_gpu_idle(fn_ptr c_ptr, device c_ptr) u8 = dynamic
+
+// Device record
+const D_ID = 0
+const D_GPU = 8
+const D_BUFFERS = 16
+const D_TRANSFERS = 24
+const D_RESOURCES = 32
+const D_ENCODERS = 40
+const D_SURFACES = 48
+const D_NEXT = 56
+const D_SIZE = 64
+
+// Buffer record
+const B_ID = 0
+const B_SIZE = 8
+const B_USAGE = 12
+const B_REFS = 16
+const B_CLOSED = 24
+const B_GPU = 32
+const B_NEXT = 40
+const B_BYTES = 48
+
+// Transfer record
+const T_ID = 0
+const T_SIZE = 8
+const T_DOWNLOAD = 16
+const T_COMPLETE = 24
+const T_STAGING = 32
+const T_FENCE = 40
+const T_NEXT = 48
+const T_BYTES = 56
+
+fn device_by_id(id int) c_ptr {
+    unsafe {
+        $d := devices_head()
+        while !ffi.is_null(d) {
+            if ffi.read_i64(d, D_ID) == id { << d }
+            d = ffi.read_ptr(d, D_NEXT)
+        }
+        << ffi.null()
+    }
+}
+
+fn device_record(id int) c_ptr {
+    if !on_main() { << ffi.null() }
+    d := device_by_id(id)
+    if ffi.is_null(d) { fail("closed or invalid GPU device") }
+    << d
+}
+
+fn buffer_record(d c_ptr, id int) c_ptr {
+    unsafe {
+        $b := ffi.read_ptr(d, D_BUFFERS)
+        while !ffi.is_null(b) {
+            if ffi.read_i64(b, B_ID) == id && ffi.read_i64(b, B_CLOSED) == 0 { << b }
+            b = ffi.read_ptr(b, B_NEXT)
+        }
+        fail("closed, foreign or invalid GPU buffer")
+        << ffi.null()
+    }
+}
+
+fn transfer_record(d c_ptr, id int) c_ptr {
+    unsafe {
+        $t := ffi.read_ptr(d, D_TRANSFERS)
+        while !ffi.is_null(t) {
+            if ffi.read_i64(t, T_ID) == id { << t }
+            t = ffi.read_ptr(t, T_NEXT)
+        }
+        fail("closed, foreign or invalid GPU submission")
+        << ffi.null()
+    }
+}
+
+fn region_ok(b c_ptr, offset int, size int) bool {
+    unsafe {
+        buf_size := int(ffi.read_u32(b, B_SIZE))
+        if offset < 0 || size <= 0 || offset > buf_size || size > buf_size - offset || (offset % 4) != 0 || (size % 4) != 0 {
+            fail("GPU transfer requires an in-bounds, positive, four-byte-aligned region")
+            << false
+        }
+        << true
+    }
+}
+
+fn free_transfer(d c_ptr, t c_ptr) {
+    unsafe {
+        gpu := ffi.read_ptr(d, D_GPU)
+        fence := ffi.read_ptr(t, T_FENCE)
+        staging := ffi.read_ptr(t, T_STAGING)
+        if !ffi.is_null(fence) { sdl_release_gpu_fence(sym(SYM_RELEASE_GPU_FENCE), gpu, fence) }
+        if !ffi.is_null(staging) { sdl_release_gpu_transfer_buffer(sym(SYM_RELEASE_GPU_TRANSFER_BUFFER), gpu, staging) }
+        ffi.free(t)
+    }
+}
+
+fn new_transfer(d c_ptr, size u32, staging bool, download bool) c_ptr {
+    unsafe {
+        t := ffi.calloc(T_BYTES)
+        if ffi.is_null(t) {
+            fail("GPU submission allocation failed")
+            << ffi.null()
+        }
+        id := identifier()
+        if id < 0 {
+            ffi.free(t)
+            << ffi.null()
+        }
+        ffi.write_i64(t, T_ID, id)
+        ffi.write_u32(t, T_SIZE, size)
+        if download { ffi.write_i64(t, T_DOWNLOAD, 1) }
+        if staging {
+            info := ffi.calloc(12)
+            if ffi.is_null(info) {
+                ffi.free(t)
+                fail("GPU submission allocation failed")
+                << ffi.null()
+            }
+            $usage := i32(0)
+            if download { usage = i32(1) }
+            ffi.write_i32(info, 0, usage)
+            ffi.write_u32(info, 4, size)
+            ffi.write_u32(info, 8, u32(0))
+            tb := sdl_create_gpu_transfer_buffer(sym(SYM_CREATE_GPU_TRANSFER_BUFFER), ffi.read_ptr(d, D_GPU), info)
+            ffi.free(info)
+            if ffi.is_null(tb) {
+                sdl_fail()
+                ffi.free(t)
+                << ffi.null()
+            }
+            ffi.write_ptr(t, T_STAGING, tb)
+        }
+        << t
+    }
+}
+
+fn begin_copy(d c_ptr, t c_ptr, command_out c_ptr) c_ptr {
+    unsafe {
+        command := sdl_acquire_gpu_command_buffer(sym(SYM_ACQUIRE_GPU_COMMAND_BUFFER), ffi.read_ptr(d, D_GPU))
+        ffi.write_ptr(command_out, 0, command)
+        $copy := ffi.null()
+        if !ffi.is_null(command) {
+            copy = sdl_begin_gpu_copy_pass(sym(SYM_BEGIN_GPU_COPY_PASS), command)
+        }
+        if ffi.is_null(copy) {
+            sdl_fail()
+            if !ffi.is_null(command) { sdl_cancel_gpu_command_buffer(sym(SYM_CANCEL_GPU_COMMAND_BUFFER), command) }
+            free_transfer(d, t)
+        }
+        << copy
+    }
+}
+
+fn submit_transfer(d c_ptr, t c_ptr, command c_ptr, copy c_ptr) int {
+    unsafe {
+        sdl_end_gpu_copy_pass(sym(SYM_END_GPU_COPY_PASS), copy)
+        fence := sdl_submit_gpu_command_buffer_and_acquire_fence(sym(SYM_SUBMIT_GPU_COMMAND_BUFFER_AND_ACQUIRE_FENCE), command)
+        if ffi.is_null(fence) {
+            sdl_fail()
+            free_transfer(d, t)
+            << -1
+        }
+        ffi.write_ptr(t, T_FENCE, fence)
+        ffi.write_ptr(t, T_NEXT, ffi.read_ptr(d, D_TRANSFERS))
+        ffi.write_ptr(d, D_TRANSFERS, t)
+        << ffi.read_i64(t, T_ID)
+    }
+}
+
+pub fn open(backend int, debug int, formats int) int {
+    if backend < 0 || backend > 3 || debug < 0 || debug > 1 || formats < 0 || formats > 31 {
+        << fail("invalid GPU device options")
+    }
+    if !load_gpu_syms() { << -1 }
+    unsafe {
+        d := ffi.calloc(D_SIZE)
+        if ffi.is_null(d) { << fail("GPU device allocation failed") }
+        id := identifier()
+        if id < 0 {
+            ffi.free(d)
+            << -1
+        }
+        ffi.write_i64(d, D_ID, id)
+        if sdl_init_subsystem(sym(SYM_INIT_SUBSYSTEM), u32(SDL_INIT_VIDEO)) == u8(0) {
+            ffi.free(d)
+            << sdl_fail()
+        }
+        $driver := ffi.null()
+        if backend == 1 {
+            s := "metal"
+            driver = ffi.cstring(&s)
+        } else if backend == 2 {
+            s := "vulkan"
+            driver = ffi.cstring(&s)
+        } else if backend == 3 {
+            s := "direct3d12"
+            driver = ffi.cstring(&s)
+        }
+        $fmt := formats
+        if fmt == 0 { fmt = 31 }
+        $dbg := u8(0)
+        if debug != 0 { dbg = u8(1) }
+        gpu := sdl_create_gpu_device(sym(SYM_CREATE_GPU_DEVICE), u32(fmt * 2), dbg, driver)
+        if !ffi.is_null(driver) { ffi.free(driver) }
+        if ffi.is_null(gpu) {
+            sdl_fail()
+            sdl_quit_subsystem(sym(SYM_QUIT_SUBSYSTEM), u32(SDL_INIT_VIDEO))
+            ffi.free(d)
+            << -1
+        }
+        ffi.write_ptr(d, D_GPU, gpu)
+        ffi.write_ptr(d, D_NEXT, devices_head())
+        set_devices_head(d)
+        << id
+    }
+}
+
+pub fn close(id int) int {
+    if !on_main() { << -1 }
+    unsafe {
+        $prev := ffi.null()
+        $d := devices_head()
+        while !ffi.is_null(d) {
+            if ffi.read_i64(d, D_ID) == id { <- }
+            prev = d
+            d = ffi.read_ptr(d, D_NEXT)
+        }
+        if ffi.is_null(d) { << 0 }
+        $ok := true
+        $saved := ffi.null()
+        if !close_graphics(d) {
+            saved = error_save()
+            ok = false
+        }
+        gpu := ffi.read_ptr(d, D_GPU)
+        if sdl_wait_for_gpu_idle(sym(SYM_WAIT_FOR_GPU_IDLE), gpu) == u8(0) {
+            sdl_fail()
+            if ok { saved = error_save() }
+            ok = false
+        }
+        if !close_surfaces(d) {
+            if ok { saved = error_save() }
+            ok = false
+        }
+        $t := ffi.read_ptr(d, D_TRANSFERS)
+        while !ffi.is_null(t) {
+            next := ffi.read_ptr(t, T_NEXT)
+            free_transfer(d, t)
+            t = next
+        }
+        $b := ffi.read_ptr(d, D_BUFFERS)
+        while !ffi.is_null(b) {
+            next := ffi.read_ptr(b, B_NEXT)
+            sdl_release_gpu_buffer(sym(SYM_RELEASE_GPU_BUFFER), gpu, ffi.read_ptr(b, B_GPU))
+            ffi.free(b)
+            b = next
+        }
+        sdl_destroy_gpu_device(sym(SYM_DESTROY_GPU_DEVICE), gpu)
+        sdl_quit_subsystem(sym(SYM_QUIT_SUBSYSTEM), u32(SDL_INIT_VIDEO))
+        next := ffi.read_ptr(d, D_NEXT)
+        if ffi.is_null(prev) {
+            set_devices_head(next)
+        } else {
+            ffi.write_ptr(prev, D_NEXT, next)
+        }
+        ffi.free(d)
+        if !ok { error_restore(saved) }
+        if ok { << 0 }
+        << -1
+    }
+}
+
+pub fn backend(id int) int {
+    d := device_record(id)
+    if ffi.is_null(d) { << -1 }
+    unsafe {
+        name := ffi.string_from(sdl_get_gpu_device_driver(sym(SYM_GET_GPU_DEVICE_DRIVER), ffi.read_ptr(d, D_GPU)))
+        if name == "metal" { << 1 }
+        if name == "vulkan" { << 2 }
+        if name == "direct3d12" { << 3 }
+        << fail("unrecognized GPU backend")
+    }
+}
+
+pub fn shader_formats(id int) int {
+    d := device_record(id)
+    if ffi.is_null(d) { << -1 }
+    unsafe {
+        raw := int(sdl_get_gpu_shader_formats(sym(SYM_GET_GPU_SHADER_FORMATS), ffi.read_ptr(d, D_GPU)))
+        << (raw / 2) & 31
+    }
+}
+
+pub fn buffer_new(owner int, size int, usage int) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    if size <= 0 || size > 4294967295 || (size % 4) != 0 || usage < 1 || usage > 63 || (usage & 3) == 3 {
+        << fail("invalid GPU buffer size, alignment or usage")
+    }
+    unsafe {
+        b := ffi.calloc(B_BYTES)
+        if ffi.is_null(b) { << fail("GPU buffer allocation failed") }
+        id := identifier()
+        if id < 0 {
+            ffi.free(b)
+            << -1
+        }
+        ffi.write_i64(b, B_ID, id)
+        ffi.write_u32(b, B_SIZE, u32(size))
+        ffi.write_u32(b, B_USAGE, u32(usage))
+        info := ffi.calloc(12)
+        if ffi.is_null(info) {
+            ffi.free(b)
+            << fail("GPU buffer allocation failed")
+        }
+        ffi.write_u32(info, 0, u32(usage))
+        ffi.write_u32(info, 4, u32(size))
+        ffi.write_u32(info, 8, u32(0))
+        gpu_buf := sdl_create_gpu_buffer(sym(SYM_CREATE_GPU_BUFFER), ffi.read_ptr(d, D_GPU), info)
+        ffi.free(info)
+        if ffi.is_null(gpu_buf) {
+            sdl_fail()
+            ffi.free(b)
+            << -1
+        }
+        ffi.write_ptr(b, B_GPU, gpu_buf)
+        ffi.write_ptr(b, B_NEXT, ffi.read_ptr(d, D_BUFFERS))
+        ffi.write_ptr(d, D_BUFFERS, b)
+        << id
+    }
+}
+
+pub fn buffer_close(owner int, id int) int {
+    if !on_main() { << -1 }
+    unsafe {
+        $d := devices_head()
+        while !ffi.is_null(d) {
+            if ffi.read_i64(d, D_ID) == owner { <- }
+            d = ffi.read_ptr(d, D_NEXT)
+        }
+        if ffi.is_null(d) { << 0 }
+        $prev := ffi.null()
+        $b := ffi.read_ptr(d, D_BUFFERS)
+        while !ffi.is_null(b) {
+            if ffi.read_i64(b, B_ID) == id { <- }
+            prev = b
+            b = ffi.read_ptr(b, B_NEXT)
+        }
+        if ffi.is_null(b) { << 0 }
+        ffi.write_i64(b, B_CLOSED, 1)
+        if ffi.read_u32(b, B_REFS) != u32(0) { << 0 }
+        next := ffi.read_ptr(b, B_NEXT)
+        if ffi.is_null(prev) {
+            ffi.write_ptr(d, D_BUFFERS, next)
+        } else {
+            ffi.write_ptr(prev, B_NEXT, next)
+        }
+        sdl_release_gpu_buffer(sym(SYM_RELEASE_GPU_BUFFER), ffi.read_ptr(d, D_GPU), ffi.read_ptr(b, B_GPU))
+        ffi.free(b)
+        << 0
+    }
+}
+
+pub fn upload(owner int, id int, offset int, bytes &[]u8) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    b := buffer_record(d, id)
+    if ffi.is_null(b) { << -1 }
+    if bytes.len < 1 || !region_ok(b, offset, bytes.len) {
+        << fail("invalid GPU upload byte span or region")
+    }
+    unsafe {
+        t := new_transfer(d, u32(bytes.len), true, false)
+        if ffi.is_null(t) { << -1 }
+        mapped := sdl_map_gpu_transfer_buffer(sym(SYM_MAP_GPU_TRANSFER_BUFFER), ffi.read_ptr(d, D_GPU), ffi.read_ptr(t, T_STAGING), u8(0))
+        if ffi.is_null(mapped) {
+            sdl_fail()
+            free_transfer(d, t)
+            << -1
+        }
+        for i in 0:bytes.len { ffi.write_u8(mapped, i, bytes[i]) }
+        sdl_unmap_gpu_transfer_buffer(sym(SYM_UNMAP_GPU_TRANSFER_BUFFER), ffi.read_ptr(d, D_GPU), ffi.read_ptr(t, T_STAGING))
+        cmd_slot := ffi.calloc(8)
+        if ffi.is_null(cmd_slot) {
+            free_transfer(d, t)
+            << fail("GPU submission allocation failed")
+        }
+        copy := begin_copy(d, t, cmd_slot)
+        if ffi.is_null(copy) {
+            ffi.free(cmd_slot)
+            << -1
+        }
+        command := ffi.read_ptr(cmd_slot, 0)
+        ffi.free(cmd_slot)
+        src := ffi.calloc(16)
+        dst := ffi.calloc(16)
+        if ffi.is_null(src) || ffi.is_null(dst) {
+            ffi.free(src)
+            ffi.free(dst)
+            free_transfer(d, t)
+            << fail("GPU submission allocation failed")
+        }
+        ffi.write_ptr(src, 0, ffi.read_ptr(t, T_STAGING))
+        ffi.write_u32(src, 8, u32(0))
+        ffi.write_ptr(dst, 0, ffi.read_ptr(b, B_GPU))
+        ffi.write_u32(dst, 8, u32(offset))
+        ffi.write_u32(dst, 12, u32(bytes.len))
+        sdl_upload_to_gpu_buffer(sym(SYM_UPLOAD_TO_GPU_BUFFER), copy, src, dst, u8(0))
+        ffi.free(src)
+        ffi.free(dst)
+        << submit_transfer(d, t, command, copy)
+    }
+}
+
+pub fn copy(owner int, source int, source_offset int, destination int, destination_offset int, size int) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    src := buffer_record(d, source)
+    if ffi.is_null(src) { << -1 }
+    dst := buffer_record(d, destination)
+    if ffi.is_null(dst) { << -1 }
+    if int(src) == int(dst) { << fail("GPU copy requires distinct buffers") }
+    if !region_ok(src, source_offset, size) || !region_ok(dst, destination_offset, size) { << -1 }
+    unsafe {
+        t := new_transfer(d, u32(0), false, false)
+        if ffi.is_null(t) { << -1 }
+        cmd_slot := ffi.calloc(8)
+        if ffi.is_null(cmd_slot) {
+            free_transfer(d, t)
+            << fail("GPU submission allocation failed")
+        }
+        copy_pass := begin_copy(d, t, cmd_slot)
+        if ffi.is_null(copy_pass) {
+            ffi.free(cmd_slot)
+            << -1
+        }
+        command := ffi.read_ptr(cmd_slot, 0)
+        ffi.free(cmd_slot)
+        from := ffi.calloc(16)
+        to := ffi.calloc(16)
+        if ffi.is_null(from) || ffi.is_null(to) {
+            ffi.free(from)
+            ffi.free(to)
+            free_transfer(d, t)
+            << fail("GPU submission allocation failed")
+        }
+        ffi.write_ptr(from, 0, ffi.read_ptr(src, B_GPU))
+        ffi.write_u32(from, 8, u32(source_offset))
+        ffi.write_ptr(to, 0, ffi.read_ptr(dst, B_GPU))
+        ffi.write_u32(to, 8, u32(destination_offset))
+        sdl_copy_gpu_buffer_to_buffer(sym(SYM_COPY_GPU_BUFFER_TO_BUFFER), copy_pass, from, to, u32(size), u8(0))
+        ffi.free(from)
+        ffi.free(to)
+        << submit_transfer(d, t, command, copy_pass)
+    }
+}
+
+pub fn download(owner int, id int, offset int, size int) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    b := buffer_record(d, id)
+    if ffi.is_null(b) || !region_ok(b, offset, size) { << -1 }
+    unsafe {
+        t := new_transfer(d, u32(size), true, true)
+        if ffi.is_null(t) { << -1 }
+        cmd_slot := ffi.calloc(8)
+        if ffi.is_null(cmd_slot) {
+            free_transfer(d, t)
+            << fail("GPU submission allocation failed")
+        }
+        copy_pass := begin_copy(d, t, cmd_slot)
+        if ffi.is_null(copy_pass) {
+            ffi.free(cmd_slot)
+            << -1
+        }
+        command := ffi.read_ptr(cmd_slot, 0)
+        ffi.free(cmd_slot)
+        src := ffi.calloc(16)
+        dst := ffi.calloc(16)
+        if ffi.is_null(src) || ffi.is_null(dst) {
+            ffi.free(src)
+            ffi.free(dst)
+            free_transfer(d, t)
+            << fail("GPU submission allocation failed")
+        }
+        ffi.write_ptr(src, 0, ffi.read_ptr(b, B_GPU))
+        ffi.write_u32(src, 8, u32(offset))
+        ffi.write_u32(src, 12, u32(size))
+        ffi.write_ptr(dst, 0, ffi.read_ptr(t, T_STAGING))
+        ffi.write_u32(dst, 8, u32(0))
+        sdl_download_from_gpu_buffer(sym(SYM_DOWNLOAD_FROM_GPU_BUFFER), copy_pass, src, dst)
+        ffi.free(src)
+        ffi.free(dst)
+        << submit_transfer(d, t, command, copy_pass)
+    }
+}
+
+pub fn ready(owner int, id int) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    t := transfer_record(d, id)
+    if ffi.is_null(t) { << -1 }
+    unsafe {
+        if ffi.read_i64(t, T_COMPLETE) != 0 { << 1 }
+        if sdl_query_gpu_fence(sym(SYM_QUERY_GPU_FENCE), ffi.read_ptr(d, D_GPU), ffi.read_ptr(t, T_FENCE)) != u8(0) {
+            ffi.write_i64(t, T_COMPLETE, 1)
+            << 1
+        }
+        << 0
+    }
+}
+
+pub fn wait(owner int, id int) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    t := transfer_record(d, id)
+    if ffi.is_null(t) { << -1 }
+    unsafe {
+        if ffi.read_i64(t, T_COMPLETE) != 0 { << 0 }
+        fence_slot := ffi.calloc(8)
+        if ffi.is_null(fence_slot) { << fail("GPU submission allocation failed") }
+        ffi.write_ptr(fence_slot, 0, ffi.read_ptr(t, T_FENCE))
+        if sdl_wait_for_gpu_fences(sym(SYM_WAIT_FOR_GPU_FENCES), ffi.read_ptr(d, D_GPU), u8(1), fence_slot, u32(1)) == u8(0) {
+            ffi.free(fence_slot)
+            << sdl_fail()
+        }
+        ffi.free(fence_slot)
+        ffi.write_i64(t, T_COMPLETE, 1)
+        << 0
+    }
+}
+
+pub fn read(owner int, id int, output $&[]u8) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    t := transfer_record(d, id)
+    if ffi.is_null(t) { << -1 }
+    unsafe {
+        if ffi.read_i64(t, T_DOWNLOAD) == 0 || output.len != int(ffi.read_u32(t, T_SIZE)) {
+            << fail("GPU readback requires an exact-size mutable byte span")
+        }
+        if ffi.read_i64(t, T_COMPLETE) == 0 {
+            if sdl_query_gpu_fence(sym(SYM_QUERY_GPU_FENCE), ffi.read_ptr(d, D_GPU), ffi.read_ptr(t, T_FENCE)) != u8(0) {
+                ffi.write_i64(t, T_COMPLETE, 1)
+            }
+        }
+        if ffi.read_i64(t, T_COMPLETE) == 0 { << fail("GPU readback is not complete") }
+        mapped := sdl_map_gpu_transfer_buffer(sym(SYM_MAP_GPU_TRANSFER_BUFFER), ffi.read_ptr(d, D_GPU), ffi.read_ptr(t, T_STAGING), u8(0))
+        if ffi.is_null(mapped) { << sdl_fail() }
+        for i in 0:output.len { output[i] = ffi.read_u8(mapped, i) }
+        sdl_unmap_gpu_transfer_buffer(sym(SYM_UNMAP_GPU_TRANSFER_BUFFER), ffi.read_ptr(d, D_GPU), ffi.read_ptr(t, T_STAGING))
+        << output.len
+    }
+}
+
+pub fn transfer_close(owner int, id int) int {
+    if !on_main() { << -1 }
+    unsafe {
+        $d := devices_head()
+        while !ffi.is_null(d) {
+            if ffi.read_i64(d, D_ID) == owner { <- }
+            d = ffi.read_ptr(d, D_NEXT)
+        }
+        if ffi.is_null(d) { << 0 }
+        $prev := ffi.null()
+        $t := ffi.read_ptr(d, D_TRANSFERS)
+        while !ffi.is_null(t) {
+            if ffi.read_i64(t, T_ID) == id { <- }
+            prev = t
+            t = ffi.read_ptr(t, T_NEXT)
+        }
+        if ffi.is_null(t) { << 0 }
+        next := ffi.read_ptr(t, T_NEXT)
+        if ffi.is_null(prev) {
+            ffi.write_ptr(d, D_TRANSFERS, next)
+        } else {
+            ffi.write_ptr(prev, T_NEXT, next)
+        }
+        free_transfer(d, t)
+        << 0
+    }
+}
+
+pub fn stats(owner int, field int) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    if field >= 4 { << graphics_stats(d, field) }
+    if field < 0 || field > 10 { << fail("invalid GPU accounting field") }
+    unsafe {
+        $total := 0
+        $b := ffi.read_ptr(d, D_BUFFERS)
+        while !ffi.is_null(b) {
+            $add := 0
+            if ffi.read_i64(b, B_CLOSED) == 0 {
+                if field == 0 { add = 1 }
+                if field == 1 { add = int(ffi.read_u32(b, B_SIZE)) }
+            }
+            if add > 9223372036854775807 - total { << fail("GPU accounting overflow") }
+            total += add
+            b = ffi.read_ptr(b, B_NEXT)
+        }
+        $t := ffi.read_ptr(d, D_TRANSFERS)
+        while !ffi.is_null(t) {
+            $add := 0
+            if field == 2 { add = 1 }
+            if field == 3 && !ffi.is_null(ffi.read_ptr(t, T_STAGING)) { add = int(ffi.read_u32(t, T_SIZE)) }
+            if add > 9223372036854775807 - total { << fail("GPU accounting overflow") }
+            total += add
+            t = ffi.read_ptr(t, T_NEXT)
+        }
+        << total
+    }
+}
+
+pub fn reference_validate(owner int, id int, kind int) int {
+    d := device_record(owner)
+    if ffi.is_null(d) { << -1 }
+    if kind == 0 {
+        if ffi.is_null(buffer_record(d, id)) { << -1 }
+        << 0
+    }
+    if kind >= 1 && kind <= 5 {
+        if ffi.is_null(resource_record(d, id, kind)) { << -1 }
+        << 0
+    }
+    << fail("invalid GPU reference kind")
+}
