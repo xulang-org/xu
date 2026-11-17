@@ -6,6 +6,17 @@
 
 ---
 
+## Xu 0.12.5
+
+- Pure-Xu `#internal/sdl` backend with dynamic FFI: Replaces the C driver in `#internal/sdl` with a pure-Xu implementation via dynamic FFI, eliminating C native build friction for windowing and GPU subsystems.
+- Hostless `#ui/font` stack: Adds `FontStack`, `GlyphAtlas`, text layout, hit-testing, caret navigation, builtin ASCII fallback rasterization, and standalone TrueType (TTF) parsing.
+- Hostless XDF1 export: Adds `Frame.export_xdf()` and `phone.Canvas.export_xdf()` to serialize UI draw commands into sealed XDF1 binary buffers for headless replay, testing, and cross-process streaming.
+- `#gpu` SoftBlob & SoftBlobRef: Adds CPU-side mesh and texture payloads with ownership tracking and bounds validation for software renderers and headless pipelines; adds `gpu.is_available()` device probe.
+- Multi-touch events: Adds `Event.touch_id` contact identification and `EVENT_TOUCH_*` event handling in SDL input queues.
+- Software framebuffer presentation: Adds `Window.present_rgba` for CPU-side raster display and software fallback.
+- Text selection and copy: Adds selectable text and clipboard copy infrastructure across widgets; fixes phone `TextField.selected_text` mutability.
+- Upgrade the compiler, standard library and SDK tools together.
+
 ## Xu 0.12.4
 
 - Extends typed-MIR optimization with global value numbering, loop-invariant code motion, loop bounds-check elimination, and forwarding values from stores to loads across loop iterations. Set `XU_DUMP_MIR` to a function label substring or `*` to inspect the optimized MIR.

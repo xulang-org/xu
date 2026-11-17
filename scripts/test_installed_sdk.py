@@ -741,9 +741,14 @@ fn main() int {
     binary_floats(xu, work / "binary floats project", clean)
     deflate_output(xu, work / "DEFLATE output project", clean)
     gpu_layout(xu, work / "GPU layout project", clean)
-    gpu_device_import(xu, work / "GPU device project", clean)
     window_event_data(xu, work / "Window event data project", clean)
-    window_surface_import(xu, work / "Window surface project", clean)
+    # Pure-Xu #internal/sdl uses extern "C"; lower_ffi still rejects Windows ARM64.
+    if manifest["target"] == "windows-arm64":
+        print("installed-sdk: gpu-device-import SKIP (Windows ARM64 FFI not lowered yet)")
+        print("installed-sdk: window-surface-import SKIP (Windows ARM64 FFI not lowered yet)")
+    else:
+        gpu_device_import(xu, work / "GPU device project", clean)
+        window_surface_import(xu, work / "Window surface project", clean)
     native_byte_spans(xu, manifest["target"], work / "native byte spans", clean)
     # SDK root discovery is independent of external GUI toolchain availability.
     # Doctor may report missing GTK/Swift/MinGW here, but must locate this SDK
