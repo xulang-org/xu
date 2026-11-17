@@ -6,6 +6,17 @@
 
 ---
 
+## Xu 0.12.5
+
+- 纯 Xu `#internal/sdl` 后端与动态 FFI：使用基于动态 FFI 的纯 Xu 实现替代 `#internal/sdl` 原有的 C 驱动，消除窗口与 GPU 子系统的 C 原生构建依赖。
+- 无宿主 `#ui/font` 字体栈：新增 `FontStack`、`GlyphAtlas`、文本排版、命中测试、光标导航、内置 ASCII 降级光栅化与独立 TrueType (TTF) 解析器。
+- 无宿主 XDF1 导出：新增 `Frame.export_xdf()` 与 `phone.Canvas.export_xdf()`，将 UI 绘制命令序列化为封印的 XDF1 二进制缓冲区，便于无头回放、自动化测试与跨进程传输。
+- `#gpu` SoftBlob 与 SoftBlobRef：提供具备所有权追踪与边界验证的 CPU 端网格与纹理载荷，用于软件渲染器与无头流水线；增加 `gpu.is_available()` 设备探测。
+- 多点触控支持：在 `#window/events` 和 SDL 输入队列中增加 `Event.touch_id` 触点标识与 `EVENT_TOUCH_*` 事件类型。
+- 软件帧缓冲区呈现：新增 `Window.present_rgba`，支持 CPU 光栅图像直接上屏与软件回退。
+- 文本选择与复制：支持控件文本选择与剪贴板复制机制；修复移动端 `TextField.selected_text` 可变性。
+- 升级时请一起更新编译器、标准库和 SDK 工具。
+
 ## Xu 0.12.4
 
 - 扩展带类型 MIR 优化，增加全局值编号、循环不变量外提、循环边界检查消除，以及跨循环迭代的存储到加载转发。将 `XU_DUMP_MIR` 设为函数标签的子串或 `*` 可查看优化后的 MIR。
