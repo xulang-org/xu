@@ -82,6 +82,7 @@ OPTIMIZED_CODE = r'''@main
 #crypto/aes
 #crypto/md5
 #crypto/sha256
+#encoding/base64
 #encoding/hex
 #math/bits
 #strings
@@ -205,6 +206,46 @@ fn rejects_invalid_hex() bool {
     << false
 }
 
+fn rejects_invalid_base64(src string) bool {
+    _ := base64.decode_string(~src) or (err) { << err.msg() == "encoding/base64: invalid padding" }
+    << false
+}
+
+fn check_recycled_strings() bool {
+    lengths := [1, 15, 16, 31, 32, 47, 48, 63, 64, 16383, 16384, 20000, 32751, 32752]
+    seed := "az"
+    for index in 0:lengths.len {
+        n := lengths[index]
+        for _ in 0:3 {
+            $buffer := make_string(n)
+            for i in 0:n {
+                if buffer[i] != 0 { << false }
+                buffer[i] = 255
+            }
+        }
+        repeated := strings.repeat(&seed, (n + 1) / 2)
+        if repeated.len != ((n + 1) / 2) * 2 { << false }
+        for i in 0:repeated.len {
+            if repeated[i] != seed[i & 1] { << false }
+        }
+    }
+    << true
+}
+
+fn check_short_string_copies() bool {
+    seed := "za"
+    src := strings.repeat(&seed, 18)
+    if find_byte(&src, 122, 1) != 2 || find_byte(&src, 98, 1) != -1 { << false }
+    for n in 1:34 {
+        piece := src[1:n + 1]
+        if piece.len != n || count_byte(&piece, 97) != (n + 1) / 2 { << false }
+        for i in 0:n {
+            if piece[i] != src[i + 1] { << false }
+        }
+    }
+    << true
+}
+
 fn gcd(a int, b int) int {
     if b == 0 { << a }
     << gcd(b, a % b)
@@ -283,8 +324,28 @@ fn main() int {
     if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
     empty := ""
     if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
-    if !check_match_lut_cases() { << 21 }
-    if !check_fnval_cases(true) || !check_fnval_cases(false) { << 22 }
+    if !check_match_lut_cases() { << 38 }
+    if !check_fnval_cases(true) || !check_fnval_cases(false) { << 39 }
+    $binary := make_string(33)
+    for i in 0:33 { binary[i] = 128 + (i & 1) }
+    if count_byte(&binary, 128) != 17 || count_byte(&binary, 129) != 16 || count_byte(&binary, 0) != 0 { << 28 }
+    parts := split_byte(&binary, 128)
+    if parts.len != 18 || parts[0] != "" || parts[1] != string_from_byte(129) || parts[17] != "" { << 29 }
+    if strings.join(parts, string_from_byte(128)) != binary { << 30 }
+    prefix := "/+7d"
+    block := strings.repeat(&prefix, 33)
+    original := base64.decode_string(block + "/g==") or (err) { << 31 }
+    if original.len != 100 || original[0] != 255 || original[99] != 254 { << 32 }
+    if base64.encode_to_string(original + "") != block + "/g==" { << 33 }
+    if !rejects_invalid_base64(block + "AA=A") { << 34 }
+    for i in 0:8 {
+        $large := make_string(20000 + i)
+        if large[0] != 0 || large[large.len - 1] != 0 { << 35 }
+        large[0] = 255
+        large[large.len - 1] = 255
+    }
+    if !check_recycled_strings() { << 36 }
+    if !check_short_string_copies() { << 37 }
     println("optimized code passed")
     << 0
 }
