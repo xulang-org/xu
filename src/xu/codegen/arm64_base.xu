@@ -1189,6 +1189,8 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
 const FV_CONST = 0
 const FV_PARAM = 1
 const FV_BIN = 2
+const FV_OR = 3
+const FV_AND = 4
 
 struct FastNode {
     kind int
@@ -1207,6 +1209,9 @@ struct FastExit {
 struct FastPlan {
     nodes []FastNode
     exits []FastExit
+    slow_blk int
+    init_locals []int
+    init_vals []int
 }
 
 fn fv_noframe_kind(k int) bool {
@@ -1360,8 +1365,11 @@ fn fv_pure_only(nodes &[]FastNode, ni int, allow_cmp_root bool) bool {
         << false
     }
     nd := &nodes[ni]
-    if nd.kind != FV_BIN {
+    if nd.kind == FV_CONST || nd.kind == FV_PARAM {
         << true
+    }
+    if nd.kind != FV_BIN {
+        << false
     }
     if fv_is_cmp_op(nd.bop) {
         if !allow_cmp_root {
@@ -1373,6 +1381,26 @@ fn fv_pure_only(nodes &[]FastNode, ni int, allow_cmp_root bool) bool {
         << false
     }
     << fv_pure_only(nodes, nd.lhs, false) && fv_pure_only(nodes, nd.rhs, false)
+}
+
+fn fv_collect_guards(nodes &[]FastNode, cn int, want_true bool, out $&[]int, depth int) bool {
+    if depth > 3 || cn < 0 || cn >= nodes.len {
+        << false
+    }
+    nd := &nodes[cn]
+    if want_true && (nd.kind == FV_OR || (nd.kind == FV_BIN && nd.bop == mir.BIN_OR)) {
+        << fv_collect_guards(nodes, nd.lhs, true, out, depth + 1) &&
+           fv_collect_guards(nodes, nd.rhs, true, out, depth + 1)
+    }
+    if !want_true && nd.kind == FV_AND {
+        << fv_collect_guards(nodes, nd.lhs, false, out, depth + 1) &&
+           fv_collect_guards(nodes, nd.rhs, false, out, depth + 1)
+    }
+    if !fv_pure_only(nodes, cn, true) || fv_depth(nodes, cn) > 2 {
+        << false
+    }
+    out.push(cn)
+    << true
 }
 
 fn fv_eval_op(f &mir.MFn, nodes $&[]FastNode, temp_node &[]int, v int) int {
@@ -1428,9 +1456,47 @@ fn fv_sim_block(f &mir.MFn, bi int, nodes $&[]FastNode, loc_node $&[]int, temp_n
             ln := fv_eval_op(f, nodes, temp_node, ins.c)
             rn := fv_eval_op(f, nodes, temp_node, ins.d)
             if ln < 0 || rn < 0 { << false }
-            idx := nodes.len
-            nodes.push(FastNode{kind: FV_BIN, val: 0, bop: ins.b, lhs: ln, rhs: rn})
-            temp_node[ins.a] = idx
+            if fv_is_arith_op(ins.b) && nodes[ln].kind == FV_CONST && nodes[rn].kind == FV_CONST {
+                lv := nodes[ln].val
+                rv := nodes[rn].val
+                $cv := 0
+                if ins.b == mir.BIN_ADD { cv = lv + rv }
+                else if ins.b == mir.BIN_SUB { cv = lv - rv }
+                else if ins.b == mir.BIN_MUL { cv = lv * rv }
+                else if ins.b == mir.BIN_AND { cv = lv & rv }
+                else if ins.b == mir.BIN_OR { cv = lv | rv }
+                else { cv = lv ^ rv }
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_CONST, val: cv, bop: 0, lhs: -1, rhs: -1})
+                temp_node[ins.a] = idx
+            } else if ins.b == mir.BIN_ADD && nodes[ln].kind == FV_CONST && nodes[ln].val == 0 {
+                temp_node[ins.a] = rn
+            } else if (ins.b == mir.BIN_ADD || ins.b == mir.BIN_SUB) && nodes[rn].kind == FV_CONST && nodes[rn].val == 0 {
+                temp_node[ins.a] = ln
+            } else {
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_BIN, val: 0, bop: ins.b, lhs: ln, rhs: rn})
+                temp_node[ins.a] = idx
+            }
+        } else if k == mir.MI_SELECT {
+            if ins.a < 0 || ins.a >= temp_node.len { << false }
+            if ins.b == ins.c {
+                ln := fv_eval_op(f, nodes, temp_node, ins.b)
+                rn := fv_eval_op(f, nodes, temp_node, ins.d)
+                if ln < 0 || rn < 0 { << false }
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_OR, val: 0, bop: 0, lhs: ln, rhs: rn})
+                temp_node[ins.a] = idx
+            } else if ins.b == ins.d {
+                ln := fv_eval_op(f, nodes, temp_node, ins.b)
+                rn := fv_eval_op(f, nodes, temp_node, ins.c)
+                if ln < 0 || rn < 0 { << false }
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_AND, val: 0, bop: 0, lhs: ln, rhs: rn})
+                temp_node[ins.a] = idx
+            } else {
+                << false
+            }
         } else {
             << false
         }
@@ -1470,7 +1536,7 @@ fn fv_try_pure_ret(f &mir.MFn, start_b int, nodes $&[]FastNode, loc_node &[]int,
 }
 
 fn analyze_fast_entry(f &mir.MFn) FastPlan {
-    $plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}}
+    $plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
     if !f.scalar_params || f.nparams <= 0 || f.nparams > 6 || f.blocks.len < 2 {
         << plan
     }
@@ -1494,8 +1560,10 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
         temp_node.push(-1)
     }
     $vis := []bool{}
+    $skipped := []bool{}
     for _ in 0:f.blocks.len {
         vis.push(false)
+        skipped.push(false)
     }
     $cur_b := 0
     for _ in 0:8 {
@@ -1508,6 +1576,7 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
         }
         tk := f.blocks[cur_b].tkind
         if tk == mir.TKIND_JUMP {
+            skipped[cur_b] = true
             cur_b = f.blocks[cur_b].ta
             ->
         }
@@ -1515,7 +1584,7 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
             <-
         }
         cn := fv_eval_op(f, $&plan.nodes, &temp_node, f.blocks[cur_b].ta)
-        if cn < 0 || !fv_pure_only(&plan.nodes, cn, true) || fv_depth(&plan.nodes, cn) > 2 {
+        if cn < 0 {
             <-
         }
         tb := f.blocks[cur_b].tb
@@ -1525,20 +1594,108 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
             rt = fv_try_pure_ret(f, tb, $&plan.nodes, &loc_node, &temp_node)
         }
         if rt >= 0 {
-            plan.exits.push(FastExit{cond_node: cn, want_true: true, ret_node: rt})
-            cur_b = tc
-            ->
+            $guards := []int{}
+            if fv_collect_guards(&plan.nodes, cn, true, $&guards, 0) && plan.exits.len + guards.len <= 4 {
+                for gi in 0:guards.len {
+                    plan.exits.push(FastExit{cond_node: guards[gi], want_true: true, ret_node: rt})
+                }
+                skipped[cur_b] = true
+                cur_b = tc
+                ->
+            }
         }
         $re := -1
         if tc >= 0 && tc < vis.len && !vis[tc] {
             re = fv_try_pure_ret(f, tc, $&plan.nodes, &loc_node, &temp_node)
         }
         if re >= 0 {
-            plan.exits.push(FastExit{cond_node: cn, want_true: false, ret_node: re})
-            cur_b = tb
-            ->
+            $guards := []int{}
+            if fv_collect_guards(&plan.nodes, cn, false, $&guards, 0) && plan.exits.len + guards.len <= 4 {
+                for gi in 0:guards.len {
+                    plan.exits.push(FastExit{cond_node: guards[gi], want_true: false, ret_node: re})
+                }
+                skipped[cur_b] = true
+                cur_b = tb
+                ->
+            }
         }
         <-
+    }
+    // If all fast-entry guards fell through to cur_b > 0, check whether the
+    // slow-path prologue can jump directly to cur_b (skipping redundant entry
+    // re-checks) after initializing any constant locals stored in skipped blocks.
+    if plan.exits.len > 0 && cur_b > 0 && cur_b < f.blocks.len && !skipped[cur_b] {
+        $can_skip := true
+        $def_skip_blk := []int{}
+        for _ in 0:f.temps.len { def_skip_blk.push(-1) }
+        $loc_written := []bool{}
+        for _ in 0:f.locals.len { loc_written.push(false) }
+        for bi in 0:f.blocks.len {
+            if !skipped[bi] { -> }
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if a64_defines(ins.kind) && ins.a >= 0 && ins.a < def_skip_blk.len {
+                    if def_skip_blk[ins.a] >= 0 && def_skip_blk[ins.a] != bi {
+                        can_skip = false
+                    }
+                    def_skip_blk[ins.a] = bi
+                }
+                if ins.kind == mir.MI_STORE_LOCAL {
+                    l := ins.a
+                    if l < f.nparams || l >= f.locals.len || f.locals[l] != 1 || f.locals_nslots[l] != 1 {
+                        can_skip = false
+                    } else {
+                        loc_written[l] = true
+                    }
+                }
+                ii = ins.next
+            }
+        }
+        if can_skip {
+            for bi in 0:f.blocks.len {
+                $ii := f.blocks[bi].head
+                while ii >= 0 {
+                    ins := &f.instrs[ii]
+                    for t in 0:def_skip_blk.len {
+                        if def_skip_blk[t] >= 0 && def_skip_blk[t] != bi && a64_reads_temp(f, ins, t) {
+                            can_skip = false
+                            <-
+                        }
+                    }
+                    if !can_skip { <- }
+                    ii = ins.next
+                }
+                if !can_skip { <- }
+                tk := f.blocks[bi].tkind
+                if (tk == mir.TKIND_BRANCH || tk == mir.TKIND_RETURN) && f.blocks[bi].ta >= 0 &&
+                   f.blocks[bi].ta < def_skip_blk.len && def_skip_blk[f.blocks[bi].ta] >= 0 &&
+                   def_skip_blk[f.blocks[bi].ta] != bi {
+                    can_skip = false
+                    <-
+                }
+            }
+        }
+        if can_skip {
+            for l in f.nparams:f.locals.len {
+                if loc_written[l] {
+                    ln := loc_node[l]
+                    if ln < 0 || plan.nodes[ln].kind != FV_CONST {
+                        can_skip = false
+                        <-
+                    }
+                    iv := plan.nodes[ln].val
+                    plan.init_locals.push(l)
+                    plan.init_vals.push(iv)
+                }
+            }
+        }
+        if can_skip {
+            plan.slow_blk = cur_b
+        } else {
+            plan.init_locals = []int{}
+            plan.init_vals = []int{}
+        }
     }
     << plan
 }
@@ -1622,7 +1779,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     $fr := a64_frame(f)
     ra := a64_ra(f, opt)
     leaf_noframe := can_elide_frame(f, &ra, opt)
-    $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}}
+    $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
     if opt && !leaf_noframe {
         fp_plan = analyze_fast_entry(f)
     }
@@ -1657,6 +1814,20 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
     }
     a64_copy_params(cb, f, &fr, &ra)
+    if fp_plan.slow_blk > 0 {
+        for ii in 0:fp_plan.init_locals.len {
+            l := fp_plan.init_locals[ii]
+            v := fp_plan.init_vals[ii]
+            lr := ra.local_reg[l]
+            if lr >= 0 && lr < 32 {
+                a64_mov_imm(cb, lr, v)
+            } else {
+                a64_mov_imm(cb, 9, v)
+                a64_str(cb, 9, R_SP, fr.local_off[l])
+            }
+        }
+        a64_branch_reloc(cb, relocs, 0x14000000, f.label + ".bb" + str(fp_plan.slow_blk), mc.RELOC_ARM64_CALL26)
+    }
     $strs := []StrFix{}
     $str_aligns := []int{}
     $uses := []int{}
