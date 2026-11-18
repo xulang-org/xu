@@ -338,12 +338,58 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   NSUInteger loc = self.selectedRange16.location;
   return [XuTextRange rangeWithStart:loc end:loc];
 }
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+  if (!self.sessionActive) return NO;
+  if (action == @selector(copy:) || action == @selector(cut:)) {
+    return !self.secureEntry && self.selectedRange16.length > 0;
+  }
+  if (action == @selector(paste:)) return [UIPasteboard.generalPasteboard hasStrings];
+  if (action == @selector(selectAll:)) return self.displayText.length > 0;
+  return [super canPerformAction:action withSender:sender];
+}
+- (void)selectAll:(id)sender {
+  if (!self.sessionActive) return;
+  xu_phone_key(78, 65, 0, 8);
+  xu_phone_key(79, 65, 0, 8);
+  [self refreshFromHost];
+}
+- (void)copy:(id)sender {
+  if (!self.sessionActive || self.secureEntry) return;
+  xu_phone_key(78, 67, 0, 8);
+  xu_phone_key(79, 67, 0, 8);
+}
+- (void)cut:(id)sender {
+  if (!self.sessionActive || self.secureEntry) return;
+  xu_phone_key(78, 88, 0, 8);
+  xu_phone_key(79, 88, 0, 8);
+  [self refreshFromHost];
+}
+- (void)paste:(id)sender {
+  if (!self.sessionActive) return;
+  xu_phone_key(78, 86, 0, 8);
+  xu_phone_key(79, 86, 0, 8);
+  [self refreshFromHost];
+}
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
   if (self.sessionActive) {
     for (UIPress *press in presses) {
       UIKey *key = press.key;
       if (!key) continue;
       BOOL shift = (key.modifierFlags & UIKeyModifierShift) != 0;
+      int mods = (shift ? 1 : 0)
+        | ((key.modifierFlags & UIKeyModifierControl) != 0 ? 2 : 0)
+        | ((key.modifierFlags & UIKeyModifierAlternate) != 0 ? 4 : 0)
+        | ((key.modifierFlags & UIKeyModifierCommand) != 0 ? 8 : 0);
+      if ((mods & (2 | 8)) != 0) {
+        NSString *ch = [key.charactersIgnoringModifiers uppercaseString];
+        int code = ch.length == 1 ? [ch characterAtIndex:0] : 0;
+        if (code == 65 || code == 67 || code == 86 || code == 88) {
+          xu_phone_key(78, code, 0, mods);
+          xu_phone_key(79, code, 0, mods);
+          [self refreshFromHost];
+          return;
+        }
+      }
       switch (key.keyCode) {
         case UIKeyboardHIDUsageKeyboardEscape:
           xu_phone_back();
@@ -354,6 +400,16 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
           return;
         case UIKeyboardHIDUsageKeyboardRightArrow:
           xu_phone_text_input_move(self.sessionId, 0, 0, shift ? 1 : 0);
+          [self refreshFromHost];
+          return;
+        case UIKeyboardHIDUsageKeyboardUpArrow:
+          xu_phone_key(78, 263, 0, mods);
+          xu_phone_key(79, 263, 0, mods);
+          [self refreshFromHost];
+          return;
+        case UIKeyboardHIDUsageKeyboardDownArrow:
+          xu_phone_key(78, 264, 0, mods);
+          xu_phone_key(79, 264, 0, mods);
           [self refreshFromHost];
           return;
         case UIKeyboardHIDUsageKeyboardHome:
@@ -483,11 +539,13 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   if (!message.frameInfo.mainFrame || ![message.body isKindOfClass:NSString.class]) return;
   NSData *data = [(NSString *)message.body dataUsingEncoding:NSUTF8StringEncoding];
   NSArray *v = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-  if (![v isKindOfClass:NSArray.class] || v.count != 7) return;
+  if (![v isKindOfClass:NSArray.class] || (v.count != 7 && v.count != 10)) return;
   for (id value in v) if (![value isKindOfClass:NSNumber.class]) return;
   int kind = [v[0] intValue];
   if (kind == 1) xu_phone_start("ios");
   else if (kind == 0) xu_phone_resize([v[4] doubleValue],[v[5] doubleValue],[v[6] doubleValue]);
+  else if ((kind == 78 || kind == 79) && v.count == 10) xu_phone_key(kind,[v[7] intValue],[v[9] intValue],[v[8] intValue]);
+  else if (v.count == 10) xu_phone_input_event(kind,[v[1] doubleValue],[v[2] doubleValue],[v[7] intValue],[v[3] intValue],[v[8] intValue],[v[9] intValue]);
   else xu_phone_input(kind,[v[1] doubleValue],[v[2] doubleValue],[v[3] intValue]);
 }
 - (UIStatusBarStyle)preferredStatusBarStyle {

@@ -385,10 +385,13 @@ extern "C" void xu_phone_reduced_motion(int enabled) {
   xu_ui_mem_set("phone_reduced_motion",on?"1":"0");
   if(changed&&generation)event(("canvas_preferences\t1\t1\t"+std::to_string(generation)+(on?"\t1":"\t0")).c_str());
 }
-extern "C" void xu_phone_input(int kind,double x,double y,int buttons) {
+extern "C" void xu_phone_input_event(int kind,double x,double y,int button,int buttons,int modifiers,int click_count) {
   std::lock_guard<std::mutex> guard(host_lock);
   if(input_enabled && generation && kind>=72 && kind<=77)
-    xu_ui_input_emit(&content,(unsigned)kind,x,y,0,0,1,buttons,0,0,0,0,kind==73?1:0);
+    xu_ui_input_emit(&content,(unsigned)kind,x,y,0,0,(unsigned)button,(unsigned)buttons,(unsigned)modifiers,0,0,0,(unsigned)click_count);
+}
+extern "C" void xu_phone_input(int kind,double x,double y,int buttons) {
+  xu_phone_input_event(kind,x,y,1,buttons,0,kind==73?1:0);
 }
 static unsigned utf8_to_utf16_pos(const std::string &s, unsigned byte_pos) {
   unsigned limit = std::min(byte_pos, (unsigned)s.size());

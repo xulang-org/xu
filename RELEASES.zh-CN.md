@@ -6,6 +6,15 @@
 
 ---
 
+## Xu 0.12.6
+
+- 完整 C FFI 与 `xu cbind`：补全跨 ARM64、x64、RISC-V、LoongArch 后端的对象/应用/原生库链接支持，新增 C union 与位域、`extern` 全局变量、C 闭包回调、FFI 诊断以及带布局断言的 `xu cbind` 头文件生成。
+- 原生移动端游戏宿主与 `#app`：新增 `xu build --phone --phone-profile game` 原生 SDL GPU 移动应用打包、`#app` 标准库与资源打包（`examples/phone_game`）、ARM64 栈切换移动端游戏运行时，以及安全区/返回键/恢复事件支持。
+- 内存安全与零 GC 加固：收紧跨容器、泛型、闭包、`match`/`select`/`or` 与 `xu` 协程的静态借用、移动和 `unsafe` 检查；新增字符串写时复制（COW）字节写入、零大小结构体装箱静态不朽头、16KB 协程栈保护页、运行时溢出检查，以及包含 67 项用例的 `memsafe-gate` 回归门禁。
+- MIR 优化器与代码生成性能提升：新增 x64 XMM 寄存器分配与 SSE2 `f64` 直接降级、x64 `cmp+cmovcc` 融合与 `lea` 降级、ARM64 2 的幂奇偶/除法/`mul 2^k+1`/`cmp+csel` 融合、复合 `||`/`&&` 快速入口守卫、`opt_gvn` 支配树区间传播与除/比较折叠、`opt_bce` 闭区间 `<=` 循环版本化、`opt_ifconv` 小常量循环展开，以及本地开关查找表与零环境函数值去虚化。
+- 运行时热路径优化：加速 `runtime/core` 中的 Base64、字符串热路径以及 MD5 块压缩与十六进制格式化。
+- 升级时请一起更新编译器、标准库和 SDK 工具。
+
 ## Xu 0.12.5
 
 - 纯 Xu `#internal/sdl` 后端与动态 FFI：使用基于动态 FFI 的纯 Xu 实现替代 `#internal/sdl` 原有的 C 驱动，消除窗口与 GPU 子系统的 C 原生构建依赖。

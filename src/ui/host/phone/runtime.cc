@@ -7,7 +7,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -25,15 +24,6 @@
 extern "C" void xu_app_start(int, char **, char **);
 extern "C" [[noreturn]] void xu_phone_finish(long);
 extern char **environ;
-extern "C" __attribute__((used, visibility("default"))) void **xu_phone_ffi_got(void) {
-  static void *got[4] = {
-    reinterpret_cast<void *>(&dlopen),
-    reinterpret_cast<void *>(&dlsym),
-    reinterpret_cast<void *>(&dlerror),
-    nullptr
-  };
-  return got;
-}
 #ifndef XU_PHONE_GAME
 extern "C" void xu_draw_text_init();
 static std::atomic<bool> started{false}, stopped{false}, active{true};

@@ -80,8 +80,11 @@ fn main() int {
 
 OPTIMIZED_CODE = r'''@main
 #crypto/aes
+#crypto/md5
 #crypto/sha256
+#encoding/base64
 #encoding/hex
+#math
 #math/bits
 #strings
 
@@ -93,14 +96,272 @@ fn (c $&Counter) add(n int) {
     c.value += n
 }
 
+fn (c &Counter) get() int {
+    << c.value
+}
+
+fn bump_one(x int) int {
+    << x + 1
+}
+
+fn bump_ten(x int) int {
+    << x + 10
+}
+
+fn check_match_lut_cases() bool {
+    // Masked dense 8-way match with else arm.
+    $masked := 0
+    for i in 0:64 {
+        k := i & 7
+        match k {
+            0 { masked += 1 }
+            1 { masked += 3 }
+            2 { masked += 5 }
+            3 { masked += 7 }
+            4 { masked += 11 }
+            5 { masked += 13 }
+            6 { masked += 17 }
+            else { masked += 19 }
+        }
+    }
+    if masked != 608 { << false }
+
+    // Unmasked match with negative lo, out-of-range inputs, duplicate arm, and empty arm.
+    $unmasked := 0
+    $inputs := [-10, -3, -2, -1, 0, 1, 2, 3, 10]
+    for idx in 0:inputs.len {
+        v := inputs[idx]
+        match v {
+            -3 { unmasked += 10 }
+            -2 { unmasked += 20 }
+            -1 { }
+            0 { unmasked += 40 }
+            1 { unmasked += 50 }
+            1 { unmasked += 999 }
+            2 { unmasked += 60 }
+            3 { unmasked += 70 }
+            else { unmasked += 3 }
+        }
+        // Keep selector live after match.
+        if v != inputs[idx] { << false }
+    }
+    if unmasked != 256 { << false }
+
+    // Selector local updated inside match arms.
+    $self_sum := 0
+    for j in 0:8 {
+        $x := j
+        match x {
+            0 { x += 2 }
+            1 { x += 4 }
+            2 { x += 6 }
+            3 { x += 8 }
+            4 { x += 10 }
+            5 { x += 12 }
+            6 { x += 14 }
+            else { x += 16 }
+        }
+        self_sum += x
+    }
+    << self_sum == 100
+}
+
+fn check_fnval_cases(flag bool) bool {
+    // Non-capturing function value (eligible for zero-env drop elim + SROA + devirt).
+    f := bump_one
+    $sum := 0
+    for i in 0:32 {
+        sum += f(i & 7)
+    }
+    if sum != 144 { << false }
+
+    // Reassigned non-capturing function value (must keep dynamic dispatch).
+    $g := bump_one
+    if flag { g = bump_ten }
+    $want_g := 6
+    if flag { want_g = 15 }
+    if g(5) != want_g { << false }
+
+    // Capturing closure (negative case: must preserve env and drop glue).
+    base := 100
+    h := fn(x int) int { << base + x }
+    if h(7) != 107 { << false }
+
+    // Mixed non-capturing and capturing reassignment (negative case: must preserve drop).
+    $m := bump_one
+    if flag {
+        m = fn(x int) int { << base + x * 2 }
+    }
+    $want_m := 7
+    if flag { want_m = 112 }
+    if m(6) != want_m { << false }
+
+    // Bound method value (negative case: non-zero borrowed receiver env).
+    c := Counter{value: 42}
+    bm := c.get
+    << bm() == 42
+}
+
 fn rejects_invalid_hex() bool {
     _ := hex.decode_string("0123456789ABCDEFg123456789abcdef") or (err) { << true }
     << false
 }
 
+fn rejects_invalid_base64(src string) bool {
+    _ := base64.decode_string(~src) or (err) { << err.msg() == "encoding/base64: invalid padding" }
+    << false
+}
+
+fn check_recycled_strings() bool {
+    lengths := [1, 15, 16, 31, 32, 47, 48, 63, 64, 16383, 16384, 20000, 32751, 32752]
+    seed := "az"
+    for index in 0:lengths.len {
+        n := lengths[index]
+        for _ in 0:3 {
+            $buffer := make_string(n)
+            for i in 0:n {
+                if buffer[i] != 0 { << false }
+                buffer[i] = 255
+            }
+        }
+        repeated := strings.repeat(&seed, (n + 1) / 2)
+        if repeated.len != ((n + 1) / 2) * 2 { << false }
+        for i in 0:repeated.len {
+            if repeated[i] != seed[i & 1] { << false }
+        }
+    }
+    << true
+}
+
+fn check_short_string_copies() bool {
+    seed := "za"
+    src := strings.repeat(&seed, 18)
+    if find_byte(&src, 122, 1) != 2 || find_byte(&src, 98, 1) != -1 { << false }
+    for n in 1:34 {
+        piece := src[1:n + 1]
+        if piece.len != n || count_byte(&piece, 97) != (n + 1) / 2 { << false }
+        for i in 0:n {
+            if piece[i] != src[i + 1] { << false }
+        }
+    }
+    << true
+}
+
 fn gcd(a int, b int) int {
     if b == 0 { << a }
     << gcd(b, a % b)
+}
+
+fn div2_if_even(x int) int {
+    if x % 2 == 0 { << x / 2 }
+    << x * 3 + 1
+}
+
+fn div4_if_mod4(x int) int {
+    if x % 4 == 0 { << x / 4 }
+    << x * 5 - 3
+}
+
+fn div8_if_neg_mod8(x int) int {
+    if x % -8 != 0 { << x * 9 + 1 }
+    << x / 8
+}
+
+fn div2_modified_after_guard(x0 int) int {
+    $x := x0
+    if x % 2 == 0 {
+        x = x - 1
+        << x / 2
+    }
+    << x
+}
+
+fn mod_value_used(x int) int {
+    r := x % 4
+    if r == 0 { << 100 }
+    << r
+}
+
+fn div4_under_mod2_guard(x int) int {
+    if x % 2 == 0 { << x / 4 }
+    << 0
+}
+
+fn verify_divc_pow2_and_mul() bool {
+    min_i64 := -9223372036854775807 - 1
+    if div2_if_even(-6) != -3 || div2_if_even(-5) != -14 || div2_if_even(min_i64) != (-4611686018427387904) { << false }
+    if div4_if_mod4(-12) != -3 || div4_if_mod4(-10) != -53 || div4_if_mod4(min_i64) != (-2305843009213693952) { << false }
+    if div8_if_neg_mod8(-16) != -2 || div8_if_neg_mod8(-10) != -89 || div8_if_neg_mod8(min_i64) != (-1152921504606846976) { << false }
+    // Negative cases: modified local after guard, modulo value used directly, narrower guard
+    if div2_modified_after_guard(-4) != -2 || div2_modified_after_guard(0) != 0 { << false }
+    if mod_value_used(-3) != -3 || mod_value_used(-4) != 100 || mod_value_used(3) != 3 { << false }
+    if div4_under_mod2_guard(-2) != 0 || div4_under_mod2_guard(-6) != -1 { << false }
+    // Collatz-style loop exercising cmp + hoisted store + select and mul by 2^k+1
+    $acc := 0
+    $x := 27
+    while x != 1 {
+        if x % 2 == 0 {
+            acc += 1
+            x = x / 2
+        } else {
+            acc += 1
+            x = x * 3 + 1
+        }
+    }
+    if acc != 111 { << false }
+    // Negative odd/even mul by 3, 5, 9, 17
+    v := -7
+    if v * 3 != -21 || 3 * v != -21 || v * 5 != -35 || v * 9 != -63 || v * 17 != -119 { << false }
+    << true
+}
+
+struct@ ZstVal {
+    fn tag() int
+}
+
+struct ZstEmpty {}
+struct ZstNonEmpty {
+    n int
+}
+struct ZstEmptyErr {}
+
+fn (e ZstEmpty) tag() int { << 42 }
+fn (n ZstNonEmpty) tag() int { << n.n }
+fn (e ZstEmptyErr) msg() string { << "zst-empty-err" }
+
+fn zst_pass(v ZstVal) int { << v.tag() }
+
+fn zst_may_fail(flag bool) int {
+    if flag { >> ZstEmptyErr{} }
+    << 99
+}
+
+fn zst_catch(flag bool) string {
+    v := zst_may_fail(flag) or (err) { << err.msg() }
+    << str(v)
+}
+
+fn check_zst_static_box() bool {
+    let e: ZstVal = ZstEmpty{}
+    if e.tag() != 42 || zst_pass(e) != 42 { << false }
+    $arr := []ZstVal{}
+    for _ in 0:16 {
+        arr.push(ZstEmpty{})
+        arr.push(ZstNonEmpty{n: 10})
+    }
+    $sum := 0
+    for i in 0:arr.len {
+        sum += arr[i].tag()
+    }
+    if sum != 832 { << false }
+    if zst_catch(true) != "zst-empty-err" || zst_catch(false) != "99" { << false }
+    let a1: any = ZstEmpty{}
+    _ := a1 as ZstEmpty
+    let a2: any = ZstNonEmpty{n: 55}
+    u := a2 as ZstNonEmpty
+    if u.n != 55 { << false }
+    let ne: ZstVal = ZstNonEmpty{n: 13}
+    << ne.tag() + zst_pass(ne) == 26
 }
 
 fn implicit_borrow_values() bool {
@@ -117,6 +378,123 @@ fn implicit_borrow_values() bool {
     << *ref == 2
 }
 
+struct Vec3 {
+    x f64
+    y f64
+    z f64
+}
+
+struct Pair32 {
+    a f32
+    b f32
+    c f64
+}
+
+fn callee_fp_pressure(a f64, b f64, c f64, d f64) f64 {
+    $v0 := a + 1.0
+    $v1 := b + 2.0
+    $v2 := c + 3.0
+    $v3 := d + 4.0
+    $v4 := v0 * 1.25 + v1
+    $v5 := v1 * 1.5 - v2
+    $v6 := v2 * 0.75 + v3
+    $v7 := v3 * 2.5 - v0
+    $v8 := v4 + v5
+    $v9 := v6 + v7
+    $v10 := v8 * v9 - v4 * v6
+    << v10 + v0 + v1 + v2 + v3 + v5 + v7 + v8 + v9
+}
+
+fn stack_params_f64(a0 f64, a1 f64, a2 f64, a3 f64, a4 f64, a5 f64, a6 f64, a7 f64, a8 f64, a9 f64, a10 f64, a11 f64) f64 {
+    << a0 * 1.0 + a1 * 2.0 + a2 * 3.0 + a3 * 4.0 +
+       a4 * 5.0 + a5 * 6.0 + a6 * 7.0 + a7 * 8.0 +
+       a8 * 9.0 + a9 * 10.0 + a10 * 11.0 + a11 * 12.0
+}
+
+fn fp_cmp_bits(a f64, b f64) int {
+    $m := 0
+    if a == b { m = m | 1 }
+    if a != b { m = m | 2 }
+    if a < b  { m = m | 4 }
+    if a <= b { m = m | 8 }
+    if a > b  { m = m | 16 }
+    if a >= b { m = m | 32 }
+    << m
+}
+
+fn select_f64(cond bool, a f64, b f64) f64 {
+    $r := b
+    if cond { r = a }
+    << r
+}
+
+fn verify_fp_regalloc() bool {
+    x := 3.5
+    y := -2.25
+    if int((x * x + y * y + (x + x) - (y - y) + (x / x)) * 100.0) != 2531 { << false }
+    if int(math.sqrt(152.25) * 1000.0) != 12338 { << false }
+    if int(-x * 10.0) != -35 { << false }
+    zero := 0.0
+    neg_zero := -0.0
+    pos_inf := 1.0 / zero
+    neg_inf := -1.0 / zero
+    nan := zero / zero
+    if int(1.9) != 1 || int(-1.9) != -1 || int(neg_zero) != 0 { << false }
+    if int(1e20) != 9223372036854775807 || int(-1e20) != (-9223372036854775807 - 1) { << false }
+    if int(pos_inf) != 9223372036854775807 || int(neg_inf) != (-9223372036854775807 - 1) || int(nan) != 0 { << false }
+    if fp_cmp_bits(1.0, 2.0) != 14 || fp_cmp_bits(2.0, 2.0) != 41 || fp_cmp_bits(3.0, 2.0) != 50 { << false }
+    if fp_cmp_bits(zero, neg_zero) != 41 || fp_cmp_bits(nan, 1.0) != 2 || fp_cmp_bits(1.0, nan) != 2 || fp_cmp_bits(nan, nan) != 2 { << false }
+    $a0 := 1.25
+    $a1 := 2.5
+    $a2 := 3.75
+    $a3 := 4.5
+    $a4 := 5.25
+    $a5 := 6.5
+    $a6 := 7.75
+    $a7 := 8.5
+    $a8 := 9.25
+    $a9 := 10.5
+    $call_sum := 0.0
+    for k in 0:10 {
+        call_sum += callee_fp_pressure(a0 + f64(k), a1, a2, a3)
+        if hex.encode_to_string("0123456789abcdef0123456789abcdef").len != 64 { << false }
+        a0 += 0.5
+        a1 += 0.25
+        a2 += 0.5
+        a3 += 0.25
+        a4 += 0.5
+        a5 += 0.25
+        a6 += 0.5
+        a7 += 0.25
+        a8 += 0.5
+        a9 += 0.25
+    }
+    if int(call_sum + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9) != 3266 { << false }
+    if int(stack_params_f64(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0)) != 650 { << false }
+    if int(select_f64(true, 42.5, -7.5) * 2.0) != 85 || int(select_f64(false, 42.5, -7.5) * 2.0) != -15 { << false }
+    $vs := []Vec3{}
+    for i in 0:32 {
+        vs.push(Vec3{x: f64(i), y: f64(i) * 0.5, z: f64(i) * 1.5})
+    }
+    $vsum := 0.0
+    for i in 0:32 {
+        vs[i].x = vs[i].x + 1.0
+        vs[i].y = vs[i].y * 2.0
+        vs[i].z = vs[i].z - 0.5
+        vsum += vs[i].x * vs[i].x + vs[i].y * vs[i].y + vs[i].z * vs[i].z
+    }
+    if int(vsum * 4.0) != 178224 { << false }
+    $ps := []Pair32{}
+    for i in 0:8 {
+        ps.push(Pair32{a: f32(i) + f32(0.25), b: f32(i) * f32(1.5), c: f64(i) * 2.25})
+    }
+    $psum := 0.0
+    for i in 0:8 {
+        psum += f64(ps[i].a) + f64(ps[i].b) + ps[i].c
+    }
+    << int(psum * 4.0) == 540
+}
+
 fn main() int {
     $counter := Counter{value: 3}
     $sum := 5
@@ -125,6 +503,7 @@ fn main() int {
         sum += i & 7
         i += 1
     }
+    if !verify_fp_regalloc() { << 40 }
     counter.add(sum)
     if i != 35 || counter.value != 120 { << 1 }
 
@@ -137,6 +516,7 @@ fn main() int {
     }
     if sum != 29 { << 2 }
     if gcd(1071, 462) != 21 { << 16 }
+    if !verify_divc_pow2_and_mul() { << 41 }
     if !implicit_borrow_values() { << 20 }
 
     if bits.len(0) != 0 || bits.leading_zeros(0) != 64 || bits.trailing_zeros(0) != 64 { << 3 }
@@ -156,6 +536,19 @@ fn main() int {
     recovered := cipher.decrypt(&encrypted) or (err) { << 14 }
     if recovered != plain { << 15 }
     if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" { << 17 }
+    if md5.sum("") != "d41d8cd98f00b204e9800998ecf8427e" { << 21 }
+    if md5.sum("abc") != "900150983cd24fb0d6963f7d28e17f72" { << 22 }
+    if md5.sum("0123456789abcdef0123456789abcdef") != "8516ac99dc60603295de7bdb6a153530" { << 23 }
+    unaligned := "x0123456789abcdef0123456789abcdefy"
+    if md5.sum(unaligned[1:33]) != "8516ac99dc60603295de7bdb6a153530" { << 24 }
+    $md := md5.new()
+    md.write(&"The quick brown ")
+    md.write(&"fox jumps over the lazy dog")
+    if md.sum() != "9e107d9d372bb6826bd81d3542a419d6" { << 25 }
+    if md.sum() != "9e107d9d372bb6826bd81d3542a419d6" { << 26 }
+    md.reset()
+    md.write(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    if md.sum() != "3b0c8ac703f828b04c6c197006d17218" { << 27 }
     source := "abcd"
     view := source[1:3]
     $once := strings.repeat(&view, 1)
@@ -163,6 +556,29 @@ fn main() int {
     if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
     empty := ""
     if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
+    if !check_match_lut_cases() { << 38 }
+    if !check_fnval_cases(true) || !check_fnval_cases(false) { << 39 }
+    $binary := make_string(33)
+    for i in 0:33 { binary[i] = 128 + (i & 1) }
+    if count_byte(&binary, 128) != 17 || count_byte(&binary, 129) != 16 || count_byte(&binary, 0) != 0 { << 28 }
+    parts := split_byte(&binary, 128)
+    if parts.len != 18 || parts[0] != "" || parts[1] != string_from_byte(129) || parts[17] != "" { << 29 }
+    if strings.join(parts, string_from_byte(128)) != binary { << 30 }
+    prefix := "/+7d"
+    block := strings.repeat(&prefix, 33)
+    original := base64.decode_string(block + "/g==") or (err) { << 31 }
+    if original.len != 100 || original[0] != 255 || original[99] != 254 { << 32 }
+    if base64.encode_to_string(original + "") != block + "/g==" { << 33 }
+    if !rejects_invalid_base64(block + "AA=A") { << 34 }
+    for i in 0:8 {
+        $large := make_string(20000 + i)
+        if large[0] != 0 || large[large.len - 1] != 0 { << 35 }
+        large[0] = 255
+        large[large.len - 1] = 255
+    }
+    if !check_recycled_strings() { << 36 }
+    if !check_short_string_copies() { << 37 }
+    if !check_zst_static_box() { << 40 }
     println("optimized code passed")
     << 0
 }
@@ -187,11 +603,51 @@ fn probe(capacity int) int {
     }
     << total
 }
+fn fp_worker(ch chan int, out chan int, seed f64) {
+    $f0 := seed + 1.5
+    $f1 := seed + 2.5
+    $f2 := seed + 3.5
+    $f3 := seed + 4.5
+    $f4 := seed + 5.5
+    $f5 := seed + 6.5
+    $f6 := seed + 7.5
+    $f7 := seed + 8.5
+    $f8 := seed + 9.5
+    $f9 := seed + 10.5
+    for _ in 0:8 {
+        dv := f64(<-ch)
+        f0 += dv * 0.25
+        f1 += dv * 0.5
+        f2 += dv * 0.75
+        f3 += dv * 1.0
+        f4 += dv * 1.25
+        f5 += dv * 1.5
+        f6 += dv * 1.75
+        f7 += dv * 2.0
+        f8 += dv * 2.25
+        f9 += dv * 2.5
+        out <- int(f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9)
+    }
+}
 fn main() int {
     for round in 0:4 {
         if probe(0) != 2512 { << 2 }
         if probe(32) != 2512 { << 4 }
     }
+    ch1 := chan int{cap: 0}
+    out1 := chan int{cap: 0}
+    ch2 := chan int{cap: 0}
+    out2 := chan int{cap: 0}
+    xu fp_worker(ch1, out1, 1.0)
+    xu fp_worker(ch2, out2, 100.0)
+    $tsum := 0
+    for i in 0:8 {
+        ch1 <- (i + 1)
+        ch2 <- (i + 10)
+        tsum += <-out1
+        tsum += <-out2
+    }
+    if tsum != 16789 { << 5 }
     println("concurrency passed")
     << 0
 }
