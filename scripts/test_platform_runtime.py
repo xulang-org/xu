@@ -364,6 +364,74 @@ fn check_zst_static_box() bool {
     << ne.tag() + zst_pass(ne) == 26
 }
 
+fn check_loop_carry_cases() bool {
+    $a := []int{}
+    $i := 0
+    while i < 64 {
+        a.push((i * 17 + 5) & 255)
+        i += 1
+    }
+    $pass := 0
+    while pass < 3 {
+        $k := 1
+        while k < a.len {
+            a[k] = (a[k - 1] * 3 + a[k]) % 1000000007
+            k += 1
+        }
+        pass += 1
+    }
+    if a[0] != 5 || a[63] != 564084038 { << false }
+    // Zero-trip bound and offset-2 index guard must keep prefix untouched.
+    $z := [11, 22, 33, 44]
+    $zi := 2
+    while zi < 2 {
+        z[zi] = (z[zi - 1] * 5 + z[zi]) % 1000000007
+        zi += 1
+    }
+    if z[0] != 11 || z[1] != 22 || z[2] != 33 || z[3] != 44 { << false }
+    $j := 2
+    while j < z.len {
+        z[j] = (z[j - 1] * 5 + z[j]) % 1000000007
+        j += 1
+    }
+    if z[0] != 11 || z[1] != 22 || z[2] != 143 || z[3] != 759 { << false }
+    << true
+}
+
+fn check_map_int_cases() bool {
+    $m := map[int]int{}
+    for i in 0:256 {
+        m[i * 3 + 1] = i * 7 + 2
+    }
+    if m.len() != 256 { << false }
+    for i in 0:160 {
+        m.delete(i * 3 + 1)
+    }
+    if m.len() != 96 { << false }
+    // Reuse tombstones and grow across threshold while overwriting existing entries.
+    for i in 0:200 {
+        key := 10000 + i
+        m[key] = i + 50
+        m[key] = m[key] + 10
+    }
+    if m.len() != 296 { << false }
+    if m.has(1) || !m.has(160 * 3 + 1) || m[160 * 3 + 1] != 160 * 7 + 2 { << false }
+    if m[10199] != 259 { << false }
+    $sm := map[string]int{}
+    for i in 0:64 {
+        k := "k-" + str(i)
+        sm[k] = i
+        sm[k] = sm[k] + 100
+    }
+    for i in 0:40 {
+        sm.delete("k-" + str(i))
+    }
+    for i in 0:64 {
+        sm["n-" + str(i)] = i * 2
+    }
+    << sm.len() == 88 && !sm.has("k-0") && sm["k-63"] == 163 && sm["n-63"] == 126
+}
+
 fn implicit_borrow_values() bool {
     first := 23
     counter := Counter{value: 42}
@@ -579,6 +647,8 @@ fn main() int {
     if !check_recycled_strings() { << 36 }
     if !check_short_string_copies() { << 37 }
     if !check_zst_static_box() { << 40 }
+    if !check_loop_carry_cases() { << 41 }
+    if !check_map_int_cases() { << 42 }
     println("optimized code passed")
     << 0
 }
@@ -774,6 +844,73 @@ fn main() int {
 }
 '''
 
+HTTP_EVENT_SET = r'''@main
+#net
+#net/http
+fn serve_task(lfd int, srv_done chan int) {
+    _ := http.serve_listener(lfd, fn(c http.Context) {
+        c.text(200, "pong:" + c.path()) or (err) { << }
+    })
+    srv_done <- 1
+}
+fn client_worker(base_url string, base_seq int, out chan int) {
+    $c := http.new_client()
+    c.set_timeout(5000000000)
+    $ok := 0
+    for i in 0:8 {
+        path := "/r/" + str(base_seq + i)
+        resp := c.get(base_url + path) or (err) {
+            out <- -1
+            <<
+        }
+        if resp.status_code() != 200 || resp.body() != "pong:" + path {
+            out <- -2
+            <<
+        }
+        ok += 1
+    }
+    out <- ok
+}
+fn try_listen(addr string) int {
+    << net.listen(addr) or (err) { << -1 }
+}
+fn main() int {
+    $port := 23401
+    $lfd := -1
+    $tries := 0
+    while lfd < 0 && tries < 64 {
+        addr := "127.0.0.1:" + str(port)
+        lfd = try_listen(addr + "")
+        if lfd < 0 {
+            port += 1
+            tries += 1
+        }
+    }
+    if lfd < 0 {
+        eprintln("no loopback port")
+        << 1
+    }
+    srv_done := chan int{cap: 1}
+    xu serve_task(lfd, srv_done)
+    base_url := "http://127.0.0.1:" + str(port)
+    out := chan int{cap: 8}
+    for w in 0:8 {
+        xu client_worker(base_url + "", w * 8, out)
+    }
+    $total := 0
+    for _ in 0:8 {
+        v := <-out
+        if v < 0 { << 2 }
+        total += v
+    }
+    net.conn_close(lfd) or (err) { << 3 }
+    if <-srv_done != 1 { << 4 }
+    if total != 64 { << 5 }
+    println("http event set passed")
+    << 0
+}
+'''
+
 
 def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected: bytes) -> None:
     try:
@@ -816,6 +953,7 @@ def main() -> int:
         run("optimized_code/no-opt", build("unoptimized_code", OPTIMIZED_CODE, "--no-opt"),
             expected="optimized code passed")
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
+        run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")
         from platform_crypto_cases import SOURCE as CRYPTO, write_fixtures
