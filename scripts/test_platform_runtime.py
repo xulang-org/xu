@@ -80,6 +80,7 @@ fn main() int {
 
 OPTIMIZED_CODE = r'''@main
 #crypto/aes
+#crypto/md5
 #crypto/sha256
 #encoding/base64
 #encoding/hex
@@ -92,6 +93,112 @@ struct Counter {
 
 fn (c $&Counter) add(n int) {
     c.value += n
+}
+
+fn (c &Counter) get() int {
+    << c.value
+}
+
+fn bump_one(x int) int {
+    << x + 1
+}
+
+fn bump_ten(x int) int {
+    << x + 10
+}
+
+fn check_match_lut_cases() bool {
+    // Masked dense 8-way match with else arm.
+    $masked := 0
+    for i in 0:64 {
+        k := i & 7
+        match k {
+            0 { masked += 1 }
+            1 { masked += 3 }
+            2 { masked += 5 }
+            3 { masked += 7 }
+            4 { masked += 11 }
+            5 { masked += 13 }
+            6 { masked += 17 }
+            else { masked += 19 }
+        }
+    }
+    if masked != 608 { << false }
+
+    // Unmasked match with negative lo, out-of-range inputs, duplicate arm, and empty arm.
+    $unmasked := 0
+    $inputs := [-10, -3, -2, -1, 0, 1, 2, 3, 10]
+    for idx in 0:inputs.len {
+        v := inputs[idx]
+        match v {
+            -3 { unmasked += 10 }
+            -2 { unmasked += 20 }
+            -1 { }
+            0 { unmasked += 40 }
+            1 { unmasked += 50 }
+            1 { unmasked += 999 }
+            2 { unmasked += 60 }
+            3 { unmasked += 70 }
+            else { unmasked += 3 }
+        }
+        // Keep selector live after match.
+        if v != inputs[idx] { << false }
+    }
+    if unmasked != 256 { << false }
+
+    // Selector local updated inside match arms.
+    $self_sum := 0
+    for j in 0:8 {
+        $x := j
+        match x {
+            0 { x += 2 }
+            1 { x += 4 }
+            2 { x += 6 }
+            3 { x += 8 }
+            4 { x += 10 }
+            5 { x += 12 }
+            6 { x += 14 }
+            else { x += 16 }
+        }
+        self_sum += x
+    }
+    << self_sum == 100
+}
+
+fn check_fnval_cases(flag bool) bool {
+    // Non-capturing function value (eligible for zero-env drop elim + SROA + devirt).
+    f := bump_one
+    $sum := 0
+    for i in 0:32 {
+        sum += f(i & 7)
+    }
+    if sum != 144 { << false }
+
+    // Reassigned non-capturing function value (must keep dynamic dispatch).
+    $g := bump_one
+    if flag { g = bump_ten }
+    $want_g := 6
+    if flag { want_g = 15 }
+    if g(5) != want_g { << false }
+
+    // Capturing closure (negative case: must preserve env and drop glue).
+    base := 100
+    h := fn(x int) int { << base + x }
+    if h(7) != 107 { << false }
+
+    // Mixed non-capturing and capturing reassignment (negative case: must preserve drop).
+    $m := bump_one
+    if flag {
+        m = fn(x int) int { << base + x * 2 }
+    }
+    $want_m := 7
+    if flag { want_m = 112 }
+    if m(6) != want_m { << false }
+
+    // Bound method value (negative case: non-zero borrowed receiver env).
+    c := Counter{value: 42}
+    bm := c.get
+    << bm() == 42
 }
 
 fn rejects_invalid_hex() bool {
@@ -197,6 +304,19 @@ fn main() int {
     recovered := cipher.decrypt(&encrypted) or (err) { << 14 }
     if recovered != plain { << 15 }
     if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" { << 17 }
+    if md5.sum("") != "d41d8cd98f00b204e9800998ecf8427e" { << 21 }
+    if md5.sum("abc") != "900150983cd24fb0d6963f7d28e17f72" { << 22 }
+    if md5.sum("0123456789abcdef0123456789abcdef") != "8516ac99dc60603295de7bdb6a153530" { << 23 }
+    unaligned := "x0123456789abcdef0123456789abcdefy"
+    if md5.sum(unaligned[1:33]) != "8516ac99dc60603295de7bdb6a153530" { << 24 }
+    $md := md5.new()
+    md.write(&"The quick brown ")
+    md.write(&"fox jumps over the lazy dog")
+    if md.sum() != "9e107d9d372bb6826bd81d3542a419d6" { << 25 }
+    if md.sum() != "9e107d9d372bb6826bd81d3542a419d6" { << 26 }
+    md.reset()
+    md.write(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    if md.sum() != "3b0c8ac703f828b04c6c197006d17218" { << 27 }
     source := "abcd"
     view := source[1:3]
     $once := strings.repeat(&view, 1)
@@ -204,26 +324,28 @@ fn main() int {
     if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
     empty := ""
     if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
+    if !check_match_lut_cases() { << 38 }
+    if !check_fnval_cases(true) || !check_fnval_cases(false) { << 39 }
     $binary := make_string(33)
     for i in 0:33 { binary[i] = 128 + (i & 1) }
-    if count_byte(&binary, 128) != 17 || count_byte(&binary, 129) != 16 || count_byte(&binary, 0) != 0 { << 21 }
+    if count_byte(&binary, 128) != 17 || count_byte(&binary, 129) != 16 || count_byte(&binary, 0) != 0 { << 28 }
     parts := split_byte(&binary, 128)
-    if parts.len != 18 || parts[0] != "" || parts[1] != string_from_byte(129) || parts[17] != "" { << 22 }
-    if strings.join(parts, string_from_byte(128)) != binary { << 23 }
+    if parts.len != 18 || parts[0] != "" || parts[1] != string_from_byte(129) || parts[17] != "" { << 29 }
+    if strings.join(parts, string_from_byte(128)) != binary { << 30 }
     prefix := "/+7d"
     block := strings.repeat(&prefix, 33)
-    original := base64.decode_string(block + "/g==") or (err) { << 24 }
-    if original.len != 100 || original[0] != 255 || original[99] != 254 { << 25 }
-    if base64.encode_to_string(original + "") != block + "/g==" { << 26 }
-    if !rejects_invalid_base64(block + "AA=A") { << 27 }
+    original := base64.decode_string(block + "/g==") or (err) { << 31 }
+    if original.len != 100 || original[0] != 255 || original[99] != 254 { << 32 }
+    if base64.encode_to_string(original + "") != block + "/g==" { << 33 }
+    if !rejects_invalid_base64(block + "AA=A") { << 34 }
     for i in 0:8 {
         $large := make_string(20000 + i)
-        if large[0] != 0 || large[large.len - 1] != 0 { << 28 }
+        if large[0] != 0 || large[large.len - 1] != 0 { << 35 }
         large[0] = 255
         large[large.len - 1] = 255
     }
-    if !check_recycled_strings() { << 29 }
-    if !check_short_string_copies() { << 30 }
+    if !check_recycled_strings() { << 36 }
+    if !check_short_string_copies() { << 37 }
     println("optimized code passed")
     << 0
 }
