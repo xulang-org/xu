@@ -983,7 +983,11 @@ fn (w $&Lw) needs_drop(tp &types.TypedProgram, ty int) bool {
         << true
     }
     if types.is_array_type(ty) {
-        << tp.arrays[types.array_index(ty)].fixed_len == 0
+        ai := types.array_index(ty)
+        if tp.arrays[ai].fixed_len == 0 {
+            << true
+        }
+        << w.needs_drop(tp, tp.arrays[ai].elem_ty)
     }
     // A map owns its record, keys and values; copies are deep clones
     // (clone_into) and moves transfer the handle.
@@ -1133,6 +1137,9 @@ fn (w $&Lw) mark_moved(id int) {
     flag := w.flag_of(id)
     if flag >= 0 {
         w.store_local(flag, 0, w.konst(0))
+    } else if w.outside_loop(id) {
+        w.note_dynamic(id)
+        w.own_disown(id)
     } else {
         w.lmoved[id] = true
     }
@@ -1298,7 +1305,7 @@ fn (w $&Lw) lower_ident(p &parser.Parser, tp &types.TypedProgram, n int) int {
         slot := w.ensure_local(tp, id)
         ty := w.local_type(tp, id)
         if tp.clone_of(n) == 2 && w.needs_drop(tp, ty) {
-            if w.owns(id) && w.in_cond == 0 {
+            if w.owns(id) && (w.in_cond == 0 || ty != 3) {
                 flag := w.flag_of(id)
                 if flag >= 0 {
                     w.store_local(flag, 0, w.konst(0))
@@ -1661,8 +1668,20 @@ fn (w $&Lw) clone_into(tp &types.TypedProgram, dst int, src int, ty int) {
         w.call_core("chan_retain", &args)
         <<
     }
-    if types.is_array_type(ty) && tp.arrays[types.array_index(ty)].fixed_len == 0 {
+    if types.is_array_type(ty) {
+        fl := tp.arrays[types.array_index(ty)].fixed_len
         ety := tp.elem_of(ty)
+        if fl > 0 {
+            w.copy_mem(dst, src, tp.size_of(ty))
+            if w.needs_drop(tp, ety) {
+                esize := tp.size_of(ety)
+                for fi in 0:fl {
+                    off := w.konst(fi * esize)
+                    w.clone_into(tp, w.bin(BIN_ADD, dst, off), w.bin(BIN_ADD, src, off), ety)
+                }
+            }
+            <<
+        }
         $args := []int{}
         args.push(dst)
         args.push(src)
@@ -2256,10 +2275,16 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
     if k == ast.NK_EXPR_STMT {
         e := p.nodes[s].a
         v := w.lower_expr(p, tp, e)
+        ety := tp.type_of(e)
         // A statement discards its value: free a fresh one of any owning
         // type, not only resource types and concatenations.
-        if w.needs_drop(tp, tp.type_of(e)) && w.transfer_safe(p, tp, e) {
-            w.drop_value(tp, v, tp.type_of(e))
+        if w.needs_drop(tp, ety) && w.transfer_safe(p, tp, e) {
+            $addr := v
+            if !is_wide(tp, ety) {
+                addr = w.scratch_words(1)
+                w.store_ptr(addr, 0, v, width_of(tp, ety))
+            }
+            w.drop_value(tp, addr, ety)
         } else {
             w.drop_fresh_str(p, tp, e, v)
         }
@@ -2535,6 +2560,9 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
             if flag >= 0 {
                 w.store_local(flag, 0, w.konst(1))
             } else {
+                if w.outside_loop(id) && w.lmoved[id] {
+                    w.note_dynamic(id)
+                }
                 w.lmoved[id] = false
             }
         }
@@ -2561,6 +2589,62 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
                 <<
             }
         }
+    }
+    if tk == ast.NK_INDEX {
+        base_n := p.nodes[target].a
+        bty := tp.deref(tp.deref(w.place_type(p, tp, base_n)))
+        if tty == 3 && aop == ast.AS_ADD {
+            rhs := w.base_addr(p, tp, p.nodes[s].b)
+            idx := w.lower_expr(p, tp, p.nodes[target].b)
+            d := w.array_desc(p, tp, base_n, bty)
+            w.bounds_check(idx, w.load_ptr(d, 8, 8))
+            elem_a := w.bin(BIN_ADD, w.load_ptr(d, 0, 8), w.bin(BIN_MUL, idx, w.konst(tp.size_of(tty))))
+            $args := []int{}
+            args.push(elem_a)
+            args.push(rhs)
+            w.call_core("str_push", &args)
+            w.drop_fresh_str(p, tp, p.nodes[s].b, rhs)
+            <<
+        }
+        // Evaluate index and RHS before loading destination element address so
+        // mutations during RHS evaluation (e.g. slice growth) cannot dangle.
+        idx := w.lower_expr(p, tp, p.nodes[target].b)
+        $v := w.own_val(p, tp, p.nodes[s].b, w.lower_expr(p, tp, p.nodes[s].b), tty)
+        d := w.array_desc(p, tp, base_n, bty)
+        if bty == 3 {
+            $sargs := []int{}
+            sargs.push(d)
+            w.call_core("str_ensure_owned", &sargs)
+        }
+        n_len := w.load_ptr(d, 8, 8)
+        w.bounds_check(idx, n_len)
+        data := w.load_ptr(d, 0, 8)
+        $esize := 1
+        $width := width_of(tp, tty)
+        if bty == 3 {
+            width = 1
+        } else {
+            esize = tp.size_of(tty)
+        }
+        $eaddr := data
+        if esize == 1 {
+            eaddr = w.bin(BIN_ADD, data, idx)
+        } else {
+            eaddr = w.bin(BIN_ADD, data, w.bin(BIN_MUL, idx, w.konst(esize)))
+        }
+        if aop == ast.AS_ASSIGN && w.needs_drop(tp, tty) {
+            w.drop_value(tp, eaddr, tty)
+        }
+        if is_wide(tp, tty) {
+            w.copy_mem(eaddr, v, tp.size_of(tty))
+            <<
+        }
+        if aop > ast.AS_ASSIGN {
+            old := w.load_ptr(eaddr, 0, width)
+            v = w.checked_bin(assign_op_code(tty, aop), old, v, tp.deref(tty))
+        }
+        w.store_ptr(eaddr, 0, v, width)
+        <<
     }
     $addr := -1
     if (tk == ast.NK_IDENT || tk == ast.NK_FIELD) && tp.global_of(target) >= 0 {

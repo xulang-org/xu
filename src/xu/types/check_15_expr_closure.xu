@@ -49,6 +49,10 @@ fn (c $&Checker) check_method_value(p &parser.Parser, n int, base_ty int, ot int
         fi = c.instantiate_fn_n(p, fi, n)
         if fi < 0 { << ERROR_TY }
     }
+    ff := c.ffi_label_flags(&c.fns[fi].label)
+    if c.fns[fi].is_extern || (ff >= 0 && (ff & ast.FFI_UNSAFE_FN) != 0) {
+        c.fail_node(p, n, "unsafe or native method values require a safe Xu wrapper")
+    }
     if c.fns[fi].params.len > 4 {
         c.fail_node(p, n, "indirect calls support at most 4 arguments (env uses A0)")
     }
@@ -213,7 +217,11 @@ fn (c $&Checker) check_fn_lit(p &parser.Parser, n int) int {
     prm = p.nodes[prm].next
     }
     $ret_ty := 0
+    $bad_ref_ret := false
     if p.nodes[n].b >= 0 {
+        if !c.typeref_ref_return_ok(p, p.nodes[n].b, n) {
+            bad_ref_ret = true
+        }
         ret_ty = c.type_of(p, p.nodes[n].b)
     }
     // Collect free idents.
@@ -341,9 +349,16 @@ fn (c $&Checker) check_fn_lit(p &parser.Parser, n int) int {
     copy_ints($&ol_head, &c.lhead)
     copy_ints($&ol_prev, &c.lprev)
     saved_ret := c.cur_ret
+    saved_ret_life := ~c.cur_ret_life
     saved_fn := c.cur_fn
     saved_rebind := c.rebind
     saved_loop := c.loop_depth
+    saved_unsafe := c.unsafe_depth
+    saved_throw := c.cur_throw_ty
+    saved_or_catch := c.in_or_catch
+    saved_or_assign := ~c.or_assign
+    saved_irq := c.in_irq
+    saved_err_base := c.fn_err_base
 
     $env_sty := -1
     $clos_params := []int{}
@@ -471,15 +486,25 @@ fn (c $&Checker) check_fn_lit(p &parser.Parser, n int) int {
     c.rebind = -1
     c.loop_depth = 0
     c.cur_ret = ret_ty
+    c.cur_ret_life = ""
+    if p.nodes[n].b >= 0 && p.nodes[p.nodes[n].b].kind == ast.NT_REF {
+        c.cur_ret_life = ~p.nodes[p.nodes[n].b].sval
+    }
     c.cur_fn = fid
+    c.unsafe_depth = 0
+    c.cur_throw_ty = 0
+    c.in_or_catch = 0
+    c.or_assign = ""
+    c.in_irq = 0
+    c.fn_err_base = c.error_count
     c.push_scope(0)
     c.cap_names = []string{}
     c.cap_fields = []int{}
     c.cap_tys = []int{}
     if env_sty >= 0 {
         c.cap_active = 1
-        eid := c.add_local("_env", c.make_ref_type(false, env_sty), false)
-        checker_set_i($&c.lorigin, eid, eid)
+        _ := c.add_local("_env", c.make_ref_type(false, env_sty), false)
+        // Do not mark _env returnable: references derived from captured state must not outlive closure/owner.
         for i in 0:cap_resolved.len {
             c.cap_names.push(cap_resolved[i])
             c.cap_fields.push(i)
@@ -491,32 +516,48 @@ fn (c $&Checker) check_fn_lit(p &parser.Parser, n int) int {
     prm = p.nodes[n].a
     $pi := 0
     while prm >= 0 {
-    c.add_local(p.nodes[prm].sval, param_tys[pi], false)
-    pi += 1
-    prm = p.nodes[prm].next
+        pid := c.add_local(p.nodes[prm].sval, param_tys[pi], false)
+        if is_ref_type(param_tys[pi]) {
+            checker_set_i($&c.lorigin, pid, pid)
+            pty := p.nodes[prm].a
+            if pty >= 0 && p.nodes[pty].kind == ast.NT_REF {
+                c.llife[pid] = p.nodes[pty].sval
+            }
+        }
+        pi += 1
+        prm = p.nodes[prm].next
     }
     $s := p.nodes[n].c
     while s >= 0 {
-    c.check_stmt(p, s)
-    s = p.nodes[s].next
+        if c.fn_failed() {
+            <-
+        }
+        c.check_stmt(p, s)
+        s = p.nodes[s].next
     }
     if ret_ty != 0 {
         // Must end with << (mirror bootstrap). nk_return = 23.
         $last := p.nodes[n].c
         $prev := -1
         while last >= 0 {
-        prev = last
-        last = p.nodes[last].next
+            prev = last
+            last = p.nodes[last].next
         }
         if prev < 0 || p.nodes[prev].kind != ast.NK_RETURN {
             c.fail_node(p, n, "non-void function literal must end with a return")
         }
-        if p.nodes[prev].a < 0 {
+        if prev >= 0 && p.nodes[prev].a < 0 {
             c.fail_node(p, n, "non-void function literal must end with a return")
         }
     }
     c.pop_scope(p, false, false)
     c.set_fnlocals_row(fid)
+    if bad_ref_ret && !c.fn_failed() {
+        c.fail_node(p, n, "reference return type in function literal requires an unambiguous reference parameter")
+    }
+    if !c.fn_failed() {
+        c.borrow_check_fn(p, n)
+    }
 
     // Restore outer locals and capture remapping; apply capture moves.
     c.lname = ol_name
@@ -551,9 +592,16 @@ fn (c $&Checker) check_fn_lit(p &parser.Parser, n int) int {
     c.pend_nodes = ol_pend_nodes
     c.pend_marks = ol_pend_marks
     c.cur_ret = saved_ret
+    c.cur_ret_life = saved_ret_life
     c.cur_fn = saved_fn
     c.rebind = saved_rebind
     c.loop_depth = saved_loop
+    c.unsafe_depth = saved_unsafe
+    c.cur_throw_ty = saved_throw
+    c.in_or_catch = saved_or_catch
+    c.or_assign = saved_or_assign
+    c.in_irq = saved_irq
+    c.fn_err_base = saved_err_base
     c.cap_active = oc_active
     c.cap_names = oc_names
     c.cap_fields = oc_fields
@@ -642,6 +690,55 @@ fn (c $&Checker) collect_free_idents_stmt(p &parser.Parser, s int, bound $&[]str
             }
         }
         c.collect_free_idents(p, p.nodes[s].c, inner, out, seen)
+        <<
+    }
+    if k == ast.NK_MATCH {
+        if p.nodes[s].a >= 0 { c.collect_free_idents_expr(p, p.nodes[s].a, bound, out, seen) }
+        $ar := p.nodes[s].b
+        while ar >= 0 {
+            $inner := []string{}
+            for j in 0:bound.len { inner.push(bound[j]) }
+            if p.nodes[ar].kind == ast.NK_ARM_ENUM {
+                $b := p.nodes[ar].a
+                while b >= 0 {
+                    inner.push(p.nodes[b].sval)
+                    b = p.nodes[b].next
+                }
+            }
+            c.collect_free_idents(p, p.nodes[ar].c, inner, out, seen)
+            ar = p.nodes[ar].next
+        }
+        <<
+    }
+    if k == ast.NK_SELECT {
+        $ar := p.nodes[s].a
+        while ar >= 0 {
+            if p.nodes[ar].a >= 0 { c.collect_free_idents_expr(p, p.nodes[ar].a, bound, out, seen) }
+            if p.nodes[ar].kind == ast.NK_SEL_SEND && p.nodes[ar].b >= 0 {
+                c.collect_free_idents_expr(p, p.nodes[ar].b, bound, out, seen)
+            }
+            $inner := []string{}
+            for j in 0:bound.len { inner.push(bound[j]) }
+            if p.nodes[ar].kind == ast.NK_SEL_RECV {
+                inner.push(p.nodes[ar].sval)
+            }
+            c.collect_free_idents(p, p.nodes[ar].c, inner, out, seen)
+            ar = p.nodes[ar].next
+        }
+        if p.nodes[s].c >= 0 {
+            $inner := []string{}
+            for j in 0:bound.len { inner.push(bound[j]) }
+            c.collect_free_idents(p, p.nodes[s].c, inner, out, seen)
+        }
+        <<
+    }
+    if k == ast.NK_XU {
+        if p.nodes[s].a >= 0 { c.collect_free_idents_expr(p, p.nodes[s].a, bound, out, seen) }
+        <<
+    }
+    if k == ast.NK_SEND {
+        if p.nodes[s].a >= 0 { c.collect_free_idents_expr(p, p.nodes[s].a, bound, out, seen) }
+        if p.nodes[s].b >= 0 { c.collect_free_idents_expr(p, p.nodes[s].b, bound, out, seen) }
     }
 }
 
@@ -689,6 +786,18 @@ fn (c $&Checker) collect_free_idents_expr(p &parser.Parser, e int, bound $&[]str
         c.collect_free_idents_expr(p, a, $&bnd, out, seen)
         a = p.nodes[a].next
         }
+        <<
+    }
+    if k == ast.NK_STRUCT_INIT {
+        $sf := p.nodes[e].a
+        while sf >= 0 {
+            c.collect_free_idents_expr(p, p.nodes[sf].a, $&bnd, out, seen)
+            sf = p.nodes[sf].next
+        }
+        <<
+    }
+    if k == ast.NK_MAP_INIT {
+        if p.nodes[e].c >= 0 { c.collect_free_idents_expr(p, p.nodes[e].c, $&bnd, out, seen) }
         <<
     }
     if k == ast.NK_OR_CATCH {
