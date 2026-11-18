@@ -252,6 +252,69 @@ fn gcd(a int, b int) int {
     << gcd(b, a % b)
 }
 
+fn div2_if_even(x int) int {
+    if x % 2 == 0 { << x / 2 }
+    << x * 3 + 1
+}
+
+fn div4_if_mod4(x int) int {
+    if x % 4 == 0 { << x / 4 }
+    << x * 5 - 3
+}
+
+fn div8_if_neg_mod8(x int) int {
+    if x % -8 != 0 { << x * 9 + 1 }
+    << x / 8
+}
+
+fn div2_modified_after_guard(x0 int) int {
+    $x := x0
+    if x % 2 == 0 {
+        x = x - 1
+        << x / 2
+    }
+    << x
+}
+
+fn mod_value_used(x int) int {
+    r := x % 4
+    if r == 0 { << 100 }
+    << r
+}
+
+fn div4_under_mod2_guard(x int) int {
+    if x % 2 == 0 { << x / 4 }
+    << 0
+}
+
+fn verify_divc_pow2_and_mul() bool {
+    min_i64 := -9223372036854775807 - 1
+    if div2_if_even(-6) != -3 || div2_if_even(-5) != -14 || div2_if_even(min_i64) != (-4611686018427387904) { << false }
+    if div4_if_mod4(-12) != -3 || div4_if_mod4(-10) != -53 || div4_if_mod4(min_i64) != (-2305843009213693952) { << false }
+    if div8_if_neg_mod8(-16) != -2 || div8_if_neg_mod8(-10) != -89 || div8_if_neg_mod8(min_i64) != (-1152921504606846976) { << false }
+    // Negative cases: modified local after guard, modulo value used directly, narrower guard
+    if div2_modified_after_guard(-4) != -2 || div2_modified_after_guard(0) != 0 { << false }
+    if mod_value_used(-3) != -3 || mod_value_used(-4) != 100 || mod_value_used(3) != 3 { << false }
+    if div4_under_mod2_guard(-2) != 0 || div4_under_mod2_guard(-6) != -1 { << false }
+    // Collatz-style loop exercising cmp + hoisted store + select and mul by 2^k+1
+    $acc := 0
+    $x := 27
+    while x != 1 {
+        if x % 2 == 0 {
+            acc += 1
+            x = x / 2
+        } else {
+            acc += 1
+            x = x * 3 + 1
+        }
+    }
+    if acc != 111 { << false }
+    // Negative odd/even mul by 3, 5, 9, 17
+    v := -7
+    if v * 3 != -21 || 3 * v != -21 || v * 5 != -35 || v * 9 != -63 || v * 17 != -119 { << false }
+    << true
+}
+
 fn implicit_borrow_values() bool {
     first := 23
     counter := Counter{value: 42}
@@ -404,6 +467,7 @@ fn main() int {
     }
     if sum != 29 { << 2 }
     if gcd(1071, 462) != 21 { << 16 }
+    if !verify_divc_pow2_and_mul() { << 41 }
     if !implicit_borrow_values() { << 20 }
 
     if bits.len(0) != 0 || bits.leading_zeros(0) != 64 || bits.trailing_zeros(0) != 64 { << 3 }
