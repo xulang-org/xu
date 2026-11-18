@@ -2,8 +2,8 @@
 """Build a disposable compiler before importing source-backed runtime primitives.
 
 An older published seed may preflight ordinary imports with a frontend that
-cannot check runtime/core primitives. Use its SHA-bound SDK sources for math
-and the string storage helper to compile the current compiler once. The caller
+cannot check runtime/core primitives. Use its SHA-bound SDK sources for math,
+strings, and encoding/base64 to compile the current compiler once. The caller
 must then restart Gen1 against the complete, unchanged current stdlib and require
 the normal fixed point. This transition artifact is never installed or counted
 as a product generation.
@@ -29,6 +29,25 @@ def source_digest(source: Path) -> str:
     return digest.hexdigest()
 
 
+def has_runtime_import(directory: Path) -> bool:
+    return any(
+        RUNTIME_IMPORT.search(path.read_text(encoding='utf-8'))
+        for path in sorted(directory.rglob('*.xu'))
+    )
+
+
+def bridge_package(sdk: Path, destination: Path, rel: str, label: str) -> str:
+    target = destination / 'src' / rel
+    old = sdk / 'src' / rel
+    if not (old / 'mod.xu').is_file():
+        raise ValueError(f'Published SDK is missing its {label} source')
+    if has_runtime_import(old):
+        raise ValueError(f'Published {label} already imports runtime/core; refusing unrelated recovery')
+    shutil.rmtree(target)
+    shutil.copytree(old, target)
+    return source_digest(old)
+
+
 def prepare(seed: Path, source: Path, destination: Path) -> dict:
     version_output = subprocess.check_output([str(seed), '--version'], text=True)
     # Published seeds can carry prerelease identities and terminal colors.
@@ -41,32 +60,28 @@ def prepare(seed: Path, source: Path, destination: Path) -> dict:
     print('seed_stdlib_bridge: original seed version=' + version + ' sha256=' + digest, flush=True)
     candidates = [seed.parent / '.xu-seed-sources' / digest, seed.parent.parent]
     sdk = next((p for p in candidates if (p / 'VERSION').is_file()
-                and (p / 'VERSION').read_text().strip() == version
+                and (p / 'VERSION').read_text(encoding='utf-8').strip() == version
                 and (p / 'src/cmd/compile/main.xu').is_file()), None)
     if sdk is None:
         raise ValueError('Matching published seed sources missing; restore its SDK again')
     current_math = source / 'src/math/float.xu'
-    if not current_math.is_file() or 'core #runtime/core' not in current_math.read_text():
+    if not current_math.is_file() or 'core #runtime/core' not in current_math.read_text(encoding='utf-8'):
         raise ValueError('Unsupported current math runtime layout')
-    old_math = sdk / 'src/math'
-    if not (old_math / 'mod.xu').is_file():
-        raise ValueError('Published SDK is missing its math source')
-    for path in old_math.rglob('*.xu'):
-        if RUNTIME_IMPORT.search(path.read_text()):
-            raise ValueError('Published math already imports runtime/core; refusing unrelated recovery')
     shutil.copytree(source / 'src', destination / 'src')
     shutil.copy2(source / 'VERSION', destination / 'VERSION')
-    shutil.rmtree(destination / 'src/math')
-    shutil.copytree(old_math, destination / 'src/math')
-    record = {'transition': 'math_runtime_v1', 'published_version': version,
-              'published_seed_sha256': digest, 'math_source_sha256': source_digest(old_math)}
-    storage = destination / 'src/strings/storage.xu'
-    if storage.is_file() and RUNTIME_IMPORT.search(storage.read_text()):
-        old_storage = sdk / 'src/strings/storage.xu'
-        if not old_storage.is_file() or RUNTIME_IMPORT.search(old_storage.read_text()):
-            raise ValueError('Published SDK is missing a seed-compatible string storage helper')
-        shutil.copy2(old_storage, storage)
-        record['string_storage_source_sha256'] = hashlib.sha256(old_storage.read_bytes()).hexdigest()
+    record = {
+        'transition': 'math_runtime_v1',
+        'published_version': version,
+        'published_seed_sha256': digest,
+        'math_source_sha256': bridge_package(sdk, destination, 'math', 'math'),
+    }
+    for rel, label, key in (
+        ('strings', 'strings', 'strings_source_sha256'),
+        ('encoding/base64', 'encoding/base64', 'base64_source_sha256'),
+    ):
+        pkg = destination / 'src' / rel
+        if pkg.is_dir() and has_runtime_import(pkg):
+            record[key] = bridge_package(sdk, destination, rel, label)
     record['transition_source_sha256'] = source_digest(destination / 'src')
     return record
 
