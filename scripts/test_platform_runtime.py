@@ -104,6 +104,41 @@ fn rejects_invalid_base64(src string) bool {
     << false
 }
 
+fn check_recycled_strings() bool {
+    lengths := [1, 15, 16, 31, 32, 47, 48, 63, 64, 16383, 16384, 20000, 32751, 32752]
+    seed := "az"
+    for index in 0:lengths.len {
+        n := lengths[index]
+        for _ in 0:3 {
+            $buffer := make_string(n)
+            for i in 0:n {
+                if buffer[i] != 0 { << false }
+                buffer[i] = 255
+            }
+        }
+        repeated := strings.repeat(&seed, (n + 1) / 2)
+        if repeated.len != ((n + 1) / 2) * 2 { << false }
+        for i in 0:repeated.len {
+            if repeated[i] != seed[i & 1] { << false }
+        }
+    }
+    << true
+}
+
+fn check_short_string_copies() bool {
+    seed := "za"
+    src := strings.repeat(&seed, 18)
+    if find_byte(&src, 122, 1) != 2 || find_byte(&src, 98, 1) != -1 { << false }
+    for n in 1:34 {
+        piece := src[1:n + 1]
+        if piece.len != n || count_byte(&piece, 97) != (n + 1) / 2 { << false }
+        for i in 0:n {
+            if piece[i] != src[i + 1] { << false }
+        }
+    }
+    << true
+}
+
 fn gcd(a int, b int) int {
     if b == 0 { << a }
     << gcd(b, a % b)
@@ -187,6 +222,8 @@ fn main() int {
         large[0] = 255
         large[large.len - 1] = 255
     }
+    if !check_recycled_strings() { << 29 }
+    if !check_short_string_copies() { << 30 }
     println("optimized code passed")
     << 0
 }
