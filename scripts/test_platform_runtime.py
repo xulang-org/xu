@@ -93,6 +93,112 @@ fn (c $&Counter) add(n int) {
     c.value += n
 }
 
+fn (c &Counter) get() int {
+    << c.value
+}
+
+fn bump_one(x int) int {
+    << x + 1
+}
+
+fn bump_ten(x int) int {
+    << x + 10
+}
+
+fn check_match_lut_cases() bool {
+    // Masked dense 8-way match with else arm.
+    $masked := 0
+    for i in 0:64 {
+        k := i & 7
+        match k {
+            0 { masked += 1 }
+            1 { masked += 3 }
+            2 { masked += 5 }
+            3 { masked += 7 }
+            4 { masked += 11 }
+            5 { masked += 13 }
+            6 { masked += 17 }
+            else { masked += 19 }
+        }
+    }
+    if masked != 608 { << false }
+
+    // Unmasked match with negative lo, out-of-range inputs, duplicate arm, and empty arm.
+    $unmasked := 0
+    $inputs := [-10, -3, -2, -1, 0, 1, 2, 3, 10]
+    for idx in 0:inputs.len {
+        v := inputs[idx]
+        match v {
+            -3 { unmasked += 10 }
+            -2 { unmasked += 20 }
+            -1 { }
+            0 { unmasked += 40 }
+            1 { unmasked += 50 }
+            1 { unmasked += 999 }
+            2 { unmasked += 60 }
+            3 { unmasked += 70 }
+            else { unmasked += 3 }
+        }
+        // Keep selector live after match.
+        if v != inputs[idx] { << false }
+    }
+    if unmasked != 256 { << false }
+
+    // Selector local updated inside match arms.
+    $self_sum := 0
+    for j in 0:8 {
+        $x := j
+        match x {
+            0 { x += 2 }
+            1 { x += 4 }
+            2 { x += 6 }
+            3 { x += 8 }
+            4 { x += 10 }
+            5 { x += 12 }
+            6 { x += 14 }
+            else { x += 16 }
+        }
+        self_sum += x
+    }
+    << self_sum == 100
+}
+
+fn check_fnval_cases(flag bool) bool {
+    // Non-capturing function value (eligible for zero-env drop elim + SROA + devirt).
+    f := bump_one
+    $sum := 0
+    for i in 0:32 {
+        sum += f(i & 7)
+    }
+    if sum != 144 { << false }
+
+    // Reassigned non-capturing function value (must keep dynamic dispatch).
+    $g := bump_one
+    if flag { g = bump_ten }
+    $want_g := 6
+    if flag { want_g = 15 }
+    if g(5) != want_g { << false }
+
+    // Capturing closure (negative case: must preserve env and drop glue).
+    base := 100
+    h := fn(x int) int { << base + x }
+    if h(7) != 107 { << false }
+
+    // Mixed non-capturing and capturing reassignment (negative case: must preserve drop).
+    $m := bump_one
+    if flag {
+        m = fn(x int) int { << base + x * 2 }
+    }
+    $want_m := 7
+    if flag { want_m = 112 }
+    if m(6) != want_m { << false }
+
+    // Bound method value (negative case: non-zero borrowed receiver env).
+    c := Counter{value: 42}
+    bm := c.get
+    << bm() == 42
+}
+
 fn rejects_invalid_hex() bool {
     _ := hex.decode_string("0123456789ABCDEFg123456789abcdef") or (err) { << true }
     << false
@@ -163,6 +269,8 @@ fn main() int {
     if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
     empty := ""
     if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
+    if !check_match_lut_cases() { << 21 }
+    if !check_fnval_cases(true) || !check_fnval_cases(false) { << 22 }
     println("optimized code passed")
     << 0
 }
