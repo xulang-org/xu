@@ -1,0 +1,304 @@
+@xu/ffi
+// C FFI: extern "C" functions, unsafe functions and blocks, @repr("C").
+//
+// Externs are body-less functions lowered to a C call; calling one, or an
+// `unsafe fn`, needs an unsafe context (an `unsafe { }` block or the body of
+// an unsafe fn). C variadic tails accept FFI scalars, c_ptr and strings
+// without boxing; lowering specializes the call from their static types.
+
+#xu/ast
+#xu/ds
+#xu/parser
+#xu/typeenv
+#xu/types
+
+// Record d's FFI role at registration; true when d is an extern "C" fn.
+pub fn ffi_register_fn(c $&typeenv.TypeEnv, p &parser.Parser, d int, label &string) bool {
+    flags := types.ffi_decl_flags(p, d)
+    if flags < 0 { << false }
+    is_ext := types.ffi_node_of(p, d) >= 0
+    for i in 0:c.ffi_labels.len {
+        if c.ffi_labels[i] == *label { << is_ext }
+    }
+    $f := flags
+    if is_ext { f = f | types.FFI_EXTERN }
+    c.ffi_labels.push(*label + "")
+    c.ffi_flags.push(f)
+    c.ffi_decls.push(d)
+    << is_ext
+}
+
+pub fn ffi_check_callback_arg(c $&typeenv.TypeEnv, p &parser.Parser, arg int, ctx string) bool {
+    t := c.ntype[arg]
+    if types.is_error_type(t) { << false }
+    k := p.nodes[arg].kind
+    if !types.is_fn_type(t) {
+        c.fail_node(p, arg, ctx + " expects a function or closure")
+        << false
+    }
+    if (k == ast.NK_IDENT || k == ast.NK_FIELD) && arg < c.ncall.len && c.ncall[arg] >= 0 && (arg >= c.nlocal.len || c.nlocal[arg] < 0) {
+        cb_fi := c.ncall[arg]
+        if cb_fi < c.fns.len {
+            ffi_call_check(c, p, arg, cb_fi)
+        }
+        if cb_fi < c.fns.len && cb_fi < c.fn_may_throw.len && c.fn_may_throw[cb_fi] != 0 {
+            c.fail_node(p, arg, ctx + ": callback function '" + c.fns[cb_fi].name + "' cannot throw")
+            << false
+        }
+    }
+    if k == ast.NK_FIELD && arg < c.ncall.len && (c.ncall[arg] == -92 || c.ncall[arg] == -95) && arg < c.nlocal.len && c.nlocal[arg] >= 0 {
+        $cb_fi := c.nlocal[arg]
+        if c.ncall[arg] == -95 && cb_fi < c.bound_mfi.len && c.bound_mfi[cb_fi] >= 0 {
+            cb_fi = c.bound_mfi[cb_fi]
+        }
+        if cb_fi >= 0 && cb_fi < c.fns.len {
+            ffi_call_check(c, p, arg, cb_fi)
+            if cb_fi < c.fn_may_throw.len && c.fn_may_throw[cb_fi] != 0 {
+                c.fail_node(p, arg, ctx + ": callback method '" + c.fns[cb_fi].name + "' cannot throw")
+                << false
+            }
+        }
+    }
+    if ctx == "c_callback" && c.type_contains_ref(t) {
+        c.fail_node(p, arg, ctx + ": persistent callback closure cannot capture references")
+        << false
+    }
+    << true
+}
+
+pub fn expr_global_root(c &typeenv.TypeEnv, p &parser.Parser, n int) int {
+    $cur := n
+    while cur >= 0 {
+        gi := c.node_global(cur)
+        if gi >= 0 { << gi }
+        k := p.nodes[cur].kind
+        if k == ast.NK_FIELD || k == ast.NK_INDEX {
+            cur = p.nodes[cur].a
+        } else {
+            << -1
+        }
+    }
+    << -1
+}
+
+pub fn check_global_write(c $&typeenv.TypeEnv, p &parser.Parser, n int, gi int) {
+    if c.unsafe_depth == 0 {
+        c.fail_node(p, n, "writing extern \"C\" global '" + c.globals[gi].name + "' requires an unsafe block")
+    }
+    if !c.globals[gi].is_mut {
+        c.fail_node(p, n, "cannot mutate immutable extern \"C\" global '" + c.globals[gi].name + "' (declare with " + string_from_byte(36) + "let)")
+    }
+}
+
+// An extern "C" or unsafe fn called outside an unsafe context fails,
+// and direct callback arguments to extern "C" calls are validated at check time.
+pub fn ffi_call_check(c $&typeenv.TypeEnv, p &parser.Parser, n int, fi int) {
+    if fi < 0 || fi >= c.fns.len { << }
+    f := c.ffi_label_flags(&c.fns[fi].label)
+    if f < 0 { << }
+    if c.unsafe_depth == 0 {
+        if (f & types.FFI_EXTERN) != 0 {
+            c.fail_node(p, n, "calling extern \"C\" function '" + c.fns[fi].name + "' requires an unsafe block")
+        } else if (f & ast.FFI_UNSAFE_FN) != 0 {
+            c.fail_node(p, n, "calling unsafe function '" + c.fns[fi].name + "' requires an unsafe block")
+        }
+    }
+    if (f & types.FFI_EXTERN) != 0 {
+        $arg := p.nodes[n].a
+        if p.nodes[n].kind == ast.NK_METHOD_CALL { arg = p.nodes[n].b }
+        $idx := 0
+        $limit := c.fns[fi].params.len
+        if c.fn_is_c_variadic(fi) && limit > 0 { limit -= 1 }
+        while arg >= 0 && idx < limit {
+            if types.is_fn_type(c.fns[fi].params[idx]) {
+                ffi_check_callback_arg(c, p, arg, "C callback")
+            }
+            idx += 1
+            arg = p.nodes[arg].next
+        }
+    }
+}
+
+// Type of one argument in a C variadic tail; strings move, &string borrows.
+pub fn ffi_vararg(c $&typeenv.TypeEnv, p &parser.Parser, arg int, aty int) {
+    $t := aty
+    if types.is_ref_type(t) && !types.is_mut_ref_type(t) { t = c.ref_inner_type(t) }
+    if types.is_integer_type(t) || types.is_float_type(t) || t == 2 || t == 6 || t == 3 { << }
+    c.fail_node(p, arg, "C variadic arguments must be integers, floats, bool, c_ptr or strings, found " + c.diag_type_display(aty))
+}
+
+// FFI-passable parameter/result type of an extern (after `cstr` desugaring).
+pub fn ffi_type_ok(c &typeenv.TypeEnv, t int, result bool) bool {
+    if t == 0 { << result }
+    if types.is_integer_type(t) || types.is_float_type(t) || t == 2 || t == 6 { << true }
+    if result && t == 3 { << true }
+    if types.is_struct_type(t) { << c.struct_is_repr_c(types.struct_index(t)) }
+    if types.is_ref_type(t) && !result {
+        inner := c.ref_inner_type(t)
+        if inner == 3 { << !types.is_mut_ref_type(t) }
+        if types.is_integer_type(inner) || types.is_float_type(inner) || inner == 6 { << true }
+        if types.is_struct_type(inner) { << c.struct_is_repr_c(types.struct_index(inner)) }
+        if types.is_array_type(inner) {
+            el := c.arrays[types.array_index(inner)].elem_ty
+            if types.is_integer_type(el) || types.is_float_type(el) || el == 6 { << true }
+            if types.is_struct_type(el) { << c.struct_is_repr_c(types.struct_index(el)) }
+        }
+        << false
+    }
+    if types.is_fn_type(t) && !result {
+        sig := types.fn_index(t)
+        for i in 0:c.fn_sigs[sig].params.len {
+            pt := c.fn_sigs[sig].params[i]
+            if types.is_integer_type(pt) || types.is_float_type(pt) || pt == 2 || pt == 6 || pt == 3 {
+                ->
+            }
+            if types.is_struct_type(pt) && c.struct_is_repr_c(types.struct_index(pt)) {
+                ->
+            }
+            if types.is_ref_type(pt) && !types.is_mut_ref_type(pt) && c.ref_inner_type(pt) == 3 {
+                ->
+            }
+            << false
+        }
+        rt := c.fn_sigs[sig].ret
+        if rt == 0 || types.is_integer_type(rt) || types.is_float_type(rt) || rt == 2 || rt == 6 { << true }
+        << types.is_struct_type(rt) && c.struct_is_repr_c(types.struct_index(rt))
+    }
+    << false
+}
+
+// `long` / `unsigned long`: 32-bit on Windows (LLP64), 64-bit on LP64 Unix.
+pub fn ffi_c_long_ty(c &typeenv.TypeEnv) int {
+    if c.target_os == 2 { << 8 }
+    << 1
+}
+
+pub fn ffi_c_ulong_ty(c &typeenv.TypeEnv) int {
+    if c.target_os == 2 { << 9 }
+    << 13
+}
+
+pub fn repr_field_ok(c &typeenv.TypeEnv, t int) bool {
+    if types.is_integer_type(t) || types.is_float_type(t) || t == 6 { << true }
+    if types.is_struct_type(t) { << c.struct_is_repr_c(types.struct_index(t)) }
+    if types.is_array_type(t) && c.arrays[types.array_index(t)].fixed_len > 0 {
+        << repr_field_ok(c, c.arrays[types.array_index(t)].elem_ty)
+    }
+    << false
+}
+
+pub fn ffi_check_structs(c $&typeenv.TypeEnv, p &parser.Parser) {
+    $sdecl := []int{}
+    for i in 0:p.ffi_nodes.len {
+        f := p.ffi_nodes[i]
+        if (p.nodes[f].ival & ast.FFI_STRUCT) != 0 {
+            d := p.nodes[f].a
+            si := c.find_struct_in_mod(p.nodes[d].sval + "", p.nodes[d].sval2 + "")
+            if si >= 0 {
+                c.repr_c_structs.push(si)
+                sdecl.push(d)
+            }
+        }
+    }
+    for i in 0:c.repr_c_structs.len {
+        si := c.repr_c_structs[i]
+        if c.structs[si].is_union && c.structs[si].fields.len == 0 {
+            c.set_cur_file(p, c.decl_file_id(p, sdecl[i]))
+            c.fail_node(p, sdecl[i], "@repr(\"C\") union " + c.structs[si].name + " must have at least one field")
+        }
+        for j in 0:c.structs[si].fields.len {
+            if !repr_field_ok(&*c, c.structs[si].fields[j].ty) {
+                c.set_cur_file(p, c.decl_file_id(p, sdecl[i]))
+                c.fail_node(p, sdecl[i], "@repr(\"C\") struct " + c.structs[si].name + ": field " + c.structs[si].fields[j].name +
+                    " has type " + c.ty_display(c.structs[si].fields[j].ty) + ", which has no C layout (use u8 for C bool fields)")
+            }
+        }
+    }
+}
+
+pub fn ffi_register_global(c $&typeenv.TypeEnv, p &parser.Parser, f int, d int, gty int) {
+    mod_id := p.nodes[d].sval2 + ""
+    name := p.nodes[d].sval + ""
+    saved_mod := c.cur_mod + ""
+    c.cur_mod = mod_id + ""
+    c.set_cur_file(p, c.decl_file_id(p, d))
+    if c.find_global_in_mod(name + "", mod_id + "") >= 0 {
+        c.fail_node(p, d, "duplicate extern global '" + name + "'")
+    } else if !repr_field_ok(&*c, gty) {
+        c.fail_node(p, d, "extern \"C\" global " + name + ": type " + c.ty_display(gty) + " has no C layout")
+    } else {
+        $libs := ""
+        meta := p.nodes[f].b
+        if meta >= 0 && meta < p.nodes.len { libs = p.nodes[meta].sval + "" }
+        gi := c.globals.len
+        c.globals.push(typeenv.CGlobal{
+            name: name + "",
+            mod_id: mod_id + "",
+            lib: libs,
+            sym: p.nodes[f].sval + "",
+            ty: gty,
+            is_pub: (p.nodes[d].ival & 1) == 1,
+            is_mut: (p.nodes[d].ival & 2) != 0,
+            decl: d
+        })
+        ds.strmap_put($&c.global_map, typeenv.map_key(mod_id + "", name + ""), gi)
+    }
+    c.cur_mod = saved_mod
+}
+
+pub fn ffi_check_extern_fns(c $&typeenv.TypeEnv, p &parser.Parser) {
+    for fi in 0:c.fns.len {
+        $fl := -1
+        $d := -1
+        for k in 0:c.ffi_labels.len {
+            if c.ffi_labels[k] == c.fns[fi].label {
+                fl = c.ffi_flags[k]
+                d = c.ffi_decls[k]
+            }
+        }
+        if fl >= 0 && (fl & types.FFI_EXTERN) != 0 {
+            c.set_cur_file(p, c.decl_file_id(p, d))
+            $np := c.fns[fi].params.len
+            if (fl & ast.FFI_VARIADIC) != 0 { np -= 1 }
+            for j in 0:np {
+                if !ffi_type_ok(&*c, c.fns[fi].params[j], false) {
+                    c.fail_node(p, d, "extern \"C\" fn " + c.fns[fi].name + ": parameter " + str(j + 1) + " has type " +
+                        c.ty_display(c.fns[fi].params[j]) + ", which cannot cross the C ABI")
+                }
+            }
+            if !ffi_type_ok(&*c, c.fns[fi].ret, true) {
+                c.fail_node(p, d, "extern \"C\" fn " + c.fns[fi].name + ": result type " + c.ty_display(c.fns[fi].ret) + " cannot cross the C ABI")
+            }
+        }
+    }
+}
+
+// A string temporary (literal, concatenation, call result) passed to an
+// extern's `cstr` parameter is passed by value instead of borrowed.
+pub fn ffi_temp_str_arg(c &typeenv.TypeEnv, p &parser.Parser, fi int, arg int, aty int, want int) bool {
+    if aty != 3 || !types.is_ref_type(want) || types.is_mut_ref_type(want) || c.ref_inner_type(want) != 3 { << false }
+    f := c.ffi_label_flags(&c.fns[fi].label)
+    if f < 0 || (f & types.FFI_EXTERN) == 0 { << false }
+    k := p.nodes[arg].kind
+    << k != ast.NK_IDENT && k != ast.NK_FIELD && k != ast.NK_INDEX && k != ast.NK_UN_OP
+}
+
+pub fn check_call_c_callback_with_ty(c $&typeenv.TypeEnv, p &parser.Parser, n int, arg int, t int) int {
+    if ffi_check_callback_arg(c, p, arg, "c_callback") {
+        if !ffi_type_ok(&*c, t, false) {
+            c.fail_node(p, arg, "c_callback: callback parameters must be C scalars, c_ptr, cstr, string, or @repr(\"C\") types, and result must be void, C scalar, c_ptr, or @repr(\"C\")")
+        }
+    }
+    typeenv.checker_set_i($&c.ncall, n, types.NCALL_C_CALLBACK)
+    typeenv.checker_set_i($&c.ntype, n, 6)
+    << 6
+}
+
+pub fn check_call_c_callback_free_with_ty(c $&typeenv.TypeEnv, p &parser.Parser, n int, arg int, t int) int {
+    if t != 6 && !types.is_error_type(t) {
+        c.fail_node(p, arg, "c_callback_free expects c_ptr")
+    }
+    typeenv.checker_set_i($&c.ncall, n, types.NCALL_C_CALLBACK_FREE)
+    typeenv.checker_set_i($&c.ntype, n, 0)
+    << 0
+}
