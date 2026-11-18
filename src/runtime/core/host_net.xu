@@ -89,14 +89,102 @@ fn host_sock_timeout_option(events int) int {
 // poll and WSAPoll take a signed 32-bit millisecond timeout.
 const POLL_TIMEOUT_MAX_MS = 2147483647
 
+// Per-fd socket timeout cache (16 bytes per fd: rcv word at +0, snd word at +8).
+// Value encoding: 0 = uncached, 1 = blocking (-1 ms), ms + 1 = timeout ms.
+fn host_fd_timeo_ptr(fd int, create bool) int {
+    if host_win() || fd < 0 || fd >= 65536 {
+        << 0
+    }
+    cap := gword(G_FD_TIMEO_CAP)
+    if fd >= cap {
+        if !create {
+            << 0
+        }
+        $ncap := cap
+        if ncap < 256 {
+            ncap = 256
+        }
+        while ncap <= fd {
+            ncap = ncap * 2
+        }
+        if ncap > 65536 {
+            ncap = 65536
+        }
+        buf := alloc(ncap * 16)
+        old := gword(G_FD_TIMEO)
+        if cap > 0 && old != 0 {
+            mem_copy(buf, old, cap * 16)
+            free(old)
+        }
+        set_gword(G_FD_TIMEO, buf)
+        set_gword(G_FD_TIMEO_CAP, ncap)
+    }
+    << gword(G_FD_TIMEO) + fd * 16
+}
+
+fn host_fd_timeo_clear(fd int) {
+    p := host_fd_timeo_ptr(fd, false)
+    if p != 0 {
+        rt_store(p, 8, 0)
+        rt_store(p + 8, 8, 0)
+    }
+}
+
+fn host_fd_timeo_enc(ms int) int {
+    if ms <= 0 {
+        << 1
+    }
+    << min_int(ms, POLL_TIMEOUT_MAX_MS) + 1
+}
+
+fn host_fd_timeo_set_both(fd int, ms int) {
+    p := host_fd_timeo_ptr(fd, true)
+    if p != 0 {
+        enc := host_fd_timeo_enc(ms)
+        rt_store(p, 8, enc)
+        rt_store(p + 8, 8, enc)
+    }
+}
+
+fn host_fd_timeo_get(fd int, events int) int {
+    p := host_fd_timeo_ptr(fd, false)
+    if p == 0 {
+        << 0
+    }
+    $off := 8
+    if (events & 1) != 0 {
+        off = 0
+    }
+    << rt_load(p + off, 8)
+}
+
+fn host_fd_timeo_store(fd int, events int, ms int) {
+    p := host_fd_timeo_ptr(fd, true)
+    if p != 0 {
+        $off := 8
+        if (events & 1) != 0 {
+            off = 0
+        }
+        rt_store(p + off, 8, host_fd_timeo_enc(ms))
+    }
+}
+
 // Return the socket timeout in milliseconds, or -1 for a blocking wait.
 // Files and pipes have no socket timeout.
 fn host_sock_timeout_ms(fd int, events int) int {
     if host_win() && !win_is_sock(fd) {
         << -1
     }
+    cached := host_fd_timeo_get(fd, events)
+    if cached != 0 {
+        if cached == 1 {
+            << -1
+        }
+        << cached - 1
+    }
     opt := host_sock_timeout_option(events)
-    value := alloc(16)
+    $tsv := HostTimespec{sec: 0, nsec: 0}
+    value := rt_addr($&tsv)
     $length := 16
     $r := 0
     if host_win() {
@@ -114,8 +202,10 @@ fn host_sock_timeout_ms(fd int, events int) int {
             usec := rt_load(value + 8, 4)
             ms = min_int(sec, POLL_TIMEOUT_MAX_MS / 1000 + 1) * 1000 + (usec + 999) / 1000
         }
+        host_fd_timeo_store(fd, events, ms)
+    } else if !host_win() && r == 0 - host_nr(38, 88) {
+        host_fd_timeo_set_both(fd, -1)
     }
-    free(value)
     if ms <= 0 {
         << -1
     }
@@ -150,7 +240,11 @@ pub fn host_socket(okp int, domain int, typ int, proto int) int {
     if host_win() {
         << host_sock_ok(okp, "socket", win_socket(domain, typ, proto))
     }
-    << host_sock_ok(okp, "socket", rt_syscall(host_nr(97, 198), domain, typ, proto, 0, 0, 0))
+    r := rt_syscall(host_nr(97, 198), domain, typ, proto, 0, 0, 0)
+    if r >= 0 {
+        host_fd_timeo_set_both(r, -1)
+    }
+    << host_sock_ok(okp, "socket", r)
 }
 
 // SO_REUSEADDR, then bind.
@@ -172,6 +266,7 @@ pub fn host_connect4(okp int, fd int, a int, b int, c int, d int, port int) int 
     sa := host_sa_in4(a, b, c, d, port)
     r := host_sock_connect(fd, sa, 16)
     free(sa)
+    if r == 0 { task_io_progress() }
     << host_sock_ok(okp, "connect", r)
 }
 
@@ -192,6 +287,7 @@ pub fn host_connect6(okp int, fd int, ip int, port int) int {
     sa := host_sa_in6(ip, port)
     r := host_sock_connect(fd, sa, 28)
     free(sa)
+    if r == 0 { task_io_progress() }
     << host_sock_ok(okp, "connect", r)
 }
 
@@ -225,6 +321,7 @@ pub fn host_connect_unix(okp int, fd int, path int) int {
     sa := host_sa_unix(path)
     r := host_sock_connect(fd, sa, 3 + desc_len(path))
     free(sa)
+    if r == 0 { task_io_progress() }
     << host_sock_ok(okp, "connect", r)
 }
 
@@ -241,11 +338,28 @@ pub fn host_accept(okp int, fd int) int {
         << host_sock_ok(okp, "accept", ready)
     }
     if host_win() {
-        << host_sock_ok(okp, "accept", win_accept(fd))
+        r := win_accept(fd)
+        if r >= 0 { task_io_progress() }
+        << host_sock_ok(okp, "accept", r)
     }
     while true {
         r := rt_syscall(host_nr(30, 202), fd, 0, 0, 0, 0, 0)
         if r != 0 - EINTR {
+            if r >= 0 {
+                if !host_linux() {
+                    host_fd_timeo_set_both(r, -1)
+                } else {
+                    sp := host_fd_timeo_ptr(fd, false)
+                    dp := host_fd_timeo_ptr(r, true)
+                    if sp != 0 && dp != 0 {
+                        rt_store(dp, 8, rt_load(sp, 8))
+                        rt_store(dp + 8, 8, rt_load(sp + 8, 8))
+                    } else {
+                        host_fd_timeo_clear(r)
+                    }
+                }
+                task_io_progress()
+            }
             << host_sock_ok(okp, "accept", r)
         }
     }
@@ -320,27 +434,39 @@ pub fn host_setsockopt_timeo(okp int, fd int, ns int) int {
         }
         << host_sock_ok(okp, "setsockopt", win_sock_setopt(fd, 65535, host_sock_timeout_option(1), ms, 4))
     }
-    tv := alloc(16)
+    $tsv := HostTimespec{sec: 0, nsec: 0}
+    tv := rt_addr($&tsv)
+    $ms := -1
     if ns > 0 {
         $us := ns / 1000
         if us < 1 {
             us = 1
         }
-        rt_store(tv, 8, us / 1000000)
-        rt_store(tv + 8, 8, us % 1000000)
+        sec := us / 1000000
+        usec := us % 1000000
+        rt_store(tv, 8, sec)
+        rt_store(tv + 8, 8, usec)
+        ms = min_int(sec, POLL_TIMEOUT_MAX_MS / 1000 + 1) * 1000 + (usec + 999) / 1000
     }
     level := host_nr(65535, 1)
     r1 := host_sock_setopt(fd, level, host_sock_timeout_option(4), tv, 16)
     if r1 < 0 {
-        free(tv)
+        host_fd_timeo_clear(fd)
         << host_err("setsockopt", 0, 0 - r1)
     }
     r2 := host_sock_setopt(fd, level, host_sock_timeout_option(1), tv, 16)
-    free(tv)
+    if r2 < 0 {
+        host_fd_timeo_clear(fd)
+    } else {
+        host_fd_timeo_set_both(fd, ms)
+    }
     << host_sock_ok(okp, "setsockopt", r2)
 }
 
 pub fn host_setsockopt(okp int, fd int, level int, opt int, value int) int {
+    if level == host_nr(65535, 1) && (opt == host_sock_timeout_option(1) || opt == host_sock_timeout_option(4)) {
+        host_fd_timeo_clear(fd)
+    }
     r := host_sock_setopt(fd, level, opt, desc_ptr(value), desc_len(value))
     << host_sock_ok(okp, "setsockopt", r)
 }

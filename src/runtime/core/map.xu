@@ -54,7 +54,7 @@ pub fn map_new(kstr int, vsize int, cap int) int {
     }
     max_slots := (9223372036854775807 - 16399) / stride
     $n := 8
-    while n - n / 4 < cap {
+    while n / 2 < cap {
         if n > max_slots / 2 {
             fatal_no_memory()
         }
@@ -90,19 +90,26 @@ fn map_alloc_slots(m int, n int) {
     set_mword(m, M_USED, 0)
 }
 
-fn map_hash(m int, key int) int {
-    $h := 0
-    if mword(m, M_KSTR) != 0 {
-        h = -3750763034362895579
-        p := desc_ptr(key)
-        n := desc_len(key)
-        for i in 0:n {
-            h = (h ^ rt_load(p + i, 1)) * 1099511628211
-        }
-    } else {
-        h = rt_load(key, 8) * -7046029254386353131
+fn map_hash_str(key int) int {
+    $h := -3750763034362895579
+    p := desc_ptr(key)
+    n := desc_len(key)
+    for i in 0:n {
+        h = (h ^ rt_load(p + i, 1)) * 1099511628211
     }
     << h ^ ((h >> 32) & 4294967295)
+}
+
+fn map_hash_int(kv int) int {
+    h := kv * -7046029254386353131
+    << h ^ ((h >> 32) & 4294967295)
+}
+
+fn map_hash(m int, key int) int {
+    if mword(m, M_KSTR) != 0 {
+        << map_hash_str(key)
+    }
+    << map_hash_int(rt_load(key, 8))
 }
 
 fn map_key_eq(m int, slot int, key int) bool {
@@ -125,16 +132,35 @@ fn map_find(m int, key int) int {
     if m == 0 {
         << 0
     }
-    h := map_hash(m, key)
+    kstr := mword(m, M_KSTR)
+    slots := mword(m, M_SLOTS)
+    stride := mword(m, M_STRIDE)
     mask := mword(m, M_CAP) - 1
+    if kstr == 0 {
+        kv := rt_load(key, 8)
+        $i := map_hash_int(kv) & mask
+        while true {
+            slot := slots + i * stride
+            state := rt_load(slot, 8)
+            if state == SLOT_EMPTY {
+                << 0
+            }
+            if state == SLOT_LIVE && rt_load(slot + MS_KEY, 8) == kv {
+                << slot
+            }
+            i = (i + 1) & mask
+        }
+        << 0
+    }
+    h := map_hash_str(key)
     $i := h & mask
     while true {
-        slot := map_slot_at(m, i)
+        slot := slots + i * stride
         state := rt_load(slot, 8)
         if state == SLOT_EMPTY {
             << 0
         }
-        if state == SLOT_LIVE && rt_load(slot + MS_HASH, 8) == h && map_key_eq(m, slot, key) {
+        if state == SLOT_LIVE && rt_load(slot + MS_HASH, 8) == h && str_eq(slot + MS_KEY, key) {
             << slot
         }
         i = (i + 1) & mask
@@ -148,15 +174,40 @@ fn map_rehash(m int, n int) {
     stride := mword(m, M_STRIDE)
     live := mword(m, M_LEN)
     map_alloc_slots(m, n)
+    slots := mword(m, M_SLOTS)
     mask := n - 1
-    for oi in 0:ocap {
-        src := old + oi * stride
-        if rt_load(src, 8) == SLOT_LIVE {
-            $i := rt_load(src + MS_HASH, 8) & mask
-            while rt_load(map_slot_at(m, i), 8) != SLOT_EMPTY {
-                i = (i + 1) & mask
+    if stride == 32 {
+        for oi in 0:ocap {
+            src := old + (oi << 5)
+            if rt_load(src, 8) == SLOT_LIVE {
+                $i := rt_load(src + MS_HASH, 8) & mask
+                $dst := slots + (i << 5)
+                while rt_load(dst, 8) != SLOT_EMPTY {
+                    i = (i + 1) & mask
+                    dst = slots + (i << 5)
+                }
+                rt_store(dst, 8, SLOT_LIVE)
+                rt_store(dst + 8, 8, rt_load(src + 8, 8))
+                rt_store(dst + 16, 8, rt_load(src + 16, 8))
+                rt_store(dst + 24, 8, rt_load(src + 24, 8))
             }
-            mem_copy(map_slot_at(m, i), src, stride)
+        }
+    } else {
+        words := stride / 8
+        for oi in 0:ocap {
+            src := old + oi * stride
+            if rt_load(src, 8) == SLOT_LIVE {
+                $i := rt_load(src + MS_HASH, 8) & mask
+                $dst := slots + i * stride
+                while rt_load(dst, 8) != SLOT_EMPTY {
+                    i = (i + 1) & mask
+                    dst = slots + i * stride
+                }
+                for wi in 0:words {
+                    off := wi * 8
+                    rt_store(dst + off, 8, rt_load(src + off, 8))
+                }
+            }
         }
     }
     set_mword(m, M_LEN, live)
@@ -176,49 +227,99 @@ pub fn map_put_has(m int, key int, existed_out int) int {
     if m == 0 {
         map_nil_panic()
     }
-    found := map_find(m, key)
-    if found != 0 {
-        if existed_out != 0 {
-            rt_store(existed_out, 8, 1)
+    kstr := mword(m, M_KSTR)
+    slots := mword(m, M_SLOTS)
+    cap := mword(m, M_CAP)
+    stride := mword(m, M_STRIDE)
+    val_off := MS_KEY + mword(m, M_KSIZE)
+    mask := cap - 1
+    $kv := 0
+    $h := 0
+    if kstr == 0 {
+        kv = rt_load(key, 8)
+        h = map_hash_int(kv)
+    } else {
+        h = map_hash_str(key)
+    }
+    $i := h & mask
+    $first_del := 0
+    while true {
+        slot := slots + i * stride
+        state := rt_load(slot, 8)
+        if state == SLOT_EMPTY {
+            <-
         }
-        << found + map_val_off(m)
+        if state == SLOT_DELETED {
+            if first_del == 0 {
+                first_del = slot
+            }
+        } else {
+            if kstr == 0 {
+                if rt_load(slot + MS_KEY, 8) == kv {
+                    if existed_out != 0 {
+                        rt_store(existed_out, 8, 1)
+                    }
+                    << slot + val_off
+                }
+            } else if rt_load(slot + MS_HASH, 8) == h && str_eq(slot + MS_KEY, key) {
+                if existed_out != 0 {
+                    rt_store(existed_out, 8, 1)
+                }
+                << slot + val_off
+            }
+        }
+        i = (i + 1) & mask
     }
     if existed_out != 0 {
         rt_store(existed_out, 8, 0)
     }
-    cap := mword(m, M_CAP)
-    if mword(m, M_USED) + 1 > cap - cap / 4 {
+    used := mword(m, M_USED)
+    live := mword(m, M_LEN)
+    $target := slots + i * stride
+    if first_del != 0 {
+        target = first_del
+    }
+    if live + 1 > cap / 2 || (first_del == 0 && used + 1 > cap - cap / 4) {
         $n := cap
-        if mword(m, M_LEN) + 1 > cap / 2 {
+        if live + 1 > cap / 2 {
             if cap > 4611686018427387903 {
                 fatal_no_memory()
             }
             n = cap * 2
         }
         map_rehash(m, n)
+        nslots := mword(m, M_SLOTS)
+        nmask := n - 1
+        $ni := h & nmask
+        while true {
+            cand := nslots + ni * stride
+            if rt_load(cand, 8) == SLOT_EMPTY {
+                target = cand
+                <-
+            }
+            ni = (ni + 1) & nmask
+        }
+        first_del = 0
     }
-    h := map_hash(m, key)
-    mask := mword(m, M_CAP) - 1
-    $i := h & mask
-    while rt_load(map_slot_at(m, i), 8) == SLOT_LIVE {
-        i = (i + 1) & mask
-    }
-    slot := map_slot_at(m, i)
-    if rt_load(slot, 8) == SLOT_EMPTY {
+    if first_del == 0 {
         set_mword(m, M_USED, mword(m, M_USED) + 1)
     }
     set_mword(m, M_LEN, mword(m, M_LEN) + 1)
-    rt_store(slot, 8, SLOT_LIVE)
-    rt_store(slot + MS_HASH, 8, h)
-    if mword(m, M_KSTR) != 0 {
-        bytes_new(slot + MS_KEY, desc_ptr(key), desc_len(key))
+    rt_store(target, 8, SLOT_LIVE)
+    rt_store(target + MS_HASH, 8, h)
+    if kstr != 0 {
+        bytes_new(target + MS_KEY, desc_ptr(key), desc_len(key))
     } else {
-        rt_store(slot + MS_KEY, 8, rt_load(key, 8))
+        rt_store(target + MS_KEY, 8, kv)
     }
-    val := slot + map_val_off(m)
+    val := target + val_off
     vsize := mword(m, M_VSIZE)
-    for b in 0:vsize {
-        rt_store(val + b, 1, 0)
+    if vsize == 8 {
+        rt_store(val, 8, 0)
+    } else {
+        for b in 0:vsize {
+            rt_store(val + b, 1, 0)
+        }
     }
     << val
 }
