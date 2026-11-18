@@ -28,7 +28,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REG = ROOT / "docs" / "audit" / "NCALL_REGISTRY.md"
-TYPES_DIR = ROOT / "src" / "xu" / "types"
+CHECKER_DIR = ROOT / "src" / "xu" / "checker"
+BORROW_DIR = ROOT / "src" / "xu" / "borrow"
+FFI_DIR = ROOT / "src" / "xu" / "ffi"
 MIR_DIR = ROOT / "src" / "xu" / "mir"
 
 # ncall holds the function index for an ordinary call site and -1 for
@@ -36,10 +38,10 @@ MIR_DIR = ROOT / "src" / "xu" / "mir"
 SENTINEL = -1
 
 ASSIGN = re.compile(
-    r"(?:ncall\[[^\]]+\]\s*=\s*|checker_set_i\(\s*\$&c\.ncall\s*,\s*[^,]+,\s*)(-?\d+)"
+    r"(?:ncall\[[^\]]+\]\s*=\s*|checker_set_i\(\s*\$&c\.ncall\s*,\s*[^,]+,\s*|c\.set_ncall\(\s*[^,]+,\s*)(-?\d+)"
 )
 COMPARE = re.compile(
-    r"(?:ncall\[[^\]]+\]\s*==\s*|fi\s*==\s*|c\.ncall\[[^\]]+\]\s*==\s*)(-?\d+)"
+    r"(?:ncall\[[^\]]+\]\s*==\s*|fi\s*==\s*|(?:c\.env\.|c\.|e\.)ncall\[[^\]]+\]\s*==\s*|tp\.call_of\([^)]+\)\s*==\s*|\bcode\s*==\s*)(-?\d+)"
 )
 # Allow markdown bold: | **-50** | name |
 ID_ROW = re.compile(r"^\|\s*\*{0,2}(-?\d+)\*{0,2}\s*\|")
@@ -100,16 +102,19 @@ def scan_by_file(paths: list[Path], pattern: re.Pattern[str]) -> dict[int, list[
 
 def main() -> int:
     ci = os.environ.get("XU_BOUNDARY_CI") == "1"
-    check_files = sources(TYPES_DIR, "check")
+    check_files = sources(CHECKER_DIR, "")
     if not check_files:
-        print(f"FAIL: no check*.xu under {TYPES_DIR}", file=sys.stderr)
+        print(f"FAIL: no *.xu under {CHECKER_DIR}", file=sys.stderr)
         return 1
+    ffi_files = sources(FFI_DIR, "") if FFI_DIR.is_dir() else []
+    borrow_files = sources(BORROW_DIR, "") if BORROW_DIR.is_dir() else []
     mir_files = sources(MIR_DIR, "")
     if not mir_files:
         print(f"FAIL: no *.xu under {MIR_DIR}", file=sys.stderr)
         return 1
 
-    assigned = scan(check_files, ASSIGN)
+    assign_files = check_files + ffi_files
+    assigned = scan(assign_files, ASSIGN)
     if not assigned:
         print("FAIL: checker source has no ncall markers", file=sys.stderr)
         return 1
@@ -124,7 +129,7 @@ def main() -> int:
         missing = sorted(assigned - reg_set)
         if missing:
             print(
-                f"FAIL: {rel(check_files)} assign unregistered ncall ids: {missing}",
+                f"FAIL: {rel(assign_files)} assign unregistered ncall ids: {missing}",
                 file=sys.stderr,
             )
             print(f"  add them to {REG}", file=sys.stderr)
@@ -139,7 +144,9 @@ def main() -> int:
     # comparison against a marker nothing assigns is a dead branch that hides
     # the real intent of the surrounding code.
     known = assigned | {SENTINEL}
-    for paths in (check_files, mir_files):
+    for paths in (assign_files, borrow_files, mir_files):
+        if not paths:
+            continue
         unknown = sorted(n for n in scan(paths, COMPARE) if n not in known)
         if unknown:
             culprits = scan_by_file(paths, COMPARE)
@@ -150,8 +157,8 @@ def main() -> int:
             return 1
 
     print(
-        f"ok: {len(check_files)} check file(s) assign {len(assigned)} ncall markers; "
-        f"{len(mir_files)} MIR file(s) scanned"
+        f"ok: {len(assign_files)} checker/ffi file(s) assign {len(assigned)} ncall markers; "
+        f"{len(borrow_files)} borrow and {len(mir_files)} MIR file(s) scanned"
     )
     return 0
 

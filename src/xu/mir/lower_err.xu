@@ -39,9 +39,17 @@ fn (w &Lw) err_wants_box(tp &types.TypedProgram, n int) bool {
 fn (w $&Lw) err_box(p &parser.Parser, tp &types.TypedProgram, n int) int {
     saved := w.unboxed
     w.unboxed = n
-    v := w.lower_expr(p, tp, n)
+    $v := w.lower_expr(p, tp, n)
+    ty := tp.deref(tp.type_of(n))
+    if w.expr_is_ref(p, tp, n) {
+        if w.needs_drop(tp, ty) {
+            v = w.clone_value(tp, v, ty)
+        }
+    } else {
+        v = w.own_val(p, tp, n, v, ty)
+    }
     w.unboxed = saved
-    << w.box_struct(tp, v, tp.deref(tp.type_of(n)))
+    << w.box_struct(tp, v, ty)
 }
 
 // Heap box holding a copy of the struct value at address v.
@@ -425,7 +433,10 @@ fn (w $&Lw) lower_iface_call(p &parser.Parser, tp &types.TypedProgram, n int) in
         }
         i += 2
     }
-    bx := w.iface_word(p, tp, p.nodes[n].a)
+    recv := p.nodes[n].a
+    bxslot := w.new_local(1, 1, "ibx")
+    bx := w.iface_word(p, tp, recv)
+    w.store_local(bxslot, 0, bx)
     $args := []int{}
     $arg := p.nodes[n].b
     $pi := 0
@@ -491,6 +502,9 @@ fn (w $&Lw) lower_iface_call(p &parser.Parser, tp &types.TypedProgram, n int) in
     w.call_core("iface_tag_panic", &pargs)
     w.jump(done_b)
     w.f.active_bb = done_b
+    if w.fresh_temp(p, tp, recv) {
+        w.box_release(tp, w.load_local(bxslot, 0))
+    }
     if wide {
         << out
     }
@@ -525,36 +539,89 @@ fn (w $&Lw) lower_type_test(p &parser.Parser, tp &types.TypedProgram, n int) int
     if !types.is_interface_type(tp.deref(tp.deref(tp.type_of(a)))) {
         << NOT_HANDLED
     }
-    bx := w.iface_word(p, tp, a)
+    $place_addr := -1
+    $bx := -1
+    ka := p.nodes[a].kind
+    is_place := (ka == ast.NK_IDENT && tp.local_of(a) >= 0) || ka == ast.NK_FIELD || ka == ast.NK_INDEX || (ka == ast.NK_UN_OP && p.nodes[a].ival == ast.UN_DEREF)
+    if is_place {
+        place_addr = w.lower_addr(p, tp, a)
+        bx = w.load_ptr(place_addr, 0, 8)
+    } else {
+        bx = w.iface_word(p, tp, a)
+    }
+    bslot := w.new_local(1, 1, "ibx")
+    w.store_local(bslot, 0, bx)
     tag := tp.local_of(n)
-    hit := w.tag_matches(tp, bx, tag)
+    hit := w.tag_matches(tp, w.load_local(bslot, 0), tag)
+    fresh := w.fresh_temp(p, tp, a)
     if p.nodes[n].kind == ast.NK_TYPE_IS {
+        if fresh {
+            w.box_release(tp, w.load_local(bslot, 0))
+        }
         << hit
     }
     w.type_assert(hit)
     ty := tp.type_of(n)
-    if tp.str_of(n) == 1 || !w.needs_drop(tp, ty) {
-        << w.bin(BIN_ADD, bx, w.konst(BOX_HDR))
+    wide := is_wide(tp, ty)
+    if !w.needs_drop(tp, ty) {
+        if !wide {
+            res := w.load_ptr(w.load_local(bslot, 0), BOX_HDR, width_of(tp, ty))
+            if fresh {
+                w.box_release(tp, w.load_local(bslot, 0))
+            }
+            << res
+        }
+        if fresh {
+            out := w.scratch(tp, ty)
+            sz := tp.size_of(ty)
+            if sz > 0 {
+                w.copy_mem(out, w.bin(BIN_ADD, w.load_local(bslot, 0), w.konst(BOX_HDR)), sz)
+            }
+            w.box_release(tp, w.load_local(bslot, 0))
+            << out
+        }
+        << w.bin(BIN_ADD, w.load_local(bslot, 0), w.konst(BOX_HDR))
     }
-    // Owning concrete cast consumes the box: take ownership when sole holder,
-    // or clone + decrement refcount when shared.
+    if tp.str_of(n) == 1 {
+        out := w.scratch(tp, ty)
+        w.clone_into(tp, out, w.bin(BIN_ADD, w.load_local(bslot, 0), w.konst(BOX_HDR)), ty)
+        if fresh {
+            w.box_release(tp, w.load_local(bslot, 0))
+        }
+        if !wide {
+            << w.load_ptr(out, 0, width_of(tp, ty))
+        }
+        << out
+    }
+    // Owning concrete cast consumes the box: clear source place, then take
+    // ownership when sole holder or clone + decrement refcount when shared.
+    if ka == ast.NK_IDENT && tp.local_of(a) >= 0 && w.owns(tp.local_of(a)) {
+        w.mark_moved(tp.local_of(a))
+    }
+    if place_addr >= 0 {
+        w.store_ptr(place_addr, 0, w.konst(0), 8)
+    }
     out := w.scratch(tp, ty)
-    bslot := w.new_local(1, 1, "ibx")
-    w.store_local(bslot, 0, bx)
     shared_b := w.new_block()
     sole_b := w.new_block()
     done_b := w.new_block()
-    w.branch(w.load_ptr(bx, BOX_RC, 8), shared_b, sole_b)
+    w.branch(w.load_ptr(w.load_local(bslot, 0), BOX_RC, 8), shared_b, sole_b)
     w.f.active_bb = shared_b
-    b := w.load_local(bslot, 0)
-    w.clone_into(tp, out, w.bin(BIN_ADD, b, w.konst(BOX_HDR)), ty)
-    b_sh := w.load_local(bslot, 0)
-    rc_sh := w.load_ptr(b_sh, BOX_RC, 8)
-    dec_sh_b := w.new_block()
-    w.branch(w.bin(BIN_GT, rc_sh, w.konst(0)), dec_sh_b, done_b)
-    w.f.active_bb = dec_sh_b
-    b_dec := w.load_local(bslot, 0)
-    w.store_ptr(b_dec, BOX_RC, w.bin(BIN_SUB, w.load_ptr(b_dec, BOX_RC, 8), w.konst(1)), 8)
+    if type_has_drop_hook_mir(tp, ty) {
+        $pargs := []int{}
+        pargs.push(w.konst(6))
+        w.call_core("rt_panic", &pargs)
+    } else {
+        b := w.load_local(bslot, 0)
+        w.clone_into(tp, out, w.bin(BIN_ADD, b, w.konst(BOX_HDR)), ty)
+        b_sh := w.load_local(bslot, 0)
+        rc_sh := w.load_ptr(b_sh, BOX_RC, 8)
+        dec_sh_b := w.new_block()
+        w.branch(w.bin(BIN_GT, rc_sh, w.konst(0)), dec_sh_b, done_b)
+        w.f.active_bb = dec_sh_b
+        b_dec := w.load_local(bslot, 0)
+        w.store_ptr(b_dec, BOX_RC, w.bin(BIN_SUB, w.load_ptr(b_dec, BOX_RC, 8), w.konst(1)), 8)
+    }
     w.jump(done_b)
     w.f.active_bb = sole_b
     b2 := w.load_local(bslot, 0)
@@ -562,11 +629,11 @@ fn (w $&Lw) lower_type_test(p &parser.Parser, tp &types.TypedProgram, n int) int
     $fargs := []int{}
     fargs.push(b2)
     w.call_core("free_owned", &fargs)
-    if p.nodes[a].kind == ast.NK_FIELD || p.nodes[a].kind == ast.NK_INDEX {
-        w.store_ptr(w.lower_place_addr(p, tp, a), 0, w.konst(0), 8)
-    }
     w.jump(done_b)
     w.f.active_bb = done_b
+    if !wide {
+        << w.load_ptr(out, 0, width_of(tp, ty))
+    }
     << out
 }
 
