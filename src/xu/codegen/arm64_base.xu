@@ -642,11 +642,47 @@ fn a64_cmp_vals(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, c int,
     a64_cmp(cb, rn, rm)
 }
 
+fn a64_mul_pow2_plus1(cv int) int {
+    if cv <= 2 { << -1 }
+    p := cv - 1
+    if (p & (p - 1)) != 0 { << -1 }
+    $k := 0
+    $v := p
+    while v > 1 {
+        v = v >> 1
+        k += 1
+    }
+    if k >= 1 && k <= 62 { << k }
+    << -1
+}
+
+fn a64_feeds_select(f &mir.MFn, ii int, cond_t int) bool {
+    $ni := f.instrs[ii].next
+    while ni >= 0 {
+        nk := f.instrs[ni].kind
+        if nk == mir.MI_SELECT {
+            << f.instrs[ni].b == cond_t && f.instrs[ni].c != cond_t && f.instrs[ni].d != cond_t
+        }
+        // Only skip instructions guaranteed not to modify NZCV flags or read cond_t.
+        if nk == mir.MI_NOP {
+            ni = f.instrs[ni].next
+        } else if nk == mir.MI_STORE_LOCAL && f.instrs[ni].b != cond_t {
+            ni = f.instrs[ni].next
+        } else {
+            << false
+        }
+    }
+    << false
+}
+
 fn a64_can_bin_imm(f &mir.MFn, op int, d int) bool {
     if d > -2 { << false }
     cv := f.consts[0 - d - 2]
     if op == mir.BIN_ADD || op == mir.BIN_SUB {
         << cv >= -4095 && cv < 4096
+    }
+    if op == mir.BIN_MUL {
+        << a64_mul_pow2_plus1(cv) > 0
     }
     if op == mir.BIN_SHL || op == mir.BIN_SHR || op == mir.BIN_ROTR32 || op == mir.BIN_ROTR64 {
         << true
@@ -685,6 +721,14 @@ fn a64_bin_imm(cb $&mc.CodeBuffer, f &mir.MFn, op int, rd int, rn int, d int) bo
         }
         if cv < 0 && cv >= -4095 {
             e32(cb, 0x91000000 | ((0 - cv) << 10) | (rn << 5) | rd)
+            << true
+        }
+    }
+    if op == mir.BIN_MUL {
+        k := a64_mul_pow2_plus1(cv)
+        if k > 0 {
+            // add rd, rn, rn, lsl #k
+            e32(cb, 0x8B000000 | (rn << 16) | (k << 10) | (rn << 5) | rd)
             << true
         }
     }
@@ -1145,6 +1189,8 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
 const FV_CONST = 0
 const FV_PARAM = 1
 const FV_BIN = 2
+const FV_OR = 3
+const FV_AND = 4
 
 struct FastNode {
     kind int
@@ -1163,6 +1209,9 @@ struct FastExit {
 struct FastPlan {
     nodes []FastNode
     exits []FastExit
+    slow_blk int
+    init_locals []int
+    init_vals []int
 }
 
 fn fv_noframe_kind(k int) bool {
@@ -1316,8 +1365,11 @@ fn fv_pure_only(nodes &[]FastNode, ni int, allow_cmp_root bool) bool {
         << false
     }
     nd := &nodes[ni]
-    if nd.kind != FV_BIN {
+    if nd.kind == FV_CONST || nd.kind == FV_PARAM {
         << true
+    }
+    if nd.kind != FV_BIN {
+        << false
     }
     if fv_is_cmp_op(nd.bop) {
         if !allow_cmp_root {
@@ -1329,6 +1381,26 @@ fn fv_pure_only(nodes &[]FastNode, ni int, allow_cmp_root bool) bool {
         << false
     }
     << fv_pure_only(nodes, nd.lhs, false) && fv_pure_only(nodes, nd.rhs, false)
+}
+
+fn fv_collect_guards(nodes &[]FastNode, cn int, want_true bool, out $&[]int, depth int) bool {
+    if depth > 3 || cn < 0 || cn >= nodes.len {
+        << false
+    }
+    nd := &nodes[cn]
+    if want_true && (nd.kind == FV_OR || (nd.kind == FV_BIN && nd.bop == mir.BIN_OR)) {
+        << fv_collect_guards(nodes, nd.lhs, true, out, depth + 1) &&
+           fv_collect_guards(nodes, nd.rhs, true, out, depth + 1)
+    }
+    if !want_true && nd.kind == FV_AND {
+        << fv_collect_guards(nodes, nd.lhs, false, out, depth + 1) &&
+           fv_collect_guards(nodes, nd.rhs, false, out, depth + 1)
+    }
+    if !fv_pure_only(nodes, cn, true) || fv_depth(nodes, cn) > 2 {
+        << false
+    }
+    out.push(cn)
+    << true
 }
 
 fn fv_eval_op(f &mir.MFn, nodes $&[]FastNode, temp_node &[]int, v int) int {
@@ -1384,9 +1456,47 @@ fn fv_sim_block(f &mir.MFn, bi int, nodes $&[]FastNode, loc_node $&[]int, temp_n
             ln := fv_eval_op(f, nodes, temp_node, ins.c)
             rn := fv_eval_op(f, nodes, temp_node, ins.d)
             if ln < 0 || rn < 0 { << false }
-            idx := nodes.len
-            nodes.push(FastNode{kind: FV_BIN, val: 0, bop: ins.b, lhs: ln, rhs: rn})
-            temp_node[ins.a] = idx
+            if fv_is_arith_op(ins.b) && nodes[ln].kind == FV_CONST && nodes[rn].kind == FV_CONST {
+                lv := nodes[ln].val
+                rv := nodes[rn].val
+                $cv := 0
+                if ins.b == mir.BIN_ADD { cv = lv + rv }
+                else if ins.b == mir.BIN_SUB { cv = lv - rv }
+                else if ins.b == mir.BIN_MUL { cv = lv * rv }
+                else if ins.b == mir.BIN_AND { cv = lv & rv }
+                else if ins.b == mir.BIN_OR { cv = lv | rv }
+                else { cv = lv ^ rv }
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_CONST, val: cv, bop: 0, lhs: -1, rhs: -1})
+                temp_node[ins.a] = idx
+            } else if ins.b == mir.BIN_ADD && nodes[ln].kind == FV_CONST && nodes[ln].val == 0 {
+                temp_node[ins.a] = rn
+            } else if (ins.b == mir.BIN_ADD || ins.b == mir.BIN_SUB) && nodes[rn].kind == FV_CONST && nodes[rn].val == 0 {
+                temp_node[ins.a] = ln
+            } else {
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_BIN, val: 0, bop: ins.b, lhs: ln, rhs: rn})
+                temp_node[ins.a] = idx
+            }
+        } else if k == mir.MI_SELECT {
+            if ins.a < 0 || ins.a >= temp_node.len { << false }
+            if ins.b == ins.c {
+                ln := fv_eval_op(f, nodes, temp_node, ins.b)
+                rn := fv_eval_op(f, nodes, temp_node, ins.d)
+                if ln < 0 || rn < 0 { << false }
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_OR, val: 0, bop: 0, lhs: ln, rhs: rn})
+                temp_node[ins.a] = idx
+            } else if ins.b == ins.d {
+                ln := fv_eval_op(f, nodes, temp_node, ins.b)
+                rn := fv_eval_op(f, nodes, temp_node, ins.c)
+                if ln < 0 || rn < 0 { << false }
+                idx := nodes.len
+                nodes.push(FastNode{kind: FV_AND, val: 0, bop: 0, lhs: ln, rhs: rn})
+                temp_node[ins.a] = idx
+            } else {
+                << false
+            }
         } else {
             << false
         }
@@ -1426,7 +1536,7 @@ fn fv_try_pure_ret(f &mir.MFn, start_b int, nodes $&[]FastNode, loc_node &[]int,
 }
 
 fn analyze_fast_entry(f &mir.MFn) FastPlan {
-    $plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}}
+    $plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
     if !f.scalar_params || f.nparams <= 0 || f.nparams > 6 || f.blocks.len < 2 {
         << plan
     }
@@ -1450,8 +1560,10 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
         temp_node.push(-1)
     }
     $vis := []bool{}
+    $skipped := []bool{}
     for _ in 0:f.blocks.len {
         vis.push(false)
+        skipped.push(false)
     }
     $cur_b := 0
     for _ in 0:8 {
@@ -1464,6 +1576,7 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
         }
         tk := f.blocks[cur_b].tkind
         if tk == mir.TKIND_JUMP {
+            skipped[cur_b] = true
             cur_b = f.blocks[cur_b].ta
             ->
         }
@@ -1471,7 +1584,7 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
             <-
         }
         cn := fv_eval_op(f, $&plan.nodes, &temp_node, f.blocks[cur_b].ta)
-        if cn < 0 || !fv_pure_only(&plan.nodes, cn, true) || fv_depth(&plan.nodes, cn) > 2 {
+        if cn < 0 {
             <-
         }
         tb := f.blocks[cur_b].tb
@@ -1481,20 +1594,108 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
             rt = fv_try_pure_ret(f, tb, $&plan.nodes, &loc_node, &temp_node)
         }
         if rt >= 0 {
-            plan.exits.push(FastExit{cond_node: cn, want_true: true, ret_node: rt})
-            cur_b = tc
-            ->
+            $guards := []int{}
+            if fv_collect_guards(&plan.nodes, cn, true, $&guards, 0) && plan.exits.len + guards.len <= 4 {
+                for gi in 0:guards.len {
+                    plan.exits.push(FastExit{cond_node: guards[gi], want_true: true, ret_node: rt})
+                }
+                skipped[cur_b] = true
+                cur_b = tc
+                ->
+            }
         }
         $re := -1
         if tc >= 0 && tc < vis.len && !vis[tc] {
             re = fv_try_pure_ret(f, tc, $&plan.nodes, &loc_node, &temp_node)
         }
         if re >= 0 {
-            plan.exits.push(FastExit{cond_node: cn, want_true: false, ret_node: re})
-            cur_b = tb
-            ->
+            $guards := []int{}
+            if fv_collect_guards(&plan.nodes, cn, false, $&guards, 0) && plan.exits.len + guards.len <= 4 {
+                for gi in 0:guards.len {
+                    plan.exits.push(FastExit{cond_node: guards[gi], want_true: false, ret_node: re})
+                }
+                skipped[cur_b] = true
+                cur_b = tb
+                ->
+            }
         }
         <-
+    }
+    // If all fast-entry guards fell through to cur_b > 0, check whether the
+    // slow-path prologue can jump directly to cur_b (skipping redundant entry
+    // re-checks) after initializing any constant locals stored in skipped blocks.
+    if plan.exits.len > 0 && cur_b > 0 && cur_b < f.blocks.len && !skipped[cur_b] {
+        $can_skip := true
+        $def_skip_blk := []int{}
+        for _ in 0:f.temps.len { def_skip_blk.push(-1) }
+        $loc_written := []bool{}
+        for _ in 0:f.locals.len { loc_written.push(false) }
+        for bi in 0:f.blocks.len {
+            if !skipped[bi] { -> }
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if a64_defines(ins.kind) && ins.a >= 0 && ins.a < def_skip_blk.len {
+                    if def_skip_blk[ins.a] >= 0 && def_skip_blk[ins.a] != bi {
+                        can_skip = false
+                    }
+                    def_skip_blk[ins.a] = bi
+                }
+                if ins.kind == mir.MI_STORE_LOCAL {
+                    l := ins.a
+                    if l < f.nparams || l >= f.locals.len || f.locals[l] != 1 || f.locals_nslots[l] != 1 {
+                        can_skip = false
+                    } else {
+                        loc_written[l] = true
+                    }
+                }
+                ii = ins.next
+            }
+        }
+        if can_skip {
+            for bi in 0:f.blocks.len {
+                $ii := f.blocks[bi].head
+                while ii >= 0 {
+                    ins := &f.instrs[ii]
+                    for t in 0:def_skip_blk.len {
+                        if def_skip_blk[t] >= 0 && def_skip_blk[t] != bi && a64_reads_temp(f, ins, t) {
+                            can_skip = false
+                            <-
+                        }
+                    }
+                    if !can_skip { <- }
+                    ii = ins.next
+                }
+                if !can_skip { <- }
+                tk := f.blocks[bi].tkind
+                if (tk == mir.TKIND_BRANCH || tk == mir.TKIND_RETURN) && f.blocks[bi].ta >= 0 &&
+                   f.blocks[bi].ta < def_skip_blk.len && def_skip_blk[f.blocks[bi].ta] >= 0 &&
+                   def_skip_blk[f.blocks[bi].ta] != bi {
+                    can_skip = false
+                    <-
+                }
+            }
+        }
+        if can_skip {
+            for l in f.nparams:f.locals.len {
+                if loc_written[l] {
+                    ln := loc_node[l]
+                    if ln < 0 || plan.nodes[ln].kind != FV_CONST {
+                        can_skip = false
+                        <-
+                    }
+                    iv := plan.nodes[ln].val
+                    plan.init_locals.push(l)
+                    plan.init_vals.push(iv)
+                }
+            }
+        }
+        if can_skip {
+            plan.slow_blk = cur_b
+        } else {
+            plan.init_locals = []int{}
+            plan.init_vals = []int{}
+        }
     }
     << plan
 }
@@ -1578,7 +1779,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     $fr := a64_frame(f)
     ra := a64_ra(f, opt)
     leaf_noframe := can_elide_frame(f, &ra, opt)
-    $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}}
+    $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
     if opt && !leaf_noframe {
         fp_plan = analyze_fast_entry(f)
     }
@@ -1613,6 +1814,20 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
     }
     a64_copy_params(cb, f, &fr, &ra)
+    if fp_plan.slow_blk > 0 {
+        for ii in 0:fp_plan.init_locals.len {
+            l := fp_plan.init_locals[ii]
+            v := fp_plan.init_vals[ii]
+            lr := ra.local_reg[l]
+            if lr >= 0 && lr < 32 {
+                a64_mov_imm(cb, lr, v)
+            } else {
+                a64_mov_imm(cb, 9, v)
+                a64_str(cb, 9, R_SP, fr.local_off[l])
+            }
+        }
+        a64_branch_reloc(cb, relocs, 0x14000000, f.label + ".bb" + str(fp_plan.slow_blk), mc.RELOC_ARM64_CALL26)
+    }
     $strs := []StrFix{}
     $str_aligns := []int{}
     $uses := []int{}
@@ -1711,10 +1926,10 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 fm := a64_fsrc(cb, f, &fr, &ra, ins.d, 1)
                 e32(cb, 0x1E602000 | (fm << 16) | (fx << 5))
                 fused = a64_fcond_of(ins.b)
-            } else if opt && k == mir.MI_BIN && a64_is_icmp(ins.b) && ins.next >= 0 && f.instrs[ins.next].kind == mir.MI_SELECT && f.instrs[ins.next].b == ins.a && ins.a >= 0 && uses[ins.a] == 1 {
+            } else if opt && k == mir.MI_BIN && a64_is_icmp(ins.b) && ins.a >= 0 && uses[ins.a] == 1 && a64_feeds_select(f, ii, ins.a) {
                 a64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
                 sel_cond = a64_cond_of(ins.b)
-            } else if opt && k == mir.MI_BIN && a64_is_fcmp(ins.b) && ins.next >= 0 && f.instrs[ins.next].kind == mir.MI_SELECT && f.instrs[ins.next].b == ins.a && ins.a >= 0 && uses[ins.a] == 1 {
+            } else if opt && k == mir.MI_BIN && a64_is_fcmp(ins.b) && ins.a >= 0 && uses[ins.a] == 1 && a64_feeds_select(f, ii, ins.a) {
                 fx := a64_fsrc(cb, f, &fr, &ra, ins.c, 0)
                 fm := a64_fsrc(cb, f, &fr, &ra, ins.d, 1)
                 e32(cb, 0x1E602000 | (fm << 16) | (fx << 5))
@@ -1730,7 +1945,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 rd := a64_dst(&ra, ins.a, 9)
                 a64_cset(cb, rd, a64_cond_of(ins.b))
                 a64_put(cb, &fr, &ra, ins.a, rd)
-            } else if opt && k == mir.MI_BIN && ((ins.c > -2 && ins.d <= -2 && a64_can_bin_imm(f, ins.b, ins.d)) || (ins.d > -2 && ins.c <= -2 && (ins.b == mir.BIN_ADD || ins.b == mir.BIN_AND || ins.b == mir.BIN_OR || ins.b == mir.BIN_XOR) && a64_can_bin_imm(f, ins.b, ins.c))) {
+            } else if opt && k == mir.MI_BIN && ((ins.c > -2 && ins.d <= -2 && a64_can_bin_imm(f, ins.b, ins.d)) || (ins.d > -2 && ins.c <= -2 && (ins.b == mir.BIN_ADD || ins.b == mir.BIN_MUL || ins.b == mir.BIN_AND || ins.b == mir.BIN_OR || ins.b == mir.BIN_XOR) && a64_can_bin_imm(f, ins.b, ins.c))) {
                 $lhs := ins.c
                 $rhs := ins.d
                 if ins.c <= -2 {
@@ -2133,11 +2348,7 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
 
 // Process entry, raw system call and runtime-state accessor shared by all
 // functions. tgt_os uses target.OS_* codes.
-pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool) {
-    emit_arm64_runtime_stubs_got(cb, syms, relocs, tgt_os, main_label, link_ui, emit_object, "")
-}
-
-pub fn emit_arm64_runtime_stubs_got(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, ffi_got_sym string) {
+pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, uses_ffi bool) {
     linux := tgt_os == target.OS_LINUX
     // __xu_start: keep argc/argv/envp, map the state block into x28, run
     // main, exit with its result.
@@ -2206,7 +2417,7 @@ pub fn emit_arm64_runtime_stubs_got(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
     if !linux {
         emit_macos_arm64_clock(cb, syms, relocs, emit_object)
     }
-    emit_arm64_pseudo_calls_got(cb, syms, relocs, ~ffi_got_sym)
+    emit_arm64_pseudo_calls(cb, syms, relocs, tgt_os, emit_object, uses_ffi)
     if linux {
         a64_mov(cb, 8, 0)
     } else {
@@ -2227,6 +2438,9 @@ pub fn emit_arm64_runtime_stubs_got(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
     }
     e32(cb, 0xD65F03C0)
     emit_arm64_globals(cb, syms)
+    if uses_ffi && emit_object && tgt_os != target.OS_WINDOWS {
+        emit_arm64_ffi_tramps(cb, syms, relocs, tgt_os)
+    }
 }
 
 fn a64_linux_save_hwcap(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc) {
@@ -2248,12 +2462,10 @@ fn a64_linux_save_hwcap(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
 }
 
 // Dispatch shared pseudo-calls before falling through to the host bridge.
-fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc) {
-    emit_arm64_pseudo_calls_got(cb, syms, relocs, "")
-}
-
-fn emit_arm64_pseudo_calls_got(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, phone_got_sym string) {
-    emit_arm64_ffi_calls(cb, syms, relocs, &phone_got_sym)
+fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, uses_ffi bool) {
+    if uses_ffi || !emit_object {
+        emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object)
+    }
     // cmn x0, #5 ; b.ne past the zeroing
     e32(cb, 0xB100141F)
     e32(cb, 0x54000000 | (11 << 5) | 1)
@@ -2325,8 +2537,35 @@ fn emit_arm64_globals(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
 // the driver defines the label there.
 pub const FFI_GOT_LABEL = "__xu_ffi_got"
 pub const FFI_STATE_LABEL = "__xu_ffi_state"
+const FFI_OBJ_GOT_OFFSET = 2048
 
-fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, phone_got_sym &string) {
+fn a64_ffi_state_addr(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, rd int, emit_object bool) {
+    if !emit_object {
+        a64_fn_addr(cb, relocs, rd, FFI_STATE_LABEL)
+        <<
+    }
+    relocs.push(mc.reloc_new(cb.len(), FFI_STATE_LABEL, mc.RELOC_ARM64_ADR_PAGE21, 0))
+    e32(cb, 0x90000000 | rd)
+    relocs.push(mc.reloc_new(cb.len(), FFI_STATE_LABEL, mc.RELOC_ARM64_ADD_LO12, 0))
+    e32(cb, 0x91000000 | (rd << 5) | rd)
+}
+
+fn emit_arm64_ffi_tramps(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int) {
+    $pfx := ""
+    if tgt_os == target.OS_MACOS { pfx = "_" }
+    names := ["dlopen", "dlsym", "dlerror"]
+    for i in 0:names.len {
+        while cb.len() % 4 != 0 { e32(cb, 0xD503201F) }
+        syms.define_label("__xu_ffi_tramp_" + names[i], cb.len())
+        e32(cb, 0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+        e32(cb, 0x910003FD) // mov x29, sp
+        a64_branch_reloc(cb, relocs, 0x94000000, pfx + names[i], mc.RELOC_ARM64_CALL26)
+        e32(cb, 0xA8C17BFD) // ldp x29, x30, [sp], #16
+        e32(cb, 0xD65F03C0) // ret
+    }
+}
+
+fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool) {
     e32(cb, 0xB100201F) // cmn x0, #8
     skip6 := cb.len()
     e32(cb, 0x54000001) // b.ne (patched)
@@ -2335,17 +2574,10 @@ fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
     a64_pair(cb, 0xA9000000, 19, 20, R_SP, 16)
     // Publish the runtime state register for C callbacks: C code between
     // here and a callback may use x28 for its own values.
-    if phone_got_sym.len > 0 {
-        a64_mov(cb, 19, 2)
-        a64_mov(cb, 20, 1)
-        a64_branch_reloc(cb, relocs, 0x94000000, *phone_got_sym + "", mc.RELOC_ARM64_CALL26)
-        a64_str(cb, R_STATE, 0, 24)
-    } else {
-        a64_fn_addr(cb, relocs, 9, FFI_STATE_LABEL)
-        a64_str(cb, 28, 9, 0)
-        a64_mov(cb, 19, 2)
-        a64_mov(cb, 20, 1)
-    }
+    a64_ffi_state_addr(cb, relocs, 9, emit_object)
+    a64_str(cb, 28, 9, 0)
+    a64_mov(cb, 19, 2)
+    a64_mov(cb, 20, 1)
     a64_ldr(cb, 9, 19, 128)
     e32(cb, 0xCB2963FF) // sub sp, sp, x9
     a64_ldr(cb, 10, 19, 136)
@@ -2374,12 +2606,24 @@ fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
     e32(cb, 0xB100241F) // cmn x0, #9
     skip7 := cb.len()
     e32(cb, 0x54000001)
-    if phone_got_sym.len > 0 {
-        a64_branch_reloc(cb, relocs, 0x14000000, *phone_got_sym + "", mc.RELOC_ARM64_CALL26)
+    a64_ffi_state_addr(cb, relocs, 9, emit_object)
+    a64_str(cb, R_STATE, 9, 0)
+    if emit_object {
+        if tgt_os == target.OS_WINDOWS {
+            a64_mov_imm(cb, 0, 0)
+        } else {
+            a64_fn_addr(cb, relocs, 9, "__xu_ffi_tramp_dlopen")
+            a64_str(cb, 9, R_STATE, FFI_OBJ_GOT_OFFSET)
+            a64_fn_addr(cb, relocs, 9, "__xu_ffi_tramp_dlsym")
+            a64_str(cb, 9, R_STATE, FFI_OBJ_GOT_OFFSET + 8)
+            a64_fn_addr(cb, relocs, 9, "__xu_ffi_tramp_dlerror")
+            a64_str(cb, 9, R_STATE, FFI_OBJ_GOT_OFFSET + 16)
+            a64_add_imm(cb, 0, R_STATE, FFI_OBJ_GOT_OFFSET)
+        }
     } else {
         a64_fn_addr(cb, relocs, 0, FFI_GOT_LABEL)
-        e32(cb, 0xD65F03C0)
     }
+    e32(cb, 0xD65F03C0)
     cb.patch_u32_le(skip7, 0x54000001 | ((((cb.len() - skip7) / 4) & 0x7FFFF) << 5))
 }
 
@@ -2391,39 +2635,65 @@ pub fn emit_arm64_ffi_slots(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     for i in 0:8 { e32(cb, 0) }
 }
 
+fn emit_arm64_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, label string, adapter string, is_clos bool, emit_object bool) {
+    while cb.len() % 16 != 0 { e32(cb, 0xD503201F) }
+    syms.define_label(label + "", cb.len())
+    e32(cb, 0xA9800000 | ((-50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // stp x29, x30, [sp, #-400]!
+    e32(cb, 0x910003FD) // mov x29, sp
+    for i in 0:5 { a64_pair(cb, 0xA9000000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16) }
+    for i in 0:4 { a64_pair(cb, 0x6D000000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16) }
+    for i in 0:4 { a64_pair(cb, 0xA9000000, i * 2, i * 2 + 1, R_SP, 160 + i * 16) }
+    for i in 0:4 { a64_pair(cb, 0x6D000000, i * 2, i * 2 + 1, R_SP, 224 + i * 16) }
+    a64_str(cb, 8, R_SP, 160 + 144) // x8 -> FB_X8
+    // Closure stubs pass the slot index in x16, which the state-address
+    // sequence below uses as scratch: park it in (already saved) x19.
+    if is_clos { e32(cb, 0xAA1003F3) } // mov x19, x16
+    // Restore the runtime state register published by the C call.
+    a64_ffi_state_addr(cb, relocs, 28, emit_object)
+    a64_ldr(cb, 28, 28, 0)
+    e32(cb, 0x91000000 | (400 << 10) | (31 << 5) | 9) // add x9, sp, #400
+    a64_str(cb, 9, R_SP, 160 + 136)
+    if is_clos {
+        a64_mov_imm(cb, 9, 24)
+        e32(cb, 0x9B097E70) // mul x16, x19, x9
+        e32(cb, 0x9130038A) // add x10, x28, #3072
+        e32(cb, 0x8B10014A) // add x10, x10, x16
+        a64_add_imm(cb, 11, 10, 8)
+        a64_str(cb, 11, R_SP, 160 + 200) // blk + FB_CLOSURE
+        a64_ldr(cb, 9, 10, 0)
+        e32(cb, 0x91000000 | (160 << 10) | (31 << 5) | 0) // add x0, sp, #160
+        e32(cb, 0xD63F0120) // blr x9
+    } else {
+        e32(cb, 0x91000000 | (160 << 10) | (31 << 5) | 0) // add x0, sp, #160
+        a64_branch_reloc(cb, relocs, 0x94000000, adapter + "", mc.RELOC_ARM64_CALL26)
+    }
+    a64_pair(cb, 0xA9400000, 0, 1, R_SP, 160 + 152)
+    a64_pair(cb, 0x6D400000, 0, 1, R_SP, 160 + 168)
+    a64_pair(cb, 0x6D400000, 2, 3, R_SP, 160 + 184)
+    for i in 0:5 { a64_pair(cb, 0xA9400000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16) }
+    for i in 0:4 { a64_pair(cb, 0x6D400000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16) }
+    e32(cb, 0xA8C00000 | ((50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // ldp x29, x30, [sp], #400
+    e32(cb, 0xD65F03C0)
+}
+
 // C-ABI entry points for Xu functions passed as C callbacks: save the C
 // callee-saved registers, spill x0-x7 / d0-d7 and the caller's stack
 // argument address into a call block on the stack, call the adapter with
 // the block, load x0, x1, d0-d3 from it and return (layout: core ffi.xu).
-pub fn emit_arm64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, phone_got_sym &string) {
+pub fn emit_arm64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, emit_object bool, emit_clos bool) {
     for t in 0:thunks.len {
+        emit_arm64_ffi_thunk_one(cb, syms, relocs, thunks[t] + "", adapters[t] + "", false, emit_object)
+    }
+    if emit_clos {
+        emit_arm64_ffi_thunk_one(cb, syms, relocs, "__xu_ffi_clos_dispatch", "", true, emit_object)
         while cb.len() % 16 != 0 { e32(cb, 0xD503201F) }
-        syms.define_label(thunks[t] + "", cb.len())
-        e32(cb, 0xA9800000 | ((-50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // stp x29, x30, [sp, #-400]!
-        e32(cb, 0x910003FD) // mov x29, sp
-        for i in 0:5 { a64_pair(cb, 0xA9000000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16) }
-        for i in 0:4 { a64_pair(cb, 0x6D000000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16) }
-        for i in 0:4 { a64_pair(cb, 0xA9000000, i * 2, i * 2 + 1, R_SP, 160 + i * 16) }
-        for i in 0:4 { a64_pair(cb, 0x6D000000, i * 2, i * 2 + 1, R_SP, 224 + i * 16) }
-        // Restore the runtime state register published by the C call.
-        if phone_got_sym.len > 0 {
-            a64_branch_reloc(cb, relocs, 0x94000000, *phone_got_sym + "", mc.RELOC_ARM64_CALL26)
-            a64_ldr(cb, R_STATE, 0, 24)
-        } else {
-            a64_fn_addr(cb, relocs, 28, FFI_STATE_LABEL)
-            a64_ldr(cb, 28, 28, 0)
+        syms.define_label("__xu_ffi_clos_stubs", cb.len())
+        for k in 0:64 {
+            a64_mov_imm(cb, 16, k)
+            a64_branch_reloc(cb, relocs, 0x14000000, "__xu_ffi_clos_dispatch", mc.RELOC_ARM64_CALL26)
+            e32(cb, 0xD503201F)
+            e32(cb, 0xD503201F)
         }
-        e32(cb, 0x91000000 | (400 << 10) | (31 << 5) | 9) // add x9, sp, #400
-        a64_str(cb, 9, R_SP, 160 + 136)
-        e32(cb, 0x91000000 | (160 << 10) | (31 << 5) | 0) // add x0, sp, #160
-        a64_branch_reloc(cb, relocs, 0x94000000, adapters[t] + "", mc.RELOC_ARM64_CALL26)
-        a64_pair(cb, 0xA9400000, 0, 1, R_SP, 160 + 152)
-        a64_pair(cb, 0x6D400000, 0, 1, R_SP, 160 + 168)
-        a64_pair(cb, 0x6D400000, 2, 3, R_SP, 160 + 184)
-        for i in 0:5 { a64_pair(cb, 0xA9400000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16) }
-        for i in 0:4 { a64_pair(cb, 0x6D400000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16) }
-        e32(cb, 0xA8C00000 | ((50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // ldp x29, x30, [sp], #400
-        e32(cb, 0xD65F03C0)
     }
 }
 

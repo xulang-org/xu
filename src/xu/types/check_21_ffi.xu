@@ -62,15 +62,84 @@ fn (c &Checker) fn_is_c_variadic(fi int) bool {
     << f >= 0 && (f & FFI_EXTERN) != 0 && (f & ast.FFI_VARIADIC) != 0
 }
 
-// An extern "C" or unsafe fn called outside an unsafe context fails.
+fn (c $&Checker) ffi_check_callback_arg(p &parser.Parser, arg int, ctx string) bool {
+    t := c.ntype[arg]
+    if is_error_type(t) { << false }
+    k := p.nodes[arg].kind
+    if !is_fn_type(t) {
+        c.fail_node(p, arg, ctx + " expects a function or closure")
+        << false
+    }
+    if (k == ast.NK_IDENT || k == ast.NK_FIELD) && arg < c.ncall.len && c.ncall[arg] >= 0 && (arg >= c.nlocal.len || c.nlocal[arg] < 0) {
+        cb_fi := c.ncall[arg]
+        if cb_fi < c.fns.len {
+            c.ffi_call_check(p, arg, cb_fi)
+        }
+        if cb_fi < c.fns.len && cb_fi < c.fn_may_throw.len && c.fn_may_throw[cb_fi] != 0 {
+            c.fail_node(p, arg, ctx + ": callback function '" + c.fns[cb_fi].name + "' cannot throw")
+            << false
+        }
+    }
+    << true
+}
+
+fn (c &Checker) node_global(n int) int {
+    if n < 0 || n >= c.nconst.len { << -1 }
+    v := c.nconst[n]
+    if v <= -1000 { << -1000 - v }
+    << -1
+}
+
+fn (c &Checker) expr_global_root(p &parser.Parser, n int) int {
+    $cur := n
+    while cur >= 0 {
+        gi := c.node_global(cur)
+        if gi >= 0 { << gi }
+        k := p.nodes[cur].kind
+        if k == ast.NK_FIELD || k == ast.NK_INDEX {
+            cur = p.nodes[cur].a
+        } else {
+            << -1
+        }
+    }
+    << -1
+}
+
+fn (c $&Checker) check_global_write(p &parser.Parser, n int, gi int) {
+    if c.unsafe_depth == 0 {
+        c.fail_node(p, n, "writing extern \"C\" global '" + c.globals[gi].name + "' requires an unsafe block")
+    }
+    if !c.globals[gi].is_mut {
+        c.fail_node(p, n, "cannot mutate immutable extern \"C\" global '" + c.globals[gi].name + "' (declare with " + string_from_byte(36) + "let)")
+    }
+}
+
+// An extern "C" or unsafe fn called outside an unsafe context fails,
+// and direct callback arguments to extern "C" calls are validated at check time.
 fn (c $&Checker) ffi_call_check(p &parser.Parser, n int, fi int) {
     if fi < 0 || fi >= c.fns.len { << }
     f := c.ffi_label_flags(&c.fns[fi].label)
-    if f < 0 || c.unsafe_depth > 0 { << }
+    if f < 0 { << }
+    if c.unsafe_depth == 0 {
+        if (f & FFI_EXTERN) != 0 {
+            c.fail_node(p, n, "calling extern \"C\" function '" + c.fns[fi].name + "' requires an unsafe block")
+        } else if (f & ast.FFI_UNSAFE_FN) != 0 {
+            c.fail_node(p, n, "calling unsafe function '" + c.fns[fi].name + "' requires an unsafe block")
+        }
+    }
     if (f & FFI_EXTERN) != 0 {
-        c.fail_node(p, n, "calling extern \"C\" function '" + c.fns[fi].name + "' requires an unsafe block")
-    } else if (f & ast.FFI_UNSAFE_FN) != 0 {
-        c.fail_node(p, n, "calling unsafe function '" + c.fns[fi].name + "' requires an unsafe block")
+        $arg := p.nodes[n].a
+        if p.nodes[n].kind == ast.NK_METHOD_CALL { arg = p.nodes[n].b }
+        $idx := 0
+        $limit := c.fns[fi].params.len
+        if c.fn_is_c_variadic(fi) && limit > 0 { limit -= 1 }
+        while arg >= 0 && idx < limit {
+            if is_fn_type(c.fns[fi].params[idx]) {
+                c.ffi_check_callback_arg(p, arg, "C callback")
+            }
+            idx += 1
+            arg = p.nodes[arg].next
+        }
     }
 }
 
@@ -104,10 +173,20 @@ fn (c &Checker) ffi_type_ok(t int, result bool) bool {
         sig := fn_index(t)
         for i in 0:c.fn_sigs[sig].params.len {
             pt := c.fn_sigs[sig].params[i]
-            if !is_integer_type(pt) && !is_float_type(pt) && pt != 2 && pt != 6 { << false }
+            if is_integer_type(pt) || is_float_type(pt) || pt == 2 || pt == 6 || pt == 3 {
+                ->
+            }
+            if is_struct_type(pt) && c.struct_is_repr_c(struct_index(pt)) {
+                ->
+            }
+            if is_ref_type(pt) && !is_mut_ref_type(pt) && c.ref_inner_type(pt) == 3 {
+                ->
+            }
+            << false
         }
         rt := c.fn_sigs[sig].ret
-        << rt == 0 || is_integer_type(rt) || is_float_type(rt) || rt == 2 || rt == 6
+        if rt == 0 || is_integer_type(rt) || is_float_type(rt) || rt == 2 || rt == 6 { << true }
+        << is_struct_type(rt) && c.struct_is_repr_c(struct_index(rt))
     }
     << false
 }
@@ -158,12 +237,52 @@ fn (c $&Checker) ffi_check_decls(p &parser.Parser) {
     }
     for i in 0:c.repr_c_structs.len {
         si := c.repr_c_structs[i]
+        if c.structs[si].is_union && c.structs[si].fields.len == 0 {
+            c.set_cur_file(p, c.decl_file_id(p, sdecl[i]))
+            c.fail_node(p, sdecl[i], "@repr(\"C\") union " + c.structs[si].name + " must have at least one field")
+        }
         for j in 0:c.structs[si].fields.len {
             if !c.repr_field_ok(c.structs[si].fields[j].ty) {
                 c.set_cur_file(p, c.decl_file_id(p, sdecl[i]))
                 c.fail_node(p, sdecl[i], "@repr(\"C\") struct " + c.structs[si].name + ": field " + c.structs[si].fields[j].name +
                     " has type " + c.ty_display(c.structs[si].fields[j].ty) + ", which has no C layout (use u8 for C bool fields)")
             }
+        }
+    }
+    for i in 0:p.ffi_nodes.len {
+        f := p.ffi_nodes[i]
+        if (p.nodes[f].ival & ast.FFI_GLOBAL) != 0 {
+            d := p.nodes[f].a
+            mod_id := p.nodes[d].sval2 + ""
+            name := p.nodes[d].sval + ""
+            saved_mod := c.cur_mod + ""
+            c.cur_mod = mod_id + ""
+            c.set_cur_file(p, c.decl_file_id(p, d))
+            if c.find_global_in_mod(name + "", mod_id + "") >= 0 {
+                c.fail_node(p, d, "duplicate extern global '" + name + "'")
+            } else {
+                gty := c.type_of(p, p.nodes[d].a)
+                if !c.repr_field_ok(gty) {
+                    c.fail_node(p, d, "extern \"C\" global " + name + ": type " + c.ty_display(gty) + " has no C layout")
+                } else {
+                    $libs := ""
+                    meta := p.nodes[f].b
+                    if meta >= 0 && meta < p.nodes.len { libs = p.nodes[meta].sval + "" }
+                    gi := c.globals.len
+                    c.globals.push(CGlobal{
+                        name: name + "",
+                        mod_id: mod_id + "",
+                        lib: libs,
+                        sym: p.nodes[f].sval + "",
+                        ty: gty,
+                        is_pub: (p.nodes[d].ival & 1) == 1,
+                        is_mut: (p.nodes[d].ival & 2) != 0,
+                        decl: d
+                    })
+                    strmap_put($&c.global_map, map_key(mod_id + "", name + ""), gi)
+                }
+            }
+            c.cur_mod = saved_mod
         }
     }
     for fi in 0:c.fns.len {
@@ -211,14 +330,31 @@ fn (c $&Checker) check_call_c_callback(p &parser.Parser, n int) int {
         << 6
     }
     t := c.check_expr(p, arg)
-    if p.nodes[arg].kind != ast.NK_IDENT || !is_fn_type(t) || c.ncall[arg] < 0 {
-        c.fail_node(p, arg, "c_callback expects the name of a top-level function")
-        << 6
-    }
-    if !c.ffi_type_ok(t, false) {
-        c.fail_node(p, arg, "c_callback: the function's parameters and result must be C scalars or c_ptr")
+    if c.ffi_check_callback_arg(p, arg, "c_callback") {
+        if !c.ffi_type_ok(t, false) {
+            c.fail_node(p, arg, "c_callback: callback parameters must be C scalars, c_ptr, cstr, string, or @repr(\"C\") types, and result must be void, C scalar, c_ptr, or @repr(\"C\")")
+        }
     }
     checker_set_i($&c.ncall, n, NCALL_C_CALLBACK)
     checker_set_i($&c.ntype, n, 6)
     << 6
+}
+
+fn (c $&Checker) check_call_c_callback_free(p &parser.Parser, n int) int {
+    if c.cur_mod != "ffi" {
+        c.fail_node(p, n, "c_callback_free is only available through ffi.callback_free")
+        << 0
+    }
+    arg := p.nodes[n].a
+    if arg < 0 || p.nodes[arg].next >= 0 {
+        c.fail_node(p, n, "c_callback_free takes exactly 1 argument")
+        << 0
+    }
+    t := c.check_expr(p, arg)
+    if t != 6 && !is_error_type(t) {
+        c.fail_node(p, arg, "c_callback_free expects c_ptr")
+    }
+    checker_set_i($&c.ncall, n, NCALL_C_CALLBACK_FREE)
+    checker_set_i($&c.ntype, n, 0)
+    << 0
 }

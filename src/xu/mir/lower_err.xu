@@ -45,12 +45,34 @@ fn (w $&Lw) err_box(p &parser.Parser, tp &types.TypedProgram, n int) int {
 }
 
 // Heap box holding a copy of the struct value at address v.
+// Zero-sized structs without drop glue use an 8-byte-aligned static immortal
+// header [tag][0][-1] on 64-bit little-endian targets (avoiding heap alloc/free).
 fn (w $&Lw) box_struct(tp &types.TypedProgram, v int, sty int) int {
     sz := tp.size_of(sty)
+    tag := types.box_struct_tag(types.struct_index(sty))
+    if sz == 0 && !w.needs_drop(tp, sty) && (w.tgt_arch == 0 || w.tgt_arch == 1) {
+        $bytes := []int{}
+        for bi in 0:8 {
+            bytes.push((tag >> (bi * 8)) & 255)
+        }
+        for _ in 0:8 {
+            bytes.push(0)
+        }
+        for _ in 0:8 {
+            bytes.push(255)
+        }
+        bx := w.new_temp()
+        $ins := minstr_new(MI_STR_CONST)
+        ins.a = bx
+        ins.d = 8
+        ins.sval = string_from_bytes(bytes)
+        w.emit(ins)
+        << bx
+    }
     $args := []int{}
     args.push(w.konst(BOX_HDR + sz))
     bx := w.call_core("alloc", &args)
-    w.store_ptr(bx, 0, w.konst(types.box_struct_tag(types.struct_index(sty))), 8)
+    w.store_ptr(bx, 0, w.konst(tag), 8)
     $drop_fn := w.konst(0)
     if w.needs_drop(tp, sty) {
         drop_fn = w.fn_addr(resource_drop_label(sty))
@@ -68,8 +90,9 @@ fn (w $&Lw) err_value(p &parser.Parser, tp &types.TypedProgram, n int) int {
         << w.lower_expr(p, tp, n)
     }
     ty := tp.deref(tp.deref(tp.type_of(n)))
-    v := w.lower_expr(p, tp, n)
+    $v := w.lower_expr(p, tp, n)
     if types.is_struct_type(ty) {
+        v = w.own_val(p, tp, n, v, ty)
         << w.box_struct(tp, v, ty)
     }
     if w.expr_is_ref(p, tp, n) {
@@ -265,6 +288,9 @@ fn (w $&Lw) err_return(p &parser.Parser, tp &types.TypedProgram, a int) {
     } else {
         v = w.lower_expr(p, tp, a)
     }
+    if w.ret_ty != 0 && !types.is_ref_type(w.ret_ty) {
+        v = w.own_val(p, tp, a, v, w.ret_ty)
+    }
     w.ensure_open()
     okp := w.load_local(w.okp, 0)
     w.store_value(tp, okp, 0, v, w.ret_ty)
@@ -328,9 +354,12 @@ fn (w $&Lw) lower_or_catch(p &parser.Parser, tp &types.TypedProgram, n int) int 
     if w.open() && res >= 0 {
         // A handler that falls through assigned the binding target; the
         // expression then yields that value.
-        tgt := last_assigned_ident(p, tp, p.nodes[n].c)
+        $tgt := tp.const_of(n)
+        if tgt < 0 {
+            tgt = last_assigned_ident(p, tp, p.nodes[n].c)
+        }
         if tgt >= 0 {
-            fv := w.lower_expr(p, tp, tgt)
+            fv := w.own_val(p, tp, tgt, w.lower_expr(p, tp, tgt), ty)
             if wide {
                 w.copy_mem(w.addr_local(res), fv, tp.size_of(ty))
             } else {
@@ -503,7 +532,42 @@ fn (w $&Lw) lower_type_test(p &parser.Parser, tp &types.TypedProgram, n int) int
         << hit
     }
     w.type_assert(hit)
-    << w.bin(BIN_ADD, bx, w.konst(BOX_HDR))
+    ty := tp.type_of(n)
+    if tp.str_of(n) == 1 || !w.needs_drop(tp, ty) {
+        << w.bin(BIN_ADD, bx, w.konst(BOX_HDR))
+    }
+    // Owning concrete cast consumes the box: take ownership when sole holder,
+    // or clone + decrement refcount when shared.
+    out := w.scratch(tp, ty)
+    bslot := w.new_local(1, 1, "ibx")
+    w.store_local(bslot, 0, bx)
+    shared_b := w.new_block()
+    sole_b := w.new_block()
+    done_b := w.new_block()
+    w.branch(w.load_ptr(bx, BOX_RC, 8), shared_b, sole_b)
+    w.f.active_bb = shared_b
+    b := w.load_local(bslot, 0)
+    w.clone_into(tp, out, w.bin(BIN_ADD, b, w.konst(BOX_HDR)), ty)
+    b_sh := w.load_local(bslot, 0)
+    rc_sh := w.load_ptr(b_sh, BOX_RC, 8)
+    dec_sh_b := w.new_block()
+    w.branch(w.bin(BIN_GT, rc_sh, w.konst(0)), dec_sh_b, done_b)
+    w.f.active_bb = dec_sh_b
+    b_dec := w.load_local(bslot, 0)
+    w.store_ptr(b_dec, BOX_RC, w.bin(BIN_SUB, w.load_ptr(b_dec, BOX_RC, 8), w.konst(1)), 8)
+    w.jump(done_b)
+    w.f.active_bb = sole_b
+    b2 := w.load_local(bslot, 0)
+    w.copy_mem(out, w.bin(BIN_ADD, b2, w.konst(BOX_HDR)), tp.size_of(ty))
+    $fargs := []int{}
+    fargs.push(b2)
+    w.call_core("free_owned", &fargs)
+    if p.nodes[a].kind == ast.NK_FIELD || p.nodes[a].kind == ast.NK_INDEX {
+        w.store_ptr(w.lower_place_addr(p, tp, a), 0, w.konst(0), 8)
+    }
+    w.jump(done_b)
+    w.f.active_bb = done_b
+    << out
 }
 
 // ===== hooks =====
@@ -525,8 +589,9 @@ fn (w $&Lw) err_call(p &parser.Parser, tp &types.TypedProgram, n int, code int) 
     }
     if code == -93 && types.is_interface_type(tp.type_of(n)) {
         arg := p.nodes[n].a
-        v := w.lower_expr(p, tp, arg)
-        << w.box_struct(tp, v, types.struct_type(tp.local_of(n)))
+        sty := types.struct_type(tp.local_of(n))
+        v := w.own_val(p, tp, arg, w.lower_expr(p, tp, arg), sty)
+        << w.box_struct(tp, v, sty)
     }
     << NOT_HANDLED
 }
@@ -540,8 +605,9 @@ fn (w $&Lw) err_method_call(p &parser.Parser, tp &types.TypedProgram, n int, cod
     }
     if code == -93 && types.is_interface_type(tp.type_of(n)) {
         arg := p.nodes[n].b
-        v := w.lower_expr(p, tp, arg)
-        << w.box_struct(tp, v, types.struct_type(tp.local_of(n)))
+        sty := types.struct_type(tp.local_of(n))
+        v := w.own_val(p, tp, arg, w.lower_expr(p, tp, arg), sty)
+        << w.box_struct(tp, v, sty)
     }
     << NOT_HANDLED
 }

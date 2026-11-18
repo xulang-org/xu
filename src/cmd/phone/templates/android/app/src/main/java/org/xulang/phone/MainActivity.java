@@ -32,6 +32,7 @@ public final class MainActivity extends Activity {
     private static native void insets(double top,double bottom,double left,double right,double ime);
     private static native void reducedMotion(boolean on);
     private static native void input(int kind,double x,double y,int buttons);
+    private static native void inputEvent(int kind,double x,double y,int button,int buttons,int modifiers,int clickCount);
     private static native void key(int kind,int key,int repeat,int modifiers);
     private static native void active(boolean on);
     private static native String poll();
@@ -311,6 +312,19 @@ public final class MainActivity extends Activity {
             }
             if(action==KeyEvent.ACTION_DOWN) {
                 boolean shift=event.isShiftPressed();
+                int mods=(shift?1:0)
+                    |(event.isCtrlPressed()?2:0)
+                    |(event.isAltPressed()?4:0)
+                    |(event.isMetaPressed()?8:0);
+                if(event.isCtrlPressed() || event.isMetaPressed()) {
+                    int ascii=code==KeyEvent.KEYCODE_A?65:code==KeyEvent.KEYCODE_C?67:code==KeyEvent.KEYCODE_X?88:code==KeyEvent.KEYCODE_V?86:0;
+                    if(ascii!=0) {
+                        key(78,ascii,event.getRepeatCount(),mods);
+                        key(79,ascii,0,mods);
+                        refreshFromHost(true);
+                        return true;
+                    }
+                }
                 if(code==KeyEvent.KEYCODE_DEL) {
                     textInputErase(sessionId,0,1);
                     refreshFromHost(true);
@@ -331,6 +345,13 @@ public final class MainActivity extends Activity {
                     refreshFromHost(true);
                     return true;
                 }
+                if(code==KeyEvent.KEYCODE_DPAD_UP || code==KeyEvent.KEYCODE_DPAD_DOWN) {
+                    int k=code==KeyEvent.KEYCODE_DPAD_UP?263:264;
+                    key(78,k,event.getRepeatCount(),mods);
+                    key(79,k,0,mods);
+                    refreshFromHost(true);
+                    return true;
+                }
                 if(code==KeyEvent.KEYCODE_MOVE_HOME) {
                     textInputSelect(sessionId,0,shift?selStart:0,0);
                     refreshFromHost(true);
@@ -340,6 +361,11 @@ public final class MainActivity extends Activity {
                     int n=displayText.length();
                     textInputSelect(sessionId,0,shift?selStart:n,n);
                     refreshFromHost(true);
+                    return true;
+                }
+                if((code==KeyEvent.KEYCODE_F10 && shift) || code==KeyEvent.KEYCODE_MENU) {
+                    key(78,297,event.getRepeatCount(),1);
+                    key(79,297,0,1);
                     return true;
                 }
                 if(code==KeyEvent.KEYCODE_ENTER || code==KeyEvent.KEYCODE_NUMPAD_ENTER) {
@@ -417,10 +443,12 @@ public final class MainActivity extends Activity {
         @JavascriptInterface public void send(String message) {
             try {
                 JSONArray v=new JSONArray(message);
-                if(v.length()!=7)return;
+                if(v.length()!=7 && v.length()!=10)return;
                 int kind=v.getInt(0);
                 if(kind==1)start();
                 else if(kind==0)resize(v.getDouble(4),v.getDouble(5),v.getDouble(6));
+                else if((kind==78 || kind==79) && v.length()==10)key(kind,v.getInt(7),v.getInt(9),v.getInt(8));
+                else if(v.length()==10)inputEvent(kind,v.getDouble(1),v.getDouble(2),v.getInt(7),v.getInt(3),v.getInt(8),v.getInt(9));
                 else input(kind,v.getDouble(1),v.getDouble(2),v.getInt(3));
             } catch(Exception ignored) { }
         }

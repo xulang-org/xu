@@ -8,6 +8,7 @@ void xu_phone_resize(double width, double height, double scale);
 void xu_phone_insets(double top, double bottom, double left, double right, double ime_bottom);
 void xu_phone_reduced_motion(int enabled);
 void xu_phone_input(int kind, double x, double y, int buttons);
+void xu_phone_input_event(int kind, double x, double y, int button, int buttons, int modifiers, int click_count);
 void xu_phone_active(int active);
 void xu_phone_stop(void);
 void xu_phone_redraw(void);

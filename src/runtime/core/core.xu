@@ -44,6 +44,9 @@ const G_FREE = 16
 // Windows: 12 argument words for pointer calls, then the cache of exports
 // resolved at run time (host_win.xu).
 const G_WIN_ARGS = 48
+// A bounded cache for frequently reused medium-size mappings.
+const G_MEDIUM_FREE = 60
+const G_MEDIUM_COUNT = 61
 const G_WIN_FN = 64
 
 const OS_MACOS = 0
@@ -52,6 +55,7 @@ const OS_WINDOWS = 2
 const OS_NONE = 3
 const OS_WASI = 4
 
+const ARCH_ARM64 = 0
 const ARCH_X64 = 1
 const ARCH_RISCV64 = 4
 const ARCH_LOONG64 = 5
@@ -158,19 +162,30 @@ fn fatal_no_memory() {
 const NCLASS = 11
 const TAG_LIVE = 0x58554c495645
 const TAG_FREED = 0x585546524545
+const MEDIUM_MAPPING = 32768
+const MEDIUM_LIMIT = 4
 
 // Zeroed, 16-byte aligned block of at least size bytes.
 pub fn alloc(size int) int {
     $n := size
-    if n <= 0 {
+    if n < 0 {
+        fatal_no_memory()
+    }
+    if n == 0 {
         n = 16
     }
     if n > (16 << (NCLASS - 1)) {
-        << alloc_big(n)
+        << alloc_big(n, true)
     }
     $c := 0
-    while (16 << c) < n {
-        c += 1
+    if n <= 64 {
+        // The first three classes are 16, 32 and 64 bytes.
+        c = min_int((n - 1) >> 4, 2)
+    } else {
+        c = 3
+        while (16 << c) < n {
+            c += 1
+        }
     }
     g := rt_globals()
     slot := g + (G_FREE + c) * 8
@@ -178,9 +193,29 @@ pub fn alloc(size int) int {
     if head != 0 {
         rt_store(slot, 8, rt_load(head, 8))
         rt_store(head - 8, 8, TAG_LIVE)
-        mem_zero(head, (n + 15) / 16 * 16)
+        if c <= 2 {
+            // These stores stay within the recycled size class.
+            rt_store(head, 8, 0)
+            rt_store(head + 8, 8, 0)
+            if c >= 1 {
+                rt_store(head + 16, 8, 0)
+                rt_store(head + 24, 8, 0)
+            }
+            if c == 2 {
+                rt_store(head + 32, 8, 0)
+                rt_store(head + 40, 8, 0)
+                rt_store(head + 48, 8, 0)
+                rt_store(head + 56, 8, 0)
+            }
+        } else {
+            mem_zero(head, (n + 15) / 16 * 16)
+        }
         << head
     }
+    << alloc_fresh_small(g, c)
+}
+
+fn alloc_fresh_small(g int, c int) int {
     need := 16 + (16 << c)
     cur := rt_load(g + G_HEAP_CUR * 8, 8)
     $p := 0
@@ -212,8 +247,21 @@ fn heap_carve(n int) int {
     << cur
 }
 
-fn alloc_big(n int) int {
+fn alloc_big(n int, clear bool) int {
+    if n < 0 || n > 9223372036854775807 - 16 - 16383 {
+        fatal_no_memory()
+    }
     total := (n + 16 + 16383) / 16384 * 16384
+    if total == MEDIUM_MAPPING {
+        head := gword(G_MEDIUM_FREE)
+        if head != 0 {
+            set_gword(G_MEDIUM_FREE, rt_load(head, 8))
+            set_gword(G_MEDIUM_COUNT, gword(G_MEDIUM_COUNT) - 1)
+            rt_store(head - 8, 8, TAG_LIVE)
+            if clear { mem_zero(head, n) }
+            << head
+        }
+    }
     m := map_pages(total)
     rt_store(m, 8, 0 - total)
     rt_store(m + 8, 8, TAG_LIVE)
@@ -229,7 +277,15 @@ pub fn free(p int) {
     if rt_load(p - 8, 8) != TAG_LIVE {
         free_fatal(p)
     }
+    free_live(p)
+}
+
+// Enter only after the caller has verified the live tag.
+fn free_live(p int) {
     c := rt_load(p - 16, 8)
+    if (c >= 0 && c >= NCLASS) || (c < 0 && c >= -16) {
+        free_fatal(p)
+    }
     rt_store(p - 8, 8, TAG_FREED)
     if debug_free() {
         $size := 16 << c
@@ -240,6 +296,12 @@ pub fn free(p int) {
         <<
     }
     if c < 0 {
+        if c == 0 - MEDIUM_MAPPING && gword(G_MEDIUM_COUNT) < MEDIUM_LIMIT {
+            rt_store(p, 8, gword(G_MEDIUM_FREE))
+            set_gword(G_MEDIUM_FREE, p)
+            set_gword(G_MEDIUM_COUNT, gword(G_MEDIUM_COUNT) + 1)
+            <<
+        }
         if host_win() {
             // MEM_RELEASE
             win_call(W_VIRTUAL_FREE, p - 16, 0, 0x8000, 0, 0, 0)
@@ -248,8 +310,9 @@ pub fn free(p int) {
         }
         <<
     }
-    rt_store(p, 8, gword(G_FREE + c))
-    set_gword(G_FREE + c, p)
+    slot := rt_globals() + (G_FREE + c) * 8
+    rt_store(p, 8, rt_load(slot, 8))
+    rt_store(slot, 8, p)
 }
 
 // Frees p if it is a live alloc block; buffers that never came from alloc
@@ -260,7 +323,7 @@ fn free_owned(p int) {
     }
     tag := rt_load(p - 8, 8)
     if tag == TAG_LIVE {
-        free(p)
+        free_live(p)
     } else if tag == TAG_FREED && debug_free() {
         free_fatal(p)
     }
@@ -357,16 +420,31 @@ fn set_desc(d int, ptr int, n int, cap int) {
 
 // Grow descriptor d so it can hold need elements of esize bytes.
 pub fn desc_reserve(d int, need int, esize int) {
+    if esize == 0 {
+        fatal_no_memory()
+        <<
+    }
+    if esize < 0 || need < 0 {
+        fatal_no_memory()
+    }
     cap := rt_load(d + 16, 8)
     if need <= cap {
         <<
     }
-    $ncap := cap * 2
+    $ncap := 0
+    if cap > 4611686018427387903 {
+        ncap = need
+    } else {
+        ncap = cap * 2
+    }
     if ncap < 4 {
         ncap = 4
     }
     if ncap < need {
         ncap = need
+    }
+    if ncap > (9223372036854775807 - 16399) / esize {
+        fatal_no_memory()
     }
     nbuf := alloc(ncap * esize)
     old := desc_ptr(d)
@@ -396,17 +474,71 @@ pub fn slice_push(d int, elem int, esize int) {
 
 // Write a fresh descriptor at out holding a copy of n bytes at src.
 pub fn bytes_new(out int, src int, n int) {
-    buf := alloc(n + 1)
-    if n > 0 {
-        mem_copy(buf, src, n)
+    if n < 0 || n > 9223372036854775807 - 16400 {
+        fatal_no_memory()
     }
+    if n == 0 {
+        set_desc(out, 0, 0, 0)
+        <<
+    }
+    if n > 0 && n <= 32 && (xu_target_arch() == ARCH_ARM64 || xu_target_arch() == ARCH_X64) {
+        // Copy the whole logical payload and the terminator before exposing
+        // the descriptor. The rest of a recycled block remains private.
+        g := rt_globals()
+        c := n >> 4
+        slot := g + (G_FREE + c) * 8
+        $buf := rt_load(slot, 8)
+        if buf != 0 {
+            rt_store(slot, 8, rt_load(buf, 8))
+            rt_store(buf - 8, 8, TAG_LIVE)
+        } else {
+            buf = alloc_fresh_small(g, c)
+        }
+        copy_short_bytes(buf, src, n)
+        rt_store(buf + n, 1, 0)
+        set_desc(out, buf, n, n)
+        <<
+    }
+    buf := alloc(n + 1)
+    mem_copy(buf, src, n)
     set_desc(out, buf, n, n)
+}
+
+// Copy 1..32 bytes between disjoint ranges. ARM64 and x64 tolerate the
+// unaligned first and last accesses, each of which stays inside the range.
+fn copy_short_bytes(dst int, src int, n int) {
+    if n >= 16 {
+        tail := n - 16
+        rt_store(dst, 8, rt_load(src, 8))
+        rt_store(dst + 8, 8, rt_load(src + 8, 8))
+        rt_store(dst + tail, 8, rt_load(src + tail, 8))
+        rt_store(dst + tail + 8, 8, rt_load(src + tail + 8, 8))
+    } else if n >= 8 {
+        tail := n - 8
+        rt_store(dst, 8, rt_load(src, 8))
+        rt_store(dst + tail, 8, rt_load(src + tail, 8))
+    } else if n >= 4 {
+        tail := n - 4
+        rt_store(dst, 4, rt_load(src, 4))
+        rt_store(dst + tail, 4, rt_load(src + tail, 4))
+    } else {
+        tail := n - 1
+        rt_store(dst, 1, rt_load(src, 1))
+        rt_store(dst + tail, 1, rt_load(src + tail, 1))
+        if n == 3 {
+            rt_store(dst + 1, 1, rt_load(src + 1, 1))
+        }
+    }
 }
 
 // out = a + b (string concatenation).
 pub fn str_concat(out int, a int, b int) {
     la := desc_len(a)
     lb := desc_len(b)
+    max_s := 9223372036854775807 - 16400
+    if la < 0 || lb < 0 || la > max_s || lb > max_s - la {
+        fatal_no_memory()
+    }
     buf := alloc(la + lb + 1)
     if la > 0 {
         mem_copy(buf, desc_ptr(a), la)
@@ -430,7 +562,15 @@ pub fn string_repeat(s &string, count int) string {
         <<< 1
     }
     total := length * count
-    buf := alloc(total + 1)
+    size := total + 1
+    $buf := 0
+    if size <= (16 << (NCLASS - 1)) {
+        buf = alloc(size)
+    } else {
+        // This operation initializes the payload and the spare byte before
+        // publishing the descriptor, even when reusing a mapped block.
+        buf = alloc_big(size, false)
+    }
     mem_copy(buf, str_ptr(s), length)
     $filled := length
     while filled < total {
@@ -438,6 +578,7 @@ pub fn string_repeat(s &string, count int) string {
         mem_copy(buf + filled, buf, chunk)
         filled += chunk
     }
+    rt_store(buf + total, 1, 0)
     $out := ""
     set_desc(rt_addr($&out), buf, total, total)
     << out
@@ -448,19 +589,34 @@ pub fn string_repeat(s &string, count int) string {
 // capacity. One spare byte keeps the bytes NUL-terminated.
 pub fn str_push(d int, b int) {
     lb := desc_len(b)
+    if lb < 0 {
+        fatal_no_memory()
+    }
     if lb == 0 {
         <<
     }
     la := desc_len(d)
+    max_s := 9223372036854775807 - 16400
+    if la < 0 || la > max_s || lb > max_s - la {
+        fatal_no_memory()
+    }
     ptr := desc_ptr(d)
     cap := rt_load(d + 16, 8)
     if cap <= la + lb || ptr == 0 || rt_load(ptr - 8, 8) != TAG_LIVE {
-        $ncap := cap * 2
+        $ncap := 0
+        if cap > 4611686018427387903 {
+            ncap = la + lb + 1
+        } else {
+            ncap = cap * 2
+        }
         if ncap < la + lb + 1 {
             ncap = la + lb + 1
         }
         if ncap < 16 {
             ncap = 16
+        }
+        if ncap > max_s + 1 {
+            ncap = max_s + 1
         }
         nbuf := alloc(ncap)
         if la > 0 {
@@ -480,6 +636,28 @@ pub fn str_free(d int) {
     if rt_load(d + 16, 8) > 0 {
         free_owned(desc_ptr(d))
     }
+}
+
+// Copy a literal or non-owned string into a fresh mutable buffer (for s[i] = b).
+pub fn str_ensure_owned(d int) {
+    ptr := desc_ptr(d)
+    cap := rt_load(d + 16, 8)
+    if cap > 0 && ptr != 0 && rt_load(ptr - 8, 8) == TAG_LIVE {
+        <<
+    }
+    n := desc_len(d)
+    if n < 0 || n > 9223372036854775807 - 16400 {
+        fatal_no_memory()
+    }
+    nbuf := alloc(n + 1)
+    if n > 0 {
+        mem_copy(nbuf, ptr, n)
+    }
+    $ncap := n
+    if ncap < 1 {
+        ncap = 1
+    }
+    set_desc(d, nbuf, n, ncap)
 }
 
 pub fn str_eq(a int, b int) bool {
@@ -520,6 +698,16 @@ pub fn str_slice(out int, s int, lo int, hi int) {
 pub fn slice_slice(out int, a int, lo int, hi int, esize int) {
     slice_check(lo, hi, desc_len(a))
     n := hi - lo
+    if esize == 0 {
+        fatal_no_memory()
+        <<
+    }
+    if esize < 0 {
+        fatal_no_memory()
+    }
+    if n > (9223372036854775807 - 16399) / esize {
+        fatal_no_memory()
+    }
     buf := alloc(n * esize)
     if n > 0 {
         mem_copy(buf, desc_ptr(a) + lo * esize, n * esize)
@@ -530,6 +718,9 @@ pub fn slice_slice(out int, a int, lo int, hi int, esize int) {
 // out = s.bytes(): one int per byte.
 pub fn str_bytes(out int, s int) {
     n := desc_len(s)
+    if n < 0 || n > (9223372036854775807 - 16407) / 8 {
+        fatal_no_memory()
+    }
     buf := alloc(n * 8 + 8)
     src := desc_ptr(s)
     for i in 0:n {
@@ -541,6 +732,9 @@ pub fn str_bytes(out int, s int) {
 // out = s.runes(): code points of strict UTF-8; invalid input panics.
 pub fn str_runes(out int, s int) {
     n := desc_len(s)
+    if n < 0 || n > (9223372036854775807 - 16407) / 8 {
+        fatal_no_memory()
+    }
     buf := alloc(n * 8 + 8)
     src := desc_ptr(s)
     $i := 0
@@ -619,6 +813,7 @@ pub fn print_int(fd int, v int, newline bool) {
         rt_store(base + pos, 1, 45)
     }
     write_fd(fd, base + pos, 24 - pos)
+    free(base)
     if newline {
         $nl := 10
         write_fd(fd, rt_addr(&nl), 1)
