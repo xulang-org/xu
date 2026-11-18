@@ -82,6 +82,7 @@ OPTIMIZED_CODE = r'''@main
 #crypto/aes
 #crypto/sha256
 #encoding/hex
+#math
 #math/bits
 #strings
 
@@ -89,8 +90,125 @@ struct Counter {
     value int
 }
 
+struct Vec3 {
+    x f64
+    y f64
+    z f64
+}
+
+struct Pair32 {
+    a f32
+    b f32
+    c f64
+}
+
 fn (c $&Counter) add(n int) {
     c.value += n
+}
+
+fn callee_fp_pressure(a f64, b f64, c f64, d f64) f64 {
+    $v0 := a + 1.0
+    $v1 := b + 2.0
+    $v2 := c + 3.0
+    $v3 := d + 4.0
+    $v4 := v0 * 1.25 + v1
+    $v5 := v1 * 1.5 - v2
+    $v6 := v2 * 0.75 + v3
+    $v7 := v3 * 2.5 - v0
+    $v8 := v4 + v5
+    $v9 := v6 + v7
+    $v10 := v8 * v9 - v4 * v6
+    << v10 + v0 + v1 + v2 + v3 + v5 + v7 + v8 + v9
+}
+
+fn stack_params_f64(a0 f64, a1 f64, a2 f64, a3 f64, a4 f64, a5 f64, a6 f64, a7 f64, a8 f64, a9 f64, a10 f64, a11 f64) f64 {
+    << a0 * 1.0 + a1 * 2.0 + a2 * 3.0 + a3 * 4.0 +
+       a4 * 5.0 + a5 * 6.0 + a6 * 7.0 + a7 * 8.0 +
+       a8 * 9.0 + a9 * 10.0 + a10 * 11.0 + a11 * 12.0
+}
+
+fn fp_cmp_bits(a f64, b f64) int {
+    $m := 0
+    if a == b { m = m | 1 }
+    if a != b { m = m | 2 }
+    if a < b  { m = m | 4 }
+    if a <= b { m = m | 8 }
+    if a > b  { m = m | 16 }
+    if a >= b { m = m | 32 }
+    << m
+}
+
+fn select_f64(cond bool, a f64, b f64) f64 {
+    $r := b
+    if cond { r = a }
+    << r
+}
+
+fn verify_fp_regalloc() bool {
+    x := 3.5
+    y := -2.25
+    if int((x * x + y * y + (x + x) - (y - y) + (x / x)) * 100.0) != 2531 { << false }
+    if int(math.sqrt(152.25) * 1000.0) != 12338 { << false }
+    if int(-x * 10.0) != -35 { << false }
+    zero := 0.0
+    neg_zero := -0.0
+    pos_inf := 1.0 / zero
+    neg_inf := -1.0 / zero
+    nan := zero / zero
+    if int(1.9) != 1 || int(-1.9) != -1 || int(neg_zero) != 0 { << false }
+    if int(1e20) != 9223372036854775807 || int(-1e20) != (-9223372036854775807 - 1) { << false }
+    if int(pos_inf) != 9223372036854775807 || int(neg_inf) != (-9223372036854775807 - 1) || int(nan) != 0 { << false }
+    if fp_cmp_bits(1.0, 2.0) != 14 || fp_cmp_bits(2.0, 2.0) != 41 || fp_cmp_bits(3.0, 2.0) != 50 { << false }
+    if fp_cmp_bits(zero, neg_zero) != 41 || fp_cmp_bits(nan, 1.0) != 2 || fp_cmp_bits(1.0, nan) != 2 || fp_cmp_bits(nan, nan) != 2 { << false }
+    $a0 := 1.25
+    $a1 := 2.5
+    $a2 := 3.75
+    $a3 := 4.5
+    $a4 := 5.25
+    $a5 := 6.5
+    $a6 := 7.75
+    $a7 := 8.5
+    $a8 := 9.25
+    $a9 := 10.5
+    $call_sum := 0.0
+    for k in 0:10 {
+        call_sum += callee_fp_pressure(a0 + f64(k), a1, a2, a3)
+        if hex.encode_to_string("0123456789abcdef0123456789abcdef").len != 64 { << false }
+        a0 += 0.5
+        a1 += 0.25
+        a2 += 0.5
+        a3 += 0.25
+        a4 += 0.5
+        a5 += 0.25
+        a6 += 0.5
+        a7 += 0.25
+        a8 += 0.5
+        a9 += 0.25
+    }
+    if int(call_sum + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9) != 3266 { << false }
+    if int(stack_params_f64(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0)) != 650 { << false }
+    if int(select_f64(true, 42.5, -7.5) * 2.0) != 85 || int(select_f64(false, 42.5, -7.5) * 2.0) != -15 { << false }
+    $vs := []Vec3{}
+    for i in 0:32 {
+        vs.push(Vec3{x: f64(i), y: f64(i) * 0.5, z: f64(i) * 1.5})
+    }
+    $vsum := 0.0
+    for i in 0:32 {
+        vs[i].x = vs[i].x + 1.0
+        vs[i].y = vs[i].y * 2.0
+        vs[i].z = vs[i].z - 0.5
+        vsum += vs[i].x * vs[i].x + vs[i].y * vs[i].y + vs[i].z * vs[i].z
+    }
+    if int(vsum * 4.0) != 178224 { << false }
+    $ps := []Pair32{}
+    for i in 0:8 {
+        ps.push(Pair32{a: f32(i) + f32(0.25), b: f32(i) * f32(1.5), c: f64(i) * 2.25})
+    }
+    $psum := 0.0
+    for i in 0:8 {
+        psum += f64(ps[i].a) + f64(ps[i].b) + ps[i].c
+    }
+    << int(psum * 4.0) == 540
 }
 
 fn rejects_invalid_hex() bool {
@@ -163,6 +281,7 @@ fn main() int {
     if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
     empty := ""
     if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
+    if !verify_fp_regalloc() { << 21 }
     println("optimized code passed")
     << 0
 }
@@ -187,11 +306,51 @@ fn probe(capacity int) int {
     }
     << total
 }
+fn fp_worker(ch chan int, out chan int, seed f64) {
+    $f0 := seed + 1.5
+    $f1 := seed + 2.5
+    $f2 := seed + 3.5
+    $f3 := seed + 4.5
+    $f4 := seed + 5.5
+    $f5 := seed + 6.5
+    $f6 := seed + 7.5
+    $f7 := seed + 8.5
+    $f8 := seed + 9.5
+    $f9 := seed + 10.5
+    for _ in 0:8 {
+        dv := f64(<-ch)
+        f0 += dv * 0.25
+        f1 += dv * 0.5
+        f2 += dv * 0.75
+        f3 += dv * 1.0
+        f4 += dv * 1.25
+        f5 += dv * 1.5
+        f6 += dv * 1.75
+        f7 += dv * 2.0
+        f8 += dv * 2.25
+        f9 += dv * 2.5
+        out <- int(f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9)
+    }
+}
 fn main() int {
     for round in 0:4 {
         if probe(0) != 2512 { << 2 }
         if probe(32) != 2512 { << 4 }
     }
+    ch1 := chan int{cap: 0}
+    out1 := chan int{cap: 0}
+    ch2 := chan int{cap: 0}
+    out2 := chan int{cap: 0}
+    xu fp_worker(ch1, out1, 1.0)
+    xu fp_worker(ch2, out2, 100.0)
+    $tsum := 0
+    for i in 0:8 {
+        ch1 <- (i + 1)
+        ch2 <- (i + 10)
+        tsum += <-out1
+        tsum += <-out2
+    }
+    if tsum != 16789 { << 5 }
     println("concurrency passed")
     << 0
 }
