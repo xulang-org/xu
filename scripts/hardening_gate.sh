@@ -364,6 +364,7 @@ run env XU="$HEAP_XU_COMPILER_PATH" \
 
 step "Static and dynamic memory-safety gates"
 run ./scripts/safety_test.sh --xu="$XU_COMPILER_PATH"
+run python3 "$ROOT/scripts/test_memory_safety.py" --xu "$XU_COMPILER_PATH"
 
 step "Host UI/FFI boundary test"
 if command -v c++ >/dev/null 2>&1; then

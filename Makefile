@@ -294,7 +294,7 @@ safety: xu
 # Product-lane multi-instance memory-safety batteries.
 # Override compiler: make memsafe XU=/path/to/xu
 XU_PRODUCT ?= /tmp/xu_prod
-.PHONY: memsafe
+.PHONY: memsafe memsafe-gate
 memsafe:
 	XU="$(XU_PRODUCT)" python3 scripts/memsafe_multi_test.py --xu "$(XU_PRODUCT)"
 	XU="$(XU_PRODUCT)" python3 scripts/memsafe_drop_multi_test.py
@@ -303,7 +303,9 @@ memsafe:
 	XU="$(XU_PRODUCT)" python3 scripts/memsafe_foreach_ledger_test.py
 	XU="$(XU_PRODUCT)" python3 scripts/memsafe_heap_ledger_test.py
 
-.PHONY: memsafe
+memsafe-gate: xu
+	$(PYTHON) scripts/test_memory_safety.py --xu $(CURDIR)/bin/xu
+
 safety-cross: xu
 	./scripts/safety_cross_target.sh
 
@@ -412,7 +414,7 @@ server-remote-rollback:
 # Run the executable policy gate on every CI bundle, even when
 # bin/xu is already up to date and the self-host recipe is not re-evaluated.
 ci-fast: boundary ncall fixtures
-ci: ci-fast safety safety-cross safety-embedded verify-gen3
+ci: ci-fast safety memsafe-gate safety-cross safety-embedded verify-gen3
 
 clean:
 	rm -rf $(BIN)
