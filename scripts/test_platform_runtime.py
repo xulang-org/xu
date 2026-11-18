@@ -81,6 +81,7 @@ fn main() int {
 OPTIMIZED_CODE = r'''@main
 #crypto/aes
 #crypto/sha256
+#encoding/base64
 #encoding/hex
 #math/bits
 #strings
@@ -95,6 +96,11 @@ fn (c $&Counter) add(n int) {
 
 fn rejects_invalid_hex() bool {
     _ := hex.decode_string("0123456789ABCDEFg123456789abcdef") or (err) { << true }
+    << false
+}
+
+fn rejects_invalid_base64(src string) bool {
+    _ := base64.decode_string(~src) or (err) { << err.msg() == "encoding/base64: invalid padding" }
     << false
 }
 
@@ -163,6 +169,24 @@ fn main() int {
     if view != "bc" || once != "xc" || strings.repeat(&view, 5) != "bcbcbcbcbc" { << 18 }
     empty := ""
     if strings.repeat(&empty, 5) != "" || strings.repeat(&view, -1) != "" { << 19 }
+    $binary := make_string(33)
+    for i in 0:33 { binary[i] = 128 + (i & 1) }
+    if count_byte(&binary, 128) != 17 || count_byte(&binary, 129) != 16 || count_byte(&binary, 0) != 0 { << 21 }
+    parts := split_byte(&binary, 128)
+    if parts.len != 18 || parts[0] != "" || parts[1] != string_from_byte(129) || parts[17] != "" { << 22 }
+    if strings.join(parts, string_from_byte(128)) != binary { << 23 }
+    prefix := "/+7d"
+    block := strings.repeat(&prefix, 33)
+    original := base64.decode_string(block + "/g==") or (err) { << 24 }
+    if original.len != 100 || original[0] != 255 || original[99] != 254 { << 25 }
+    if base64.encode_to_string(original + "") != block + "/g==" { << 26 }
+    if !rejects_invalid_base64(block + "AA=A") { << 27 }
+    for i in 0:8 {
+        $large := make_string(20000 + i)
+        if large[0] != 0 || large[large.len - 1] != 0 { << 28 }
+        large[0] = 255
+        large[large.len - 1] = 255
+    }
     println("optimized code passed")
     << 0
 }
