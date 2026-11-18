@@ -742,10 +742,327 @@ fn ifc_try(f $&MFn, bi int, w $&IfcWork) bool {
     << true
 }
 
+fn unroll_reads_temp(f &MFn, ins &MInstr, t int) bool {
+    k := ins.kind
+    if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR || k == MI_CALL_IND {
+        if ins.b == t { << true }
+    } else if k == MI_STORE_PTR {
+        if ins.a == t || ins.b == t { << true }
+    } else if k == MI_UN {
+        if ins.c == t { << true }
+    } else if k == MI_BIN {
+        if ins.c == t || ins.d == t { << true }
+    } else if k == MI_SELECT {
+        if ins.b == t || ins.c == t || ins.d == t { << true }
+    }
+    if k == MI_CALL || k == MI_CALL_IND {
+        $a := ins.c
+        while a >= 0 {
+            if f.margs[a].v == t { << true }
+            a = f.margs[a].next
+        }
+    }
+    << false
+}
+
+fn unroll_used_outside(f &MFn, t int, b1 int, b2 int) bool {
+    for bi in 0:f.blocks.len {
+        if bi == b1 || bi == b2 { -> }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            if unroll_reads_temp(f, &f.instrs[ii], t) { << true }
+            ii = f.instrs[ii].next
+        }
+        tk := f.blocks[bi].tkind
+        if (tk == TKIND_BRANCH || tk == TKIND_RETURN) && f.blocks[bi].ta == t {
+            << true
+        }
+    }
+    << false
+}
+
+fn unroll_small_loops(f $&MFn, w $&IfcWork) int {
+    nb := f.blocks.len
+    if nb < 3 { << 0 }
+    // Fast pre-check: any 2-block loop h -> b -> h?
+    $has_loop := false
+    for h in 0:nb {
+        if f.blocks[h].tkind == TKIND_BRANCH {
+            b := f.blocks[h].tb
+            e := f.blocks[h].tc
+            if b >= 0 && b < nb && b != h && e >= 0 && e < nb && e != h && e != b &&
+               f.blocks[b].tkind == TKIND_JUMP && f.blocks[b].ta == h {
+                has_loop = true
+                <-
+            }
+        }
+    }
+    if !has_loop { << 0 }
+    for ii in 0:f.instrs.len {
+        if !fold_known_kind(f.instrs[ii].kind) { << 0 }
+    }
+    w.nb = nb
+    mir_fill_int($&w.npred, nb, 0)
+    $pred_p := []int{}
+    for _ in 0:nb { pred_p.push(-1) }
+    for bi in 0:nb {
+        tk := f.blocks[bi].tkind
+        if tk == TKIND_JUMP {
+            s := f.blocks[bi].ta
+            if s >= 0 && s < nb {
+                w.npred[s] = w.npred[s] + 1
+                if f.blocks[s].tkind != TKIND_BRANCH || f.blocks[s].tb != bi {
+                    pred_p[s] = bi
+                }
+            }
+        } else if tk == TKIND_BRANCH {
+            sb := f.blocks[bi].tb
+            sc := f.blocks[bi].tc
+            if sb >= 0 && sb < nb {
+                w.npred[sb] = w.npred[sb] + 1
+                if f.blocks[sb].tkind != TKIND_BRANCH || f.blocks[sb].tb != bi {
+                    pred_p[sb] = bi
+                }
+            }
+            if sc >= 0 && sc < nb {
+                w.npred[sc] = w.npred[sc] + 1
+                if f.blocks[sc].tkind != TKIND_BRANCH || f.blocks[sc].tb != bi {
+                    pred_p[sc] = bi
+                }
+            }
+        }
+    }
+    nl := f.locals.len
+    w.nl = nl
+    $clim := w.cand.len
+    if nl < clim { clim = nl }
+    for l in 0:clim { w.cand[l] = f.locals_nslots[l] == 1 }
+    while w.cand.len < nl { w.cand.push(f.locals_nslots[w.cand.len] == 1) }
+    for ii in 0:f.instrs.len {
+        ins := &f.instrs[ii]
+        k := ins.kind
+        if k == MI_ADDR && ins.b >= 0 && ins.b < nl {
+            w.cand[ins.b] = false
+        } else if k == MI_LOAD_LOCAL && ins.b >= 0 && ins.b < nl && ins.c > 0 {
+            w.cand[ins.b] = false
+        } else if k == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl && ins.c > 0 {
+            w.cand[ins.a] = false
+        }
+    }
+    ifc_collect_info(f, w)
+
+    for h in 1:nb {
+        if f.blocks[h].tkind != TKIND_BRANCH || w.npred[h] != 2 { -> }
+        b := f.blocks[h].tb
+        e := f.blocks[h].tc
+        if b < 0 || b >= nb || b == h || e < 0 || e >= nb || e == h || e == b { -> }
+        if w.npred[b] != 1 || f.blocks[b].tkind != TKIND_JUMP || f.blocks[b].ta != h { -> }
+        p := pred_p[h]
+        if p < 0 || p == h || p == b { -> }
+        // Header must be solely: t_iv = load iv; t_cmp = lt/le t_iv, hi.
+        $h_ids := []int{}
+        $hi_ii := f.blocks[h].head
+        while hi_ii >= 0 {
+            if f.instrs[hi_ii].kind != MI_NOP { h_ids.push(hi_ii) }
+            hi_ii = f.instrs[hi_ii].next
+        }
+        if h_ids.len != 2 { -> }
+        ld_ins := ~f.instrs[h_ids[0]]
+        cmp_ins := ~f.instrs[h_ids[1]]
+        if ld_ins.kind != MI_LOAD_LOCAL || ld_ins.c != 0 { -> }
+        iv := ld_ins.b
+        if iv < 0 || iv >= nl || !w.cand[iv] { -> }
+        t_iv := ld_ins.a
+        if t_iv < 0 || t_iv >= w.nt || w.ndef[t_iv] != 1 { -> }
+        if cmp_ins.kind != MI_BIN || (cmp_ins.b != BIN_LT && cmp_ins.b != BIN_LE) { -> }
+        if cmp_ins.c != t_iv || cmp_ins.d > -2 || cmp_ins.a != f.blocks[h].ta { -> }
+        t_cmp := cmp_ins.a
+        if t_cmp < 0 || t_cmp >= w.nt || w.ndef[t_cmp] != 1 || w.ub[t_cmp] != h { -> }
+        if unroll_used_outside(f, t_iv, h, b) { -> }
+        hi_val := f.consts[0 - cmp_ins.d - 2]
+
+        // Preheader p must initialize iv to a constant lo.
+        $init_v := -1
+        $pi := f.blocks[p].head
+        while pi >= 0 {
+            pins := &f.instrs[pi]
+            if pins.kind == MI_STORE_LOCAL && pins.a == iv {
+                if pins.c != 0 {
+                    init_v = -1
+                } else {
+                    init_v = pins.b
+                }
+            }
+            pi = pins.next
+        }
+        if init_v > -2 { -> }
+        lo_val := f.consts[0 - init_v - 2]
+
+        // Inspect body b: 1..16 safe instructions, single iv += const step store.
+        $body_ids := []int{}
+        $bi_ii := f.blocks[b].head
+        $ok_b := true
+        $step_store_ii := -1
+        $seen_iv_store := false
+        while bi_ii >= 0 {
+            ins := &f.instrs[bi_ii]
+            k := ins.kind
+            if k != MI_NOP {
+                if k != MI_COPY && k != MI_LOAD_LOCAL && k != MI_STORE_LOCAL &&
+                   k != MI_BIN && k != MI_UN && k != MI_SELECT &&
+                   k != MI_LOAD_PTR && k != MI_STORE_PTR {
+                    ok_b = false
+                    <-
+                }
+                if fold_defines(k) && ins.a >= 0 && ins.a < w.nt {
+                    if w.ndef[ins.a] != 1 || (w.ub[ins.a] != b && w.ub[ins.a] != -1) {
+                        ok_b = false
+                        <-
+                    }
+                }
+                if k == MI_LOAD_LOCAL && ins.b == iv && seen_iv_store {
+                    ok_b = false
+                    <-
+                }
+                if k == MI_STORE_LOCAL && ins.a == iv {
+                    if seen_iv_store || ins.c != 0 {
+                        ok_b = false
+                        <-
+                    }
+                    seen_iv_store = true
+                    step_store_ii = bi_ii
+                }
+                body_ids.push(bi_ii)
+                if body_ids.len > 16 {
+                    ok_b = false
+                    <-
+                }
+            }
+            bi_ii = ins.next
+        }
+        if !ok_b || !seen_iv_store || body_ids.len == 0 { -> }
+
+        // Verify step store is iv = iv + step (step in 1..64).
+        sv := f.instrs[step_store_ii].b
+        if sv < 0 || sv >= w.nt || w.defi[sv] < 0 { -> }
+        sadd := ~f.instrs[w.defi[sv]]
+        if sadd.kind != MI_BIN || sadd.b != BIN_ADD { -> }
+        $step := 0
+        $base_t := -1
+        if sadd.c >= 0 && sadd.d <= -2 {
+            base_t = sadd.c
+            step = f.consts[0 - sadd.d - 2]
+        } else if sadd.d >= 0 && sadd.c <= -2 {
+            base_t = sadd.d
+            step = f.consts[0 - sadd.c - 2]
+        } else { -> }
+        if step < 1 || step > 64 { -> }
+        $base_ok := base_t == t_iv
+        if !base_ok && base_t >= 0 && base_t < w.nt && w.defi[base_t] >= 0 {
+            bdi := w.defi[base_t]
+            bd := &f.instrs[bdi]
+            if bd.kind == MI_LOAD_LOCAL && bd.b == iv && bd.c == 0 {
+                // Must be defined in b (before step_store_ii, already guaranteed).
+                for bi_k in 0:body_ids.len {
+                    if body_ids[bi_k] == bdi {
+                        base_ok = true
+                        <-
+                    }
+                }
+            }
+        }
+        if !base_ok { -> }
+
+        // Exact trip count N in 2..8 and total unrolled size <= 96.
+        $ntrip := 0
+        if cmp_ins.b == BIN_LT {
+            if hi_val <= lo_val || hi_val - lo_val > 1024 { -> }
+            ntrip = (hi_val - lo_val + step - 1) / step
+        } else {
+            if hi_val < lo_val || hi_val - lo_val > 1024 { -> }
+            ntrip = (hi_val - lo_val) / step + 1
+        }
+        if ntrip < 2 || ntrip > 8 || ntrip * body_ids.len > 96 { -> }
+
+        // Unroll ntrip copies of b directly into h and jump to e.
+        line := f.blocks[h].line
+        f.blocks[h].head = -1
+        f.blocks[h].tail = -1
+        for it in 0:ntrip {
+            c_cur := alloc_const(f, lo_val + it * step)
+            $from_t := []int{}
+            $to_t := []int{}
+            from_t.push(t_iv)
+            to_t.push(c_cur)
+            for bi_k in 0:body_ids.len {
+                oid := body_ids[bi_k]
+                if oid == step_store_ii { -> }
+                $ins := ~f.instrs[oid]
+                k := ins.kind
+                if k == MI_LOAD_LOCAL && ins.b == iv && ins.c == 0 {
+                    from_t.push(ins.a)
+                    to_t.push(c_cur)
+                    ->
+                }
+                if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR {
+                    ins.b = ifc_sub(&from_t, &to_t, ins.b)
+                } else if k == MI_STORE_PTR {
+                    ins.a = ifc_sub(&from_t, &to_t, ins.a)
+                    ins.b = ifc_sub(&from_t, &to_t, ins.b)
+                } else if k == MI_UN {
+                    ins.c = ifc_sub(&from_t, &to_t, ins.c)
+                } else if k == MI_BIN {
+                    ins.c = ifc_sub(&from_t, &to_t, ins.c)
+                    ins.d = ifc_sub(&from_t, &to_t, ins.d)
+                } else if k == MI_SELECT {
+                    ins.b = ifc_sub(&from_t, &to_t, ins.b)
+                    ins.c = ifc_sub(&from_t, &to_t, ins.c)
+                    ins.d = ifc_sub(&from_t, &to_t, ins.d)
+                }
+                if fold_defines(k) && ins.a >= 0 {
+                    old_a := ins.a
+                    nt_new := alloc_temp(f)
+                    if old_a < f.temps.len {
+                        f.temps[nt_new] = f.temps[old_a]
+                        f.temps_nslots[nt_new] = f.temps_nslots[old_a]
+                    }
+                    from_t.push(old_a)
+                    to_t.push(nt_new)
+                    ins.a = nt_new
+                }
+                ins.next = -1
+                nidx := f.instrs.len
+                f.instrs.push(ins)
+                mir_append_instr(f, h, nidx)
+            }
+        }
+        // Preserve final post-loop value of iv (dead store folded away if unused).
+        c_end := alloc_const(f, lo_val + ntrip * step)
+        end_st := ifc_new(f, MI_STORE_LOCAL, iv, c_end, 0, -1)
+        f.instrs[end_st].line = line
+        mir_append_instr(f, h, end_st)
+        f.blocks[h].tkind = TKIND_JUMP
+        f.blocks[h].ta = e
+        f.blocks[h].tb = -1
+        f.blocks[h].tc = -1
+        f.blocks[b].head = -1
+        f.blocks[b].tail = -1
+        f.blocks[b].tkind = TKIND_OPEN
+        f.blocks[b].ta = -1
+        f.blocks[b].tb = -1
+        f.blocks[b].tc = -1
+        << 1
+    }
+    << 0
+}
+
 // Returns how many branches it converted, reusing workspace w across functions.
 pub fn opt_ifconv_with(f $&MFn, w $&IfcWork) int {
-    if f.blocks.len < 3 || !ifc_has_cand(f) {
+    if f.blocks.len < 3 {
         << 0
+    }
+    if !ifc_has_cand(f) {
+        << unroll_small_loops(f, w)
     }
     $cand_ready := false
     $count := 0
@@ -812,6 +1129,9 @@ pub fn opt_ifconv_with(f $&MFn, w $&IfcWork) int {
         if !hit {
             <-
         }
+    }
+    if count == 0 {
+        count = unroll_small_loops(f, w)
     }
     << count
 }
