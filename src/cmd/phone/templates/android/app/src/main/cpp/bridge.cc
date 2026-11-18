@@ -106,6 +106,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_resize(JNIE
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_insets(JNIEnv *,jclass,jdouble top,jdouble bottom,jdouble left,jdouble right,jdouble ime) { xu_phone_insets(top,bottom,left,right,ime); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_reducedMotion(JNIEnv *,jclass,jboolean on) { xu_phone_reduced_motion(on?1:0); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_input(JNIEnv *,jclass,jint kind,jdouble x,jdouble y,jint buttons) { xu_phone_input(kind,x,y,buttons); }
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_inputEvent(JNIEnv *,jclass,jint kind,jdouble x,jdouble y,jint button,jint buttons,jint modifiers,jint clickCount) { xu_phone_input_event(kind,x,y,button,buttons,modifiers,clickCount); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_key(JNIEnv *,jclass,jint kind,jint key,jint repeat,jint modifiers) { xu_phone_key(kind,key,repeat,modifiers); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_active(JNIEnv *,jclass,jboolean on) { xu_phone_active(on); }
 extern "C" JNIEXPORT jstring JNICALL Java_org_xulang_phone_MainActivity_poll(JNIEnv *env,jclass) {

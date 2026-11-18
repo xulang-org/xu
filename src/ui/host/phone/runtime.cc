@@ -1,5 +1,7 @@
 #include "phone.h"
+#ifndef XU_PHONE_GAME
 #include "../xu_ui_mem.h"
+#endif
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -15,10 +17,15 @@
 #ifdef __APPLE__
 #include <crt_externs.h>
 #endif
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
-extern "C" void xu_draw_text_init();
 extern "C" void xu_app_start(int, char **, char **);
+extern "C" [[noreturn]] void xu_phone_finish(long);
 extern char **environ;
+#ifndef XU_PHONE_GAME
+extern "C" void xu_draw_text_init();
 static std::atomic<bool> started{false}, stopped{false}, active{true};
 static thread_local void *state;
 extern "C" void *xu_phone_state() {
@@ -31,6 +38,37 @@ extern "C" [[noreturn]] void xu_phone_finish(long status) {
   free(state); state = nullptr;
   pthread_exit(nullptr);
 }
+#else
+extern "C" void xu_phone_game_mapped(void *, size_t);
+extern "C" void xu_phone_game_unmapped(void *, size_t);
+#endif
+#ifdef __ANDROID__
+static void android_log_stdio(int fd, const void *buf, ssize_t count) {
+  if ((fd != 1 && fd != 2) || count <= 0 || !buf) return;
+  static thread_local char line[512];
+  static thread_local size_t used = 0;
+  static thread_local int last_fd = 1;
+  auto flush = [](int stream) {
+    if (!used) return;
+    line[used] = 0;
+    __android_log_print(stream == 2 ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "XuGame", "%s", line);
+    used = 0;
+  };
+  if (used && last_fd != fd) flush(last_fd);
+  last_fd = fd;
+  const char *p = static_cast<const char *>(buf);
+  for (ssize_t i = 0; i < count; ++i) {
+    if (p[i] == '\n') {
+      line[used] = 0;
+      __android_log_print(fd == 2 ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "XuGame", "%s", line);
+      used = 0;
+    } else {
+      line[used++] = p[i];
+      if (used == sizeof(line) - 1) flush(fd);
+    }
+  }
+}
+#endif
 // No private iOS system-call instructions. The runtime's Unix ABI is translated
 // to public libc APIs here; unsupported services fail with -ENOSYS.
 extern "C" long xu_phone_syscall(long nr, long a, long b, long c, long d, long e, long f) {
@@ -44,9 +82,14 @@ extern "C" long xu_phone_syscall(long nr, long a, long b, long c, long d, long e
     case 4: result = write((int)a, (void *)b, c); break;
     case 5: result = open((char *)a, (int)b, (mode_t)c); break;
     case 6: result = close((int)a); break;
+    case 10: result = unlink((char *)a); break;
     case 12: result = chdir((char *)a); break;
     case 20: result = getpid(); break;
-    case 73: result = munmap((void *)a, b); break;
+    case 73: result = munmap((void *)a, b);
+#ifdef XU_PHONE_GAME
+      if (!result) xu_phone_game_unmapped((void *)a, b);
+#endif
+      break;
     case 93: { // Runtime select-based sleep, a timeval in the fifth argument.
       auto *tv = (timeval *)e;
       if (!tv) return -EINVAL;
@@ -54,7 +97,13 @@ extern "C" long xu_phone_syscall(long nr, long a, long b, long c, long d, long e
       result = nanosleep(&ts, nullptr); break;
     }
     case 116: result = gettimeofday((timeval *)a, nullptr); break;
+    case 128: result = rename((char *)a, (char *)b); break;
+    case 136: result = mkdir((char *)a, (mode_t)b); break;
+    case 137: result = rmdir((char *)a); break;
     case 197: { void *p = mmap((void *)a, b, (int)c, (int)d, (int)e, 0);
+#ifdef XU_PHONE_GAME
+      if (p != MAP_FAILED) xu_phone_game_mapped(p, b);
+#endif
       return p == MAP_FAILED ? -errno : (long)p; }
     case 199: result = lseek((int)a, b, (int)c); break;
     case 338: result = stat((char *)a, (struct stat *)b); break;
@@ -62,23 +111,40 @@ extern "C" long xu_phone_syscall(long nr, long a, long b, long c, long d, long e
   }
 #else
   switch (nr) {
+    case 34: result = mkdirat((int)a, (char *)b, (mode_t)c); break;
+    case 35: result = unlinkat((int)a, (char *)b, (int)c); break;
+    case 38: result = renameat((int)a, (char *)b, (int)c, (char *)d); break;
     case 56: result = openat((int)a, (char *)b, (int)c, (mode_t)d); break;
     case 57: result = close((int)a); break;
     case 62: result = lseek((int)a, b, (int)c); break;
     case 63: result = read((int)a, (void *)b, c); break;
-    case 64: result = write((int)a, (void *)b, c); break;
+    case 64:
+      result = write((int)a, (void *)b, c);
+#ifdef __ANDROID__
+      if (result > 0) android_log_stdio((int)a, (const void *)b, result);
+#endif
+      break;
+    case 79: result = fstatat((int)a, (char *)b, (struct stat *)c, (int)d); break;
     case 93: case 94: xu_phone_finish(a);
     case 101: result = nanosleep((timespec *)a, (timespec *)b); break;
     case 113: result = clock_gettime((clockid_t)a, (timespec *)b); break;
     case 172: result = getpid(); break;
-    case 215: result = munmap((void *)a, b); break;
+    case 215: result = munmap((void *)a, b);
+#ifdef XU_PHONE_GAME
+      if (!result) xu_phone_game_unmapped((void *)a, b);
+#endif
+      break;
     case 222: { void *p = mmap((void *)a, b, (int)c, (int)d, (int)e, 0);
+#ifdef XU_PHONE_GAME
+      if (p != MAP_FAILED) xu_phone_game_mapped(p, b);
+#endif
       return p == MAP_FAILED ? -errno : (long)p; }
     default: return -ENOSYS;
   }
 #endif
   return result == -1 ? -errno : result;
 }
+#ifndef XU_PHONE_GAME
 extern "C" int xu_ui_host_run_cooperative(const char *, int (*pump)(void *, int (*)(void)),
                                            void *context, int (*yield_task)(void)) {
   xu_ui_mem_set_task_pump(pump, context, yield_task);
@@ -121,3 +187,4 @@ extern "C" void xu_phone_start(const char *platform) {
   if (pthread_create(&thread, nullptr, worker, nullptr) != 0) abort();
   pthread_detach(thread);
 }
+#endif
