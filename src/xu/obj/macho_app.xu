@@ -5,16 +5,20 @@
 
 const LC_BUILD_VERSION = 0x32
 
-fn macho_app_symbol(syms $&mc.CodeBuffer, strx int, section int, value int) {
+fn macho_app_symbol_type(syms $&mc.CodeBuffer, strx int, ntype int, section int, value int) {
     syms.emit_u32_le(strx)
-    if section == 0 {
-        syms.emit_u8(0x01) // N_UNDF | N_EXT
-    } else {
-        syms.emit_u8(0x0f) // N_SECT | N_EXT
-    }
+    syms.emit_u8(ntype)
     syms.emit_u8(section)
     syms.emit_u16_le(0)
     syms.emit_u64_le(value)
+}
+
+fn macho_app_symbol(syms $&mc.CodeBuffer, strx int, section int, value int) {
+    if section == 0 {
+        macho_app_symbol_type(syms, strx, 0x01, 0, value) // N_UNDF | N_EXT
+    } else {
+        macho_app_symbol_type(syms, strx, 0x0f, section, value) // N_SECT | N_EXT
+    }
 }
 
 fn macho_app_object(app &AppObject) mc.CodeBuffer {
@@ -27,9 +31,21 @@ fn macho_app_object_platform(app &AppObject, platform int, minimum int) mc.CodeB
         cpu = MACHO_CPU_TYPE_X86_64
     }
 
+    bss_addr := align8(app.text.len)
     $names := mc.code_buffer_new()
     names.emit_u8(0)
     $syms := mc.code_buffer_new()
+    $nlocals := 0
+    $iext := 0
+    $iundef := 1
+    if app.has_ffi_state {
+        state_lbl := "__xu_ffi_state"
+        state_name := app_cstr($&names, &state_lbl)
+        macho_app_symbol_type($&syms, state_name, 0x0e, 2, bss_addr) // local N_SECT in __bss
+        nlocals = 1
+        iext = 1
+        iundef = 2
+    }
     entry_name := app_cstr($&names, &app.entry)
     macho_app_symbol($&syms, entry_name, 1, app.entry_offset)
     for i in 0:app.imports.len {
@@ -37,16 +53,27 @@ fn macho_app_object_platform(app &AppObject, platform int, minimum int) mc.CodeB
         macho_app_symbol($&syms, strx, 0, 0)
     }
 
-    cmds := 152 + 24 + 24 + 80 // LC_SEGMENT_64, BUILD_VERSION, SYMTAB, DYSYMTAB
+    $nsects := 1
+    $seg_vmsize := app.text.len
+    $seg_cmd := 152
+    if app.has_ffi_state {
+        nsects = 2
+        seg_vmsize = bss_addr + 8
+        seg_cmd = 72 + 160
+    }
+    cmds := seg_cmd + 24 + 24 + 80 // LC_SEGMENT_64, BUILD_VERSION, SYMTAB, DYSYMTAB
     text_off := align8(32 + cmds)
     reloc_off := align8(text_off + app.text.len)
     sym_off := reloc_off + app.relocs.len * 8
     str_off := sym_off + syms.len()
     $out := mc.code_buffer_new()
     macho_write_header($&out, cpu, MACHO_FILETYPE_OBJECT, 4, cmds)
-    macho_segment($&out, "", 1, 0, app.text.len, text_off, app.text.len, 7)
+    macho_segment($&out, "", nsects, 0, seg_vmsize, text_off, app.text.len, 7)
     section_off := out.len()
     macho_section($&out, "__text", "__TEXT", 0, app.text.len, text_off, 3, 0x80000400)
+    if app.has_ffi_state {
+        macho_section($&out, "__bss", "__DATA", bss_addr, 8, 0, 3, 1) // S_ZEROFILL
+    }
     if app.relocs.len > 0 {
         out.patch_u32_le(section_off + 56, reloc_off) // section_64.reloff
         out.patch_u32_le(section_off + 60, app.relocs.len)
@@ -60,29 +87,41 @@ fn macho_app_object_platform(app &AppObject, platform int, minimum int) mc.CodeB
     out.emit_u32_le(LC_SYMTAB)
     out.emit_u32_le(24)
     out.emit_u32_le(sym_off)
-    out.emit_u32_le(app.imports.len + 1)
+    out.emit_u32_le(app.imports.len + iundef)
     out.emit_u32_le(str_off)
     out.emit_u32_le(names.len())
     out.emit_u32_le(LC_DYSYMTAB)
     out.emit_u32_le(80)
     out.emit_u32_le(0) // ilocalsym
-    out.emit_u32_le(0) // nlocalsym
-    out.emit_u32_le(0) // iextdefsym
+    out.emit_u32_le(nlocals) // nlocalsym
+    out.emit_u32_le(iext) // iextdefsym
     out.emit_u32_le(1) // nextdefsym
-    out.emit_u32_le(1) // iundefsym
+    out.emit_u32_le(iundef) // iundefsym
     out.emit_u32_le(app.imports.len)
     for i in 0:12 { out.emit_u32_le(0) }
 
     pad_to($&out, text_off)
     emit_app_text($&out, &app.text)
     pad_to($&out, reloc_off)
-    // Both arm64 BRANCH26 and x64 BRANCH use relocation type 2.
-    // The flags mark a PC-relative, external, four-byte relocation.
+    // Mach-O arm64: BR26=0x2d000000, PAGE21=0x3d000000, PAGEOFF12=0x4c000000.
+    // Mach-O x64: BRANCH=0x2d000000, SIGNED=0x1d000000.
     for i in 0:app.relocs.len {
         index := app.relocs.len - 1 - i
         reloc := &app.relocs[index]
+        $sym_idx := reloc.symbol
+        if reloc.symbol < 0 {
+            sym_idx = 0
+        } else if app.has_ffi_state {
+            sym_idx = reloc.symbol + 1
+        }
+        $rflags := 0x2d000000
+        if reloc.kind == 2 {
+            if app.arch == target.ARCH_ARM64 { rflags = 0x3d000000 } else { rflags = 0x1d000000 }
+        } else if reloc.kind == 3 {
+            rflags = 0x4c000000
+        }
         out.emit_u32_le(reloc.offset)
-        out.emit_u32_le(0x2d000000 | reloc.symbol)
+        out.emit_u32_le(rflags | sym_idx)
     }
     out.emit_bytes(&syms.bytes)
     out.emit_bytes(&names.bytes)
