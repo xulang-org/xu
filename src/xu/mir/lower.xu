@@ -543,6 +543,9 @@ fn (w $&Lw) expr_is_ref(p &parser.Parser, tp &types.TypedProgram, n int) bool {
 
 // Address of the value designated by expression n (a place or a wide value).
 fn (w $&Lw) lower_addr(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    if tp.global_of(n) >= 0 {
+        << w.lower_global_addr(tp, tp.global_of(n))
+    }
     k := p.nodes[n].kind
     if k == ast.NK_IDENT {
         id := tp.local_of(n)
@@ -1329,6 +1332,9 @@ fn (w $&Lw) lower_ident(p &parser.Parser, tp &types.TypedProgram, n int) int {
     if tp.const_of(n) >= 0 {
         << w.lower_const(tp, tp.const_of(n))
     }
+    if tp.global_of(n) >= 0 {
+        << w.lower_global_val(tp, tp.global_of(n))
+    }
     w.fail(p, n, "unresolved name '" + p.nodes[n].sval + "'")
     << w.konst(0)
 }
@@ -1453,9 +1459,53 @@ fn (w $&Lw) lower_ternary(p &parser.Parser, tp &types.TypedProgram, n int) int {
     << w.load_local(res, 0)
 }
 
+fn bitfield_mask(w int) int {
+    if w >= 64 { << -1 }
+    if w == 63 { << 9223372036854775807 }
+    $m := 1
+    for i in 0:w { m = m * 2 }
+    << m - 1
+}
+
+fn (w $&Lw) lower_bitfield_read(base_addr int, fld &types.TField) int {
+    raw := w.load_ptr(base_addr, fld.offset, fld.bit_unit)
+    if fld.bit_width >= 64 { << raw }
+    signed := fld.ty == 1 || fld.ty == 7 || fld.ty == 8 || fld.ty == 11
+    if signed {
+        shl := 64 - fld.bit_off - fld.bit_width
+        $v := raw
+        if shl > 0 { v = w.bin(BIN_SHL, v, w.konst(shl)) }
+        << w.bin(BIN_SHR, v, w.konst(64 - fld.bit_width))
+    }
+    $v := raw
+    if fld.bit_off > 0 { v = w.bin(BIN_SHR, v, w.konst(fld.bit_off)) }
+    << w.bin(BIN_AND, v, w.konst(bitfield_mask(fld.bit_width)))
+}
+
+fn (w $&Lw) lower_bitfield_write(base_addr int, fld &types.TField, val int) {
+    if fld.bit_width >= 64 {
+        w.store_ptr(base_addr, fld.offset, val, fld.bit_unit)
+        <<
+    }
+    m := w.konst(bitfield_mask(fld.bit_width))
+    $vm := w.bin(BIN_AND, val, m)
+    $sm := m
+    if fld.bit_off > 0 {
+        vm = w.bin(BIN_SHL, vm, w.konst(fld.bit_off))
+        sm = w.bin(BIN_SHL, sm, w.konst(fld.bit_off))
+    }
+    clear := w.bin(BIN_XOR, sm, w.konst(-1))
+    old := w.load_ptr(base_addr, fld.offset, fld.bit_unit)
+    merged := w.bin(BIN_OR, w.bin(BIN_AND, old, clear), vm)
+    w.store_ptr(base_addr, fld.offset, merged, fld.bit_unit)
+}
+
 fn (w $&Lw) lower_field(p &parser.Parser, tp &types.TypedProgram, n int) int {
     if tp.const_of(n) >= 0 {
         << w.lower_const(tp, tp.const_of(n))
+    }
+    if tp.global_of(n) >= 0 {
+        << w.lower_global_val(tp, tp.global_of(n))
     }
     if tp.call_of(n) == -30 {
         << w.enum_ctor(p, tp, n, -1)
@@ -1476,6 +1526,14 @@ fn (w $&Lw) lower_field(p &parser.Parser, tp &types.TypedProgram, n int) int {
         }
         w.fail(p, n, "unknown field '" + name + "'")
         << w.konst(0)
+    }
+    if types.is_struct_type(bty) {
+        fname := name + ""
+        fld := tp.field_of(bty, &fname)
+        if fld.offset >= 0 && fld.bit_width > 0 {
+            baddr := w.base_addr(p, tp, base)
+            << w.lower_bitfield_read(baddr, &fld)
+        }
     }
     addr := w.lower_place_addr(p, tp, n)
     fty := tp.type_of(n)
@@ -1689,7 +1747,11 @@ fn (w $&Lw) lower_struct_init(p &parser.Parser, tp &types.TypedProgram, n int) i
             fty := tp.structs[si].fields[fi].ty
             fe := p.nodes[fld].a
             v := w.own_val(p, tp, fe, w.lower_expr(p, tp, fe), fty)
-            w.store_value(tp, out, tp.structs[si].fields[fi].offset, v, fty)
+            if tp.structs[si].fields[fi].bit_width > 0 {
+                w.lower_bitfield_write(out, &tp.structs[si].fields[fi], v)
+            } else {
+                w.store_value(tp, out, tp.structs[si].fields[fi].offset, v, fty)
+            }
         }
         fld = p.nodes[fld].next
     }
@@ -1890,6 +1952,10 @@ fn is_log_callsite(p &parser.Parser, tp &types.TypedProgram, n int, fi int) bool
 
 // Call of user function or method fi from method-call node n.
 fn (w $&Lw) lower_user_method_call(p &parser.Parser, tp &types.TypedProgram, n int, fi int) int {
+    if tp.fns[fi].is_extern && tp.fns[fi].decl >= 0 {
+        ffi := types.ffi_node_of(p, tp.fns[fi].decl)
+        if ffi >= 0 { << w.lower_ffi_call(p, tp, n, fi, ffi) }
+    }
     $args := []int{}
     // `pkg.f(...)` parses as a method call on the package name.
     if tp.fns[fi].recv >= 0 {
@@ -2007,13 +2073,12 @@ fn (w $&Lw) lower_call(p &parser.Parser, tp &types.TypedProgram, n int) int {
         << w.konst(0)
     }
     if code == types.NCALL_C_CALLBACK {
-        arg := p.nodes[n].a
-        fi := tp.call_of(arg)
-        if fi < 0 || fi >= tp.fns.len || fn_throws(tp, fi) {
-            w.fail(p, arg, "a C callback must name a non-throwing top-level function")
-            << w.konst(0)
-        }
-        << w.fn_addr(FFI_THUNK_PREFIX + tp.fns[fi].label)
+        $no_free := [-999999]
+        << w.lower_c_callback_ref(p, tp, p.nodes[n].a, 0, $&no_free)
+    }
+    if code == types.NCALL_C_CALLBACK_FREE {
+        w.free_closure_cb(tp, w.lower_expr(p, tp, p.nodes[n].a))
+        << w.konst(0)
     }
     if code == types.NCALL_RT_GLOBALS {
         << w.call_noargs("__xu_globals")
@@ -2390,6 +2455,9 @@ fn (w $&Lw) place_type(p &parser.Parser, tp &types.TypedProgram, n int) int {
     if k == ast.NK_IDENT && tp.local_of(n) >= 0 {
         << tp.deref(w.local_type(tp, tp.local_of(n)))
     }
+    if (k == ast.NK_IDENT || k == ast.NK_FIELD) && tp.global_of(n) >= 0 {
+        << tp.deref(tp.globals[tp.global_of(n)].ty)
+    }
     if k == ast.NK_FIELD || k == ast.NK_INDEX {
         bty := tp.deref(tp.deref(w.place_type(p, tp, p.nodes[n].a)))
         if k == ast.NK_FIELD && types.is_struct_type(bty) {
@@ -2476,8 +2544,28 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
         w.map_assign(p, tp, s)
         <<
     }
+    if tk == ast.NK_FIELD {
+        bnode := p.nodes[target].a
+        bty_bf := tp.deref(tp.deref(w.place_type(p, tp, bnode)))
+        if types.is_struct_type(bty_bf) {
+            fname_bf := p.nodes[target].sval + ""
+            fld_bf := tp.field_of(bty_bf, &fname_bf)
+            if fld_bf.offset >= 0 && fld_bf.bit_width > 0 {
+                baddr := w.base_addr(p, tp, bnode)
+                $v := w.lower_expr(p, tp, p.nodes[s].b)
+                if aop > ast.AS_ASSIGN {
+                    old := w.lower_bitfield_read(baddr, &fld_bf)
+                    v = w.checked_bin(assign_op_code(tty, aop), old, v, tp.deref(tty))
+                }
+                w.lower_bitfield_write(baddr, &fld_bf, v)
+                <<
+            }
+        }
+    }
     $addr := -1
-    if tk == ast.NK_IDENT {
+    if (tk == ast.NK_IDENT || tk == ast.NK_FIELD) && tp.global_of(target) >= 0 {
+        addr = w.lower_global_addr(tp, tp.global_of(target))
+    } else if tk == ast.NK_IDENT {
         addr = w.lower_addr(p, tp, target)
     } else if tk == ast.NK_FIELD || tk == ast.NK_INDEX {
         addr = w.lower_place_addr(p, tp, target)
@@ -2727,22 +2815,33 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
         } else {
             f = lower_queued(p, tp, fi, tgt_os, tgt_arch, debug, &core_names, &core_labels, $&errs)
         }
-        for ii in 0:f.instrs.len {
-            if f.instrs[ii].kind == MI_CALL || f.instrs[ii].kind == MI_LOAD_FN_ADDR {
-                $callee := by_label.get(f.instrs[ii].sval)
-                if callee < 0 && ffi_is_thunk(&f.instrs[ii].sval) {
-                    callee = ffi_thunk_request(tp, &by_label, &f.instrs[ii].sval, tgt_os, tgt_arch, &core_names, &core_labels, out)
-                }
-                if callee < 0 {
-                    callee = fnval_shim_key(tp, &by_label, f.instrs[ii].sval)
-                }
-                if callee >= 0 && !queued[callee] {
-                    queued[callee] = true
-                    queue.push(callee)
+        $scan_pos := out.fns.len
+        out.fns.push(f)
+        while scan_pos < out.fns.len {
+            cur_fn := scan_pos
+            scan_pos += 1
+            n_instrs := out.fns[cur_fn].instrs.len
+            for ii in 0:n_instrs {
+                ik := out.fns[cur_fn].instrs[ii].kind
+                if ik == MI_CALL || ik == MI_LOAD_FN_ADDR {
+                    sval := out.fns[cur_fn].instrs[ii].sval + ""
+                    $callee := by_label.get(sval)
+                    if callee < 0 && ffi_is_thunk(&sval) {
+                        callee = ffi_thunk_request(tp, &by_label, &sval, tgt_os, tgt_arch, &core_names, &core_labels, out)
+                    }
+                    if callee < 0 && ffi_is_sig_adapter(&sval) {
+                        ffi_sig_adapter_request(tp, &sval, tgt_os, tgt_arch, &core_names, &core_labels, out)
+                    }
+                    if callee < 0 {
+                        callee = fnval_shim_key(tp, &by_label, sval)
+                    }
+                    if callee >= 0 && !queued[callee] {
+                        queued[callee] = true
+                        queue.push(callee)
+                    }
                 }
             }
         }
-        out.fns.push(f)
     }
     $errors := 0
     for ei in 0:errs.len {
