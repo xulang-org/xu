@@ -80,6 +80,7 @@ fn main() int {
 
 OPTIMIZED_CODE = r'''@main
 #crypto/aes
+#crypto/md5
 #crypto/sha256
 #encoding/hex
 #math/bits
@@ -156,6 +157,19 @@ fn main() int {
     recovered := cipher.decrypt(&encrypted) or (err) { << 14 }
     if recovered != plain { << 15 }
     if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" { << 17 }
+    if md5.sum("") != "d41d8cd98f00b204e9800998ecf8427e" { << 21 }
+    if md5.sum("abc") != "900150983cd24fb0d6963f7d28e17f72" { << 22 }
+    if md5.sum("0123456789abcdef0123456789abcdef") != "8516ac99dc60603295de7bdb6a153530" { << 23 }
+    unaligned := "x0123456789abcdef0123456789abcdefy"
+    if md5.sum(unaligned[1:33]) != "8516ac99dc60603295de7bdb6a153530" { << 24 }
+    $md := md5.new()
+    md.write(&"The quick brown ")
+    md.write(&"fox jumps over the lazy dog")
+    if md.sum() != "9e107d9d372bb6826bd81d3542a419d6" { << 25 }
+    if md.sum() != "9e107d9d372bb6826bd81d3542a419d6" { << 26 }
+    md.reset()
+    md.write(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    if md.sum() != "3b0c8ac703f828b04c6c197006d17218" { << 27 }
     source := "abcd"
     view := source[1:3]
     $once := strings.repeat(&view, 1)
