@@ -186,6 +186,13 @@ xu-platform: $(XU)
 tools: xu-doctor xu-desktop xu-phone xu-fmt xu-map xu-doc xu-setup xu-update xu-lsp xu-native xu-xacp
 
 xu-phone: $(XU_PHONE)
+
+# Local ARM64 hosted ABI/FFI/event acceptance; device execution is a separate gate.
+.PHONY: phone-game-test
+phone-game-test: xu-phone xu-native
+	$(PYTHON) tests/test_phone_game.py -v
+	$(PYTHON) tests/test_phone_apps.py -v
+
 xu-desktop: $(XU_DESKTOP)
 xu-doctor: $(XU_DOCTOR)
 xu-fmt: $(XU_FMT)
