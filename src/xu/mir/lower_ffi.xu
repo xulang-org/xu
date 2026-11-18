@@ -19,12 +19,23 @@
 #xu/parser
 #xu/types
 
+// Target OS/arch codes matching src/xu/target/target.xu (Layer 4B).
+const FFI_OS_MACOS = 0
+const FFI_OS_LINUX = 1
+const FFI_OS_WINDOWS = 2
+const FFI_ARCH_ARM64 = 0
+const FFI_ARCH_X64 = 1
+const FFI_ARCH_RISCV64 = 4
+const FFI_ARCH_LOONG64 = 5
+
 const FB_FPR = 64
 const FB_NSTACK = 128
 const FB_STACK = 136
 const FB_X8 = 144
 const FB_RET = 152
 const FB_FRET = 168
+const FB_CLOSURE = 200
+const BOX_HDR_SZ = 24
 
 struct FfiCc {
     ngr int
@@ -37,19 +48,25 @@ struct FfiCc {
     apple bool
     x64 bool
     win bool
+    win_arm64 bool
+    lp64d bool
+    arch int
     npos int
 }
 
 fn ffi_cc_new(tgt_os int, tgt_arch int, emit bool, blk int, stk int) FfiCc {
-    $x64 := tgt_arch == 1
-    win := x64 && tgt_os == 2
+    x64 := tgt_arch == FFI_ARCH_X64
+    lp64d := tgt_arch == FFI_ARCH_RISCV64 || tgt_arch == FFI_ARCH_LOONG64
+    win := x64 && tgt_os == FFI_OS_WINDOWS
+    win_arm64 := tgt_arch == FFI_ARCH_ARM64 && tgt_os == FFI_OS_WINDOWS
     $max := 8
     if x64 { max = 6 }
     if win { max = 4 }
-    << FfiCc{ngr: 0, nfr: 0, nstack: 0, max_gr: max, blk: blk, stk: stk, emit: emit, apple: tgt_os == 0 && !x64, x64: x64, win: win, npos: 0}
+    << FfiCc{ngr: 0, nfr: 0, nstack: 0, max_gr: max, blk: blk, stk: stk, emit: emit, apple: tgt_os == FFI_OS_MACOS && !x64, x64: x64, win: win, win_arm64: win_arm64, lp64d: lp64d, arch: tgt_arch, npos: 0}
 }
 
 fn ffi_align(n int, a int) int {
+    if a <= 1 { << n }
     << (n + a - 1) / a * a
 }
 
@@ -58,7 +75,13 @@ fn ffi_leaves(tp &types.TypedProgram, ty int, base int, offs $&[]int, tys $&[]in
     if types.is_struct_type(ty) {
         si := types.struct_index(ty)
         for i in 0:tp.structs[si].fields.len {
-            ffi_leaves(tp, tp.structs[si].fields[i].ty, base + tp.structs[si].fields[i].offset, offs, tys)
+            fld := &tp.structs[si].fields[i]
+            if fld.bit_width > 0 {
+                offs.push(base + fld.offset + fld.bit_off / 8)
+                tys.push(fld.ty)
+            } else {
+                ffi_leaves(tp, fld.ty, base + fld.offset, offs, tys)
+            }
         }
         <<
     }
@@ -73,16 +96,42 @@ fn ffi_leaves(tp &types.TypedProgram, ty int, base int, offs $&[]int, tys $&[]in
     tys.push(ty)
 }
 
+// True when `ty` is or contains a C union or bitfield (disqualifies LP64D FP-reg flattening).
+fn ffi_has_union_or_bitfield(tp &types.TypedProgram, ty int) bool {
+    if types.is_struct_type(ty) {
+        si := types.struct_index(ty)
+        if tp.structs[si].is_union { << true }
+        for i in 0:tp.structs[si].fields.len {
+            if tp.structs[si].fields[i].bit_width > 0 { << true }
+            if ffi_has_union_or_bitfield(tp, tp.structs[si].fields[i].ty) { << true }
+        }
+        << false
+    }
+    if types.is_array_type(ty) {
+        << ffi_has_union_or_bitfield(tp, tp.arrays[types.array_index(ty)].elem_ty)
+    }
+    << false
+}
+
 // Homogeneous floating aggregate: member count (1..4), else 0.
 fn ffi_hfa(tp &types.TypedProgram, ty int) int {
     $offs := []int{}
     $tys := []int{}
     ffi_leaves(tp, ty, 0, $&offs, $&tys)
-    if tys.len < 1 || tys.len > 4 || !types.is_float_type(tys[0]) { << 0 }
+    if tys.len < 1 || !types.is_float_type(tys[0]) { << 0 }
     for i in 0:tys.len {
         if tys[i] != tys[0] { << 0 }
     }
-    << tys.len
+    elem_sz := tp.size_of(tys[0])
+    total := tp.size_of(ty)
+    if elem_sz <= 0 { << 0 }
+    if total % elem_sz != 0 { << 0 }
+    cnt := total / elem_sz
+    if cnt < 1 || cnt > 4 { << 0 }
+    if types.is_struct_type(ty) && !tp.structs[types.struct_index(ty)].is_union {
+        if !ffi_has_union_or_bitfield(tp, ty) && tys.len != cnt { << 0 }
+    }
+    << cnt
 }
 
 fn (w $&Lw) ffi_gr(cc $&FfiCc, v int) {
@@ -109,6 +158,14 @@ fn (w $&Lw) ffi_gr_w(cc $&FfiCc, v int, width int) {
     w.ffi_stack_word(cc, v, width)
 }
 
+fn (w $&Lw) ffi_store_fpr(blk int, off int, v int, width int, arch int) {
+    if arch == FFI_ARCH_RISCV64 && width == 4 {
+        w.store_ptr(blk, off, w.bin(BIN_OR, w.wrap_int(v, 9), w.konst(-4294967296)), 8)
+    } else {
+        w.store_ptr(blk, off, v, width)
+    }
+}
+
 fn (w $&Lw) ffi_fr(cc $&FfiCc, v int, width int) {
     if cc.win {
         if cc.npos < 4 {
@@ -120,8 +177,12 @@ fn (w $&Lw) ffi_fr(cc $&FfiCc, v int, width int) {
         <<
     }
     if cc.nfr < 8 {
-        if cc.emit { w.store_ptr(cc.blk, FB_FPR + cc.nfr * 8, v, width) }
+        if cc.emit { w.ffi_store_fpr(cc.blk, FB_FPR + cc.nfr * 8, v, width, cc.arch) }
         cc.nfr += 1
+        <<
+    }
+    if cc.lp64d && cc.ngr < cc.max_gr {
+        w.ffi_gr(cc, v)
         <<
     }
     w.ffi_stack_word(cc, v, width)
@@ -137,14 +198,20 @@ fn (w $&Lw) ffi_stack_word(cc $&FfiCc, v int, width int) {
     cc.nstack += size
 }
 
-fn (w $&Lw) ffi_stack_mem(cc $&FfiCc, src int, size int, align int) {
+fn (w $&Lw) ffi_stack_mem_slot(cc $&FfiCc, size int, align int) int {
     $a := align
     if !cc.apple && a < 8 { a = 8 }
     cc.nstack = ffi_align(cc.nstack, a)
-    if cc.emit { w.copy_mem(w.bin(BIN_ADD, cc.stk, w.konst(cc.nstack)), src, size) }
+    off := cc.nstack
     $sz := size
     if !cc.apple { sz = ffi_align(size, 8) }
     cc.nstack += sz
+    << off
+}
+
+fn (w $&Lw) ffi_stack_mem(cc $&FfiCc, src int, size int, align int) {
+    off := w.ffi_stack_mem_slot(cc, size, align)
+    if cc.emit { w.copy_mem(w.bin(BIN_ADD, cc.stk, w.konst(off)), src, size) }
 }
 
 fn struct_align(tp &types.TypedProgram, ty int) int {
@@ -170,6 +237,8 @@ fn (w $&Lw) ffi_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, v int, vararg bo
         }
         if vararg && cc.apple {
             w.ffi_stack_word(cc, fv, 8)
+        } else if vararg && (cc.win_arm64 || cc.lp64d) {
+            w.ffi_gr(cc, fv)
         } else if vararg && cc.win {
             // Win64 variadics: the value in both the integer and the vector
             // register of its slot.
@@ -182,6 +251,10 @@ fn (w $&Lw) ffi_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, v int, vararg bo
     }
     if vararg && cc.apple {
         w.ffi_stack_word(cc, v, 8)
+        <<
+    }
+    if vararg && (cc.win_arm64 || cc.lp64d) {
+        w.ffi_gr(cc, v)
         <<
     }
     w.ffi_gr_w(cc, v, ffi_int_width(tp, ty))
@@ -239,6 +312,70 @@ fn (w $&Lw) ffi_struct_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, addr int)
         }
         <<
     }
+    if cc.lp64d {
+        if size > 16 {
+            $copy := addr
+            if cc.emit {
+                copy = w.scratch_words((size + 7) / 8)
+                w.copy_mem(copy, addr, size)
+            }
+            w.ffi_gr(cc, copy)
+            <<
+        }
+        if !ffi_has_union_or_bitfield(tp, ty) {
+            $offs := []int{}
+            $tys := []int{}
+            ffi_leaves(tp, ty, 0, $&offs, $&tys)
+            if tys.len == 1 && types.is_float_type(tys[0]) && cc.nfr < 8 {
+                $width := 8
+                if tys[0] == 14 { width = 4 }
+                $fv := w.konst(0)
+                if cc.emit { fv = w.load_ptr(addr, offs[0], width) }
+                w.ffi_fr(cc, fv, width)
+                <<
+            }
+            if tys.len == 2 && types.is_float_type(tys[0]) && types.is_float_type(tys[1]) && cc.nfr + 2 <= 8 {
+                for i in 0:2 {
+                    $width := 8
+                    if tys[i] == 14 { width = 4 }
+                    $fv := w.konst(0)
+                    if cc.emit { fv = w.load_ptr(addr, offs[i], width) }
+                    w.ffi_fr(cc, fv, width)
+                }
+                <<
+            }
+            if tys.len == 2 && (types.is_float_type(tys[0]) != types.is_float_type(tys[1])) && cc.nfr < 8 && cc.ngr < cc.max_gr {
+                for i in 0:2 {
+                    if types.is_float_type(tys[i]) {
+                        $width := 8
+                        if tys[i] == 14 { width = 4 }
+                        $fv := w.konst(0)
+                        if cc.emit { fv = w.load_ptr(addr, offs[i], width) }
+                        w.ffi_fr(cc, fv, width)
+                    } else {
+                        isz := ffi_int_width(tp, tys[i])
+                        $iv := w.konst(0)
+                        if cc.emit { iv = w.wrap_int(w.load_ptr(addr, offs[i], isz), tys[i]) }
+                        w.ffi_gr(cc, iv)
+                    }
+                }
+                <<
+            }
+        }
+        words := (size + 7) / 8
+        $tmp := addr
+        if cc.emit {
+            tmp = w.scratch_words(2)
+            w.zero_mem(tmp, 16)
+            w.copy_mem(tmp, addr, size)
+        }
+        for i in 0:words {
+            $word := w.konst(0)
+            if cc.emit { word = w.load_ptr(tmp, i * 8, 8) }
+            w.ffi_gr(cc, word)
+        }
+        <<
+    }
     hfa := ffi_hfa(tp, ty)
     if hfa > 0 {
         if cc.nfr + hfa <= 8 {
@@ -249,7 +386,7 @@ fn (w $&Lw) ffi_struct_arg(tp &types.TypedProgram, cc $&FfiCc, ty int, addr int)
             if tys[0] == 14 { width = 4 }
             for i in 0:hfa {
                 $word := w.konst(0)
-                if cc.emit { word = w.load_ptr(addr, offs[i], width) }
+                if cc.emit { word = w.load_ptr(addr, i * width, width) }
                 w.ffi_fr(cc, word, width)
             }
             <<
@@ -304,8 +441,8 @@ fn (w &Lw) ffi_x64_classes(tp &types.TypedProgram, ty int, cls $&[]bool) {
 }
 
 // Value of a C argument expression for an extern parameter of type pty.
-// Records cstr copies and fresh strings to release after the call.
-fn (w $&Lw) ffi_arg_value(p &parser.Parser, tp &types.TypedProgram, arg int, pty int, cstr bool, frees $&[]int, fresh $&[]int, fresh_nodes $&[]int) int {
+// Records cstr copies, fresh strings, and transient closure trampolines to release after the call.
+fn (w $&Lw) ffi_arg_value(p &parser.Parser, tp &types.TypedProgram, arg int, pty int, cstr bool, frees $&[]int, fresh $&[]int, fresh_nodes $&[]int, cb_frees $&[]int) int {
     if cstr || (pty == 3) {
         $d := 0
         if tp.type_of(arg) == 3 {
@@ -324,12 +461,7 @@ fn (w $&Lw) ffi_arg_value(p &parser.Parser, tp &types.TypedProgram, arg int, pty
         << c
     }
     if types.is_fn_type(pty) {
-        fi := tp.call_of(arg)
-        if p.nodes[arg].kind != ast.NK_IDENT || tp.local_of(arg) >= 0 || fi < 0 || fi >= tp.fns.len || fn_throws(tp, fi) {
-            w.fail(p, arg, "a C callback must name a non-throwing top-level function")
-            << w.konst(0)
-        }
-        << w.fn_addr(FFI_THUNK_PREFIX + tp.fns[fi].label)
+        << w.lower_c_callback_ref(p, tp, arg, pty, cb_frees)
     }
     if types.is_ref_type(pty) {
         a := w.lower_arg(p, tp, arg, pty)
@@ -345,6 +477,22 @@ fn (w $&Lw) ffi_arg_value(p &parser.Parser, tp &types.TypedProgram, arg int, pty
     << w.lower_arg(p, tp, arg, pty)
 }
 
+fn (w $&Lw) lower_global_addr(tp &types.TypedProgram, gi int) int {
+    g := &tp.globals[gi]
+    $args := []int{}
+    args.push(w.konst(tp.fns.len + gi))
+    args.push(w.ffi_str_ptr(g.sym + ""))
+    args.push(w.ffi_str_ptr(g.lib + ""))
+    << w.call_core("ffi_sym", &args)
+}
+
+fn (w $&Lw) lower_global_val(tp &types.TypedProgram, gi int) int {
+    addr := w.lower_global_addr(tp, gi)
+    gty := tp.globals[gi].ty
+    if is_wide(tp, gty) { << addr }
+    << w.load_ptr(addr, 0, width_of(tp, gty))
+}
+
 fn (w $&Lw) ffi_str_ptr(s string) int {
     t := w.new_temp()
     $ins := minstr_new(MI_STR_CONST)
@@ -356,7 +504,10 @@ fn (w $&Lw) ffi_str_ptr(s string) int {
 
 // Call node n of extern "C" function fi (ffi = its NK_FFI node).
 fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi int, ffi int) int {
-    if (w.tgt_arch != 0 && w.tgt_arch != 1) || (w.tgt_os == 2 && w.tgt_arch != 1) {
+    hosted := (w.tgt_os == FFI_OS_MACOS && (w.tgt_arch == FFI_ARCH_ARM64 || w.tgt_arch == FFI_ARCH_X64)) ||
+        (w.tgt_os == FFI_OS_LINUX && (w.tgt_arch == FFI_ARCH_ARM64 || w.tgt_arch == FFI_ARCH_X64 || w.tgt_arch == FFI_ARCH_RISCV64 || w.tgt_arch == FFI_ARCH_LOONG64)) ||
+        (w.tgt_os == FFI_OS_WINDOWS && (w.tgt_arch == FFI_ARCH_ARM64 || w.tgt_arch == FFI_ARCH_X64))
+    if !hosted {
         w.fail(p, n, "extern \"C\" calls are not supported on this target yet")
         << w.konst(0)
     }
@@ -381,7 +532,9 @@ fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi i
     $frees := []int{}
     $fresh := []int{}
     $fresh_nodes := []int{}
+    $cb_frees := []int{}
     $arg := p.nodes[n].a
+    if p.nodes[n].kind == ast.NK_METHOD_CALL { arg = p.nodes[n].b }
     $ai := 0
     while arg >= 0 {
         $pty := 0
@@ -393,7 +546,7 @@ fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi i
             pty = tp.type_of(arg)
             if types.is_ref_type(pty) && tp.deref(pty) == 3 { pty = 3 }
         }
-        v := w.ffi_arg_value(p, tp, arg, pty, cstr, $&frees, $&fresh, $&fresh_nodes)
+        v := w.ffi_arg_value(p, tp, arg, pty, cstr, $&frees, $&fresh, $&fresh_nodes, $&cb_frees)
         vals.push(v)
         $cty := pty
         if cstr || pty == 3 || types.is_ref_type(pty) || types.is_fn_type(pty) { cty = 6 }
@@ -409,14 +562,10 @@ fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi i
     }
     rty := tp.fns[fi].ret
     ret_cstr := parts.len > 0 && parts[0] == "cstr"
-    $sret := rty != 0 && !ret_cstr && types.is_struct_type(rty) && tp.size_of(rty) > 16
-    if w.tgt_os == 2 && rty != 0 && !ret_cstr && types.is_struct_type(rty) {
-        rsz := tp.size_of(rty)
-        sret = rsz != 1 && rsz != 2 && rsz != 4 && rsz != 8
-    }
+    sret := ffi_sret_for(tp, rty, w.tgt_os, w.tgt_arch) && !ret_cstr
     // Pass 1 sizes the stack area; pass 2 fills the block.
     $probe := ffi_cc_new(w.tgt_os, w.tgt_arch, false, 0, 0)
-    if sret && w.tgt_arch == 1 {
+    if sret && w.tgt_arch != 0 {
         probe.ngr = 1
         probe.npos = 1
     }
@@ -432,7 +581,7 @@ fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi i
     $out := -1
     if rty != 0 && (types.is_struct_type(rty) || ret_cstr) { out = w.scratch(tp, rty) }
     if sret {
-        if w.tgt_arch == 1 {
+        if w.tgt_arch != 0 {
             w.ffi_gr($&cc, out)
         } else {
             w.store_ptr(blk, FB_X8, out, 8)
@@ -466,6 +615,9 @@ fn (w $&Lw) lower_ffi_call(p &parser.Parser, tp &types.TypedProgram, n int, fi i
     for i in 0:fresh.len {
         w.drop_fresh_str(p, tp, fresh_nodes[i], fresh[i])
     }
+    for i in 0:cb_frees.len {
+        w.free_closure_cb(tp, cb_frees[i])
+    }
     << w.ffi_result(tp, rty, ret_cstr, sret, blk, out)
 }
 
@@ -481,7 +633,36 @@ fn (w $&Lw) ffi_result(tp &types.TypedProgram, rty int, ret_cstr bool, sret bool
     if types.is_struct_type(rty) {
         if sret { << out }
         size := tp.size_of(rty)
-        if w.tgt_os == 2 {
+        if w.tgt_os == FFI_OS_WINDOWS && w.tgt_arch == FFI_ARCH_X64 {
+            w.copy_mem(out, w.bin(BIN_ADD, blk, w.konst(FB_RET)), size)
+            << out
+        }
+        if w.tgt_arch == FFI_ARCH_RISCV64 || w.tgt_arch == FFI_ARCH_LOONG64 {
+            if !ffi_has_union_or_bitfield(tp, rty) {
+                $offs := []int{}
+                $tys := []int{}
+                ffi_leaves(tp, rty, 0, $&offs, $&tys)
+                if (tys.len == 1 && types.is_float_type(tys[0])) || (tys.len == 2 && types.is_float_type(tys[0]) && types.is_float_type(tys[1])) {
+                    for i in 0:tys.len {
+                        $width := 8
+                        if tys[i] == 14 { width = 4 }
+                        w.store_ptr(out, offs[i], w.load_ptr(blk, FB_FRET + i * 8, width), width)
+                    }
+                    << out
+                }
+                if tys.len == 2 && (types.is_float_type(tys[0]) != types.is_float_type(tys[1])) {
+                    for i in 0:2 {
+                        if types.is_float_type(tys[i]) {
+                            $width := 8
+                            if tys[i] == 14 { width = 4 }
+                            w.store_ptr(out, offs[i], w.load_ptr(blk, FB_FRET, width), width)
+                        } else {
+                            w.store_ptr(out, offs[i], w.load_ptr(blk, FB_RET, 8), ffi_int_width(tp, tys[i]))
+                        }
+                    }
+                    << out
+                }
+            }
             w.copy_mem(out, w.bin(BIN_ADD, blk, w.konst(FB_RET)), size)
             << out
         }
@@ -513,7 +694,7 @@ fn (w $&Lw) ffi_result(tp &types.TypedProgram, rty int, ret_cstr bool, sret bool
             $width := 8
             if tys[0] == 14 { width = 4 }
             for i in 0:hfa {
-                w.store_ptr(out, offs[i], w.load_ptr(blk, FB_FRET + i * 8, width), width)
+                w.store_ptr(out, i * width, w.load_ptr(blk, FB_FRET + i * 8, width), width)
             }
             << out
         }
@@ -539,8 +720,81 @@ fn (w $&Lw) ffi_result(tp &types.TypedProgram, rty int, ret_cstr bool, sret bool
 // registers the adapter stored in the block. The C call has to come back on
 // the calling thread (the runtime state register is callee-saved in C).
 
+fn ffi_sret_for(tp &types.TypedProgram, rty int, tgt_os int, tgt_arch int) bool {
+    if rty == 0 || !types.is_struct_type(rty) { << false }
+    rsz := tp.size_of(rty)
+    if tgt_os == FFI_OS_WINDOWS && tgt_arch == FFI_ARCH_X64 {
+        << rsz != 1 && rsz != 2 && rsz != 4 && rsz != 8
+    }
+    if tgt_arch == FFI_ARCH_ARM64 {
+        << ffi_hfa(tp, rty) == 0 && rsz > 16
+    }
+    << rsz > 16
+}
+
+// Lowers a C callback argument or `c_callback(fn_ref)` expression:
+// named top-level non-throwing fns lower directly to a zero-cost static
+// thunk; closures, lambdas, local fn values, and bound methods allocate a
+// W^X static closure stub slot paired with a generated signature adapter.
+fn (w $&Lw) lower_c_callback_ref(p &parser.Parser, tp &types.TypedProgram, arg int, sig_ty int, cb_frees $&[]int) int {
+    k := p.nodes[arg].kind
+    fi := tp.call_of(arg)
+    if (k == ast.NK_IDENT || k == ast.NK_FIELD) && tp.local_of(arg) < 0 && fi >= 0 && fi < tp.fns.len && !fn_throws(tp, fi) {
+        << w.fn_addr(FFI_THUNK_PREFIX + tp.fns[fi].label)
+    }
+    $ty := sig_ty
+    if ty <= 0 || !types.is_fn_type(ty) { ty = tp.type_of(arg) }
+    sig := types.fn_index(ty)
+    if sig < 0 || sig >= tp.sig_params.len {
+        w.fail(p, arg, "c_callback expects a valid function or closure")
+        << w.konst(0)
+    }
+    fv := w.lower_expr(p, tp, arg)
+    code := w.load_ptr(fv, 0, 8)
+    env := w.load_ptr(fv, 8, 8)
+    own_b := w.new_block()
+    after_b := w.new_block()
+    w.branch(w.bin(BIN_AND, env, w.konst(1)), own_b, after_b)
+    w.f.active_bb = own_b
+    w.box_retain(w.bin(BIN_SUB, w.bin(BIN_AND, env, w.konst(-2)), w.konst(BOX_HDR_SZ)))
+    w.jump(after_b)
+    w.f.active_bb = after_b
+    adapter := w.fn_addr(FFI_SIG_ADAPTER_PREFIX + str(sig))
+    stubs := w.fn_addr("__xu_ffi_clos_stubs")
+    $aargs := []int{}
+    aargs.push(adapter)
+    aargs.push(code)
+    aargs.push(env)
+    aargs.push(stubs)
+    tramp := w.call_core("ffi_closure_alloc", &aargs)
+    if cb_frees.len >= 0 {
+        // Callers from extern "C" call sites pass cb_frees to release after the call;
+        // explicit c_callback(...) relies on the sentinel slot check (only pushed by extern calls).
+        if cb_frees.len == 0 || cb_frees[cb_frees.len - 1] != -999999 {
+            cb_frees.push(tramp)
+        }
+    }
+    << tramp
+}
+
+fn (w $&Lw) free_closure_cb(tp &types.TypedProgram, p_val int) {
+    stubs := w.fn_addr("__xu_ffi_clos_stubs")
+    $args := []int{}
+    args.push(p_val)
+    args.push(stubs)
+    env := w.call_core("ffi_closure_take_env", &args)
+    own_b := w.new_block()
+    done_b := w.new_block()
+    w.branch(w.bin(BIN_AND, env, w.konst(1)), own_b, done_b)
+    w.f.active_bb = own_b
+    w.box_release(tp, w.bin(BIN_SUB, w.bin(BIN_AND, env, w.konst(-2)), w.konst(BOX_HDR_SZ)))
+    w.jump(done_b)
+    w.f.active_bb = done_b
+}
+
 const FFI_THUNK_PREFIX = "__xu_ffi_thunk."
 const FFI_ADAPTER_PREFIX = "__xu_ffi_adapter."
+const FFI_SIG_ADAPTER_PREFIX = "__xu_ffi_clos_adapter."
 
 // Queue the adapter of thunk label `label` once; returns the target
 // function's queue key so it is lowered too.
@@ -558,6 +812,138 @@ fn ffi_thunk_request(tp &types.TypedProgram, by_label &LabelIndex, label &string
     << fi
 }
 
+fn ffi_is_sig_adapter(label &string) bool {
+    if label.len <= FFI_SIG_ADAPTER_PREFIX.len { << false }
+    << label[0:FFI_SIG_ADAPTER_PREFIX.len] == FFI_SIG_ADAPTER_PREFIX
+}
+
+fn ffi_parse_pos_int(s &string) int {
+    if s.len == 0 { << -1 }
+    $v := 0
+    for i in 0:s.len {
+        ch := s[i] & 255
+        if ch < 48 || ch > 57 { << -1 }
+        v = v * 10 + (ch - 48)
+    }
+    << v
+}
+
+fn ffi_sig_adapter_request(tp &types.TypedProgram, label &string, tgt_os int, tgt_arch int, core_names &[]string, core_labels &[]string, out $&Mir) bool {
+    for i in 0:out.fns.len {
+        if out.fns[i].label == *label { << false }
+    }
+    tail := label[FFI_SIG_ADAPTER_PREFIX.len:label.len]
+    sig := ffi_parse_pos_int(&tail)
+    if sig < 0 || sig >= tp.sig_params.len { << false }
+    out.fns.push(lower_ffi_sig_adapter(tp, sig, label, tgt_os, tgt_arch, core_names, core_labels))
+    << true
+}
+
+fn (w $&Lw) ffi_adapter_init_sret(tp &types.TypedProgram, blk int, cc $&FfiCc, rty int) int {
+    if !ffi_sret_for(tp, rty, w.tgt_os, w.tgt_arch) { << 0 }
+    if w.tgt_arch == FFI_ARCH_ARM64 {
+        << w.load_ptr(blk, FB_X8, 8)
+    }
+    cc.ngr = 1
+    cc.npos = 1
+    << w.load_ptr(blk, 0, 8)
+}
+
+fn (w $&Lw) ffi_adapter_store_ret(tp &types.TypedProgram, blk int, rty int, r int, sret bool, sret_ptr int) {
+    if rty == 0 { << }
+    if types.is_struct_type(rty) {
+        size := tp.size_of(rty)
+        if sret {
+            w.copy_mem(sret_ptr, r, size)
+            if w.tgt_arch != FFI_ARCH_ARM64 { w.store_ptr(blk, FB_RET, sret_ptr, 8) }
+            <<
+        }
+        if w.tgt_os == FFI_OS_WINDOWS && w.tgt_arch == FFI_ARCH_X64 {
+            w.copy_mem(w.bin(BIN_ADD, blk, w.konst(FB_RET)), r, size)
+            <<
+        }
+        if w.tgt_arch == FFI_ARCH_RISCV64 || w.tgt_arch == FFI_ARCH_LOONG64 {
+            if !ffi_has_union_or_bitfield(tp, rty) {
+                $offs := []int{}
+                $tys := []int{}
+                ffi_leaves(tp, rty, 0, $&offs, $&tys)
+                if (tys.len == 1 && types.is_float_type(tys[0])) || (tys.len == 2 && types.is_float_type(tys[0]) && types.is_float_type(tys[1])) {
+                    for i in 0:tys.len {
+                        $width := 8
+                        if tys[i] == 14 { width = 4 }
+                        w.ffi_store_fpr(blk, FB_FRET + i * 8, w.load_ptr(r, offs[i], width), width, w.tgt_arch)
+                    }
+                    <<
+                }
+                if tys.len == 2 && (types.is_float_type(tys[0]) != types.is_float_type(tys[1])) {
+                    for i in 0:2 {
+                        if types.is_float_type(tys[i]) {
+                            $width := 8
+                            if tys[i] == 14 { width = 4 }
+                            w.ffi_store_fpr(blk, FB_FRET, w.load_ptr(r, offs[i], width), width, w.tgt_arch)
+                        } else {
+                            iw := ffi_int_width(tp, tys[i])
+                            w.store_ptr(blk, FB_RET, w.wrap_int(w.load_ptr(r, offs[i], iw), tys[i]), 8)
+                        }
+                    }
+                    <<
+                }
+            }
+            w.copy_mem(w.bin(BIN_ADD, blk, w.konst(FB_RET)), r, size)
+            <<
+        }
+        if w.tgt_arch == FFI_ARCH_X64 {
+            $cls := []bool{}
+            w.ffi_x64_classes(tp, rty, $&cls)
+            tmp := w.scratch_words(2)
+            w.zero_mem(tmp, 16)
+            w.copy_mem(tmp, r, size)
+            $ng := 0
+            $nf := 0
+            for i in 0:cls.len {
+                word := w.load_ptr(tmp, i * 8, 8)
+                if cls[i] {
+                    w.store_ptr(blk, FB_FRET + nf * 8, word, 8)
+                    nf += 1
+                } else {
+                    w.store_ptr(blk, FB_RET + ng * 8, word, 8)
+                    ng += 1
+                }
+            }
+            <<
+        }
+        hfa := ffi_hfa(tp, rty)
+        if hfa > 0 {
+            $offs := []int{}
+            $tys := []int{}
+            ffi_leaves(tp, rty, 0, $&offs, $&tys)
+            $width := 8
+            if tys[0] == 14 { width = 4 }
+            for i in 0:hfa {
+                w.store_ptr(blk, FB_FRET + i * 8, w.load_ptr(r, i * width, width), width)
+            }
+            <<
+        }
+        w.copy_mem(w.bin(BIN_ADD, blk, w.konst(FB_RET)), r, size)
+        <<
+    }
+    if types.is_float_type(rty) {
+        $width := 8
+        if rty == 14 { width = 4 }
+        w.ffi_store_fpr(blk, FB_FRET, r, width, w.tgt_arch)
+    } else {
+        w.store_ptr(blk, FB_RET, r, 8)
+    }
+}
+
+fn (w $&Lw) ffi_free_cb_strs(str_frees &[]int) {
+    for i in 0:str_frees.len {
+        $sargs := []int{}
+        sargs.push(str_frees[i])
+        w.call_core("str_free", &sargs)
+    }
+}
+
 // Adapter of Xu function fi: one incoming word, the call block address.
 fn lower_ffi_adapter(tp &types.TypedProgram, fi int, label &string, tgt_os int, tgt_arch int, core_names &[]string, core_labels &[]string) MFn {
     $w := lw_new(tp.fns[fi].name + ".c", *label + "", fi, tgt_os, tgt_arch)
@@ -573,19 +959,23 @@ fn lower_ffi_adapter(tp &types.TypedProgram, fi int, label &string, tgt_os int, 
     blk := w.load_local(inb, 0)
     stk := w.load_ptr(blk, FB_STACK, 8)
     $cc := ffi_cc_new(tgt_os, tgt_arch, true, blk, stk)
-    $args := []int{}
-    for i in 0:tp.fns[fi].params.len {
-        args.push(w.ffi_take(tp, $&cc, tp.fns[fi].params[i]))
-    }
-    r := w.call(tp.fns[fi].label, &args)
     rty := tp.fns[fi].ret
-    if types.is_float_type(rty) {
-        $width := 8
-        if rty == 14 { width = 4 }
-        w.store_ptr(blk, FB_FRET, r, width)
-    } else if rty != 0 {
-        w.store_ptr(blk, FB_RET, r, 8)
+    sret := ffi_sret_for(tp, rty, tgt_os, tgt_arch)
+    sret_ptr := w.ffi_adapter_init_sret(tp, blk, $&cc, rty)
+    $args := []int{}
+    $xu_out := 0
+    if rty != 0 && is_wide(tp, rty) {
+        xu_out = w.scratch(tp, rty)
+        args.push(xu_out)
     }
+    $str_frees := []int{}
+    for i in 0:tp.fns[fi].params.len {
+        args.push(w.ffi_take(tp, $&cc, tp.fns[fi].params[i], $&str_frees))
+    }
+    $r := w.call(tp.fns[fi].label, &args)
+    if rty != 0 && is_wide(tp, rty) { r = xu_out }
+    w.ffi_free_cb_strs(&str_frees)
+    w.ffi_adapter_store_ret(tp, blk, rty, r, sret, sret_ptr)
     w.ret(w.konst(0))
     while w.lbyref.len < w.f.locals.len {
         w.lbyref.push(false)
@@ -593,8 +983,191 @@ fn lower_ffi_adapter(tp &types.TypedProgram, fi int, label &string, tgt_os int, 
     << mfn_copy(&w.f)
 }
 
-// Read one incoming C scalar of Xu type ty (callee side of ffi_arg).
-fn (w $&Lw) ffi_take(tp &types.TypedProgram, cc $&FfiCc, ty int) int {
+// Generic adapter for closure/dynamic callback signature `sig`:
+// incoming blk holds `[blk + FB_CLOSURE] -> [code, env]`.
+fn lower_ffi_sig_adapter(tp &types.TypedProgram, sig int, label &string, tgt_os int, tgt_arch int, core_names &[]string, core_labels &[]string) MFn {
+    $w := lw_new("__clos_sig" + str(sig) + ".c", *label + "", 0, tgt_os, tgt_arch)
+    for i in 0:core_names.len {
+        w.core_names.push(core_names[i] + "")
+        w.core_labels.push(core_labels[i] + "")
+    }
+    w.f.ret = 0
+    w.f.blocks.push(mblock_new())
+    w.f.active_bb = 0
+    inb := w.new_local(1, 1, "blk")
+    w.f.nparams = w.f.locals.len
+    blk := w.load_local(inb, 0)
+    stk := w.load_ptr(blk, FB_STACK, 8)
+    $cc := ffi_cc_new(tgt_os, tgt_arch, true, blk, stk)
+    rty := tp.sig_ret[sig]
+    sret := ffi_sret_for(tp, rty, tgt_os, tgt_arch)
+    sret_ptr := w.ffi_adapter_init_sret(tp, blk, $&cc, rty)
+    $args := []int{}
+    $str_frees := []int{}
+    for i in 0:tp.sig_params[sig].len {
+        args.push(w.ffi_take(tp, $&cc, tp.sig_params[sig][i], $&str_frees))
+    }
+    fv := w.load_ptr(blk, FB_CLOSURE, 8)
+    r := w.fnval_invoke(tp, fv, rty, &args)
+    w.ffi_free_cb_strs(&str_frees)
+    w.ffi_adapter_store_ret(tp, blk, rty, r, sret, sret_ptr)
+    w.ret(w.konst(0))
+    while w.lbyref.len < w.f.locals.len {
+        w.lbyref.push(false)
+    }
+    << mfn_copy(&w.f)
+}
+
+fn (w $&Lw) ffi_take_stack_mem(cc $&FfiCc, dst int, size int, align int) {
+    off := w.ffi_stack_mem_slot(cc, size, align)
+    w.copy_mem(dst, w.bin(BIN_ADD, cc.stk, w.konst(off)), size)
+}
+
+// Read one incoming C parameter of Xu type ty (callee side of ffi_arg).
+fn (w $&Lw) ffi_take(tp &types.TypedProgram, cc $&FfiCc, ty int, str_frees $&[]int) int {
+    if ty == 3 || (types.is_ref_type(ty) && !types.is_mut_ref_type(ty) && tp.deref(ty) == 3) {
+        cp := w.ffi_take_scalar(tp, cc, 6)
+        desc := w.scratch_words(3)
+        $args := []int{}
+        args.push(desc)
+        args.push(cp)
+        w.call_core("ffi_string_from", &args)
+        if ty != 3 { str_frees.push(desc) }
+        << desc
+    }
+    if types.is_struct_type(ty) {
+        out := w.scratch(tp, ty)
+        size := tp.size_of(ty)
+        al := struct_align(tp, ty)
+        if cc.win {
+            if size == 1 || size == 2 || size == 4 || size == 8 {
+                tmp := w.scratch_words(1)
+                w.store_ptr(tmp, 0, w.ffi_take_scalar(tp, cc, 1), 8)
+                w.copy_mem(out, tmp, size)
+            } else {
+                w.copy_mem(out, w.ffi_take_scalar(tp, cc, 6), size)
+            }
+            << out
+        }
+        if cc.x64 {
+            if size > 16 {
+                w.ffi_take_stack_mem(cc, out, size, al)
+                << out
+            }
+            $cls := []bool{}
+            w.ffi_x64_classes(tp, ty, $&cls)
+            $ng := 0
+            $nf := 0
+            for i in 0:cls.len {
+                if cls[i] { nf += 1 } else { ng += 1 }
+            }
+            if cc.ngr + ng > cc.max_gr || cc.nfr + nf > 8 {
+                w.ffi_take_stack_mem(cc, out, size, al)
+                << out
+            }
+            tmp := w.scratch_words(2)
+            for i in 0:cls.len {
+                $word := 0
+                if cls[i] {
+                    cc.nfr += 1
+                    word = w.load_ptr(cc.blk, FB_FPR + (cc.nfr - 1) * 8, 8)
+                } else {
+                    cc.ngr += 1
+                    word = w.load_ptr(cc.blk, (cc.ngr - 1) * 8, 8)
+                }
+                w.store_ptr(tmp, i * 8, word, 8)
+            }
+            w.copy_mem(out, tmp, size)
+            << out
+        }
+        if cc.lp64d {
+            if size > 16 {
+                w.copy_mem(out, w.ffi_take_scalar(tp, cc, 6), size)
+                << out
+            }
+            if !ffi_has_union_or_bitfield(tp, ty) {
+                $offs := []int{}
+                $tys := []int{}
+                ffi_leaves(tp, ty, 0, $&offs, $&tys)
+                if tys.len == 1 && types.is_float_type(tys[0]) && cc.nfr < 8 {
+                    $width := 8
+                    if tys[0] == 14 { width = 4 }
+                    cc.nfr += 1
+                    w.store_ptr(out, offs[0], w.load_ptr(cc.blk, FB_FPR + (cc.nfr - 1) * 8, width), width)
+                    << out
+                }
+                if tys.len == 2 && types.is_float_type(tys[0]) && types.is_float_type(tys[1]) && cc.nfr + 2 <= 8 {
+                    for i in 0:2 {
+                        $width := 8
+                        if tys[i] == 14 { width = 4 }
+                        cc.nfr += 1
+                        w.store_ptr(out, offs[i], w.load_ptr(cc.blk, FB_FPR + (cc.nfr - 1) * 8, width), width)
+                    }
+                    << out
+                }
+                if tys.len == 2 && (types.is_float_type(tys[0]) != types.is_float_type(tys[1])) && cc.nfr < 8 && cc.ngr < cc.max_gr {
+                    for i in 0:2 {
+                        if types.is_float_type(tys[i]) {
+                            $width := 8
+                            if tys[i] == 14 { width = 4 }
+                            cc.nfr += 1
+                            w.store_ptr(out, offs[i], w.load_ptr(cc.blk, FB_FPR + (cc.nfr - 1) * 8, width), width)
+                        } else {
+                            isz := ffi_int_width(tp, tys[i])
+                            cc.ngr += 1
+                            w.store_ptr(out, offs[i], w.wrap_int(w.load_ptr(cc.blk, (cc.ngr - 1) * 8, 8), tys[i]), isz)
+                        }
+                    }
+                    << out
+                }
+            }
+            words := (size + 7) / 8
+            tmp := w.scratch_words(words)
+            for i in 0:words {
+                w.store_ptr(tmp, i * 8, w.ffi_take_scalar(tp, cc, 1), 8)
+            }
+            w.copy_mem(out, tmp, size)
+            << out
+        }
+        hfa := ffi_hfa(tp, ty)
+        if hfa > 0 {
+            if cc.nfr + hfa <= 8 {
+                $offs := []int{}
+                $tys := []int{}
+                ffi_leaves(tp, ty, 0, $&offs, $&tys)
+                $width := 8
+                if tys[0] == 14 { width = 4 }
+                for i in 0:hfa {
+                    cc.nfr += 1
+                    w.store_ptr(out, i * width, w.load_ptr(cc.blk, FB_FPR + (cc.nfr - 1) * 8, width), width)
+                }
+                << out
+            }
+            cc.nfr = 8
+            w.ffi_take_stack_mem(cc, out, size, al)
+            << out
+        }
+        if size > 16 {
+            w.copy_mem(out, w.ffi_take_scalar(tp, cc, 6), size)
+            << out
+        }
+        words := (size + 7) / 8
+        if cc.ngr + words > cc.max_gr {
+            cc.ngr = cc.max_gr
+            w.ffi_take_stack_mem(cc, out, size, al)
+            << out
+        }
+        tmp := w.scratch_words(2)
+        for i in 0:words {
+            w.store_ptr(tmp, i * 8, w.ffi_take_scalar(tp, cc, 1), 8)
+        }
+        w.copy_mem(out, tmp, size)
+        << out
+    }
+    << w.ffi_take_scalar(tp, cc, ty)
+}
+
+fn (w $&Lw) ffi_take_scalar(tp &types.TypedProgram, cc $&FfiCc, ty int) int {
     if cc.win {
         pos := cc.npos
         cc.npos += 1
@@ -617,6 +1190,12 @@ fn (w $&Lw) ffi_take(tp &types.TypedProgram, cc $&FfiCc, ty int) int {
         if cc.nfr < 8 {
             cc.nfr += 1
             << w.load_ptr(cc.blk, FB_FPR + (cc.nfr - 1) * 8, width)
+        }
+        if cc.lp64d && cc.ngr < cc.max_gr {
+            cc.ngr += 1
+            raw := w.load_ptr(cc.blk, (cc.ngr - 1) * 8, 8)
+            if ty == 14 { << w.wrap_int(raw, 9) }
+            << raw
         }
         << w.ffi_take_stack(cc, width)
     }
