@@ -315,6 +315,55 @@ fn verify_divc_pow2_and_mul() bool {
     << true
 }
 
+struct@ ZstVal {
+    fn tag() int
+}
+
+struct ZstEmpty {}
+struct ZstNonEmpty {
+    n int
+}
+struct ZstEmptyErr {}
+
+fn (e ZstEmpty) tag() int { << 42 }
+fn (n ZstNonEmpty) tag() int { << n.n }
+fn (e ZstEmptyErr) msg() string { << "zst-empty-err" }
+
+fn zst_pass(v ZstVal) int { << v.tag() }
+
+fn zst_may_fail(flag bool) int {
+    if flag { >> ZstEmptyErr{} }
+    << 99
+}
+
+fn zst_catch(flag bool) string {
+    v := zst_may_fail(flag) or (err) { << err.msg() }
+    << str(v)
+}
+
+fn check_zst_static_box() bool {
+    let e: ZstVal = ZstEmpty{}
+    if e.tag() != 42 || zst_pass(e) != 42 { << false }
+    $arr := []ZstVal{}
+    for _ in 0:16 {
+        arr.push(ZstEmpty{})
+        arr.push(ZstNonEmpty{n: 10})
+    }
+    $sum := 0
+    for i in 0:arr.len {
+        sum += arr[i].tag()
+    }
+    if sum != 832 { << false }
+    if zst_catch(true) != "zst-empty-err" || zst_catch(false) != "99" { << false }
+    let a1: any = ZstEmpty{}
+    _ := a1 as ZstEmpty
+    let a2: any = ZstNonEmpty{n: 55}
+    u := a2 as ZstNonEmpty
+    if u.n != 55 { << false }
+    let ne: ZstVal = ZstNonEmpty{n: 13}
+    << ne.tag() + zst_pass(ne) == 26
+}
+
 fn implicit_borrow_values() bool {
     first := 23
     counter := Counter{value: 42}
@@ -529,6 +578,7 @@ fn main() int {
     }
     if !check_recycled_strings() { << 36 }
     if !check_short_string_copies() { << 37 }
+    if !check_zst_static_box() { << 40 }
     println("optimized code passed")
     << 0
 }
