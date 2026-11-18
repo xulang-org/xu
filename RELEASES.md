@@ -6,6 +6,15 @@
 
 ---
 
+## Xu 0.12.6
+
+- Complete C FFI & `xu cbind`: Adds full object/app/native linking across ARM64, x64, RISC-V, and LoongArch backends, C unions and bitfields, `extern` globals, C closure callbacks, FFI diagnostics, and `xu cbind` C header generation with layout assertions.
+- Native Phone Game Host & `#app`: Adds `xu build --phone --phone-profile game` for native SDL GPU mobile apps, `#app` stdlib module and resource packaging (`examples/phone_game`), ARM64 stack-switching phone game runtime, and safe-area/back-key/resume events.
+- Memory safety & Zero-GC hardening: Tightens static borrow, move, `unsafe`, closure, `match`/`select`/`or`, and `xu` spawn checks across containers and generics; adds string COW byte writes, immortal static headers for boxed zero-sized structs, 16KB task stack guard pages, runtime overflow checks, and the 67-check `memsafe-gate` regression suite.
+- MIR optimizer & codegen performance: Adds x64 XMM register allocation and direct SSE2 `f64` lowering, x64 `cmp+cmovcc` select fusion and `lea` lowering, ARM64 power-of-2 parity/div/`mul 2^k+1`/`cmp+csel` fusion, compound `||`/`&&` fast-entry guards, dominator range bounds and div/cmp folding in `opt_gvn`, inclusive `<=` loop versioning in `opt_bce`, small constant-trip loop unrolling in `opt_ifconv`, and local-backed switch LUTs with zero-env function-value devirtualization.
+- Runtime hot paths: Accelerates Base64, string operations, and MD5 block compression and hex formatting in `runtime/core`.
+- Upgrade the compiler, standard library and SDK tools together.
+
 ## Xu 0.12.5
 
 - Pure-Xu `#internal/sdl` backend with dynamic FFI: Replaces the C driver in `#internal/sdl` with a pure-Xu implementation via dynamic FFI, eliminating C native build friction for windowing and GPU subsystems.
