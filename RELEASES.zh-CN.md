@@ -6,7 +6,7 @@
 
 ---
 
-## Xu 0.12.7-dev.1（开发版）
+## Xu 0.12.7-dev.11（开发版）
 
 - WebAssembly 宿主可以调用 `xu build app.xu --target wasm32-wasi --wasm-export step -o app.wasm` 导出的 Xu 函数。重复传入 `--wasm-export` 可导出多个函数。导出项必须是 `@main` 中无抛错、非泛型的顶层函数，参数与返回值均为 `int`。宿主 ABI 使用 `i32`，实参按有符号值扩展为 Xu `int`，返回值取低 32 位。
 - ARM64 Phone game 构建在 iOS 和 Android 的应用对象中支持原生导入。生成工程包含平台链接所需的原生归档和 C 桥接源码。编译器、标准库、`xu-native` 和 `xu-phone` 使用同一套 SDK。

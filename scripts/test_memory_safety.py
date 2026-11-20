@@ -941,6 +941,211 @@ fn main() {
         expect_stdout="hello:Hello\n",
     ),
     PosCase(
+        name="Split_short_string_copy_survives_element_and_array_drop",
+        code="""@main
+#strings
+
+fn copy_and_replace(src &string) string {
+    $parts := strings.split(src, "|")
+    $piece := parts[1]
+    parts[1] = "replacement"
+    piece[0] = 90
+    << piece
+}
+
+fn copy_and_join(src &string) string {
+    parts := strings.split(src, "|")
+    piece := parts[1]
+    joined := strings.join(parts, "|")
+    if joined != *src { << "" }
+    << piece
+}
+
+fn main() int {
+    for n in 31:66 {
+        body := strings.repeat(&"a", n)
+        original := "|" + body + "|"
+        replaced := copy_and_replace(&original)
+        if replaced.len != n || replaced[0] != 90 || original[1] != 97 { << 1 }
+        for i in 1:n {
+            if replaced[i] != 97 { << 2 }
+        }
+        retained := copy_and_join(&original)
+        if retained.len != n { << 3 }
+        for i in 0:n {
+            if retained[i] != 97 { << 4 }
+        }
+    }
+    println("split copies survived")
+    << 0
+}
+""",
+        expect_stdout="split copies survived\n",
+        test_no_opt=True,
+        debug_free=True,
+    ),
+    PosCase(
+        name="Runtime_debug_free_enable_after_cached_disabled",
+        code="""@main
+core #runtime/core
+
+fn main() int {
+    first := core.alloc(24)
+    core.free(first)
+    recycled := core.alloc(24)
+    if recycled != first {
+        core.free(recycled)
+        << 1
+    }
+
+    core.debug_free_enable()
+    core.free(recycled)
+    next := core.alloc(24)
+    if next == recycled {
+        core.free(next)
+        << 2
+    }
+    core.free(next)
+    println("debug free prevented reuse")
+    << 0
+}
+""",
+        expect_stdout="debug free prevented reuse\n",
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
+        name="Runtime_free_rejects_duplicate_release",
+        code="""@main
+core #runtime/core
+
+fn main() {
+    block := core.alloc(24)
+    core.free(block)
+    core.free(block)
+}
+""",
+        expect_trap=True,
+        expect_trap_substrings=("double free?",),
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
+        name="Empty_concat_preserves_free_block_and_copy_ownership",
+        code="""@main
+core #runtime/core
+#strings
+
+fn concatenate(a &string, b &string) string {
+    << *a + *b
+}
+
+fn main() int {
+    empty := ""
+    saved := core.alloc(16)
+    core.free(saved)
+    result := concatenate(&empty, &empty)
+    reused := core.alloc(16)
+    core.free(reused)
+    if result.len != 0 { << 1 }
+    if saved != reused { << 2 }
+
+    sizes := [1, 15, 16, 31, 32, 63, 64, 20001]
+    for i in 0:sizes.len {
+        n := sizes[i]
+        source := strings.repeat(&"a", n)
+        $left := concatenate(&source, &empty)
+        $right := concatenate(&empty, &source)
+        if left != source || right != source { << 3 }
+        left[0] = 98
+        if source[0] != 97 || right[0] != 97 { << 4 }
+        right[n - 1] = 99
+        if source[n - 1] != 97 || left[0] != 98 { << 5 }
+    }
+    println("empty concat preserved ownership")
+    << 0
+}
+""",
+        expect_stdout="empty concat preserved ownership\n",
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
+        name="Push_byte_releases_small_blocks_at_terminator_boundary",
+        code="""@main
+core #runtime/core
+
+fn main() int {
+    first := core.alloc(16)
+    second := core.alloc(16)
+    core.free(second)
+    core.free(first)
+
+    $text := ""
+    for i in 0:16 { text.push_byte(256 + i) }
+    // A 16-byte string needs room for its terminator. Both original
+    // 16-byte blocks must be reusable while the completed text is live.
+    reused_first := core.alloc(16)
+    reused_second := core.alloc(16)
+    core.free(reused_second)
+    core.free(reused_first)
+    if !((reused_first == first && reused_second == second) ||
+         (reused_first == second && reused_second == first)) { << 1 }
+
+    text.push_str("!")
+    if text.len != 17 || text[16] != 33 { << 2 }
+    prefix := text[0:16]
+    text.push_str(prefix)
+    if text.len != 33 || text[16] != 33 { << 3 }
+    for i in 0:16 {
+        if text[i] != i || text[17 + i] != i { << 4 }
+    }
+    println("push_byte preserved the payload and spare byte")
+    << 0
+}
+""",
+        expect_stdout="push_byte preserved the payload and spare byte\n",
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
+        name="Push_str_short_binary_suffix_preserves_both_buffers",
+        code="""@main
+#strings
+
+fn main() int {
+    sizes := [0, 1, 7, 8, 9, 10, 15, 16, 17, 63, 64]
+    for size_index in 0:sizes.len {
+        n := sizes[size_index]
+        $source := make_string(n)
+        for i in 0:n { source[i] = (i * 73) & 255 }
+        for prefix in 0:18 {
+            $text := strings.repeat(&"z", prefix)
+            for _ in 0:5 { text.push_str(source) }
+            if text.len != prefix + 5 * n { << 1 }
+            for i in 0:prefix {
+                if text[i] != 122 { << 2 }
+            }
+            for part in 0:5 {
+                for i in 0:n {
+                    expected := (i * 73) & 255
+                    if text[prefix + part * n + i] != expected || source[i] != expected { << 3 }
+                }
+            }
+            if n > 0 {
+                text[prefix] = 255
+                if source[0] != 0 || text[prefix + n] != 0 { << 4 }
+            }
+        }
+    }
+    println("short appends preserved both buffers")
+    << 0
+}
+""",
+        expect_stdout="short appends preserved both buffers\n",
+        test_no_opt=True,
+    ),
+    PosCase(
         name="H15_map_delete_and_take_stress",
         code="""@main
 struct Guard { id int }
@@ -1046,6 +1251,7 @@ fn main() {
 }
 """,
         expect_stdout="drop:42\ndone\ndrop:43\n",
+        test_no_opt=True,
     ),
     PosCase(
         name="LowerErr_iface_field_cast_and_or",
