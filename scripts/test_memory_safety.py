@@ -1109,6 +1109,43 @@ fn main() int {
         debug_free=False,
     ),
     PosCase(
+        name="Push_str_short_binary_suffix_preserves_both_buffers",
+        code="""@main
+#strings
+
+fn main() int {
+    sizes := [0, 1, 7, 8, 9, 10, 15, 16, 17, 63, 64]
+    for size_index in 0:sizes.len {
+        n := sizes[size_index]
+        $source := make_string(n)
+        for i in 0:n { source[i] = (i * 73) & 255 }
+        for prefix in 0:18 {
+            $text := strings.repeat(&"z", prefix)
+            for _ in 0:5 { text.push_str(source) }
+            if text.len != prefix + 5 * n { << 1 }
+            for i in 0:prefix {
+                if text[i] != 122 { << 2 }
+            }
+            for part in 0:5 {
+                for i in 0:n {
+                    expected := (i * 73) & 255
+                    if text[prefix + part * n + i] != expected || source[i] != expected { << 3 }
+                }
+            }
+            if n > 0 {
+                text[prefix] = 255
+                if source[0] != 0 || text[prefix + n] != 0 { << 4 }
+            }
+        }
+    }
+    println("short appends preserved both buffers")
+    << 0
+}
+""",
+        expect_stdout="short appends preserved both buffers\n",
+        test_no_opt=True,
+    ),
+    PosCase(
         name="H15_map_delete_and_take_stress",
         code="""@main
 struct Guard { id int }
