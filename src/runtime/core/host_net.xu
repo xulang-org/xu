@@ -20,6 +20,13 @@ fn host_sa_head(sa int, len int, family int) {
     }
 }
 
+fn host_sa_family(sa int) int {
+    if host_linux() || host_win() {
+        << rt_load(sa, 1) | (rt_load(sa + 1, 1) << 8)
+    }
+    << rt_load(sa + 1, 1)
+}
+
 fn host_sa_in4(a int, b int, c int, d int, port int) int {
     sa := alloc(16)
     host_sa_head(sa, 16, 2)
@@ -89,14 +96,102 @@ fn host_sock_timeout_option(events int) int {
 // poll and WSAPoll take a signed 32-bit millisecond timeout.
 const POLL_TIMEOUT_MAX_MS = 2147483647
 
+// Per-fd socket timeout cache (16 bytes per fd: rcv word at +0, snd word at +8).
+// Value encoding: 0 = uncached, 1 = blocking (-1 ms), ms + 1 = timeout ms.
+fn host_fd_timeo_ptr(fd int, create bool) int {
+    if host_win() || fd < 0 || fd >= 65536 {
+        << 0
+    }
+    cap := gword(G_FD_TIMEO_CAP)
+    if fd >= cap {
+        if !create {
+            << 0
+        }
+        $ncap := cap
+        if ncap < 256 {
+            ncap = 256
+        }
+        while ncap <= fd {
+            ncap = ncap * 2
+        }
+        if ncap > 65536 {
+            ncap = 65536
+        }
+        buf := alloc(ncap * 16)
+        old := gword(G_FD_TIMEO)
+        if cap > 0 && old != 0 {
+            mem_copy(buf, old, cap * 16)
+            free(old)
+        }
+        set_gword(G_FD_TIMEO, buf)
+        set_gword(G_FD_TIMEO_CAP, ncap)
+    }
+    << gword(G_FD_TIMEO) + fd * 16
+}
+
+fn host_fd_timeo_clear(fd int) {
+    p := host_fd_timeo_ptr(fd, false)
+    if p != 0 {
+        rt_store(p, 8, 0)
+        rt_store(p + 8, 8, 0)
+    }
+}
+
+fn host_fd_timeo_enc(ms int) int {
+    if ms <= 0 {
+        << 1
+    }
+    << min_int(ms, POLL_TIMEOUT_MAX_MS) + 1
+}
+
+fn host_fd_timeo_set_both(fd int, ms int) {
+    p := host_fd_timeo_ptr(fd, true)
+    if p != 0 {
+        enc := host_fd_timeo_enc(ms)
+        rt_store(p, 8, enc)
+        rt_store(p + 8, 8, enc)
+    }
+}
+
+fn host_fd_timeo_get(fd int, events int) int {
+    p := host_fd_timeo_ptr(fd, false)
+    if p == 0 {
+        << 0
+    }
+    $off := 8
+    if (events & 1) != 0 {
+        off = 0
+    }
+    << rt_load(p + off, 8)
+}
+
+fn host_fd_timeo_store(fd int, events int, ms int) {
+    p := host_fd_timeo_ptr(fd, true)
+    if p != 0 {
+        $off := 8
+        if (events & 1) != 0 {
+            off = 0
+        }
+        rt_store(p + off, 8, host_fd_timeo_enc(ms))
+    }
+}
+
 // Return the socket timeout in milliseconds, or -1 for a blocking wait.
 // Files and pipes have no socket timeout.
 fn host_sock_timeout_ms(fd int, events int) int {
     if host_win() && !win_is_sock(fd) {
         << -1
     }
+    cached := host_fd_timeo_get(fd, events)
+    if cached != 0 {
+        if cached == 1 {
+            << -1
+        }
+        << cached - 1
+    }
     opt := host_sock_timeout_option(events)
-    value := alloc(16)
+    $tsv := HostTimespec{sec: 0, nsec: 0}
+    value := rt_addr($&tsv)
     $length := 16
     $r := 0
     if host_win() {
@@ -114,8 +209,10 @@ fn host_sock_timeout_ms(fd int, events int) int {
             usec := rt_load(value + 8, 4)
             ms = min_int(sec, POLL_TIMEOUT_MAX_MS / 1000 + 1) * 1000 + (usec + 999) / 1000
         }
+        host_fd_timeo_store(fd, events, ms)
+    } else if !host_win() && r == 0 - host_nr(38, 88) {
+        host_fd_timeo_set_both(fd, -1)
     }
-    free(value)
     if ms <= 0 {
         << -1
     }
@@ -150,7 +247,11 @@ pub fn host_socket(okp int, domain int, typ int, proto int) int {
     if host_win() {
         << host_sock_ok(okp, "socket", win_socket(domain, typ, proto))
     }
-    << host_sock_ok(okp, "socket", rt_syscall(host_nr(97, 198), domain, typ, proto, 0, 0, 0))
+    r := rt_syscall(host_nr(97, 198), domain, typ, proto, 0, 0, 0)
+    if r >= 0 {
+        host_fd_timeo_set_both(r, -1)
+    }
+    << host_sock_ok(okp, "socket", r)
 }
 
 // SO_REUSEADDR, then bind.
@@ -172,6 +273,7 @@ pub fn host_connect4(okp int, fd int, a int, b int, c int, d int, port int) int 
     sa := host_sa_in4(a, b, c, d, port)
     r := host_sock_connect(fd, sa, 16)
     free(sa)
+    if r == 0 { task_io_progress() }
     << host_sock_ok(okp, "connect", r)
 }
 
@@ -192,6 +294,7 @@ pub fn host_connect6(okp int, fd int, ip int, port int) int {
     sa := host_sa_in6(ip, port)
     r := host_sock_connect(fd, sa, 28)
     free(sa)
+    if r == 0 { task_io_progress() }
     << host_sock_ok(okp, "connect", r)
 }
 
@@ -225,6 +328,7 @@ pub fn host_connect_unix(okp int, fd int, path int) int {
     sa := host_sa_unix(path)
     r := host_sock_connect(fd, sa, 3 + desc_len(path))
     free(sa)
+    if r == 0 { task_io_progress() }
     << host_sock_ok(okp, "connect", r)
 }
 
@@ -241,36 +345,84 @@ pub fn host_accept(okp int, fd int) int {
         << host_sock_ok(okp, "accept", ready)
     }
     if host_win() {
-        << host_sock_ok(okp, "accept", win_accept(fd))
+        r := win_accept(fd)
+        if r >= 0 { task_io_progress() }
+        << host_sock_ok(okp, "accept", r)
     }
     while true {
         r := rt_syscall(host_nr(30, 202), fd, 0, 0, 0, 0, 0)
         if r != 0 - EINTR {
+            if r >= 0 {
+                if !host_linux() {
+                    host_fd_timeo_set_both(r, -1)
+                } else {
+                    sp := host_fd_timeo_ptr(fd, false)
+                    dp := host_fd_timeo_ptr(r, true)
+                    if sp != 0 && dp != 0 {
+                        rt_store(dp, 8, rt_load(sp, 8))
+                        rt_store(dp + 8, 8, rt_load(sp + 8, 8))
+                    } else {
+                        host_fd_timeo_clear(r)
+                    }
+                }
+                task_io_progress()
+            }
             << host_sock_ok(okp, "accept", r)
         }
     }
     << 0
 }
 
-// addr = 4 IPv4 bytes then the big-endian port.
+// addr = 4 IPv4 bytes + BE port (6), tagged IPv4 (7), 16 IPv6 bytes + BE port (18), or tagged IPv6 (19).
 pub fn host_sendto(okp int, fd int, addr int, data int) int {
-    if desc_len(addr) != 6 {
+    n := desc_len(addr)
+    ap := desc_ptr(addr)
+    $sa := 0
+    $salen := 0
+    if n == 6 {
+        port := (rt_load(ap + 4, 1) << 8) | rt_load(ap + 5, 1)
+        sa = host_sa_in4(rt_load(ap, 1), rt_load(ap + 1, 1), rt_load(ap + 2, 1), rt_load(ap + 3, 1), port)
+        salen = 16
+    } else if n == 7 && rt_load(ap, 1) == 4 {
+        port := (rt_load(ap + 1, 1) << 8) | rt_load(ap + 2, 1)
+        sa = host_sa_in4(rt_load(ap + 3, 1), rt_load(ap + 4, 1), rt_load(ap + 5, 1), rt_load(ap + 6, 1), port)
+        salen = 16
+    } else if n == 18 {
+        port := (rt_load(ap + 16, 1) << 8) | rt_load(ap + 17, 1)
+        sa = alloc(32)
+        $af6 := host_nr(30, 10)
+        if host_win() { af6 = 23 }
+        host_sa_head(sa, 28, af6)
+        rt_store(sa + 2, 1, (port >> 8) & 255)
+        rt_store(sa + 3, 1, port & 255)
+        mem_copy(sa + 8, ap, 16)
+        salen = 28
+    } else if n == 19 && rt_load(ap, 1) == 6 {
+        port := (rt_load(ap + 1, 1) << 8) | rt_load(ap + 2, 1)
+        sa = alloc(32)
+        $af6 := host_nr(30, 10)
+        if host_win() { af6 = 23 }
+        host_sa_head(sa, 28, af6)
+        rt_store(sa + 2, 1, (port >> 8) & 255)
+        rt_store(sa + 3, 1, port & 255)
+        mem_copy(sa + 8, ap + 3, 16)
+        salen = 28
+    } else {
         << host_err_msg("sendto: invalid address")
     }
-    ap := desc_ptr(addr)
-    port := (rt_load(ap + 4, 1) << 8) | rt_load(ap + 5, 1)
-    sa := host_sa_in4(rt_load(ap, 1), rt_load(ap + 1, 1), rt_load(ap + 2, 1), rt_load(ap + 3, 1), port)
     $r := 0
     if host_win() {
-        r = win_sendto(fd, desc_ptr(data), desc_len(data), sa, 16)
+        r = win_sendto(fd, desc_ptr(data), desc_len(data), sa, salen)
     } else {
-        r = rt_syscall(host_nr(133, 206), fd, desc_ptr(data), desc_len(data), 0, sa, 16)
+        r = rt_syscall(host_nr(133, 206), fd, desc_ptr(data), desc_len(data), 0, sa, salen)
     }
     free(sa)
     << host_sock_ok(okp, "sendto", r)
 }
 
-// Result = 4 IPv4 bytes, big-endian port, payload.
+// Result = tagged datagram packet:
+// Tag 4: 1-byte tag (4), 2-byte BE port, 4-byte IPv4, payload. Total header = 7.
+// Tag 6: 1-byte tag (6), 2-byte BE port, 16-byte IPv6, payload. Total header = 19.
 pub fn host_recvfrom(out int, fd int, max int) int {
     set_desc(out, 0, 0, 0)
     if max <= 0 || max > 9223372036854775807 - 16406 {
@@ -280,29 +432,56 @@ pub fn host_recvfrom(out int, fd int, max int) int {
     if ready < 0 {
         << host_err("recvfrom", 0, 0 - ready)
     }
-    buf := alloc(max + 6)
-    sa := alloc(32)
+    tmp := alloc(max)
+    sa := alloc(128)
     lenp := alloc(16)
-    rt_store(lenp, 4, 16)
+    rt_store(lenp, 4, 128)
     $r := 0
     if host_win() {
-        r = win_recvfrom(fd, buf + 6, max, sa, lenp)
+        r = win_recvfrom(fd, tmp, max, sa, lenp)
     } else {
-        r = rt_syscall(host_nr(29, 207), fd, buf + 6, max, 0, sa, lenp)
+        r = rt_syscall(host_nr(29, 207), fd, tmp, max, 0, sa, lenp)
     }
     free(lenp)
     if r < 0 {
         free(sa)
-        free(buf)
+        free(tmp)
         << host_err("recvfrom", 0, 0 - r)
     }
-    for i in 0:4 {
-        rt_store(buf + i, 1, rt_load(sa + 4 + i, 1))
+    fam := host_sa_family(sa)
+    $af6 := host_nr(30, 10)
+    if host_win() {
+        af6 = 23
     }
-    rt_store(buf + 4, 1, rt_load(sa + 2, 1))
-    rt_store(buf + 5, 1, rt_load(sa + 3, 1))
+    if fam == af6 {
+        hdr_len := 19
+        buf := alloc(hdr_len + r)
+        rt_store(buf, 1, 6)
+        rt_store(buf + 1, 1, rt_load(sa + 2, 1))
+        rt_store(buf + 2, 1, rt_load(sa + 3, 1))
+        mem_copy(buf + 3, sa + 8, 16)
+        if r > 0 {
+            mem_copy(buf + hdr_len, tmp, r)
+        }
+        free(sa)
+        free(tmp)
+        set_desc(out, buf, hdr_len + r, hdr_len + r)
+        << 0
+    }
+    hdr_len := 7
+    buf := alloc(hdr_len + r)
+    rt_store(buf, 1, 4)
+    rt_store(buf + 1, 1, rt_load(sa + 2, 1))
+    rt_store(buf + 2, 1, rt_load(sa + 3, 1))
+    for i in 0:4 {
+        rt_store(buf + 3 + i, 1, rt_load(sa + 4 + i, 1))
+    }
+    if r > 0 {
+        mem_copy(buf + hdr_len, tmp, r)
+    }
     free(sa)
-    set_desc(out, buf, r + 6, max + 6)
+    free(tmp)
+    set_desc(out, buf, hdr_len + r, hdr_len + r)
     << 0
 }
 
@@ -316,31 +495,46 @@ pub fn host_setsockopt_timeo(okp int, fd int, ns int) int {
         }
         w1 := win_sock_setopt(fd, 65535, host_sock_timeout_option(4), ms, 4)
         if w1 < 0 {
+            free(ms)
             << host_err("setsockopt", 0, 0 - w1)
         }
-        << host_sock_ok(okp, "setsockopt", win_sock_setopt(fd, 65535, host_sock_timeout_option(1), ms, 4))
+        w2 := win_sock_setopt(fd, 65535, host_sock_timeout_option(1), ms, 4)
+        free(ms)
+        << host_sock_ok(okp, "setsockopt", w2)
     }
-    tv := alloc(16)
+    $tsv := HostTimespec{sec: 0, nsec: 0}
+    tv := rt_addr($&tsv)
+    $ms := -1
     if ns > 0 {
         $us := ns / 1000
         if us < 1 {
             us = 1
         }
-        rt_store(tv, 8, us / 1000000)
-        rt_store(tv + 8, 8, us % 1000000)
+        sec := us / 1000000
+        usec := us % 1000000
+        rt_store(tv, 8, sec)
+        rt_store(tv + 8, 8, usec)
+        ms = min_int(sec, POLL_TIMEOUT_MAX_MS / 1000 + 1) * 1000 + (usec + 999) / 1000
     }
     level := host_nr(65535, 1)
     r1 := host_sock_setopt(fd, level, host_sock_timeout_option(4), tv, 16)
     if r1 < 0 {
-        free(tv)
+        host_fd_timeo_clear(fd)
         << host_err("setsockopt", 0, 0 - r1)
     }
     r2 := host_sock_setopt(fd, level, host_sock_timeout_option(1), tv, 16)
-    free(tv)
+    if r2 < 0 {
+        host_fd_timeo_clear(fd)
+    } else {
+        host_fd_timeo_set_both(fd, ms)
+    }
     << host_sock_ok(okp, "setsockopt", r2)
 }
 
 pub fn host_setsockopt(okp int, fd int, level int, opt int, value int) int {
+    if level == host_nr(65535, 1) && (opt == host_sock_timeout_option(1) || opt == host_sock_timeout_option(4)) {
+        host_fd_timeo_clear(fd)
+    }
     r := host_sock_setopt(fd, level, opt, desc_ptr(value), desc_len(value))
     << host_sock_ok(okp, "setsockopt", r)
 }
@@ -365,29 +559,7 @@ pub fn host_socket_poll(okp int, fd int, events int) int {
     << host_ok(okp, ready)
 }
 
-// events: read 1, write 2. ok = mask of read 1, write 2, error 4, hangup 8.
-// timeout_ns: 0 waits forever, negative polls once.
-pub fn host_socket_wait(okp int, fd int, events int, timeout_ns int) int {
-    if host_win() && !win_is_sock(fd) {
-        << host_err("poll", 0, EBADF)
-    }
-    $pev := 0
-    if (events & 1) != 0 {
-        pev = pev | 1
-    }
-    if (events & 2) != 0 {
-        pev = pev | 4
-    }
-    $ms := -1
-    if timeout_ns < 0 {
-        ms = 0
-    } else if timeout_ns > 0 {
-        ms = (timeout_ns + 999999) / 1000000
-    }
-    r := host_poll_task(fd, pev, ms)
-    if r < 0 {
-        << host_err("poll", 0, 0 - r)
-    }
+fn socket_wait_ready_bits(r int) int {
     $mask := 0
     if (r & 1) != 0 {
         mask = mask | 1
@@ -401,5 +573,109 @@ pub fn host_socket_wait(okp int, fd int, events int, timeout_ns int) int {
     if (r & 16) != 0 {
         mask = mask | 8
     }
-    << host_ok(okp, mask)
+    << mask
+}
+
+// events: read 1, write 2. ok = mask of read 1, write 2, error 4, hangup 8.
+// timeout_ns: 0 waits forever, negative polls once.
+pub fn host_socket_wait(okp int, fd int, events int, timeout_ns int) int {
+    if host_win() && !win_is_sock(fd) {
+        << host_err("poll", 0, EBADF)
+    }
+    pev := (events & 1) | ((events & 2) << 1)
+    $ms := -1
+    if timeout_ns < 0 {
+        ms = 0
+    } else if timeout_ns > 0 {
+        ms = (timeout_ns + 999999) / 1000000
+    }
+    r := host_poll_task(fd, pev, ms)
+    if r < 0 {
+        << host_err("poll", 0, 0 - r)
+    }
+    << host_ok(okp, socket_wait_ready_bits(r))
+}
+
+fn host_sock_addr(out int, op string, fd int, is_peer bool) int {
+    set_desc(out, 0, 0, 0)
+    sa := alloc(128)
+    lenp := alloc(16)
+    rt_store(lenp, 4, 128)
+    $r := 0
+    if host_win() {
+        if is_peer {
+            r = win_getpeername(fd, sa, lenp)
+        } else {
+            r = win_getsockname(fd, sa, lenp)
+        }
+    } else {
+        if is_peer {
+            r = rt_syscall(host_nr(31, 205), fd, sa, lenp, 0, 0, 0)
+        } else {
+            r = rt_syscall(host_nr(32, 204), fd, sa, lenp, 0, 0, 0)
+        }
+    }
+    if r < 0 {
+        free(sa)
+        free(lenp)
+        << host_err(op, 0, 0 - r)
+    }
+    free(lenp)
+    fam := host_sa_family(sa)
+    $af6 := host_nr(30, 10)
+    if host_win() {
+        af6 = 23
+    }
+    if fam == 2 {
+        buf := alloc(7)
+        rt_store(buf, 1, 4)
+        rt_store(buf + 1, 1, rt_load(sa + 2, 1))
+        rt_store(buf + 2, 1, rt_load(sa + 3, 1))
+        mem_copy(buf + 3, sa + 4, 4)
+        free(sa)
+        set_desc(out, buf, 7, 7)
+        << 0
+    }
+    if fam == af6 {
+        buf := alloc(19)
+        rt_store(buf, 1, 6)
+        rt_store(buf + 1, 1, rt_load(sa + 2, 1))
+        rt_store(buf + 2, 1, rt_load(sa + 3, 1))
+        mem_copy(buf + 3, sa + 8, 16)
+        free(sa)
+        set_desc(out, buf, 19, 19)
+        << 0
+    }
+    if fam == 1 {
+        $path_len := 0
+        while path_len < 104 && rt_load(sa + 2 + path_len, 1) != 0 {
+            path_len += 1
+        }
+        buf := alloc(1 + path_len)
+        rt_store(buf, 1, 1)
+        if path_len > 0 {
+            mem_copy(buf + 1, sa + 2, path_len)
+        }
+        free(sa)
+        set_desc(out, buf, 1 + path_len, 1 + path_len)
+        << 0
+    }
+    free(sa)
+    << host_err_msg("net: unknown address family")
+}
+
+pub fn host_getsockname(out int, fd int) int {
+    << host_sock_addr(out, "getsockname", fd, false)
+}
+
+pub fn host_getpeername(out int, fd int) int {
+    << host_sock_addr(out, "getpeername", fd, true)
+}
+
+pub fn host_shutdown(okp int, fd int, how int) int {
+    if host_win() {
+        << host_sock_ok(okp, "shutdown", win_shutdown(fd, how))
+    }
+    r := rt_syscall(host_nr(134, 210), fd, how, 0, 0, 0, 0)
+    << host_sock_ok(okp, "shutdown", r)
 }

@@ -6,6 +6,26 @@
 
 ---
 
+## Xu 0.13.1
+
+- Standard Library Hardening & Full Zero-Stub Implementation:
+  - `compress/zstd`: Corrects frame header content size encoding and parsing; enforces complete last block verification with truncated input protection; cross-verified with `bsdtar` libzstd 1.5.7.
+  - `sync.Cond`: Re-engineers notification semantics on registered waiter queues, ensuring exact 1-waiter signaling, full broadcast waking without waiter limits (verified with 4097 coroutines), and zero unobserved notification leakage.
+  - `os/exec`: Implements cross-platform streaming pipes (`stdin_pipe`, `stdout_pipe`, `stderr_pipe`) with Windows handle inheritance and descriptor recycling on startup failure.
+  - `os/signal`: Implements real OS console signal trapping and dispatching (Windows SRWLock+Event and Unix signal hooks) with channel ownership preservation on invalid input.
+  - `net/http`: Adds HTTPS connection pooling and reuse by host/SNI and TLS config, idle connection pruning on `Connection: close`, explicit `close_idle_connections()`, and safe idempotent retries.
+  - `net/poller`: Bridges `Poller` onto `EventSet` persistence; implements native Windows `WSAPoll` batch socket polling for zero-latency wakeups.
+  - `net/http2`: Adds RFC 7541 HPACK Huffman decoding (`decode_huffman`) for response status and header parsing.
+  - `net`: Implements real `SOCK_RAW` IP socket support (`dial_ip`, `listen_ip`, `listen_packet`) for IPv4/IPv6 and protocol dispatch.
+  - `crypto/cipher` & `encoding/json`: Adds AES-CFB and AES-OFB streaming cipher modes; expands JSON parsing capacity to 64 MiB with `parse_max`.
+  - `time`: Adds cross-platform external IANA TZif database loading via `$env:ZONEINFO` with builtin Windows fallback.
+- WebAssembly & Phone Game Linking:
+  - Export top-level functions to WebAssembly with `--wasm-export`.
+  - Added native archive and C bridge linking for ARM64 iOS and Android app objects.
+- Runtime & Concurrency:
+  - Guarded task stack cache, optimized `strings.Reader` borrow, and bridged hosted socket wrappers for published seeds.
+- Upgrade the compiler, standard library and SDK tools together.
+
 ## Xu 0.12.6
 
 - Complete C FFI & `xu cbind`: Adds full object/app/native linking across ARM64, x64, RISC-V, and LoongArch backends, C unions and bitfields, `extern` globals, C closure callbacks, FFI diagnostics, and `xu cbind` C header generation with layout assertions.

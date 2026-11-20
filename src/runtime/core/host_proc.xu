@@ -311,7 +311,12 @@ fn host_sleep_os(ns int) {
         <<
     }
     if host_win() {
-        win_sleep(ns)
+        if gword(G_SIGNAL_EVENT) != 0 {
+            // WaitForSingleObject reserves the largest DWORD for INFINITE.
+            rt_signal_poll(min_int((ns - 1) / 1000000 + 1, 4294967294))
+        } else {
+            win_sleep(ns)
+        }
         <<
     }
     $tv := HostTimespec{sec: 0, nsec: 0}
@@ -340,6 +345,9 @@ fn host_sleep_os(ns int) {
 
 // Waits up to ns for cancellation of done: a buffered value or close.
 pub fn host_wait_cancel(done int, ns int) bool {
+    if ns <= 0 {
+        << done != 0 && chan_ready(done)
+    }
     << host_wait_until(done, host_now_ns() + ns)
 }
 
@@ -364,7 +372,220 @@ fn host_execve(path int, argv int) {
     rt_syscall(host_nr(59, 221), path, argv, gword(G_ENVP), 0, 0, 0)
 }
 
+fn signal_get_state() int {
+    $st := gword(G_SIGNAL_STATE)
+    if st != 0 {
+        << st
+    }
+    st = alloc(512)
+    rt_store(st, 8, 16)
+    rt_store(st + 8, 8, 0)
+    rt_store(st + 16, 8, 0)
+    set_gword(G_SIGNAL_STATE, st)
+    << st
+}
+
+fn signal_update_os_hook() {
+    if !host_win() { << }
+    st := gword(G_SIGNAL_STATE)
+    if st == 0 { << }
+    $interest := rt_load(st + 16, 8)
+    count := rt_load(st + 8, 8)
+    for i in 0:count {
+        entry := st + 24 + i * 24
+        if rt_load(entry + 16, 8) != 0 && rt_load(rt_load(entry, 8) + C_CLOSED, 8) == 0 {
+            sig := rt_load(entry + 8, 8)
+            if sig == 0 {
+                interest = -1
+                <-
+            }
+            interest = interest | (1 << sig)
+        }
+    }
+    win_signal_configure(interest)
+}
+
+pub fn rt_signal_notify(c chan int, sig int) {
+    ch := rt_load(rt_addr(&c), 8)
+    if ch == 0 {
+        <<
+    }
+    st := signal_get_state()
+    count := rt_load(st + 8, 8)
+    cap := rt_load(st, 8)
+    $found := -1
+    $free_idx := -1
+    for i in 0:count {
+        entry := st + 24 + i * 24
+        ech := rt_load(entry, 8)
+        esig := rt_load(entry + 8, 8)
+        act := rt_load(entry + 16, 8)
+        if ech == ch && esig == sig {
+            found = i
+            ->
+        }
+        if act == 0 && free_idx < 0 {
+            free_idx = i
+        }
+    }
+    if found >= 0 {
+        entry := st + 24 + found * 24
+        if rt_load(entry + 16, 8) == 0 {
+            rt_store(entry + 16, 8, 1)
+            chan_retain(ch)
+        }
+        signal_update_os_hook()
+        <<
+    }
+    if free_idx >= 0 {
+        entry := st + 24 + free_idx * 24
+        rt_store(entry, 8, ch)
+        rt_store(entry + 8, 8, sig)
+        rt_store(entry + 16, 8, 1)
+        chan_retain(ch)
+        signal_update_os_hook()
+        <<
+    }
+    if count < cap {
+        entry := st + 24 + count * 24
+        rt_store(entry, 8, ch)
+        rt_store(entry + 8, 8, sig)
+        rt_store(entry + 16, 8, 1)
+        rt_store(st + 8, 8, count + 1)
+        chan_retain(ch)
+        signal_update_os_hook()
+        <<
+    }
+}
+
+pub fn rt_signal_stop(c chan int) {
+    ch := rt_load(rt_addr(&c), 8)
+    if ch == 0 {
+        <<
+    }
+    st := gword(G_SIGNAL_STATE)
+    if st == 0 {
+        <<
+    }
+    count := rt_load(st + 8, 8)
+    for i in 0:count {
+        entry := st + 24 + i * 24
+        if rt_load(entry, 8) == ch && rt_load(entry + 16, 8) != 0 {
+            rt_store(entry + 16, 8, 0)
+            rt_store(entry, 8, 0)
+            if chan_release(ch) != 0 {
+                // Signal channels carry ints, which need no element drops.
+                chan_free(ch)
+            }
+        }
+    }
+    signal_update_os_hook()
+}
+
+pub fn rt_signal_ignore(sig int) {
+    if sig < 0 || sig > 31 {
+        <<
+    }
+    st := signal_get_state()
+    ignored := rt_load(st + 16, 8)
+    rt_store(st + 16, 8, ignored | (1 << sig))
+    signal_update_os_hook()
+}
+
+pub fn rt_signal_dispatch(sig int) bool {
+    st := gword(G_SIGNAL_STATE)
+    if st == 0 {
+        << false
+    }
+    ignored := rt_load(st + 16, 8)
+    if (ignored & (1 << sig)) != 0 {
+        << true
+    }
+    $delivered := false
+    count := rt_load(st + 8, 8)
+    for i in 0:count {
+        entry := st + 24 + i * 24
+        if rt_load(entry + 16, 8) != 0 {
+            esig := rt_load(entry + 8, 8)
+            if esig == 0 || esig == sig {
+                ch := rt_load(entry, 8)
+                if rt_load(ch + C_CLOSED, 8) == 0 {
+                    $v := sig
+                    chan_try_send(ch, rt_addr(&v), 8)
+                    delivered = true
+                }
+            }
+        }
+    }
+    << delivered
+}
+
+pub fn rt_signal_has_waiters() bool {
+    if !host_win() || gword(G_SIGNAL_EVENT) == 0 {
+        << false
+    }
+    st := gword(G_SIGNAL_STATE)
+    if st == 0 {
+        << false
+    }
+    count := rt_load(st + 8, 8)
+    for i in 0:count {
+        entry := st + 24 + i * 24
+        if rt_load(entry + 16, 8) != 0 && rt_load(rt_load(entry, 8) + C_CLOSED, 8) == 0 {
+            << true
+        }
+    }
+    << false
+}
+
+fn rt_signal_poll(wait_ms int) bool {
+    if !host_win() { << false }
+    pending := win_signal_pending(wait_ms)
+    if pending == 0 { << false }
+    for sig in 1:32 {
+        if (pending & (1 << sig)) != 0 {
+            rt_signal_dispatch(sig)
+        }
+    }
+    << true
+}
+
 fn host_kill(pid int, sig int) int {
+    if host_win() {
+        if pid == 0 || pid == host_pid() {
+            if rt_signal_dispatch(sig) {
+                << 0
+            }
+            if sig == 9 || sig == 15 || sig == 2 {
+                exit_process(128 + sig)
+            }
+            << 0
+        }
+        if sig == 9 {
+            open_fn := win_fn(WF_OPEN_PROCESS, "kernel32.dll", "OpenProcess")
+            if open_fn != 0 {
+                hp := win_callp(open_fn, 1, 0, pid, 0, 0, 0)
+                if hp != 0 {
+                    win_call(W_TERMINATE_PROCESS, hp, 1, 0, 0, 0, 0)
+                    win_close(hp)
+                    << 0
+                }
+            }
+            << -3
+        }
+        if sig == 2 || sig == 3 {
+            gen_fn := win_fn(WF_GENERATE_CONSOLE_CTRL_EVENT, "kernel32.dll", "GenerateConsoleCtrlEvent")
+            if gen_fn != 0 {
+                $ev := 1
+                if sig == 2 {
+                    ev = 0
+                }
+                win_callp(gen_fn, ev, pid, 0, 0, 0, 0)
+                << 0
+            }
+        }
+        << 0
+    }
     << rt_syscall(host_nr(37, 129), pid, sig, 0, 0, 0, 0)
 }
 
@@ -383,7 +604,7 @@ fn host_wait4(pid int, st int, options int) int {
 // os_system(cmd): wait(2) status of `/bin/sh -c cmd`.
 pub fn host_system(cmd int) int {
     if host_win() {
-        << win_exec(0, host_cstr(cmd), 0, -1, -1, 0, false, false, 0)
+        << win_exec(0, host_cstr(cmd), 0, -1, -1, -1, 0, false, false, 0)
     }
     $sh := "/bin/sh"
     $dash := "-c"
@@ -475,6 +696,7 @@ fn host_exec_run(path int, pathz int, blob int, bz int, redir int, has_deadline 
     }
     $out_fd := -1
     $in_fd := -1
+    $err_fd := -1
     $file := 0
     $both := false
     rl := desc_len(redir)
@@ -488,9 +710,29 @@ fn host_exec_run(path int, pathz int, blob int, bz int, redir int, has_deadline 
             if rl >= 17 {
                 in_fd = host_le64(rp + 9)
             }
+            if rl >= 25 {
+                err_fd = host_le64(rp + 17)
+            }
         } else if tag == 3 {
             if rl >= 9 {
                 in_fd = host_le64(rp + 1)
+            }
+            if rl >= 17 {
+                err_fd = host_le64(rp + 9)
+            }
+        } else if tag == 4 {
+            if rl >= 9 {
+                out_fd = host_le64(rp + 1)
+            }
+            if rl >= 17 {
+                in_fd = host_le64(rp + 9)
+            }
+            if rl >= 25 {
+                err_fd = host_le64(rp + 17)
+            }
+        } else if tag == 5 {
+            if rl >= 9 {
+                err_fd = host_le64(rp + 1)
             }
         } else {
             $fp := rp
@@ -507,18 +749,28 @@ fn host_exec_run(path int, pathz int, blob int, bz int, redir int, has_deadline 
         }
     }
     if host_win() {
+        free(argv)
         // The bytes after dir NUL are one command line.
         $cmd := 0
+        $cmd_owned := false
         if start < bl {
             cmd = bz + start
         } else if rt_load(pathz, 1) != 0 {
             cmd = host_cstr(path)
+            cmd_owned = true
         }
         $app := 0
         if rt_load(pathz, 1) != 0 {
             app = pathz
         }
-        << win_exec(app, cmd, dir, out_fd, in_fd, file, both, has_deadline, deadline)
+        res := win_exec(app, cmd, dir, out_fd, in_fd, err_fd, file, both, has_deadline, deadline)
+        if cmd_owned {
+            free(cmd)
+        }
+        if file != 0 {
+            free(file)
+        }
+        << res
     }
     pid := host_fork()
     if pid == 0 {
@@ -543,6 +795,10 @@ fn host_exec_run(path int, pathz int, blob int, bz int, redir int, has_deadline 
             }
             host_close(fd)
         }
+        if err_fd >= 0 {
+            host_dup2(err_fd, 2)
+            host_close(err_fd)
+        }
         host_execve(pathz, argv)
         exit_process(127)
     }
@@ -556,6 +812,9 @@ fn host_exec_run(path int, pathz int, blob int, bz int, redir int, has_deadline 
     }
     if in_fd >= 0 {
         host_close(in_fd)
+    }
+    if err_fd >= 0 {
+        host_close(err_fd)
     }
     if pid < 0 {
         << -3

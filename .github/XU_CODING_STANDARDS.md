@@ -42,7 +42,7 @@ cmp path/to/file.xu /tmp/xu-file-formatted.xu
 | XU-NAME-04 | 对外可见性显式使用 `pub`；类型名首字母大写不表示导出。只开放实际契约需要的声明与字段。 |
 | XU-NAME-05 | 不遮蔽被调用的内建入口、包别名或重要类型；包装函数须确认调用的是底层实现，避免同名递归。 |
 
-命名规则由 `src/xu/types/check_00_names.xu` 及门禁脚本 `scripts/check_const_casing.py` 实施；单个前导 `_` 和弃值 `_` 按语言实际规则使用。`__` 等内部保留标识不作为用户代码规避命名检查的手段。
+命名规则由 `src/xu/checker/names.xu` 及门禁脚本 `scripts/check_const_casing.py` 实施；单个前导 `_` 和弃值 `_` 按语言实际规则使用。`__` 等内部保留标识不作为用户代码规避命名检查的手段。
 
 名称说明角色、单位或边界，例如 `timeout_ms`、`body_len`、`read_count`。局部循环中的 `i`、`j`，编译器惯用的 AST/MIR 标识可以保留；跨较长作用域时使用更具体的名称。不要在同一接口中混用含义不同的 `size`、`len` 和 `cap`。
 

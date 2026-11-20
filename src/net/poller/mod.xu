@@ -5,13 +5,13 @@
 #net/stream
 #os
 #time
+core #runtime/core
 
 // Connection registry for long-lived peers (gateway / 5k sessions).
 //
-// Readiness is delegated to the hosted runtime. Linux uses an epoll
-// registration, Darwin uses kqueue, and Windows uses an IOCP completion
-// request. The low-level primitive is one-shot, so this registry keeps the
-// stable ids and performs the fd-to-id mapping here.
+// Linux and Darwin use a persistent EventSet. Windows batches the socket
+// probes. Event tokens identify registrations independently of reused
+// descriptors and slots.
 
 pub const EVENT_READ = 1
 pub const EVENT_WRITE = 2
@@ -23,92 +23,195 @@ pub struct Event {
     pub events int
 }
 
+struct PollSlot {
+    id int
+    interest int
+    conn stream.Stream
+    next_free int
+}
+
+fn vacant_slot(next_free int) PollSlot {
+    << PollSlot{id: 0, interest: 0, conn: stream.from_tcp(net.closed_conn()), next_free: next_free}
+}
+
 pub struct Poller {
-    ids []int
-    streams []stream.Stream
-    live []int
+    slots []PollSlot
+    indices map[int]int
+    free_head int
+    active int
     next_id int
+    es EventSet
 }
 
 // new creates an empty registry.
 pub fn new() Poller {
-    << Poller{ids: []int{}, streams: []stream.Stream{}, live: []int{}, next_id: 1}
+    $p := Poller{slots: []PollSlot{}, indices: map[int]int{}, free_head: -1, active: 0, next_id: 1, es: EventSet{handle: -1}}
+    if event_set_supported() {
+        es := new_event_set() or (err) { << p }
+        p.es = es
+    }
+    << p
 }
 
 fn find(p $&Poller, id int) int {
-    n := p.ids.len
-    $i := 0
-    while i < n {
-        if p.live[i] == 1 {
-            if p.ids[i] == id {
-                << i
-            }
-        }
-        i = i + 1
-    }
-    << -1
+    << p.indices.get_or(id, -1)
 }
 
-// add registers a stream. Returns a stable id (>0).
+// add registers a stream with default EVENT_READ interest. Returns a stable id (>0).
 pub fn (p $&Poller) add(s stream.Stream) int {
+    << p.add_interest(s, EVENT_READ)
+}
+
+// add_interest registers a stream with the specified event interest mask.
+pub fn (p $&Poller) add_interest(s stream.Stream, interest int) int {
     id := p.next_id
     p.next_id = p.next_id + 1
-    p.ids.push(id)
-    p.streams.push(s)
-    p.live.push(1)
+    $idx := p.free_head
+    if idx < 0 {
+        idx = p.slots.len
+        p.slots.push(vacant_slot(-1))
+    } else {
+        p.free_head = p.slots[idx].next_free
+    }
+    p.slots[idx] = PollSlot{id: id, interest: interest, conn: s, next_free: -1}
+    indices := $&p.indices
+    indices[id] = idx
+    p.active += 1
+    if p.es.handle >= 0 {
+        fd := p.slots[idx].conn.fd() or (err) {
+            << id
+        }
+        es := $&p.es
+        es.watch(fd, id, interest) or (err) {
+            << id
+        }
+    }
     << id
 }
 
-// remove drops id. Returns true if it existed.
-pub fn (p $&Poller) remove(id int) bool {
+// set_interest modifies event interest for an already registered stream.
+pub fn (p $&Poller) set_interest(id int, interest int) bool {
     idx := find(p, id)
     if idx < 0 {
         << false
     }
-    p.live[idx] = 0
+    p.slots[idx].interest = interest
+    if p.es.handle >= 0 {
+        fd := p.slots[idx].conn.fd() or (err) {
+            << true
+        }
+        es := $&p.es
+        es.modify(fd, id, interest) or (err) {
+            << true
+        }
+    }
     << true
 }
 
-pub fn (p Poller) count() int {
-    $n := 0
-    $i := 0
-    while i < p.live.len {
-        if p.live[i] == 1 {
-            n = n + 1
-        }
-        i = i + 1
-    }
-    << n
+fn (p $&Poller) unwatch(idx int) {
+    if p.es.handle < 0 { << }
+    fd := p.slots[idx].conn.fd() or (err) { << }
+    es := $&p.es
+    es.remove(fd) or (err) { << }
 }
 
-// wait returns the descriptors that became ready. A timeout of zero blocks;
-// a positive timeout is in nanoseconds. After the first descriptor has been
-// checked, subsequent one-shot waits are non-blocking so a ready set cannot
-// multiply the caller's deadline by the number of registered streams.
-pub fn (p $&Poller) wait(timeout_ns int) []Event {
+fn (p $&Poller) recycle(id int, idx int) {
+    indices := $&p.indices
+    indices.delete(id)
+    p.slots[idx] = vacant_slot(p.free_head)
+    p.free_head = idx
+    p.active -= 1
+}
+
+// remove drops the registration and its owned stream. Returns true if the
+// id existed. Use close_id to observe an OS close error.
+pub fn (p $&Poller) remove(id int) bool {
+    << p.close_id(id) or (err) { << true }
+}
+
+pub fn (p Poller) count() int {
+    << p.active
+}
+
+fn (p &Poller) wait_windows(timeout_ns int) []Event {
+    $watches := []core.WinSocketWatch{}
+    for i in 0:p.slots.len {
+        id := p.slots[i].id
+        if id == 0 { -> }
+        fd := p.slots[i].conn.fd() or (err) { -> }
+        watches.push(core.WinSocketWatch{fd: fd, interest: p.slots[i].interest, token: id, ready: 0})
+    }
+    if core.win_wait_sockets($&watches, timeout_ns) <= 0 {
+        << []Event{}
+    }
     $out := []Event{}
-    $first := true
-    $i := 0
-    while i < p.live.len {
-        if p.live[i] == 1 {
-            fd := p.streams[i].fd() or (err) {
-                i = i + 1
-                <-
-            }
-            $wait_ns := -1
-            if first {
-                wait_ns = timeout_ns
-                first = false
-            }
-            ready := os.socket_wait(fd, EVENT_READ | EVENT_WRITE, wait_ns) or (err) {
-                i = i + 1
-                <-
-            }
-            if ready != 0 {
-                out.push(Event{id: p.ids[i], events: ready})
+    for watch in watches {
+        if watch.ready != 0 {
+            out.push(Event{id: watch.token, events: watch.ready})
+        }
+    }
+    << out
+}
+
+// wait returns the descriptors that became ready. An empty registry returns
+// immediately. With registered streams, zero blocks and a positive timeout
+// is in nanoseconds.
+pub fn (p $&Poller) wait(timeout_ns int) []Event {
+    if p.count() == 0 {
+        << []Event{}
+    }
+    if xu_target_os() == 2 {
+        << p.wait_windows(timeout_ns)
+    }
+    if p.es.handle >= 0 {
+        es := $&p.es
+        events := es.wait(timeout_ns) or (err) {
+            << []Event{}
+        }
+        $out := []Event{}
+        for i in 0:events.len {
+            ev := events[i]
+            if find(p, ev.id) >= 0 {
+                out.push(ev)
             }
         }
-        i = i + 1
+        << out
+    }
+    $out := []Event{}
+    $deadline := 0
+    if timeout_ns > 0 {
+        deadline = time.now() + timeout_ns
+    }
+    while true {
+        $i := 0
+        while i < p.slots.len {
+            id := p.slots[i].id
+            if id != 0 {
+                fd := p.slots[i].conn.fd() or (err) {
+                    i = i + 1
+                    <-
+                }
+                interest := p.slots[i].interest
+                ready := os.socket_wait(fd, interest, -1) or (err) {
+                    i = i + 1
+                    <-
+                }
+                if ready != 0 {
+                    out.push(Event{id: id, events: ready})
+                }
+            }
+            i = i + 1
+        }
+        if out.len > 0 {
+            << out
+        }
+        if timeout_ns < 0 {
+            << out
+        }
+        if timeout_ns > 0 && time.now() >= deadline {
+            << out
+        }
+        time.sleep(1000000)
     }
     << out
 }
@@ -125,10 +228,10 @@ pub fn (p $&Poller) read_timeout(id int, max int, timeout_ns int) string {
         << ""
     }
     if timeout_ns > 0 {
-        s := $&p.streams[idx]
+        s := $&p.slots[idx].conn
         s.set_read_deadline(time.now() + timeout_ns)
     }
-    s2 := $&p.streams[idx]
+    s2 := $&p.slots[idx].conn
     out := s2.read(max) or (err) {
         if timeout_ns > 0 {
             s2.set_read_deadline(0)
@@ -147,7 +250,7 @@ pub fn (p $&Poller) write_all(id int, data &string) int {
     if idx < 0 {
         << -1
     }
-    s := $&p.streams[idx]
+    s := $&p.slots[idx].conn
     << s.write(data) or >>
 }
 
@@ -157,8 +260,12 @@ pub fn (p $&Poller) close_id(id int) bool {
     if idx < 0 {
         << false
     }
-    s := $&p.streams[idx]
-    s.close() or >>
-    p.live[idx] = 0
+    p.unwatch(idx)
+    s := $&p.slots[idx].conn
+    s.close() or (err) {
+        p.recycle(id, idx)
+        >> err
+    }
+    p.recycle(id, idx)
     << true
 }
