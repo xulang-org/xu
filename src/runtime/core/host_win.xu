@@ -836,10 +836,9 @@ fn win_closesocket(fd int) int {
     << win_sock_r(win_callp(win_ws(WF_CLOSESOCKET, "closesocket"), fd - WIN_SOCK_TAG, 0, 0, 0, 0, 0))
 }
 
-// poll(2) result bits (read 1, write 4, error 8, hang-up 16) from WSAPoll.
-fn win_sock_poll(fd int, events int, timeout_ms int) int {
-    pfd := alloc(16)
-    rt_store(pfd, 8, fd - WIN_SOCK_TAG)
+const WIN_POLLFD_SIZE = 16
+
+fn win_poll_flags(events int) int {
     $ev := 0
     if (events & 1) != 0 {
         // POLLRDNORM
@@ -849,13 +848,11 @@ fn win_sock_poll(fd int, events int, timeout_ms int) int {
         // POLLWRNORM
         ev = ev | 16
     }
-    rt_store(pfd + 8, 2, ev)
-    r := win_sock_r(win_callp(win_ws(WF_WSA_POLL, "WSAPoll"), pfd, 1, timeout_ms, 0, 0, 0))
-    re := rt_load(pfd + 10, 2)
-    free(pfd)
-    if r < 0 {
-        << r
-    }
+    << ev
+}
+
+// poll(2) result bits (read 1, write 4, error 8, hang-up 16) from WSAPoll.
+fn win_poll_result(re int, events int) int {
     $out := 0
     if (re & 768) != 0 {
         out = out | 1
@@ -873,6 +870,95 @@ fn win_sock_poll(fd int, events int, timeout_ms int) int {
         out = out | 16 | (events & 1)
     }
     << out
+}
+
+fn win_sock_poll(fd int, events int, timeout_ms int) int {
+    pfd := alloc(WIN_POLLFD_SIZE)
+    rt_store(pfd, 8, fd - WIN_SOCK_TAG)
+    rt_store(pfd + 8, 2, win_poll_flags(events))
+    r := win_sock_r(win_callp(win_ws(WF_WSA_POLL, "WSAPoll"), pfd, 1, timeout_ms, 0, 0, 0))
+    re := rt_load(pfd + 10, 2)
+    free(pfd)
+    if r < 0 { << r }
+    << win_poll_result(re, events)
+}
+
+pub struct WinSocketWatch {
+    pub fd int
+    pub interest int
+    pub token int
+    pub ready int
+}
+
+// The native array lives for the whole wait, including cooperative yields.
+// Only block in Winsock if there is no other Xu task or signal waiter.
+fn win_wait_poll_batch(fp int, pfd int, count int, timeout_ns int) int {
+    started := host_now_ns()
+    $remaining := timeout_ns
+    while true {
+        $ms := 0
+        if timeout_ns >= 0 && !task_others() && !rt_signal_has_waiters() {
+            if timeout_ns == 0 {
+                ms = -1
+            } else if remaining > 0 {
+                ms = min_int((remaining - 1) / 1000000 + 1, 2147483647)
+            }
+        }
+        r := win_sock_r(win_callp(fp, pfd, count, ms, 0, 0, 0))
+        if r != 0 || timeout_ns < 0 { << r }
+        if timeout_ns > 0 {
+            remaining = timeout_ns - (host_now_ns() - started)
+            if remaining <= 0 { << 0 }
+        }
+        if ms == 0 {
+            $pause := 1000000
+            if timeout_ns > 0 { pause = min_int(pause, remaining) }
+            host_sleep_ns(pause)
+            if timeout_ns > 0 { remaining = timeout_ns - (host_now_ns() - started) }
+        }
+    }
+    << 0
+}
+
+// The caller owns the sockets during the wait. Uses the same interest and
+// readiness bits as host_socket_wait. Negative results are -errno.
+pub fn win_wait_sockets(watches $&[]WinSocketWatch, timeout_ns int) int {
+    if !host_win() || watches.len == 0 { << 0 }
+    n := watches.len
+    if n > 4294967295 { << -22 } // ULONG nfds
+    fp := win_ws(WF_WSA_POLL, "WSAPoll")
+    if fp == 0 { << -38 }
+    pfd := alloc(n * WIN_POLLFD_SIZE)
+    $valid := false
+    for i in 0:n {
+        fd := watches[i].fd
+        at := pfd + i * WIN_POLLFD_SIZE
+        watches[i].ready = 0
+        if win_is_sock(fd) {
+            valid = true
+            interest := watches[i].interest
+            events := (interest & 1) | ((interest & 2) << 1)
+            rt_store(at, 8, fd - WIN_SOCK_TAG)
+            rt_store(at + 8, 2, win_poll_flags(events))
+        } else {
+            rt_store(at, 8, -1)
+        }
+    }
+    if !valid {
+        free(pfd)
+        << 0
+    }
+    r := win_wait_poll_batch(fp, pfd, n, timeout_ns)
+    if r > 0 {
+        task_io_progress()
+        for i in 0:n {
+            re := rt_load(pfd + i * WIN_POLLFD_SIZE + 10, 2)
+            mask := win_poll_result(re, watches[i].interest & 1)
+            if mask > 0 { watches[i].ready = socket_wait_ready_bits(mask) }
+        }
+    }
+    free(pfd)
+    << r
 }
 
 // HandlerRoutine runs on a Windows thread. Use its own stack for arguments
