@@ -985,6 +985,52 @@ fn main() int {
         debug_free=True,
     ),
     PosCase(
+        name="Runtime_debug_free_enable_after_cached_disabled",
+        code="""@main
+core #runtime/core
+
+fn main() int {
+    first := core.alloc(24)
+    core.free(first)
+    recycled := core.alloc(24)
+    if recycled != first {
+        core.free(recycled)
+        << 1
+    }
+
+    core.debug_free_enable()
+    core.free(recycled)
+    next := core.alloc(24)
+    if next == recycled {
+        core.free(next)
+        << 2
+    }
+    core.free(next)
+    println("debug free prevented reuse")
+    << 0
+}
+""",
+        expect_stdout="debug free prevented reuse\n",
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
+        name="Runtime_free_rejects_duplicate_release",
+        code="""@main
+core #runtime/core
+
+fn main() {
+    block := core.alloc(24)
+    core.free(block)
+    core.free(block)
+}
+""",
+        expect_trap=True,
+        expect_trap_substrings=("double free?",),
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
         name="H15_map_delete_and_take_stress",
         code="""@main
 struct Guard { id int }
