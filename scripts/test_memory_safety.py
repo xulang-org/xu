@@ -1251,6 +1251,7 @@ fn main() {
 }
 """,
         expect_stdout="drop:42\ndone\ndrop:43\n",
+        test_no_opt=True,
     ),
     PosCase(
         name="LowerErr_iface_field_cast_and_or",
