@@ -941,6 +941,50 @@ fn main() {
         expect_stdout="hello:Hello\n",
     ),
     PosCase(
+        name="Split_short_string_copy_survives_element_and_array_drop",
+        code="""@main
+#strings
+
+fn copy_and_replace(src &string) string {
+    $parts := strings.split(src, "|")
+    $piece := parts[1]
+    parts[1] = "replacement"
+    piece[0] = 90
+    << piece
+}
+
+fn copy_and_join(src &string) string {
+    parts := strings.split(src, "|")
+    piece := parts[1]
+    joined := strings.join(parts, "|")
+    if joined != *src { << "" }
+    << piece
+}
+
+fn main() int {
+    for n in 31:66 {
+        body := strings.repeat(&"a", n)
+        original := "|" + body + "|"
+        replaced := copy_and_replace(&original)
+        if replaced.len != n || replaced[0] != 90 || original[1] != 97 { << 1 }
+        for i in 1:n {
+            if replaced[i] != 97 { << 2 }
+        }
+        retained := copy_and_join(&original)
+        if retained.len != n { << 3 }
+        for i in 0:n {
+            if retained[i] != 97 { << 4 }
+        }
+    }
+    println("split copies survived")
+    << 0
+}
+""",
+        expect_stdout="split copies survived\n",
+        test_no_opt=True,
+        debug_free=True,
+    ),
+    PosCase(
         name="H15_map_delete_and_take_stress",
         code="""@main
 struct Guard { id int }
