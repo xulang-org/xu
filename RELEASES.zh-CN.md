@@ -6,10 +6,25 @@
 
 ---
 
-## Xu 0.12.7-dev.11（开发版）
+## Xu 0.13.1
 
-- WebAssembly 宿主可以调用 `xu build app.xu --target wasm32-wasi --wasm-export step -o app.wasm` 导出的 Xu 函数。重复传入 `--wasm-export` 可导出多个函数。导出项必须是 `@main` 中无抛错、非泛型的顶层函数，参数与返回值均为 `int`。宿主 ABI 使用 `i32`，实参按有符号值扩展为 Xu `int`，返回值取低 32 位。
-- ARM64 Phone game 构建在 iOS 和 Android 的应用对象中支持原生导入。生成工程包含平台链接所需的原生归档和 C 桥接源码。编译器、标准库、`xu-native` 和 `xu-phone` 使用同一套 SDK。
+- 标准库全面加固与零桩审计（全量达成）：
+  - `compress/zstd`：修正帧头长度编码与末块校验，拦截截断帧，并通过 `bsdtar` 外部参考实现交叉验证。
+  - `sync.Cond`：重构登记队列精确唤醒机制，实现单通知精准唤醒与广播全量唤醒（覆盖 4097 协程边界），消除无等待者时的通知滞留。
+  - `os/exec`：实现 Windows 与 Unix 跨平台标准流双向管道（`stdin_pipe`、`stdout_pipe`、`stderr_pipe`）与启动失败句柄回收。
+  - `os/signal`：接入真实系统信号投递（Windows SRWLock+Event 及控制台信号），无效参数严格校验且保留通道所有权。
+  - `net/http`：支持 HTTPS 连接复用、TLS 配置隔离、`Connection: close` 自动淘汰、`close_idle_connections` 连接池管理与幂等重试。
+  - `net/poller`：兼容入口复用持久化 `EventSet` 后端，Windows 原生接入 `WSAPoll` 批量就绪检测，实现零延迟就绪分发。
+  - `net/http2`：增加 RFC 7541 规范的 HPACK 哈夫曼解码器（`decode_huffman`），支持各大标准 HTTP/2 服务端响应头解析。
+  - `net`：实现 real `SOCK_RAW` 原始套接字创建（`dial_ip`、`listen_ip`、`listen_packet`）与协议分发。
+  - `crypto/cipher` 与 `encoding/json`：扩充 AES-CFB 与 AES-OFB 流密码加解密模式；JSON 缓冲区上限提升至 64 MiB 并支持 `parse_max` 动态容量。
+  - `time`：消除 Windows 硬编码绕过，支持通过 `$env:ZONEINFO` 加载外部 IANA TZif 时区数据。
+- WebAssembly 与移动端支持：
+  - 支持通过 `--wasm-export` 向 WebAssembly 宿主导出顶层函数。
+  - ARM64 移动端游戏构建在 iOS 与 Android 应用对象中支持原生导入与 C 桥接链接。
+- 运行时与并发优化：
+  - 协程栈保护页缓存加固、`strings.Reader` 借用优化，以及已发布种子的宿主套接字桥接。
+- 升级时请一起更新编译器、标准库和 SDK 工具。
 
 ## Xu 0.12.6
 
