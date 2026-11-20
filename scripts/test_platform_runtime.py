@@ -244,6 +244,19 @@ fn check_short_string_copies() bool {
             if piece[i] != src[i + 1] { << false }
         }
     }
+    $binary := make_string(67)
+    for i in 0:binary.len { binary[i] = (i + 255) & 255 }
+    for n in 31:66 {
+        piece := binary[1:n + 1]
+        if piece.len != n { << false }
+        joined := strings.join(["start", piece, "end"], "|")
+        if joined.len != n + 10 || !strings.has_prefix(&joined, "start|") || !strings.has_suffix(&joined, "|end") {
+            << false
+        }
+        for i in 0:n {
+            if joined[i + 6] != i { << false }
+        }
+    }
     << true
 }
 
