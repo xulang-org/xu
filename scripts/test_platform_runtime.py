@@ -15,6 +15,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+from threading import Timer
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = tuple(f"{os_name}-{arch}" for os_name in ("linux", "macos", "windows") for arch in ("x64", "arm64"))
@@ -947,6 +948,167 @@ def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected:
         raise RuntimeError(f"{command}: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}")
 
 
+WINDOWS_MEMORY = r'''@main
+#net
+#net/poller
+#net/stream
+fn checkpoint(label string) {
+    println(label)
+    os_fd_read(0, 1) or (err) { <<< 1 }
+}
+fn empty_lengths(s string) int {
+    joined := s + s
+    bytes := s.bytes()
+    runes := s.runes()
+    src := [1, 2, 3]
+    empty := src[1:1]
+    << joined.len + bytes.len + runes.len + empty.len
+}
+fn worker(start chan int, done chan int) {
+    _ := <-start
+    done <- 1
+}
+fn wave(inspect bool) int {
+    start := chan int{cap: 0}
+    done := chan int{cap: 32}
+    for i in 0:32 { xu worker(start, done) }
+    if inspect { checkpoint("active") }
+    close(start)
+    $sum := 0
+    for i in 0:32 { sum += <-done }
+    << sum
+}
+fn churn(p $&poller.Poller, n int) {
+    for i in 0:n {
+        id := p.add(stream.from_tcp(net.closed_conn()))
+        if !p.remove(id) { <<< 5 }
+    }
+}
+fn main() {
+    checkpoint("start")
+    empty := ""
+    $sum := 0
+    for i in 0:200000 { sum += empty_lengths(empty) }
+    if sum != 0 { <<< 2 }
+    checkpoint("empty")
+    if wave(true) != 32 { <<< 3 }
+    checkpoint("idle")
+    if wave(false) != 32 { <<< 4 }
+    checkpoint("idle again")
+    $p := poller.new()
+    churn($&p, 1024)
+    checkpoint("poller warm")
+    churn($&p, 65536)
+    checkpoint("poller churn")
+    if p.count() != 0 { <<< 6 }
+}
+'''
+
+
+def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("page_faults", wintypes.DWORD),
+            ("working_set_and_pool", ctypes.c_size_t * 8),
+            ("private_usage", ctypes.c_size_t),
+        ]
+
+    class MemoryRegion(ctypes.Structure):
+        _fields_ = [
+            ("base", ctypes.c_void_p),
+            ("allocation", ctypes.c_void_p),
+            ("allocation_protect", wintypes.DWORD),
+            ("partition_id", wintypes.WORD),
+            ("size", ctypes.c_size_t),
+            ("state", wintypes.DWORD),
+            ("protect", wintypes.DWORD),
+            ("type", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_memory = kernel32.K32GetProcessMemoryInfo
+    get_memory.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
+    query = kernel32.VirtualQueryEx
+    query.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(MemoryRegion), ctypes.c_size_t]
+    query.restype = ctypes.c_size_t
+
+    def guarded_stacks(handle: int) -> set[int]:
+        stack_size = 1024**2
+        guard_size = 16 * 1024
+        mem_reserve, mem_commit, page_readwrite = 0x2000, 0x1000, 4
+        stacks = set()
+        guard = None
+        address = 0
+        region = MemoryRegion()
+        while query(handle, address, ctypes.byref(region), ctypes.sizeof(region)):
+            base = region.base or 0
+            # A Xu stack is a reserved guard followed by writable pages in
+            # the same allocation.
+            if guard is not None and guard == region.allocation and base == guard + guard_size:
+                if region.state == mem_commit and region.protect == page_readwrite and region.size == stack_size - guard_size:
+                    stacks.add(guard)
+            guard = None
+            if region.state == mem_reserve and region.size == guard_size and base == region.allocation:
+                guard = base
+            address = base + region.size
+        return stacks
+
+    with subprocess.Popen(
+        [str(binary)], cwd=work, env=env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ) as child:
+        # Each marker holds the process at a known point until we sample it.
+        timer = Timer(20, child.kill)
+        timer.start()
+        try:
+            usage: dict[bytes, int] = {}
+            stacks: dict[bytes, set[int]] = {}
+            handle = int(child._handle)
+            for marker in (
+                b"start\n", b"empty\n", b"active\n", b"idle\n", b"idle again\n",
+                b"poller warm\n", b"poller churn\n",
+            ):
+                line = child.stdout.readline()
+                if line != marker:
+                    raise AssertionError(f"expected {marker!r}, got {line!r}")
+                counters = MemoryCounters()
+                counters.size = ctypes.sizeof(counters)
+                if not get_memory(handle, ctypes.byref(counters), counters.size):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                usage[marker] = counters.private_usage
+                stacks[marker] = guarded_stacks(handle)
+                child.stdin.write(b"x")
+                child.stdin.flush()
+            out, err = child.communicate(timeout=10)
+            if child.returncode != 0 or out or err:
+                raise AssertionError(f"memory workload exited {child.returncode}: {out!r} {err!r}")
+        finally:
+            timer.cancel()
+            if child.poll() is None:
+                child.kill()
+
+    start_bytes, empty_bytes, idle_bytes = usage[b"start\n"], usage[b"empty\n"], usage[b"idle\n"]
+    if empty_bytes - start_bytes > 12 * 1024**2 or idle_bytes - empty_bytes > 16 * 1024**2:
+        raise AssertionError(
+            f"excess private commit growth: start={start_bytes}, empty={empty_bytes}, idle={idle_bytes}"
+        )
+    baseline = stacks[b"start\n"]
+    active = stacks[b"active\n"] - baseline
+    idle = stacks[b"idle\n"] - baseline
+    idle_again = stacks[b"idle again\n"] - baseline
+    if len(active) != 32 or len(idle) != 8 or not idle <= active or len(idle_again) != 8:
+        raise AssertionError(
+            f"unexpected guarded stack counts: active={len(active)}, idle={len(idle)}, idle again={len(idle_again)}"
+        )
+    poller_growth = usage[b"poller churn\n"] - usage[b"poller warm\n"]
+    if poller_growth > 4 * 1024**2:
+        raise AssertionError(f"Poller grew by {poller_growth} private bytes after warm-up")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
@@ -979,6 +1141,9 @@ def main() -> int:
         run("optimized_code/no-opt", build("unoptimized_code", OPTIMIZED_CODE, "--no-opt"),
             expected="optimized code passed")
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
+        if os.name == "nt":
+            check_windows_memory(build("memory", WINDOWS_MEMORY), work, env)
+            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/{args.target} (executed)", flush=True)
         run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")
