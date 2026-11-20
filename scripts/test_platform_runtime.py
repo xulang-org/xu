@@ -15,6 +15,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+from threading import Timer
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = tuple(f"{os_name}-{arch}" for os_name in ("linux", "macos", "windows") for arch in ("x64", "arm64"))
@@ -921,6 +922,90 @@ def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected:
         raise RuntimeError(f"{command}: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}")
 
 
+WINDOWS_MEMORY = r'''@main
+fn checkpoint(label string) {
+    println(label)
+    os_fd_read(0, 1) or (err) { <<< 1 }
+}
+fn empty_lengths(s string) int {
+    joined := s + s
+    bytes := s.bytes()
+    runes := s.runes()
+    src := [1, 2, 3]
+    empty := src[1:1]
+    << joined.len + bytes.len + runes.len + empty.len
+}
+fn worker(done chan int) { done <- 1 }
+fn wave() int {
+    done := chan int{cap: 32}
+    for i in 0:32 { xu worker(done) }
+    $sum := 0
+    for i in 0:32 { sum += <-done }
+    << sum
+}
+fn main() {
+    checkpoint("start")
+    empty := ""
+    $sum := 0
+    for i in 0:200000 { sum += empty_lengths(empty) }
+    if sum != 0 { <<< 2 }
+    checkpoint("empty")
+    if wave() != 32 { <<< 3 }
+    checkpoint("idle")
+    if wave() != 32 { <<< 4 }
+}
+'''
+
+
+def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("page_faults", wintypes.DWORD),
+            ("working_set_and_pool", ctypes.c_size_t * 8),
+            ("private_usage", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_memory = kernel32.K32GetProcessMemoryInfo
+    get_memory.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
+
+    with subprocess.Popen(
+        [str(binary)], cwd=work, env=env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ) as child:
+        # Each marker holds the process at a known point until we sample it.
+        timer = Timer(20, child.kill)
+        timer.start()
+        try:
+            usage = []
+            for marker in (b"start\n", b"empty\n", b"idle\n"):
+                line = child.stdout.readline()
+                if line != marker:
+                    raise AssertionError(f"expected {marker!r}, got {line!r}")
+                counters = MemoryCounters()
+                counters.size = ctypes.sizeof(counters)
+                if not get_memory(int(child._handle), ctypes.byref(counters), counters.size):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                usage.append(counters.private_usage)
+                child.stdin.write(b"x")
+                child.stdin.flush()
+            out, err = child.communicate(timeout=10)
+            if child.returncode != 0 or out or err:
+                raise AssertionError(f"memory workload exited {child.returncode}: {out!r} {err!r}")
+        finally:
+            timer.cancel()
+            if child.poll() is None:
+                child.kill()
+
+    start, empty, idle = usage
+    if empty - start > 12 * 1024**2 or idle - empty > 16 * 1024**2:
+        raise AssertionError(f"excess private commit growth: start={start}, empty={empty}, idle={idle}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
@@ -953,6 +1038,9 @@ def main() -> int:
         run("optimized_code/no-opt", build("unoptimized_code", OPTIMIZED_CODE, "--no-opt"),
             expected="optimized code passed")
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
+        if os.name == "nt":
+            check_windows_memory(build("memory", WINDOWS_MEMORY), work, env)
+            print(f"PASS empty_allocations/task_stack_cache/{args.target} (executed)", flush=True)
         run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")

@@ -20,10 +20,11 @@ Step-by-step verification for os/signal:
 """
 
 import os
+import queue
 import sys
 import subprocess
 import tempfile
-import time
+import threading
 
 XU_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 COMPILER = os.path.join(XU_ROOT, "bin", "xu.exe" if os.name == "nt" else "xu")
@@ -35,7 +36,7 @@ def run(cmd, env=None, check=True):
     e["XU_ROOT"] = XU_ROOT
     if env:
         e.update(env)
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, timeout=90)
     if check and p.returncode != 0:
         print("COMMAND FAILED:", cmd)
         print("STDOUT:", p.stdout)
@@ -177,59 +178,83 @@ pub fn main() {
             os.remove(tmp.name)
 
 def test_child_signal_process():
-    print("Testing child process real signal handling...")
+    if os.name != "nt":
+        print("Skipping console signal delivery outside Windows")
+        return
+    print("Testing Windows console signal delivery...")
     child_src = """@main
 
 signal #os/signal
 
 pub fn main() {
-    c := chan int{cap: 10}
-    signal.notify(c, signal.SIGINT) or (err) {
+    c := chan int{cap: 2}
+    signal.notify(c, signal.SIGQUIT) or (err) {
         eprintln("notify failed")
         <<< 1
     }
     println("READY")
 
-    $sig := 0
+    println(<-c)
+    // Wait through another scheduler poll to catch duplicate delivery.
+    sleep_ns(70000000)
     select {
-        val := <-c {
-            sig = val
+        duplicate := <-c {
+            eprintln("duplicate: " + str(duplicate))
+            <<< 2
         }
+        else { println("single delivery") }
     }
-    println("RECEIVED:" + str(sig))
+    signal.stop(c)
 }
 """
-    tmp_child = tempfile.NamedTemporaryFile(suffix=".xu", delete=False)
-    tmp_child.write(child_src.encode("utf-8"))
-    tmp_child.close()
-    child_exe = tmp_child.name.replace(".xu", ".exe" if os.name == "nt" else "")
-
-    try:
-        run([COMPILER, "build", tmp_child.name, "-o", child_exe])
-        env = os.environ.copy()
-        env["XU_STDLIB_ROOT"] = STDLIB_SRC
-        env["XU_ROOT"] = XU_ROOT
-
-        p = subprocess.Popen(
-            [child_exe],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+    with tempfile.TemporaryDirectory(prefix="xu-console-signal-") as work:
+        source = os.path.join(work, "main.xu")
+        child_exe = os.path.join(work, "child.exe")
+        with open(source, "w", encoding="utf-8") as f:
+            f.write(child_src)
+        run([COMPILER, "build", source, "-o", child_exe])
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = subprocess.SW_HIDE
+        result = subprocess.run(
+            [sys.executable, __file__, "--console-driver", child_exe],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            startupinfo=startup,
+            timeout=30,
+            capture_output=True,
             text=True,
-            env=env
         )
-        ready_line = p.stdout.readline().strip()
-        assert ready_line == "READY", f"Expected READY, got {ready_line}"
-        print("Child is READY and waiting on signal channel.")
+        if result.returncode != 0:
+            raise RuntimeError(f"console driver failed:\n{result.stdout}{result.stderr}")
+    print("OK: CTRL_BREAK was delivered once")
 
-        time.sleep(0.1)
-        p.terminate()
-        p.wait(timeout=5)
-        print("OK: child process handled cleanly")
-    finally:
-        if os.path.exists(tmp_child.name):
-            os.remove(tmp_child.name)
-        if os.path.exists(child_exe):
-            os.remove(child_exe)
+
+def run_console_driver(child_exe):
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Only the child process group receives CTRL_BREAK in this console.
+    with subprocess.Popen(
+        [child_exe],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    ) as child:
+        try:
+            ready = queue.Queue()
+            threading.Thread(target=lambda: ready.put(child.stdout.readline()), daemon=True).start()
+            line = ready.get(timeout=10)
+            if line.strip() != "READY":
+                raise RuntimeError(f"expected READY, got {line!r}")
+            if not kernel32.GenerateConsoleCtrlEvent(1, child.pid):
+                raise ctypes.WinError(ctypes.get_last_error())
+            out, err = child.communicate(timeout=10)
+            if child.returncode != 0 or out.splitlines() != ["3", "single delivery"]:
+                raise RuntimeError(f"child exit={child.returncode}, stdout={out!r}, stderr={err!r}")
+        finally:
+            if child.poll() is None:
+                child.kill()
 
 def main():
     test_unit_semantics()
@@ -237,4 +262,7 @@ def main():
     print("SUCCESS: os/signal fully verified!")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--console-driver":
+        run_console_driver(sys.argv[2])
+    else:
+        main()
