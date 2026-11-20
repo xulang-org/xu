@@ -413,23 +413,36 @@ fn check_loop_carry_cases() bool {
 
 fn check_map_int_cases() bool {
     $m := map[int]int{}
+    edge_keys := [0, -1, -9223372036854775807 - 1, 9223372036854775807]
+    for i in 0:edge_keys.len {
+        m[edge_keys[i]] = 1000 + i
+    }
     for i in 0:256 {
         m[i * 3 + 1] = i * 7 + 2
     }
-    if m.len() != 256 { << false }
+    if m.len() != 260 { << false }
     for i in 0:160 {
         m.delete(i * 3 + 1)
     }
-    if m.len() != 96 { << false }
+    if m.len() != 100 { << false }
     // Reuse tombstones and grow across threshold while overwriting existing entries.
     for i in 0:200 {
         key := 10000 + i
         m[key] = i + 50
         m[key] = m[key] + 10
     }
-    if m.len() != 296 { << false }
+    if m.len() != 300 { << false }
     if m.has(1) || !m.has(160 * 3 + 1) || m[160 * 3 + 1] != 160 * 7 + 2 { << false }
     if m[10199] != 259 { << false }
+    for i in 0:edge_keys.len {
+        if m[edge_keys[i]] != 1000 + i { << false }
+    }
+    $seen := 0
+    for key, value in m {
+        if !m.has(key) || m[key] != value { << false }
+        seen += 1
+    }
+    if seen != m.len() { << false }
     $sm := map[string]int{}
     for i in 0:64 {
         k := "k-" + str(i)
