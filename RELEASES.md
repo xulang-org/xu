@@ -6,6 +6,11 @@
 
 ---
 
+## Xu 0.12.7-dev.1 (development)
+
+- WebAssembly hosts can call Xu functions exported with `xu build app.xu --target wasm32-wasi --wasm-export step -o app.wasm`. Repeat `--wasm-export` for each additional function. An export must be a non-throwing, non-generic top-level function in `@main` with only `int` parameters and an `int` result. The host ABI uses `i32` for each argument and the result. Arguments are sign-extended to Xu `int`, and the return value is truncated to the low 32 bits.
+- ARM64 Phone game builds support native imports in the generated app object for iOS and Android. The generated project carries the native archives and C bridge sources for platform linking. Build with the compiler, standard library, `xu-native`, and `xu-phone` from the same SDK.
+
 ## Xu 0.12.6
 
 - Complete C FFI & `xu cbind`: Adds full object/app/native linking across ARM64, x64, RISC-V, and LoongArch backends, C unions and bitfields, `extern` globals, C closure callbacks, FFI diagnostics, and `xu cbind` C header generation with layout assertions.
