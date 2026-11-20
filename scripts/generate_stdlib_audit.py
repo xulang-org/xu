@@ -94,7 +94,8 @@ def build_report() -> str:
                       for line in path.read_text(encoding="utf-8").splitlines())
         platform = pkg["status"]["platform"]
         measured = sum(v != "not-measured" for t, v in platform.items() if t != "macos-arm64")
-        lines.append(f"| {source_link('src/'+pkg['package']+'/mod.xu')} | {pkg['public_symbol_count']} | "
+        mod_target = "mod.xu" if (directory / "mod.xu").is_file() else sorted(p.name for p in directory.glob("*.xu"))[0]
+        lines.append(f"| {source_link('src/'+pkg['package']+'/'+mod_target)} | {pkg['public_symbol_count']} | "
                      f"{len(pkg['fixtures'])} | {markers} | {pkg['status']['semantic']} | {platform['macos-arm64']} | {measured} |")
     lines.extend(["", "## 重放", "", "```sh",
                   "python3 scripts/generate_stdlib_matrix.py",
