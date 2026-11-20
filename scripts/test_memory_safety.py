@@ -1071,6 +1071,44 @@ fn main() int {
         debug_free=False,
     ),
     PosCase(
+        name="Push_byte_releases_small_blocks_at_terminator_boundary",
+        code="""@main
+core #runtime/core
+
+fn main() int {
+    first := core.alloc(16)
+    second := core.alloc(16)
+    core.free(second)
+    core.free(first)
+
+    $text := ""
+    for i in 0:16 { text.push_byte(256 + i) }
+    // A 16-byte string needs room for its terminator. Both original
+    // 16-byte blocks must be reusable while the completed text is live.
+    reused_first := core.alloc(16)
+    reused_second := core.alloc(16)
+    core.free(reused_second)
+    core.free(reused_first)
+    if !((reused_first == first && reused_second == second) ||
+         (reused_first == second && reused_second == first)) { << 1 }
+
+    text.push_str("!")
+    if text.len != 17 || text[16] != 33 { << 2 }
+    prefix := text[0:16]
+    text.push_str(prefix)
+    if text.len != 33 || text[16] != 33 { << 3 }
+    for i in 0:16 {
+        if text[i] != i || text[17 + i] != i { << 4 }
+    }
+    println("push_byte preserved the payload and spare byte")
+    << 0
+}
+""",
+        expect_stdout="push_byte preserved the payload and spare byte\n",
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
         name="H15_map_delete_and_take_stress",
         code="""@main
 struct Guard { id int }
