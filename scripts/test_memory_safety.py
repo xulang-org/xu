@@ -1031,6 +1031,46 @@ fn main() {
         debug_free=False,
     ),
     PosCase(
+        name="Empty_concat_preserves_free_block_and_copy_ownership",
+        code="""@main
+core #runtime/core
+#strings
+
+fn concatenate(a &string, b &string) string {
+    << *a + *b
+}
+
+fn main() int {
+    empty := ""
+    saved := core.alloc(16)
+    core.free(saved)
+    result := concatenate(&empty, &empty)
+    reused := core.alloc(16)
+    core.free(reused)
+    if result.len != 0 { << 1 }
+    if saved != reused { << 2 }
+
+    sizes := [1, 15, 16, 31, 32, 63, 64, 20001]
+    for i in 0:sizes.len {
+        n := sizes[i]
+        source := strings.repeat(&"a", n)
+        $left := concatenate(&source, &empty)
+        $right := concatenate(&empty, &source)
+        if left != source || right != source { << 3 }
+        left[0] = 98
+        if source[0] != 97 || right[0] != 97 { << 4 }
+        right[n - 1] = 99
+        if source[n - 1] != 97 || left[0] != 98 { << 5 }
+    }
+    println("empty concat preserved ownership")
+    << 0
+}
+""",
+        expect_stdout="empty concat preserved ownership\n",
+        test_no_opt=True,
+        debug_free=False,
+    ),
+    PosCase(
         name="H15_map_delete_and_take_stress",
         code="""@main
 struct Guard { id int }
