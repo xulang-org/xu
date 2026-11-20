@@ -166,13 +166,13 @@ def main() -> int:
         static_file = Path(td) / "static_test.txt"
         static_file.write_text("Hello, this is static content for HTTP concurrency and caching test! 1234567890\n", encoding="utf-8")
         src.write_text(CONCURRENCY_TEST_XU, encoding="utf-8")
-        
+
         cmd_build = [str(COMPILER), "build", str(src), "--target", "windows-arm64", "-o", str(exe)]
         res_build = subprocess.run(cmd_build, env=env, capture_output=True, text=True)
         if res_build.returncode != 0:
             print(f"BUILD FAILED:\n{res_build.stderr}\n{res_build.stdout}")
             return 1
-        
+
         res_run = subprocess.run([str(exe)], env=env, cwd=str(td), capture_output=True, text=True, timeout=30)
         if res_run.returncode != 0 or "http concurrency test passed" not in res_run.stdout:
             print(f"RUN FAILED (exit {res_run.returncode}):\n{res_run.stdout}\n{res_run.stderr}")
