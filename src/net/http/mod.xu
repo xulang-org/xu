@@ -8,7 +8,7 @@
 // Server: Request.read + write / FileServer / Context handler.
 // There is no ServeMux value in this version; route dispatch is supplied by
 // the caller's handler function.
-// Client keep-alive reuses one idle HTTP (not HTTPS) connection per Client.
+// Client keep-alive reuses one idle HTTP or HTTPS connection per Client.
 // No HTTP/2.
 
 #net
@@ -587,7 +587,7 @@ struct MsgBuf {
     data string
     fd int
     tls_h int
-    tls_conn tls.Conn
+    tls_chan chan tls.Conn
     deadline_ns int
     max_bytes int
     progress DownloadProgress
@@ -601,8 +601,12 @@ fn (b &MsgBuf) message_limit() int {
 fn (b $&MsgBuf) read_more() int {
     $chunk := ""
     if b.tls_h != 0 {
-        t := $&b.tls_conn
-        chunk = t.read(READ_CHUNK_BYTES) or >>
+        $tc := <-b.tls_chan
+        chunk = tc.read(READ_CHUNK_BYTES) or (err) {
+            b.tls_chan <- tc
+            >> err
+        }
+        b.tls_chan <- tc
     } else {
         if b.deadline_ns > 0 {
             apply_http_deadline(b.fd, b.deadline_ns) or >>
@@ -797,7 +801,7 @@ fn read_http_message_buf(b $&MsgBuf, until_close bool) string {
 // Requests without Content-Length / chunked encoding have an empty body
 // (RFC 7230) and must not block waiting for the client to close.
 fn read_http_message_mode(fd int, until_close bool, tls_h int) string {
-    $b := MsgBuf{data: "", fd: fd, tls_h: tls_h, tls_conn: tls.closed_conn(), deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
+    $b := MsgBuf{data: "", fd: fd, tls_h: tls_h, tls_chan: chan tls.Conn{cap: 1}, deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
     << read_http_message_buf($&b, until_close) or (err) {
         << ""
     }
@@ -916,12 +920,16 @@ fn exchange_deadline_limit(https bool, addr string, sni string, req string, dead
             http_remaining(deadline_ns) or >>
             >> err
         }
-        $b := MsgBuf{data: "", fd: -1, tls_h: 1, tls_conn: tc, deadline_ns: deadline_ns, max_bytes: max_bytes, progress: download_progress(report)}
+        $ch := chan tls.Conn{cap: 1}
+        ch <- tc
+        $b := MsgBuf{data: "", fd: -1, tls_h: 1, tls_chan: ch, deadline_ns: deadline_ns, max_bytes: max_bytes, progress: download_progress(report)}
         msg := read_http_message_buf($&b, true) or (err) {
+            $t := <-ch
+            _ := t.close()
             http_remaining(deadline_ns) or >>
             >> err
         }
-        t := $&b.tls_conn
+        $t := <-ch
         t.close() or (err) {
             http_remaining(deadline_ns) or >>
             << msg + ""
@@ -945,8 +953,94 @@ fn (c $&Client) close_idle() {
         fd := c.idle_fd
         c.idle_fd = -1
         c.idle_buf = ""
+        c.idle_addr = ""
+        c.idle_https = 0
         net.conn_close(fd) or (err) { << }
     }
+    c.idle_buf = ""
+    c.idle_addr = ""
+    c.idle_sni = ""
+    c.idle_https = 0
+    select {
+        tc := <-c.idle_tls {
+            $t := tc
+            t.close() or (err) { << }
+        }
+        else {
+            <<
+        }
+    }
+}
+
+fn (c $&Client) exchange_https(addr string, sni string, req string, deadline_ns int, retry_safe bool) string {
+    $leftover := ""
+    $reused := false
+    $tc := tls.closed_conn()
+    if c.idle_https != 0 && c.idle_addr == addr && c.idle_sni == sni {
+        select {
+            conn := <-c.idle_tls {
+                tc = conn
+                leftover = c.idle_buf + ""
+                c.idle_buf = ""
+                reused = true
+            }
+            else {
+                reused = false
+            }
+        }
+    }
+    if !reused {
+        c.close_idle()
+        $cfg := tls.new_config(sni)
+        cfg.insecure_skip_verify = c.insecure_skip_verify
+        cfg.set_next_protos(["http/1.1"])
+        remaining := http_remaining(deadline_ns) or >>
+        $nc := net.dial_timeout("tcp", addr, remaining) or >>
+        nc.set_deadline(deadline_ns)
+        tc = tls.client(nc, &cfg) or (err) {
+            http_remaining(deadline_ns) or >>
+            >> err
+        }
+    }
+    tc.set_deadline(deadline_ns)
+    tc.write(&req) or (err) {
+        $t := tc
+        _ := t.close()
+        http_remaining(deadline_ns) or >>
+        if reused && retry_safe {
+            << c.exchange_https(addr, sni, req, deadline_ns, false) or >>
+        }
+        >> err
+    }
+    $ch := chan tls.Conn{cap: 1}
+    ch <- tc
+    $b := MsgBuf{data: leftover, fd: -1, tls_h: 1, tls_chan: ch, deadline_ns: deadline_ns, max_bytes: c.max_response_bytes, progress: download_progress(c.progress)}
+    msg := read_http_message_buf($&b, true) or (err) {
+        $t := <-ch
+        _ := t.close()
+        http_remaining(deadline_ns) or >>
+        if reused && retry_safe {
+            << c.exchange_https(addr, sni, req, deadline_ns, false) or >>
+        }
+        >> err
+    }
+    $tc_back := <-ch
+    header_end := find_crlf_crlf(&msg)
+    $hdrs := ""
+    if header_end >= 0 {
+        hdrs = msg[0:header_end]
+    }
+    if connection_wants_close(&hdrs) {
+        $t := tc_back
+        _ := t.close()
+        << msg
+    }
+    c.idle_https = 1
+    c.idle_addr = addr + ""
+    c.idle_sni = sni + ""
+    c.idle_buf = b.data + ""
+    c.idle_tls <- tc_back
+    << msg
 }
 
 fn (c $&Client) exchange_http(addr string, req string, deadline_ns int, retry_safe bool) string {
@@ -1019,8 +1113,7 @@ fn (r $&Response) do_request_ex(method string, raw_url string, body &string, ext
 
 fn (c $&Client) do_exchange(https bool, addr string, sni string, req string, deadline_ns int, retry_safe bool) string {
     if https {
-        c.close_idle()
-        << exchange_deadline_limit(true, addr, sni, req, deadline_ns, c.max_response_bytes, c.progress) or >>
+        << c.exchange_https(addr, sni, req, deadline_ns, retry_safe) or >>
     }
     << c.exchange_http(addr, req, deadline_ns, retry_safe) or >>
 }
@@ -1061,6 +1154,9 @@ pub struct Client {
     idle_https int
     idle_addr string
     idle_buf string
+    idle_sni string
+    idle_tls chan tls.Conn
+    pub insecure_skip_verify bool
     // One budget for HTTP/TLS I/O and redirects; 0 disables it. Synchronous
     // DNS and Linux TCP connect still need cancellable platform adapters.
     pub timeout_ns int
@@ -1072,7 +1168,7 @@ pub struct Client {
 }
 
 pub fn new_client() Client {
-    << Client{jar: cookiejar.new_jar(), jar_on: 0, idle_fd: -1, idle_https: 0, idle_addr: "", idle_buf: "", timeout_ns: 0, max_redirects: 10, max_response_bytes: 0, progress: no_download_progress}
+    << Client{jar: cookiejar.new_jar(), jar_on: 0, idle_fd: -1, idle_https: 0, idle_addr: "", idle_buf: "", idle_sni: "", idle_tls: chan tls.Conn{cap: 1}, insecure_skip_verify: false, timeout_ns: 0, max_redirects: 10, max_response_bytes: 0, progress: no_download_progress}
 }
 
 pub fn (c $&Client) set_jar(j cookiejar.Jar) {
@@ -1193,13 +1289,13 @@ pub fn (req $&Request) read(fd int) int {
 // A zero timeout preserves the caller-owned blocking read contract.
 pub fn (req $&Request) read_timeout(fd int, timeout_ns int) int {
     deadline := http_deadline(timeout_ns) or >>
-    $b := MsgBuf{data: "", fd: fd, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: deadline, max_bytes: 0, progress: download_progress(no_download_progress)}
+    $b := MsgBuf{data: "", fd: fd, tls_h: 0, tls_chan: chan tls.Conn{cap: 1}, deadline_ns: deadline, max_bytes: 0, progress: download_progress(no_download_progress)}
     msg := read_http_message_buf($&b, false) or >>
     << req.parse_message(&msg) or >>
 }
 
 fn buffered_request(data string) Request {
-    $b := MsgBuf{data: data, fd: -1, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
+    $b := MsgBuf{data: data, fd: -1, tls_h: 0, tls_chan: chan tls.Conn{cap: 1}, deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
     msg := read_http_message_buf($&b, false) or >>
     $req := new_request()
     req.parse_message(&msg) or >>
@@ -1368,4 +1464,11 @@ fn response_extra_closes(extra &string) bool {
 
 fn (c $&Client) drop() { c.close_idle() }
 
-pub fn (c &Client) has_idle_connection() bool { << c.idle_fd >= 0 }
+pub fn (c &Client) has_idle_connection() bool {
+    if c.idle_fd >= 0 {
+        << true
+    }
+    << c.idle_https != 0
+}
+
+pub fn (c $&Client) close_idle_connections() { c.close_idle() }
