@@ -1211,6 +1211,27 @@ fn main() {
         expect_stdout="other:mysql://127.0.0.1:3306/long_database_name_pad\n",
     ),
     PosCase(
+        name="Reader_read_rune_borrowed_utf8",
+        code="""@main
+#strings
+fn main() {
+    $r := strings.new_reader("A中🙂" + string_from_byte(255))
+    for i in 0:4 {
+        rune := r.read_rune() or (err) { <<< 1 }
+        println(rune.ch)
+        println(rune.size)
+    }
+    r.read_rune() or (err) {
+        println(err.msg())
+        <<
+    }
+    <<< 2
+}
+""",
+        expect_stdout="65\n1\n20013\n3\n128578\n4\n65533\n1\nEOF\n",
+        test_no_opt=True,
+    ),
+    PosCase(
         name="Ord_generic_self_method_works",
         code="""@main
 #cmp
