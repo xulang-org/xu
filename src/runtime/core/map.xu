@@ -2,7 +2,7 @@
 // Native maps: open addressing with linear probing.
 //
 // A map value is one word, the address of a header record. Slots live in a
-// separate buffer; each slot is [state][hash][key][value], where the key is
+// separate buffer; each slot is [tagged hash][key][value], where the key is
 // an 8-byte int or a 24-byte string descriptor (its bytes copied on insert)
 // and the value is copied by size. Deleted slots stay as tombstones until
 // the next rehash. Iteration walks the slots in table order.
@@ -21,11 +21,8 @@ const M_SIZE = 64
 
 const SLOT_EMPTY = 0
 const SLOT_DELETED = 1
-const SLOT_LIVE = 2
 
-// Slot offsets: state word, hash word, then key and value.
-const MS_HASH = 8
-const MS_KEY = 16
+const MS_KEY = 8
 
 fn mword(m int, off int) int {
     << rt_load(m + off, 8)
@@ -90,6 +87,12 @@ fn map_alloc_slots(m int, n int) {
     set_mword(m, M_USED, 0)
 }
 
+// Live hashes use the sign bit, which is outside every valid capacity mask.
+// Zero and one mark empty slots and tombstones, respectively.
+fn map_tag_hash(h int) int {
+    << (h ^ ((h >> 32) & 4294967295)) | (1 << 63)
+}
+
 fn map_hash_str(key int) int {
     $h := -3750763034362895579
     p := desc_ptr(key)
@@ -97,12 +100,11 @@ fn map_hash_str(key int) int {
     for i in 0:n {
         h = (h ^ rt_load(p + i, 1)) * 1099511628211
     }
-    << h ^ ((h >> 32) & 4294967295)
+    << map_tag_hash(h)
 }
 
 fn map_hash_int(kv int) int {
-    h := kv * -7046029254386353131
-    << h ^ ((h >> 32) & 4294967295)
+    << map_tag_hash(kv * -7046029254386353131)
 }
 
 fn map_hash(m int, key int) int {
@@ -145,7 +147,7 @@ fn map_find(m int, key int) int {
             if state == SLOT_EMPTY {
                 << 0
             }
-            if state == SLOT_LIVE && rt_load(slot + MS_KEY, 8) == kv {
+            if state < 0 && rt_load(slot + MS_KEY, 8) == kv {
                 << slot
             }
             i = (i + 1) & mask
@@ -160,7 +162,7 @@ fn map_find(m int, key int) int {
         if state == SLOT_EMPTY {
             << 0
         }
-        if state == SLOT_LIVE && rt_load(slot + MS_HASH, 8) == h && str_eq(slot + MS_KEY, key) {
+        if state == h && str_eq(slot + MS_KEY, key) {
             << slot
         }
         i = (i + 1) & mask
@@ -176,34 +178,36 @@ fn map_rehash(m int, n int) {
     map_alloc_slots(m, n)
     slots := mword(m, M_SLOTS)
     mask := n - 1
-    if stride == 32 {
+    if stride == 24 {
         for oi in 0:ocap {
-            src := old + (oi << 5)
-            if rt_load(src, 8) == SLOT_LIVE {
-                $i := rt_load(src + MS_HASH, 8) & mask
-                $dst := slots + (i << 5)
+            src := old + oi * 24
+            hash := rt_load(src, 8)
+            if hash < 0 {
+                $i := hash & mask
+                $dst := slots + i * 24
                 while rt_load(dst, 8) != SLOT_EMPTY {
                     i = (i + 1) & mask
-                    dst = slots + (i << 5)
+                    dst = slots + i * 24
                 }
-                rt_store(dst, 8, SLOT_LIVE)
+                rt_store(dst, 8, hash)
                 rt_store(dst + 8, 8, rt_load(src + 8, 8))
                 rt_store(dst + 16, 8, rt_load(src + 16, 8))
-                rt_store(dst + 24, 8, rt_load(src + 24, 8))
             }
         }
     } else {
         words := stride / 8
         for oi in 0:ocap {
             src := old + oi * stride
-            if rt_load(src, 8) == SLOT_LIVE {
-                $i := rt_load(src + MS_HASH, 8) & mask
+            hash := rt_load(src, 8)
+            if hash < 0 {
+                $i := hash & mask
                 $dst := slots + i * stride
                 while rt_load(dst, 8) != SLOT_EMPTY {
                     i = (i + 1) & mask
                     dst = slots + i * stride
                 }
-                for wi in 0:words {
+                rt_store(dst, 8, hash)
+                for wi in 1:words {
                     off := wi * 8
                     rt_store(dst + off, 8, rt_load(src + off, 8))
                 }
@@ -261,7 +265,7 @@ pub fn map_put_has(m int, key int, existed_out int) int {
                     }
                     << slot + val_off
                 }
-            } else if rt_load(slot + MS_HASH, 8) == h && str_eq(slot + MS_KEY, key) {
+            } else if state == h && str_eq(slot + MS_KEY, key) {
                 if existed_out != 0 {
                     rt_store(existed_out, 8, 1)
                 }
@@ -305,14 +309,18 @@ pub fn map_put_has(m int, key int, existed_out int) int {
         set_mword(m, M_USED, mword(m, M_USED) + 1)
     }
     set_mword(m, M_LEN, mword(m, M_LEN) + 1)
-    rt_store(target, 8, SLOT_LIVE)
-    rt_store(target + MS_HASH, 8, h)
+    rt_store(target, 8, h)
     if kstr != 0 {
         bytes_new(target + MS_KEY, desc_ptr(key), desc_len(key))
     } else {
         rt_store(target + MS_KEY, 8, kv)
     }
     val := target + val_off
+    // map_alloc_slots zeroes the table. An empty slot still has its initial
+    // value bytes; a tombstone can contain a previous entry's payload.
+    if first_del == 0 {
+        << val
+    }
     vsize := mword(m, M_VSIZE)
     if vsize == 8 {
         rt_store(val, 8, 0)
@@ -380,7 +388,7 @@ pub fn map_free(m int) {
     if mword(m, M_KSTR) != 0 {
         for i in 0:cap {
             slot := map_slot_at(m, i)
-            if rt_load(slot, 8) == SLOT_LIVE {
+            if rt_load(slot, 8) < 0 {
                 str_free(slot + MS_KEY)
             }
         }
@@ -412,7 +420,7 @@ pub fn map_next(m int, i int) int {
     cap := mword(m, M_CAP)
     $j := i
     while j < cap {
-        if rt_load(map_slot_at(m, j), 8) == SLOT_LIVE {
+        if rt_load(map_slot_at(m, j), 8) < 0 {
             << j
         }
         j += 1
