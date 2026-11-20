@@ -7,7 +7,7 @@
 #strings
 
 const MAX_ACCEPT_BATCH = 1024
-const MAX_HTTP_ACTIVE_HANDLERS = 64
+const DEFAULT_MAX_ACTIVE_HANDLERS = 256
 const MAX_HTTP_CONNECTIONS = 110000
 const MAX_LEGACY_CONNECTIONS = 4096
 const EVENT_SLOT_SPAN = 131072
@@ -22,6 +22,14 @@ pub struct ServerOptions {
     pub max_header_bytes int
     pub max_body_bytes int
     pub max_buffer_bytes int
+    // Maximum number of handler coroutines running concurrently. Defaults to
+    // 256; raise for handlers that block on I/O (database, RPC). Has no effect
+    // when sync_handlers is true.
+    pub max_active_handlers int
+    // Number of event-loop worker tasks. Defaults to 1. When > 1, multiple
+    // independent event sets share the listener to distribute connection
+    // intake across CPU cores (Nginx multi-worker model).
+    pub workers int
     // Runs handlers directly on the event-loop owner instead of `xu`. Defaults
     // to false; enable only when handlers do not block or wait for I/O.
     pub sync_handlers bool
@@ -29,13 +37,14 @@ pub struct ServerOptions {
 
 // Defaults: 10-second I/O budgets, 110,000 connections with the event-set
 // backend (256 with the portable legacy backend), 64 KiB headers,
-// 10 MiB bodies and 32 MiB total pending input.
+// 10 MiB bodies, 32 MiB total pending input, and 256 concurrent handlers.
 pub fn server_options() ServerOptions {
     $max_connections := 110000
     if !poller.event_set_supported() { max_connections = 256 }
     << ServerOptions{read_timeout_ns: 10000000000, write_timeout_ns: 10000000000,
         max_connections: max_connections, max_header_bytes: 65536, max_body_bytes: 10485760,
-        max_buffer_bytes: 33554432, sync_handlers: false}
+        max_buffer_bytes: 33554432, max_active_handlers: DEFAULT_MAX_ACTIVE_HANDLERS,
+        workers: 1, sync_handlers: false}
 }
 
 struct PendingRequest {
@@ -382,7 +391,7 @@ pub fn (s &Server) serve_with_options(handle fn(Context), options ServerOptions)
     << serve_listener_with_options(s.lfd, handle, options) or >>
 }
 
-fn serve_listener_with_options(lfd int, handle fn(Context), options ServerOptions) int {
+pub fn serve_listener_with_options(lfd int, handle fn(Context), options ServerOptions) int {
     << serve_listener_root(lfd, handle, options, "") or >>
 }
 
@@ -396,14 +405,50 @@ fn validate_server_options(options &ServerOptions) int {
     if options.sync_handlers && !poller.event_set_supported() {
         >> errors.new("net/http: synchronous handlers require event-set backend")
     }
-    if options.read_timeout_ns <= 0 || options.write_timeout_ns <= 0 || options.max_connections <= 0 || options.max_connections > MAX_HTTP_CONNECTIONS || options.max_header_bytes <= 0 || options.max_header_bytes > MAX_MESSAGE_BYTES || options.max_body_bytes < 0 || options.max_body_bytes > MAX_MESSAGE_BYTES || options.max_buffer_bytes <= 0 {
+    if options.workers > 1 && !poller.event_set_supported() {
+        >> errors.new("net/http: multi-worker requires event-set backend")
+    }
+    if options.read_timeout_ns <= 0 || options.write_timeout_ns <= 0 || options.max_connections <= 0 || options.max_connections > MAX_HTTP_CONNECTIONS || options.max_header_bytes <= 0 || options.max_header_bytes > MAX_MESSAGE_BYTES || options.max_body_bytes < 0 || options.max_body_bytes > MAX_MESSAGE_BYTES || options.max_buffer_bytes <= 0 || options.max_active_handlers <= 0 || options.workers <= 0 || options.workers > 256 {
         >> errors.new("net/http: invalid server options")
+    }
+    << 0
+}
+
+fn serve_worker_task(lfd int, handle fn(Context), options ServerOptions, file_root string, worker_done chan int) {
+    _ := serve_listener_root_event_set(lfd, handle, options, file_root) or (err) {
+        worker_done <- 1
+        <<
+    }
+    worker_done <- 1
+}
+
+fn serve_listener_root_event_set_multi(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
+    $w_count := options.workers
+    if w_count > 64 { w_count = 64 }
+    $w_opts := options
+    w_opts.workers = 1
+    if options.max_connections > 0 {
+        $per_worker_conn := options.max_connections / w_count
+        if per_worker_conn < 256 { per_worker_conn = 256 }
+        w_opts.max_connections = per_worker_conn
+    }
+    worker_done := chan int{cap: w_count}
+    for i in 0:w_count {
+        opts_copy := w_opts
+        root_copy := file_root + ""
+        xu serve_worker_task(lfd, handle, opts_copy, root_copy, worker_done)
+    }
+    for i in 0:w_count {
+        _ := <-worker_done
     }
     << 0
 }
 
 fn serve_listener_root(lfd int, handle fn(Context), options ServerOptions, file_root string) int {
     if poller.event_set_supported() {
+        if options.workers > 1 {
+            << serve_listener_root_event_set_multi(lfd, handle, options, file_root) or >>
+        }
         << serve_listener_root_event_set(lfd, handle, options, file_root) or >>
     }
     << serve_listener_root_legacy(lfd, handle, options, file_root) or >>
@@ -432,8 +477,11 @@ fn serve_listener_root_legacy(lfd int, handle fn(Context), options ServerOptions
             ready := os.socket_poll(lfd, 1) or (err) { running = false
                 <- }
             if ready == 0 { <- }
-            fd := net.accept(lfd) or (err) { running = false
-                <- }
+            fd := net.accept(lfd) or (err) {
+                _ := os.socket_poll(lfd, 1) or (e2) { running = false
+                    <- }
+                <-
+            }
             deadline := http_deadline(options.read_timeout_ns) or (err) { close_http_fd(fd)
                 -> }
             for i in 0:peers.len {
@@ -537,7 +585,7 @@ fn dispatch_queued_event_set(slot int, peers $&[]PendingRequest, buffered $&int,
 }
 
 fn drain_ready_event_set(peers $&[]PendingRequest, generation $&[]int, buffered $&int, pending_wakes $&int, active_handlers $&int, active $&int, ready_slots $&ReadySlots, free_slots $&FreeSlots, timers $&PendingTimers, events $&poller.EventSet, handle fn(Context), done chan int, finished chan int, options &ServerOptions, file_root string, wake poller.EventWake) {
-    while ready_slots.len > 0 && (options.sync_handlers || *active_handlers < MAX_HTTP_ACTIVE_HANDLERS) {
+    while ready_slots.len > 0 && (options.sync_handlers || *active_handlers < options.max_active_handlers) {
         slot := ready_slots.take()
         if slot < 0 || slot >= peers.len { -> }
         if peers[slot].fd < 0 || !peers[slot].processing || !peers[slot].queued { -> }
@@ -740,7 +788,10 @@ fn accept_ready_event_set(lfd int, peers $&[]PendingRequest, generation $&[]int,
         }
         ready := os.socket_poll(lfd, poller.EVENT_READ) or (err) { << false }
         if ready == 0 { <- }
-        fd := net.accept(lfd) or (err) { << false }
+        fd := net.accept(lfd) or (err) {
+            _ := os.socket_poll(lfd, poller.EVENT_READ) or (e2) { << false }
+            <-
+        }
         deadline := http_deadline(options.read_timeout_ns) or (err) {
             close_http_fd(fd)
             ->
@@ -804,7 +855,7 @@ fn serve_listener_root_event_set(lfd int, handle fn(Context), options ServerOpti
     $ready_slots := ReadySlots{values: ready_values, head: 0, tail: 0, len: 0}
     $timers := PendingTimers{heap: []int{}, positions: timer_positions, len: 0}
     $chan_cap := options.max_connections
-    if chan_cap > MAX_HTTP_ACTIVE_HANDLERS * 4 { chan_cap = MAX_HTTP_ACTIVE_HANDLERS * 4 }
+    if chan_cap > options.max_active_handlers * 4 { chan_cap = options.max_active_handlers * 4 }
     done := chan int{cap: chan_cap}
     finished := chan int{cap: chan_cap}
     $active := 0
