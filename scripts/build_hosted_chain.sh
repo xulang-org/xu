@@ -373,15 +373,15 @@ PY_EXEC_BRIDGE
     "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT"
     set -u
 elif [ "$seed_build_rc" -ne 0 ]; then
-    # Older hosted SDKs cannot type-check the new, unused os wrapper. Build
-    # an intermediate compiler without that wrapper, then restart Gen1 on
-    # the complete original source. Never install or compare the bridge as
-    # a product generation, and never recover unrelated compiler failures.
-    if ! grep -Eq "undefined name 'sys_(socket_(poll|wait)|fd_peek_read|setsockopt)'" "$tmp/seed-build.log"; then
+    # Older hosted SDKs cannot type-check wrappers for newer intrinsics.
+    # Build a disposable compiler with compatibility wrappers, then restart
+    # Gen1 on the complete original source. The bridge is not a product
+    # generation and does not handle unrelated compiler failures.
+    if ! grep -Eq "undefined name 'sys_(socket_(poll|wait)|fd_peek_read|setsockopt|getsockname|getpeername|shutdown)'" "$tmp/seed-build.log"; then
         exit "$seed_build_rc"
     fi
     FAILED_STAGE="socket_seed_bridge"
-    echo "build_hosted_chain: bootstrapping file/socket readiness support for the older hosted seed"
+    echo "build_hosted_chain: bootstrapping hosted socket support for the older seed"
     python3 - "$ROOT/src" "$tmp/seed-bridge-src" <<'PY_BRIDGE'
 from pathlib import Path
 import re
@@ -392,15 +392,16 @@ source, destination = map(Path, sys.argv[1:])
 shutil.copytree(source, destination)
 socket = destination / 'os/socket.xu'
 text = socket.read_text(encoding="utf-8")
-# These wrappers are unused by the compiler itself. Remove their complete
-# declarations only in this disposable stdlib; production Gen1 and later
-# compile the original wrappers with the newly supported intrinsics.
-text, removed = re.subn(
-    r'^pub fn (?:socket_poll|socket_wait|socket_wait_read|fd_wait_read|setsockopt|setsockopt_int)\([^\n]*\) int \{\n.*?^\}\n',
-    '', text, flags=re.MULTILINE | re.DOTALL,
+# A seed can type-check the full stdlib closure without calling these
+# operations during self-hosting. Retain their signatures in the private
+# source tree so callers still check. Gen1 uses the original implementations.
+text, stubbed = re.subn(
+    r'^((?:pub fn )(?:socket_poll|socket_wait|socket_wait_read|fd_wait_read|setsockopt|setsockopt_int|getsockname|getpeername|shutdown)\([^\n]*\) (?:int|string) \{)\n.*?^\}\n',
+    lambda match: match[1] + '\n    >> errors.new("os: socket operation unavailable to the bootstrap seed")\n}\n',
+    text, flags=re.MULTILINE | re.DOTALL,
 )
-if removed != 6:
-    raise SystemExit('unsupported socket readiness wrapper layout; refusing seed bridge')
+if stubbed != 9:
+    raise SystemExit('unsupported socket wrapper layout; refusing seed bridge')
 socket.write_text(text, encoding="utf-8")
 PY_BRIDGE
     BRIDGE_SOCKET_SHA256=$(sha256_file "$tmp/seed-bridge-src/os/socket.xu")
@@ -435,17 +436,17 @@ PY_SOCKET_EXEC_BRIDGE
             "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/socket-poll-bootstrap$CHAIN_BIN_EXT"
         set -u
         if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
-            SEED_MANIFEST_BRIDGE=socket_readiness_wrapper_v2+exec_cancellation_v1
+            SEED_MANIFEST_BRIDGE=socket_wrappers_v3+exec_cancellation_v1
         else
-            SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+socket_readiness_wrapper_v2+exec_cancellation_v1"
+            SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+socket_wrappers_v3+exec_cancellation_v1"
         fi
     elif [ "$socket_build_rc" -ne 0 ]; then
         exit "$socket_build_rc"
     else
         if [ "$SEED_MANIFEST_BRIDGE" = none ]; then
-            SEED_MANIFEST_BRIDGE=socket_readiness_wrapper_v2
+            SEED_MANIFEST_BRIDGE=socket_wrappers_v3
         else
-            SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+socket_readiness_wrapper_v2"
+            SEED_MANIFEST_BRIDGE="${SEED_MANIFEST_BRIDGE}+socket_wrappers_v3"
         fi
     fi
     BRIDGE_SEED=$(pick_bin "$tmp/socket-poll-bootstrap$CHAIN_BIN_EXT")

@@ -543,6 +543,16 @@ fn (w $&Lw) expr_is_ref(p &parser.Parser, tp &types.TypedProgram, n int) bool {
 
 // Address of the value designated by expression n (a place or a wide value).
 fn (w $&Lw) lower_addr(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    if n != w.noclone && w.wants_clone(p, tp, n) {
+        ty := tp.deref(tp.type_of(n))
+        v := w.lower_expr(p, tp, n)
+        if is_wide(tp, ty) {
+            << v
+        }
+        a := w.scratch_words(1)
+        w.store_ptr(a, 0, v, 8)
+        << a
+    }
     if tp.global_of(n) >= 0 {
         << w.lower_global_addr(tp, tp.global_of(n))
     }
@@ -744,17 +754,12 @@ fn (w $&Lw) lower_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
         << w.lower_addr(p, tp, n)
     }
     if n != w.unboxed && w.err_wants_box(tp, n) {
-        w.disown_root(p, tp, n)
         << w.err_box(p, tp, n)
     }
     if n != w.unboxed && w.iface_wants_box(tp, n) {
-        w.disown_root(p, tp, n)
         << w.iface_box(p, tp, n)
     }
     k := p.nodes[n].kind
-    if k == ast.NK_TYPE_AS {
-        w.disown_root(p, tp, p.nodes[n].a)
-    }
     if n != w.noclone && w.wants_clone(p, tp, n) {
         prev := w.noclone
         w.noclone = n
@@ -881,7 +886,7 @@ fn (w $&Lw) lower_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
 
 // A place read in a move position that the checker marked for cloning, so
 // the new owner does not share the source's buffers.
-fn (w &Lw) wants_clone(p &parser.Parser, tp &types.TypedProgram, n int) bool {
+fn (w $&Lw) wants_clone(p &parser.Parser, tp &types.TypedProgram, n int) bool {
     if tp.clone_of(n) != 1 || tp.const_of(n) >= 0 {
         << false
     }
@@ -890,38 +895,117 @@ fn (w &Lw) wants_clone(p &parser.Parser, tp &types.TypedProgram, n int) bool {
         << false
     }
     ty := tp.deref(tp.type_of(n))
-    << ty == 3 || types.is_struct_type(ty)
+    << w.needs_drop(tp, ty)
 }
 
-// The string value of e is a new heap buffer that nothing else refers to,
-// so its consumer may free it once the bytes have been used.
-fn (w &Lw) fresh_str(p &parser.Parser, tp &types.TypedProgram, e int) bool {
-    if e < 0 || tp.type_of(e) != 3 || tp.box_of(e) != 0 || tp.const_of(e) >= 0 {
+// Expression e produces a fresh, unaliased owned value (not a literal, local,
+// place borrow, or reference) whose consumer is responsible for dropping it
+// once read if ownership is not transferred elsewhere.
+fn (w $&Lw) fresh_temp(p &parser.Parser, tp &types.TypedProgram, e int) bool {
+    if e < 0 || (tp.box_of(e) != 0 && e != w.unboxed) || tp.const_of(e) >= 0 || tp.borrows_place(e) || w.expr_is_ref(p, tp, e) {
         << false
     }
     if w.wants_clone(p, tp, e) {
         << true
     }
     k := p.nodes[e].kind
+    if k == ast.NK_STR || k == ast.NK_IDENT || k == ast.NK_INDEX || k == ast.NK_UN_OP {
+        << false
+    }
+    if k == ast.NK_FIELD {
+        c := tp.call_of(e)
+        << c == -30 || c == -92
+    }
     if k == ast.NK_BIN_OP {
         << p.nodes[e].ival == ast.OP_ADD && tp.deref(tp.type_of(p.nodes[e].a)) == 3
     }
-    if k == ast.NK_SLICE || k == ast.NK_CLONE || k == ast.NK_TERNARY {
+    if k == ast.NK_OR_CATCH {
+        << w.fresh_temp(p, tp, p.nodes[e].a)
+    }
+    if k == ast.NK_TERNARY || k == ast.NK_STRUCT_INIT || k == ast.NK_ARRAY_LIT ||
+       k == ast.NK_EMPTY_ARRAY || k == ast.NK_CLONE || k == ast.NK_SLICE ||
+       k == ast.NK_MAP_INIT || k == ast.NK_CHAN_INIT || k == ast.NK_RECV ||
+       k == ast.NK_TYPE_AS || k == ast.NT_FN_LIT {
         << true
     }
-    if k == ast.NK_CALL {
+    if k == ast.NK_CALL || k == ast.NK_METHOD_CALL {
         code := tp.call_of(e)
         if code == -19 {
-            << w.fresh_str(p, tp, p.nodes[e].a)
+            << w.fresh_temp(p, tp, p.nodes[e].a)
         }
-        if code == -8 || code == -9 {
+        if code >= 0 || code == -80 || code == -83 || code == -94 ||
+           code == -8 || code == -9 || code == -30 ||
+           code == -75 || code == -76 || code == -87 || code == -88 {
             << true
         }
-        if code >= 0 && code < tp.fns.len && tp.fns[code].name == "itoa" && tp.fns[code].mod_id == "runtime" {
+        if intrin_wide_name(code).len > 0 {
             << true
         }
+        sig := host_sig_of(code)
+        << sig.name.len > 0 && (sig.shape == HR_WIDE || sig.shape == HR_TWIDE)
     }
     << false
+}
+
+// Drop temporary value v of type ty when expression e produced a fresh owner.
+fn (w $&Lw) drop_temp(p &parser.Parser, tp &types.TypedProgram, e int, v int, ty int) {
+    if w.needs_drop(tp, ty) && w.fresh_temp(p, tp, e) {
+        $addr := v
+        if !is_wide(tp, ty) {
+            addr = w.scratch_words(1)
+            w.store_ptr(addr, 0, v, width_of(tp, ty))
+        }
+        w.drop_value(tp, addr, ty)
+    }
+}
+
+// Drop an argument lowered via host_arg when the argument expression produced
+// a fresh temporary owner (fixed-size arrays wrap the base address in {p,N,N}).
+fn (w $&Lw) drop_host_temp_arg(p &parser.Parser, tp &types.TypedProgram, e int, v int) {
+    ty := tp.deref(tp.deref(tp.type_of(e)))
+    if !w.needs_drop(tp, ty) || !w.fresh_temp(p, tp, e) {
+        <<
+    }
+    $addr := v
+    if is_wide(tp, ty) && types.is_array_type(ty) && fixed_len_of(tp, ty) > 0 {
+        addr = w.load_ptr(v, 0, 8)
+    } else if !is_wide(tp, ty) {
+        addr = w.scratch_words(1)
+        w.store_ptr(addr, 0, v, width_of(tp, ty))
+    }
+    w.drop_value(tp, addr, ty)
+}
+
+// Allocate a scoped drop-tracked scratch slot for a temporary owner of type ty.
+fn (w $&Lw) own_temp_slot(tp &types.TypedProgram, ty int, name string) int {
+    while w.lslot.len < tp.fns[w.fi].locals.len {
+        w.lslot.push(-1)
+    }
+    id := w.lslot.len
+    slot := w.new_local(ty, tp.words_of(ty), name)
+    w.lslot.push(slot)
+    while w.lbyref.len < w.f.locals.len {
+        w.lbyref.push(false)
+    }
+    w.own_grow(id)
+    if w.needs_drop(tp, ty) {
+        w.lowned[id] = true
+        w.lmoved[id] = false
+        w.ldrop_flag[id] = -1
+        w.scope_ids.push(id)
+        w.scope_ostart.push(w.scope_offs.len)
+        w.drop_offsets(tp, ty, 0)
+    }
+    << slot
+}
+
+// The string value of e is a new heap buffer that nothing else refers to,
+// so its consumer may free it once the bytes have been used.
+fn (w $&Lw) fresh_str(p &parser.Parser, tp &types.TypedProgram, e int) bool {
+    if e < 0 || tp.type_of(e) != 3 {
+        << false
+    }
+    << w.fresh_temp(p, tp, e)
 }
 
 // Free the string at address d when expression e produced a fresh buffer.
@@ -1104,18 +1188,6 @@ fn (w $&Lw) scope_truncate(mark int) {
     }
 }
 
-// A part of the local under place n may be consumed (boxing, `as`), which
-// moves are not tracked for; the local is never dropped.
-fn (w $&Lw) disown_root(p &parser.Parser, tp &types.TypedProgram, n int) {
-    $x := n
-    while x >= 0 && (p.nodes[x].kind == ast.NK_FIELD || p.nodes[x].kind == ast.NK_INDEX || p.nodes[x].kind == ast.NK_TYPE_AS) {
-        x = p.nodes[x].a
-    }
-    if x >= 0 && x != n && p.nodes[x].kind == ast.NK_IDENT {
-        w.own_disown(tp.local_of(x))
-    }
-}
-
 // Local id was declared outside the innermost loop. The checker lets a
 // loop body move it on a path ending in break/continue, which leaves the
 // moved state of the code after the loop unknown here.
@@ -1204,9 +1276,12 @@ fn (w $&Lw) drop_owned_from(mark int) {
 // The value of e may be stored into a new owner as is: it is fresh (a
 // literal, constructor, slice copy or user call result), a checker clone,
 // or a local move (lower_ident clones views).
-fn (w &Lw) transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bool {
-    if e < 0 || tp.const_of(e) >= 0 || w.fresh_str(p, tp, e) {
+fn (w $&Lw) transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bool {
+    if e < 0 || tp.const_of(e) >= 0 || w.fresh_temp(p, tp, e) {
         << true
+    }
+    if w.expr_is_ref(p, tp, e) || tp.borrows_place(e) {
+        << false
     }
     // Boxing into temp/any or an interface makes a new box.
     if e != w.unboxed && (w.iface_wants_box(tp, e) || w.err_wants_box(tp, e)) {
@@ -1218,10 +1293,7 @@ fn (w &Lw) transfer_safe(p &parser.Parser, tp &types.TypedProgram, e int) bool {
     if (c == 1 && w.wants_clone(p, tp, e)) || (c == 2 && k == ast.NK_IDENT) {
         << true
     }
-    if k == ast.NK_STR || k == ast.NK_TERNARY || k == ast.NK_STRUCT_INIT || k == ast.NK_ARRAY_LIT || k == ast.NK_EMPTY_ARRAY || k == ast.NK_CLONE || k == ast.NK_SLICE || k == ast.NK_MAP_INIT || k == ast.NK_CHAN_INIT {
-        << true
-    }
-    if (k == ast.NK_CALL || k == ast.NK_METHOD_CALL) && (tp.call_of(e) >= 0 || tp.call_of(e) == -80 || tp.call_of(e) == -83) {
+    if k == ast.NK_STR {
         << true
     }
     << w.builtin_fresh(p, tp, e)
@@ -1525,11 +1597,20 @@ fn (w $&Lw) lower_field(p &parser.Parser, tp &types.TypedProgram, n int) int {
             << w.konst(tp.local_of(n))
         }
         d := w.array_desc(p, tp, base, bty)
-        if name == "len" {
-            << w.load_ptr(d, 8, 8)
-        }
-        if name == "cap" {
-            << w.load_ptr(d, 16, 8)
+        if name == "len" || name == "cap" {
+            $off := 8
+            if name == "cap" {
+                off = 16
+            }
+            res := w.load_ptr(d, off, 8)
+            if w.needs_drop(tp, bty) && w.fresh_temp(p, tp, base) {
+                $ba := d
+                if fixed_len_of(tp, bty) > 0 {
+                    ba = w.load_ptr(d, 0, 8)
+                }
+                w.drop_value(tp, ba, bty)
+            }
+            << res
         }
         w.fail(p, n, "unknown field '" + name + "'")
         << w.konst(0)
@@ -1539,11 +1620,25 @@ fn (w $&Lw) lower_field(p &parser.Parser, tp &types.TypedProgram, n int) int {
         fld := tp.field_of(bty, &fname)
         if fld.offset >= 0 && fld.bit_width > 0 {
             baddr := w.base_addr(p, tp, base)
-            << w.lower_bitfield_read(baddr, &fld)
+            res := w.lower_bitfield_read(baddr, &fld)
+            if w.needs_drop(tp, bty) && w.fresh_temp(p, tp, base) {
+                w.drop_value(tp, baddr, bty)
+            }
+            << res
+        }
+    }
+    fty := tp.type_of(n)
+    if types.is_struct_type(bty) && !is_wide(tp, fty) && !w.needs_drop(tp, fty) && !types.is_ref_type(fty) && w.needs_drop(tp, bty) && w.fresh_temp(p, tp, base) {
+        fname := name + ""
+        fld := tp.field_of(bty, &fname)
+        if fld.offset >= 0 {
+            baddr := w.base_addr(p, tp, base)
+            res := w.load_ptr(baddr, fld.offset, width_of(tp, fty))
+            w.drop_value(tp, baddr, bty)
+            << res
         }
     }
     addr := w.lower_place_addr(p, tp, n)
-    fty := tp.type_of(n)
     if is_wide(tp, fty) {
         << addr
     }
@@ -1554,13 +1649,34 @@ fn (w $&Lw) lower_index(p &parser.Parser, tp &types.TypedProgram, n int) int {
     if tp.call_of(n) == -77 {
         << w.map_index(p, tp, n)
     }
-    bty := tp.deref(tp.deref(tp.type_of(p.nodes[n].a)))
+    base := p.nodes[n].a
+    bty := tp.deref(tp.deref(tp.type_of(base)))
     if bty != 3 && !types.is_array_type(bty) {
         w.fail(p, n, "indexing this type is not supported yet")
         << w.konst(0)
     }
-    addr := w.lower_place_addr(p, tp, n)
     ety := tp.type_of(n)
+    if (bty == 3 || (!is_wide(tp, ety) && !w.needs_drop(tp, ety) && !types.is_ref_type(ety))) && w.needs_drop(tp, bty) && w.fresh_temp(p, tp, base) {
+        d := w.array_desc(p, tp, base, bty)
+        idx := w.lower_expr(p, tp, p.nodes[n].b)
+        w.bounds_check(idx, w.load_ptr(d, 8, 8))
+        data := w.load_ptr(d, 0, 8)
+        $res := -1
+        if bty == 3 {
+            res = w.load_ptr(w.bin(BIN_ADD, data, idx), 0, 1)
+        } else {
+            esize := tp.size_of(ety)
+            eaddr := w.bin(BIN_ADD, data, w.bin(BIN_MUL, idx, w.konst(esize)))
+            res = w.load_ptr(eaddr, 0, width_of(tp, ety))
+        }
+        $ba := d
+        if fixed_len_of(tp, bty) > 0 {
+            ba = w.load_ptr(d, 0, 8)
+        }
+        w.drop_value(tp, ba, bty)
+        << res
+    }
+    addr := w.lower_place_addr(p, tp, n)
     if bty == 3 {
         << w.load_ptr(addr, 0, 1)
     }
@@ -1601,6 +1717,9 @@ fn (w $&Lw) lower_slice(p &parser.Parser, tp &types.TypedProgram, n int) int {
         // not be shared with the source array, which frees its own.
         if w.needs_drop(tp, ety) {
             w.clone_elems(tp, out, ety)
+        }
+        if w.needs_drop(tp, bty) && w.fresh_temp(p, tp, base) {
+            w.drop_value(tp, d, bty)
         }
     }
     << out
@@ -2144,25 +2263,22 @@ fn (w $&Lw) lower_method_call(p &parser.Parser, tp &types.TypedProgram, n int) i
     if code == -110 {
         d := w.base_addr(p, tp, recv)
         v := w.lower_expr(p, tp, p.nodes[n].b)
-        ea := w.scratch_words(1)
-        w.store_ptr(ea, 0, v, 8)
-        $args := []int{}
-        args.push(d)
-        args.push(ea)
-        args.push(w.konst(1))
-        w.call_core("slice_push", &args)
+        args := [d, v]
+        w.call_core("str_push_byte", &args)
         << w.konst(0)
     }
     if code == -75 || code == -76 {
         out := w.scratch_words(3)
+        sd := w.base_addr(p, tp, recv)
         $args := []int{}
         args.push(out)
-        args.push(w.base_addr(p, tp, recv))
+        args.push(sd)
         if code == -75 {
             w.call_core("str_bytes", &args)
         } else {
             w.call_core("str_runes", &args)
         }
+        w.drop_fresh_str(p, tp, recv, sd)
         << out
     }
     if code == -70 {
@@ -2174,10 +2290,15 @@ fn (w $&Lw) lower_method_call(p &parser.Parser, tp &types.TypedProgram, n int) i
         << w.bin(BIN_LT, a, b)
     }
     if code == -71 {
+        sa := w.base_addr(p, tp, recv)
+        sb := w.base_addr(p, tp, p.nodes[n].b)
         $args := []int{}
-        args.push(w.base_addr(p, tp, recv))
-        args.push(w.base_addr(p, tp, p.nodes[n].b))
-        << w.call_core("str_less", &args)
+        args.push(sa)
+        args.push(sb)
+        res := w.call_core("str_less", &args)
+        w.drop_fresh_str(p, tp, recv, sa)
+        w.drop_fresh_str(p, tp, p.nodes[n].b, sb)
+        << res
     }
     if code == -97 {
         << w.lower_caller_frame(p, tp, n)
@@ -2274,8 +2395,11 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
     }
     if k == ast.NK_EXPR_STMT {
         e := p.nodes[s].a
+        $ety := tp.type_of(e)
+        if e != w.unboxed && (w.iface_wants_box(tp, e) || w.err_wants_box(tp, e)) {
+            ety = tp.box_of(e)
+        }
         v := w.lower_expr(p, tp, e)
-        ety := tp.type_of(e)
         // A statement discards its value: free a fresh one of any owning
         // type, not only resource types and concatenations.
         if w.needs_drop(tp, ety) && w.transfer_safe(p, tp, e) {
@@ -2813,7 +2937,7 @@ fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, 
 // Lower every concrete function. Returns the number of reported errors.
 // all=true lowers every concrete function (diagnostics for coverage gaps).
 // debug: a debug build; main enables the runtime's memory checks.
-pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_arch int, all bool, debug bool, out $&Mir) int {
+pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_arch int, all bool, debug bool, roots &[]int, out $&Mir) int {
     $core_names := []string{}
     $core_labels := []string{}
     for i in 0:tp.fns.len {
@@ -2855,6 +2979,12 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
     if main_fi >= 0 {
         queue.push(main_fi)
         queued[main_fi] = true
+    }
+    for fi in roots {
+        if !queued[fi] {
+            queue.push(fi)
+            queued[fi] = true
+        }
     }
     // On WASI the backend's system call stub hands Linux system calls to
     // the runtime's emulation, which no Xu code calls by name.

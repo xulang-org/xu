@@ -55,11 +55,24 @@ IMPORT_RE = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)?#([A-Za-z0-9_./-]+)\s
 
 
 def iter_package_dirs() -> Iterable[Path]:
-    for mod in sorted(SRC.rglob("mod.xu")):
-        rel = mod.parent.relative_to(SRC)
-        if rel.parts and rel.parts[0] in EXCLUDED_TOP_LEVEL:
+    import os
+    for root, dirs, files in os.walk(SRC):
+        dirs[:] = [d for d in dirs if d not in {".git", "vendor"}]
+        p_root = Path(root)
+        rel = p_root.relative_to(SRC)
+        if not rel.parts or rel.parts[0] in EXCLUDED_TOP_LEVEL:
             continue
-        yield mod.parent
+        pkg_name = rel.as_posix()
+        if "mod.xu" in files:
+            yield p_root
+            continue
+        for f in files:
+            if f.endswith(".xu") and not f.startswith(("test_", "test.", "bench_", "bench.")):
+                text = (p_root / f).read_text(encoding="utf-8")
+                m = re.search(r"(?m)^@([A-Za-z0-9_/]+)\s*$", text)
+                if m and m.group(1) == pkg_name and re.search(r"(?m)^pub\s", text):
+                    yield p_root
+                    break
 
 
 def package_id(package_dir: Path) -> str:
@@ -236,7 +249,7 @@ def build_matrix() -> dict:
     packages: list[dict] = []
     for directory in iter_package_dirs():
         pkg = package_id(directory)
-        files = sorted(directory.rglob("*.xu"))
+        files = sorted(directory.glob("*.xu"))
         symbols = public_symbols(files)
         imports = sorted(
             {

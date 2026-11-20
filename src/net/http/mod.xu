@@ -8,11 +8,12 @@
 // Server: Request.read + write / FileServer / Context handler.
 // There is no ServeMux value in this version; route dispatch is supplied by
 // the caller's handler function.
-// Client keep-alive reuses one idle HTTP (not HTTPS) connection per Client.
+// Client keep-alive reuses one idle HTTP or HTTPS connection per Client.
 // No HTTP/2.
 
 #net
 #net/url
+#os
 #strconv
 #strings
 #crypto/tls
@@ -52,10 +53,11 @@ pub struct Request {
     pub headers string
     pub body string
     pub sticky string
+    pub remote_addr string
 }
 
 pub fn new_request() Request {
-    << Request{method: "", path: "", headers: "", body: "", sticky: ""}
+    << Request{method: "", path: "", headers: "", body: "", sticky: "", remote_addr: ""}
 }
 
 pub fn (r Request) method() string {
@@ -82,12 +84,37 @@ pub fn (r Request) host() string {
     << r.header("Host")
 }
 
+pub fn (r Request) remote_addr() string {
+    << r.remote_addr + ""
+}
+
+pub fn (r Request) query_value(key string) string {
+    u := url.parse(r.path + "")
+    q := u.query()
+    << q.get(key)
+}
+
+pub fn (r Request) form_value(key string) string {
+    ct := r.header("Content-Type")
+    if r.method == "POST" && strings.has_prefix(&ct, "application/x-www-form-urlencoded") {
+        q := url.parse_query(r.body + "")
+        v := q.get(key)
+        if v.len > 0 { << v }
+    }
+    << r.query_value(key)
+}
+
 pub struct Server {
     pub lfd int
+    pub laddr string
 }
 
 pub fn new_server() Server {
-    << Server{lfd: -1}
+    << Server{lfd: -1, laddr: ""}
+}
+
+pub fn (s Server) clone() Server {
+    << Server{lfd: s.lfd, laddr: s.laddr + ""}
 }
 
 pub fn (s $&Server) listen(addr string) int {
@@ -95,7 +122,16 @@ pub fn (s $&Server) listen(addr string) int {
         >> errors.new("net/http: empty address")
     }
     s.lfd = net.listen(addr) or >>
+    s.laddr = net.socket_local_addr(s.lfd)
     << 0
+}
+
+pub fn (s Server) addr() string {
+    if s.lfd >= 0 {
+        loc := net.socket_local_addr(s.lfd)
+        if loc.len > 0 { << loc }
+    }
+    << s.laddr + ""
 }
 
 pub fn (s Server) accept() int {
@@ -115,6 +151,18 @@ pub fn (s $&Server) close() int {
     }
     s.lfd = -1
     << 0
+}
+
+fn http_shutdown_quiet(fd int) {
+    os.shutdown(fd, 2) or (err) { << }
+}
+
+pub fn (s $&Server) shutdown() int {
+    if s.lfd < 0 {
+        << 0
+    }
+    http_shutdown_quiet(s.lfd)
+    << s.close()
 }
 
 fn header_lookup(headers &string, name string) string {
@@ -342,7 +390,9 @@ fn build_request(method string, u &url.URL, body &string, extra string) string {
         out = out + extra
     }
     if method == "POST" || body.len > 0 {
-        out = out + "Content-Type: application/octet-stream\r\n"
+        if !strings.contains(&extra, "Content-Type:") {
+            out = out + "Content-Type: application/octet-stream\r\n"
+        }
         out = out + "Content-Length: " + strconv.itoa(body.len) + "\r\n"
     }
     out = out + "\r\n"
@@ -404,6 +454,9 @@ pub fn status_text(code int) string {
     if code == 204 {
         << "No Content"
     }
+    if code == 206 {
+        << "Partial Content"
+    }
     if code == 404 {
         << "Not Found"
     }
@@ -413,11 +466,20 @@ pub fn status_text(code int) string {
     if code == 401 {
         << "Unauthorized"
     }
+    if code == 416 {
+        << "Range Not Satisfiable"
+    }
     if code == 418 {
         << "I'm a teapot"
     }
     if code == 500 {
         << "Internal Server Error"
+    }
+    if code == 502 {
+        << "Bad Gateway"
+    }
+    if code == 503 {
+        << "Service Unavailable"
     }
     if code == 301 {
         << "Moved Permanently"
@@ -427,6 +489,9 @@ pub fn status_text(code int) string {
     }
     if code == 303 {
         << "See Other"
+    }
+    if code == 304 {
+        << "Not Modified"
     }
     if code == 307 {
         << "Temporary Redirect"
@@ -537,7 +602,7 @@ struct MsgBuf {
     data string
     fd int
     tls_h int
-    tls_conn tls.Conn
+    tls_chan chan tls.Conn
     deadline_ns int
     max_bytes int
     progress DownloadProgress
@@ -551,8 +616,12 @@ fn (b &MsgBuf) message_limit() int {
 fn (b $&MsgBuf) read_more() int {
     $chunk := ""
     if b.tls_h != 0 {
-        t := $&b.tls_conn
-        chunk = t.read(READ_CHUNK_BYTES) or >>
+        $tc := <-b.tls_chan
+        chunk = tc.read(READ_CHUNK_BYTES) or (err) {
+            b.tls_chan <- tc
+            >> err
+        }
+        b.tls_chan <- tc
     } else {
         if b.deadline_ns > 0 {
             apply_http_deadline(b.fd, b.deadline_ns) or >>
@@ -747,7 +816,7 @@ fn read_http_message_buf(b $&MsgBuf, until_close bool) string {
 // Requests without Content-Length / chunked encoding have an empty body
 // (RFC 7230) and must not block waiting for the client to close.
 fn read_http_message_mode(fd int, until_close bool, tls_h int) string {
-    $b := MsgBuf{data: "", fd: fd, tls_h: tls_h, tls_conn: tls.closed_conn(), deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
+    $b := MsgBuf{data: "", fd: fd, tls_h: tls_h, tls_chan: chan tls.Conn{cap: 1}, deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
     << read_http_message_buf($&b, until_close) or (err) {
         << ""
     }
@@ -866,12 +935,16 @@ fn exchange_deadline_limit(https bool, addr string, sni string, req string, dead
             http_remaining(deadline_ns) or >>
             >> err
         }
-        $b := MsgBuf{data: "", fd: -1, tls_h: 1, tls_conn: tc, deadline_ns: deadline_ns, max_bytes: max_bytes, progress: download_progress(report)}
+        $ch := chan tls.Conn{cap: 1}
+        ch <- tc
+        $b := MsgBuf{data: "", fd: -1, tls_h: 1, tls_chan: ch, deadline_ns: deadline_ns, max_bytes: max_bytes, progress: download_progress(report)}
         msg := read_http_message_buf($&b, true) or (err) {
+            $t := <-ch
+            _ := t.close()
             http_remaining(deadline_ns) or >>
             >> err
         }
-        t := $&b.tls_conn
+        $t := <-ch
         t.close() or (err) {
             http_remaining(deadline_ns) or >>
             << msg + ""
@@ -895,8 +968,94 @@ fn (c $&Client) close_idle() {
         fd := c.idle_fd
         c.idle_fd = -1
         c.idle_buf = ""
+        c.idle_addr = ""
+        c.idle_https = 0
         net.conn_close(fd) or (err) { << }
     }
+    c.idle_buf = ""
+    c.idle_addr = ""
+    c.idle_sni = ""
+    c.idle_https = 0
+    select {
+        tc := <-c.idle_tls {
+            $t := tc
+            t.close() or (err) { << }
+        }
+        else {
+            <<
+        }
+    }
+}
+
+fn (c $&Client) exchange_https(addr string, sni string, req string, deadline_ns int, retry_safe bool) string {
+    $leftover := ""
+    $reused := false
+    $tc := tls.closed_conn()
+    if c.idle_https != 0 && c.idle_addr == addr && c.idle_sni == sni {
+        select {
+            conn := <-c.idle_tls {
+                tc = conn
+                leftover = c.idle_buf + ""
+                c.idle_buf = ""
+                reused = true
+            }
+            else {
+                reused = false
+            }
+        }
+    }
+    if !reused {
+        c.close_idle()
+        $cfg := tls.new_config(sni)
+        cfg.insecure_skip_verify = c.insecure_skip_verify
+        cfg.set_next_protos(["http/1.1"])
+        remaining := http_remaining(deadline_ns) or >>
+        $nc := net.dial_timeout("tcp", addr, remaining) or >>
+        nc.set_deadline(deadline_ns)
+        tc = tls.client(nc, &cfg) or (err) {
+            http_remaining(deadline_ns) or >>
+            >> err
+        }
+    }
+    tc.set_deadline(deadline_ns)
+    tc.write(&req) or (err) {
+        $t := tc
+        _ := t.close()
+        http_remaining(deadline_ns) or >>
+        if reused && retry_safe {
+            << c.exchange_https(addr, sni, req, deadline_ns, false) or >>
+        }
+        >> err
+    }
+    $ch := chan tls.Conn{cap: 1}
+    ch <- tc
+    $b := MsgBuf{data: leftover, fd: -1, tls_h: 1, tls_chan: ch, deadline_ns: deadline_ns, max_bytes: c.max_response_bytes, progress: download_progress(c.progress)}
+    msg := read_http_message_buf($&b, true) or (err) {
+        $t := <-ch
+        _ := t.close()
+        http_remaining(deadline_ns) or >>
+        if reused && retry_safe {
+            << c.exchange_https(addr, sni, req, deadline_ns, false) or >>
+        }
+        >> err
+    }
+    $tc_back := <-ch
+    header_end := find_crlf_crlf(&msg)
+    $hdrs := ""
+    if header_end >= 0 {
+        hdrs = msg[0:header_end]
+    }
+    if connection_wants_close(&hdrs) {
+        $t := tc_back
+        _ := t.close()
+        << msg
+    }
+    c.idle_https = 1
+    c.idle_addr = addr + ""
+    c.idle_sni = sni + ""
+    c.idle_buf = b.data + ""
+    c.idle_tls <- tc_back
+    << msg
 }
 
 fn (c $&Client) exchange_http(addr string, req string, deadline_ns int, retry_safe bool) string {
@@ -969,8 +1128,7 @@ fn (r $&Response) do_request_ex(method string, raw_url string, body &string, ext
 
 fn (c $&Client) do_exchange(https bool, addr string, sni string, req string, deadline_ns int, retry_safe bool) string {
     if https {
-        c.close_idle()
-        << exchange_deadline_limit(true, addr, sni, req, deadline_ns, c.max_response_bytes, c.progress) or >>
+        << c.exchange_https(addr, sni, req, deadline_ns, retry_safe) or >>
     }
     << c.exchange_http(addr, req, deadline_ns, retry_safe) or >>
 }
@@ -1011,6 +1169,9 @@ pub struct Client {
     idle_https int
     idle_addr string
     idle_buf string
+    idle_sni string
+    idle_tls chan tls.Conn
+    pub insecure_skip_verify bool
     // One budget for HTTP/TLS I/O and redirects; 0 disables it. Synchronous
     // DNS and Linux TCP connect still need cancellable platform adapters.
     pub timeout_ns int
@@ -1022,7 +1183,7 @@ pub struct Client {
 }
 
 pub fn new_client() Client {
-    << Client{jar: cookiejar.new_jar(), jar_on: 0, idle_fd: -1, idle_https: 0, idle_addr: "", idle_buf: "", timeout_ns: 0, max_redirects: 10, max_response_bytes: 0, progress: no_download_progress}
+    << Client{jar: cookiejar.new_jar(), jar_on: 0, idle_fd: -1, idle_https: 0, idle_addr: "", idle_buf: "", idle_sni: "", idle_tls: chan tls.Conn{cap: 1}, insecure_skip_verify: false, timeout_ns: 0, max_redirects: 10, max_response_bytes: 0, progress: no_download_progress}
 }
 
 pub fn (c $&Client) set_jar(j cookiejar.Jar) {
@@ -1053,17 +1214,17 @@ fn ingest_cookies(j $&cookiejar.Jar, u &url.URL, headers &string) {
     }
 }
 
-fn (c $&Client) do_once(method string, raw_url string, body &string, deadline_ns int) Response {
+fn (c $&Client) do_once(method string, raw_url string, body &string, extra0 string, deadline_ns int) Response {
     http_remaining(deadline_ns) or >>
     url0 := raw_url + ""
     $u := url.new_url()
     u.parse(url0 + "") or >>
-    $extra := ""
+    $extra := extra0 + ""
     if c.jar_on != 0 {
         cs := cookie_list(&c.jar, &u)
         ch := cookiejar.cookie_header(&cs)
         if ch.len > 0 {
-            extra = "Cookie: " + ch + "\r\n"
+            extra = extra + "Cookie: " + ch + "\r\n"
         }
     }
     $r := new_response()
@@ -1097,11 +1258,11 @@ fn (c $&Client) do_once(method string, raw_url string, body &string, deadline_ns
     << r
 }
 
-pub fn (c $&Client) do(method string, raw_url string, body &string) Response {
+pub fn (c $&Client) do_extra(method string, raw_url string, extra string, body &string) Response {
     m := method + ""
     u := raw_url + ""
     deadline_ns := http_deadline(c.timeout_ns) or >>
-    r := c.do_once(m + "", u + "", body, deadline_ns) or (err) {
+    r := c.do_once(m + "", u + "", body, extra, deadline_ns) or (err) {
         c.close_idle()
         >> err
     }
@@ -1109,6 +1270,15 @@ pub fn (c $&Client) do(method string, raw_url string, body &string) Response {
         c.close_idle()
         >> err
     }
+}
+
+pub fn (c $&Client) get_extra(raw_url string, extra string) Response {
+    empty := ""
+    << c.do_extra("GET", raw_url, extra, &empty) or >>
+}
+
+pub fn (c $&Client) do(method string, raw_url string, body &string) Response {
+    << c.do_extra(method, raw_url, "", body) or >>
 }
 
 pub fn (c $&Client) get(raw_url string) Response {
@@ -1120,6 +1290,17 @@ pub fn (c $&Client) post(raw_url string, body &string) Response {
     << c.do("POST", raw_url, body) or >>
 }
 
+pub fn (c $&Client) post_form(raw_url string, data &url.Query) Response {
+    body := data.encode()
+    extra := "Content-Type: application/x-www-form-urlencoded\r\n"
+    deadline_ns := http_deadline(c.timeout_ns) or >>
+    r := c.do_once("POST", raw_url + "", &body, extra, deadline_ns) or (err) {
+        c.close_idle()
+        >> err
+    }
+    << r
+}
+
 pub fn (req $&Request) read(fd int) int {
     << req.read_timeout(fd, 0) or >>
 }
@@ -1128,13 +1309,13 @@ pub fn (req $&Request) read(fd int) int {
 // A zero timeout preserves the caller-owned blocking read contract.
 pub fn (req $&Request) read_timeout(fd int, timeout_ns int) int {
     deadline := http_deadline(timeout_ns) or >>
-    $b := MsgBuf{data: "", fd: fd, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: deadline, max_bytes: 0, progress: download_progress(no_download_progress)}
+    $b := MsgBuf{data: "", fd: fd, tls_h: 0, tls_chan: chan tls.Conn{cap: 1}, deadline_ns: deadline, max_bytes: 0, progress: download_progress(no_download_progress)}
     msg := read_http_message_buf($&b, false) or >>
     << req.parse_message(&msg) or >>
 }
 
 fn buffered_request(data string) Request {
-    $b := MsgBuf{data: data, fd: -1, tls_h: 0, tls_conn: tls.closed_conn(), deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
+    $b := MsgBuf{data: data, fd: -1, tls_h: 0, tls_chan: chan tls.Conn{cap: 1}, deadline_ns: 0, max_bytes: 0, progress: download_progress(no_download_progress)}
     msg := read_http_message_buf($&b, false) or >>
     $req := new_request()
     req.parse_message(&msg) or >>
@@ -1238,7 +1419,24 @@ fn write_n_mode(fd int, status_code int, content_type string, extra string, body
     if keep_alive { out = out + "Connection: keep-alive\r\n" }
     else { out = out + "Connection: close\r\n" }
     out = out + "\r\n"
-    if send_body {
+    if send_body && body.len > 4096 {
+        $sent_hdr := 0
+        while sent_hdr < out.len {
+            part := out[sent_hdr:out.len]
+            n := net.conn_write(fd, &part) or >>
+            if n <= 0 { >> errors.new("net/http: write made no progress") }
+            sent_hdr += n
+        }
+        $sent_body := 0
+        while sent_body < body.len {
+            part := body[sent_body:body.len]
+            n := net.conn_write(fd, &part) or >>
+            if n <= 0 { >> errors.new("net/http: write made no progress") }
+            sent_body += n
+        }
+        << sent_hdr + sent_body
+    }
+    if send_body && body.len > 0 {
         out = out + body
     }
     $sent := 0
@@ -1303,4 +1501,11 @@ fn response_extra_closes(extra &string) bool {
 
 fn (c $&Client) drop() { c.close_idle() }
 
-pub fn (c &Client) has_idle_connection() bool { << c.idle_fd >= 0 }
+pub fn (c &Client) has_idle_connection() bool {
+    if c.idle_fd >= 0 {
+        << true
+    }
+    << c.idle_https != 0
+}
+
+pub fn (c $&Client) close_idle_connections() { c.close_idle() }

@@ -78,7 +78,21 @@ def top_level_fn_blocks(lines: list[str]) -> list[tuple[int, int]]:
 
 def candidate_files(src_root: Path) -> list[Path]:
     files: list[Path] = []
-    for sub in ("cmd/compile", "xu/types", "xu/parser", "xu/scanner", "xu/ast"):
+    for sub in (
+        "cmd/compile",
+        "xu/ds",
+        "xu/types",
+        "xu/typeenv",
+        "xu/risks",
+        "xu/ffi",
+        "xu/cbind",
+        "xu/borrow",
+        "xu/checker",
+        "xu/mir",
+        "xu/parser",
+        "xu/scanner",
+        "xu/ast",
+    ):
         d = src_root / sub
         if not d.is_dir():
             continue

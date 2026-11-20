@@ -15,6 +15,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+from threading import Timer
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = tuple(f"{os_name}-{arch}" for os_name in ("linux", "macos", "windows") for arch in ("x64", "arm64"))
@@ -244,6 +245,19 @@ fn check_short_string_copies() bool {
             if piece[i] != src[i + 1] { << false }
         }
     }
+    $binary := make_string(67)
+    for i in 0:binary.len { binary[i] = (i + 255) & 255 }
+    for n in 31:66 {
+        piece := binary[1:n + 1]
+        if piece.len != n { << false }
+        joined := strings.join(["start", piece, "end"], "|")
+        if joined.len != n + 10 || !strings.has_prefix(&joined, "start|") || !strings.has_suffix(&joined, "|end") {
+            << false
+        }
+        for i in 0:n {
+            if joined[i + 6] != i { << false }
+        }
+    }
     << true
 }
 
@@ -362,6 +376,87 @@ fn check_zst_static_box() bool {
     if u.n != 55 { << false }
     let ne: ZstVal = ZstNonEmpty{n: 13}
     << ne.tag() + zst_pass(ne) == 26
+}
+
+fn check_loop_carry_cases() bool {
+    $a := []int{}
+    $i := 0
+    while i < 64 {
+        a.push((i * 17 + 5) & 255)
+        i += 1
+    }
+    $pass := 0
+    while pass < 3 {
+        $k := 1
+        while k < a.len {
+            a[k] = (a[k - 1] * 3 + a[k]) % 1000000007
+            k += 1
+        }
+        pass += 1
+    }
+    if a[0] != 5 || a[63] != 564084038 { << false }
+    // Zero-trip bound and offset-2 index guard must keep prefix untouched.
+    $z := [11, 22, 33, 44]
+    $zi := 2
+    while zi < 2 {
+        z[zi] = (z[zi - 1] * 5 + z[zi]) % 1000000007
+        zi += 1
+    }
+    if z[0] != 11 || z[1] != 22 || z[2] != 33 || z[3] != 44 { << false }
+    $j := 2
+    while j < z.len {
+        z[j] = (z[j - 1] * 5 + z[j]) % 1000000007
+        j += 1
+    }
+    if z[0] != 11 || z[1] != 22 || z[2] != 143 || z[3] != 759 { << false }
+    << true
+}
+
+fn check_map_int_cases() bool {
+    $m := map[int]int{}
+    edge_keys := [0, -1, -9223372036854775807 - 1, 9223372036854775807]
+    for i in 0:edge_keys.len {
+        m[edge_keys[i]] = 1000 + i
+    }
+    for i in 0:256 {
+        m[i * 3 + 1] = i * 7 + 2
+    }
+    if m.len() != 260 { << false }
+    for i in 0:160 {
+        m.delete(i * 3 + 1)
+    }
+    if m.len() != 100 { << false }
+    // Reuse tombstones and grow across threshold while overwriting existing entries.
+    for i in 0:200 {
+        key := 10000 + i
+        m[key] = i + 50
+        m[key] = m[key] + 10
+    }
+    if m.len() != 300 { << false }
+    if m.has(1) || !m.has(160 * 3 + 1) || m[160 * 3 + 1] != 160 * 7 + 2 { << false }
+    if m[10199] != 259 { << false }
+    for i in 0:edge_keys.len {
+        if m[edge_keys[i]] != 1000 + i { << false }
+    }
+    $seen := 0
+    for key, value in m {
+        if !m.has(key) || m[key] != value { << false }
+        seen += 1
+    }
+    if seen != m.len() { << false }
+    $sm := map[string]int{}
+    for i in 0:64 {
+        k := "k-" + str(i)
+        sm[k] = i
+        sm[k] = sm[k] + 100
+    }
+    for i in 0:40 {
+        sm.delete("k-" + str(i))
+    }
+    for i in 0:64 {
+        sm["n-" + str(i)] = i * 2
+    }
+    << sm.len() == 88 && !sm.has("k-0") && sm["k-63"] == 163 && sm["n-63"] == 126
 }
 
 fn implicit_borrow_values() bool {
@@ -579,6 +674,8 @@ fn main() int {
     if !check_recycled_strings() { << 36 }
     if !check_short_string_copies() { << 37 }
     if !check_zst_static_box() { << 40 }
+    if !check_loop_carry_cases() { << 41 }
+    if !check_map_int_cases() { << 42 }
     println("optimized code passed")
     << 0
 }
@@ -774,6 +871,73 @@ fn main() int {
 }
 '''
 
+HTTP_EVENT_SET = r'''@main
+#net
+#net/http
+fn serve_task(lfd int, srv_done chan int) {
+    _ := http.serve_listener(lfd, fn(c http.Context) {
+        c.text(200, "pong:" + c.path()) or (err) { << }
+    })
+    srv_done <- 1
+}
+fn client_worker(base_url string, base_seq int, out chan int) {
+    $c := http.new_client()
+    c.set_timeout(5000000000)
+    $ok := 0
+    for i in 0:8 {
+        path := "/r/" + str(base_seq + i)
+        resp := c.get(base_url + path) or (err) {
+            out <- -1
+            <<
+        }
+        if resp.status_code() != 200 || resp.body() != "pong:" + path {
+            out <- -2
+            <<
+        }
+        ok += 1
+    }
+    out <- ok
+}
+fn try_listen(addr string) int {
+    << net.listen(addr) or (err) { << -1 }
+}
+fn main() int {
+    $port := 23401
+    $lfd := -1
+    $tries := 0
+    while lfd < 0 && tries < 64 {
+        addr := "127.0.0.1:" + str(port)
+        lfd = try_listen(addr + "")
+        if lfd < 0 {
+            port += 1
+            tries += 1
+        }
+    }
+    if lfd < 0 {
+        eprintln("no loopback port")
+        << 1
+    }
+    srv_done := chan int{cap: 1}
+    xu serve_task(lfd, srv_done)
+    base_url := "http://127.0.0.1:" + str(port)
+    out := chan int{cap: 8}
+    for w in 0:8 {
+        xu client_worker(base_url + "", w * 8, out)
+    }
+    $total := 0
+    for _ in 0:8 {
+        v := <-out
+        if v < 0 { << 2 }
+        total += v
+    }
+    net.conn_close(lfd) or (err) { << 3 }
+    if <-srv_done != 1 { << 4 }
+    if total != 64 { << 5 }
+    println("http event set passed")
+    << 0
+}
+'''
+
 
 def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected: bytes) -> None:
     try:
@@ -782,6 +946,167 @@ def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected:
         raise RuntimeError(f"{command}: runtime timeout; stdout={error.stdout!r}, stderr={error.stderr!r}") from error
     if result.returncode != 0 or result.stdout != expected or result.stderr:
         raise RuntimeError(f"{command}: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}")
+
+
+WINDOWS_MEMORY = r'''@main
+#net
+#net/poller
+#net/stream
+fn checkpoint(label string) {
+    println(label)
+    os_fd_read(0, 1) or (err) { <<< 1 }
+}
+fn empty_lengths(s string) int {
+    joined := s + s
+    bytes := s.bytes()
+    runes := s.runes()
+    src := [1, 2, 3]
+    empty := src[1:1]
+    << joined.len + bytes.len + runes.len + empty.len
+}
+fn worker(start chan int, done chan int) {
+    _ := <-start
+    done <- 1
+}
+fn wave(inspect bool) int {
+    start := chan int{cap: 0}
+    done := chan int{cap: 32}
+    for i in 0:32 { xu worker(start, done) }
+    if inspect { checkpoint("active") }
+    close(start)
+    $sum := 0
+    for i in 0:32 { sum += <-done }
+    << sum
+}
+fn churn(p $&poller.Poller, n int) {
+    for i in 0:n {
+        id := p.add(stream.from_tcp(net.closed_conn()))
+        if !p.remove(id) { <<< 5 }
+    }
+}
+fn main() {
+    checkpoint("start")
+    empty := ""
+    $sum := 0
+    for i in 0:200000 { sum += empty_lengths(empty) }
+    if sum != 0 { <<< 2 }
+    checkpoint("empty")
+    if wave(true) != 32 { <<< 3 }
+    checkpoint("idle")
+    if wave(false) != 32 { <<< 4 }
+    checkpoint("idle again")
+    $p := poller.new()
+    churn($&p, 1024)
+    checkpoint("poller warm")
+    churn($&p, 65536)
+    checkpoint("poller churn")
+    if p.count() != 0 { <<< 6 }
+}
+'''
+
+
+def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("page_faults", wintypes.DWORD),
+            ("working_set_and_pool", ctypes.c_size_t * 8),
+            ("private_usage", ctypes.c_size_t),
+        ]
+
+    class MemoryRegion(ctypes.Structure):
+        _fields_ = [
+            ("base", ctypes.c_void_p),
+            ("allocation", ctypes.c_void_p),
+            ("allocation_protect", wintypes.DWORD),
+            ("partition_id", wintypes.WORD),
+            ("size", ctypes.c_size_t),
+            ("state", wintypes.DWORD),
+            ("protect", wintypes.DWORD),
+            ("type", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_memory = kernel32.K32GetProcessMemoryInfo
+    get_memory.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
+    query = kernel32.VirtualQueryEx
+    query.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(MemoryRegion), ctypes.c_size_t]
+    query.restype = ctypes.c_size_t
+
+    def guarded_stacks(handle: int) -> set[int]:
+        stack_size = 1024**2
+        guard_size = 16 * 1024
+        mem_reserve, mem_commit, page_readwrite = 0x2000, 0x1000, 4
+        stacks = set()
+        guard = None
+        address = 0
+        region = MemoryRegion()
+        while query(handle, address, ctypes.byref(region), ctypes.sizeof(region)):
+            base = region.base or 0
+            # A Xu stack is a reserved guard followed by writable pages in
+            # the same allocation.
+            if guard is not None and guard == region.allocation and base == guard + guard_size:
+                if region.state == mem_commit and region.protect == page_readwrite and region.size == stack_size - guard_size:
+                    stacks.add(guard)
+            guard = None
+            if region.state == mem_reserve and region.size == guard_size and base == region.allocation:
+                guard = base
+            address = base + region.size
+        return stacks
+
+    with subprocess.Popen(
+        [str(binary)], cwd=work, env=env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ) as child:
+        # Each marker holds the process at a known point until we sample it.
+        timer = Timer(20, child.kill)
+        timer.start()
+        try:
+            usage: dict[bytes, int] = {}
+            stacks: dict[bytes, set[int]] = {}
+            handle = int(child._handle)
+            for marker in (
+                b"start\n", b"empty\n", b"active\n", b"idle\n", b"idle again\n",
+                b"poller warm\n", b"poller churn\n",
+            ):
+                line = child.stdout.readline()
+                if line != marker:
+                    raise AssertionError(f"expected {marker!r}, got {line!r}")
+                counters = MemoryCounters()
+                counters.size = ctypes.sizeof(counters)
+                if not get_memory(handle, ctypes.byref(counters), counters.size):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                usage[marker] = counters.private_usage
+                stacks[marker] = guarded_stacks(handle)
+                child.stdin.write(b"x")
+                child.stdin.flush()
+            out, err = child.communicate(timeout=10)
+            if child.returncode != 0 or out or err:
+                raise AssertionError(f"memory workload exited {child.returncode}: {out!r} {err!r}")
+        finally:
+            timer.cancel()
+            if child.poll() is None:
+                child.kill()
+
+    start_bytes, empty_bytes, idle_bytes = usage[b"start\n"], usage[b"empty\n"], usage[b"idle\n"]
+    if empty_bytes - start_bytes > 12 * 1024**2 or idle_bytes - empty_bytes > 16 * 1024**2:
+        raise AssertionError(
+            f"excess private commit growth: start={start_bytes}, empty={empty_bytes}, idle={idle_bytes}"
+        )
+    baseline = stacks[b"start\n"]
+    active = stacks[b"active\n"] - baseline
+    idle = stacks[b"idle\n"] - baseline
+    idle_again = stacks[b"idle again\n"] - baseline
+    if len(active) != 32 or len(idle) != 8 or not idle <= active or len(idle_again) != 8:
+        raise AssertionError(
+            f"unexpected guarded stack counts: active={len(active)}, idle={len(idle)}, idle again={len(idle_again)}"
+        )
+    poller_growth = usage[b"poller churn\n"] - usage[b"poller warm\n"]
+    if poller_growth > 4 * 1024**2:
+        raise AssertionError(f"Poller grew by {poller_growth} private bytes after warm-up")
 
 
 def main() -> int:
@@ -816,6 +1141,10 @@ def main() -> int:
         run("optimized_code/no-opt", build("unoptimized_code", OPTIMIZED_CODE, "--no-opt"),
             expected="optimized code passed")
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
+        if os.name == "nt":
+            check_windows_memory(build("memory", WINDOWS_MEMORY), work, env)
+            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/{args.target} (executed)", flush=True)
+        run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")
         from platform_crypto_cases import SOURCE as CRYPTO, write_fixtures
