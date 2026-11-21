@@ -28,7 +28,7 @@ pos("struct_scope_drop", """
 struct U { s string n int }
 fn main() int {
     $u := U{s: "init_padpad", n: 1}
-    for i in 0 -< 15 {
+    for i in 0:15 {
         u.s = "v" + str(i) + "_padpadpad"
     }
     println(u.s)
@@ -102,7 +102,7 @@ pos("array_struct_scope", """
 struct P { name string id int }
 fn main() int {
     $ps := []P{}
-    for i in 0 -< 12 {
+    for i in 0:12 {
         ps.push(P{name: "p" + str(i) + "_padpad", id: i})
     }
     println(ps[11].name)
@@ -116,7 +116,7 @@ pos("rebind_struct_field_loop", """
 struct Box { a string b string }
 fn main() int {
     $x := Box{a: "a0_padpad", b: "b0_padpad"}
-    for i in 0 -< 8 {
+    for i in 0:8 {
         x.a = "a" + str(i) + "_padpad"
         x.b = "b" + str(i) + "_padpad"
     }
@@ -163,7 +163,7 @@ pos("map_string_churn", """
 @main
 fn main() int {
     $m := map[string]string{}
-    for i in 0 -< 12 {
+    for i in 0:12 {
         m["k" + str(i)] = "v" + str(i) + "_padpad"
     }
     m["k5"] = "replaced_pad"
