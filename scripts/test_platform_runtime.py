@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+import errno
 import os
 from pathlib import Path
 import platform
+import select
 import socket
 import ssl
 import subprocess
 import tempfile
 from threading import Timer
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = tuple(f"{os_name}-{arch}" for os_name in ("linux", "macos", "windows") for arch in ("x64", "arm64"))
@@ -955,6 +959,154 @@ fn main() int {
 '''
 
 
+HTTP_PENDING_UPLOAD = r'''@main
+#net
+#net/http
+#os
+fn upload(c http.Context) {
+    body := c.body()
+    for i in 0:body.len {
+        if body[i] != 120 {
+            c.text(400, "bad body") or (err) { << }
+            <<
+        }
+    }
+    c.text(200, str(body.len)) or (err) { << }
+}
+fn main() int {
+    args := os.args()
+    $options := http.server_options()
+    options.max_connections = 8
+    options.max_buffer_bytes = 32768
+    options.read_timeout_ns = 3000000000
+    options.sync_handlers = args[1] == "sync"
+    lfd := net.listen("127.0.0.1:0") or (err) { << 1 }
+    println(net.socket_local_addr(lfd))
+    http.serve_listener_with_options(lfd, upload, options) or (err) { << 2 }
+    << 0
+}
+'''
+
+
+def check_http_pending(binary: Path, work: Path, env: dict[str, str], sync: bool) -> None:
+    def request(size: int, connection: str = "close") -> bytes:
+        return (f"POST /upload HTTP/1.1\r\nHost: localhost\r\n"
+                f"Content-Length: {size}\r\nConnection: {connection}\r\n\r\n").encode()
+
+    def response(stream, size: int) -> None:
+        status = stream.readline()
+        if not status.startswith(b"HTTP/1.1 200 "):
+            raise AssertionError(f"Unexpected HTTP status {status!r}")
+        headers = {}
+        for line in iter(stream.readline, b"\r\n"):
+            name, separator, value = line.partition(b":")
+            if not separator:
+                raise AssertionError(f"Malformed HTTP header {line!r}")
+            headers[name.lower()] = value.strip()
+        content = stream.read(int(headers[b"content-length"]))
+        if content != str(size).encode():
+            raise AssertionError(f"Unexpected response body {content!r}")
+
+    mode = "sync" if sync else "async"
+    with subprocess.Popen([str(binary), mode], cwd=work, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            startup = Timer(15, child.kill)
+            startup.start()
+            try:
+                address = child.stdout.readline().strip()
+            finally:
+                startup.cancel()
+            port = int(address.rsplit(b":", 1)[1])
+
+            def dial():
+                return socket.create_connection(("127.0.0.1", port), timeout=12)
+
+            def send_upload(size: int) -> None:
+                with dial() as sock, sock.makefile("rb") as stream:
+                    head = request(size)
+                    sock.sendall(head[:-3])
+                    sock.sendall(head[-3:] + b"x" * (size // 2))
+                    sock.sendall(b"x" * (size - size // 2))
+                    response(stream, size)
+
+            def expect_close(sock) -> None:
+                try:
+                    if sock.recv(1):
+                        raise AssertionError("Incomplete request received a response")
+                except (ConnectionAbortedError, ConnectionResetError):
+                    pass
+
+            if not sync:
+                send_upload(12288)
+                with dial() as sock, sock.makefile("rb") as stream:
+                    sock.sendall(b"POST /upload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+                                 b"Transfer-Encoding: chunked\r\n\r\n5\r\nxx")
+                    sock.sendall(b"xxx\r\n3\r\nxxx\r\n0\r\n\r\n")
+                    response(stream, 8)
+                # The payload fits the logical limit. Growing a pending buffer
+                # to hold it would exceed the limit while the old one is live.
+                with dial() as sock:
+                    try:
+                        sock.sendall(request(24576) + b"x" * 24576)
+                        if sock.recv(1):
+                            raise AssertionError("Request exceeded the pending-buffer growth budget")
+                    except ConnectionResetError:
+                        pass
+                with dial() as sock:
+                    started = time.monotonic()
+                    sock.sendall(request(12000) + b"x" * 8192)
+                    expect_close(sock)
+                    if time.monotonic() - started < 1.0:
+                        raise AssertionError("Incomplete request closed before its intake timeout")
+                for _ in range(3):
+                    with dial() as sock:
+                        sock.sendall(request(12000) + b"x" * 8192)
+                        sock.shutdown(socket.SHUT_WR)
+                        expect_close(sock)
+
+                # Each partial upload fits alone. Keeping all six unfinished
+                # forces the listener to enforce its shared 32 KiB budget.
+                with ExitStack() as pending:
+                    started = time.monotonic()
+                    peers = [pending.enter_context(dial()) for _ in range(6)]
+                    partial = request(7001) + b"x" * 7000
+                    for peer in peers:
+                        try:
+                            peer.sendall(partial)
+                        except (ConnectionAbortedError, ConnectionResetError):
+                            pass
+                    remaining = max(0.0, started + 2.0 - time.monotonic())
+                    readable, _, _ = select.select(peers, [], [], remaining)
+                    if not readable or time.monotonic() >= started + 3.0:
+                        raise AssertionError("Shared pending-buffer budget did not reject a peer before its timeout")
+                    for peer in peers:
+                        if peer not in readable:
+                            try:
+                                peer.shutdown(socket.SHUT_WR)
+                            except (ConnectionAbortedError, ConnectionResetError):
+                                pass
+                            except OSError as error:
+                                if error.errno not in (errno.ENOTCONN, getattr(errno, "WSAENOTCONN", errno.ENOTCONN)):
+                                    raise
+                        expect_close(peer)
+                send_upload(12288)
+
+            if os.name != "nt":
+                with dial() as sock, sock.makefile("rb") as stream:
+                    sock.sendall(request(3, "keep-alive") + b"xxx" + request(4) + b"xxxx")
+                    response(stream, 3)
+                    response(stream, 4)
+                send_upload(12288)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            _, stderr = child.communicate(timeout=10)
+            if stderr:
+                raise AssertionError(f"HTTP pending fixture wrote to stderr {stderr!r}")
+    print(f"PASS net_http_pending_budget/{mode}/{native_target()} (executed)", flush=True)
+
+
 def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected: bytes) -> None:
     try:
         result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, timeout=45)
@@ -1161,6 +1313,10 @@ def main() -> int:
             check_windows_memory(build("memory", WINDOWS_MEMORY), work, env)
             print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/{args.target} (executed)", flush=True)
         run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
+        upload = build("http_pending_upload", HTTP_PENDING_UPLOAD)
+        check_http_pending(upload, work, env, sync=False)
+        if os.name != "nt":
+            check_http_pending(upload, work, env, sync=True)
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")
         from platform_crypto_cases import SOURCE as CRYPTO, write_fixtures

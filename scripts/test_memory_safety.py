@@ -1071,6 +1071,31 @@ fn main() int {
         debug_free=False,
     ),
     PosCase(
+        name="Bounded_string_append_preserves_buffer_on_rejection",
+        code="""@main
+core #runtime/core
+
+fn main() int {
+    $text := ""
+    if core.string_append_bounded($&text, &"abc", 20, 3) { << 1 }
+    if text != "" || core.string_buffer_size(&text) != 0 { << 2 }
+    if !core.string_append_bounded($&text, &"abc", 20, 4) { << 3 }
+    if text != "abc" || core.string_buffer_size(&text) != 4 { << 4 }
+    if core.string_append_bounded($&text, &"def", 20, 6) { << 5 }
+    if text != "abc" || core.string_buffer_size(&text) != 4 { << 6 }
+    if !core.string_append_bounded($&text, &"def", 20, 7) { << 7 }
+    if core.string_append_bounded($&text, &"g", 6, 14) { << 8 }
+    if !core.string_append_bounded($&text, &"g", 20, 14) { << 9 }
+    if !core.string_append_bounded($&text, &"h", 20, 0) { << 10 }
+    if text != "abcdefgh" || core.string_buffer_size(&text) != 14 { << 11 }
+    println("bounded append preserved ownership")
+    << 0
+}
+""",
+        expect_stdout="bounded append preserved ownership\n",
+        test_no_opt=True,
+    ),
+    PosCase(
         name="Push_byte_releases_small_blocks_at_terminator_boundary",
         code="""@main
 core #runtime/core
