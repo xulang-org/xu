@@ -39,6 +39,7 @@ def compiler_env() -> dict[str, str]:
 
 LIBRARY = r'''@main
 #os
+iofs #io/fs
 #path/filepath
 #time
 #crypto/sha256
@@ -58,7 +59,17 @@ fn file_read_boundary(size int) bool {
     $body := os.read("file-read-boundary") or (err) { << false }
     if body != want { << false }
     body.push_byte(128)
-    << body.len == size + 1 && body[size] == 128 && body[0:size] == want
+    if body.len != size + 1 || body[size] != 128 || body[0:size] != want { << false }
+    fs := os.dir_fs(".")
+    $relative := iofs.read_file(&fs, "file-read-boundary") or (err) { << false }
+    if relative != want { << false }
+    relative.push_byte(129)
+    << relative.len == size + 1 && relative[size] == 129 && relative[0:size] == want
+}
+fn dirfs_rejects_directory() bool {
+    fs := os.dir_fs(".")
+    _ := fs.read_file(".") or (err) { << true }
+    << false
 }
 fn main() int {
     // Separate evaluations must own separate storage, including literals
@@ -77,7 +88,10 @@ fn main() int {
     body := os.read("roundtrip") or (err) { eprintln(err.msg())
         << 2 }
     if body != "Xu\nbytes" { << 3 }
-    for size in [0, 65534, 65535, 65536, 524288] {
+    for _ in 0:3 {
+        if !dirfs_rejects_directory() { << 16 }
+    }
+    for size in [0, 4095, 4096, 4097, 65534, 65535, 65536, 524288] {
         if !file_read_boundary(size) { << 15 }
     }
     path := "a/../b/./c"
