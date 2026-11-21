@@ -97,6 +97,112 @@ fn parse_byte_range(range_hdr string, total_size int) ByteRange {
     << ByteRange{start: start, end: end, ok: true}
 }
 
+fn static_file_length(fsys &os.DirFS, name string) int {
+    $file := fsys.open(name) or >>
+    length := file.seek(0, os.SEEK_END) or >>
+    file.close() or >>
+    << length
+}
+
+fn static_header(c Context, status int, content_type string, extra string, length int) int {
+    head := response_header_bytes(status, content_type, extra, length, *c.keep_alive)
+    << write_response_data(c.fd, &head) or (err) {
+        *c.keep_alive = false
+        >> err
+    }
+}
+
+fn static_error(c Context, status int, message string, send_body bool) {
+    write_n_mode(c.fd, status, "text/plain; charset=utf-8", "", &message, send_body, *c.keep_alive) or (err) {
+        *c.keep_alive = false
+        <<
+    }
+}
+
+fn static_file_headers(length int) string {
+    << "ETag: \"" + strconv.itoa(length) + "\"\r\nAccept-Ranges: bytes\r\n"
+}
+
+fn static_range_outside(c Context, content_type string, size int, send_body bool) {
+    extra := "Content-Range: bytes */" + strconv.itoa(size) + "\r\n"
+    message := "range not satisfiable\n"
+    write_n_mode(c.fd, 416, content_type, extra, &message, send_body, *c.keep_alive) or (err) {
+        *c.keep_alive = false
+        <<
+    }
+}
+
+fn write_static_range(fd int, file &os.File, length int) int {
+    $remaining := length
+    while remaining > 0 {
+        $take := remaining
+        if take > READ_CHUNK_BYTES { take = READ_CHUNK_BYTES }
+        chunk := file.read(take) or >>
+        if chunk.len == 0 || chunk.len > take { >> errors.new("net/http: incomplete file range") }
+        write_response_data(fd, &chunk) or >>
+        remaining -= chunk.len
+    }
+    << length
+}
+
+fn serve_static_range(c Context, fsys &os.DirFS, name string, content_type string, range_header string, size_hint int, send_body bool) {
+    original := parse_byte_range(range_header + "", size_hint)
+    if !original.ok {
+        static_range_outside(c, content_type + "", size_hint, send_body)
+        <<
+    }
+    file := fsys.open(name) or (err) {
+        static_error(c, 404, "404 page not found\n", send_body)
+        <<
+    }
+    size := file.seek(0, os.SEEK_END) or (err) {
+        static_error(c, 404, "404 page not found\n", send_body)
+        <<
+    }
+    range := parse_byte_range(range_header, size)
+    if !range.ok {
+        static_range_outside(c, content_type + "", size, send_body)
+        <<
+    }
+    if send_body {
+        _ := file.seek(range.start, os.SEEK_SET) or (err) {
+            static_error(c, 404, "404 page not found\n", true)
+            <<
+        }
+    }
+    length := range.end - range.start + 1
+    extra := static_file_headers(size) + "Content-Range: bytes " + strconv.itoa(range.start) + "-" + strconv.itoa(range.end) + "/" + strconv.itoa(size) + "\r\n"
+    if !send_body {
+        static_header(c, 206, content_type, extra, length) or (err) { << }
+        <<
+    }
+    head := response_header_bytes(206, content_type, extra, length, *c.keep_alive)
+    write_response_data(c.fd, &head) or (err) {
+        *c.keep_alive = false
+        <<
+    }
+    // The advertised length requires retiring the connection on any
+    // incomplete transfer, before the next response can be sent.
+    write_static_range(c.fd, &file, length) or (err) {
+        *c.keep_alive = false
+        <<
+    }
+}
+
+fn static_index_length(fsys &os.DirFS, name string) int {
+    info := iofs.stat(fsys, name + "") or >>
+    if info.is_dir { >> errors.new("net/http: index is a directory") }
+    << static_file_length(fsys, name) or >>
+}
+
+fn static_listing(c Context, fsys &os.DirFS, path string, name string, send_body bool) {
+    html := dir_listing(path, fsys, name)
+    write_n_mode(c.fd, 200, "text/html; charset=utf-8", "", &html, send_body, *c.keep_alive) or (err) {
+        *c.keep_alive = false
+        <<
+    }
+}
+
 pub fn (fs FileServer) serve_context(c Context) {
     fd := c.fd
     method := c.req.method()
@@ -110,15 +216,13 @@ pub fn (fs FileServer) serve_context(c Context) {
     url_path := strip_query(raw)
     local := map_url_path(&url_path)
     if local.len == 0 {
-        msg := "forbidden\n"
-        write_n_mode(fd, 403, "text/plain; charset=utf-8", "", &msg, true, *c.keep_alive) or (err) { << }
+        static_error(c, 403, "forbidden\n", send_body)
         <<
     }
     fsys := os.dir_fs(fs.root + "")
     loc := local + ""
     info := iofs.stat(&fsys, loc + "") or (err) {
-        msg := "404 page not found\n"
-        write_n_mode(fd, 404, "text/plain; charset=utf-8", "", &msg, true, *c.keep_alive) or (e2) { << }
+        static_error(c, 404, "404 page not found\n", send_body)
         <<
     }
     if info.is_dir {
@@ -132,12 +236,19 @@ pub fn (fs FileServer) serve_context(c Context) {
         if loc != "." {
             idx = loc + "/index.html"
         }
-        idx_body := iofs.read_file(&fsys, idx) or (err) {
-            html := dir_listing(url_path, &fsys, loc + "")
-            write_n_mode(fd, 200, "text/html; charset=utf-8", "", &html, send_body, *c.keep_alive) or (e2) { << }
+        if !send_body {
+            length := static_index_length(&fsys, idx + "") or (err) {
+                static_listing(c, &fsys, url_path, loc, false)
+                <<
+            }
+            static_header(c, 200, "text/html; charset=utf-8", "", length) or (err) { << }
             <<
         }
-        write_n_mode(fd, 200, "text/html; charset=utf-8", "", &idx_body, send_body, *c.keep_alive) or (err) { << }
+        idx_body := iofs.read_file(&fsys, idx) or (err) {
+            static_listing(c, &fsys, url_path, loc, true)
+            <<
+        }
+        write_n_mode(fd, 200, "text/html; charset=utf-8", "", &idx_body, true, *c.keep_alive) or (err) { << }
         <<
     }
     ext := filepath.ext(&loc)
@@ -148,39 +259,27 @@ pub fn (fs FileServer) serve_context(c Context) {
     etag := "\"" + strconv.itoa(info.size) + "\""
     inm := c.header("if-none-match")
     if inm.len > 0 && (inm == etag || inm == "*") {
-        extra := "ETag: " + etag + "\r\nAccept-Ranges: bytes\r\n"
-        empty := ""
-        write_n_mode(fd, 304, ctype, extra, &empty, false, *c.keep_alive) or (err) { << }
+        static_header(c, 304, ctype, static_file_headers(info.size), 0) or (err) { << }
         <<
     }
     range_req := c.header("range")
     if range_req.len > 0 && strings.has_prefix(&range_req, "bytes=") {
-        br := parse_byte_range(range_req, info.size)
-        if br.ok {
-            body := iofs.read_file(&fsys, loc + "") or (err) {
-                msg := "404 page not found\n"
-                write_n_mode(fd, 404, "text/plain; charset=utf-8", "", &msg, true, *c.keep_alive) or (e2) { << }
-                <<
-            }
-            content_range := "bytes " + strconv.itoa(br.start) + "-" + strconv.itoa(br.end) + "/" + strconv.itoa(info.size)
-            extra := "ETag: " + etag + "\r\nAccept-Ranges: bytes\r\nContent-Range: " + content_range + "\r\n"
-            part := body[br.start:(br.end + 1)]
-            write_n_mode(fd, 206, ctype, extra, &part, send_body, *c.keep_alive) or (err) { << }
-            <<
-        } else {
-            extra := "Content-Range: bytes */" + strconv.itoa(info.size) + "\r\n"
-            msg := "range not satisfiable\n"
-            write_n_mode(fd, 416, "text/plain; charset=utf-8", extra, &msg, true, *c.keep_alive) or (err) { << }
-            <<
-        }
-    }
-    body := iofs.read_file(&fsys, loc + "") or (err) {
-        msg := "404 page not found\n"
-        write_n_mode(fd, 404, "text/plain; charset=utf-8", "", &msg, true, *c.keep_alive) or (e2) { << }
+        serve_static_range(c, &fsys, loc, ctype, range_req, info.size, send_body)
         <<
     }
-    extra := "ETag: " + etag + "\r\nAccept-Ranges: bytes\r\n"
-    write_n_mode(fd, 200, ctype, extra, &body, send_body, *c.keep_alive) or (err) { << }
+    if !send_body {
+        length := static_file_length(&fsys, loc) or (err) {
+            static_error(c, 404, "404 page not found\n", false)
+            <<
+        }
+        static_header(c, 200, ctype, static_file_headers(length), length) or (err) { << }
+        <<
+    }
+    body := iofs.read_file(&fsys, loc + "") or (err) {
+        static_error(c, 404, "404 page not found\n", true)
+        <<
+    }
+    write_n_mode(fd, 200, ctype, static_file_headers(info.size), &body, true, *c.keep_alive) or (err) { << }
 }
 
 pub fn serve_file(fd int, name string) int {
