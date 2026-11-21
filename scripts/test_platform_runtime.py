@@ -1116,6 +1116,104 @@ def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected:
         raise RuntimeError(f"{command}: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}")
 
 
+HTTP_CLIENT_BUFFER = r'''@main
+#net/http
+#os
+#strconv
+#strings
+
+fn valid_body(data &string, size int) bool {
+    if data.len != size { << false }
+    for i in 0:data.len {
+        if (data[i] & 255) != i % 251 { << false }
+    }
+    << true
+}
+
+fn get_error(client $&http.Client, url string) string {
+    _ := client.get(url) or (err) { << err.msg() }
+    << ""
+}
+
+fn main() int {
+    args := os.args()
+    base := args[1] + ""
+    $client := http.new_client()
+    client.set_timeout(30000000000)
+    client.insecure_skip_verify = true
+    client.max_response_bytes = strconv.atoi(&args[2]) or (err) { << 6 }
+    first := client.get(base + "/fixed") or (err) { << 7 }
+    if first.status_code != 200 || !valid_body(&first.body, 16384) || !client.has_idle_connection() { << 1 }
+    client.max_response_bytes = 9223372036854775807
+    chunked := client.get(base + "/chunked") or (err) { << 8 }
+    if chunked.status_code != 200 || !valid_body(&chunked.body, 12288) { << 2 }
+    client.max_response_bytes = strconv.atoi(&args[3]) or (err) { << 9 }
+    limit_failure := get_error($&client, base + "/over-limit")
+    if !strings.contains(&limit_failure, "message too large") || client.has_idle_connection() { << 3 }
+    client.max_response_bytes = 0
+    short_failure := get_error($&client, base + "/truncated")
+    if short_failure.len == 0 || client.has_idle_connection() { << 4 }
+    fresh := client.get(base + "/fresh") or (err) { << 10 }
+    if fresh.status_code != 200 || !valid_body(&fresh.body, 8192) || !valid_body(&first.body, 16384) { << 5 }
+    client.close_idle_connections()
+    println("HTTP client buffer passed")
+    << 0
+}
+'''
+
+
+def check_http_client_buffer(binary: Path, work: Path, env: dict[str, str],
+                             context: ssl.SSLContext | None = None) -> None:
+    def payload(size: int) -> bytes:
+        return (bytes(range(251)) * ((size + 250) // 251))[:size]
+
+    def fixed(size: int, connection: str = "close") -> bytes:
+        return (f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: {connection}\r\n\r\n".encode()
+                + payload(size))
+
+    first = fixed(16384, "keep-alive")
+    over_limit = fixed(16384)
+    chunks = payload(12288)
+    chunked = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+               + b"".join(b"1000\r\n" + chunks[i:i + 4096] + b"\r\n" for i in range(0, len(chunks), 4096))
+               + b"0\r\n\r\n")
+    fresh = fixed(8192) if context else b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + payload(8192)
+    sessions = (
+        (("/fixed", first), ("/chunked", chunked)),
+        (("/over-limit", over_limit),),
+        (("/truncated", fixed(16384)[:-8192]),),
+        (("/fresh", fresh),),
+    )
+
+    def peer(listener: socket.socket) -> None:
+        for exchanges in sessions:
+            with ExitStack() as sockets:
+                raw = sockets.enter_context(listener.accept()[0])
+                raw.settimeout(20)
+                conn = sockets.enter_context(context.wrap_socket(raw, server_side=True)) if context else raw
+                stream = sockets.enter_context(conn.makefile("rb"))
+                for path, response in exchanges:
+                    request = stream.readline()
+                    if not request.startswith(f"GET {path} ".encode()):
+                        raise AssertionError(f"Expected GET {path}, received {request!r}")
+                    for line in iter(stream.readline, b"\r\n"):
+                        if not line:
+                            raise AssertionError("Incomplete HTTP request")
+                    conn.sendall(response)
+
+    scheme = "https" if context else "http"
+    with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as peers:
+        listener.settimeout(20)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        address = f"{scheme}://127.0.0.1:{listener.getsockname()[1]}"
+        future = peers.submit(peer, listener)
+        checked_run([str(binary), address, str(len(first)), str(len(over_limit) - 1)],
+                    cwd=work, env=env, expected=b"HTTP client buffer passed\n")
+        future.result(timeout=20)
+    print(f"PASS net_http_client_buffer/{scheme}/{native_target()} (executed)", flush=True)
+
+
 WINDOWS_MEMORY = r'''@main
 #net
 #net/poller
@@ -1317,6 +1415,8 @@ def main() -> int:
         check_http_pending(upload, work, env, sync=False)
         if os.name != "nt":
             check_http_pending(upload, work, env, sync=True)
+        client = build("http_client_buffer", HTTP_CLIENT_BUFFER)
+        check_http_client_buffer(client, work, env)
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")
         from platform_crypto_cases import SOURCE as CRYPTO, write_fixtures
@@ -1341,6 +1441,7 @@ def main() -> int:
                 future = peers.submit(tls_peer, listener, context)
                 run("crypto_tls_ecdhe_interop", crypto, "interop", f"127.0.0.1:{listener.getsockname()[1]}", expected="TLS ECDHE interop passed")
                 future.result(timeout=20)
+            check_http_client_buffer(client, work, env, context)
             for family, network, host in ((socket.AF_INET, "tcp4", "127.0.0.1"), (socket.AF_INET6, "tcp6", "::1")):
                 # Missing IPv6 is a hard failure, including on CI runners.
                 with socket.socket(family) as listener:
