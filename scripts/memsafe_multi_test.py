@@ -71,7 +71,7 @@ pos("arr_overwrite_owning", """
 @main
 fn main() int {
     $a := []string{}
-    for i in 0 -< 40 {
+    for i in 0:40 {
         a.push("item_" + str(i) + "_padpad")
     }
     a[3] = "replaced_padpad"
@@ -116,7 +116,7 @@ pos("map_owning_values", """
 @main
 fn main() int {
     $m := map[string]string{}
-    for i in 0 -< 25 {
+    for i in 0:25 {
         m["k" + str(i)] = "v" + str(i) + "_padpad"
     }
     m["k0"] = "replaced0"
@@ -157,12 +157,12 @@ fn main() int {
     xu sender(3, ch, done)
     xu sender(4, ch, done)
     $got := 0
-    for i in 0 -< 4 {
+    for i in 0:4 {
         s := <-ch
         println(s)
         got = got + s.len
     }
-    for i in 0 -< 4 {
+    for i in 0:4 {
         <-done
     }
     println(got)
@@ -197,7 +197,7 @@ pos("slice_copy_borrow_src", """
 @main
 fn main() int {
     s := "0123456789abcdef"
-    t := s[3 -< 9]
+    t := s[3:9]
     println(t)
     println(s)
     << 0
@@ -267,7 +267,7 @@ pos("field_churn", """
 struct U { s string }
 fn main() int {
     $u := U{s: "init"}
-    for i in 0 -< 60 {
+    for i in 0:60 {
         u.s = "val_" + str(i) + "_padpadpadpad"
     }
     println(u.s)
@@ -279,7 +279,7 @@ pos("live_string_array", """
 @main
 fn main() int {
     $a := []string{}
-    for i in 0 -< 80 {
+    for i in 0:80 {
         a.push("live_" + str(i) + "_padpadpadpad")
     }
     println(a.len)
@@ -293,7 +293,7 @@ pos("concat_loop", """
 @main
 fn main() int {
     $acc := ""
-    for i in 0 -< 40 {
+    for i in 0:40 {
         acc = acc + str(i % 10)
     }
     println(acc.len)
@@ -362,7 +362,7 @@ reject("const_slice_oob", """
 @main
 fn main() int {
     s := "abcd"
-    println(s[10 -< 12])
+    println(s[10:12])
     << 0
 }
 """)
@@ -551,6 +551,57 @@ fn main() int {
 }
 """)
 
+
+pos("map_growth_tombstones_and_take", """
+@main
+fn main() int {
+    $m := map[int]string{}
+    for batch in 0:4 {
+        base := batch * 512
+        for i in 0:512 {
+            m[base + i] = "value-" + str(base + i)
+        }
+        for i in 0:512 {
+            key := base + i
+            if i % 2 == 0 {
+                m.delete(key)
+            } else {
+                m[key] = "kept-" + str(key)
+            }
+        }
+    }
+    for i in 0:2048 {
+        if i % 2 == 0 {
+            if m.has(i) { << 1 }
+        } else if m.take(i) != "kept-" + str(i) {
+            << 2
+        }
+    }
+    println(m.len())
+    << 0
+}
+""", "0\n")
+
+pos("split_byte_owned_fragments", """
+@main
+#strings
+fn split_owned() []string {
+    source := "," + "0123456789abcdef0123456789abcdef" + ",,last,"
+    << strings.split(&source, ",")
+}
+fn main() int {
+    $parts := split_owned()
+    if parts.len != 5 || parts[0] != "" || parts[2] != "" || parts[4] != "" {
+        << 1
+    }
+    if parts[1] != "0123456789abcdef0123456789abcdef" || parts[3] != "last" {
+        << 2
+    }
+    parts[1] = "new"
+    println(strings.join(parts, "|"))
+    << 0
+}
+""", "|new||last|\n")
 
 def run_one(xu: str, env: dict, name: str, src: str, kind: str, expect: str | None):
     td = Path(tempfile.mkdtemp(prefix=f"xuMS_{name}_"))
