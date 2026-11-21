@@ -1135,6 +1135,13 @@ fn get_error(client $&http.Client, url string) string {
     << ""
 }
 
+fn ignore_progress(received int, total int) {}
+
+fn chunk_progress(received int, total int) {
+    if total != -1 || received < 0 || received > 12288 { <<< 11 }
+    if received == 0 || received == 12288 { println(str(received)) }
+}
+
 fn main() int {
     args := os.args()
     base := args[1] + ""
@@ -1144,17 +1151,30 @@ fn main() int {
     client.max_response_bytes = strconv.atoi(&args[2]) or (err) { << 6 }
     first := client.get(base + "/fixed") or (err) { << 7 }
     if first.status_code != 200 || !valid_body(&first.body, 16384) || !client.has_idle_connection() { << 1 }
-    client.max_response_bytes = 9223372036854775807
+    chunk_limit := strconv.atoi(&args[4]) or (err) { << 12 }
+    client.max_response_bytes = chunk_limit
+    client.set_download_progress(chunk_progress)
     chunked := client.get(base + "/chunked") or (err) { << 8 }
-    if chunked.status_code != 200 || !valid_body(&chunked.body, 12288) { << 2 }
+    client.set_download_progress(ignore_progress)
+    if chunked.status_code != 200 || !valid_body(&chunked.body, 12288) || !client.has_idle_connection() { << 2 }
+    client.max_response_bytes = 9223372036854775807
+    continued := client.get(base + "/continued") or (err) { << 13 }
+    if continued.status_code != 200 || !valid_body(&continued.body, 17) { << 14 }
     client.max_response_bytes = strconv.atoi(&args[3]) or (err) { << 9 }
     limit_failure := get_error($&client, base + "/over-limit")
     if !strings.contains(&limit_failure, "message too large") || client.has_idle_connection() { << 3 }
     client.max_response_bytes = 0
     short_failure := get_error($&client, base + "/truncated")
     if short_failure.len == 0 || client.has_idle_connection() { << 4 }
+    client.max_response_bytes = chunk_limit - 1
+    chunk_failure := get_error($&client, base + "/chunk-over-limit")
+    if !strings.contains(&chunk_failure, "message too large") || client.has_idle_connection() { << 15 }
+    client.max_response_bytes = 0
+    trailer_failure := get_error($&client, base + "/truncated-trailer")
+    if trailer_failure.len == 0 || client.has_idle_connection() { << 16 }
     fresh := client.get(base + "/fresh") or (err) { << 10 }
     if fresh.status_code != 200 || !valid_body(&fresh.body, 8192) || !valid_body(&first.body, 16384) { << 5 }
+    if !valid_body(&chunked.body, 12288) { << 17 }
     client.close_idle_connections()
     println("HTTP client buffer passed")
     << 0
@@ -1174,15 +1194,21 @@ def check_http_client_buffer(binary: Path, work: Path, env: dict[str, str],
     first = fixed(16384, "keep-alive")
     over_limit = fixed(16384)
     chunks = payload(12288)
-    chunked = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-               + b"".join(b"1000\r\n" + chunks[i:i + 4096] + b"\r\n" for i in range(0, len(chunks), 4096))
-               + b"0\r\n\r\n")
+    chunked = (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n2000;probe=yes\r",
+        b"\n" + chunks[:8192] + b"\r",
+        b"\n1000\r\n" + chunks[8192:] + b"\r\n0\r\nX-Trailer: sample\r",
+        b"\nX-End: yes\r\n\r",
+        b"\n",
+    )
     fresh = fixed(8192) if context else b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + payload(8192)
     sessions = (
-        (("/fixed", first), ("/chunked", chunked)),
-        (("/over-limit", over_limit),),
-        (("/truncated", fixed(16384)[:-8192]),),
-        (("/fresh", fresh),),
+        (("/fixed", (first,)), ("/chunked", chunked), ("/continued", (fixed(17),))),
+        (("/over-limit", (over_limit,)),),
+        (("/truncated", (fixed(16384)[:-8192],)),),
+        (("/chunk-over-limit", chunked),),
+        (("/truncated-trailer", chunked[:-1]),),
+        (("/fresh", (fresh,)),),
     )
 
     def peer(listener: socket.socket) -> None:
@@ -1192,14 +1218,15 @@ def check_http_client_buffer(binary: Path, work: Path, env: dict[str, str],
                 raw.settimeout(20)
                 conn = sockets.enter_context(context.wrap_socket(raw, server_side=True)) if context else raw
                 stream = sockets.enter_context(conn.makefile("rb"))
-                for path, response in exchanges:
+                for path, fragments in exchanges:
                     request = stream.readline()
                     if not request.startswith(f"GET {path} ".encode()):
                         raise AssertionError(f"Expected GET {path}, received {request!r}")
                     for line in iter(stream.readline, b"\r\n"):
                         if not line:
                             raise AssertionError("Incomplete HTTP request")
-                    conn.sendall(response)
+                    for response in fragments:
+                        conn.sendall(response)
 
     scheme = "https" if context else "http"
     with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as peers:
@@ -1208,8 +1235,9 @@ def check_http_client_buffer(binary: Path, work: Path, env: dict[str, str],
         listener.listen(1)
         address = f"{scheme}://127.0.0.1:{listener.getsockname()[1]}"
         future = peers.submit(peer, listener)
-        checked_run([str(binary), address, str(len(first)), str(len(over_limit) - 1)],
-                    cwd=work, env=env, expected=b"HTTP client buffer passed\n")
+        chunk_limit = sum(map(len, chunked))
+        checked_run([str(binary), address, str(len(first)), str(len(over_limit) - 1), str(chunk_limit)],
+                    cwd=work, env=env, expected=b"0\n12288\nHTTP client buffer passed\n")
         future.result(timeout=20)
     print(f"PASS net_http_client_buffer/{scheme}/{native_target()} (executed)", flush=True)
 

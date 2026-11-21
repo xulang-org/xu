@@ -610,12 +610,31 @@ struct MsgBuf {
 }
 
 fn (b &MsgBuf) message_limit() int {
+    if b.max_bytes > core.MAX_STRING_PAYLOAD { << core.MAX_STRING_PAYLOAD }
     if b.max_bytes > 0 { << b.max_bytes }
     << MAX_MESSAGE_BYTES
 }
 
 // frame_end is the end offset of a known fixed-length message, or zero.
-fn (b $&MsgBuf) read_more(frame_end int) int {
+fn append_message_data(dst $&string, part &string, limit int, frame_end int) bool {
+    if part.len > limit - dst.len { << false }
+    // Leave room for the string terminator. Keep a smaller growth step for
+    // unknown lengths, and reserve extra beyond a fixed frame only as needed.
+    need := dst.len + part.len + 1
+    $reserve := limit + 1
+    if frame_end == 0 {
+        current := core.string_buffer_size(dst)
+        if need > current && current / 2 < reserve - current {
+            reserve = current + current / 2
+        }
+    } else if frame_end < limit {
+        reserve = frame_end + 1
+    }
+    if need > reserve { reserve = need }
+    << core.string_append_bounded(dst, part, limit, reserve)
+}
+
+fn (b $&MsgBuf) read_more(frame_end int, discarded int) int {
     $chunk := ""
     if b.tls_h != 0 {
         $tc := <-b.tls_chan
@@ -633,89 +652,101 @@ fn (b $&MsgBuf) read_more(frame_end int) int {
     if chunk.len == 0 {
         << 0
     }
-    $limit := b.message_limit()
-    if limit > core.MAX_STRING_PAYLOAD { limit = core.MAX_STRING_PAYLOAD }
-    if chunk.len > limit - b.data.len {
-        >> errors.new("net/http: message too large")
-    }
-
-    // The wire-byte limit excludes the string terminator. Use smaller
-    // growth steps when the final size is unknown. For a fixed-length frame,
-    // allow extra capacity only for bytes already read beyond its end.
-    need := b.data.len + chunk.len + 1
-    $reserve := limit + 1
-    if frame_end == 0 {
-        current := core.string_buffer_size(&b.data)
-        if need > current && current / 2 < reserve - current {
-            reserve = current + current / 2
-        }
-    } else if frame_end < limit {
-        reserve = frame_end + 1
-    }
-    if need > reserve { reserve = need }
-    if !core.string_append_bounded($&b.data, &chunk, limit, reserve) {
+    limit := b.message_limit() - discarded
+    if !append_message_data($&b.data, &chunk, limit, frame_end) {
         >> errors.new("net/http: message too large")
     }
     b.report_buffered_progress(false)
     << chunk.len
 }
 
-fn (b $&MsgBuf) decode_chunked(body_start int) string {
-    $i := body_start
-    $out := ""
-    for round in 0:100000 {
-        $line_end := find_crlf_from(&b.data, i)
-        while line_end < 0 {
-            n_r := b.read_more(0) or >>
-            if n_r == 0 {
-                >> errors.new("net/http: truncated chunk size")
-            }
-            line_end = find_crlf_from(&b.data, i)
+fn (b $&MsgBuf) discard_prefix(n int) {
+    if n == 0 { << }
+    if n == b.data.len {
+        b.data = ""
+    } else {
+        b.data = b.data[n:b.data.len]
+    }
+}
+
+fn (b $&MsgBuf) read_chunk_bytes(cursor $&int, discarded $&int) int {
+    // Charge dropped bytes against the whole message's wire limit.
+    b.discard_prefix(*cursor)
+    *discarded += *cursor
+    *cursor = 0
+    << b.read_more(0, *discarded) or >>
+}
+
+fn (b $&MsgBuf) chunk_line_end(cursor $&int, discarded $&int, eof_error string) int {
+    $scan := *cursor
+    while true {
+        end := find_crlf_from(&b.data, scan)
+        if end >= 0 { << end }
+        // After compaction, resume at the last pending byte so a CRLF
+        // split across reads is still found.
+        scan = b.data.len - *cursor
+        if scan > 0 { scan -= 1 }
+        if b.read_chunk_bytes(cursor, discarded) or >> == 0 {
+            >> errors.new(eof_error)
         }
+    }
+}
+
+fn (b $&MsgBuf) finish_chunked(cursor $&int, discarded $&int) int {
+    while true {
+        end := b.chunk_line_end(cursor, discarded, "net/http: truncated chunk trailers") or >>
+        empty := end == *cursor
+        *cursor = end + 2
+        if empty {
+            b.discard_prefix(*cursor)
+            << 0
+        }
+    }
+}
+
+fn (b $&MsgBuf) decode_chunked(body_start int) string {
+    limit := b.message_limit()
+    if b.data.len > limit { >> errors.new("net/http: message too large") }
+    $i := body_start
+    $discarded := 0
+    $out := ""
+    for _ in 0:100000 {
+        line_end := b.chunk_line_end($&i, $&discarded, "net/http: truncated chunk size") or >>
         size_line := b.data[i:line_end]
-        size_r := parse_hex_size_limit(size_line + "", b.message_limit()) or >>
-        size := size_r
+        size := parse_hex_size_limit(size_line, limit) or >>
         i = line_end + 2
         if size == 0 {
-            if i + 1 < b.data.len && (b.data[i] & 255) == 13 && (b.data[i + 1] & 255) == 10 {
-                b.report_progress(out.len, true)
-                << out + ""
-            }
-            $trailer_end := find_crlf_crlf_from(&b.data, i)
-            while trailer_end < 0 {
-                if i + 1 < b.data.len && (b.data[i] & 255) == 13 && (b.data[i + 1] & 255) == 10 {
-                    b.report_progress(out.len, true)
-                    << out + ""
-                }
-                n_r2 := b.read_more(0) or >>
-                if n_r2 == 0 {
-                    >> errors.new("net/http: truncated chunk trailers")
-                }
-                trailer_end = find_crlf_crlf_from(&b.data, i)
-            }
+            b.finish_chunked($&i, $&discarded) or >>
             b.report_progress(out.len, true)
-            << out + ""
+            << out
         }
-        need := i + size + 2
-        while b.data.len < need {
-            $available := b.data.len - i
-            if available > size { available = size }
-            b.report_progress(out.len + available, false)
-            n_r3 := b.read_more(0) or >>
-            if n_r3 == 0 {
+        if size > limit - discarded - i - 2 {
+            >> errors.new("net/http: message too large")
+        }
+        $remaining := size
+        while remaining > 0 {
+            if i == b.data.len && (b.read_chunk_bytes($&i, $&discarded) or >>) == 0 {
+                >> errors.new("net/http: truncated chunk")
+            }
+            $take := b.data.len - i
+            if take > remaining { take = remaining }
+            part := b.data[i:(i + take)]
+            if !append_message_data($&out, &part, limit, 0) {
+                >> errors.new("net/http: message too large")
+            }
+            i += take
+            remaining -= take
+            b.report_progress(out.len, false)
+        }
+        while b.data.len - i < 2 {
+            if b.read_chunk_bytes($&i, $&discarded) or >> == 0 {
                 >> errors.new("net/http: truncated chunk")
             }
         }
-        out = out + b.data[i:(i + size)]
-        b.report_progress(out.len, false)
-        i = i + size
         if (b.data[i] & 255) != 13 || (b.data[i + 1] & 255) != 10 {
             >> errors.new("net/http: bad chunk CRLF")
         }
-        i = i + 2
-        if round > MAX_READ_ITERATIONS {
-            >> errors.new("net/http: too many chunks")
-        }
+        i += 2
     }
     >> errors.new("net/http: too many chunks")
 }
@@ -781,7 +812,7 @@ fn read_http_message_buf(b $&MsgBuf, until_close bool) string {
         if header_end >= 0 {
             <-
         }
-        n_r := b.read_more(0)
+        n_r := b.read_more(0, 0)
         if n_r == 0 {
             <-
         }
@@ -797,13 +828,12 @@ fn read_http_message_buf(b $&MsgBuf, until_close bool) string {
         body_r := b.decode_chunked(header_end + 4)
         body := body_r
         msg := head + "\r\n\r\n" + body
-        b.data = ""
         << msg
     }
     if cl >= 0 {
         need := header_end + 4 + cl
         while b.data.len < need {
-            n_r2 := b.read_more(need)
+            n_r2 := b.read_more(need, 0)
             if n_r2 == 0 {
                 >> errors.new("net/http: truncated body")
             }
@@ -820,7 +850,7 @@ fn read_http_message_buf(b $&MsgBuf, until_close bool) string {
     if until_close {
         $ended := false
         for round in 0:MAX_READ_ITERATIONS {
-            if b.read_more(0) == 0 {
+            if b.read_more(0, 0) == 0 {
                 ended = true
                 <-
             }
