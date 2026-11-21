@@ -1002,6 +1002,99 @@ fn main() int {
 '''
 
 
+HTTP_STATIC_FILES = r'''@main
+#net
+#net/http
+fn files(c http.Context) {
+    server := http.file_server("www")
+    server.serve_context(c)
+}
+fn main() int {
+    lfd := net.listen("127.0.0.1:0") or (err) { << 1 }
+    println(net.socket_local_addr(lfd))
+    << http.serve_listener(lfd, files)
+}
+'''
+
+
+def check_http_static_files(binary: Path, work: Path, env: dict[str, str]) -> None:
+    payload = bytes((i + i // 257) % 256 for i in range(16384))
+    root = work / "www"
+    root.mkdir()
+    (root / "data.bin").write_bytes(payload)
+    (root / "index.html").write_bytes(b"<p>index</p>")
+    (root / "listing" / "index.html").mkdir(parents=True)
+    (root / "empty").touch()
+
+    def request(method: str, path: str, extra: str = "", connection: str = "close") -> bytes:
+        return (f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: {connection}\r\n"
+                + extra + "\r\n").encode()
+
+    def parse(wire: bytes, status: int, length: int) -> tuple[dict[bytes, bytes], bytes]:
+        block, separator, body = wire.partition(b"\r\n\r\n")
+        line, *fields = block.split(b"\r\n")
+        assert separator and line.startswith(f"HTTP/1.1 {status} ".encode()), wire[:300]
+        headers = {key.lower(): value.strip() for key, value in (p.split(b":", 1) for p in fields)}
+        assert headers[b"content-length"] == str(length).encode(), headers
+        return headers, body
+
+    with subprocess.Popen([str(binary)], cwd=work, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            timer = Timer(20, child.kill)
+            timer.start()
+            try:
+                port = int(child.stdout.readline().strip().rsplit(b":", 1)[-1])
+            finally:
+                timer.cancel()
+
+            def roundtrip(data: bytes) -> bytes:
+                result = bytearray()
+                with socket.create_connection(("127.0.0.1", port), timeout=15) as conn:
+                    conn.sendall(data)
+                    while True:
+                        try:
+                            part = conn.recv(65536)
+                        except ConnectionResetError:
+                            break
+                        if not part:
+                            break
+                        result.extend(part)
+                return bytes(result)
+
+            head, body = parse(roundtrip(request("HEAD", "/data.bin")), 200, len(payload))
+            assert not body and head[b"etag"] == b'"16384"' and head[b"accept-ranges"] == b"bytes"
+            assert parse(roundtrip(request("HEAD", "/")), 200, len(b"<p>index</p>"))[1] == b""
+            assert parse(roundtrip(request("HEAD", "/empty")), 200, 0)[1] == b""
+            assert parse(roundtrip(request("HEAD", "/missing")), 404, len(b"404 page not found\n"))[1] == b""
+            assert parse(roundtrip(request("GET", "/data.bin")), 200, len(payload))[1] == payload
+            assert parse(roundtrip(request("GET", "/data.bin", 'If-None-Match: "16384"\r\n')), 304, 0)[1] == b""
+            assert parse(roundtrip(request("HEAD", "/data.bin", "Range: bytes=16384-\r\n")),
+                         416, len(b"range not satisfiable\n"))[1] == b""
+            listing = roundtrip(request("GET", "/listing/")).partition(b"\r\n\r\n")[2]
+            assert listing and parse(roundtrip(request("HEAD", "/listing/")), 200, len(listing))[1] == b""
+
+            for spec, start, end in (("1001-10050", 1001, 10050), ("-4097", 12287, 16383), ("16000-", 16000, 16383)):
+                field = f"Range: bytes={spec}\r\n"
+                length = end - start + 1
+                expected_range = f"bytes {start}-{end}/16384".encode()
+                for method, expected_body in (("HEAD", b""), ("GET", payload[start:end + 1])):
+                    head, body = parse(roundtrip(request(method, "/data.bin", field)), 206, length)
+                    assert body == expected_body and head[b"content-range"] == expected_range
+            if os.name != "nt":
+                pipeline = (request("GET", "/data.bin", "Range: bytes=1001-10050\r\n", "keep-alive")
+                            + request("HEAD", "/data.bin"))
+                head, body = parse(roundtrip(pipeline), 206, 9050)
+                assert head[b"connection"] == b"keep-alive" and body[:9050] == payload[1001:10051]
+                assert parse(body[9050:], 200, len(payload))[1] == b""
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            _, stderr = child.communicate(timeout=10)
+            assert not stderr, stderr
+    print(f"PASS net_http_static_file_ranges/{native_target()} (executed)", flush=True)
+
+
 def check_http_pending(binary: Path, work: Path, env: dict[str, str], sync: bool) -> None:
     def request(size: int, connection: str = "close") -> bytes:
         return (f"POST /upload HTTP/1.1\r\nHost: localhost\r\n"
@@ -1260,6 +1353,7 @@ WINDOWS_MEMORY = r'''@main
 #net
 #net/poller
 #net/stream
+#os
 fn checkpoint(label string) {
     println(label)
     os_fd_read(0, 1) or (err) { <<< 1 }
@@ -1292,6 +1386,16 @@ fn churn(p $&poller.Poller, n int) {
         if !p.remove(id) { <<< 5 }
     }
 }
+fn missing_stat() bool {
+    _ := os.stat("metadata-missing") or (err) { << true }
+    << false
+}
+fn stat_churn(n int) {
+    for _ in 0:n {
+        info := os.stat("metadata-file") or (err) { <<< 7 }
+        if info.size != 1 || !missing_stat() { <<< 8 }
+    }
+}
 fn main() {
     checkpoint("start")
     empty := ""
@@ -1309,6 +1413,11 @@ fn main() {
     churn($&p, 65536)
     checkpoint("poller churn")
     if p.count() != 0 { <<< 6 }
+    _ := os.write("metadata-file", "x") or (err) { <<< 9 }
+    stat_churn(1024)
+    checkpoint("stat warm")
+    stat_churn(32768)
+    checkpoint("stat churn")
 }
 '''
 
@@ -1378,7 +1487,7 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
             handle = int(child._handle)
             for marker in (
                 b"start\n", b"empty\n", b"active\n", b"idle\n", b"idle again\n",
-                b"poller warm\n", b"poller churn\n",
+                b"poller warm\n", b"poller churn\n", b"stat warm\n", b"stat churn\n",
             ):
                 line = child.stdout.readline()
                 if line != marker:
@@ -1415,6 +1524,9 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
     poller_growth = usage[b"poller churn\n"] - usage[b"poller warm\n"]
     if poller_growth > 4 * 1024**2:
         raise AssertionError(f"Poller grew by {poller_growth} private bytes after warm-up")
+    stat_growth = usage[b"stat churn\n"] - usage[b"stat warm\n"]
+    if stat_growth > 4 * 1024**2:
+        raise AssertionError(f"File metadata queries grew by {stat_growth} private bytes after warm-up")
 
 
 def main() -> int:
@@ -1451,8 +1563,9 @@ def main() -> int:
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
         if os.name == "nt":
             check_windows_memory(build("memory", WINDOWS_MEMORY), work, env)
-            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/{args.target} (executed)", flush=True)
+            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/stat_churn/{args.target} (executed)", flush=True)
         run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
+        check_http_static_files(build("http_static_files", HTTP_STATIC_FILES), work, env)
         upload = build("http_pending_upload", HTTP_PENDING_UPLOAD)
         check_http_pending(upload, work, env, sync=False)
         if os.name != "nt":
