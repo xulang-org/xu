@@ -43,6 +43,19 @@ LIBRARY = r'''@main
 fn literal_values() []int {
     << [0, 1, 2, 3, 4, 5, 6, 7]
 }
+fn file_read_boundary(size int) bool {
+    $want := make_string(size)
+    if size > 0 {
+        want[0] = 255
+        want[size - 1] = 129
+    }
+    written := os.write("file-read-boundary", want + "") or (err) { << false }
+    if written != size { << false }
+    $body := os.read("file-read-boundary") or (err) { << false }
+    if body != want { << false }
+    body.push_byte(128)
+    << body.len == size + 1 && body[size] == 128 && body[0:size] == want
+}
 fn main() int {
     // Separate evaluations must own separate storage, including literals
     // whose constant elements can be initialized from a compiler data pool.
@@ -60,6 +73,9 @@ fn main() int {
     body := os.read("roundtrip") or (err) { eprintln(err.msg())
         << 2 }
     if body != "Xu\nbytes" { << 3 }
+    for size in [0, 65534, 65535, 65536, 524288] {
+        if !file_read_boundary(size) { << 15 }
+    }
     path := "a/../b/./c"
     clean := filepath.clean(&path)
     slash := filepath.to_slash(&clean)
