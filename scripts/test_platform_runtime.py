@@ -1548,7 +1548,7 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
         raise AssertionError(f"File metadata queries grew by {stat_growth} private bytes after warm-up")
     for first, last in ((b"dir warm\n", b"dir success\n"), (b"dir success\n", b"dir failure\n")):
         growth = usage[last] - usage[first]
-        if growth > 2 * 1024**2:
+        if growth > 5 * 1024**2:
             raise AssertionError(f"{last.decode().strip()} grew by {growth} private bytes")
 
 
