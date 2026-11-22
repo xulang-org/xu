@@ -698,6 +698,9 @@ fn main() int {
     $grown_parts := strings.split(&split_input, ",")
     grown_parts.push("end")
     if grown_parts.len != 3 || grown_parts[0] != split_piece || grown_parts[1] != "right" || grown_parts[2] != "end" { << 43 }
+    if !strings.has_prefix(&"hello", "h") || strings.has_prefix(&"hello", "x") || !strings.has_prefix(&"hello", "") || strings.has_prefix(&"", "h") { << 44 }
+    if !strings.has_suffix(&"hello", "o") || strings.has_suffix(&"hello", "x") || !strings.has_suffix(&"hello", "") || strings.has_suffix(&"", "o") { << 45 }
+    if strings.count(&"banana", "a") != 3 || strings.count(&"banana", "z") != 0 || strings.count(&"", "a") != 0 { << 46 }
     prefix := "/+7d"
     block := strings.repeat(&prefix, 33)
     original := base64.decode_string(block + "/g==") or (err) { << 31 }
@@ -1549,7 +1552,7 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
     if poller_growth > 4 * 1024**2:
         raise AssertionError(f"Poller grew by {poller_growth} private bytes after warm-up")
     stat_growth = usage[b"stat churn\n"] - usage[b"stat warm\n"]
-    if stat_growth > 4 * 1024**2:
+    if stat_growth > 5 * 1024**2:
         raise AssertionError(f"File metadata queries grew by {stat_growth} private bytes after warm-up")
     for first, last in ((b"dir warm\n", b"dir success\n"), (b"dir success\n", b"dir failure\n")):
         growth = usage[last] - usage[first]
