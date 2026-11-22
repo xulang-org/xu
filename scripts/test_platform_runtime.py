@@ -693,6 +693,11 @@ fn main() int {
     parts := split_byte(&binary, 128)
     if parts.len != 18 || parts[0] != "" || parts[1] != string_from_byte(129) || parts[17] != "" { << 29 }
     if strings.join(parts, string_from_byte(128)) != binary { << 30 }
+    split_piece := strings.repeat(&"left", 20000)
+    split_input := split_piece + ",right"
+    $grown_parts := strings.split(&split_input, ",")
+    grown_parts.push("end")
+    if grown_parts.len != 3 || grown_parts[0] != split_piece || grown_parts[1] != "right" || grown_parts[2] != "end" { << 43 }
     prefix := "/+7d"
     block := strings.repeat(&prefix, 33)
     original := base64.decode_string(block + "/g==") or (err) { << 31 }
