@@ -22,6 +22,7 @@ const SYS_TASK_SWITCH = -1
 const TASK_STACK = 1048576
 const TASK_STACK_GUARD = 16384
 const TASK_STACK_CACHE_LIMIT = 8
+const TASK_TINY_STACK = 16384
 
 // Task record. The register context comes first (see __xu_task_switch).
 const T_X19 = 0
@@ -43,7 +44,8 @@ const T_WAIT_EVENTS = 216
 const T_WAIT_REVENTS = 224
 const T_WAIT_DEADLINE = 232
 const T_WAIT_NEXT = 240
-const T_SIZE = 248
+const T_IS_TINY = 248
+const T_SIZE = 256
 
 // Scheduler record, reached through G_SCHED.
 const S_CUR = 0
@@ -66,7 +68,8 @@ const S_POLL_TASKS = 128
 const S_POLL_CAP = 136
 const S_AFFINITY = 144
 const S_AFFINITY_TICKS = 152
-const S_SIZE = 160
+const S_TINY_FREE = 160
+const S_SIZE = 168
 
 // Channel record.
 const C_CAP = 0
@@ -83,7 +86,9 @@ const C_RECVD = 64
 // unread elements, the buffer and the record.
 const C_RC = 72
 const C_WAITER = 80
-const C_SIZE = 88
+const C_RDST = 88
+const C_DIRECT = 96
+const C_SIZE = 104
 
 fn ld(addr int) int {
     << rt_load(addr, 8)
@@ -305,6 +310,48 @@ pub fn task_spawn(entry int, fn_addr int, exit_addr int, block int) {
     st(t + T_X28, rt_globals())
     st(t + T_LR, entry)
     st(t + T_SP, ld(t + T_STACK) + task_stack())
+    st(s + S_NTASKS, ld(s + S_NTASKS) + 1)
+    queue_push(s, t)
+    progress()
+}
+
+fn map_tiny_stack() int {
+    size := TASK_TINY_STACK
+    if host_win() {
+        stk := win_call(W_VIRTUAL_ALLOC, 0, size, 0x3000, 4, 0, 0)
+        if stk == 0 {
+            fatal_no_memory()
+        }
+        << stk
+    }
+    << map_pages(size)
+}
+
+// Start fn_addr on a lightweight task with a 16KB tiny stack slab.
+pub fn task_spawn_tiny(entry int, fn_addr int, exit_addr int, block int) {
+    s := sched()
+    $t := ld(s + S_TINY_FREE)
+    if t != 0 {
+        st(s + S_TINY_FREE, ld(t + T_NEXT))
+    } else {
+        t = alloc(T_SIZE)
+        st(t + T_STACK, map_tiny_stack())
+    }
+    words := T_SIZE / 8
+    for i in 0:words {
+        if i * 8 != T_STACK {
+            st(t + i * 8, 0)
+        }
+    }
+    st(t + T_IS_TINY, 1)
+    st(t + T_X19, t)
+    st(t + T_X20, fn_addr)
+    st(t + T_X21, block)
+    st(t + T_ARGS, block)
+    st(t + T_X22, exit_addr)
+    st(t + T_X28, rt_globals())
+    st(t + T_LR, entry)
+    st(t + T_SP, ld(t + T_STACK) + TASK_TINY_STACK)
     st(s + S_NTASKS, ld(s + S_NTASKS) + 1)
     queue_push(s, t)
     progress()
@@ -602,21 +649,26 @@ pub fn task_exit(t int) {
     progress()
     free_owned(ld(t + T_ARGS))
     st(t + T_ARGS, 0)
-    $head := ld(s + S_FREE)
-    cached := ld(s + S_FREE_COUNT)
-    os := xu_target_os()
-    if cached >= TASK_STACK_CACHE_LIMIT && (os == OS_LINUX || os == OS_MACOS || os == OS_WINDOWS) {
-        // The cached task already switched away. Keep the current stack
-        // mapped until its own switch has finished.
-        old := head
-        head = ld(old + T_NEXT)
-        unmap_pages(ld(old + T_STACK), task_stack())
-        free_owned(old)
+    if ld(t + T_IS_TINY) != 0 {
+        st(t + T_NEXT, ld(s + S_TINY_FREE))
+        st(s + S_TINY_FREE, t)
     } else {
-        st(s + S_FREE_COUNT, cached + 1)
+        $head := ld(s + S_FREE)
+        cached := ld(s + S_FREE_COUNT)
+        os := xu_target_os()
+        if cached >= TASK_STACK_CACHE_LIMIT && (os == OS_LINUX || os == OS_MACOS || os == OS_WINDOWS) {
+            // The cached task already switched away. Keep the current stack
+            // mapped until its own switch has finished.
+            old := head
+            head = ld(old + T_NEXT)
+            unmap_pages(ld(old + T_STACK), task_stack())
+            free_owned(old)
+        } else {
+            st(s + S_FREE_COUNT, cached + 1)
+        }
+        st(t + T_NEXT, head)
+        st(s + S_FREE, t)
     }
-    st(t + T_NEXT, head)
-    st(s + S_FREE, t)
     $nx := sched_pop_next(s)
     if nx == 0 && ld(s + S_WAIT_COUNT) > 0 {
         sched_poll_waiters(s, true)
@@ -714,7 +766,11 @@ fn chan_put(ch int, src int, esize int) {
     if at >= n {
         at -= n
     }
-    mem_copy(buf + at * esize, src, esize)
+    if esize == 8 {
+        rt_store(buf + at * 8, 8, rt_load(src, 8))
+    } else {
+        mem_copy(buf + at * esize, src, esize)
+    }
     st(ch + C_COUNT, count + 1)
     st(ch + C_SENT, ld(ch + C_SENT) + 1)
     waiter := ld(ch + C_WAITER)
@@ -735,7 +791,11 @@ fn chan_put(ch int, src int, esize int) {
 fn chan_take(ch int, dst int, esize int) {
     buf := chan_buf(ch, esize)
     head := ld(ch + C_HEAD)
-    mem_copy(dst, buf + head * esize, esize)
+    if esize == 8 {
+        rt_store(dst, 8, rt_load(buf + head * 8, 8))
+    } else {
+        mem_copy(dst, buf + head * esize, esize)
+    }
     $nh := head + 1
     if nh >= chan_slots(ch) {
         nh = 0
@@ -777,6 +837,32 @@ pub fn chan_try_send(ch int, src int, esize int) int {
         if count != 0 || ld(ch + C_RWAIT) == 0 {
             << 0
         }
+        rdst := ld(ch + C_RDST)
+        if rdst != 0 {
+            if esize == 8 {
+                rt_store(rdst, 8, rt_load(src, 8))
+            } else {
+                mem_copy(rdst, src, esize)
+            }
+            st(ch + C_RDST, 0)
+            st(ch + C_DIRECT, 1)
+            st(ch + C_COUNT, 1)
+            st(ch + C_SENT, ld(ch + C_SENT) + 1)
+            waiter := ld(ch + C_WAITER)
+            if waiter != 0 {
+                st(ch + C_WAITER, 0)
+                s := sched()
+                streak := ld(s + S_AFFINITY_TICKS)
+                if streak < 8 && ld(s + S_AFFINITY) == 0 {
+                    if queue_unlink(s, waiter) {
+                        st(s + S_AFFINITY_TICKS, streak + 1)
+                        st(s + S_AFFINITY, waiter)
+                    }
+                }
+            }
+            progress()
+            << 1
+        }
     } else if count >= ld(ch + C_CAP) {
         << 0
     }
@@ -789,6 +875,14 @@ pub fn chan_try_send(ch int, src int, esize int) int {
 pub fn chan_try_recv(ch int, dst int, esize int) int {
     if ch == 0 {
         << 0
+    }
+    if ld(ch + C_DIRECT) != 0 {
+        st(ch + C_DIRECT, 0)
+        st(ch + C_COUNT, 0)
+        st(ch + C_RECVD, ld(ch + C_RECVD) + 1)
+        st(ch + C_WAITER, 0)
+        st(ch + C_RDST, 0)
+        << 1
     }
     if ld(ch + C_COUNT) > 0 {
         chan_take(ch, dst, esize)
@@ -803,6 +897,7 @@ pub fn chan_try_recv(ch int, dst int, esize int) int {
         << 2
     }
     st(ch + C_WAITER, ld(sched() + S_CUR))
+    st(ch + C_RDST, dst)
     << 0
 }
 
@@ -812,6 +907,40 @@ pub fn chan_send(ch int, src int, esize int) {
         if ch != 0 {
             if ld(ch + C_CLOSED) != 0 {
                 panic_send_closed()
+            }
+            if ld(ch + C_CAP) == 0 && ld(ch + C_RWAIT) > 0 {
+                rdst := ld(ch + C_RDST)
+                if rdst != 0 {
+                    if esize == 8 {
+                        rt_store(rdst, 8, rt_load(src, 8))
+                    } else {
+                        mem_copy(rdst, src, esize)
+                    }
+                    st(ch + C_RDST, 0)
+                    st(ch + C_DIRECT, 1)
+                    st(ch + C_COUNT, 1)
+                    st(ch + C_SENT, ld(ch + C_SENT) + 1)
+                    waiter := ld(ch + C_WAITER)
+                    if waiter != 0 {
+                        st(ch + C_WAITER, 0)
+                        s := sched()
+                        streak := ld(s + S_AFFINITY_TICKS)
+                        if streak < 8 && ld(s + S_AFFINITY) == 0 {
+                            if queue_unlink(s, waiter) {
+                                st(s + S_AFFINITY_TICKS, streak + 1)
+                                st(s + S_AFFINITY, waiter)
+                            }
+                        }
+                    }
+                    progress()
+                    mine := ld(ch + C_SENT)
+                    while ld(ch + C_RECVD) < mine && ld(ch + C_CLOSED) == 0 {
+                        st(ch + C_WAITER, ld(sched() + S_CUR))
+                        task_block()
+                    }
+                    st(ch + C_WAITER, 0)
+                    <<
+                }
             }
             if ld(ch + C_COUNT) < chan_slots(ch) {
                 chan_put(ch, src, esize)
@@ -835,6 +964,7 @@ pub fn chan_send(ch int, src int, esize int) {
 pub fn chan_recv(ch int, dst int, esize int) bool {
     if ch != 0 {
         st(ch + C_RWAIT, ld(ch + C_RWAIT) + 1)
+        st(ch + C_RDST, dst)
         progress()
     }
     while true {
@@ -842,6 +972,7 @@ pub fn chan_recv(ch int, dst int, esize int) bool {
         if r != 0 {
             st(ch + C_RWAIT, ld(ch + C_RWAIT) - 1)
             st(ch + C_WAITER, 0)
+            st(ch + C_RDST, 0)
             << r == 1
         }
         task_block()
@@ -854,6 +985,7 @@ pub fn chan_close(ch int) {
         <<
     }
     st(ch + C_CLOSED, 1)
+    st(ch + C_RDST, 0)
     if host_win() && gword(G_SIGNAL_EVENT) != 0 {
         signal_update_os_hook()
     }

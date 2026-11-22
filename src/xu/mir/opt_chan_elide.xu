@@ -1,0 +1,193 @@
+@xu/mir
+// Channel communication and allocation elision (SPSC Move Elision).
+//
+// Identifies non-escaping 1:1 single-producer single-consumer (SPSC) channels
+// within a local function or inlined scope. When chan_new, chan_send, and chan_recv
+// are provably local and sequential, replaces the runtime channel queue handoff
+// with direct SSA register / memory moves (%dst = load(%src); store(%dst, %val)),
+// and completely eliminates chan_new, chan_send, chan_recv, and chan_release.
+
+#xu/ast
+
+fn str_match_sub(s &string, sub string) bool {
+    if sub.len == 0 { << true }
+    if s.len < sub.len { << false }
+    limit := s.len - sub.len
+    for i in 0:limit + 1 {
+        $match := true
+        for j in 0:sub.len {
+            if (*s)[i + j] != sub[j] {
+                match = false
+                <-
+            }
+        }
+        if match {
+            << true
+        }
+    }
+    << false
+}
+
+fn chan_elide_margs(f &MFn, head int) []int {
+    $out := []int{}
+    $c := head
+    while c >= 0 && c < f.margs.len {
+        out.push(f.margs[c].v)
+        c = f.margs[c].next
+    }
+    << out
+}
+
+pub fn opt_chan_elide(f $&MFn) bool {
+    if f.blocks.len == 0 || f.instrs.len == 0 {
+        << false
+    }
+
+    $changed := false
+
+    // 1. Find all candidate chan_new call instructions
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            if f.instrs[ii].kind == MI_CALL && str_match_sub(&f.instrs[ii].sval, "chan_new") {
+                ch_temp := f.instrs[ii].a
+                new_inst := ii
+                if ch_temp >= 0 {
+                    // 2. Track all uses of ch_temp across the entire function
+                    $send_inst := -1
+                    $send_bi := -1
+                    $recv_inst := -1
+                    $recv_bi := -1
+                    $cleanups := []int{}
+                    $escapes := false
+
+                    for bj in 0:f.blocks.len {
+                        $jj := f.blocks[bj].head
+                        while jj >= 0 {
+                            if jj != new_inst {
+                                ins := &f.instrs[jj]
+                                $uses_ch := false
+                                if ins.b == ch_temp || ins.imm == ch_temp {
+                                    uses_ch = true
+                                }
+                                $c := ins.c
+                                while c >= 0 && c < f.margs.len {
+                                    if f.margs[c].v == ch_temp {
+                                        uses_ch = true
+                                        <-
+                                    }
+                                    c = f.margs[c].next
+                                }
+
+                                if uses_ch {
+                                    if ins.kind == MI_CALL {
+                                        if str_match_sub(&ins.sval, "chan_send") {
+                                            if send_inst < 0 {
+                                                send_inst = jj
+                                                send_bi = bj
+                                            } else {
+                                                escapes = true // Multiple sends
+                                            }
+                                        } else if str_match_sub(&ins.sval, "chan_recv") {
+                                            if recv_inst < 0 {
+                                                recv_inst = jj
+                                                recv_bi = bj
+                                            } else {
+                                                escapes = true // Multiple recvs
+                                            }
+                                        } else if str_match_sub(&ins.sval, "chan_close") ||
+                                                   str_match_sub(&ins.sval, "chan_release") ||
+                                                   str_match_sub(&ins.sval, "chan_retain") {
+                                            cleanups.push(jj)
+                                        } else {
+                                            escapes = true // Escapes to unknown call
+                                        }
+                                    } else {
+                                        escapes = true // Escapes to store/return/etc.
+                                    }
+                                }
+                            }
+                            jj = f.instrs[jj].next
+                        }
+                    }
+
+                    // 3. If single send and single recv within the same block or send precedes recv
+                    if !escapes && send_inst >= 0 && recv_inst >= 0 && send_bi == recv_bi {
+                        // Verify send precedes recv in the block
+                        $send_first := false
+                        $scan := f.blocks[send_bi].head
+                        while scan >= 0 {
+                            if scan == send_inst {
+                                send_first = true
+                                <-
+                            }
+                            if scan == recv_inst {
+                                <-
+                            }
+                            scan = f.instrs[scan].next
+                        }
+
+                        if send_first {
+                            s_args := chan_elide_margs(f, f.instrs[send_inst].c)
+                            r_args := chan_elide_margs(f, f.instrs[recv_inst].c)
+                            if s_args.len >= 3 && r_args.len >= 3 {
+                                src := s_args[1]
+                                dst := r_args[1]
+
+                                // Transform recv into direct load from src
+                                t := f.ntemps
+                                f.ntemps += 1
+
+                                nx := f.instrs[recv_inst].next
+                                f.instrs[recv_inst].kind = MI_LOAD_PTR
+                                f.instrs[recv_inst].a = t
+                                f.instrs[recv_inst].b = src
+                                f.instrs[recv_inst].c = 0
+                                f.instrs[recv_inst].d = 8
+                                f.instrs[recv_inst].sval = ""
+                                f.instrs[recv_inst].imm = 0
+
+                                // Insert store to dst right after
+                                store_idx := f.instrs.len
+                                $ins_st := minstr_new(MI_STORE_PTR)
+                                ins_st.a = dst
+                                ins_st.b = t
+                                ins_st.c = 0
+                                ins_st.d = 8
+                                ins_st.next = nx
+                                f.instrs.push(ins_st)
+                                f.instrs[recv_inst].next = store_idx
+                                if f.blocks[recv_bi].tail == recv_inst {
+                                    f.blocks[recv_bi].tail = store_idx
+                                }
+
+                                // Nop out send
+                                f.instrs[send_inst].kind = MI_NOP
+                                f.instrs[send_inst].c = -1
+                                f.instrs[send_inst].sval = ""
+
+                                // Nop out chan_new
+                                f.instrs[new_inst].kind = MI_NOP
+                                f.instrs[new_inst].c = -1
+                                f.instrs[new_inst].sval = ""
+
+                                // Nop out cleanups
+                                for ci in 0:cleanups.len {
+                                    c_idx := cleanups[ci]
+                                    f.instrs[c_idx].kind = MI_NOP
+                                    f.instrs[c_idx].c = -1
+                                    f.instrs[c_idx].sval = ""
+                                }
+
+                                changed = true
+                            }
+                        }
+                    }
+                }
+            }
+            ii = f.instrs[ii].next
+        }
+    }
+
+    << changed
+}
