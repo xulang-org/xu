@@ -6,6 +6,14 @@
 
 ---
 
+## Xu 0.13.2
+
+- HTTP bounds pending server request and client receive buffers, decodes chunked bodies incrementally, and serves static `HEAD` and byte-range responses without reading the whole file.
+- File I/O reuses buffer capacity in `DirFS`, avoids an extra allocation when a whole-file read reaches EOF, and releases Windows directory enumeration buffers on success and failure.
+- The cooperative scheduler batches socket waits when it runs out of runnable tasks. The runtime also reduces hash map memory and reuses AES initialization tables.
+- String operations scan shorter buffers a word at a time on ARM64 and x64 and use single-byte paths for prefix and suffix checks. Split results keep owning their strings when the result array grows.
+- Upgrade the compiler, standard library, and SDK tools together. The SDK targets Linux, macOS, and Windows on ARM64 and x64, with cross-built Linux LoongArch64 and RISC-V SDKs.
+
 ## Xu 0.13.1
 
 - Standard Library Hardening & Full Zero-Stub Implementation:
