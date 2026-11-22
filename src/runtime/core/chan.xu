@@ -64,7 +64,9 @@ const S_WAIT_COUNT = 112
 const S_POLL_PFD = 120
 const S_POLL_TASKS = 128
 const S_POLL_CAP = 136
-const S_SIZE = 144
+const S_AFFINITY = 144
+const S_AFFINITY_TICKS = 152
+const S_SIZE = 160
 
 // Channel record.
 const C_CAP = 0
@@ -80,7 +82,8 @@ const C_RECVD = 64
 // value adds a holder and every drop removes one; the last drop frees the
 // unread elements, the buffer and the record.
 const C_RC = 72
-const C_SIZE = 80
+const C_WAITER = 80
+const C_SIZE = 88
 
 fn ld(addr int) int {
     << rt_load(addr, 8)
@@ -153,6 +156,48 @@ fn queue_pop(s int) int {
     << t
 }
 
+fn queue_unlink(s int, target int) bool {
+    head := ld(s + S_HEAD)
+    if head == 0 || target == 0 {
+        << false
+    }
+    if head == target {
+        nx := ld(target + T_NEXT)
+        st(s + S_HEAD, nx)
+        if nx == 0 {
+            st(s + S_TAIL, 0)
+        }
+        st(target + T_NEXT, 0)
+        << true
+    }
+    $prev := head
+    $cur := ld(head + T_NEXT)
+    while cur != 0 {
+        if cur == target {
+            nx := ld(cur + T_NEXT)
+            st(prev + T_NEXT, nx)
+            if nx == 0 {
+                st(s + S_TAIL, prev)
+            }
+            st(cur + T_NEXT, 0)
+            << true
+        }
+        prev = cur
+        cur = ld(cur + T_NEXT)
+    }
+    << false
+}
+
+fn sched_pop_next(s int) int {
+    aff := ld(s + S_AFFINITY)
+    if aff != 0 {
+        st(s + S_AFFINITY, 0)
+        << aff
+    }
+    st(s + S_AFFINITY_TICKS, 0)
+    << queue_pop(s)
+}
+
 fn switch_to(from int, to int) {
     if from == to {
         <<
@@ -186,19 +231,19 @@ pub fn task_block() {
         if ld(s + S_WAIT_COUNT) > 0 {
             sched_poll_waiters(s, true)
             queue_push(s, t)
-            switch_to(t, queue_pop(s))
+            switch_to(t, sched_pop_next(s))
             <<
         }
         if rt_signal_has_waiters() {
             rt_signal_poll(4294967295) // INFINITE
             queue_push(s, t)
-            switch_to(t, queue_pop(s))
+            switch_to(t, sched_pop_next(s))
             <<
         }
         fatal_deadlock()
     }
     queue_push(s, t)
-    switch_to(t, queue_pop(s))
+    switch_to(t, sched_pop_next(s))
 }
 
 // Bare-metal boards have a few MiB of RAM in all.
@@ -514,7 +559,7 @@ pub fn task_yield() {
         }
     }
     queue_push(s, t)
-    switch_to(t, queue_pop(s))
+    switch_to(t, sched_pop_next(s))
 }
 
 // A value is buffered or the channel is closed.
@@ -546,7 +591,7 @@ pub fn task_drain() {
             }
         }
         queue_push(s, t)
-        switch_to(t, queue_pop(s))
+        switch_to(t, sched_pop_next(s))
     }
 }
 
@@ -572,10 +617,10 @@ pub fn task_exit(t int) {
     }
     st(t + T_NEXT, head)
     st(s + S_FREE, t)
-    $nx := queue_pop(s)
+    $nx := sched_pop_next(s)
     if nx == 0 && ld(s + S_WAIT_COUNT) > 0 {
         sched_poll_waiters(s, true)
-        nx = queue_pop(s)
+        nx = sched_pop_next(s)
     }
     if nx == 0 {
         exit_process(0)
@@ -672,6 +717,18 @@ fn chan_put(ch int, src int, esize int) {
     mem_copy(buf + at * esize, src, esize)
     st(ch + C_COUNT, count + 1)
     st(ch + C_SENT, ld(ch + C_SENT) + 1)
+    waiter := ld(ch + C_WAITER)
+    if waiter != 0 {
+        st(ch + C_WAITER, 0)
+        s := sched()
+        streak := ld(s + S_AFFINITY_TICKS)
+        if streak < 8 && ld(s + S_AFFINITY) == 0 {
+            if queue_unlink(s, waiter) {
+                st(s + S_AFFINITY_TICKS, streak + 1)
+                st(s + S_AFFINITY, waiter)
+            }
+        }
+    }
     progress()
 }
 
@@ -686,6 +743,18 @@ fn chan_take(ch int, dst int, esize int) {
     st(ch + C_HEAD, nh)
     st(ch + C_COUNT, ld(ch + C_COUNT) - 1)
     st(ch + C_RECVD, ld(ch + C_RECVD) + 1)
+    waiter := ld(ch + C_WAITER)
+    if waiter != 0 {
+        st(ch + C_WAITER, 0)
+        s := sched()
+        streak := ld(s + S_AFFINITY_TICKS)
+        if streak < 8 && ld(s + S_AFFINITY) == 0 {
+            if queue_unlink(s, waiter) {
+                st(s + S_AFFINITY_TICKS, streak + 1)
+                st(s + S_AFFINITY, waiter)
+            }
+        }
+    }
     progress()
 }
 
@@ -723,14 +792,17 @@ pub fn chan_try_recv(ch int, dst int, esize int) int {
     }
     if ld(ch + C_COUNT) > 0 {
         chan_take(ch, dst, esize)
+        st(ch + C_WAITER, 0)
         << 1
     }
     if ld(ch + C_CLOSED) != 0 {
         for i in 0:esize {
             rt_store(dst + i, 1, 0)
         }
+        st(ch + C_WAITER, 0)
         << 2
     }
+    st(ch + C_WAITER, ld(sched() + S_CUR))
     << 0
 }
 
@@ -746,11 +818,14 @@ pub fn chan_send(ch int, src int, esize int) {
                 if ld(ch + C_CAP) == 0 {
                     mine := ld(ch + C_SENT)
                     while ld(ch + C_RECVD) < mine && ld(ch + C_CLOSED) == 0 {
+                        st(ch + C_WAITER, ld(sched() + S_CUR))
                         task_block()
                     }
+                    st(ch + C_WAITER, 0)
                 }
                 <<
             }
+            st(ch + C_WAITER, ld(sched() + S_CUR))
         }
         task_block()
     }
@@ -766,6 +841,7 @@ pub fn chan_recv(ch int, dst int, esize int) bool {
         r := chan_try_recv(ch, dst, esize)
         if r != 0 {
             st(ch + C_RWAIT, ld(ch + C_RWAIT) - 1)
+            st(ch + C_WAITER, 0)
             << r == 1
         }
         task_block()
