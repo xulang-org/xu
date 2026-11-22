@@ -698,6 +698,9 @@ fn main() int {
     $grown_parts := strings.split(&split_input, ",")
     grown_parts.push("end")
     if grown_parts.len != 3 || grown_parts[0] != split_piece || grown_parts[1] != "right" || grown_parts[2] != "end" { << 43 }
+    if !strings.has_prefix(&"hello", "h") || strings.has_prefix(&"hello", "x") || !strings.has_prefix(&"hello", "") || strings.has_prefix(&"", "h") { << 44 }
+    if !strings.has_suffix(&"hello", "o") || strings.has_suffix(&"hello", "x") || !strings.has_suffix(&"hello", "") || strings.has_suffix(&"", "o") { << 45 }
+    if strings.count(&"banana", "a") != 3 || strings.count(&"banana", "z") != 0 || strings.count(&"", "a") != 0 { << 46 }
     prefix := "/+7d"
     block := strings.repeat(&prefix, 33)
     original := base64.decode_string(block + "/g==") or (err) { << 31 }
