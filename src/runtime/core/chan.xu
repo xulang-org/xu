@@ -38,7 +38,12 @@ const T_STACK = 192
 // The argument block handed to the task; freed when the task ends (the
 // task function copies its arguments on entry).
 const T_ARGS = 200
-const T_SIZE = 208
+const T_WAIT_FD = 208
+const T_WAIT_EVENTS = 216
+const T_WAIT_REVENTS = 224
+const T_WAIT_DEADLINE = 232
+const T_WAIT_NEXT = 240
+const T_SIZE = 248
 
 // Scheduler record, reached through G_SCHED.
 const S_CUR = 0
@@ -53,7 +58,10 @@ const S_IO_PROBE = 64
 const S_IO_IDLE = 72
 const S_ES_DEPTH = 80
 const S_FREE_COUNT = 88
-const S_SIZE = 96
+const S_WAIT_HEAD = 96
+const S_WAIT_TAIL = 104
+const S_WAIT_COUNT = 112
+const S_SIZE = 120
 
 // Channel record.
 const C_CAP = 0
@@ -171,7 +179,13 @@ pub fn task_block() {
         st(t + T_EPOCH, mark)
         st(s + S_NBLOCKED, ld(s + S_NBLOCKED) + 1)
     }
-    if ld(s + S_NBLOCKED) >= ld(s + S_NTASKS) && ld(s + S_DRAIN) == 0 {
+    if ld(s + S_NBLOCKED) + ld(s + S_WAIT_COUNT) >= ld(s + S_NTASKS) && ld(s + S_DRAIN) == 0 {
+        if ld(s + S_WAIT_COUNT) > 0 {
+            sched_poll_waiters(s, true)
+            queue_push(s, t)
+            switch_to(t, queue_pop(s))
+            <<
+        }
         if rt_signal_has_waiters() {
             rt_signal_poll(4294967295) // INFINITE
             queue_push(s, t)
@@ -289,6 +303,187 @@ fn task_io_yield() bool {
     << task_io_yield_kind(false)
 }
 
+fn waiter_add(s int, t int, fd int, events int, deadline int) {
+    st(t + T_WAIT_FD, fd)
+    st(t + T_WAIT_EVENTS, events)
+    st(t + T_WAIT_REVENTS, 0)
+    st(t + T_WAIT_DEADLINE, deadline)
+    st(t + T_WAIT_NEXT, 0)
+    tail := ld(s + S_WAIT_TAIL)
+    if tail == 0 {
+        st(s + S_WAIT_HEAD, t)
+    } else {
+        st(tail + T_WAIT_NEXT, t)
+    }
+    st(s + S_WAIT_TAIL, t)
+    st(s + S_WAIT_COUNT, ld(s + S_WAIT_COUNT) + 1)
+}
+
+fn sched_poll_waiters(s int, blocking bool) {
+    while true {
+        cnt := ld(s + S_WAIT_COUNT)
+        if cnt <= 0 {
+            <<
+        }
+        pfd := alloc(cnt * 8)
+        tasks := alloc(cnt * 8)
+        $curr := ld(s + S_WAIT_HEAD)
+        $i := 0
+        $earliest_deadline := 0
+        $now := host_now_ns()
+
+        while curr != 0 && i < cnt {
+            fd := ld(curr + T_WAIT_FD)
+            events := ld(curr + T_WAIT_EVENTS)
+            deadline := ld(curr + T_WAIT_DEADLINE)
+
+            rt_store(pfd + i * 8, 8, fd | ((events & 65535) << 32))
+            rt_store(tasks + i * 8, 8, curr)
+
+            if deadline > 0 {
+                if earliest_deadline == 0 || deadline < earliest_deadline {
+                    earliest_deadline = deadline
+                }
+            }
+            curr = ld(curr + T_WAIT_NEXT)
+            i += 1
+        }
+        actual_cnt := i
+        if actual_cnt == 0 {
+            free(pfd)
+            free(tasks)
+            <<
+        }
+
+        $timeout_ms := 0
+        if blocking {
+            if earliest_deadline > 0 {
+                rem_ns := earliest_deadline - now
+                if rem_ns <= 0 {
+                    timeout_ms = 0
+                } else {
+                    timeout_ms = min_int((rem_ns + 999999) / 1000000, 2147483647)
+                }
+            } else {
+                timeout_ms = -1
+            }
+        }
+
+        r := host_poll_batch(pfd, tasks, actual_cnt, timeout_ms)
+        rt_signal_poll(0)
+
+        if r < 0 && r != 0 - EINTR {
+            for j in 0:actual_cnt {
+                t := rt_load(tasks + j * 8, 8)
+                st(t + T_WAIT_REVENTS, r)
+                st(t + T_WAIT_NEXT, 0)
+                queue_push(s, t)
+            }
+            st(s + S_WAIT_HEAD, 0)
+            st(s + S_WAIT_TAIL, 0)
+            st(s + S_WAIT_COUNT, 0)
+            free(pfd)
+            free(tasks)
+            <<
+        }
+
+        now = host_now_ns()
+        $new_head := 0
+        $new_tail := 0
+        $new_count := 0
+        $woken := 0
+
+        for j in 0:actual_cnt {
+            t := rt_load(tasks + j * 8, 8)
+            pollfd := rt_load(pfd + j * 8, 8)
+            revents := (pollfd >> 48) & 65535
+            deadline := ld(t + T_WAIT_DEADLINE)
+            $ready := -1
+
+            if (revents & 32) != 0 {
+                ready = 0 - EBADF
+            } else if revents != 0 {
+                ready = revents
+            } else if deadline > 0 && now >= deadline {
+                ready = 0
+            }
+
+            if ready != -1 {
+                st(t + T_WAIT_REVENTS, ready)
+                st(t + T_WAIT_NEXT, 0)
+                queue_push(s, t)
+                woken += 1
+            } else {
+                st(t + T_WAIT_NEXT, 0)
+                if new_tail == 0 {
+                    new_head = t
+                } else {
+                    st(new_tail + T_WAIT_NEXT, t)
+                }
+                new_tail = t
+                new_count += 1
+            }
+        }
+
+        st(s + S_WAIT_HEAD, new_head)
+        st(s + S_WAIT_TAIL, new_tail)
+        st(s + S_WAIT_COUNT, new_count)
+
+        free(pfd)
+        free(tasks)
+
+        if woken > 0 {
+            task_io_progress()
+            <<
+        }
+        if !blocking || new_count == 0 {
+            <<
+        }
+    }
+}
+
+pub fn task_poll_wait(fd int, events int, timeout_ms int) int {
+    if !host_fd_in_range(fd) {
+        << 0 - EBADF
+    }
+    r := host_poll_ms(fd, events, 0)
+    if r != 0 {
+        if r > 0 { task_io_progress() }
+        << r
+    }
+    if timeout_ms == 0 {
+        << 0
+    }
+    s := sched()
+    if !task_others() {
+        << host_poll_ms(fd, events, timeout_ms)
+    }
+
+    $deadline := 0
+    if timeout_ms > 0 {
+        deadline = host_now_ns() + timeout_ms * 1000000
+    }
+
+    t := ld(s + S_CUR)
+    waiter_add(s, t, fd, events, deadline)
+
+    $nx := queue_pop(s)
+    if nx == 0 {
+        sched_poll_waiters(s, true)
+        nx = queue_pop(s)
+    }
+
+    if nx != 0 {
+        switch_to(t, nx)
+    }
+
+    rev := ld(t + T_WAIT_REVENTS)
+    if rev > 0 {
+        task_io_progress()
+    }
+    << rev
+}
+
 // Let the other tasks run without counting this task as blocked (it is
 // waiting for time or I/O, not for another task). Once main has returned
 // it does count: a task only waiting on the outside world must not keep
@@ -296,6 +491,9 @@ fn task_io_yield() bool {
 pub fn task_yield() {
     rt_signal_poll(0)
     s := sched()
+    if ld(s + S_WAIT_COUNT) > 0 {
+        sched_poll_waiters(s, false)
+    }
     t := ld(s + S_CUR)
     if ld(s + S_DRAIN) != 0 {
         mark := ld(s + S_EPOCH) + 1
@@ -329,8 +527,12 @@ pub fn task_drain() {
             st(t + T_EPOCH, mark)
             st(s + S_NBLOCKED, ld(s + S_NBLOCKED) + 1)
         }
-        if ld(s + S_NBLOCKED) >= ld(s + S_NTASKS) {
-            <<
+        if ld(s + S_NBLOCKED) + ld(s + S_WAIT_COUNT) >= ld(s + S_NTASKS) {
+            if ld(s + S_WAIT_COUNT) > 0 {
+                sched_poll_waiters(s, true)
+            } else {
+                <<
+            }
         }
         queue_push(s, t)
         switch_to(t, queue_pop(s))
@@ -359,7 +561,11 @@ pub fn task_exit(t int) {
     }
     st(t + T_NEXT, head)
     st(s + S_FREE, t)
-    nx := queue_pop(s)
+    $nx := queue_pop(s)
+    if nx == 0 && ld(s + S_WAIT_COUNT) > 0 {
+        sched_poll_waiters(s, true)
+        nx = queue_pop(s)
+    }
     if nx == 0 {
         exit_process(0)
     }
