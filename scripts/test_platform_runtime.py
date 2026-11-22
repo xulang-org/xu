@@ -1396,6 +1396,15 @@ fn stat_churn(n int) {
         if info.size != 1 || !missing_stat() { <<< 8 }
     }
 }
+fn dir_churn(path string, n int, exists bool) {
+    for _ in 0:n {
+        names := os.read_dir(path + "") or (err) {
+            if exists { <<< 10 }
+            ->
+        }
+        if !exists || names != "entry.txt\n" { <<< 11 }
+    }
+}
 fn main() {
     checkpoint("start")
     empty := ""
@@ -1418,6 +1427,15 @@ fn main() {
     checkpoint("stat warm")
     stat_churn(32768)
     checkpoint("stat churn")
+    _ := os.mkdir("dir-enum") or (err) { <<< 12 }
+    _ := os.write("dir-enum/entry.txt", "x") or (err) { <<< 13 }
+    dir_churn("dir-enum", 256, true)
+    dir_churn("dir-enum/missing", 256, false)
+    checkpoint("dir warm")
+    dir_churn("dir-enum", 8192, true)
+    checkpoint("dir success")
+    dir_churn("dir-enum/missing", 8192, false)
+    checkpoint("dir failure")
 }
 '''
 
@@ -1488,6 +1506,7 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
             for marker in (
                 b"start\n", b"empty\n", b"active\n", b"idle\n", b"idle again\n",
                 b"poller warm\n", b"poller churn\n", b"stat warm\n", b"stat churn\n",
+                b"dir warm\n", b"dir success\n", b"dir failure\n",
             ):
                 line = child.stdout.readline()
                 if line != marker:
@@ -1527,6 +1546,10 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
     stat_growth = usage[b"stat churn\n"] - usage[b"stat warm\n"]
     if stat_growth > 4 * 1024**2:
         raise AssertionError(f"File metadata queries grew by {stat_growth} private bytes after warm-up")
+    for first, last in ((b"dir warm\n", b"dir success\n"), (b"dir success\n", b"dir failure\n")):
+        growth = usage[last] - usage[first]
+        if growth > 5 * 1024**2:
+            raise AssertionError(f"{last.decode().strip()} grew by {growth} private bytes")
 
 
 def main() -> int:
@@ -1563,7 +1586,7 @@ def main() -> int:
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
         if os.name == "nt":
             check_windows_memory(build("memory", WINDOWS_MEMORY), work, env)
-            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/stat_churn/{args.target} (executed)", flush=True)
+            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/stat_churn/dir_churn/{args.target} (executed)", flush=True)
         run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
         check_http_static_files(build("http_static_files", HTTP_STATIC_FILES), work, env)
         upload = build("http_pending_upload", HTTP_PENDING_UPLOAD)
