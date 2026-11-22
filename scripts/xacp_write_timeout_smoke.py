@@ -142,14 +142,15 @@ def blocked_stdio(app, drip=False):
 
 
 def readable_stdio(app):
-    child = launch(app, XU_XACP_WRITE_TIMEOUT_MS="150", XU_XACP_HELLO_TIMEOUT_MS="1500",
-                   XU_XACP_IDLE_TIMEOUT_MS="1000")
+    # The idle clock starts at frame arrival, before decoding the large nonce.
+    # Keep this write test independent of the expiry checked by blocked_fatal.
+    child = launch(app, XU_XACP_WRITE_TIMEOUT_MS="150", XU_XACP_HELLO_TIMEOUT_MS="5000")
     try:
         # Read-side waits outlast the write budget without a write timeout.
         time.sleep(0.3)
         send_pipe(child, LARGE_HELLO)
         response = read_frame(fd_reader(child.stdout.fileno(), 5))
-        assert "ok: !b true\n" in response and len(response) > 65536
+        assert "ok: !b true\n" in response and len(response) > 65536, response[:200]
         time.sleep(0.3)
         send_pipe(child, STATUS)
         response = read_frame(fd_reader(child.stdout.fileno(), 5))

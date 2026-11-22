@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+import errno
 import os
 from pathlib import Path
 import platform
+import select
 import socket
 import ssl
 import subprocess
 import tempfile
 from threading import Timer
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = tuple(f"{os_name}-{arch}" for os_name in ("linux", "macos", "windows") for arch in ("x64", "arm64"))
@@ -35,6 +39,7 @@ def compiler_env() -> dict[str, str]:
 
 LIBRARY = r'''@main
 #os
+iofs #io/fs
 #path/filepath
 #time
 #crypto/sha256
@@ -42,6 +47,29 @@ LIBRARY = r'''@main
 #encoding/json
 fn literal_values() []int {
     << [0, 1, 2, 3, 4, 5, 6, 7]
+}
+fn file_read_boundary(size int) bool {
+    $want := make_string(size)
+    if size > 0 {
+        want[0] = 255
+        want[size - 1] = 129
+    }
+    written := os.write("file-read-boundary", want + "") or (err) { << false }
+    if written != size { << false }
+    $body := os.read("file-read-boundary") or (err) { << false }
+    if body != want { << false }
+    body.push_byte(128)
+    if body.len != size + 1 || body[size] != 128 || body[0:size] != want { << false }
+    fs := os.dir_fs(".")
+    $relative := iofs.read_file(&fs, "file-read-boundary") or (err) { << false }
+    if relative != want { << false }
+    relative.push_byte(129)
+    << relative.len == size + 1 && relative[size] == 129 && relative[0:size] == want
+}
+fn dirfs_rejects_directory() bool {
+    fs := os.dir_fs(".")
+    _ := fs.read_file(".") or (err) { << true }
+    << false
 }
 fn main() int {
     // Separate evaluations must own separate storage, including literals
@@ -60,6 +88,12 @@ fn main() int {
     body := os.read("roundtrip") or (err) { eprintln(err.msg())
         << 2 }
     if body != "Xu\nbytes" { << 3 }
+    for _ in 0:3 {
+        if !dirfs_rejects_directory() { << 16 }
+    }
+    for size in [0, 4095, 4096, 4097, 65534, 65535, 65536, 524288] {
+        if !file_read_boundary(size) { << 15 }
+    }
     path := "a/../b/./c"
     clean := filepath.clean(&path)
     slash := filepath.to_slash(&clean)
@@ -659,6 +693,11 @@ fn main() int {
     parts := split_byte(&binary, 128)
     if parts.len != 18 || parts[0] != "" || parts[1] != string_from_byte(129) || parts[17] != "" { << 29 }
     if strings.join(parts, string_from_byte(128)) != binary { << 30 }
+    split_piece := strings.repeat(&"left", 20000)
+    split_input := split_piece + ",right"
+    $grown_parts := strings.split(&split_input, ",")
+    grown_parts.push("end")
+    if grown_parts.len != 3 || grown_parts[0] != split_piece || grown_parts[1] != "right" || grown_parts[2] != "end" { << 43 }
     prefix := "/+7d"
     block := strings.repeat(&prefix, 33)
     original := base64.decode_string(block + "/g==") or (err) { << 31 }
@@ -939,6 +978,247 @@ fn main() int {
 '''
 
 
+HTTP_PENDING_UPLOAD = r'''@main
+#net
+#net/http
+#os
+fn upload(c http.Context) {
+    body := c.body()
+    for i in 0:body.len {
+        if body[i] != 120 {
+            c.text(400, "bad body") or (err) { << }
+            <<
+        }
+    }
+    c.text(200, str(body.len)) or (err) { << }
+}
+fn main() int {
+    args := os.args()
+    $options := http.server_options()
+    options.max_connections = 8
+    options.max_buffer_bytes = 32768
+    options.read_timeout_ns = 3000000000
+    options.sync_handlers = args[1] == "sync"
+    lfd := net.listen("127.0.0.1:0") or (err) { << 1 }
+    println(net.socket_local_addr(lfd))
+    http.serve_listener_with_options(lfd, upload, options) or (err) { << 2 }
+    << 0
+}
+'''
+
+
+HTTP_STATIC_FILES = r'''@main
+#net
+#net/http
+fn files(c http.Context) {
+    server := http.file_server("www")
+    server.serve_context(c)
+}
+fn main() int {
+    lfd := net.listen("127.0.0.1:0") or (err) { << 1 }
+    println(net.socket_local_addr(lfd))
+    << http.serve_listener(lfd, files)
+}
+'''
+
+
+def check_http_static_files(binary: Path, work: Path, env: dict[str, str]) -> None:
+    payload = bytes((i + i // 257) % 256 for i in range(16384))
+    root = work / "www"
+    root.mkdir()
+    (root / "data.bin").write_bytes(payload)
+    (root / "index.html").write_bytes(b"<p>index</p>")
+    (root / "listing" / "index.html").mkdir(parents=True)
+    (root / "empty").touch()
+
+    def request(method: str, path: str, extra: str = "", connection: str = "close") -> bytes:
+        return (f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: {connection}\r\n"
+                + extra + "\r\n").encode()
+
+    def parse(wire: bytes, status: int, length: int) -> tuple[dict[bytes, bytes], bytes]:
+        block, separator, body = wire.partition(b"\r\n\r\n")
+        line, *fields = block.split(b"\r\n")
+        assert separator and line.startswith(f"HTTP/1.1 {status} ".encode()), wire[:300]
+        headers = {key.lower(): value.strip() for key, value in (p.split(b":", 1) for p in fields)}
+        assert headers[b"content-length"] == str(length).encode(), headers
+        return headers, body
+
+    with subprocess.Popen([str(binary)], cwd=work, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            timer = Timer(20, child.kill)
+            timer.start()
+            try:
+                port = int(child.stdout.readline().strip().rsplit(b":", 1)[-1])
+            finally:
+                timer.cancel()
+
+            def roundtrip(data: bytes) -> bytes:
+                result = bytearray()
+                with socket.create_connection(("127.0.0.1", port), timeout=15) as conn:
+                    conn.sendall(data)
+                    while True:
+                        try:
+                            part = conn.recv(65536)
+                        except ConnectionResetError:
+                            break
+                        if not part:
+                            break
+                        result.extend(part)
+                return bytes(result)
+
+            head, body = parse(roundtrip(request("HEAD", "/data.bin")), 200, len(payload))
+            assert not body and head[b"etag"] == b'"16384"' and head[b"accept-ranges"] == b"bytes"
+            assert parse(roundtrip(request("HEAD", "/")), 200, len(b"<p>index</p>"))[1] == b""
+            assert parse(roundtrip(request("HEAD", "/empty")), 200, 0)[1] == b""
+            assert parse(roundtrip(request("HEAD", "/missing")), 404, len(b"404 page not found\n"))[1] == b""
+            assert parse(roundtrip(request("GET", "/data.bin")), 200, len(payload))[1] == payload
+            assert parse(roundtrip(request("GET", "/data.bin", 'If-None-Match: "16384"\r\n')), 304, 0)[1] == b""
+            assert parse(roundtrip(request("HEAD", "/data.bin", "Range: bytes=16384-\r\n")),
+                         416, len(b"range not satisfiable\n"))[1] == b""
+            listing = roundtrip(request("GET", "/listing/")).partition(b"\r\n\r\n")[2]
+            assert listing and parse(roundtrip(request("HEAD", "/listing/")), 200, len(listing))[1] == b""
+
+            for spec, start, end in (("1001-10050", 1001, 10050), ("-4097", 12287, 16383), ("16000-", 16000, 16383)):
+                field = f"Range: bytes={spec}\r\n"
+                length = end - start + 1
+                expected_range = f"bytes {start}-{end}/16384".encode()
+                for method, expected_body in (("HEAD", b""), ("GET", payload[start:end + 1])):
+                    head, body = parse(roundtrip(request(method, "/data.bin", field)), 206, length)
+                    assert body == expected_body and head[b"content-range"] == expected_range
+            if os.name != "nt":
+                pipeline = (request("GET", "/data.bin", "Range: bytes=1001-10050\r\n", "keep-alive")
+                            + request("HEAD", "/data.bin"))
+                head, body = parse(roundtrip(pipeline), 206, 9050)
+                assert head[b"connection"] == b"keep-alive" and body[:9050] == payload[1001:10051]
+                assert parse(body[9050:], 200, len(payload))[1] == b""
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            _, stderr = child.communicate(timeout=10)
+            assert not stderr, stderr
+    print(f"PASS net_http_static_file_ranges/{native_target()} (executed)", flush=True)
+
+
+def check_http_pending(binary: Path, work: Path, env: dict[str, str], sync: bool) -> None:
+    def request(size: int, connection: str = "close") -> bytes:
+        return (f"POST /upload HTTP/1.1\r\nHost: localhost\r\n"
+                f"Content-Length: {size}\r\nConnection: {connection}\r\n\r\n").encode()
+
+    def response(stream, size: int) -> None:
+        status = stream.readline()
+        if not status.startswith(b"HTTP/1.1 200 "):
+            raise AssertionError(f"Unexpected HTTP status {status!r}")
+        headers = {}
+        for line in iter(stream.readline, b"\r\n"):
+            name, separator, value = line.partition(b":")
+            if not separator:
+                raise AssertionError(f"Malformed HTTP header {line!r}")
+            headers[name.lower()] = value.strip()
+        content = stream.read(int(headers[b"content-length"]))
+        if content != str(size).encode():
+            raise AssertionError(f"Unexpected response body {content!r}")
+
+    mode = "sync" if sync else "async"
+    with subprocess.Popen([str(binary), mode], cwd=work, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            startup = Timer(15, child.kill)
+            startup.start()
+            try:
+                address = child.stdout.readline().strip()
+            finally:
+                startup.cancel()
+            port = int(address.rsplit(b":", 1)[1])
+
+            def dial():
+                return socket.create_connection(("127.0.0.1", port), timeout=12)
+
+            def send_upload(size: int) -> None:
+                with dial() as sock, sock.makefile("rb") as stream:
+                    head = request(size)
+                    sock.sendall(head[:-3])
+                    sock.sendall(head[-3:] + b"x" * (size // 2))
+                    sock.sendall(b"x" * (size - size // 2))
+                    response(stream, size)
+
+            def expect_close(sock) -> None:
+                try:
+                    if sock.recv(1):
+                        raise AssertionError("Incomplete request received a response")
+                except (ConnectionAbortedError, ConnectionResetError):
+                    pass
+
+            if not sync:
+                send_upload(12288)
+                with dial() as sock, sock.makefile("rb") as stream:
+                    sock.sendall(b"POST /upload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+                                 b"Transfer-Encoding: chunked\r\n\r\n5\r\nxx")
+                    sock.sendall(b"xxx\r\n3\r\nxxx\r\n0\r\n\r\n")
+                    response(stream, 8)
+                # The payload fits the logical limit. Growing a pending buffer
+                # to hold it would exceed the limit while the old one is live.
+                with dial() as sock:
+                    try:
+                        sock.sendall(request(24576) + b"x" * 24576)
+                        if sock.recv(1):
+                            raise AssertionError("Request exceeded the pending-buffer growth budget")
+                    except ConnectionResetError:
+                        pass
+                with dial() as sock:
+                    started = time.monotonic()
+                    sock.sendall(request(12000) + b"x" * 8192)
+                    expect_close(sock)
+                    if time.monotonic() - started < 1.0:
+                        raise AssertionError("Incomplete request closed before its intake timeout")
+                for _ in range(3):
+                    with dial() as sock:
+                        sock.sendall(request(12000) + b"x" * 8192)
+                        sock.shutdown(socket.SHUT_WR)
+                        expect_close(sock)
+
+                # Each partial upload fits alone. Keeping all six unfinished
+                # forces the listener to enforce its shared 32 KiB budget.
+                with ExitStack() as pending:
+                    started = time.monotonic()
+                    peers = [pending.enter_context(dial()) for _ in range(6)]
+                    partial = request(7001) + b"x" * 7000
+                    for peer in peers:
+                        try:
+                            peer.sendall(partial)
+                        except (ConnectionAbortedError, ConnectionResetError):
+                            pass
+                    remaining = max(0.0, started + 2.0 - time.monotonic())
+                    readable, _, _ = select.select(peers, [], [], remaining)
+                    if not readable or time.monotonic() >= started + 3.0:
+                        raise AssertionError("Shared pending-buffer budget did not reject a peer before its timeout")
+                    for peer in peers:
+                        if peer not in readable:
+                            try:
+                                peer.shutdown(socket.SHUT_WR)
+                            except (ConnectionAbortedError, ConnectionResetError):
+                                pass
+                            except OSError as error:
+                                if error.errno not in (errno.ENOTCONN, getattr(errno, "WSAENOTCONN", errno.ENOTCONN)):
+                                    raise
+                        expect_close(peer)
+                send_upload(12288)
+
+            if os.name != "nt":
+                with dial() as sock, sock.makefile("rb") as stream:
+                    sock.sendall(request(3, "keep-alive") + b"xxx" + request(4) + b"xxxx")
+                    response(stream, 3)
+                    response(stream, 4)
+                send_upload(12288)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            _, stderr = child.communicate(timeout=10)
+            if stderr:
+                raise AssertionError(f"HTTP pending fixture wrote to stderr {stderr!r}")
+    print(f"PASS net_http_pending_budget/{mode}/{native_target()} (executed)", flush=True)
+
+
 def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected: bytes) -> None:
     try:
         result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, timeout=45)
@@ -948,10 +1228,137 @@ def checked_run(command: list[str], *, cwd: Path, env: dict[str, str], expected:
         raise RuntimeError(f"{command}: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}")
 
 
+HTTP_CLIENT_BUFFER = r'''@main
+#net/http
+#os
+#strconv
+#strings
+
+fn valid_body(data &string, size int) bool {
+    if data.len != size { << false }
+    for i in 0:data.len {
+        if (data[i] & 255) != i % 251 { << false }
+    }
+    << true
+}
+
+fn get_error(client $&http.Client, url string) string {
+    _ := client.get(url) or (err) { << err.msg() }
+    << ""
+}
+
+fn ignore_progress(received int, total int) {}
+
+fn chunk_progress(received int, total int) {
+    if total != -1 || received < 0 || received > 12288 { <<< 11 }
+    if received == 0 || received == 12288 { println(str(received)) }
+}
+
+fn main() int {
+    args := os.args()
+    base := args[1] + ""
+    $client := http.new_client()
+    client.set_timeout(30000000000)
+    client.insecure_skip_verify = true
+    client.max_response_bytes = strconv.atoi(&args[2]) or (err) { << 6 }
+    first := client.get(base + "/fixed") or (err) { << 7 }
+    if first.status_code != 200 || !valid_body(&first.body, 16384) || !client.has_idle_connection() { << 1 }
+    chunk_limit := strconv.atoi(&args[4]) or (err) { << 12 }
+    client.max_response_bytes = chunk_limit
+    client.set_download_progress(chunk_progress)
+    chunked := client.get(base + "/chunked") or (err) { << 8 }
+    client.set_download_progress(ignore_progress)
+    if chunked.status_code != 200 || !valid_body(&chunked.body, 12288) || !client.has_idle_connection() { << 2 }
+    client.max_response_bytes = 9223372036854775807
+    continued := client.get(base + "/continued") or (err) { << 13 }
+    if continued.status_code != 200 || !valid_body(&continued.body, 17) { << 14 }
+    client.max_response_bytes = strconv.atoi(&args[3]) or (err) { << 9 }
+    limit_failure := get_error($&client, base + "/over-limit")
+    if !strings.contains(&limit_failure, "message too large") || client.has_idle_connection() { << 3 }
+    client.max_response_bytes = 0
+    short_failure := get_error($&client, base + "/truncated")
+    if short_failure.len == 0 || client.has_idle_connection() { << 4 }
+    client.max_response_bytes = chunk_limit - 1
+    chunk_failure := get_error($&client, base + "/chunk-over-limit")
+    if !strings.contains(&chunk_failure, "message too large") || client.has_idle_connection() { << 15 }
+    client.max_response_bytes = 0
+    trailer_failure := get_error($&client, base + "/truncated-trailer")
+    if trailer_failure.len == 0 || client.has_idle_connection() { << 16 }
+    fresh := client.get(base + "/fresh") or (err) { << 10 }
+    if fresh.status_code != 200 || !valid_body(&fresh.body, 8192) || !valid_body(&first.body, 16384) { << 5 }
+    if !valid_body(&chunked.body, 12288) { << 17 }
+    client.close_idle_connections()
+    println("HTTP client buffer passed")
+    << 0
+}
+'''
+
+
+def check_http_client_buffer(binary: Path, work: Path, env: dict[str, str],
+                             context: ssl.SSLContext | None = None) -> None:
+    def payload(size: int) -> bytes:
+        return (bytes(range(251)) * ((size + 250) // 251))[:size]
+
+    def fixed(size: int, connection: str = "close") -> bytes:
+        return (f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: {connection}\r\n\r\n".encode()
+                + payload(size))
+
+    first = fixed(16384, "keep-alive")
+    over_limit = fixed(16384)
+    chunks = payload(12288)
+    chunked = (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n2000;probe=yes\r",
+        b"\n" + chunks[:8192] + b"\r",
+        b"\n1000\r\n" + chunks[8192:] + b"\r\n0\r\nX-Trailer: sample\r",
+        b"\nX-End: yes\r\n\r",
+        b"\n",
+    )
+    fresh = fixed(8192) if context else b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + payload(8192)
+    sessions = (
+        (("/fixed", (first,)), ("/chunked", chunked), ("/continued", (fixed(17),))),
+        (("/over-limit", (over_limit,)),),
+        (("/truncated", (fixed(16384)[:-8192],)),),
+        (("/chunk-over-limit", chunked),),
+        (("/truncated-trailer", chunked[:-1]),),
+        (("/fresh", (fresh,)),),
+    )
+
+    def peer(listener: socket.socket) -> None:
+        for exchanges in sessions:
+            with ExitStack() as sockets:
+                raw = sockets.enter_context(listener.accept()[0])
+                raw.settimeout(20)
+                conn = sockets.enter_context(context.wrap_socket(raw, server_side=True)) if context else raw
+                stream = sockets.enter_context(conn.makefile("rb"))
+                for path, fragments in exchanges:
+                    request = stream.readline()
+                    if not request.startswith(f"GET {path} ".encode()):
+                        raise AssertionError(f"Expected GET {path}, received {request!r}")
+                    for line in iter(stream.readline, b"\r\n"):
+                        if not line:
+                            raise AssertionError("Incomplete HTTP request")
+                    for response in fragments:
+                        conn.sendall(response)
+
+    scheme = "https" if context else "http"
+    with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as peers:
+        listener.settimeout(20)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        address = f"{scheme}://127.0.0.1:{listener.getsockname()[1]}"
+        future = peers.submit(peer, listener)
+        chunk_limit = sum(map(len, chunked))
+        checked_run([str(binary), address, str(len(first)), str(len(over_limit) - 1), str(chunk_limit)],
+                    cwd=work, env=env, expected=b"0\n12288\nHTTP client buffer passed\n")
+        future.result(timeout=20)
+    print(f"PASS net_http_client_buffer/{scheme}/{native_target()} (executed)", flush=True)
+
+
 WINDOWS_MEMORY = r'''@main
 #net
 #net/poller
 #net/stream
+#os
 fn checkpoint(label string) {
     println(label)
     os_fd_read(0, 1) or (err) { <<< 1 }
@@ -984,6 +1391,25 @@ fn churn(p $&poller.Poller, n int) {
         if !p.remove(id) { <<< 5 }
     }
 }
+fn missing_stat() bool {
+    _ := os.stat("metadata-missing") or (err) { << true }
+    << false
+}
+fn stat_churn(n int) {
+    for _ in 0:n {
+        info := os.stat("metadata-file") or (err) { <<< 7 }
+        if info.size != 1 || !missing_stat() { <<< 8 }
+    }
+}
+fn dir_churn(path string, n int, exists bool) {
+    for _ in 0:n {
+        names := os.read_dir(path + "") or (err) {
+            if exists { <<< 10 }
+            ->
+        }
+        if !exists || names != "entry.txt\n" { <<< 11 }
+    }
+}
 fn main() {
     checkpoint("start")
     empty := ""
@@ -1001,6 +1427,20 @@ fn main() {
     churn($&p, 65536)
     checkpoint("poller churn")
     if p.count() != 0 { <<< 6 }
+    _ := os.write("metadata-file", "x") or (err) { <<< 9 }
+    stat_churn(1024)
+    checkpoint("stat warm")
+    stat_churn(32768)
+    checkpoint("stat churn")
+    _ := os.mkdir("dir-enum") or (err) { <<< 12 }
+    _ := os.write("dir-enum/entry.txt", "x") or (err) { <<< 13 }
+    dir_churn("dir-enum", 256, true)
+    dir_churn("dir-enum/missing", 256, false)
+    checkpoint("dir warm")
+    dir_churn("dir-enum", 8192, true)
+    checkpoint("dir success")
+    dir_churn("dir-enum/missing", 8192, false)
+    checkpoint("dir failure")
 }
 '''
 
@@ -1070,7 +1510,8 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
             handle = int(child._handle)
             for marker in (
                 b"start\n", b"empty\n", b"active\n", b"idle\n", b"idle again\n",
-                b"poller warm\n", b"poller churn\n",
+                b"poller warm\n", b"poller churn\n", b"stat warm\n", b"stat churn\n",
+                b"dir warm\n", b"dir success\n", b"dir failure\n",
             ):
                 line = child.stdout.readline()
                 if line != marker:
@@ -1107,6 +1548,13 @@ def check_windows_memory(binary: Path, work: Path, env: dict[str, str]) -> None:
     poller_growth = usage[b"poller churn\n"] - usage[b"poller warm\n"]
     if poller_growth > 4 * 1024**2:
         raise AssertionError(f"Poller grew by {poller_growth} private bytes after warm-up")
+    stat_growth = usage[b"stat churn\n"] - usage[b"stat warm\n"]
+    if stat_growth > 4 * 1024**2:
+        raise AssertionError(f"File metadata queries grew by {stat_growth} private bytes after warm-up")
+    for first, last in ((b"dir warm\n", b"dir success\n"), (b"dir success\n", b"dir failure\n")):
+        growth = usage[last] - usage[first]
+        if growth > 5 * 1024**2:
+            raise AssertionError(f"{last.decode().strip()} grew by {growth} private bytes")
 
 
 def main() -> int:
@@ -1143,8 +1591,15 @@ def main() -> int:
         run("chan_parallel/channel_blocking_string", build("concurrency", CONCURRENCY), expected="concurrency passed")
         if os.name == "nt":
             check_windows_memory(build("memory", WINDOWS_MEMORY), work, env)
-            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/{args.target} (executed)", flush=True)
+            print(f"PASS empty_allocations/guarded_task_stack_cache/poller_churn/stat_churn/dir_churn/{args.target} (executed)", flush=True)
         run("net_http_event_set", build("http_event_set", HTTP_EVENT_SET), expected="http event set passed")
+        check_http_static_files(build("http_static_files", HTTP_STATIC_FILES), work, env)
+        upload = build("http_pending_upload", HTTP_PENDING_UPLOAD)
+        check_http_pending(upload, work, env, sync=False)
+        if os.name != "nt":
+            check_http_pending(upload, work, env, sync=True)
+        client = build("http_client_buffer", HTTP_CLIENT_BUFFER)
+        check_http_client_buffer(client, work, env)
         run("net_interfaces", build("interfaces", INTERFACES), expected="interfaces passed")
         run("net_platform_files/net_unsupported_contract", build("net_contract", NET_CONTRACT), expected="network contracts passed")
         from platform_crypto_cases import SOURCE as CRYPTO, write_fixtures
@@ -1169,6 +1624,7 @@ def main() -> int:
                 future = peers.submit(tls_peer, listener, context)
                 run("crypto_tls_ecdhe_interop", crypto, "interop", f"127.0.0.1:{listener.getsockname()[1]}", expected="TLS ECDHE interop passed")
                 future.result(timeout=20)
+            check_http_client_buffer(client, work, env, context)
             for family, network, host in ((socket.AF_INET, "tcp4", "127.0.0.1"), (socket.AF_INET6, "tcp6", "::1")):
                 # Missing IPv6 is a hard failure, including on CI runners.
                 with socket.socket(family) as listener:
