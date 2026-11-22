@@ -105,6 +105,10 @@ struct Lw {
     // Set while lowering the body of a clone glue function, so its own
     // type is cloned inline once instead of calling itself.
     in_clone_glue bool
+    lscope []int
+    slot_scope []int
+    temp_scope []int
+    next_scope_id int
 }
 
 // Hook result for "this feature does not lower the node".
@@ -144,7 +148,11 @@ fn lw_new(name string, label string, fi int, tgt_os int, tgt_arch int) Lw {
         dyn_ids: []int{},
         dyn_found: []int{},
         block_depth: 0,
-        in_clone_glue: false
+        in_clone_glue: false,
+        lscope: []int{},
+        slot_scope: []int{},
+        temp_scope: []int{},
+        next_scope_id: 1
     }
 }
 
@@ -244,6 +252,30 @@ fn (w $&Lw) new_local(ty int, words int, name string) int {
     << id
 }
 
+fn (w $&Lw) set_lscope(id int, sid int) {
+    while w.lscope.len <= id {
+        w.lscope.push(0)
+    }
+    w.lscope[id] = sid
+    if id < w.lslot.len && w.lslot[id] >= 0 {
+        w.set_slot_scope(w.lslot[id], sid)
+    }
+}
+
+fn (w $&Lw) set_slot_scope(slot int, sid int) {
+    while w.slot_scope.len <= slot {
+        w.slot_scope.push(0)
+    }
+    w.slot_scope[slot] = sid
+}
+
+fn (w $&Lw) set_temp_scope(t int, sid int) {
+    while w.temp_scope.len <= t {
+        w.temp_scope.push(0)
+    }
+    w.temp_scope[t] = sid
+}
+
 fn (w $&Lw) bin(op int, a int, b int) int {
     t := w.new_temp()
     $ins := minstr_new(MI_BIN)
@@ -252,6 +284,13 @@ fn (w $&Lw) bin(op int, a int, b int) int {
     ins.c = a
     ins.d = b
     w.emit(ins)
+    if op == BIN_ADD {
+        if a >= 0 && a < w.temp_scope.len && w.temp_scope[a] > 0 {
+            w.set_temp_scope(t, w.temp_scope[a])
+        } else if b >= 0 && b < w.temp_scope.len && w.temp_scope[b] > 0 {
+            w.set_temp_scope(t, w.temp_scope[b])
+        }
+    }
     << t
 }
 
@@ -262,6 +301,9 @@ fn (w $&Lw) load_local(slot int, word int) int {
     ins.b = slot
     ins.c = word
     w.emit(ins)
+    if slot >= 0 && slot < w.slot_scope.len && w.slot_scope[slot] > 0 {
+        w.set_temp_scope(t, w.slot_scope[slot])
+    }
     << t
 }
 
@@ -279,6 +321,9 @@ fn (w $&Lw) addr_local(slot int) int {
     ins.a = t
     ins.b = slot
     w.emit(ins)
+    if slot >= 0 && slot < w.slot_scope.len && w.slot_scope[slot] > 0 {
+        w.set_temp_scope(t, w.slot_scope[slot])
+    }
     << t
 }
 
@@ -297,6 +342,9 @@ fn (w $&Lw) load_ptr(base int, off int, width int) int {
     ins.b = base
     ins.c = off
     ins.d = width
+    if base >= 0 && base < w.temp_scope.len && w.temp_scope[base] > 0 {
+        ins.scope_id = w.temp_scope[base]
+    }
     w.emit(ins)
     << t
 }
@@ -311,6 +359,9 @@ fn (w $&Lw) store_ptr(base int, off int, v int, width int) {
     ins.b = v
     ins.c = off
     ins.d = width
+    if base >= 0 && base < w.temp_scope.len && w.temp_scope[base] > 0 {
+        ins.scope_id = w.temp_scope[base]
+    }
     w.emit(ins)
 }
 
@@ -461,6 +512,9 @@ fn (w $&Lw) ensure_local(tp &types.TypedProgram, id int) int {
     w.lslot[id] = slot
     while w.lbyref.len < w.f.locals.len {
         w.lbyref.push(false)
+    }
+    if id >= 0 && id < w.lscope.len && w.lscope[id] > 0 {
+        w.set_slot_scope(slot, w.lscope[id])
     }
     << slot
 }
@@ -812,7 +866,24 @@ fn (w $&Lw) lower_expr(p &parser.Parser, tp &types.TypedProgram, n int) int {
         if is_wide(tp, ty) {
             << ptr
         }
-        << w.load_ptr(ptr, 0, width_of(tp, ty))
+        $sid := 0
+        if ptr >= 0 && ptr < w.temp_scope.len && w.temp_scope[ptr] > 0 {
+            sid = w.temp_scope[ptr]
+        }
+        if sid == 0 && p.nodes[n].a >= 0 && p.nodes[p.nodes[n].a].kind == ast.NK_IDENT {
+            aid := tp.local_of(p.nodes[n].a)
+            if aid >= 0 && aid < w.lscope.len && w.lscope[aid] > 0 {
+                sid = w.lscope[aid]
+            }
+        }
+        res := w.load_ptr(ptr, 0, width_of(tp, ty))
+        if sid > 0 {
+            last_i := w.f.instrs.len - 1
+            if last_i >= 0 && w.f.instrs[last_i].kind == MI_LOAD_PTR {
+                w.f.instrs[last_i].scope_id = sid
+            }
+        }
+        << res
     }
     if k == ast.NK_BORROW {
         target := p.nodes[n].a
@@ -2385,6 +2456,23 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
             w.fail(p, s, "unresolved binding '" + p.nodes[s].sval + "'")
             <<
         }
+        $sid := 0
+        if p.nodes[e].kind == ast.NK_BORROW {
+            target := p.nodes[e].a
+            if p.nodes[target].kind == ast.NK_IDENT {
+                tid := tp.local_of(target)
+                if tid >= 0 && tid < w.lscope.len && w.lscope[tid] > 0 {
+                    sid = w.lscope[tid]
+                }
+            }
+        }
+        if sid == 0 {
+            sid = w.next_scope_id
+            w.next_scope_id += 1
+        }
+        w.set_lscope(id, sid)
+        slot := w.ensure_local(tp, id)
+        w.set_slot_scope(slot, sid)
         w.store_to_local(tp, id, v)
         w.own_declare(tp, id)
         <<
@@ -2809,6 +2897,24 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
         v = w.checked_bin(assign_op_code(tty, aop), old, v, tp.deref(tty))
     }
     w.store_ptr(addr, 0, v, width)
+    if tk == ast.NK_UN_OP && p.nodes[target].ival == ast.UN_DEREF {
+        $sid := 0
+        if addr >= 0 && addr < w.temp_scope.len && w.temp_scope[addr] > 0 {
+            sid = w.temp_scope[addr]
+        }
+        if sid == 0 && p.nodes[target].a >= 0 && p.nodes[p.nodes[target].a].kind == ast.NK_IDENT {
+            aid := tp.local_of(p.nodes[target].a)
+            if aid >= 0 && aid < w.lscope.len && w.lscope[aid] > 0 {
+                sid = w.lscope[aid]
+            }
+        }
+        if sid > 0 {
+            last_i := w.f.instrs.len - 1
+            if last_i >= 0 && w.f.instrs[last_i].kind == MI_STORE_PTR {
+                w.f.instrs[last_i].scope_id = sid
+            }
+        }
+    }
 }
 
 // ===== functions =====
@@ -2893,6 +2999,10 @@ fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, 
     }
     for i in 0:nin {
         ty := w.local_type(tp, i)
+        sid := w.next_scope_id
+        w.next_scope_id += 1
+        w.set_lscope(i, sid)
+        w.set_slot_scope(incoming[i], sid)
         if ty != 1 { w.f.scalar_params = false }
         while w.lslot.len <= i {
             w.lslot.push(-1)
@@ -2902,6 +3012,7 @@ fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, 
             w.lbyref[incoming[i]] = true
         } else if is_wide(tp, ty) {
             slot := w.ensure_local(tp, i)
+            w.set_slot_scope(slot, sid)
             src := w.load_local(incoming[i], 0)
             w.copy_mem(w.addr_local(slot), src, tp.size_of(ty))
             w.own_declare(tp, i)
@@ -3114,6 +3225,7 @@ fn mfn_copy(f &MFn) MFn {
         ins.line = f.instrs[i].line
         ins.col = f.instrs[i].col
         ins.file = f.instrs[i].file
+        ins.scope_id = f.instrs[i].scope_id
         out.instrs.push(ins)
     }
     for i in 0:f.margs.len {
