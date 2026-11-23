@@ -374,17 +374,13 @@ Xu is a fast, safe, GC-free systems programming language combining Go-style tool
 ## Quick Installation
 
 ### Windows:
-直接双击运行本目录下的 `xu-setup.exe`（或在控制台执行 `xu-setup.exe`），无需运行 PowerShell 脚本，自动完成安装与系统环境变量配置。
+Directly run `xu-setup.exe` in this directory (or execute `xu-setup.exe` in a terminal) to install and configure environment variables automatically.
 
 ### macOS / Linux:
-在终端中直接运行本目录下的原生安装程序：
+Run the native installer in a terminal:
 ```bash
 ./xu-setup
 ```
-
-### 独立使用（不修改系统环境）：
-- Unix: `source env.sh`
-- Windows: `. .\\env.ps1` 或调用已安装目录的 `env.cmd`
 
 ### Instant Try (No System Modification):
 - Unix: `source env.sh`
