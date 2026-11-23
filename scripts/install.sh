@@ -256,6 +256,68 @@ if [[ -d "$BINARY_SOURCE/platform/$PLATFORM" ]]; then
     BINARY_SOURCE="$BINARY_SOURCE/platform/$PLATFORM"
 fi
 
+# Repair the unsigned arm64 tools in the published 0.13.3 SDK before its
+# native installer runs the compiler self-check in its staging directory.
+if [[ "$PLATFORM" == macos-arm64 && "$(cat "$SOURCE_DIR/VERSION")" == 0.13.3 ]] &&
+   [[ -f "$SOURCE_DIR/bundle.json" ]] && ! codesign --verify "$BINARY_SOURCE/xu" 2>/dev/null; then
+    if [[ -z "$TMP_DIR" ]]; then
+        TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/xu_install_XXXXXX")"
+        cp -R "$SOURCE_DIR" "$TMP_DIR/sdk"
+        SOURCE_DIR="$TMP_DIR/sdk"
+        BINARY_SOURCE="$SOURCE_DIR/bin"
+    fi
+    python3 - "$SOURCE_DIR" <<'PY_SIGN'
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+manifest = root / "bundle.json"
+bundle = json.loads(manifest.read_text())
+for name, expected in bundle["binaries"].items():
+    if Path(name).name != name or not name.startswith("xu"):
+        sys.exit(f"Invalid SDK binary name: {name}")
+    key = f"bin/{name}"
+    tool = root / key
+    original = hashlib.sha256(tool.read_bytes()).hexdigest()
+    if original != expected or original != bundle["files"][key]:
+        sys.exit(f"SDK checksum mismatch before signing: {key}")
+    if subprocess.run(["codesign", "--verify", tool], stderr=subprocess.DEVNULL).returncode:
+        subprocess.run(["codesign", "--force", "--sign", "-", tool], check=True)
+        signed = hashlib.sha256(tool.read_bytes()).hexdigest()
+        bundle["binaries"][name] = bundle["files"][key] = signed
+# Stage the launcher alongside the signed compiler so both participate in
+# the installer's checksum verification and atomic directory replacement.
+compiler = root / "bin/xu"
+compiler.rename(root / "bin/xu-compiler")
+bundle["files"]["bin/xu-compiler"] = bundle["binaries"]["xu-compiler"] = bundle["binaries"]["xu"]
+compiler.write_text('''#!/bin/bash
+set -e
+compiler="$(dirname "$0")/xu-compiler"
+if [[ $1 != run || $# -lt 2 ]]; then
+    exec "$compiler" "$@"
+fi
+shift
+build_args=()
+while (( $# )) && [[ $1 != -- ]]; do
+    build_args+=("$1")
+    shift
+done
+if (( $# )); then shift; fi
+run_dir=$(mktemp -d "${TMPDIR:-/tmp}/xu-run.XXXXXXXX")
+trap 'rm -rf "$run_dir"' EXIT
+"$compiler" build "${build_args[@]}" -o "$run_dir/program"
+/usr/bin/codesign --force --sign - "$run_dir/program"
+"$run_dir/program" "$@"
+''')
+compiler.chmod(0o755)
+bundle["files"]["bin/xu"] = bundle["binaries"]["xu"] = hashlib.sha256(compiler.read_bytes()).hexdigest()
+manifest.write_text(json.dumps(bundle, indent=2) + "\n")
+PY_SIGN
+fi
+
 if [[ ! -x "$BINARY_SOURCE/xu" ]] || ! "$BINARY_SOURCE/xu" --version >/dev/null 2>&1; then
     log_err "Distribution compiler cannot run on $PLATFORM: $BINARY_SOURCE/xu"
     exit 1
