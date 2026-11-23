@@ -146,7 +146,14 @@ def check(archive):
         env.update(HOME=str(home), TMPDIR=str(work), XU_SKIP_EDITOR_INSTALL="1")
         prefix = work / "installed SDK with spaces"
         native = [payload / ("xu-setup" + suffix), "--yes", "--prefix", prefix, "--no-modify-path"]
-        run(native, work, env)
+        installed = run(native, work, env)
+        if manifest["target"] == "windows-arm64":
+            # The PowerShell wrapper forwards this console installer's output.
+            # Paths come from the user and may legitimately contain Unicode.
+            messages = (installed.stdout + installed.stderr).replace(str(work), "").replace(work.as_posix(), "")
+            assert messages.isascii() and "Xu SDK installed successfully." in messages, messages
+            help_text = run([native[0], "--help"], work, env).stdout
+            assert help_text.isascii() and "--no-modify-path" in help_text, help_text
         verify(prefix, manifest)
         banner = run([prefix / "bin" / ("xu" + suffix), "--version"], work, env).stdout
         assert banner.count("Xu Compiler Toolchain v" + manifest["version"]) == 1, banner
