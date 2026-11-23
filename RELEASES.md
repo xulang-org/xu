@@ -6,6 +6,29 @@
 
 ---
 
+## Xu 0.13.3
+
+- **Ownership-Aware Optimization & Alias Disambiguation**:
+  - Propagates borrow exclusivity and disjoint ownership scopes (`scope_id`) into SSA memory instructions.
+  - Implements scope-disjoint loop invariant hoisting (`opt_licm`), safely hoisting invariant memory loads past loop stores belonging to disjoint alias domains.
+  - Hardens GVN load forwarding with monotonic global epoch verification, eliminating stale value forwarding across aliased stores.
+- **Microsecond Scheduler & Bounded Coroutine Stack Analysis**:
+  - Adds interprocedural call-graph stack analysis to calculate bounded frame heights, routing bounded coroutines ($\le 12$ KB) to zero-syscall 16KB tiny stack slabs (`task_spawn_tiny`).
+  - Implements `S_AFFINITY` L1/L2 cache handoff slots in the scheduler deque to drastically minimize tail latency and context-switch ping-pong.
+  - Strictly preserves the standard 1MB guarded stack allocation contract on desktop platforms.
+- **Channel Communication & SPSC Move Elision**:
+  - Optimizes provably sequential 1:1 single-producer single-consumer channels into direct SSA register moves (`opt_chan_elide`), eliminating runtime channel queues and allocation overhead.
+  - Achieves zero-copy direct stack-to-stack rendezvous handoffs on unbuffered channels (`C_RDST`, `C_DIRECT`).
+- **MEMOIR GEMM Vectorization & Local SROA**:
+  - Scalarizes local aggregate structures into distinct SSA virtual registers (`opt_sroa`), eliminating struct padding holes.
+  - Vectorizes GEMM 3-level loop nests with embedded micro-kernel tiling runtime routines (`opt_tile`).
+- **Profile-Guided Optimization (PGO) & Binary Layout Reordering**:
+  - Adds native CLI `--pgo <file>` and `--pgo-file=<file>` flag parsing in the compiler driver.
+  - Reorders binary functions according to execution weight (BOLT-style clustering) across all architectures (ARM64, x64, RISC-V, LoongArch).
+  - Out-of-lines cold blocks and reverses branch conditions in `opt_cfg_pgo` to make happy paths fall through with zero Taken-branch decoding stalls.
+  - Delivers standalone PGO profile inspection and merging utility (`scripts/generate_pgo_profile.py`).
+- Upgrade the compiler, standard library, and SDK tools together.
+
 ## Xu 0.13.2
 
 - HTTP bounds pending server request and client receive buffers, decodes chunked bodies incrementally, and serves static `HEAD` and byte-range responses without reading the whole file.
