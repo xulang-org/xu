@@ -337,7 +337,12 @@ int xu_ui_text_input_select(uint64_t id,unsigned a,unsigned f) { return input_ed
 int xu_ui_text_input_delete_surrounding(uint64_t id,unsigned start,unsigned end) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.delete_surrounding(start,end,e); }); }
 int xu_ui_text_input_erase(uint64_t id,int backward) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.erase(backward!=0,e); }); }
 int xu_ui_text_input_erase_count(uint64_t id,int backward,unsigned count) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.erase(backward!=0,e,count); }); }
+int xu_ui_text_input_erase_word(uint64_t id,int backward) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.erase_word(backward!=0,e); }); }
+int xu_ui_text_input_erase_line(uint64_t id,int backward) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.erase_line(backward!=0,e); }); }
 int xu_ui_text_input_move(uint64_t id,int backward,int extend) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.move(backward!=0,extend!=0,e); }); }
+int xu_ui_text_input_move_word(uint64_t id,int backward,int extend) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.move_word(backward!=0,extend!=0,e); }); }
+int xu_ui_text_input_move_line(uint64_t id,int to_end,int extend) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.move_line(to_end!=0,extend!=0,e); }); }
+int xu_ui_text_input_move_document(uint64_t id,int to_end,int extend) { return input_edit(id,[&](XuUiEditModel &m,XuUiEditChange *e) { return m.move_document(to_end!=0,extend!=0,e); }); }
 static void input_close_canvas(unsigned canvas,unsigned generation) {
   for(auto &slot:g_text_inputs) if(slot.state==INPUT_ACTIVE && slot.canvas==canvas && slot.generation==generation) input_end(slot,XUTI_WINDOW_CLOSED);
 }

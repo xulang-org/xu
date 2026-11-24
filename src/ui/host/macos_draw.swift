@@ -357,8 +357,18 @@ private func xuInputCancel(_ id: UInt64) -> Int32
 private func xuInputSelect(_ id: UInt64, _ anchor: UInt32, _ focus: UInt32) -> Int32
 @_silgen_name("xu_ui_text_input_erase")
 private func xuInputErase(_ id: UInt64, _ backward: Int32) -> Int32
+@_silgen_name("xu_ui_text_input_erase_word")
+private func xuInputEraseWord(_ id: UInt64, _ backward: Int32) -> Int32
+@_silgen_name("xu_ui_text_input_erase_line")
+private func xuInputEraseLine(_ id: UInt64, _ backward: Int32) -> Int32
 @_silgen_name("xu_ui_text_input_move")
 private func xuInputMove(_ id: UInt64, _ backward: Int32, _ extend: Int32) -> Int32
+@_silgen_name("xu_ui_text_input_move_word")
+private func xuInputMoveWord(_ id: UInt64, _ backward: Int32, _ extend: Int32) -> Int32
+@_silgen_name("xu_ui_text_input_move_line")
+private func xuInputMoveLine(_ id: UInt64, _ toEnd: Int32, _ extend: Int32) -> Int32
+@_silgen_name("xu_ui_text_input_move_document")
+private func xuInputMoveDocument(_ id: UInt64, _ toEnd: Int32, _ extend: Int32) -> Int32
 
 struct InputUTFMap {
   let value: String
@@ -569,12 +579,40 @@ final class DrawInputClient: NSResponder, NSTextInputClient {
     case "selectAll:":
       accepted = xuInputCancel(id)
       if accepted != 0 { accepted = xuInputSelectAll(id) }
-    case "deleteBackward:": accepted = xuInputErase(id, 1)
+    case "deleteBackward:", "deleteBackwardByDecomposingPreviousCharacter:": accepted = xuInputErase(id, 1)
     case "deleteForward:": accepted = xuInputErase(id, 0)
+    case "deleteWordBackward:": accepted = xuInputEraseWord(id, 1)
+    case "deleteWordForward:": accepted = xuInputEraseWord(id, 0)
+    case "deleteToBeginningOfLine:", "deleteToBeginningOfParagraph:": accepted = xuInputEraseLine(id, 1)
+    case "deleteToEndOfLine:", "deleteToEndOfParagraph:": accepted = xuInputEraseLine(id, 0)
     case "moveLeft:", "moveBackward:": accepted = xuInputMove(id, 1, 0)
     case "moveRight:", "moveForward:": accepted = xuInputMove(id, 0, 0)
     case "moveLeftAndModifySelection:", "moveBackwardAndModifySelection:": accepted = xuInputMove(id, 1, 1)
     case "moveRightAndModifySelection:", "moveForwardAndModifySelection:": accepted = xuInputMove(id, 0, 1)
+    case "moveWordLeft:", "moveWordBackward:": accepted = xuInputMoveWord(id, 1, 0)
+    case "moveWordRight:", "moveWordForward:": accepted = xuInputMoveWord(id, 0, 0)
+    case "moveWordLeftAndModifySelection:", "moveWordBackwardAndModifySelection:": accepted = xuInputMoveWord(id, 1, 1)
+    case "moveWordRightAndModifySelection:", "moveWordForwardAndModifySelection:": accepted = xuInputMoveWord(id, 0, 1)
+    case "moveToBeginningOfLine:", "moveToLeftEndOfLine:", "moveToBeginningOfParagraph:": accepted = xuInputMoveLine(id, 0, 0)
+    case "moveToEndOfLine:", "moveToRightEndOfLine:", "moveToEndOfParagraph:": accepted = xuInputMoveLine(id, 1, 0)
+    case "moveToBeginningOfLineAndModifySelection:", "moveToLeftEndOfLineAndModifySelection:", "moveToBeginningOfParagraphAndModifySelection:": accepted = xuInputMoveLine(id, 0, 1)
+    case "moveToEndOfLineAndModifySelection:", "moveToRightEndOfLineAndModifySelection:", "moveToEndOfParagraphAndModifySelection:": accepted = xuInputMoveLine(id, 1, 1)
+    case "moveToBeginningOfDocument:": accepted = xuInputMoveDocument(id, 0, 0)
+    case "moveToEndOfDocument:": accepted = xuInputMoveDocument(id, 1, 0)
+    case "moveToBeginningOfDocumentAndModifySelection:": accepted = xuInputMoveDocument(id, 0, 1)
+    case "moveToEndOfDocumentAndModifySelection:": accepted = xuInputMoveDocument(id, 1, 1)
+    case "moveUp:":
+      guard state.flags & 1 == 0 else { return }
+      accepted = xuInputMoveLine(id, 0, 0)
+    case "moveUpAndModifySelection:":
+      guard state.flags & 1 == 0 else { return }
+      accepted = xuInputMoveLine(id, 0, 1)
+    case "moveDown:":
+      guard state.flags & 1 == 0 else { return }
+      accepted = xuInputMoveLine(id, 1, 0)
+    case "moveDownAndModifySelection:":
+      guard state.flags & 1 == 0 else { return }
+      accepted = xuInputMoveLine(id, 1, 1)
     case "insertNewline:", "insertLineBreak:":
       guard state.flags & 1 != 0 else { return }
       accepted = "\n".withCString { xuInputCommit(id, $0, 1, UInt32.max, UInt32.max) }
@@ -959,7 +997,7 @@ final class DrawCanvasView: NSView {
     if let inputTracking { removeTrackingArea(inputTracking) }
     // Passive hover must also work before a click activates this window.
     // Keyboard/editing focus still follows the key-window notifications below.
-    let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+    let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .cursorUpdate, .activeAlways, .inVisibleRect], owner: self)
     addTrackingArea(area); inputTracking = area
   }
   override func viewDidMoveToWindow() {
@@ -989,9 +1027,20 @@ final class DrawCanvasView: NSView {
     return true
   }
   override func resignFirstResponder() -> Bool { blurTextInput(); cancelInput(); return true }
+  private static let hostCursors: [NSCursor] = [.arrow, .iBeam, .crosshair, .pointingHand, .resizeLeftRight, .resizeUpDown]
+  func currentCursor() -> NSCursor {
+    Self.hostCursors[max(0, min(cursorIndex, Self.hostCursors.count - 1))]
+  }
+  func applyCursorIfHovered() {
+    guard let window, window.isVisible, NSApp.isActive || window.isKeyWindow else { return }
+    let pt = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    if bounds.contains(pt) { currentCursor().set() }
+  }
   override func resetCursorRects() {
-    let cursors: [NSCursor] = [.arrow, .iBeam, .crosshair, .pointingHand, .resizeLeftRight, .resizeUpDown]
-    addCursorRect(bounds, cursor: cursors[cursorIndex])
+    addCursorRect(bounds, cursor: currentCursor())
+  }
+  override func cursorUpdate(with event: NSEvent) {
+    currentCursor().set()
   }
   func inputModifiers(_ event: NSEvent) -> UInt32 {
     let flags = event.modifierFlags
@@ -1029,8 +1078,16 @@ final class DrawCanvasView: NSView {
     emitInput(74, p, NSPoint(x: p.x - previous.x, y: p.y - previous.y), modifiers: inputModifiers(event))
     inputPoint = p
   }
-  override func mouseEntered(with event: NSEvent) { emitInput(75, convert(event.locationInWindow, from: nil), modifiers: inputModifiers(event)) }
-  override func mouseExited(with event: NSEvent) { emitInput(76, convert(event.locationInWindow, from: nil), modifiers: inputModifiers(event)) }
+  override func mouseEntered(with event: NSEvent) {
+    applyCursorIfHovered()
+    emitInput(75, convert(event.locationInWindow, from: nil), modifiers: inputModifiers(event))
+  }
+  override func mouseExited(with event: NSEvent) {
+    emitInput(76, convert(event.locationInWindow, from: nil), modifiers: inputModifiers(event))
+    if let window, window.isVisible, NSApp.isActive || window.isKeyWindow {
+      if window.contentView?.hitTest(event.locationInWindow) !== self { NSCursor.arrow.set() }
+    }
+  }
   override func rightMouseDown(with event: NSEvent) { window?.makeFirstResponder(self); pointerDown(event) }
   override func otherMouseDown(with event: NSEvent) { window?.makeFirstResponder(self); pointerDown(event) }
   override func rightMouseUp(with event: NSEvent) { pointerUp(event) }
@@ -1291,13 +1348,11 @@ final class XuDrawPlugin: NSObject, XuContentPlugin {
     }
     if s.hasPrefix("cursor\t") {
       guard let index = Int(s.dropFirst(7)), (0...5).contains(index) else { return false }
-      canvas.cursorIndex = index
-      canvas.window?.invalidateCursorRects(for: canvas)
-      if let window = canvas.window, window.isKeyWindow,
-         canvas.bounds.contains(canvas.convert(window.mouseLocationOutsideOfEventStream, from: nil)) {
-        let cursors: [NSCursor] = [.arrow, .iBeam, .crosshair, .pointingHand, .resizeLeftRight, .resizeUpDown]
-        cursors[index].set()
+      if canvas.cursorIndex != index {
+        canvas.cursorIndex = index
+        canvas.window?.invalidateCursorRects(for: canvas)
       }
+      canvas.applyCursorIfHovered()
       return true
     }
     if s.hasPrefix("__draw_frame\t") {
