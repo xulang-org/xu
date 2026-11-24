@@ -73,8 +73,9 @@ fn main() int {
 可变绑定在声明处标记一次：`$x := value` 或 `let $x: T = value`，随后使用普通名称 `x`。
 普通值的共享借用写 `&x`，可写借用写 `$&x`，对应引用类型为 `$&T`。
 复用引用直接写 `r`，显式再借用写 `&*r`；普通值自动借用尚未实现。
+底层硬件与裸机契约：操作系统内核与设备驱动使用裸指针 `*raw T`，解引用必须置于显式 `unsafe { ... }` 块中（如 `p := addr as *raw u32; unsafe { *p = val }`），借用推导图完全跳过裸指针；MMIO 交互内建 `volatile_read` / `volatile_write` 访存屏障；结构体支持 `@repr("C", align: N)` 精确对齐与 `@repr("C", packed)` 紧凑排布；裸机内核源码标记 `$freestanding` 彻底阻断宿主 syscall 与 libc。
 
-当前借用与可变绑定规则见[借用指南](https://xulang.org/zh/docs/lang/memory/)。
+当前借用与底层契约规则见[借用与内存模型指南](https://xulang.org/zh/docs/lang/memory/)。
 
 ---
 
