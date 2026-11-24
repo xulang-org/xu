@@ -41,6 +41,69 @@ class XuUiEditModel {
     auto at = std::lower_bound(stops_.begin(), stops_.end(), index);
     return at == stops_.end() ? (unsigned)text_.size() : *at;
   }
+  enum StopClass { SC_NL = 0, SC_WS = 1, SC_PUNCT = 2, SC_WORD = 3 };
+  static unsigned decode_cp(const std::string &s, unsigned at) {
+    unsigned char b = (unsigned char)s[at];
+    if (b < 0x80u) return b;
+    unsigned cp = 0; int cont = 0;
+    if (b < 0xe0u) { cp = b & 31u; cont = 1; }
+    else if (b < 0xf0u) { cp = b & 15u; cont = 2; }
+    else { cp = b & 7u; cont = 3; }
+    for (int i = 1; i <= cont && at + (unsigned)i < s.size(); ++i)
+      cp = (cp << 6) | ((unsigned char)s[at + (unsigned)i] & 63u);
+    return cp;
+  }
+  StopClass stop_class(unsigned stop_idx) const {
+    unsigned pos = stops_[stop_idx];
+    if (pos >= text_.size()) return SC_WS;
+    unsigned cp = decode_cp(text_, pos);
+    if (cp == '\n' || cp == '\r' || cp == 0x2028u || cp == 0x2029u) return SC_NL;
+    if (cp <= 0x20u || cp == 0x7fu || cp == 0xa0u || (cp >= 0x2000u && cp <= 0x200bu) || cp == 0x3000u) return SC_WS;
+    if (cp < 0x80u) {
+      bool is_word = (cp >= '0' && cp <= '9') || (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') || cp == '_';
+      return is_word ? SC_WORD : SC_PUNCT;
+    }
+    if ((cp >= 0x2010u && cp <= 0x2027u) || (cp >= 0x3001u && cp <= 0x3003u) ||
+        (cp >= 0x3008u && cp <= 0x301fu) || (cp >= 0xff01u && cp <= 0xff0fu) ||
+        (cp >= 0xff1au && cp <= 0xff20u) || (cp >= 0xff3bu && cp <= 0xff40u) ||
+        (cp >= 0xff5bu && cp <= 0xff65u)) return SC_PUNCT;
+    return SC_WORD;
+  }
+  unsigned stop_index_of(unsigned offset) const {
+    unsigned floored = floor_stop(offset);
+    return (unsigned)(std::lower_bound(stops_.begin(), stops_.end(), floored) - stops_.begin());
+  }
+  unsigned word_boundary(unsigned offset, bool backward) const {
+    unsigned idx = stop_index_of(offset);
+    unsigned last = (unsigned)stops_.size() - 1u;
+    if (backward) {
+      if (idx == 0) return 0;
+      if (stop_class(idx - 1u) == SC_NL) return stops_[idx - 1u];
+      while (idx > 0 && stop_class(idx - 1u) == SC_WS) --idx;
+      if (idx > 0 && stop_class(idx - 1u) != SC_NL) {
+        StopClass cls = stop_class(idx - 1u);
+        while (idx > 0 && stop_class(idx - 1u) == cls) --idx;
+      }
+      return stops_[idx];
+    }
+    if (idx >= last) return (unsigned)text_.size();
+    if (stop_class(idx) == SC_NL) return stops_[idx + 1u];
+    while (idx < last && stop_class(idx) == SC_WS) ++idx;
+    if (idx < last && stop_class(idx) != SC_NL) {
+      StopClass cls = stop_class(idx);
+      while (idx < last && stop_class(idx) == cls) ++idx;
+    }
+    return stops_[idx];
+  }
+  unsigned line_boundary(unsigned offset, bool to_end) const {
+    unsigned pos = to_end ? ceil_stop(offset) : floor_stop(offset);
+    if (to_end) {
+      while (pos < text_.size() && text_[pos] != '\n' && text_[pos] != '\r') ++pos;
+      return floor_stop(pos);
+    }
+    while (pos > 0 && text_[pos - 1u] != '\n' && text_[pos - 1u] != '\r') --pos;
+    return ceil_stop(pos);
+  }
 public:
   uint64_t revision() const { return revision_; }
   const std::string &text() const { return text_; }
@@ -169,5 +232,42 @@ public:
       if (at!=stops_.end()) next=*at;
     }
     return select(extend ? anchor_ : next,next,change);
+  }
+  bool move_word(bool backward, bool extend, XuUiEditChange *change) {
+    if (composing_ || !writable(change)) return false;
+    unsigned base = (!extend && anchor_ != focus_)
+      ? (backward ? floor_stop(std::min(anchor_, focus_)) : ceil_stop(std::max(anchor_, focus_)))
+      : focus_;
+    unsigned next = word_boundary(base, backward);
+    return select(extend ? anchor_ : next, next, change);
+  }
+  bool erase_word(bool backward, XuUiEditChange *change) {
+    if (composing_ || !writable(change)) return false;
+    unsigned start = std::min(anchor_, focus_), end = std::max(anchor_, focus_);
+    if (start != end) return commit("", 0, change, floor_stop(start), ceil_stop(end));
+    unsigned bound = word_boundary(start, backward);
+    if (bound == start) return noop(change);
+    return commit("", 0, change, std::min(bound, start), std::max(bound, start));
+  }
+  bool move_line(bool to_end, bool extend, XuUiEditChange *change) {
+    if (composing_ || !writable(change)) return false;
+    unsigned base = (!extend && anchor_ != focus_)
+      ? (to_end ? ceil_stop(std::max(anchor_, focus_)) : floor_stop(std::min(anchor_, focus_)))
+      : focus_;
+    unsigned next = line_boundary(base, to_end);
+    return select(extend ? anchor_ : next, next, change);
+  }
+  bool erase_line(bool backward, XuUiEditChange *change) {
+    if (composing_ || !writable(change)) return false;
+    unsigned start = std::min(anchor_, focus_), end = std::max(anchor_, focus_);
+    if (start != end) return commit("", 0, change, floor_stop(start), ceil_stop(end));
+    unsigned bound = line_boundary(start, !backward);
+    if (bound == start) return noop(change);
+    return commit("", 0, change, std::min(bound, start), std::max(bound, start));
+  }
+  bool move_document(bool to_end, bool extend, XuUiEditChange *change) {
+    if (composing_ || !writable(change)) return false;
+    unsigned next = to_end ? (unsigned)text_.size() : 0u;
+    return select(extend ? anchor_ : next, next, change);
   }
 };

@@ -73,8 +73,9 @@ fn main() int {
 可变绑定在声明处标记一次：`$x := value` 或 `let $x: T = value`，随后使用普通名称 `x`。
 普通值的共享借用写 `&x`，可写借用写 `$&x`，对应引用类型为 `$&T`。
 复用引用直接写 `r`，显式再借用写 `&*r`；普通值自动借用尚未实现。
+底层硬件与裸机契约：操作系统内核与设备驱动使用裸指针 `*raw T`，解引用必须置于显式 `unsafe { ... }` 块中（如 `p := addr as *raw u32; unsafe { *p = val }`），借用推导图完全跳过裸指针；MMIO 交互内建 `volatile_read` / `volatile_write` 访存屏障；结构体支持 `@repr("C", align: N)` 精确对齐与 `@repr("C", packed)` 紧凑排布；裸机内核源码标记 `$freestanding` 彻底阻断宿主 syscall 与 libc。
 
-当前借用与可变绑定规则见[借用指南](https://xulang.org/zh/docs/lang/memory/)。
+当前借用与底层契约规则见[借用与内存模型指南](https://xulang.org/zh/docs/lang/memory/)。
 
 ---
 
@@ -109,6 +110,7 @@ fn main() int {
 | **控制流表达** | `return` / `break` / `continue` | `return` / `break` / `continue` | `return` / 隐式尾表达式 | **统一符号流：`<<` 返回 / `>>` 抛错 / `<-` 跳出** |
 | **工具链集成度** | 分散 (CMake/Make/Conan 拼装) | 一体化开箱即用 | 一体化 (Cargo) | **单二进制闭环 (编译/测试/格式化/文档一体化)** |
 | **跨平台安装** | 需配置繁杂编译器工具链 | 安装包 / 手动配置环境变量 | 依赖 rustup / 跨平台网络脚本 | **单文件原生自绘向导 / 一键全局免配置** |
+| **裸机与内核开发** | 手动管理链接/汇编，无安全约束 | 不支持 (强绑定 GC 与调度运行时) | 支持 (`no_std`)，但生命周期标注沉重 | **原生支持 (`freestanding` / `#core`)<br>零 GC 确定性析构 + 隐式生命周期推导** |
 
 ---
 
@@ -190,6 +192,36 @@ xu build app/ --phone --target android-arm64 --bundle-id org.example.app -o buil
 
 ---
 
+## 🖥️ 操作系统内核与裸机开发 (Baremetal OS & Kernel Development)
+
+Xu 原生支持**操作系统内核、嵌入式固件与裸机驱动开发**。通过严格隔离的分层架构，既能在常规业务代码中维持**零 GC 确定性析构**与**隐式所有权推导（无手写生命周期标注）**，又能在底层 5% 代码中通过受控的硬件契约直达底层微架构：
+
+* **Freestanding 无宿主模式**：
+  * 支持源码级指令 `$freestanding`、清单配置 `xu.xun`（`profile: freestanding`）或 CLI 参数 `--profile=freestanding` / `--no-std`，彻底阻断宿主操作系统 syscall、运行时调度器与 libc 依赖。
+* **严格隔离的底层硬件契约**：
+  * **裸指针类型 `*raw T`**：解引用必须置于显式 `unsafe { ... }` 块中，借用推导图完全跳过裸指针，零侵入常规应用开发；
+  * **Volatile MMIO 屏障**：内建 `volatile_read` 与 `volatile_write`，严密防范死代码消除（DCE）与循环不变量外提（LICM）；
+  * **精确内存排布控制**：`@repr("C", align: 4096)` 控制 4KB 对齐页表（PML4 / Page Directory），`@repr("C", packed)` 控制硬件网络帧与控制块无填充紧凑排布。
+* **纯静态核心库（`#core`）**：
+  * `#core/arch`：CPU 特权指令（`cli`、`sti`、`hlt`、`pause`、`wfi`）、控制寄存器读写（`read_cr2/cr3`、`write_cr3`、`invlpg`、`set_vbar`、`set_trap_vector`）、IDT 中断门管理（`load_idt`）、8259A PIC 重映射（`pic_remap`）与 8254 PIT 定时器初始化；
+  * `#core/sync`：硬件中断安全自旋锁 `IrqSpinlock` 与 `Spinlock`，利用 RAII 守卫 `IrqGuard` / `SpinGuard` 在作用域退出时**确定性自动释放并恢复中断（零 GC）**；
+  * `#core/task`：跨架构 192 字节 16 字节对齐的 `TaskContext`、原子上下文切换（`switch_context`）、全寄存器异常栈帧快照（`TrapFrame`）与系统调用入口（`syscall_entry`）；
+  * `#core/virtio`：纯静态 VirtIO MMIO 驱动框架、VirtQueue 描述符环、`VirtioBlkDriver`（磁盘块设备）与 `VirtioNetDriver`（虚拟网卡）；
+  * `#core/mem` & `#core/alloc`：零分配内存原语（`memset`/`memcpy`/`memcmp`）与可插拔全局分配器契约（`GlobalAlloc`）。
+* **一键生成内核工程脚手架**：
+  ```bash
+  # 初始化全新的裸机内核工程（自动生成 xu.xun、main.xu、linker.ld 与跨架构 Makefile）
+  xu init --baremetal my_os
+  cd my_os
+
+  # 一键构建多架构纯净裸机内核 ELF（镜像仅 1.9 KB ~ 2.4 KB）
+  make
+  # 或在 QEMU 模拟器中即刻启动
+  make qemu
+  ```
+
+---
+
 ## 🗺️ 项目路线图 (Roadmap)
 
 以下以已发布的正式 SDK 为基线，区分已交付能力与后续工作。各目标的运行边界见[限制与现状](https://xulang.org/zh/docs/status/)。
@@ -200,6 +232,7 @@ xu build app/ --phone --target android-arm64 --bundle-id org.example.app -o buil
 - [x] **国密算法完整性与工程收口**：SM2/SM3/SM4/SM9 算法全量通过；SM9 双线性对栈帧压降 71.5% 且零编译告警
 - [x] **极简符号流控制**：`<<` 返回、`>>` 抛错与 `or (err) { ... }` 强制就地处理
 - [x] **多平台代码生成**：Windows / macOS / Linux、ARM64 / x64 / LoongArch64 / RISC-V、WASM 及裸机目标
+- [x] **操作系统内核与裸机开发支持**：Freestanding 编译配置、`#core` 纯静态子集（arch/mem/sync/task/alloc/virtio）、中断安全自旋锁、原子上下文切换、VirtIO 驱动以及一键裸机脚手架 (`xu init --baremetal`)
 - [x] **SDK 安装与自更新**：Windows 安装向导、macOS PKG、跨平台单文件 Setup 与 `xu up/update`
 - [x] **可复现模块依赖**：`init/get/install`、MVS、锁文件/vendor、代理、离线/冻结构建与固定公钥校验客户端
 - [x] **LSP 与编辑器集成**：`xu-lsp`、VS Code/Cursor 扩展；诊断、补全、定义、悬停、大纲、引用、重命名与格式化

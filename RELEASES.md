@@ -6,6 +6,26 @@
 
 ---
 
+## Xu 0.14.0
+
+- **Operating System Kernel & Bare-Metal Support (Freestanding & #core)**:
+  - Adds freestanding unhosted execution profiles: source directive `$freestanding`, project manifest `xu.xun` (`profile: freestanding`), and CLI flags `--profile=freestanding` / `--no-std`, completely isolating the compiler output from host OS syscalls, schedulers, and libc.
+  - Strictly isolated hardware contracts: introduces raw pointer type `*raw T` guarded by mandatory `unsafe { ... }` blocks, volatile MMIO intrinsics (`volatile_read` / `volatile_write`), and precise structure layout attributes (`@repr("C", align: N)` and `@repr("C", packed)`).
+  - Pure static `#core` foundation library: includes `#core/arch` (CPU interrupt handling, control registers, 8259A PIC, 8254 PIT, IDT gates), `#core/mem` (zero-allocation memory primitives), `#core/alloc` (pluggable `GlobalAlloc` allocator contract), `#core/sync` (interrupt-safe spinlocks `IrqSpinlock`/`Spinlock` with RAII auto-restoring guards), `#core/task` (cross-architecture 192-byte atomic context switching, `TrapFrame` exception snapshots, and syscall dispatch entries), and `#core/virtio` (VirtIO MMIO drivers, block devices, and network devices).
+  - Scaffolding & Developer Tooling: adds `xu init --baremetal <name>` and `xu new --baremetal <name>` commands to scaffold multi-architecture kernel projects, custom linker scripts, and Makefiles emitting lean freestanding kernel ELFs (~1.9 KB to 2.4 KB).
+- **Advanced Compiler & Memory Optimizations**:
+  - GVN can reuse loads across direct call chains proven to only read memory or write to their own stack frames. Recursive cycles, indirect calls and calls without analyzable bodies remain conservative.
+  - GVN can retain loads across stores to disjoint byte ranges of the same base, including constant-index slice element stores.
+  - Direct acyclic call chains preserve unrelated loads when every possible write maps to a fixed byte range relative to an unchanged incoming argument.
+  - GVN retains dominating load facts at control-flow joins whose incoming paths all carry the same memory version as the immediate dominator.
+  - Single-read PGO profile indexing: builds read and index the PGO profile once, accept tab-separated block counts, and report the line of malformed data. Profile-guided function reordering preserves DWARF function ranges and source locations.
+  - Matrix loops use the normal typed lowering on ARM64 and x64; experimental GEMM rewrite is kept inactive pending complete bounds and dependency checks.
+  - Cooperative scheduling polling: set `XU_TASK_POLL=1` at build time to try cooperative scheduling polls in main module `while` and integer range loops on optimized native ARM64 and x64 executables.
+- **Installer, Toolchain & Platform Improvements**:
+  - Native setup installer and interactive wizard strictly enforce pure English ASCII across all terminal locales and encoding environments.
+  - Setup installer automatically ad-hoc codesigns unsigned macOS arm64 tools and execution outputs (`codesign --force --deep --sign -`), eliminating Gatekeeper blocks and process kills on Apple Silicon.
+- Upgrade the compiler, standard library, and SDK tools together.
+
 ## Xu 0.13.3
 
 - **Ownership-Aware Optimization & Alias Disambiguation**:

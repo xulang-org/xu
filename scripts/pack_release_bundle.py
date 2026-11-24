@@ -253,12 +253,16 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
             embed_invoker_manifest(bin_dir / dest_name)
         (bin_dir / dest_name).chmod(0o755)
 
-    # 2.1 Copy xu-setup to bundle root for direct execution
+    # Keep a root entry point while storing the macOS UI host only in bin/.
     exe_suffix = ".exe" if is_windows else ""
     setup_name = f"xu-setup{exe_suffix}"
     if (bin_dir / setup_name).exists():
-        shutil.copy2(bin_dir / setup_name, stage_dir / setup_name)
-        (stage_dir / setup_name).chmod(0o755)
+        root_setup = stage_dir / setup_name
+        if target.startswith("macos-"):
+            root_setup.write_text('#!/bin/sh\nexec "$(dirname "$0")/bin/xu-setup" "$@"\n', encoding="ascii")
+        else:
+            shutil.copy2(bin_dir / setup_name, root_setup)
+        root_setup.chmod(0o755)
 
 
     # 3. Standard Library (src/)
@@ -374,17 +378,13 @@ Xu is a fast, safe, GC-free systems programming language combining Go-style tool
 ## Quick Installation
 
 ### Windows:
-直接双击运行本目录下的 `xu-setup.exe`（或在控制台执行 `xu-setup.exe`），无需运行 PowerShell 脚本，自动完成安装与系统环境变量配置。
+Directly run `xu-setup.exe` in this directory (or execute `xu-setup.exe` in a terminal) to install and configure environment variables automatically.
 
 ### macOS / Linux:
-在终端中直接运行本目录下的原生安装程序：
+Run the native installer in a terminal:
 ```bash
 ./xu-setup
 ```
-
-### 独立使用（不修改系统环境）：
-- Unix: `source env.sh`
-- Windows: `. .\\env.ps1` 或调用已安装目录的 `env.cmd`
 
 ### Instant Try (No System Modification):
 - Unix: `source env.sh`

@@ -6,6 +6,26 @@
 
 ---
 
+## Xu 0.14.0
+
+- **操作系统内核与裸机开发支持 (Freestanding & #core)**：
+  - 新增无宿主运行环境配置：源码级 `$freestanding`、`xu.xun`（`profile: freestanding`）及命令行 `--profile=freestanding` / `--no-std`，阻断宿主 syscall、调度器与 libc 依赖。
+  - 严格受控的底层硬件契约：引入裸指针 `*raw T` 与 `unsafe { ... }` 隔离块，提供 `volatile_read` / `volatile_write` 易失访存屏障，支持 `@repr("C", align: N)` 任意对齐与 `@repr("C", packed)` 紧凑结构体。
+  - 交付纯静态无依赖核心库 `#core`：包含 `#core/arch`（CPU 中断、控制寄存器、8259A PIC、8254 PIT、IDT 门）、`#core/mem`（零分配内存原语）、`#core/alloc`（可插拔 `GlobalAlloc` 分配器契约）、`#core/sync`（中断安全自旋锁与 RAII 自动恢复守卫 `IrqSpinlock`/`Spinlock`）、`#core/task`（跨架构 192 字节原子上下文切换、`TrapFrame` 异常快照与系统调用入口）、`#core/virtio`（VirtIO MMIO 驱动、块设备与网络设备）。
+  - 脚手架与工程化支持：新增 `xu init --baremetal <name>` 与 `xu new --baremetal <name>`，自动生成跨架构内核工程、链接脚本与 Makefile，编译产物仅 1.9 KB ~ 2.4 KB。
+- **高级编译器与内存优化**：
+  - GVN 可跨直接调用链复用载入，前提是整条调用链只读内存或写入各自的栈帧；递归环、间接调用和缺少可分析函数体的调用仍按可能写入保守处理。
+  - GVN 可跨同一基址上字节区间不相交的写入复用载入，覆盖常量下标的切片元素写入。
+  - 对每处可能写入均可映射到未被改写的入参及其固定字节区间的无环直接调用链，GVN 可跨调用复用不相交的加载。
+  - 控制流汇合时，若所有传入路径的内存版本均与直接支配块的出口一致，GVN 可保留支配块上的载入事实。
+  - 一次性读取并索引 PGO 性能剖析文件，支持制表符分隔基本块计数并精准定位数据错误行；PGO 函数重排保留 DWARF 调试信息范围与源码位置。
+  - ARM64 与 x64 矩阵循环采用常规类型化降级；实验性 GEMM 改写在完善边界与依赖检查期间保持停用。
+  - 构建时支持设置 `XU_TASK_POLL=1`，在主模块 `while` 与整数范围循环中启用协作式调度轮询（每 65,536 次循环回边轮询一次）。
+- **安装器、工具链与平台健全性**：
+  - 原生 Setup 安装向导严格采用纯英文字符集（ASCII），消除跨终端语言环境与编码差异导致的乱码或中断。
+  - 安装流程自动为 macOS arm64 未签名工具链组件与执行产物实施 Ad-hoc 签名（`codesign --force --deep --sign -`），杜绝 Apple Silicon 上的 Gatekeeper 拦截与进程强杀。
+- 升级时请一起更新编译器、标准库和 SDK 工具。
+
 ## Xu 0.13.3
 
 - **所有权感知底层优化与别名消歧**：
