@@ -8,6 +8,11 @@
 
 ## Xu 0.13.3
 
+- **Operating System Kernel & Bare-Metal Support (Freestanding & #core)**:
+  - Adds freestanding unhosted execution profiles: source directive `$freestanding`, project manifest `xu.xun` (`profile: freestanding`), and CLI flags `--profile=freestanding` / `--no-std`, completely isolating the compiler output from host OS syscalls, schedulers, and libc.
+  - Strictly isolated hardware contracts: introduces raw pointer type `*raw T` guarded by mandatory `unsafe { ... }` blocks, volatile MMIO intrinsics (`volatile_read` / `volatile_write`), and precise structure layout attributes (`@repr("C", align: N)` and `@repr("C", packed)`).
+  - Pure static `#core` foundation library: includes `#core/arch` (CPU interrupt handling, control registers, 8259A PIC, 8254 PIT, IDT gates), `#core/mem` (zero-allocation memory primitives), `#core/alloc` (pluggable `GlobalAlloc` allocator contract), `#core/sync` (interrupt-safe spinlocks `IrqSpinlock`/`Spinlock` with RAII auto-restoring guards), `#core/task` (cross-architecture 192-byte atomic context switching, `TrapFrame` exception snapshots, and syscall dispatch entries), and `#core/virtio` (VirtIO MMIO drivers, block devices, and network devices).
+  - Scaffolding & Developer Tooling: adds `xu init --baremetal <name>` and `xu new --baremetal <name>` commands to scaffold multi-architecture kernel projects, custom linker scripts, and Makefiles emitting lean freestanding kernel ELFs (~1.9 KB to 2.4 KB).
 - **Ownership-Aware Optimization & Alias Disambiguation**:
   - Propagates borrow exclusivity and disjoint ownership scopes (`scope_id`) into SSA memory instructions.
   - Implements scope-disjoint loop invariant hoisting (`opt_licm`), safely hoisting invariant memory loads past loop stores belonging to disjoint alias domains.

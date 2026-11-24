@@ -8,6 +8,11 @@
 
 ## Xu 0.13.3
 
+- **操作系统内核与裸机开发支持 (Freestanding & #core)**：
+  - 新增无宿主运行环境配置：源码级 `$freestanding`、`xu.xun`（`profile: freestanding`）及命令行 `--profile=freestanding` / `--no-std`，阻断宿主 syscall、调度器与 libc 依赖。
+  - 严格受控的底层硬件契约：引入裸指针 `*raw T` 与 `unsafe { ... }` 隔离块，提供 `volatile_read` / `volatile_write` 易失访存屏障，支持 `@repr("C", align: N)` 任意对齐与 `@repr("C", packed)` 紧凑结构体。
+  - 交付纯静态无依赖核心库 `#core`：包含 `#core/arch`（CPU 中断、控制寄存器、8259A PIC、8254 PIT、IDT 门）、`#core/mem`（零分配内存原语）、`#core/alloc`（可插拔 `GlobalAlloc` 分配器契约）、`#core/sync`（中断安全自旋锁与 RAII 自动恢复守卫 `IrqSpinlock`/`Spinlock`）、`#core/task`（跨架构 192 字节原子上下文切换、`TrapFrame` 异常快照与系统调用入口）、`#core/virtio`（VirtIO MMIO 驱动、块设备与网络设备）。
+  - 脚手架与工程化支持：新增 `xu init --baremetal <name>` 与 `xu new --baremetal <name>`，自动生成跨架构内核工程、链接脚本与 Makefile，编译产物仅 1.9 KB ~ 2.4 KB。
 - **所有权感知底层优化与别名消歧**：
   - 将借用检查排他性与独立所有权域（`scope_id`）贯穿透传至 SSA 内存读写指令。
   - 实现基于作用域互斥的循环不变量外提（`opt_licm`），当循环体内存储与载入属于互斥作用域时，允许安全外提载入指令。
