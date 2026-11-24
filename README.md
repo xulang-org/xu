@@ -113,6 +113,7 @@ As software engineers building high-performance systems and services, we are con
 | **Flow Control** | `return` / `break` / `continue` | `return` / `break` / `continue` | `return` / Tail expressions | **Symbolic flow: `<<` return / `>>` throw / `<-` break** |
 | **Toolchain Cohesion**| Fragmented (CMake/Make/Conan) | Integrated out-of-the-box | Integrated (Cargo) | **Single-binary loop (Built-in build/test/fmt/doc)** |
 | **Cross-Platform Setup**| Complex toolchain & linker dependencies | Official installer / manual PATH config | Requires rustup & external network scripts | **Standalone GUI Setup wizards / One-click setup** |
+| **Baremetal & Kernel Dev**| Manual linkage & inline asm, unsafe | Unsupported (Tied to GC & runtime) | Supported (`no_std`), but heavy lifetimes | **Native support (`freestanding` / `#core`)<br>Zero-GC deterministic drops + Inferred lifetimes** |
 
 ---
 
@@ -199,6 +200,36 @@ See [Phone prerequisites and boundaries](src/ui/host/phone/README.md) and the
 
 ---
 
+## 🖥️ Baremetal OS & Kernel Development
+
+Xu natively supports **operating system kernels, embedded firmware, and bare-metal driver development**. Through a strictly isolated layered architecture, Xu preserves **zero-GC deterministic destruction** and **implicit ownership inference (no manual lifetime annotations)** in normal code, while isolating hardware-level manipulation to the bottom 5% of code:
+
+* **Freestanding Unhosted Mode**:
+  * Source directive `$freestanding`, project manifest `xu.xun` (`profile: freestanding`), or CLI flags `--profile=freestanding` / `--no-std` completely sever dependencies on host OS syscalls, runtime schedulers, and libc.
+* **Strictly Isolated Hardware Contracts**:
+  * **Raw Pointers (`*raw T`)**: Dereferencing requires explicit `unsafe { ... }` blocks; ownership and borrow inference skips raw pointers entirely, preserving zero friction for standard application code;
+  * **Volatile MMIO Barriers**: Built-in `volatile_read` and `volatile_write` primitives prevent dead-code elimination (DCE) and loop-invariant code motion (LICM);
+  * **Precise Memory Layout Controls**: `@repr("C", align: 4096)` for 4KB page directory tables (PML4 / Page Directory), and `@repr("C", packed)` for zero-padding hardware network packets and control descriptors.
+* **Pure Core Subsystem Library (`#core`)**:
+  * `#core/arch`: CPU privileged instructions (`cli`, `sti`, `hlt`, `pause`, `wfi`), control register access (`read_cr2/cr3`, `write_cr3`, `invlpg`, `set_vbar`, `set_trap_vector`), IDT interrupt gate descriptors (`load_idt`), 8259A PIC remapping (`pic_remap`), and 8254 PIT timer initialization;
+  * `#core/sync`: Interrupt-safe spinlocks `IrqSpinlock` and `Spinlock` paired with RAII guards `IrqGuard` and `SpinGuard` for **zero-GC deterministic lock release and interrupt restoration upon scope exit**;
+  * `#core/task`: Cross-architecture 192-byte 16-byte aligned `TaskContext`, atomic context switching (`switch_context`), full register trap snapshot structures (`TrapFrame`), and syscall dispatch entries (`syscall_entry`);
+  * `#core/virtio`: Pure static VirtIO MMIO driver framework, VirtQueue descriptor rings, `VirtioBlkDriver` (disk block device), and `VirtioNetDriver` (virtual network card);
+  * `#core/mem` & `#core/alloc`: Zero-allocation memory intrinsics (`memset`/`memcpy`/`memcmp`) and pluggable allocator contracts (`GlobalAlloc`).
+* **Instant Kernel Project Scaffolding**:
+  ```bash
+  # Initialize a fresh baremetal kernel project (scaffolds xu.xun, main.xu, linker.ld, and multi-arch Makefile)
+  xu init --baremetal my_os
+  cd my_os
+
+  # Build lean baremetal kernel ELF binaries across architectures (~1.9 KB to 2.4 KB image size)
+  make
+  # Or run directly in the QEMU emulator
+  make qemu
+  ```
+
+---
+
 ## 🗺️ Project Roadmap
 
 The published SDK is the baseline for this roadmap. See [Status & Limitations](https://xulang.org/docs/status/) for target-specific runtime boundaries.
@@ -209,6 +240,7 @@ The published SDK is the baseline for this roadmap. See [Status & Limitations](h
 - [x] **Cryptographic Suite Completeness**: SM2/SM3/SM4/SM9 full-suite conformance; SM9 pairing stack frame reduced by 71.5% with zero compile warnings
 - [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
 - [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM, and bare-metal targets
+- [x] **Operating System Kernel & Bare-Metal Support**: Freestanding compilation profile, `#core` pure static subsystem (arch/mem/sync/task/alloc/virtio), interrupt-safe spinlocks, atomic context switching, VirtIO driver framework, and one-command scaffolding (`xu init --baremetal`)
 - [x] **SDK Installation and Self-Updates**: Windows wizard, macOS PKG, cross-platform single-file Setup, and `xu up/update`
 - [x] **Reproducible Module Dependencies**: `init/get/install`, MVS, locks/vendor, proxies, offline/frozen builds, and a trusted-key checksum client
 - [x] **LSP and Editor Integration**: `xu-lsp` and VS Code/Cursor extensions; diagnostics, completion, definitions, hover, symbols, references, rename, and formatting
