@@ -6,6 +6,7 @@
 const GVN_MAX_BLOCKS = 1024
 const GVN_MAX_INSTRS = 8192
 const GVN_MAX_COMPOSED_WRITES = 64
+const GVN_FRAME_WRITE = -2
 const GVN_BUCKETS = 1024
 const GVN_CONST_HT = 4096
 const GVN_CONST_MASK = 4095
@@ -28,6 +29,7 @@ struct GvnHdr {
 }
 
 struct GvnExact {
+    frame_slot int
     base_vid int
     off int
     width int
@@ -319,9 +321,9 @@ struct GvnCallEdge {
     next int
 }
 
-// Resolve a store address to a single incoming ABI word plus a fixed offset.
-// A load through a pointer or a merge of definitions ends the proof.
-fn gvn_param_write(f &MFn, defs &[]int, address int, offset int, width int, access int) GvnParamWrite {
+// Resolve a store to a bounded frame range or an incoming ABI word plus
+// a fixed offset. A pointer load or merged definition ends the proof.
+fn gvn_describe_write(f &MFn, defs &[]int, address int, offset int, width int, access int) GvnParamWrite {
     $off := u64(offset)
     $operand := address
     $before := access
@@ -330,6 +332,12 @@ fn gvn_param_write(f &MFn, defs &[]int, address int, offset int, width int, acce
         if def < 0 || def >= before { <- }
         ins := &f.instrs[def]
         before = def
+        if ins.kind == MI_ADDR {
+            if gvn_range_in_frame(f, ins.b, int(off), width) {
+                << GvnParamWrite{param: GVN_FRAME_WRITE, off: 0, width: 0}
+            }
+            <-
+        }
         if ins.kind == MI_LOAD_LOCAL {
             param := ins.b
             if ins.c == 0 && param >= 0 && param < f.nparams && f.locals_nslots[param] == 1 {
@@ -367,6 +375,8 @@ fn gvn_call_arg(f &MFn, head int, param int) int {
 }
 
 fn gvn_add_param_write(writes $&[]GvnParamWrite, write GvnParamWrite, composed bool) bool {
+    // A callee may overwrite its own frame without touching the caller's.
+    if write.param == GVN_FRAME_WRITE { << true }
     if write.param < 0 { << false }
     if composed {
         for i in 0:writes.len {
@@ -382,10 +392,10 @@ fn gvn_add_param_write(writes $&[]GvnParamWrite, write GvnParamWrite, composed b
     << true
 }
 
-// Collect writes in the current function's incoming-argument coordinates.
-// Incoming words must stay immutable and their frame addresses cannot escape.
-fn gvn_body_writes(f &MFn, effects &LabelIndex, groups &[][]GvnParamWrite, composed bool) []GvnParamWrite {
-    if f.nparams == 0 || f.instrs.len > GVN_MAX_INSTRS { << []GvnParamWrite{} }
+// Collect writes visible to callers in incoming-argument coordinates.
+// An empty list on success means writes were confined to this frame.
+fn gvn_body_writes(f &MFn, effects &LabelIndex, groups &[][]GvnParamWrite, composed bool, writes $&[]GvnParamWrite) bool {
+    if f.instrs.len > GVN_MAX_INSTRS { << false }
     $defs := []int{}
     for _ in 0:f.temps.len {
         defs.push(-1)
@@ -395,35 +405,34 @@ fn gvn_body_writes(f &MFn, effects &LabelIndex, groups &[][]GvnParamWrite, compo
         k := ins.kind
         if (k == MI_STORE_LOCAL && ins.a < f.nparams) ||
            (k == MI_ADDR && ins.b < f.nparams) {
-            << []GvnParamWrite{}
+            << false
         }
         if fold_defines(k) && ins.a >= 0 && ins.a < defs.len {
             if defs[ins.a] == -1 { defs[ins.a] = ii } else { defs[ins.a] = -2 }
         }
     }
-    $writes := []GvnParamWrite{}
     $budget := GVN_MAX_INSTRS
     for ii in 0:f.instrs.len {
         ins := &f.instrs[ii]
         if ins.kind == MI_STORE_PTR {
-            write := gvn_param_write(f, &defs, ins.a, ins.c, gvn_norm_width(ins.d), ii)
-            if !gvn_add_param_write($&writes, write, composed) { << []GvnParamWrite{} }
+            write := gvn_describe_write(f, &defs, ins.a, ins.c, gvn_norm_width(ins.d), ii)
+            if !gvn_add_param_write(writes, write, composed) { << false }
         } else if composed && ins.kind == MI_CALL {
             effect := effects.get(&ins.sval)
-            if effect < 0 { << []GvnParamWrite{} }
+            if effect < 0 { << false }
             if effect == 0 { -> }
             group := &groups[effect]
-            if group.len > budget { << []GvnParamWrite{} }
+            if group.len > budget { << false }
             budget -= group.len
             for wi in 0:group.len {
                 child := &group[wi]
                 arg := gvn_call_arg(f, ins.c, child.param)
-                write := gvn_param_write(f, &defs, arg, child.off, child.width, ii)
-                if !gvn_add_param_write($&writes, write, true) { << []GvnParamWrite{} }
+                write := gvn_describe_write(f, &defs, arg, child.off, child.width, ii)
+                if !gvn_add_param_write(writes, write, true) { << false }
             }
         }
     }
-    << writes
+    << true
 }
 
 // Summarize the typed bodies before the optimization passes mutate them.
@@ -433,7 +442,7 @@ pub fn gvn_summarize_call_effects(w $&GvnWork, unit &Mir, overridden &[]bool) {
     $labels := label_index_new(unit.fns.len)
     $effects := label_index_new(unit.fns.len)
     $writes := [][]GvnParamWrite{}
-    // Summary zero represents a read-only call.
+    // Summary zero represents a call with no writes visible to its caller.
     writes.push([]GvnParamWrite{})
     $caller_heads := []int{}
     // Number of unresolved calls, or -1 if the body's effects are unknown.
@@ -486,10 +495,12 @@ pub fn gvn_summarize_call_effects(w $&GvnWork, unit &Mir, overridden &[]bool) {
         cursor += 1
         $effect := 0
         if local_writes[fi] || callee_writes[fi] {
-            ranges := gvn_body_writes(&unit.fns[fi], &effects, &writes, callee_writes[fi])
-            if ranges.len == 0 { -> }
-            effect = writes.len
-            writes.push(~ranges)
+            $ranges := []GvnParamWrite{}
+            if !gvn_body_writes(&unit.fns[fi], &effects, &writes, callee_writes[fi], $&ranges) { -> }
+            if ranges.len > 0 {
+                effect = writes.len
+                writes.push(~ranges)
+            }
         }
         effects.put(&unit.fns[fi].label, effect)
         $edge := caller_heads[fi]
@@ -928,7 +939,29 @@ fn gvn_disjoint_ranges(a_off int, a_width int, b_off int, b_width int) bool {
     << b - a >= u64(gvn_access_size(a_width)) && a - b >= u64(gvn_access_size(b_width))
 }
 
-fn gvn_find_exact(w &GvnWork, loc &GvnLocation, width int) int {
+fn gvn_range_in_frame(f &MFn, slot int, offset int, width int) bool {
+    if offset < 0 || slot < 0 || slot >= f.locals_nslots.len || f.locals_nslots[slot] <= 0 {
+        << false
+    }
+    // A MIR local owns eight-byte words. Check the last byte without
+    // overflowing signed offsets or multiplying the number of words.
+    last := u64(offset) + u64(gvn_access_size(width) - 1)
+    << last / 8 < u64(f.locals_nslots[slot])
+}
+
+// A frame-object proof covers only the bytes of the local itself. In
+// particular, loading a slice's data pointer does not inherit this proof.
+fn gvn_frame_slot(w &GvnWork, f &MFn, loc &GvnLocation, width int) int {
+    rep := gvn_rep_of_vid(w, loc.base_vid)
+    if rep < 0 || rep >= w.nt || loc.off < 0 { << -1 }
+    def := w.tdef[rep]
+    if def < 0 || f.instrs[def].kind != MI_ADDR { << -1 }
+    slot := f.instrs[def].b
+    if !gvn_range_in_frame(f, slot, loc.off, width) { << -1 }
+    << slot
+}
+
+fn gvn_find_exact(w &GvnWork, loc &GvnLocation, width int, slot int) int {
     $i := w.exact_top - 1
     while i >= 0 {
         access := &w.exacts[i]
@@ -938,7 +971,8 @@ fn gvn_find_exact(w &GvnWork, loc &GvnLocation, width int) int {
             << access.val_vid
         }
         if access.is_store {
-            if !same_base || !gvn_disjoint_ranges(access.off, access.width, loc.off, width) {
+            different_slots := slot >= 0 && access.frame_slot >= 0 && slot != access.frame_slot
+            if !different_slots && (!same_base || !gvn_disjoint_ranges(access.off, access.width, loc.off, width)) {
                 <-
             }
         }
@@ -959,6 +993,7 @@ fn gvn_record_call_writes(w $&GvnWork, f &MFn, head int, effect int) bool {
         loc := gvn_location(w, f, base, write.off)
         // A may-write invalidates overlapping loads and supplies no value.
         gvn_push_exact(w, GvnExact{
+            frame_slot: gvn_frame_slot(w, f, &loc, write.width),
             base_vid: loc.base_vid,
             off: loc.off,
             width: write.width,
@@ -1315,13 +1350,14 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
             nw := gvn_norm_width(id)
             if bvid != -1 && ia >= 0 && w.ndef[ia] == 1 {
                 loc := gvn_location(w, f, bvid, ic)
+                slot := gvn_frame_slot(w, f, &loc, nw)
                 header_word := nw == 8 && (ic == 0 || ic == 8 || ic == 16)
                 $hit := -1
                 if header_word {
                     hit = gvn_find_hdr(w, bvid, ic)
                 }
                 if hit == -1 {
-                    hit = gvn_find_exact(w, &loc, nw)
+                    hit = gvn_find_exact(w, &loc, nw, slot)
                 }
                 if hit != -1 {
                     rep := gvn_rep_of_vid(w, hit)
@@ -1354,6 +1390,7 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                         }
                     }
                     gvn_push_exact(w, GvnExact{
+                        frame_slot: slot,
                         base_vid: loc.base_vid,
                         off: loc.off,
                         width: nw,
@@ -1416,6 +1453,7 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                     stored = vvid
                 }
                 gvn_push_exact(w, GvnExact{
+                    frame_slot: gvn_frame_slot(w, f, &loc, nw),
                     base_vid: loc.base_vid,
                     off: loc.off,
                     width: nw,
