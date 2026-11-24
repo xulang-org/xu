@@ -6,6 +6,16 @@
 
 ---
 
+## Xu 0.13.4-dev.1
+
+- Matrix loops use the normal typed lowering on ARM64 and x64. The experimental GEMM rewrite is inactive while its bounds and dependency checks are developed.
+- GVN can reuse loads across direct call chains proven to only read memory or write to their own stack frames. Recursive cycles, indirect calls and calls without analyzable bodies remain conservative.
+- GVN can retain loads across stores to disjoint byte ranges of the same base, including constant-index slice element stores.
+- Direct acyclic call chains preserve unrelated loads when every possible write maps to a fixed byte range relative to an unchanged incoming argument.
+- GVN retains dominating load facts at control-flow joins whose incoming paths all carry the same memory version as the immediate dominator.
+- Builds read and index the PGO profile once, accept tab-separated block counts, and report the line of malformed data. Profile-guided function reordering preserves DWARF function ranges and source locations.
+- Set `XU_TASK_POLL=1` at build time to try cooperative scheduling polls in the main module's `while` and integer range loops. Optimized native ARM64 and x64 executable builds poll every 65,536 backedges and use standard task stacks in this mode.
+
 ## Xu 0.13.3
 
 - **Operating System Kernel & Bare-Metal Support (Freestanding & #core)**:
