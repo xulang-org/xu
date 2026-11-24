@@ -77,8 +77,9 @@ direct pointee type. Declare a mutable binding once with `$x := value` (or
 shared borrow or `$&x` for a writable borrow, whose reference type is `$&T`.
 Reuse reference names as `r`, or write `&*r` for an explicit reborrow.
 Automatic borrowing from ordinary values is not implemented.
+Low-level hardware & baremetal contracts: OS kernels and device drivers operate via raw pointers `*raw T`, whose dereferencing requires explicit `unsafe { ... }` blocks (e.g. `p := addr as *raw u32; unsafe { *p = val }`), completely bypassed by borrow inference; MMIO uses built-in `volatile_read` / `volatile_write` barriers; struct layouts accept `@repr("C", align: N)` alignment and `@repr("C", packed)` zero-padding; baremetal sources specify `$freestanding` to sever host syscall and libc ties.
 
-See [Borrowing and mutable bindings](https://xulang.org/docs/lang/memory/) for the current rules.
+See [Borrowing and memory model guide](https://xulang.org/docs/lang/memory/) for the current rules.
 
 ---
 
