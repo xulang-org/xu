@@ -36,8 +36,8 @@ const T_SP = 96
 const T_NEXT = 176
 const T_EPOCH = 184
 const T_STACK = 192
-// The argument block handed to the task; freed when the task ends (the
-// task function copies its arguments on entry).
+// Owned argument block, the scheduler's shared empty area, or zero for a
+// task whose entire argument payload fits in T_X21.
 const T_ARGS = 200
 const T_WAIT_FD = 208
 const T_WAIT_EVENTS = 216
@@ -69,7 +69,10 @@ const S_POLL_CAP = 136
 const S_AFFINITY = 144
 const S_AFFINITY_TICKS = 152
 const S_TINY_FREE = 160
-const S_SIZE = 168
+// The task entry trampoline always reads 16 words, even for a zero-argument
+// target. These zeroed words are read-only for the scheduler's lifetime.
+const S_EMPTY_ARGS = 176
+const S_SIZE = 304
 
 // Channel record.
 const C_CAP = 0
@@ -108,6 +111,10 @@ fn sched() int {
     st(s + S_NTASKS, 1)
     set_gword(G_SCHED, s)
     << s
+}
+
+pub fn task_empty_args() int {
+    << sched() + S_EMPTY_ARGS
 }
 
 fn progress() {
@@ -284,37 +291,6 @@ fn map_task_stack() int {
     << stk
 }
 
-// Start fn_addr on a new task. block holds 16 argument words (x0-x7 then
-// the stack words); entry is __xu_task_entry and exit_addr task_exit.
-pub fn task_spawn(entry int, fn_addr int, exit_addr int, block int) {
-    s := sched()
-    $t := ld(s + S_FREE)
-    if t != 0 {
-        st(s + S_FREE, ld(t + T_NEXT))
-        st(s + S_FREE_COUNT, ld(s + S_FREE_COUNT) - 1)
-    } else {
-        t = alloc(T_SIZE)
-        st(t + T_STACK, map_task_stack())
-    }
-    words := T_SIZE / 8
-    for i in 0:words {
-        if i * 8 != T_STACK {
-            st(t + i * 8, 0)
-        }
-    }
-    st(t + T_X19, t)
-    st(t + T_X20, fn_addr)
-    st(t + T_X21, block)
-    st(t + T_ARGS, block)
-    st(t + T_X22, exit_addr)
-    st(t + T_X28, rt_globals())
-    st(t + T_LR, entry)
-    st(t + T_SP, ld(t + T_STACK) + task_stack())
-    st(s + S_NTASKS, ld(s + S_NTASKS) + 1)
-    queue_push(s, t)
-    progress()
-}
-
 fn map_tiny_stack() int {
     size := TASK_TINY_STACK
     if host_win() {
@@ -327,15 +303,30 @@ fn map_tiny_stack() int {
     << map_pages(size)
 }
 
-// Start fn_addr on a lightweight task with a 16KB tiny stack slab.
-pub fn task_spawn_tiny(entry int, fn_addr int, exit_addr int, block int) {
+// The entry trampoline interprets arg as either a block address or a
+// register word. args records which allocation task_exit needs to release.
+fn task_start(entry int, fn_addr int, exit_addr int, arg int, args int, tiny bool) {
     s := sched()
-    $t := ld(s + S_TINY_FREE)
+    $free_slot := S_FREE
+    $stack_size := TASK_TINY_STACK
+    if tiny {
+        free_slot = S_TINY_FREE
+    } else {
+        stack_size = task_stack()
+    }
+    $t := ld(s + free_slot)
     if t != 0 {
-        st(s + S_TINY_FREE, ld(t + T_NEXT))
+        st(s + free_slot, ld(t + T_NEXT))
+        if !tiny {
+            st(s + S_FREE_COUNT, ld(s + S_FREE_COUNT) - 1)
+        }
     } else {
         t = alloc(T_SIZE)
-        st(t + T_STACK, map_tiny_stack())
+        if tiny {
+            st(t + T_STACK, map_tiny_stack())
+        } else {
+            st(t + T_STACK, map_task_stack())
+        }
     }
     words := T_SIZE / 8
     for i in 0:words {
@@ -343,18 +334,35 @@ pub fn task_spawn_tiny(entry int, fn_addr int, exit_addr int, block int) {
             st(t + i * 8, 0)
         }
     }
-    st(t + T_IS_TINY, 1)
+    if tiny {
+        st(t + T_IS_TINY, 1)
+    }
     st(t + T_X19, t)
     st(t + T_X20, fn_addr)
-    st(t + T_X21, block)
-    st(t + T_ARGS, block)
+    st(t + T_X21, arg)
+    st(t + T_ARGS, args)
     st(t + T_X22, exit_addr)
     st(t + T_X28, rt_globals())
     st(t + T_LR, entry)
-    st(t + T_SP, ld(t + T_STACK) + TASK_TINY_STACK)
+    st(t + T_SP, ld(t + T_STACK) + stack_size)
     st(s + S_NTASKS, ld(s + S_NTASKS) + 1)
     queue_push(s, t)
     progress()
+}
+
+// The block contains the incoming register and stack argument words.
+pub fn task_spawn(entry int, fn_addr int, exit_addr int, block int) {
+    task_start(entry, fn_addr, exit_addr, block, block, false)
+}
+
+pub fn task_spawn_tiny(entry int, fn_addr int, exit_addr int, block int) {
+    task_start(entry, fn_addr, exit_addr, block, block, true)
+}
+
+// The saved argument travels in the task context until first entry. It
+// needs no frame storage and task_exit has no argument block to release.
+pub fn task_spawn_word(entry int, fn_addr int, exit_addr int, word int, tiny bool) {
+    task_start(entry, fn_addr, exit_addr, word, 0, tiny)
 }
 
 // Whether other tasks exist that could run while this one waits.
@@ -654,7 +662,10 @@ pub fn task_exit(t int) {
     s := sched()
     st(s + S_NTASKS, ld(s + S_NTASKS) - 1)
     progress()
-    free_owned(ld(t + T_ARGS))
+    args := ld(t + T_ARGS)
+    if args != s + S_EMPTY_ARGS {
+        free_owned(args)
+    }
     st(t + T_ARGS, 0)
     if ld(t + T_IS_TINY) != 0 {
         st(t + T_NEXT, ld(s + S_TINY_FREE))

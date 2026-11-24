@@ -1,0 +1,200 @@
+@xu/mir
+
+#xu/ast
+#xu/parser
+#xu/types
+
+// Match the typed range and index before ordinary lowering expands a fixed
+// array into a descriptor, bounds branches, and pointer arithmetic.
+fn tile_extent(p &parser.Parser, n int) int {
+    if n < 0 || p.nodes[n].kind != ast.NK_FOR { << 0 }
+    lo_id := p.nodes[n].a
+    hi_id := p.nodes[n].b
+    if lo_id < 0 || hi_id < 0 { << 0 }
+    lo := &p.nodes[lo_id]
+    hi := &p.nodes[hi_id]
+    if lo.kind != ast.NK_INT || lo.ival != 0 || hi.kind != ast.NK_INT { << 0 }
+    << hi.ival
+}
+
+fn tile_iv(p &parser.Parser, tp &types.TypedProgram, n int, id int) bool {
+    << n >= 0 && p.nodes[n].kind == ast.NK_IDENT && tp.local_of(n) == id
+}
+
+struct TileRange {
+    head int
+    done int
+    slot int
+    step int
+}
+
+fn (w $&Lw) tile_begin(slot int, lo int, hi int, step int) TileRange {
+    w.store_local(slot, 0, lo)
+    head := w.new_block()
+    body := w.new_block()
+    done := w.new_block()
+    w.jump(head)
+    w.f.active_bb = head
+    iv := w.load_local(slot, 0)
+    w.branch(w.bin(BIN_LT, iv, hi), body, done)
+    w.f.active_bb = body
+    << TileRange{head: head, done: done, slot: slot, step: step}
+}
+
+fn (w $&Lw) tile_end(r &TileRange) {
+    w.store_local(r.slot, 0, w.bin(BIN_ADD, w.load_local(r.slot, 0), w.konst(r.step)))
+    w.jump(r.head)
+    w.f.active_bb = r.done
+}
+
+fn (w $&Lw) tile_end_bound(start int, extent int, size int) int {
+    next := w.bin(BIN_ADD, start, w.konst(size))
+    limit := w.konst(extent)
+    cond := w.bin(BIN_LT, next, limit)
+    end := w.new_temp()
+    $ins := minstr_new(MI_SELECT)
+    ins.a = end
+    ins.b = cond
+    ins.c = next
+    ins.d = limit
+    w.emit(ins)
+    << end
+}
+
+// Match major * stride + minor using the typed induction variable IDs.
+fn tile_index(p &parser.Parser, tp &types.TypedProgram, n int, major int, stride int, minor int) bool {
+    if n < 0 { << false }
+    sum := &p.nodes[n]
+    if sum.kind != ast.NK_BIN_OP || sum.ival != ast.OP_ADD || !tile_iv(p, tp, sum.b, minor) { << false }
+    mul_id := sum.a
+    mul := &p.nodes[mul_id]
+    if mul.kind != ast.NK_BIN_OP || mul.ival != ast.OP_MUL || !tile_iv(p, tp, mul.a, major) { << false }
+    step_id := mul.b
+    step := &p.nodes[step_id]
+    << step.kind == ast.NK_INT && step.ival == stride
+}
+
+// Fixed int arrays occupy bounded, disjoint frame objects when reached
+// through their own slots. Parameters borrowed by address and slice
+// descriptors do not establish that provenance.
+fn (w $&Lw) tile_array_slot(p &parser.Parser, tp &types.TypedProgram, n int, length int) int {
+    if n < 0 || p.nodes[n].kind != ast.NK_IDENT { << -1 }
+    id := tp.local_of(n)
+    if id < 0 || id >= w.lslot.len { << -1 }
+    slot := w.lslot[id]
+    if slot < 0 || w.byref(slot) { << -1 }
+    ty := w.local_type(tp, id)
+    if !types.is_array_type(ty) || tp.elem_of(ty) != 1 ||
+       fixed_len_of(tp, ty) < length || w.f.locals_nslots[slot] < length {
+        << -1
+    }
+    << slot
+}
+
+// The injective destination index covers exactly [0, rows * cols). A
+// transposed read from a different frame object covers the same interval
+// in its own storage, so reordering preserves all memory dependencies.
+fn (w $&Lw) lower_affine_tile(p &parser.Parser, tp &types.TypedProgram, outer int) bool {
+    rows := tile_extent(p, outer)
+    if rows <= 8 || rows > 32767 { << false }
+    inner := p.nodes[outer].c
+    cols := tile_extent(p, inner)
+    if cols <= 8 || cols > 32767 || p.nodes[inner].next >= 0 { << false }
+    body := p.nodes[inner].c
+    if body < 0 || p.nodes[body].kind != ast.NK_ASSIGN || p.nodes[body].ival != ast.AS_ASSIGN || p.nodes[body].next >= 0 { << false }
+    i := tp.local_of(outer)
+    j := tp.local_of(inner)
+    if i < 0 || j < 0 || i == j { << false }
+    dst_id := p.nodes[body].a
+    dst_index := &p.nodes[dst_id]
+    if dst_index.kind != ast.NK_INDEX || !tile_index(p, tp, dst_index.b, j, rows, i) { << false }
+    // The extent cap keeps the product in range even on a 32-bit host.
+    length := rows * cols
+    dest := w.tile_array_slot(p, tp, dst_index.a, length)
+    if dest < 0 { << false }
+    rhs := p.nodes[body].b
+    rhs_is_i := tile_iv(p, tp, rhs, i)
+    $source := -1
+    if p.nodes[rhs].kind == ast.NK_INDEX {
+        source = w.tile_array_slot(p, tp, p.nodes[rhs].a, length)
+        if source < 0 || source == dest || !tile_index(p, tp, p.nodes[rhs].b, i, cols, j) { << false }
+    } else if p.nodes[rhs].kind != ast.NK_INT && !rhs_is_i && !tile_iv(p, tp, rhs, j) {
+        << false
+    }
+
+    w.cur_line = p.nodes[outer].line
+    data := w.addr_local(dest)
+    $input := -1
+    if source >= 0 { input = w.addr_local(source) }
+    si := w.ensure_local(tp, i)
+    sj := w.ensure_local(tp, j)
+    it := w.new_local(1, 1, "tile_i")
+    jt := w.new_local(1, 1, "tile_j")
+    tile_size := 8
+    tj := w.tile_begin(jt, w.konst(0), w.konst(cols), tile_size)
+    start_j := w.load_local(jt, 0)
+    end_j := w.tile_end_bound(start_j, cols, tile_size)
+    ti := w.tile_begin(it, w.konst(0), w.konst(rows), tile_size)
+    start_i := w.load_local(it, 0)
+    end_i := w.tile_end_bound(start_i, rows, tile_size)
+    jj := w.tile_begin(sj, start_j, end_j, 1)
+    w.cur_line = p.nodes[body].line
+    word_size := tp.size_of(1)
+    col := w.load_local(sj, 0)
+    row_offset := w.bin(BIN_MUL, col, w.konst(rows * word_size))
+    row := w.bin(BIN_ADD, data, row_offset)
+    input_stride := cols * word_size
+    $input_column := -1
+    if source >= 0 {
+        input_column = w.bin(BIN_ADD, input, w.bin(BIN_MUL, col, w.konst(word_size)))
+    }
+    width := width_of(tp, 1)
+    // A full row within a tile has eight consecutive stores. The last
+    // partial tile uses a bounded scalar loop.
+    full := w.new_block()
+    done := w.new_block()
+    if rows % tile_size == 0 {
+        w.jump(full)
+    } else {
+        tail := w.new_block()
+        w.branch(w.bin(BIN_LT, start_i, w.konst(rows - rows % tile_size)), full, tail)
+        w.f.active_bb = tail
+        ii := w.tile_begin(si, start_i, end_i, 1)
+        iv := w.load_local(si, 0)
+        offset := w.bin(BIN_MUL, iv, w.konst(word_size))
+        addr := w.bin(BIN_ADD, row, offset)
+        $value := -1
+        if source >= 0 {
+            input_offset := w.bin(BIN_MUL, iv, w.konst(input_stride))
+            value = w.load_ptr(w.bin(BIN_ADD, input_column, input_offset), 0, width)
+        } else {
+            value = w.lower_expr(p, tp, rhs)
+        }
+        w.store_ptr(addr, 0, value, width)
+        w.tile_end(&ii)
+        w.jump(done)
+    }
+    w.f.active_bb = full
+    first := w.bin(BIN_ADD, row, w.bin(BIN_MUL, start_i, w.konst(word_size)))
+    $input_first := -1
+    if source >= 0 {
+        input_first = w.bin(BIN_ADD, input_column, w.bin(BIN_MUL, start_i, w.konst(input_stride)))
+    }
+    for cell in 0:tile_size {
+        $value := -1
+        if source >= 0 {
+            value = w.load_ptr(input_first, cell * input_stride, width)
+        } else if rhs_is_i {
+            value = w.bin(BIN_ADD, start_i, w.konst(cell))
+        } else {
+            value = w.lower_expr(p, tp, rhs)
+        }
+        w.store_ptr(first, cell * word_size, value, width)
+    }
+    w.jump(done)
+    w.f.active_bb = done
+    w.tile_end(&jj)
+    w.tile_end(&ti)
+    w.tile_end(&tj)
+    << true
+}

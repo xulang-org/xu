@@ -88,6 +88,7 @@ pub fn print_help() {
     println("  --xacp-port PORT  enable XACP TCP on loopback (0 = stdio only)")
     println("  --no-opt         disable optimization")
     println("  --release        select a release build (default)")
+    println("  --pgo FILE        apply .xupgo block or branch-edge counts during layout")
     println("  --ra=1            select the default register allocator")
     println("  --offline         resolve dependencies using local sources, vendor, and cache")
     println("  --frozen          use locked dependencies without writes or downloads")
@@ -2091,12 +2092,15 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
         << 1
     }
 
+    // -g describes locals by frame offset, so it keeps them in memory.
+    use_ra := !is_debug && !no_opt && !dwarf && os.getenv("XU_NO_RA") != "1"
     task_poll := !link_object && !is_debug && !no_opt && !dwarf &&
                  (tgt_arch == target.ARCH_ARM64 || tgt_arch == target.ARCH_X64) &&
                  (tgt_os == target.OS_MACOS || tgt_os == target.OS_LINUX || tgt_os == target.OS_WINDOWS) &&
                  os.getenv("XU_TASK_POLL") == "1"
     $mir_unit := mir.Mir{fns: []mir.MFn{}, ffi_thunks: []string{}, ffi_adapters: []string{}}
-    lower_errors := mir.lower_typed(&p, $&tp, tgt_os, tgt_arch, os.getenv("XU_LOWER_ALL") == "1", is_debug, task_poll, &wasm_roots, $&mir_unit)
+    affine_tile := use_ra && (tgt_arch == target.ARCH_ARM64 || tgt_arch == target.ARCH_X64) && os.getenv("XU_AFFINE_TILE") == "1"
+    lower_errors := mir.lower_typed(&p, $&tp, tgt_os, tgt_arch, os.getenv("XU_LOWER_ALL") == "1", is_debug, task_poll, affine_tile, &wasm_roots, $&mir_unit)
     if lower_errors > 0 {
         println("error: " + str(lower_errors) + " construct(s) cannot be lowered yet")
         <<< 1
@@ -2117,8 +2121,6 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
     // fn_rows holds the starting index for each emitted function.
     $line_rows := []int{}
     $fn_rows := []int{}
-    // -g describes locals by frame offset, so it keeps them in memory.
-    use_ra := !is_debug && !no_opt && !dwarf && os.getenv("XU_NO_RA") != "1"
     $native_entries := []bool{}
     $inl_skip_entries := []bool{}
     for fi in 0:mir_unit.fns.len {
@@ -2137,13 +2139,20 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
     if pgo_file.len == 0 {
         pgo_file = os.getenv("XU_PGO_FILE")
     }
+    $pgo_keys := []string{}
     $pgo_counts := [][]int{}
     if pgo_file.len > 0 {
-        pgo_counts = load_pgo_counts(pgo_file + "", &mir_unit) or (err) {
+        pgo_counts = load_pgo_counts(pgo_file + "", &mir_unit, $&pgo_keys) or (err) {
             eprintln("xu build: PGO profile " + pgo_file + ": " + err.msg())
             << 1
         }
     }
+    emit_pgo_map := os.getenv("XU_PGO_MAP") == "1"
+    if emit_pgo_map && (!use_ra || link_object || temporary || tgt_os != target.OS_LINUX || tgt_arch != target.ARCH_X64) {
+        eprintln("xu build: XU_PGO_MAP requires an optimized linux-x64 executable build")
+        << 1
+    }
+    $map_keys := []string{}
     if use_ra {
         // Every pass added after 0.12.3 runs only for arm64 / x64, the
         // backends it was written and tested for; the other backends see
@@ -2326,11 +2335,34 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
                 }
             }
         }
+        dump_cfg := os.getenv("XU_DUMP_PGO_CFG")
         for fi in 0:mir_unit.fns.len {
+            mir.simplify_cfg($&mir_unit.fns[fi])
+            if emit_pgo_map {
+                map_keys.push(mir.pgo_cfg_key(&mir_unit.fns[fi]))
+                $ordinal := 0
+                for bi in 0:mir_unit.fns[fi].blocks.len {
+                    if mir_unit.fns[fi].blocks[bi].tkind == mir.TKIND_BRANCH {
+                        mir_unit.fns[fi].blocks[bi].pgo_ordinal = ordinal
+                        ordinal += 1
+                    }
+                }
+            }
+            show_cfg := dump_cfg.len > 0 && (dump_cfg == "*" || dump_cfg == mir_unit.fns[fi].label)
+            if show_cfg || (pgo_keys.len > 0 && pgo_keys[fi].len > 0) {
+                key := mir.pgo_cfg_key(&mir_unit.fns[fi])
+                if show_cfg { println("fn " + mir_unit.fns[fi].label + " " + key) }
+                if pgo_keys.len > 0 && pgo_keys[fi].len > 0 {
+                    if pgo_keys[fi] == key && mir.layout_edge_profile($&mir_unit.fns[fi], &pgo_counts[fi]) { -> }
+                    eprintln("xu build: ignoring mismatched edge profile for " + mir_unit.fns[fi].label)
+                    pgo_counts[fi] = []int{}
+                }
+            }
             if pgo_counts.len > 0 && pgo_counts[fi].len > 0 {
-                mir.opt_cfg_pgo($&mir_unit.fns[fi], &pgo_counts[fi])
+                mir.reorder_blocks_out_of_line($&mir_unit.fns[fi], &pgo_counts[fi])
             } else {
-                mir.opt_cfg($&mir_unit.fns[fi])
+                empty := []int{}
+                mir.reorder_blocks_out_of_line($&mir_unit.fns[fi], &empty)
             }
         }
     }
@@ -2363,7 +2395,7 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
     if pgo_counts.len > 0 {
         $cold_fns := []int{}
         for fi in 0:mir_unit.fns.len {
-            if pgo_has_samples(&pgo_counts[fi]) {
+            if (pgo_keys[fi].len == 0 || use_ra) && pgo_has_samples(&pgo_counts[fi]) {
                 emit_order.push(fi)
             } else {
                 cold_fns.push(fi)
@@ -2386,7 +2418,7 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
             } else if native_entries[opt_i] {
                 codegen.emit_x64_hex($&cb, $&syms, $&relocs, &mir_unit.fns[opt_i].label)
             } else {
-                codegen.isel_fn_x64_base(&mir_unit.fns[opt_i], $&cb, $&syms, $&relocs, $&line_rows, use_ra)
+                codegen.isel_fn_x64_base(&mir_unit.fns[opt_i], $&cb, $&syms, $&relocs, $&line_rows, use_ra, emit_pgo_map)
             }
         }
         codegen.emit_x64_runtime_stubs($&cb, $&syms, $&relocs, tgt_os, "_xu_main", link_ui, link_object, uses_ffi)
@@ -2683,6 +2715,12 @@ fn build_program(files &[]string, files_count int, out_file string, target_code 
 
     raw_str := bin_buf.to_string()
 
+    if emit_pgo_map {
+        write_pgo_map(&actual_out, &raw_str, &mir_unit, &syms, &map_keys) or (err) {
+            eprintln("xu build: cannot write PGO map: " + err.msg())
+            << 1
+        }
+    }
     if temporary {
         created := write_exclusive(&actual_out, &raw_str) or (err) {
             eprintln("xu run: " + err.msg())
