@@ -40,7 +40,12 @@ int xu_ui_text_input_select(uint64_t, unsigned anchor, unsigned focus);
 int xu_ui_text_input_delete_surrounding(uint64_t, unsigned start, unsigned end);
 int xu_ui_text_input_erase(uint64_t, int backward);
 int xu_ui_text_input_erase_count(uint64_t, int backward, unsigned count);
+int xu_ui_text_input_erase_word(uint64_t, int backward);
+int xu_ui_text_input_erase_line(uint64_t, int backward);
 int xu_ui_text_input_move(uint64_t, int backward, int extend);
+int xu_ui_text_input_move_word(uint64_t, int backward, int extend);
+int xu_ui_text_input_move_line(uint64_t, int to_end, int extend);
+int xu_ui_text_input_move_document(uint64_t, int to_end, int extend);
 // Bind the immutable layout of this revision's display text. Transform maps
 // layout top-left coordinates into canvas logical coordinates, before camera
 // and DPI. upstream chooses the preceding grapheme edge at soft wraps/bidi.
