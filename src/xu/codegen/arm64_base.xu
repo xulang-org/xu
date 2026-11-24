@@ -45,12 +45,46 @@ fn e32(cb $&mc.CodeBuffer, w int) {
 }
 
 fn a64_mov_imm(cb $&mc.CodeBuffer, rd int, v int) {
-    e32(cb, 0xD2800000 | ((v & 0xffff) << 5) | rd)
-    for hw in 1:4 {
+    $nz := 0
+    $nn := 0
+    for hw in 0:4 {
+        chunk := (v >> (16 * hw)) & 0xffff
+        if chunk != 0 { nz += 1 }
+        if chunk != 0xffff { nn += 1 }
+    }
+    if nn < nz {
+        $first := true
+        for hw in 0:4 {
+            chunk := (v >> (16 * hw)) & 0xffff
+            if chunk != 0xffff {
+                inv := chunk ^ 0xffff
+                if first {
+                    e32(cb, 0x92800000 | (hw << 21) | (inv << 5) | rd)
+                    first = false
+                } else {
+                    e32(cb, 0xF2800000 | (hw << 21) | (chunk << 5) | rd)
+                }
+            }
+        }
+        if first {
+            e32(cb, 0x92800000 | rd)
+        }
+        <<
+    }
+    $first := true
+    for hw in 0:4 {
         chunk := (v >> (16 * hw)) & 0xffff
         if chunk != 0 {
-            e32(cb, 0xF2800000 | (hw << 21) | (chunk << 5) | rd)
+            if first {
+                e32(cb, 0xD2800000 | (hw << 21) | (chunk << 5) | rd)
+                first = false
+            } else {
+                e32(cb, 0xF2800000 | (hw << 21) | (chunk << 5) | rd)
+            }
         }
+    }
+    if first {
+        e32(cb, 0xD2800000 | rd)
     }
 }
 
@@ -684,17 +718,38 @@ fn a64_mul_pow2_plus1(cv int) int {
     << -1
 }
 
-fn a64_feeds_select(f &mir.MFn, ii int, cond_t int) bool {
+fn a64_feeds_select(f &mir.MFn, ii int, cond_t int, need_uses int) bool {
+    if need_uses <= 0 {
+        << false
+    }
+    $matched := 0
     $ni := f.instrs[ii].next
     while ni >= 0 {
         nk := f.instrs[ni].kind
         if nk == mir.MI_SELECT {
-            << f.instrs[ni].b == cond_t && f.instrs[ni].c != cond_t && f.instrs[ni].d != cond_t
+            if f.instrs[ni].b != cond_t || f.instrs[ni].c == cond_t || f.instrs[ni].d == cond_t || f.instrs[ni].a == cond_t {
+                << false
+            }
+            matched += 1
+            if matched == need_uses {
+                << true
+            }
+            ni = f.instrs[ni].next
+            ->
         }
-        // Only skip instructions guaranteed not to modify NZCV flags or read cond_t.
+        // Only skip instructions guaranteed not to modify NZCV flags or read/write cond_t.
         if nk == mir.MI_NOP {
             ni = f.instrs[ni].next
         } else if nk == mir.MI_STORE_LOCAL && f.instrs[ni].b != cond_t {
+            ni = f.instrs[ni].next
+        } else if nk == mir.MI_LOAD_LOCAL && f.instrs[ni].a != cond_t {
+            ni = f.instrs[ni].next
+        } else if nk == mir.MI_COPY && f.instrs[ni].a != cond_t && f.instrs[ni].b != cond_t {
+            ni = f.instrs[ni].next
+        } else if nk == mir.MI_BIN &&
+                  (f.instrs[ni].b == mir.BIN_ADD || f.instrs[ni].b == mir.BIN_SUB ||
+                   f.instrs[ni].b == mir.BIN_MUL || f.instrs[ni].b == mir.BIN_SHL || f.instrs[ni].b == mir.BIN_SHR) &&
+                  f.instrs[ni].a != cond_t && f.instrs[ni].c != cond_t && f.instrs[ni].d != cond_t {
             ni = f.instrs[ni].next
         } else {
             << false
@@ -811,14 +866,26 @@ fn a64_bin_imm(cb $&mc.CodeBuffer, f &mir.MFn, op int, rd int, rn int, d int) bo
 }
 
 // Two adjacent instructions done as one, the first's result read only by
-// the second: 1 for t = shr h, 63; q = sub h, t (sub q, h, h, asr #63),
-// 2 for t = mul a, b; r = sub x, t (msub r, a, b, x). 0 otherwise.
+// the second: 1 for sub-asr63, 2 for integer msub, 3 for fp fmadd,
+// 4 for fp fmsub. 0 otherwise.
 fn a64_fuse2(f &mir.MFn, ins &mir.MInstr, uses &[]int) int {
     if ins.kind != mir.MI_BIN || ins.a < 0 || ins.a >= uses.len || uses[ins.a] != 1 || ins.next < 0 {
         << 0
     }
     nx := ~f.instrs[ins.next]
-    if nx.kind != mir.MI_BIN || nx.b != mir.BIN_SUB || nx.d != ins.a || nx.c == ins.a {
+    if nx.kind != mir.MI_BIN {
+        << 0
+    }
+    if ins.b == mir.BIN_FMUL {
+        if nx.b == mir.BIN_FADD && ((nx.c == ins.a && nx.d != ins.a) || (nx.d == ins.a && nx.c != ins.a)) {
+            << 3
+        }
+        if nx.b == mir.BIN_FSUB && nx.d == ins.a && nx.c != ins.a {
+            << 4
+        }
+        << 0
+    }
+    if nx.b != mir.BIN_SUB || nx.d != ins.a || nx.c == ins.a {
         << 0
     }
     if ins.b == mir.BIN_SHR && ins.c >= 0 && nx.c == ins.c && ins.d <= -2 && f.consts[0 - ins.d - 2] == 63 {
@@ -892,18 +959,27 @@ fn a64_ra(f &mir.MFn, opt bool) RaInfo {
     for r in 12:16 {
         caller.push(r)
     }
-    $is_leaf := true
+    $max_args := 0
     for ii in 0:f.instrs.len {
         k := f.instrs[ii].kind
-        if k == mir.MI_CALL_IND || (k == mir.MI_CALL && !is_noreturn_call(&f.instrs[ii].sval)) {
-            is_leaf = false
-            <-
+        if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+            $n := 0
+            $a := f.instrs[ii].c
+            while a >= 0 {
+                n += 1
+                a = f.margs[a].next
+            }
+            if n > max_args {
+                max_args = n
+            }
         }
     }
-    if is_leaf {
-        for r in 1:8 {
-            caller.push(r)
-        }
+    $start_r := 1
+    if max_args > start_r {
+        start_r = max_args
+    }
+    for r in start_r:8 {
+        caller.push(r)
     }
     $fp_callee := []int{}
     for r in 8:16 {
@@ -1093,7 +1169,7 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
                                 else if w == 2 { need_s = 1 }
                                 else if w == 1 { need_s = 0 }
                                 $fp_bad := w != 8 && a64_temp_reg(ra, uins.a) >= 32
-                                if need_s == s && idx_mode[ui] == 0 && !fp_bad {
+                                if (s == 0 || need_s == s) && idx_mode[ui] == 0 && !fp_bad {
                                     cand_mems.push(ui)
                                     last_use_ii = ui
                                 } else {
@@ -1108,7 +1184,7 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
                                 else if w == 2 { need_s = 1 }
                                 else if w == 1 { need_s = 0 }
                                 $fp_bad := w != 8 && a64_temp_reg(ra, uins.b) >= 32
-                                if need_s == s && idx_mode[ui] == 0 && !fp_bad {
+                                if (s == 0 || need_s == s) && idx_mode[ui] == 0 && !fp_bad {
                                     cand_mems.push(ui)
                                     last_use_ii = ui
                                 } else {
@@ -1205,6 +1281,72 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
                             idx_base[nx] = bv
                             idx_off[nx] = ins.c
                             idx_shift[nx] = f.consts[0 - ins.d - 2] & 63
+                        }
+                    }
+                }
+            }
+            ii = ins.next
+        }
+        ii = f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            if idx_mode[ii] == 0 && ins.kind == mir.MI_BIN && (ins.b == mir.BIN_EQ || ins.b == mir.BIN_NE) &&
+               ins.a >= 0 && ins.a < uses.len && uses[ins.a] >= 1 {
+                will_fuse := (ins.next < 0 && uses[ins.a] == 1 && tk == mir.TKIND_BRANCH && f.blocks[bi].ta == ins.a) || a64_feeds_select(f, ii, ins.a, uses[ins.a])
+                if will_fuse {
+                    $and_t := -1
+                    if ins.c >= 0 && ins.d <= -2 && f.consts[0 - ins.d - 2] == 0 {
+                        and_t = ins.c
+                    } else if ins.d >= 0 && ins.c <= -2 && f.consts[0 - ins.c - 2] == 0 {
+                        and_t = ins.d
+                    }
+                    if and_t >= 0 && and_t < nt && def_cnt[and_t] == 1 && def_blk[and_t] == bi && and_t < uses.len && uses[and_t] == 1 {
+                        and_ii := def_ii[and_t]
+                        ains := &f.instrs[and_ii]
+                        if idx_mode[and_ii] == 0 && ains.kind == mir.MI_BIN && ains.b == mir.BIN_AND {
+                            $xv := -1
+                            $cv := 0
+                            if ains.c >= 0 && ains.d <= -2 {
+                                xv = ains.c
+                                cv = f.consts[0 - ains.d - 2]
+                            } else if ains.d >= 0 && ains.c <= -2 {
+                                xv = ains.d
+                                cv = f.consts[0 - ains.c - 2]
+                            }
+                            if xv >= 0 && xv < nt && cv != 0 && cv != -1 {
+                                enc := a64_encode_bitmask64(cv)
+                                rx := a64_temp_reg(ra, xv)
+                                if enc >= 0 && rx >= 0 && rx < 32 {
+                                    $safe := true
+                                    $wi := f.instrs[and_ii].next
+                                    while wi >= 0 && wi != ii {
+                                        wins := &f.instrs[wi]
+                                        if idx_mode[wi] != 1 && a64_defines(wins.kind) && wins.a >= 0 {
+                                            if wins.a == xv || a64_temp_reg(ra, wins.a) == rx {
+                                                safe = false
+                                                <-
+                                            }
+                                        }
+                                        if wins.kind == mir.MI_STORE_LOCAL && wins.a >= 0 && wins.a < ra.local_reg.len && ra.local_reg[wins.a] == rx {
+                                            safe = false
+                                            <-
+                                        }
+                                        if wins.kind == mir.MI_CALL_IND || (wins.kind == mir.MI_CALL && !is_noreturn_call(&f.instrs[wi].sval)) {
+                                            if rx < 19 {
+                                                safe = false
+                                                <-
+                                            }
+                                        }
+                                        wi = wins.next
+                                    }
+                                    if safe {
+                                        idx_mode[and_ii] = 1
+                                        idx_mode[ii] = 4
+                                        idx_base[ii] = rx
+                                        idx_shift[ii] = enc
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1728,6 +1870,47 @@ fn analyze_fast_entry(f &mir.MFn) FastPlan {
             plan.init_vals = []int{}
         }
     }
+    // If we have two equality base-case exits for param P == 0 -> 0 and param P == 1 -> 1,
+    // merge them into a single param P <= 1 -> P exit.
+    if plan.exits.len == 2 {
+        e0 := &plan.exits[0]
+        e1 := &plan.exits[1]
+        if e0.want_true && e1.want_true {
+            cn0 := e0.cond_node
+            cn1 := e1.cond_node
+            c0 := &plan.nodes[cn0]
+            c1 := &plan.nodes[cn1]
+            if c0.kind == FV_BIN && c0.bop == mir.BIN_EQ &&
+               c1.kind == FV_BIN && c1.bop == mir.BIN_EQ {
+                l0_idx := c0.lhs
+                r0_idx := c0.rhs
+                l1_idx := c1.lhs
+                r1_idx := c1.rhs
+                lhs0 := &plan.nodes[l0_idx]
+                rhs0 := &plan.nodes[r0_idx]
+                lhs1 := &plan.nodes[l1_idx]
+                rhs1 := &plan.nodes[r1_idx]
+                if lhs0.kind == FV_PARAM && rhs0.kind == FV_CONST && rhs0.val == 0 &&
+                   lhs1.kind == FV_PARAM && rhs1.kind == FV_CONST && rhs1.val == 1 &&
+                   lhs0.val == lhs1.val {
+                    rn0 := e0.ret_node
+                    rn1 := e1.ret_node
+                    r0 := &plan.nodes[rn0]
+                    r1 := &plan.nodes[rn1]
+                    r0_is_0 := (r0.kind == FV_CONST && r0.val == 0) || (r0.kind == FV_PARAM && r0.val == lhs0.val)
+                    r1_is_1 := (r1.kind == FV_CONST && r1.val == 1) || (r1.kind == FV_PARAM && r1.val == lhs0.val)
+                    if r0_is_0 && r1_is_1 {
+                        p_node := c0.lhs
+                        one_node := c1.rhs
+                        le_node := plan.nodes.len
+                        plan.nodes.push(FastNode{kind: FV_BIN, val: 0, bop: mir.BIN_LE, lhs: p_node, rhs: one_node})
+                        plan.exits = []FastExit{}
+                        plan.exits.push(FastExit{cond_node: le_node, want_true: true, ret_node: p_node})
+                    }
+                }
+            }
+        }
+    }
     << plan
 }
 
@@ -1850,8 +2033,58 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         lines.push(cb.len())
         lines.push(last_line)
     }
-    for ei in 0:fp_plan.exits.len {
-        a64_emit_fast_guard(cb, relocs, &fp_plan.nodes, &fp_plan.exits[ei], f.label + ".fp" + str(ei))
+    inline_fast_exit := fp_plan.exits.len > 0 && fp_plan.slow_blk > 0
+    if inline_fast_exit {
+        prologue_lbl := f.label + ".prologue"
+        if fp_plan.exits.len == 1 {
+            $inv_ex := FastExit{cond_node: fp_plan.exits[0].cond_node, want_true: !fp_plan.exits[0].want_true, ret_node: fp_plan.exits[0].ret_node}
+            a64_emit_fast_guard(cb, relocs, &fp_plan.nodes, &inv_ex, prologue_lbl + "")
+            rn := fp_plan.exits[0].ret_node
+            if fp_plan.nodes[rn].kind == FV_CONST {
+                a64_mov_imm(cb, 0, fp_plan.nodes[rn].val)
+            } else {
+                rr := a64_eval_fast_node(cb, &fp_plan.nodes, rn, 0)
+                if rr != 0 {
+                    a64_mov(cb, 0, rr)
+                }
+            }
+            e32(cb, 0xD65F03C0)
+        } else {
+            last_ei := fp_plan.exits.len - 1
+            for ei in 0:last_ei {
+                a64_emit_fast_guard(cb, relocs, &fp_plan.nodes, &fp_plan.exits[ei], f.label + ".fp" + str(ei))
+            }
+            $inv_last := FastExit{cond_node: fp_plan.exits[last_ei].cond_node, want_true: !fp_plan.exits[last_ei].want_true, ret_node: fp_plan.exits[last_ei].ret_node}
+            a64_emit_fast_guard(cb, relocs, &fp_plan.nodes, &inv_last, prologue_lbl + "")
+            rn_last := fp_plan.exits[last_ei].ret_node
+            if fp_plan.nodes[rn_last].kind == FV_CONST {
+                a64_mov_imm(cb, 0, fp_plan.nodes[rn_last].val)
+            } else {
+                rr := a64_eval_fast_node(cb, &fp_plan.nodes, rn_last, 0)
+                if rr != 0 {
+                    a64_mov(cb, 0, rr)
+                }
+            }
+            e32(cb, 0xD65F03C0)
+            for ei in 0:last_ei {
+                syms.define_label(f.label + ".fp" + str(ei), cb.len())
+                rn := fp_plan.exits[ei].ret_node
+                if fp_plan.nodes[rn].kind == FV_CONST {
+                    a64_mov_imm(cb, 0, fp_plan.nodes[rn].val)
+                } else {
+                    rr := a64_eval_fast_node(cb, &fp_plan.nodes, rn, 0)
+                    if rr != 0 {
+                        a64_mov(cb, 0, rr)
+                    }
+                }
+                e32(cb, 0xD65F03C0)
+            }
+        }
+        syms.define_label(prologue_lbl, cb.len())
+    } else {
+        for ei in 0:fp_plan.exits.len {
+            a64_emit_fast_guard(cb, relocs, &fp_plan.nodes, &fp_plan.exits[ei], f.label + ".fp" + str(ei))
+        }
     }
     // Prologue.
     if !leaf_noframe {
@@ -1875,7 +2108,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 a64_str(cb, 9, R_SP, fr.local_off[l])
             }
         }
-        a64_branch_reloc(cb, relocs, 0x14000000, f.label + ".bb" + str(fp_plan.slow_blk), mc.RELOC_ARM64_CALL26)
+        if !inline_fast_exit {
+            a64_branch_reloc(cb, relocs, 0x14000000, f.label + ".bb" + str(fp_plan.slow_blk), mc.RELOC_ARM64_CALL26)
+        }
     }
     $strs := []StrFix{}
     $str_aligns := []int{}
@@ -1890,8 +2125,16 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     }
     $order := []int{}
     if opt {
+        $slow := -1
+        if inline_fast_exit {
+            slow = fp_plan.slow_blk
+            if slow > 0 && slow < f.blocks.len {
+                order.push(slow)
+            }
+        }
         $cold_list := []int{}
         for obi in 0:f.blocks.len {
+            if obi == slow { -> }
             $cold := false
             if obi > 0 {
                 $cii := f.blocks[obi].head
@@ -1917,19 +2160,67 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     }
     // Local labels use "." so they cannot collide with any function label.
     epilogue := f.label + ".ret"
+    nb_fn := f.blocks.len
+    $pred_cnt := []int{}
+    $pred_blk := []int{}
+    $blk_cmp_kind := []int{}
+    $blk_cmp_c := []int{}
+    $blk_cmp_d := []int{}
+    $blk_cmp_base := []int{}
+    $blk_cmp_shift := []int{}
+    for _ in 0:nb_fn {
+        pred_cnt.push(0)
+        pred_blk.push(-1)
+        blk_cmp_kind.push(0)
+        blk_cmp_c.push(0)
+        blk_cmp_d.push(0)
+        blk_cmp_base.push(0)
+        blk_cmp_shift.push(0)
+    }
+    if opt {
+        for pbi in 0:nb_fn {
+            ptk := f.blocks[pbi].tkind
+            if ptk == mir.TKIND_JUMP {
+                s := f.blocks[pbi].ta
+                if s >= 0 && s < nb_fn {
+                    pred_cnt[s] = pred_cnt[s] + 1
+                    pred_blk[s] = pbi
+                }
+            } else if ptk == mir.TKIND_BRANCH {
+                sb := f.blocks[pbi].tb
+                if sb >= 0 && sb < nb_fn {
+                    pred_cnt[sb] = pred_cnt[sb] + 1
+                    pred_blk[sb] = pbi
+                }
+                sc := f.blocks[pbi].tc
+                if sc >= 0 && sc < nb_fn {
+                    pred_cnt[sc] = pred_cnt[sc] + 1
+                    pred_blk[sc] = pbi
+                }
+            }
+        }
+    }
     for oi in 0:order.len {
         bi := order[oi]
         $next_bi := -1
         if oi + 1 < order.len { next_bi = order[oi + 1] }
         syms.define_label(f.label + ".bb" + str(bi), cb.len())
+        cb_blk_start := cb.len()
         // A compare feeding only this block's branch becomes cmp + b.cond.
         $fused := -1
+        $last_cmp_kind := 0
+        $last_cmp_c := 0
+        $last_cmp_d := 0
+        $last_cmp_base := 0
+        $last_cmp_shift := 0
         // A tagged bounds check (idx < 0 || idx >= len) ending the block
         // becomes one unsigned compare.
         bounds := a64_bounds_check(f, bi, &uses, opt)
-        // A compare read only by the MI_SELECT right after it leaves its
-        // condition in the flags for csel.
+        // A compare read only by one or more MI_SELECTs in this block leaves its
+        // condition in NZCV across flag-preserving instructions for csel.
         $sel_cond := -1
+        $sel_cond_t := -1
+        $sel_rem := 0
         $ii := f.blocks[bi].head
         // An instruction already emitted together with its predecessor.
         $paired := -1
@@ -1967,22 +2258,76 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 e32(cb, 0x9B008000 | (rm << 16) | (rx << 10) | (rn << 5) | rd)
                 a64_put(cb, &fr, &ra, nx.a, rd)
                 paired = ins.next
+            } else if pk == 3 || pk == 4 {
+                nx := ~f.instrs[ins.next]
+                $acc_v := nx.c
+                if nx.c == ins.a { acc_v = nx.d }
+                fx := a64_fsrc(cb, f, &fr, &ra, ins.c, 0)
+                fm := a64_fsrc(cb, f, &fr, &ra, ins.d, 1)
+                fa := a64_fsrc(cb, f, &fr, &ra, acc_v, 2)
+                fd := a64_fdst(&ra, nx.a, 0)
+                $op_fma := 0x1F400000
+                if pk == 4 { op_fma = 0x1F408000 }
+                e32(cb, op_fma | (fm << 16) | (fa << 10) | (fx << 5) | fd)
+                a64_put(cb, &fr, &ra, nx.a, 32 + fd)
+                paired = ins.next
             } else if opt && k == mir.MI_BIN && ins.next < 0 && a64_is_icmp(ins.b) && f.blocks[bi].tkind == mir.TKIND_BRANCH && f.blocks[bi].ta == ins.a && ins.a >= 0 && uses[ins.a] == 1 {
-                a64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
+                same_pred := cb.len() == cb_blk_start && bi > 0 && pred_cnt[bi] == 1 && pred_blk[bi] >= 0 && pred_blk[bi] != bi
+                pb := pred_blk[bi]
+                if idx_mode[ii] == 4 {
+                    last_cmp_kind = 3
+                    last_cmp_base = idx_base[ii]
+                    last_cmp_shift = idx_shift[ii]
+                    if !(same_pred && blk_cmp_kind[pb] == 3 && blk_cmp_base[pb] == idx_base[ii] && blk_cmp_shift[pb] == idx_shift[ii]) {
+                        e32(cb, 0xF200001F | (idx_shift[ii] << 10) | (idx_base[ii] << 5))
+                    }
+                } else {
+                    last_cmp_kind = 1
+                    last_cmp_c = ins.c
+                    last_cmp_d = ins.d
+                    if !(same_pred && blk_cmp_kind[pb] == 1 && blk_cmp_c[pb] == ins.c && blk_cmp_d[pb] == ins.d) {
+                        a64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
+                    }
+                }
                 fused = a64_cond_of(ins.b)
             } else if opt && k == mir.MI_BIN && ins.next < 0 && a64_is_fcmp(ins.b) && f.blocks[bi].tkind == mir.TKIND_BRANCH && f.blocks[bi].ta == ins.a && ins.a >= 0 && uses[ins.a] == 1 {
-                fx := a64_fsrc(cb, f, &fr, &ra, ins.c, 0)
-                fm := a64_fsrc(cb, f, &fr, &ra, ins.d, 1)
-                e32(cb, 0x1E602000 | (fm << 16) | (fx << 5))
+                same_pred := cb.len() == cb_blk_start && bi > 0 && pred_cnt[bi] == 1 && pred_blk[bi] >= 0 && pred_blk[bi] != bi
+                pb := pred_blk[bi]
+                last_cmp_kind = 2
+                last_cmp_c = ins.c
+                last_cmp_d = ins.d
+                if !(same_pred && blk_cmp_kind[pb] == 2 && blk_cmp_c[pb] == ins.c && blk_cmp_d[pb] == ins.d) {
+                    fx := a64_fsrc(cb, f, &fr, &ra, ins.c, 0)
+                    fm := a64_fsrc(cb, f, &fr, &ra, ins.d, 1)
+                    e32(cb, 0x1E602000 | (fm << 16) | (fx << 5))
+                }
                 fused = a64_fcond_of(ins.b)
-            } else if opt && k == mir.MI_BIN && a64_is_icmp(ins.b) && ins.a >= 0 && uses[ins.a] == 1 && a64_feeds_select(f, ii, ins.a) {
-                a64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
+            } else if opt && k == mir.MI_BIN && a64_is_icmp(ins.b) && ins.a >= 0 && uses[ins.a] >= 1 && a64_feeds_select(f, ii, ins.a, uses[ins.a]) {
+                same_pred := cb.len() == cb_blk_start && bi > 0 && pred_cnt[bi] == 1 && pred_blk[bi] >= 0 && pred_blk[bi] != bi
+                pb := pred_blk[bi]
+                if idx_mode[ii] == 4 {
+                    if !(same_pred && blk_cmp_kind[pb] == 3 && blk_cmp_base[pb] == idx_base[ii] && blk_cmp_shift[pb] == idx_shift[ii]) {
+                        e32(cb, 0xF200001F | (idx_shift[ii] << 10) | (idx_base[ii] << 5))
+                    }
+                } else {
+                    if !(same_pred && blk_cmp_kind[pb] == 1 && blk_cmp_c[pb] == ins.c && blk_cmp_d[pb] == ins.d) {
+                        a64_cmp_vals(cb, f, &fr, &ra, ins.c, ins.d)
+                    }
+                }
                 sel_cond = a64_cond_of(ins.b)
-            } else if opt && k == mir.MI_BIN && a64_is_fcmp(ins.b) && ins.a >= 0 && uses[ins.a] == 1 && a64_feeds_select(f, ii, ins.a) {
-                fx := a64_fsrc(cb, f, &fr, &ra, ins.c, 0)
-                fm := a64_fsrc(cb, f, &fr, &ra, ins.d, 1)
-                e32(cb, 0x1E602000 | (fm << 16) | (fx << 5))
+                sel_cond_t = ins.a
+                sel_rem = uses[ins.a]
+            } else if opt && k == mir.MI_BIN && a64_is_fcmp(ins.b) && ins.a >= 0 && uses[ins.a] >= 1 && a64_feeds_select(f, ii, ins.a, uses[ins.a]) {
+                same_pred := cb.len() == cb_blk_start && bi > 0 && pred_cnt[bi] == 1 && pred_blk[bi] >= 0 && pred_blk[bi] != bi
+                pb := pred_blk[bi]
+                if !(same_pred && blk_cmp_kind[pb] == 2 && blk_cmp_c[pb] == ins.c && blk_cmp_d[pb] == ins.d) {
+                    fx := a64_fsrc(cb, f, &fr, &ra, ins.c, 0)
+                    fm := a64_fsrc(cb, f, &fr, &ra, ins.d, 1)
+                    e32(cb, 0x1E602000 | (fm << 16) | (fx << 5))
+                }
                 sel_cond = a64_fcond_of(ins.b)
+                sel_cond_t = ins.a
+                sel_rem = uses[ins.a]
             } else if opt && idx_mode[ii] == 3 {
                 rn := a64_src(cb, f, &fr, &ra, idx_base[ii], 9)
                 rm := a64_src(cb, f, &fr, &ra, idx_off[ii], 10)
@@ -2170,9 +2515,18 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             } else if k == mir.MI_SELECT {
                 // [cmp xc, #0]; csel xd, xthen, xelse, cond (operand loads
                 // between the compare and csel leave the flags alone).
-                $cond := sel_cond
-                sel_cond = -1
-                if cond < 0 {
+                $cond := -1
+                if sel_cond >= 0 && ins.b == sel_cond_t {
+                    cond = sel_cond
+                    sel_rem -= 1
+                    if sel_rem <= 0 {
+                        sel_cond = -1
+                        sel_cond_t = -1
+                    }
+                } else {
+                    sel_cond = -1
+                    sel_cond_t = -1
+                    sel_rem = 0
                     rc := a64_src(cb, f, &fr, &ra, ins.b, 9)
                     e32(cb, 0xF100001F | (rc << 5))
                     cond = target.ARM64_COND_NE
@@ -2295,6 +2649,13 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 }
             }
         } else if blk.tkind == mir.TKIND_BRANCH && fused >= 0 {
+            if last_cmp_kind > 0 {
+                blk_cmp_kind[bi] = last_cmp_kind
+                blk_cmp_c[bi] = last_cmp_c
+                blk_cmp_d[bi] = last_cmp_d
+                blk_cmp_base[bi] = last_cmp_base
+                blk_cmp_shift[bi] = last_cmp_shift
+            }
             if blk.tb == next_bi {
                 a64_branch_reloc(cb, relocs, 0x54000000 | (fused ^ 1), f.label + ".bb" + str(blk.tc), mc.RELOC_ARM64_COND_BR19)
             } else {
@@ -2330,18 +2691,20 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         e32(cb, 0xA8C17BFD)
     }
     e32(cb, 0xD65F03C0)
-    for ei in 0:fp_plan.exits.len {
-        syms.define_label(f.label + ".fp" + str(ei), cb.len())
-        rn := fp_plan.exits[ei].ret_node
-        if fp_plan.nodes[rn].kind == FV_CONST {
-            a64_mov_imm(cb, 0, fp_plan.nodes[rn].val)
-        } else {
-            rr := a64_eval_fast_node(cb, &fp_plan.nodes, rn, 0)
-            if rr != 0 {
-                a64_mov(cb, 0, rr)
+    if !inline_fast_exit {
+        for ei in 0:fp_plan.exits.len {
+            syms.define_label(f.label + ".fp" + str(ei), cb.len())
+            rn := fp_plan.exits[ei].ret_node
+            if fp_plan.nodes[rn].kind == FV_CONST {
+                a64_mov_imm(cb, 0, fp_plan.nodes[rn].val)
+            } else {
+                rr := a64_eval_fast_node(cb, &fp_plan.nodes, rn, 0)
+                if rr != 0 {
+                    a64_mov(cb, 0, rr)
+                }
             }
+            e32(cb, 0xD65F03C0)
         }
-        e32(cb, 0xD65F03C0)
     }
     // String literal pool, patched into the ADR instructions above.
     for si in 0:strs.len {

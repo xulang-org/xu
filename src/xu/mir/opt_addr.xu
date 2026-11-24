@@ -792,6 +792,9 @@ fn fnval_elim_zero_drops_fn(f $&MFn, drop_labels &[]string) bool {
                     if addr_is(&taddr, v) && toff[v] == 0 {
                         l := taddr[v]
                         if !esc[l] && has_drop[l] && drops_safe[l] {
+                            if l < f.locals_owning.len {
+                                f.locals_owning[l] = false
+                            }
                             if f.instrs[ii].a >= 0 {
                                 f.instrs[ii].kind = MI_COPY
                                 f.instrs[ii].b = zero
@@ -830,6 +833,175 @@ pub fn opt_fnval_zero_env_drops(u $&Mir) []bool {
         if fnval_elim_zero_drops_fn($&u.fns[fi], &drop_labels) {
             changed[fi] = true
         }
+    }
+    << changed
+}
+
+fn fp_mark_nonmem(nonmem $&[]bool, nt int, v int) {
+    if v >= 0 && v < nt {
+        nonmem[v] = true
+    }
+}
+
+fn fp_disp_ok(w_raw int, off int, max_disp int, align_disp bool) bool {
+    if !align_disp {
+        << off >= (0 - 2147483648) && off <= max_disp
+    }
+    $w := w_raw
+    if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
+    $align := w
+    if w == -4 { align = 4 }
+    << off >= 0 && off % align == 0 && off / align < 4096 && off < max_disp
+}
+
+// Fold single-def `p = base +/- small_const` into MI_LOAD_PTR/MI_STORE_PTR
+// displacements when every use of `p` is a foldable memory access, dropping
+// redundant derived-pointer register pressure and spills before regalloc.
+pub fn opt_fold_ptr_offs(f $&MFn, max_disp int, align_disp bool) bool {
+    nt := f.temps.len
+    if nt == 0 || f.blocks.len == 0 {
+        << false
+    }
+    for ii in 0:f.instrs.len {
+        if !fold_known_kind(f.instrs[ii].kind) {
+            << false
+        }
+    }
+    $ndef := []int{}
+    $def_ii := []int{}
+    $nonmem := []bool{}
+    $u_head := []int{}
+    for _ in 0:nt {
+        ndef.push(0)
+        def_ii.push(-1)
+        nonmem.push(false)
+        u_head.push(-1)
+    }
+    $u_ii := []int{}
+    $u_next := []int{}
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if fold_defines(k) && ins.a >= 0 && ins.a < nt {
+                ndef[ins.a] = ndef[ins.a] + 1
+                def_ii[ins.a] = ii
+            }
+            if k == MI_LOAD_PTR {
+                b := ins.b
+                if b >= 0 && b < nt {
+                    idx := u_ii.len
+                    u_ii.push(ii)
+                    u_next.push(u_head[b])
+                    u_head[b] = idx
+                }
+            } else if k == MI_STORE_PTR {
+                a := ins.a
+                if a >= 0 && a < nt {
+                    idx := u_ii.len
+                    u_ii.push(ii)
+                    u_next.push(u_head[a])
+                    u_head[a] = idx
+                }
+                fp_mark_nonmem($&nonmem, nt, ins.b)
+            } else if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_VOLATILE_LOAD {
+                fp_mark_nonmem($&nonmem, nt, ins.b)
+            } else if k == MI_VOLATILE_STORE {
+                fp_mark_nonmem($&nonmem, nt, ins.a)
+                fp_mark_nonmem($&nonmem, nt, ins.b)
+            } else if k == MI_UN {
+                fp_mark_nonmem($&nonmem, nt, ins.c)
+            } else if k == MI_BIN {
+                fp_mark_nonmem($&nonmem, nt, ins.c)
+                fp_mark_nonmem($&nonmem, nt, ins.d)
+            } else if k == MI_SELECT {
+                fp_mark_nonmem($&nonmem, nt, ins.b)
+                fp_mark_nonmem($&nonmem, nt, ins.c)
+                fp_mark_nonmem($&nonmem, nt, ins.d)
+            } else if k == MI_CALL || k == MI_CALL_IND {
+                if k == MI_CALL_IND {
+                    fp_mark_nonmem($&nonmem, nt, ins.b)
+                }
+                $ai := ins.c
+                while ai >= 0 {
+                    fp_mark_nonmem($&nonmem, nt, f.margs[ai].v)
+                    ai = f.margs[ai].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[bi].tkind
+        if tk == TKIND_BRANCH || tk == TKIND_RETURN {
+            fp_mark_nonmem($&nonmem, nt, f.blocks[bi].ta)
+        }
+    }
+    $changed := false
+    for _ in 0:4 {
+        $round_changed := false
+        for p in 0:nt {
+            if ndef[p] != 1 || nonmem[p] || u_head[p] < 0 { -> }
+            dii := def_ii[p]
+            if dii < 0 { -> }
+            dins := &f.instrs[dii]
+            if dins.kind != MI_BIN || (dins.b != BIN_ADD && dins.b != BIN_SUB) { -> }
+            $base := -1
+            $delta := 0
+            if dins.b == BIN_ADD {
+                if dins.c >= 0 && dins.d <= -2 {
+                    base = dins.c
+                    delta = f.consts[0 - dins.d - 2]
+                } else if dins.d >= 0 && dins.c <= -2 {
+                    base = dins.d
+                    delta = f.consts[0 - dins.c - 2]
+                }
+            } else {
+                if dins.c >= 0 && dins.d <= -2 {
+                    base = dins.c
+                    delta = 0 - f.consts[0 - dins.d - 2]
+                }
+            }
+            if base < 0 || base >= nt || base == p || ndef[base] != 1 { -> }
+            if delta < (0 - 65536) || delta > 65536 { -> }
+            $ok := true
+            $ui := u_head[p]
+            while ui >= 0 {
+                mii := u_ii[ui]
+                mins := &f.instrs[mii]
+                if mins.kind != MI_LOAD_PTR && mins.kind != MI_STORE_PTR {
+                    ok = false
+                    <-
+                }
+                if !fp_disp_ok(mins.d, mins.c + delta, max_disp, align_disp) {
+                    ok = false
+                    <-
+                }
+                ui = u_next[ui]
+            }
+            if !ok { -> }
+            $tail := -1
+            ui = u_head[p]
+            while ui >= 0 {
+                mii := u_ii[ui]
+                if f.instrs[mii].kind == MI_LOAD_PTR {
+                    f.instrs[mii].b = base
+                } else {
+                    f.instrs[mii].a = base
+                }
+                f.instrs[mii].c = f.instrs[mii].c + delta
+                tail = ui
+                ui = u_next[ui]
+            }
+            if tail >= 0 {
+                u_next[tail] = u_head[base]
+                u_head[base] = u_head[p]
+            }
+            u_head[p] = -1
+            f.instrs[dii].kind = MI_NOP
+            round_changed = true
+            changed = true
+        }
+        if !round_changed { <- }
     }
     << changed
 }
