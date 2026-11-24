@@ -253,12 +253,16 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
             embed_invoker_manifest(bin_dir / dest_name)
         (bin_dir / dest_name).chmod(0o755)
 
-    # 2.1 Copy xu-setup to bundle root for direct execution
+    # Keep a root entry point while storing the macOS UI host only in bin/.
     exe_suffix = ".exe" if is_windows else ""
     setup_name = f"xu-setup{exe_suffix}"
     if (bin_dir / setup_name).exists():
-        shutil.copy2(bin_dir / setup_name, stage_dir / setup_name)
-        (stage_dir / setup_name).chmod(0o755)
+        root_setup = stage_dir / setup_name
+        if target.startswith("macos-"):
+            root_setup.write_text('#!/bin/sh\nexec "$(dirname "$0")/bin/xu-setup" "$@"\n', encoding="ascii")
+        else:
+            shutil.copy2(bin_dir / setup_name, root_setup)
+        root_setup.chmod(0o755)
 
 
     # 3. Standard Library (src/)
