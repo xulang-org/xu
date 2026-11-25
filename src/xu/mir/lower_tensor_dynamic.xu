@@ -1,5 +1,7 @@
 @xu/mir
 
+#xu/mir/ai
+
 #xu/ast
 #xu/parser
 #xu/types
@@ -35,18 +37,11 @@ fn (w &Lw) tensor_read_local(p &parser.Parser, tp &types.TypedProgram, n int) in
     << id
 }
 
-fn tensor_dynamic_bound(p &parser.Parser, loop int) int {
-    if loop < 0 || p.nodes[loop].kind != ast.NK_FOR { << -1 }
-    lo := p.nodes[loop].a
-    if lo < 0 || p.nodes[lo].kind != ast.NK_INT || p.nodes[lo].ival != 0 { << -1 }
-    << p.nodes[loop].b
-}
-
 fn (w &Lw) tensor_slice_base(p &parser.Parser, tp &types.TypedProgram, n int) bool {
     id := w.tensor_read_local(p, tp, n)
     if id < 0 { << false }
     ty := tp.deref(w.local_type(tp, id))
-    << types.is_array_type(ty) && fixed_len_of(tp, ty) == 0 && tp.elem_of(ty) == TENSOR_F32
+    << types.is_array_type(ty) && fixed_len_of(tp, ty) == 0 && tp.elem_of(ty) == ai.TENSOR_F32
 }
 
 // The caller has already checked that decl initializes a fresh fixed f32
@@ -56,33 +51,33 @@ fn (w &Lw) tensor_dynamic_mul_add_plan(p &parser.Parser, tp &types.TypedProgram,
     no_match := TensorDynamicMulAdd{mul_loop: -1, add_loop: -1, bound: -1,
                                    x: -1, scale: -1, bias: -1, out: -1}
     mul_loop := p.nodes[decl].next
-    bound := tensor_dynamic_bound(p, mul_loop)
+    bound := ai.tensor_dynamic_bound(p, mul_loop)
     length_id := w.tensor_read_local(p, tp, bound)
     if length_id < 0 || w.local_type(tp, length_id) != 1 { << no_match }
     add_loop := p.nodes[mul_loop].next
-    next_bound := tensor_dynamic_bound(p, add_loop)
+    next_bound := ai.tensor_dynamic_bound(p, add_loop)
     if w.tensor_read_local(p, tp, next_bound) != length_id { << no_match }
 
-    mul := tensor_assignment(p, p.nodes[mul_loop].c, ast.AS_ASSIGN, ast.OP_MUL)
-    add := tensor_assignment(p, p.nodes[add_loop].c, ast.AS_ASSIGN, ast.OP_ADD)
+    mul := ai.tensor_assignment(p, p.nodes[mul_loop].c, ast.AS_ASSIGN, ast.OP_MUL)
+    add := ai.tensor_assignment(p, p.nodes[add_loop].c, ast.AS_ASSIGN, ast.OP_ADD)
     if mul < 0 || add < 0 { << no_match }
     product := p.nodes[mul].b
     sum := p.nodes[add].b
     tmp := tp.local_of(decl)
-    tmp_write := pointwise_base(p, tp, p.nodes[mul].a, mul_loop)
-    tmp_read := pointwise_base(p, tp, p.nodes[sum].a, add_loop)
+    tmp_write := ai.pointwise_base(p, tp, p.nodes[mul].a, mul_loop)
+    tmp_read := ai.pointwise_base(p, tp, p.nodes[sum].a, add_loop)
     if tp.local_of(tmp_write) != tmp || tp.local_of(tmp_read) != tmp { << no_match }
 
-    x := pointwise_base(p, tp, p.nodes[product].a, mul_loop)
-    scale := pointwise_base(p, tp, p.nodes[product].b, mul_loop)
-    bias := pointwise_base(p, tp, p.nodes[sum].b, add_loop)
-    out := pointwise_base(p, tp, p.nodes[add].a, add_loop)
+    x := ai.pointwise_base(p, tp, p.nodes[product].a, mul_loop)
+    scale := ai.pointwise_base(p, tp, p.nodes[product].b, mul_loop)
+    bias := ai.pointwise_base(p, tp, p.nodes[sum].b, add_loop)
+    out := ai.pointwise_base(p, tp, p.nodes[add].a, add_loop)
     if !w.tensor_slice_base(p, tp, x) || !w.tensor_slice_base(p, tp, scale) ||
        !w.tensor_slice_base(p, tp, bias) || !w.tensor_slice_base(p, tp, out) {
         << no_match
     }
     binding := &p.nodes[decl]
-    if tensor_may_reference(p, p.nodes[add_loop].next, &binding.sval, 0) { << no_match }
+    if ai.tensor_may_reference(p, p.nodes[add_loop].next, &binding.sval, 0) { << no_match }
     << TensorDynamicMulAdd{mul_loop: mul_loop, add_loop: add_loop, bound: bound,
                            x: x, scale: scale, bias: bias, out: out}
 }
@@ -133,4 +128,282 @@ fn (w $&Lw) tensor_dynamic_inputs(p &parser.Parser, tp &types.TypedProgram, plan
         valid = w.bin(BIN_AND, valid, w.tensor_disjoint(out, input, span, neg_span))
     }
     << TensorDynamicInputs{x: x, scale: scale, bias: bias, out: out, valid: valid}
+}
+
+struct TensorDynamicReduction {
+    add_loop int
+    reduce_loop int
+    bound int
+    x int
+    skip int
+    accum_slot int
+    keep_residual bool
+    scale_decl int
+    norm_loop int
+    out int
+    weight int
+}
+
+struct TensorDynamicReductionInputs {
+    x int
+    skip int
+    out int
+    weight int
+    valid int
+}
+
+// Accept only pure scalar arithmetic and math.sqrt so evaluating the scale
+// cannot observe or mutate any buffer involved in residual reuse.
+fn (w &Lw) tensor_pure_scale_expr(p &parser.Parser, tp &types.TypedProgram, n int, depth int) bool {
+    if n < 0 || depth >= 32 { << false }
+    node := &p.nodes[n]
+    k := node.kind
+    if k == ast.NK_INT || k == ast.NK_FLOAT { << true }
+    if k == ast.NK_IDENT {
+        id := w.tensor_read_local(p, tp, n)
+        if id < 0 { << false }
+        ty := w.local_type(tp, id)
+        << ty == 1 || types.is_float_type(ty)
+    }
+    if k == ast.NK_CAST {
+        ty := tp.type_of(n)
+        aty := tp.type_of(node.a)
+        << types.is_float_type(ty) && (aty == 1 || types.is_float_type(aty)) &&
+           w.tensor_pure_scale_expr(p, tp, node.a, depth + 1)
+    }
+    if k == ast.NK_UN_OP {
+        << node.ival == ast.OP_SUB && types.is_float_type(tp.type_of(n)) &&
+           w.tensor_pure_scale_expr(p, tp, node.a, depth + 1)
+    }
+    if k == ast.NK_BIN_OP {
+        op := node.ival
+        if op != ast.OP_ADD && op != ast.OP_SUB && op != ast.OP_MUL && op != ast.OP_DIV {
+            << false
+        }
+        << types.is_float_type(tp.type_of(n)) &&
+           w.tensor_pure_scale_expr(p, tp, node.a, depth + 1) &&
+           w.tensor_pure_scale_expr(p, tp, node.b, depth + 1)
+    }
+    if k == ast.NK_CALL || k == ast.NK_METHOD_CALL {
+        fi := tp.call_of(n)
+        if fi < 0 || fi >= tp.fns.len || tp.fns[fi].label != "_xu_math_sqrt" { << false }
+        $arg := node.a
+        if k == ast.NK_METHOD_CALL { arg = node.b }
+        if arg < 0 || p.nodes[arg].next >= 0 { << false }
+        << w.tensor_pure_scale_expr(p, tp, arg, depth + 1)
+    }
+    << false
+}
+
+// Match a fresh fixed f32 residual written from two slice prefixes, then
+// reduced in the same index order into an existing scalar accumulator.
+// Optionally match an immediately following pure scale + normalization loop
+// so the fast path can hold the residual in out without allocating tmp.
+fn (w &Lw) tensor_dynamic_reduction_plan(p &parser.Parser, tp &types.TypedProgram, decl int) TensorDynamicReduction {
+    no_match := TensorDynamicReduction{add_loop: -1, reduce_loop: -1, bound: -1,
+                                      x: -1, skip: -1, accum_slot: -1, keep_residual: false,
+                                      scale_decl: -1, norm_loop: -1, out: -1, weight: -1}
+    add_loop := p.nodes[decl].next
+    bound := ai.tensor_dynamic_bound(p, add_loop)
+    length_id := w.tensor_read_local(p, tp, bound)
+    if length_id < 0 || w.local_type(tp, length_id) != 1 { << no_match }
+    reduce_loop := p.nodes[add_loop].next
+    reduce_bound := ai.tensor_dynamic_bound(p, reduce_loop)
+    if w.tensor_read_local(p, tp, reduce_bound) != length_id { << no_match }
+
+    add := ai.tensor_assignment(p, p.nodes[add_loop].c, ast.AS_ASSIGN, ast.OP_ADD)
+    if add < 0 { << no_match }
+    residual := tp.local_of(decl)
+    dest := ai.pointwise_base(p, tp, p.nodes[add].a, add_loop)
+    if tp.local_of(dest) != residual { << no_match }
+
+    sum := p.nodes[add].b
+    x := ai.pointwise_base(p, tp, p.nodes[sum].a, add_loop)
+    skip := ai.pointwise_base(p, tp, p.nodes[sum].b, add_loop)
+    if !w.tensor_slice_base(p, tp, x) || !w.tensor_slice_base(p, tp, skip) { << no_match }
+
+    reduce := ai.tensor_square_sum(p, tp, reduce_loop, residual)
+    if reduce < 0 { << no_match }
+    accumulator := w.tensor_read_local(p, tp, p.nodes[reduce].a)
+    if accumulator < 0 || w.local_type(tp, accumulator) != ai.TENSOR_F32 { << no_match }
+
+    binding := &p.nodes[decl]
+    $scale_decl := -1
+    $norm_loop := -1
+    $out := -1
+    $weight := -1
+    cand_scale := p.nodes[reduce_loop].next
+    if cand_scale >= 0 && p.nodes[cand_scale].kind == ast.NK_LET {
+        scale_id := tp.local_of(cand_scale)
+        cand_norm := p.nodes[cand_scale].next
+        if cand_norm >= 0 && scale_id >= 0 && w.local_type(tp, scale_id) == ai.TENSOR_F32 &&
+           w.tensor_read_local(p, tp, ai.tensor_dynamic_bound(p, cand_norm)) == length_id {
+            stmt := ai.tensor_assignment(p, p.nodes[cand_norm].c, ast.AS_ASSIGN, ast.OP_MUL)
+            if stmt >= 0 && w.tensor_pure_scale_expr(p, tp, p.nodes[cand_scale].a, 0) &&
+               !ai.tensor_may_reference(p, p.nodes[cand_scale].a, &binding.sval, 0) &&
+               !ai.tensor_may_reference(p, p.nodes[cand_norm].next, &binding.sval, 0) {
+                cand_out := ai.pointwise_base(p, tp, p.nodes[stmt].a, cand_norm)
+                if w.tensor_slice_base(p, tp, cand_out) {
+                    $mul := p.nodes[stmt].b
+                    $cand_weight := -1
+                    $ok := true
+                    left := p.nodes[mul].a
+                    if p.nodes[left].kind == ast.NK_BIN_OP && p.nodes[left].ival == ast.OP_MUL {
+                        cand_weight = ai.pointwise_base(p, tp, p.nodes[mul].b, cand_norm)
+                        if !w.tensor_slice_base(p, tp, cand_weight) { ok = false }
+                        mul = left
+                    }
+                    cand_res := ai.pointwise_base(p, tp, p.nodes[mul].a, cand_norm)
+                    scale_use := p.nodes[mul].b
+                    if ok && tp.local_of(cand_res) == residual &&
+                       ai.range_uses_iv(p, tp, scale_use, scale_id) &&
+                       !tp.borrows_place(scale_use) && tp.clone_of(scale_use) == 0 && tp.box_of(scale_use) == 0 {
+                        scale_decl = cand_scale
+                        norm_loop = cand_norm
+                        out = cand_out
+                        weight = cand_weight
+                    }
+                }
+            }
+        }
+    }
+
+    $keep := false
+    if norm_loop < 0 {
+        keep = ai.tensor_may_reference(p, p.nodes[reduce_loop].next, &binding.sval, 0)
+    }
+    << TensorDynamicReduction{add_loop: add_loop, reduce_loop: reduce_loop, bound: bound,
+                             x: x, skip: skip, accum_slot: w.lslot[accumulator], keep_residual: keep,
+                             scale_decl: scale_decl, norm_loop: norm_loop, out: out, weight: weight}
+}
+
+// Called after the positive-bound check. Both slice prefixes are read-only,
+// and the optional residual storage is a fresh frame object or disjoint out slice.
+fn (w $&Lw) tensor_dynamic_reduction_inputs(p &parser.Parser, tp &types.TypedProgram, plan &TensorDynamicReduction, n int, capacity int) TensorDynamicReductionInputs {
+    x_desc := w.tensor_slice_desc(p, tp, plan.x)
+    skip_desc := w.tensor_slice_desc(p, tp, plan.skip)
+    width := 4
+    address_limit := 1 << 56
+    $limit := address_limit / width
+    if capacity < limit { limit = capacity }
+    $valid := w.bin(BIN_LE, n, w.konst(limit))
+    valid = w.bin(BIN_AND, valid, w.bin(BIN_LE, n, w.load_ptr(x_desc, 8, 8)))
+    valid = w.bin(BIN_AND, valid, w.bin(BIN_LE, n, w.load_ptr(skip_desc, 8, 8)))
+    x := w.load_ptr(x_desc, 0, 8)
+    skip := w.load_ptr(skip_desc, 0, 8)
+    $out := -1
+    $weight := -1
+    if plan.norm_loop >= 0 {
+        out_desc := w.tensor_slice_desc(p, tp, plan.out)
+        valid = w.bin(BIN_AND, valid, w.bin(BIN_LE, n, w.load_ptr(out_desc, 8, 8)))
+        out = w.load_ptr(out_desc, 0, 8)
+        span := w.bin(BIN_MUL, n, w.konst(width))
+        // Admit only ranges within the low 56 bits so tagged ARM64 pointers
+        // fall back safely and signed disjointness checks cannot overflow.
+        max_start := w.bin(BIN_SUB, w.konst(address_limit), span)
+        for ptr in [x, skip, out] {
+            valid = w.bin(BIN_AND, valid, w.u64_bin(BIN_LE, ptr, max_start))
+        }
+        neg_span := w.bin(BIN_SUB, w.konst(0), span)
+        valid = w.bin(BIN_AND, valid, w.tensor_disjoint(out, x, span, neg_span))
+        valid = w.bin(BIN_AND, valid, w.tensor_disjoint(out, skip, span, neg_span))
+        if plan.weight >= 0 {
+            weight_desc := w.tensor_slice_desc(p, tp, plan.weight)
+            valid = w.bin(BIN_AND, valid, w.bin(BIN_LE, n, w.load_ptr(weight_desc, 8, 8)))
+            weight = w.load_ptr(weight_desc, 0, 8)
+            valid = w.bin(BIN_AND, valid, w.u64_bin(BIN_LE, weight, max_start))
+            valid = w.bin(BIN_AND, valid, w.tensor_disjoint(out, weight, span, neg_span))
+        }
+    }
+    << TensorDynamicReductionInputs{x: x, skip: skip, out: out, weight: weight, valid: valid}
+}
+
+struct TensorNormalize {
+    loop int
+    output_decl int
+    scale_decl int
+    weight_slot int
+}
+
+// Match a fresh output that is completely written by the normalization
+// loop. Its storage has not escaped, so it can hold the residual before
+// the output's source declaration. Any other residual use needs its own
+// buffer. The scale initializer stays at its original evaluation point.
+fn (w &Lw) tensor_normalize_plan(p &parser.Parser, tp &types.TypedProgram, reduce_loop int, residual_decl int, extent int) TensorNormalize {
+    no_match := TensorNormalize{loop: -1, output_decl: -1, scale_decl: -1, weight_slot: -1}
+    scale_decl := p.nodes[reduce_loop].next
+    if scale_decl < 0 || p.nodes[scale_decl].kind != ast.NK_LET { << no_match }
+    scale := tp.local_of(scale_decl)
+    if scale < 0 || w.local_type(tp, scale) != ai.TENSOR_F32 { << no_match }
+
+    output_decl := p.nodes[scale_decl].next
+    if output_decl < 0 || w.tensor_temp_extent(p, tp, output_decl) != extent { << no_match }
+    loop := p.nodes[output_decl].next
+    stmt := ai.pointwise_assignment(p, loop, extent, ast.OP_MUL)
+    if stmt < 0 { << no_match }
+    output := ai.pointwise_base(p, tp, p.nodes[stmt].a, loop)
+    if tp.local_of(output) != tp.local_of(output_decl) { << no_match }
+
+    $mul := p.nodes[stmt].b
+    $weight_slot := -1
+    left := p.nodes[mul].a
+    if p.nodes[left].kind == ast.NK_BIN_OP && p.nodes[left].ival == ast.OP_MUL {
+        weight := ai.pointwise_base(p, tp, p.nodes[mul].b, loop)
+        weight_slot = w.pointwise_slot(p, tp, weight, extent)
+        if weight_slot < 0 { << no_match }
+        mul = left
+    }
+    residual := ai.pointwise_base(p, tp, p.nodes[mul].a, loop)
+    if tp.local_of(residual) != tp.local_of(residual_decl) ||
+       !ai.range_uses_iv(p, tp, p.nodes[mul].b, scale) {
+        << no_match
+    }
+
+    binding := &p.nodes[residual_decl]
+    if ai.tensor_may_reference(p, p.nodes[scale_decl].a, &binding.sval, 0) ||
+       ai.tensor_may_reference(p, p.nodes[loop].next, &binding.sval, 0) {
+        << no_match
+    }
+    << TensorNormalize{loop: loop, output_decl: output_decl, scale_decl: scale_decl, weight_slot: weight_slot}
+}
+
+fn (w $&Lw) emit_tensor_normalize_loop(tp &types.TypedProgram, extent int, dst_addr int, src_addr int, weight_addr int, scale int, norm_line int, iv_name string) {
+    w.cur_line = norm_line
+    if w.tgt_arch == 0 || w.tgt_arch == 1 {
+        $w_ptr := weight_addr
+        if w_ptr < 0 { w_ptr = w.konst(0) }
+        $args := []int{}
+        args.push(dst_addr)
+        args.push(src_addr)
+        args.push(w_ptr)
+        args.push(scale)
+        args.push(extent)
+        w.call("__xu_tensor_norm_f32", &args)
+        <<
+    }
+    iv := w.new_local(1, 1, iv_name)
+    loop := w.begin_lowered_range(iv, w.konst(0), extent, 1)
+    width := tp.size_of(ai.TENSOR_F32)
+    offset := w.bin(BIN_MUL, w.load_local(iv, 0), w.konst(width))
+    residual := w.load_ptr(w.bin(BIN_ADD, src_addr, offset), 0, width)
+    // Round each multiplication independently, including before weighting.
+    $value := w.checked_bin(BIN_FMUL, residual, scale, ai.TENSOR_F32)
+    if weight_addr >= 0 {
+        weight := w.load_ptr(w.bin(BIN_ADD, weight_addr, offset), 0, width)
+        value = w.checked_bin(BIN_FMUL, value, weight, ai.TENSOR_F32)
+    }
+    w.store_ptr(w.bin(BIN_ADD, dst_addr, offset), 0, value, width)
+    w.end_lowered_range(&loop)
+}
+
+fn (w $&Lw) lower_tensor_normalize(p &parser.Parser, tp &types.TypedProgram, plan &TensorNormalize, output_addr int, extent int) {
+    w.lower_stmt(p, tp, plan.scale_decl)
+    w.ensure_open()
+    scale := w.load_local(w.lslot[tp.local_of(plan.scale_decl)], 0)
+    $weight_addr := -1
+    if plan.weight_slot >= 0 {
+        weight_addr = w.addr_local(plan.weight_slot)
+    }
+    w.emit_tensor_normalize_loop(tp, w.konst(extent), output_addr, output_addr, weight_addr,
+                                 scale, p.nodes[plan.loop].line, "tensor_normalize_i")
 }
