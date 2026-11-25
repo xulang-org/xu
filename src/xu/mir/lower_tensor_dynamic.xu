@@ -1,0 +1,136 @@
+@xu/mir
+
+#xu/ast
+#xu/parser
+#xu/types
+
+struct TensorDynamicMulAdd {
+    mul_loop int
+    add_loop int
+    bound int
+    x int
+    scale int
+    bias int
+    out int
+}
+
+struct TensorDynamicInputs {
+    x int
+    scale int
+    bias int
+    out int
+    valid int
+}
+
+// Match a read of an existing local, without clone or boxing behavior.
+fn (w &Lw) tensor_read_local(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    if n < 0 || p.nodes[n].kind != ast.NK_IDENT ||
+       tp.borrows_place(n) || tp.clone_of(n) != 0 || tp.box_of(n) != 0 {
+        << -1
+    }
+    id := tp.local_of(n)
+    if id < 0 || id >= w.lslot.len { << -1 }
+    slot := w.lslot[id]
+    if slot < 0 || w.byref(slot) { << -1 }
+    << id
+}
+
+fn tensor_dynamic_bound(p &parser.Parser, loop int) int {
+    if loop < 0 || p.nodes[loop].kind != ast.NK_FOR { << -1 }
+    lo := p.nodes[loop].a
+    if lo < 0 || p.nodes[lo].kind != ast.NK_INT || p.nodes[lo].ival != 0 { << -1 }
+    << p.nodes[loop].b
+}
+
+fn (w &Lw) tensor_slice_base(p &parser.Parser, tp &types.TypedProgram, n int) bool {
+    id := w.tensor_read_local(p, tp, n)
+    if id < 0 { << false }
+    ty := tp.deref(w.local_type(tp, id))
+    << types.is_array_type(ty) && fixed_len_of(tp, ty) == 0 && tp.elem_of(ty) == TENSOR_F32
+}
+
+// The caller has already checked that decl initializes a fresh fixed f32
+// array with no effects. Accept only straight-line, unit-stride loops over
+// the same scalar bound, with the temporary unobservable outside the pair.
+fn (w &Lw) tensor_dynamic_mul_add_plan(p &parser.Parser, tp &types.TypedProgram, decl int) TensorDynamicMulAdd {
+    no_match := TensorDynamicMulAdd{mul_loop: -1, add_loop: -1, bound: -1,
+                                   x: -1, scale: -1, bias: -1, out: -1}
+    mul_loop := p.nodes[decl].next
+    bound := tensor_dynamic_bound(p, mul_loop)
+    length_id := w.tensor_read_local(p, tp, bound)
+    if length_id < 0 || w.local_type(tp, length_id) != 1 { << no_match }
+    add_loop := p.nodes[mul_loop].next
+    next_bound := tensor_dynamic_bound(p, add_loop)
+    if w.tensor_read_local(p, tp, next_bound) != length_id { << no_match }
+
+    mul := tensor_assignment(p, p.nodes[mul_loop].c, ast.AS_ASSIGN, ast.OP_MUL)
+    add := tensor_assignment(p, p.nodes[add_loop].c, ast.AS_ASSIGN, ast.OP_ADD)
+    if mul < 0 || add < 0 { << no_match }
+    product := p.nodes[mul].b
+    sum := p.nodes[add].b
+    tmp := tp.local_of(decl)
+    tmp_write := pointwise_base(p, tp, p.nodes[mul].a, mul_loop)
+    tmp_read := pointwise_base(p, tp, p.nodes[sum].a, add_loop)
+    if tp.local_of(tmp_write) != tmp || tp.local_of(tmp_read) != tmp { << no_match }
+
+    x := pointwise_base(p, tp, p.nodes[product].a, mul_loop)
+    scale := pointwise_base(p, tp, p.nodes[product].b, mul_loop)
+    bias := pointwise_base(p, tp, p.nodes[sum].b, add_loop)
+    out := pointwise_base(p, tp, p.nodes[add].a, add_loop)
+    if !w.tensor_slice_base(p, tp, x) || !w.tensor_slice_base(p, tp, scale) ||
+       !w.tensor_slice_base(p, tp, bias) || !w.tensor_slice_base(p, tp, out) {
+        << no_match
+    }
+    binding := &p.nodes[decl]
+    if tensor_may_reference(p, p.nodes[add_loop].next, &binding.sval, 0) { << no_match }
+    << TensorDynamicMulAdd{mul_loop: mul_loop, add_loop: add_loop, bound: bound,
+                           x: x, scale: scale, bias: bias, out: out}
+}
+
+fn (w $&Lw) tensor_slice_desc(p &parser.Parser, tp &types.TypedProgram, n int) int {
+    ty := tp.deref(w.local_type(tp, tp.local_of(n)))
+    << w.array_desc(p, tp, n, ty)
+}
+
+// Under the address and length guards below, the signed difference and
+// signed span are exact. Comparing the gap avoids adding to the pointers.
+fn (w $&Lw) tensor_disjoint(out int, input int, span int, neg_span int) int {
+    gap := w.bin(BIN_SUB, out, input)
+    << w.bin(BIN_OR, w.bin(BIN_GE, gap, span), w.bin(BIN_LE, gap, neg_span))
+}
+
+// Only reached for a positive bound. Read slice descriptors once and guard
+// the requested prefixes. A rejected guard must run ordinary lowering.
+fn (w $&Lw) tensor_dynamic_inputs(p &parser.Parser, tp &types.TypedProgram, plan &TensorDynamicMulAdd, n int, capacity int) TensorDynamicInputs {
+    x_desc := w.tensor_slice_desc(p, tp, plan.x)
+    scale_desc := w.tensor_slice_desc(p, tp, plan.scale)
+    bias_desc := w.tensor_slice_desc(p, tp, plan.bias)
+    out_desc := w.tensor_slice_desc(p, tp, plan.out)
+    width := 4
+    address_limit := 1 << 56
+    $limit := address_limit / width
+    if capacity < limit { limit = capacity }
+    $valid := w.bin(BIN_LE, n, w.konst(limit))
+    for desc in [x_desc, scale_desc, bias_desc, out_desc] {
+        length := w.load_ptr(desc, 8, 8)
+        valid = w.bin(BIN_AND, valid, w.bin(BIN_LE, n, length))
+    }
+
+    x := w.load_ptr(x_desc, 0, 8)
+    scale := w.load_ptr(scale_desc, 0, 8)
+    bias := w.load_ptr(bias_desc, 0, 8)
+    out := w.load_ptr(out_desc, 0, 8)
+    span := w.bin(BIN_MUL, n, w.konst(width))
+    // Admit only ranges within the low 56 bits. This rejects tagged ARM64
+    // pointers and prefixes that would cross into the tagged address space.
+    max_start := w.bin(BIN_SUB, w.konst(address_limit), span)
+    for ptr in [x, scale, bias, out] {
+        valid = w.bin(BIN_AND, valid, w.u64_bin(BIN_LE, ptr, max_start))
+    }
+
+    neg_span := w.bin(BIN_SUB, w.konst(0), span)
+    for input in [x, scale, bias] {
+        valid = w.bin(BIN_AND, valid, w.tensor_disjoint(out, input, span, neg_span))
+    }
+    << TensorDynamicInputs{x: x, scale: scale, bias: bias, out: out, valid: valid}
+}
