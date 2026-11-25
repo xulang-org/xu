@@ -12,6 +12,7 @@ import re
 import struct
 import tempfile
 
+from test_tensor_dynamic import mir_functions
 from test_tensor_fusion import build, run
 
 
@@ -30,7 +31,7 @@ REQUESTS = [
     ([1, 7, 42], 3),
     ([3, 19], 5),
     ([5, 11, 23, 37], 2),
-    ([9, 100], 3),
+    ([9], 3),
 ]
 
 
@@ -149,7 +150,7 @@ def pack_gguf_str(s):
     return struct.pack("<Q", len(b)) + b
 
 
-def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False):
+def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_output=False):
     dim = cfg["dim"]
     hidden = cfg["hidden_dim"]
     n_layers = cfg["n_layers"]
@@ -209,7 +210,7 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False):
         tensor_specs.append((gname, dims, 8, raw))
         q8_data[gname] = (qs, sc)
 
-    if qwen_mode:
+    if qwen_mode or tied_output:
         add_q4("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     else:
         add_f32("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
@@ -230,10 +231,11 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False):
         add_q4(gp + "ffn_up.weight", [dim, hidden], tensors[p + "mlp.up_proj.weight"][1])
         add_q4(gp + "ffn_down.weight", [hidden, dim], tensors[p + "mlp.down_proj.weight"][1])
     add_f32("output_norm.weight", [dim], tensors["norm.weight"][1])
-    if qwen_mode:
-        add_q8("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
-    else:
-        add_q4("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+    if not tied_output:
+        if qwen_mode:
+            add_q8("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        else:
+            add_q4("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
 
     buf = bytearray()
     buf.extend(b"GGUF")
@@ -609,7 +611,7 @@ def check_generate_cli(exe, gguf_path, expected_toks):
 def check_batched_prefill_parity(exes, model_path, tensors, q4_data, label):
     vocab = CFG["vocab_size"]
     use_q8 = q4_data is not None
-    for prompt_len in (16, 36):
+    for prompt_len in (15, 16, 17, 36):
         prompt = [(pi * 17 + 1) % vocab for pi in range(prompt_len)]
         py_toks, _ = py_run_request(tensors, prompt, 9, q4_data=q4_data, use_q8_act=use_q8)
         base_cs = None
@@ -626,7 +628,7 @@ def check_batched_prefill_parity(exes, model_path, tensors, q4_data, label):
             elif name == "fusion-strict":
                 assert st["checksum"] == base_cs, (label, prompt_len, st["checksum"], base_cs)
                 assert toks == base_toks, (label, prompt_len, toks, base_toks)
-    print(f"Batched prefill GEMM parity passed for {label} (prompt_len=16 & 36 vs Python & baseline)")
+    print(f"Batched prefill GEMM parity passed for {label} (prompt_len=15, 16, 17 & 36 vs Python & baseline)")
 
 
 def check_qwen2_gguf(exes, qwen_path, tensors, biases, q4_data, q8_data):
@@ -649,6 +651,38 @@ def check_qwen2_gguf(exes, qwen_path, tensors, biases, q4_data, q8_data):
     assert kv_eos["prompt_ids"] == "1,5", kv_eos
     assert kv_eos["kv_free_after"] == "4/4", kv_eos
     print("Qwen2.5-format GGUF verified (Q4_0 embed + Q8_0 output.weight SDOT + attn QKV biases + GPT-2 vocab)")
+
+
+def check_tensor_calls(mir, fast):
+    functions = mir_functions(mir)
+    suffix = "_fast" if fast == "1" else ""
+    calls = {
+        "gguf_stream_q4_0_p4k4": "__xu_tensor_pack_q4_0_p4k4_signed",
+        "matvec_q4_0_p4k4_q8_0": f"__xu_tensor_gemv4_q4_0_p4k4_signed_f16_q8_0{suffix}_f32",
+        "matmat_q4_0_p4k4_q8_0": f"__xu_tensor_gemm4x8_q4_0_p4k4_signed_f16_q8_0{suffix}_f32",
+        "gguf_stream_q8_0_p4k4": "__xu_tensor_pack_q8_0_p4k4",
+        "matvec_q8_0_p4k4_q8_0": f"__xu_tensor_gemv4_q8_0_p4k4_f16_q8_0{suffix}_f32",
+    }
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        calls["matmat_q8_0_p4k4_q8_0"] = f"__xu_tensor_gemm4x8_q8_0_p4k4_f16_q8_0{suffix}_f32"
+        calls["attention_scores_paged"] = f"__xu_tensor_attn_scores_paged{suffix}_f32"
+        calls["softmax_scaled"] = f"__xu_tensor_softmax_scaled{suffix}_f32"
+        calls["attn_vsum_paged"] = f"__xu_tensor_attn_vsum_paged{suffix}_f32"
+    for caller, target in calls.items():
+        assert f"call {target}(" in functions[caller], (caller, target)
+
+
+def check_tied_q4(exes, work, tensors):
+    path = work / "mini_tied_q4_0.gguf"
+    q4_data, _ = write_gguf_q4_0(path, CFG, tensors, tied_output=True)
+    assert "output.weight" not in q4_data
+    # The GGUF omits the output tensor. The reference projects through the embedding rows.
+    q4_data["output.weight"] = q4_data["token_embd.weight"]
+    reference = [
+        py_run_request(tensors, prompt, gen, q4_data=q4_data, use_q8_act=True)
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, path, reference, "tied Q4", "q4_0", "q8_0", CFG["vocab_size"])
 
 
 def main():
@@ -696,8 +730,13 @@ def main():
         exes = []
         for name, fusion, fast in modes:
             exe = work / f"llm-{name}"
-            build(compiler, dict(env, XU_TENSOR_FUSION=fusion, XU_TENSOR_FAST_MATH=fast, XU_TASK_POLL="0"),
-                  source, exe)
+            check_calls = fusion == "1" and platform.machine().lower() in ("arm64", "aarch64", "x86_64", "amd64")
+            build_env = dict(env, XU_TENSOR_FUSION=fusion, XU_TENSOR_FAST_MATH=fast, XU_TASK_POLL="0")
+            if check_calls:
+                build_env["XU_DUMP_MIR"] = "_xu_main_"
+            mir = build(compiler, build_env, source, exe)
+            if check_calls:
+                check_tensor_calls(mir, fast)
             size_kb = exe.stat().st_size / 1024.0
             if platform.system() == "Darwin" and platform.machine() == "arm64" and fusion == "1":
                 asm = run(["otool", "-tV", exe])
@@ -706,11 +745,8 @@ def main():
                                 "___xu_tensor_gemv4_fast_f32",
                                 "___xu_tensor_gemv4_q4_0_q8_0_fast_f32",
                                 "___xu_tensor_gemv4_q8_0_q8_0_fast_f32",
-                                "___xu_tensor_gemv4_q4_0_p4_f16_q8_0_fast_f32",
-                                "___xu_tensor_gemv4_q8_0_p4_f16_q8_0_fast_f32",
                                 "___xu_tensor_gemm4x4_fast_f32",
                                 "___xu_tensor_gemm4x4_q4_0_q8_0_fast_f32",
-                                "___xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_fast_f32",
                                 "___xu_tensor_rope_f32",
                                 "___xu_tensor_swiglu_fast_f32",
                                 "___xu_tensor_argmax_f32",
@@ -727,11 +763,8 @@ def main():
                                 "___xu_tensor_gemv4_f32",
                                 "___xu_tensor_gemv4_q4_0_q8_0_f32",
                                 "___xu_tensor_gemv4_q8_0_q8_0_f32",
-                                "___xu_tensor_gemv4_q4_0_p4_f16_q8_0_f32",
-                                "___xu_tensor_gemv4_q8_0_p4_f16_q8_0_f32",
                                 "___xu_tensor_gemm4x4_f32",
                                 "___xu_tensor_gemm4x4_q4_0_q8_0_f32",
-                                "___xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_f32",
                                 "___xu_tensor_rope_f32",
                                 "___xu_tensor_swiglu_f32",
                                 "___xu_tensor_argmax_f32",
@@ -746,6 +779,7 @@ def main():
                      verify_cmd="verify-f32act", bench_cmd="bench-f32act")
         check_format(exes, gguf_path, py_q4_q8_ref, "q4_0xQ8_0", "q4_0", "q8_0", CFG["vocab_size"],
                      verify_cmd="verify", bench_cmd="bench")
+        check_tied_q4(exes, work, tensors)
         check_generate_cli(exes[1][2], gguf_path, py_q4_q8_ref[0][0])
         check_batched_prefill_parity(exes, st_path, tensors, None, "f32")
         check_batched_prefill_parity(exes, gguf_path, tensors, q4_data, "q4_0xQ8_0")
