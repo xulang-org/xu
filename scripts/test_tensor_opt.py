@@ -935,6 +935,338 @@ fn check_p4_f16() int {
     << 0
 }
 
+fn kernel_pack_q4_p4k4_signed(chunk &string, qs_p $&[]u8, ws_p $&[]u16,
+                                gb_start int, cg_cnt int, nb int, row_bytes int) {
+    for cg in 0:cg_cnt {
+        base0 := cg * 4 * row_bytes
+        g_off := gb_start + cg * nb
+        for b in 0:nb {
+            gb := g_off + b
+            b_off := b * 18
+            s_base := gb * 4
+            for r4 in 0:4 {
+                p := base0 + r4 * row_bytes + b_off
+                ws_p[s_base + r4] = u16(chunk[p] | (chunk[p + 1] << 8))
+            }
+            q_gb := gb * 64
+            for r4 in 0:4 {
+                p := base0 + r4 * row_bytes + b_off + 2
+                q_dst := q_gb + r4 * 4
+                for j in 0:16 {
+                    qs_p[q_dst + (j >> 2) * 16 + (j & 3)] = u8(chunk[p + j] ^ 136)
+                }
+            }
+        }
+    }
+}
+
+fn kernel_pack_q8_p4k4(chunk &string, qs_p $&[]i8, ws_p $&[]u16,
+                        gb_start int, cg_cnt int, nb int, row_bytes int) {
+    for cg in 0:cg_cnt {
+        base0 := cg * 4 * row_bytes
+        g_off := gb_start + cg * nb
+        for b in 0:nb {
+            gb := g_off + b
+            b_off := b * 34
+            s_base := gb * 4
+            for r4 in 0:4 {
+                p := base0 + r4 * row_bytes + b_off
+                ws_p[s_base + r4] = u16(chunk[p] | (chunk[p + 1] << 8))
+            }
+            q_gb := gb * 128
+            for r4 in 0:4 {
+                p := base0 + r4 * row_bytes + b_off + 2
+                q_dst := q_gb + r4 * 4
+                for j in 0:32 {
+                    qs_p[q_dst + (j >> 2) * 16 + (j & 3)] = i8(chunk[p + j])
+                }
+            }
+        }
+    }
+}
+
+fn kernel_gemv_q4_p4k4_signed(out $&[]f32, qs_p &[]u8, ws_p &[]u16, p4_blk_off int,
+                                xq &[]i8, xs &[]f32, rows int, cols int) {
+    rg_cnt := rows / 4
+    nb := cols / 32
+    for rg in 0:rg_cnt {
+        g_off := p4_blk_off + rg * nb
+        out_off := rg * 4
+        for r4 in 0:4 {
+            $acc := f32(0)
+            for b in 0:nb {
+                gb := g_off + b
+                q_base := gb * 64 + r4 * 4
+                x_base := b * 32
+                $isum := 0
+                for j in 0:16 {
+                    bv := int(qs_p[q_base + (j >> 2) * 16 + (j & 3)]) ^ 136
+                    q0 := (bv & 15) - 8
+                    q1 := (bv >> 4) - 8
+                    isum += q0 * int(xq[x_base + j]) + q1 * int(xq[x_base + 16 + j])
+                }
+                acc += f32(isum) * (math.float16_to_f32(int(ws_p[gb * 4 + r4])) * xs[b])
+            }
+            out[out_off + r4] = acc
+        }
+    }
+}
+
+fn kernel_gemv_q8_p4k4(out $&[]f32, qs_p &[]i8, ws_p &[]u16, p4_blk_off int,
+                         xq &[]i8, xs &[]f32, rows int, cols int) {
+    rg_cnt := rows / 4
+    nb := cols / 32
+    for rg in 0:rg_cnt {
+        g_off := p4_blk_off + rg * nb
+        out_off := rg * 4
+        for r4 in 0:4 {
+            $acc := f32(0)
+            for b in 0:nb {
+                gb := g_off + b
+                q_base := gb * 128 + r4 * 4
+                x_base := b * 32
+                $isum := 0
+                for j in 0:32 {
+                    isum += int(qs_p[q_base + (j >> 2) * 16 + (j & 3)]) * int(xq[x_base + j])
+                }
+                acc += f32(isum) * (math.float16_to_f32(int(ws_p[gb * 4 + r4])) * xs[b])
+            }
+            out[out_off + r4] = acc
+        }
+    }
+}
+
+fn kernel_gemm_q4_p4k4_signed(out $&[]f32, qs_p &[]u8, ws_p &[]u16, p4_blk_off int,
+                                xq &[]i8, xs &[]f32, m_cnt int, rows int, cols int) {
+    rg_cnt := rows / 4
+    nb := cols / 32
+    for m in 0:m_cnt {
+        xm_s := m * nb
+        xm_q := xm_s * 32
+        m_out := m * rows
+        for rg in 0:rg_cnt {
+            g_off := p4_blk_off + rg * nb
+            out_off := m_out + rg * 4
+            for r4 in 0:4 {
+                $acc := f32(0)
+                for b in 0:nb {
+                    gb := g_off + b
+                    q_base := gb * 64 + r4 * 4
+                    x_base := xm_q + b * 32
+                    $isum := 0
+                    for j in 0:16 {
+                        bv := int(qs_p[q_base + (j >> 2) * 16 + (j & 3)]) ^ 136
+                        q0 := (bv & 15) - 8
+                        q1 := (bv >> 4) - 8
+                        isum += q0 * int(xq[x_base + j]) + q1 * int(xq[x_base + 16 + j])
+                    }
+                    acc += f32(isum) * (math.float16_to_f32(int(ws_p[gb * 4 + r4])) * xs[xm_s + b])
+                }
+                out[out_off + r4] = acc
+            }
+        }
+    }
+}
+
+fn kernel_gemm_q8_p4k4(out $&[]f32, qs_p &[]i8, ws_p &[]u16, p4_blk_off int,
+                         xq &[]i8, xs &[]f32, m_cnt int, rows int, cols int) {
+    rg_cnt := rows / 4
+    nb := cols / 32
+    for m in 0:m_cnt {
+        xm_s := m * nb
+        xm_q := xm_s * 32
+        m_out := m * rows
+        for rg in 0:rg_cnt {
+            g_off := p4_blk_off + rg * nb
+            out_off := m_out + rg * 4
+            for r4 in 0:4 {
+                $acc := f32(0)
+                for b in 0:nb {
+                    gb := g_off + b
+                    q_base := gb * 128 + r4 * 4
+                    x_base := xm_q + b * 32
+                    $isum := 0
+                    for j in 0:32 {
+                        isum += int(qs_p[q_base + (j >> 2) * 16 + (j & 3)]) * int(xq[x_base + j])
+                    }
+                    acc += f32(isum) * (math.float16_to_f32(int(ws_p[gb * 4 + r4])) * xs[xm_s + b])
+                }
+                out[out_off + r4] = acc
+            }
+        }
+    }
+}
+
+fn kernel_attn_scores_paged(q &[]f32, keys &[]f32, bt &[]int, scores $&[]f32,
+                            q_off int, bt_off int, block_stride int, kv_base int, kv_dim int,
+                            head_dim int, seq_len int) {
+    for t in 0:seq_len {
+        pb := bt[bt_off + (t >> 4)]
+        k_off := pb * block_stride + kv_base + (t & 15) * kv_dim
+        $sum := f32(0)
+        for j in 0:head_dim {
+            sum += q[q_off + j] * keys[k_off + j]
+        }
+        scores[t] = sum
+    }
+}
+
+fn kernel_softmax_scaled(scores $&[]f32, seq_len int, scale f32) {
+    $max_v := scores[0] * scale
+    scores[0] = max_v
+    for t in 1:seq_len {
+        v := scores[t] * scale
+        scores[t] = v
+        if v > max_v { max_v = v }
+    }
+    $sum_v := 0.0
+    for t in 0:seq_len {
+        ew := f32(math.exp(f64(scores[t] - max_v)))
+        scores[t] = ew
+        sum_v += f64(ew)
+    }
+    inv := f32(1.0 / sum_v)
+    for t in 0:seq_len {
+        scores[t] = scores[t] * inv
+    }
+}
+
+fn kernel_attn_vsum_paged(out $&[]f32, scores &[]f32, v_blocks &[]f32, bt &[]int,
+                          out_off int, bt_off int, block_stride int, kv_base_off int, kv_dim int,
+                          head_dim int, seq_len int) {
+    for d in 0:head_dim { out[out_off + d] = f32(0) }
+    for t in 0:seq_len {
+        w := scores[t]
+        t_pb := bt[bt_off + (t >> 4)]
+        v_off := t_pb * block_stride + kv_base_off + (t & 15) * kv_dim
+        for d in 0:head_dim {
+            out[out_off + d] += w * v_blocks[v_off + d]
+        }
+    }
+}
+
+fn check_phase7() int {
+    // 1) Test p4k4_signed (Q4) and p4k4 (Q8) packing + GEMV + GEMM across rows/nb/m_cnt
+    rows := 8
+    nb := 3
+    cols := nb * 32
+    cg_cnt := rows / 4
+    prefix_gb := 2
+    $raw_q4 := ""
+    $raw_q8 := ""
+    for r in 0:rows {
+        for b in 0:nb {
+            sc := (0x3400 + ((r * 5 + b * 3) & 0x1ff))
+            raw_q4.push_byte(sc & 255)
+            raw_q4.push_byte((sc >> 8) & 255)
+            for j in 0:16 {
+                raw_q4.push_byte((r * 17 + b * 29 + j * 13) & 255)
+            }
+            raw_q8.push_byte(sc & 255)
+            raw_q8.push_byte((sc >> 8) & 255)
+            for j in 0:32 {
+                raw_q8.push_byte((r * 23 + b * 31 + j * 11) & 255)
+            }
+        }
+    }
+    $q4_qs := []u8{}
+    $q4_ws := []u16{}
+    $q8_qs := []i8{}
+    $q8_ws := []u16{}
+    for _ in 0:(prefix_gb + cg_cnt * nb) * 64 { q4_qs.push(u8(0)) }
+    for _ in 0:(prefix_gb + cg_cnt * nb) * 128 { q8_qs.push(i8(0)) }
+    for _ in 0:(prefix_gb + cg_cnt * nb) * 4 {
+        q4_ws.push(u16(0))
+        q8_ws.push(u16(0))
+    }
+    kernel_pack_q4_p4k4_signed(&raw_q4, $&q4_qs, $&q4_ws, prefix_gb, cg_cnt, nb, nb * 18)
+    kernel_pack_q8_p4k4(&raw_q8, $&q8_qs, $&q8_ws, prefix_gb, cg_cnt, nb, nb * 34)
+    $h_q4p := 0
+    for i in 0:q4_qs.len { h_q4p = (h_q4p * 131 + int(q4_qs[i])) & 0x7fffffff }
+    for i in 0:q4_ws.len { h_q4p = (h_q4p * 131 + int(q4_ws[i])) & 0x7fffffff }
+    $h_q8p := 0
+    for i in 0:q8_qs.len { h_q8p = (h_q8p * 131 + (int(q8_qs[i]) & 255)) & 0x7fffffff }
+    for i in 0:q8_ws.len { h_q8p = (h_q8p * 131 + int(q8_ws[i])) & 0x7fffffff }
+    println("PACK_Q4K4:" + str(rows) + ":" + str(nb) + ":" + str(h_q4p))
+    println("PACK_Q8K4:" + str(rows) + ":" + str(nb) + ":" + str(h_q8p))
+
+    $xq1 := []i8{}
+    $xs1 := []f32{}
+    for b in 0:nb {
+        xs1.push(f32(0.0625 * f64((b % 5) + 1)))
+        for j in 0:32 { xq1.push(i8(((b * 17 + j * 13) % 241) - 120)) }
+    }
+    $ov4 := zeros_f32(rows)
+    $ov8 := zeros_f32(rows)
+    kernel_gemv_q4_p4k4_signed($&ov4, &q4_qs, &q4_ws, prefix_gb, &xq1, &xs1, rows, cols)
+    kernel_gemv_q8_p4k4($&ov8, &q8_qs, &q8_ws, prefix_gb, &xq1, &xs1, rows, cols)
+    for r in 0:rows {
+        println("P7F32:GVQ4:" + str(r) + ":" + str(bits(ov4[r])))
+        println("P7F32:GVQ8:" + str(r) + ":" + str(bits(ov8[r])))
+    }
+
+    m_cnt := 15
+    $xqm := []i8{}
+    $xsm := []f32{}
+    for mi in 0:m_cnt {
+        for b in 0:nb {
+            xsm.push(f32(0.03125 * f64(((mi + b) % 7) + 1)))
+            for j in 0:32 { xqm.push(i8(((mi * 19 + b * 11 + j * 7) % 241) - 120)) }
+        }
+    }
+    $om4 := zeros_f32(m_cnt * rows)
+    $om8 := zeros_f32(m_cnt * rows)
+    kernel_gemm_q4_p4k4_signed($&om4, &q4_qs, &q4_ws, prefix_gb, &xqm, &xsm, m_cnt, rows, cols)
+    kernel_gemm_q8_p4k4($&om8, &q8_qs, &q8_ws, prefix_gb, &xqm, &xsm, m_cnt, rows, cols)
+    for i in 0:m_cnt * rows {
+        println("P7F32:GMQ4:" + str(i) + ":" + str(bits(om4[i])))
+        println("P7F32:GMQ8:" + str(i) + ":" + str(bits(om8[i])))
+    }
+
+    // 2) Test paged attention (head_dim=64 and head_dim=40) across >1 page (seq_len=23)
+    hds := [64, 40]
+    for hi in 0:hds.len {
+        hd := hds[hi]
+        seq_len := 23
+        kv_dim := hd * 2
+        bs := 16 * kv_dim + 8
+        bt := [99, 2, 0, 1]
+        bt_off := 1
+        kv_base := 5
+        num_pages := 3
+        $k_blocks := zeros_f32(num_pages * bs)
+        $v_blocks := zeros_f32(num_pages * bs)
+        for pg in 0:num_pages {
+            for t in 0:16 {
+                base := pg * bs + kv_base + t * kv_dim
+                for d in 0:hd {
+                    k_blocks[base + d] = f32(f64(((pg * 31 + t * 13 + d * 7) % 29) - 14) * 0.0625)
+                    v_blocks[base + d] = f32(f64(((pg * 19 + t * 17 + d * 5) % 23) - 11) * 0.0625)
+                }
+            }
+        }
+        $q := zeros_f32(hd + 8)
+        q_off := 4
+        for d in 0:hd { q[q_off + d] = f32(f64(((d * 11 + 3) % 19) - 9) * 0.125) }
+        $scores := zeros_f32(seq_len)
+        kernel_attn_scores_paged(&q, &k_blocks, &bt, $&scores, q_off, bt_off, bs, kv_base, kv_dim, hd, seq_len)
+        for t in 0:seq_len {
+            println("P7F32:ATSC:" + str(hd) + ":" + str(t) + ":" + str(bits(scores[t])))
+        }
+        kernel_softmax_scaled($&scores, seq_len, f32(0.125))
+        for t in 0:seq_len {
+            println("P7F32:ATSM:" + str(hd) + ":" + str(t) + ":" + str(bits(scores[t])))
+        }
+        $aout := zeros_f32(hd + 6)
+        out_off := 3
+        kernel_attn_vsum_paged($&aout, &scores, &v_blocks, &bt, out_off, bt_off, bs, kv_base, kv_dim, hd, seq_len)
+        for d in 0:hd {
+            println("P7F32:ATVS:" + str(hd) + ":" + str(d) + ":" + str(bits(aout[out_off + d])))
+        }
+    }
+    << 0
+}
+
 fn main() int {
     args := os.argv()
     if args.len > 1 && args[1] == "bench" {
@@ -959,6 +1291,7 @@ fn main() int {
     if check_argmax() != 0 { << 3 }
     if check_rms_batch() != 0 { << 4 }
     if check_p4_quant() != 0 { << 5 }
+    if check_phase7() != 0 { << 6 }
     if check_vscale() != 0 { << 8 }
     if check_rope() != 0 { << 9 }
     if check_p4_f16() != 0 { << 10 }
@@ -975,7 +1308,7 @@ def parse_lines(out):
         if line.startswith("SWIGLU:"):
             _, n, i, b = line.split(":")
             swiglu[(int(n), int(i))] = int(b)
-        elif line.startswith(("VSCALE:", "ROPE:", "F16GEMVQ4:", "F16GEMVQ8:", "F16GEMMQ4:")):
+        elif line.startswith(("VSCALE:", "ROPE:", "F16GEMVQ4:", "F16GEMVQ8:", "F16GEMMQ4:", "P7F32:")):
             k, v = line.rsplit(":", 1)
             if line.startswith("VSCALE:"):
                 parts = line.split(":")
@@ -983,7 +1316,7 @@ def parse_lines(out):
                 f32_vals[("VSCALE_IP", parts[1], parts[2])] = int(parts[4])
             else:
                 f32_vals[k] = int(v)
-        elif line.startswith(("ARGMAX:", "RMSBATCH:", "GEMV4_", "GEMM4X8_", "SWIGLU_ALIAS:")):
+        elif line.startswith(("ARGMAX:", "RMSBATCH:", "GEMV4_", "GEMM4X8_", "SWIGLU_ALIAS:", "PACK_Q4K4:", "PACK_Q8K4:")):
             k, v = line.rsplit(":", 1)
             other[k] = int(v)
     return swiglu, f32_vals, other
@@ -1041,6 +1374,16 @@ def main():
                 assert f"call __xu_tensor_gemv4_q4_0_p4_f16_q8_0{suf}_f32(" in funcs["kernel_gemv_q4_p4_f16"], mode
                 assert f"call __xu_tensor_gemv4_q8_0_p4_f16_q8_0{suf}_f32(" in funcs["kernel_gemv_q8_p4_f16"], mode
                 assert f"call __xu_tensor_gemm4x8_q4_0_p4_f16_q8_0{suf}_f32(" in funcs["kernel_gemm_q4_p4_f16"], mode
+                assert "call __xu_tensor_pack_q4_0_p4k4_signed(" in funcs["kernel_pack_q4_p4k4_signed"], mode
+                assert "call __xu_tensor_pack_q8_0_p4k4(" in funcs["kernel_pack_q8_p4k4"], mode
+                assert f"call __xu_tensor_gemv4_q4_0_p4k4_signed_f16_q8_0{suf}_f32(" in funcs["kernel_gemv_q4_p4k4_signed"], mode
+                assert f"call __xu_tensor_gemv4_q8_0_p4k4_f16_q8_0{suf}_f32(" in funcs["kernel_gemv_q8_p4k4"], mode
+                assert f"call __xu_tensor_gemm4x8_q4_0_p4k4_signed_f16_q8_0{suf}_f32(" in funcs["kernel_gemm_q4_p4k4_signed"], mode
+                assert f"call __xu_tensor_attn_scores_paged{suf}_f32(" in funcs["kernel_attn_scores_paged"], mode
+                assert f"call __xu_tensor_softmax_scaled{suf}_f32(" in funcs["kernel_softmax_scaled"], mode
+                assert f"call __xu_tensor_attn_vsum_paged{suf}_f32(" in funcs["kernel_attn_vsum_paged"], mode
+                if platform.machine().lower() in ("arm64", "aarch64"):
+                    assert f"call __xu_tensor_gemm4x8_q8_0_p4k4_f16_q8_0{suf}_f32(" in funcs["kernel_gemm_q8_p4k4"], mode
                 copy_mir = funcs["kernel_copy16_32"]
                 assert copy_mir.count("load8 [") >= 6 and copy_mir.count("store8 [") >= 6, copy_mir
 
@@ -1058,6 +1401,14 @@ def main():
                         f"___xu_tensor_gemv4_q4_0_p4_f16_q8_0{suf}_f32",
                         f"___xu_tensor_gemv4_q8_0_p4_f16_q8_0{suf}_f32",
                         f"___xu_tensor_gemm4x8_q4_0_p4_f16_q8_0{suf}_f32",
+                        "___xu_tensor_pack_q4_0_p4k4_signed",
+                        "___xu_tensor_pack_q8_0_p4k4",
+                        f"___xu_tensor_gemv4_q4_0_p4k4_signed_f16_q8_0{suf}_f32",
+                        f"___xu_tensor_gemv4_q8_0_p4k4_f16_q8_0{suf}_f32",
+                        f"___xu_tensor_gemm4x8_q4_0_p4k4_signed_f16_q8_0{suf}_f32",
+                        f"___xu_tensor_attn_scores_paged{suf}_f32",
+                        f"___xu_tensor_softmax_scaled{suf}_f32",
+                        f"___xu_tensor_attn_vsum_paged{suf}_f32",
                     ]
                     for sym in expected_syms:
                         assert f"{sym}:" in asm, (mode, sym)
@@ -1115,6 +1466,14 @@ def main():
             assert "call __xu_tensor_gemv4_q4_0_p4_f16_q8_0_f32(" in x64_mir
             assert "call __xu_tensor_gemv4_q8_0_p4_f16_q8_0_f32(" in x64_mir
             assert "call __xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_f32(" in x64_mir
+            assert "call __xu_tensor_pack_q4_0_p4k4_signed(" in x64_mir
+            assert "call __xu_tensor_pack_q8_0_p4k4(" in x64_mir
+            assert "call __xu_tensor_gemv4_q4_0_p4k4_signed_f16_q8_0_f32(" in x64_mir
+            assert "call __xu_tensor_gemv4_q8_0_p4k4_f16_q8_0_f32(" in x64_mir
+            assert "call __xu_tensor_gemm4x8_q4_0_p4k4_signed_f16_q8_0_f32(" in x64_mir
+            assert "call __xu_tensor_attn_scores_paged_f32(" in x64_mir
+            assert "call __xu_tensor_softmax_scaled_f32(" in x64_mir
+            assert "call __xu_tensor_attn_vsum_paged_f32(" in x64_mir
             x64_asm = run(["otool", "-tV", x64_exe])
             for sym in ("___xu_tensor_swiglu_f32", "___xu_tensor_argmax_f32", "___xu_tensor_rope_f32",
                         "___xu_tensor_gemv4_q4_0_p4_q8_0_f32",
@@ -1122,7 +1481,15 @@ def main():
                         "___xu_tensor_gemm4x8_q4_0_p4_q8_0_f32",
                         "___xu_tensor_gemv4_q4_0_p4_f16_q8_0_f32",
                         "___xu_tensor_gemv4_q8_0_p4_f16_q8_0_f32",
-                        "___xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_f32"):
+                        "___xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_f32",
+                        "___xu_tensor_pack_q4_0_p4k4_signed",
+                        "___xu_tensor_pack_q8_0_p4k4",
+                        "___xu_tensor_gemv4_q4_0_p4k4_signed_f16_q8_0_f32",
+                        "___xu_tensor_gemv4_q8_0_p4k4_f16_q8_0_f32",
+                        "___xu_tensor_gemm4x8_q4_0_p4k4_signed_f16_q8_0_f32",
+                        "___xu_tensor_attn_scores_paged_f32",
+                        "___xu_tensor_softmax_scaled_f32",
+                        "___xu_tensor_attn_vsum_paged_f32"):
                 assert f"{sym}:" in x64_asm, ("macos-x64", sym)
             print("macos-x64 cross-compile and SSE stub disassembly passed")
 
