@@ -7,6 +7,7 @@
 #crypto/rand
 #crypto/rsa
 #crypto/rsa/oaep
+#crypto/ecdh
 #crypto/ecdsa
 #crypto/ed25519
 #crypto/sha256
@@ -221,7 +222,7 @@ fn make_client_hello(random &string, name &string, key_shares &[]string, protoco
     << hs_wrap(HS_CH, &body)
 }
 
-fn make_server_hello(random &string, suite int, session_id &string, key_share &string) string {
+fn make_server_hello(random &string, suite int, session_id &string, share_group int, key_share &string) string {
     $b := []int{}
     b.push(3)
     b.push(3)
@@ -232,12 +233,14 @@ fn make_server_hello(random &string, suite int, session_id &string, key_share &s
     b.push(suite & 255)
     b.push(0)
     if suite == TLS_AES_128_GCM_SHA256 {
-        if key_share.len != ecdsa.PUBLIC_KEY_SIZE_P256 {
+        if !((share_group == 29 && key_share.len == 32) || (share_group == 23 && key_share.len == ecdsa.PUBLIC_KEY_SIZE_P256)) {
             >> errors.new("tls: invalid TLS 1.3 key share")
         }
-        // supported_versions + server_share(secp256r1).
-        b.push(0)
-        b.push(79)
+        // supported_versions (6) + key_share (4 + 4 + key_share.len)
+        ext_total := 14 + key_share.len
+        ks_ext_len := 4 + key_share.len
+        b.push((ext_total >> 8) & 255)
+        b.push(ext_total & 255)
         b.push(0)
         b.push(43)
         b.push(0)
@@ -246,12 +249,12 @@ fn make_server_hello(random &string, suite int, session_id &string, key_share &s
         b.push(4)
         b.push(0)
         b.push(51)
-        b.push(0)
-        b.push(69)
-        b.push(0)
-        b.push(23)
-        b.push(0)
-        b.push(65)
+        b.push((ks_ext_len >> 8) & 255)
+        b.push(ks_ext_len & 255)
+        b.push((share_group >> 8) & 255)
+        b.push(share_group & 255)
+        b.push((key_share.len >> 8) & 255)
+        b.push(key_share.len & 255)
         push_s($&b, key_share)
     } else {
         // renegotiation_info with an empty renegotiated_connection. This
@@ -546,21 +549,7 @@ fn int_be(b &string) int {
     << x
 }
 
-fn parse_pkcs8_rsa(der string) rsa.PrivateKey {
-    top := asn1.unmarshal(&der) or >>
-    if top.tag != asn1.TAG_SEQUENCE {
-        >> errors.new("tls: pkcs8")
-    }
-    $d := asn1.new_decoder(&top.bytes)
-    ver := d.next() or >>
-    alg := d.next() or >>
-    // Version and algorithm identifiers are validated by the surrounding
-    // PKCS#8 structure; the RSA payload below is the value we need.
-    oct := d.next() or >>
-    if oct.tag != asn1.TAG_OCTET_STRING {
-        >> errors.new("tls: pkcs8")
-    }
-    inner := oct.bytes
+fn parse_pkcs1_rsa(inner string) rsa.PrivateKey {
     seq := asn1.unmarshal(&inner) or >>
     if seq.tag != asn1.TAG_SEQUENCE {
         >> errors.new("tls: rsa key")
@@ -589,6 +578,37 @@ fn parse_pkcs8_rsa(der string) rsa.PrivateKey {
         q.set_bytes(qv.bytes)
     }
     << rsa.PrivateKey{public: rsa.PublicKey{n: n, e: e}, d: dd, p: p, q: q}
+}
+
+fn parse_pkcs8_rsa(der string) rsa.PrivateKey {
+    top := asn1.unmarshal(&der) or >>
+    if top.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("tls: pkcs8")
+    }
+    $d := asn1.new_decoder(&top.bytes)
+    ver := d.next() or >>
+    alg := d.next() or >>
+    // Version and algorithm identifiers are validated by the surrounding
+    // PKCS#8 structure; the RSA payload below is the value we need.
+    oct := d.next() or >>
+    if oct.tag != asn1.TAG_OCTET_STRING {
+        >> errors.new("tls: pkcs8")
+    }
+    << parse_pkcs1_rsa(oct.bytes) or >>
+}
+
+fn parse_rsa_key_pem(key_pem &string) rsa.PrivateKey {
+    blk := pem.decode(key_pem)
+    if blk.bytes.len == 0 {
+        >> errors.new("tls: pem empty")
+    }
+    if blk.typ == "PRIVATE KEY" {
+        << parse_pkcs8_rsa(blk.bytes) or >>
+    }
+    if blk.typ == "RSA PRIVATE KEY" {
+        << parse_pkcs1_rsa(blk.bytes) or >>
+    }
+    >> errors.new("tls: unsupported private key PEM type: " + blk.typ)
 }
 
 fn apply_keys(c $&Conn, ms &string, cr &string, sr &string, is_client int) int {
@@ -774,9 +794,14 @@ fn verify_server_chain(cfg &Config, name string, chain &[]string) x509.Certifica
     << cert
 }
 
+fn try_client_key_share(body &string) ClientKeyShare {
+    << client_key_share(body) or (err) {
+        << ClientKeyShare{group: 0, data: ""}
+    }
+}
+
 fn handshake_server(c $&Conn, cfg &Config) int {
-    keyder := pem_der(cfg.key_pem, "PRIVATE KEY") or >>
-    sk := parse_pkcs8_rsa(keyder) or >>
+    sk := parse_rsa_key_pem(&cfg.key_pem) or >>
     rec := rec_read(c) or >>
     if rec.typ != REC_HS {
         >> errors.new("tls: expected handshake")
@@ -793,31 +818,51 @@ fn handshake_server(c $&Conn, cfg &Config) int {
     }
     cr := slice_copy(&chb, 2, 34)
     $suite := 0
+    $ks := ClientKeyShare{group: 0, data: ""}
     if client_supports_tls13(&chb) && client_offers_suite(&chb, TLS_AES_128_GCM_SHA256) {
-        suite = TLS_AES_128_GCM_SHA256
-    } else if client_offers_suite(&chb, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256) {
-        suite = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-    } else if client_offers_suite(&chb, TLS_RSA_WITH_AES_128_GCM_SHA256) {
-        suite = TLS_RSA_WITH_AES_128_GCM_SHA256
-    } else {
-        >> errors.new("tls: no shared cipher suite")
+        ks = try_client_key_share(&chb)
+        if ks.group != 0 {
+            suite = TLS_AES_128_GCM_SHA256
+        }
+    }
+    if suite == 0 {
+        if client_offers_suite(&chb, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256) {
+            suite = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        } else if client_offers_suite(&chb, TLS_RSA_WITH_AES_128_GCM_SHA256) {
+            suite = TLS_RSA_WITH_AES_128_GCM_SHA256
+        } else {
+            >> errors.new("tls: no shared cipher suite")
+        }
     }
     c.cipher_suite = suite
     sr := make_random()
     $session_id := ""
+    $share_group := 0
     $server_share := ""
     $shared := ""
     if suite == TLS_AES_128_GCM_SHA256 {
         session_id = client_session_id(&chb) or >>
-        peer_share := client_key_share_p256(&chb) or >>
-        server_private := ecdsa.generate_key(ecdsa.P256) or >>
-        server_share = ecdsa.public(&server_private) or >>
-        shared = ecdsa.ecdh(&server_private, &peer_share) or >>
+        if ks.group == 29 {
+            xpriv := ecdh.generate_key(ecdh.x25519()) or >>
+            server_share = xpriv.public_key().bytes()
+            peer_xpub := ecdh.new_public_key(ecdh.x25519(), &ks.data) or >>
+            shared = xpriv.ecdh(&peer_xpub) or >>
+            share_group = 29
+        } else {
+            server_private := ecdsa.generate_key(ecdsa.P256) or >>
+            server_share = ecdsa.public(&server_private) or >>
+            shared = ecdsa.ecdh(&server_private, &ks.data) or >>
+            share_group = 23
+        }
     }
-    sh := make_server_hello(&sr, suite, &session_id, &server_share) or >>
+    sh := make_server_hello(&sr, suite, &session_id, share_group, &server_share) or >>
     log.write(&sh)
     rec_write(c, REC_HS, &sh) or >>
     if suite == TLS_AES_128_GCM_SHA256 {
+        if session_id.len > 0 {
+            ccs := string_from_byte(1)
+            rec_write(c, REC_CCS, &ccs) or >>
+        }
         log_s1 := log.bytes()
         << handshake_server13(c, cfg, &sk, &log_s1, &shared)
     }
