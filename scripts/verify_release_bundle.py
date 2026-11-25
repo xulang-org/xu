@@ -107,6 +107,32 @@ def verify_archive(path, version, target, host):
     print(f"release-verify: {target} complete inventory, tools, architectures and VSIX PASS", flush=True)
 
 
+
+def macos_payload_bounds(source, file_size):
+    header = source.read(32)
+    assert header[:4] == b"\xcf\xfa\xed\xfe"
+    count, commands_size = struct.unpack_from("<II", header, 16)
+    end = 32 + commands_size
+    assert end <= file_size and count <= commands_size // 8
+    offset = 32
+    for _ in range(count):
+        assert offset <= end - 8
+        source.seek(offset)
+        kind, size = struct.unpack("<II", source.read(8))
+        assert 8 <= size <= end - offset
+        if kind == 0x19 and size >= 72:
+            segment = source.read(64)
+            if segment[:16].rstrip(b"\0") == b"__XU_SDK":
+                assert size >= 152 and struct.unpack_from("<I", segment, 56)[0] == 1
+                section = source.read(80)
+                assert section[:16].rstrip(b"\0") == b"__archive"
+                length, start = struct.unpack_from("<QI", section, 40)
+                assert end <= start and 0 < length <= file_size - start
+                return start, length
+        offset += size
+    raise ValueError("macOS installer is missing its signed SDK section")
+
+
 def verify(root, receipt):
     version = (ROOT / "VERSION").read_text().strip()
     sums = {}
@@ -130,13 +156,20 @@ def verify(root, receipt):
         installer = root / f"xu-setup-{target}{suffix}"
         alias = root / f"xu-v{version}-{target}-setup{suffix}"
         assert sha256(installer) == sha256(alias)
+        if target.startswith("macos-") and host_os == "macos":
+            subprocess.run(["codesign", "--verify", "--strict", str(installer)], check=True)
         with installer.open("rb") as source:
-            source.seek(-24, 2)
-            footer = source.read()
-            assert footer[16:] == b"XUPACK01"
-            size = int(footer[:16])
-            assert 0 < size < installer.stat().st_size - 24
-            source.seek(-24 - size, 2)
+            file_size = installer.stat().st_size
+            if target.startswith("macos-"):
+                start, size = macos_payload_bounds(source, file_size)
+            else:
+                source.seek(-24, 2)
+                footer = source.read()
+                assert footer[16:] == b"XUPACK01"
+                size = int(footer[:16])
+                start = file_size - 24 - size
+                assert size > 0 and start > 0
+            source.seek(start)
             digest = hashlib.sha256()
             while size:
                 chunk = source.read(min(size, 1024 * 1024))
