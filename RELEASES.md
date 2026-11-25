@@ -6,6 +6,13 @@
 
 ---
 
+## Xu 0.14.1
+
+- **AI inference**. The pure-Xu LLM example packs GGUF Q4_0 and Q8_0 weights into the internal P4K4 layout for grouped matrix-vector and matrix-matrix kernels. Its paged key/value cache supports batched prefill and autoregressive decoding. The example loads F32 Safetensors and supported Llama- and Qwen2-compatible GGUF models.
+- **Compiler**. Opt-in tensor fusion recognizes paged attention scores, scaled softmax and value accumulation. The compiler selects available scalar or SIMD kernel implementations by target. The optimizing pipeline also improves loop-invariant code motion, loop unrolling, global value numbering for direct calls, register coalescing and native code generation.
+- **Runtime and standard library**. Short string operations use faster paths. X25519 and modular exponentiation use optimized arithmetic. TLS 1.3 completes more supported handshake combinations, and the JSON parser checks node limits.
+- **Platforms and upgrade**. Upgrade the compiler, standard library and SDK tools together. GGUF files keep their existing format and are packed in memory as they load. See the [technical release article](https://xulang.org/blog/xu-0-14-1) and [Chinese release notes](https://github.com/xulang-org/xu/blob/v0.14.1/RELEASES.zh-CN.md#xu-0141).
+
 ## Xu 0.14.0
 
 - **Operating System Kernel & Bare-Metal Support (Freestanding & #core)**:
