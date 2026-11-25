@@ -513,6 +513,11 @@ pub struct LicmWork {
     maybe_loc []int
     loc_addr_taken []bool
     loc_escaped []bool
+    fn_loc_stored []bool
+    desc_root []int
+    desc_off []int
+    slice_desc_loc []bool
+    buf_owner []int
     blk_unk []bool
     inv []bool
     loc_stored []bool
@@ -533,6 +538,11 @@ pub fn licm_work_new() LicmWork {
         maybe_loc: []int{},
         loc_addr_taken: []bool{},
         loc_escaped: []bool{},
+        fn_loc_stored: []bool{},
+        desc_root: []int{},
+        desc_off: []int{},
+        slice_desc_loc: []bool{},
+        buf_owner: []int{},
         blk_unk: []bool{},
         inv: []bool{},
         loc_stored: []bool{},
@@ -732,8 +742,38 @@ fn licm_scope_disjoint_from_stores(f &MFn, stores &[]int, load_scope int) bool {
 }
 
 fn licm_load_ptr_alias_safe(f &MFn, w &LicmWork, stores &[]int, ptr int, off int, wl int) bool {
-    if ptr < 0 || ptr >= w.addr_exact.len || !w.addr_exact[ptr] {
+    if ptr < 0 || ptr >= w.addr_exact.len {
         << false
+    }
+    if !w.addr_exact[ptr] {
+        // Slice descriptor header loads ({data, len, cap}) via an invariant slice
+        // local are disjoint from element-buffer writes derived from that same slice's data ptr.
+        dl := w.desc_root[ptr]
+        if dl < 0 || dl >= w.slice_desc_loc.len || !w.slice_desc_loc[dl] {
+            << false
+        }
+        if (off != 0 && off != 8 && off != 16) || off + wl > 24 {
+            << false
+        }
+        for si in 0:stores.len {
+            sii := stores[si]
+            ins := &f.instrs[sii]
+            sp := ins.a
+            if sp < 0 || sp >= w.buf_owner.len {
+                << false
+            }
+            if w.buf_owner[sp] == dl {
+                ->
+            }
+            if w.addr_exact[sp] {
+                ls := w.addr_root[sp]
+                if ls >= 0 && ls != dl && ls < w.loc_escaped.len && !w.loc_escaped[ls] {
+                    ->
+                }
+            }
+            << false
+        }
+        << true
     }
     l_load := w.addr_root[ptr]
     if l_load >= 0 && l_load < w.loc_stored.len && w.loc_stored[l_load] {
@@ -743,10 +783,14 @@ fn licm_load_ptr_alias_safe(f &MFn, w &LicmWork, stores &[]int, ptr int, off int
         << true
     }
     off_l := w.addr_off[ptr] + off
+    is_slice_hdr := l_load >= 0 && l_load < w.slice_desc_loc.len && w.slice_desc_loc[l_load] && (off_l == 0 || off_l == 8 || off_l == 16) && off_l + wl <= 24
     for si in 0:stores.len {
         sii := stores[si]
         ins := &f.instrs[sii]
         sp := ins.a
+        if is_slice_hdr && sp >= 0 && sp < w.buf_owner.len && w.buf_owner[sp] == l_load {
+            ->
+        }
         if sp < 0 || sp >= w.addr_exact.len {
             if w.loc_escaped[l_load] {
                 << false
@@ -805,6 +849,14 @@ fn licm_load_ptr_trap_safe(f &MFn, w $&LicmWork, lp &LoopInfo, b int, ii int, pt
     if off < 0 || off >= 4096 {
         << false
     }
+    $ptr_root := -1
+    $ptr_doff := 0
+    if ptr >= 0 && ptr < w.desc_root.len {
+        ptr_root = w.desc_root[ptr]
+        if ptr < w.desc_off.len {
+            ptr_doff = w.desc_off[ptr]
+        }
+    }
     // Pre-dereferenced on the same invariant pointer in a dominating non-loop block.
     for db in 0:f.blocks.len {
         if !w.reach[db] || lp.body[db] || db >= w.blk_unk.len {
@@ -816,10 +868,10 @@ fn licm_load_ptr_trap_safe(f &MFn, w $&LicmWork, lp &LoopInfo, b int, ii int, pt
         $di := f.blocks[db].head
         while di >= 0 {
             dins := &f.instrs[di]
-            if dins.kind == MI_LOAD_PTR && dins.b == ptr && (dins.c == off || (off <= 64 && dins.c >= off && dins.c <= 64)) {
+            if dins.kind == MI_LOAD_PTR && (dins.b == ptr || (ptr_root >= 0 && dins.b >= 0 && dins.b < w.desc_root.len && w.desc_root[dins.b] == ptr_root && w.desc_off[dins.b] == ptr_doff)) && (dins.c == off || (off <= 64 && dins.c >= off && dins.c <= 64)) {
                 << true
             }
-            if dins.kind == MI_STORE_PTR && dins.a == ptr && (dins.c == off || (off <= 64 && dins.c >= off && dins.c <= 64)) {
+            if dins.kind == MI_STORE_PTR && (dins.a == ptr || (ptr_root >= 0 && dins.a >= 0 && dins.a < w.desc_root.len && w.desc_root[dins.a] == ptr_root)) && (dins.c == off || (off <= 64 && dins.c >= off && dins.c <= 64)) {
                 << true
             }
             di = dins.next
@@ -828,9 +880,502 @@ fn licm_load_ptr_trap_safe(f &MFn, w $&LicmWork, lp &LoopInfo, b int, ii int, pt
     << false
 }
 
+fn licm_h_val_inv(f &MFn, w $&LicmWork, lp &LoopInfo, h int, v int) bool {
+    if v <= -2 {
+        << true
+    }
+    if v < 0 || v >= f.temps.len || w.def_cnt[v] != 1 {
+        << false
+    }
+    if w.inv[v] {
+        << true
+    }
+    db := w.def_blk[v]
+    if db < 0 || db >= lp.body.len || lp.body[db] {
+        << false
+    }
+    << licm_dom(f, db, h, w)
+}
+
+fn licm_is_h_var(w &LicmWork, h int, v int) bool {
+    << v >= 0 && v < w.def_blk.len && w.def_blk[v] == h && !w.inv[v]
+}
+
+fn licm_h_var_used_outside(f &MFn, w &LicmWork, h int) bool {
+    for bi in 0:f.blocks.len {
+        if bi == h || !w.reach[bi] { -> }
+        if w.blk_unk[bi] { << true }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR || k == MI_CALL_IND {
+                if licm_is_h_var(w, h, ins.b) { << true }
+            } else if k == MI_STORE_PTR {
+                if licm_is_h_var(w, h, ins.a) || licm_is_h_var(w, h, ins.b) { << true }
+            } else if k == MI_UN {
+                if licm_is_h_var(w, h, ins.c) { << true }
+            } else if k == MI_BIN {
+                if licm_is_h_var(w, h, ins.c) || licm_is_h_var(w, h, ins.d) { << true }
+            } else if k == MI_SELECT {
+                if licm_is_h_var(w, h, ins.b) || licm_is_h_var(w, h, ins.c) || licm_is_h_var(w, h, ins.d) { << true }
+            }
+            if k == MI_CALL || k == MI_CALL_IND {
+                $a := ins.c
+                while a >= 0 {
+                    if licm_is_h_var(w, h, f.margs[a].v) { << true }
+                    a = f.margs[a].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[bi].tkind
+        if (tk == TKIND_BRANCH || tk == TKIND_RETURN) && licm_is_h_var(w, h, f.blocks[bi].ta) {
+            << true
+        }
+    }
+    << false
+}
+
+fn opt_peel_inv_guards(f $&MFn, w $&LicmWork, init_loops &[]LoopInfo) bool {
+    nt := f.temps.len
+    nl := f.locals.len
+    $any_peeled := false
+    $extra_loops := []LoopInfo{}
+    for step in 0:4 {
+        $cur_loops := init_loops
+        if step > 0 {
+            cur_loops = &extra_loops
+        }
+        nb := f.blocks.len
+        licm_fill_int($&w.def_cnt, nt, 0)
+        licm_fill_int($&w.def_blk, nt, -1)
+        licm_fill_int($&w.def_ii, nt, -1)
+        licm_fill_bool($&w.loc_addr_taken, nl, false)
+        licm_fill_bool($&w.blk_unk, nb, false)
+        for bi in 0:nb {
+            if !w.reach[bi] { -> }
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                k := ins.kind
+                if !fold_known_kind(k) { w.blk_unk[bi] = true }
+                if fold_defines(k) && ins.a >= 0 && ins.a < nt {
+                    w.def_cnt[ins.a] = w.def_cnt[ins.a] + 1
+                    w.def_blk[ins.a] = bi
+                    w.def_ii[ins.a] = ii
+                }
+                if k == MI_ADDR && ins.b >= 0 && ins.b < nl {
+                    w.loc_addr_taken[ins.b] = true
+                }
+                ii = ins.next
+            }
+        }
+        $step_peeled := false
+        for li in 0:cur_loops.len {
+            lp := &cur_loops[li]
+            h := lp.header
+            if h <= 0 || h >= nb || !w.reach[h] || lp.blocks.len < 2 { -> }
+            if f.blocks[h].tkind != TKIND_BRANCH { -> }
+            htb := f.blocks[h].tb
+            htc := f.blocks[h].tc
+            if htb < 0 || htb >= nb || htc < 0 || htc >= nb { -> }
+            $cont_b := -1
+            $exit_b := -1
+            if htb != h && htb < lp.body.len && lp.body[htb] && (htc >= lp.body.len || !lp.body[htc]) {
+                cont_b = htb
+                exit_b = htc
+            } else if htc != h && htc < lp.body.len && lp.body[htc] && (htb >= lp.body.len || !lp.body[htb]) {
+                cont_b = htc
+                exit_b = htb
+            }
+            if cont_b < 0 { -> }
+            $irreducible := false
+            $ext_preds := []int{}
+            for p in 0:nb {
+                if !w.reach[p] || (p < lp.body.len && lp.body[p]) { -> }
+                tk := f.blocks[p].tkind
+                if tk == TKIND_JUMP {
+                    s := f.blocks[p].ta
+                    if s == h { ext_preds.push(p) }
+                    else if s >= 0 && s < lp.body.len && lp.body[s] {
+                        irreducible = true
+                        <-
+                    }
+                } else if tk == TKIND_BRANCH {
+                    sb := f.blocks[p].tb
+                    sc := f.blocks[p].tc
+                    if sb == h || sc == h { ext_preds.push(p) }
+                    if (sb != h && sb >= 0 && sb < lp.body.len && lp.body[sb]) ||
+                       (sc != h && sc >= 0 && sc < lp.body.len && lp.body[sc]) {
+                        irreducible = true
+                        <-
+                    }
+                } else if tk != TKIND_RETURN && tk != TKIND_OPEN {
+                    irreducible = true
+                    <-
+                }
+            }
+            if irreducible || ext_preds.len == 0 { -> }
+            licm_fill_bool($&w.loc_stored, nl, false)
+            $lp_unk := false
+            for bi_i in 0:lp.blocks.len {
+                b := lp.blocks[bi_i]
+                if b >= w.blk_unk.len || w.blk_unk[b] {
+                    lp_unk = true
+                    <-
+                }
+                $ii := f.blocks[b].head
+                while ii >= 0 {
+                    ins := &f.instrs[ii]
+                    if ins.kind == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl {
+                        w.loc_stored[ins.a] = true
+                    }
+                    ii = ins.next
+                }
+            }
+            if lp_unk { -> }
+            licm_fill_int($&w.dom_cache, nb, -1)
+            licm_fill_bool($&w.inv, nt, false)
+            $h_pure := true
+            $all_inv := true
+            $ii := f.blocks[h].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                k := ins.kind
+                dest := ins.a
+                if fold_defines(k) && (dest < 0 || dest >= nt || w.def_cnt[dest] != 1) {
+                    h_pure = false
+                    all_inv = false
+                    <-
+                }
+                $pure_ok := false
+                $inv_ok := false
+                if k == MI_NOP || k == MI_STR_CONST {
+                    pure_ok = true
+                    inv_ok = true
+                } else if k == MI_COPY {
+                    pure_ok = true
+                    inv_ok = licm_h_val_inv(f, w, lp, h, ins.b)
+                } else if k == MI_LOAD_LOCAL {
+                    pure_ok = ins.b >= 0 && ins.b < nl && ins.c == 0 && !w.loc_addr_taken[ins.b]
+                    inv_ok = pure_ok && !w.loc_stored[ins.b]
+                } else if k == MI_UN {
+                    pure_ok = true
+                    inv_ok = licm_h_val_inv(f, w, lp, h, ins.c)
+                } else if k == MI_BIN {
+                    pure_ok = licm_is_safe_bin(f, ins.b, ins.d)
+                    inv_ok = pure_ok && licm_h_val_inv(f, w, lp, h, ins.c) && licm_h_val_inv(f, w, lp, h, ins.d)
+                } else if k == MI_SELECT {
+                    pure_ok = true
+                    inv_ok = licm_h_val_inv(f, w, lp, h, ins.b) && licm_h_val_inv(f, w, lp, h, ins.c) && licm_h_val_inv(f, w, lp, h, ins.d)
+                }
+                if !pure_ok {
+                    h_pure = false
+                    all_inv = false
+                    <-
+                }
+                if inv_ok {
+                    if fold_defines(k) && dest >= 0 && dest < nt {
+                        w.inv[dest] = true
+                    }
+                } else {
+                    all_inv = false
+                }
+                ii = ins.next
+            }
+            if !h_pure { -> }
+            if all_inv && licm_h_val_inv(f, w, lp, h, f.blocks[h].ta) {
+                for bi_i in 0:lp.blocks.len {
+                    b := lp.blocks[bi_i]
+                    if f.blocks[b].tkind == TKIND_JUMP && f.blocks[b].ta == h {
+                        f.blocks[b].ta = cont_b
+                    } else if f.blocks[b].tkind == TKIND_BRANCH {
+                        if f.blocks[b].tb == h { f.blocks[b].tb = cont_b }
+                        if f.blocks[b].tc == h { f.blocks[b].tc = cont_b }
+                    }
+                }
+                step_peeled = true
+                any_peeled = true
+                <-
+            }
+            // Split loop-invariant short-circuit disjunction/conjunction MI_SELECT guards out of header.
+            cnd := f.blocks[h].ta
+            if cnd >= 0 && cnd < nt && w.def_cnt[cnd] == 1 && w.def_blk[cnd] == h {
+                sii := w.def_ii[cnd]
+                if sii >= 0 && f.instrs[sii].kind == MI_SELECT {
+                    sb := f.instrs[sii].b
+                    sc := f.instrs[sii].c
+                    sd := f.instrs[sii].d
+                    $matched := false
+                    $exit_on_true := true
+                    $inv_c := -1
+                    $rem_c := -1
+                    if exit_b == htb && sb >= 0 && sb == sc && licm_h_val_inv(f, w, lp, h, sb) && !licm_h_val_inv(f, w, lp, h, sd) {
+                        matched = true
+                        exit_on_true = true
+                        inv_c = sb
+                        rem_c = sd
+                    } else if exit_b == htc && sb >= 0 && licm_h_val_inv(f, w, lp, h, sb) && sd <= -2 && f.consts[0 - sd - 2] == 0 && !licm_h_val_inv(f, w, lp, h, sc) {
+                        matched = true
+                        exit_on_true = false
+                        inv_c = sb
+                        rem_c = sc
+                    }
+                    if matched && !licm_h_var_used_outside(f, w, h) {
+                        $ph := -1
+                        if ext_preds.len == 1 && f.blocks[ext_preds[0]].tkind == TKIND_JUMP && f.blocks[ext_preds[0]].ta == h {
+                            ph = ext_preds[0]
+                        } else {
+                            ph = f.blocks.len
+                            $nblk := mblock_new()
+                            nblk.tkind = TKIND_JUMP
+                            nblk.ta = h
+                            nblk.line = f.blocks[h].line
+                            f.blocks.push(nblk)
+                            w.reach.push(true)
+                            w.blk_unk.push(false)
+                            for ei in 0:ext_preds.len {
+                                p := ext_preds[ei]
+                                if f.blocks[p].tkind == TKIND_JUMP && f.blocks[p].ta == h {
+                                    f.blocks[p].ta = ph
+                                } else if f.blocks[p].tkind == TKIND_BRANCH {
+                                    if f.blocks[p].tb == h { f.blocks[p].tb = ph }
+                                    if f.blocks[p].tc == h { f.blocks[p].tc = ph }
+                                }
+                            }
+                        }
+                        $mi := f.blocks[h].head
+                        while mi >= 0 {
+                            nx := f.instrs[mi].next
+                            md := f.instrs[mi].a
+                            if fold_defines(f.instrs[mi].kind) && md >= 0 && md < nt && w.inv[md] {
+                                mir_detach_instr(f, h, mi)
+                                mir_append_instr(f, ph, mi)
+                                w.def_blk[md] = ph
+                            }
+                            mi = nx
+                        }
+                        f.instrs[sii].kind = MI_COPY
+                        f.instrs[sii].b = rem_c
+                        f.instrs[sii].c = -1
+                        f.instrs[sii].d = -1
+                        f.blocks[h].ta = rem_c
+                        f.blocks[ph].tkind = TKIND_BRANCH
+                        f.blocks[ph].ta = inv_c
+                        if exit_on_true {
+                            f.blocks[ph].tb = exit_b
+                            f.blocks[ph].tc = h
+                        } else {
+                            f.blocks[ph].tb = h
+                            f.blocks[ph].tc = exit_b
+                        }
+                        step_peeled = true
+                        any_peeled = true
+                        <-
+                    }
+                }
+            }
+        }
+        if !step_peeled { <- }
+        extra_loops = find_loops(f, false)
+        if extra_loops.len == 0 { <- }
+        licm_mark_reach(f, w)
+    }
+    << any_peeled
+}
+
+fn licm_sync_temp_arrays(w $&LicmWork, nt int) {
+    while w.def_cnt.len < nt { w.def_cnt.push(0) }
+    while w.def_blk.len < nt { w.def_blk.push(-1) }
+    while w.def_ii.len < nt { w.def_ii.push(-1) }
+    while w.addr_root.len < nt { w.addr_root.push(-1) }
+    while w.addr_off.len < nt { w.addr_off.push(0) }
+    while w.addr_exact.len < nt { w.addr_exact.push(false) }
+    while w.maybe_loc.len < nt { w.maybe_loc.push(-1) }
+    while w.desc_root.len < nt { w.desc_root.push(-1) }
+    while w.desc_off.len < nt { w.desc_off.push(0) }
+    while w.buf_owner.len < nt { w.buf_owner.push(-1) }
+    while w.inv.len < nt { w.inv.push(false) }
+}
+
+fn licm_precedes_in_blk(f &MFn, bi int, first_ii int, second_ii int) bool {
+    if first_ii < 0 || second_ii < 0 || first_ii == second_ii {
+        << false
+    }
+    $ii := f.blocks[bi].head
+    while ii >= 0 {
+        if ii == first_ii { << true }
+        if ii == second_ii { << false }
+        ii = f.instrs[ii].next
+    }
+    << false
+}
+
+fn licm_insert_before(f $&MFn, bi int, target_ii int, prev_ii int, ins MInstr) int {
+    idx := f.instrs.len
+    f.instrs.push(ins)
+    f.instrs[idx].next = target_ii
+    if prev_ii < 0 {
+        f.blocks[bi].head = idx
+    } else {
+        f.instrs[prev_ii].next = idx
+    }
+    << idx
+}
+
+fn licm_try_scale_const(f &MFn, ins &MInstr, out_arg $&int, out_op $&int, out_c $&int) bool {
+    if ins.kind != MI_BIN { << false }
+    if ins.b == BIN_SHL && ins.c >= 0 && ins.d <= -2 {
+        cv := f.consts[0 - ins.d - 2]
+        if cv > 0 && cv < 64 {
+            *out_arg = ins.c
+            *out_op = BIN_SHL
+            *out_c = ins.d
+            << true
+        }
+        << false
+    }
+    if ins.b == BIN_MUL {
+        if ins.c >= 0 && ins.d <= -2 {
+            *out_arg = ins.c
+            *out_op = BIN_MUL
+            *out_c = ins.d
+            << true
+        }
+        if ins.d >= 0 && ins.c <= -2 {
+            *out_arg = ins.d
+            *out_op = BIN_MUL
+            *out_c = ins.c
+            << true
+        }
+    }
+    << false
+}
+
+// Reassociates base + ((var +/- inv) << C) (or * C) into
+// (base +/- (inv << C)) + (var << C) so the loop-invariant row base hoists out.
+fn licm_distribute_affine(f $&MFn, w $&LicmWork, lp &LoopInfo, max_hoist int) bool {
+    $added := 0
+    $cap := max_hoist / 3
+    if cap > 8 { cap = 8 }
+    if cap <= 0 { << false }
+    for bi_i in 0:lp.blocks.len {
+        if added >= cap { <- }
+        b := lp.blocks[bi_i]
+        $prev := -1
+        $ii := f.blocks[b].head
+        while ii >= 0 && added < cap {
+            nx := f.instrs[ii].next
+            nt := f.temps.len
+            $did := false
+            if f.instrs[ii].kind == MI_BIN && f.instrs[ii].b == BIN_ADD &&
+               f.instrs[ii].a >= 0 && f.instrs[ii].a < nt && w.def_cnt[f.instrs[ii].a] == 1 {
+                ic := f.instrs[ii].c
+                id := f.instrs[ii].d
+                for pass in 0:2 {
+                    if did { <- }
+                    $base := ic
+                    $scaled := id
+                    if pass == 1 {
+                        base = id
+                        scaled = ic
+                    }
+                    if base < 0 || base >= nt || !licm_is_inv(f, w, lp, base) { -> }
+                    if scaled < 0 || scaled >= nt || w.def_cnt[scaled] != 1 || w.def_blk[scaled] != b { -> }
+                    scaled_ii := w.def_ii[scaled]
+                    if !licm_precedes_in_blk(f, b, scaled_ii, ii) { -> }
+                    $inner := -1
+                    $scale_op := 0
+                    $scale_c := -1
+                    if !licm_try_scale_const(f, &f.instrs[scaled_ii], $&inner, $&scale_op, $&scale_c) { -> }
+                    if inner < 0 || inner >= nt || w.def_cnt[inner] != 1 || w.def_blk[inner] != b { -> }
+                    inner_ii := w.def_ii[inner]
+                    if !licm_precedes_in_blk(f, b, inner_ii, scaled_ii) { -> }
+                    iins := &f.instrs[inner_ii]
+                    if iins.kind != MI_BIN || (iins.b != BIN_ADD && iins.b != BIN_SUB) { -> }
+                    $inv := -1
+                    $var := -1
+                    $sub_inv := false
+                    if iins.b == BIN_ADD {
+                        if licm_is_inv(f, w, lp, iins.c) && iins.d >= 0 && iins.d < nt &&
+                           w.def_cnt[iins.d] == 1 && !licm_is_inv(f, w, lp, iins.d) {
+                            inv = iins.c
+                            var = iins.d
+                        } else if licm_is_inv(f, w, lp, iins.d) && iins.c >= 0 && iins.c < nt &&
+                                  w.def_cnt[iins.c] == 1 && !licm_is_inv(f, w, lp, iins.c) {
+                            inv = iins.d
+                            var = iins.c
+                        }
+                    } else {
+                        if iins.c >= 0 && iins.c < nt && w.def_cnt[iins.c] == 1 &&
+                           !licm_is_inv(f, w, lp, iins.c) && licm_is_inv(f, w, lp, iins.d) {
+                            var = iins.c
+                            inv = iins.d
+                            sub_inv = true
+                        }
+                    }
+                    if var < 0 { -> }
+                    line := f.instrs[ii].line
+                    t_inv_s := alloc_temp(f)
+                    t_row := alloc_temp(f)
+                    t_var_s := alloc_temp(f)
+                    licm_sync_temp_arrays(w, f.temps.len)
+
+                    $ins1 := minstr_new(MI_BIN)
+                    ins1.a = t_inv_s
+                    ins1.b = scale_op
+                    ins1.c = inv
+                    ins1.d = scale_c
+                    ins1.line = line
+                    p1 := licm_insert_before(f, b, ii, prev, ins1)
+                    w.def_cnt[t_inv_s] = 1
+                    w.def_blk[t_inv_s] = b
+                    w.def_ii[t_inv_s] = p1
+
+                    $ins2 := minstr_new(MI_BIN)
+                    ins2.a = t_row
+                    ins2.b = BIN_ADD
+                    if sub_inv { ins2.b = BIN_SUB }
+                    ins2.c = base
+                    ins2.d = t_inv_s
+                    ins2.line = line
+                    p2 := licm_insert_before(f, b, ii, p1, ins2)
+                    w.def_cnt[t_row] = 1
+                    w.def_blk[t_row] = b
+                    w.def_ii[t_row] = p2
+                    if base >= 0 && base < w.buf_owner.len && w.buf_owner[base] >= 0 {
+                        w.buf_owner[t_row] = w.buf_owner[base]
+                    }
+
+                    $ins3 := minstr_new(MI_BIN)
+                    ins3.a = t_var_s
+                    ins3.b = scale_op
+                    ins3.c = var
+                    ins3.d = scale_c
+                    ins3.line = line
+                    p3 := licm_insert_before(f, b, ii, p2, ins3)
+                    w.def_cnt[t_var_s] = 1
+                    w.def_blk[t_var_s] = b
+                    w.def_ii[t_var_s] = p3
+                    prev = p3
+
+                    f.instrs[ii].c = t_row
+                    f.instrs[ii].d = t_var_s
+                    added += 1
+                    did = true
+                }
+            }
+            prev = ii
+            ii = nx
+        }
+    }
+    << added > 0
+}
+
 pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
     nb0 := f.blocks.len
-    nt := f.temps.len
+    $nt := f.temps.len
     nl := f.locals.len
     if nb0 < 2 || nt == 0 {
         << false
@@ -840,6 +1385,14 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
         << false
     }
     licm_mark_reach(f, w)
+    peeled := opt_peel_inv_guards(f, w, &loops)
+    if peeled {
+        loops = find_loops(f, false)
+        if loops.len == 0 {
+            << true
+        }
+        licm_mark_reach(f, w)
+    }
     licm_fill_int($&w.def_cnt, nt, 0)
     licm_fill_int($&w.def_blk, nt, -1)
     licm_fill_int($&w.def_ii, nt, -1)
@@ -849,6 +1402,11 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
     licm_fill_int($&w.maybe_loc, nt, -1)
     licm_fill_bool($&w.loc_addr_taken, nl, false)
     licm_fill_bool($&w.loc_escaped, nl, false)
+    licm_fill_bool($&w.fn_loc_stored, nl, false)
+    licm_fill_int($&w.desc_root, nt, -1)
+    licm_fill_int($&w.desc_off, nt, 0)
+    licm_fill_bool($&w.slice_desc_loc, nl, false)
+    licm_fill_int($&w.buf_owner, nt, -1)
     licm_fill_bool($&w.blk_unk, nb0, false)
     $any_unk := false
     for bi in 0:nb0 {
@@ -870,11 +1428,13 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
             }
             if k == MI_ADDR && ins.b >= 0 && ins.b < nl {
                 w.loc_addr_taken[ins.b] = true
+            } else if k == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl {
+                w.fn_loc_stored[ins.a] = true
             }
             ii = ins.next
         }
     }
-    // Propagate stack MI_ADDR base+const derivations.
+    // Propagate stack MI_ADDR base+const derivations and invariant descriptor roots.
     for _ in 0:3 {
         $prog := false
         for bi in 0:nb0 {
@@ -892,6 +1452,14 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                             w.addr_off[t] = 0
                             w.addr_exact[t] = true
                             w.maybe_loc[t] = ins.b
+                            w.desc_root[t] = ins.b
+                            w.desc_off[t] = 0
+                            prog = true
+                        }
+                    } else if ins.kind == MI_LOAD_LOCAL && ins.b >= 0 && ins.b < nl && ins.c == 0 && !w.fn_loc_stored[ins.b] && !w.loc_addr_taken[ins.b] {
+                        if w.desc_root[t] < 0 {
+                            w.desc_root[t] = ins.b
+                            w.desc_off[t] = 0
                             prog = true
                         }
                     } else if ins.kind == MI_COPY && ins.b >= 0 && ins.b < nt && w.def_cnt[ins.b] == 1 {
@@ -903,6 +1471,11 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                         }
                         if w.maybe_loc[ins.b] >= 0 && w.maybe_loc[t] < 0 {
                             w.maybe_loc[t] = w.maybe_loc[ins.b]
+                            prog = true
+                        }
+                        if w.desc_root[ins.b] >= 0 && w.desc_root[t] < 0 {
+                            w.desc_root[t] = w.desc_root[ins.b]
+                            w.desc_off[t] = w.desc_off[ins.b]
                             prog = true
                         }
                     } else if ins.kind == MI_BIN && (ins.b == BIN_ADD || ins.b == BIN_SUB) {
@@ -922,6 +1495,11 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                                 w.maybe_loc[t] = w.maybe_loc[ins.c]
                                 prog = true
                             }
+                            if ins.b == BIN_ADD && cv >= 0 && w.desc_root[ins.c] >= 0 && w.desc_root[t] < 0 {
+                                w.desc_root[t] = w.desc_root[ins.c]
+                                w.desc_off[t] = w.desc_off[ins.c] + cv
+                                prog = true
+                            }
                         } else if ins.b == BIN_ADD && ins.d >= 0 && ins.d < nt && w.def_cnt[ins.d] == 1 && ins.c <= -2 {
                             cv := f.consts[0 - ins.c - 2]
                             if w.addr_exact[ins.d] && !w.addr_exact[t] {
@@ -932,6 +1510,11 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                             }
                             if w.maybe_loc[ins.d] >= 0 && w.maybe_loc[t] < 0 {
                                 w.maybe_loc[t] = w.maybe_loc[ins.d]
+                                prog = true
+                            }
+                            if cv >= 0 && w.desc_root[ins.d] >= 0 && w.desc_root[t] < 0 {
+                                w.desc_root[t] = w.desc_root[ins.d]
+                                w.desc_off[t] = w.desc_off[ins.d] + cv
                                 prog = true
                             }
                         } else if ins.c >= 0 && ins.c < nt && w.maybe_loc[ins.c] >= 0 && (ins.d < 0 || w.maybe_loc[ins.d] < 0) {
@@ -953,6 +1536,68 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
         if !prog {
             <-
         }
+    }
+    // Identify proven slice descriptors via bounds checks (idx >= load8 [desc+8])
+    // and track pointers derived from their element buffer [desc+0].
+    for bi in 0:nb0 {
+        if !w.reach[bi] { -> }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            if ins.kind == MI_BIN && ins.sval == "bounds" && ins.b == BIN_GE && ins.d >= 0 && ins.d < nt && w.def_cnt[ins.d] == 1 {
+                li := w.def_ii[ins.d]
+                if li >= 0 && f.instrs[li].kind == MI_LOAD_PTR && f.instrs[li].c == 8 && licm_wbytes(f.instrs[li].d) == 8 {
+                    dp := f.instrs[li].b
+                    if dp >= 0 && dp < nt && w.desc_root[dp] >= 0 {
+                        w.slice_desc_loc[w.desc_root[dp]] = true
+                    }
+                }
+            }
+            ii = ins.next
+        }
+    }
+    for _ in 0:4 {
+        $bprog := false
+        for bi in 0:nb0 {
+            if !w.reach[bi] { -> }
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                t := ins.a
+                if fold_defines(ins.kind) && t >= 0 && t < nt && w.def_cnt[t] == 1 && w.buf_owner[t] < 0 {
+                    if ins.kind == MI_LOAD_PTR && ins.c == 0 && licm_wbytes(ins.d) == 8 && ins.b >= 0 && ins.b < nt {
+                        dl := w.desc_root[ins.b]
+                        if dl >= 0 && w.slice_desc_loc[dl] {
+                            w.buf_owner[t] = dl
+                            bprog = true
+                        }
+                    } else if ins.kind == MI_COPY && ins.b >= 0 && ins.b < nt && w.def_cnt[ins.b] == 1 && w.buf_owner[ins.b] >= 0 {
+                        w.buf_owner[t] = w.buf_owner[ins.b]
+                        bprog = true
+                    } else if ins.kind == MI_BIN && ins.b == BIN_ADD {
+                        $oc := -1
+                        if ins.c >= 0 && ins.c < nt && w.def_cnt[ins.c] == 1 { oc = w.buf_owner[ins.c] }
+                        $od := -1
+                        if ins.d >= 0 && ins.d < nt && w.def_cnt[ins.d] == 1 { od = w.buf_owner[ins.d] }
+                        if oc >= 0 && od < 0 {
+                            w.buf_owner[t] = oc
+                            bprog = true
+                        } else if od >= 0 && oc < 0 {
+                            w.buf_owner[t] = od
+                            bprog = true
+                        }
+                    } else if ins.kind == MI_BIN && ins.b == BIN_SUB {
+                        if ins.c >= 0 && ins.c < nt && w.def_cnt[ins.c] == 1 && w.buf_owner[ins.c] >= 0 &&
+                           (ins.d < 0 || ins.d >= nt || w.buf_owner[ins.d] < 0) {
+                            w.buf_owner[t] = w.buf_owner[ins.c]
+                            bprog = true
+                        }
+                    }
+                }
+                ii = ins.next
+            }
+        }
+        if !bprog { <- }
     }
     if any_unk {
         licm_fill_bool($&w.loc_escaped, nl, true)
@@ -1053,7 +1698,6 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                 ins := &f.instrs[ii]
                 if ins.kind == MI_CALL_IND || (ins.kind == MI_CALL && !is_panic_call(ins)) {
                     has_impure_call = true
-                    <-
                 }
                 if ins.kind == MI_STORE_PTR {
                     lp_stores.push(ii)
@@ -1062,11 +1706,8 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                 }
                 ii = ins.next
             }
-            if has_impure_call {
-                <-
-            }
         }
-        if has_unk || has_impure_call {
+        if has_unk {
             ->
         }
         // Verify single-entry naturalness and collect external reachable preds of h.
@@ -1103,6 +1744,13 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
         }
         licm_fill_int($&w.dom_cache, f.blocks.len, -1)
         licm_fill_bool($&w.inv, nt, false)
+        $max_hoist := 24
+        if has_impure_call {
+            max_hoist = 6
+        } else if licm_distribute_affine(f, w, lp, max_hoist) {
+            nt = f.temps.len
+            changed = true
+        }
         $hoist_ii := []int{}
         $hoist_blk := []int{}
         for _ in 0:8 {
@@ -1117,10 +1765,10 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                     ic := f.instrs[ii].c
                     id := f.instrs[ii].d
                     nx := f.instrs[ii].next
-                    if hoist_ii.len < 24 && fold_defines(k) && dest >= 0 && dest < nt && w.def_cnt[dest] == 1 && !w.inv[dest] {
+                    if hoist_ii.len < max_hoist && fold_defines(k) && dest >= 0 && dest < nt && w.def_cnt[dest] == 1 && !w.inv[dest] {
                         $ok := false
                         if k == MI_STR_CONST || k == MI_LOAD_FN_ADDR || k == MI_ADDR {
-                            ok = true
+                            ok = !has_impure_call
                         } else if k == MI_COPY {
                             ok = licm_is_inv(f, w, lp, ib)
                         } else if k == MI_LOAD_LOCAL {
@@ -1131,7 +1779,7 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                             ok = licm_is_safe_bin(f, ib, id) && licm_is_inv(f, w, lp, ic) && licm_is_inv(f, w, lp, id)
                         } else if k == MI_SELECT {
                             ok = licm_is_inv(f, w, lp, ib) && licm_is_inv(f, w, lp, ic) && licm_is_inv(f, w, lp, id)
-                        } else if k == MI_LOAD_PTR {
+                        } else if k == MI_LOAD_PTR && !has_impure_call {
                             wl := licm_wbytes(id)
                             $alias_ok := licm_load_ptr_alias_safe(f, w, &lp_stores, ib, ic, wl)
                             if !alias_ok && f.instrs[ii].scope_id > 0 {
@@ -1155,7 +1803,7 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
                     ii = nx
                 }
             }
-            if !found || hoist_ii.len >= 24 {
+            if !found || hoist_ii.len >= max_hoist {
                 <-
             }
         }
@@ -1219,7 +1867,10 @@ pub fn opt_licm_typed_with(f $&MFn, w $&LicmWork) bool {
         }
         changed = true
     }
-    << changed
+    if opt_iv_sr_with(f, w) {
+        changed = true
+    }
+    << peeled || changed
 }
 // ===== Loop-Carried Store-to-Load Forwarding =====
 
@@ -1239,6 +1890,359 @@ fn lc_new_local(f $&MFn, ty int, name string) int {
     f.locals_owning.push(false)
     f.local_names.push(name)
     << id
+}
+
+fn iv_insert_after(f $&MFn, blk int, after_ii int, ins MInstr) int {
+    ni := f.instrs.len
+    $new_ins := ~ins
+    nx := f.instrs[after_ii].next
+    new_ins.next = nx
+    f.instrs.push(~new_ins)
+    f.instrs[after_ii].next = ni
+    if nx < 0 {
+        f.blocks[blk].tail = ni
+    }
+    << ni
+}
+
+fn opt_iv_sr_with(f $&MFn, w $&LicmWork) bool {
+    nt := f.temps.len
+    nl := f.locals.len
+    if f.blocks.len < 2 || nt == 0 || nl == 0 {
+        << false
+    }
+    $has_mul := false
+    for ii in 0:f.instrs.len {
+        if f.instrs[ii].kind == MI_BIN && f.instrs[ii].b == BIN_MUL && f.instrs[ii].c >= 0 && f.instrs[ii].d >= 0 {
+            has_mul = true
+            <-
+        }
+    }
+    if !has_mul {
+        << false
+    }
+    $loops := find_loops(f, false)
+    if loops.len == 0 {
+        << false
+    }
+    licm_mark_reach(f, w)
+    nb0 := f.blocks.len
+    licm_fill_int($&w.def_cnt, nt, 0)
+    licm_fill_int($&w.def_blk, nt, -1)
+    licm_fill_int($&w.def_ii, nt, -1)
+    licm_fill_bool($&w.loc_addr_taken, nl, false)
+    licm_fill_bool($&w.blk_unk, nb0, false)
+    for bi in 0:nb0 {
+        if !w.reach[bi] { -> }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if !fold_known_kind(k) { w.blk_unk[bi] = true }
+            if fold_defines(k) && ins.a >= 0 && ins.a < nt {
+                w.def_cnt[ins.a] = w.def_cnt[ins.a] + 1
+                w.def_blk[ins.a] = bi
+                w.def_ii[ins.a] = ii
+            }
+            if k == MI_ADDR && ins.b >= 0 && ins.b < nl {
+                w.loc_addr_taken[ins.b] = true
+            }
+            ii = ins.next
+        }
+    }
+    $changed := false
+    for li in 0:loops.len {
+        lp := &loops[li]
+        h := lp.header
+        if h <= 0 || h >= f.blocks.len || !w.reach[h] || lp.blocks.len < 2 { -> }
+        $has_call := false
+        $step_blk := -1
+        $back_cnt := 0
+        for bi_i in 0:lp.blocks.len {
+            b := lp.blocks[bi_i]
+            if b >= w.blk_unk.len || w.blk_unk[b] {
+                has_call = true
+                <-
+            }
+            $ii := f.blocks[b].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind == MI_CALL_IND || (ins.kind == MI_CALL && !is_panic_call(ins)) {
+                    has_call = true
+                    <-
+                }
+                ii = ins.next
+            }
+            if has_call { <- }
+            tk := f.blocks[b].tkind
+            if tk == TKIND_JUMP && f.blocks[b].ta == h {
+                step_blk = b
+                back_cnt += 1
+            } else if tk == TKIND_BRANCH && (f.blocks[b].tb == h || f.blocks[b].tc == h) {
+                back_cnt += 2
+            }
+        }
+        if has_call || back_cnt != 1 || step_blk < 0 { -> }
+        // Require single-entry loop and collect external reachable predecessors.
+        $irreducible := false
+        $ext_preds := []int{}
+        for p in 0:f.blocks.len {
+            if !w.reach[p] || (p < lp.body.len && lp.body[p]) { -> }
+            tk := f.blocks[p].tkind
+            if tk == TKIND_JUMP {
+                s := f.blocks[p].ta
+                if s == h { ext_preds.push(p) }
+                else if s >= 0 && s < lp.body.len && lp.body[s] {
+                    irreducible = true
+                    <-
+                }
+            } else if tk == TKIND_BRANCH {
+                sb := f.blocks[p].tb
+                sc := f.blocks[p].tc
+                if sb == h || sc == h { ext_preds.push(p) }
+                if (sb != h && sb >= 0 && sb < lp.body.len && lp.body[sb]) ||
+                   (sc != h && sc >= 0 && sc < lp.body.len && lp.body[sc]) {
+                    irreducible = true
+                    <-
+                }
+            }
+        }
+        if irreducible || ext_preds.len == 0 { -> }
+        // Find single-store integer induction local updated in step_blk.
+        $iv := -1
+        $step_store_ii := -1
+        $step_val := -1
+        $iv_store_cnt := []int{}
+        for _ in 0:nl { iv_store_cnt.push(0) }
+        for bi_i in 0:lp.blocks.len {
+            b := lp.blocks[bi_i]
+            $ii := f.blocks[b].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl && ins.c == 0 {
+                    iv_store_cnt[ins.a] = iv_store_cnt[ins.a] + 1
+                }
+                ii = ins.next
+            }
+        }
+        licm_fill_int($&w.dom_cache, f.blocks.len, -1)
+        $sii := f.blocks[step_blk].head
+        while sii >= 0 {
+            sins := &f.instrs[sii]
+            if sins.kind == MI_STORE_LOCAL && sins.a >= 0 && sins.a < nl && sins.c == 0 &&
+               iv_store_cnt[sins.a] == 1 && !w.loc_addr_taken[sins.a] &&
+               sins.a < f.locals_nslots.len && f.locals_nslots[sins.a] == 1 && f.locals[sins.a] == 1 {
+                cand_iv := sins.a
+                v := sins.b
+                if v >= 0 && v < w.def_cnt.len && w.def_cnt[v] == 1 && w.def_blk[v] == step_blk {
+                    adi := w.def_ii[v]
+                    if adi >= 0 && f.instrs[adi].kind == MI_BIN && f.instrs[adi].b == BIN_ADD {
+                        $ld_t := -1
+                        $st_v := -1
+                        ac := f.instrs[adi].c
+                        ad := f.instrs[adi].d
+                        if ac >= 0 && ac < w.def_cnt.len && w.def_cnt[ac] == 1 && w.def_blk[ac] == step_blk {
+                            lci := w.def_ii[ac]
+                            if lci >= 0 && f.instrs[lci].kind == MI_LOAD_LOCAL && f.instrs[lci].b == cand_iv && f.instrs[lci].c == 0 {
+                                ld_t = ac
+                                st_v = ad
+                            }
+                        }
+                        if ld_t < 0 && ad >= 0 && ad < w.def_cnt.len && w.def_cnt[ad] == 1 && w.def_blk[ad] == step_blk {
+                            ldi := w.def_ii[ad]
+                            if ldi >= 0 && f.instrs[ldi].kind == MI_LOAD_LOCAL && f.instrs[ldi].b == cand_iv && f.instrs[ldi].c == 0 {
+                                ld_t = ad
+                                st_v = ac
+                            }
+                        }
+                        if ld_t >= 0 {
+                            $st_ok := false
+                            if st_v <= -2 {
+                                st_ok = true
+                            } else if st_v >= 0 && st_v < w.def_cnt.len && w.def_cnt[st_v] == 1 {
+                                db := w.def_blk[st_v]
+                                if db >= 0 && (db >= lp.body.len || !lp.body[db]) && licm_dom(f, db, h, w) {
+                                    st_ok = true
+                                }
+                            }
+                            if st_ok {
+                                iv = cand_iv
+                                step_store_ii = sii
+                                step_val = st_v
+                                <-
+                            }
+                        }
+                    }
+                }
+            }
+            sii = sins.next
+        }
+        if iv < 0 { -> }
+        // Collect up to 2 invariant*iv multiplications in lp executed before step_store_ii.
+        $sr_muls := []int{}
+        $sr_invs := []int{}
+        for bi_i in 0:lp.blocks.len {
+            b := lp.blocks[bi_i]
+            $ii := f.blocks[b].head
+            $past_step := false
+            while ii >= 0 {
+                if ii == step_store_ii {
+                    past_step = true
+                }
+                ins := &f.instrs[ii]
+                if ins.kind == MI_BIN && ins.b == BIN_MUL && ins.a >= 0 && ins.a < nt &&
+                   ins.c >= 0 && ins.d >= 0 && sr_muls.len < 2 {
+                    if b == step_blk && past_step {
+                        <-
+                    }
+                    $inv := -1
+                    $c_ok := ins.c < w.def_cnt.len && w.def_cnt[ins.c] == 1
+                    $d_ok := ins.d < w.def_cnt.len && w.def_cnt[ins.d] == 1
+                    if c_ok {
+                        cii := w.def_ii[ins.c]
+                        if cii >= 0 && f.instrs[cii].kind == MI_LOAD_LOCAL && f.instrs[cii].b == iv && f.instrs[cii].c == 0 {
+                            cblk := w.def_blk[ins.c]
+                            if cblk != step_blk || licm_dom(f, b, step_blk, w) {
+                                if d_ok && (w.def_blk[ins.d] >= lp.body.len || !lp.body[w.def_blk[ins.d]]) && licm_dom(f, w.def_blk[ins.d], h, w) {
+                                    inv = ins.d
+                                }
+                            }
+                        }
+                    }
+                    if inv < 0 && d_ok {
+                        dii := w.def_ii[ins.d]
+                        if dii >= 0 && f.instrs[dii].kind == MI_LOAD_LOCAL && f.instrs[dii].b == iv && f.instrs[dii].c == 0 {
+                            dblk := w.def_blk[ins.d]
+                            if dblk != step_blk || licm_dom(f, b, step_blk, w) {
+                                if c_ok && (w.def_blk[ins.c] >= lp.body.len || !lp.body[w.def_blk[ins.c]]) && licm_dom(f, w.def_blk[ins.c], h, w) {
+                                    inv = ins.c
+                                }
+                            }
+                        }
+                    }
+                    if inv >= 0 {
+                        sr_muls.push(ii)
+                        sr_invs.push(inv)
+                    }
+                }
+                ii = ins.next
+            }
+        }
+        if sr_muls.len == 0 { -> }
+        // Reuse or create preheader ph jumping unconditionally to h.
+        $ph := -1
+        if ext_preds.len == 1 {
+            ep := ext_preds[0]
+            if f.blocks[ep].tkind == TKIND_JUMP && f.blocks[ep].ta == h {
+                ph = ep
+            }
+        }
+        if ph < 0 {
+            ph = f.blocks.len
+            $nb := mblock_new()
+            nb.tkind = TKIND_JUMP
+            nb.ta = h
+            nb.line = f.blocks[h].line
+            f.blocks.push(nb)
+            w.reach.push(true)
+            w.blk_unk.push(false)
+            for ei in 0:ext_preds.len {
+                p := ext_preds[ei]
+                if f.blocks[p].tkind == TKIND_JUMP && f.blocks[p].ta == h {
+                    f.blocks[p].ta = ph
+                } else if f.blocks[p].tkind == TKIND_BRANCH {
+                    if f.blocks[p].tb == h { f.blocks[p].tb = ph }
+                    if f.blocks[p].tc == h { f.blocks[p].tc = ph }
+                }
+            }
+            for mi in li + 1:loops.len {
+                olp := $&loops[mi]
+                if olp.header != h && h < olp.body.len && olp.body[h] {
+                    $all_in := true
+                    for ei in 0:ext_preds.len {
+                        ep := ext_preds[ei]
+                        if ep >= olp.body.len || !olp.body[ep] {
+                            all_in = false
+                            <-
+                        }
+                    }
+                    olp.body.push(all_in)
+                    if all_in { olp.blocks.push(ph) }
+                } else {
+                    olp.body.push(false)
+                }
+            }
+        }
+        hline := f.blocks[h].line
+        t_iv0 := alloc_temp(f)
+        $ldi0 := minstr_new(MI_LOAD_LOCAL)
+        ldi0.a = t_iv0
+        ldi0.b = iv
+        ldi0.c = 0
+        ldi0.line = hline
+        f.instrs.push(ldi0)
+        mir_append_instr(f, ph, f.instrs.len - 1)
+        for si in 0:sr_muls.len {
+            mii := sr_muls[si]
+            inv := sr_invs[si]
+            l_sr := lc_new_local(f, 1, ".ivsr")
+            t_sr0 := alloc_temp(f)
+            $mi0 := minstr_new(MI_BIN)
+            mi0.a = t_sr0
+            mi0.b = BIN_MUL
+            mi0.c = t_iv0
+            mi0.d = inv
+            mi0.line = hline
+            f.instrs.push(mi0)
+            mir_append_instr(f, ph, f.instrs.len - 1)
+            $si0 := minstr_new(MI_STORE_LOCAL)
+            si0.a = l_sr
+            si0.b = t_sr0
+            si0.c = 0
+            si0.line = hline
+            f.instrs.push(si0)
+            mir_append_instr(f, ph, f.instrs.len - 1)
+            $delta_v := inv
+            if !(step_val <= -2 && f.consts[0 - step_val - 2] == 1) {
+                delta_v = alloc_temp(f)
+                $di := minstr_new(MI_BIN)
+                di.a = delta_v
+                di.b = BIN_MUL
+                di.c = inv
+                di.d = step_val
+                di.line = hline
+                f.instrs.push(di)
+                mir_append_instr(f, ph, f.instrs.len - 1)
+            }
+            f.instrs[mii].kind = MI_LOAD_LOCAL
+            f.instrs[mii].b = l_sr
+            f.instrs[mii].c = 0
+            f.instrs[mii].d = 0
+            t_cur := alloc_temp(f)
+            t_nxt := alloc_temp(f)
+            $ins_ld := minstr_new(MI_LOAD_LOCAL)
+            ins_ld.a = t_cur
+            ins_ld.b = l_sr
+            ins_ld.c = 0
+            ins_ld.line = f.instrs[step_store_ii].line
+            i1 := iv_insert_after(f, step_blk, step_store_ii, ins_ld)
+            $ins_add := minstr_new(MI_BIN)
+            ins_add.a = t_nxt
+            ins_add.b = BIN_ADD
+            ins_add.c = t_cur
+            ins_add.d = delta_v
+            ins_add.line = f.instrs[step_store_ii].line
+            i2 := iv_insert_after(f, step_blk, i1, ins_add)
+            $ins_st := minstr_new(MI_STORE_LOCAL)
+            ins_st.a = l_sr
+            ins_st.b = t_nxt
+            ins_st.c = 0
+            ins_st.line = f.instrs[step_store_ii].line
+            iv_insert_after(f, step_blk, i2, ins_st)
+            changed = true
+        }
+    }
+    << changed
 }
 
 fn lc_temp_used_in_instr(f &MFn, ins &MInstr, t1 int, t2 int) bool {
@@ -1312,6 +2316,34 @@ fn lc_match_addr8(f &MFn, w $&LicmWork, lp &LoopInfo, ptr int, byte_off int, iv_
         if base < 0 || base >= f.temps.len || !licm_is_inv(f, w, lp, base) {
             ->
         }
+        $extra_byte := 0
+        if w.def_cnt[base] == 1 {
+            bii := w.def_ii[base]
+            bins := &f.instrs[bii]
+            if bins.kind == MI_BIN && (bins.b == BIN_ADD || bins.b == BIN_SUB) {
+                if bins.b == BIN_ADD {
+                    if bins.c >= 0 && bins.d <= -2 && (0 - bins.d - 2) < f.consts.len && licm_is_inv(f, w, lp, bins.c) {
+                        cv := f.consts[0 - bins.d - 2]
+                        if (cv & 7) == 0 && cv >= -512 && cv <= 512 {
+                            base = bins.c
+                            extra_byte = cv
+                        }
+                    } else if bins.d >= 0 && bins.c <= -2 && (0 - bins.c - 2) < f.consts.len && licm_is_inv(f, w, lp, bins.d) {
+                        cv := f.consts[0 - bins.c - 2]
+                        if (cv & 7) == 0 && cv >= -512 && cv <= 512 {
+                            base = bins.d
+                            extra_byte = cv
+                        }
+                    }
+                } else if bins.c >= 0 && bins.d <= -2 && (0 - bins.d - 2) < f.consts.len && licm_is_inv(f, w, lp, bins.c) {
+                    cv := f.consts[0 - bins.d - 2]
+                    if (cv & 7) == 0 && cv >= -512 && cv <= 512 {
+                        base = bins.c
+                        extra_byte = 0 - cv
+                    }
+                }
+            }
+        }
         if scaled < 0 || scaled >= f.temps.len || w.def_cnt[scaled] != 1 || w.def_blk[scaled] != body_bi {
             ->
         }
@@ -1357,7 +2389,7 @@ fn lc_match_addr8(f &MFn, w $&LicmWork, lp &LoopInfo, ptr int, byte_off int, iv_
         }
         if ok_idx {
             *out_base = base
-            *out_eoff = eoff + byte_off / 8
+            *out_eoff = eoff + (byte_off + extra_byte) / 8
             << true
         }
     }
@@ -1868,6 +2900,361 @@ pub fn opt_loop_carry_with(f $&MFn, w $&LicmWork) bool {
     for _ in 0:8 {
         if !lc_try_once(f, w) {
             <-
+        }
+        changed = true
+    }
+    << changed
+}
+
+fn hc_is_panic_call(ins &MInstr) bool {
+    << ins.kind == MI_CALL && (ins.sval == "_xu_runtime_core_rt_panic" ||
+       ins.sval == "_xu_runtime_core_iface_tag_panic" ||
+       ins.sval == "panic" || ins.sval == "rt_panic")
+}
+
+fn hc_imm_cost(cv int) int {
+    if cv >= -65536 && cv <= 65535 { << 1 }
+    if cv >= -4294967296 && cv <= 4294967295 { << 2 }
+    << 4
+}
+
+fn hc_u64_shr(x int, k int) int {
+    if k <= 0 { << x }
+    if k >= 64 { << 0 }
+    if k == 1 { << (x >> 1) & 9223372036854775807 }
+    << (x >> k) & ((1 << (64 - k)) - 1)
+}
+
+fn hc_is_bitmask_imm(v int) bool {
+    if v == 0 || v == -1 { << false }
+    $sz := 64
+    $p := v
+    hi32 := hc_u64_shr(p, 32)
+    lo32 := p & 4294967295
+    if hi32 == lo32 {
+        sz = 32
+        p = lo32
+        while sz > 2 {
+            half := sz / 2
+            mask := (1 << half) - 1
+            if (p & mask) == ((p >> half) & mask) {
+                sz = half
+                p = p & mask
+            } else {
+                <-
+            }
+        }
+    }
+    $ones := 0
+    if (p & 1) == 0 {
+        $tz := 1
+        while tz < sz && ((p >> tz) & 1) == 0 { tz += 1 }
+        if tz >= sz { << false }
+        q := hc_u64_shr(p, tz)
+        if (q & (q + 1)) != 0 { << false }
+        while (q >> ones) != 0 { ones += 1 }
+    } else {
+        $emask := -1
+        if sz < 64 { emask = (1 << sz) - 1 }
+        np := p ^ emask
+        if np == 0 { << false }
+        $tz := 1
+        while tz < sz && ((np >> tz) & 1) == 0 { tz += 1 }
+        if tz >= sz { << false }
+        q := hc_u64_shr(np, tz)
+        if (q & (q + 1)) != 0 { << false }
+        $zeros := 0
+        while (q >> zeros) != 0 { zeros += 1 }
+        ones = sz - zeros
+    }
+    << ones >= 1 && ones < sz
+}
+
+fn hc_const_cost(ins &MInstr, op_pos int, cv int, arm64_mode bool) int {
+    // Skip bounds checks and ops where small immediates already fold natively.
+    if ins.kind != MI_BIN || ins.sval == "bounds" {
+        << 0
+    }
+    op := ins.b
+    if op == BIN_SHL || op == BIN_SHR || op == BIN_ROTR32 || op == BIN_ROTR64 {
+        << 0
+    }
+    if op == BIN_AND || op == BIN_OR || op == BIN_XOR {
+        if cv == 0 || cv == -1 { << 0 }
+        if arm64_mode {
+            if hc_is_bitmask_imm(cv) { << 0 }
+        } else {
+            if cv >= -2147483648 && cv <= 2147483647 { << 0 }
+        }
+        << hc_imm_cost(cv)
+    }
+    if op >= BIN_FADD && op <= BIN_FGE {
+        << 0
+    }
+    // Skip div/mod directly in case opt_divc kept any constant divisor as immediate.
+    if (op == BIN_DIV || op == BIN_MOD) && op_pos == 1 {
+        << 0
+    }
+    if op == BIN_MUL || op == BIN_MULH || op == BIN_MULH_U {
+        if cv >= -1 && cv <= 1 {
+            << 0
+        }
+        if arm64_mode && op == BIN_MUL && cv > 2 && ((cv - 1) & (cv - 2)) == 0 {
+            << 0
+        }
+        << hc_imm_cost(cv)
+    }
+    // Add/Sub/Compare fit 12-bit (or shifted 12-bit) immediates on ARM64 and imm32 on x64.
+    if op_pos == 1 || op == BIN_ADD || op == BIN_EQ || op == BIN_NE {
+        if cv >= -4095 && cv <= 4095 {
+            << 0
+        }
+        if cv > 0 && (cv & 4095) == 0 && (cv >> 12) <= 4095 {
+            << 0
+        }
+    }
+    << hc_imm_cost(cv)
+}
+
+// Materialize expensive loop-invariant integer constants into temps in the
+// preheader of call-free loops (run after opt_fold/opt_gvn so copy-prop
+// does not fold them back inline).
+pub fn opt_hoist_loop_consts(f $&MFn, allow_cost1 bool) bool {
+    if f.blocks.len < 2 || f.consts.len == 0 || f.instrs.len == 0 {
+        << false
+    }
+    $loops := find_loops(f, false)
+    if loops.len == 0 {
+        << false
+    }
+    // Compute incoming edge sources per block to find unique external preheaders.
+    nb := f.blocks.len
+    $order := []int{}
+    for i in 0:loops.len {
+        order.push(i)
+    }
+    // Sort outermost-first (descending block count) so outer preheaders win.
+    for i in 0:order.len {
+        for j in i + 1:order.len {
+            if loops[order[j]].blocks.len > loops[order[i]].blocks.len {
+                tmp := order[i]
+                order[i] = order[j]
+                order[j] = tmp
+            }
+        }
+    }
+    $preds := [][]int{}
+    for _ in 0:nb {
+        preds.push([]int{})
+    }
+    for b in 0:nb {
+        ss := loop_succs(f, b)
+        for si in 0:ss.len {
+            s := ss[si]
+            if s >= 0 && s < nb {
+                preds[s].push(b)
+            }
+        }
+    }
+    $changed := false
+    for oi in 0:order.len {
+        lo_idx := order[oi]
+        lp := ~loops[lo_idx]
+        h := lp.header
+        $has_call := false
+        for bi in 0:lp.blocks.len {
+            $ii := f.blocks[lp.blocks[bi]].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind == MI_CALL_IND || (ins.kind == MI_CALL && !hc_is_panic_call(ins)) {
+                    has_call = true
+                    <-
+                }
+                ii = ins.next
+            }
+            if has_call { <- }
+        }
+        // Check if an inner loop sits inside lp so outer-only constants don't
+        // occupy registers across a complex inner loop.
+        $inner_only := []bool{}
+        $has_inner := false
+        for _ in 0:nb { inner_only.push(false) }
+        for li2 in 0:loops.len {
+            if loops[li2].header != h && loops[li2].header < lp.body.len && lp.body[loops[li2].header] {
+                has_inner = true
+                for b2i in 0:loops[li2].blocks.len {
+                    inner_only[loops[li2].blocks[b2i]] = true
+                }
+            }
+        }
+        // Only hoist multi-instruction constants in simple non-nested call loops.
+        if has_call && (has_inner || f.locals.len > 14 || lp.blocks.len > 10) {
+            ->
+        }
+        // Find unique external predecessor (either jump preheader or single branch arm).
+        $ph := -1
+        $ext_cnt := 0
+        for pi in 0:preds[h].len {
+            p := preds[h][pi]
+            if p >= 0 && p < lp.body.len && !lp.body[p] {
+                ph = p
+                ext_cnt += 1
+            }
+        }
+        is_jmp_ph := ph >= 0 && f.blocks[ph].tkind == TKIND_JUMP && f.blocks[ph].ta == h
+        is_br_ph := ph >= 0 && f.blocks[ph].tkind == TKIND_BRANCH && (f.blocks[ph].tb == h || f.blocks[ph].tc == h)
+        if ext_cnt != 1 || (!is_jmp_ph && !is_br_ph) {
+            ->
+        }
+        // Keep empty entry trampoline block 0 clean in parametric functions so
+        // fast-entry shrink-wrapping can still skip block 0 when beneficial.
+        if ph == 0 && f.nparams > 0 && f.blocks[0].head < 0 && is_jmp_ph {
+            ->
+        }
+        // Collect unique constant indices used in loop, scored by savings * frequency.
+        $cand_idx := []int{}
+        $cand_score := []int{}
+        $cand_cost := []int{}
+        for bi in 0:lp.blocks.len {
+            blk_id := lp.blocks[bi]
+            in_inner := inner_only[blk_id]
+            $ii := f.blocks[blk_id].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind == MI_BIN {
+                    $mul_w := 1
+                    if in_inner { mul_w = 16 }
+                    if ins.c <= -2 {
+                        cv := f.consts[0 - ins.c - 2]
+                        $cs := hc_const_cost(ins, 0, cv, allow_cost1)
+                        if has_inner && !in_inner && cs < 4 && (has_call || f.locals.len > 10 || cs < 2) { cs = 0 }
+                        if cs > 0 {
+                            $pos := -1
+                            for ki in 0:cand_idx.len {
+                                if cand_idx[ki] == ins.c {
+                                    pos = ki
+                                    <-
+                                }
+                            }
+                            if pos < 0 {
+                                cand_idx.push(ins.c)
+                                cand_score.push(cs * mul_w)
+                                cand_cost.push(cs)
+                            } else {
+                                cand_score[pos] = cand_score[pos] + cs * mul_w
+                                if cs > cand_cost[pos] { cand_cost[pos] = cs }
+                            }
+                        }
+                    }
+                    if ins.d <= -2 {
+                        cv := f.consts[0 - ins.d - 2]
+                        $cs := hc_const_cost(ins, 1, cv, allow_cost1)
+                        if has_inner && !in_inner && cs < 4 && (has_call || f.locals.len > 10 || cs < 2) { cs = 0 }
+                        if cs > 0 {
+                            $pos := -1
+                            for ki in 0:cand_idx.len {
+                                if cand_idx[ki] == ins.d {
+                                    pos = ki
+                                    <-
+                                }
+                            }
+                            if pos < 0 {
+                                cand_idx.push(ins.d)
+                                cand_score.push(cs * mul_w)
+                                cand_cost.push(cs)
+                            } else {
+                                cand_score[pos] = cand_score[pos] + cs * mul_w
+                                if cs > cand_cost[pos] { cand_cost[pos] = cs }
+                            }
+                        }
+                    }
+                }
+                ii = ins.next
+            }
+        }
+        if cand_idx.len == 0 { -> }
+        // Pick up to 3 top candidates; only hoist 1-cost immediates in tiny uncrowded ARM64 inner loops.
+        allow_c1_loop := allow_cost1 && !has_call && !has_inner && lp.blocks.len <= 4 && f.locals.len <= 6
+        $max_hoist := 3
+        $min_cost := 1
+        if has_call {
+            max_hoist = 2
+            min_cost = 2
+            if !allow_cost1 { min_cost = 4 }
+        }
+        $emit_ph := ph
+        $taken := []int{}
+        $hoist_temp := []int{}
+        for _ in 0:max_hoist {
+            $best := -1
+            for ki in 0:cand_idx.len {
+                if cand_score[ki] <= 0 || cand_cost[ki] < min_cost { -> }
+                if cand_cost[ki] < 2 && !allow_c1_loop { -> }
+                $already := false
+                for ti in 0:taken.len {
+                    if taken[ti] == cand_idx[ki] {
+                        already = true
+                        <-
+                    }
+                }
+                if !already && (best < 0 || cand_score[ki] > cand_score[best]) {
+                    best = ki
+                }
+            }
+            if best < 0 { <- }
+            if f.blocks[emit_ph].tkind == TKIND_BRANCH {
+                new_ph := f.blocks.len
+                $nblk := mblock_new()
+                nblk.tkind = TKIND_JUMP
+                nblk.ta = h
+                nblk.line = f.blocks[h].line
+                f.blocks.push(nblk)
+                if f.blocks[emit_ph].tb == h { f.blocks[emit_ph].tb = new_ph }
+                if f.blocks[emit_ph].tc == h { f.blocks[emit_ph].tc = new_ph }
+                $np := []int{}
+                np.push(emit_ph)
+                preds.push(np)
+                for pi in 0:preds[h].len {
+                    if preds[h][pi] == emit_ph { preds[h][pi] = new_ph }
+                }
+                for mi in 0:loops.len {
+                    olp := $&loops[mi]
+                    $add_in := olp.header != h && emit_ph < olp.body.len && olp.body[emit_ph] && h < olp.body.len && olp.body[h]
+                    olp.body.push(add_in)
+                    if add_in { olp.blocks.push(new_ph) }
+                }
+                emit_ph = new_ph
+            }
+            c_op := cand_idx[best]
+            t_c := alloc_temp(f)
+            $ci := minstr_new(MI_COPY)
+            ci.a = t_c
+            ci.b = c_op
+            ci.line = f.blocks[emit_ph].line
+            ni := f.instrs.len
+            f.instrs.push(ci)
+            mir_append_instr(f, emit_ph, ni)
+            taken.push(c_op)
+            hoist_temp.push(t_c)
+        }
+        if taken.len == 0 { -> }
+        for bi in 0:lp.blocks.len {
+            $ii := f.blocks[lp.blocks[bi]].head
+            while ii >= 0 {
+                ins := ~f.instrs[ii]
+                if ins.kind == MI_BIN {
+                    for ti in 0:taken.len {
+                        tc := taken[ti]
+                        if ins.c == tc && hc_const_cost(&ins, 0, f.consts[0 - tc - 2], allow_cost1) > 0 {
+                            f.instrs[ii].c = hoist_temp[ti]
+                        }
+                        if ins.d == tc && hc_const_cost(&ins, 1, f.consts[0 - tc - 2], allow_cost1) > 0 {
+                            f.instrs[ii].d = hoist_temp[ti]
+                        }
+                    }
+                }
+                ii = ins.next
+            }
         }
         changed = true
     }

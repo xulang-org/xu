@@ -169,6 +169,12 @@ def ensure_compiler_built(xu_bin: Path, target: str, cache_dir: Path) -> None:
     validate_binary(output, target)
 
 
+def macos_setup_command(xu_bin: Path, target: str, output: Path) -> list[str]:
+    return [sys.executable, str(REPO_ROOT / "scripts/pack_macos_ui_oneexe.py"),
+            "--src", str(REPO_ROOT / "src/cmd/setup/main.xu"), "--no-webview",
+            "--arch", target.removeprefix("macos-"), "--xu", str(xu_bin), "-o", str(output)]
+
+
 def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, cache_dir: Path) -> Path:
     """Ensures sibling tool is built for the given target."""
     is_windows = target.startswith("windows")
@@ -193,10 +199,7 @@ def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, c
         str(cached_tool),
     ]
     if tool_name == "xu-setup" and target.startswith("macos-") and sys.platform == "darwin":
-        cmd = [sys.executable, str(REPO_ROOT / "scripts/pack_macos_ui_oneexe.py"),
-               "--src", str(REPO_ROOT / src_dir / "main.xu"), "--no-webview",
-               "--arch", target.removeprefix("macos-"), "--xu", str(xu_bin),
-               "-o", str(cached_tool)]
+        cmd = macos_setup_command(xu_bin, target, cached_tool)
     elif tool_name == "xu-setup" and target == "windows-x64":
         cross_cxx = shutil.which("x86_64-w64-mingw32-g++") or (shutil.which("g++") if os.name == "nt" else None)
         if cross_cxx:
@@ -220,6 +223,11 @@ def ensure_tool_built(xu_bin: Path, target: str, tool_name: str, src_dir: str, c
     cached_tool.chmod(0o755)
     validate_binary(cached_tool, target)
     return cached_tool
+
+
+def sign_macos_executable(path: Path) -> None:
+    subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
+    subprocess.run(["codesign", "--verify", "--strict", str(path)], check=True)
 
 
 def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: Path, version: str):
@@ -252,6 +260,10 @@ def assemble_bundle_dir(target: str, stage_dir: Path, xu_bin: Path, cache_dir: P
         if is_windows and tool_name in ("xu-setup", "xu-update"):
             embed_invoker_manifest(bin_dir / dest_name)
         (bin_dir / dest_name).chmod(0o755)
+
+    if target.startswith("macos-") and sys.platform == "darwin":
+        for executable in sorted(bin_dir.iterdir()):
+            sign_macos_executable(executable)
 
     # Keep a root entry point while storing the macOS UI host only in bin/.
     exe_suffix = ".exe" if is_windows else ""
@@ -534,7 +546,15 @@ def main():
         stage_setup = stage_dir / "bin" / setup_bin_name
         if stage_setup.exists():
             versioned_installer = out_dir / f"xu-v{version}-{target}-setup{exe_suffix}"
-            create_offline_installer(stage_setup, archive_file, versioned_installer)
+            if target.startswith("macos-") and sys.platform == "darwin":
+                subprocess.run(
+                    [*macos_setup_command(xu_bin, target, versioned_installer.resolve()),
+                     "--offline-payload", str(archive_file.resolve())],
+                    cwd=REPO_ROOT, env=build_environment(), check=True,
+                )
+                sign_macos_executable(versioned_installer)
+            else:
+                create_offline_installer(stage_setup, archive_file, versioned_installer)
             inst_size = versioned_installer.stat().st_size / (1024 * 1024)
             inst_sha = compute_sha256(versioned_installer)
             print(f"  [installer] {versioned_installer.name} ({inst_size:.2f} MB) - SHA256: {inst_sha[:12]}...")

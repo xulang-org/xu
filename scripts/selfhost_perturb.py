@@ -89,6 +89,7 @@ def candidate_files(src_root: Path) -> list[Path]:
         "xu/borrow",
         "xu/checker",
         "xu/mir",
+        "xu/mir/ai",
         "xu/parser",
         "xu/scanner",
         "xu/ast",
