@@ -1,0 +1,208 @@
+@xu/mir
+
+#xu/ast
+#xu/parser
+#xu/types
+
+struct TensorDotPlan {
+    loop int
+    bound int
+    iv int
+    a int
+    b int
+    off_a int
+    off_b int
+    accum_slot int
+}
+
+struct TensorDotOperand {
+    ptr int
+    valid int
+}
+
+fn (w &Lw) tensor_dot_bound_ok(p &parser.Parser, tp &types.TypedProgram, expr int) bool {
+    if expr < 0 { << false }
+    if p.nodes[expr].kind == ast.NK_INT { << p.nodes[expr].ival > 0 }
+    id := w.tensor_read_local(p, tp, expr)
+    << id >= 0 && w.local_type(tp, id) == 1
+}
+
+fn (w &Lw) tensor_offset_local(p &parser.Parser, tp &types.TypedProgram, n int, allow &[]int) int {
+    id := w.tensor_read_local(p, tp, n)
+    if id >= 0 { << id }
+    if n >= 0 && p.nodes[n].kind == ast.NK_IDENT && !tp.borrows_place(n) &&
+       tp.clone_of(n) == 0 && tp.box_of(n) == 0 {
+        lid := tp.local_of(n)
+        if lid >= 0 && w.local_type(tp, lid) == 1 {
+            for i in 0:allow.len {
+                if allow[i] == lid { << lid }
+            }
+        }
+    }
+    << -1
+}
+
+fn (w &Lw) tensor_dot_offset_in(p &parser.Parser, tp &types.TypedProgram, expr int, iv int, allow &[]int) int {
+    if expr < 0 { << -2 }
+    if range_uses_iv(p, tp, expr, iv) { << -1 }
+    node := &p.nodes[expr]
+    if node.kind != ast.NK_BIN_OP || node.ival != ast.OP_ADD { << -2 }
+    $off := -1
+    if range_uses_iv(p, tp, node.b, iv) {
+        off = node.a
+    } else if range_uses_iv(p, tp, node.a, iv) {
+        off = node.b
+    } else {
+        << -2
+    }
+    if off < 0 { << -2 }
+    if p.nodes[off].kind == ast.NK_INT { << off }
+    id := w.tensor_offset_local(p, tp, off, allow)
+    if id < 0 || id == iv || w.local_type(tp, id) != 1 { << -2 }
+    << off
+}
+
+fn (w &Lw) tensor_dot_offset(p &parser.Parser, tp &types.TypedProgram, expr int, iv int) int {
+    empty := []int{}
+    << w.tensor_dot_offset_in(p, tp, expr, iv, &empty)
+}
+
+fn (w &Lw) tensor_typed_array_base(p &parser.Parser, tp &types.TypedProgram, n int, elem_ty int) bool {
+    id := w.tensor_read_local(p, tp, n)
+    if id < 0 { << false }
+    ty := tp.deref(w.local_type(tp, id))
+    << types.is_array_type(ty) && tp.elem_of(ty) == elem_ty
+}
+
+fn (w &Lw) tensor_f32_array_base(p &parser.Parser, tp &types.TypedProgram, n int) bool {
+    << w.tensor_typed_array_base(p, tp, n, TENSOR_F32)
+}
+
+fn tensor_same_offset(p &parser.Parser, tp &types.TypedProgram, off_a int, off_b int) bool {
+    if off_a < 0 && off_b < 0 { << true }
+    if off_a < 0 || off_b < 0 { << false }
+    na := &p.nodes[off_a]
+    nb := &p.nodes[off_b]
+    if na.kind == ast.NK_INT && nb.kind == ast.NK_INT {
+        << na.ival == nb.ival
+    }
+    if na.kind == ast.NK_IDENT && nb.kind == ast.NK_IDENT {
+        << tp.local_of(off_a) == tp.local_of(off_b)
+    }
+    << false
+}
+
+// Match guarded f32 dot products and row-offset GEMV inner loops:
+//   for i in 0:n { acc += a[off_a + i] * b[off_b + i] }
+// Exclude identical base+offset self-squares (x[i] * x[i]) so RMS residual
+// fallbacks keep their exact unfused structure.
+fn (w &Lw) tensor_dot_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorDotPlan {
+    no_match := TensorDotPlan{loop: -1, bound: -1, iv: -1, a: -1, b: -1,
+                              off_a: -2, off_b: -2, accum_slot: -1}
+    bound := tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 { << no_match }
+
+    stmt := tensor_assignment(p, p.nodes[loop].c, ast.AS_ADD, ast.OP_MUL)
+    if stmt < 0 { << no_match }
+    accumulator := w.tensor_read_local(p, tp, p.nodes[stmt].a)
+    if accumulator < 0 || w.local_type(tp, accumulator) != TENSOR_F32 { << no_match }
+
+    prod := p.nodes[stmt].b
+    if tp.type_of(prod) != TENSOR_F32 { << no_match }
+    left := p.nodes[prod].a
+    right := p.nodes[prod].b
+    if p.nodes[left].kind != ast.NK_INDEX || p.nodes[right].kind != ast.NK_INDEX { << no_match }
+    if tp.type_of(left) != TENSOR_F32 || tp.type_of(right) != TENSOR_F32 { << no_match }
+
+    a := p.nodes[left].a
+    b := p.nodes[right].a
+    if !w.tensor_f32_array_base(p, tp, a) || !w.tensor_f32_array_base(p, tp, b) { << no_match }
+
+    off_a := w.tensor_dot_offset(p, tp, p.nodes[left].b, iv)
+    off_b := w.tensor_dot_offset(p, tp, p.nodes[right].b, iv)
+    if off_a == -2 || off_b == -2 { << no_match }
+    if tp.local_of(a) == tp.local_of(b) && tensor_same_offset(p, tp, off_a, off_b) {
+        << no_match
+    }
+
+    << TensorDotPlan{loop: loop, bound: bound, iv: iv, a: a, b: b,
+                     off_a: off_a, off_b: off_b, accum_slot: w.lslot[accumulator]}
+}
+
+fn (w $&Lw) tensor_strided_operand(p &parser.Parser, tp &types.TypedProgram, n int, off_node int, elem_count int, elem_bytes int, limit_val int) TensorDotOperand {
+    ty := tp.deref(w.local_type(tp, tp.local_of(n)))
+    fl := fixed_len_of(tp, ty)
+    $base_ptr := -1
+    $arr_len := -1
+    if fl > 0 {
+        base_ptr = w.base_addr(p, tp, n)
+        arr_len = w.konst(fl)
+    } else {
+        desc := w.base_addr(p, tp, n)
+        base_ptr = w.load_ptr(desc, 0, 8)
+        arr_len = w.load_ptr(desc, 8, 8)
+    }
+    if off_node < 0 {
+        valid := w.bin(BIN_LE, elem_count, arr_len)
+        << TensorDotOperand{ptr: base_ptr, valid: valid}
+    }
+    off := w.lower_expr(p, tp, off_node)
+    nonneg := w.bin(BIN_GE, off, w.konst(0))
+    in_cap := w.bin(BIN_LE, off, limit_val)
+    end := w.bin(BIN_ADD, off, elem_count)
+    fits := w.bin(BIN_LE, end, arr_len)
+    valid := w.bin(BIN_AND, nonneg, w.bin(BIN_AND, in_cap, fits))
+    $byte_off := off
+    if elem_bytes != 1 {
+        byte_off = w.bin(BIN_MUL, off, w.konst(elem_bytes))
+    }
+    ptr := w.bin(BIN_ADD, base_ptr, byte_off)
+    << TensorDotOperand{ptr: ptr, valid: valid}
+}
+
+fn (w $&Lw) tensor_dot_operand(p &parser.Parser, tp &types.TypedProgram, n int, off_node int, bound_val int, limit_val int) TensorDotOperand {
+    << w.tensor_strided_operand(p, tp, n, off_node, bound_val, 4, limit_val)
+}
+
+fn (w $&Lw) lower_tensor_dot(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_dot_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    n := w.lower_expr(p, tp, plan.bound)
+    done := w.new_block()
+    check := w.new_block()
+    w.branch(w.bin(BIN_GT, n, w.konst(0)), check, done)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 54)
+    n_fits := w.bin(BIN_LE, n, limit_val)
+    op_a := w.tensor_dot_operand(p, tp, plan.a, plan.off_a, n, limit_val)
+    op_b := w.tensor_dot_operand(p, tp, plan.b, plan.off_b, n, limit_val)
+    valid := w.bin(BIN_AND, n_fits, w.bin(BIN_AND, op_a.valid, op_b.valid))
+    fast := w.new_block()
+    slow := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $stub := "__xu_tensor_dot_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_dot_fast_f32" }
+    $args := []int{}
+    args.push(op_a.ptr)
+    args.push(op_b.ptr)
+    args.push(n)
+    args.push(w.load_local(plan.accum_slot, 0))
+    sum := w.call(stub, &args)
+    w.store_local(plan.accum_slot, 0, sum)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}

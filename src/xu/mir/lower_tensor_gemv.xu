@@ -1,0 +1,534 @@
+@xu/mir
+
+#xu/ast
+#xu/parser
+#xu/types
+
+// Lower 2D register-tiled GEMV loops into ARM64 NEON / x86-64 SSE2 4-row microkernels:
+//   1. F32 GEMV:       for r in 0:rows { ... for c in 0:cols { acc += w[w_off+r*cols+c]*x[x_off+c] }; out[out_off+r] = acc }
+//   2. Q4_0xQ8_0 GEMV: for r in 0:rows { ... for b in 0:nb { ... isum ... }; out[out_off+r] = acc }
+struct TensorGemvF32Plan {
+    loop int
+    rows int
+    cols int
+    out int
+    w int
+    x int
+    off_out int
+    off_w int
+    off_x int
+}
+
+struct TensorGemvQ4Q8Plan {
+    loop int
+    rows int
+    n_blocks int
+    out int
+    qs int
+    ws int
+    xq int
+    xs int
+    off_out int
+    blk_off int
+    off_xq int
+    off_xs int
+}
+
+fn (w $&Lw) tensor_disjoint_ranges(a int, a_span int, b int, b_span int) int {
+    a_end := w.bin(BIN_ADD, a, a_span)
+    b_end := w.bin(BIN_ADD, b, b_span)
+    << w.bin(BIN_OR, w.u64_bin(BIN_LE, a_end, b), w.u64_bin(BIN_LE, b_end, a))
+}
+
+fn tensor_same_bound_atom(p &parser.Parser, tp &types.TypedProgram, a int, b int) bool {
+    if a < 0 || b < 0 { << false }
+    if p.nodes[b].kind == ast.NK_INT {
+        << tensor_int_lit(p, a, p.nodes[b].ival)
+    }
+    bid := tp.local_of(b)
+    << bid >= 0 && tensor_ident_id(p, tp, a, bid)
+}
+
+fn tensor_mul_iv_bound(p &parser.Parser, tp &types.TypedProgram, expr int, iv int, bound_node int) bool {
+    if expr < 0 || p.nodes[expr].kind != ast.NK_BIN_OP || p.nodes[expr].ival != ast.OP_MUL {
+        << false
+    }
+    a := p.nodes[expr].a
+    b := p.nodes[expr].b
+    << (range_uses_iv(p, tp, a, iv) && tensor_same_bound_atom(p, tp, b, bound_node)) ||
+       (range_uses_iv(p, tp, b, iv) && tensor_same_bound_atom(p, tp, a, bound_node))
+}
+
+fn (w &Lw) tensor_bound_offset(p &parser.Parser, tp &types.TypedProgram, expr int, iv int, bound_node int) int {
+    if expr < 0 { << -2 }
+    if tensor_mul_iv_bound(p, tp, expr, iv, bound_node) { << -1 }
+    node := &p.nodes[expr]
+    if node.kind != ast.NK_BIN_OP || node.ival != ast.OP_ADD { << -2 }
+    $off := -1
+    if tensor_mul_iv_bound(p, tp, node.b, iv, bound_node) {
+        off = node.a
+    } else if tensor_mul_iv_bound(p, tp, node.a, iv, bound_node) {
+        off = node.b
+    } else {
+        << -2
+    }
+    if off < 0 { << -2 }
+    if p.nodes[off].kind == ast.NK_INT { << off }
+    id := w.tensor_read_local(p, tp, off)
+    if id < 0 || id == iv || w.local_type(tp, id) != 1 { << -2 }
+    << off
+}
+
+fn (w &Lw) tensor_gemv_f32_plan_in(p &parser.Parser, tp &types.TypedProgram, loop int, allow &[]int) TensorGemvF32Plan {
+    no_match := TensorGemvF32Plan{loop: -1, rows: -1, cols: -1, out: -1, w: -1, x: -1,
+                                  off_out: -2, off_w: -2, off_x: -2}
+    rows := tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, rows) { << no_match }
+    r_iv := tp.local_of(loop)
+    if r_iv < 0 { << no_match }
+
+    s1 := p.nodes[loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    row_off_id := tp.local_of(s1)
+    if row_off_id < 0 || w.local_type(tp, row_off_id) != 1 { << no_match }
+
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET || !tensor_is_f32_zero(p, tp, p.nodes[s2].a) {
+        << no_match
+    }
+    acc_id := tp.local_of(s2)
+    if acc_id < 0 || w.local_type(tp, acc_id) != TENSOR_F32 { << no_match }
+
+    s3 := p.nodes[s2].next
+    cols := tensor_dynamic_bound(p, s3)
+    if !w.tensor_dot_bound_ok(p, tp, cols) { << no_match }
+    c_iv := tp.local_of(s3)
+    if c_iv < 0 || c_iv == r_iv { << no_match }
+
+    off_w := w.tensor_bound_offset(p, tp, p.nodes[s1].a, r_iv, cols)
+    if off_w == -2 { << no_match }
+
+    dot := tensor_assignment(p, p.nodes[s3].c, ast.AS_ADD, ast.OP_MUL)
+    if dot < 0 || !tensor_ident_id(p, tp, p.nodes[dot].a, acc_id) { << no_match }
+    prod := p.nodes[dot].b
+    if tp.type_of(prod) != TENSOR_F32 { << no_match }
+    pa := p.nodes[prod].a
+    pb := p.nodes[prod].b
+    if pa < 0 || p.nodes[pa].kind != ast.NK_INDEX || tp.type_of(pa) != TENSOR_F32 ||
+       pb < 0 || p.nodes[pb].kind != ast.NK_INDEX || tp.type_of(pb) != TENSOR_F32 {
+        << no_match
+    }
+
+    $w_idx := pa
+    $x_idx := pb
+    if tensor_add_local_iv(p, tp, p.nodes[pa].b, row_off_id, c_iv) {
+        w_idx = pa
+        x_idx = pb
+    } else if tensor_add_local_iv(p, tp, p.nodes[pb].b, row_off_id, c_iv) {
+        w_idx = pb
+        x_idx = pa
+    } else {
+        << no_match
+    }
+    weights := p.nodes[w_idx].a
+    x := p.nodes[x_idx].a
+    if !w.tensor_f32_array_base(p, tp, weights) || !w.tensor_f32_array_base(p, tp, x) {
+        << no_match
+    }
+    off_x := w.tensor_dot_offset_in(p, tp, p.nodes[x_idx].b, c_iv, allow)
+    if off_x == -2 { << no_match }
+
+    s4 := p.nodes[s3].next
+    if s4 < 0 || p.nodes[s4].kind != ast.NK_ASSIGN || p.nodes[s4].ival != ast.AS_ASSIGN ||
+       p.nodes[s4].next >= 0 || !tensor_ident_id(p, tp, p.nodes[s4].b, acc_id) {
+        << no_match
+    }
+    out_idx := p.nodes[s4].a
+    if out_idx < 0 || p.nodes[out_idx].kind != ast.NK_INDEX || tp.type_of(out_idx) != TENSOR_F32 {
+        << no_match
+    }
+    out := p.nodes[out_idx].a
+    if !w.tensor_f32_array_base(p, tp, out) { << no_match }
+    off_out := w.tensor_dot_offset_in(p, tp, p.nodes[out_idx].b, r_iv, allow)
+    if off_out == -2 { << no_match }
+
+    << TensorGemvF32Plan{loop: loop, rows: rows, cols: cols, out: out, w: weights, x: x,
+                         off_out: off_out, off_w: off_w, off_x: off_x}
+}
+
+fn (w &Lw) tensor_gemv_f32_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorGemvF32Plan {
+    empty := []int{}
+    << w.tensor_gemv_f32_plan_in(p, tp, loop, &empty)
+}
+
+fn (w $&Lw) lower_tensor_gemv_f32(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    plan := w.tensor_gemv_f32_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    rows := w.lower_expr(p, tp, plan.rows)
+    done := w.new_block()
+    pos_rows := w.new_block()
+    w.branch(w.bin(BIN_GT, rows, w.konst(0)), pos_rows, done)
+
+    w.f.active_bb = pos_rows
+    cols := w.lower_expr(p, tp, plan.cols)
+    check := w.new_block()
+    slow := w.new_block()
+    w.branch(w.bin(BIN_GT, cols, w.konst(0)), check, slow)
+
+    w.f.active_bb = check
+    cap_rc := w.konst(1 << 26)
+    rc_fits := w.bin(BIN_AND, w.bin(BIN_LE, rows, cap_rc), w.bin(BIN_LE, cols, cap_rc))
+    off_limit := w.konst(1 << 54)
+    w_elems := w.bin(BIN_MUL, rows, cols)
+    op_out := w.tensor_strided_operand(p, tp, plan.out, plan.off_out, rows, 4, off_limit)
+    op_w := w.tensor_strided_operand(p, tp, plan.w, plan.off_w, w_elems, 4, off_limit)
+    op_x := w.tensor_strided_operand(p, tp, plan.x, plan.off_x, cols, 4, off_limit)
+
+    out_span := w.bin(BIN_MUL, rows, w.konst(4))
+    w_span := w.bin(BIN_MUL, w_elems, w.konst(4))
+    x_span := w.bin(BIN_MUL, cols, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    out_ok := w.u64_bin(BIN_LE, op_out.ptr, w.bin(BIN_SUB, addr_lim, out_span))
+    w_ok := w.u64_bin(BIN_LE, op_w.ptr, w.bin(BIN_SUB, addr_lim, w_span))
+    x_ok := w.u64_bin(BIN_LE, op_x.ptr, w.bin(BIN_SUB, addr_lim, x_span))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_w.ptr, w_span),
+                           w.tensor_disjoint_ranges(op_out.ptr, out_span, op_x.ptr, x_span))
+
+    valid := w.bin(BIN_AND, rc_fits,
+             w.bin(BIN_AND, op_out.valid,
+             w.bin(BIN_AND, op_w.valid,
+             w.bin(BIN_AND, op_x.valid,
+             w.bin(BIN_AND, out_ok,
+             w.bin(BIN_AND, w_ok, w.bin(BIN_AND, x_ok, disj)))))))
+    fast := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $stub := "__xu_tensor_gemv4_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_gemv4_fast_f32" }
+    $args := []int{}
+    args.push(op_out.ptr)
+    args.push(op_w.ptr)
+    args.push(op_x.ptr)
+    args.push(rows)
+    args.push(cols)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+fn tensor_i8_cast_ident(p &parser.Parser, tp &types.TypedProgram, expr int, expect_base_id int, expect_iv int) int {
+    if expr < 0 || p.nodes[expr].kind != ast.NK_CAST || tp.type_of(expr) != 1 { << -1 }
+    idx := p.nodes[expr].a
+    if idx < 0 || p.nodes[idx].kind != ast.NK_INDEX || tp.type_of(idx) != TENSOR_I8 { << -1 }
+    if !tensor_add_local_iv(p, tp, p.nodes[idx].b, expect_base_id, expect_iv) { << -1 }
+    << p.nodes[idx].a
+}
+
+fn (w &Lw) tensor_q8_q8_dot_match(p &parser.Parser, tp &types.TypedProgram, b_loop int,
+                                   expect_q_off_id int, expect_ws_off_id int, expect_acc_id int) TensorQ4Q8DotPlan {
+    no_match := TensorQ4Q8DotPlan{loop: -1, bound: -1, qs: -1, ws: -1, xq: -1, xs: -1,
+                                  off_q: -2, off_ws: -2, off_xq: -2, off_xs: -2,
+                                  accum_id: -1, accum_slot: -1}
+    bound := tensor_dynamic_bound(p, b_loop)
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    b_iv := tp.local_of(b_loop)
+    if b_iv < 0 { << no_match }
+
+    s1 := p.nodes[b_loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET || !tensor_int_zero(p, p.nodes[s1].a) {
+        << no_match
+    }
+    isum_id := tp.local_of(s1)
+    if isum_id < 0 || w.local_type(tp, isum_id) != 1 { << no_match }
+
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    q_base_id := tp.local_of(s2)
+    if q_base_id < 0 || w.local_type(tp, q_base_id) != 1 { << no_match }
+    q_init := p.nodes[s2].a
+    if q_init < 0 || p.nodes[q_init].kind != ast.NK_BIN_OP || p.nodes[q_init].ival != ast.OP_ADD {
+        << no_match
+    }
+    if !((tensor_ident_id(p, tp, p.nodes[q_init].a, expect_q_off_id) &&
+          tensor_scaled_mul_iv(p, tp, p.nodes[q_init].b, b_iv, 32)) ||
+         (tensor_ident_id(p, tp, p.nodes[q_init].b, expect_q_off_id) &&
+          tensor_scaled_mul_iv(p, tp, p.nodes[q_init].a, b_iv, 32))) {
+        << no_match
+    }
+
+    s3 := p.nodes[s2].next
+    if s3 < 0 || p.nodes[s3].kind != ast.NK_LET { << no_match }
+    x_base_id := tp.local_of(s3)
+    if x_base_id < 0 || x_base_id == q_base_id || w.local_type(tp, x_base_id) != 1 { << no_match }
+    off_xq := w.tensor_scaled_offset(p, tp, p.nodes[s3].a, b_iv, 32)
+    if off_xq == -2 { << no_match }
+
+    s4 := p.nodes[s3].next
+    if static_range_extent(p, s4) != 32 { << no_match }
+    j_iv := tp.local_of(s4)
+    if j_iv < 0 || j_iv == b_iv { << no_match }
+
+    mul_stmt := tensor_assignment(p, p.nodes[s4].c, ast.AS_ADD, ast.OP_MUL)
+    if mul_stmt < 0 || !tensor_ident_id(p, tp, p.nodes[mul_stmt].a, isum_id) { << no_match }
+    prod := p.nodes[mul_stmt].b
+    if tp.type_of(prod) != 1 { << no_match }
+    pa := p.nodes[prod].a
+    pb := p.nodes[prod].b
+    $wqs := tensor_i8_cast_ident(p, tp, pa, q_base_id, j_iv)
+    $xq := tensor_i8_cast_ident(p, tp, pb, x_base_id, j_iv)
+    if wqs < 0 || xq < 0 {
+        wqs = tensor_i8_cast_ident(p, tp, pb, q_base_id, j_iv)
+        xq = tensor_i8_cast_ident(p, tp, pa, x_base_id, j_iv)
+    }
+    if wqs < 0 || xq < 0 || !w.tensor_typed_array_base(p, tp, wqs, TENSOR_I8) ||
+       !w.tensor_typed_array_base(p, tp, xq, TENSOR_I8) {
+        << no_match
+    }
+
+    s5 := p.nodes[s4].next
+    if s5 < 0 || p.nodes[s5].next >= 0 { << no_match }
+    stmt5 := tensor_assignment(p, s5, ast.AS_ADD, ast.OP_MUL)
+    if stmt5 < 0 || !tensor_ident_id(p, tp, p.nodes[stmt5].a, expect_acc_id) { << no_match }
+    mul := p.nodes[stmt5].b
+    if tp.type_of(mul) != TENSOR_F32 { << no_match }
+    ma := p.nodes[mul].a
+    mb := p.nodes[mul].b
+    $smul := -1
+    if tensor_f32_cast_ident(p, tp, ma, isum_id) {
+        smul = mb
+    } else if tensor_f32_cast_ident(p, tp, mb, isum_id) {
+        smul = ma
+    } else {
+        << no_match
+    }
+    if smul < 0 || p.nodes[smul].kind != ast.NK_BIN_OP || p.nodes[smul].ival != ast.OP_MUL ||
+       tp.type_of(smul) != TENSOR_F32 {
+        << no_match
+    }
+    si_a := p.nodes[smul].a
+    si_b := p.nodes[smul].b
+    if si_a < 0 || p.nodes[si_a].kind != ast.NK_INDEX || tp.type_of(si_a) != TENSOR_F32 ||
+       si_b < 0 || p.nodes[si_b].kind != ast.NK_INDEX || tp.type_of(si_b) != TENSOR_F32 {
+        << no_match
+    }
+    $ws_idx := si_a
+    $xs_idx := si_b
+    if tensor_add_local_iv(p, tp, p.nodes[si_a].b, expect_ws_off_id, b_iv) {
+        ws_idx = si_a
+        xs_idx = si_b
+    } else if tensor_add_local_iv(p, tp, p.nodes[si_b].b, expect_ws_off_id, b_iv) {
+        ws_idx = si_b
+        xs_idx = si_a
+    } else {
+        << no_match
+    }
+    ws := p.nodes[ws_idx].a
+    xs := p.nodes[xs_idx].a
+    if !w.tensor_f32_array_base(p, tp, ws) || !w.tensor_f32_array_base(p, tp, xs) {
+        << no_match
+    }
+    off_xs := w.tensor_dot_offset(p, tp, p.nodes[xs_idx].b, b_iv)
+    if off_xs == -2 { << no_match }
+
+    << TensorQ4Q8DotPlan{loop: b_loop, bound: bound, qs: wqs, ws: ws, xq: xq, xs: xs,
+                         off_q: -1, off_ws: -1, off_xq: off_xq, off_xs: off_xs,
+                         accum_id: expect_acc_id, accum_slot: -1}
+}
+
+fn (w &Lw) tensor_gemv_quant_plan_in(p &parser.Parser, tp &types.TypedProgram, loop int, q_stride int, allow &[]int) TensorGemvQ4Q8Plan {
+    no_match := TensorGemvQ4Q8Plan{loop: -1, rows: -1, n_blocks: -1, out: -1,
+                                    qs: -1, ws: -1, xq: -1, xs: -1,
+                                    off_out: -2, blk_off: -2, off_xq: -2, off_xs: -2}
+    rows := tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, rows) { << no_match }
+    r_iv := tp.local_of(loop)
+    if r_iv < 0 { << no_match }
+
+    s1 := p.nodes[loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    s_off_id := tp.local_of(s1)
+    if s_off_id < 0 || w.local_type(tp, s_off_id) != 1 { << no_match }
+
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    q_off_id := tp.local_of(s2)
+    if q_off_id < 0 || q_off_id == s_off_id || w.local_type(tp, q_off_id) != 1 { << no_match }
+    if !tensor_scaled_mul_iv(p, tp, p.nodes[s2].a, s_off_id, q_stride) { << no_match }
+
+    s3 := p.nodes[s2].next
+    if s3 < 0 || p.nodes[s3].kind != ast.NK_LET || !tensor_is_f32_zero(p, tp, p.nodes[s3].a) {
+        << no_match
+    }
+    acc_id := tp.local_of(s3)
+    if acc_id < 0 || w.local_type(tp, acc_id) != TENSOR_F32 { << no_match }
+
+    s4 := p.nodes[s3].next
+    if s4 < 0 || p.nodes[s4].kind != ast.NK_FOR { << no_match }
+    $inner := TensorQ4Q8DotPlan{loop: -1, bound: -1, qs: -1, ws: -1, xq: -1, xs: -1,
+                                off_q: -2, off_ws: -2, off_xq: -2, off_xs: -2,
+                                accum_id: -1, accum_slot: -1}
+    if q_stride == 16 {
+        inner = w.tensor_q4_q8_dot_match_in(p, tp, s4, q_off_id, s_off_id, acc_id, allow)
+    } else {
+        inner = w.tensor_q8_q8_dot_match(p, tp, s4, q_off_id, s_off_id, acc_id)
+    }
+    if inner.loop < 0 { << no_match }
+
+    blk_off := w.tensor_bound_offset(p, tp, p.nodes[s1].a, r_iv, inner.bound)
+    if blk_off == -2 { << no_match }
+
+    s5 := p.nodes[s4].next
+    if s5 < 0 || p.nodes[s5].kind != ast.NK_ASSIGN || p.nodes[s5].ival != ast.AS_ASSIGN ||
+       p.nodes[s5].next >= 0 || !tensor_ident_id(p, tp, p.nodes[s5].b, acc_id) {
+        << no_match
+    }
+    out_idx := p.nodes[s5].a
+    if out_idx < 0 || p.nodes[out_idx].kind != ast.NK_INDEX || tp.type_of(out_idx) != TENSOR_F32 {
+        << no_match
+    }
+    out := p.nodes[out_idx].a
+    if !w.tensor_f32_array_base(p, tp, out) { << no_match }
+    off_out := w.tensor_dot_offset_in(p, tp, p.nodes[out_idx].b, r_iv, allow)
+    if off_out == -2 { << no_match }
+
+    << TensorGemvQ4Q8Plan{loop: loop, rows: rows, n_blocks: inner.bound, out: out,
+                          qs: inner.qs, ws: inner.ws, xq: inner.xq, xs: inner.xs,
+                          off_out: off_out, blk_off: blk_off, off_xq: inner.off_xq, off_xs: inner.off_xs}
+}
+
+fn (w &Lw) tensor_gemv_quant_plan(p &parser.Parser, tp &types.TypedProgram, loop int, q_stride int) TensorGemvQ4Q8Plan {
+    empty := []int{}
+    << w.tensor_gemv_quant_plan_in(p, tp, loop, q_stride, &empty)
+}
+
+fn (w &Lw) tensor_gemv_q4_q8_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorGemvQ4Q8Plan {
+    << w.tensor_gemv_quant_plan(p, tp, loop, 16)
+}
+
+fn (w $&Lw) tensor_scaled_block_operand(p &parser.Parser, tp &types.TypedProgram, n int,
+                                       blk_off_node int, off_mul int, elem_count int, elem_bytes int, limit_val int) TensorDotOperand {
+    ty := tp.deref(w.local_type(tp, tp.local_of(n)))
+    fl := fixed_len_of(tp, ty)
+    $base_ptr := -1
+    $arr_len := -1
+    if fl > 0 {
+        base_ptr = w.base_addr(p, tp, n)
+        arr_len = w.konst(fl)
+    } else {
+        desc := w.base_addr(p, tp, n)
+        base_ptr = w.load_ptr(desc, 0, 8)
+        arr_len = w.load_ptr(desc, 8, 8)
+    }
+    if blk_off_node < 0 {
+        valid := w.bin(BIN_LE, elem_count, arr_len)
+        << TensorDotOperand{ptr: base_ptr, valid: valid}
+    }
+    boff := w.lower_expr(p, tp, blk_off_node)
+    nonneg := w.bin(BIN_GE, boff, w.konst(0))
+    in_cap := w.bin(BIN_LE, boff, limit_val)
+    $off := boff
+    if off_mul != 1 { off = w.bin(BIN_MUL, boff, w.konst(off_mul)) }
+    fits := w.bin(BIN_LE, w.bin(BIN_ADD, off, elem_count), arr_len)
+    valid := w.bin(BIN_AND, nonneg, w.bin(BIN_AND, in_cap, fits))
+    $byte_off := off
+    if elem_bytes != 1 { byte_off = w.bin(BIN_MUL, off, w.konst(elem_bytes)) }
+    ptr := w.bin(BIN_ADD, base_ptr, byte_off)
+    << TensorDotOperand{ptr: ptr, valid: valid}
+}
+
+fn (w $&Lw) lower_tensor_gemv_quant(p &parser.Parser, tp &types.TypedProgram, loop int,
+                                    q_stride int, stub_strict string, stub_fast string) int {
+    plan := w.tensor_gemv_quant_plan(p, tp, loop, q_stride)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    rows := w.lower_expr(p, tp, plan.rows)
+    done := w.new_block()
+    pos_rows := w.new_block()
+    w.branch(w.bin(BIN_GT, rows, w.konst(0)), pos_rows, done)
+
+    w.f.active_bb = pos_rows
+    nb := w.lower_expr(p, tp, plan.n_blocks)
+    check := w.new_block()
+    slow := w.new_block()
+    w.branch(w.bin(BIN_GT, nb, w.konst(0)), check, slow)
+
+    w.f.active_bb = check
+    cap_rc := w.konst(1 << 24)
+    rc_fits := w.bin(BIN_AND, w.bin(BIN_LE, rows, cap_rc), w.bin(BIN_LE, nb, cap_rc))
+    blk_limit := w.konst(1 << 48)
+    off_limit := w.konst(1 << 54)
+    rn := w.bin(BIN_MUL, rows, nb)
+    q_elems := w.bin(BIN_MUL, rn, w.konst(q_stride))
+    xq_elems := w.bin(BIN_MUL, nb, w.konst(32))
+
+    op_out := w.tensor_strided_operand(p, tp, plan.out, plan.off_out, rows, 4, off_limit)
+    op_qs := w.tensor_scaled_block_operand(p, tp, plan.qs, plan.blk_off, q_stride, q_elems, 1, blk_limit)
+    op_ws := w.tensor_scaled_block_operand(p, tp, plan.ws, plan.blk_off, 1, rn, 4, blk_limit)
+    op_xq := w.tensor_strided_operand(p, tp, plan.xq, plan.off_xq, xq_elems, 1, off_limit)
+    op_xs := w.tensor_strided_operand(p, tp, plan.xs, plan.off_xs, nb, 4, off_limit)
+
+    out_span := w.bin(BIN_MUL, rows, w.konst(4))
+    ws_span := w.bin(BIN_MUL, rn, w.konst(4))
+    xs_span := w.bin(BIN_MUL, nb, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_out.ptr, w.bin(BIN_SUB, addr_lim, out_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_qs.ptr, w.bin(BIN_SUB, addr_lim, q_elems)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_ws.ptr, w.bin(BIN_SUB, addr_lim, ws_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_xq.ptr, w.bin(BIN_SUB, addr_lim, xq_elems)),
+                              w.u64_bin(BIN_LE, op_xs.ptr, w.bin(BIN_SUB, addr_lim, xs_span))))))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_qs.ptr, q_elems),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_ws.ptr, ws_span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_xq.ptr, xq_elems),
+                           w.tensor_disjoint_ranges(op_out.ptr, out_span, op_xs.ptr, xs_span))))
+
+    valid := w.bin(BIN_AND, rc_fits,
+             w.bin(BIN_AND, op_out.valid,
+             w.bin(BIN_AND, op_qs.valid,
+             w.bin(BIN_AND, op_ws.valid,
+             w.bin(BIN_AND, op_xq.valid,
+             w.bin(BIN_AND, op_xs.valid, w.bin(BIN_AND, addr_ok, disj)))))))
+    fast := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    packed := w.bin(BIN_OR, w.bin(BIN_SHL, rows, w.konst(32)), nb)
+    $stub := stub_strict
+    if w.tensor_fast_math { stub = stub_fast }
+    $args := []int{}
+    args.push(op_out.ptr)
+    args.push(op_qs.ptr)
+    args.push(op_ws.ptr)
+    args.push(op_xq.ptr)
+    args.push(op_xs.ptr)
+    args.push(packed)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+fn (w $&Lw) lower_tensor_gemv(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    f32_gemv := w.lower_tensor_gemv_f32(p, tp, loop)
+    if f32_gemv >= 0 { << f32_gemv }
+    q4_gemv := w.lower_tensor_gemv_quant(p, tp, loop, 16,
+        "__xu_tensor_gemv4_q4_0_q8_0_f32", "__xu_tensor_gemv4_q4_0_q8_0_fast_f32")
+    if q4_gemv >= 0 { << q4_gemv }
+    << w.lower_tensor_gemv_quant(p, tp, loop, 32,
+        "__xu_tensor_gemv4_q8_0_q8_0_f32", "__xu_tensor_gemv4_q8_0_q8_0_fast_f32")
+}

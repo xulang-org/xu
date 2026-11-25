@@ -1,0 +1,5081 @@
+@xu/codegen
+// Vectorized f32 tensor kernels for ARM64 (NEON) and x86-64 (SSE).
+//
+// Strict stubs preserve exact IEEE-754 single-precision rounding and serial
+// reduction order. Fast-math variants (emitted and called under
+// XU_TENSOR_FAST_MATH=1) opt into NEON FMA contraction and parallel lane
+// accumulation while still preserving incoming acc_bits when n <= 0.
+//
+// Register contracts (never touch callee-saved or reserved registers):
+//   ARM64: arguments x0..x4, result x0; uses only x0..x4, v0..v7, v16..v20.
+//          Preserves x18..x30 and v8..v15.
+//   x64:   arguments rdi, rsi, rdx, rcx, r8, result rax; uses only rax/rcx/
+//          rdx/rsi/rdi/r8 and xmm0..xmm5. Preserves rbx/rbp/r12..r15, xmm6..xmm15.
+
+#xu/mc
+
+// ===== ARM64 encoding & branch helpers =====
+
+const A64_COND_EQ = 0
+const A64_COND_NE = 1
+const A64_COND_GE = 10
+const A64_COND_LT = 11
+const A64_COND_GT = 12
+const A64_COND_LE = 13
+
+fn ts_a64_cmp_imm(cb $&mc.CodeBuffer, rn int, imm int) {
+    e32(cb, 0xF100001F | ((imm & 0xfff) << 10) | (rn << 5))
+}
+
+fn ts_a64_sub_imm(cb $&mc.CodeBuffer, rd int, rn int, imm int) {
+    e32(cb, 0xD1000000 | ((imm & 0xfff) << 10) | (rn << 5) | rd)
+}
+
+fn ts_a64_b_cond_fwd(cb $&mc.CodeBuffer) int {
+    at := cb.len()
+    e32(cb, 0)
+    << at
+}
+
+fn ts_a64_patch_cond(cb $&mc.CodeBuffer, at int, cond int) {
+    disp := (cb.len() - at) >> 2
+    cb.patch_u32_le(at, 0x54000000 | ((disp & 0x7ffff) << 5) | cond)
+}
+
+fn ts_a64_cbz_fwd(cb $&mc.CodeBuffer) int {
+    at := cb.len()
+    e32(cb, 0)
+    << at
+}
+
+fn ts_a64_patch_cbz(cb $&mc.CodeBuffer, at int, rn int, nz bool) {
+    disp := (cb.len() - at) >> 2
+    $base := 0xB4000000
+    if nz { base = 0xB5000000 }
+    cb.patch_u32_le(at, base | ((disp & 0x7ffff) << 5) | rn)
+}
+
+fn ts_a64_b_back(cb $&mc.CodeBuffer, target int) {
+    disp := (target - cb.len()) >> 2
+    e32(cb, 0x14000000 | (disp & 0x3ffffff))
+}
+
+fn ts_a64_ret(cb $&mc.CodeBuffer) {
+    e32(cb, 0xD65F03C0)
+}
+
+fn ts_a64_ldr_q_post(cb $&mc.CodeBuffer, vt int, rn int) {
+    e32(cb, 0x3CC10400 | (rn << 5) | vt)
+}
+
+fn ts_a64_str_q_post(cb $&mc.CodeBuffer, vt int, rn int) {
+    e32(cb, 0x3C810400 | (rn << 5) | vt)
+}
+
+fn ts_a64_ldr_s_post(cb $&mc.CodeBuffer, st int, rn int) {
+    e32(cb, 0xBC404400 | (rn << 5) | st)
+}
+
+fn ts_a64_str_s_post(cb $&mc.CodeBuffer, st int, rn int) {
+    e32(cb, 0xBC004400 | (rn << 5) | st)
+}
+
+fn ts_a64_ldr_s_zero(cb $&mc.CodeBuffer, st int, rn int) {
+    e32(cb, 0xBD400000 | (rn << 5) | st)
+}
+
+fn ts_a64_ldr_q_off(cb $&mc.CodeBuffer, vt int, rn int, off16 int) {
+    e32(cb, 0x3DC00000 | ((off16 & 0xfff) << 10) | (rn << 5) | vt)
+}
+
+fn ts_a64_add_imm(cb $&mc.CodeBuffer, rd int, rn int, imm int) {
+    e32(cb, 0x91000000 | ((imm & 0xfff) << 10) | (rn << 5) | rd)
+}
+
+fn ts_a64_movi_16b(cb $&mc.CodeBuffer, vd int, imm8 int) {
+    e32(cb, 0x4F00E400 | (((imm8 >> 5) & 7) << 16) | ((imm8 & 31) << 5) | vd)
+}
+
+fn ts_a64_and_16b(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4E201C00 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_ushr_16b_4(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x6F0C0400 | (vn << 5) | vd)
+}
+
+fn ts_a64_sub_16b(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x6E208400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_sxtl_8h(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x0F08A400 | (vn << 5) | vd)
+}
+
+fn ts_a64_sxtl2_8h(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4F08A400 | (vn << 5) | vd)
+}
+
+fn ts_a64_sxtl_4s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x0F10A400 | (vn << 5) | vd)
+}
+
+fn ts_a64_sxtl2_4s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4F10A400 | (vn << 5) | vd)
+}
+
+fn ts_a64_scvtf_4s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4E21D800 | (vn << 5) | vd)
+}
+
+fn ts_a64_mov_w(cb $&mc.CodeBuffer, rd int, rm int) {
+    e32(cb, 0x2A0003E0 | (rm << 16) | rd)
+}
+
+fn ts_a64_lsr_imm(cb $&mc.CodeBuffer, rd int, rn int, shift int) {
+    e32(cb, 0xD340FC00 | ((shift & 63) << 16) | (rn << 5) | rd)
+}
+
+fn ts_a64_lsl_imm(cb $&mc.CodeBuffer, rd int, rn int, shift int) {
+    e32(cb, 0xD3400000 | (((64 - shift) & 63) << 16) | (((63 - shift) & 63) << 10) | (rn << 5) | rd)
+}
+
+fn ts_a64_add_reg(cb $&mc.CodeBuffer, rd int, rn int, rm int) {
+    e32(cb, 0x8B000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+fn ts_a64_sub_reg_lsl(cb $&mc.CodeBuffer, rd int, rn int, rm int, shift int) {
+    e32(cb, 0xCB000000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd)
+}
+
+fn ts_a64_sdot_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4E809400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_addv_4s(cb $&mc.CodeBuffer, sd int, vn int) {
+    e32(cb, 0x4EB1B800 | (vn << 5) | sd)
+}
+
+fn ts_a64_scvtf_s(cb $&mc.CodeBuffer, sd int, sn int) {
+    e32(cb, 0x5E21D800 | (sn << 5) | sd)
+}
+
+fn ts_a64_fadd_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4E20D400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fmul_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x6E20DC00 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fmla_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4E20CC00 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fadd_s(cb $&mc.CodeBuffer, sd int, sn int, sm int) {
+    e32(cb, 0x1E202800 | (sm << 16) | (sn << 5) | sd)
+}
+
+fn ts_a64_fmul_s(cb $&mc.CodeBuffer, sd int, sn int, sm int) {
+    e32(cb, 0x1E200800 | (sm << 16) | (sn << 5) | sd)
+}
+
+fn ts_a64_fmadd_s(cb $&mc.CodeBuffer, sd int, sn int, sm int, sa int) {
+    e32(cb, 0x1F000000 | (sm << 16) | (sa << 10) | (sn << 5) | sd)
+}
+
+fn ts_a64_dup_4s_0(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4E040400 | (vn << 5) | vd)
+}
+
+fn ts_a64_mov_s_lane(cb $&mc.CodeBuffer, sd int, vn int, lane int) {
+    e32(cb, 0x5E040400 | (lane << 19) | (vn << 5) | sd)
+}
+
+fn ts_a64_fmov_s_w(cb $&mc.CodeBuffer, sd int, wn int) {
+    e32(cb, 0x1E270000 | (wn << 5) | sd)
+}
+
+fn ts_a64_fmov_w_s(cb $&mc.CodeBuffer, wd int, sn int) {
+    e32(cb, 0x1E260000 | (sn << 5) | wd)
+}
+
+fn ts_a64_zero_4s(cb $&mc.CodeBuffer, vd int) {
+    e32(cb, 0x4F000400 | vd)
+}
+
+fn ts_a64_faddp_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x6E20D400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_faddp_2s(cb $&mc.CodeBuffer, sd int, vn int) {
+    e32(cb, 0x7E30D800 | (vn << 5) | sd)
+}
+
+// Accumulate lanes 0..3 of v0 serially into s<acc>, using s3 as scratch.
+fn ts_a64_serial_sum_v0(cb $&mc.CodeBuffer, acc int) {
+    ts_a64_fadd_s(cb, acc, acc, 0)
+    ts_a64_mov_s_lane(cb, 3, 0, 1)
+    ts_a64_fadd_s(cb, acc, acc, 3)
+    ts_a64_mov_s_lane(cb, 3, 0, 2)
+    ts_a64_fadd_s(cb, acc, acc, 3)
+    ts_a64_mov_s_lane(cb, 3, 0, 3)
+    ts_a64_fadd_s(cb, acc, acc, 3)
+}
+
+fn ts_a64_ldp_q_post(cb $&mc.CodeBuffer, vt1 int, vt2 int, rn int) {
+    e32(cb, 0xACC10000 | (vt2 << 10) | (rn << 5) | vt1)
+}
+
+fn ts_a64_stp_q_post(cb $&mc.CodeBuffer, vt1 int, vt2 int, rn int) {
+    e32(cb, 0xAC810000 | (vt2 << 10) | (rn << 5) | vt1)
+}
+
+fn ts_a64_fcvtl_4s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x0E217800 | (vn << 5) | vd)
+}
+
+fn ts_a64_ldr_d_post(cb $&mc.CodeBuffer, dt int, rn int) {
+    e32(cb, 0xFC408400 | (rn << 5) | dt)
+}
+
+fn ts_a64_prfm_pldl1(cb $&mc.CodeBuffer, rn int, off int) {
+    e32(cb, 0xF9800000 | (((off >> 3) & 0xfff) << 10) | (rn << 5))
+}
+
+fn ts_a64_fsub_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4EA0D400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fsub_s(cb $&mc.CodeBuffer, sd int, sn int, sm int) {
+    e32(cb, 0x1E203800 | (sm << 16) | (sn << 5) | sd)
+}
+
+fn ts_a64_str_q_zero(cb $&mc.CodeBuffer, vt int, rn int) {
+    e32(cb, 0x3D800000 | (rn << 5) | vt)
+}
+
+fn ts_a64_str_s_zero(cb $&mc.CodeBuffer, st int, rn int) {
+    e32(cb, 0xBD000000 | (rn << 5) | st)
+}
+
+fn ts_a64_addp_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4EA0BC00 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_ld1_s_lane_post(cb $&mc.CodeBuffer, vt int, lane int, rn int) {
+    e32(cb, 0x0DDF8000 | (((lane >> 1) & 1) << 30) | ((lane & 1) << 12) | (rn << 5) | vt)
+}
+
+fn ts_a64_fmul_4s_elem0(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4F809000 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fabs_4s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4EA0F800 | (vn << 5) | vd)
+}
+
+fn ts_a64_fmaxnm_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4E20C400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fmaxnmv_4s(cb $&mc.CodeBuffer, sd int, vn int) {
+    e32(cb, 0x6E30C800 | (vn << 5) | sd)
+}
+
+fn ts_a64_fcvt_ds(cb $&mc.CodeBuffer, dd int, sn int) {
+    e32(cb, 0x1E22C000 | (sn << 5) | dd)
+}
+
+fn ts_a64_fcvt_sd(cb $&mc.CodeBuffer, sd int, dn int) {
+    e32(cb, 0x1E624000 | (dn << 5) | sd)
+}
+
+fn ts_a64_fdiv_d(cb $&mc.CodeBuffer, dd int, dn int, dm int) {
+    e32(cb, 0x1E601800 | (dm << 16) | (dn << 5) | dd)
+}
+
+fn ts_a64_fcmp_d0(cb $&mc.CodeBuffer, dn int) {
+    e32(cb, 0x1E602008 | (dn << 5))
+}
+
+fn ts_a64_fmov_d_x(cb $&mc.CodeBuffer, dd int, xn int) {
+    e32(cb, 0x9E670000 | (xn << 5) | dd)
+}
+
+fn ts_a64_fcvtl_2d(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x0E617800 | (vn << 5) | vd)
+}
+
+fn ts_a64_fcvtl2_2d(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4E617800 | (vn << 5) | vd)
+}
+
+fn ts_a64_fmul_2d_elem0(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4FC09000 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fcvtas_2d(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4E61C800 | (vn << 5) | vd)
+}
+
+fn ts_a64_fcvtas_4s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4E21C800 | (vn << 5) | vd)
+}
+
+fn ts_a64_sqxtn_2s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x0EA14800 | (vn << 5) | vd)
+}
+
+fn ts_a64_sqxtn2_4s(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4EA14800 | (vn << 5) | vd)
+}
+
+fn ts_a64_sqxtn_4h(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x0E614800 | (vn << 5) | vd)
+}
+
+fn ts_a64_sqxtn2_8h(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4E614800 | (vn << 5) | vd)
+}
+
+fn ts_a64_sqxtn_8b(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x0E214800 | (vn << 5) | vd)
+}
+
+fn ts_a64_sqxtn2_16b(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4E214800 | (vn << 5) | vd)
+}
+
+fn ts_a64_smax_16b(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4E206400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_add_reg_lsl(cb $&mc.CodeBuffer, rd int, rn int, rm int, shift int) {
+    e32(cb, 0x8B000000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd)
+}
+
+fn ts_a64_mul_reg(cb $&mc.CodeBuffer, rd int, rn int, rm int) {
+    e32(cb, 0x9B007C00 | (rm << 16) | (rn << 5) | rd)
+}
+
+fn ts_a64_ubfx_21(cb $&mc.CodeBuffer, rd int, rn int, lsb int) {
+    e32(cb, 0xD3400000 | ((lsb & 63) << 16) | (((lsb + 20) & 63) << 10) | (rn << 5) | rd)
+}
+
+fn ts_a64_and_21(cb $&mc.CodeBuffer, rd int, rn int) {
+    e32(cb, 0x92405000 | (rn << 5) | rd)
+}
+
+fn ts_a64_save_x19_x26_frame128(cb $&mc.CodeBuffer) {
+    e32(cb, 0xA9B853F3)
+    e32(cb, 0xA9015BF5)
+    e32(cb, 0xA90263F7)
+    e32(cb, 0xA9036BF9)
+}
+
+fn ts_a64_restore_x19_x26_frame128(cb $&mc.CodeBuffer) {
+    e32(cb, 0xA9436BF9)
+    e32(cb, 0xA94263F7)
+    e32(cb, 0xA9415BF5)
+    e32(cb, 0xA8C853F3)
+}
+
+fn ts_a64_str_sp_u64(cb $&mc.CodeBuffer, rt int, slot int) {
+    e32(cb, 0xF90003E0 | ((8 + slot) << 10) | rt)
+}
+
+fn ts_a64_ldr_sp_u64(cb $&mc.CodeBuffer, rt int, slot int) {
+    e32(cb, 0xF94003E0 | ((8 + slot) << 10) | rt)
+}
+
+fn ts_a64_fmov_d_127(cb $&mc.CodeBuffer, dd int, scratch int) {
+    e32(cb, 0xD2E80BE0 | scratch) // movz x<scratch>, #0x405f, lsl #48
+    e32(cb, 0xF2D80000 | scratch) // movk x<scratch>, #0xc000, lsl #32
+    ts_a64_fmov_d_x(cb, dd, scratch)
+}
+
+fn ts_a64_orr_16b(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4EA01C00 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fadd_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) {
+    e32(cb, 0x4E60D400 | (vm << 16) | (vn << 5) | vd)
+}
+
+fn ts_a64_fcvtzs_2d(cb $&mc.CodeBuffer, vd int, vn int) {
+    e32(cb, 0x4EE1B800 | (vn << 5) | vd)
+}
+
+fn ts_a64_dup_2d(cb $&mc.CodeBuffer, vd int, rn int) {
+    e32(cb, 0x4E080C00 | (rn << 5) | vd)
+}
+
+fn ts_a64_fmov_d_zero(cb $&mc.CodeBuffer, dd int) {
+    e32(cb, 0x9E6703E0 | dd)
+}
+
+fn ts_a64_frintn_4s(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x4E218800 | (vn << 5) | vd) }
+fn ts_a64_frintn_2d(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x4E618800 | (vn << 5) | vd) }
+fn ts_a64_fcvtzs_4s(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x4EA1B800 | (vn << 5) | vd) }
+fn ts_a64_shl_4s_23(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x4F375400 | (vn << 5) | vd) }
+fn ts_a64_shl_2d_52(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x4F745400 | (vn << 5) | vd) }
+fn ts_a64_add_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4EA08400 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_add_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4EE08400 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fdiv_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x6E20FC00 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fdiv_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x6E60FC00 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fmul_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x6E60DC00 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fmla_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4E60CC00 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fmls_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4EA0CC00 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fmls_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4EE0CC00 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fminnm_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4EA0C400 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fmaxnm_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4E60C400 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fminnm_2d(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x4EE0C400 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_fneg_4s(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x6EA0F800 | (vn << 5) | vd) }
+fn ts_a64_fneg_2d(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x6EE0F800 | (vn << 5) | vd) }
+fn ts_a64_fcvtn_2s(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x0E616800 | (vn << 5) | vd) }
+fn ts_a64_fcvtn2_4s(cb $&mc.CodeBuffer, vd int, vn int) { e32(cb, 0x4E616800 | (vn << 5) | vd) }
+fn ts_a64_fcmgt_4s(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x6EA0E400 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_bit_16b(cb $&mc.CodeBuffer, vd int, vn int, vm int) { e32(cb, 0x6EA01C00 | (vm << 16) | (vn << 5) | vd) }
+fn ts_a64_dup_4s_w(cb $&mc.CodeBuffer, vd int, rn int) { e32(cb, 0x4E040C00 | (rn << 5) | vd) }
+fn ts_a64_mov_w_lane(cb $&mc.CodeBuffer, rd int, vn int, lane int) { e32(cb, 0x0E043C00 | (lane << 19) | (vn << 5) | rd) }
+fn ts_a64_fcmp_s(cb $&mc.CodeBuffer, sn int, sm int) { e32(cb, 0x1E202000 | (sm << 16) | (sn << 5)) }
+fn ts_a64_fcsel_s_gt(cb $&mc.CodeBuffer, sd int, sn int, sm int) { e32(cb, 0x1E20CC00 | (sm << 16) | (sn << 5) | sd) }
+fn ts_a64_csel_x_gt(cb $&mc.CodeBuffer, rd int, rn int, rm int) { e32(cb, 0x9A80C000 | (rm << 16) | (rn << 5) | rd) }
+fn ts_a64_ldr_q_zero(cb $&mc.CodeBuffer, vt int, rn int) { e32(cb, 0x3DC00000 | (rn << 5) | vt) }
+fn ts_a64_save_q8_q15(cb $&mc.CodeBuffer) {
+    e32(cb, 0xADBC27E8)
+    e32(cb, 0xAD012FEA)
+    e32(cb, 0xAD0237EC)
+    e32(cb, 0xAD033FEE)
+}
+fn ts_a64_restore_q8_q15(cb $&mc.CodeBuffer) {
+    e32(cb, 0xAD433FEE)
+    e32(cb, 0xAD4237EC)
+    e32(cb, 0xAD412FEA)
+    e32(cb, 0xACC427E8)
+}
+fn ts_a64_dup_4s_u32(cb $&mc.CodeBuffer, vd int, scratch int, lo int, hi int) {
+    e32(cb, 0x52800000 | ((lo & 0xffff) << 5) | scratch)
+    if (hi & 0xffff) != 0 { e32(cb, 0x72A00000 | ((hi & 0xffff) << 5) | scratch) }
+    ts_a64_dup_4s_w(cb, vd, scratch)
+}
+fn ts_a64_dup_2d_u16(cb $&mc.CodeBuffer, vd int, scratch int, s3 int, s2 int, s1 int, s0 int) {
+    e32(cb, 0xD2800000 | ((s0 & 0xffff) << 5) | scratch)
+    if (s1 & 0xffff) != 0 { e32(cb, 0xF2A00000 | ((s1 & 0xffff) << 5) | scratch) }
+    if (s2 & 0xffff) != 0 { e32(cb, 0xF2C00000 | ((s2 & 0xffff) << 5) | scratch) }
+    if (s3 & 0xffff) != 0 { e32(cb, 0xF2E00000 | ((s3 & 0xffff) << 5) | scratch) }
+    ts_a64_dup_2d(cb, vd, scratch)
+}
+
+fn ts_a64_sdot_reduce4_off(cb $&mc.CodeBuffer, acc_reg int, off_reg int, s_regs &[]int, fast bool) {
+    ts_a64_addp_4s(cb, 4, 4, 5)
+    ts_a64_addp_4s(cb, 6, 6, 7)
+    ts_a64_addp_4s(cb, 4, 4, 6)
+    if off_reg >= 0 {
+        ts_a64_add_4s(cb, 4, 4, off_reg)
+    }
+    ts_a64_scvtf_4s(cb, 4, 4)
+    if s_regs.len == 4 {
+        for r in 0:4 {
+            ts_a64_ld1_s_lane_post(cb, 23, r, s_regs[r])
+        }
+    }
+    ts_a64_fmul_4s_elem0(cb, 23, 23, 22)
+    if fast {
+        ts_a64_fmla_4s(cb, acc_reg, 4, 23)
+    } else {
+        ts_a64_fmul_4s(cb, 4, 4, 23)
+        ts_a64_fadd_4s(cb, acc_reg, acc_reg, 4)
+    }
+}
+
+fn ts_a64_sdot_reduce4(cb $&mc.CodeBuffer, acc_reg int, s_regs &[]int, fast bool) {
+    ts_a64_sdot_reduce4_off(cb, acc_reg, -1, s_regs, fast)
+}
+
+fn ts_a64_emit_mul_add(cb $&mc.CodeBuffer, fma bool) {
+    // (out=x0, x=x1, scale=x2, bias=x3, n=x4)
+    ts_a64_cmp_imm(cb, 4, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+
+    loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 4, 4)
+    to_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 1)
+    ts_a64_ldr_q_post(cb, 1, 2)
+    ts_a64_ldr_q_post(cb, 2, 3)
+    if fma {
+        ts_a64_fmla_4s(cb, 2, 0, 1)
+        ts_a64_str_q_post(cb, 2, 0)
+    } else {
+        ts_a64_fmul_4s(cb, 0, 0, 1)
+        ts_a64_fadd_4s(cb, 0, 0, 2)
+        ts_a64_str_q_post(cb, 0, 0)
+    }
+    ts_a64_sub_imm(cb, 4, 4, 4)
+    ts_a64_b_back(cb, loop4)
+
+    ts_a64_patch_cond(cb, to_tail, A64_COND_LT)
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 4, 0)
+    done_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 0, 1)
+    ts_a64_ldr_s_post(cb, 1, 2)
+    ts_a64_ldr_s_post(cb, 2, 3)
+    if fma {
+        ts_a64_fmadd_s(cb, 0, 0, 1, 2)
+    } else {
+        ts_a64_fmul_s(cb, 0, 0, 1)
+        ts_a64_fadd_s(cb, 0, 0, 2)
+    }
+    ts_a64_str_s_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 4, 4, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_tail, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_add_sqsum_arm(cb $&mc.CodeBuffer, write_dst bool, fast bool) {
+    // x0=dst, x1=x, x2=skip, x3=n, acc in s4 (strict) or s5+v4 (fast)
+    if fast {
+        ts_a64_zero_4s(cb, 4)
+    }
+    loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 3, 4)
+    to_tail_or_fold := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 1)
+    ts_a64_ldr_q_post(cb, 1, 2)
+    ts_a64_fadd_4s(cb, 0, 0, 1)
+    if write_dst {
+        ts_a64_str_q_post(cb, 0, 0)
+    }
+    if fast {
+        ts_a64_fmla_4s(cb, 4, 0, 0)
+    } else {
+        ts_a64_fmul_4s(cb, 0, 0, 0)
+        ts_a64_serial_sum_v0(cb, 4)
+    }
+    ts_a64_sub_imm(cb, 3, 3, 4)
+    ts_a64_b_back(cb, loop4)
+
+    ts_a64_patch_cond(cb, to_tail_or_fold, A64_COND_LT)
+    if fast {
+        ts_a64_faddp_4s(cb, 4, 4, 4)
+        ts_a64_faddp_2s(cb, 4, 4)
+        ts_a64_fadd_s(cb, 5, 5, 4)
+    }
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 3, 0)
+    done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 0, 1)
+    ts_a64_ldr_s_post(cb, 1, 2)
+    ts_a64_fadd_s(cb, 0, 0, 1)
+    if write_dst {
+        ts_a64_str_s_post(cb, 0, 0)
+    }
+    if fast {
+        ts_a64_fmadd_s(cb, 5, 0, 0, 5)
+    } else {
+        ts_a64_fmul_s(cb, 0, 0, 0)
+        ts_a64_fadd_s(cb, 4, 4, 0)
+    }
+    ts_a64_sub_imm(cb, 3, 3, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    if fast {
+        ts_a64_fmov_w_s(cb, 0, 5)
+    } else {
+        ts_a64_fmov_w_s(cb, 0, 4)
+    }
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_add_sqsum(cb $&mc.CodeBuffer, fast bool) {
+    // (dst=x0, x=x1, skip=x2, n=x3, acc_bits=x4) -> x0
+    ts_a64_cmp_imm(cb, 3, 0)
+    positive := ts_a64_b_cond_fwd(cb)
+    a64_mov(cb, 0, 4)
+    ts_a64_ret(cb)
+
+    ts_a64_patch_cond(cb, positive, A64_COND_GT)
+    if fast {
+        ts_a64_fmov_s_w(cb, 5, 4)
+    } else {
+        ts_a64_fmov_s_w(cb, 4, 4)
+    }
+    no_dst := ts_a64_cbz_fwd(cb)
+    ts_a64_emit_add_sqsum_arm(cb, true, fast)
+    ts_a64_patch_cbz(cb, no_dst, 0, false)
+    ts_a64_emit_add_sqsum_arm(cb, false, fast)
+}
+
+fn ts_a64_emit_norm_arm(cb $&mc.CodeBuffer, weighted bool) {
+    // x0=dst, x1=src, x2=weight, v3=broadcast(scale), x4=n
+    loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 4, 4)
+    to_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 1)
+    ts_a64_fmul_4s(cb, 0, 0, 3)
+    if weighted {
+        ts_a64_ldr_q_post(cb, 1, 2)
+        ts_a64_fmul_4s(cb, 0, 0, 1)
+    }
+    ts_a64_str_q_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 4, 4, 4)
+    ts_a64_b_back(cb, loop4)
+
+    ts_a64_patch_cond(cb, to_tail, A64_COND_LT)
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 4, 0)
+    done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 0, 1)
+    ts_a64_fmul_s(cb, 0, 0, 3)
+    if weighted {
+        ts_a64_ldr_s_post(cb, 1, 2)
+        ts_a64_fmul_s(cb, 0, 0, 1)
+    }
+    ts_a64_str_s_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 4, 4, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_norm(cb $&mc.CodeBuffer) {
+    // (dst=x0, src=x1, weight=x2, scale_bits=x3, n=x4)
+    ts_a64_cmp_imm(cb, 4, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_fmov_s_w(cb, 3, 3)
+    ts_a64_dup_4s_0(cb, 3, 3)
+    weighted := ts_a64_cbz_fwd(cb)
+    ts_a64_emit_norm_arm(cb, false)
+    ts_a64_patch_cbz(cb, weighted, 2, true)
+    ts_a64_emit_norm_arm(cb, true)
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_dot(cb $&mc.CodeBuffer, fast bool) {
+    // (a=x0, b=x1, n=x2, acc_bits=x3) -> x0
+    ts_a64_cmp_imm(cb, 2, 0)
+    positive := ts_a64_b_cond_fwd(cb)
+    a64_mov(cb, 0, 3)
+    ts_a64_ret(cb)
+
+    ts_a64_patch_cond(cb, positive, A64_COND_GT)
+    if !fast {
+        ts_a64_fmov_s_w(cb, 4, 3)
+        loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 2, 4)
+        to_tail := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 0, 0)
+        ts_a64_ldr_q_post(cb, 1, 1)
+        ts_a64_fmul_4s(cb, 0, 0, 1)
+        ts_a64_serial_sum_v0(cb, 4)
+        ts_a64_sub_imm(cb, 2, 2, 4)
+        ts_a64_b_back(cb, loop4)
+
+        ts_a64_patch_cond(cb, to_tail, A64_COND_LT)
+        tail := cb.len()
+        ts_a64_cmp_imm(cb, 2, 0)
+        done := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_s_post(cb, 0, 0)
+        ts_a64_ldr_s_post(cb, 1, 1)
+        ts_a64_fmul_s(cb, 0, 0, 1)
+        ts_a64_fadd_s(cb, 4, 4, 0)
+        ts_a64_sub_imm(cb, 2, 2, 1)
+        ts_a64_b_back(cb, tail)
+
+        ts_a64_patch_cond(cb, done, A64_COND_LE)
+        ts_a64_fmov_w_s(cb, 0, 4)
+        ts_a64_ret(cb)
+        <<
+    }
+
+    // Fast 16-wide (4 independent 4-lane NEON FMA accumulators v4..v7).
+    ts_a64_fmov_s_w(cb, 16, 3)
+    ts_a64_zero_4s(cb, 4)
+    ts_a64_zero_4s(cb, 5)
+    ts_a64_zero_4s(cb, 6)
+    ts_a64_zero_4s(cb, 7)
+
+    loop16 := cb.len()
+    ts_a64_cmp_imm(cb, 2, 16)
+    to_loop4 := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 0)
+    ts_a64_ldr_q_post(cb, 1, 0)
+    ts_a64_ldr_q_post(cb, 2, 0)
+    ts_a64_ldr_q_post(cb, 3, 0)
+    ts_a64_ldr_q_post(cb, 17, 1)
+    ts_a64_ldr_q_post(cb, 18, 1)
+    ts_a64_ldr_q_post(cb, 19, 1)
+    ts_a64_ldr_q_post(cb, 20, 1)
+    ts_a64_fmla_4s(cb, 4, 0, 17)
+    ts_a64_fmla_4s(cb, 5, 1, 18)
+    ts_a64_fmla_4s(cb, 6, 2, 19)
+    ts_a64_fmla_4s(cb, 7, 3, 20)
+    ts_a64_sub_imm(cb, 2, 2, 16)
+    ts_a64_b_back(cb, loop16)
+
+    ts_a64_patch_cond(cb, to_loop4, A64_COND_LT)
+    loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 2, 4)
+    fold := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 0)
+    ts_a64_ldr_q_post(cb, 1, 1)
+    ts_a64_fmla_4s(cb, 4, 0, 1)
+    ts_a64_sub_imm(cb, 2, 2, 4)
+    ts_a64_b_back(cb, loop4)
+
+    ts_a64_patch_cond(cb, fold, A64_COND_LT)
+    ts_a64_fadd_4s(cb, 4, 4, 5)
+    ts_a64_fadd_4s(cb, 6, 6, 7)
+    ts_a64_fadd_4s(cb, 4, 4, 6)
+    ts_a64_faddp_4s(cb, 4, 4, 4)
+    ts_a64_faddp_2s(cb, 4, 4)
+    ts_a64_fadd_s(cb, 16, 16, 4)
+
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 2, 0)
+    done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 0, 0)
+    ts_a64_ldr_s_post(cb, 1, 1)
+    ts_a64_fmadd_s(cb, 16, 0, 1, 16)
+    ts_a64_sub_imm(cb, 2, 2, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    ts_a64_fmov_w_s(cb, 0, 16)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_axpy(cb $&mc.CodeBuffer, fma bool) {
+    // (dst=x0, src=x1, scale_bits=x2, n=x3)
+    ts_a64_cmp_imm(cb, 3, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_fmov_s_w(cb, 2, 2)
+    ts_a64_dup_4s_0(cb, 2, 2)
+
+    loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 3, 4)
+    to_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_off(cb, 0, 0, 0)
+    ts_a64_ldr_q_post(cb, 1, 1)
+    if fma {
+        ts_a64_fmla_4s(cb, 0, 1, 2)
+    } else {
+        ts_a64_fmul_4s(cb, 1, 2, 1)
+        ts_a64_fadd_4s(cb, 0, 0, 1)
+    }
+    ts_a64_str_q_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 3, 3, 4)
+    ts_a64_b_back(cb, loop4)
+
+    ts_a64_patch_cond(cb, to_tail, A64_COND_LT)
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 3, 0)
+    done_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_zero(cb, 0, 0)
+    ts_a64_ldr_s_post(cb, 1, 1)
+    if fma {
+        ts_a64_fmadd_s(cb, 0, 2, 1, 0)
+    } else {
+        ts_a64_fmul_s(cb, 1, 2, 1)
+        ts_a64_fadd_s(cb, 0, 0, 1)
+    }
+    ts_a64_str_s_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 3, 3, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_tail, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_vadd_inplace(cb $&mc.CodeBuffer) {
+    // (dst=x0, src=x1, n=x2)
+    ts_a64_cmp_imm(cb, 2, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+
+    loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 2, 4)
+    to_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_off(cb, 0, 0, 0)
+    ts_a64_ldr_q_post(cb, 1, 1)
+    ts_a64_fadd_4s(cb, 0, 0, 1)
+    ts_a64_str_q_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 2, 2, 4)
+    ts_a64_b_back(cb, loop4)
+
+    ts_a64_patch_cond(cb, to_tail, A64_COND_LT)
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 2, 0)
+    done_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_zero(cb, 0, 0)
+    ts_a64_ldr_s_post(cb, 1, 1)
+    ts_a64_fadd_s(cb, 0, 0, 1)
+    ts_a64_str_s_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 2, 2, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_tail, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_dot_q4_0(cb $&mc.CodeBuffer, fast bool) {
+    // (qs=x0, scales=x1, x=x2, n_blocks=x3, acc_bits=x4) -> x0
+    ts_a64_cmp_imm(cb, 3, 0)
+    positive := ts_a64_b_cond_fwd(cb)
+    a64_mov(cb, 0, 4)
+    ts_a64_ret(cb)
+
+    ts_a64_patch_cond(cb, positive, A64_COND_GT)
+    ts_a64_fmov_s_w(cb, 16, 4)
+    ts_a64_movi_16b(cb, 20, 15)
+    ts_a64_movi_16b(cb, 21, 8)
+
+    loop_blk := cb.len()
+    ts_a64_cmp_imm(cb, 3, 0)
+    done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 0)
+    ts_a64_and_16b(cb, 1, 0, 20)
+    ts_a64_ushr_16b_4(cb, 2, 0)
+    ts_a64_sub_16b(cb, 1, 1, 21)
+    ts_a64_sub_16b(cb, 2, 2, 21)
+
+    if !fast {
+        ts_a64_zero_4s(cb, 4)
+        for half in 0:2 {
+            if half == 0 {
+                ts_a64_sxtl_8h(cb, 17, 1)
+                ts_a64_sxtl_8h(cb, 18, 2)
+            } else {
+                ts_a64_sxtl2_8h(cb, 17, 1)
+                ts_a64_sxtl2_8h(cb, 18, 2)
+            }
+            off_lo_a := half * 2
+            off_hi_a := 4 + half * 2
+            ts_a64_sxtl_4s(cb, 19, 17)
+            ts_a64_scvtf_4s(cb, 19, 19)
+            ts_a64_sxtl_4s(cb, 22, 18)
+            ts_a64_scvtf_4s(cb, 22, 22)
+            ts_a64_ldr_q_off(cb, 0, 2, off_lo_a)
+            ts_a64_ldr_q_off(cb, 5, 2, off_hi_a)
+            ts_a64_fmul_4s(cb, 0, 19, 0)
+            ts_a64_fmul_4s(cb, 5, 22, 5)
+            ts_a64_fadd_4s(cb, 0, 0, 5)
+            ts_a64_serial_sum_v0(cb, 4)
+
+            off_lo_b := half * 2 + 1
+            off_hi_b := 5 + half * 2
+            ts_a64_sxtl2_4s(cb, 19, 17)
+            ts_a64_scvtf_4s(cb, 19, 19)
+            ts_a64_sxtl2_4s(cb, 22, 18)
+            ts_a64_scvtf_4s(cb, 22, 22)
+            ts_a64_ldr_q_off(cb, 0, 2, off_lo_b)
+            ts_a64_ldr_q_off(cb, 5, 2, off_hi_b)
+            ts_a64_fmul_4s(cb, 0, 19, 0)
+            ts_a64_fmul_4s(cb, 5, 22, 5)
+            ts_a64_fadd_4s(cb, 0, 0, 5)
+            ts_a64_serial_sum_v0(cb, 4)
+        }
+        ts_a64_ldr_s_post(cb, 3, 1)
+        ts_a64_fmul_s(cb, 4, 4, 3)
+        ts_a64_fadd_s(cb, 16, 16, 4)
+    } else {
+        ts_a64_sxtl_8h(cb, 17, 1)
+        ts_a64_sxtl2_8h(cb, 18, 1)
+        ts_a64_sxtl_4s(cb, 19, 17)
+        ts_a64_scvtf_4s(cb, 19, 19)
+        ts_a64_ldr_q_off(cb, 0, 2, 0)
+        ts_a64_fmul_4s(cb, 4, 19, 0)
+        ts_a64_sxtl2_4s(cb, 22, 17)
+        ts_a64_scvtf_4s(cb, 22, 22)
+        ts_a64_ldr_q_off(cb, 3, 2, 1)
+        ts_a64_fmul_4s(cb, 5, 22, 3)
+        ts_a64_sxtl_4s(cb, 19, 18)
+        ts_a64_scvtf_4s(cb, 19, 19)
+        ts_a64_ldr_q_off(cb, 0, 2, 2)
+        ts_a64_fmul_4s(cb, 6, 19, 0)
+        ts_a64_sxtl2_4s(cb, 22, 18)
+        ts_a64_scvtf_4s(cb, 22, 22)
+        ts_a64_ldr_q_off(cb, 3, 2, 3)
+        ts_a64_fmul_4s(cb, 7, 22, 3)
+
+        ts_a64_sxtl_8h(cb, 17, 2)
+        ts_a64_sxtl2_8h(cb, 18, 2)
+        ts_a64_sxtl_4s(cb, 19, 17)
+        ts_a64_scvtf_4s(cb, 19, 19)
+        ts_a64_ldr_q_off(cb, 0, 2, 4)
+        ts_a64_fmla_4s(cb, 4, 19, 0)
+        ts_a64_sxtl2_4s(cb, 22, 17)
+        ts_a64_scvtf_4s(cb, 22, 22)
+        ts_a64_ldr_q_off(cb, 3, 2, 5)
+        ts_a64_fmla_4s(cb, 5, 22, 3)
+        ts_a64_sxtl_4s(cb, 19, 18)
+        ts_a64_scvtf_4s(cb, 19, 19)
+        ts_a64_ldr_q_off(cb, 0, 2, 6)
+        ts_a64_fmla_4s(cb, 6, 19, 0)
+        ts_a64_sxtl2_4s(cb, 22, 18)
+        ts_a64_scvtf_4s(cb, 22, 22)
+        ts_a64_ldr_q_off(cb, 3, 2, 7)
+        ts_a64_fmla_4s(cb, 7, 22, 3)
+
+        ts_a64_fadd_4s(cb, 4, 4, 5)
+        ts_a64_fadd_4s(cb, 6, 6, 7)
+        ts_a64_fadd_4s(cb, 4, 4, 6)
+        ts_a64_faddp_4s(cb, 4, 4, 4)
+        ts_a64_faddp_2s(cb, 4, 4)
+        ts_a64_ldr_s_post(cb, 3, 1)
+        ts_a64_fmadd_s(cb, 16, 4, 3, 16)
+    }
+
+    ts_a64_add_imm(cb, 2, 2, 128)
+    ts_a64_sub_imm(cb, 3, 3, 1)
+    ts_a64_b_back(cb, loop_blk)
+
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    ts_a64_fmov_w_s(cb, 0, 16)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_gemv4_f32(cb $&mc.CodeBuffer, fast bool) {
+    // (out=x0, w=x1, x=x2, rows=x3, cols=x4)
+    ts_a64_cmp_imm(cb, 3, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_lsl_imm(cb, 5, 4, 2) // x5 = cols * 4
+
+    w_regs := [1, 6, 7, 9]
+    loop4_rows := cb.len()
+    ts_a64_cmp_imm(cb, 3, 4)
+    to_tail_rows := ts_a64_b_cond_fwd(cb)
+
+    ts_a64_add_reg(cb, 6, 1, 5)
+    ts_a64_add_reg(cb, 7, 6, 5)
+    ts_a64_add_reg(cb, 9, 7, 5)
+    a64_mov(cb, 10, 2)
+    a64_mov(cb, 11, 4)
+
+    if !fast {
+        for r in 0:4 { ts_a64_zero_4s(cb, 4 + r) }
+        c_loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 11, 4)
+        to_c_tail := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 1, 10)
+        for r in 0:4 {
+            ts_a64_ldr_q_post(cb, 0, w_regs[r])
+            ts_a64_fmul_4s(cb, 0, 0, 1)
+            ts_a64_serial_sum_v0(cb, 4 + r)
+        }
+        ts_a64_sub_imm(cb, 11, 11, 4)
+        ts_a64_b_back(cb, c_loop4)
+
+        ts_a64_patch_cond(cb, to_c_tail, A64_COND_LT)
+        c_tail := cb.len()
+        ts_a64_cmp_imm(cb, 11, 0)
+        to_store4 := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_s_post(cb, 1, 10)
+        for r in 0:4 {
+            ts_a64_ldr_s_post(cb, 0, w_regs[r])
+            ts_a64_fmul_s(cb, 0, 0, 1)
+            ts_a64_fadd_s(cb, 4 + r, 4 + r, 0)
+        }
+        ts_a64_sub_imm(cb, 11, 11, 1)
+        ts_a64_b_back(cb, c_tail)
+
+        ts_a64_patch_cond(cb, to_store4, A64_COND_LE)
+        for r in 0:4 { ts_a64_str_s_post(cb, 4 + r, 0) }
+    } else {
+        for r in 0:4 {
+            ts_a64_zero_4s(cb, 4 + r)
+            ts_a64_zero_4s(cb, 16 + r)
+        }
+        c_loop16 := cb.len()
+        ts_a64_cmp_imm(cb, 11, 16)
+        to_c8 := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldp_q_post(cb, 0, 1, 10)
+        ts_a64_ldp_q_post(cb, 2, 3, 10)
+        for r in 0:4 {
+            wr := w_regs[r]
+            ts_a64_ldp_q_post(cb, 20, 21, wr)
+            ts_a64_ldp_q_post(cb, 22, 23, wr)
+            ts_a64_fmla_4s(cb, 4 + r, 20, 0)
+            ts_a64_fmla_4s(cb, 16 + r, 21, 1)
+            ts_a64_fmla_4s(cb, 4 + r, 22, 2)
+            ts_a64_fmla_4s(cb, 16 + r, 23, 3)
+        }
+        ts_a64_sub_imm(cb, 11, 11, 16)
+        ts_a64_b_back(cb, c_loop16)
+
+        ts_a64_patch_cond(cb, to_c8, A64_COND_LT)
+        c_loop8 := cb.len()
+        ts_a64_cmp_imm(cb, 11, 8)
+        to_c4 := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldp_q_post(cb, 0, 1, 10)
+        for r in 0:4 {
+            wr := w_regs[r]
+            ts_a64_ldp_q_post(cb, 20, 21, wr)
+            ts_a64_fmla_4s(cb, 4 + r, 20, 0)
+            ts_a64_fmla_4s(cb, 16 + r, 21, 1)
+        }
+        ts_a64_sub_imm(cb, 11, 11, 8)
+        ts_a64_b_back(cb, c_loop8)
+
+        ts_a64_patch_cond(cb, to_c4, A64_COND_LT)
+        c_loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 11, 4)
+        to_fold := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 0, 10)
+        for r in 0:4 {
+            ts_a64_ldr_q_post(cb, 2, w_regs[r])
+            ts_a64_fmla_4s(cb, 4 + r, 2, 0)
+        }
+        ts_a64_sub_imm(cb, 11, 11, 4)
+        ts_a64_b_back(cb, c_loop4)
+
+        ts_a64_patch_cond(cb, to_fold, A64_COND_LT)
+        for r in 0:4 { ts_a64_fadd_4s(cb, 4 + r, 4 + r, 16 + r) }
+        ts_a64_faddp_4s(cb, 4, 4, 5)
+        ts_a64_faddp_4s(cb, 6, 6, 7)
+        ts_a64_faddp_4s(cb, 4, 4, 6)
+
+        ts_a64_cmp_imm(cb, 11, 0)
+        has_tail := ts_a64_b_cond_fwd(cb)
+        ts_a64_str_q_post(cb, 4, 0)
+        skip_tail := ts_a64_b_cond_fwd(cb)
+
+        ts_a64_patch_cond(cb, has_tail, A64_COND_GT)
+        ts_a64_mov_s_lane(cb, 5, 4, 1)
+        ts_a64_mov_s_lane(cb, 6, 4, 2)
+        ts_a64_mov_s_lane(cb, 7, 4, 3)
+        c_tail := cb.len()
+        ts_a64_cmp_imm(cb, 11, 0)
+        to_store_t := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_s_post(cb, 0, 10)
+        for r in 0:4 {
+            ts_a64_ldr_s_post(cb, 1, w_regs[r])
+            ts_a64_fmadd_s(cb, 4 + r, 1, 0, 4 + r)
+        }
+        ts_a64_sub_imm(cb, 11, 11, 1)
+        ts_a64_b_back(cb, c_tail)
+
+        ts_a64_patch_cond(cb, to_store_t, A64_COND_LE)
+        for r in 0:4 { ts_a64_str_s_post(cb, 4 + r, 0) }
+        ts_a64_patch_cond(cb, skip_tail, A64_COND_LE)
+    }
+
+    a64_mov(cb, 1, 9)
+    ts_a64_sub_imm(cb, 3, 3, 4)
+    ts_a64_b_back(cb, loop4_rows)
+
+    ts_a64_patch_cond(cb, to_tail_rows, A64_COND_LT)
+    tail_rows := cb.len()
+    ts_a64_cmp_imm(cb, 3, 0)
+    done_tail := ts_a64_b_cond_fwd(cb)
+    a64_mov(cb, 10, 2)
+    a64_mov(cb, 11, 4)
+    if !fast {
+        ts_a64_zero_4s(cb, 4)
+        rl4 := cb.len()
+        ts_a64_cmp_imm(cb, 11, 4)
+        rto_t := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 0, 1)
+        ts_a64_ldr_q_post(cb, 1, 10)
+        ts_a64_fmul_4s(cb, 0, 0, 1)
+        ts_a64_serial_sum_v0(cb, 4)
+        ts_a64_sub_imm(cb, 11, 11, 4)
+        ts_a64_b_back(cb, rl4)
+
+        ts_a64_patch_cond(cb, rto_t, A64_COND_LT)
+        rt := cb.len()
+        ts_a64_cmp_imm(cb, 11, 0)
+        rdone := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_s_post(cb, 0, 1)
+        ts_a64_ldr_s_post(cb, 1, 10)
+        ts_a64_fmul_s(cb, 0, 0, 1)
+        ts_a64_fadd_s(cb, 4, 4, 0)
+        ts_a64_sub_imm(cb, 11, 11, 1)
+        ts_a64_b_back(cb, rt)
+        ts_a64_patch_cond(cb, rdone, A64_COND_LE)
+        ts_a64_str_s_post(cb, 4, 0)
+    } else {
+        ts_a64_zero_4s(cb, 4)
+        ts_a64_zero_4s(cb, 5)
+        rl8 := cb.len()
+        ts_a64_cmp_imm(cb, 11, 8)
+        rto_4 := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldp_q_post(cb, 0, 1, 1)
+        ts_a64_ldp_q_post(cb, 2, 3, 10)
+        ts_a64_fmla_4s(cb, 4, 0, 2)
+        ts_a64_fmla_4s(cb, 5, 1, 3)
+        ts_a64_sub_imm(cb, 11, 11, 8)
+        ts_a64_b_back(cb, rl8)
+
+        ts_a64_patch_cond(cb, rto_4, A64_COND_LT)
+        rl4 := cb.len()
+        ts_a64_cmp_imm(cb, 11, 4)
+        rfold := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 0, 1)
+        ts_a64_ldr_q_post(cb, 2, 10)
+        ts_a64_fmla_4s(cb, 4, 0, 2)
+        ts_a64_sub_imm(cb, 11, 11, 4)
+        ts_a64_b_back(cb, rl4)
+
+        ts_a64_patch_cond(cb, rfold, A64_COND_LT)
+        ts_a64_fadd_4s(cb, 4, 4, 5)
+        ts_a64_faddp_4s(cb, 4, 4, 4)
+        ts_a64_faddp_2s(cb, 4, 4)
+
+        rt := cb.len()
+        ts_a64_cmp_imm(cb, 11, 0)
+        rdone := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_s_post(cb, 0, 1)
+        ts_a64_ldr_s_post(cb, 1, 10)
+        ts_a64_fmadd_s(cb, 4, 0, 1, 4)
+        ts_a64_sub_imm(cb, 11, 11, 1)
+        ts_a64_b_back(cb, rt)
+        ts_a64_patch_cond(cb, rdone, A64_COND_LE)
+        ts_a64_str_s_post(cb, 4, 0)
+    }
+    ts_a64_sub_imm(cb, 3, 3, 1)
+    ts_a64_b_back(cb, tail_rows)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_tail, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_dot_q4_0_q8_0(cb $&mc.CodeBuffer, fast bool) {
+    // (qs=x0, ws=x1, xq=x2, xs=x3, n_blocks=x4, acc_bits=x5) -> x0
+    ts_a64_cmp_imm(cb, 4, 0)
+    positive := ts_a64_b_cond_fwd(cb)
+    a64_mov(cb, 0, 5)
+    ts_a64_ret(cb)
+
+    ts_a64_patch_cond(cb, positive, A64_COND_GT)
+    ts_a64_fmov_s_w(cb, 16, 5)
+    ts_a64_movi_16b(cb, 20, 15)
+    ts_a64_movi_16b(cb, 21, 8)
+
+    loop_blk := cb.len()
+    ts_a64_cmp_imm(cb, 4, 0)
+    done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 0)
+    ts_a64_and_16b(cb, 1, 0, 20)
+    ts_a64_ushr_16b_4(cb, 0, 0)
+    ts_a64_sub_16b(cb, 1, 1, 21)
+    ts_a64_sub_16b(cb, 0, 0, 21)
+    ts_a64_ldr_q_post(cb, 2, 2)
+    ts_a64_ldr_q_post(cb, 3, 2)
+    ts_a64_zero_4s(cb, 4)
+    ts_a64_sdot_4s(cb, 4, 1, 2)
+    ts_a64_sdot_4s(cb, 4, 0, 3)
+    ts_a64_addv_4s(cb, 4, 4)
+    ts_a64_scvtf_s(cb, 4, 4)
+    ts_a64_ldr_s_post(cb, 5, 1)
+    ts_a64_ldr_s_post(cb, 6, 3)
+    ts_a64_fmul_s(cb, 5, 5, 6)
+    if fast {
+        ts_a64_fmadd_s(cb, 16, 4, 5, 16)
+    } else {
+        ts_a64_fmul_s(cb, 4, 4, 5)
+        ts_a64_fadd_s(cb, 16, 16, 4)
+    }
+    ts_a64_sub_imm(cb, 4, 4, 1)
+    ts_a64_b_back(cb, loop_blk)
+
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    ts_a64_fmov_w_s(cb, 0, 16)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_b_fwd(cb $&mc.CodeBuffer) int {
+    at := cb.len()
+    e32(cb, 0)
+    << at
+}
+
+fn ts_a64_patch_b(cb $&mc.CodeBuffer, at int) {
+    disp := (cb.len() - at) >> 2
+    cb.patch_u32_le(at, 0x14000000 | (disp & 0x3ffffff))
+}
+
+fn ts_a64_emit_gemv4_q4_0_q8_0(cb $&mc.CodeBuffer, fast bool) {
+    // (out=x0, qs=x1, ws=x2, xq=x3, xs=x4, packed_dims=(rows<<32)|n_blocks in x5)
+    ts_a64_mov_w(cb, 6, 5)       // x6 = n_blocks
+    ts_a64_lsr_imm(cb, 5, 5, 32) // x5 = rows
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_lsl_imm(cb, 7, 6, 4)  // x7 = n_blocks * 16
+    ts_a64_lsl_imm(cb, 8, 6, 2)  // x8 = n_blocks * 4
+    ts_a64_movi_16b(cb, 20, 15)
+    ts_a64_movi_16b(cb, 21, 248) // -8 in i8 for xq offset elimination
+
+    q_regs := [1, 9, 10, 11]
+    s_regs := [2, 12, 13, 14]
+    loop4_rows := cb.len()
+    ts_a64_cmp_imm(cb, 5, 4)
+    to_tail_rows := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 9, 1, 7)
+    ts_a64_add_reg(cb, 10, 9, 7)
+    ts_a64_add_reg(cb, 11, 10, 7)
+    ts_a64_add_reg(cb, 12, 2, 8)
+    ts_a64_add_reg(cb, 13, 12, 8)
+    ts_a64_add_reg(cb, 14, 13, 8)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 15, 6)
+
+    blk4 := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    blk4_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_zero_4s(cb, 24)
+    ts_a64_sdot_4s(cb, 24, 2, 21)
+    ts_a64_sdot_4s(cb, 24, 3, 21)
+    ts_a64_addv_4s(cb, 24, 24)
+    ts_a64_dup_4s_0(cb, 24, 24)
+    for r in 0:4 {
+        ts_a64_ldr_q_post(cb, 0, q_regs[r])
+        ts_a64_and_16b(cb, 1, 0, 20)
+        ts_a64_ushr_16b_4(cb, 0, 0)
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, 24, &s_regs, fast)
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, blk4)
+
+    ts_a64_patch_cond(cb, blk4_done, A64_COND_LE)
+    ts_a64_str_q_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 1)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    a64_mov(cb, 1, 11)
+    a64_mov(cb, 2, 14)
+    ts_a64_sub_imm(cb, 5, 5, 4)
+    ts_a64_b_back(cb, loop4_rows)
+
+    ts_a64_patch_cond(cb, to_tail_rows, A64_COND_LT)
+    ts_a64_movi_16b(cb, 21, 8)
+    tail_rows := cb.len()
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 15, 6)
+
+    blkt := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    blkt_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_ldr_q_post(cb, 0, 1)
+    ts_a64_and_16b(cb, 1, 0, 20)
+    ts_a64_ushr_16b_4(cb, 0, 0)
+    ts_a64_sub_16b(cb, 1, 1, 21)
+    ts_a64_sub_16b(cb, 0, 0, 21)
+    ts_a64_zero_4s(cb, 4)
+    ts_a64_sdot_4s(cb, 4, 1, 2)
+    ts_a64_sdot_4s(cb, 4, 0, 3)
+    ts_a64_addv_4s(cb, 4, 4)
+    ts_a64_scvtf_s(cb, 4, 4)
+    ts_a64_ldr_s_post(cb, 23, 2)
+    ts_a64_fmul_s(cb, 23, 23, 22)
+    if fast {
+        ts_a64_fmadd_s(cb, 16, 4, 23, 16)
+    } else {
+        ts_a64_fmul_s(cb, 4, 4, 23)
+        ts_a64_fadd_s(cb, 16, 16, 4)
+    }
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, blkt)
+
+    ts_a64_patch_cond(cb, blkt_done, A64_COND_LE)
+    ts_a64_str_s_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 1)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_b_back(cb, tail_rows)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_tail, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_quantize4_strict_2s(cb $&mc.CodeBuffer, src int, dst_s int) {
+    // Expects v2[0]=inv (f64), v26=[0.5, 0.5], v27=[-0.0, -0.0]. Clobbers v16, v17, v18.
+    ts_a64_fcvtl_2d(cb, 16, src)
+    ts_a64_fcvtl2_2d(cb, 17, src)
+    ts_a64_fmul_2d_elem0(cb, 16, 16, 2)
+    ts_a64_fmul_2d_elem0(cb, 17, 17, 2)
+    ts_a64_and_16b(cb, 18, 16, 27)
+    ts_a64_orr_16b(cb, 18, 18, 26)
+    ts_a64_fadd_2d(cb, 16, 16, 18)
+    ts_a64_and_16b(cb, 18, 17, 27)
+    ts_a64_orr_16b(cb, 18, 18, 26)
+    ts_a64_fadd_2d(cb, 17, 17, 18)
+    ts_a64_fcvtzs_2d(cb, 16, 16)
+    ts_a64_fcvtzs_2d(cb, 17, 17)
+    ts_a64_sqxtn_2s(cb, dst_s, 16)
+    ts_a64_sqxtn2_4s(cb, dst_s, 17)
+}
+
+fn ts_a64_emit_quantize_q8_0(cb $&mc.CodeBuffer, fast bool) {
+    // (x=x0, xq=x1, xs=x2, nb=x3)
+    ts_a64_cmp_imm(cb, 3, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_fmov_d_127(cb, 24, 9)
+    ts_a64_movi_16b(cb, 25, 129) // -127
+    if !fast {
+        e32(cb, 0xD2E00009 | (0x3fe0 << 5)) // movz x9, #0x3fe0, lsl #48 (0.5)
+        ts_a64_dup_2d(cb, 26, 9)
+        e32(cb, 0xD2E00009 | (0x8000 << 5)) // movz x9, #0x8000, lsl #48 (-0.0 sign mask)
+        ts_a64_dup_2d(cb, 27, 9)
+    }
+
+    blk_loop := cb.len()
+    ts_a64_cmp_imm(cb, 3, 0)
+    done := ts_a64_b_cond_fwd(cb)
+
+    a64_mov(cb, 4, 0)
+    ts_a64_ldp_q_post(cb, 0, 1, 4)
+    ts_a64_fabs_4s(cb, 0, 0)
+    ts_a64_fabs_4s(cb, 1, 1)
+    ts_a64_fmaxnm_4s(cb, 0, 0, 1)
+    ts_a64_ldp_q_post(cb, 2, 3, 4)
+    ts_a64_fabs_4s(cb, 2, 2)
+    ts_a64_fabs_4s(cb, 3, 3)
+    ts_a64_fmaxnm_4s(cb, 2, 2, 3)
+    ts_a64_fmaxnm_4s(cb, 0, 0, 2)
+    ts_a64_ldp_q_post(cb, 4, 5, 4)
+    ts_a64_fabs_4s(cb, 4, 4)
+    ts_a64_fabs_4s(cb, 5, 5)
+    ts_a64_fmaxnm_4s(cb, 4, 4, 5)
+    ts_a64_ldp_q_post(cb, 6, 7, 4)
+    ts_a64_fabs_4s(cb, 6, 6)
+    ts_a64_fabs_4s(cb, 7, 7)
+    ts_a64_fmaxnm_4s(cb, 6, 6, 7)
+    ts_a64_fmaxnm_4s(cb, 4, 4, 6)
+    ts_a64_fmaxnm_4s(cb, 0, 0, 4)
+    ts_a64_fmaxnmv_4s(cb, 0, 0)
+
+    ts_a64_fcvt_ds(cb, 0, 0)
+    ts_a64_fdiv_d(cb, 1, 0, 24)
+    ts_a64_fcvt_sd(cb, 1, 1)
+    ts_a64_str_s_post(cb, 1, 2)
+    ts_a64_fcvt_ds(cb, 1, 1)
+    ts_a64_fcmp_d0(cb, 1)
+    br_zero := ts_a64_b_cond_fwd(cb)
+    e32(cb, 0x1E6E1002) // fmov d2, #1.0
+    ts_a64_fdiv_d(cb, 2, 2, 1)
+    br_have_inv := ts_a64_b_fwd(cb)
+    ts_a64_patch_cond(cb, br_zero, A64_COND_EQ)
+    ts_a64_fmov_d_zero(cb, 2)
+    ts_a64_patch_b(cb, br_have_inv)
+
+    if !fast {
+        dst_regs := [6, 7]
+        for h in 0:2 {
+            ts_a64_ldp_q_post(cb, 0, 1, 0)
+            ts_a64_ldp_q_post(cb, 4, 5, 0)
+            ts_a64_quantize4_strict_2s(cb, 0, 19)
+            ts_a64_sqxtn_4h(cb, 20, 19)
+            ts_a64_quantize4_strict_2s(cb, 1, 19)
+            ts_a64_sqxtn2_8h(cb, 20, 19)
+            ts_a64_sqxtn_8b(cb, dst_regs[h], 20)
+            ts_a64_quantize4_strict_2s(cb, 4, 19)
+            ts_a64_sqxtn_4h(cb, 20, 19)
+            ts_a64_quantize4_strict_2s(cb, 5, 19)
+            ts_a64_sqxtn2_8h(cb, 20, 19)
+            ts_a64_sqxtn2_16b(cb, dst_regs[h], 20)
+            ts_a64_smax_16b(cb, dst_regs[h], dst_regs[h], 25)
+        }
+        ts_a64_stp_q_post(cb, 6, 7, 1)
+    } else {
+        ts_a64_fcvt_sd(cb, 2, 2)
+        dst_regs := [6, 7]
+        for h in 0:2 {
+            ts_a64_ldp_q_post(cb, 0, 1, 0)
+            ts_a64_ldp_q_post(cb, 4, 5, 0)
+            ts_a64_fmul_4s_elem0(cb, 0, 0, 2)
+            ts_a64_fmul_4s_elem0(cb, 1, 1, 2)
+            ts_a64_fmul_4s_elem0(cb, 4, 4, 2)
+            ts_a64_fmul_4s_elem0(cb, 5, 5, 2)
+            ts_a64_fcvtas_4s(cb, 0, 0)
+            ts_a64_fcvtas_4s(cb, 1, 1)
+            ts_a64_fcvtas_4s(cb, 4, 4)
+            ts_a64_fcvtas_4s(cb, 5, 5)
+            ts_a64_sqxtn_4h(cb, 19, 0)
+            ts_a64_sqxtn2_8h(cb, 19, 1)
+            ts_a64_sqxtn_8b(cb, dst_regs[h], 19)
+            ts_a64_sqxtn_4h(cb, 19, 4)
+            ts_a64_sqxtn2_8h(cb, 19, 5)
+            ts_a64_sqxtn2_16b(cb, dst_regs[h], 19)
+            ts_a64_smax_16b(cb, dst_regs[h], dst_regs[h], 25)
+        }
+        ts_a64_stp_q_post(cb, 6, 7, 1)
+    }
+
+    ts_a64_sub_imm(cb, 3, 3, 1)
+    ts_a64_b_back(cb, blk_loop)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_gemv4_q8_0_q8_0(cb $&mc.CodeBuffer, fast bool) {
+    // (out=x0, w_qs=x1, w_scales=x2, xq=x3, xs=x4, packed_dims=(rows<<32)|n_blocks in x5)
+    ts_a64_mov_w(cb, 6, 5)       // x6 = n_blocks
+    ts_a64_lsr_imm(cb, 5, 5, 32) // x5 = rows
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_lsl_imm(cb, 7, 6, 5)  // x7 = n_blocks * 32
+    ts_a64_lsl_imm(cb, 8, 6, 2)  // x8 = n_blocks * 4
+
+    q_regs := [1, 9, 10, 11]
+    s_regs := [2, 12, 13, 14]
+    loop4_rows := cb.len()
+    ts_a64_cmp_imm(cb, 5, 4)
+    to_tail_rows := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 9, 1, 7)
+    ts_a64_add_reg(cb, 10, 9, 7)
+    ts_a64_add_reg(cb, 11, 10, 7)
+    ts_a64_add_reg(cb, 12, 2, 8)
+    ts_a64_add_reg(cb, 13, 12, 8)
+    ts_a64_add_reg(cb, 14, 13, 8)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 15, 6)
+
+    blk4 := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    blk4_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    for r in 0:4 {
+        ts_a64_ldp_q_post(cb, 0, 1, q_regs[r])
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 3)
+    }
+    ts_a64_sdot_reduce4(cb, 16, &s_regs, fast)
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, blk4)
+
+    ts_a64_patch_cond(cb, blk4_done, A64_COND_LE)
+    ts_a64_str_q_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 0)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    a64_mov(cb, 1, 11)
+    a64_mov(cb, 2, 14)
+    ts_a64_sub_imm(cb, 5, 5, 4)
+    ts_a64_b_back(cb, loop4_rows)
+
+    ts_a64_patch_cond(cb, to_tail_rows, A64_COND_LT)
+    tail_rows := cb.len()
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 15, 6)
+
+    blkt := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    blkt_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_ldp_q_post(cb, 0, 1, 1)
+    ts_a64_zero_4s(cb, 4)
+    ts_a64_sdot_4s(cb, 4, 0, 2)
+    ts_a64_sdot_4s(cb, 4, 1, 3)
+    ts_a64_addv_4s(cb, 4, 4)
+    ts_a64_scvtf_s(cb, 4, 4)
+    ts_a64_ldr_s_post(cb, 23, 2)
+    ts_a64_fmul_s(cb, 23, 23, 22)
+    if fast {
+        ts_a64_fmadd_s(cb, 16, 4, 23, 16)
+    } else {
+        ts_a64_fmul_s(cb, 4, 4, 23)
+        ts_a64_fadd_s(cb, 16, 16, 4)
+    }
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, blkt)
+
+    ts_a64_patch_cond(cb, blkt_done, A64_COND_LE)
+    ts_a64_str_s_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 0)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_b_back(cb, tail_rows)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_tail, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_gemm4x4_f32(cb $&mc.CodeBuffer, fast bool) {
+    // (out=x0, w=x1, x=x2, M=x3, N=x4, K=x5)
+    ts_a64_cmp_imm(cb, 3, 0)
+    early_m := ts_a64_b_cond_fwd(cb)
+    ts_a64_cmp_imm(cb, 4, 0)
+    early_n := ts_a64_b_cond_fwd(cb)
+
+    ts_a64_save_x19_x26_frame128(cb)
+    a64_mov(cb, 26, 5)          // x26 = K
+    ts_a64_lsl_imm(cb, 25, 5, 2) // x25 = K * 4
+    a64_mov(cb, 24, 4)          // x24 = N
+    ts_a64_lsl_imm(cb, 23, 4, 2) // x23 = N * 4
+    ts_a64_str_sp_u64(cb, 1, 0)  // [slot 0] = w_base
+    ts_a64_str_sp_u64(cb, 2, 1)  // [slot 1] = x_m
+    ts_a64_str_sp_u64(cb, 0, 2)  // [slot 2] = out_m
+    ts_a64_str_sp_u64(cb, 3, 3)  // [slot 3] = M_rem
+
+    out_regs := [19, 20, 21, 22]
+    w_regs := [1, 6, 7, 9]
+    x_regs := [10, 11, 12, 13]
+
+    m_loop4 := cb.len()
+    ts_a64_ldr_sp_u64(cb, 5, 3)
+    ts_a64_cmp_imm(cb, 5, 4)
+    to_m_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_sp_u64(cb, 1, 0)
+    ts_a64_ldr_sp_u64(cb, 19, 2)
+    ts_a64_add_reg(cb, 20, 19, 23)
+    ts_a64_add_reg(cb, 21, 20, 23)
+    ts_a64_add_reg(cb, 22, 21, 23)
+    a64_mov(cb, 15, 24) // n_rem
+
+    n_loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 15, 4)
+    to_n_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 6, 1, 25)
+    ts_a64_add_reg(cb, 7, 6, 25)
+    ts_a64_add_reg(cb, 9, 7, 25)
+    ts_a64_ldr_sp_u64(cb, 10, 1)
+    ts_a64_add_reg(cb, 11, 10, 25)
+    ts_a64_add_reg(cb, 12, 11, 25)
+    ts_a64_add_reg(cb, 13, 12, 25)
+    a64_mov(cb, 14, 26)
+    for v in 16:32 { ts_a64_zero_4s(cb, v) }
+
+    if !fast {
+        k_loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 14, 4)
+        to_k_tail := ts_a64_b_cond_fwd(cb)
+        for t in 0:4 { ts_a64_ldr_q_post(cb, 4 + t, x_regs[t]) }
+        for r in 0:4 {
+            ts_a64_ldr_q_post(cb, 1, w_regs[r])
+            for t in 0:4 {
+                ts_a64_fmul_4s(cb, 0, 1, 4 + t)
+                ts_a64_serial_sum_v0(cb, 16 + t * 4 + r)
+            }
+        }
+        ts_a64_sub_imm(cb, 14, 14, 4)
+        ts_a64_b_back(cb, k_loop4)
+
+        ts_a64_patch_cond(cb, to_k_tail, A64_COND_LT)
+        k_tail := cb.len()
+        ts_a64_cmp_imm(cb, 14, 0)
+        to_k_store := ts_a64_b_cond_fwd(cb)
+        for t in 0:4 { ts_a64_ldr_s_post(cb, 4 + t, x_regs[t]) }
+        for r in 0:4 {
+            ts_a64_ldr_s_post(cb, 1, w_regs[r])
+            for t in 0:4 {
+                ts_a64_fmul_s(cb, 0, 1, 4 + t)
+                ts_a64_fadd_s(cb, 16 + t * 4 + r, 16 + t * 4 + r, 0)
+            }
+        }
+        ts_a64_sub_imm(cb, 14, 14, 1)
+        ts_a64_b_back(cb, k_tail)
+
+        ts_a64_patch_cond(cb, to_k_store, A64_COND_LE)
+        for t in 0:4 {
+            for r in 0:4 {
+                ts_a64_str_s_post(cb, 16 + t * 4 + r, out_regs[t])
+            }
+        }
+    } else {
+        k_loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 14, 4)
+        to_k_fold := ts_a64_b_cond_fwd(cb)
+        for t in 0:4 { ts_a64_ldr_q_post(cb, 4 + t, x_regs[t]) }
+        for r in 0:4 {
+            ts_a64_ldr_q_post(cb, 0, w_regs[r])
+            for t in 0:4 {
+                ts_a64_fmla_4s(cb, 16 + t * 4 + r, 0, 4 + t)
+            }
+        }
+        ts_a64_sub_imm(cb, 14, 14, 4)
+        ts_a64_b_back(cb, k_loop4)
+
+        ts_a64_patch_cond(cb, to_k_fold, A64_COND_LT)
+        for t in 0:4 {
+            b := 16 + t * 4
+            ts_a64_faddp_4s(cb, b, b, b + 1)
+            ts_a64_faddp_4s(cb, b + 2, b + 2, b + 3)
+            ts_a64_faddp_4s(cb, b, b, b + 2)
+        }
+        ts_a64_cmp_imm(cb, 14, 0)
+        has_kt := ts_a64_b_cond_fwd(cb)
+        for t in 0:4 { ts_a64_str_q_post(cb, 16 + t * 4, out_regs[t]) }
+        skip_kt := ts_a64_b_fwd(cb)
+
+        ts_a64_patch_cond(cb, has_kt, A64_COND_GT)
+        for t in 0:4 {
+            b := 16 + t * 4
+            ts_a64_mov_s_lane(cb, b + 1, b, 1)
+            ts_a64_mov_s_lane(cb, b + 2, b, 2)
+            ts_a64_mov_s_lane(cb, b + 3, b, 3)
+        }
+        k_tail := cb.len()
+        ts_a64_cmp_imm(cb, 14, 0)
+        to_st := ts_a64_b_cond_fwd(cb)
+        for t in 0:4 { ts_a64_ldr_s_post(cb, 4 + t, x_regs[t]) }
+        for r in 0:4 {
+            ts_a64_ldr_s_post(cb, 0, w_regs[r])
+            for t in 0:4 {
+                b := 16 + t * 4 + r
+                ts_a64_fmadd_s(cb, b, 0, 4 + t, b)
+            }
+        }
+        ts_a64_sub_imm(cb, 14, 14, 1)
+        ts_a64_b_back(cb, k_tail)
+
+        ts_a64_patch_cond(cb, to_st, A64_COND_LE)
+        for t in 0:4 {
+            for r in 0:4 {
+                ts_a64_str_s_post(cb, 16 + t * 4 + r, out_regs[t])
+            }
+        }
+        ts_a64_patch_b(cb, skip_kt)
+    }
+
+    a64_mov(cb, 1, 9)
+    ts_a64_sub_imm(cb, 15, 15, 4)
+    ts_a64_b_back(cb, n_loop4)
+
+    ts_a64_patch_cond(cb, to_n_tail, A64_COND_LT)
+    n_tail := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    done_n_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_sp_u64(cb, 10, 1)
+    ts_a64_add_reg(cb, 11, 10, 25)
+    ts_a64_add_reg(cb, 12, 11, 25)
+    ts_a64_add_reg(cb, 13, 12, 25)
+    a64_mov(cb, 14, 26)
+    for t in 0:4 { ts_a64_zero_4s(cb, 16 + t) }
+
+    if !fast {
+        nt_loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 14, 4)
+        nt_to_t := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 1, 1)
+        for t in 0:4 {
+            ts_a64_ldr_q_post(cb, 2, x_regs[t])
+            ts_a64_fmul_4s(cb, 0, 1, 2)
+            ts_a64_serial_sum_v0(cb, 16 + t)
+        }
+        ts_a64_sub_imm(cb, 14, 14, 4)
+        ts_a64_b_back(cb, nt_loop4)
+        ts_a64_patch_cond(cb, nt_to_t, A64_COND_LT)
+    } else {
+        nt_loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 14, 4)
+        nt_to_fold := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 0, 1)
+        for t in 0:4 {
+            ts_a64_ldr_q_post(cb, 2, x_regs[t])
+            ts_a64_fmla_4s(cb, 16 + t, 0, 2)
+        }
+        ts_a64_sub_imm(cb, 14, 14, 4)
+        ts_a64_b_back(cb, nt_loop4)
+        ts_a64_patch_cond(cb, nt_to_fold, A64_COND_LT)
+        for t in 0:4 {
+            ts_a64_faddp_4s(cb, 16 + t, 16 + t, 16 + t)
+            ts_a64_faddp_2s(cb, 16 + t, 16 + t)
+        }
+    }
+    nt_tail := cb.len()
+    ts_a64_cmp_imm(cb, 14, 0)
+    nt_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 0, 1)
+    for t in 0:4 {
+        ts_a64_ldr_s_post(cb, 1, x_regs[t])
+        if fast {
+            ts_a64_fmadd_s(cb, 16 + t, 0, 1, 16 + t)
+        } else {
+            ts_a64_fmul_s(cb, 1, 0, 1)
+            ts_a64_fadd_s(cb, 16 + t, 16 + t, 1)
+        }
+    }
+    ts_a64_sub_imm(cb, 14, 14, 1)
+    ts_a64_b_back(cb, nt_tail)
+    ts_a64_patch_cond(cb, nt_done, A64_COND_LE)
+    for t in 0:4 { ts_a64_str_s_post(cb, 16 + t, out_regs[t]) }
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, n_tail)
+
+    ts_a64_patch_cond(cb, done_n_tail, A64_COND_LE)
+    ts_a64_ldr_sp_u64(cb, 5, 1)
+    ts_a64_add_reg_lsl(cb, 5, 5, 25, 2)
+    ts_a64_str_sp_u64(cb, 5, 1)
+    ts_a64_ldr_sp_u64(cb, 5, 2)
+    ts_a64_add_reg_lsl(cb, 5, 5, 23, 2)
+    ts_a64_str_sp_u64(cb, 5, 2)
+    ts_a64_ldr_sp_u64(cb, 5, 3)
+    ts_a64_sub_imm(cb, 5, 5, 4)
+    ts_a64_str_sp_u64(cb, 5, 3)
+    ts_a64_b_back(cb, m_loop4)
+
+    ts_a64_patch_cond(cb, to_m_tail, A64_COND_LT)
+    m_tail := cb.len()
+    ts_a64_ldr_sp_u64(cb, 5, 3)
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_all := ts_a64_b_cond_fwd(cb)
+
+    ts_a64_ldr_sp_u64(cb, 1, 0)
+    ts_a64_ldr_sp_u64(cb, 19, 2)
+    a64_mov(cb, 15, 24)
+    mt_n4 := cb.len()
+    ts_a64_cmp_imm(cb, 15, 4)
+    to_mt_n1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 6, 1, 25)
+    ts_a64_add_reg(cb, 7, 6, 25)
+    ts_a64_add_reg(cb, 9, 7, 25)
+    ts_a64_ldr_sp_u64(cb, 10, 1)
+    a64_mov(cb, 14, 26)
+    for r in 0:4 { ts_a64_zero_4s(cb, 16 + r) }
+    mt_k4 := cb.len()
+    ts_a64_cmp_imm(cb, 14, 4)
+    to_mt_kt := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 1, 10)
+    for r in 0:4 {
+        ts_a64_ldr_q_post(cb, 2, w_regs[r])
+        if fast {
+            ts_a64_fmla_4s(cb, 16 + r, 2, 1)
+        } else {
+            ts_a64_fmul_4s(cb, 0, 2, 1)
+            ts_a64_serial_sum_v0(cb, 16 + r)
+        }
+    }
+    ts_a64_sub_imm(cb, 14, 14, 4)
+    ts_a64_b_back(cb, mt_k4)
+    ts_a64_patch_cond(cb, to_mt_kt, A64_COND_LT)
+    if fast {
+        ts_a64_faddp_4s(cb, 16, 16, 17)
+        ts_a64_faddp_4s(cb, 18, 18, 19)
+        ts_a64_faddp_4s(cb, 16, 16, 18)
+        ts_a64_mov_s_lane(cb, 17, 16, 1)
+        ts_a64_mov_s_lane(cb, 18, 16, 2)
+        ts_a64_mov_s_lane(cb, 19, 16, 3)
+    }
+    mt_kt := cb.len()
+    ts_a64_cmp_imm(cb, 14, 0)
+    to_mt_st := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 1, 10)
+    for r in 0:4 {
+        ts_a64_ldr_s_post(cb, 0, w_regs[r])
+        if fast {
+            ts_a64_fmadd_s(cb, 16 + r, 0, 1, 16 + r)
+        } else {
+            ts_a64_fmul_s(cb, 0, 0, 1)
+            ts_a64_fadd_s(cb, 16 + r, 16 + r, 0)
+        }
+    }
+    ts_a64_sub_imm(cb, 14, 14, 1)
+    ts_a64_b_back(cb, mt_kt)
+    ts_a64_patch_cond(cb, to_mt_st, A64_COND_LE)
+    for r in 0:4 { ts_a64_str_s_post(cb, 16 + r, 19) }
+    a64_mov(cb, 1, 9)
+    ts_a64_sub_imm(cb, 15, 15, 4)
+    ts_a64_b_back(cb, mt_n4)
+
+    ts_a64_patch_cond(cb, to_mt_n1, A64_COND_LT)
+    mt_n1 := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    done_mt_n := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_sp_u64(cb, 10, 1)
+    a64_mov(cb, 14, 26)
+    ts_a64_zero_4s(cb, 16)
+    mt1_k4 := cb.len()
+    ts_a64_cmp_imm(cb, 14, 4)
+    to_mt1_kt := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 2, 1)
+    ts_a64_ldr_q_post(cb, 1, 10)
+    if fast {
+        ts_a64_fmla_4s(cb, 16, 2, 1)
+    } else {
+        ts_a64_fmul_4s(cb, 0, 2, 1)
+        ts_a64_serial_sum_v0(cb, 16)
+    }
+    ts_a64_sub_imm(cb, 14, 14, 4)
+    ts_a64_b_back(cb, mt1_k4)
+    ts_a64_patch_cond(cb, to_mt1_kt, A64_COND_LT)
+    if fast {
+        ts_a64_faddp_4s(cb, 16, 16, 16)
+        ts_a64_faddp_2s(cb, 16, 16)
+    }
+    mt1_kt := cb.len()
+    ts_a64_cmp_imm(cb, 14, 0)
+    to_mt1_st := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 0, 1)
+    ts_a64_ldr_s_post(cb, 1, 10)
+    if fast {
+        ts_a64_fmadd_s(cb, 16, 0, 1, 16)
+    } else {
+        ts_a64_fmul_s(cb, 0, 0, 1)
+        ts_a64_fadd_s(cb, 16, 16, 0)
+    }
+    ts_a64_sub_imm(cb, 14, 14, 1)
+    ts_a64_b_back(cb, mt1_kt)
+    ts_a64_patch_cond(cb, to_mt1_st, A64_COND_LE)
+    ts_a64_str_s_post(cb, 16, 19)
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, mt_n1)
+
+    ts_a64_patch_cond(cb, done_mt_n, A64_COND_LE)
+    ts_a64_ldr_sp_u64(cb, 5, 1)
+    ts_a64_add_reg(cb, 5, 5, 25)
+    ts_a64_str_sp_u64(cb, 5, 1)
+    ts_a64_ldr_sp_u64(cb, 5, 2)
+    ts_a64_add_reg(cb, 5, 5, 23)
+    ts_a64_str_sp_u64(cb, 5, 2)
+    ts_a64_ldr_sp_u64(cb, 5, 3)
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_str_sp_u64(cb, 5, 3)
+    ts_a64_b_back(cb, m_tail)
+
+    ts_a64_patch_cond(cb, done_all, A64_COND_LE)
+    ts_a64_restore_x19_x26_frame128(cb)
+    ts_a64_patch_cond(cb, early_m, A64_COND_LE)
+    ts_a64_patch_cond(cb, early_n, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_gemm4x4_q4_0_q8_0(cb $&mc.CodeBuffer, fast bool) {
+    // (out=x0, qs=x1, ws=x2, xq=x3, xs=x4, packed=(M<<42)|(N<<21)|nb in x5)
+    ts_a64_and_21(cb, 6, 5)      // x6 = nb
+    ts_a64_ubfx_21(cb, 7, 5, 21) // x7 = N
+    ts_a64_ubfx_21(cb, 8, 5, 42) // x8 = M
+    ts_a64_cmp_imm(cb, 8, 0)
+    early_m := ts_a64_b_cond_fwd(cb)
+    ts_a64_cmp_imm(cb, 7, 0)
+    early_n := ts_a64_b_cond_fwd(cb)
+
+    ts_a64_save_x19_x26_frame128(cb)
+    ts_a64_str_sp_u64(cb, 1, 0) // slot 0 = qs_base
+    ts_a64_str_sp_u64(cb, 2, 1) // slot 1 = ws_base
+    ts_a64_str_sp_u64(cb, 7, 2) // slot 2 = N
+    ts_a64_str_sp_u64(cb, 6, 3) // slot 3 = nb
+    ts_a64_str_sp_u64(cb, 3, 4) // slot 4 = xq_m
+    ts_a64_str_sp_u64(cb, 4, 5) // slot 5 = xs_m
+    ts_a64_str_sp_u64(cb, 0, 6) // slot 6 = out_m
+    ts_a64_str_sp_u64(cb, 8, 7) // slot 7 = M_rem
+
+    ts_a64_movi_16b(cb, 20, 15)
+    ts_a64_movi_16b(cb, 21, 8)
+    ts_a64_mov_w(cb, 25, 6)     // x25 = nb
+    ts_a64_lsl_imm(cb, 7, 25, 4) // x7 = nb * 16
+    ts_a64_lsl_imm(cb, 8, 25, 2) // x8 = nb * 4
+
+    q_regs := [1, 9, 10, 11]
+    s_regs := [2, 12, 13, 14]
+    xq_regs := [3, 15, 16, 17]
+    xs_regs := [4, 19, 20, 26]
+    out_regs := [0, 21, 22, 23]
+
+    m_loop4 := cb.len()
+    ts_a64_ldr_sp_u64(cb, 5, 7)
+    ts_a64_cmp_imm(cb, 5, 4)
+    to_m_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_sp_u64(cb, 24, 2) // n_rem = N
+    ts_a64_lsl_imm(cb, 5, 24, 2) // N * 4
+    ts_a64_ldr_sp_u64(cb, 0, 6)
+    ts_a64_add_reg(cb, 21, 0, 5)
+    ts_a64_add_reg(cb, 22, 21, 5)
+    ts_a64_add_reg(cb, 23, 22, 5)
+    ts_a64_ldr_sp_u64(cb, 1, 0)
+    ts_a64_ldr_sp_u64(cb, 2, 1)
+
+    n_loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 24, 4)
+    to_n_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 9, 1, 7)
+    ts_a64_add_reg(cb, 10, 9, 7)
+    ts_a64_add_reg(cb, 11, 10, 7)
+    ts_a64_add_reg(cb, 12, 2, 8)
+    ts_a64_add_reg(cb, 13, 12, 8)
+    ts_a64_add_reg(cb, 14, 13, 8)
+
+    ts_a64_lsl_imm(cb, 5, 25, 5) // nb * 32
+    ts_a64_ldr_sp_u64(cb, 3, 4)
+    ts_a64_add_reg(cb, 15, 3, 5)
+    ts_a64_add_reg(cb, 16, 15, 5)
+    ts_a64_add_reg(cb, 17, 16, 5)
+    ts_a64_ldr_sp_u64(cb, 4, 5)
+    ts_a64_add_reg(cb, 19, 4, 8)
+    ts_a64_add_reg(cb, 20, 19, 8)
+    ts_a64_add_reg(cb, 26, 20, 8)
+
+    for t in 0:4 { ts_a64_zero_4s(cb, 16 + t) }
+    a64_mov(cb, 5, 25) // b_cnt = nb
+
+    blk4 := cb.len()
+    ts_a64_cmp_imm(cb, 5, 0)
+    blk4_done := ts_a64_b_cond_fwd(cb)
+    for r in 0:4 {
+        ts_a64_ldr_q_post(cb, 0, q_regs[r])
+        ts_a64_and_16b(cb, 24 + r, 0, 20)
+        ts_a64_ushr_16b_4(cb, 0, 0)
+        ts_a64_sub_16b(cb, 24 + r, 24 + r, 21)
+        ts_a64_sub_16b(cb, 28 + r, 0, 21)
+        ts_a64_ld1_s_lane_post(cb, 23, r, s_regs[r])
+    }
+    for t in 0:4 {
+        ts_a64_ldp_q_post(cb, 2, 3, xq_regs[t])
+        ts_a64_ldr_s_post(cb, 22, xs_regs[t])
+        for r in 0:4 {
+            ts_a64_zero_4s(cb, 4 + r)
+            ts_a64_sdot_4s(cb, 4 + r, 24 + r, 2)
+            ts_a64_sdot_4s(cb, 4 + r, 28 + r, 3)
+        }
+        ts_a64_addp_4s(cb, 4, 4, 5)
+        ts_a64_addp_4s(cb, 6, 6, 7)
+        ts_a64_addp_4s(cb, 4, 4, 6)
+        ts_a64_scvtf_4s(cb, 4, 4)
+        ts_a64_fmul_4s_elem0(cb, 1, 23, 22)
+        if fast {
+            ts_a64_fmla_4s(cb, 16 + t, 4, 1)
+        } else {
+            ts_a64_fmul_4s(cb, 4, 4, 1)
+            ts_a64_fadd_4s(cb, 16 + t, 16 + t, 4)
+        }
+    }
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_b_back(cb, blk4)
+
+    ts_a64_patch_cond(cb, blk4_done, A64_COND_LE)
+    for t in 0:4 { ts_a64_str_q_post(cb, 16 + t, out_regs[t]) }
+    a64_mov(cb, 1, 11)
+    a64_mov(cb, 2, 14)
+    ts_a64_sub_imm(cb, 24, 24, 4)
+    ts_a64_b_back(cb, n_loop4)
+
+    ts_a64_patch_cond(cb, to_n_tail, A64_COND_LT)
+    n_tail := cb.len()
+    ts_a64_cmp_imm(cb, 24, 0)
+    done_n_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_lsl_imm(cb, 5, 25, 5)
+    ts_a64_ldr_sp_u64(cb, 3, 4)
+    ts_a64_add_reg(cb, 15, 3, 5)
+    ts_a64_add_reg(cb, 16, 15, 5)
+    ts_a64_add_reg(cb, 17, 16, 5)
+    ts_a64_ldr_sp_u64(cb, 4, 5)
+    ts_a64_add_reg(cb, 19, 4, 8)
+    ts_a64_add_reg(cb, 20, 19, 8)
+    ts_a64_add_reg(cb, 26, 20, 8)
+    for t in 0:4 { ts_a64_zero_4s(cb, 16 + t) }
+    a64_mov(cb, 5, 25)
+
+    blkt := cb.len()
+    ts_a64_cmp_imm(cb, 5, 0)
+    blkt_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 0, 1)
+    ts_a64_and_16b(cb, 24, 0, 20)
+    ts_a64_ushr_16b_4(cb, 0, 0)
+    ts_a64_sub_16b(cb, 24, 24, 21)
+    ts_a64_sub_16b(cb, 28, 0, 21)
+    ts_a64_ldr_s_post(cb, 23, 2)
+    for t in 0:4 {
+        ts_a64_ldp_q_post(cb, 2, 3, xq_regs[t])
+        ts_a64_ldr_s_post(cb, 22, xs_regs[t])
+        ts_a64_zero_4s(cb, 4)
+        ts_a64_sdot_4s(cb, 4, 24, 2)
+        ts_a64_sdot_4s(cb, 4, 28, 3)
+        ts_a64_addv_4s(cb, 4, 4)
+        ts_a64_scvtf_s(cb, 4, 4)
+        ts_a64_fmul_s(cb, 1, 23, 22)
+        if fast {
+            ts_a64_fmadd_s(cb, 16 + t, 4, 1, 16 + t)
+        } else {
+            ts_a64_fmul_s(cb, 4, 4, 1)
+            ts_a64_fadd_s(cb, 16 + t, 16 + t, 4)
+        }
+    }
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_b_back(cb, blkt)
+
+    ts_a64_patch_cond(cb, blkt_done, A64_COND_LE)
+    for t in 0:4 { ts_a64_str_s_post(cb, 16 + t, out_regs[t]) }
+    ts_a64_sub_imm(cb, 24, 24, 1)
+    ts_a64_b_back(cb, n_tail)
+
+    ts_a64_patch_cond(cb, done_n_tail, A64_COND_LE)
+    ts_a64_ldr_sp_u64(cb, 5, 4)
+    ts_a64_add_reg_lsl(cb, 5, 5, 25, 7) // nb * 128 bytes (= nb << 7)
+    ts_a64_str_sp_u64(cb, 5, 4)
+    ts_a64_ldr_sp_u64(cb, 5, 5)
+    ts_a64_add_reg_lsl(cb, 5, 5, 8, 2)  // nb*4 * 4 = nb * 16 bytes
+    ts_a64_str_sp_u64(cb, 5, 5)
+    ts_a64_ldr_sp_u64(cb, 6, 2)
+    ts_a64_ldr_sp_u64(cb, 5, 6)
+    ts_a64_add_reg_lsl(cb, 5, 5, 6, 4)  // N * 16 bytes
+    ts_a64_str_sp_u64(cb, 5, 6)
+    ts_a64_ldr_sp_u64(cb, 5, 7)
+    ts_a64_sub_imm(cb, 5, 5, 4)
+    ts_a64_str_sp_u64(cb, 5, 7)
+    ts_a64_b_back(cb, m_loop4)
+
+    // M tail (1..3 tokens)
+    ts_a64_patch_cond(cb, to_m_tail, A64_COND_LT)
+    m_tail := cb.len()
+    ts_a64_ldr_sp_u64(cb, 5, 7)
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_all := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_sp_u64(cb, 0, 6)
+    ts_a64_ldr_sp_u64(cb, 1, 0)
+    ts_a64_ldr_sp_u64(cb, 2, 1)
+    ts_a64_ldr_sp_u64(cb, 3, 4)
+    ts_a64_ldr_sp_u64(cb, 4, 5)
+    ts_a64_ldr_sp_u64(cb, 24, 2)
+
+    mt_n4 := cb.len()
+    ts_a64_cmp_imm(cb, 24, 4)
+    to_mt_n1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 9, 1, 7)
+    ts_a64_add_reg(cb, 10, 9, 7)
+    ts_a64_add_reg(cb, 11, 10, 7)
+    ts_a64_add_reg(cb, 12, 2, 8)
+    ts_a64_add_reg(cb, 13, 12, 8)
+    ts_a64_add_reg(cb, 14, 13, 8)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 15, 25)
+    mt_b4 := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    mt_b4_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    for r in 0:4 {
+        ts_a64_ldr_q_post(cb, 0, q_regs[r])
+        ts_a64_and_16b(cb, 1, 0, 20)
+        ts_a64_ushr_16b_4(cb, 0, 0)
+        ts_a64_sub_16b(cb, 1, 1, 21)
+        ts_a64_sub_16b(cb, 0, 0, 21)
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 3)
+    }
+    ts_a64_sdot_reduce4(cb, 16, &s_regs, fast)
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, mt_b4)
+    ts_a64_patch_cond(cb, mt_b4_done, A64_COND_LE)
+    ts_a64_str_q_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 1)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    a64_mov(cb, 1, 11)
+    a64_mov(cb, 2, 14)
+    ts_a64_sub_imm(cb, 24, 24, 4)
+    ts_a64_b_back(cb, mt_n4)
+
+    ts_a64_patch_cond(cb, to_mt_n1, A64_COND_LT)
+    mt_n1 := cb.len()
+    ts_a64_cmp_imm(cb, 24, 0)
+    done_mt_n := ts_a64_b_cond_fwd(cb)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 15, 25)
+    mt_b1 := cb.len()
+    ts_a64_cmp_imm(cb, 15, 0)
+    mt_b1_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_ldr_q_post(cb, 0, 1)
+    ts_a64_and_16b(cb, 1, 0, 20)
+    ts_a64_ushr_16b_4(cb, 0, 0)
+    ts_a64_sub_16b(cb, 1, 1, 21)
+    ts_a64_sub_16b(cb, 0, 0, 21)
+    ts_a64_zero_4s(cb, 4)
+    ts_a64_sdot_4s(cb, 4, 1, 2)
+    ts_a64_sdot_4s(cb, 4, 0, 3)
+    ts_a64_addv_4s(cb, 4, 4)
+    ts_a64_scvtf_s(cb, 4, 4)
+    ts_a64_ldr_s_post(cb, 23, 2)
+    ts_a64_fmul_s(cb, 23, 23, 22)
+    if fast {
+        ts_a64_fmadd_s(cb, 16, 4, 23, 16)
+    } else {
+        ts_a64_fmul_s(cb, 4, 4, 23)
+        ts_a64_fadd_s(cb, 16, 16, 4)
+    }
+    ts_a64_sub_imm(cb, 15, 15, 1)
+    ts_a64_b_back(cb, mt_b1)
+    ts_a64_patch_cond(cb, mt_b1_done, A64_COND_LE)
+    ts_a64_str_s_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 1)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    ts_a64_sub_imm(cb, 24, 24, 1)
+    ts_a64_b_back(cb, mt_n1)
+
+    ts_a64_patch_cond(cb, done_mt_n, A64_COND_LE)
+    ts_a64_ldr_sp_u64(cb, 5, 4)
+    ts_a64_add_reg_lsl(cb, 5, 5, 25, 5) // nb * 32
+    ts_a64_str_sp_u64(cb, 5, 4)
+    ts_a64_ldr_sp_u64(cb, 5, 5)
+    ts_a64_add_reg(cb, 5, 5, 8)        // nb * 4
+    ts_a64_str_sp_u64(cb, 5, 5)
+    ts_a64_ldr_sp_u64(cb, 6, 2)
+    ts_a64_ldr_sp_u64(cb, 5, 6)
+    ts_a64_add_reg_lsl(cb, 5, 5, 6, 2) // N * 4
+    ts_a64_str_sp_u64(cb, 5, 6)
+    ts_a64_ldr_sp_u64(cb, 5, 7)
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_str_sp_u64(cb, 5, 7)
+    ts_a64_b_back(cb, m_tail)
+
+    ts_a64_patch_cond(cb, done_all, A64_COND_LE)
+    ts_a64_restore_x19_x26_frame128(cb)
+    ts_a64_patch_cond(cb, early_m, A64_COND_LE)
+    ts_a64_patch_cond(cb, early_n, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_swiglu_fast_step(cb $&mc.CodeBuffer) {
+    // 4-wide f32 Cody-Waite exp(-g) + silu*up. Constants in v16..v27; v0=g, v1=up -> v0.
+    ts_a64_fneg_4s(cb, 2, 0)
+    ts_a64_fmaxnm_4s(cb, 2, 2, 16)
+    ts_a64_fminnm_4s(cb, 2, 2, 17)
+    ts_a64_fmul_4s(cb, 3, 2, 18)
+    ts_a64_frintn_4s(cb, 3, 3)
+    ts_a64_orr_16b(cb, 4, 2, 2)
+    ts_a64_fmls_4s(cb, 4, 3, 19)
+    ts_a64_fmls_4s(cb, 4, 3, 20)
+    ts_a64_orr_16b(cb, 5, 25, 25)
+    ts_a64_fmla_4s(cb, 5, 26, 4)
+    ts_a64_orr_16b(cb, 6, 24, 24)
+    ts_a64_fmla_4s(cb, 6, 5, 4)
+    ts_a64_orr_16b(cb, 5, 23, 23)
+    ts_a64_fmla_4s(cb, 5, 6, 4)
+    ts_a64_orr_16b(cb, 6, 22, 22)
+    ts_a64_fmla_4s(cb, 6, 5, 4)
+    ts_a64_orr_16b(cb, 5, 21, 21)
+    ts_a64_fmla_4s(cb, 5, 6, 4)
+    ts_a64_orr_16b(cb, 6, 21, 21)
+    ts_a64_fmla_4s(cb, 6, 5, 4)
+    ts_a64_fcvtzs_4s(cb, 3, 3)
+    ts_a64_add_4s(cb, 3, 3, 27)
+    ts_a64_shl_4s_23(cb, 3, 3)
+    ts_a64_fmul_4s(cb, 6, 6, 3)
+    ts_a64_fadd_4s(cb, 6, 6, 21)
+    ts_a64_fdiv_4s(cb, 0, 0, 6)
+    ts_a64_fmul_4s(cb, 0, 0, 1)
+}
+
+fn ts_a64_silu_strict_2d(cb $&mc.CodeBuffer, dst_reg int) {
+    // Expects v0 = 2 f64 g values, constants in v15..v31. Produces silu(g) in dst_reg.2d.
+    ts_a64_fneg_2d(cb, 1, 0)
+    ts_a64_fmaxnm_2d(cb, 1, 1, 16)
+    ts_a64_fminnm_2d(cb, 1, 1, 17)
+    ts_a64_fmul_2d(cb, 2, 1, 18)
+    ts_a64_frintn_2d(cb, 2, 2)
+    ts_a64_orr_16b(cb, 3, 1, 1)
+    ts_a64_fmls_2d(cb, 3, 2, 19)
+    ts_a64_fmls_2d(cb, 3, 2, 20)
+    ts_a64_orr_16b(cb, 4, 30, 30)
+    ts_a64_fmla_2d(cb, 4, 31, 3)
+    for c_reg in [29, 28, 27, 26, 25, 24, 23, 22, 21, 21] {
+        ts_a64_orr_16b(cb, 5, c_reg, c_reg)
+        ts_a64_fmla_2d(cb, 5, 4, 3)
+        ts_a64_orr_16b(cb, 4, 5, 5)
+    }
+    ts_a64_fcvtzs_2d(cb, 2, 2)
+    ts_a64_add_2d(cb, 2, 2, 15)
+    ts_a64_shl_2d_52(cb, 2, 2)
+    ts_a64_fmul_2d(cb, 4, 4, 2)
+    ts_a64_fadd_2d(cb, 4, 4, 21)
+    ts_a64_fdiv_2d(cb, dst_reg, 0, 4)
+}
+
+fn ts_a64_emit_swiglu(cb $&mc.CodeBuffer, fast bool) {
+    // (dst=x0, gate=x1, up=x2, n=x3)
+    ts_a64_cmp_imm(cb, 3, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    if fast {
+        ts_a64_dup_4s_u32(cb, 16, 9, 0x0000, 0xC2AE) // -87.0
+        ts_a64_dup_4s_u32(cb, 17, 9, 0x999A, 0x42AE) // 87.3
+        ts_a64_dup_4s_u32(cb, 18, 9, 0xAA3B, 0x3FB8) // 1.44269504
+        ts_a64_dup_4s_u32(cb, 19, 9, 0x7200, 0x3F31) // ln2_hi
+        ts_a64_dup_4s_u32(cb, 20, 9, 0xBE8E, 0x35BF) // ln2_lo
+        ts_a64_dup_4s_u32(cb, 21, 9, 0x0000, 0x3F80) // 1.0
+        ts_a64_dup_4s_u32(cb, 22, 9, 0x0000, 0x3F00) // 0.5
+        ts_a64_dup_4s_u32(cb, 23, 9, 0xAAAB, 0x3E2A) // 1/6
+        ts_a64_dup_4s_u32(cb, 24, 9, 0xAAAB, 0x3D2A) // 1/24
+        ts_a64_dup_4s_u32(cb, 25, 9, 0x8889, 0x3C08) // 1/120
+        ts_a64_dup_4s_u32(cb, 26, 9, 0x0B61, 0x3AB6) // 1/720
+        ts_a64_dup_4s_u32(cb, 27, 9, 127, 0)         // 127
+
+        loop4 := cb.len()
+        ts_a64_cmp_imm(cb, 3, 4)
+        to_tail := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_q_post(cb, 0, 1)
+        ts_a64_ldr_q_post(cb, 1, 2)
+        ts_a64_swiglu_fast_step(cb)
+        ts_a64_str_q_post(cb, 0, 0)
+        ts_a64_sub_imm(cb, 3, 3, 4)
+        ts_a64_b_back(cb, loop4)
+
+        ts_a64_patch_cond(cb, to_tail, A64_COND_LT)
+        tail := cb.len()
+        ts_a64_cmp_imm(cb, 3, 0)
+        done_tail := ts_a64_b_cond_fwd(cb)
+        ts_a64_ldr_s_post(cb, 0, 1)
+        ts_a64_ldr_s_post(cb, 1, 2)
+        ts_a64_dup_4s_0(cb, 0, 0)
+        ts_a64_dup_4s_0(cb, 1, 1)
+        ts_a64_swiglu_fast_step(cb)
+        ts_a64_str_s_post(cb, 0, 0)
+        ts_a64_sub_imm(cb, 3, 3, 1)
+        ts_a64_b_back(cb, tail)
+
+        ts_a64_patch_cond(cb, done_tail, A64_COND_LE)
+        ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+        ts_a64_ret(cb)
+        <<
+    }
+
+    // Strict 2-wide f64 Cody-Waite exp(-g) + degree-11 Horner (0 ULP in f32).
+    ts_a64_save_q8_q15(cb)
+    ts_a64_dup_2d_u16(cb, 16, 9, 0xC086, 0x2000, 0x0000, 0x0000) // -708.0
+    ts_a64_dup_2d_u16(cb, 17, 9, 0x4086, 0x2000, 0x0000, 0x0000) // 708.0
+    ts_a64_dup_2d_u16(cb, 18, 9, 0x3FF7, 0x1547, 0x652B, 0x82FE) // invln2
+    ts_a64_dup_2d_u16(cb, 19, 9, 0x3FE6, 0x2E42, 0xFEFA, 0x39EF) // ln2_hi
+    ts_a64_dup_2d_u16(cb, 20, 9, 0x3C7A, 0xBC9E, 0x3B39, 0x803F) // ln2_lo
+    ts_a64_dup_2d_u16(cb, 21, 9, 0x3FF0, 0x0000, 0x0000, 0x0000) // 1.0
+    ts_a64_dup_2d_u16(cb, 22, 9, 0x3FE0, 0x0000, 0x0000, 0x0000) // 1/2!
+    ts_a64_dup_2d_u16(cb, 23, 9, 0x3FC5, 0x5555, 0x5555, 0x5555) // 1/3!
+    ts_a64_dup_2d_u16(cb, 24, 9, 0x3FA5, 0x5555, 0x5555, 0x5555) // 1/4!
+    ts_a64_dup_2d_u16(cb, 25, 9, 0x3F81, 0x1111, 0x1111, 0x1111) // 1/5!
+    ts_a64_dup_2d_u16(cb, 26, 9, 0x3F56, 0xC16C, 0x16C1, 0x6C17) // 1/6!
+    ts_a64_dup_2d_u16(cb, 27, 9, 0x3F2A, 0x01A0, 0x1A01, 0xA01A) // 1/7!
+    ts_a64_dup_2d_u16(cb, 28, 9, 0x3EFA, 0x01A0, 0x1A01, 0xA01A) // 1/8!
+    ts_a64_dup_2d_u16(cb, 29, 9, 0x3EC7, 0x1DE3, 0xA556, 0xC734) // 1/9!
+    ts_a64_dup_2d_u16(cb, 30, 9, 0x3E92, 0x7E4F, 0xB778, 0x9F5C) // 1/10!
+    ts_a64_dup_2d_u16(cb, 31, 9, 0x3E5A, 0xE645, 0x67F5, 0x44E4) // 1/11!
+    ts_a64_dup_2d_u16(cb, 15, 9, 0x0000, 0x0000, 0x0000, 1023)   // 1023
+
+    loop4s := cb.len()
+    ts_a64_cmp_imm(cb, 3, 4)
+    to_tail1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 8, 1)
+    ts_a64_ldr_q_post(cb, 9, 2)
+    ts_a64_fcvtl_2d(cb, 0, 8)
+    ts_a64_silu_strict_2d(cb, 10)
+    ts_a64_fcvtl2_2d(cb, 0, 8)
+    ts_a64_silu_strict_2d(cb, 11)
+    ts_a64_fcvtn_2s(cb, 0, 10)
+    ts_a64_fcvtn2_4s(cb, 0, 11)
+    ts_a64_fmul_4s(cb, 0, 0, 9)
+    ts_a64_str_q_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 3, 3, 4)
+    ts_a64_b_back(cb, loop4s)
+
+    ts_a64_patch_cond(cb, to_tail1, A64_COND_LT)
+    tail1 := cb.len()
+    ts_a64_cmp_imm(cb, 3, 0)
+    done_t1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 8, 1)
+    ts_a64_ldr_s_post(cb, 9, 2)
+    ts_a64_fcvtl_2d(cb, 0, 8)
+    ts_a64_silu_strict_2d(cb, 10)
+    ts_a64_fcvtn_2s(cb, 0, 10)
+    ts_a64_fmul_4s(cb, 0, 0, 9)
+    ts_a64_str_s_post(cb, 0, 0)
+    ts_a64_sub_imm(cb, 3, 3, 1)
+    ts_a64_b_back(cb, tail1)
+
+    ts_a64_patch_cond(cb, done_t1, A64_COND_LE)
+    ts_a64_restore_q8_q15(cb)
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_argmax_f32(cb $&mc.CodeBuffer) {
+    // (x=x0, n=x1) -> best_idx in x0
+    ts_a64_cmp_imm(cb, 1, 1)
+    too_small := ts_a64_b_cond_fwd(cb)
+    ts_a64_cmp_imm(cb, 1, 8)
+    small_scalar := ts_a64_b_cond_fwd(cb)
+
+    // Vector path (n >= 8): seed best_v=x[0..3], best_i=[0,1,2,3], cur_i=[4,5,6,7], step=[4,4,4,4]
+    ts_a64_ldr_q_post(cb, 0, 0)
+    e32(cb, 0xD280002A)             // movz x10, #1
+    e32(cb, 0xD280004B)             // movz x11, #2
+    e32(cb, 0xD280006C)             // movz x12, #3
+    ts_a64_zero_4s(cb, 1)
+    e32(cb, 0x4E0C1D41)             // ins v1.s[1], w10
+    e32(cb, 0x4E141D61)             // ins v1.s[2], w11
+    e32(cb, 0x4E1C1D81)             // ins v1.s[3], w12
+    ts_a64_dup_4s_u32(cb, 3, 9, 4, 0)
+    ts_a64_add_4s(cb, 2, 1, 3)      // cur_i = [4,5,6,7]
+    e32(cb, 0xD280008D)             // movz x13, #4 (idx = 4)
+    ts_a64_sub_imm(cb, 1, 1, 4)     // rem = n - 4
+
+    vec_loop := cb.len()
+    ts_a64_cmp_imm(cb, 1, 4)
+    vec_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_post(cb, 4, 0)
+    ts_a64_fcmgt_4s(cb, 5, 4, 0)
+    ts_a64_bit_16b(cb, 0, 4, 5)
+    ts_a64_bit_16b(cb, 1, 2, 5)
+    ts_a64_add_4s(cb, 2, 2, 3)
+    ts_a64_add_imm(cb, 13, 13, 4)
+    ts_a64_sub_imm(cb, 1, 1, 4)
+    ts_a64_b_back(cb, vec_loop)
+
+    ts_a64_patch_cond(cb, vec_done, A64_COND_LT)
+    ts_a64_mov_w_lane(cb, 9, 1, 0)
+    ts_a64_orr_16b(cb, 6, 0, 0)
+    for lane in 1:4 {
+        ts_a64_mov_s_lane(cb, 4, 6, lane)
+        ts_a64_mov_w_lane(cb, 10, 1, lane)
+        ts_a64_fcmp_s(cb, 4, 0)
+        not_gt := ts_a64_b_cond_fwd(cb)
+        a64_mov(cb, 9, 10)
+        e32(cb, 0x1E204080) // fmov s0, s4
+        gt_done := ts_a64_b_fwd(cb)
+        ts_a64_patch_cond(cb, not_gt, A64_COND_LE)
+        not_eq := ts_a64_b_cond_fwd(cb)
+        e32(cb, 0xEB09015F) // cmp x10, x9
+        eq_keep := ts_a64_b_cond_fwd(cb)
+        a64_mov(cb, 9, 10)
+        ts_a64_patch_cond(cb, not_eq, A64_COND_NE)
+        ts_a64_patch_cond(cb, eq_keep, A64_COND_GE)
+        ts_a64_patch_b(cb, gt_done)
+    }
+    b_fwd_tail := ts_a64_b_fwd(cb)
+
+    // Small scalar path (1 < n < 8)
+    ts_a64_patch_cond(cb, small_scalar, A64_COND_LT)
+    ts_a64_ldr_s_post(cb, 0, 0)
+    e32(cb, 0xD2800009)             // best_i = 0
+    e32(cb, 0xD280002D)             // x13 = 1
+    ts_a64_sub_imm(cb, 1, 1, 1)
+
+    ts_a64_patch_b(cb, b_fwd_tail)
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 1, 0)
+    done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_post(cb, 4, 0)
+    ts_a64_fcmp_s(cb, 4, 0)
+    skip_tail := ts_a64_b_cond_fwd(cb)
+    e32(cb, 0x1E204080)             // fmov s0, s4
+    a64_mov(cb, 9, 13)
+    ts_a64_patch_cond(cb, skip_tail, A64_COND_LE)
+    ts_a64_add_imm(cb, 13, 13, 1)
+    ts_a64_sub_imm(cb, 1, 1, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    a64_mov(cb, 0, 9)
+    ts_a64_ret(cb)
+
+    ts_a64_patch_cond(cb, too_small, A64_COND_LE)
+    e32(cb, 0xD2800000)             // movz x0, #0
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_rope_f32(cb $&mc.CodeBuffer) {
+    // (v0=x0, v1=x1, cos=x2, sin=x3, half=x4)
+    ts_a64_cmp_imm(cb, 4, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+
+    loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 4, 4)
+    to_tail := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_q_zero(cb, 0, 0)
+    ts_a64_ldr_q_zero(cb, 1, 1)
+    ts_a64_ldr_q_post(cb, 2, 2)
+    ts_a64_ldr_q_post(cb, 3, 3)
+    ts_a64_fmul_4s(cb, 4, 0, 2)
+    ts_a64_fmul_4s(cb, 5, 1, 3)
+    ts_a64_fsub_4s(cb, 4, 4, 5)
+    ts_a64_fmul_4s(cb, 6, 0, 3)
+    ts_a64_fmul_4s(cb, 7, 1, 2)
+    ts_a64_fadd_4s(cb, 5, 6, 7)
+    ts_a64_str_q_post(cb, 4, 0)
+    ts_a64_str_q_post(cb, 5, 1)
+    ts_a64_sub_imm(cb, 4, 4, 4)
+    ts_a64_b_back(cb, loop4)
+
+    ts_a64_patch_cond(cb, to_tail, A64_COND_LT)
+    tail := cb.len()
+    ts_a64_cmp_imm(cb, 4, 0)
+    done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldr_s_zero(cb, 0, 0)
+    ts_a64_ldr_s_zero(cb, 1, 1)
+    ts_a64_ldr_s_post(cb, 2, 2)
+    ts_a64_ldr_s_post(cb, 3, 3)
+    ts_a64_fmul_s(cb, 4, 0, 2)
+    ts_a64_fmul_s(cb, 5, 1, 3)
+    ts_a64_fsub_s(cb, 4, 4, 5)
+    ts_a64_fmul_s(cb, 6, 0, 3)
+    ts_a64_fmul_s(cb, 7, 1, 2)
+    ts_a64_fadd_s(cb, 5, 6, 7)
+    ts_a64_str_s_post(cb, 4, 0)
+    ts_a64_str_s_post(cb, 5, 1)
+    ts_a64_sub_imm(cb, 4, 4, 1)
+    ts_a64_b_back(cb, tail)
+
+    ts_a64_patch_cond(cb, done, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_gemv4_q4_0_p4_q8_0(cb $&mc.CodeBuffer, fast bool, f16_scale bool) {
+    // (out=x0, qs_p=x1, ws_p=x2, xq=x3, xs=x4, packed=(rg_cnt<<32)|nb in x5)
+    ts_a64_mov_w(cb, 6, 5)       // x6 = nb
+    ts_a64_lsr_imm(cb, 5, 5, 32) // x5 = rg_cnt
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_lsl_imm(cb, 7, 6, 5)  // x7 = nb * 32
+    ts_a64_lsl_imm(cb, 8, 6, 2)  // x8 = nb * 4
+    ts_a64_lsl_imm(cb, 12, 6, 6) // x12 = nb * 64 (qs bytes per rg)
+    $ws_shift := 4
+    if f16_scale { ws_shift = 3 }
+    ts_a64_lsl_imm(cb, 13, 6, ws_shift)
+    ts_a64_movi_16b(cb, 20, 15)
+    ts_a64_movi_16b(cb, 21, 248) // -8 in i8
+    empty_s := []int{}
+    q_b := [0, 1, 17, 18]
+    q_b1 := [25, 26, 27, 28]
+
+    // 8-row main loop (2 row groups per pass)
+    rg_loop8 := cb.len()
+    ts_a64_cmp_imm(cb, 5, 2)
+    to_rg1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 10, 1, 12)
+    ts_a64_add_reg(cb, 11, 2, 13)
+    ts_a64_zero_4s(cb, 16)
+    ts_a64_zero_4s(cb, 19)
+    a64_mov(cb, 9, 6) // b_rem = nb
+
+    b8_loop := cb.len()
+    ts_a64_cmp_imm(cb, 9, 0)
+    b8_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_prfm_pldl1(cb, 1, 512)
+    ts_a64_prfm_pldl1(cb, 10, 512)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_zero_4s(cb, 24)
+    ts_a64_sdot_4s(cb, 24, 2, 21)
+    ts_a64_sdot_4s(cb, 24, 3, 21)
+    ts_a64_addv_4s(cb, 24, 24)
+    ts_a64_dup_4s_0(cb, 24, 24)
+
+    ts_a64_ldp_q_post(cb, 0, 1, 1)
+    ts_a64_ldp_q_post(cb, 17, 18, 1)
+    ts_a64_ldp_q_post(cb, 25, 26, 10)
+    ts_a64_ldp_q_post(cb, 27, 28, 10)
+
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    for r in 0:4 {
+        ts_a64_and_16b(cb, 29, q_b[r], 20)
+        ts_a64_ushr_16b_4(cb, 30, q_b[r])
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 29, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 30, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, 24, &empty_s, fast)
+
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 11)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 11)
+    }
+    for r in 0:4 {
+        ts_a64_and_16b(cb, 29, q_b1[r], 20)
+        ts_a64_ushr_16b_4(cb, 30, q_b1[r])
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 29, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 30, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 19, 24, &empty_s, fast)
+
+    ts_a64_sub_imm(cb, 9, 9, 1)
+    ts_a64_b_back(cb, b8_loop)
+
+    ts_a64_patch_cond(cb, b8_done, A64_COND_LE)
+    ts_a64_stp_q_post(cb, 16, 19, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 0)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    a64_mov(cb, 1, 10)
+    a64_mov(cb, 2, 11)
+    ts_a64_sub_imm(cb, 5, 5, 2)
+    ts_a64_b_back(cb, rg_loop8)
+
+    ts_a64_patch_cond(cb, to_rg1, A64_COND_LT)
+    rg_loop := cb.len()
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_rg := ts_a64_b_cond_fwd(cb)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 9, 6) // b_rem = nb
+
+    // K-unrolled 2-block loop
+    blk2 := cb.len()
+    ts_a64_cmp_imm(cb, 9, 2)
+    to_blk1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldp_q_post(cb, 25, 26, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_ldr_s_post(cb, 27, 4)
+
+    ts_a64_zero_4s(cb, 24)
+    ts_a64_sdot_4s(cb, 24, 2, 21)
+    ts_a64_sdot_4s(cb, 24, 3, 21)
+    ts_a64_addv_4s(cb, 24, 24)
+    ts_a64_dup_4s_0(cb, 24, 24)
+
+    ts_a64_zero_4s(cb, 28)
+    ts_a64_sdot_4s(cb, 28, 25, 21)
+    ts_a64_sdot_4s(cb, 28, 26, 21)
+    ts_a64_addv_4s(cb, 28, 28)
+    ts_a64_dup_4s_0(cb, 28, 28)
+
+    // Block 0 (uses xq=v2,v3, xs=s22, xq_off=v24)
+    ts_a64_ldp_q_post(cb, 0, 1, 1)
+    ts_a64_ldp_q_post(cb, 17, 18, 1)
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    for r in 0:4 {
+        ts_a64_and_16b(cb, 29, q_b[r], 20)
+        ts_a64_ushr_16b_4(cb, 30, q_b[r])
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 29, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 30, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, 24, &empty_s, fast)
+
+    // Block 1 (uses xq=v25,v26, xs=s27, xq_off=v28)
+    ts_a64_ldp_q_post(cb, 0, 1, 1)
+    ts_a64_ldp_q_post(cb, 17, 18, 1)
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    ts_a64_orr_16b(cb, 22, 27, 27)
+    for r in 0:4 {
+        ts_a64_and_16b(cb, 29, q_b[r], 20)
+        ts_a64_ushr_16b_4(cb, 30, q_b[r])
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 29, 25)
+        ts_a64_sdot_4s(cb, 4 + r, 30, 26)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, 28, &empty_s, fast)
+
+    ts_a64_sub_imm(cb, 9, 9, 2)
+    ts_a64_b_back(cb, blk2)
+
+    ts_a64_patch_cond(cb, to_blk1, A64_COND_LT)
+    blk1 := cb.len()
+    ts_a64_cmp_imm(cb, 9, 0)
+    blk1_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_zero_4s(cb, 24)
+    ts_a64_sdot_4s(cb, 24, 2, 21)
+    ts_a64_sdot_4s(cb, 24, 3, 21)
+    ts_a64_addv_4s(cb, 24, 24)
+    ts_a64_dup_4s_0(cb, 24, 24)
+    ts_a64_ldp_q_post(cb, 0, 1, 1)
+    ts_a64_ldp_q_post(cb, 17, 18, 1)
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    for r in 0:4 {
+        ts_a64_and_16b(cb, 29, q_b[r], 20)
+        ts_a64_ushr_16b_4(cb, 30, q_b[r])
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 29, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 30, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, 24, &empty_s, fast)
+    ts_a64_sub_imm(cb, 9, 9, 1)
+    ts_a64_b_back(cb, blk1)
+
+    ts_a64_patch_cond(cb, blk1_done, A64_COND_LE)
+    ts_a64_str_q_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 0)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_b_back(cb, rg_loop)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_rg, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_gemv4_q8_0_p4_q8_0(cb $&mc.CodeBuffer, fast bool, f16_scale bool) {
+    // (out=x0, qs_p=x1, ws_p=x2, xq=x3, xs=x4, packed=(rg_cnt<<32)|nb in x5)
+    ts_a64_mov_w(cb, 6, 5)
+    ts_a64_lsr_imm(cb, 5, 5, 32)
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_early := ts_a64_b_cond_fwd(cb)
+    ts_a64_lsl_imm(cb, 7, 6, 5)  // x7 = nb * 32
+    ts_a64_lsl_imm(cb, 8, 6, 2)  // x8 = nb * 4
+    ts_a64_lsl_imm(cb, 12, 6, 7) // x12 = nb * 128
+    $ws_shift := 4
+    if f16_scale { ws_shift = 3 }
+    ts_a64_lsl_imm(cb, 13, 6, ws_shift)
+    empty_s := []int{}
+
+    // 8-row main loop (2 row groups per pass)
+    rg_loop8 := cb.len()
+    ts_a64_cmp_imm(cb, 5, 2)
+    to_rg1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_add_reg(cb, 10, 1, 12)
+    ts_a64_add_reg(cb, 11, 2, 13)
+    ts_a64_zero_4s(cb, 16)
+    ts_a64_zero_4s(cb, 19)
+    a64_mov(cb, 9, 6)
+
+    b8_loop := cb.len()
+    ts_a64_cmp_imm(cb, 9, 0)
+    b8_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_prfm_pldl1(cb, 1, 512)
+    ts_a64_prfm_pldl1(cb, 10, 512)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    for r in 0:4 {
+        ts_a64_ldp_q_post(cb, 0, 1, 1)
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, -1, &empty_s, fast)
+
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 11)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 11)
+    }
+    for r in 0:4 {
+        ts_a64_ldp_q_post(cb, 0, 1, 10)
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 19, -1, &empty_s, fast)
+
+    ts_a64_sub_imm(cb, 9, 9, 1)
+    ts_a64_b_back(cb, b8_loop)
+
+    ts_a64_patch_cond(cb, b8_done, A64_COND_LE)
+    ts_a64_stp_q_post(cb, 16, 19, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 0)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    a64_mov(cb, 1, 10)
+    a64_mov(cb, 2, 11)
+    ts_a64_sub_imm(cb, 5, 5, 2)
+    ts_a64_b_back(cb, rg_loop8)
+
+    ts_a64_patch_cond(cb, to_rg1, A64_COND_LT)
+    rg_loop := cb.len()
+    ts_a64_cmp_imm(cb, 5, 0)
+    done_rg := ts_a64_b_cond_fwd(cb)
+    ts_a64_zero_4s(cb, 16)
+    a64_mov(cb, 9, 6)
+
+    blk2 := cb.len()
+    ts_a64_cmp_imm(cb, 9, 2)
+    to_blk1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldp_q_post(cb, 24, 25, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    ts_a64_ldr_s_post(cb, 26, 4)
+
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    for r in 0:4 {
+        ts_a64_ldp_q_post(cb, 0, 1, 1)
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, -1, &empty_s, fast)
+
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    ts_a64_orr_16b(cb, 22, 26, 26)
+    for r in 0:4 {
+        ts_a64_ldp_q_post(cb, 0, 1, 1)
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 24)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 25)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, -1, &empty_s, fast)
+
+    ts_a64_sub_imm(cb, 9, 9, 2)
+    ts_a64_b_back(cb, blk2)
+
+    ts_a64_patch_cond(cb, to_blk1, A64_COND_LT)
+    blk1 := cb.len()
+    ts_a64_cmp_imm(cb, 9, 0)
+    blk1_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_ldp_q_post(cb, 2, 3, 3)
+    ts_a64_ldr_s_post(cb, 22, 4)
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 2)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 2)
+    }
+    for r in 0:4 {
+        ts_a64_ldp_q_post(cb, 0, 1, 1)
+        ts_a64_zero_4s(cb, 4 + r)
+        ts_a64_sdot_4s(cb, 4 + r, 0, 2)
+        ts_a64_sdot_4s(cb, 4 + r, 1, 3)
+    }
+    ts_a64_sdot_reduce4_off(cb, 16, -1, &empty_s, fast)
+    ts_a64_sub_imm(cb, 9, 9, 1)
+    ts_a64_b_back(cb, blk1)
+
+    ts_a64_patch_cond(cb, blk1_done, A64_COND_LE)
+    ts_a64_str_q_post(cb, 16, 0)
+    ts_a64_sub_reg_lsl(cb, 3, 3, 7, 0)
+    ts_a64_sub_reg_lsl(cb, 4, 4, 8, 0)
+    ts_a64_sub_imm(cb, 5, 5, 1)
+    ts_a64_b_back(cb, rg_loop)
+
+    ts_a64_patch_cond(cb, done_early, A64_COND_LE)
+    ts_a64_patch_cond(cb, done_rg, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+fn ts_a64_emit_gemm_p4_mtile(cb $&mc.CodeBuffer, fast bool, m_tile int, adv_shift int, f16_scale bool) {
+    // Runs one M chunk of m_tile tokens across all rg_cnt groups:
+    // Inputs: x19=qs_base, x20=ws_base, x21=out_m, x22=xq_m, x23=xs_m, x24=M_rem, x25=rg_cnt, x26=nb,
+    //         x5=stride_xq (nb*32), x6=stride_xs (nb*4), x10=stride_out (rg_cnt*16), v20=0x0F, v21=0x08(+8).
+    a64_mov(cb, 0, 19)
+    a64_mov(cb, 1, 20)
+    a64_mov(cb, 9, 21)
+    a64_mov(cb, 12, 25) // rg_rem = rg_cnt
+    w_in := [0, 1, 17, 18]
+
+    rg_loop := cb.len()
+    ts_a64_cmp_imm(cb, 12, 0)
+    rg_done := ts_a64_b_cond_fwd(cb)
+    for t in 0:m_tile { ts_a64_zero_4s(cb, 8 + t) }
+    a64_mov(cb, 2, 26)  // b_rem = nb
+    a64_mov(cb, 3, 22)  // xq_cur
+    a64_mov(cb, 4, 23)  // xs_cur
+
+    b_loop := cb.len()
+    ts_a64_cmp_imm(cb, 2, 0)
+    b_done := ts_a64_b_cond_fwd(cb)
+    ts_a64_prfm_pldl1(cb, 0, 512)
+    ts_a64_ldp_q_post(cb, 0, 1, 0)
+    ts_a64_ldp_q_post(cb, 17, 18, 0)
+    if f16_scale {
+        ts_a64_ldr_d_post(cb, 23, 1)
+        ts_a64_fcvtl_4s(cb, 23, 23)
+    } else {
+        ts_a64_ldr_q_post(cb, 23, 1)
+    }
+    for r in 0:4 {
+        ts_a64_and_16b(cb, 24 + r, w_in[r], 20)
+        ts_a64_ushr_16b_4(cb, 28 + r, w_in[r])
+        ts_a64_sub_16b(cb, 24 + r, 24 + r, 21)
+        ts_a64_sub_16b(cb, 28 + r, 28 + r, 21)
+    }
+    a64_mov(cb, 7, 3)
+    a64_mov(cb, 8, 4)
+    ts_a64_ldr_q_zero(cb, 2, 7)
+    ts_a64_ldr_q_off(cb, 3, 7, 1)
+    ts_a64_ldr_s_zero(cb, 22, 8)
+    if m_tile > 1 {
+        ts_a64_add_reg(cb, 7, 7, 5)
+        ts_a64_add_reg(cb, 8, 8, 6)
+    }
+    for t in 0:m_tile {
+        $cx0 := 2
+        $cx1 := 3
+        $cxs := 22
+        $nx0 := 16
+        $nx1 := 17
+        $nxs := 18
+        if (t & 1) != 0 {
+            cx0 = 16
+            cx1 = 17
+            cxs = 18
+            nx0 = 2
+            nx1 = 3
+            nxs = 22
+        }
+        if t + 1 < m_tile {
+            ts_a64_ldr_q_zero(cb, nx0, 7)
+            ts_a64_ldr_q_off(cb, nx1, 7, 1)
+            ts_a64_ldr_s_zero(cb, nxs, 8)
+            if t + 2 < m_tile {
+                ts_a64_add_reg(cb, 7, 7, 5)
+                ts_a64_add_reg(cb, 8, 8, 6)
+            }
+        }
+        for r in 0:4 {
+            ts_a64_zero_4s(cb, 4 + r)
+            ts_a64_sdot_4s(cb, 4 + r, 24 + r, cx0)
+            ts_a64_sdot_4s(cb, 4 + r, 28 + r, cx1)
+        }
+        ts_a64_addp_4s(cb, 4, 4, 5)
+        ts_a64_addp_4s(cb, 6, 6, 7)
+        ts_a64_addp_4s(cb, 4, 4, 6)
+        ts_a64_scvtf_4s(cb, 4, 4)
+        ts_a64_fmul_4s_elem0(cb, 1, 23, cxs)
+        if fast {
+            ts_a64_fmla_4s(cb, 8 + t, 4, 1)
+        } else {
+            ts_a64_fmul_4s(cb, 4, 4, 1)
+            ts_a64_fadd_4s(cb, 8 + t, 8 + t, 4)
+        }
+    }
+    ts_a64_add_imm(cb, 3, 3, 32)
+    ts_a64_add_imm(cb, 4, 4, 4)
+    ts_a64_sub_imm(cb, 2, 2, 1)
+    ts_a64_b_back(cb, b_loop)
+
+    ts_a64_patch_cond(cb, b_done, A64_COND_LE)
+    a64_mov(cb, 11, 9)
+    for t in 0:m_tile {
+        ts_a64_str_q_zero(cb, 8 + t, 11)
+        if t + 1 < m_tile {
+            ts_a64_add_reg(cb, 11, 11, 10)
+        }
+    }
+    ts_a64_add_imm(cb, 9, 9, 16)
+    ts_a64_sub_imm(cb, 12, 12, 1)
+    ts_a64_b_back(cb, rg_loop)
+
+    ts_a64_patch_cond(cb, rg_done, A64_COND_LE)
+    ts_a64_add_reg_lsl(cb, 21, 21, 10, adv_shift)
+    ts_a64_add_reg_lsl(cb, 22, 22, 5, adv_shift)
+    ts_a64_add_reg_lsl(cb, 23, 23, 6, adv_shift)
+    ts_a64_sub_imm(cb, 24, 24, m_tile)
+}
+
+fn ts_a64_emit_gemm4x8_q4_0_p4_q8_0(cb $&mc.CodeBuffer, fast bool, f16_scale bool) {
+    // (out=x0, qs_p=x1, ws_p=x2, xq=x3, xs=x4, packed=(M<<42)|(rg_cnt<<21)|nb in x5)
+    ts_a64_and_21(cb, 6, 5)      // x6 = nb
+    ts_a64_ubfx_21(cb, 7, 5, 21) // x7 = rg_cnt
+    ts_a64_ubfx_21(cb, 8, 5, 42) // x8 = M
+    ts_a64_cmp_imm(cb, 8, 0)
+    early_m := ts_a64_b_cond_fwd(cb)
+    ts_a64_cmp_imm(cb, 7, 0)
+    early_rg := ts_a64_b_cond_fwd(cb)
+
+    ts_a64_save_q8_q15(cb)
+    ts_a64_save_x19_x26_frame128(cb)
+    a64_mov(cb, 19, 1)           // qs_base
+    a64_mov(cb, 20, 2)           // ws_base
+    a64_mov(cb, 21, 0)           // out_m
+    a64_mov(cb, 22, 3)           // xq_m
+    a64_mov(cb, 23, 4)           // xs_m
+    a64_mov(cb, 24, 8)           // M_rem
+    a64_mov(cb, 25, 7)           // rg_cnt
+    a64_mov(cb, 26, 6)           // nb
+    ts_a64_lsl_imm(cb, 5, 26, 5) // x5 = nb * 32
+    ts_a64_lsl_imm(cb, 6, 26, 2) // x6 = nb * 4
+    ts_a64_lsl_imm(cb, 10, 25, 4)// x10 = rg_cnt * 16 = N * 4
+    ts_a64_movi_16b(cb, 20, 15)
+    ts_a64_movi_16b(cb, 21, 8)   // +8 in i8 for pre-unpacked sub.16b
+
+    m_loop8 := cb.len()
+    ts_a64_cmp_imm(cb, 24, 8)
+    to_m4 := ts_a64_b_cond_fwd(cb)
+    ts_a64_emit_gemm_p4_mtile(cb, fast, 8, 3, f16_scale)
+    ts_a64_b_back(cb, m_loop8)
+
+    ts_a64_patch_cond(cb, to_m4, A64_COND_LT)
+    m_loop4 := cb.len()
+    ts_a64_cmp_imm(cb, 24, 4)
+    to_m1 := ts_a64_b_cond_fwd(cb)
+    ts_a64_emit_gemm_p4_mtile(cb, fast, 4, 2, f16_scale)
+    ts_a64_b_back(cb, m_loop4)
+
+    ts_a64_patch_cond(cb, to_m1, A64_COND_LT)
+    m_loop1 := cb.len()
+    ts_a64_cmp_imm(cb, 24, 0)
+    done_all := ts_a64_b_cond_fwd(cb)
+    ts_a64_emit_gemm_p4_mtile(cb, fast, 1, 0, f16_scale)
+    ts_a64_b_back(cb, m_loop1)
+
+    ts_a64_patch_cond(cb, done_all, A64_COND_LE)
+    ts_a64_restore_x19_x26_frame128(cb)
+    ts_a64_restore_q8_q15(cb)
+    ts_a64_patch_cond(cb, early_m, A64_COND_LE)
+    ts_a64_patch_cond(cb, early_rg, A64_COND_LE)
+    ts_a64_ret(cb)
+}
+
+pub fn emit_arm64_tensor_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+    syms.define_label("__xu_tensor_mul_add_f32", cb.len())
+    ts_a64_emit_mul_add(cb, false)
+    syms.define_label("__xu_tensor_mul_add_fma_f32", cb.len())
+    ts_a64_emit_mul_add(cb, true)
+    syms.define_label("__xu_tensor_add_sqsum_f32", cb.len())
+    ts_a64_emit_add_sqsum(cb, false)
+    syms.define_label("__xu_tensor_add_sqsum_fast_f32", cb.len())
+    ts_a64_emit_add_sqsum(cb, true)
+    syms.define_label("__xu_tensor_norm_f32", cb.len())
+    ts_a64_emit_norm(cb)
+    syms.define_label("__xu_tensor_dot_f32", cb.len())
+    ts_a64_emit_dot(cb, false)
+    syms.define_label("__xu_tensor_dot_fast_f32", cb.len())
+    ts_a64_emit_dot(cb, true)
+    syms.define_label("__xu_tensor_axpy_f32", cb.len())
+    ts_a64_emit_axpy(cb, false)
+    syms.define_label("__xu_tensor_axpy_fma_f32", cb.len())
+    ts_a64_emit_axpy(cb, true)
+    syms.define_label("__xu_tensor_vadd_inplace_f32", cb.len())
+    ts_a64_emit_vadd_inplace(cb)
+    syms.define_label("__xu_tensor_dot_q4_0_f32", cb.len())
+    ts_a64_emit_dot_q4_0(cb, false)
+    syms.define_label("__xu_tensor_dot_q4_0_fast_f32", cb.len())
+    ts_a64_emit_dot_q4_0(cb, true)
+    syms.define_label("__xu_tensor_gemv4_f32", cb.len())
+    ts_a64_emit_gemv4_f32(cb, false)
+    syms.define_label("__xu_tensor_gemv4_fast_f32", cb.len())
+    ts_a64_emit_gemv4_f32(cb, true)
+    syms.define_label("__xu_tensor_dot_q4_0_q8_0_f32", cb.len())
+    ts_a64_emit_dot_q4_0_q8_0(cb, false)
+    syms.define_label("__xu_tensor_dot_q4_0_q8_0_fast_f32", cb.len())
+    ts_a64_emit_dot_q4_0_q8_0(cb, true)
+    syms.define_label("__xu_tensor_gemv4_q4_0_q8_0_f32", cb.len())
+    ts_a64_emit_gemv4_q4_0_q8_0(cb, false)
+    syms.define_label("__xu_tensor_gemv4_q4_0_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemv4_q4_0_q8_0(cb, true)
+    syms.define_label("__xu_tensor_quantize_q8_0", cb.len())
+    ts_a64_emit_quantize_q8_0(cb, false)
+    syms.define_label("__xu_tensor_quantize_q8_0_fast", cb.len())
+    ts_a64_emit_quantize_q8_0(cb, true)
+    syms.define_label("__xu_tensor_gemv4_q8_0_q8_0_f32", cb.len())
+    ts_a64_emit_gemv4_q8_0_q8_0(cb, false)
+    syms.define_label("__xu_tensor_gemv4_q8_0_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemv4_q8_0_q8_0(cb, true)
+    syms.define_label("__xu_tensor_gemm4x4_f32", cb.len())
+    ts_a64_emit_gemm4x4_f32(cb, false)
+    syms.define_label("__xu_tensor_gemm4x4_fast_f32", cb.len())
+    ts_a64_emit_gemm4x4_f32(cb, true)
+    syms.define_label("__xu_tensor_gemm4x4_q4_0_q8_0_f32", cb.len())
+    ts_a64_emit_gemm4x4_q4_0_q8_0(cb, false)
+    syms.define_label("__xu_tensor_gemm4x4_q4_0_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemm4x4_q4_0_q8_0(cb, true)
+    syms.define_label("__xu_tensor_swiglu_f32", cb.len())
+    ts_a64_emit_swiglu(cb, false)
+    syms.define_label("__xu_tensor_swiglu_fast_f32", cb.len())
+    ts_a64_emit_swiglu(cb, true)
+    syms.define_label("__xu_tensor_argmax_f32", cb.len())
+    ts_a64_emit_argmax_f32(cb)
+    syms.define_label("__xu_tensor_rope_f32", cb.len())
+    ts_a64_emit_rope_f32(cb)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_q8_0_f32", cb.len())
+    ts_a64_emit_gemv4_q4_0_p4_q8_0(cb, false, false)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemv4_q4_0_p4_q8_0(cb, true, false)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_q8_0_f32", cb.len())
+    ts_a64_emit_gemv4_q8_0_p4_q8_0(cb, false, false)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemv4_q8_0_p4_q8_0(cb, true, false)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_q8_0_f32", cb.len())
+    ts_a64_emit_gemm4x8_q4_0_p4_q8_0(cb, false, false)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemm4x8_q4_0_p4_q8_0(cb, true, false)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_f16_q8_0_f32", cb.len())
+    ts_a64_emit_gemv4_q4_0_p4_q8_0(cb, false, true)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_f16_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemv4_q4_0_p4_q8_0(cb, true, true)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_f16_q8_0_f32", cb.len())
+    ts_a64_emit_gemv4_q8_0_p4_q8_0(cb, false, true)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_f16_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemv4_q8_0_p4_q8_0(cb, true, true)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_f32", cb.len())
+    ts_a64_emit_gemm4x8_q4_0_p4_q8_0(cb, false, true)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_fast_f32", cb.len())
+    ts_a64_emit_gemm4x8_q4_0_p4_q8_0(cb, true, true)
+}
+
+// ===== x86-64 SSE encoding & branch helpers =====
+
+fn ts_x64_add_imm(cb $&mc.CodeBuffer, r int, imm int) {
+    x64_rex(cb, true, 0, r, false)
+    xb(cb, 0x83)
+    x64_modrm_rr(cb, 0, r)
+    xb(cb, imm)
+}
+
+fn ts_x64_add_imm32(cb $&mc.CodeBuffer, r int, imm int) {
+    x64_rex(cb, true, 0, r, false)
+    xb(cb, 0x81)
+    x64_modrm_rr(cb, 0, r)
+    cb.emit_u32_le(imm & 0xffffffff)
+}
+
+fn ts_x64_movd_ld(cb $&mc.CodeBuffer, xd int, base int, disp int) {
+    xb(cb, 0x66)
+    x64_rex(cb, false, xd, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x6E)
+    x64_modrm_mem(cb, xd, base, disp)
+}
+
+fn ts_x64_pcmpeqd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x76)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_punpcklbw(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x60)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_punpcklwd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x61)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_pslld_imm(cb $&mc.CodeBuffer, xd int, imm int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x72)
+    x64_modrm_rr(cb, 6, xd)
+    xb(cb, imm)
+}
+
+fn ts_x64_psrld_imm(cb $&mc.CodeBuffer, xd int, imm int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x72)
+    x64_modrm_rr(cb, 2, xd)
+    xb(cb, imm)
+}
+
+fn ts_x64_psubd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0xFA)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_cvtdq2ps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x5B)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_mov32_rr(cb $&mc.CodeBuffer, rd int, rs int) {
+    if rd >= 8 || rs >= 8 { x64_rex(cb, false, rs, rd, false) }
+    xb(cb, 0x89)
+    x64_modrm_rr(cb, rs, rd)
+}
+
+fn ts_x64_shr_imm(cb $&mc.CodeBuffer, r int, imm int) {
+    x64_rex(cb, true, 0, r, false)
+    xb(cb, 0xC1)
+    x64_modrm_rr(cb, 5, r)
+    xb(cb, imm)
+}
+
+fn ts_x64_shl_imm(cb $&mc.CodeBuffer, r int, imm int) {
+    x64_rex(cb, true, 0, r, false)
+    xb(cb, 0xC1)
+    x64_modrm_rr(cb, 4, r)
+    xb(cb, imm)
+}
+
+fn ts_x64_sub_rr(cb $&mc.CodeBuffer, rd int, rs int) {
+    x64_rex(cb, true, rs, rd, false)
+    xb(cb, 0x29)
+    x64_modrm_rr(cb, rs, rd)
+}
+
+fn ts_x64_movq_ld(cb $&mc.CodeBuffer, xd int, base int, disp int) {
+    xb(cb, 0xF3)
+    if xd >= 8 || base >= 8 { x64_rex(cb, false, xd, base, false) }
+    xb(cb, 0x0F)
+    xb(cb, 0x7E)
+    x64_modrm_mem(cb, xd, base, disp)
+}
+
+fn ts_x64_psrlw_imm(cb $&mc.CodeBuffer, xd int, imm int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x71)
+    x64_modrm_rr(cb, 2, xd)
+    xb(cb, imm)
+}
+
+fn ts_x64_psllw_imm(cb $&mc.CodeBuffer, xd int, imm int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x71)
+    x64_modrm_rr(cb, 6, xd)
+    xb(cb, imm)
+}
+
+fn ts_x64_psraw_imm(cb $&mc.CodeBuffer, xd int, imm int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x71)
+    x64_modrm_rr(cb, 4, xd)
+    xb(cb, imm)
+}
+
+fn ts_x64_psubw(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0xF9)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_pmaddwd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0xF5)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_paddd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0xFE)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_pshufd(cb $&mc.CodeBuffer, xd int, xs int, imm int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x70)
+    x64_modrm_rr(cb, xd, xs)
+    xb(cb, imm)
+}
+
+fn ts_x64_sub_imm(cb $&mc.CodeBuffer, r int, imm int) {
+    x64_rex(cb, true, 0, r, false)
+    xb(cb, 0x83)
+    x64_modrm_rr(cb, 5, r)
+    xb(cb, imm)
+}
+
+fn ts_x64_jcc_fwd(cb $&mc.CodeBuffer, cc int) int {
+    xb(cb, 0x0F)
+    xb(cb, 0x80 | cc)
+    cb.emit_u32_le(0)
+    << cb.len()
+}
+
+fn ts_x64_patch_rel32(cb $&mc.CodeBuffer, at int) {
+    cb.patch_u32_le(at - 4, (cb.len() - at) & 0xffffffff)
+}
+
+fn ts_x64_jmp_back(cb $&mc.CodeBuffer, target int) {
+    xb(cb, 0xE9)
+    cb.emit_u32_le((target - (cb.len() + 4)) & 0xffffffff)
+}
+
+fn ts_x64_movups_ld(cb $&mc.CodeBuffer, xd int, base int, disp int) {
+    x64_rex(cb, false, xd, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x10)
+    x64_modrm_mem(cb, xd, base, disp)
+}
+
+fn ts_x64_movups_st(cb $&mc.CodeBuffer, xs int, base int, disp int) {
+    x64_rex(cb, false, xs, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x11)
+    x64_modrm_mem(cb, xs, base, disp)
+}
+
+fn ts_x64_movss_ld(cb $&mc.CodeBuffer, xd int, base int, disp int) {
+    xb(cb, 0xF3)
+    x64_rex(cb, false, xd, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x10)
+    x64_modrm_mem(cb, xd, base, disp)
+}
+
+fn ts_x64_movss_st(cb $&mc.CodeBuffer, xs int, base int, disp int) {
+    xb(cb, 0xF3)
+    x64_rex(cb, false, xs, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x11)
+    x64_modrm_mem(cb, xs, base, disp)
+}
+
+fn ts_x64_movaps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x28)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_xorps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x57)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_addps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x58)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_subps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x5C)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_mulps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x59)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_orps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x56)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_addss(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF3)
+    xb(cb, 0x0F)
+    xb(cb, 0x58)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_subss(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF3)
+    xb(cb, 0x0F)
+    xb(cb, 0x5C)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_or_rr(cb $&mc.CodeBuffer, rd int, rs int) {
+    x64_rex(cb, true, rs, rd, false)
+    xb(cb, 0x09)
+    x64_modrm_rr(cb, rs, rd)
+}
+
+fn ts_x64_and_imm8(cb $&mc.CodeBuffer, r int, imm int) {
+    x64_rex(cb, true, 0, r, false)
+    xb(cb, 0x83)
+    x64_modrm_rr(cb, 4, r)
+    xb(cb, imm)
+}
+
+fn ts_x64_mulss(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF3)
+    xb(cb, 0x0F)
+    xb(cb, 0x59)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_shufps(cb $&mc.CodeBuffer, xd int, xs int, imm int) {
+    xb(cb, 0x0F)
+    xb(cb, 0xC6)
+    x64_modrm_rr(cb, xd, xs)
+    xb(cb, imm)
+}
+
+fn ts_x64_movd_to_xmm(cb $&mc.CodeBuffer, xd int, rs int) {
+    xb(cb, 0x66)
+    x64_rex(cb, false, xd, rs, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x6E)
+    x64_modrm_rr(cb, xd, rs)
+}
+
+fn ts_x64_movd_from_xmm(cb $&mc.CodeBuffer, rd int, xs int) {
+    xb(cb, 0x66)
+    x64_rex(cb, false, xs, rd, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x7E)
+    x64_modrm_rr(cb, xs, rd)
+}
+
+fn ts_x64_serial_sum_xmm0(cb $&mc.CodeBuffer, acc int) {
+    ts_x64_addss(cb, acc, 0)
+    for _ in 0:3 {
+        ts_x64_shufps(cb, 0, 0, 0x39)
+        ts_x64_addss(cb, acc, 0)
+    }
+}
+
+fn ts_x64_hsum_xmm(cb $&mc.CodeBuffer, v int) {
+    ts_x64_movaps(cb, 0, v)
+    ts_x64_shufps(cb, 0, 0, 0x4E)
+    ts_x64_addps(cb, v, 0)
+    ts_x64_movaps(cb, 0, v)
+    ts_x64_shufps(cb, 0, 0, 0x01)
+    ts_x64_addss(cb, v, 0)
+}
+
+fn ts_x64_emit_mul_add(cb $&mc.CodeBuffer) {
+    // (out=rdi, x=rsi, scale=rdx, bias=rcx, n=r8)
+    x64_test(cb, X_R8)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+
+    loop4 := cb.len()
+    x64_cmp_imm8(cb, X_R8, 4)
+    to_tail := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RSI, 0)
+    ts_x64_movups_ld(cb, 1, X_RDX, 0)
+    ts_x64_movups_ld(cb, 2, X_RCX, 0)
+    ts_x64_mulps(cb, 0, 1)
+    ts_x64_addps(cb, 0, 2)
+    ts_x64_movups_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_add_imm(cb, X_RDX, 16)
+    ts_x64_add_imm(cb, X_RCX, 16)
+    ts_x64_sub_imm(cb, X_R8, 4)
+    ts_x64_jmp_back(cb, loop4)
+
+    ts_x64_patch_rel32(cb, to_tail)
+    tail := cb.len()
+    x64_test(cb, X_R8)
+    done_tail := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RSI, 0)
+    ts_x64_movss_ld(cb, 1, X_RDX, 0)
+    ts_x64_movss_ld(cb, 2, X_RCX, 0)
+    ts_x64_mulss(cb, 0, 1)
+    ts_x64_addss(cb, 0, 2)
+    ts_x64_movss_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_add_imm(cb, X_RCX, 4)
+    ts_x64_sub_imm(cb, X_R8, 1)
+    ts_x64_jmp_back(cb, tail)
+
+    ts_x64_patch_rel32(cb, done_early)
+    ts_x64_patch_rel32(cb, done_tail)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_add_sqsum_arm(cb $&mc.CodeBuffer, write_dst bool, fast bool) {
+    // dst=rdi, x=rsi, skip=rdx, n=rcx, acc in xmm4 (strict) or xmm5+xmm4 (fast)
+    if fast {
+        ts_x64_xorps(cb, 4, 4)
+    }
+    loop4 := cb.len()
+    x64_cmp_imm8(cb, X_RCX, 4)
+    to_tail := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RSI, 0)
+    ts_x64_movups_ld(cb, 1, X_RDX, 0)
+    ts_x64_addps(cb, 0, 1)
+    if write_dst {
+        ts_x64_movups_st(cb, 0, X_RDI, 0)
+        ts_x64_add_imm(cb, X_RDI, 16)
+    }
+    ts_x64_mulps(cb, 0, 0)
+    if fast {
+        ts_x64_addps(cb, 4, 0)
+    } else {
+        ts_x64_serial_sum_xmm0(cb, 4)
+    }
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_add_imm(cb, X_RDX, 16)
+    ts_x64_sub_imm(cb, X_RCX, 4)
+    ts_x64_jmp_back(cb, loop4)
+
+    ts_x64_patch_rel32(cb, to_tail)
+    if fast {
+        ts_x64_hsum_xmm(cb, 4)
+        ts_x64_addss(cb, 5, 4)
+    }
+    tail := cb.len()
+    x64_test(cb, X_RCX)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RSI, 0)
+    ts_x64_movss_ld(cb, 1, X_RDX, 0)
+    ts_x64_addss(cb, 0, 1)
+    if write_dst {
+        ts_x64_movss_st(cb, 0, X_RDI, 0)
+        ts_x64_add_imm(cb, X_RDI, 4)
+    }
+    ts_x64_mulss(cb, 0, 0)
+    if fast {
+        ts_x64_addss(cb, 5, 0)
+    } else {
+        ts_x64_addss(cb, 4, 0)
+    }
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_sub_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, tail)
+
+    ts_x64_patch_rel32(cb, done)
+    if fast {
+        ts_x64_movd_from_xmm(cb, X_RAX, 5)
+    } else {
+        ts_x64_movd_from_xmm(cb, X_RAX, 4)
+    }
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_add_sqsum(cb $&mc.CodeBuffer, fast bool) {
+    // (dst=rdi, x=rsi, skip=rdx, n=rcx, acc_bits=r8) -> rax
+    x64_test(cb, X_RCX)
+    positive := ts_x64_jcc_fwd(cb, CC_G)
+    x64_mov(cb, X_RAX, X_R8)
+    x64_ret(cb)
+
+    ts_x64_patch_rel32(cb, positive)
+    if fast {
+        ts_x64_movd_to_xmm(cb, 5, X_R8)
+    } else {
+        ts_x64_movd_to_xmm(cb, 4, X_R8)
+    }
+    x64_test(cb, X_RDI)
+    no_dst := ts_x64_jcc_fwd(cb, CC_E)
+    ts_x64_emit_add_sqsum_arm(cb, true, fast)
+    ts_x64_patch_rel32(cb, no_dst)
+    ts_x64_emit_add_sqsum_arm(cb, false, fast)
+}
+
+fn ts_x64_emit_norm_arm(cb $&mc.CodeBuffer, weighted bool) {
+    // dst=rdi, src=rsi, weight=rdx, xmm3=broadcast(scale), n=r8
+    loop4 := cb.len()
+    x64_cmp_imm8(cb, X_R8, 4)
+    to_tail := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RSI, 0)
+    ts_x64_mulps(cb, 0, 3)
+    if weighted {
+        ts_x64_movups_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_add_imm(cb, X_RDX, 16)
+    }
+    ts_x64_movups_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_sub_imm(cb, X_R8, 4)
+    ts_x64_jmp_back(cb, loop4)
+
+    ts_x64_patch_rel32(cb, to_tail)
+    tail := cb.len()
+    x64_test(cb, X_R8)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RSI, 0)
+    ts_x64_mulss(cb, 0, 3)
+    if weighted {
+        ts_x64_movss_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_add_imm(cb, X_RDX, 4)
+    }
+    ts_x64_movss_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_sub_imm(cb, X_R8, 1)
+    ts_x64_jmp_back(cb, tail)
+
+    ts_x64_patch_rel32(cb, done)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_norm(cb $&mc.CodeBuffer) {
+    // (dst=rdi, src=rsi, weight=rdx, scale_bits=rcx, n=r8)
+    x64_test(cb, X_R8)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movd_to_xmm(cb, 3, X_RCX)
+    ts_x64_shufps(cb, 3, 3, 0x00)
+    x64_test(cb, X_RDX)
+    weighted := ts_x64_jcc_fwd(cb, CC_NE)
+    ts_x64_emit_norm_arm(cb, false)
+    ts_x64_patch_rel32(cb, weighted)
+    ts_x64_emit_norm_arm(cb, true)
+    ts_x64_patch_rel32(cb, done_early)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_dot(cb $&mc.CodeBuffer, fast bool) {
+    // (a=rdi, b=rsi, n=rdx, acc_bits=rcx) -> rax
+    x64_test(cb, X_RDX)
+    positive := ts_x64_jcc_fwd(cb, CC_G)
+    x64_mov(cb, X_RAX, X_RCX)
+    x64_ret(cb)
+
+    ts_x64_patch_rel32(cb, positive)
+    if !fast {
+        ts_x64_movd_to_xmm(cb, 4, X_RCX)
+        loop4 := cb.len()
+        x64_cmp_imm8(cb, X_RDX, 4)
+        to_tail := ts_x64_jcc_fwd(cb, CC_L)
+        ts_x64_movups_ld(cb, 0, X_RDI, 0)
+        ts_x64_movups_ld(cb, 1, X_RSI, 0)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_serial_sum_xmm0(cb, 4)
+        ts_x64_add_imm(cb, X_RDI, 16)
+        ts_x64_add_imm(cb, X_RSI, 16)
+        ts_x64_sub_imm(cb, X_RDX, 4)
+        ts_x64_jmp_back(cb, loop4)
+
+        ts_x64_patch_rel32(cb, to_tail)
+        tail := cb.len()
+        x64_test(cb, X_RDX)
+        done := ts_x64_jcc_fwd(cb, CC_LE)
+        ts_x64_movss_ld(cb, 0, X_RDI, 0)
+        ts_x64_movss_ld(cb, 1, X_RSI, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_addss(cb, 4, 0)
+        ts_x64_add_imm(cb, X_RDI, 4)
+        ts_x64_add_imm(cb, X_RSI, 4)
+        ts_x64_sub_imm(cb, X_RDX, 1)
+        ts_x64_jmp_back(cb, tail)
+
+        ts_x64_patch_rel32(cb, done)
+        ts_x64_movd_from_xmm(cb, X_RAX, 4)
+        x64_ret(cb)
+        <<
+    }
+
+    // Fast 8-wide SSE using only caller-saved xmm0..xmm5.
+    ts_x64_movd_to_xmm(cb, 5, X_RCX)
+    ts_x64_xorps(cb, 3, 3)
+    ts_x64_xorps(cb, 4, 4)
+
+    loop8 := cb.len()
+    x64_cmp_imm8(cb, X_RDX, 8)
+    to_loop4 := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RDI, 0)
+    ts_x64_movups_ld(cb, 1, X_RSI, 0)
+    ts_x64_mulps(cb, 0, 1)
+    ts_x64_addps(cb, 3, 0)
+    ts_x64_movups_ld(cb, 0, X_RDI, 16)
+    ts_x64_movups_ld(cb, 1, X_RSI, 16)
+    ts_x64_mulps(cb, 0, 1)
+    ts_x64_addps(cb, 4, 0)
+    ts_x64_add_imm(cb, X_RDI, 32)
+    ts_x64_add_imm(cb, X_RSI, 32)
+    ts_x64_sub_imm(cb, X_RDX, 8)
+    ts_x64_jmp_back(cb, loop8)
+
+    ts_x64_patch_rel32(cb, to_loop4)
+    loop4 := cb.len()
+    x64_cmp_imm8(cb, X_RDX, 4)
+    fold := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RDI, 0)
+    ts_x64_movups_ld(cb, 1, X_RSI, 0)
+    ts_x64_mulps(cb, 0, 1)
+    ts_x64_addps(cb, 3, 0)
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_sub_imm(cb, X_RDX, 4)
+    ts_x64_jmp_back(cb, loop4)
+
+    ts_x64_patch_rel32(cb, fold)
+    ts_x64_addps(cb, 3, 4)
+    ts_x64_hsum_xmm(cb, 3)
+    ts_x64_addss(cb, 5, 3)
+
+    tail := cb.len()
+    x64_test(cb, X_RDX)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RDI, 0)
+    ts_x64_movss_ld(cb, 1, X_RSI, 0)
+    ts_x64_mulss(cb, 0, 1)
+    ts_x64_addss(cb, 5, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_sub_imm(cb, X_RDX, 1)
+    ts_x64_jmp_back(cb, tail)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_movd_from_xmm(cb, X_RAX, 5)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_axpy(cb $&mc.CodeBuffer) {
+    // (dst=rdi, src=rsi, scale_bits=rdx, n=rcx)
+    x64_test(cb, X_RCX)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movd_to_xmm(cb, 2, X_RDX)
+    ts_x64_shufps(cb, 2, 2, 0x00)
+
+    loop4 := cb.len()
+    x64_cmp_imm8(cb, X_RCX, 4)
+    to_tail := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RDI, 0)
+    ts_x64_movups_ld(cb, 1, X_RSI, 0)
+    ts_x64_mulps(cb, 1, 2)
+    ts_x64_addps(cb, 0, 1)
+    ts_x64_movups_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_sub_imm(cb, X_RCX, 4)
+    ts_x64_jmp_back(cb, loop4)
+
+    ts_x64_patch_rel32(cb, to_tail)
+    tail := cb.len()
+    x64_test(cb, X_RCX)
+    done_tail := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RDI, 0)
+    ts_x64_movss_ld(cb, 1, X_RSI, 0)
+    ts_x64_mulss(cb, 1, 2)
+    ts_x64_addss(cb, 0, 1)
+    ts_x64_movss_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_sub_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, tail)
+
+    ts_x64_patch_rel32(cb, done_early)
+    ts_x64_patch_rel32(cb, done_tail)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_vadd_inplace(cb $&mc.CodeBuffer) {
+    // (dst=rdi, src=rsi, n=rdx)
+    x64_test(cb, X_RDX)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+
+    loop4 := cb.len()
+    x64_cmp_imm8(cb, X_RDX, 4)
+    to_tail := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RDI, 0)
+    ts_x64_movups_ld(cb, 1, X_RSI, 0)
+    ts_x64_addps(cb, 0, 1)
+    ts_x64_movups_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_sub_imm(cb, X_RDX, 4)
+    ts_x64_jmp_back(cb, loop4)
+
+    ts_x64_patch_rel32(cb, to_tail)
+    tail := cb.len()
+    x64_test(cb, X_RDX)
+    done_tail := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RDI, 0)
+    ts_x64_movss_ld(cb, 1, X_RSI, 0)
+    ts_x64_addss(cb, 0, 1)
+    ts_x64_movss_st(cb, 0, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_sub_imm(cb, X_RDX, 1)
+    ts_x64_jmp_back(cb, tail)
+
+    ts_x64_patch_rel32(cb, done_early)
+    ts_x64_patch_rel32(cb, done_tail)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_dot_q4_0(cb $&mc.CodeBuffer, fast bool) {
+    // (qs=rdi, scales=rsi, x=rdx, n_blocks=rcx, acc_bits=r8) -> rax
+    x64_test(cb, X_RCX)
+    positive := ts_x64_jcc_fwd(cb, CC_G)
+    x64_mov(cb, X_RAX, X_R8)
+    x64_ret(cb)
+
+    ts_x64_patch_rel32(cb, positive)
+    ts_x64_movd_to_xmm(cb, 5, X_R8)
+    ts_x64_pcmpeqd(cb, 3, 3)
+    ts_x64_psrld_imm(cb, 3, 31)
+    ts_x64_pslld_imm(cb, 3, 3)
+
+    loop_blk := cb.len()
+    x64_test(cb, X_RCX)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_xorps(cb, 4, 4)
+
+    for q in 0:4 {
+        q_disp := q * 4
+        x_lo := q * 16
+        x_hi := 64 + q * 16
+        ts_x64_movd_ld(cb, 0, X_RDI, q_disp)
+        ts_x64_punpcklbw(cb, 0, 0)
+        ts_x64_punpcklwd(cb, 0, 0)
+        ts_x64_movaps(cb, 1, 0)
+
+        ts_x64_pslld_imm(cb, 0, 28)
+        ts_x64_psrld_imm(cb, 0, 28)
+        ts_x64_psubd(cb, 0, 3)
+        ts_x64_cvtdq2ps(cb, 0, 0)
+        ts_x64_movups_ld(cb, 2, X_RDX, x_lo)
+        ts_x64_mulps(cb, 0, 2)
+
+        ts_x64_pslld_imm(cb, 1, 24)
+        ts_x64_psrld_imm(cb, 1, 28)
+        ts_x64_psubd(cb, 1, 3)
+        ts_x64_cvtdq2ps(cb, 1, 1)
+        ts_x64_movups_ld(cb, 2, X_RDX, x_hi)
+        ts_x64_mulps(cb, 1, 2)
+
+        ts_x64_addps(cb, 0, 1)
+        if fast {
+            ts_x64_addps(cb, 4, 0)
+        } else {
+            ts_x64_serial_sum_xmm0(cb, 4)
+        }
+    }
+
+    if fast {
+        ts_x64_hsum_xmm(cb, 4)
+    }
+    ts_x64_movss_ld(cb, 0, X_RSI, 0)
+    ts_x64_mulss(cb, 4, 0)
+    ts_x64_addss(cb, 5, 4)
+
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_add_imm32(cb, X_RDX, 128)
+    ts_x64_sub_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, loop_blk)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_movd_from_xmm(cb, X_RAX, 5)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_gemv4_f32(cb $&mc.CodeBuffer, fast bool) {
+    // (out=rdi, w=rsi, x=rdx, rows=rcx, cols=r8)
+    x64_test(cb, X_RCX)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_mov(cb, X_R9, X_RDX)
+
+    row_loop := cb.len()
+    x64_test(cb, X_RCX)
+    done_rows := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_mov(cb, X_RDX, X_R9)
+    x64_mov(cb, X_R10, X_R8)
+    ts_x64_xorps(cb, 5, 5)
+
+    if !fast {
+        loop4 := cb.len()
+        x64_cmp_imm8(cb, X_R10, 4)
+        to_tail := ts_x64_jcc_fwd(cb, CC_L)
+        ts_x64_movups_ld(cb, 0, X_RSI, 0)
+        ts_x64_movups_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_serial_sum_xmm0(cb, 5)
+        ts_x64_add_imm(cb, X_RSI, 16)
+        ts_x64_add_imm(cb, X_RDX, 16)
+        ts_x64_sub_imm(cb, X_R10, 4)
+        ts_x64_jmp_back(cb, loop4)
+
+        ts_x64_patch_rel32(cb, to_tail)
+        tail := cb.len()
+        x64_test(cb, X_R10)
+        to_st := ts_x64_jcc_fwd(cb, CC_LE)
+        ts_x64_movss_ld(cb, 0, X_RSI, 0)
+        ts_x64_movss_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_addss(cb, 5, 0)
+        ts_x64_add_imm(cb, X_RSI, 4)
+        ts_x64_add_imm(cb, X_RDX, 4)
+        ts_x64_sub_imm(cb, X_R10, 1)
+        ts_x64_jmp_back(cb, tail)
+        ts_x64_patch_rel32(cb, to_st)
+    } else {
+        ts_x64_xorps(cb, 3, 3)
+        ts_x64_xorps(cb, 4, 4)
+        loop8 := cb.len()
+        x64_cmp_imm8(cb, X_R10, 8)
+        to_l4 := ts_x64_jcc_fwd(cb, CC_L)
+        ts_x64_movups_ld(cb, 0, X_RSI, 0)
+        ts_x64_movups_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_addps(cb, 3, 0)
+        ts_x64_movups_ld(cb, 0, X_RSI, 16)
+        ts_x64_movups_ld(cb, 1, X_RDX, 16)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_addps(cb, 4, 0)
+        ts_x64_add_imm(cb, X_RSI, 32)
+        ts_x64_add_imm(cb, X_RDX, 32)
+        ts_x64_sub_imm(cb, X_R10, 8)
+        ts_x64_jmp_back(cb, loop8)
+
+        ts_x64_patch_rel32(cb, to_l4)
+        loop4 := cb.len()
+        x64_cmp_imm8(cb, X_R10, 4)
+        fold := ts_x64_jcc_fwd(cb, CC_L)
+        ts_x64_movups_ld(cb, 0, X_RSI, 0)
+        ts_x64_movups_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_addps(cb, 3, 0)
+        ts_x64_add_imm(cb, X_RSI, 16)
+        ts_x64_add_imm(cb, X_RDX, 16)
+        ts_x64_sub_imm(cb, X_R10, 4)
+        ts_x64_jmp_back(cb, loop4)
+
+        ts_x64_patch_rel32(cb, fold)
+        ts_x64_addps(cb, 3, 4)
+        ts_x64_hsum_xmm(cb, 3)
+        ts_x64_addss(cb, 5, 3)
+
+        tail := cb.len()
+        x64_test(cb, X_R10)
+        to_st := ts_x64_jcc_fwd(cb, CC_LE)
+        ts_x64_movss_ld(cb, 0, X_RSI, 0)
+        ts_x64_movss_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_addss(cb, 5, 0)
+        ts_x64_add_imm(cb, X_RSI, 4)
+        ts_x64_add_imm(cb, X_RDX, 4)
+        ts_x64_sub_imm(cb, X_R10, 1)
+        ts_x64_jmp_back(cb, tail)
+        ts_x64_patch_rel32(cb, to_st)
+    }
+
+    ts_x64_movss_st(cb, 5, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_sub_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, row_loop)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_patch_rel32(cb, done_rows)
+    x64_ret(cb)
+}
+
+// Compute 32-weight Q4_0 x Q8_0 integer block sum into xmm4 as f32.
+// Preserves xmm3 ([8]*8 i16) and xmm5 (running f32 acc).
+fn ts_x64_q4_q8_block(cb $&mc.CodeBuffer, q_base int, xq_base int) {
+    ts_x64_xorps(cb, 4, 4)
+    for half in 0:2 {
+        q_disp := half * 8
+        x_lo := half * 8
+        x_hi := 16 + half * 8
+        ts_x64_movq_ld(cb, 0, q_base, q_disp)
+        ts_x64_punpcklbw(cb, 0, 0)
+        ts_x64_movaps(cb, 1, 0)
+
+        ts_x64_psllw_imm(cb, 0, 12)
+        ts_x64_psrlw_imm(cb, 0, 12)
+        ts_x64_psubw(cb, 0, 3)
+        ts_x64_movq_ld(cb, 2, xq_base, x_lo)
+        ts_x64_punpcklbw(cb, 2, 2)
+        ts_x64_psraw_imm(cb, 2, 8)
+        ts_x64_pmaddwd(cb, 0, 2)
+        ts_x64_paddd(cb, 4, 0)
+
+        ts_x64_psllw_imm(cb, 1, 8)
+        ts_x64_psrlw_imm(cb, 1, 12)
+        ts_x64_psubw(cb, 1, 3)
+        ts_x64_movq_ld(cb, 2, xq_base, x_hi)
+        ts_x64_punpcklbw(cb, 2, 2)
+        ts_x64_psraw_imm(cb, 2, 8)
+        ts_x64_pmaddwd(cb, 1, 2)
+        ts_x64_paddd(cb, 4, 1)
+    }
+    ts_x64_pshufd(cb, 0, 4, 0x4E)
+    ts_x64_paddd(cb, 4, 0)
+    ts_x64_pshufd(cb, 0, 4, 0x01)
+    ts_x64_paddd(cb, 4, 0)
+    ts_x64_cvtdq2ps(cb, 4, 4)
+}
+
+fn ts_x64_emit_dot_q4_0_q8_0(cb $&mc.CodeBuffer) {
+    // (qs=rdi, ws=rsi, xq=rdx, xs=rcx, n_blocks=r8, acc_bits=r9) -> rax
+    x64_test(cb, X_R8)
+    positive := ts_x64_jcc_fwd(cb, CC_G)
+    x64_mov(cb, X_RAX, X_R9)
+    x64_ret(cb)
+
+    ts_x64_patch_rel32(cb, positive)
+    ts_x64_movd_to_xmm(cb, 5, X_R9)
+    ts_x64_pcmpeqd(cb, 3, 3)
+    ts_x64_psrlw_imm(cb, 3, 15)
+    ts_x64_psllw_imm(cb, 3, 3)
+
+    loop_blk := cb.len()
+    x64_test(cb, X_R8)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_q4_q8_block(cb, X_RDI, X_RDX)
+    ts_x64_movss_ld(cb, 0, X_RSI, 0)
+    ts_x64_movss_ld(cb, 1, X_RCX, 0)
+    ts_x64_mulss(cb, 0, 1)
+    ts_x64_mulss(cb, 4, 0)
+    ts_x64_addss(cb, 5, 4)
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_add_imm(cb, X_RDX, 32)
+    ts_x64_add_imm(cb, X_RCX, 4)
+    ts_x64_sub_imm(cb, X_R8, 1)
+    ts_x64_jmp_back(cb, loop_blk)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_movd_from_xmm(cb, X_RAX, 5)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_gemv4_q4_0_q8_0(cb $&mc.CodeBuffer) {
+    // (out=rdi, qs=rsi, ws=rdx, xq=rcx, xs=r8, packed_dims=(rows<<32)|n_blocks in r9)
+    ts_x64_mov32_rr(cb, X_R10, X_R9)
+    ts_x64_shr_imm(cb, X_R9, 32)
+    x64_test(cb, X_R9)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_pcmpeqd(cb, 3, 3)
+    ts_x64_psrlw_imm(cb, 3, 15)
+    ts_x64_psllw_imm(cb, 3, 3)
+
+    row_loop := cb.len()
+    x64_test(cb, X_R9)
+    done_rows := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_xorps(cb, 5, 5)
+    x64_mov(cb, X_RAX, X_R10)
+
+    blk_loop := cb.len()
+    x64_test(cb, X_RAX)
+    blk_done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_q4_q8_block(cb, X_RSI, X_RCX)
+    ts_x64_movss_ld(cb, 0, X_RDX, 0)
+    ts_x64_movss_ld(cb, 1, X_R8, 0)
+    ts_x64_mulss(cb, 0, 1)
+    ts_x64_mulss(cb, 4, 0)
+    ts_x64_addss(cb, 5, 4)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_add_imm(cb, X_RCX, 32)
+    ts_x64_add_imm(cb, X_R8, 4)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    ts_x64_jmp_back(cb, blk_loop)
+
+    ts_x64_patch_rel32(cb, blk_done)
+    ts_x64_movss_st(cb, 5, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    x64_mov(cb, X_R11, X_R10)
+    ts_x64_shl_imm(cb, X_R11, 5)
+    ts_x64_sub_rr(cb, X_RCX, X_R11)
+    x64_mov(cb, X_R11, X_R10)
+    ts_x64_shl_imm(cb, X_R11, 2)
+    ts_x64_sub_rr(cb, X_R8, X_R11)
+    ts_x64_sub_imm(cb, X_R9, 1)
+    ts_x64_jmp_back(cb, row_loop)
+
+    ts_x64_patch_rel32(cb, done_early)
+    ts_x64_patch_rel32(cb, done_rows)
+    x64_ret(cb)
+}
+
+fn ts_x64_jmp_fwd(cb $&mc.CodeBuffer) int {
+    xb(cb, 0xE9)
+    cb.emit_u32_le(0)
+    << cb.len()
+}
+
+fn ts_x64_movdqu_ld(cb $&mc.CodeBuffer, xd int, base int, disp int) {
+    xb(cb, 0xF3)
+    x64_rex(cb, false, xd, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x6F)
+    x64_modrm_mem(cb, xd, base, disp)
+}
+
+fn ts_x64_punpckhbw(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x68)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_andps_mem(cb $&mc.CodeBuffer, xd int, base int, disp int) {
+    x64_rex(cb, false, xd, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x54)
+    x64_modrm_mem(cb, xd, base, disp)
+}
+
+fn ts_x64_maxps(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x0F)
+    xb(cb, 0x5F)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_cvtss2sd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF3)
+    xb(cb, 0x0F)
+    xb(cb, 0x5A)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_cvtsd2ss(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF2)
+    xb(cb, 0x0F)
+    xb(cb, 0x5A)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_mulsd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF2)
+    xb(cb, 0x0F)
+    xb(cb, 0x59)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_divsd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF2)
+    xb(cb, 0x0F)
+    xb(cb, 0x5E)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_addsd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF2)
+    xb(cb, 0x0F)
+    xb(cb, 0x58)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_subsd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0xF2)
+    xb(cb, 0x0F)
+    xb(cb, 0x5C)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_ucomisd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x2E)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_xorpd(cb $&mc.CodeBuffer, xd int, xs int) {
+    xb(cb, 0x66)
+    xb(cb, 0x0F)
+    xb(cb, 0x57)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_cvttsd2si(cb $&mc.CodeBuffer, rd int, xs int) {
+    xb(cb, 0xF2)
+    x64_rex(cb, false, rd, xs, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x2C)
+    x64_modrm_rr(cb, rd, xs)
+}
+
+fn ts_x64_movq_to_xmm(cb $&mc.CodeBuffer, xd int, rs int) {
+    xb(cb, 0x66)
+    x64_rex(cb, true, xd, rs, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x6E)
+    x64_modrm_rr(cb, xd, rs)
+}
+
+fn ts_x64_movb_al_st(cb $&mc.CodeBuffer, base int, disp int) {
+    if base >= 8 { x64_rex(cb, false, 0, base, false) }
+    xb(cb, 0x88)
+    x64_modrm_mem(cb, 0, base, disp)
+}
+
+fn ts_x64_add_rr(cb $&mc.CodeBuffer, rd int, rs int) {
+    x64_op_rr(cb, 0x01, rs, rd)
+}
+
+fn ts_x64_and_rr(cb $&mc.CodeBuffer, rd int, rs int) {
+    x64_op_rr(cb, 0x21, rs, rd)
+}
+
+fn ts_x64_neg(cb $&mc.CodeBuffer, r int) {
+    x64_rex(cb, true, 0, r, false)
+    xb(cb, 0xF7)
+    x64_modrm_rr(cb, 3, r)
+}
+
+fn ts_x64_emit_quantize_q8_0(cb $&mc.CodeBuffer) {
+    // (x=rdi, xq=rsi, xs=rdx, nb=rcx)
+    x64_test(cb, X_RCX)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+
+    ts_x64_sub_imm(cb, X_RSP, 64)
+    x64_mov_imm(cb, X_RAX, 0x7fffffff7fffffff)
+    x64_str(cb, X_RAX, X_RSP, 32)
+    x64_str(cb, X_RAX, X_RSP, 40)
+    x64_mov_imm(cb, X_RAX, 0x405fc00000000000) // 127.0
+    x64_str(cb, X_RAX, X_RSP, 48)
+    x64_mov_imm(cb, X_RAX, 0x3fe0000000000000) // 0.5
+    x64_str(cb, X_RAX, X_RSP, 56)
+
+    blk_loop := cb.len()
+    x64_test(cb, X_RCX)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+
+    ts_x64_xorps(cb, 0, 0)
+    for k in 0:8 {
+        ts_x64_movups_ld(cb, 1, X_RDI, k * 16)
+        ts_x64_andps_mem(cb, 1, X_RSP, 32)
+        ts_x64_maxps(cb, 0, 1)
+    }
+    ts_x64_movaps(cb, 1, 0)
+    ts_x64_shufps(cb, 1, 1, 0x4E)
+    ts_x64_maxps(cb, 0, 1)
+    ts_x64_movaps(cb, 1, 0)
+    ts_x64_shufps(cb, 1, 1, 0x01)
+    ts_x64_maxps(cb, 0, 1)
+
+    ts_x64_cvtss2sd(cb, 0, 0)
+    x64_ldr(cb, X_RAX, X_RSP, 48)
+    ts_x64_movq_to_xmm(cb, 1, X_RAX)
+    ts_x64_divsd(cb, 0, 1)
+    ts_x64_cvtsd2ss(cb, 0, 0)
+    ts_x64_movss_st(cb, 0, X_RDX, 0)
+    ts_x64_cvtss2sd(cb, 0, 0)
+
+    ts_x64_xorpd(cb, 3, 3)
+    ts_x64_ucomisd(cb, 0, 3)
+    is_zero := ts_x64_jcc_fwd(cb, CC_E)
+    x64_mov_imm(cb, X_RAX, 0x3ff0000000000000) // 1.0
+    ts_x64_movq_to_xmm(cb, 2, X_RAX)
+    ts_x64_divsd(cb, 2, 0)
+    have_inv := ts_x64_jmp_fwd(cb)
+    ts_x64_patch_rel32(cb, is_zero)
+    ts_x64_xorpd(cb, 2, 2)
+    ts_x64_patch_rel32(cb, have_inv)
+
+    x64_ldr(cb, X_RAX, X_RSP, 56)
+    ts_x64_movq_to_xmm(cb, 4, X_RAX) // 0.5
+    ts_x64_xorpd(cb, 3, 3)            // 0.0
+
+    x64_mov_imm(cb, X_R8, 32)
+    elem_loop := cb.len()
+    x64_test(cb, X_R8)
+    elem_done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RDI, 0)
+    ts_x64_cvtss2sd(cb, 0, 0)
+    ts_x64_mulsd(cb, 0, 2)
+    ts_x64_ucomisd(cb, 0, 3)
+    is_neg := ts_x64_jcc_fwd(cb, CC_B)
+    ts_x64_addsd(cb, 0, 4)
+    ts_x64_cvttsd2si(cb, X_RAX, 0)
+    got_q := ts_x64_jmp_fwd(cb)
+    ts_x64_patch_rel32(cb, is_neg)
+    ts_x64_movaps(cb, 1, 4)
+    ts_x64_subsd(cb, 1, 0)
+    ts_x64_cvttsd2si(cb, X_RAX, 1)
+    ts_x64_neg(cb, X_RAX)
+    ts_x64_patch_rel32(cb, got_q)
+    x64_cmp_imm8(cb, X_RAX, 127)
+    ok_hi := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_mov_imm(cb, X_RAX, 127)
+    ts_x64_patch_rel32(cb, ok_hi)
+    x64_cmp_imm8(cb, X_RAX, -127)
+    ok_lo := ts_x64_jcc_fwd(cb, CC_GE)
+    x64_mov_imm(cb, X_RAX, -127)
+    ts_x64_patch_rel32(cb, ok_lo)
+    ts_x64_movb_al_st(cb, X_RSI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 1)
+    ts_x64_sub_imm(cb, X_R8, 1)
+    ts_x64_jmp_back(cb, elem_loop)
+
+    ts_x64_patch_rel32(cb, elem_done)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_sub_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, blk_loop)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_add_imm(cb, X_RSP, 64)
+    ts_x64_patch_rel32(cb, done_early)
+    x64_ret(cb)
+}
+
+fn ts_x64_q8_q8_block(cb $&mc.CodeBuffer, w_base int, xq_base int) {
+    ts_x64_xorps(cb, 4, 4)
+    for half in 0:2 {
+        disp := half * 16
+        ts_x64_movdqu_ld(cb, 0, w_base, disp)
+        ts_x64_movdqu_ld(cb, 1, xq_base, disp)
+        ts_x64_movaps(cb, 2, 0)
+        ts_x64_movaps(cb, 3, 1)
+        ts_x64_punpcklbw(cb, 0, 0)
+        ts_x64_psraw_imm(cb, 0, 8)
+        ts_x64_punpcklbw(cb, 1, 1)
+        ts_x64_psraw_imm(cb, 1, 8)
+        ts_x64_pmaddwd(cb, 0, 1)
+        ts_x64_paddd(cb, 4, 0)
+
+        ts_x64_punpckhbw(cb, 2, 2)
+        ts_x64_psraw_imm(cb, 2, 8)
+        ts_x64_punpckhbw(cb, 3, 3)
+        ts_x64_psraw_imm(cb, 3, 8)
+        ts_x64_pmaddwd(cb, 2, 3)
+        ts_x64_paddd(cb, 4, 2)
+    }
+    ts_x64_pshufd(cb, 0, 4, 0x4E)
+    ts_x64_paddd(cb, 4, 0)
+    ts_x64_pshufd(cb, 0, 4, 0x01)
+    ts_x64_paddd(cb, 4, 0)
+    ts_x64_cvtdq2ps(cb, 4, 4)
+}
+
+fn ts_x64_emit_gemv4_q8_0_q8_0(cb $&mc.CodeBuffer) {
+    // (out=rdi, w_qs=rsi, w_scales=rdx, xq=rcx, xs=r8, packed=(rows<<32)|nb in r9)
+    ts_x64_mov32_rr(cb, X_R10, X_R9)
+    ts_x64_shr_imm(cb, X_R9, 32)
+    x64_test(cb, X_R9)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+
+    row_loop := cb.len()
+    x64_test(cb, X_R9)
+    done_rows := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_xorps(cb, 5, 5)
+    x64_mov(cb, X_RAX, X_R10)
+
+    blk_loop := cb.len()
+    x64_test(cb, X_RAX)
+    blk_done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_q8_q8_block(cb, X_RSI, X_RCX)
+    ts_x64_movss_ld(cb, 0, X_RDX, 0)
+    ts_x64_movss_ld(cb, 1, X_R8, 0)
+    ts_x64_mulss(cb, 0, 1)
+    ts_x64_mulss(cb, 4, 0)
+    ts_x64_addss(cb, 5, 4)
+    ts_x64_add_imm(cb, X_RSI, 32)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_add_imm(cb, X_RCX, 32)
+    ts_x64_add_imm(cb, X_R8, 4)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    ts_x64_jmp_back(cb, blk_loop)
+
+    ts_x64_patch_rel32(cb, blk_done)
+    ts_x64_movss_st(cb, 5, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    x64_mov(cb, X_R11, X_R10)
+    ts_x64_shl_imm(cb, X_R11, 5)
+    ts_x64_sub_rr(cb, X_RCX, X_R11)
+    x64_mov(cb, X_R11, X_R10)
+    ts_x64_shl_imm(cb, X_R11, 2)
+    ts_x64_sub_rr(cb, X_R8, X_R11)
+    ts_x64_sub_imm(cb, X_R9, 1)
+    ts_x64_jmp_back(cb, row_loop)
+
+    ts_x64_patch_rel32(cb, done_early)
+    ts_x64_patch_rel32(cb, done_rows)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_gemm4x4_f32(cb $&mc.CodeBuffer, fast bool) {
+    // (out=rdi, w=rsi, x=rdx, M=rcx, N=r8, K=r9)
+    x64_test(cb, X_RCX)
+    early_m := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_test(cb, X_R8)
+    early_n := ts_x64_jcc_fwd(cb, CC_LE)
+
+    ts_x64_sub_imm(cb, X_RSP, 64)
+    x64_str(cb, X_RSI, X_RSP, 0)  // w_base
+    x64_str(cb, X_RDX, X_RSP, 8)  // x_cur
+    x64_str(cb, X_RDI, X_RSP, 16) // out_cur
+    x64_str(cb, X_RCX, X_RSP, 24) // M_rem
+    x64_str(cb, X_R8, X_RSP, 32)  // N
+    x64_str(cb, X_R9, X_RSP, 40)  // K
+
+    m_loop := cb.len()
+    x64_ldr(cb, X_RAX, X_RSP, 24)
+    x64_test(cb, X_RAX)
+    done_all := ts_x64_jcc_fwd(cb, CC_LE)
+
+    x64_ldr(cb, X_RDI, X_RSP, 16)
+    x64_ldr(cb, X_RSI, X_RSP, 0)
+    x64_ldr(cb, X_RCX, X_RSP, 32) // r_rem = N
+
+    row_loop := cb.len()
+    x64_test(cb, X_RCX)
+    rows_done := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_ldr(cb, X_RDX, X_RSP, 8)  // x_cur
+    x64_ldr(cb, X_R10, X_RSP, 40) // k_rem = K
+    ts_x64_xorps(cb, 5, 5)
+
+    if !fast {
+        loop4 := cb.len()
+        x64_cmp_imm8(cb, X_R10, 4)
+        to_tail := ts_x64_jcc_fwd(cb, CC_L)
+        ts_x64_movups_ld(cb, 0, X_RSI, 0)
+        ts_x64_movups_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_serial_sum_xmm0(cb, 5)
+        ts_x64_add_imm(cb, X_RSI, 16)
+        ts_x64_add_imm(cb, X_RDX, 16)
+        ts_x64_sub_imm(cb, X_R10, 4)
+        ts_x64_jmp_back(cb, loop4)
+
+        ts_x64_patch_rel32(cb, to_tail)
+        tail := cb.len()
+        x64_test(cb, X_R10)
+        to_st := ts_x64_jcc_fwd(cb, CC_LE)
+        ts_x64_movss_ld(cb, 0, X_RSI, 0)
+        ts_x64_movss_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_addss(cb, 5, 0)
+        ts_x64_add_imm(cb, X_RSI, 4)
+        ts_x64_add_imm(cb, X_RDX, 4)
+        ts_x64_sub_imm(cb, X_R10, 1)
+        ts_x64_jmp_back(cb, tail)
+        ts_x64_patch_rel32(cb, to_st)
+    } else {
+        ts_x64_xorps(cb, 3, 3)
+        loop4 := cb.len()
+        x64_cmp_imm8(cb, X_R10, 4)
+        fold := ts_x64_jcc_fwd(cb, CC_L)
+        ts_x64_movups_ld(cb, 0, X_RSI, 0)
+        ts_x64_movups_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulps(cb, 0, 1)
+        ts_x64_addps(cb, 3, 0)
+        ts_x64_add_imm(cb, X_RSI, 16)
+        ts_x64_add_imm(cb, X_RDX, 16)
+        ts_x64_sub_imm(cb, X_R10, 4)
+        ts_x64_jmp_back(cb, loop4)
+
+        ts_x64_patch_rel32(cb, fold)
+        ts_x64_hsum_xmm(cb, 3)
+        ts_x64_addss(cb, 5, 3)
+
+        tail := cb.len()
+        x64_test(cb, X_R10)
+        to_st := ts_x64_jcc_fwd(cb, CC_LE)
+        ts_x64_movss_ld(cb, 0, X_RSI, 0)
+        ts_x64_movss_ld(cb, 1, X_RDX, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_addss(cb, 5, 0)
+        ts_x64_add_imm(cb, X_RSI, 4)
+        ts_x64_add_imm(cb, X_RDX, 4)
+        ts_x64_sub_imm(cb, X_R10, 1)
+        ts_x64_jmp_back(cb, tail)
+        ts_x64_patch_rel32(cb, to_st)
+    }
+
+    ts_x64_movss_st(cb, 5, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_sub_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, row_loop)
+
+    ts_x64_patch_rel32(cb, rows_done)
+    x64_ldr(cb, X_RAX, X_RSP, 40)
+    ts_x64_shl_imm(cb, X_RAX, 2)
+    x64_ldr(cb, X_RDX, X_RSP, 8)
+    ts_x64_add_rr(cb, X_RDX, X_RAX)
+    x64_str(cb, X_RDX, X_RSP, 8)
+
+    x64_ldr(cb, X_RAX, X_RSP, 32)
+    ts_x64_shl_imm(cb, X_RAX, 2)
+    x64_ldr(cb, X_RDI, X_RSP, 16)
+    ts_x64_add_rr(cb, X_RDI, X_RAX)
+    x64_str(cb, X_RDI, X_RSP, 16)
+
+    x64_ldr(cb, X_RAX, X_RSP, 24)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    x64_str(cb, X_RAX, X_RSP, 24)
+    ts_x64_jmp_back(cb, m_loop)
+
+    ts_x64_patch_rel32(cb, done_all)
+    ts_x64_add_imm(cb, X_RSP, 64)
+    ts_x64_patch_rel32(cb, early_m)
+    ts_x64_patch_rel32(cb, early_n)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_gemm4x4_q4_0_q8_0(cb $&mc.CodeBuffer) {
+    // (out=rdi, qs=rsi, ws=rdx, xq=rcx, xs=r8, packed=(M<<42)|(N<<21)|nb in r9)
+    x64_mov_imm(cb, X_R11, 0x1fffff)
+    x64_mov(cb, X_R10, X_R9)
+    ts_x64_and_rr(cb, X_R10, X_R11) // nb
+    ts_x64_shr_imm(cb, X_R9, 21)
+    x64_mov(cb, X_RAX, X_R9)
+    ts_x64_and_rr(cb, X_RAX, X_R11) // N
+    ts_x64_shr_imm(cb, X_R9, 21)
+    ts_x64_and_rr(cb, X_R9, X_R11)  // M
+
+    x64_test(cb, X_R9)
+    early_m := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_test(cb, X_RAX)
+    early_n := ts_x64_jcc_fwd(cb, CC_LE)
+
+    ts_x64_sub_imm(cb, X_RSP, 64)
+    x64_str(cb, X_RSI, X_RSP, 0)  // qs_base
+    x64_str(cb, X_RDX, X_RSP, 8)  // ws_base
+    x64_str(cb, X_RCX, X_RSP, 16) // xq_cur
+    x64_str(cb, X_R8, X_RSP, 24)  // xs_cur
+    x64_str(cb, X_RDI, X_RSP, 32) // out_cur
+    x64_str(cb, X_R9, X_RSP, 40)  // M_rem
+    x64_str(cb, X_RAX, X_RSP, 48) // N
+    x64_str(cb, X_R10, X_RSP, 56) // nb
+
+    ts_x64_pcmpeqd(cb, 3, 3)
+    ts_x64_psrlw_imm(cb, 3, 15)
+    ts_x64_psllw_imm(cb, 3, 3)
+
+    m_loop := cb.len()
+    x64_ldr(cb, X_RAX, X_RSP, 40)
+    x64_test(cb, X_RAX)
+    done_all := ts_x64_jcc_fwd(cb, CC_LE)
+
+    x64_ldr(cb, X_RDI, X_RSP, 32)
+    x64_ldr(cb, X_RSI, X_RSP, 0)
+    x64_ldr(cb, X_RDX, X_RSP, 8)
+    x64_ldr(cb, X_R9, X_RSP, 48) // r_rem = N
+
+    row_loop := cb.len()
+    x64_test(cb, X_R9)
+    rows_done := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_ldr(cb, X_RCX, X_RSP, 16) // xq_cur
+    x64_ldr(cb, X_R8, X_RSP, 24)  // xs_cur
+    x64_ldr(cb, X_RAX, X_RSP, 56) // b_rem = nb
+    ts_x64_xorps(cb, 5, 5)
+
+    blk_loop := cb.len()
+    x64_test(cb, X_RAX)
+    blk_done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_q4_q8_block(cb, X_RSI, X_RCX)
+    ts_x64_movss_ld(cb, 0, X_RDX, 0)
+    ts_x64_movss_ld(cb, 1, X_R8, 0)
+    ts_x64_mulss(cb, 0, 1)
+    ts_x64_mulss(cb, 4, 0)
+    ts_x64_addss(cb, 5, 4)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_add_imm(cb, X_RCX, 32)
+    ts_x64_add_imm(cb, X_R8, 4)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    ts_x64_jmp_back(cb, blk_loop)
+
+    ts_x64_patch_rel32(cb, blk_done)
+    ts_x64_movss_st(cb, 5, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_sub_imm(cb, X_R9, 1)
+    ts_x64_jmp_back(cb, row_loop)
+
+    ts_x64_patch_rel32(cb, rows_done)
+    x64_ldr(cb, X_RAX, X_RSP, 56) // nb
+    x64_mov(cb, X_R11, X_RAX)
+    ts_x64_shl_imm(cb, X_R11, 5)
+    x64_ldr(cb, X_RCX, X_RSP, 16)
+    ts_x64_add_rr(cb, X_RCX, X_R11)
+    x64_str(cb, X_RCX, X_RSP, 16)
+
+    ts_x64_shl_imm(cb, X_RAX, 2)
+    x64_ldr(cb, X_R8, X_RSP, 24)
+    ts_x64_add_rr(cb, X_R8, X_RAX)
+    x64_str(cb, X_R8, X_RSP, 24)
+
+    x64_ldr(cb, X_RAX, X_RSP, 48) // N
+    ts_x64_shl_imm(cb, X_RAX, 2)
+    x64_ldr(cb, X_RDI, X_RSP, 32)
+    ts_x64_add_rr(cb, X_RDI, X_RAX)
+    x64_str(cb, X_RDI, X_RSP, 32)
+
+    x64_ldr(cb, X_RAX, X_RSP, 40)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    x64_str(cb, X_RAX, X_RSP, 40)
+    ts_x64_jmp_back(cb, m_loop)
+
+    ts_x64_patch_rel32(cb, done_all)
+    ts_x64_add_imm(cb, X_RSP, 64)
+    ts_x64_patch_rel32(cb, early_m)
+    ts_x64_patch_rel32(cb, early_n)
+    x64_ret(cb)
+}
+
+fn ts_x64_cvtsi2sd(cb $&mc.CodeBuffer, xd int, rs int) {
+    xb(cb, 0xF2)
+    x64_rex(cb, true, xd, rs, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x2A)
+    x64_modrm_rr(cb, xd, rs)
+}
+
+fn ts_x64_ucomiss(cb $&mc.CodeBuffer, xd int, xs int) {
+    if xd >= 8 || xs >= 8 { x64_rex(cb, false, xd, xs, false) }
+    xb(cb, 0x0F)
+    xb(cb, 0x2E)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn ts_x64_load_f64(cb $&mc.CodeBuffer, xd int, s3 int, s2 int, s1 int, s0 int) {
+    hi := ((s3 & 0xffff) << 48) | ((s2 & 0xffff) << 32) | ((s1 & 0xffff) << 16) | (s0 & 0xffff)
+    x64_mov_imm(cb, X_RAX, hi)
+    ts_x64_movq_to_xmm(cb, xd, X_RAX)
+}
+
+fn ts_x64_emit_swiglu(cb $&mc.CodeBuffer) {
+    // (dst=rdi, gate=rsi, up=rdx, n=rcx)
+    x64_test(cb, X_RCX)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_sub_imm(cb, X_RSP, 112)
+    ts_x64_load_f64(cb, 0, 0x3FF7, 0x1547, 0x652B, 0x82FE) // [0] invln2
+    x64_str(cb, X_RAX, X_RSP, 0)
+    ts_x64_load_f64(cb, 0, 0x3FE6, 0x2E42, 0xFEFA, 0x39EF) // [8] ln2_hi
+    x64_str(cb, X_RAX, X_RSP, 8)
+    ts_x64_load_f64(cb, 0, 0x3C7A, 0xBC9E, 0x3B39, 0x803F) // [16] ln2_lo
+    x64_str(cb, X_RAX, X_RSP, 16)
+    ts_x64_load_f64(cb, 0, 0x3FF0, 0x0000, 0x0000, 0x0000) // [24] 1.0
+    x64_str(cb, X_RAX, X_RSP, 24)
+    ts_x64_load_f64(cb, 0, 0x3FE0, 0x0000, 0x0000, 0x0000) // [32] 0.5
+    x64_str(cb, X_RAX, X_RSP, 32)
+    ts_x64_load_f64(cb, 0, 0x3FC5, 0x5555, 0x5555, 0x5555) // [40] 1/6
+    x64_str(cb, X_RAX, X_RSP, 40)
+    ts_x64_load_f64(cb, 0, 0x3FA5, 0x5555, 0x5555, 0x5555) // [48] 1/24
+    x64_str(cb, X_RAX, X_RSP, 48)
+    ts_x64_load_f64(cb, 0, 0x3F81, 0x1111, 0x1111, 0x1111) // [56] 1/120
+    x64_str(cb, X_RAX, X_RSP, 56)
+    ts_x64_load_f64(cb, 0, 0x3F56, 0xC16C, 0x16C1, 0x6C17) // [64] 1/720
+    x64_str(cb, X_RAX, X_RSP, 64)
+    ts_x64_load_f64(cb, 0, 0x3F2A, 0x01A0, 0x1A01, 0xA01A) // [72] 1/5040
+    x64_str(cb, X_RAX, X_RSP, 72)
+    ts_x64_load_f64(cb, 0, 0x3EFA, 0x01A0, 0x1A01, 0xA01A) // [80] 1/40320
+    x64_str(cb, X_RAX, X_RSP, 80)
+    ts_x64_load_f64(cb, 0, 0x4086, 0x2000, 0x0000, 0x0000) // [88] 708.0
+    x64_str(cb, X_RAX, X_RSP, 88)
+    ts_x64_load_f64(cb, 0, 0xC086, 0x2000, 0x0000, 0x0000) // [96] -708.0
+    x64_str(cb, X_RAX, X_RSP, 96)
+
+    loop_i := cb.len()
+    x64_test(cb, X_RCX)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 5, X_RSI, 0)
+    ts_x64_cvtss2sd(cb, 5, 5) // xmm5 = g_d
+    ts_x64_xorpd(cb, 0, 0)
+    ts_x64_subsd(cb, 0, 5)    // xmm0 = y = -g_d
+
+    x64_ldr(cb, X_RAX, X_RSP, 88)
+    ts_x64_movq_to_xmm(cb, 1, X_RAX)
+    ts_x64_ucomisd(cb, 0, 1)
+    le_hi := ts_x64_jcc_fwd(cb, CC_BE)
+    ts_x64_movaps(cb, 0, 1)
+    ts_x64_patch_rel32(cb, le_hi)
+    x64_ldr(cb, X_RAX, X_RSP, 96)
+    ts_x64_movq_to_xmm(cb, 1, X_RAX)
+    ts_x64_ucomisd(cb, 1, 0)
+    ge_lo := ts_x64_jcc_fwd(cb, CC_BE)
+    ts_x64_movaps(cb, 0, 1)
+    ts_x64_patch_rel32(cb, ge_lo)
+
+    x64_ldr(cb, X_RAX, X_RSP, 0)
+    ts_x64_movq_to_xmm(cb, 1, X_RAX)
+    ts_x64_mulsd(cb, 1, 0)    // y * invln2
+    ts_x64_xorpd(cb, 2, 2)
+    x64_ldr(cb, X_RAX, X_RSP, 32) // 0.5
+    ts_x64_movq_to_xmm(cb, 3, X_RAX)
+    ts_x64_ucomisd(cb, 1, 2)
+    is_neg := ts_x64_jcc_fwd(cb, CC_B)
+    ts_x64_addsd(cb, 1, 3)
+    ts_x64_cvttsd2si(cb, X_RAX, 1)
+    got_n := ts_x64_jmp_fwd(cb)
+    ts_x64_patch_rel32(cb, is_neg)
+    ts_x64_subsd(cb, 1, 3)
+    ts_x64_cvttsd2si(cb, X_RAX, 1)
+    ts_x64_patch_rel32(cb, got_n)
+
+    ts_x64_cvtsi2sd(cb, 2, X_RAX) // nf
+    x64_mov(cb, X_R8, X_RAX)      // save n
+    x64_ldr(cb, X_RAX, X_RSP, 8)
+    ts_x64_movq_to_xmm(cb, 3, X_RAX)
+    ts_x64_mulsd(cb, 3, 2)
+    ts_x64_subsd(cb, 0, 3)
+    x64_ldr(cb, X_RAX, X_RSP, 16)
+    ts_x64_movq_to_xmm(cb, 3, X_RAX)
+    ts_x64_mulsd(cb, 3, 2)
+    ts_x64_subsd(cb, 0, 3)        // xmm0 = r
+
+    x64_ldr(cb, X_RAX, X_RSP, 80) // 1/8!
+    ts_x64_movq_to_xmm(cb, 1, X_RAX)
+    for off in [72, 64, 56, 48, 40, 32, 24, 24] {
+        ts_x64_mulsd(cb, 1, 0)
+        x64_ldr(cb, X_RAX, X_RSP, off)
+        ts_x64_movq_to_xmm(cb, 2, X_RAX)
+        ts_x64_addsd(cb, 1, 2)
+    }
+    ts_x64_add_imm32(cb, X_R8, 1023)
+    ts_x64_shl_imm(cb, X_R8, 52)
+    ts_x64_movq_to_xmm(cb, 2, X_R8)
+    ts_x64_mulsd(cb, 1, 2)        // exp(-g)
+    x64_ldr(cb, X_RAX, X_RSP, 24)
+    ts_x64_movq_to_xmm(cb, 2, X_RAX)
+    ts_x64_addsd(cb, 1, 2)        // 1 + exp(-g)
+    ts_x64_divsd(cb, 5, 1)        // g / (1 + exp(-g))
+    ts_x64_cvtsd2ss(cb, 5, 5)
+    ts_x64_movss_ld(cb, 0, X_RDX, 0)
+    ts_x64_mulss(cb, 5, 0)
+    ts_x64_movss_st(cb, 5, X_RDI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_sub_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, loop_i)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_add_imm(cb, X_RSP, 112)
+    ts_x64_patch_rel32(cb, done_early)
+    x64_ret(cb)
+}
+
+fn ts_x64_cmp_rr(cb $&mc.CodeBuffer, rd int, rs int) {
+    x64_op_rr(cb, 0x39, rs, rd)
+}
+
+fn ts_x64_emit_argmax_f32(cb $&mc.CodeBuffer) {
+    // (x=rdi, n=rsi) -> best_idx in rax
+    x64_mov_imm(cb, X_RAX, 0)
+    x64_cmp_imm8(cb, X_RSI, 1)
+    done_small := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 1, X_RDI, 0) // best_v = x[0]
+    x64_mov_imm(cb, X_RCX, 1)
+
+    loop_i := cb.len()
+    ts_x64_cmp_rr(cb, X_RCX, X_RSI)
+    done := ts_x64_jcc_fwd(cb, CC_GE)
+    ts_x64_movss_ld(cb, 0, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_ucomiss(cb, 0, 1)
+    skip := ts_x64_jcc_fwd(cb, CC_BE)
+    ts_x64_movaps(cb, 1, 0)
+    x64_mov(cb, X_RAX, X_RCX)
+    ts_x64_patch_rel32(cb, skip)
+    ts_x64_add_imm(cb, X_RCX, 1)
+    ts_x64_jmp_back(cb, loop_i)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_patch_rel32(cb, done_small)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_rope_f32(cb $&mc.CodeBuffer) {
+    // (v0=rdi, v1=rsi, cos=rdx, sin=rcx, half=r8)
+    x64_test(cb, X_R8)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+
+    loop4 := cb.len()
+    x64_cmp_imm8(cb, X_R8, 4)
+    to_tail := ts_x64_jcc_fwd(cb, CC_L)
+    ts_x64_movups_ld(cb, 0, X_RDI, 0)
+    ts_x64_movups_ld(cb, 1, X_RSI, 0)
+    ts_x64_movups_ld(cb, 2, X_RDX, 0)
+    ts_x64_movups_ld(cb, 3, X_RCX, 0)
+    ts_x64_movaps(cb, 4, 0)
+    ts_x64_mulps(cb, 4, 2)
+    ts_x64_movaps(cb, 5, 1)
+    ts_x64_mulps(cb, 5, 3)
+    ts_x64_subps(cb, 4, 5)
+    ts_x64_mulps(cb, 0, 3)
+    ts_x64_mulps(cb, 1, 2)
+    ts_x64_addps(cb, 0, 1)
+    ts_x64_movups_st(cb, 4, X_RDI, 0)
+    ts_x64_movups_st(cb, 0, X_RSI, 0)
+    ts_x64_add_imm(cb, X_RDI, 16)
+    ts_x64_add_imm(cb, X_RSI, 16)
+    ts_x64_add_imm(cb, X_RDX, 16)
+    ts_x64_add_imm(cb, X_RCX, 16)
+    ts_x64_sub_imm(cb, X_R8, 4)
+    ts_x64_jmp_back(cb, loop4)
+
+    ts_x64_patch_rel32(cb, to_tail)
+    tail := cb.len()
+    x64_test(cb, X_R8)
+    done := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_movss_ld(cb, 0, X_RDI, 0)
+    ts_x64_movss_ld(cb, 1, X_RSI, 0)
+    ts_x64_movss_ld(cb, 2, X_RDX, 0)
+    ts_x64_movss_ld(cb, 3, X_RCX, 0)
+    ts_x64_movaps(cb, 4, 0)
+    ts_x64_mulss(cb, 4, 2)
+    ts_x64_movaps(cb, 5, 1)
+    ts_x64_mulss(cb, 5, 3)
+    ts_x64_subss(cb, 4, 5)
+    ts_x64_mulss(cb, 0, 3)
+    ts_x64_mulss(cb, 1, 2)
+    ts_x64_addss(cb, 0, 1)
+    ts_x64_movss_st(cb, 4, X_RDI, 0)
+    ts_x64_movss_st(cb, 0, X_RSI, 0)
+    ts_x64_add_imm(cb, X_RDI, 4)
+    ts_x64_add_imm(cb, X_RSI, 4)
+    ts_x64_add_imm(cb, X_RDX, 4)
+    ts_x64_add_imm(cb, X_RCX, 4)
+    ts_x64_sub_imm(cb, X_R8, 1)
+    ts_x64_jmp_back(cb, tail)
+
+    ts_x64_patch_rel32(cb, done)
+    ts_x64_patch_rel32(cb, done_early)
+    x64_ret(cb)
+}
+
+fn ts_x64_load_f16_to_xmm0(cb $&mc.CodeBuffer, base_reg int, off_rax int, off_rcx int) {
+    // Loads u16 IEEE-754 half from [base_reg] and converts to f32 in xmm0.
+    // Preserves RAX, RCX via [rsp+off_rax], [rsp+off_rcx]; clobbers R10, xmm0, xmm1.
+    x64_str(cb, X_RAX, X_RSP, off_rax)
+    x64_str(cb, X_RCX, X_RSP, off_rcx)
+    x64_load(cb, 2, X_RAX, base_reg, 0)
+    x64_mov(cb, X_R10, X_RAX)
+    ts_x64_shr_imm(cb, X_R10, 15)
+    ts_x64_shl_imm(cb, X_R10, 31)
+    x64_mov(cb, X_RCX, X_RAX)
+    ts_x64_shr_imm(cb, X_RCX, 10)
+    ts_x64_and_imm8(cb, X_RCX, 31)
+    ts_x64_shl_imm(cb, X_RAX, 54)
+    ts_x64_shr_imm(cb, X_RAX, 54)
+    x64_test(cb, X_RCX)
+    is_exp_zero := ts_x64_jcc_fwd(cb, CC_E)
+    x64_cmp_imm8(cb, X_RCX, 31)
+    is_inf_nan := ts_x64_jcc_fwd(cb, CC_E)
+    ts_x64_add_imm(cb, X_RCX, 112)
+    ts_x64_shl_imm(cb, X_RCX, 23)
+    ts_x64_shl_imm(cb, X_RAX, 13)
+    ts_x64_or_rr(cb, X_RAX, X_RCX)
+    ts_x64_or_rr(cb, X_RAX, X_R10)
+    ts_x64_movd_to_xmm(cb, 0, X_RAX)
+    done_norm := ts_x64_jmp_fwd(cb)
+
+    ts_x64_patch_rel32(cb, is_exp_zero)
+    ts_x64_movd_to_xmm(cb, 0, X_RAX)
+    ts_x64_cvtdq2ps(cb, 0, 0)
+    x64_mov_imm(cb, X_RAX, 0x33800000)
+    ts_x64_movd_to_xmm(cb, 1, X_RAX)
+    ts_x64_mulss(cb, 0, 1)
+    ts_x64_movd_to_xmm(cb, 1, X_R10)
+    ts_x64_orps(cb, 0, 1)
+    done_zero := ts_x64_jmp_fwd(cb)
+
+    ts_x64_patch_rel32(cb, is_inf_nan)
+    ts_x64_shl_imm(cb, X_RAX, 13)
+    ts_x64_or_rr(cb, X_RAX, X_R10)
+    x64_mov_imm(cb, X_R10, 0x7F800000)
+    ts_x64_or_rr(cb, X_RAX, X_R10)
+    ts_x64_movd_to_xmm(cb, 0, X_RAX)
+
+    ts_x64_patch_rel32(cb, done_norm)
+    ts_x64_patch_rel32(cb, done_zero)
+    x64_ldr(cb, X_RAX, X_RSP, off_rax)
+    x64_ldr(cb, X_RCX, X_RSP, off_rcx)
+}
+
+fn ts_x64_emit_gemv4_p4_q8_0(cb $&mc.CodeBuffer, is_q8 bool, f16_scale bool) {
+    // (out=rdi, qs_p=rsi, ws_p=rdx, xq=rcx, xs=r8, packed=(rg_cnt<<32)|nb in r9)
+    ts_x64_mov32_rr(cb, X_R10, X_R9) // nb
+    ts_x64_shr_imm(cb, X_R9, 32)     // rg_cnt
+    x64_test(cb, X_R9)
+    done_early := ts_x64_jcc_fwd(cb, CC_LE)
+    ts_x64_sub_imm(cb, X_RSP, 48)
+    x64_str(cb, X_RCX, X_RSP, 0)     // xq
+    x64_str(cb, X_R8, X_RSP, 8)      // xs
+    x64_str(cb, X_R9, X_RSP, 16)     // rg_rem
+    x64_str(cb, X_R10, X_RSP, 24)    // nb
+    if !is_q8 {
+        ts_x64_pcmpeqd(cb, 3, 3)
+        ts_x64_psrlw_imm(cb, 3, 15)
+        ts_x64_psllw_imm(cb, 3, 3)
+    }
+    $w_stride := 16
+    if is_q8 { w_stride = 32 }
+    $ws_elem := 4
+    $ws_blk := 16
+    $ws_sh := 4
+    if f16_scale {
+        ws_elem = 2
+        ws_blk = 8
+        ws_sh = 3
+    }
+
+    rg_loop := cb.len()
+    x64_ldr(cb, X_RAX, X_RSP, 16)
+    x64_test(cb, X_RAX)
+    done_rg := ts_x64_jcc_fwd(cb, CC_LE)
+    for r4 in 0:4 {
+        x64_mov(cb, X_R11, X_RSI)
+        if r4 > 0 { ts_x64_add_imm(cb, X_R11, r4 * w_stride) }
+        x64_mov(cb, X_R9, X_RDX)
+        if r4 > 0 { ts_x64_add_imm(cb, X_R9, r4 * ws_elem) }
+        x64_ldr(cb, X_RCX, X_RSP, 0)
+        x64_ldr(cb, X_R8, X_RSP, 8)
+        x64_ldr(cb, X_RAX, X_RSP, 24)
+        ts_x64_xorps(cb, 5, 5)
+        blk := cb.len()
+        x64_test(cb, X_RAX)
+        blk_done := ts_x64_jcc_fwd(cb, CC_LE)
+        if is_q8 { ts_x64_q8_q8_block(cb, X_R11, X_RCX) }
+        else { ts_x64_q4_q8_block(cb, X_R11, X_RCX) }
+        if f16_scale {
+            ts_x64_load_f16_to_xmm0(cb, X_R9, 32, 40)
+        } else {
+            ts_x64_movss_ld(cb, 0, X_R9, 0)
+        }
+        ts_x64_movss_ld(cb, 1, X_R8, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_mulss(cb, 4, 0)
+        ts_x64_addss(cb, 5, 4)
+        if is_q8 {
+            ts_x64_add_imm32(cb, X_R11, 128)
+        } else {
+            ts_x64_add_imm(cb, X_R11, 64)
+        }
+        ts_x64_add_imm(cb, X_R9, ws_blk)
+        ts_x64_add_imm(cb, X_RCX, 32)
+        ts_x64_add_imm(cb, X_R8, 4)
+        ts_x64_sub_imm(cb, X_RAX, 1)
+        ts_x64_jmp_back(cb, blk)
+        ts_x64_patch_rel32(cb, blk_done)
+        ts_x64_movss_st(cb, 5, X_RDI, 0)
+        ts_x64_add_imm(cb, X_RDI, 4)
+    }
+    x64_ldr(cb, X_RAX, X_RSP, 24)
+    $sh := 6
+    if is_q8 { sh = 7 }
+    x64_mov(cb, X_R11, X_RAX)
+    ts_x64_shl_imm(cb, X_R11, sh)
+    ts_x64_add_rr(cb, X_RSI, X_R11)
+    ts_x64_shl_imm(cb, X_RAX, ws_sh)
+    ts_x64_add_rr(cb, X_RDX, X_RAX)
+    x64_ldr(cb, X_RAX, X_RSP, 16)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    x64_str(cb, X_RAX, X_RSP, 16)
+    ts_x64_jmp_back(cb, rg_loop)
+
+    ts_x64_patch_rel32(cb, done_rg)
+    ts_x64_add_imm(cb, X_RSP, 48)
+    ts_x64_patch_rel32(cb, done_early)
+    x64_ret(cb)
+}
+
+fn ts_x64_emit_gemm4x8_q4_0_p4_q8_0(cb $&mc.CodeBuffer, f16_scale bool) {
+    // (out=rdi, qs_p=rsi, ws_p=rdx, xq=rcx, xs=r8, packed=(M<<42)|(rg_cnt<<21)|nb in r9)
+    x64_mov_imm(cb, X_R11, 0x1fffff)
+    x64_mov(cb, X_R10, X_R9)
+    ts_x64_and_rr(cb, X_R10, X_R11) // nb
+    ts_x64_shr_imm(cb, X_R9, 21)
+    x64_mov(cb, X_RAX, X_R9)
+    ts_x64_and_rr(cb, X_RAX, X_R11) // rg_cnt
+    ts_x64_shr_imm(cb, X_R9, 21)
+    ts_x64_and_rr(cb, X_R9, X_R11)  // M
+    x64_test(cb, X_R9)
+    early_m := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_test(cb, X_RAX)
+    early_rg := ts_x64_jcc_fwd(cb, CC_LE)
+
+    ts_x64_sub_imm(cb, X_RSP, 96)
+    x64_str(cb, X_RSI, X_RSP, 0)   // qs_base
+    x64_str(cb, X_RDX, X_RSP, 8)   // ws_base
+    x64_str(cb, X_RCX, X_RSP, 16)  // xq_m
+    x64_str(cb, X_R8, X_RSP, 24)   // xs_m
+    x64_str(cb, X_RDI, X_RSP, 32)  // out_m
+    x64_str(cb, X_R9, X_RSP, 40)   // M_rem
+    x64_str(cb, X_RAX, X_RSP, 48)  // rg_cnt
+    x64_str(cb, X_R10, X_RSP, 56)  // nb
+    ts_x64_pcmpeqd(cb, 3, 3)
+    ts_x64_psrlw_imm(cb, 3, 15)
+    ts_x64_psllw_imm(cb, 3, 3)
+    $ws_elem := 4
+    $ws_blk := 16
+    $ws_sh := 4
+    if f16_scale {
+        ws_elem = 2
+        ws_blk = 8
+        ws_sh = 3
+    }
+
+    m_loop := cb.len()
+    x64_ldr(cb, X_RAX, X_RSP, 40)
+    x64_test(cb, X_RAX)
+    done_all := ts_x64_jcc_fwd(cb, CC_LE)
+    x64_ldr(cb, X_RDI, X_RSP, 32)
+    x64_ldr(cb, X_RSI, X_RSP, 0)
+    x64_ldr(cb, X_RDX, X_RSP, 8)
+    x64_ldr(cb, X_RAX, X_RSP, 48)
+    x64_str(cb, X_RAX, X_RSP, 64)  // rg_rem
+
+    rg_loop := cb.len()
+    x64_ldr(cb, X_RAX, X_RSP, 64)
+    x64_test(cb, X_RAX)
+    rg_done := ts_x64_jcc_fwd(cb, CC_LE)
+    for r4 in 0:4 {
+        x64_mov(cb, X_R11, X_RSI)
+        if r4 > 0 { ts_x64_add_imm(cb, X_R11, r4 * 16) }
+        x64_mov(cb, X_R9, X_RDX)
+        if r4 > 0 { ts_x64_add_imm(cb, X_R9, r4 * ws_elem) }
+        x64_ldr(cb, X_RCX, X_RSP, 16)
+        x64_ldr(cb, X_R8, X_RSP, 24)
+        x64_ldr(cb, X_RAX, X_RSP, 56)
+        ts_x64_xorps(cb, 5, 5)
+        blk := cb.len()
+        x64_test(cb, X_RAX)
+        blk_done := ts_x64_jcc_fwd(cb, CC_LE)
+        ts_x64_q4_q8_block(cb, X_R11, X_RCX)
+        if f16_scale {
+            ts_x64_load_f16_to_xmm0(cb, X_R9, 80, 88)
+        } else {
+            ts_x64_movss_ld(cb, 0, X_R9, 0)
+        }
+        ts_x64_movss_ld(cb, 1, X_R8, 0)
+        ts_x64_mulss(cb, 0, 1)
+        ts_x64_mulss(cb, 4, 0)
+        ts_x64_addss(cb, 5, 4)
+        ts_x64_add_imm(cb, X_R11, 64)
+        ts_x64_add_imm(cb, X_R9, ws_blk)
+        ts_x64_add_imm(cb, X_RCX, 32)
+        ts_x64_add_imm(cb, X_R8, 4)
+        ts_x64_sub_imm(cb, X_RAX, 1)
+        ts_x64_jmp_back(cb, blk)
+        ts_x64_patch_rel32(cb, blk_done)
+        ts_x64_movss_st(cb, 5, X_RDI, 0)
+        ts_x64_add_imm(cb, X_RDI, 4)
+    }
+    x64_ldr(cb, X_RAX, X_RSP, 56)
+    x64_mov(cb, X_R11, X_RAX)
+    ts_x64_shl_imm(cb, X_R11, 6)
+    ts_x64_add_rr(cb, X_RSI, X_R11)
+    ts_x64_shl_imm(cb, X_RAX, ws_sh)
+    ts_x64_add_rr(cb, X_RDX, X_RAX)
+    x64_ldr(cb, X_RAX, X_RSP, 64)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    x64_str(cb, X_RAX, X_RSP, 64)
+    ts_x64_jmp_back(cb, rg_loop)
+
+    ts_x64_patch_rel32(cb, rg_done)
+    x64_ldr(cb, X_RAX, X_RSP, 56) // nb
+    x64_mov(cb, X_R11, X_RAX)
+    ts_x64_shl_imm(cb, X_R11, 5)
+    x64_ldr(cb, X_RCX, X_RSP, 16)
+    ts_x64_add_rr(cb, X_RCX, X_R11)
+    x64_str(cb, X_RCX, X_RSP, 16)
+    ts_x64_shl_imm(cb, X_RAX, 2)
+    x64_ldr(cb, X_R8, X_RSP, 24)
+    ts_x64_add_rr(cb, X_R8, X_RAX)
+    x64_str(cb, X_R8, X_RSP, 24)
+    x64_ldr(cb, X_RAX, X_RSP, 48) // rg_cnt
+    ts_x64_shl_imm(cb, X_RAX, 4)
+    x64_ldr(cb, X_RDI, X_RSP, 32)
+    ts_x64_add_rr(cb, X_RDI, X_RAX)
+    x64_str(cb, X_RDI, X_RSP, 32)
+    x64_ldr(cb, X_RAX, X_RSP, 40)
+    ts_x64_sub_imm(cb, X_RAX, 1)
+    x64_str(cb, X_RAX, X_RSP, 40)
+    ts_x64_jmp_back(cb, m_loop)
+
+    ts_x64_patch_rel32(cb, done_all)
+    ts_x64_add_imm(cb, X_RSP, 96)
+    ts_x64_patch_rel32(cb, early_m)
+    ts_x64_patch_rel32(cb, early_rg)
+    x64_ret(cb)
+}
+
+pub fn emit_x64_tensor_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+    syms.define_label("__xu_tensor_mul_add_f32", cb.len())
+    ts_x64_emit_mul_add(cb)
+    syms.define_label("__xu_tensor_mul_add_fma_f32", cb.len())
+    ts_x64_emit_mul_add(cb)
+    syms.define_label("__xu_tensor_add_sqsum_f32", cb.len())
+    ts_x64_emit_add_sqsum(cb, false)
+    syms.define_label("__xu_tensor_add_sqsum_fast_f32", cb.len())
+    ts_x64_emit_add_sqsum(cb, true)
+    syms.define_label("__xu_tensor_norm_f32", cb.len())
+    ts_x64_emit_norm(cb)
+    syms.define_label("__xu_tensor_dot_f32", cb.len())
+    ts_x64_emit_dot(cb, false)
+    syms.define_label("__xu_tensor_dot_fast_f32", cb.len())
+    ts_x64_emit_dot(cb, true)
+    syms.define_label("__xu_tensor_axpy_f32", cb.len())
+    ts_x64_emit_axpy(cb)
+    syms.define_label("__xu_tensor_axpy_fma_f32", cb.len())
+    ts_x64_emit_axpy(cb)
+    syms.define_label("__xu_tensor_vadd_inplace_f32", cb.len())
+    ts_x64_emit_vadd_inplace(cb)
+    syms.define_label("__xu_tensor_dot_q4_0_f32", cb.len())
+    ts_x64_emit_dot_q4_0(cb, false)
+    syms.define_label("__xu_tensor_dot_q4_0_fast_f32", cb.len())
+    ts_x64_emit_dot_q4_0(cb, true)
+    syms.define_label("__xu_tensor_gemv4_f32", cb.len())
+    ts_x64_emit_gemv4_f32(cb, false)
+    syms.define_label("__xu_tensor_gemv4_fast_f32", cb.len())
+    ts_x64_emit_gemv4_f32(cb, true)
+    syms.define_label("__xu_tensor_dot_q4_0_q8_0_f32", cb.len())
+    ts_x64_emit_dot_q4_0_q8_0(cb)
+    syms.define_label("__xu_tensor_dot_q4_0_q8_0_fast_f32", cb.len())
+    ts_x64_emit_dot_q4_0_q8_0(cb)
+    syms.define_label("__xu_tensor_gemv4_q4_0_q8_0_f32", cb.len())
+    ts_x64_emit_gemv4_q4_0_q8_0(cb)
+    syms.define_label("__xu_tensor_gemv4_q4_0_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemv4_q4_0_q8_0(cb)
+    syms.define_label("__xu_tensor_quantize_q8_0", cb.len())
+    ts_x64_emit_quantize_q8_0(cb)
+    syms.define_label("__xu_tensor_quantize_q8_0_fast", cb.len())
+    ts_x64_emit_quantize_q8_0(cb)
+    syms.define_label("__xu_tensor_gemv4_q8_0_q8_0_f32", cb.len())
+    ts_x64_emit_gemv4_q8_0_q8_0(cb)
+    syms.define_label("__xu_tensor_gemv4_q8_0_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemv4_q8_0_q8_0(cb)
+    syms.define_label("__xu_tensor_gemm4x4_f32", cb.len())
+    ts_x64_emit_gemm4x4_f32(cb, false)
+    syms.define_label("__xu_tensor_gemm4x4_fast_f32", cb.len())
+    ts_x64_emit_gemm4x4_f32(cb, true)
+    syms.define_label("__xu_tensor_gemm4x4_q4_0_q8_0_f32", cb.len())
+    ts_x64_emit_gemm4x4_q4_0_q8_0(cb)
+    syms.define_label("__xu_tensor_gemm4x4_q4_0_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemm4x4_q4_0_q8_0(cb)
+    syms.define_label("__xu_tensor_swiglu_f32", cb.len())
+    ts_x64_emit_swiglu(cb)
+    syms.define_label("__xu_tensor_swiglu_fast_f32", cb.len())
+    ts_x64_emit_swiglu(cb)
+    syms.define_label("__xu_tensor_argmax_f32", cb.len())
+    ts_x64_emit_argmax_f32(cb)
+    syms.define_label("__xu_tensor_rope_f32", cb.len())
+    ts_x64_emit_rope_f32(cb)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_q8_0_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, false, false)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, false, false)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_q8_0_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, true, false)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, true, false)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_q8_0_f32", cb.len())
+    ts_x64_emit_gemm4x8_q4_0_p4_q8_0(cb, false)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemm4x8_q4_0_p4_q8_0(cb, false)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_f16_q8_0_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, false, true)
+    syms.define_label("__xu_tensor_gemv4_q4_0_p4_f16_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, false, true)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_f16_q8_0_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, true, true)
+    syms.define_label("__xu_tensor_gemv4_q8_0_p4_f16_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemv4_p4_q8_0(cb, true, true)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_f32", cb.len())
+    ts_x64_emit_gemm4x8_q4_0_p4_q8_0(cb, true)
+    syms.define_label("__xu_tensor_gemm4x8_q4_0_p4_f16_q8_0_fast_f32", cb.len())
+    ts_x64_emit_gemm4x8_q4_0_p4_q8_0(cb, true)
+}

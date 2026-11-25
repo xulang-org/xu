@@ -1,0 +1,310 @@
+@xu/mir
+
+#xu/ast
+#xu/parser
+#xu/types
+
+// Lower 3D batched projection (Prefill GEMM) loops into 4x4 register-tiled
+// ARM64 NEON / SDOT & x86-64 SSE2 microkernels:
+//   1. F32 GEMM:       for m in 0:M { x_off := ...; out_off := ...; GEMV(N, K) }
+//   2. Q4_0xQ8_0 GEMM: for m in 0:M { xm_s := ...; xm_q := xm_s * 32; out_off := ...; GEMV_Q4_Q8(N, nb) }
+struct TensorGemmF32Plan {
+    loop int
+    m_bound int
+    n_bound int
+    k_bound int
+    out int
+    w int
+    x int
+    off_out int
+    off_w int
+    off_x int
+}
+
+struct TensorGemmQ4Q8Plan {
+    loop int
+    m_bound int
+    n_bound int
+    nb_bound int
+    out int
+    qs int
+    ws int
+    xq int
+    xs int
+    off_out int
+    blk_off int
+    off_xs int
+}
+
+fn (w &Lw) tensor_gemm_f32_plan(p &parser.Parser, tp &types.TypedProgram, m_loop int) TensorGemmF32Plan {
+    no_match := TensorGemmF32Plan{loop: -1, m_bound: -1, n_bound: -1, k_bound: -1,
+                                  out: -1, w: -1, x: -1, off_out: -2, off_w: -2, off_x: -2}
+    m_bound := tensor_dynamic_bound(p, m_loop)
+    if !w.tensor_dot_bound_ok(p, tp, m_bound) { << no_match }
+    m_iv := tp.local_of(m_loop)
+    if m_iv < 0 { << no_match }
+
+    s1 := p.nodes[m_loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    id1 := tp.local_of(s1)
+    if id1 < 0 || id1 == m_iv || w.local_type(tp, id1) != 1 { << no_match }
+
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    id2 := tp.local_of(s2)
+    if id2 < 0 || id2 == m_iv || id2 == id1 || w.local_type(tp, id2) != 1 { << no_match }
+
+    s3 := p.nodes[s2].next
+    if s3 < 0 || p.nodes[s3].kind != ast.NK_FOR || p.nodes[s3].next >= 0 { << no_match }
+    allow := [id1, id2]
+    inner := w.tensor_gemv_f32_plan_in(p, tp, s3, &allow)
+    if inner.loop < 0 { << no_match }
+    if inner.off_x < 0 || inner.off_out < 0 { << no_match }
+    if inner.off_w >= 0 && range_uses_iv(p, tp, inner.off_w, m_iv) { << no_match }
+
+    $x_stmt := -1
+    $out_stmt := -1
+    if tensor_ident_id(p, tp, inner.off_x, id1) && tensor_ident_id(p, tp, inner.off_out, id2) {
+        x_stmt = s1
+        out_stmt = s2
+    } else if tensor_ident_id(p, tp, inner.off_x, id2) && tensor_ident_id(p, tp, inner.off_out, id1) {
+        x_stmt = s2
+        out_stmt = s1
+    } else {
+        << no_match
+    }
+
+    off_x := w.tensor_bound_offset(p, tp, p.nodes[x_stmt].a, m_iv, inner.cols)
+    if off_x == -2 { << no_match }
+    off_out := w.tensor_bound_offset(p, tp, p.nodes[out_stmt].a, m_iv, inner.rows)
+    if off_out == -2 { << no_match }
+    if (off_x >= 0 && range_uses_iv(p, tp, off_x, m_iv)) ||
+       (off_out >= 0 && range_uses_iv(p, tp, off_out, m_iv)) {
+        << no_match
+    }
+
+    << TensorGemmF32Plan{loop: m_loop, m_bound: m_bound, n_bound: inner.rows, k_bound: inner.cols,
+                         out: inner.out, w: inner.w, x: inner.x,
+                         off_out: off_out, off_w: inner.off_w, off_x: off_x}
+}
+
+fn (w $&Lw) lower_tensor_gemm_f32(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    plan := w.tensor_gemm_f32_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    m_val := w.lower_expr(p, tp, plan.m_bound)
+    done := w.new_block()
+    pos_m := w.new_block()
+    w.branch(w.bin(BIN_GT, m_val, w.konst(0)), pos_m, done)
+
+    w.f.active_bb = pos_m
+    n_val := w.lower_expr(p, tp, plan.n_bound)
+    k_val := w.lower_expr(p, tp, plan.k_bound)
+    pos_nk := w.bin(BIN_AND, w.bin(BIN_GT, n_val, w.konst(0)), w.bin(BIN_GT, k_val, w.konst(0)))
+    check := w.new_block()
+    slow := w.new_block()
+    w.branch(pos_nk, check, slow)
+
+    w.f.active_bb = check
+    cap_dim := w.konst(1 << 20)
+    dims_fit := w.bin(BIN_AND, w.bin(BIN_LE, m_val, cap_dim),
+                w.bin(BIN_AND, w.bin(BIN_LE, n_val, cap_dim), w.bin(BIN_LE, k_val, cap_dim)))
+    off_limit := w.konst(1 << 54)
+    mn_elems := w.bin(BIN_MUL, m_val, n_val)
+    nk_elems := w.bin(BIN_MUL, n_val, k_val)
+    mk_elems := w.bin(BIN_MUL, m_val, k_val)
+
+    op_out := w.tensor_strided_operand(p, tp, plan.out, plan.off_out, mn_elems, 4, off_limit)
+    op_w := w.tensor_strided_operand(p, tp, plan.w, plan.off_w, nk_elems, 4, off_limit)
+    op_x := w.tensor_strided_operand(p, tp, plan.x, plan.off_x, mk_elems, 4, off_limit)
+
+    out_span := w.bin(BIN_MUL, mn_elems, w.konst(4))
+    w_span := w.bin(BIN_MUL, nk_elems, w.konst(4))
+    x_span := w.bin(BIN_MUL, mk_elems, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_out.ptr, w.bin(BIN_SUB, addr_lim, out_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_w.ptr, w.bin(BIN_SUB, addr_lim, w_span)),
+                              w.u64_bin(BIN_LE, op_x.ptr, w.bin(BIN_SUB, addr_lim, x_span))))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_w.ptr, w_span),
+                           w.tensor_disjoint_ranges(op_out.ptr, out_span, op_x.ptr, x_span))
+
+    valid := w.bin(BIN_AND, dims_fit,
+             w.bin(BIN_AND, op_out.valid,
+             w.bin(BIN_AND, op_w.valid,
+             w.bin(BIN_AND, op_x.valid, w.bin(BIN_AND, addr_ok, disj)))))
+    fast := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $stub := "__xu_tensor_gemm4x4_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_gemm4x4_fast_f32" }
+    $args := []int{}
+    args.push(op_out.ptr)
+    args.push(op_w.ptr)
+    args.push(op_x.ptr)
+    args.push(m_val)
+    args.push(n_val)
+    args.push(k_val)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+fn (w &Lw) tensor_gemm_q4_q8_plan(p &parser.Parser, tp &types.TypedProgram, m_loop int) TensorGemmQ4Q8Plan {
+    no_match := TensorGemmQ4Q8Plan{loop: -1, m_bound: -1, n_bound: -1, nb_bound: -1,
+                                   out: -1, qs: -1, ws: -1, xq: -1, xs: -1,
+                                   off_out: -2, blk_off: -2, off_xs: -2}
+    m_bound := tensor_dynamic_bound(p, m_loop)
+    if !w.tensor_dot_bound_ok(p, tp, m_bound) { << no_match }
+    m_iv := tp.local_of(m_loop)
+    if m_iv < 0 { << no_match }
+
+    $stmts := [0, 0, 0]
+    $ids := [0, 0, 0]
+    $cur := p.nodes[m_loop].c
+    for k in 0:3 {
+        if cur < 0 || p.nodes[cur].kind != ast.NK_LET { << no_match }
+        lid := tp.local_of(cur)
+        if lid < 0 || lid == m_iv || w.local_type(tp, lid) != 1 { << no_match }
+        for prev in 0:k {
+            if ids[prev] == lid { << no_match }
+        }
+        stmts[k] = cur
+        ids[k] = lid
+        cur = p.nodes[cur].next
+    }
+
+    if cur < 0 || p.nodes[cur].kind != ast.NK_FOR || p.nodes[cur].next >= 0 { << no_match }
+    inner := w.tensor_gemv_quant_plan_in(p, tp, cur, 16, &ids)
+    if inner.loop < 0 { << no_match }
+    if inner.off_out < 0 || inner.off_xq < 0 || inner.off_xs < 0 { << no_match }
+    if inner.blk_off >= 0 && range_uses_iv(p, tp, inner.blk_off, m_iv) { << no_match }
+
+    $xs_stmt := -1
+    $xs_id := -1
+    $xq_stmt := -1
+    $out_stmt := -1
+    for k in 0:3 {
+        if tensor_ident_id(p, tp, inner.off_xs, ids[k]) {
+            xs_stmt = stmts[k]
+            xs_id = ids[k]
+        } else if tensor_ident_id(p, tp, inner.off_xq, ids[k]) {
+            xq_stmt = stmts[k]
+        } else if tensor_ident_id(p, tp, inner.off_out, ids[k]) {
+            out_stmt = stmts[k]
+        } else {
+            << no_match
+        }
+    }
+    if xs_stmt < 0 || xq_stmt < 0 || out_stmt < 0 { << no_match }
+
+    off_xs := w.tensor_bound_offset(p, tp, p.nodes[xs_stmt].a, m_iv, inner.n_blocks)
+    if off_xs == -2 { << no_match }
+    if !tensor_scaled_mul_iv(p, tp, p.nodes[xq_stmt].a, xs_id, 32) { << no_match }
+    off_out := w.tensor_bound_offset(p, tp, p.nodes[out_stmt].a, m_iv, inner.rows)
+    if off_out == -2 { << no_match }
+    if (off_xs >= 0 && range_uses_iv(p, tp, off_xs, m_iv)) ||
+       (off_out >= 0 && range_uses_iv(p, tp, off_out, m_iv)) {
+        << no_match
+    }
+
+    << TensorGemmQ4Q8Plan{loop: m_loop, m_bound: m_bound, n_bound: inner.rows, nb_bound: inner.n_blocks,
+                          out: inner.out, qs: inner.qs, ws: inner.ws, xq: inner.xq, xs: inner.xs,
+                          off_out: off_out, blk_off: inner.blk_off, off_xs: off_xs}
+}
+
+fn (w $&Lw) lower_tensor_gemm_q4_0_q8_0(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    plan := w.tensor_gemm_q4_q8_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    m_val := w.lower_expr(p, tp, plan.m_bound)
+    done := w.new_block()
+    pos_m := w.new_block()
+    w.branch(w.bin(BIN_GT, m_val, w.konst(0)), pos_m, done)
+
+    w.f.active_bb = pos_m
+    n_val := w.lower_expr(p, tp, plan.n_bound)
+    nb_val := w.lower_expr(p, tp, plan.nb_bound)
+    pos_nnb := w.bin(BIN_AND, w.bin(BIN_GT, n_val, w.konst(0)), w.bin(BIN_GT, nb_val, w.konst(0)))
+    check := w.new_block()
+    slow := w.new_block()
+    w.branch(pos_nnb, check, slow)
+
+    w.f.active_bb = check
+    cap_dim := w.konst((1 << 20) - 1)
+    dims_fit := w.bin(BIN_AND, w.bin(BIN_LE, m_val, cap_dim),
+                w.bin(BIN_AND, w.bin(BIN_LE, n_val, cap_dim), w.bin(BIN_LE, nb_val, cap_dim)))
+    blk_limit := w.konst(1 << 48)
+    off_limit := w.konst(1 << 54)
+    mn_elems := w.bin(BIN_MUL, m_val, n_val)
+    rn := w.bin(BIN_MUL, n_val, nb_val)
+    q_elems := w.bin(BIN_MUL, rn, w.konst(16))
+    m_nb := w.bin(BIN_MUL, m_val, nb_val)
+    xq_elems := w.bin(BIN_MUL, m_nb, w.konst(32))
+
+    op_out := w.tensor_strided_operand(p, tp, plan.out, plan.off_out, mn_elems, 4, off_limit)
+    op_qs := w.tensor_scaled_block_operand(p, tp, plan.qs, plan.blk_off, 16, q_elems, 1, blk_limit)
+    op_ws := w.tensor_scaled_block_operand(p, tp, plan.ws, plan.blk_off, 1, rn, 4, blk_limit)
+    op_xq := w.tensor_scaled_block_operand(p, tp, plan.xq, plan.off_xs, 32, xq_elems, 1, blk_limit)
+    op_xs := w.tensor_strided_operand(p, tp, plan.xs, plan.off_xs, m_nb, 4, off_limit)
+
+    out_span := w.bin(BIN_MUL, mn_elems, w.konst(4))
+    ws_span := w.bin(BIN_MUL, rn, w.konst(4))
+    xs_span := w.bin(BIN_MUL, m_nb, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_out.ptr, w.bin(BIN_SUB, addr_lim, out_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_qs.ptr, w.bin(BIN_SUB, addr_lim, q_elems)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_ws.ptr, w.bin(BIN_SUB, addr_lim, ws_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_xq.ptr, w.bin(BIN_SUB, addr_lim, xq_elems)),
+                              w.u64_bin(BIN_LE, op_xs.ptr, w.bin(BIN_SUB, addr_lim, xs_span))))))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_qs.ptr, q_elems),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_ws.ptr, ws_span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_xq.ptr, xq_elems),
+                           w.tensor_disjoint_ranges(op_out.ptr, out_span, op_xs.ptr, xs_span))))
+
+    valid := w.bin(BIN_AND, dims_fit,
+             w.bin(BIN_AND, op_out.valid,
+             w.bin(BIN_AND, op_qs.valid,
+             w.bin(BIN_AND, op_ws.valid,
+             w.bin(BIN_AND, op_xq.valid,
+             w.bin(BIN_AND, op_xs.valid, w.bin(BIN_AND, addr_ok, disj)))))))
+    fast := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    packed := w.bin(BIN_OR, w.bin(BIN_SHL, m_val, w.konst(42)),
+              w.bin(BIN_OR, w.bin(BIN_SHL, n_val, w.konst(21)), nb_val))
+    $stub := "__xu_tensor_gemm4x4_q4_0_q8_0_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_gemm4x4_q4_0_q8_0_fast_f32" }
+    $args := []int{}
+    args.push(op_out.ptr)
+    args.push(op_qs.ptr)
+    args.push(op_ws.ptr)
+    args.push(op_xq.ptr)
+    args.push(op_xs.ptr)
+    args.push(packed)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+fn (w $&Lw) lower_tensor_gemm(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    f32_gemm := w.lower_tensor_gemm_f32(p, tp, loop)
+    if f32_gemm >= 0 { << f32_gemm }
+    << w.lower_tensor_gemm_q4_0_q8_0(p, tp, loop)
+}
