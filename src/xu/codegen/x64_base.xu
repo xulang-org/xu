@@ -895,7 +895,11 @@ fn x64_ra(f &mir.MFn, opt bool) RaInfo {
     for r in 2:6 {
         fp_caller.push(32 + r)
     }
-    << ra_alloc_fp(f, &callee, &caller, &fp_callee, &fp_caller)
+    $arg_regs := []int{}
+    for i in 0:8 {
+        arg_regs.push(x64_arg_reg(i))
+    }
+    << ra_alloc_fp_hints(f, &callee, &caller, &fp_callee, &fp_caller, &arg_regs, -1)
 }
 
 // Compute f64 binary arithmetic/comparison directly in XMM registers.
@@ -1199,6 +1203,13 @@ fn x64_bin(cb $&mc.CodeBuffer, op int) {
         x64_rex(cb, true, 0, X_RCX, false)
         xb(cb, 0xF7)
         x64_modrm_rr(cb, 5, X_RCX)
+        x64_mov(cb, X_RAX, X_RDX)
+    }
+    else if op == mir.BIN_MULH_U {
+        // mul rcx (rdx:rax = rax * rcx, unsigned); mov rax, rdx.
+        x64_rex(cb, true, 0, X_RCX, false)
+        xb(cb, 0xF7)
+        x64_modrm_rr(cb, 4, X_RCX)
         x64_mov(cb, X_RAX, X_RDX)
     }
     else if op == mir.BIN_AND { x64_op_rr(cb, 0x21, X_RCX, X_RAX) }
@@ -1676,7 +1687,7 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
     leaf_noframe := can_elide_frame(f, &ra, opt)
     $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
     if opt && !leaf_noframe {
-        fp_plan = analyze_fast_entry(f)
+        fp_plan = analyze_fast_entry(f, &ra)
     }
     // Saved callee registers sit above the locals and temps.
     save_off := fr.size
@@ -1815,6 +1826,10 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
         uses = temp_use_counts(f)
         x64_prepare_idx(f, &fr, &ra, &uses, $&idx_mode, $&idx_base, $&idx_off, $&idx_shift)
     }
+    nb_fn := f.blocks.len
+    $cold := []bool{}
+    $is_ret := []bool{}
+    $blk_pos := []int{}
     $order := []int{}
     if opt {
         $slow := -1
@@ -1824,26 +1839,34 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                 order.push(slow)
             }
         }
-        $cold_list := []int{}
-        for obi in 0:f.blocks.len {
-            if obi == slow { -> }
-            $cold := false
-            if obi > 0 {
+        for obi in 0:nb_fn {
+            $c := false
+            if obi > 0 && obi != slow {
                 $cii := f.blocks[obi].head
                 while cii >= 0 {
                     cins := &f.instrs[cii]
                     if cins.kind == mir.MI_CALL && is_noreturn_call(&f.instrs[cii].sval) {
-                        cold = true
+                        c = true
                         <-
                     }
                     cii = cins.next
                 }
             }
-            if !cold { order.push(obi) }
+            cold.push(c)
+            is_ret.push(obi > 0 && obi != slow && !c && f.blocks[obi].tkind == mir.TKIND_RETURN)
+        }
+        $cold_list := []int{}
+        for obi in 0:nb_fn {
+            if obi == slow { -> }
+            if !cold[obi] { order.push(obi) }
             else { cold_list.push(obi) }
         }
         for ci in 0:cold_list.len {
             order.push(cold_list[ci])
+        }
+        for _ in 0:nb_fn { blk_pos.push(-1) }
+        for oi2 in 0:order.len {
+            blk_pos[order[oi2]] = oi2
         }
     } else {
         for obi in 0:f.blocks.len {
@@ -2117,6 +2140,19 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
             ii = ins.next
         }
         blk := ~f.blocks[bi]
+        $invert_br := false
+        if blk.tkind == mir.TKIND_BRANCH {
+            invert_br = blk.tb == next_bi
+            if !invert_br && opt && !pgo_map && blk.tc != next_bi && blk_pos.len == nb_fn {
+                tb_back := blk.tb >= 0 && blk.tb < nb_fn && blk_pos[blk.tb] >= 0 && blk_pos[blk.tb] <= oi
+                tc_back := blk.tc >= 0 && blk.tc < nb_fn && blk_pos[blk.tc] >= 0 && blk_pos[blk.tc] <= oi
+                tb_cold := blk.tb >= 0 && blk.tb < nb_fn && (cold[blk.tb] || is_ret[blk.tb])
+                tc_cold := blk.tc >= 0 && blk.tc < nb_fn && (cold[blk.tc] || is_ret[blk.tc])
+                if (tc_back && !tb_back) || (tb_cold && !tc_cold && !tb_back) {
+                    invert_br = true
+                }
+            }
+        }
         if blk.tkind == mir.TKIND_RETURN {
             x64_operand(cb, f, &fr, &ra, X_RAX, blk.ta)
             if leaf_noframe {
@@ -2135,8 +2171,11 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                 cc = CC_AE
             }
             if pgo_map { syms.define_label(f.label + ".pgo" + str(bi), cb.len()) }
-            if blk.tb == next_bi {
+            if invert_br {
                 x64_jcc(cb, relocs, cc ^ 1, f.label + ".bb" + str(blk.tc))
+                if blk.tb != next_bi {
+                    x64_jmp(cb, relocs, f.label + ".bb" + str(blk.tb))
+                }
             } else {
                 x64_jcc(cb, relocs, cc, f.label + ".bb" + str(blk.tb))
                 if blk.tc != next_bi {
@@ -2151,8 +2190,11 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
             }
             x64_test(cb, cr)
             if pgo_map { syms.define_label(f.label + ".pgo" + str(bi), cb.len()) }
-            if blk.tb == next_bi {
+            if invert_br {
                 x64_jcc(cb, relocs, CC_E, f.label + ".bb" + str(blk.tc))
+                if blk.tb != next_bi {
+                    x64_jmp(cb, relocs, f.label + ".bb" + str(blk.tb))
+                }
             } else {
                 x64_jcc(cb, relocs, CC_NE, f.label + ".bb" + str(blk.tb))
                 if blk.tc != next_bi {

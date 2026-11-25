@@ -10,6 +10,10 @@ const GVN_FRAME_WRITE = -2
 const GVN_BUCKETS = 1024
 const GVN_CONST_HT = 4096
 const GVN_CONST_MASK = 4095
+const GVN_MEM_NONE = 0
+const GVN_MEM_VID = 1
+const GVN_MEM_FRAME = 2
+const GVN_MEM_PARAM = 3
 
 struct GvnExpr {
     bucket int
@@ -23,6 +27,8 @@ struct GvnExpr {
 
 struct GvnHdr {
     desc_vid int
+    root_vid int
+    root_off int
     off int
     val_vid int
     epoch int
@@ -47,6 +53,17 @@ struct GvnParamWrite {
     param int
     off int
     width int
+    is_buf bool
+}
+
+struct GvnMemWrite {
+    kind int
+    id int
+    base_vid int
+    off int
+    width int
+    is_buf bool
+    root_safe bool
 }
 
 struct GvnRel {
@@ -68,6 +85,7 @@ struct GvnDfsFrame {
     saved_vrep_len int
     saved_buf_len int
     saved_sd_len int
+    saved_sl_len int
     saved_loc_len int
     saved_hdr_len int
     saved_exact_len int
@@ -152,6 +170,7 @@ pub struct GvnWork {
     idom []int
     mem_exit []int
     join_keeps_memory []bool
+    join_is_forward []bool
     dom_first []int
     dom_last []int
     dom_next []int
@@ -181,11 +200,23 @@ pub struct GvnWork {
     vrep_undo_rep []int
     vrep_top int
     buf_owner []int
+    buf_owner_off []int
     buf_undo []int
     buf_top int
     is_slice_desc []bool
     sd_undo []int
     sd_top int
+    sl_base []int
+    sl_off []int
+    sl_top int
+    struct_sl_kind []int
+    struct_sl_id []int
+    struct_sl_off []int
+    struct_sl_top int
+    loc_region_mark []int
+    loc_region_q []int
+    loc_clobber_gen []int
+    loc_region_gen int
     local_vid []int
     loc_undo_l []int
     loc_undo_v []int
@@ -247,6 +278,7 @@ pub fn gvn_work_new() GvnWork {
         idom: []int{},
         mem_exit: []int{},
         join_keeps_memory: []bool{},
+        join_is_forward: []bool{},
         dom_first: []int{},
         dom_last: []int{},
         dom_next: []int{},
@@ -276,11 +308,23 @@ pub fn gvn_work_new() GvnWork {
         vrep_undo_rep: []int{},
         vrep_top: 0,
         buf_owner: []int{},
+        buf_owner_off: []int{},
         buf_undo: []int{},
         buf_top: 0,
         is_slice_desc: []bool{},
         sd_undo: []int{},
         sd_top: 0,
+        sl_base: []int{},
+        sl_off: []int{},
+        sl_top: 0,
+        struct_sl_kind: []int{},
+        struct_sl_id: []int{},
+        struct_sl_off: []int{},
+        struct_sl_top: 0,
+        loc_region_mark: []int{},
+        loc_region_q: []int{},
+        loc_clobber_gen: []int{},
+        loc_region_gen: 0,
         local_vid: []int{},
         loc_undo_l: []int{},
         loc_undo_v: []int{},
@@ -313,7 +357,8 @@ pub fn gvn_work_new() GvnWork {
 // A function may read through pointers and write its own frame slots.
 fn gvn_readonly_instr(k int) bool {
     << k == MI_NOP || k == MI_COPY || k == MI_LOAD_LOCAL || k == MI_STORE_LOCAL ||
-       k == MI_ADDR || k == MI_LOAD_PTR || k == MI_BIN || k == MI_UN
+       k == MI_ADDR || k == MI_LOAD_PTR || k == MI_BIN || k == MI_UN ||
+       k == MI_SELECT || k == MI_STR_CONST || k == MI_LOAD_FN_ADDR
 }
 
 struct GvnCallEdge {
@@ -323,25 +368,37 @@ struct GvnCallEdge {
 
 // Resolve a store to a bounded frame range or an incoming ABI word plus
 // a fixed offset. A pointer load or merged definition ends the proof.
-fn gvn_describe_write(f &MFn, defs &[]int, address int, offset int, width int, access int) GvnParamWrite {
+fn gvn_trace_addr(f &MFn, defs &[]int, address int, offset int, width int, access int, allow_frame bool) GvnMemWrite {
     $off := u64(offset)
     $operand := address
     $before := access
-    while operand >= 0 && operand < defs.len {
+    $steps := 0
+    $seen := [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    while operand >= 0 && operand < defs.len && steps < 16 {
+        $cyc := false
+        for si in 0:steps {
+            if seen[si] == operand {
+                cyc = true
+                <-
+            }
+        }
+        if cyc { <- }
+        seen[steps] = operand
+        steps += 1
         def := defs[operand]
-        if def < 0 || def >= before { <- }
+        if def < 0 || (before >= 0 && def >= before) { <- }
         ins := &f.instrs[def]
-        before = def
+        if before >= 0 { before = def }
         if ins.kind == MI_ADDR {
-            if gvn_range_in_frame(f, ins.b, int(off), width) {
-                << GvnParamWrite{param: GVN_FRAME_WRITE, off: 0, width: 0}
+            if allow_frame && gvn_range_in_frame(f, ins.b, int(off), width) {
+                << GvnMemWrite{kind: GVN_MEM_FRAME, id: ins.b, base_vid: -1, off: int(off), width: width, is_buf: false, root_safe: true}
             }
             <-
         }
         if ins.kind == MI_LOAD_LOCAL {
             param := ins.b
             if ins.c == 0 && param >= 0 && param < f.nparams && f.locals_nslots[param] == 1 {
-                << GvnParamWrite{param: param, off: int(off), width: width}
+                << GvnMemWrite{kind: GVN_MEM_PARAM, id: param, base_vid: -1, off: int(off), width: width, is_buf: false, root_safe: true}
             }
             <-
         }
@@ -361,7 +418,132 @@ fn gvn_describe_write(f &MFn, defs &[]int, address int, offset int, width int, a
             <-
         }
     }
-    << GvnParamWrite{param: -1, off: 0, width: 0}
+    << GvnMemWrite{kind: GVN_MEM_NONE, id: -1, base_vid: -1, off: 0, width: 0, is_buf: false, root_safe: false}
+}
+
+fn gvn_describe_write(f &MFn, defs &[]int, address int, offset int, width int, access int) GvnParamWrite {
+    tb := gvn_trace_addr(f, defs, address, offset, width, access, true)
+    if tb.kind == GVN_MEM_FRAME {
+        << GvnParamWrite{param: GVN_FRAME_WRITE, off: 0, width: 0, is_buf: false}
+    }
+    if tb.kind == GVN_MEM_PARAM {
+        << GvnParamWrite{param: tb.id, off: tb.off, width: tb.width, is_buf: false}
+    }
+    << GvnParamWrite{param: -1, off: 0, width: 0, is_buf: false}
+}
+
+fn gvn_has_slice_coord(kinds &[]int, ids &[]int, offs &[]int, top int, kind int, id int, off int) bool {
+    for i in 0:top {
+        if kinds[i] == kind && ids[i] == id && offs[i] == off {
+            << true
+        }
+    }
+    << false
+}
+
+fn gvn_push_struct_slice(kinds $&[]int, ids $&[]int, offs $&[]int, top $&int, kind int, id int, off int) {
+    if gvn_has_slice_coord(kinds, ids, offs, *top, kind, id, off) { << }
+    if *top < kinds.len {
+        kinds[*top] = kind
+        ids[*top] = id
+        offs[*top] = off
+    } else {
+        kinds.push(kind)
+        ids.push(id)
+        offs.push(off)
+    }
+    *top = *top + 1
+}
+
+fn gvn_check_bounds_ge(f &MFn, defs &[]int, ge_ii int, use_before bool, allow_frame bool, kinds $&[]int, ids $&[]int, offs $&[]int, top $&int) {
+    ge := &f.instrs[ge_ii]
+    if ge.kind != MI_BIN || ge.b != BIN_GE { << }
+    $op := ge.d
+    $cur_before := -1
+    if use_before { cur_before = ge_ii }
+    $load_ii := -1
+    for _ in 0:8 {
+        if op < 0 || op >= defs.len { <- }
+        d := defs[op]
+        if d < 0 || (cur_before >= 0 && d >= cur_before) { <- }
+        if f.instrs[d].kind == MI_LOAD_PTR {
+            load_ii = d
+            <-
+        }
+        if f.instrs[d].kind != MI_COPY { <- }
+        if cur_before >= 0 { cur_before = d }
+        op = f.instrs[d].b
+    }
+    if load_ii < 0 { << }
+    load := &f.instrs[load_ii]
+    if load.c < 8 || (load.c & 7) != 0 || load.c > 520 || gvn_norm_width(load.d) != 8 { << }
+    $lb := -1
+    if use_before { lb = load_ii }
+    tb := gvn_trace_addr(f, defs, load.b, load.c - 8, 8, lb, allow_frame)
+    if tb.kind != GVN_MEM_NONE && tb.off >= 0 && (tb.off & 7) == 0 && tb.off <= 512 {
+        gvn_push_struct_slice(kinds, ids, offs, top, tb.kind, tb.id, tb.off)
+    }
+}
+
+fn gvn_collect_struct_slices(f &MFn, defs &[]int, rpo_idx &[]int, use_before bool, allow_frame bool, kinds $&[]int, ids $&[]int, offs $&[]int, top $&int) {
+    *top = 0
+    has_rpo := rpo_idx.len > 0
+    for bi in 0:f.blocks.len {
+        if has_rpo && rpo_idx[bi] < 0 { -> }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            if ins.kind == MI_BIN && ins.sval == "bounds" {
+                if ins.b == BIN_GE {
+                    gvn_check_bounds_ge(f, defs, ii, use_before, allow_frame, kinds, ids, offs, top)
+                } else if ins.b == BIN_OR {
+                    if ins.c >= 0 && ins.c < defs.len && defs[ins.c] >= 0 {
+                        gvn_check_bounds_ge(f, defs, defs[ins.c], use_before, allow_frame, kinds, ids, offs, top)
+                    }
+                    if ins.d >= 0 && ins.d < defs.len && defs[ins.d] >= 0 {
+                        gvn_check_bounds_ge(f, defs, defs[ins.d], use_before, allow_frame, kinds, ids, offs, top)
+                    }
+                }
+            }
+            ii = ins.next
+        }
+    }
+}
+
+fn gvn_trace_buf_ptr(f &MFn, defs &[]int, operand int, access int, allow_frame bool, kinds &[]int, ids &[]int, offs &[]int, top int, depth int, budget $&int) GvnMemWrite {
+    if depth >= 12 || *budget <= 0 || operand < 0 || operand >= defs.len || top <= 0 {
+        << GvnMemWrite{kind: GVN_MEM_NONE, id: -1, base_vid: -1, off: 0, width: 0, is_buf: false, root_safe: false}
+    }
+    *budget = *budget - 1
+    def := defs[operand]
+    if def < 0 || (access >= 0 && def >= access) {
+        << GvnMemWrite{kind: GVN_MEM_NONE, id: -1, base_vid: -1, off: 0, width: 0, is_buf: false, root_safe: false}
+    }
+    ins := &f.instrs[def]
+    $next_acc := -1
+    if access >= 0 { next_acc = def }
+    if ins.kind == MI_LOAD_PTR {
+        if gvn_norm_width(ins.d) == 8 {
+            tb := gvn_trace_addr(f, defs, ins.b, ins.c, 8, next_acc, allow_frame)
+            if tb.kind != GVN_MEM_NONE && tb.off >= 0 && (tb.off & 7) == 0 && tb.off <= 512 &&
+               gvn_has_slice_coord(kinds, ids, offs, top, tb.kind, tb.id, tb.off) {
+                << GvnMemWrite{kind: tb.kind, id: tb.id, base_vid: -1, off: tb.off, width: 8, is_buf: true, root_safe: true}
+            }
+        }
+        << GvnMemWrite{kind: GVN_MEM_NONE, id: -1, base_vid: -1, off: 0, width: 0, is_buf: false, root_safe: false}
+    }
+    if ins.kind == MI_COPY {
+        << gvn_trace_buf_ptr(f, defs, ins.b, next_acc, allow_frame, kinds, ids, offs, top, depth + 1, budget)
+    }
+    if ins.kind == MI_BIN && ins.b == BIN_SUB {
+        << gvn_trace_buf_ptr(f, defs, ins.c, next_acc, allow_frame, kinds, ids, offs, top, depth + 1, budget)
+    }
+    if ins.kind == MI_BIN && ins.b == BIN_ADD {
+        lhs := gvn_trace_buf_ptr(f, defs, ins.c, next_acc, allow_frame, kinds, ids, offs, top, depth + 1, budget)
+        if lhs.kind != GVN_MEM_NONE { << lhs }
+        << gvn_trace_buf_ptr(f, defs, ins.d, next_acc, allow_frame, kinds, ids, offs, top, depth + 1, budget)
+    }
+    << GvnMemWrite{kind: GVN_MEM_NONE, id: -1, base_vid: -1, off: 0, width: 0, is_buf: false, root_safe: false}
 }
 
 fn gvn_call_arg(f &MFn, head int, param int) int {
@@ -374,21 +556,35 @@ fn gvn_call_arg(f &MFn, head int, param int) int {
     << f.margs[arg].v
 }
 
-fn gvn_add_param_write(writes $&[]GvnParamWrite, write GvnParamWrite, composed bool) bool {
-    // A callee may overwrite its own frame without touching the caller's.
-    if write.param == GVN_FRAME_WRITE { << true }
+fn gvn_add_param_write(writes $&[]GvnParamWrite, write GvnParamWrite) bool {
+    // A direct frame write cannot touch the caller; a buf_write must map to a param.
+    if write.param == GVN_FRAME_WRITE { << !write.is_buf }
     if write.param < 0 { << false }
-    if composed {
-        for i in 0:writes.len {
-            existing := &writes[i]
-            if existing.param == write.param && existing.off == write.off && existing.width == write.width {
-                << true
+    for i in 0:writes.len {
+        existing := &writes[i]
+        if existing.param == write.param && existing.off == write.off &&
+           existing.width == write.width && existing.is_buf == write.is_buf {
+            << true
+        }
+    }
+    if writes.len >= GVN_MAX_COMPOSED_WRITES { << false }
+    writes.push(write)
+    << true
+}
+
+fn gvn_writes_equal(a &[]GvnParamWrite, b &[]GvnParamWrite) bool {
+    if a.len != b.len { << false }
+    for i in 0:a.len {
+        $found := false
+        for j in 0:b.len {
+            if a[i].param == b[j].param && a[i].off == b[j].off &&
+               a[i].width == b[j].width && a[i].is_buf == b[j].is_buf {
+                found = true
+                <-
             }
         }
-        // Bound expansion across repeated calls and branching call graphs.
-        if writes.len >= GVN_MAX_COMPOSED_WRITES { << false }
+        if !found { << false }
     }
-    writes.push(write)
     << true
 }
 
@@ -411,13 +607,30 @@ fn gvn_body_writes(f &MFn, effects &LabelIndex, groups &[][]GvnParamWrite, compo
             if defs[ins.a] == -1 { defs[ins.a] = ii } else { defs[ins.a] = -2 }
         }
     }
+    $sl_k := []int{}
+    $sl_i := []int{}
+    $sl_o := []int{}
+    $sl_top := 0
+    $empty_rpo := []int{}
+    gvn_collect_struct_slices(f, &defs, &empty_rpo, true, false, $&sl_k, $&sl_i, $&sl_o, $&sl_top)
     $budget := GVN_MAX_INSTRS
     for ii in 0:f.instrs.len {
         ins := &f.instrs[ii]
         if ins.kind == MI_STORE_PTR {
             write := gvn_describe_write(f, &defs, ins.a, ins.c, gvn_norm_width(ins.d), ii)
-            if !gvn_add_param_write(writes, write, composed) { << false }
+            if write.param != -1 {
+                if !gvn_add_param_write(writes, write) { << false }
+            } else {
+                // Only proven offset-0 slice-data backing writes qualify as buf_write.
+                if ins.c != 0 { << false }
+                $trace_budget := 32
+                bt := gvn_trace_buf_ptr(f, &defs, ins.a, ii, false, &sl_k, &sl_i, &sl_o, sl_top, 0, $&trace_budget)
+                if bt.kind != GVN_MEM_PARAM { << false }
+                bw := GvnParamWrite{param: bt.id, off: bt.off, width: 8, is_buf: true}
+                if !gvn_add_param_write(writes, bw) { << false }
+            }
         } else if composed && ins.kind == MI_CALL {
+            if gvn_is_noreturn(&ins.sval) { -> }
             effect := effects.get(&ins.sval)
             if effect < 0 { << false }
             if effect == 0 { -> }
@@ -427,95 +640,200 @@ fn gvn_body_writes(f &MFn, effects &LabelIndex, groups &[][]GvnParamWrite, compo
             for wi in 0:group.len {
                 child := &group[wi]
                 arg := gvn_call_arg(f, ins.c, child.param)
-                write := gvn_describe_write(f, &defs, arg, child.off, child.width, ii)
-                if !gvn_add_param_write(writes, write, true) { << false }
+                if arg < 0 { << false }
+                if child.is_buf {
+                    tb := gvn_trace_addr(f, &defs, arg, child.off, 8, ii, false)
+                    if tb.kind != GVN_MEM_PARAM || tb.off < 0 || (tb.off & 7) != 0 || tb.off > 512 {
+                        << false
+                    }
+                    bw := GvnParamWrite{param: tb.id, off: tb.off, width: 8, is_buf: true}
+                    if !gvn_add_param_write(writes, bw) { << false }
+                } else {
+                    write := gvn_describe_write(f, &defs, arg, child.off, child.width, ii)
+                    if !gvn_add_param_write(writes, write) { << false }
+                }
             }
         }
     }
     << true
 }
 
+fn gvn_propagate_bad(start int, bad $&[]bool, fn_effect $&[]int, effects $&LabelIndex, unit &Mir, caller_heads &[]int, callers &[]GvnCallEdge) {
+    if bad[start] { << }
+    $q := []int{}
+    q.push(start)
+    bad[start] = true
+    fn_effect[start] = -1
+    effects.put(&unit.fns[start].label, -1)
+    $qh := 0
+    while qh < q.len {
+        fi := q[qh]
+        qh += 1
+        $edge := caller_heads[fi]
+        while edge >= 0 {
+            c := callers[edge].caller
+            if !bad[c] {
+                bad[c] = true
+                fn_effect[c] = -1
+                effects.put(&unit.fns[c].label, -1)
+                q.push(c)
+            }
+            edge = callers[edge].next
+        }
+    }
+}
+
 // Summarize the typed bodies before the optimization passes mutate them.
-// Resolve a caller only after every direct callee has an effect summary.
-// Missing bodies, backend overrides and recursive cycles stay conservative.
+// Fixed-point propagation over call SCCs degrades any cycle hitting -1.
 pub fn gvn_summarize_call_effects(w $&GvnWork, unit &Mir, overridden &[]bool) {
-    $labels := label_index_new(unit.fns.len)
-    $effects := label_index_new(unit.fns.len)
+    nf := unit.fns.len
+    $labels := label_index_new(nf)
+    $effects := label_index_new(nf)
     $writes := [][]GvnParamWrite{}
     // Summary zero represents a call with no writes visible to its caller.
     writes.push([]GvnParamWrite{})
     $caller_heads := []int{}
-    // Number of unresolved calls, or -1 if the body's effects are unknown.
-    $pending := []int{}
+    $bad := []bool{}
     $local_writes := []bool{}
-    $callee_writes := []bool{}
-    for fi in 0:unit.fns.len {
+    $has_calls := []bool{}
+    $fn_effect := []int{}
+    $in_wl := []bool{}
+    $iters := []int{}
+    for fi in 0:nf {
         labels.put(&unit.fns[fi].label, fi)
         caller_heads.push(-1)
-        pending.push(-1)
+        bad.push(false)
         local_writes.push(false)
-        callee_writes.push(false)
+        has_calls.push(false)
+        fn_effect.push(-1)
+        in_wl.push(false)
+        iters.push(0)
     }
 
     $callers := []GvnCallEdge{}
-    $ready := []int{}
-    for fi in 0:unit.fns.len {
+    for fi in 0:nf {
         f := &unit.fns[fi]
-        if overridden[fi] || f.is_extern || f.blocks.len == 0 { -> }
-        $deps := 0
+        if overridden[fi] || f.is_extern || f.blocks.len == 0 || f.instrs.len > GVN_MAX_INSTRS {
+            bad[fi] = true
+            ->
+        }
         for ii in 0:f.instrs.len {
             ins := &f.instrs[ii]
-            if gvn_readonly_instr(ins.kind) { -> }
-            if ins.kind == MI_STORE_PTR {
+            k := ins.kind
+            if (k == MI_STORE_LOCAL && ins.a < f.nparams) ||
+               (k == MI_ADDR && ins.b < f.nparams) {
+                bad[fi] = true
+                <-
+            }
+            if gvn_readonly_instr(k) { -> }
+            if k == MI_STORE_PTR {
                 local_writes[fi] = true
                 ->
             }
-            if ins.kind != MI_CALL {
-                deps = -1
+            if k != MI_CALL {
+                bad[fi] = true
                 <-
             }
+            if gvn_is_noreturn(&ins.sval) { -> }
             callee := labels.get(&ins.sval)
-            if callee < 0 {
-                deps = -1
+            if callee < 0 || overridden[callee] || unit.fns[callee].is_extern || unit.fns[callee].blocks.len == 0 {
+                bad[fi] = true
                 <-
             }
+            has_calls[fi] = true
             callers.push(GvnCallEdge{caller: fi, next: caller_heads[callee]})
             caller_heads[callee] = callers.len - 1
-            deps += 1
         }
-        pending[fi] = deps
-        if deps == 0 {
-            ready.push(fi)
+    }
+
+    // Direct stores that fail classification poison the function before SCC propagation.
+    for fi in 0:nf {
+        if !bad[fi] && local_writes[fi] {
+            $init_ranges := []GvnParamWrite{}
+            if !gvn_body_writes(&unit.fns[fi], &effects, &writes, false, $&init_ranges) {
+                bad[fi] = true
+            }
+        }
+    }
+
+    // Reverse-propagate initial bad markers so any SCC touching -1 degrades to -1.
+    $bad_q := []int{}
+    for fi in 0:nf {
+        if bad[fi] {
+            effects.put(&unit.fns[fi].label, -1)
+            fn_effect[fi] = -1
+            bad_q.push(fi)
+        }
+    }
+    $bqh := 0
+    while bqh < bad_q.len {
+        fi := bad_q[bqh]
+        bqh += 1
+        $edge := caller_heads[fi]
+        while edge >= 0 {
+            c := callers[edge].caller
+            if !bad[c] {
+                bad[c] = true
+                fn_effect[c] = -1
+                effects.put(&unit.fns[c].label, -1)
+                bad_q.push(c)
+            }
+            edge = callers[edge].next
+        }
+    }
+
+    $wl := []int{}
+    for fi in 0:nf {
+        if !bad[fi] {
+            fn_effect[fi] = 0
+            effects.put(&unit.fns[fi].label, 0)
+            if local_writes[fi] {
+                wl.push(fi)
+                in_wl[fi] = true
+            }
         }
     }
 
     $cursor := 0
-    while cursor < ready.len {
-        fi := ready[cursor]
+    while cursor < wl.len {
+        fi := wl[cursor]
         cursor += 1
-        $effect := 0
-        if local_writes[fi] || callee_writes[fi] {
-            $ranges := []GvnParamWrite{}
-            if !gvn_body_writes(&unit.fns[fi], &effects, &writes, callee_writes[fi], $&ranges) { -> }
+        in_wl[fi] = false
+        if bad[fi] { -> }
+        iters[fi] += 1
+        if iters[fi] > 16 {
+            gvn_propagate_bad(fi, $&bad, $&fn_effect, $&effects, unit, &caller_heads, &callers)
+            ->
+        }
+        $ranges := []GvnParamWrite{}
+        if !gvn_body_writes(&unit.fns[fi], &effects, &writes, has_calls[fi], $&ranges) {
+            gvn_propagate_bad(fi, $&bad, $&fn_effect, $&effects, unit, &caller_heads, &callers)
+            ->
+        }
+        old_eff := fn_effect[fi]
+        $same := false
+        if ranges.len == 0 {
+            same = old_eff == 0
+        } else if old_eff > 0 {
+            same = gvn_writes_equal(&ranges, &writes[old_eff])
+        }
+        if !same {
+            $new_eff := 0
             if ranges.len > 0 {
-                effect = writes.len
+                new_eff = writes.len
                 writes.push(~ranges)
             }
-        }
-        effects.put(&unit.fns[fi].label, effect)
-        $edge := caller_heads[fi]
-        while edge >= 0 {
-            caller := callers[edge].caller
-            if pending[caller] > 0 {
-                if effect > 0 {
-                    callee_writes[caller] = true
+            fn_effect[fi] = new_eff
+            effects.put(&unit.fns[fi].label, new_eff)
+            $edge := caller_heads[fi]
+            while edge >= 0 {
+                caller := callers[edge].caller
+                if !bad[caller] && !in_wl[caller] {
+                    wl.push(caller)
+                    in_wl[caller] = true
                 }
-                pending[caller] -= 1
-                if pending[caller] == 0 {
-                    ready.push(caller)
-                }
+                edge = callers[edge].next
             }
-            edge = callers[edge].next
         }
     }
 
@@ -668,9 +986,10 @@ fn gvn_set_local(w $&GvnWork, l int, vid int, blk int) {
     }
 }
 
-fn gvn_set_buf_owner(w $&GvnWork, t int, owner_vid int) {
+fn gvn_set_buf_owner(w $&GvnWork, t int, owner_vid int, owner_off int) {
     if t >= 0 && t < w.nt && w.ndef[t] == 1 && w.buf_owner[t] < 0 && owner_vid >= 0 {
         w.buf_owner[t] = owner_vid
+        w.buf_owner_off[t] = owner_off
         if w.buf_top < w.buf_undo.len { w.buf_undo[w.buf_top] = t } else { w.buf_undo.push(t) }
         w.buf_top = w.buf_top + 1
     }
@@ -682,6 +1001,65 @@ fn gvn_mark_slice_desc(w $&GvnWork, vid int) {
         if w.sd_top < w.sd_undo.len { w.sd_undo[w.sd_top] = vid } else { w.sd_undo.push(vid) }
         w.sd_top = w.sd_top + 1
     }
+}
+
+fn gvn_has_slice_loc(w &GvnWork, vid int, off int) bool {
+    if vid < 0 || off < 0 { << false }
+    if off == 0 && vid < w.vid_top && w.is_slice_desc[vid] {
+        << true
+    }
+    $i := w.sl_top - 1
+    while i >= 0 {
+        if w.sl_base[i] == vid && w.sl_off[i] == off {
+            << true
+        }
+        i -= 1
+    }
+    << false
+}
+
+fn gvn_push_slice_loc(w $&GvnWork, vid int, off int) {
+    if !gvn_has_slice_loc(w, vid, off) {
+        if w.sl_top < w.sl_base.len {
+            w.sl_base[w.sl_top] = vid
+            w.sl_off[w.sl_top] = off
+        } else {
+            w.sl_base.push(vid)
+            w.sl_off.push(off)
+        }
+        w.sl_top = w.sl_top + 1
+    }
+}
+
+fn gvn_mark_slice_loc(w $&GvnWork, f &MFn, bvid int, off int) {
+    if bvid < 0 || off < 0 || (off & 7) != 0 || off > 512 { << }
+    if off == 0 {
+        gvn_mark_slice_desc(w, bvid)
+    } else {
+        gvn_push_slice_loc(w, bvid, off)
+    }
+    loc := gvn_location(w, f, bvid, off)
+    if loc.base_vid >= 0 && loc.off >= 0 && (loc.off & 7) == 0 && loc.off <= 512 {
+        if loc.off == 0 {
+            gvn_mark_slice_desc(w, loc.base_vid)
+        } else {
+            gvn_push_slice_loc(w, loc.base_vid, loc.off)
+        }
+    }
+}
+
+fn gvn_hdr_is_slice(w &GvnWork, hi int) bool {
+    dv := w.hdrs[hi].desc_vid
+    ho := w.hdrs[hi].off
+    if ho >= 0 && (gvn_has_slice_loc(w, dv, ho) || (ho >= 8 && gvn_has_slice_loc(w, dv, ho - 8)) || (ho >= 16 && gvn_has_slice_loc(w, dv, ho - 16))) {
+        << true
+    }
+    rv := w.hdrs[hi].root_vid
+    ro := w.hdrs[hi].root_off
+    if rv >= 0 && ro >= 0 && (gvn_has_slice_loc(w, rv, ro) || (ro >= 8 && gvn_has_slice_loc(w, rv, ro - 8)) || (ro >= 16 && gvn_has_slice_loc(w, rv, ro - 16))) {
+        << true
+    }
+    << false
 }
 
 fn gvn_is_const_zero(w &GvnWork, f &MFn, vid int) bool {
@@ -981,13 +1359,217 @@ fn gvn_find_exact(w &GvnWork, loc &GvnLocation, width int, slot int) int {
     << -1
 }
 
-fn gvn_record_call_writes(w $&GvnWork, f &MFn, head int, effect int) bool {
+fn gvn_param_of_vid(w &GvnWork, f &MFn, vid int) int {
+    if vid < 0 { << -1 }
+    rep := gvn_rep_of_vid(w, vid)
+    if rep < 0 || rep >= w.nt { << -1 }
+    def := w.tdef[rep]
+    if def < 0 || f.instrs[def].kind != MI_LOAD_LOCAL { << -1 }
+    param := f.instrs[def].b
+    if f.instrs[def].c == 0 && param >= 0 && param < f.nparams &&
+       param < w.nl && f.locals_nslots[param] == 1 &&
+       w.l_cand[param] && w.l_stores[param] == 0 {
+        << param
+    }
+    << -1
+}
+
+fn gvn_has_struct_slice_tri(w &GvnWork, kind int, id int, off int) bool {
+    if kind == GVN_MEM_NONE || id < 0 || off < 0 || w.struct_sl_top <= 0 { << false }
+    if gvn_has_slice_coord(&w.struct_sl_kind, &w.struct_sl_id, &w.struct_sl_off, w.struct_sl_top, kind, id, off) {
+        << true
+    }
+    if off >= 8 && gvn_has_slice_coord(&w.struct_sl_kind, &w.struct_sl_id, &w.struct_sl_off, w.struct_sl_top, kind, id, off - 8) {
+        << true
+    }
+    if off >= 16 && gvn_has_slice_coord(&w.struct_sl_kind, &w.struct_sl_id, &w.struct_sl_off, w.struct_sl_top, kind, id, off - 16) {
+        << true
+    }
+    << false
+}
+
+fn gvn_resolve_mem_write(w &GvnWork, f &MFn, ptr int, off int, width int, is_buf bool, try_buf_trace bool) GvnMemWrite {
+    vid := gvn_vid_of(w, ptr)
+    if vid != -1 {
+        loc := gvn_location(w, f, vid, off)
+        slot := gvn_frame_slot(w, f, &loc, width)
+        param := gvn_param_of_vid(w, f, loc.base_vid)
+        if slot >= 0 {
+            << GvnMemWrite{kind: GVN_MEM_FRAME, id: slot, base_vid: loc.base_vid, off: loc.off, width: width, is_buf: is_buf, root_safe: true}
+        }
+        if param >= 0 {
+            << GvnMemWrite{kind: GVN_MEM_PARAM, id: param, base_vid: loc.base_vid, off: loc.off, width: width, is_buf: is_buf, root_safe: true}
+        }
+    }
+    tb := gvn_trace_addr(f, &w.tdef, ptr, off, width, -1, true)
+    if tb.kind == GVN_MEM_FRAME {
+        << GvnMemWrite{kind: GVN_MEM_FRAME, id: tb.id, base_vid: -1, off: tb.off, width: width, is_buf: is_buf, root_safe: true}
+    }
+    if tb.kind == GVN_MEM_PARAM && tb.id < w.nl && w.l_cand[tb.id] && w.l_stores[tb.id] == 0 {
+        << GvnMemWrite{kind: GVN_MEM_PARAM, id: tb.id, base_vid: -1, off: tb.off, width: width, is_buf: is_buf, root_safe: true}
+    }
+    if try_buf_trace && off == 0 {
+        if ptr >= 0 && ptr < w.nt && w.buf_owner[ptr] >= 0 && gvn_has_slice_loc(w, w.buf_owner[ptr], w.buf_owner_off[ptr]) {
+            oloc := gvn_location(w, f, w.buf_owner[ptr], w.buf_owner_off[ptr])
+            oslot := gvn_frame_slot(w, f, &oloc, 8)
+            oparam := gvn_param_of_vid(w, f, oloc.base_vid)
+            if oslot >= 0 {
+                << GvnMemWrite{kind: GVN_MEM_FRAME, id: oslot, base_vid: oloc.base_vid, off: oloc.off, width: 8, is_buf: true, root_safe: true}
+            }
+            if oparam >= 0 {
+                << GvnMemWrite{kind: GVN_MEM_PARAM, id: oparam, base_vid: oloc.base_vid, off: oloc.off, width: 8, is_buf: true, root_safe: true}
+            }
+        }
+        $budget := 32
+        bt := gvn_trace_buf_ptr(f, &w.tdef, ptr, -1, true, &w.struct_sl_kind, &w.struct_sl_id, &w.struct_sl_off, w.struct_sl_top, 0, $&budget)
+        if bt.kind == GVN_MEM_FRAME {
+            << GvnMemWrite{kind: GVN_MEM_FRAME, id: bt.id, base_vid: -1, off: bt.off, width: 8, is_buf: true, root_safe: true}
+        }
+        if bt.kind == GVN_MEM_PARAM && bt.id < w.nl && w.l_cand[bt.id] && w.l_stores[bt.id] == 0 {
+            << GvnMemWrite{kind: GVN_MEM_PARAM, id: bt.id, base_vid: -1, off: bt.off, width: 8, is_buf: true, root_safe: true}
+        }
+    }
+    if !try_buf_trace && !is_buf && vid != -1 {
+        loc := gvn_location(w, f, vid, off)
+        if loc.base_vid >= 0 {
+            << GvnMemWrite{kind: GVN_MEM_VID, id: loc.base_vid, base_vid: loc.base_vid, off: loc.off, width: width, is_buf: false, root_safe: false}
+        }
+    }
+    << GvnMemWrite{kind: GVN_MEM_NONE, id: -1, base_vid: -1, off: 0, width: 0, is_buf: false, root_safe: false}
+}
+
+fn gvn_preserve_disjoint_hdrs(w $&GvnWork, f &MFn, writes &[]GvnMemWrite, old_g int) {
+    nh := w.hdr_top
+    for hi in 0:nh {
+        if w.hdrs[hi].epoch != old_g { -> }
+        $ok := true
+        if writes.len > 0 {
+            hdr := &w.hdrs[hi]
+            h_loc := GvnLocation{base_vid: hdr.root_vid, off: hdr.root_off}
+            h_slot := gvn_frame_slot(w, f, &h_loc, 8)
+            h_param := gvn_param_of_vid(w, f, hdr.root_vid)
+            h_root_safe := h_slot >= 0 || h_param >= 0
+            $h_slice := -1
+            for wi in 0:writes.len {
+                mw := &writes[wi]
+                same_root := (mw.base_vid >= 0 && hdr.root_vid == mw.base_vid) ||
+                             (h_slot >= 0 && mw.kind == GVN_MEM_FRAME && h_slot == mw.id) ||
+                             (h_param >= 0 && mw.kind == GVN_MEM_PARAM && h_param == mw.id)
+                if mw.is_buf {
+                    if h_slice < 0 {
+                        $is_sl := gvn_hdr_is_slice(w, hi)
+                        if !is_sl && h_root_safe {
+                            $hk := GVN_MEM_PARAM
+                            $hid := h_param
+                            if h_slot >= 0 {
+                                hk = GVN_MEM_FRAME
+                                hid = h_slot
+                            }
+                            if gvn_has_struct_slice_tri(w, hk, hid, hdr.root_off) {
+                                is_sl = true
+                            }
+                        }
+                        if is_sl { h_slice = 1 } else { h_slice = 0 }
+                    }
+                    if !mw.root_safe || !h_root_safe || h_slice != 1 || !same_root {
+                        ok = false
+                        <-
+                    }
+                } else {
+                    distinct_slots := h_slot >= 0 && mw.kind == GVN_MEM_FRAME && h_slot != mw.id
+                    disjoint := same_root && gvn_disjoint_ranges(mw.off, mw.width, hdr.root_off, 8)
+                    if !distinct_slots && !disjoint {
+                        ok = false
+                        <-
+                    }
+                }
+            }
+        }
+        if ok {
+            gvn_push_hdr(w, GvnHdr{
+                desc_vid: w.hdrs[hi].desc_vid,
+                root_vid: w.hdrs[hi].root_vid,
+                root_off: w.hdrs[hi].root_off,
+                off: w.hdrs[hi].off,
+                val_vid: w.hdrs[hi].val_vid,
+                epoch: w.gen_epoch
+            })
+        }
+    }
+}
+
+fn gvn_preserve_call_hdrs(w $&GvnWork, f &MFn, head int, effect int, old_g int) {
+    if w.hdr_top <= 0 { << }
+    count := w.call_writes[effect].len
+    if count == 0 { << }
+    $writes := []GvnMemWrite{}
+    for i in 0:count {
+        cw := &w.call_writes[effect][i]
+        arg := gvn_call_arg(f, head, cw.param)
+        if arg < 0 { << }
+        mw := gvn_resolve_mem_write(w, f, arg, cw.off, cw.width, cw.is_buf, false)
+        if mw.kind == GVN_MEM_NONE { << }
+        writes.push(mw)
+    }
+    gvn_preserve_disjoint_hdrs(w, f, &writes, old_g)
+}
+
+fn gvn_preserve_region_hdrs(w $&GvnWork, f &MFn, qt int, old_g int) {
+    if w.hdr_top <= 0 { << }
+    $writes := []GvnMemWrite{}
+    for qi in 0:qt {
+        u := w.loc_region_q[qi]
+        $ui := f.blocks[u].head
+        while ui >= 0 {
+            ins := &f.instrs[ui]
+            k := ins.kind
+            if gvn_readonly_instr(k) {
+                if k == MI_STORE_LOCAL && !gvn_scalar_local_store(w, ins.a, ins.c) {
+                    if ins.a < 0 || ins.a >= w.nl || ins.c < 0 || !gvn_range_in_frame(f, ins.a, ins.c * 8, 8) { << }
+                    if writes.len >= GVN_MAX_COMPOSED_WRITES { << }
+                    writes.push(GvnMemWrite{kind: GVN_MEM_FRAME, id: ins.a, base_vid: -1, off: ins.c * 8, width: 8, is_buf: false, root_safe: true})
+                }
+            } else if k == MI_STORE_PTR {
+                mw := gvn_resolve_mem_write(w, f, ins.a, ins.c, gvn_norm_width(ins.d), false, true)
+                if mw.kind == GVN_MEM_NONE { << }
+                if writes.len >= GVN_MAX_COMPOSED_WRITES { << }
+                writes.push(mw)
+            } else if k == MI_CALL {
+                ceff := gvn_call_effect(w, ins)
+                if ceff < 0 { << }
+                if ceff > 0 {
+                    count := w.call_writes[ceff].len
+                    if count > GVN_MAX_COMPOSED_WRITES - writes.len { << }
+                    for i in 0:count {
+                        cw := &w.call_writes[ceff][i]
+                        arg := gvn_call_arg(f, ins.c, cw.param)
+                        if arg < 0 { << }
+                        mw := gvn_resolve_mem_write(w, f, arg, cw.off, cw.width, cw.is_buf, false)
+                        if mw.kind == GVN_MEM_NONE { << }
+                        writes.push(mw)
+                    }
+                }
+            } else {
+                <<
+            }
+            ui = ins.next
+        }
+    }
+    gvn_preserve_disjoint_hdrs(w, f, &writes, old_g)
+}
+
+fn gvn_record_call_writes(w $&GvnWork, f &MFn, head int, effect int, has_buf $&bool) bool {
     count := w.call_writes[effect].len
     if count > GVN_MAX_INSTRS - w.exact_top {
         << false
     }
+    *has_buf = false
     for i in 0:count {
         write := w.call_writes[effect][i]
+        if write.is_buf {
+            *has_buf = true
+            ->
+        }
         base := gvn_vid_of(w, gvn_call_arg(f, head, write.param))
         if base == -1 { << false }
         loc := gvn_location(w, f, base, write.off)
@@ -1055,9 +1637,23 @@ fn gvn_prepare_memory_joins(w $&GvnWork, f &MFn, reachable int) {
     nb := w.nb
     gvn_fill_int($&w.mem_exit, nb, -1)
     gvn_fill_bool($&w.join_keeps_memory, nb, false)
+    gvn_fill_bool($&w.join_is_forward, nb, false)
     for ri in 0:reachable {
         b := w.rpo[ri]
         if w.is_panic[b] { -> }
+        if b > 0 && w.n_eff_preds[b] > 1 {
+            $fwd := true
+            $pe := w.pred_head[b]
+            while pe >= 0 {
+                p := w.pred_from[pe]
+                if w.rpo_idx[p] < 0 || w.rpo_idx[p] >= w.rpo_idx[b] {
+                    fwd = false
+                    <-
+                }
+                pe = w.pred_next[pe]
+            }
+            w.join_is_forward[b] = fwd
+        }
         entry := gvn_memory_entry(w, b)
         dom := w.idom[b]
         if w.n_eff_preds[b] > 1 && dom >= 0 && entry == w.mem_exit[dom] {
@@ -1144,12 +1740,12 @@ fn gvn_assume_cond(w $&GvnWork, f &MFn, v int, want_true bool, depth int, is_bou
             if gvn_is_const_ge(f, vc, -1) {
                 gvn_add_nn(w, vd)
             }
-            // A bounds check uses ge(idx, load8 [desc+8]): mark desc as slice.
+            // A bounds check uses ge(idx, load8 [desc + slice_off + 8]): mark slice descriptor.
             if (is_bounds || f.instrs[ii].sval == "bounds") && f.instrs[ii].d >= 0 && f.instrs[ii].d < w.nt {
                 lii := w.tdef[f.instrs[ii].d]
-                if lii >= 0 && f.instrs[lii].kind == MI_LOAD_PTR && f.instrs[lii].c == 8 && gvn_norm_width(f.instrs[lii].d) == 8 {
+                if lii >= 0 && f.instrs[lii].kind == MI_LOAD_PTR && f.instrs[lii].c >= 8 && (f.instrs[lii].c & 7) == 0 && f.instrs[lii].c <= 520 && gvn_norm_width(f.instrs[lii].d) == 8 {
                     dvid := gvn_vid_of(w, f.instrs[lii].b)
-                    gvn_mark_slice_desc(w, dvid)
+                    gvn_mark_slice_loc(w, f, dvid, f.instrs[lii].c - 8)
                 }
             }
         } else if op == BIN_LE {
@@ -1226,20 +1822,96 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
     // locals never written or written solely by a single store strictly
     // dominating this block stay valid.
     if b > 0 && w.n_eff_preds[b] > 1 {
+        $need_bfs := false
+        for l in 0:w.nl {
+            if w.local_vid[l] != -1 {
+                fast_keep := w.l_stores[l] == 0 ||
+                             (w.l_stores[l] == 1 && w.l_store_blk[l] >= 0 &&
+                              w.l_store_blk[l] != b && w.in_dom[w.l_store_blk[l]])
+                if !fast_keep {
+                    need_bfs = true
+                    <-
+                }
+            }
+        }
+        need_hdr_check := !w.join_keeps_memory[b] && w.join_is_forward[b] && w.hdr_top > 0
+        $bad_region := false
+        $rgen := 0
+        $qt := 0
+        if need_bfs || need_hdr_check {
+            dom := w.idom[b]
+            w.loc_region_gen = w.loc_region_gen + 1
+            rgen = w.loc_region_gen
+            if dom < 0 {
+                bad_region = true
+            } else {
+                $qh := 0
+                $pe := w.pred_head[b]
+                while pe >= 0 {
+                    p := w.pred_from[pe]
+                    if p != dom && w.rpo_idx[p] >= 0 && !w.is_panic[p] {
+                        if p == 0 && dom != 0 {
+                            bad_region = true
+                            <-
+                        }
+                        if w.loc_region_mark[p] != rgen {
+                            w.loc_region_mark[p] = rgen
+                            if qt < w.loc_region_q.len { w.loc_region_q[qt] = p } else { w.loc_region_q.push(p) }
+                            qt += 1
+                        }
+                    }
+                    pe = w.pred_next[pe]
+                }
+                while qh < qt && !bad_region {
+                    u := w.loc_region_q[qh]
+                    qh += 1
+                    if need_bfs {
+                        $ui := f.blocks[u].head
+                        while ui >= 0 {
+                            if f.instrs[ui].kind == MI_STORE_LOCAL && f.instrs[ui].a >= 0 && f.instrs[ui].a < w.nl {
+                                w.loc_clobber_gen[f.instrs[ui].a] = rgen
+                            }
+                            ui = f.instrs[ui].next
+                        }
+                    }
+                    $upe := w.pred_head[u]
+                    while upe >= 0 {
+                        up := w.pred_from[upe]
+                        if up != dom && w.rpo_idx[up] >= 0 && !w.is_panic[up] {
+                            if up == 0 && dom != 0 {
+                                bad_region = true
+                                <-
+                            }
+                            if w.loc_region_mark[up] != rgen {
+                                w.loc_region_mark[up] = rgen
+                                if qt < w.loc_region_q.len { w.loc_region_q[qt] = up } else { w.loc_region_q.push(up) }
+                                qt += 1
+                            }
+                        }
+                        upe = w.pred_next[upe]
+                    }
+                }
+            }
+        }
         for l in 0:w.nl {
             if w.local_vid[l] != -1 {
                 keep := w.l_stores[l] == 0 ||
                         (w.l_stores[l] == 1 && w.l_store_blk[l] >= 0 &&
-                         w.l_store_blk[l] != b && w.in_dom[w.l_store_blk[l]])
+                         w.l_store_blk[l] != b && w.in_dom[w.l_store_blk[l]]) ||
+                        (!bad_region && rgen > 0 && w.loc_clobber_gen[l] != rgen)
                 if !keep {
                     gvn_set_local(w, l, -1, -1)
                 }
             }
         }
         if !w.join_keeps_memory[b] {
-            w.gen_epoch = w.gen_epoch + 1
+            old_g := w.gen_epoch
+            w.gen_epoch = old_g + 1
             w.elem_epoch = w.elem_epoch + 1
             w.exact_epoch = w.exact_epoch + 1
+            if need_hdr_check && !bad_region && qt > 0 {
+                gvn_preserve_region_hdrs(w, f, qt, old_g)
+            }
         }
     }
 
@@ -1268,7 +1940,7 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                 gvn_bind_temp(w, ia, nv)
             }
             if ib >= 0 && ib < w.nt && w.buf_owner[ib] >= 0 {
-                gvn_set_buf_owner(w, ia, w.buf_owner[ib])
+                gvn_set_buf_owner(w, ia, w.buf_owner[ib], w.buf_owner_off[ib])
             }
         } else if k == MI_LOAD_LOCAL {
             l := ib
@@ -1292,7 +1964,7 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                         } else if ia >= 0 && w.ndef[ia] == 1 {
                             gvn_bind_temp(w, ia, lvid)
                             if rep >= 0 && rep < w.nt && w.buf_owner[rep] >= 0 {
-                                gvn_set_buf_owner(w, ia, w.buf_owner[rep])
+                                gvn_set_buf_owner(w, ia, w.buf_owner[rep], w.buf_owner_off[rep])
                             }
                             if lvid >= 0 {
                                 gvn_set_vid_rep(w, lvid, ia)
@@ -1351,7 +2023,8 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
             if bvid != -1 && ia >= 0 && w.ndef[ia] == 1 {
                 loc := gvn_location(w, f, bvid, ic)
                 slot := gvn_frame_slot(w, f, &loc, nw)
-                header_word := nw == 8 && (ic == 0 || ic == 8 || ic == 16)
+                header_word := nw == 8 && ic >= 0 && (ic & 7) == 0 && ic <= 528
+                data_cand := nw == 8 && loc.base_vid >= 0 && loc.off >= 0 && (loc.off & 7) == 0 && loc.off <= 512
                 $hit := -1
                 if header_word {
                     hit = gvn_find_hdr(w, bvid, ic)
@@ -1370,8 +2043,8 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                         w.changed = true
                         rewritten = true
                         gvn_bind_temp(w, ia, hit)
-                        if nw == 8 && ic == 0 && bvid >= 0 {
-                            gvn_set_buf_owner(w, ia, bvid)
+                        if data_cand {
+                            gvn_set_buf_owner(w, ia, loc.base_vid, loc.off)
                         }
                     }
                 }
@@ -1381,12 +2054,14 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                     if header_word && bvid >= 0 {
                         gvn_push_hdr(w, GvnHdr{
                             desc_vid: bvid,
+                            root_vid: loc.base_vid,
+                            root_off: loc.off,
                             off: ic,
                             val_vid: nv,
                             epoch: w.gen_epoch
                         })
-                        if ic == 0 {
-                            gvn_set_buf_owner(w, ia, bvid)
+                        if data_cand {
+                            gvn_set_buf_owner(w, ia, loc.base_vid, loc.off)
                         }
                     }
                     gvn_push_exact(w, GvnExact{
@@ -1414,22 +2089,31 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                 w.changed = true
             }
             $owner := -1
-            if ia >= 0 && ia < w.nt {
+            $owner_off := 0
+            if ia >= 0 && ia < w.nt && w.buf_owner[ia] >= 0 {
                 o := w.buf_owner[ia]
-                if o >= 0 && o < w.vid_top && w.is_slice_desc[o] {
+                oo := w.buf_owner_off[ia]
+                if gvn_has_slice_loc(w, o, oo) {
                     owner = o
+                    owner_off = oo
                 }
             }
             old_g := w.gen_epoch
             w.gen_epoch = w.gen_epoch + 1
             w.elem_epoch = w.elem_epoch + 1
             if owner >= 0 {
-                // Backing-buffer stores cannot overwrite their own slice descriptor.
+                // Backing-buffer stores cannot overwrite slice headers on the same root descriptor/struct.
+                oloc := gvn_location(w, f, owner, owner_off)
+                oroot := oloc.base_vid
                 nh := w.hdr_top
                 for hi in 0:nh {
-                    if w.hdrs[hi].epoch == old_g && w.hdrs[hi].desc_vid == owner {
+                    if w.hdrs[hi].epoch == old_g &&
+                       ((w.hdrs[hi].desc_vid == owner && (w.hdrs[hi].off == owner_off || w.hdrs[hi].off == owner_off + 8 || w.hdrs[hi].off == owner_off + 16)) ||
+                        (oroot >= 0 && w.hdrs[hi].root_vid == oroot && gvn_hdr_is_slice(w, hi))) {
                         gvn_push_hdr(w, GvnHdr{
                             desc_vid: w.hdrs[hi].desc_vid,
+                            root_vid: w.hdrs[hi].root_vid,
+                            root_off: w.hdrs[hi].root_off,
                             off: w.hdrs[hi].off,
                             val_vid: w.hdrs[hi].val_vid,
                             epoch: w.gen_epoch
@@ -1584,6 +2268,9 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                             w.changed = true
                             rewritten = true
                             gvn_bind_temp(w, ia, hit)
+                            if op == BIN_ADD && rep >= 0 && rep < w.nt && w.buf_owner[rep] >= 0 {
+                                gvn_set_buf_owner(w, ia, w.buf_owner[rep], w.buf_owner_off[rep])
+                            }
                         }
                     }
                     if !rewritten {
@@ -1592,9 +2279,9 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                         gvn_push_expr(w, MI_BIN, op, k1, k2, nv)
                         if op == BIN_ADD {
                             if ic >= 0 && ic < w.nt && w.buf_owner[ic] >= 0 {
-                                gvn_set_buf_owner(w, ia, w.buf_owner[ic])
+                                gvn_set_buf_owner(w, ia, w.buf_owner[ic], w.buf_owner_off[ic])
                             } else if id >= 0 && id < w.nt && w.buf_owner[id] >= 0 {
-                                gvn_set_buf_owner(w, ia, w.buf_owner[id])
+                                gvn_set_buf_owner(w, ia, w.buf_owner[id], w.buf_owner_off[id])
                             }
                         }
                     }
@@ -1662,12 +2349,19 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
             }
             effect := gvn_call_effect(w, &f.instrs[ii])
             if effect != 0 {
-                w.gen_epoch = w.gen_epoch + 1
+                old_g := w.gen_epoch
+                w.gen_epoch = old_g + 1
                 w.elem_epoch = w.elem_epoch + 1
+                $has_buf := false
                 exact_top := w.exact_top
-                if effect < 0 || !gvn_record_call_writes(w, f, ic, effect) {
+                if effect < 0 || !gvn_record_call_writes(w, f, ic, effect, $&has_buf) {
                     w.exact_top = exact_top
                     w.exact_epoch = w.exact_epoch + 1
+                } else if has_buf {
+                    w.exact_epoch = w.exact_epoch + 1
+                }
+                if effect > 0 {
+                    gvn_preserve_call_hdrs(w, f, ic, effect, old_g)
                 }
             }
         } else {
@@ -1700,6 +2394,7 @@ fn gvn_enter_block(w $&GvnWork, f $&MFn, b int, depth int) bool {
     saved_vrep_len := w.vrep_top
     saved_buf_len := w.buf_top
     saved_sd_len := w.sd_top
+    saved_sl_len := w.sl_top
     saved_loc_len := w.loc_top
     saved_hdr_len := w.hdr_top
     saved_exact_len := w.exact_top
@@ -1727,6 +2422,7 @@ fn gvn_enter_block(w $&GvnWork, f $&MFn, b int, depth int) bool {
         saved_vrep_len: saved_vrep_len,
         saved_buf_len: saved_buf_len,
         saved_sd_len: saved_sd_len,
+        saved_sl_len: saved_sl_len,
         saved_loc_len: saved_loc_len,
         saved_hdr_len: saved_hdr_len,
         saved_exact_len: saved_exact_len,
@@ -1754,6 +2450,7 @@ fn gvn_leave_block(w $&GvnWork, fi int) {
     saved_vrep_len := w.dfs_frames[fi].saved_vrep_len
     saved_buf_len := w.dfs_frames[fi].saved_buf_len
     saved_sd_len := w.dfs_frames[fi].saved_sd_len
+    saved_sl_len := w.dfs_frames[fi].saved_sl_len
     saved_loc_len := w.dfs_frames[fi].saved_loc_len
 
     while w.expr_top > saved_expr_len {
@@ -1777,12 +2474,14 @@ fn gvn_leave_block(w $&GvnWork, fi int) {
         w.buf_top = w.buf_top - 1
         t := w.buf_undo[w.buf_top]
         w.buf_owner[t] = -1
+        w.buf_owner_off[t] = 0
     }
     while w.sd_top > saved_sd_len {
         w.sd_top = w.sd_top - 1
         v := w.sd_undo[w.sd_top]
         w.is_slice_desc[v] = false
     }
+    w.sl_top = saved_sl_len
     while w.loc_top > saved_loc_len {
         w.loc_top = w.loc_top - 1
         l := w.loc_undo_l[w.loc_top]
@@ -1878,6 +2577,8 @@ pub fn opt_gvn_with(f $&MFn, w $&GvnWork) bool {
     w.vrep_top = 0
     w.buf_top = 0
     w.sd_top = 0
+    w.sl_top = 0
+    w.struct_sl_top = 0
     w.loc_top = 0
     w.expr_top = 0
     w.hdr_top = 0
@@ -1895,6 +2596,9 @@ pub fn opt_gvn_with(f $&MFn, w $&GvnWork) bool {
     gvn_fill_bool($&w.is_panic, nb, false)
     gvn_fill_bool($&w.in_dom, nb, false)
     gvn_fill_int($&w.dom_first, nb, -1)
+    gvn_fill_int($&w.loc_region_mark, nb, 0)
+    gvn_fill_int($&w.loc_clobber_gen, nl, 0)
+    w.loc_region_gen = 0
 
     $has_multi_pred := false
     $reachable := 1
@@ -2062,6 +2766,7 @@ pub fn opt_gvn_with(f $&MFn, w $&GvnWork) bool {
     gvn_fill_int($&w.tdef, nt, -1)
     gvn_fill_int($&w.temp_vn, nt, -1)
     gvn_fill_int($&w.buf_owner, nt, -1)
+    gvn_fill_int($&w.buf_owner_off, nt, 0)
 
     gvn_fill_bool($&w.l_cand, nl, true)
     n_nslots := f.locals_nslots.len
@@ -2110,6 +2815,7 @@ pub fn opt_gvn_with(f $&MFn, w $&GvnWork) bool {
     if has_multi_pred {
         gvn_prepare_memory_joins(w, f, reachable)
     }
+    gvn_collect_struct_slices(f, &w.tdef, &w.rpo_idx, false, true, $&w.struct_sl_kind, $&w.struct_sl_id, $&w.struct_sl_off, $&w.struct_sl_top)
 
     nc := w.nc
     gvn_ensure_int($&w.const_canon, nc, 0)
