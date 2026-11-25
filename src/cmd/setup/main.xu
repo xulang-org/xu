@@ -291,6 +291,72 @@ fn setup_close_fd(fd int) {
     os_fd_close(fd) or (err) { << }
 }
 
+struct SetupArchive {
+    start int
+    length int
+}
+
+// Read the little-endian Mach-O load command fields used by the SDK section.
+fn setup_macho_uint(data &string, offset int, width int) int {
+    $value := 0
+    for i in 0:width {
+        value = value | ((data[offset + i] & 255) << (8 * i))
+    }
+    << value
+}
+
+// Offline macOS packages place the archive inside a signed file section.
+fn setup_macho_archive(fd int, file_size int) SetupArchive {
+    os_fd_seek(fd, 0, 0) or (err) { << SetupArchive{start: 0, length: 0} }
+    header := os_fd_read(fd, 32) or (err) { << SetupArchive{start: 0, length: 0} }
+    if header.len != 32 || setup_macho_uint(&header, 0, 4) != 0xfeedfacf { << SetupArchive{start: 0, length: 0} }
+    command_count := setup_macho_uint(&header, 16, 4)
+    command_end := 32 + setup_macho_uint(&header, 20, 4)
+    if command_end > file_size || command_count > (command_end - 32) / 8 { << SetupArchive{start: 0, length: -1} }
+    $offset := 32
+    for i in 0:command_count {
+        if offset > command_end - 8 { << SetupArchive{start: 0, length: -1} }
+        os_fd_seek(fd, offset, 0) or (err) { << SetupArchive{start: 0, length: -1} }
+        command := os_fd_read(fd, 8) or (err) { << SetupArchive{start: 0, length: -1} }
+        if command.len != 8 { << SetupArchive{start: 0, length: -1} }
+        kind := setup_macho_uint(&command, 0, 4)
+        size := setup_macho_uint(&command, 4, 4)
+        if size < 8 || size > command_end - offset { << SetupArchive{start: 0, length: -1} }
+        if kind == 0x19 && size >= 72 {
+            segment := os_fd_read(fd, 64) or (err) { << SetupArchive{start: 0, length: -1} }
+            if segment.len != 64 { << SetupArchive{start: 0, length: -1} }
+            if segment[0:8] == "__XU_SDK" && segment[8] == 0 {
+                if setup_macho_uint(&segment, 56, 4) != 1 || size < 152 { << SetupArchive{start: 0, length: -1} }
+                section := os_fd_read(fd, 80) or (err) { << SetupArchive{start: 0, length: -1} }
+                if section.len != 80 || (section[0:9] != "__archive" || section[9] != 0) { << SetupArchive{start: 0, length: -1} }
+                length := setup_macho_uint(&section, 40, 8)
+                start := setup_macho_uint(&section, 48, 4)
+                if length <= 0 || start < command_end || length > file_size - start { << SetupArchive{start: 0, length: -1} }
+                << SetupArchive{start: start, length: length}
+            }
+        }
+        offset += size
+    }
+    << SetupArchive{start: 0, length: 0}
+}
+
+fn setup_trailing_archive(fd int, file_sz int) SetupArchive {
+    os_fd_seek(fd, file_sz - 24, 0) or (err) { << SetupArchive{start: 0, length: -1} }
+    tail := os_fd_read(fd, 24) or (err) { << SetupArchive{start: 0, length: -1} }
+    if tail.len != 24 { << SetupArchive{start: 0, length: -1} }
+    if tail[16:24] != "XUPACK01" { << SetupArchive{start: 0, length: 0} }
+
+    len_str := setup_trim(tail[0:16])
+    $length := 0
+    for i in 0:len_str.len {
+        digit := len_str[i]
+        if digit < 48 || digit > 57 { << SetupArchive{start: 0, length: -1} }
+        length = length * 10 + digit - 48
+    }
+    if length <= 0 || length > file_sz - 24 { << SetupArchive{start: 0, length: -1} }
+    << SetupArchive{start: file_sz - 24 - length, length: length}
+}
+
 // 0 = no embedded archive; 1 = extracted; -1 = corrupt or unreadable payload.
 fn extract_embedded_payload(self_exe string, temp_stage string) int {
     info := os_stat(self_exe + "") or (err) { << 0 - 1 }
@@ -299,42 +365,23 @@ fn extract_embedded_payload(self_exe string, temp_stage string) int {
 
     fd := os_open(self_exe + "", os.O_RDONLY) or (err) { << 0 - 1 }
 
-    os_fd_seek(fd, file_sz - 24, 0) or (err) {
+    $archive := SetupArchive{start: 0, length: 0}
+    if xu_target_os() == 0 { archive = setup_macho_archive(fd, file_sz) }
+    if archive.length < 0 {
         setup_close_fd(fd)
         << 0 - 1
     }
-    tail := os_fd_read(fd, 24) or (err) {
-        setup_close_fd(fd)
-        << 0 - 1
-    }
-    if tail.len < 24 {
-        setup_close_fd(fd)
-        << 0 - 1
-    }
-
-    magic := tail[16:24]
-    if magic != "XUPACK01" {
-        setup_close_fd(fd)
-        << 0
-    }
-
-    len_str := setup_trim(tail[0:16])
-    $zip_len := 0
-    for i in 0:len_str.len {
-        b := len_str[i]
-        if b >= 48 && b <= 57 {
-            zip_len = zip_len * 10 + (b - 48)
-        } else {
+    $zip_start := archive.start
+    $zip_len := archive.length
+    if zip_len == 0 {
+        legacy := setup_trailing_archive(fd, file_sz)
+        if legacy.length <= 0 {
             setup_close_fd(fd)
-            << 0 - 1
+            << legacy.length
         }
+        zip_start = legacy.start
+        zip_len = legacy.length
     }
-    if zip_len <= 0 || zip_len > file_sz - 24 {
-        setup_close_fd(fd)
-        << 0 - 1
-    }
-
-    zip_start := file_sz - 24 - zip_len
     os_fd_seek(fd, zip_start, 0) or (err) {
         setup_close_fd(fd)
         << 0 - 1
@@ -627,7 +674,7 @@ fn main() int {
     argv := os.argv()
     $is_silent := false
     $custom_prefix := ""
-    $req_version := "0.14.1-dev.1"
+    $req_version := "0.14.2-dev.1"
     $modify_env := true
     $force_cli := false
     $force_gui := false
