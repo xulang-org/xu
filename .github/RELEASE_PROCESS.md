@@ -54,24 +54,31 @@ flowchart TD
 
 **规范要求：拒绝空泛的性能宣称。性能结论必须具备真实源码、测量环境、编译器提交和独立数据支撑。**
 
-1. **测试矩阵**：
+1. **独立横测仓库定位 (`xulang-org/bench`)**：
+   - **独立维护原则**：Xu 的跨语言性能基准套件、工作负载源码（Osprey 24 题、Benchmarks Game、标准库、高并发网络等）及各语言对照实现（C Clang、Rust、Go、Swift）全部由独立的 **`xulang-org/bench`** 仓库独立维护，避免污染核心编译器源码。
+   - **工具版本管理**：`bench` 仓库拥有独立的根 `VERSION` 标识工具集合版本，实际测试结果严格记录所测编译器版本、Git 提交哈希、平台硬件及运行时参数。
+2. **测试矩阵与负载覆盖**：
    - **支持平台与架构**：双架构（`ARM64` + `x86_64`），覆盖三大主流操作系统（`Linux`、`macOS`、`Windows`），共计 6 大标准目标平台（`linux-arm64`、`linux-x64`、`macos-arm64`、`macos-x64`、`windows-arm64`、`windows-x64`）。
    - **对比语言工具链**：同环境下最新稳定版 C (Clang -O3)、Rust (rustc -O3)、Go (go build)、Swift (swiftc -O)。
    - **核心基准负载（72 组 Workloads）**：涵盖表达式树（expr_tree）、SPSC 通道会合延迟、高并发协程调度与内存开销、GEMM 矩阵乘法、SROA 聚合体拆解、JSON 解析、SHA-256 哈希计算等典型场景。
-2. **测量与数据导入**：
-   - 在专用物理机或标准 CI 隔离节点运行基准测试，记录机器规格、CPU 型号、OS 核心版本及各编译器具体版本。
-   - 将测得的数据集导入官网：
+3. **在 `bench` 仓库触发自动化横测流水线**：
+   - 正式版本发布时，在 `xulang-org/bench` 仓库触发自动化流水线（`.github/workflows/bench.yml`）：
+     ```sh
+     gh workflow run bench.yml --repo xulang-org/bench -f mode=full -f xu_ref=vX.Y.Z
+     ```
+   - 该工作流在 GitHub Actions 的 6 大标准 Runner 矩阵上完整拉取待测 Xu 编译器，全自动完成 72 项负载编译、对拍执行与可信度采样，生成 6 份结构化数据工件 `benchmark-reports-<target>`。
+4. **数据导入与官网看板同步 (`xulang-org`)**：
+   - 从 `bench` 的 Actions 运行产物中下载 6 平台的 `benchmark-reports-*` 工件包。
+   - 在 `xulang-org` 仓库运行导入与校验脚本：
      ```sh
      # 检查工作负载目录与基准提交一致性
      python3 scripts/sync_all_benches.py
-     # 导入 6 平台完整测量工件 (需指定版本、完整 commit 及 Actions run_id)
+     # 导入 6 平台完整测量工件 (需指定版本、完整 commit 及 bench Actions run_id)
      python3 scripts/import-benchmarks.py --artifacts <path> --version X.Y.Z --commit <sha40> --run-id <id> --date YYYY-MM-DD
      # 重新生成全语言基准看板静态页面
      python3 scripts/gen-benchmarks.py
      ```
-3. **看板与产物核验**：
-   - 确保 `www/benchmarks.json` 与 `www/bench_sources.json` 包含该版本的确切数据与源码映射。
-   - 生成的 `content/{lang}/benchmarks.html` 中必须展示清晰的横向对比图表与数据表。
+   - 验证 `www/benchmarks.json` 与 `www/bench_sources.json` 包含该版本的确切数据与源码映射，生成的 `content/{lang}/benchmarks.html` 包含最新实测图表，并将关键横测数据写入发布说明与发布博客中。
 
 ---
 

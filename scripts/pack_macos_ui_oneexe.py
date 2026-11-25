@@ -323,6 +323,7 @@ def main() -> None:
         default=None,
         help="static www/ to embed",
     )
+    ap.add_argument("--offline-payload", type=pathlib.Path, help="SDK tar archive to embed in a signed Mach-O section")
     ap.add_argument("--webview", action="store_true", help="force WebKit host plugin")
     ap.add_argument("--no-webview", action="store_true", help="force shell-only host (no WebKit)")
     args = ap.parse_args()
@@ -498,6 +499,9 @@ def main() -> None:
         link.extend(["-Xlinker", "-force_load", "-Xlinker", str(host_a)])
         # Prefer host's strong _xu_ui_host_run over Xu weak stub.
         link.extend(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"])
+        if args.offline_payload is not None:
+            link.extend(["-Xlinker", "-sectcreate", "-Xlinker", "__XU_SDK",
+                         "-Xlinker", "__archive", "-Xlinker", str(args.offline_payload.resolve(strict=True))])
         subprocess.check_call(link, cwd=str(ROOT))
 
     print("ship:", out, out.stat().st_size, "bytes", f"arch={arch}", f"target={xu_target}")

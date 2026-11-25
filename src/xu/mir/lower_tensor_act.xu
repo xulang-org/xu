@@ -1,0 +1,832 @@
+@xu/mir
+
+#xu/mir/ai
+
+#xu/ast
+#xu/parser
+#xu/types
+
+// Lower activation, normalization-offset, and argmax loops to native SIMD stubs:
+//   1. SwiGLU:      for i in 0:n { g := gate[i]; silu := f32(f64(g) / (1.0 + math.exp(f64(-g)))); dst[i] = silu * up[i] }
+//   2. Argmax:      $best_i := 0; $best_v := x[0]; for i in 1:n { if x[i] > best_v { best_v = x[i]; best_i = i } }
+//   3. Norm-offset: for k in 0:n { out[base + k] = (x[base + k] * inv) * weight[k] }
+struct TensorSwigluPlan {
+    loop int
+    bound int
+    dst int
+    gate int
+    up int
+    off_dst int
+    off_gate int
+    off_up int
+}
+
+struct TensorArgmaxPlan {
+    decl int
+    vdecl int
+    loop int
+    bound int
+    x int
+    i_id int
+    v_id int
+}
+
+struct TensorNormOffsetPlan {
+    loop int
+    bound int
+    out int
+    x int
+    weight int
+    off_out int
+    off_x int
+    off_w int
+    inv_id int
+}
+
+fn (w &Lw) tensor_swiglu_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorSwigluPlan {
+    no_match := TensorSwigluPlan{loop: -1, bound: -1, dst: -1, gate: -1, up: -1,
+                                 off_dst: -2, off_gate: -2, off_up: -2}
+    bound := ai.tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 { << no_match }
+
+    // g := gate[off + i]
+    s1 := p.nodes[loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    g_id := tp.local_of(s1)
+    if g_id < 0 || w.local_type(tp, g_id) != ai.TENSOR_F32 { << no_match }
+    g_idx := p.nodes[s1].a
+    if g_idx < 0 || p.nodes[g_idx].kind != ast.NK_INDEX || tp.type_of(g_idx) != ai.TENSOR_F32 { << no_match }
+    gate := p.nodes[g_idx].a
+    if !w.tensor_f32_array_base(p, tp, gate) { << no_match }
+    off_gate := w.tensor_dot_offset(p, tp, p.nodes[g_idx].b, iv)
+    if off_gate == -2 { << no_match }
+
+    // silu := f32(f64(g) / (1.0 + math.exp(f64(-g))))
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    silu_id := tp.local_of(s2)
+    if silu_id < 0 || silu_id == g_id || w.local_type(tp, silu_id) != ai.TENSOR_F32 { << no_match }
+    cast_f32 := p.nodes[s2].a
+    if cast_f32 < 0 || p.nodes[cast_f32].kind != ast.NK_CAST || tp.type_of(cast_f32) != ai.TENSOR_F32 {
+        << no_match
+    }
+    div_e := p.nodes[cast_f32].a
+    if div_e < 0 || p.nodes[div_e].kind != ast.NK_BIN_OP || p.nodes[div_e].ival != ast.OP_DIV ||
+       !ai.tensor_f64_cast_ident(p, tp, p.nodes[div_e].a, g_id) {
+        << no_match
+    }
+    den := p.nodes[div_e].b
+    if den < 0 || p.nodes[den].kind != ast.NK_BIN_OP || p.nodes[den].ival != ast.OP_ADD { << no_match }
+    if !((ai.tensor_f64_lit(p, tp, p.nodes[den].a, F64_BITS_ONE) && ai.tensor_math_exp_call(p, tp, p.nodes[den].b, g_id)) ||
+         (ai.tensor_f64_lit(p, tp, p.nodes[den].b, F64_BITS_ONE) && ai.tensor_math_exp_call(p, tp, p.nodes[den].a, g_id))) {
+        << no_match
+    }
+
+    // dst[off + i] = silu * up[off + i]
+    s3 := p.nodes[s2].next
+    stmt := ai.tensor_assignment(p, s3, ast.AS_ASSIGN, ast.OP_MUL)
+    if stmt < 0 { << no_match }
+    dst_idx := p.nodes[stmt].a
+    if dst_idx < 0 || p.nodes[dst_idx].kind != ast.NK_INDEX || tp.type_of(dst_idx) != ai.TENSOR_F32 { << no_match }
+    dst := p.nodes[dst_idx].a
+    if !w.tensor_f32_array_base(p, tp, dst) { << no_match }
+    off_dst := w.tensor_dot_offset(p, tp, p.nodes[dst_idx].b, iv)
+    if off_dst == -2 { << no_match }
+
+    mul := p.nodes[stmt].b
+    $up_idx := -1
+    if ai.tensor_ident_id(p, tp, p.nodes[mul].a, silu_id) {
+        up_idx = p.nodes[mul].b
+    } else if ai.tensor_ident_id(p, tp, p.nodes[mul].b, silu_id) {
+        up_idx = p.nodes[mul].a
+    } else {
+        << no_match
+    }
+    if up_idx < 0 || p.nodes[up_idx].kind != ast.NK_INDEX || tp.type_of(up_idx) != ai.TENSOR_F32 { << no_match }
+    up := p.nodes[up_idx].a
+    if !w.tensor_f32_array_base(p, tp, up) { << no_match }
+    off_up := w.tensor_dot_offset(p, tp, p.nodes[up_idx].b, iv)
+    if off_up == -2 { << no_match }
+
+    << TensorSwigluPlan{loop: loop, bound: bound, dst: dst, gate: gate, up: up,
+                        off_dst: off_dst, off_gate: off_gate, off_up: off_up}
+}
+
+fn (w $&Lw) lower_tensor_swiglu(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_swiglu_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    n := w.lower_expr(p, tp, plan.bound)
+    done := w.new_block()
+    check := w.new_block()
+    w.branch(w.bin(BIN_GT, n, w.konst(0)), check, done)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 54)
+    n_fits := w.bin(BIN_LE, n, limit_val)
+    op_dst := w.tensor_dot_operand(p, tp, plan.dst, plan.off_dst, n, limit_val)
+    op_gate := w.tensor_dot_operand(p, tp, plan.gate, plan.off_gate, n, limit_val)
+    op_up := w.tensor_dot_operand(p, tp, plan.up, plan.off_up, n, limit_val)
+
+    span := w.bin(BIN_MUL, n, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_dst.ptr, w.bin(BIN_SUB, addr_lim, span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_gate.ptr, w.bin(BIN_SUB, addr_lim, span)),
+                              w.u64_bin(BIN_LE, op_up.ptr, w.bin(BIN_SUB, addr_lim, span))))
+    // Allow dst == gate (in-place hb[i] = silu(hb[i]) * hb2[i]) or completely disjoint dst & gate,
+    // while strictly requiring dst & up to be disjoint.
+    gate_ok := w.bin(BIN_OR, w.bin(BIN_EQ, op_dst.ptr, op_gate.ptr),
+                             w.tensor_disjoint_ranges(op_dst.ptr, span, op_gate.ptr, span))
+    up_ok := w.tensor_disjoint_ranges(op_dst.ptr, span, op_up.ptr, span)
+    valid := w.bin(BIN_AND, n_fits,
+             w.bin(BIN_AND, op_dst.valid,
+             w.bin(BIN_AND, op_gate.valid,
+             w.bin(BIN_AND, op_up.valid,
+             w.bin(BIN_AND, addr_ok, w.bin(BIN_AND, gate_ok, up_ok))))))
+
+    fast := w.new_block()
+    slow := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $stub := "__xu_tensor_swiglu_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_swiglu_fast_f32" }
+    $args := []int{}
+    args.push(op_dst.ptr)
+    args.push(op_gate.ptr)
+    args.push(op_up.ptr)
+    args.push(n)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+fn (w &Lw) tensor_argmax_plan(p &parser.Parser, tp &types.TypedProgram, decl int) TensorArgmaxPlan {
+    no_match := TensorArgmaxPlan{decl: -1, vdecl: -1, loop: -1, bound: -1, x: -1, i_id: -1, v_id: -1}
+    if decl < 0 || p.nodes[decl].kind != ast.NK_LET || !ai.tensor_int_zero(p, p.nodes[decl].a) {
+        << no_match
+    }
+    i_id := tp.local_of(decl)
+    if i_id < 0 || w.local_type(tp, i_id) != 1 { << no_match }
+
+    vdecl := p.nodes[decl].next
+    if vdecl < 0 || p.nodes[vdecl].kind != ast.NK_LET { << no_match }
+    v_id := tp.local_of(vdecl)
+    if v_id < 0 || v_id == i_id || w.local_type(tp, v_id) != ai.TENSOR_F32 {
+        << no_match
+    }
+    v_idx := p.nodes[vdecl].a
+    if v_idx < 0 || p.nodes[v_idx].kind != ast.NK_INDEX || tp.type_of(v_idx) != ai.TENSOR_F32 ||
+       !ai.tensor_int_zero(p, p.nodes[v_idx].b) {
+        << no_match
+    }
+    x := p.nodes[v_idx].a
+    if !w.tensor_f32_array_base(p, tp, x) { << no_match }
+    x_id := tp.local_of(x)
+
+    loop := p.nodes[vdecl].next
+    if loop < 0 || p.nodes[loop].kind != ast.NK_FOR || !ai.tensor_int_lit(p, p.nodes[loop].a, 1) {
+        << no_match
+    }
+    bound := p.nodes[loop].b
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 || iv == i_id || iv == v_id { << no_match }
+
+    body := p.nodes[loop].c
+    if body < 0 || p.nodes[body].kind != ast.NK_IF || p.nodes[body].next >= 0 || p.nodes[body].b >= 0 {
+        << no_match
+    }
+    br := p.nodes[body].a
+    if br < 0 || p.nodes[br].next >= 0 { << no_match }
+    cond := p.nodes[br].a
+    if cond < 0 || p.nodes[cond].kind != ast.NK_BIN_OP || p.nodes[cond].ival != ast.OP_GT ||
+       !ai.tensor_ident_id(p, tp, p.nodes[cond].b, v_id) {
+        << no_match
+    }
+    c_lhs := p.nodes[cond].a
+    if c_lhs < 0 || p.nodes[c_lhs].kind != ast.NK_INDEX || tp.type_of(c_lhs) != ai.TENSOR_F32 ||
+       !ai.tensor_ident_id(p, tp, p.nodes[c_lhs].a, x_id) || !ai.tensor_ident_id(p, tp, p.nodes[c_lhs].b, iv) {
+        << no_match
+    }
+
+    bs1 := p.nodes[br].b
+    if bs1 < 0 || p.nodes[bs1].kind != ast.NK_ASSIGN || p.nodes[bs1].ival != ast.AS_ASSIGN ||
+       !ai.tensor_ident_id(p, tp, p.nodes[bs1].a, v_id) {
+        << no_match
+    }
+    b_rhs := p.nodes[bs1].b
+    if b_rhs < 0 || p.nodes[b_rhs].kind != ast.NK_INDEX || tp.type_of(b_rhs) != ai.TENSOR_F32 ||
+       !ai.tensor_ident_id(p, tp, p.nodes[b_rhs].a, x_id) || !ai.tensor_ident_id(p, tp, p.nodes[b_rhs].b, iv) {
+        << no_match
+    }
+    bs2 := p.nodes[bs1].next
+    if bs2 < 0 || p.nodes[bs2].kind != ast.NK_ASSIGN || p.nodes[bs2].ival != ast.AS_ASSIGN ||
+       p.nodes[bs2].next >= 0 || !ai.tensor_ident_id(p, tp, p.nodes[bs2].a, i_id) ||
+       !ai.tensor_ident_id(p, tp, p.nodes[bs2].b, iv) {
+        << no_match
+    }
+
+    << TensorArgmaxPlan{decl: decl, vdecl: vdecl, loop: loop, bound: bound, x: x, i_id: i_id, v_id: v_id}
+}
+
+fn (w $&Lw) lower_tensor_argmax(p &parser.Parser, tp &types.TypedProgram, decl int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_argmax_plan(p, tp, decl)
+    if plan.loop < 0 { << -1 }
+
+    w.lower_stmt(p, tp, plan.decl)
+    w.ensure_open()
+    w.lower_stmt(p, tp, plan.vdecl)
+    w.ensure_open()
+
+    i_slot := w.lslot[plan.i_id]
+    v_slot := w.lslot[plan.v_id]
+    if i_slot < 0 || v_slot < 0 || w.byref(i_slot) || w.byref(v_slot) {
+        w.lower_stmt(p, tp, plan.loop)
+        << plan.loop
+    }
+
+    w.cur_line = p.nodes[plan.loop].line
+    n := w.lower_expr(p, tp, plan.bound)
+    done := w.new_block()
+    check := w.new_block()
+    w.branch(w.bin(BIN_GT, n, w.konst(1)), check, done)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 30)
+    n_fits := w.bin(BIN_LE, n, limit_val)
+    op_x := w.tensor_dot_operand(p, tp, plan.x, -1, n, limit_val)
+    valid := w.bin(BIN_AND, n_fits, op_x.valid)
+    fast := w.new_block()
+    slow := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $args := []int{}
+    args.push(op_x.ptr)
+    args.push(n)
+    idx := w.call("__xu_tensor_argmax_f32", &args)
+    w.store_local(i_slot, 0, idx)
+    best_elem := w.load_ptr(w.bin(BIN_ADD, op_x.ptr, w.bin(BIN_MUL, idx, w.konst(4))), 0, 4)
+    w.store_local(v_slot, 0, best_elem)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+fn (w &Lw) tensor_norm_offset_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorNormOffsetPlan {
+    no_match := TensorNormOffsetPlan{loop: -1, bound: -1, out: -1, x: -1, weight: -1,
+                                     off_out: -2, off_x: -2, off_w: -2, inv_id: -1}
+    bound := ai.tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 { << no_match }
+
+    stmt := ai.tensor_assignment(p, p.nodes[loop].c, ast.AS_ASSIGN, ast.OP_MUL)
+    if stmt < 0 { << no_match }
+    out_idx := p.nodes[stmt].a
+    if out_idx < 0 || p.nodes[out_idx].kind != ast.NK_INDEX || tp.type_of(out_idx) != ai.TENSOR_F32 {
+        << no_match
+    }
+    out := p.nodes[out_idx].a
+    if !w.tensor_f32_array_base(p, tp, out) { << no_match }
+    off_out := w.tensor_dot_offset(p, tp, p.nodes[out_idx].b, iv)
+    if off_out == -2 { << no_match }
+
+    mul := p.nodes[stmt].b
+    $scaled := p.nodes[mul].a
+    $w_idx := p.nodes[mul].b
+    if scaled < 0 || p.nodes[scaled].kind != ast.NK_BIN_OP || p.nodes[scaled].ival != ast.OP_MUL {
+        scaled = p.nodes[mul].b
+        w_idx = p.nodes[mul].a
+    }
+    if scaled < 0 || p.nodes[scaled].kind != ast.NK_BIN_OP || p.nodes[scaled].ival != ast.OP_MUL {
+        << no_match
+    }
+    if w_idx < 0 || p.nodes[w_idx].kind != ast.NK_INDEX || tp.type_of(w_idx) != ai.TENSOR_F32 {
+        << no_match
+    }
+    weight := p.nodes[w_idx].a
+    if !w.tensor_f32_array_base(p, tp, weight) { << no_match }
+    off_w := w.tensor_dot_offset(p, tp, p.nodes[w_idx].b, iv)
+    if off_w == -2 { << no_match }
+
+    $x_idx := p.nodes[scaled].a
+    $inv_node := p.nodes[scaled].b
+    if x_idx < 0 || p.nodes[x_idx].kind != ast.NK_INDEX {
+        x_idx = p.nodes[scaled].b
+        inv_node = p.nodes[scaled].a
+    }
+    if x_idx < 0 || p.nodes[x_idx].kind != ast.NK_INDEX || tp.type_of(x_idx) != ai.TENSOR_F32 {
+        << no_match
+    }
+    x := p.nodes[x_idx].a
+    if !w.tensor_f32_array_base(p, tp, x) { << no_match }
+    off_x := w.tensor_dot_offset(p, tp, p.nodes[x_idx].b, iv)
+    if off_x == -2 { << no_match }
+    if off_out < 0 && off_x < 0 && off_w < 0 { << no_match }
+
+    inv_id := w.tensor_read_local(p, tp, inv_node)
+    if inv_id < 0 || w.local_type(tp, inv_id) != ai.TENSOR_F32 { << no_match }
+
+    << TensorNormOffsetPlan{loop: loop, bound: bound, out: out, x: x, weight: weight,
+                            off_out: off_out, off_x: off_x, off_w: off_w, inv_id: inv_id}
+}
+
+fn (w $&Lw) lower_tensor_norm_offset(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_norm_offset_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    n := w.lower_expr(p, tp, plan.bound)
+    done := w.new_block()
+    check := w.new_block()
+    w.branch(w.bin(BIN_GT, n, w.konst(0)), check, done)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 54)
+    n_fits := w.bin(BIN_LE, n, limit_val)
+    op_out := w.tensor_dot_operand(p, tp, plan.out, plan.off_out, n, limit_val)
+    op_x := w.tensor_dot_operand(p, tp, plan.x, plan.off_x, n, limit_val)
+    op_w := w.tensor_dot_operand(p, tp, plan.weight, plan.off_w, n, limit_val)
+
+    span := w.bin(BIN_MUL, n, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_out.ptr, w.bin(BIN_SUB, addr_lim, span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_x.ptr, w.bin(BIN_SUB, addr_lim, span)),
+                              w.u64_bin(BIN_LE, op_w.ptr, w.bin(BIN_SUB, addr_lim, span))))
+    x_ok := w.bin(BIN_OR, w.bin(BIN_EQ, op_out.ptr, op_x.ptr),
+                          w.tensor_disjoint_ranges(op_out.ptr, span, op_x.ptr, span))
+    w_ok := w.tensor_disjoint_ranges(op_out.ptr, span, op_w.ptr, span)
+    valid := w.bin(BIN_AND, n_fits,
+             w.bin(BIN_AND, op_out.valid,
+             w.bin(BIN_AND, op_x.valid,
+             w.bin(BIN_AND, op_w.valid,
+             w.bin(BIN_AND, addr_ok, w.bin(BIN_AND, x_ok, w_ok))))))
+
+    fast := w.new_block()
+    slow := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    inv_val := w.load_local(w.lslot[plan.inv_id], 0)
+    $args := []int{}
+    args.push(op_out.ptr)
+    args.push(op_x.ptr)
+    args.push(op_w.ptr)
+    args.push(inv_val)
+    args.push(n)
+    w.call("__xu_tensor_norm_f32", &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+struct TensorSqsumOffsetPlan {
+    loop int
+    bound int
+    x int
+    off_x int
+    accum_slot int
+}
+
+fn (w &Lw) tensor_sqsum_offset_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorSqsumOffsetPlan {
+    no_match := TensorSqsumOffsetPlan{loop: -1, bound: -1, x: -1, off_x: -2, accum_slot: -1}
+    bound := ai.tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 { << no_match }
+
+    s1 := p.nodes[loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    v_id := tp.local_of(s1)
+    if v_id < 0 || w.local_type(tp, v_id) != ai.TENSOR_F32 { << no_match }
+    x_idx := p.nodes[s1].a
+    if x_idx < 0 || p.nodes[x_idx].kind != ast.NK_INDEX || tp.type_of(x_idx) != ai.TENSOR_F32 { << no_match }
+    x := p.nodes[x_idx].a
+    if !w.tensor_f32_array_base(p, tp, x) { << no_match }
+    off_x := w.tensor_dot_offset(p, tp, p.nodes[x_idx].b, iv)
+    if off_x < 0 { << no_match }
+
+    s2 := p.nodes[s1].next
+    stmt := ai.tensor_assignment(p, s2, ast.AS_ADD, ast.OP_MUL)
+    if stmt < 0 { << no_match }
+    accum := w.tensor_read_local(p, tp, p.nodes[stmt].a)
+    if accum < 0 || accum == v_id || w.local_type(tp, accum) != ai.TENSOR_F32 { << no_match }
+    prod := p.nodes[stmt].b
+    if tp.type_of(prod) != ai.TENSOR_F32 ||
+       !ai.tensor_ident_id(p, tp, p.nodes[prod].a, v_id) ||
+       !ai.tensor_ident_id(p, tp, p.nodes[prod].b, v_id) {
+        << no_match
+    }
+
+    << TensorSqsumOffsetPlan{loop: loop, bound: bound, x: x, off_x: off_x, accum_slot: w.lslot[accum]}
+}
+
+fn (w $&Lw) lower_tensor_sqsum_offset(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_sqsum_offset_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    n := w.lower_expr(p, tp, plan.bound)
+    done := w.new_block()
+    check := w.new_block()
+    w.branch(w.bin(BIN_GT, n, w.konst(0)), check, done)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 54)
+    n_fits := w.bin(BIN_LE, n, limit_val)
+    op_x := w.tensor_dot_operand(p, tp, plan.x, plan.off_x, n, limit_val)
+    valid := w.bin(BIN_AND, n_fits, op_x.valid)
+    fast := w.new_block()
+    slow := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $stub := "__xu_tensor_dot_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_dot_fast_f32" }
+    $args := []int{}
+    args.push(op_x.ptr)
+    args.push(op_x.ptr)
+    args.push(n)
+    args.push(w.load_local(plan.accum_slot, 0))
+    sum := w.call(stub, &args)
+    w.store_local(plan.accum_slot, 0, sum)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+const TENSOR_STR_TY = 3
+const TENSOR_BYTE_U8 = 10
+const TENSOR_BYTE_I8 = 7
+
+struct TensorVscalePlan {
+    loop int
+    bound int
+    dst int
+    x int
+    off_dst int
+    off_x int
+    scale_id int
+}
+
+fn (w &Lw) tensor_vscale_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorVscalePlan {
+    no_match := TensorVscalePlan{loop: -1, bound: -1, dst: -1, x: -1, off_dst: -2, off_x: -2, scale_id: -1}
+    bound := ai.tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 { << no_match }
+
+    stmt := ai.tensor_assignment(p, p.nodes[loop].c, ast.AS_ASSIGN, ast.OP_MUL)
+    if stmt < 0 { << no_match }
+    dst_idx := p.nodes[stmt].a
+    if dst_idx < 0 || p.nodes[dst_idx].kind != ast.NK_INDEX || tp.type_of(dst_idx) != ai.TENSOR_F32 { << no_match }
+    dst := p.nodes[dst_idx].a
+    if !w.tensor_f32_array_base(p, tp, dst) { << no_match }
+    off_dst := w.tensor_dot_offset(p, tp, p.nodes[dst_idx].b, iv)
+    if off_dst == -2 { << no_match }
+
+    mul := p.nodes[stmt].b
+    if tp.type_of(mul) != ai.TENSOR_F32 { << no_match }
+    $x_idx := p.nodes[mul].a
+    $s_node := p.nodes[mul].b
+    if x_idx < 0 || p.nodes[x_idx].kind != ast.NK_INDEX {
+        x_idx = p.nodes[mul].b
+        s_node = p.nodes[mul].a
+    }
+    if x_idx < 0 || p.nodes[x_idx].kind != ast.NK_INDEX || tp.type_of(x_idx) != ai.TENSOR_F32 { << no_match }
+    x := p.nodes[x_idx].a
+    if !w.tensor_f32_array_base(p, tp, x) { << no_match }
+    off_x := w.tensor_dot_offset(p, tp, p.nodes[x_idx].b, iv)
+    if off_x == -2 { << no_match }
+    if off_dst < 0 && off_x < 0 { << no_match }
+
+    scale_id := w.tensor_read_local(p, tp, s_node)
+    if scale_id < 0 || w.local_type(tp, scale_id) != ai.TENSOR_F32 { << no_match }
+    << TensorVscalePlan{loop: loop, bound: bound, dst: dst, x: x, off_dst: off_dst, off_x: off_x, scale_id: scale_id}
+}
+
+fn (w $&Lw) lower_tensor_vscale(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_vscale_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    n := w.lower_expr(p, tp, plan.bound)
+    done := w.new_block()
+    check := w.new_block()
+    w.branch(w.bin(BIN_GT, n, w.konst(0)), check, done)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 54)
+    n_fits := w.bin(BIN_LE, n, limit_val)
+    op_dst := w.tensor_dot_operand(p, tp, plan.dst, plan.off_dst, n, limit_val)
+    op_x := w.tensor_dot_operand(p, tp, plan.x, plan.off_x, n, limit_val)
+    span := w.bin(BIN_MUL, n, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_dst.ptr, w.bin(BIN_SUB, addr_lim, span)),
+                              w.u64_bin(BIN_LE, op_x.ptr, w.bin(BIN_SUB, addr_lim, span)))
+    alias_ok := w.bin(BIN_OR, w.bin(BIN_EQ, op_dst.ptr, op_x.ptr),
+                              w.tensor_disjoint_ranges(op_dst.ptr, span, op_x.ptr, span))
+    valid := w.bin(BIN_AND, n_fits,
+             w.bin(BIN_AND, op_dst.valid,
+             w.bin(BIN_AND, op_x.valid, w.bin(BIN_AND, addr_ok, alias_ok))))
+    fast := w.new_block()
+    slow := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    s_val := w.load_local(w.lslot[plan.scale_id], 0)
+    $args := []int{}
+    args.push(op_dst.ptr)
+    args.push(op_x.ptr)
+    args.push(w.konst(0))
+    args.push(s_val)
+    args.push(n)
+    w.call("__xu_tensor_norm_f32", &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+struct TensorRopePlan {
+    loop int
+    bound int
+    vec int
+    cos_t int
+    sin_t int
+    off_v0 int
+    off_v1 int
+    off_cos int
+    off_sin int
+}
+
+fn (w &Lw) tensor_rope_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorRopePlan {
+    no_match := TensorRopePlan{loop: -1, bound: -1, vec: -1, cos_t: -1, sin_t: -1,
+                               off_v0: -2, off_v1: -2, off_cos: -2, off_sin: -2}
+    bound := ai.tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 { << no_match }
+
+    s1 := p.nodes[loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    c_id := tp.local_of(s1)
+    c_idx := p.nodes[s1].a
+    if c_id < 0 || w.local_type(tp, c_id) != ai.TENSOR_F32 || c_idx < 0 ||
+       p.nodes[c_idx].kind != ast.NK_INDEX || tp.type_of(c_idx) != ai.TENSOR_F32 { << no_match }
+    cos_t := p.nodes[c_idx].a
+    off_cos := w.tensor_dot_offset(p, tp, p.nodes[c_idx].b, iv)
+    if !w.tensor_f32_array_base(p, tp, cos_t) || off_cos == -2 { << no_match }
+
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    s_id := tp.local_of(s2)
+    s_idx := p.nodes[s2].a
+    if s_id < 0 || s_id == c_id || w.local_type(tp, s_id) != ai.TENSOR_F32 || s_idx < 0 ||
+       p.nodes[s_idx].kind != ast.NK_INDEX || tp.type_of(s_idx) != ai.TENSOR_F32 { << no_match }
+    sin_t := p.nodes[s_idx].a
+    off_sin := w.tensor_dot_offset(p, tp, p.nodes[s_idx].b, iv)
+    if !w.tensor_f32_array_base(p, tp, sin_t) || off_sin == -2 { << no_match }
+
+    s3 := p.nodes[s2].next
+    if s3 < 0 || p.nodes[s3].kind != ast.NK_LET { << no_match }
+    v0_id := tp.local_of(s3)
+    v0_idx := p.nodes[s3].a
+    if v0_id < 0 || v0_id == c_id || v0_id == s_id || w.local_type(tp, v0_id) != ai.TENSOR_F32 || v0_idx < 0 ||
+       p.nodes[v0_idx].kind != ast.NK_INDEX || tp.type_of(v0_idx) != ai.TENSOR_F32 { << no_match }
+    vec := p.nodes[v0_idx].a
+    off_v0 := w.tensor_dot_offset(p, tp, p.nodes[v0_idx].b, iv)
+    if !w.tensor_f32_array_base(p, tp, vec) || off_v0 == -2 { << no_match }
+
+    s4 := p.nodes[s3].next
+    if s4 < 0 || p.nodes[s4].kind != ast.NK_LET { << no_match }
+    v1_id := tp.local_of(s4)
+    v1_idx := p.nodes[s4].a
+    if v1_id < 0 || v1_id == v0_id || w.local_type(tp, v1_id) != ai.TENSOR_F32 || v1_idx < 0 ||
+       p.nodes[v1_idx].kind != ast.NK_INDEX || tp.type_of(v1_idx) != ai.TENSOR_F32 { << no_match }
+    vec1 := p.nodes[v1_idx].a
+    off_v1 := w.tensor_dot_offset(p, tp, p.nodes[v1_idx].b, iv)
+    if tp.local_of(vec1) != tp.local_of(vec) || off_v1 == -2 { << no_match }
+
+    s5 := p.nodes[s4].next
+    if s5 < 0 || p.nodes[s5].kind != ast.NK_ASSIGN || p.nodes[s5].ival != ast.AS_ASSIGN { << no_match }
+    w0_idx := p.nodes[s5].a
+    if w0_idx < 0 || p.nodes[w0_idx].kind != ast.NK_INDEX || tp.type_of(w0_idx) != ai.TENSOR_F32 ||
+       tp.local_of(p.nodes[w0_idx].a) != tp.local_of(vec) { << no_match }
+    off_w0 := w.tensor_dot_offset(p, tp, p.nodes[w0_idx].b, iv)
+    if !ai.tensor_same_offset(p, tp, off_v0, off_w0) { << no_match }
+    sub_e := ai.tensor_unwrap_f32_cast(p, tp, p.nodes[s5].b)
+    if sub_e < 0 || p.nodes[sub_e].kind != ast.NK_BIN_OP || p.nodes[sub_e].ival != ast.OP_SUB ||
+       !ai.tensor_mul_pair_ids(p, tp, p.nodes[sub_e].a, v0_id, c_id) ||
+       !ai.tensor_mul_pair_ids(p, tp, p.nodes[sub_e].b, v1_id, s_id) {
+        << no_match
+    }
+
+    s6 := p.nodes[s5].next
+    if s6 < 0 || p.nodes[s6].kind != ast.NK_ASSIGN || p.nodes[s6].ival != ast.AS_ASSIGN || p.nodes[s6].next >= 0 {
+        << no_match
+    }
+    w1_idx := p.nodes[s6].a
+    if w1_idx < 0 || p.nodes[w1_idx].kind != ast.NK_INDEX || tp.type_of(w1_idx) != ai.TENSOR_F32 ||
+       tp.local_of(p.nodes[w1_idx].a) != tp.local_of(vec) { << no_match }
+    off_w1 := w.tensor_dot_offset(p, tp, p.nodes[w1_idx].b, iv)
+    if !ai.tensor_same_offset(p, tp, off_v1, off_w1) { << no_match }
+    add_e := ai.tensor_unwrap_f32_cast(p, tp, p.nodes[s6].b)
+    if add_e < 0 || p.nodes[add_e].kind != ast.NK_BIN_OP || p.nodes[add_e].ival != ast.OP_ADD { << no_match }
+    if !((ai.tensor_mul_pair_ids(p, tp, p.nodes[add_e].a, v0_id, s_id) && ai.tensor_mul_pair_ids(p, tp, p.nodes[add_e].b, v1_id, c_id)) ||
+         (ai.tensor_mul_pair_ids(p, tp, p.nodes[add_e].b, v0_id, s_id) && ai.tensor_mul_pair_ids(p, tp, p.nodes[add_e].a, v1_id, c_id))) {
+        << no_match
+    }
+
+    << TensorRopePlan{loop: loop, bound: bound, vec: vec, cos_t: cos_t, sin_t: sin_t,
+                      off_v0: off_v0, off_v1: off_v1, off_cos: off_cos, off_sin: off_sin}
+}
+
+fn (w $&Lw) lower_tensor_rope(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_rope_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    half := w.lower_expr(p, tp, plan.bound)
+    done := w.new_block()
+    check := w.new_block()
+    w.branch(w.bin(BIN_GT, half, w.konst(0)), check, done)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 54)
+    n_fits := w.bin(BIN_LE, half, limit_val)
+    op_v0 := w.tensor_dot_operand(p, tp, plan.vec, plan.off_v0, half, limit_val)
+    op_v1 := w.tensor_dot_operand(p, tp, plan.vec, plan.off_v1, half, limit_val)
+    op_c := w.tensor_dot_operand(p, tp, plan.cos_t, plan.off_cos, half, limit_val)
+    op_s := w.tensor_dot_operand(p, tp, plan.sin_t, plan.off_sin, half, limit_val)
+
+    span := w.bin(BIN_MUL, half, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_v0.ptr, w.bin(BIN_SUB, addr_lim, span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_v1.ptr, w.bin(BIN_SUB, addr_lim, span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_c.ptr, w.bin(BIN_SUB, addr_lim, span)),
+                              w.u64_bin(BIN_LE, op_s.ptr, w.bin(BIN_SUB, addr_lim, span)))))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_v0.ptr, span, op_v1.ptr, span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_v0.ptr, span, op_c.ptr, span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_v0.ptr, span, op_s.ptr, span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_v1.ptr, span, op_c.ptr, span),
+                           w.tensor_disjoint_ranges(op_v1.ptr, span, op_s.ptr, span)))))
+    valid := w.bin(BIN_AND, n_fits,
+             w.bin(BIN_AND, op_v0.valid,
+             w.bin(BIN_AND, op_v1.valid,
+             w.bin(BIN_AND, op_c.valid,
+             w.bin(BIN_AND, op_s.valid, w.bin(BIN_AND, addr_ok, disj))))))
+    fast := w.new_block()
+    slow := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $args := []int{}
+    args.push(op_v0.ptr)
+    args.push(op_v1.ptr)
+    args.push(op_c.ptr)
+    args.push(op_s.ptr)
+    args.push(half)
+    w.call("__xu_tensor_rope_f32", &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+struct TensorCopyBlockPlan {
+    loop int
+    extent int
+    dst int
+    src int
+    off_dst int
+    off_src int
+}
+
+fn (w &Lw) tensor_byte_src_base(p &parser.Parser, tp &types.TypedProgram, n int, expect_str bool) bool {
+    id := w.tensor_read_local(p, tp, n)
+    if id < 0 { << false }
+    ty := tp.deref(w.local_type(tp, id))
+    if expect_str && ty == TENSOR_STR_TY { << true }
+    if types.is_array_type(ty) {
+        et := tp.elem_of(ty)
+        << et == TENSOR_BYTE_U8 || et == TENSOR_BYTE_I8
+    }
+    << false
+}
+
+fn (w &Lw) tensor_copy16_32_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorCopyBlockPlan {
+    no_match := TensorCopyBlockPlan{loop: -1, extent: 0, dst: -1, src: -1, off_dst: -2, off_src: -2}
+    extent := ai.static_range_extent(p, loop)
+    if extent != 16 && extent != 32 { << no_match }
+    iv := tp.local_of(loop)
+    if iv < 0 { << no_match }
+
+    stmt := p.nodes[loop].c
+    if stmt < 0 || p.nodes[stmt].kind != ast.NK_ASSIGN || p.nodes[stmt].ival != ast.AS_ASSIGN ||
+       p.nodes[stmt].next >= 0 {
+        << no_match
+    }
+    lhs := p.nodes[stmt].a
+    if lhs < 0 || p.nodes[lhs].kind != ast.NK_INDEX { << no_match }
+    dst_ety := tp.type_of(lhs)
+    if dst_ety != TENSOR_BYTE_U8 && dst_ety != TENSOR_BYTE_I8 { << no_match }
+    dst := p.nodes[lhs].a
+    if !w.tensor_typed_array_base(p, tp, dst, dst_ety) { << no_match }
+    off_dst := w.tensor_dot_offset(p, tp, p.nodes[lhs].b, iv)
+    if off_dst == -2 { << no_match }
+
+    $rhs := p.nodes[stmt].b
+    $had_cast := false
+    if rhs >= 0 && p.nodes[rhs].kind == ast.NK_CAST && tp.type_of(rhs) == dst_ety {
+        rhs = p.nodes[rhs].a
+        had_cast = true
+    }
+    if rhs < 0 || p.nodes[rhs].kind != ast.NK_INDEX { << no_match }
+    src_rty := tp.type_of(rhs)
+    if src_rty != 1 && src_rty != TENSOR_BYTE_U8 && src_rty != TENSOR_BYTE_I8 { << no_match }
+    if !had_cast && src_rty != dst_ety { << no_match }
+    src := p.nodes[rhs].a
+    if !w.tensor_byte_src_base(p, tp, src, src_rty == 1) { << no_match }
+    off_src := w.tensor_dot_offset(p, tp, p.nodes[rhs].b, iv)
+    if off_src == -2 { << no_match }
+
+    << TensorCopyBlockPlan{loop: loop, extent: extent, dst: dst, src: src, off_dst: off_dst, off_src: off_src}
+}
+
+fn (w $&Lw) lower_tensor_copy16_32(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_copy16_32_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    ext_v := w.konst(plan.extent)
+    limit_val := w.konst(1 << 54)
+    op_dst := w.tensor_strided_operand(p, tp, plan.dst, plan.off_dst, ext_v, 1, limit_val)
+    op_src := w.tensor_strided_operand(p, tp, plan.src, plan.off_src, ext_v, 1, limit_val)
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_dst.ptr, w.bin(BIN_SUB, addr_lim, ext_v)),
+                              w.u64_bin(BIN_LE, op_src.ptr, w.bin(BIN_SUB, addr_lim, ext_v)))
+    disj := w.tensor_disjoint_ranges(op_dst.ptr, ext_v, op_src.ptr, ext_v)
+    valid := w.bin(BIN_AND, op_dst.valid, w.bin(BIN_AND, op_src.valid, w.bin(BIN_AND, addr_ok, disj)))
+
+    fast := w.new_block()
+    slow := w.new_block()
+    done := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    words := plan.extent / 8
+    for wi in 0:words {
+        val := w.load_ptr(op_src.ptr, wi * 8, 8)
+        w.store_ptr(op_dst.ptr, wi * 8, val, 8)
+    }
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}

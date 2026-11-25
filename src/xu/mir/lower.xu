@@ -52,6 +52,8 @@ struct Lw {
     task_poll bool
     poll_loops bool
     affine_tile bool
+    tensor_fusion bool
+    tensor_fast_math bool
     // Line of the statement being lowered; stamped on emitted instructions.
     cur_line int
     // checker local id -> MIR local; -1 until declared
@@ -126,6 +128,8 @@ fn lw_new(name string, label string, fi int, tgt_os int, tgt_arch int) Lw {
         task_poll: false,
         poll_loops: false,
         affine_tile: false,
+        tensor_fusion: false,
+        tensor_fast_math: false,
         cur_line: 0,
         lslot: []int{},
         lbyref: []bool{},
@@ -514,7 +518,7 @@ fn (w $&Lw) store_value(tp &types.TypedProgram, dst int, off int, v int, ty int)
 
 // ===== locals =====
 
-fn (w $&Lw) local_type(tp &types.TypedProgram, id int) int {
+fn (w &Lw) local_type(tp &types.TypedProgram, id int) int {
     if id >= 0 && id < tp.fns[w.fi].locals.len {
         << tp.fns[w.fi].locals[id]
     }
@@ -735,8 +739,10 @@ fn (w $&Lw) bounds_check(idx int, n int) {
     w.branch(bad, panic_b, ok_b)
     w.f.active_bb = panic_b
     $args := []int{}
-    args.push(idx)
-    args.push(n)
+    // runtime.index_panic ignores arguments and calls rt_panic(1); pass constants
+    // so cold out-of-line panic blocks never extend idx/len live ranges across hot paths.
+    args.push(w.konst(0))
+    args.push(w.konst(0))
     w.call_core("index_panic", &args)
     w.jump(ok_b)
     w.f.active_bb = ok_b
@@ -2406,6 +2412,69 @@ fn (w $&Lw) lower_method_call(p &parser.Parser, tp &types.TypedProgram, n int) i
         w.push_value(tp, d, v, ety)
         << w.konst(0)
     }
+    if code == -170 {
+        d := w.base_addr(p, tp, recv)
+        need := w.lower_expr(p, tp, p.nodes[n].b)
+        esize := tp.size_of(tp.elem_of(tp.deref(tp.type_of(recv))))
+        $args := []int{}
+        args.push(d)
+        args.push(need)
+        args.push(w.konst(esize))
+        w.call_core("desc_reserve", &args)
+        << w.konst(0)
+    }
+    if code == -171 {
+        d := w.base_addr(p, tp, recv)
+        need := w.lower_expr(p, tp, p.nodes[n].b)
+        esize := tp.size_of(tp.elem_of(tp.deref(tp.type_of(recv))))
+        done_rz := w.new_block()
+        pos_rz := w.new_block()
+        w.branch(w.bin(BIN_GE, need, w.konst(0)), pos_rz, done_rz)
+
+        w.f.active_bb = pos_rz
+        old_len := w.load_ptr(d, 8, 8)
+        old_cap := w.load_ptr(d, 16, 8)
+        grow_b := w.new_block()
+        chk_zero_b := w.new_block()
+        zero_b := w.new_block()
+        setlen_b := w.new_block()
+        w.branch(w.bin(BIN_GT, need, old_cap), grow_b, chk_zero_b)
+
+        w.f.active_bb = grow_b
+        $r_args := []int{}
+        r_args.push(d)
+        r_args.push(need)
+        r_args.push(w.konst(esize))
+        w.call_core("desc_reserve", &r_args)
+        w.jump(setlen_b)
+
+        w.f.active_bb = chk_zero_b
+        w.branch(w.bin(BIN_GT, need, old_len), zero_b, setlen_b)
+
+        w.f.active_bb = zero_b
+        base_ptr := w.load_ptr(d, 0, 8)
+        $off_b := w.bin(BIN_SUB, need, old_len)
+        $z_ptr := base_ptr
+        $z_bytes := off_b
+        if esize == 1 {
+            z_ptr = w.bin(BIN_ADD, base_ptr, old_len)
+        } else {
+            z_ptr = w.bin(BIN_ADD, base_ptr, w.bin(BIN_MUL, old_len, w.konst(esize)))
+            z_bytes = w.bin(BIN_MUL, off_b, w.konst(esize))
+        }
+        $z_args := []int{}
+        z_args.push(z_ptr)
+        z_args.push(z_bytes)
+        w.call_core("mem_zero", &z_args)
+        w.jump(setlen_b)
+
+        w.f.active_bb = setlen_b
+        w.store_ptr(d, 8, need, 8)
+        w.jump(done_rz)
+
+        w.f.active_bb = done_rz
+        << w.konst(0)
+    }
     if code == -3 {
         d := w.base_addr(p, tp, recv)
         s := w.base_addr(p, tp, p.nodes[n].b)
@@ -2419,8 +2488,25 @@ fn (w $&Lw) lower_method_call(p &parser.Parser, tp &types.TypedProgram, n int) i
     if code == -110 {
         d := w.base_addr(p, tp, recv)
         v := w.lower_expr(p, tp, p.nodes[n].b)
+        slen := w.load_ptr(d, 8, 8)
+        total := w.bin(BIN_ADD, slen, w.konst(1))
+        scap := w.load_ptr(d, 16, 8)
+        fast_b := w.new_block()
+        slow_b := w.new_block()
+        done_b := w.new_block()
+        w.branch(w.bin(BIN_LT, total, scap), fast_b, slow_b)
+        w.f.active_bb = fast_b
+        ptr := w.load_ptr(d, 0, 8)
+        slot := w.bin(BIN_ADD, ptr, slen)
+        w.store_ptr(slot, 0, v, 1)
+        w.store_ptr(slot, 1, w.konst(0), 1)
+        w.store_ptr(d, 8, total, 8)
+        w.jump(done_b)
+        w.f.active_bb = slow_b
         args := [d, v]
         w.call_core("str_push_byte", &args)
+        w.jump(done_b)
+        w.f.active_bb = done_b
         << w.konst(0)
     }
     if code == -75 || code == -76 {
@@ -2481,6 +2567,13 @@ fn (w $&Lw) lower_block(p &parser.Parser, tp &types.TypedProgram, head int) {
     $s := head
     while s >= 0 {
         w.ensure_open()
+        if w.tensor_fusion {
+            last := w.lower_tensor_fusion(p, tp, s)
+            if last >= 0 {
+                s = p.nodes[last].next
+                ->
+            }
+        }
         if !w.affine_tile || !w.lower_affine_tile(p, tp, s) {
             w.lower_stmt(p, tp, s)
         }
@@ -2527,6 +2620,18 @@ fn (w $&Lw) store_to_local(tp &types.TypedProgram, id int, v int) {
     }
 }
 
+fn (w $&Lw) declare_local(tp &types.TypedProgram, id int, shared_scope int) int {
+    $sid := shared_scope
+    if sid == 0 {
+        sid = w.next_scope_id
+        w.next_scope_id += 1
+    }
+    w.set_lscope(id, sid)
+    slot := w.ensure_local(tp, id)
+    w.set_slot_scope(slot, sid)
+    << slot
+}
+
 fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
     k := p.nodes[s].kind
     if p.nodes[s].line > 0 {
@@ -2553,13 +2658,7 @@ fn (w $&Lw) lower_stmt(p &parser.Parser, tp &types.TypedProgram, s int) {
                 }
             }
         }
-        if sid == 0 {
-            sid = w.next_scope_id
-            w.next_scope_id += 1
-        }
-        w.set_lscope(id, sid)
-        slot := w.ensure_local(tp, id)
-        w.set_slot_scope(slot, sid)
+        _ := w.declare_local(tp, id, sid)
         w.store_to_local(tp, id, v)
         w.own_declare(tp, id)
         <<
@@ -3021,13 +3120,13 @@ fn (w $&Lw) lower_assign(p &parser.Parser, tp &types.TypedProgram, s int) {
 // Lower function fi. A pass that finds locals needing a drop flag (see
 // Lw.dyn_ids) is repeated with those locals flagged from their declaration,
 // because the drops it already emitted for them were unconditional.
-fn lower_fn(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_arch int, debug bool, task_poll bool, affine_tile bool, core_names &[]string, core_labels &[]string, errs $&[]int) MFn {
+fn lower_fn(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_arch int, debug bool, task_poll bool, affine_tile bool, tensor_fusion bool, tensor_fast_math bool, core_names &[]string, core_labels &[]string, errs $&[]int) MFn {
     $dyn := []int{}
     $pass := 0
     while true {
         $found := []int{}
         $perrs := []int{}
-        f := lower_fn_pass(p, tp, fi, tgt_os, tgt_arch, debug, task_poll, affine_tile, core_names, core_labels, &dyn, $&found, $&perrs)
+        f := lower_fn_pass(p, tp, fi, tgt_os, tgt_arch, debug, task_poll, affine_tile, tensor_fusion, tensor_fast_math, core_names, core_labels, &dyn, $&found, $&perrs)
         $nerr := 0
         for i in 0:perrs.len {
             nerr += perrs[i]
@@ -3056,7 +3155,7 @@ fn lower_fn(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_a
     << mfn_new("", "")
 }
 
-fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_arch int, debug bool, task_poll bool, affine_tile bool, core_names &[]string, core_labels &[]string, dyn &[]int, found $&[]int, errs $&[]int) MFn {
+fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, tgt_arch int, debug bool, task_poll bool, affine_tile bool, tensor_fusion bool, tensor_fast_math bool, core_names &[]string, core_labels &[]string, dyn &[]int, found $&[]int, errs $&[]int) MFn {
     tp.use_fn(fi)
     $w := lw_new(tp.fns[fi].name, tp.fns[fi].label, fi, tgt_os, tgt_arch)
     for i in 0:dyn.len {
@@ -3070,6 +3169,8 @@ fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, 
     w.task_poll = task_poll
     w.poll_loops = task_poll && (tfn.mod_id == "" || tfn.mod_id == "main")
     w.affine_tile = affine_tile && !w.poll_loops
+    w.tensor_fusion = tensor_fusion && !w.poll_loops
+    w.tensor_fast_math = tensor_fast_math && !w.poll_loops
     w.ret_ty = tfn.ret
     w.f.ret = tfn.ret
     if tfn.decl >= 0 && tfn.decl < p.nodes.len {
@@ -3150,7 +3251,7 @@ fn lower_fn_pass(p &parser.Parser, tp $&types.TypedProgram, fi int, tgt_os int, 
 // Lower every concrete function. Returns the number of reported errors.
 // all=true lowers every concrete function (diagnostics for coverage gaps).
 // debug: a debug build; main enables the runtime's memory checks.
-pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_arch int, all bool, debug bool, task_poll bool, affine_tile bool, roots &[]int, out $&Mir) int {
+pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_arch int, all bool, debug bool, task_poll bool, affine_tile bool, tensor_fusion bool, tensor_fast_math bool, roots &[]int, out $&Mir) int {
     $core_names := []string{}
     $core_labels := []string{}
     for i in 0:tp.fns.len {
@@ -3240,7 +3341,7 @@ pub fn lower_typed(p &parser.Parser, tp $&types.TypedProgram, tgt_os int, tgt_ar
         } else if fi >= tp.fns.len * 2 {
             f = lower_resource_drop(tp, resource_types[fi - tp.fns.len * 2], tgt_os, tgt_arch, &core_names, &core_labels)
         } else {
-            f = lower_queued(p, tp, fi, tgt_os, tgt_arch, debug, task_poll, affine_tile, &core_names, &core_labels, $&errs)
+            f = lower_queued(p, tp, fi, tgt_os, tgt_arch, debug, task_poll, affine_tile, tensor_fusion, tensor_fast_math, &core_names, &core_labels, $&errs)
         }
         $scan_pos := out.fns.len
         out.fns.push(f)
