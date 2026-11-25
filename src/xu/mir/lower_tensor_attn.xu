@@ -1,0 +1,1151 @@
+@xu/mir
+
+#xu/mir/ai
+
+#xu/ast
+#xu/parser
+#xu/types
+
+// Lower canonical p4k4 GGUF pack loops, paged attention K-score loops,
+// scaled softmax sequences, and paged attention V-sum loops to native SIMD stubs.
+
+struct TensorPackP4k4Plan {
+    loop int
+    is_q8 bool
+    signed_nibbles bool
+    cg_cnt int
+    nb int
+    row_bytes_id int
+    qs_p int
+    ws_p int
+    chunk int
+    gb_off int
+}
+
+struct TensorAttnScoresPlan {
+    loop int
+    seq_len int
+    head_dim int
+    scores int
+    q int
+    q_off int
+    k_blocks int
+    bt int
+    bt_off int
+    block_stride int
+    kv_base_off int
+    kv_dim int
+}
+
+struct TensorSoftmaxPlan {
+    decl int
+    s_set0 int
+    loop1 int
+    s_sum0 int
+    loop2 int
+    s_inv int
+    loop3 int
+    bound int
+    scores int
+    scale_id int
+}
+
+struct TensorAttnVsumPlan {
+    zero_loop int
+    t_loop int
+    seq_len int
+    head_dim int
+    out int
+    out_off int
+    scores int
+    v_blocks int
+    bt int
+    bt_off int
+    block_stride int
+    kv_base_off int
+    kv_dim int
+}
+
+fn (w &Lw) tensor_is_i64_val(p &parser.Parser, tp &types.TypedProgram, expr int) bool {
+    if expr < 0 { << false }
+    if p.nodes[expr].kind == ast.NK_INT { << true }
+    id := w.tensor_read_local(p, tp, expr)
+    << id >= 0 && w.local_type(tp, id) == 1
+}
+
+// Match chunk[p] | (chunk[p + 1] << 8) wrapped in u16(...) -> returns chunk node or -1.
+fn (w &Lw) tensor_pack_le16_chunk(p &parser.Parser, tp &types.TypedProgram, expr int, p_id int) int {
+    if expr < 0 || p.nodes[expr].kind != ast.NK_CAST || tp.type_of(expr) != TENSOR_U16 { << -1 }
+    or_e := p.nodes[expr].a
+    if or_e < 0 || p.nodes[or_e].kind != ast.NK_BIN_OP || p.nodes[or_e].ival != ast.OP_BIT_OR {
+        << -1
+    }
+    $lo := p.nodes[or_e].a
+    $hi := p.nodes[or_e].b
+    if hi < 0 || p.nodes[hi].kind != ast.NK_BIN_OP || p.nodes[hi].ival != ast.OP_SHL {
+        lo = p.nodes[or_e].b
+        hi = p.nodes[or_e].a
+    }
+    if lo < 0 || p.nodes[lo].kind != ast.NK_INDEX || tp.type_of(lo) != 1 ||
+       !ai.tensor_ident_id(p, tp, p.nodes[lo].b, p_id) {
+        << -1
+    }
+    if hi < 0 || p.nodes[hi].kind != ast.NK_BIN_OP || p.nodes[hi].ival != ast.OP_SHL ||
+       !ai.tensor_int_lit(p, p.nodes[hi].b, 8) {
+        << -1
+    }
+    hi_idx := p.nodes[hi].a
+    if hi_idx < 0 || p.nodes[hi_idx].kind != ast.NK_INDEX || tp.type_of(hi_idx) != 1 ||
+       !ai.tensor_add_local_const(p, tp, p.nodes[hi_idx].b, p_id, 1) {
+        << -1
+    }
+    c0 := p.nodes[lo].a
+    c1 := p.nodes[hi_idx].a
+    if !w.tensor_byte_src_base(p, tp, c0, true) || tp.local_of(c0) != tp.local_of(c1) { << -1 }
+    << c0
+}
+
+fn (w &Lw) tensor_pack_p4k4_plan_in(p &parser.Parser, tp &types.TypedProgram, cg_loop int, is_q8 bool) TensorPackP4k4Plan {
+    no_match := TensorPackP4k4Plan{loop: -1, is_q8: is_q8, signed_nibbles: false, cg_cnt: -1, nb: -1, row_bytes_id: -1,
+                                   qs_p: -1, ws_p: -1, chunk: -1, gb_off: -2}
+    cg_cnt := ai.tensor_dynamic_bound(p, cg_loop)
+    if !w.tensor_dot_bound_ok(p, tp, cg_cnt) { << no_match }
+    cg_iv := tp.local_of(cg_loop)
+    if cg_iv < 0 { << no_match }
+
+    // base0 := cg * 4 * row_bytes
+    s1 := p.nodes[cg_loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    base0_id := tp.local_of(s1)
+    if base0_id < 0 || w.local_type(tp, base0_id) != 1 { << no_match }
+    b0_e := p.nodes[s1].a
+    if b0_e < 0 || p.nodes[b0_e].kind != ast.NK_BIN_OP || p.nodes[b0_e].ival != ast.OP_MUL { << no_match }
+    $row_bytes_id := -1
+    $cand_rb := w.tensor_read_local(p, tp, p.nodes[b0_e].b)
+    if cand_rb >= 0 && ai.tensor_pack_base0(p, tp, b0_e, cg_iv, cand_rb) {
+        row_bytes_id = cand_rb
+    } else {
+        cand_rb = w.tensor_read_local(p, tp, p.nodes[b0_e].a)
+        if cand_rb >= 0 && ai.tensor_pack_base0(p, tp, b0_e, cg_iv, cand_rb) {
+            row_bytes_id = cand_rb
+        }
+    }
+    if row_bytes_id < 0 {
+        // Also check cg * (4 * row_bytes) where left is cg and right is (4 * rb)
+        if ai.tensor_ident_id(p, tp, p.nodes[b0_e].a, cg_iv) &&
+           p.nodes[b0_e].b >= 0 && p.nodes[p.nodes[b0_e].b].kind == ast.NK_BIN_OP &&
+           p.nodes[p.nodes[b0_e].b].ival == ast.OP_MUL {
+            rba := w.tensor_read_local(p, tp, p.nodes[p.nodes[b0_e].b].a)
+            rbb := w.tensor_read_local(p, tp, p.nodes[p.nodes[b0_e].b].b)
+            if rba >= 0 && ai.tensor_pack_base0(p, tp, b0_e, cg_iv, rba) { row_bytes_id = rba }
+            else if rbb >= 0 && ai.tensor_pack_base0(p, tp, b0_e, cg_iv, rbb) { row_bytes_id = rbb }
+        }
+    }
+    if row_bytes_id < 0 || row_bytes_id == cg_iv || w.local_type(tp, row_bytes_id) != 1 { << no_match }
+
+    // g_off := [gb_start +] cg * nb
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    g_off_id := tp.local_of(s2)
+    if g_off_id < 0 || g_off_id == base0_id || w.local_type(tp, g_off_id) != 1 { << no_match }
+
+    // for b in 0:nb
+    b_loop := p.nodes[s2].next
+    if b_loop < 0 || p.nodes[b_loop].next >= 0 || b_loop < 0 { << no_match }
+    nb := ai.tensor_dynamic_bound(p, b_loop)
+    if !w.tensor_dot_bound_ok(p, tp, nb) { << no_match }
+    b_iv := tp.local_of(b_loop)
+    if b_iv < 0 || b_iv == cg_iv { << no_match }
+    gb_off := w.tensor_bound_offset(p, tp, p.nodes[s2].a, cg_iv, nb)
+    if gb_off == -2 { << no_match }
+
+    // gb := g_off + b
+    bs1 := p.nodes[b_loop].c
+    if bs1 < 0 || p.nodes[bs1].kind != ast.NK_LET { << no_match }
+    gb_id := tp.local_of(bs1)
+    if gb_id < 0 || w.local_type(tp, gb_id) != 1 || !ai.tensor_add_local_iv(p, tp, p.nodes[bs1].a, g_off_id, b_iv) {
+        << no_match
+    }
+
+    $raw_stride := 18
+    $q_blk_b := 64
+    $q_row_n := 16
+    if is_q8 {
+        raw_stride = 34
+        q_blk_b = 128
+        q_row_n = 32
+    }
+
+    // b_off := b * (18|34)
+    bs2 := p.nodes[bs1].next
+    if bs2 < 0 || p.nodes[bs2].kind != ast.NK_LET { << no_match }
+    b_off_id := tp.local_of(bs2)
+    if b_off_id < 0 || w.local_type(tp, b_off_id) != 1 || !ai.tensor_scaled_mul_iv(p, tp, p.nodes[bs2].a, b_iv, raw_stride) {
+        << no_match
+    }
+
+    // s_base := gb * 4
+    bs3 := p.nodes[bs2].next
+    if bs3 < 0 || p.nodes[bs3].kind != ast.NK_LET { << no_match }
+    s_base_id := tp.local_of(bs3)
+    if s_base_id < 0 || w.local_type(tp, s_base_id) != 1 || !ai.tensor_scaled_mul_iv(p, tp, p.nodes[bs3].a, gb_id, 4) {
+        << no_match
+    }
+
+    // Scale copy loop: for r4 in 0:4 { p := base0 + r4 * row_bytes + b_off; ws_p[s_base + r4] = u16(chunk[p] | (chunk[p + 1] << 8)) }
+    r4_s_loop := p.nodes[bs3].next
+    if ai.static_range_extent(p, r4_s_loop) != 4 { << no_match }
+    r4_s_iv := tp.local_of(r4_s_loop)
+    if r4_s_iv < 0 { << no_match }
+
+    rs1 := p.nodes[r4_s_loop].c
+    if rs1 < 0 || p.nodes[rs1].kind != ast.NK_LET { << no_match }
+    p_s_id := tp.local_of(rs1)
+    if p_s_id < 0 || w.local_type(tp, p_s_id) != 1 { << no_match }
+    $ps_terms := []int{}
+    if !ai.tensor_collect_add_terms(p, p.nodes[rs1].a, $&ps_terms, 0) || ps_terms.len != 3 { << no_match }
+    if !ai.tensor_ident_id(p, tp, ps_terms[0], base0_id) ||
+       !ai.tensor_mul_pair_of(p, tp, ps_terms[1], r4_s_iv, row_bytes_id) ||
+       !ai.tensor_ident_id(p, tp, ps_terms[2], b_off_id) {
+        << no_match
+    }
+
+    rs2 := p.nodes[rs1].next
+    if rs2 < 0 || p.nodes[rs2].next >= 0 || p.nodes[rs2].kind != ast.NK_ASSIGN ||
+       p.nodes[rs2].ival != ast.AS_ASSIGN {
+        << no_match
+    }
+    ws_idx := p.nodes[rs2].a
+    if ws_idx < 0 || p.nodes[ws_idx].kind != ast.NK_INDEX || tp.type_of(ws_idx) != TENSOR_U16 { << no_match }
+    ws_p := p.nodes[ws_idx].a
+    if !w.tensor_typed_array_base(p, tp, ws_p, TENSOR_U16) ||
+       !ai.tensor_add_local_iv(p, tp, p.nodes[ws_idx].b, s_base_id, r4_s_iv) {
+        << no_match
+    }
+    chunk0 := w.tensor_pack_le16_chunk(p, tp, p.nodes[rs2].b, p_s_id)
+    if chunk0 < 0 { << no_match }
+
+    // q_gb := gb * (64|128)
+    bs4 := p.nodes[r4_s_loop].next
+    if bs4 < 0 || p.nodes[bs4].kind != ast.NK_LET { << no_match }
+    q_gb_id := tp.local_of(bs4)
+    if q_gb_id < 0 || w.local_type(tp, q_gb_id) != 1 || !ai.tensor_scaled_mul_iv(p, tp, p.nodes[bs4].a, gb_id, q_blk_b) {
+        << no_match
+    }
+
+    // Quants transpose loop: for r4 in 0:4 { p := base0 + r4 * row_bytes + b_off + 2; q_r := q_gb + r4 * 4; for j in 0:(16|32) { qs_p[q_r + (j >> 2) * 16 + (j & 3)] = (u8|i8)(chunk[p + j]) } }
+    r4_q_loop := p.nodes[bs4].next
+    if r4_q_loop < 0 || p.nodes[r4_q_loop].next >= 0 || ai.static_range_extent(p, r4_q_loop) != 4 { << no_match }
+    r4_q_iv := tp.local_of(r4_q_loop)
+    if r4_q_iv < 0 { << no_match }
+
+    rq1 := p.nodes[r4_q_loop].c
+    if rq1 < 0 || p.nodes[rq1].kind != ast.NK_LET { << no_match }
+    p_q_id := tp.local_of(rq1)
+    if p_q_id < 0 || w.local_type(tp, p_q_id) != 1 { << no_match }
+    $pq_terms := []int{}
+    if !ai.tensor_collect_add_terms(p, p.nodes[rq1].a, $&pq_terms, 0) || pq_terms.len != 4 { << no_match }
+    if !ai.tensor_ident_id(p, tp, pq_terms[0], base0_id) ||
+       !ai.tensor_mul_pair_of(p, tp, pq_terms[1], r4_q_iv, row_bytes_id) ||
+       !ai.tensor_ident_id(p, tp, pq_terms[2], b_off_id) ||
+       !ai.tensor_int_lit(p, pq_terms[3], 2) {
+        << no_match
+    }
+
+    rq2 := p.nodes[rq1].next
+    if rq2 < 0 || p.nodes[rq2].kind != ast.NK_LET { << no_match }
+    q_r_id := tp.local_of(rq2)
+    if q_r_id < 0 || w.local_type(tp, q_r_id) != 1 { << no_match }
+    qr_e := p.nodes[rq2].a
+    if qr_e < 0 || p.nodes[qr_e].kind != ast.NK_BIN_OP || p.nodes[qr_e].ival != ast.OP_ADD { << no_match }
+    qra := p.nodes[qr_e].a
+    qrb := p.nodes[qr_e].b
+    if !((ai.tensor_ident_id(p, tp, qra, q_gb_id) && ai.tensor_scaled_mul_iv(p, tp, qrb, r4_q_iv, 4)) ||
+         (ai.tensor_ident_id(p, tp, qrb, q_gb_id) && ai.tensor_scaled_mul_iv(p, tp, qra, r4_q_iv, 4))) {
+        << no_match
+    }
+
+    j_loop := p.nodes[rq2].next
+    if j_loop < 0 || p.nodes[j_loop].next >= 0 || ai.static_range_extent(p, j_loop) != q_row_n { << no_match }
+    j_iv := tp.local_of(j_loop)
+    if j_iv < 0 { << no_match }
+
+    js := p.nodes[j_loop].c
+    if js < 0 || p.nodes[js].next >= 0 || p.nodes[js].kind != ast.NK_ASSIGN || p.nodes[js].ival != ast.AS_ASSIGN {
+        << no_match
+    }
+    $want_q_ty := TENSOR_U8
+    if is_q8 { want_q_ty = ai.TENSOR_I8 }
+    qs_idx := p.nodes[js].a
+    if qs_idx < 0 || p.nodes[qs_idx].kind != ast.NK_INDEX || tp.type_of(qs_idx) != want_q_ty { << no_match }
+    qs_p := p.nodes[qs_idx].a
+    if !w.tensor_typed_array_base(p, tp, qs_p, want_q_ty) ||
+       !ai.tensor_p4k4_idx(p, tp, p.nodes[qs_idx].b, q_r_id, j_iv) {
+        << no_match
+    }
+
+    $rhs := p.nodes[js].b
+    if rhs >= 0 && p.nodes[rhs].kind == ast.NK_CAST && tp.type_of(rhs) == want_q_ty {
+        rhs = p.nodes[rhs].a
+    }
+    signed_nibbles := !is_q8 && tensor_p4k4_sign_flip(p, rhs)
+    if signed_nibbles { rhs = p.nodes[rhs].a }
+    if rhs < 0 || p.nodes[rhs].kind != ast.NK_INDEX ||
+       !ai.tensor_add_local_iv(p, tp, p.nodes[rhs].b, p_q_id, j_iv) {
+        << no_match
+    }
+    chunk1 := p.nodes[rhs].a
+    if !w.tensor_byte_src_base(p, tp, chunk1, true) || tp.local_of(chunk1) != tp.local_of(chunk0) {
+        << no_match
+    }
+
+    << TensorPackP4k4Plan{loop: cg_loop, is_q8: is_q8, signed_nibbles: signed_nibbles, cg_cnt: cg_cnt, nb: nb, row_bytes_id: row_bytes_id,
+                          qs_p: qs_p, ws_p: ws_p, chunk: chunk0, gb_off: gb_off}
+}
+
+fn (w $&Lw) lower_tensor_pack_p4k4(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    $plan := w.tensor_pack_p4k4_plan_in(p, tp, loop, false)
+    if plan.loop < 0 {
+        plan = w.tensor_pack_p4k4_plan_in(p, tp, loop, true)
+    }
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    cg_val := w.lower_expr(p, tp, plan.cg_cnt)
+    done := w.new_block()
+    pos_cg := w.new_block()
+    w.branch(w.bin(BIN_GT, cg_val, w.konst(0)), pos_cg, done)
+
+    w.f.active_bb = pos_cg
+    nb_val := w.lower_expr(p, tp, plan.nb)
+    rb_val := w.load_local(w.lslot[plan.row_bytes_id], 0)
+    $raw_stride := 18
+    $q_blk_b := 64
+    if plan.is_q8 {
+        raw_stride = 34
+        q_blk_b = 128
+    }
+    check := w.new_block()
+    slow := w.new_block()
+    dims_ok := w.bin(BIN_AND, w.bin(BIN_GT, nb_val, w.konst(0)),
+                              w.bin(BIN_EQ, rb_val, w.bin(BIN_MUL, nb_val, w.konst(raw_stride))))
+    w.branch(dims_ok, check, slow)
+
+    w.f.active_bb = check
+    cap_rc := w.konst(1 << 24)
+    rc_fits := w.bin(BIN_AND, w.bin(BIN_LE, cg_val, cap_rc), w.bin(BIN_LE, nb_val, cap_rc))
+    blk_limit := w.konst(1 << 46)
+    off_limit := w.konst(1 << 54)
+    grp_cnt := w.bin(BIN_MUL, cg_val, nb_val)
+    qs_elems := w.bin(BIN_MUL, grp_cnt, w.konst(q_blk_b))
+    ws_elems := w.bin(BIN_MUL, grp_cnt, w.konst(4))
+    src_elems := w.bin(BIN_MUL, w.bin(BIN_MUL, cg_val, w.konst(4)), rb_val)
+
+    op_qs := w.tensor_scaled_block_operand(p, tp, plan.qs_p, plan.gb_off, q_blk_b, qs_elems, 1, blk_limit)
+    op_ws := w.tensor_scaled_block_operand(p, tp, plan.ws_p, plan.gb_off, 4, ws_elems, 2, blk_limit)
+    op_src := w.tensor_strided_operand(p, tp, plan.chunk, -1, src_elems, 1, off_limit)
+
+    ws_span := w.bin(BIN_MUL, ws_elems, w.konst(2))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_qs.ptr, w.bin(BIN_SUB, addr_lim, qs_elems)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_ws.ptr, w.bin(BIN_SUB, addr_lim, ws_span)),
+                              w.u64_bin(BIN_LE, op_src.ptr, w.bin(BIN_SUB, addr_lim, src_elems))))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_qs.ptr, qs_elems, op_ws.ptr, ws_span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_qs.ptr, qs_elems, op_src.ptr, src_elems),
+                           w.tensor_disjoint_ranges(op_ws.ptr, ws_span, op_src.ptr, src_elems)))
+
+    valid := w.bin(BIN_AND, rc_fits,
+             w.bin(BIN_AND, op_qs.valid,
+             w.bin(BIN_AND, op_ws.valid,
+             w.bin(BIN_AND, op_src.valid, w.bin(BIN_AND, addr_ok, disj)))))
+    fast := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $stub := "__xu_tensor_pack_q4_0_p4k4"
+    if plan.is_q8 { stub = "__xu_tensor_pack_q8_0_p4k4" }
+    else if plan.signed_nibbles { stub = "__xu_tensor_pack_q4_0_p4k4_signed" }
+    $args := []int{}
+    args.push(op_qs.ptr)
+    args.push(op_ws.ptr)
+    args.push(op_src.ptr)
+    args.push(cg_val)
+    args.push(nb_val)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+// Match [bt_off +] (t >> 4). Returns -1 if no offset, >=0 if offset node, -2 on mismatch.
+fn (w &Lw) tensor_bt_index(p &parser.Parser, tp &types.TypedProgram, expr int, iv int) int {
+    if expr < 0 { << -2 }
+    if ai.tensor_shr_4(p, tp, expr, iv) { << -1 }
+    if p.nodes[expr].kind != ast.NK_BIN_OP || p.nodes[expr].ival != ast.OP_ADD { << -2 }
+    a := p.nodes[expr].a
+    b := p.nodes[expr].b
+    $off := -1
+    if ai.tensor_shr_4(p, tp, b, iv) { off = a }
+    else if ai.tensor_shr_4(p, tp, a, iv) { off = b }
+    else { << -2 }
+    if !w.tensor_is_i64_val(p, tp, off) { << -2 }
+    << off
+}
+
+fn (w &Lw) tensor_mul_local_term(p &parser.Parser, tp &types.TypedProgram, expr int, id int, val_out $&int) bool {
+    if expr < 0 || p.nodes[expr].kind != ast.NK_BIN_OP || p.nodes[expr].ival != ast.OP_MUL {
+        << false
+    }
+    a := p.nodes[expr].a
+    b := p.nodes[expr].b
+    if ai.tensor_ident_id(p, tp, a, id) && w.tensor_is_i64_val(p, tp, b) {
+        *val_out = b
+        << true
+    }
+    if ai.tensor_ident_id(p, tp, b, id) && w.tensor_is_i64_val(p, tp, a) {
+        *val_out = a
+        << true
+    }
+    << false
+}
+
+fn (w &Lw) tensor_mul_and15_term(p &parser.Parser, tp &types.TypedProgram, expr int, t_iv int, val_out $&int) bool {
+    if expr < 0 || p.nodes[expr].kind != ast.NK_BIN_OP || p.nodes[expr].ival != ast.OP_MUL {
+        << false
+    }
+    a := p.nodes[expr].a
+    b := p.nodes[expr].b
+    if ai.tensor_and_15(p, tp, a, t_iv) && w.tensor_is_i64_val(p, tp, b) {
+        *val_out = b
+        << true
+    }
+    if ai.tensor_and_15(p, tp, b, t_iv) && w.tensor_is_i64_val(p, tp, a) {
+        *val_out = a
+        << true
+    }
+    << false
+}
+
+// Match t_pb * block_stride [+ kv_base_off] + (t & 15) * kv_dim (any order).
+fn (w &Lw) tensor_paged_kv_off_expr(p &parser.Parser, tp &types.TypedProgram, expr int,
+                                     t_pb_id int, t_iv int,
+                                     bs_out $&int, kvb_out $&int, kvd_out $&int) bool {
+    $terms := []int{}
+    if !ai.tensor_collect_add_terms(p, expr, $&terms, 0) { << false }
+    if terms.len != 2 && terms.len != 3 { << false }
+    $bs := -1
+    $kvd := -1
+    $kvb := -1
+    for i in 0:terms.len {
+        term := terms[i]
+        $v := -1
+        if bs < 0 && w.tensor_mul_local_term(p, tp, term, t_pb_id, $&v) {
+            bs = v
+        } else if kvd < 0 && w.tensor_mul_and15_term(p, tp, term, t_iv, $&v) {
+            kvd = v
+        } else if kvb < 0 && w.tensor_is_i64_val(p, tp, term) {
+            kvb = term
+        } else {
+            << false
+        }
+    }
+    if bs < 0 || kvd < 0 { << false }
+    *bs_out = bs
+    *kvb_out = kvb
+    *kvd_out = kvd
+    << true
+}
+
+fn (w &Lw) tensor_attn_scores_plan(p &parser.Parser, tp &types.TypedProgram, loop int) TensorAttnScoresPlan {
+    no_match := TensorAttnScoresPlan{loop: -1, seq_len: -1, head_dim: -1, scores: -1, q: -1, q_off: -2,
+                                     k_blocks: -1, bt: -1, bt_off: -2, block_stride: -1,
+                                     kv_base_off: -1, kv_dim: -1}
+    seq_len := ai.tensor_dynamic_bound(p, loop)
+    if !w.tensor_dot_bound_ok(p, tp, seq_len) { << no_match }
+    t_iv := tp.local_of(loop)
+    if t_iv < 0 { << no_match }
+
+    // t_pb := bt[[bt_off +] (t >> 4)]
+    s1 := p.nodes[loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    t_pb_id := tp.local_of(s1)
+    if t_pb_id < 0 || w.local_type(tp, t_pb_id) != 1 { << no_match }
+    bt_idx := p.nodes[s1].a
+    if bt_idx < 0 || p.nodes[bt_idx].kind != ast.NK_INDEX || tp.type_of(bt_idx) != 1 { << no_match }
+    bt := p.nodes[bt_idx].a
+    if !w.tensor_typed_array_base(p, tp, bt, 1) { << no_match }
+    bt_off := w.tensor_bt_index(p, tp, p.nodes[bt_idx].b, t_iv)
+    if bt_off == -2 { << no_match }
+
+    // k_off := t_pb * block_stride [+ kv_base_off] + (t & 15) * kv_dim
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    k_off_id := tp.local_of(s2)
+    if k_off_id < 0 || k_off_id == t_pb_id || w.local_type(tp, k_off_id) != 1 { << no_match }
+    $bs_node := -1
+    $kvb_node := -1
+    $kvd_node := -1
+    if !w.tensor_paged_kv_off_expr(p, tp, p.nodes[s2].a, t_pb_id, t_iv, $&bs_node, $&kvb_node, $&kvd_node) {
+        << no_match
+    }
+
+    // $acc := f32(0)
+    s3 := p.nodes[s2].next
+    if s3 < 0 || p.nodes[s3].kind != ast.NK_LET || !ai.tensor_is_f32_zero(p, tp, p.nodes[s3].a) {
+        << no_match
+    }
+    acc_id := tp.local_of(s3)
+    if acc_id < 0 || w.local_type(tp, acc_id) != ai.TENSOR_F32 { << no_match }
+
+    // for d in 0:head_dim { acc += q[[q_off +] d] * k_blocks[k_off + d] }
+    d_loop := p.nodes[s3].next
+    head_dim := ai.tensor_dynamic_bound(p, d_loop)
+    if !w.tensor_dot_bound_ok(p, tp, head_dim) { << no_match }
+    d_iv := tp.local_of(d_loop)
+    if d_iv < 0 || d_iv == t_iv { << no_match }
+    dot := ai.tensor_assignment(p, p.nodes[d_loop].c, ast.AS_ADD, ast.OP_MUL)
+    if dot < 0 || !ai.tensor_ident_id(p, tp, p.nodes[dot].a, acc_id) { << no_match }
+    prod := p.nodes[dot].b
+    if tp.type_of(prod) != ai.TENSOR_F32 { << no_match }
+    pa := p.nodes[prod].a
+    pb := p.nodes[prod].b
+    if pa < 0 || p.nodes[pa].kind != ast.NK_INDEX || tp.type_of(pa) != ai.TENSOR_F32 ||
+       pb < 0 || p.nodes[pb].kind != ast.NK_INDEX || tp.type_of(pb) != ai.TENSOR_F32 {
+        << no_match
+    }
+    $k_idx := -1
+    $q_idx := -1
+    if ai.tensor_add_local_iv(p, tp, p.nodes[pb].b, k_off_id, d_iv) {
+        q_idx = pa
+        k_idx = pb
+    } else if ai.tensor_add_local_iv(p, tp, p.nodes[pa].b, k_off_id, d_iv) {
+        q_idx = pb
+        k_idx = pa
+    } else {
+        << no_match
+    }
+    q := p.nodes[q_idx].a
+    k_blocks := p.nodes[k_idx].a
+    if !w.tensor_f32_array_base(p, tp, q) || !w.tensor_f32_array_base(p, tp, k_blocks) { << no_match }
+    q_off := w.tensor_dot_offset(p, tp, p.nodes[q_idx].b, d_iv)
+    if q_off == -2 { << no_match }
+
+    // scores[t] = acc
+    s5 := p.nodes[d_loop].next
+    if s5 < 0 || p.nodes[s5].next >= 0 || p.nodes[s5].kind != ast.NK_ASSIGN ||
+       p.nodes[s5].ival != ast.AS_ASSIGN || !ai.tensor_ident_id(p, tp, p.nodes[s5].b, acc_id) {
+        << no_match
+    }
+    sc_idx := p.nodes[s5].a
+    if sc_idx < 0 || p.nodes[sc_idx].kind != ast.NK_INDEX || tp.type_of(sc_idx) != ai.TENSOR_F32 ||
+       !ai.range_uses_iv(p, tp, p.nodes[sc_idx].b, t_iv) {
+        << no_match
+    }
+    scores := p.nodes[sc_idx].a
+    if !w.tensor_f32_array_base(p, tp, scores) { << no_match }
+
+    << TensorAttnScoresPlan{loop: loop, seq_len: seq_len, head_dim: head_dim, scores: scores,
+                                q: q, q_off: q_off, k_blocks: k_blocks, bt: bt, bt_off: bt_off,
+                                block_stride: bs_node, kv_base_off: kvb_node, kv_dim: kvd_node}
+}
+
+fn (w $&Lw) tensor_kv_len_and_ptr(p &parser.Parser, tp &types.TypedProgram, n int) TensorDotOperand {
+    ty := tp.deref(w.local_type(tp, tp.local_of(n)))
+    fl := fixed_len_of(tp, ty)
+    if fl > 0 {
+        << TensorDotOperand{ptr: w.base_addr(p, tp, n), valid: w.konst(fl)}
+    }
+    desc := w.base_addr(p, tp, n)
+    << TensorDotOperand{ptr: w.load_ptr(desc, 0, 8), valid: w.load_ptr(desc, 8, 8)}
+}
+
+// Validate bt_ptr[0..num_bt) entries: each pb >= 0 && pb <= cap && pb * bs + blk_need <= kv_len.
+fn (w $&Lw) tensor_validate_bt_loop(bt_ptr int, num_bt int, bs_val int, blk_need int, kv_len int) int {
+    pb_ok := w.new_local(1, 1, "tensor_pb_ok")
+    bi := w.new_local(1, 1, "tensor_bt_i")
+    w.store_local(pb_ok, 0, w.konst(1))
+    loop := w.begin_lowered_range(bi, w.konst(0), num_bt, 1)
+    pb := w.load_ptr(w.bin(BIN_ADD, bt_ptr, w.bin(BIN_MUL, w.load_local(bi, 0), w.konst(8))), 0, 8)
+    end := w.bin(BIN_ADD, w.bin(BIN_MUL, pb, bs_val), blk_need)
+    ok := w.bin(BIN_AND, w.bin(BIN_GE, pb, w.konst(0)),
+          w.bin(BIN_AND, w.bin(BIN_LE, pb, w.konst(1 << 30)), w.bin(BIN_LE, end, kv_len)))
+    fail_bb := w.new_block()
+    next_bb := w.new_block()
+    w.branch(ok, next_bb, fail_bb)
+    w.f.active_bb = fail_bb
+    w.store_local(pb_ok, 0, w.konst(0))
+    w.jump(loop.done)
+    w.f.active_bb = next_bb
+    w.end_lowered_range(&loop)
+    << w.load_local(pb_ok, 0)
+}
+
+fn (w $&Lw) lower_tensor_attn_scores_paged(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_attn_scores_plan(p, tp, loop)
+    if plan.loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.loop].line
+    seq_val := w.lower_expr(p, tp, plan.seq_len)
+    done := w.new_block()
+    pos_s := w.new_block()
+    w.branch(w.bin(BIN_GT, seq_val, w.konst(0)), pos_s, done)
+
+    w.f.active_bb = pos_s
+    hd_val := w.lower_expr(p, tp, plan.head_dim)
+    bs_val := w.lower_expr(p, tp, plan.block_stride)
+    kvd_val := w.lower_expr(p, tp, plan.kv_dim)
+    $kvb_val := w.konst(0)
+    if plan.kv_base_off >= 0 { kvb_val = w.lower_expr(p, tp, plan.kv_base_off) }
+
+    check := w.new_block()
+    slow := w.new_block()
+    dims_pos := w.bin(BIN_AND, w.bin(BIN_GT, hd_val, w.konst(0)),
+                w.bin(BIN_AND, w.bin(BIN_GT, kvd_val, w.konst(0)),
+                w.bin(BIN_AND, w.bin(BIN_GE, bs_val, w.konst(0)), w.bin(BIN_GE, kvb_val, w.konst(0)))))
+    w.branch(dims_pos, check, slow)
+
+    w.f.active_bb = check
+    dims_fit := w.bin(BIN_AND, w.bin(BIN_LE, seq_val, w.konst(1 << 24)),
+                w.bin(BIN_AND, w.bin(BIN_LE, hd_val, w.konst(1 << 24)),
+                w.bin(BIN_AND, w.bin(BIN_LE, bs_val, w.konst(1 << 30)),
+                w.bin(BIN_AND, w.bin(BIN_LE, kvd_val, w.konst(1 << 30)),
+                               w.bin(BIN_LE, kvb_val, w.konst(1 << 46))))))
+
+    off_limit := w.konst(1 << 54)
+    num_bt := w.bin(BIN_SHR, w.bin(BIN_ADD, seq_val, w.konst(15)), w.konst(4))
+    op_scores := w.tensor_dot_operand(p, tp, plan.scores, -1, seq_val, off_limit)
+    op_q := w.tensor_dot_operand(p, tp, plan.q, plan.q_off, hd_val, off_limit)
+    op_bt := w.tensor_strided_operand(p, tp, plan.bt, plan.bt_off, num_bt, 8, off_limit)
+    kv_info := w.tensor_kv_len_and_ptr(p, tp, plan.k_blocks)
+    kv_base_ptr := kv_info.ptr
+    kv_len := kv_info.valid
+
+    // max_in = min(seq_val - 1, 15); blk_need = kvb + max_in * kvd + hd
+    s_m1 := w.bin(BIN_SUB, seq_val, w.konst(1))
+    max_in := w.new_temp()
+    $sel := minstr_new(MI_SELECT)
+    sel.a = max_in
+    sel.b = w.bin(BIN_LT, s_m1, w.konst(15))
+    sel.c = s_m1
+    sel.d = w.konst(15)
+    w.emit(sel)
+    blk_need := w.bin(BIN_ADD, kvb_val, w.bin(BIN_ADD, w.bin(BIN_MUL, max_in, kvd_val), hd_val))
+
+    scores_span := w.bin(BIN_MUL, seq_val, w.konst(4))
+    q_span := w.bin(BIN_MUL, hd_val, w.konst(4))
+    bt_span := w.bin(BIN_MUL, num_bt, w.konst(8))
+    kv_span := w.bin(BIN_MUL, kv_len, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_scores.ptr, w.bin(BIN_SUB, addr_lim, scores_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_q.ptr, w.bin(BIN_SUB, addr_lim, q_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_bt.ptr, w.bin(BIN_SUB, addr_lim, bt_span)),
+                              w.u64_bin(BIN_LE, kv_base_ptr, w.bin(BIN_SUB, addr_lim, kv_span)))))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_scores.ptr, scores_span, op_q.ptr, q_span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_scores.ptr, scores_span, kv_base_ptr, kv_span),
+                           w.tensor_disjoint_ranges(op_scores.ptr, scores_span, op_bt.ptr, bt_span)))
+    pre_ok := w.bin(BIN_AND, dims_fit,
+              w.bin(BIN_AND, op_scores.valid,
+              w.bin(BIN_AND, op_q.valid,
+              w.bin(BIN_AND, op_bt.valid,
+              w.bin(BIN_AND, w.bin(BIN_LE, blk_need, kv_len), w.bin(BIN_AND, addr_ok, disj))))))
+    bt_check := w.new_block()
+    w.branch(pre_ok, bt_check, slow)
+
+    w.f.active_bb = bt_check
+    pb_ok := w.tensor_validate_bt_loop(op_bt.ptr, num_bt, bs_val, blk_need, kv_len)
+    fast := w.new_block()
+    w.branch(pb_ok, fast, slow)
+
+    w.f.active_bb = fast
+    k_ptr := w.bin(BIN_ADD, kv_base_ptr, w.bin(BIN_MUL, kvb_val, w.konst(4)))
+    packed_sh := w.bin(BIN_OR, w.bin(BIN_SHL, seq_val, w.konst(32)), hd_val)
+    packed_bk := w.bin(BIN_OR, w.bin(BIN_SHL, bs_val, w.konst(32)), kvd_val)
+    $stub := "__xu_tensor_attn_scores_paged_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_attn_scores_paged_fast_f32" }
+    $args := []int{}
+    args.push(op_scores.ptr)
+    args.push(op_q.ptr)
+    args.push(k_ptr)
+    args.push(op_bt.ptr)
+    args.push(packed_sh)
+    args.push(packed_bk)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop
+}
+
+fn (w &Lw) tensor_softmax_plan(p &parser.Parser, tp &types.TypedProgram, decl int) TensorSoftmaxPlan {
+    no_match := TensorSoftmaxPlan{decl: -1, s_set0: -1, loop1: -1, s_sum0: -1, loop2: -1,
+                                  s_inv: -1, loop3: -1, bound: -1, scores: -1, scale_id: -1}
+    if decl < 0 || p.nodes[decl].kind != ast.NK_LET { << no_match }
+    max_id := tp.local_of(decl)
+    if max_id < 0 || w.local_type(tp, max_id) != ai.TENSOR_F32 { << no_match }
+
+    // $max_v := scores[0] * scale
+    m_e := p.nodes[decl].a
+    if m_e < 0 || p.nodes[m_e].kind != ast.NK_BIN_OP || p.nodes[m_e].ival != ast.OP_MUL ||
+       tp.type_of(m_e) != ai.TENSOR_F32 {
+        << no_match
+    }
+    $sc0_idx := p.nodes[m_e].a
+    $scale_node := p.nodes[m_e].b
+    if sc0_idx < 0 || p.nodes[sc0_idx].kind != ast.NK_INDEX {
+        sc0_idx = p.nodes[m_e].b
+        scale_node = p.nodes[m_e].a
+    }
+    if sc0_idx < 0 || p.nodes[sc0_idx].kind != ast.NK_INDEX || tp.type_of(sc0_idx) != ai.TENSOR_F32 ||
+       !ai.tensor_int_zero(p, p.nodes[sc0_idx].b) {
+        << no_match
+    }
+    scores := p.nodes[sc0_idx].a
+    if !w.tensor_f32_array_base(p, tp, scores) { << no_match }
+    scores_id := tp.local_of(scores)
+    scale_id := w.tensor_read_local(p, tp, scale_node)
+    if scale_id < 0 || w.local_type(tp, scale_id) != ai.TENSOR_F32 { << no_match }
+
+    // scores[0] = max_v
+    s_set0 := p.nodes[decl].next
+    if s_set0 < 0 || p.nodes[s_set0].kind != ast.NK_ASSIGN || p.nodes[s_set0].ival != ast.AS_ASSIGN ||
+       !ai.tensor_ident_id(p, tp, p.nodes[s_set0].b, max_id) {
+        << no_match
+    }
+    set0_lhs := p.nodes[s_set0].a
+    if set0_lhs < 0 || p.nodes[set0_lhs].kind != ast.NK_INDEX ||
+       !ai.tensor_ident_id(p, tp, p.nodes[set0_lhs].a, scores_id) ||
+       !ai.tensor_int_zero(p, p.nodes[set0_lhs].b) {
+        << no_match
+    }
+
+    // for t in 1:seq_len { v := scores[t] * scale; scores[t] = v; if v > max_v { max_v = v } }
+    loop1 := p.nodes[s_set0].next
+    if loop1 < 0 || p.nodes[loop1].kind != ast.NK_FOR || !ai.tensor_int_lit(p, p.nodes[loop1].a, 1) {
+        << no_match
+    }
+    bound := p.nodes[loop1].b
+    if !w.tensor_dot_bound_ok(p, tp, bound) { << no_match }
+    t1 := tp.local_of(loop1)
+    if t1 < 0 { << no_match }
+
+    l1a := p.nodes[loop1].c
+    if l1a < 0 || p.nodes[l1a].kind != ast.NK_LET { << no_match }
+    v_id := tp.local_of(l1a)
+    if v_id < 0 || v_id == max_id || w.local_type(tp, v_id) != ai.TENSOR_F32 { << no_match }
+    v_mul := p.nodes[l1a].a
+    if v_mul < 0 || p.nodes[v_mul].kind != ast.NK_BIN_OP || p.nodes[v_mul].ival != ast.OP_MUL { << no_match }
+    $vt_idx := p.nodes[v_mul].a
+    $vt_sc := p.nodes[v_mul].b
+    if !ai.tensor_ident_id(p, tp, vt_sc, scale_id) {
+        vt_idx = p.nodes[v_mul].b
+        vt_sc = p.nodes[v_mul].a
+    }
+    if !ai.tensor_ident_id(p, tp, vt_sc, scale_id) || vt_idx < 0 || p.nodes[vt_idx].kind != ast.NK_INDEX ||
+       !ai.tensor_ident_id(p, tp, p.nodes[vt_idx].a, scores_id) || !ai.range_uses_iv(p, tp, p.nodes[vt_idx].b, t1) {
+        << no_match
+    }
+
+    l1b := p.nodes[l1a].next
+    if l1b < 0 || p.nodes[l1b].kind != ast.NK_ASSIGN || p.nodes[l1b].ival != ast.AS_ASSIGN ||
+       !ai.tensor_ident_id(p, tp, p.nodes[l1b].b, v_id) {
+        << no_match
+    }
+    st_idx := p.nodes[l1b].a
+    if st_idx < 0 || p.nodes[st_idx].kind != ast.NK_INDEX ||
+       !ai.tensor_ident_id(p, tp, p.nodes[st_idx].a, scores_id) || !ai.range_uses_iv(p, tp, p.nodes[st_idx].b, t1) {
+        << no_match
+    }
+
+    l1c := p.nodes[l1b].next
+    if l1c < 0 || p.nodes[l1c].next >= 0 || p.nodes[l1c].kind != ast.NK_IF || p.nodes[l1c].b >= 0 {
+        << no_match
+    }
+    br1 := p.nodes[l1c].a
+    if br1 < 0 || p.nodes[br1].next >= 0 { << no_match }
+    c1 := p.nodes[br1].a
+    if c1 < 0 || p.nodes[c1].kind != ast.NK_BIN_OP || c1 < 0 { << no_match }
+    $cond_ok := false
+    if p.nodes[c1].ival == ast.OP_GT && ai.tensor_ident_id(p, tp, p.nodes[c1].a, v_id) &&
+       ai.tensor_ident_id(p, tp, p.nodes[c1].b, max_id) {
+        cond_ok = true
+    } else if p.nodes[c1].ival == ast.OP_LT && ai.tensor_ident_id(p, tp, p.nodes[c1].a, max_id) &&
+              ai.tensor_ident_id(p, tp, p.nodes[c1].b, v_id) {
+        cond_ok = true
+    }
+    if !cond_ok { << no_match }
+    b1 := p.nodes[br1].b
+    if b1 < 0 || p.nodes[b1].next >= 0 || p.nodes[b1].kind != ast.NK_ASSIGN ||
+       p.nodes[b1].ival != ast.AS_ASSIGN || !ai.tensor_ident_id(p, tp, p.nodes[b1].a, max_id) ||
+       !ai.tensor_ident_id(p, tp, p.nodes[b1].b, v_id) {
+        << no_match
+    }
+
+    // $sum_v := 0.0
+    s_sum0 := p.nodes[loop1].next
+    if s_sum0 < 0 || p.nodes[s_sum0].kind != ast.NK_LET || !ai.tensor_f64_lit(p, tp, p.nodes[s_sum0].a, 0) {
+        << no_match
+    }
+    sum_id := tp.local_of(s_sum0)
+    if sum_id < 0 || w.local_type(tp, sum_id) != ai.TENSOR_F64 { << no_match }
+
+    // for t in 0:seq_len { ew := f32(math.exp(f64(scores[t] - max_v))); scores[t] = ew; sum_v += f64(ew) }
+    loop2 := p.nodes[s_sum0].next
+    bound2 := ai.tensor_dynamic_bound(p, loop2)
+    if bound2 < 0 || !ai.tensor_same_bound_atom(p, tp, bound2, bound) { << no_match }
+    t2 := tp.local_of(loop2)
+    if t2 < 0 { << no_match }
+
+    l2a := p.nodes[loop2].c
+    if l2a < 0 || p.nodes[l2a].kind != ast.NK_LET { << no_match }
+    ew_id := tp.local_of(l2a)
+    if ew_id < 0 || w.local_type(tp, ew_id) != ai.TENSOR_F32 { << no_match }
+    ew_c := p.nodes[l2a].a
+    if ew_c < 0 || p.nodes[ew_c].kind != ast.NK_CAST || tp.type_of(ew_c) != ai.TENSOR_F32 { << no_match }
+    exp_call := p.nodes[ew_c].a
+    if exp_call < 0 { << no_match }
+    ek := p.nodes[exp_call].kind
+    if ek != ast.NK_CALL && ek != ast.NK_METHOD_CALL { << no_match }
+    efi := tp.call_of(exp_call)
+    if efi < 0 || efi >= tp.fns.len || tp.fns[efi].label != "_xu_math_exp" { << no_match }
+    $exp_arg := p.nodes[exp_call].a
+    if ek == ast.NK_METHOD_CALL { exp_arg = p.nodes[exp_call].b }
+    if exp_arg < 0 || p.nodes[exp_arg].next >= 0 || p.nodes[exp_arg].kind != ast.NK_CAST ||
+       tp.type_of(exp_arg) != ai.TENSOR_F64 {
+        << no_match
+    }
+    sub_e := p.nodes[exp_arg].a
+    if sub_e < 0 || p.nodes[sub_e].kind != ast.NK_BIN_OP || p.nodes[sub_e].ival != ast.OP_SUB ||
+       !ai.tensor_ident_id(p, tp, p.nodes[sub_e].b, max_id) {
+        << no_match
+    }
+    sc2_idx := p.nodes[sub_e].a
+    if sc2_idx < 0 || p.nodes[sc2_idx].kind != ast.NK_INDEX ||
+       !ai.tensor_ident_id(p, tp, p.nodes[sc2_idx].a, scores_id) || !ai.range_uses_iv(p, tp, p.nodes[sc2_idx].b, t2) {
+        << no_match
+    }
+
+    l2b := p.nodes[l2a].next
+    if l2b < 0 || p.nodes[l2b].kind != ast.NK_ASSIGN || p.nodes[l2b].ival != ast.AS_ASSIGN ||
+       !ai.tensor_ident_id(p, tp, p.nodes[l2b].b, ew_id) {
+        << no_match
+    }
+    sc2w_idx := p.nodes[l2b].a
+    if sc2w_idx < 0 || p.nodes[sc2w_idx].kind != ast.NK_INDEX ||
+       !ai.tensor_ident_id(p, tp, p.nodes[sc2w_idx].a, scores_id) || !ai.range_uses_iv(p, tp, p.nodes[sc2w_idx].b, t2) {
+        << no_match
+    }
+
+    l2c := p.nodes[l2b].next
+    if l2c < 0 || p.nodes[l2c].next >= 0 || p.nodes[l2c].kind != ast.NK_ASSIGN ||
+       p.nodes[l2c].ival != ast.AS_ADD || !ai.tensor_ident_id(p, tp, p.nodes[l2c].a, sum_id) ||
+       !ai.tensor_f64_cast_ident(p, tp, p.nodes[l2c].b, ew_id) {
+        << no_match
+    }
+
+    // inv := f32(1.0 / sum_v)
+    s_inv := p.nodes[loop2].next
+    if s_inv < 0 || p.nodes[s_inv].kind != ast.NK_LET { << no_match }
+    inv_id := tp.local_of(s_inv)
+    if inv_id < 0 || w.local_type(tp, inv_id) != ai.TENSOR_F32 { << no_match }
+    inv_c := p.nodes[s_inv].a
+    if inv_c < 0 || p.nodes[inv_c].kind != ast.NK_CAST || tp.type_of(inv_c) != ai.TENSOR_F32 { << no_match }
+    inv_div := p.nodes[inv_c].a
+    if inv_div < 0 || p.nodes[inv_div].kind != ast.NK_BIN_OP || p.nodes[inv_div].ival != ast.OP_DIV ||
+       !ai.tensor_f64_lit(p, tp, p.nodes[inv_div].a, F64_BITS_ONE) ||
+       !ai.tensor_ident_id(p, tp, p.nodes[inv_div].b, sum_id) {
+        << no_match
+    }
+
+    // for t in 0:seq_len { scores[t] = scores[t] * inv }
+    loop3 := p.nodes[s_inv].next
+    bound3 := ai.tensor_dynamic_bound(p, loop3)
+    if bound3 < 0 || !ai.tensor_same_bound_atom(p, tp, bound3, bound) { << no_match }
+    t3 := tp.local_of(loop3)
+    if t3 < 0 { << no_match }
+    stmt3 := ai.tensor_assignment(p, p.nodes[loop3].c, ast.AS_ASSIGN, ast.OP_MUL)
+    if stmt3 < 0 { << no_match }
+    w3_idx := p.nodes[stmt3].a
+    if w3_idx < 0 || p.nodes[w3_idx].kind != ast.NK_INDEX ||
+       !ai.tensor_ident_id(p, tp, p.nodes[w3_idx].a, scores_id) || !ai.range_uses_iv(p, tp, p.nodes[w3_idx].b, t3) {
+        << no_match
+    }
+    mul3 := p.nodes[stmt3].b
+    $r3_idx := p.nodes[mul3].a
+    $r3_inv := p.nodes[mul3].b
+    if !ai.tensor_ident_id(p, tp, r3_inv, inv_id) {
+        r3_idx = p.nodes[mul3].b
+        r3_inv = p.nodes[mul3].a
+    }
+    if !ai.tensor_ident_id(p, tp, r3_inv, inv_id) || r3_idx < 0 || p.nodes[r3_idx].kind != ast.NK_INDEX ||
+       !ai.tensor_ident_id(p, tp, p.nodes[r3_idx].a, scores_id) || !ai.range_uses_iv(p, tp, p.nodes[r3_idx].b, t3) {
+        << no_match
+    }
+
+    after := p.nodes[loop3].next
+    if ai.tensor_may_reference(p, after, &p.nodes[decl].sval, 0) ||
+       ai.tensor_may_reference(p, after, &p.nodes[s_sum0].sval, 0) ||
+       ai.tensor_may_reference(p, after, &p.nodes[s_inv].sval, 0) {
+        << no_match
+    }
+
+    << TensorSoftmaxPlan{decl: decl, s_set0: s_set0, loop1: loop1, s_sum0: s_sum0, loop2: loop2,
+                         s_inv: s_inv, loop3: loop3, bound: bound, scores: scores, scale_id: scale_id}
+}
+
+fn (w $&Lw) lower_tensor_softmax_scaled(p &parser.Parser, tp &types.TypedProgram, decl int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_softmax_plan(p, tp, decl)
+    if plan.decl < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.decl].line
+    n := w.lower_expr(p, tp, plan.bound)
+    check := w.new_block()
+    slow := w.new_block()
+    done := w.new_block()
+    w.branch(w.bin(BIN_GT, n, w.konst(0)), check, slow)
+
+    w.f.active_bb = check
+    limit_val := w.konst(1 << 54)
+    n_fits := w.bin(BIN_LE, n, limit_val)
+    op_sc := w.tensor_dot_operand(p, tp, plan.scores, -1, n, limit_val)
+    span := w.bin(BIN_MUL, n, w.konst(4))
+    addr_ok := w.u64_bin(BIN_LE, op_sc.ptr, w.bin(BIN_SUB, w.konst(1 << 56), span))
+    valid := w.bin(BIN_AND, n_fits, w.bin(BIN_AND, op_sc.valid, addr_ok))
+    fast := w.new_block()
+    w.branch(valid, fast, slow)
+
+    w.f.active_bb = fast
+    $stub := "__xu_tensor_softmax_scaled_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_softmax_scaled_fast_f32" }
+    $args := []int{}
+    args.push(op_sc.ptr)
+    args.push(n)
+    args.push(w.load_local(w.lslot[plan.scale_id], 0))
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.decl)
+    w.lower_stmt(p, tp, plan.s_set0)
+    w.lower_stmt(p, tp, plan.loop1)
+    w.lower_stmt(p, tp, plan.s_sum0)
+    w.lower_stmt(p, tp, plan.loop2)
+    w.lower_stmt(p, tp, plan.s_inv)
+    w.lower_stmt(p, tp, plan.loop3)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.loop3
+}
+
+fn (w &Lw) tensor_attn_vsum_plan(p &parser.Parser, tp &types.TypedProgram, zero_loop int) TensorAttnVsumPlan {
+    no_match := TensorAttnVsumPlan{zero_loop: -1, t_loop: -1, seq_len: -1, head_dim: -1,
+                                   out: -1, out_off: -2, scores: -1, v_blocks: -1, bt: -1,
+                                   bt_off: -2, block_stride: -1, kv_base_off: -1, kv_dim: -1}
+    head_dim := ai.tensor_dynamic_bound(p, zero_loop)
+    if !w.tensor_dot_bound_ok(p, tp, head_dim) { << no_match }
+    d0 := tp.local_of(zero_loop)
+    if d0 < 0 { << no_match }
+    zstmt := p.nodes[zero_loop].c
+    if zstmt < 0 || p.nodes[zstmt].next >= 0 || p.nodes[zstmt].kind != ast.NK_ASSIGN ||
+       p.nodes[zstmt].ival != ast.AS_ASSIGN || !ai.tensor_is_f32_zero(p, tp, p.nodes[zstmt].b) {
+        << no_match
+    }
+    z_idx := p.nodes[zstmt].a
+    if z_idx < 0 || p.nodes[z_idx].kind != ast.NK_INDEX || tp.type_of(z_idx) != ai.TENSOR_F32 { << no_match }
+    out := p.nodes[z_idx].a
+    if !w.tensor_f32_array_base(p, tp, out) { << no_match }
+    out_id := tp.local_of(out)
+    out_off := w.tensor_dot_offset(p, tp, p.nodes[z_idx].b, d0)
+    if out_off == -2 { << no_match }
+
+    // t_loop: for t in 0:seq_len
+    t_loop := p.nodes[zero_loop].next
+    seq_len := ai.tensor_dynamic_bound(p, t_loop)
+    if !w.tensor_dot_bound_ok(p, tp, seq_len) { << no_match }
+    t_iv := tp.local_of(t_loop)
+    if t_iv < 0 { << no_match }
+
+    // w := scores[t]
+    s1 := p.nodes[t_loop].c
+    if s1 < 0 || p.nodes[s1].kind != ast.NK_LET { << no_match }
+    w_id := tp.local_of(s1)
+    if w_id < 0 || w.local_type(tp, w_id) != ai.TENSOR_F32 { << no_match }
+    w_idx := p.nodes[s1].a
+    if w_idx < 0 || p.nodes[w_idx].kind != ast.NK_INDEX || tp.type_of(w_idx) != ai.TENSOR_F32 ||
+       !ai.range_uses_iv(p, tp, p.nodes[w_idx].b, t_iv) {
+        << no_match
+    }
+    scores := p.nodes[w_idx].a
+    if !w.tensor_f32_array_base(p, tp, scores) { << no_match }
+
+    // t_pb := bt[[bt_off +] (t >> 4)]
+    s2 := p.nodes[s1].next
+    if s2 < 0 || p.nodes[s2].kind != ast.NK_LET { << no_match }
+    t_pb_id := tp.local_of(s2)
+    if t_pb_id < 0 || w.local_type(tp, t_pb_id) != 1 { << no_match }
+    bt_idx := p.nodes[s2].a
+    if bt_idx < 0 || p.nodes[bt_idx].kind != ast.NK_INDEX || tp.type_of(bt_idx) != 1 { << no_match }
+    bt := p.nodes[bt_idx].a
+    if !w.tensor_typed_array_base(p, tp, bt, 1) { << no_match }
+    bt_off := w.tensor_bt_index(p, tp, p.nodes[bt_idx].b, t_iv)
+    if bt_off == -2 { << no_match }
+
+    // v_off := t_pb * block_stride [+ kv_base_off] + (t & 15) * kv_dim
+    s3 := p.nodes[s2].next
+    if s3 < 0 || p.nodes[s3].kind != ast.NK_LET { << no_match }
+    v_off_id := tp.local_of(s3)
+    if v_off_id < 0 || v_off_id == t_pb_id || w.local_type(tp, v_off_id) != 1 { << no_match }
+    $bs_node := -1
+    $kvb_node := -1
+    $kvd_node := -1
+    if !w.tensor_paged_kv_off_expr(p, tp, p.nodes[s3].a, t_pb_id, t_iv, $&bs_node, $&kvb_node, $&kvd_node) {
+        << no_match
+    }
+
+    // for d in 0:head_dim { out[out_off + d] += w * v_blocks[v_off + d] }
+    d_loop := p.nodes[s3].next
+    if d_loop < 0 || p.nodes[d_loop].next >= 0 { << no_match }
+    d_bound := ai.tensor_dynamic_bound(p, d_loop)
+    if d_bound < 0 || !ai.tensor_same_bound_atom(p, tp, d_bound, head_dim) { << no_match }
+    d_iv := tp.local_of(d_loop)
+    if d_iv < 0 || d_iv == t_iv { << no_match }
+    axpy := ai.tensor_assignment(p, p.nodes[d_loop].c, ast.AS_ADD, ast.OP_MUL)
+    if axpy < 0 { << no_match }
+    olhs := p.nodes[axpy].a
+    if olhs < 0 || p.nodes[olhs].kind != ast.NK_INDEX || tp.type_of(olhs) != ai.TENSOR_F32 ||
+       !ai.tensor_ident_id(p, tp, p.nodes[olhs].a, out_id) {
+        << no_match
+    }
+    o_off2 := w.tensor_dot_offset(p, tp, p.nodes[olhs].b, d_iv)
+    if o_off2 == -2 || !ai.tensor_same_offset(p, tp, out_off, o_off2) { << no_match }
+
+    mul := p.nodes[axpy].b
+    $v_idx := p.nodes[mul].b
+    $w_arg := p.nodes[mul].a
+    if !ai.tensor_ident_id(p, tp, w_arg, w_id) {
+        v_idx = p.nodes[mul].a
+        w_arg = p.nodes[mul].b
+    }
+    if !ai.tensor_ident_id(p, tp, w_arg, w_id) || v_idx < 0 || p.nodes[v_idx].kind != ast.NK_INDEX ||
+       tp.type_of(v_idx) != ai.TENSOR_F32 {
+        << no_match
+    }
+    v_blocks := p.nodes[v_idx].a
+    if !w.tensor_f32_array_base(p, tp, v_blocks) ||
+       !ai.tensor_add_local_iv(p, tp, p.nodes[v_idx].b, v_off_id, d_iv) {
+        << no_match
+    }
+
+    << TensorAttnVsumPlan{zero_loop: zero_loop, t_loop: t_loop, seq_len: seq_len, head_dim: head_dim,
+                              out: out, out_off: out_off, scores: scores, v_blocks: v_blocks, bt: bt,
+                              bt_off: bt_off, block_stride: bs_node, kv_base_off: kvb_node, kv_dim: kvd_node}
+}
+
+fn (w $&Lw) lower_tensor_attn_vsum_paged(p &parser.Parser, tp &types.TypedProgram, loop int) int {
+    if w.tgt_arch != 0 && w.tgt_arch != 1 { << -1 }
+    plan := w.tensor_attn_vsum_plan(p, tp, loop)
+    if plan.zero_loop < 0 { << -1 }
+
+    w.cur_line = p.nodes[plan.zero_loop].line
+    hd_val := w.lower_expr(p, tp, plan.head_dim)
+    seq_val := w.lower_expr(p, tp, plan.seq_len)
+    bs_val := w.lower_expr(p, tp, plan.block_stride)
+    kvd_val := w.lower_expr(p, tp, plan.kv_dim)
+    $kvb_val := w.konst(0)
+    if plan.kv_base_off >= 0 { kvb_val = w.lower_expr(p, tp, plan.kv_base_off) }
+
+    check := w.new_block()
+    slow := w.new_block()
+    done := w.new_block()
+    dims_pos := w.bin(BIN_AND, w.bin(BIN_GT, seq_val, w.konst(0)),
+                w.bin(BIN_AND, w.bin(BIN_GT, hd_val, w.konst(0)),
+                w.bin(BIN_AND, w.bin(BIN_GT, kvd_val, w.konst(0)),
+                w.bin(BIN_AND, w.bin(BIN_GE, bs_val, w.konst(0)), w.bin(BIN_GE, kvb_val, w.konst(0))))))
+    w.branch(dims_pos, check, slow)
+
+    w.f.active_bb = check
+    dims_fit := w.bin(BIN_AND, w.bin(BIN_LE, seq_val, w.konst(1 << 24)),
+                w.bin(BIN_AND, w.bin(BIN_LE, hd_val, w.konst(1 << 24)),
+                w.bin(BIN_AND, w.bin(BIN_LE, bs_val, w.konst(1 << 30)),
+                w.bin(BIN_AND, w.bin(BIN_LE, kvd_val, w.konst(1 << 30)),
+                               w.bin(BIN_LE, kvb_val, w.konst(1 << 46))))))
+    off_limit := w.konst(1 << 54)
+    num_bt := w.bin(BIN_SHR, w.bin(BIN_ADD, seq_val, w.konst(15)), w.konst(4))
+    op_out := w.tensor_dot_operand(p, tp, plan.out, plan.out_off, hd_val, off_limit)
+    op_sc := w.tensor_dot_operand(p, tp, plan.scores, -1, seq_val, off_limit)
+    op_bt := w.tensor_strided_operand(p, tp, plan.bt, plan.bt_off, num_bt, 8, off_limit)
+    kv_info := w.tensor_kv_len_and_ptr(p, tp, plan.v_blocks)
+    kv_base_ptr := kv_info.ptr
+    kv_len := kv_info.valid
+
+    s_m1 := w.bin(BIN_SUB, seq_val, w.konst(1))
+    max_in := w.new_temp()
+    $sel := minstr_new(MI_SELECT)
+    sel.a = max_in
+    sel.b = w.bin(BIN_LT, s_m1, w.konst(15))
+    sel.c = s_m1
+    sel.d = w.konst(15)
+    w.emit(sel)
+    blk_need := w.bin(BIN_ADD, kvb_val, w.bin(BIN_ADD, w.bin(BIN_MUL, max_in, kvd_val), hd_val))
+
+    out_span := w.bin(BIN_MUL, hd_val, w.konst(4))
+    sc_span := w.bin(BIN_MUL, seq_val, w.konst(4))
+    bt_span := w.bin(BIN_MUL, num_bt, w.konst(8))
+    kv_span := w.bin(BIN_MUL, kv_len, w.konst(4))
+    addr_lim := w.konst(1 << 56)
+    addr_ok := w.bin(BIN_AND, w.u64_bin(BIN_LE, op_out.ptr, w.bin(BIN_SUB, addr_lim, out_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_sc.ptr, w.bin(BIN_SUB, addr_lim, sc_span)),
+               w.bin(BIN_AND, w.u64_bin(BIN_LE, op_bt.ptr, w.bin(BIN_SUB, addr_lim, bt_span)),
+                              w.u64_bin(BIN_LE, kv_base_ptr, w.bin(BIN_SUB, addr_lim, kv_span)))))
+    disj := w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, op_sc.ptr, sc_span),
+            w.bin(BIN_AND, w.tensor_disjoint_ranges(op_out.ptr, out_span, kv_base_ptr, kv_span),
+                           w.tensor_disjoint_ranges(op_out.ptr, out_span, op_bt.ptr, bt_span)))
+    pre_ok := w.bin(BIN_AND, dims_fit,
+              w.bin(BIN_AND, op_out.valid,
+              w.bin(BIN_AND, op_sc.valid,
+              w.bin(BIN_AND, op_bt.valid,
+              w.bin(BIN_AND, w.bin(BIN_LE, blk_need, kv_len), w.bin(BIN_AND, addr_ok, disj))))))
+    bt_check := w.new_block()
+    w.branch(pre_ok, bt_check, slow)
+
+    w.f.active_bb = bt_check
+    pb_ok := w.tensor_validate_bt_loop(op_bt.ptr, num_bt, bs_val, blk_need, kv_len)
+    fast := w.new_block()
+    w.branch(pb_ok, fast, slow)
+
+    w.f.active_bb = fast
+    v_ptr := w.bin(BIN_ADD, kv_base_ptr, w.bin(BIN_MUL, kvb_val, w.konst(4)))
+    packed_sh := w.bin(BIN_OR, w.bin(BIN_SHL, seq_val, w.konst(32)), hd_val)
+    packed_bk := w.bin(BIN_OR, w.bin(BIN_SHL, bs_val, w.konst(32)), kvd_val)
+    $stub := "__xu_tensor_attn_vsum_paged_f32"
+    if w.tensor_fast_math { stub = "__xu_tensor_attn_vsum_paged_fast_f32" }
+    $args := []int{}
+    args.push(op_out.ptr)
+    args.push(op_sc.ptr)
+    args.push(v_ptr)
+    args.push(op_bt.ptr)
+    args.push(packed_sh)
+    args.push(packed_bk)
+    w.call(stub, &args)
+    w.jump(done)
+
+    w.f.active_bb = slow
+    w.lower_stmt(p, tp, plan.zero_loop)
+    w.lower_stmt(p, tp, plan.t_loop)
+    w.jump(done)
+
+    w.f.active_bb = done
+    << plan.t_loop
+}
