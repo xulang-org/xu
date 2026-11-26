@@ -13,6 +13,7 @@ and GGML quantization blocks.
 | GGML Q5_0 | 22 bytes per 32 values | `Q5Block` |
 | GGML Q8_0 | 34 bytes per 32 values | `Q8Block` |
 | GGML Q4_K | 144 bytes per 256 values | `Q4KBlock` |
+| GGML Q5_K | 176 bytes per 256 values | `Q5KBlock` |
 | GGML Q6_K | 210 bytes per 256 values | `Q6KBlock` |
 
 Use `tensor.f16(value)`, `tensor.bf16(value)`, or a `tensor.fp8_*(value)`
@@ -32,19 +33,27 @@ describes one scalar, and any zero dimension makes the view empty.
 row-major index, including for noncontiguous views. `read_f32_bytes` and
 `write_f32_bytes` support zero-copy reads and writes over caller-owned `[]u8` buffers.
 
-Use `read_q4_0`, `read_q5_0`, `read_q8_0`, `read_q4_k`, or `read_q6_k` to read a block at a
+Use `read_q4_0`, `read_q5_0`, `read_q8_0`, `read_q4_k`, `read_q5_k`, or `read_q6_k` to read a block at a
 byte offset. `at` decodes an indexed value, `append_f32` decodes a whole block,
-and `q4_k_dot_f32`, `q6_k_dot_f32`, `q5_0_dot_f32`, and `q8_0_dot_f32` perform zero-copy
-inner products directly over backing bytes.
+and `q4_k_dot_f32`, `dot_q5_k_bytes_f32`, `q6_k_dot_f32`, `q5_0_dot_f32`, `q8_0_dot_f32`, whole-row
+`dot_{q4_k,q5_k,q6_k,q5_0,q8_0}_row_f32`, plus integer K-quant activation helpers
+`quantize_q8_k_row` / `dot_{q4_k,q5_k,q6_k}_q8_k_row_f32` perform zero-copy inner products
+directly over backing bytes; `quantize_q5_0_row` and `dequant_{f16,bf16}_to_f32`
+handle packed Q5_0 writes and bulk 16-bit decoding.
 The block types expose their scales and packed lanes for raw access.
 
 ## Numerical kernels (`ops.xu`)
 
-`#tensor` also provides 20 composable pure-Xu numerical primitives in `ops.xu`:
+`#tensor` also provides 37 composable pure-Xu numerical primitives in `ops.xu`:
 `dot_f32`, `axpy_f32`, `vadd_f32`, `vsub_f32`, `vmul_f32`, `vscale_f32`,
-`silu_f32`, `gelu_f32`, `rmsnorm_f32`, `layernorm_f32`, `l2_normalize_f32`,
-`cosine_similarity_f32`, `softmax_f32`, `swiglu_f32`, `rope_f32`, `matvec_f32`,
-`matmul_f32`, `argmax_f32`, `quantize_q8_0`, and `quantize_q4_0_row`. Each
+`silu_f32`, `gelu_f32`, `rmsnorm_f32`, `add_rmsnorm_f32`, `layernorm_f32`,
+`l2_normalize_f32`, `cosine_similarity_f32`, `topk_f32`, `topk_cosine_f32`,
+`moe_router_f32`, `softmax_f32`, `log_softmax_f32`, `swiglu_f32`, `geglu_f32`,
+`rope_f32`, `rope_interleaved_f32`, `rope_yarn_f32`, `matvec_f32`, `matmul_f32`,
+`argmax_f32`, `quantize_q8_0`, `quantize_q4_0_row`, `cross_entropy_grad_f32`,
+`adamw_step_f32`, `lora_add_f32`, `lora_backward_f32`, `rmsnorm_backward_f32`,
+`swiglu_backward_f32`, `layernorm_backward_f32`, `softmax_backward_f32`,
+and `grad_clip_norm_f32`. Each
 core loop uses the canonical shape recognized by `XU_TENSOR_FUSION=1` so the
 compiler lowers eligible kernels directly to ARM64 NEON / x86-64 SSE2 stubs
 when bounds and aliasing checks pass.

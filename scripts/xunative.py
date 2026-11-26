@@ -16,6 +16,7 @@ import json
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -284,11 +285,14 @@ def resolve_archive_tool(requested: str, _target: str) -> str:
     raise SystemExit("archive tool not found: install llvm-ar or pass --ar PATH")
 
 
-def ar_archive(output: Path, metadata: Path, native: list[Path], ar: str) -> None:
+def ar_archive(output: Path, metadata: Path, native: list[Path], ar: str, target: str = "") -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         output.unlink()
-    cmd = [ar, "rcs", str(output), str(metadata), *(str(p) for p in native)]
+    # BSD ar's default `rcs` invokes Apple ranlib, which drops non-Mach-O object members
+    # (such as ELF/COFF metadata objects compiled on macOS for Linux/Windows slices).
+    flags = "rcS" if (sys.platform == "darwin" and target and not target.startswith("macos-") and Path(ar).name == "ar") else "rcs"
+    cmd = [ar, flags, str(output), str(metadata), *(str(p) for p in native)]
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError:
@@ -399,7 +403,7 @@ def cmd_archive(args: argparse.Namespace) -> None:
         metadata = root / "xu.o"
         compile_metadata_object(encoded, args.target, metadata, cc)
         members = native_members(args.native, ar, root)
-        ar_archive(args.output, metadata, members, ar)
+        ar_archive(args.output, metadata, members, ar, args.target)
     print(f"archive: {args.output} target={args.target}")
 
 
@@ -415,7 +419,7 @@ def cmd_compile(args: argparse.Namespace) -> None:
         compile_metadata_object(encoded, args.target, metadata, cc)
         compiled = compile_c_sources(args.source, args.target, root, cc, args.cflag)
         members = [*compiled, *native_members(args.native, ar, root)]
-        ar_archive(args.output, metadata, members, ar)
+        ar_archive(args.output, metadata, members, ar, args.target)
     print(f"compile: {args.output} target={args.target} sources={len(args.source)}")
 
 
