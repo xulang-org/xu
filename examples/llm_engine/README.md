@@ -4,8 +4,8 @@ A zero-dependency Transformer inference and OpenAI-compatible HTTP serving engin
 
 ## Supported Formats & Architectures
 
-- **Model containers**: Safetensors (`F32` weights + JSON config) and streaming GGUF (`F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q6_K`, tied or untied embeddings).
-- **Architectures**: LLaMA, Qwen2 / Qwen3 (`qkv` biases, `qk_norm`), Gemma / Gemma2 (`final_logit_softcapping`), Mistral, and custom `head_dim` / `dim` / GQA models (`rope.freq_base`, `rope.scaling.factor`).
+- **Model containers**: HuggingFace model directories (`config.json` + single `model.safetensors` or sharded `model.safetensors.index.json` + `tokenizer.json` / `tokenizer_config.json`, supporting `F32`, `F16`, `BF16`, `F8_E4M3`), single-file Safetensors (`F32`), and streaming GGUF (`F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0` including `p4k4` SIMD layer weights, `Q4_K`, `Q5_K`, `Q6_K`, tied or untied embeddings; zero-copy `#tensor` row dots for `K`-quants/`Q5_0`/`Q8_0`, plus `--q8k-act` integer K-quant activation dots).
+- **Architectures**: LLaMA, Qwen2 / Qwen3 (`qkv` biases, `qk_norm`), Gemma / Gemma2 (`final_logit_softcapping`, `attn_logit_softcapping`, `use_geglu`, `post_attention_norm`/`ffn_post_norm`, `sqrt(dim)` embedding scale), Mistral (`sliding_window`), Mixture-of-Experts / MoE (`Mixtral`, `Qwen2-MoE`, `DeepSeek-V2/V3` style — 3D packed `ffn_*_exps.weight` and split `ffn_*.{e}.weight`, Softmax/Sigmoid + routing bias, `expert_weights_norm`/`expert_weights_scale`, shared experts `ffn_*_shexp.weight` + optional `ffn_gate_inp_shexp.weight`), Multi-head Latent Attention / MLA (`DeepSeek-V2/V3/R1` `kv_lora_rank`, `q_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`), partial RoPE (`.rope.dimension_count`), interleaved RoPE (`--rope-type auto|norm|neox`), and linear/YaRN NTK-by-parts RoPE scaling (`rope.scaling.type="yarn"`, `rope.scaling.original_context_length`, `beta_fast`/`beta_slow`/`attn_factor`).
 - **Tokenizers**: SentencePiece BPE (`▁` word boundaries + `<0xHH>` byte-fallback pieces), GPT-2 byte-level BPE with pre-tokenization chunking + merge ranks, greedy fallback, and explicit `ids:1,2,3` inputs.
 - **Chat templates & EOS**: Auto-detected from GGUF `tokenizer.chat_template` / vocabulary markers (`ChatML`, `Llama-3`, `Gemma`, `Mistral`, or raw fallback), plus multi-EOS token matching.
 
@@ -26,20 +26,25 @@ xu build --tensor-fusion --tensor-fast-math -O3 examples/llm_engine/main.xu -o l
 ## Subcommands & Flags
 
 ```sh
-llm_engine <verify|verify-f32act|bench|bench-f32act|generate|serve> <model.safetensors|model.gguf> [args...] \
-  [--ctx N] [--kv-dtype f32|f16|q8_0] [--max-slots N] [--api-key K] \
-  [--top-p N] [--min-p N] [--repeat-penalty N] [--presence-penalty N] [--frequency-penalty N] \
+llm_engine <verify|verify-f32act|bench|bench-f32act|generate|serve|train-lora> <model_dir|model.safetensors|model.gguf> [args...] \
+  [--ctx N] [--kv-dtype f32|f16|q8_0] [--rope-type auto|norm|neox] [--max-slots N] [--api-key K] \
+  [--lora PATH] [--lora-scale F] [--draft PATH] [--draft-k N] \
+  [--lora-rank R] [--lora-alpha F] [--steps N] [--lr F] [--max-grad-norm G] \
+  [--q8k-act] [--top-p N] [--min-p N] [--repeat-penalty N] [--presence-penalty N] [--frequency-penalty N] \
   [--seed N] [--ignore-eos]
 ```
 
-- `verify` / `verify-f32act`: Compare sequential and continuous-batch outputs bit-for-bit across GQA/paged-KV slots.
+- `verify` / `verify-f32act`: Compare sequential and continuous-batch outputs bit-for-bit across GQA/MLA/paged-KV slots (supports `--lora`).
 - `bench` / `bench-f32act`: Measure load time, TTFT, p50/p99 decode latency, and continuous-batch throughput.
-- `generate <model> <prompt|ids:...> [max_tokens] [temp_milli] [top_k]`: Run single-sequence generation with $O(L)$ penalties, `top_k` (unbounded), `top_p`, and `min_p`.
-- `serve <model> [host:port]`: Start an OpenAI-compatible HTTP server with paged KV prefix caching, batched multi-slot ARM64 decode, SSE client-disconnect cancellation, CORS (`OPTIONS` preflight), and optional `Authorization: Bearer <key>` enforcement (`--api-key`).
+- `generate <model> <prompt|ids:...> [max_tokens] [temp_milli] [top_k]`: Run single-sequence generation with $O(L)$ penalties, `top_k` (unbounded), `top_p`, and `min_p`, optional `--lora <adapter>` inference, and lossless speculative decoding via `--draft <draft_model> [--draft-k N]` (batched target verification + KV rollback + greedy/rejection sampling).
+- `train-lora <base_model> <prompt|ids:...> <out_adapter.safetensors>`: Pure-Xu LoRA fine-tuning of `lm_head` using `#tensor` training & backprop primitives (`lora_add_f32`, `cross_entropy_grad_f32`, `lora_backward_f32`, `grad_clip_norm_f32` via `--max-grad-norm`, `adamw_step_f32`), exporting a PEFT-compatible SafeTensors adapter.
+- `serve <model> [host:port]`: Start an OpenAI & Anthropic-compatible HTTP server with paged KV prefix caching, batched multi-slot ARM64 decode, SSE client-disconnect cancellation (`SO_NOSIGPIPE`/`SIGPIPE`), unique request `id` & Unix `created` timestamps, CORS (`OPTIONS` preflight including `x-api-key` and `anthropic-version`), and optional `Authorization: Bearer <key>` / `x-api-key` enforcement (`--api-key`).
   - `GET /health`
   - `GET /v1/models`
-  - `POST /v1/completions` (`stream`, `stream_options.include_usage`, `stop`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`)
-  - `POST /v1/chat/completions` (auto-formatted via detected chat template)
+  - `POST /v1/completions` (`stream`, `stream_options.include_usage`, `stop`, `max_completion_tokens`, `logprobs`, `top_logprobs`, `response_format`, `logit_bias`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`)
+  - `POST /v1/chat/completions` (auto-formatted via detected chat template; `<think>...</think>` extracted to `reasoning_content` sync + SSE; supports `tools` -> `tool_calls` sync + SSE `delta.tool_calls`, multi-turn `assistant.tool_calls` + `role:"tool"` messages, `response_format` `"json_object"` / `"json_schema"`, `logit_bias`, `logprobs`/`top_logprobs`)
+  - `POST /v1/responses` (OpenAI Responses API compatible, sync + SSE `response.output_text.delta`/`response.output_item.done`/`response.completed`, `instructions`, `previous_response_id` 64-entry stateful continuation cache, structured `input` items including `function_call` / `function_call_output`, `tools`, `max_output_tokens`, `text.format`)
+  - `POST /v1/messages` (Anthropic Messages API compatible, sync + SSE `message_start`/`content_block_*`/`message_delta`/`message_stop`, `thinking`/`text`/`tool_use` blocks, `tools` with `input_schema`, multi-turn `tool_result` blocks, `stop_sequences`)
   - `POST /v1/embeddings` (`input` as string or batch string array)
 
 ## Verification

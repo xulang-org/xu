@@ -188,11 +188,15 @@ fn check_blocks() int {
     require(vals4k[0] == f32(0.0) && vals4k[32] == f32(14.75) && vals4k[160] == f32(44.25), "Q4_K decoded values") >>>
     require(math.abs(f64(blk4k.dot_f32(&x4k, 0) - ref_dot4k)) < 1e-4, "Q4_K dot_f32") >>>
 
-    // Q4_K zero-copy dot_f32 matches Q4KBlock.dot_f32
+    // Q4_K, Q8_0, Q5_0, Q6_K single-block & row zero-copy dot checks
     q4k_zc := tensor.q4_k_dot_f32(&q4k, 1, &x4k, 0) >>>
     require(math.abs(f64(q4k_zc - ref_dot4k)) < 1e-4, "q4_k_dot_f32") >>>
+    q4k_row := tensor.dot_q4_k_row_f32(&q4k, 1, &x4k, 0, 1) >>>
+    require(math.abs(f64(q4k_row - ref_dot4k)) < 1e-4, "dot_q4_k_row_f32") >>>
     q8_zc := tensor.q8_0_dot_f32(&q8, 1, &x4k, 0) >>>
     require(math.abs(f64(q8_zc - b_dot_ref(&b, &x4k))) < 1e-4, "q8_0_dot_f32") >>>
+    q8_row := tensor.dot_q8_0_row_f32(&q8, 1, &x4k, 0, 1) >>>
+    require(math.abs(f64(q8_row - b_dot_ref(&b, &x4k))) < 1e-4, "dot_q8_0_row_f32") >>>
 
     // Q5_0 block check (22 bytes -> 32 values)
     $q5 := "x" + half
@@ -221,6 +225,26 @@ fn check_blocks() int {
     require(math.abs(f64(blk5.dot_f32(&x4k, 0) - ref_dot5)) < 1e-4, "Q5_0 dot_f32") >>>
     q5_zc := tensor.q5_0_dot_f32(&q5, 1, &x4k, 0) >>>
     require(math.abs(f64(q5_zc - ref_dot5)) < 1e-4, "q5_0_dot_f32") >>>
+    q5_row := tensor.dot_q5_0_row_f32(&q5, 1, &x4k, 0, 1) >>>
+    require(math.abs(f64(q5_row - ref_dot5)) < 1e-4, "dot_q5_0_row_f32") >>>
+
+    // quantize_q5_0_row round-trip & dot parity
+    $q5_in := []f32{}
+    for i in 0:32 { q5_in.push(f32(f64((i * 5) % 19 - 9) * 0.25)) }
+    $q5_buf := []u8{}
+    for _ in 0:tensor.Q5_0_BYTES { q5_buf.push(u8(0)) }
+    tensor.quantize_q5_0_row(&q5_in, $&q5_buf, 32)
+    $q5_s := ""
+    for i in 0:q5_buf.len { q5_s.push_str(string_from_byte(int(q5_buf[i]))) }
+    q5_blk_rt := tensor.read_q5_0(&q5_s, 0) >>>
+    $q5_ref_dot := f32(0)
+    for i in 0:32 {
+        dv := q5_blk_rt.at(i) >>>
+        require(math.abs(f64(dv - q5_in[i])) <= 0.2, "quantize_q5_0_row error") >>>
+        q5_ref_dot += dv * x4k[i]
+    }
+    q5_rt_dot := tensor.dot_q5_0_row_f32(&q5_s, 0, &x4k, 0, 1) >>>
+    require(math.abs(f64(q5_rt_dot - q5_ref_dot)) < 1e-4, "quantize_q5_0_row dot") >>>
 
     // Q6_K super-block check (210 bytes -> 256 values)
     $q6k := "x"
@@ -245,6 +269,27 @@ fn check_blocks() int {
     require(math.abs(f64(blk6k.dot_f32(&x4k, 0) - ref_dot6k)) < 1e-4, "Q6_K dot_f32") >>>
     q6k_zc := tensor.q6_k_dot_f32(&q6k, 1, &x4k, 0) >>>
     require(math.abs(f64(q6k_zc - ref_dot6k)) < 1e-4, "q6_k_dot_f32") >>>
+    q6k_row := tensor.dot_q6_k_row_f32(&q6k, 1, &x4k, 0, 1) >>>
+    require(math.abs(f64(q6k_row - ref_dot6k)) < 1e-4, "dot_q6_k_row_f32") >>>
+
+    // bulk dequant_f16_to_f32 & dequant_bf16_to_f32
+    $f16_s := "p"
+    $bf16_s := "p"
+    for i in 0:4 {
+        fv := f32(f64(i - 1) * 1.5)
+        fb := int(tensor.f16(fv).bits)
+        f16_s.push_str(string_from_byte(fb & 255))
+        f16_s.push_str(string_from_byte((fb >> 8) & 255))
+        bb := int(tensor.bf16(fv).bits)
+        bf16_s.push_str(string_from_byte(bb & 255))
+        bf16_s.push_str(string_from_byte((bb >> 8) & 255))
+    }
+    $dq16 := [f32(0), f32(0), f32(0), f32(0)]
+    _ := tensor.dequant_f16_to_f32(&f16_s, 1, $&dq16, 0, 4) >>>
+    for i in 0:4 { require(dq16[i] == f32(f64(i - 1) * 1.5), "dequant_f16_to_f32") >>> }
+    $dqb16 := [f32(0), f32(0), f32(0), f32(0)]
+    _ := tensor.dequant_bf16_to_f32(&bf16_s, 1, $&dqb16, 0, 4) >>>
+    for i in 0:4 { require(dqb16[i] == f32(f64(i - 1) * 1.5), "dequant_bf16_to_f32") >>> }
 
     _ := tensor.read_q4_k(&q4k, 2) >>> (err) {
         _ := tensor.read_q6_k(&q6k, 2) >>> (err2) {
@@ -471,6 +516,66 @@ XU_OPS_CHECKS = """@main
 #math
 #tensor
 
+fn check_q8_k() int {
+    // quantize_q8_k_row + dot_q4_k_q8_k_row_f32 + dot_q6_k_q8_k_row_f32
+    $k_x := []f32{}
+    for i in 0:256 { k_x.push(f32(f64((i % 29) - 14) * 0.125)) }
+    $qk_qs := []i8{}
+    for _ in 0:256 { qk_qs.push(i8(0)) }
+    $qk_d := [f32(0)]
+    $qk_bs := []int{}
+    for _ in 0:16 { qk_bs.push(0) }
+    tensor.quantize_q8_k_row(&k_x, 0, $&qk_qs, $&qk_d, $&qk_bs, 1) >>>
+    $q4k_row := ""
+    for j in 0:144 {
+        if j == 0 { q4k_row = q4k_row + string_from_byte(0x00) }
+        else if j == 1 { q4k_row = q4k_row + string_from_byte(0x3c) }
+        else if j == 2 { q4k_row = q4k_row + string_from_byte(0x00) }
+        else if j == 3 { q4k_row = q4k_row + string_from_byte(0x38) }
+        else if j < 16 { q4k_row = q4k_row + string_from_byte(1 + (j % 3)) }
+        else { q4k_row = q4k_row + string_from_byte((j * 17) & 255) }
+    }
+    dq4_f := tensor.dot_q4_k_row_f32(&q4k_row, 0, &k_x, 0, 1) >>>
+    dq4_i := tensor.dot_q4_k_q8_k_row_f32(&q4k_row, 0, &qk_qs, &qk_d, &qk_bs, 1) >>>
+    if math.abs(f64(dq4_f - dq4_i)) > 0.01 * (1.0 + math.abs(f64(dq4_f))) { << 34 }
+
+    $q6k_row := ""
+    for j in 0:210 {
+        if j == 208 { q6k_row = q6k_row + string_from_byte(0x00) }
+        else if j == 209 { q6k_row = q6k_row + string_from_byte(0x3c) }
+        else if j >= 192 { q6k_row = q6k_row + string_from_byte((j % 5) + 1) }
+        else { q6k_row = q6k_row + string_from_byte((j * 31) & 255) }
+    }
+    dq6_f := tensor.dot_q6_k_row_f32(&q6k_row, 0, &k_x, 0, 1) >>>
+    dq6_i := tensor.dot_q6_k_q8_k_row_f32(&q6k_row, 0, &qk_qs, &qk_d, 1) >>>
+    if math.abs(f64(dq6_f - dq6_i)) > 0.01 * (1.0 + math.abs(f64(dq6_f))) { << 35 }
+
+    $q5k_row := ""
+    for j in 0:176 {
+        if j == 0 { q5k_row = q5k_row + string_from_byte(0x00) }
+        else if j == 1 { q5k_row = q5k_row + string_from_byte(0x3c) }
+        else if j == 2 { q5k_row = q5k_row + string_from_byte(0x00) }
+        else if j == 3 { q5k_row = q5k_row + string_from_byte(0x38) }
+        else if j < 16 { q5k_row = q5k_row + string_from_byte(1 + (j % 3)) }
+        else if j < 48 { q5k_row = q5k_row + string_from_byte((j * 13) & 255) }
+        else { q5k_row = q5k_row + string_from_byte((j * 17) & 255) }
+    }
+    b5 := tensor.read_q5_k(&q5k_row, 0) >>>
+    $d5_arr := []f32{}
+    b5.append_f32($&d5_arr)
+    if d5_arr.len != 256 { << 37 }
+    for idx in 0:256 {
+        if math.abs(f64(d5_arr[idx] - b5.at(idx) >>>)) > 1e-6 { << 38 }
+    }
+    dq5_b := b5.dot_f32(&k_x, 0)
+    dq5_f := tensor.dot_q5_k_row_f32(&q5k_row, 0, &k_x, 0, 1) >>>
+    dq5_i := tensor.dot_q5_k_q8_k_row_f32(&q5k_row, 0, &qk_qs, &qk_d, &qk_bs, 1) >>>
+    if math.abs(f64(dq5_b - dq5_f)) > 1e-4 { << 39 }
+    if math.abs(f64(dq5_f - dq5_i)) > 0.01 * (1.0 + math.abs(f64(dq5_f))) { << 40 }
+    println("Q5K_F:" + str(math.float32_bits(f64(dq5_f))))
+    << 0
+}
+
 fn bits(v f32) int { << math.float32_bits(f64(v)) }
 
 fn main() int {
@@ -601,6 +706,187 @@ fn main() int {
     tensor.quantize_q4_0_row(&qx, $&q4p, $&q4sc, qn)
     for i in 0:q4p.len { println("Q4P:" + str(i) + ":" + str(int(q4p[i]))) }
     for b_i in 0:q4sc.len { println("Q4S:" + str(b_i) + ":" + str(bits(q4sc[b_i]))) }
+
+    // geglu_f32 parity with gelu(a) * b
+    $geglu_out := []f32{}
+    for _ in 0:n { geglu_out.push(f32(0)) }
+    tensor.geglu_f32($&geglu_out, &a, &b, n)
+    for i in 0:n {
+        if math.abs(f64(geglu_out[i] - gelu_out[i] * b[i])) > 1e-6 { << 21 }
+    }
+
+    // log_softmax_f32: exp(log_softmax) sums to 1.0
+    $lsm := []f32{}
+    for i in 0:n { lsm.push(a[i]) }
+    tensor.log_softmax_f32($&lsm, n)
+    $lsm_sum := 0.0
+    for i in 0:n {
+        if f64(lsm[i]) > 0.0 { << 22 }
+        lsm_sum += math.exp(f64(lsm[i]))
+    }
+    if math.abs(lsm_sum - 1.0) > 1e-5 { << 23 }
+
+    // rope_interleaved_f32 matches rotating (2*j, 2*j+1) pairs manually
+    $ri := []f32{}
+    for i in 0:16 { ri.push(f32(f64((i * 5 + 3) % 13 - 6) * 0.25)) }
+    $ri_copy := []f32{}
+    for i in 0:16 { ri_copy.push(ri[i]) }
+    tensor.rope_interleaved_f32($&ri, 2, 8, 5, 10000.0)
+    // Check head 0 pair (0,1) at angle=5.0
+    c0 := f32(math.cos(5.0))
+    s0 := f32(math.sin(5.0))
+    exp0 := f32(ri_copy[0] * c0 - ri_copy[1] * s0)
+    exp1 := f32(ri_copy[0] * s0 + ri_copy[1] * c0)
+    if math.abs(f64(ri[0] - exp0)) > 1e-6 || math.abs(f64(ri[1] - exp1)) > 1e-6 { << 24 }
+
+    // add_rmsnorm_f32 parity with separate add + rmsnorm_f32
+    $res_out := []f32{}
+    $anorm_out := []f32{}
+    $add_ref := []f32{}
+    $anorm_ref := []f32{}
+    for i in 0:n {
+        res_out.push(f32(0))
+        anorm_out.push(f32(0))
+        add_ref.push(a[i] + b[i])
+        anorm_ref.push(f32(0))
+    }
+    tensor.add_rmsnorm_f32($&anorm_out, $&res_out, &a, &b, &w, n, 1e-5)
+    tensor.rmsnorm_f32($&anorm_ref, &add_ref, &w, n, 1e-5)
+    for i in 0:n {
+        if math.abs(f64(res_out[i] - add_ref[i])) > 1e-6 { << 25 }
+        if math.abs(f64(anorm_out[i] - anorm_ref[i])) > 1e-5 { << 26 }
+    }
+
+    // topk_f32 + moe_router_f32 (Softmax & Sigmoid + bias)
+    logits := [f32(0.2), f32(2.0), f32(-1.0), f32(1.0)]
+    bias4 := [f32(0.0), f32(0.0), f32(0.0), f32(0.0)]
+    $t_idx := [0, 0]
+    $t_val := [f32(0), f32(0)]
+    picked := tensor.topk_f32(&logits, 4, 2, $&t_idx, $&t_val)
+    if picked != 2 || t_idx[0] != 1 || t_idx[1] != 3 { << 27 }
+    $r_idx := [0, 0]
+    $r_w := [f32(0), f32(0)]
+    r_cnt := tensor.moe_router_f32(&logits, 4, 2, false, true, 1.0, &[]f32{}, $&r_idx, $&r_w)
+    if r_cnt != 2 || r_idx[0] != 1 || r_idx[1] != 3 { << 28 }
+    if math.abs(f64(r_w[0] + r_w[1]) - 1.0) > 1e-5 { << 29 }
+    // Sigmoid + bias favoring expert 2
+    bias_push := [f32(0.0), f32(0.0), f32(2.0), f32(0.0)]
+    $sb_idx := [0, 0]
+    $sb_w := [f32(0), f32(0)]
+    _ := tensor.moe_router_f32(&logits, 4, 2, true, false, 2.5, &bias_push, $&sb_idx, $&sb_w)
+    if sb_idx[0] != 2 || sb_idx[1] != 1 { << 30 }
+
+    // rope_yarn_f32 with scale=1.0, orig_ctx=0 reduces to rope_f32 / rope_interleaved_f32
+    $yr := []f32{}
+    $yr_ref := []f32{}
+    for i in 0:16 {
+        v := f32(f64((i * 5 + 3) % 13 - 6) * 0.25)
+        yr.push(v)
+        yr_ref.push(v)
+    }
+    tensor.rope_yarn_f32($&yr, 2, 8, 8, false, 5, 10000.0, 1.0, 0, 32.0, 1.0, 1.0)
+    tensor.rope_f32($&yr_ref, 2, 8, 5, 10000.0)
+    for i in 0:16 {
+        if math.abs(f64(yr[i] - yr_ref[i])) > 1e-5 { << 31 }
+    }
+    // YaRN scaling active test
+    $yr2 := []f32{}
+    for i in 0:16 { yr2.push(f32(f64(i + 1) * 0.1)) }
+    tensor.rope_yarn_f32($&yr2, 2, 8, 4, true, 12, 10000.0, 4.0, 32, 32.0, 1.0, 0.0)
+    if math.abs(f64(yr2[0])) <= 0.0 { << 32 }
+
+    // topk_cosine_f32
+    q_cos := [f32(1.0), f32(0.0)]
+    c_cos := [f32(0.0), f32(1.0), f32(1.0), f32(1.0), f32(2.0), f32(0.0)]
+    $c_idx := [0, 0]
+    $c_sc := [f32(0), f32(0)]
+    c_picked := tensor.topk_cosine_f32(&q_cos, &c_cos, 3, 2, 2, $&c_idx, $&c_sc)
+    if c_picked != 2 || c_idx[0] != 2 || c_idx[1] != 1 { << 33 }
+
+    code := check_q8_k() >>> (e) {
+        _ := e
+        << 36
+    }
+    if code != 0 { << code }
+
+    // cross_entropy_grad_f32, adamw_step_f32, lora_add_f32
+    ce_logits := [f32(1.0), f32(2.5), f32(-0.5)]
+    $ce_grad := [f32(0), f32(0), f32(0)]
+    ce_loss := tensor.cross_entropy_grad_f32($&ce_grad, &ce_logits, 1, 3)
+    println("CE_LOSS:" + str(math.float32_bits(f64(ce_loss))))
+    println("CE_G0:" + str(math.float32_bits(f64(ce_grad[0]))))
+    println("CE_G1:" + str(math.float32_bits(f64(ce_grad[1]))))
+    println("CE_G2:" + str(math.float32_bits(f64(ce_grad[2]))))
+
+    $aparam := [f32(1.0), f32(-2.0)]
+    agrad := [f32(0.5), f32(-0.25)]
+    $am := [f32(0.0), f32(0.0)]
+    $av := [f32(0.0), f32(0.0)]
+    tensor.adamw_step_f32($&aparam, &agrad, $&am, $&av, 2, f32(0.1), f32(0.9), f32(0.999), f32(1e-8), f32(0.01), 1)
+    println("ADAMW_P0:" + str(math.float32_bits(f64(aparam[0]))))
+    println("ADAMW_P1:" + str(math.float32_bits(f64(aparam[1]))))
+
+    $lout := [f32(0.25), f32(-0.5)]
+    lx := [f32(2.0), f32(-1.0), f32(0.5)]
+    la := [f32(1.0), f32(0.0), f32(-2.0), f32(0.5), f32(3.0), f32(1.0)]
+    lb := [f32(2.0), f32(-1.0), f32(0.5), f32(4.0)]
+    tensor.lora_add_f32($&lout, &lx, &la, &lb, 2, 3, 2, f32(0.5))
+    println("LORA_0:" + str(math.float32_bits(f64(lout[0]))))
+    println("LORA_1:" + str(math.float32_bits(f64(lout[1]))))
+
+    // lora_backward_f32, rmsnorm_backward_f32, swiglu_backward_f32
+    ldy := [f32(1.5), f32(-2.0)]
+    $ldx := [f32(0), f32(0), f32(0)]
+    $lda := [f32(0), f32(0), f32(0), f32(0), f32(0), f32(0)]
+    $ldb := [f32(0), f32(0), f32(0), f32(0)]
+    tensor.lora_backward_f32($&ldx, $&lda, $&ldb, &ldy, &lx, &la, &lb, 2, 3, 2, 0.5)
+    for i in 0:3 { println("LB_DX" + str(i) + ":" + str(math.float32_bits(f64(ldx[i])))) }
+    for i in 0:6 { println("LB_DA" + str(i) + ":" + str(math.float32_bits(f64(lda[i])))) }
+    for i in 0:4 { println("LB_DB" + str(i) + ":" + str(math.float32_bits(f64(ldb[i])))) }
+
+    rx := [f32(1.0), f32(-2.0), f32(0.5), f32(3.0)]
+    rw := [f32(0.5), f32(1.5), f32(2.0), f32(-1.0)]
+    rdy := [f32(0.25), f32(-0.5), f32(1.0), f32(0.75)]
+    $rdx := [f32(0), f32(0), f32(0), f32(0)]
+    $rdw := [f32(0), f32(0), f32(0), f32(0)]
+    tensor.rmsnorm_backward_f32($&rdx, $&rdw, &rdy, &rx, &rw, 4, 1e-5)
+    for i in 0:4 { println("RMS_DX" + str(i) + ":" + str(math.float32_bits(f64(rdx[i])))) }
+    for i in 0:4 { println("RMS_DW" + str(i) + ":" + str(math.float32_bits(f64(rdw[i])))) }
+
+    sg := [f32(-1.2), f32(0.8)]
+    su := [f32(2.0), f32(-1.5)]
+    sdy := [f32(0.75), f32(1.25)]
+    $sdg := [f32(0), f32(0)]
+    $sdu := [f32(0), f32(0)]
+    tensor.swiglu_backward_f32($&sdg, $&sdu, &sdy, &sg, &su, 2)
+    for i in 0:2 { println("SWI_DG" + str(i) + ":" + str(math.float32_bits(f64(sdg[i])))) }
+    for i in 0:2 { println("SWI_DU" + str(i) + ":" + str(math.float32_bits(f64(sdu[i])))) }
+
+    // layernorm_backward_f32, softmax_backward_f32, grad_clip_norm_f32
+    $lndx := [f32(0), f32(0), f32(0), f32(0)]
+    $lndw := [f32(0), f32(0), f32(0), f32(0)]
+    $lndb := [f32(0), f32(0), f32(0), f32(0)]
+    tensor.layernorm_backward_f32($&lndx, $&lndw, $&lndb, &rdy, &rx, &rw, 4, 1e-5)
+    for i in 0:4 {
+        println("LN_DX" + str(i) + ":" + str(math.float32_bits(f64(lndx[i]))))
+        println("LN_DW" + str(i) + ":" + str(math.float32_bits(f64(lndw[i]))))
+        println("LN_DB" + str(i) + ":" + str(math.float32_bits(f64(lndb[i]))))
+    }
+
+    $sm_p := [f32(1.0), f32(2.0), f32(-1.0)]
+    tensor.softmax_f32($&sm_p, 3, f32(1.0))
+    sm_dy := [f32(0.5), f32(-1.25), f32(2.0)]
+    $sm_dx := [f32(0), f32(0), f32(0)]
+    tensor.softmax_backward_f32($&sm_dx, &sm_dy, &sm_p, 3)
+    for i in 0:3 { println("SM_DX" + str(i) + ":" + str(math.float32_bits(f64(sm_dx[i])))) }
+
+    $gc := [f32(3.0), f32(4.0), f32(0.0)]
+    gc_norm := tensor.grad_clip_norm_f32($&gc, 3, f32(2.5))
+    println("GC_NORM:" + str(math.float32_bits(f64(gc_norm))))
+    for i in 0:3 { println("GC_G" + str(i) + ":" + str(math.float32_bits(f64(gc[i])))) }
+
+    println("ROUND3:OK")
+    _ := bias4
     << 0
 }
 """
@@ -623,6 +909,148 @@ def check_ops(compiler, env, work):
     assert abs(l2_norm_sq - 1.0) < 1e-5, l2_norm_sq
     cos_self = bits_to_f32(int(kv["COSSELF"]))
     assert abs(cos_self - 1.0) < 1e-5, cos_self
+    assert kv.get("ROUND3") == "OK", kv
+
+    # Verify cross_entropy_grad_f32 parity
+    ce_l = [1.0, 2.5, -0.5]
+    mx = max(ce_l)
+    exps = [math.exp(v - mx) for v in ce_l]
+    sm = sum(exps)
+    probs = [e / sm for e in exps]
+    ref_loss = math.log(sm) + mx - ce_l[1]
+    assert abs(bits_to_f32(int(kv["CE_LOSS"])) - ref_loss) < 1e-5
+    for idx, kname in enumerate(["CE_G0", "CE_G1", "CE_G2"]):
+        want = probs[idx] - (1.0 if idx == 1 else 0.0)
+        assert abs(bits_to_f32(int(kv[kname])) - want) < 1e-5, (kname, bits_to_f32(int(kv[kname])), want)
+
+    # Verify adamw_step_f32 parity (step=1, m=0, v=0)
+    lr, b1, b2, eps, wd = 0.1, 0.9, 0.999, 1e-8, 0.01
+    for p_init, g_val, kname in [(1.0, 0.5, "ADAMW_P0"), (-2.0, -0.25, "ADAMW_P1")]:
+        m_hat = g_val
+        v_hat = g_val * g_val
+        want_p = p_init * (1.0 - lr * wd) - lr * m_hat / (math.sqrt(v_hat) + eps)
+        assert abs(bits_to_f32(int(kv[kname])) - want_p) < 1e-5, (kname, bits_to_f32(int(kv[kname])), want_p)
+
+    # Verify lora_add_f32 parity
+    lx = [2.0, -1.0, 0.5]
+    la = [[1.0, 0.0, -2.0], [0.5, 3.0, 1.0]]
+    lb = [[2.0, -1.0], [0.5, 4.0]]
+    h = [sum(row[c] * lx[c] for c in range(3)) for row in la]
+    lout_ref = [0.25 + 0.5 * (lb[0][0] * h[0] + lb[0][1] * h[1]), -0.5 + 0.5 * (lb[1][0] * h[0] + lb[1][1] * h[1])]
+    assert abs(bits_to_f32(int(kv["LORA_0"])) - lout_ref[0]) < 1e-5
+    assert abs(bits_to_f32(int(kv["LORA_1"])) - lout_ref[1]) < 1e-5
+
+    # Verify lora_backward_f32 against analytic & finite-difference gradients
+    ldy = [1.5, -2.0]
+    dh = [0.5 * sum(lb[i][r] * ldy[i] for i in range(2)) for r in range(2)]
+    want_dx = [sum(la[r][j] * dh[r] for r in range(2)) for j in range(3)]
+    for j in range(3):
+        assert abs(bits_to_f32(int(kv[f"LB_DX{j}"])) - want_dx[j]) < 1e-5
+    for r in range(2):
+        for j in range(3):
+            want_da = dh[r] * lx[j]
+            assert abs(bits_to_f32(int(kv[f"LB_DA{r * 3 + j}"])) - want_da) < 1e-5
+    for i in range(2):
+        for r in range(2):
+            want_db = 0.5 * ldy[i] * h[r]
+            assert abs(bits_to_f32(int(kv[f"LB_DB{i * 2 + r}"])) - want_db) < 1e-5
+
+    # Verify rmsnorm_backward_f32 against central finite differences
+    rx, rw, rdy = [1.0, -2.0, 0.5, 3.0], [0.5, 1.5, 2.0, -1.0], [0.25, -0.5, 1.0, 0.75]
+    def rms_loss(vx, vw):
+        inv = 1.0 / math.sqrt(sum(v * v for v in vx) / 4.0 + 1e-5)
+        return sum(rdy[i] * (vx[i] * inv * vw[i]) for i in range(4))
+    h_fd = 1e-5
+    for i in range(4):
+        xp, xm = list(rx), list(rx)
+        xp[i] += h_fd
+        xm[i] -= h_fd
+        fd_dx = (rms_loss(xp, rw) - rms_loss(xm, rw)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"RMS_DX{i}"])) - fd_dx) < 1e-4, (i, bits_to_f32(int(kv[f"RMS_DX{i}"])), fd_dx)
+        wp, wm = list(rw), list(rw)
+        wp[i] += h_fd
+        wm[i] -= h_fd
+        fd_dw = (rms_loss(rx, wp) - rms_loss(rx, wm)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"RMS_DW{i}"])) - fd_dw) < 1e-4, (i, bits_to_f32(int(kv[f"RMS_DW{i}"])), fd_dw)
+
+    # Verify swiglu_backward_f32 against central finite differences
+    sg, su, sdy = [-1.2, 0.8], [2.0, -1.5], [0.75, 1.25]
+    for i in range(2):
+        def swi(g, u):
+            return sdy[i] * (g / (1.0 + math.exp(-g))) * u
+        fd_dg = (swi(sg[i] + h_fd, su[i]) - swi(sg[i] - h_fd, su[i])) / (2.0 * h_fd)
+        fd_du = (swi(sg[i], su[i] + h_fd) - swi(sg[i], su[i] - h_fd)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"SWI_DG{i}"])) - fd_dg) < 1e-4
+        assert abs(bits_to_f32(int(kv[f"SWI_DU{i}"])) - fd_du) < 1e-4
+
+    # Verify Q5_K dequant dot parity vs Python block_q5_K
+    kx_py = [float((i % 29) - 14) * 0.125 for i in range(256)]
+    q5k_bytes = bytearray(176)
+    q5k_bytes[0], q5k_bytes[1] = 0x00, 0x3c  # d=1.0
+    q5k_bytes[2], q5k_bytes[3] = 0x00, 0x38  # dmin=0.5
+    for j in range(4, 16):
+        q5k_bytes[j] = 1 + (j % 3)
+    for j in range(16, 48):
+        q5k_bytes[j] = (j * 13) & 255
+    for j in range(48, 176):
+        q5k_bytes[j] = (j * 17) & 255
+    sc_b = q5k_bytes[4:16]
+    qh_b = q5k_bytes[16:48]
+    qs_b = q5k_bytes[48:176]
+    want_q5k = 0.0
+    for chunk in range(4):
+        is0 = chunk * 2
+        is1 = is0 + 1
+        sc1 = (sc_b[is0] & 63) if chunk < 2 else ((sc_b[is0 + 4] & 15) | (((sc_b[is0 - 4] >> 6) & 3) << 4))
+        m1 = (sc_b[is0 + 4] & 63) if chunk < 2 else (((sc_b[is0 + 4] >> 4) & 15) | (((sc_b[is0] >> 6) & 3) << 4))
+        sc2 = (sc_b[is1] & 63) if chunk < 2 else ((sc_b[is1 + 4] & 15) | (((sc_b[is1 - 4] >> 6) & 3) << 4))
+        m2 = (sc_b[is1 + 4] & 63) if chunk < 2 else (((sc_b[is1 + 4] >> 4) & 15) | (((sc_b[is1] >> 6) & 3) << 4))
+        for l in range(32):
+            qb = qs_b[chunk * 32 + l]
+            hb = qh_b[l]
+            q0 = (qb & 15) | (((hb >> (chunk * 2)) & 1) << 4)
+            q1 = ((qb >> 4) & 15) | (((hb >> (chunk * 2 + 1)) & 1) << 4)
+            want_q5k += (1.0 * sc1 * q0 - 0.5 * m1) * kx_py[chunk * 64 + l]
+            want_q5k += (1.0 * sc2 * q1 - 0.5 * m2) * kx_py[chunk * 64 + 32 + l]
+    assert abs(bits_to_f32(int(kv["Q5K_F"])) - want_q5k) < 1e-4, (bits_to_f32(int(kv["Q5K_F"])), want_q5k)
+
+    # Verify layernorm_backward_f32 against central finite differences
+    def ln_loss(vx, vw):
+        mu = sum(vx) / 4.0
+        inv = 1.0 / math.sqrt(sum((v - mu) ** 2 for v in vx) / 4.0 + 1e-5)
+        return sum(rdy[i] * ((vx[i] - mu) * inv * vw[i]) for i in range(4))
+    for i in range(4):
+        xp, xm = list(rx), list(rx)
+        xp[i] += h_fd
+        xm[i] -= h_fd
+        fd_dx = (ln_loss(xp, rw) - ln_loss(xm, rw)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"LN_DX{i}"])) - fd_dx) < 1e-4
+        wp, wm = list(rw), list(rw)
+        wp[i] += h_fd
+        wm[i] -= h_fd
+        fd_dw = (ln_loss(rx, wp) - ln_loss(rx, wm)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"LN_DW{i}"])) - fd_dw) < 1e-4
+        assert abs(bits_to_f32(int(kv[f"LN_DB{i}"])) - rdy[i]) < 1e-5
+
+    # Verify softmax_backward_f32 against finite differences
+    sm_x, sm_dy = [1.0, 2.0, -1.0], [0.5, -1.25, 2.0]
+    def sm_loss(vx):
+        mx = max(vx)
+        ex = [math.exp(v - mx) for v in vx]
+        s = sum(ex)
+        return sum((ex[j] / s) * sm_dy[j] for j in range(3))
+    for i in range(3):
+        xp, xm = list(sm_x), list(sm_x)
+        xp[i] += h_fd
+        xm[i] -= h_fd
+        fd_sdx = (sm_loss(xp) - sm_loss(xm)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"SM_DX{i}"])) - fd_sdx) < 1e-4
+
+    # Verify grad_clip_norm_f32
+    assert abs(bits_to_f32(int(kv["GC_NORM"])) - 5.0) < 1e-5
+    assert abs(bits_to_f32(int(kv["GC_G0"])) - 1.5) < 1e-5
+    assert abs(bits_to_f32(int(kv["GC_G1"])) - 2.0) < 1e-5
+    assert abs(bits_to_f32(int(kv["GC_G2"])) - 0.0) < 1e-5
     parts = re.split(r"(?m)^fn _xu_tensor_(\w+) ", mir)
     funcs = {name: body.split("\nBuild complete:", 1)[0] for name, body in zip(parts[1::2], parts[2::2])}
     expected_calls = {

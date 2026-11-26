@@ -217,6 +217,79 @@ def quantize_q4_k_matrix(vals):
     return bytes(raw), dequant
 
 
+def quantize_q5_k_matrix(vals):
+    assert len(vals) % 256 == 0
+    nb = len(vals) // 256
+    raw = bytearray()
+    dequant = []
+    for b in range(nb):
+        blk = vals[b * 256:(b + 1) * 256]
+        sub_scales = []
+        sub_mins = []
+        q_subs = []
+        for s in range(8):
+            sub = blk[s * 32:(s + 1) * 32]
+            lo = min(0.0, min(sub))
+            hi = max(sub)
+            rng = max(hi - lo, 0.0)
+            sc = rng / 31.0 if rng > 0.0 else 0.0
+            mn = -lo
+            sub_scales.append(sc)
+            sub_mins.append(mn)
+            q_subs.append(sub)
+        max_sc = max(sub_scales) if sub_scales else 0.0
+        max_mn = max(sub_mins) if sub_mins else 0.0
+        d = f32(max_sc / 63.0) if max_sc > 0.0 else 0.0
+        dmin = f32(max_mn / 63.0) if max_mn > 0.0 else 0.0
+        d16_b = struct.pack("<e", d)
+        dmin16_b = struct.pack("<e", dmin)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        dmin16 = f32(struct.unpack("<e", dmin16_b)[0])
+        raw.extend(d16_b)
+        raw.extend(dmin16_b)
+
+        sc_q = [min(63, max(0, int(round(s / d16)))) if d16 > 0.0 else 0 for s in sub_scales]
+        mn_q = [min(63, max(0, int(round(m / dmin16)))) if dmin16 > 0.0 else 0 for m in sub_mins]
+        scales_b = bytearray(12)
+        for j in range(4):
+            scales_b[j] = sc_q[j] & 63
+            scales_b[j + 4] = mn_q[j] & 63
+        for j in range(4, 8):
+            scales_b[j + 4] = (sc_q[j] & 15) | ((mn_q[j] & 15) << 4)
+            scales_b[j - 4] |= ((sc_q[j] >> 4) & 3) << 6
+            scales_b[j] |= ((mn_q[j] >> 4) & 3) << 6
+        raw.extend(scales_b)
+
+        qh_b = bytearray(32)
+        qs_b = bytearray(128)
+        for chunk in range(4):
+            s_lo = chunk * 2
+            s_hi = s_lo + 1
+            d1 = f32(d16 * sc_q[s_lo])
+            m1 = f32(dmin16 * mn_q[s_lo])
+            d2 = f32(d16 * sc_q[s_hi])
+            m2 = f32(dmin16 * mn_q[s_hi])
+            sub_lo = q_subs[s_lo]
+            sub_hi = q_subs[s_hi]
+            ql_vals = []
+            qh_vals = []
+            for l in range(32):
+                q0 = min(31, max(0, int(round((sub_lo[l] + m1) / d1)))) if d1 > 0.0 else 0
+                q1 = min(31, max(0, int(round((sub_hi[l] + m2) / d2)))) if d2 > 0.0 else 0
+                qs_b[chunk * 32 + l] = (q0 & 15) | ((q1 & 15) << 4)
+                if q0 & 16:
+                    qh_b[l] |= 1 << (chunk * 2)
+                if q1 & 16:
+                    qh_b[l] |= 1 << (chunk * 2 + 1)
+                ql_vals.append(f32(f32(d1 * q0) - m1))
+                qh_vals.append(f32(f32(d2 * q1) - m2))
+            dequant.extend(ql_vals)
+            dequant.extend(qh_vals)
+        raw.extend(qh_b)
+        raw.extend(qs_b)
+    return bytes(raw), dequant
+
+
 def quantize_q6_k_matrix(vals):
     assert len(vals) % 256 == 0
     nb = len(vals) // 256
@@ -295,7 +368,8 @@ def quantize_q5_0_matrix(vals):
 
 def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_output=False,
                     encode_dense=None, merges=None, vocab_pieces=None, qk_norms=None,
-                    kquant_mode=False, quant_mode=None, tok_model=None):
+                    kquant_mode=False, quant_mode=None, tok_model=None,
+                    arch_name=None, extra_kv=None, post_norms=None, return_q8_all=False, moe=None):
     dim = cfg["dim"]
     hidden = cfg["hidden_dim"]
     n_layers = cfg["n_layers"]
@@ -305,7 +379,7 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
     kv_dim = n_kv * head_dim
     vocab = cfg["vocab_size"]
 
-    arch = "qwen2" if qwen_mode else "llama"
+    arch = arch_name if arch_name is not None else ("qwen2" if qwen_mode else "llama")
     if vocab_pieces is None:
         vocab_pieces = []
         if qwen_mode:
@@ -347,6 +421,8 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
             "tokenizer.ggml.merges", 9,
             struct.pack("<IQ", 8, len(merges)) + b"".join(pack_gguf_str(m) for m in merges),
         ))
+    if extra_kv:
+        kv_entries.extend(extra_kv)
 
     tensor_specs = []
     q4_data = {}
@@ -389,9 +465,15 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         tensor_specs.append((gname, dims, 6, raw))
         dequant_data[gname] = dq
 
+    def add_q5k(gname, dims, vals):
+        raw, dq = quantize_q5_k_matrix(vals)
+        tensor_specs.append((gname, dims, 13, raw))
+        dequant_data[gname] = dq
+
     def add_q8_dq(gname, dims, vals):
         raw, qs, sc = quantize_q8_0_matrix(vals)
         tensor_specs.append((gname, dims, 8, raw))
+        q8_data[gname] = (qs, sc)
         dequant_data[gname] = [f32(qs[i] * sc[i // 32]) for i in range(len(vals))]
 
     def add_matrix(gname, st_key, dims, vals):
@@ -402,17 +484,29 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
                 add_q4k(gname, dims, vals)
         elif quant_mode == "q5_0":
             add_q5(gname, dims, vals)
+        elif quant_mode == "q5_k":
+            add_q5k(gname, dims, vals)
         elif quant_mode == "q8_0":
             add_q8_dq(gname, dims, vals)
+        elif quant_mode == "f32":
+            add_f32(gname, dims, vals)
+            dequant_data[gname] = [f32(v) for v in vals]
         elif encode_dense is not None:
             add_dense(gname, st_key, dims, vals)
         else:
             add_q4(gname, dims, vals)
 
+    def add_f16_dequant(gname, dims, vals):
+        raw = struct.pack(f"<{len(vals)}e", *[float(v) for v in vals])
+        tensor_specs.append((gname, dims, 1, raw))
+        dequant_data[gname] = [f32(struct.unpack("<e", struct.pack("<e", float(v)))[0]) for v in vals]
+
     if kquant_mode:
         add_q6k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif quant_mode == "q5_0":
         add_q5("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q5_k":
+        add_q5k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif quant_mode == "q8_0":
         add_q8_dq("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif encode_dense is not None:
@@ -435,19 +529,73 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         if qk_norms is not None:
             add_f32(gp + "attn_q_norm.weight", [head_dim], qk_norms[l][0])
             add_f32(gp + "attn_k_norm.weight", [head_dim], qk_norms[l][1])
-        add_matrix(gp + "attn_output.weight", p + "self_attn.o_proj.weight", [dim, dim], tensors[p + "self_attn.o_proj.weight"][1])
+        add_dense(gp + "attn_output.weight", p + "self_attn.o_proj.weight", [dim, dim], tensors[p + "self_attn.o_proj.weight"][1]) if False else add_matrix(gp + "attn_output.weight", p + "self_attn.o_proj.weight", [dim, dim], tensors[p + "self_attn.o_proj.weight"][1])
+        if post_norms is not None:
+            add_f32(gp + "post_attention_norm.weight", [dim], post_norms[l][0])
+            add_f32(gp + "ffn_post_norm.weight", [dim], post_norms[l][1])
         add_dense(gp + "ffn_norm.weight", p + "post_attention_layernorm.weight", [dim], tensors[p + "post_attention_layernorm.weight"][1])
-        add_matrix(gp + "ffn_gate.weight", p + "mlp.gate_proj.weight", [dim, hidden], tensors[p + "mlp.gate_proj.weight"][1])
-        add_matrix(gp + "ffn_up.weight", p + "mlp.up_proj.weight", [dim, hidden], tensors[p + "mlp.up_proj.weight"][1])
-        add_matrix(gp + "ffn_down.weight", p + "mlp.down_proj.weight", [hidden, dim], tensors[p + "mlp.down_proj.weight"][1])
+        if moe is not None and l < len(moe["layers"]):
+            ml = moe["layers"][l]
+            exp_cnt = moe["expert_count"]
+            exp_h = moe["expert_hidden_dim"]
+            if moe.get("router_f16"):
+                add_f16_dequant(gp + "ffn_gate_inp.weight", [dim, exp_cnt], ml["gate_inp"])
+            else:
+                add_f32(gp + "ffn_gate_inp.weight", [dim, exp_cnt], ml["gate_inp"])
+                dequant_data[gp + "ffn_gate_inp.weight"] = [f32(v) for v in ml["gate_inp"]]
+            if ml.get("bias") is not None:
+                add_f32(gp + "ffn_exp_probs_b.bias", [exp_cnt], ml["bias"])
+            if moe.get("packed_3d"):
+                for kind, key, dims3 in (
+                    ("ffn_gate_exps.weight", "w1_exps", [dim, exp_h, exp_cnt]),
+                    ("ffn_up_exps.weight", "w3_exps", [dim, exp_h, exp_cnt]),
+                    ("ffn_down_exps.weight", "w2_exps", [exp_h, dim, exp_cnt]),
+                ):
+                    raw_all = bytearray()
+                    base_k = kind.replace("_exps.weight", "")
+                    for e_i, evals in enumerate(ml[key]):
+                        ekey = f"{gp}{base_k}.{e_i}.weight"
+                        if quant_mode == "f32":
+                            raw_all.extend(struct.pack(f"<{len(evals)}f", *evals))
+                            dequant_data[ekey] = [f32(v) for v in evals]
+                        else:
+                            eraw, eqs, esc = quantize_q4_0_matrix(evals)
+                            raw_all.extend(eraw)
+                            q4_data[ekey] = (eqs, esc)
+                    tensor_specs.append((gp + kind, dims3, 0 if quant_mode == "f32" else 2, bytes(raw_all)))
+            else:
+                for e_i in range(exp_cnt):
+                    add_matrix(f"{gp}ffn_gate.{e_i}.weight", "", [dim, exp_h], ml["w1_exps"][e_i])
+                    add_matrix(f"{gp}ffn_up.{e_i}.weight", "", [dim, exp_h], ml["w3_exps"][e_i])
+                    add_matrix(f"{gp}ffn_down.{e_i}.weight", "", [exp_h, dim], ml["w2_exps"][e_i])
+            if moe.get("shared_hidden_dim", 0) > 0:
+                sh_h = moe["shared_hidden_dim"]
+                add_matrix(gp + "ffn_gate_shexp.weight", "", [dim, sh_h], ml["sh_w1"])
+                add_matrix(gp + "ffn_up_shexp.weight", "", [dim, sh_h], ml["sh_w3"])
+                add_matrix(gp + "ffn_down_shexp.weight", "", [sh_h, dim], ml["sh_w2"])
+                if ml.get("sh_gate_inp") is not None:
+                    if moe.get("router_f16"):
+                        add_f16_dequant(gp + "ffn_gate_inp_shexp.weight", [dim, 1], ml["sh_gate_inp"])
+                    else:
+                        add_f32(gp + "ffn_gate_inp_shexp.weight", [dim, 1], ml["sh_gate_inp"])
+                        dequant_data[gp + "ffn_gate_inp_shexp.weight"] = [f32(v) for v in ml["sh_gate_inp"]]
+        else:
+            add_matrix(gp + "ffn_gate.weight", p + "mlp.gate_proj.weight", [dim, hidden], tensors[p + "mlp.gate_proj.weight"][1])
+            add_matrix(gp + "ffn_up.weight", p + "mlp.up_proj.weight", [dim, hidden], tensors[p + "mlp.up_proj.weight"][1])
+            add_matrix(gp + "ffn_down.weight", p + "mlp.down_proj.weight", [hidden, dim], tensors[p + "mlp.down_proj.weight"][1])
     add_dense("output_norm.weight", "norm.weight", [dim], tensors["norm.weight"][1])
     if not tied_output:
         if kquant_mode:
             add_q6k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif quant_mode == "q5_0":
             add_q5("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q5_k":
+            add_q5k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif quant_mode == "q8_0":
             add_q8_dq("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "f32":
+            add_f32("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+            dequant_data["output.weight"] = [f32(v) for v in tensors["lm_head.weight"][1]]
         elif encode_dense is not None:
             add_dense("output.weight", "lm_head.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif qwen_mode:
@@ -479,7 +627,9 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
     buf.extend(b"\x00" * pad)
     buf.extend(payload)
     path.write_bytes(buf)
-    if kquant_mode or quant_mode in ("q5_0", "q8_0"):
+    if return_q8_all:
+        return dequant_data, q8_data
+    if kquant_mode or quant_mode in ("q5_0", "q5_k", "q8_0", "f32"):
         return dequant_data, None
     return q4_data, q8_data if qwen_mode else None
 
@@ -593,20 +743,49 @@ def py_dequantize_q4_0(qs, scales):
     return out
 
 
-def py_rope(vec, n_heads, head_dim, pos, theta):
+def py_rope(vec, n_heads, head_dim, pos, theta, rope_dim=None, rope_interleaved=False, yarn=None):
     out = list(vec)
-    half = head_dim // 2
+    rdim = head_dim if rope_dim is None else rope_dim
+    half = rdim // 2
     log_theta = math.log(float(theta))
+    use_yarn = yarn is not None and yarn["scale"] > 1.0 and yarn["orig_ctx"] > 0
+    if use_yarn:
+        scale = float(yarn["scale"])
+        orig_ctx = int(yarn["orig_ctx"])
+        bfast = float(yarn.get("beta_fast", 32.0))
+        bslow = float(yarn.get("beta_slow", 1.0))
+        two_pi = 6.283185307179586
+        low = max(0.0, (rdim * math.log(orig_ctx / (bfast * two_pi))) / (2.0 * log_theta))
+        high = min(float(half - 1), (rdim * math.log(orig_ctx / (bslow * two_pi))) / (2.0 * log_theta))
+        if high <= low:
+            high = low + 0.001
+        af = float(yarn.get("attn_factor", 0.0))
+        mscale = af if af > 0.0 else (0.1 * math.log(scale) + 1.0)
     for j in range(half):
-        angle = pos * math.exp(-log_theta * ((2 * j) / head_dim))
-        c = f32(math.cos(angle))
-        s = f32(math.sin(angle))
+        if use_yarn:
+            f_ext = math.exp(-log_theta * ((2 * j) / rdim))
+            f_int = f_ext / scale
+            ramp = min(1.0, max(0.0, (j - low) / (high - low)))
+            gamma = 1.0 - ramp
+            angle = pos * ((1.0 - gamma) * f_int + gamma * f_ext)
+            c = f32(math.cos(angle) * mscale)
+            s = f32(math.sin(angle) * mscale)
+        else:
+            angle = pos * math.exp(-log_theta * ((2 * j) / rdim))
+            c = f32(math.cos(angle))
+            s = f32(math.sin(angle))
         for h in range(n_heads):
             off = h * head_dim
-            v0 = out[off + j]
-            v1 = out[off + j + half]
-            out[off + j] = f32(f32(v0 * c) - f32(v1 * s))
-            out[off + j + half] = f32(f32(v0 * s) + f32(v1 * c))
+            if rope_interleaved:
+                v0 = out[off + 2 * j]
+                v1 = out[off + 2 * j + 1]
+                out[off + 2 * j] = f32(f32(v0 * c) - f32(v1 * s))
+                out[off + 2 * j + 1] = f32(f32(v0 * s) + f32(v1 * c))
+            else:
+                v0 = out[off + j]
+                v1 = out[off + j + half]
+                out[off + j] = f32(f32(v0 * c) - f32(v1 * s))
+                out[off + j + half] = f32(f32(v0 * s) + f32(v1 * c))
     return out
 
 
@@ -622,7 +801,10 @@ def py_head_rmsnorm(vec, n_heads, head_dim, weight):
 
 
 def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_data=None,
-                   biases=None, qk_norms=None, dequant_data=None):
+                   biases=None, qk_norms=None, dequant_data=None,
+                   rope_dim=None, rope_interleaved=False, sliding_window=0,
+                   attn_softcap=0.0, final_softcap=0.0, use_geglu=False,
+                   embed_scale=1.0, post_norms=None, yarn=None, moe_cfg=None):
     dim = CFG["dim"]
     hidden = CFG["hidden_dim"]
     n_layers = CFG["n_layers"]
@@ -636,6 +818,10 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
     inv_sqrt_d = f32(1.0 / math.sqrt(head_dim))
 
     def proj(x, q8, st_name, gguf_name, rows, cols):
+        if q8_data is not None and gguf_name in q8_data and use_q8_act:
+            qs, sc = q8_data[gguf_name]
+            xq, xs = q8
+            return py_matvec_q8_0_q8_0(xq, xs, qs, sc, rows, cols)
         if dequant_data is not None and gguf_name in dequant_data:
             return py_matvec(x, dequant_data[gguf_name], rows, cols)
         if q8_data is not None and gguf_name in q8_data:
@@ -663,17 +849,28 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
     v_cache = [[] for _ in range(n_layers)]
     zeros = [0.0] * dim
 
+    def cap_attn(raw):
+        s = float(f32(raw * inv_sqrt_d))
+        if attn_softcap > 0.0:
+            return attn_softcap * math.tanh(s / attn_softcap)
+        return s
+
     tokens = []
     logits_out = []
     cur = prompt[0]
     total_steps = len(prompt) + max_gen - 1
+    esc = f32(embed_scale)
+    q8_layers = (q4_data is not None) or (q8_data is not None and "blk.0.attn_q.weight" in q8_data)
+    q8_head = q8_layers or (q8_data is not None and "output.weight" in q8_data)
     for step in range(total_steps):
         x = embed[cur * dim:(cur + 1) * dim]
+        if embed_scale != 1.0:
+            x = [f32(v * esc) for v in x]
         for l in range(n_layers):
             p = f"layers.{l}."
             gp = f"blk.{l}."
             xb = py_rmsnorm(x, zeros, tensors[p + "input_layernorm.weight"][1])
-            q8_xb = py_quantize_q8_0(xb) if (q4_data is not None and use_q8_act) else None
+            q8_xb = py_quantize_q8_0(xb) if (q8_layers and use_q8_act) else None
             q_raw = proj(xb, q8_xb, p + "self_attn.q_proj.weight", gp + "attn_q.weight", dim, dim)
             k_raw = proj(xb, q8_xb, p + "self_attn.k_proj.weight", gp + "attn_k.weight", kv_dim, dim)
             v = proj(xb, q8_xb, p + "self_attn.v_proj.weight", gp + "attn_v.weight", kv_dim, dim)
@@ -685,33 +882,34 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
             if qk_norms is not None:
                 q_raw = py_head_rmsnorm(q_raw, n_heads, head_dim, qk_norms[l][0])
                 k_raw = py_head_rmsnorm(k_raw, n_kv, head_dim, qk_norms[l][1])
-            q = py_rope(q_raw, n_heads, head_dim, step, theta)
-            k = py_rope(k_raw, n_kv, head_dim, step, theta)
+            q = py_rope(q_raw, n_heads, head_dim, step, theta, rope_dim=rope_dim, rope_interleaved=rope_interleaved, yarn=yarn)
+            k = py_rope(k_raw, n_kv, head_dim, step, theta, rope_dim=rope_dim, rope_interleaved=rope_interleaved, yarn=yarn)
             k_cache[l].append(k)
             v_cache[l].append(v)
 
+            win_start = max(0, step + 1 - sliding_window) if sliding_window > 0 else 0
             # Online Softmax 1-pass attention matching forward_token
             xb_att = [0.0] * dim
             for h in range(n_heads):
                 q_off = h * head_dim
                 kv_off = (h // kv_mul) * head_dim
-                k0 = k_cache[l][0]
-                v0 = v_cache[l][0]
+                k0 = k_cache[l][win_start]
+                v0 = v_cache[l][win_start]
                 acc0 = 0.0
                 for d in range(head_dim):
                     acc0 = f32(acc0 + f32(q[q_off + d] * k0[kv_off + d]))
-                m_val = float(f32(acc0 * inv_sqrt_d))
+                m_val = cap_attn(acc0)
                 l_val = 1.0
                 for d in range(head_dim):
                     xb_att[q_off + d] = v0[kv_off + d]
 
-                for t in range(1, step + 1):
+                for t in range(win_start + 1, step + 1):
                     kt = k_cache[l][t]
                     vt = v_cache[l][t]
                     acc = 0.0
                     for d in range(head_dim):
                         acc = f32(acc + f32(q[q_off + d] * kt[kv_off + d]))
-                    score = float(f32(acc * inv_sqrt_d))
+                    score = cap_attn(acc)
                     if score > m_val:
                         alpha = f32(math.exp(m_val - score))
                         for d in range(head_dim):
@@ -730,22 +928,90 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
                 for d in range(head_dim):
                     xb_att[q_off + d] = f32(xb_att[q_off + d] * inv_l)
 
-            q8_att = py_quantize_q8_0(xb_att) if (q4_data is not None and use_q8_act) else None
+            q8_att = py_quantize_q8_0(xb_att) if (q8_layers and use_q8_act) else None
             xb2 = proj(xb_att, q8_att, p + "self_attn.o_proj.weight", gp + "attn_output.weight", dim, dim)
+            if post_norms is not None:
+                xb2 = py_rmsnorm(xb2, zeros, post_norms[l][0])
             x = [f32(a + b) for a, b in zip(x, xb2)]
             xb = py_rmsnorm(x, zeros, tensors[p + "post_attention_layernorm.weight"][1])
-            q8_ffn = py_quantize_q8_0(xb) if (q4_data is not None and use_q8_act) else None
-            hb = proj(xb, q8_ffn, p + "mlp.gate_proj.weight", gp + "ffn_gate.weight", hidden, dim)
-            hb2 = proj(xb, q8_ffn, p + "mlp.up_proj.weight", gp + "ffn_up.weight", hidden, dim)
-            act = [f32(f32(g / (1.0 + math.exp(-g))) * u) for g, u in zip(hb, hb2)]
-            q8_act = py_quantize_q8_0(act) if (q4_data is not None and use_q8_act) else None
-            xb2 = proj(act, q8_act, p + "mlp.down_proj.weight", gp + "ffn_down.weight", dim, hidden)
+            if moe_cfg is not None:
+                exp_cnt = moe_cfg["expert_count"]
+                k_used = moe_cfg["expert_used_count"]
+                exp_h = moe_cfg["expert_hidden_dim"]
+                r_w = dequant_data[gp + "ffn_gate_inp.weight"]
+                r_logits = py_matvec(xb, None, 0, 0) if False else py_matvec(xb, r_w, exp_cnt, dim)
+                if moe_cfg.get("use_sigmoid"):
+                    scores = [f32(1.0 / (1.0 + math.exp(-float(v)))) for v in r_logits]
+                else:
+                    rmax = max(float(v) for v in r_logits)
+                    exps = [math.exp(float(v) - rmax) for v in r_logits]
+                    esum = sum(exps)
+                    scores = [f32(ev / esum) for ev in exps]
+                bias = moe_cfg["layers"][l].get("bias")
+                if bias is not None:
+                    pick_scores = [f32(scores[ei] + bias[ei]) for ei in range(exp_cnt)]
+                else:
+                    pick_scores = list(scores)
+                chosen = []
+                used = [False] * exp_cnt
+                for _ in range(k_used):
+                    bi = max((ei for ei in range(exp_cnt) if not used[ei]), key=lambda idx: pick_scores[idx])
+                    used[bi] = True
+                    chosen.append((bi, scores[bi]))
+                wscale = float(moe_cfg.get("weights_scale", 1.0))
+                if wscale <= 0.0:
+                    wscale = 1.0
+                if moe_cfg.get("norm_topk"):
+                    wsum = 0.0
+                    for _, wv in chosen:
+                        wsum += float(wv)
+                    if wsum > 0.0:
+                        inv_w = wscale / wsum
+                        chosen = [(ei, f32(float(wv) * inv_w)) for ei, wv in chosen]
+                elif wscale != 1.0:
+                    chosen = [(ei, f32(float(wv) * wscale)) for ei, wv in chosen]
+                xb2 = [f32(0.0)] * dim
+                q8_ffn = py_quantize_q8_0(xb) if (q8_layers and use_q8_act) else None
+                for ei, ew in chosen:
+                    hb = proj(xb, q8_ffn, "", f"{gp}ffn_gate.{ei}.weight", exp_h, dim)
+                    hb2 = proj(xb, q8_ffn, "", f"{gp}ffn_up.{ei}.weight", exp_h, dim)
+                    act = [f32(f32(g / (1.0 + math.exp(-g))) * u) for g, u in zip(hb, hb2)]
+                    q8_act = py_quantize_q8_0(act) if (q8_layers and use_q8_act) else None
+                    e_out = proj(act, q8_act, "", f"{gp}ffn_down.{ei}.weight", dim, exp_h)
+                    xb2 = [f32(xb2[i] + f32(ew * e_out[i])) for i in range(dim)]
+                if moe_cfg.get("shared_hidden_dim", 0) > 0:
+                    sh_h = moe_cfg["shared_hidden_dim"]
+                    hb = proj(xb, q8_ffn, "", gp + "ffn_gate_shexp.weight", sh_h, dim)
+                    hb2 = proj(xb, q8_ffn, "", gp + "ffn_up_shexp.weight", sh_h, dim)
+                    act = [f32(f32(g / (1.0 + math.exp(-g))) * u) for g, u in zip(hb, hb2)]
+                    q8_act = py_quantize_q8_0(act) if (q8_layers and use_q8_act) else None
+                    e_out = proj(act, q8_act, "", gp + "ffn_down_shexp.weight", dim, sh_h)
+                    sh_scale = f32(1.0)
+                    sh_gw = dequant_data.get(gp + "ffn_gate_inp_shexp.weight")
+                    if sh_gw is not None:
+                        sg = py_matvec(xb, sh_gw, 1, dim)[0]
+                        sh_scale = f32(1.0 / (1.0 + math.exp(-float(sg))))
+                    xb2 = [f32(xb2[i] + f32(sh_scale * e_out[i])) for i in range(dim)]
+            else:
+                q8_ffn = py_quantize_q8_0(xb) if (q8_layers and use_q8_act) else None
+                hb = proj(xb, q8_ffn, p + "mlp.gate_proj.weight", gp + "ffn_gate.weight", hidden, dim)
+                hb2 = proj(xb, q8_ffn, p + "mlp.up_proj.weight", gp + "ffn_up.weight", hidden, dim)
+                if use_geglu:
+                    act = [f32(f32(0.5 * g * (1.0 + math.tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)))) * u) for g, u in zip(hb, hb2)]
+                else:
+                    act = [f32(f32(g / (1.0 + math.exp(-g))) * u) for g, u in zip(hb, hb2)]
+                q8_act = py_quantize_q8_0(act) if (q8_layers and use_q8_act) else None
+                xb2 = proj(act, q8_act, p + "mlp.down_proj.weight", gp + "ffn_down.weight", dim, hidden)
+            if post_norms is not None:
+                xb2 = py_rmsnorm(xb2, zeros, post_norms[l][1])
             if l + 1 < n_layers:
                 x = [f32(a + b) for a, b in zip(x, xb2)]
 
         xb = py_rmsnorm(x, xb2, final_norm)
-        q8_out = py_quantize_q8_0(xb) if (q4_data is not None and use_q8_act) else None
+        q8_out = py_quantize_q8_0(xb) if (q8_head and use_q8_act) else None
         logits = proj(xb, q8_out, "lm_head.weight", "output.weight", vocab, dim)
+        if final_softcap > 0.0:
+            logits = [f32(final_softcap * math.tanh(float(v) / final_softcap)) for v in logits]
         nxt = max(range(vocab), key=lambda i: logits[i])
         if step + 1 < len(prompt):
             cur = prompt[step + 1]
@@ -898,10 +1164,10 @@ def check_tensor_calls(mir, fast):
     functions = mir_functions(mir)
     suffix = "_fast" if fast == "1" else ""
     calls = {
-        "gguf_stream_q4_0_p4k4": "__xu_tensor_pack_q4_0_p4k4_signed",
+        "gguf_stream_q4_0_p4k4_at": "__xu_tensor_pack_q4_0_p4k4_signed",
         "matvec_q4_0_p4k4_q8_0": f"__xu_tensor_gemv4_q4_0_p4k4_signed_f16_q8_0{suffix}_f32",
         "matmat_q4_0_p4k4_q8_0": f"__xu_tensor_gemm4x8_q4_0_p4k4_signed_f16_q8_0{suffix}_f32",
-        "gguf_stream_q8_0_p4k4": "__xu_tensor_pack_q8_0_p4k4",
+        "gguf_stream_q8_0_p4k4_at": "__xu_tensor_pack_q8_0_p4k4",
         "matvec_q8_0_p4k4_q8_0": f"__xu_tensor_gemv4_q8_0_p4k4_f16_q8_0{suffix}_f32",
     }
     if platform.machine().lower() in ("arm64", "aarch64"):
@@ -1309,10 +1575,86 @@ def check_q5_0_and_q8_0_layer_gguf(exes, work, tensors):
     check_format(exes, q5_path, py_q5, "Q5_0", "q5_0", "f32", CFG["vocab_size"])
 
     q8_path = work / "mini_q8_0_layers.gguf"
-    q8_dq, _ = write_gguf_q4_0(q8_path, CFG, tensors, quant_mode="q8_0")
-    py_q8 = [py_run_request(tensors, prompt, gen, dequant_data=q8_dq) for prompt, gen in REQUESTS]
-    check_format(exes, q8_path, py_q8, "Q8_0_layers", "q8_0", "f32", CFG["vocab_size"],
+    q8_dq, q8_all = write_gguf_q4_0(q8_path, CFG, tensors, quant_mode="q8_0", return_q8_all=True)
+    py_q8_f32 = [py_run_request(tensors, prompt, gen, dequant_data=q8_dq) for prompt, gen in REQUESTS]
+    check_format(exes, q8_path, py_q8_f32, "Q8_0_layers_f32act", "q8_0", "f32", CFG["vocab_size"],
                  verify_cmd="verify-f32act", bench_cmd="bench-f32act")
+    py_q8_simd = [
+        py_run_request(tensors, prompt, gen, q8_data=q8_all, use_q8_act=True,
+                       dequant_data={"token_embd.weight": q8_dq["token_embd.weight"]})
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, q8_path, py_q8_simd, "Q8_0_layers_p4k4_q8act", "q8_0", "q8_0", CFG["vocab_size"],
+                 verify_cmd="verify", bench_cmd="bench")
+
+
+def check_arch_extensions(exes, work, tensors):
+    # 1. Partial RoPE (rope_dim=32 < head_dim=64) + Interleaved RoPE (--rope-type norm / metadata)
+    rope_path = work / "mini_partial_interleaved_rope.gguf"
+    q4_r, _ = write_gguf_q4_0(
+        rope_path, CFG, tensors,
+        extra_kv=[
+            ("llama.rope.dimension_count", 4, struct.pack("<I", 32)),
+            ("llama.rope.interleaved", 7, b"\x01"),
+        ],
+    )
+    py_rope_ref = [
+        py_run_request(tensors, prompt, gen, q4_data=q4_r, use_q8_act=True, rope_dim=32, rope_interleaved=True)
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, rope_path, py_rope_ref, "partial_interleaved_rope", "q4_0", "q8_0", CFG["vocab_size"])
+    # Verify --rope-type norm matches metadata and --rope-type neox differs
+    out_norm = run([exes[1][2], "verify", str(rope_path), "--rope-type", "norm"])
+    out_neox = run([exes[1][2], "verify", str(rope_path), "--rope-type", "neox"])
+    seq_norm, _, _ = parse_verify(out_norm)
+    seq_neox, _, _ = parse_verify(out_neox)
+    assert seq_norm[0][0] == (py_rope_ref[0][0][0], struct.unpack("<I", struct.pack("<f", py_rope_ref[0][1][0]))[0])
+    assert seq_neox[0] != seq_norm[0], "Expected --rope-type neox to diverge from interleaved RoPE"
+
+    # 2. Sliding window attention (window=2) + attention logit softcap (15.0)
+    sw_path = work / "mini_sliding_softcap.gguf"
+    q4_sw, _ = write_gguf_q4_0(
+        sw_path, CFG, tensors,
+        extra_kv=[
+            ("llama.attention.sliding_window", 4, struct.pack("<I", 2)),
+            ("llama.attn_logit_softcapping", 6, struct.pack("<f", 15.0)),
+        ],
+    )
+    py_sw_ref = [
+        py_run_request(tensors, prompt, gen, q4_data=q4_sw, use_q8_act=True, sliding_window=2, attn_softcap=15.0)
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, sw_path, py_sw_ref, "sliding_window+attn_softcap", "q4_0", "q8_0", CFG["vocab_size"])
+
+    # 3. Gemma-2 style (arch=gemma2 -> sqrt(dim) embed_scale + GeGLU + post_attention_norm + ffn_post_norm + final_logit_softcap)
+    rng = random.Random(20261127)
+    dim = CFG["dim"]
+    post_norms = [
+        (
+            [f32(0.8 + 0.3 * rng.random()) for _ in range(dim)],
+            [f32(0.8 + 0.3 * rng.random()) for _ in range(dim)],
+        )
+        for _ in range(CFG["n_layers"])
+    ]
+    gemma_path = work / "mini_gemma2.gguf"
+    q4_g, _ = write_gguf_q4_0(
+        gemma_path, CFG, tensors,
+        arch_name="gemma2",
+        post_norms=post_norms,
+        extra_kv=[
+            ("gemma2.attn_logit_softcapping", 6, struct.pack("<f", 20.0)),
+            ("gemma2.final_logit_softcapping", 6, struct.pack("<f", 30.0)),
+        ],
+    )
+    py_g_ref = [
+        py_run_request(
+            tensors, prompt, gen, q4_data=q4_g, use_q8_act=True,
+            attn_softcap=20.0, final_softcap=30.0, use_geglu=True,
+            embed_scale=math.sqrt(dim), post_norms=post_norms,
+        )
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, gemma_path, py_g_ref, "gemma2_geglu_postnorms", "q4_0", "q8_0", CFG["vocab_size"])
 
 
 def check_extended_sampling_and_spm(exe, work, cfg, tensors):
@@ -1477,7 +1819,46 @@ def check_serve_enterprise_features(exe, spm_path):
             batch_texts = list(pool.map(do_cmpl, [0, 1, 2]))
         seq_texts = [do_cmpl(i) for i in range(3)]
         assert batch_texts == seq_texts, (batch_texts, seq_texts)
-        print("Enterprise serve verified (CORS, --api-key, --max-slots, batch embeddings, Llama-3 template, include_usage, SSE cancel, concurrent batched decode)")
+
+        # 7. Request created timestamp + unique ids + max_completion_tokens + logprobs/top_logprobs + response_format json_object
+        c_lp1 = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": " hello world"}],
+                "max_completion_tokens": 2,
+                "temperature": 0.0,
+                "logprobs": True,
+                "top_logprobs": 4,
+            }).encode(),
+            headers=auth_headers,
+            method="POST",
+        )
+        c_lp2 = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": " hello world"}],
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+            }).encode(),
+            headers=auth_headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(c_lp1, timeout=5) as resp:
+            d1 = json.loads(resp.read().decode())
+        with urllib.request.urlopen(c_lp2, timeout=5) as resp:
+            d2 = json.loads(resp.read().decode())
+        assert d1["created"] > 1700000000 and d2["created"] >= d1["created"], (d1, d2)
+        assert d1["id"] != d2["id"] and d1["id"].startswith("chatcmpl-"), (d1["id"], d2["id"])
+        assert d1["usage"]["completion_tokens"] == 2, d1
+        lp_content = d1["choices"][0]["logprobs"]["content"]
+        assert len(lp_content) == 2, lp_content
+        for entry in lp_content:
+            assert entry["logprob"] <= 0.0, entry
+            assert len(entry["top_logprobs"]) == 4, entry
+            assert entry["top_logprobs"][0]["logprob"] >= entry["top_logprobs"][1]["logprob"], entry
+
+        print("Enterprise serve verified (CORS, --api-key, --max-slots, batch embeddings, Llama-3 template, include_usage, created/id, logprobs/top_logprobs, response_format, SSE cancel, concurrent batched decode)")
     finally:
         proc.terminate()
         try:
@@ -1485,6 +1866,932 @@ def check_serve_enterprise_features(exe, spm_path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
+
+
+def check_serve_tools_and_json_mode(exe, work, cfg, base_tensors):
+    import json
+    import subprocess
+    import time
+    import urllib.request
+
+    # Build a tiny deterministic Q4_0 GGUF whose lm_head strongly predicts '{"ok":1}' or '<tool_call>{"name":"add","arguments":{"a":2}}</tool_call>'
+    vocab = cfg["vocab_size"]
+    t_map = {k: (list(s), list(v)) for k, (s, v) in base_tensors.items()}
+    dim = cfg["dim"]
+    # Zero lm_head except chosen output tokens so argmax emits an exact sequence:
+    # We'll zero all rows of lm_head + norm/post weights? Actually bias-only doesn't apply to lm_head;
+    # simpler: set final norm weight large positive and lm_head row = +50 * constant sign of last hidden?
+    # Wait: residual stream x preserves embed(tok) + attn/ffn; make all attn/ffn layer weights 0.0 -> x stays exact embed(last_tok)!
+    zero_tensors = {k: (list(s), [f32(0.0)] * len(v)) for k, (s, v) in base_tensors.items()}
+    zero_tensors["norm.weight"] = ([dim], [f32(1.0)] * dim)
+    emb = [f32(0.0)] * (vocab * dim)
+    head = [f32(0.0)] * (vocab * dim)
+    # Every token embedding activates dim[0..31] = +1.0, and dim[32..63] selects per-state
+    for tid in range(vocab):
+        emb[tid * dim] = f32(1.0)
+    # Token 10..15 encode a single complete tool call piece by piece, triggered linearly or in sequence:
+    # Even simpler: one single piece token for JSON `{` + `}` (`tok 10 = "{}"`) won't match because prompt could trigger multiple tokens,
+    # Wait: if token 8 has emb[8*dim + 1] = +1.0 (user prompt ends with `\n`), after step 0 generates tok 10, tok 10 feeds step 1!
+    # So each emitted token uniquely selects the NEXT token via x = embed[cur]!
+    # Prompt ends with token 7 ('\n'): step 0 -> token 10 (`<tool_call>`), token 10 -> token 11 (`{"name":"calc","arguments":{"x":1}}`), token 11 -> token 12 (`</tool_call>`), token 12 -> EOS (token 2)!
+    # And for JSON mode test, prompt token 9 ("json") -> token 13 (`{`), token 13 -> token 14 (`"k":1}`), after `}` JSON mode stops immediately!
+    chain = [(7, 10), (10, 11), (11, 12), (12, 2), (9, 13), (13, 14), (14, 15)]
+    for col_idx, (src_tok, dst_tok) in enumerate(chain, start=1):
+        emb[src_tok * dim + col_idx] = f32(1.0)
+        for j in range(32):
+            head[dst_tok * dim + (col_idx if j == 0 else j + 32)] = f32(2.0 if j == 0 else 0.0)
+        head[dst_tok * dim + col_idx] = f32(5.0)
+    head[13 * dim + 1] = f32(2.0)
+    zero_tensors["embed_tokens.weight"] = ([vocab, dim], emb)
+    zero_tensors["lm_head.weight"] = ([vocab, dim], head)
+
+    vocab_pieces = [f"tok_{i}" for i in range(vocab)]
+    vocab_pieces[0] = "<|endoftext|>"
+    vocab_pieces[1] = "<|im_start|>"
+    vocab_pieces[2] = "<|im_end|>"
+    vocab_pieces[3] = "user"
+    vocab_pieces[4] = "assistant"
+    vocab_pieces[5] = "system"
+    vocab_pieces[7] = "\n"
+    vocab_pieces[9] = "json"
+    vocab_pieces[10] = "<tool_call>"
+    vocab_pieces[11] = "{\"name\":\"calc\",\"arguments\":{\"x\":1}}"
+    vocab_pieces[12] = "</tool_call>"
+    vocab_pieces[13] = "{"
+    vocab_pieces[14] = "\"k\":1}"
+    vocab_pieces[15] = "EXTRA_TRAILING_TEXT"
+
+    tool_path = work / "mini_tools_json.gguf"
+    write_gguf_q4_0(tool_path, cfg, zero_tensors, vocab_pieces=vocab_pieces)
+
+    proc = subprocess.Popen(
+        [str(exe), "serve", str(tool_path), "127.0.0.1:0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        base_url = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if line and line.strip().startswith("serving:http://"):
+                base_url = line.strip().split("serving:", 1)[1]
+                break
+        assert base_url
+
+        # 1. tools -> tool_calls structured response
+        req_tc = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": "json"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "calc", "description": "calc", "parameters": {"type": "object"}},
+                }],
+                "max_tokens": 6,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_tc, timeout=5) as resp:
+            tc_data = json.loads(resp.read().decode())
+        ch0 = tc_data["choices"][0]
+        assert ch0["finish_reason"] == "tool_calls", tc_data
+        tcs = ch0["message"]["tool_calls"]
+        assert len(tcs) == 1 and tcs[0]["function"]["name"] == "calc", tc_data
+        assert json.loads(tcs[0]["function"]["arguments"]) == {"x": 1}, tc_data
+
+        # 2. response_format json_object constrains start to '{' and terminates on balanced '}' before token 15
+        req_js = urllib.request.Request(
+            base_url + "/v1/completions",
+            data=json.dumps({
+                "prompt": "ids:7",
+                "response_format": {"type": "json_object"},
+                "max_tokens": 6,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_js, timeout=5) as resp:
+            js_data = json.loads(resp.read().decode())
+        # Note: token 7 leads to <tool_call> without json_mode, while with json_mode step 0 masks <tool_call> and picks '{' (tok 13) -> '"k":1}' (tok 14) -> stop!
+        txt = js_data["choices"][0]["text"]
+        assert txt == "{\"k\":1}", (txt, js_data)
+        assert json.loads(txt) == {"k": 1}, js_data
+        assert js_data["choices"][0]["finish_reason"] == "stop", js_data
+
+        # 3. response_format json_schema matches json_object constraint
+        req_jschema = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": "json"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "kv", "schema": {"type": "object"}},
+                },
+                "max_tokens": 6,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_jschema, timeout=5) as resp:
+            jsc_data = json.loads(resp.read().decode())
+        jsc_txt = jsc_data["choices"][0]["message"]["content"]
+        assert json.loads(jsc_txt) == {"k": 1}, jsc_data
+
+        # 4. Multi-turn chat formatting with assistant.content=null + tool_calls + role="tool"
+        req_mt = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [
+                    {"role": "user", "content": "json"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_0",
+                            "type": "function",
+                            "function": {"name": "calc", "arguments": "{\"x\":1}"},
+                        }],
+                    },
+                    {"role": "tool", "tool_call_id": "call_0", "content": "{\"y\":2}"},
+                ],
+                "max_tokens": 2,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_mt, timeout=5) as resp:
+            mt_data = json.loads(resp.read().decode())
+        assert "content" in mt_data["choices"][0]["message"], mt_data
+
+        # 5. logit_bias steers greedy sampling directly to token 15 ("EXTRA_TRAILING_TEXT")
+        req_lb = urllib.request.Request(
+            base_url + "/v1/completions",
+            data=json.dumps({
+                "prompt": "ids:7",
+                "logit_bias": {"15": 100.0},
+                "max_tokens": 1,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_lb, timeout=5) as resp:
+            lb_data = json.loads(resp.read().decode())
+        assert lb_data["choices"][0]["text"] == "EXTRA_TRAILING_TEXT", lb_data
+        print("Serve tools/multi-turn/json_object/json_schema/logit_bias verified")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+
+def check_moe_and_yarn_gguf(exes, work, tensors):
+    rng = random.Random(20261130)
+    dim = CFG["dim"]
+    exp_cnt = 4
+    exp_h = 64
+
+    # Case A: 3D packed ffn_*_exps.weight (Q4_0) + F16 router (compact negative offset) + Softmax + YaRN RoPE
+    layers_a = []
+    for _ in range(CFG["n_layers"]):
+        layers_a.append({
+            "gate_inp": gen_weights(rng, exp_cnt * dim, 0.2),
+            "w1_exps": [gen_weights(rng, exp_h * dim, 0.08) for _ in range(exp_cnt)],
+            "w3_exps": [gen_weights(rng, exp_h * dim, 0.08) for _ in range(exp_cnt)],
+            "w2_exps": [gen_weights(rng, dim * exp_h, 0.08) for _ in range(exp_cnt)],
+        })
+    moe_a = {
+        "expert_count": exp_cnt,
+        "expert_used_count": 2,
+        "expert_hidden_dim": exp_h,
+        "norm_topk": True,
+        "packed_3d": True,
+        "router_f16": True,
+        "layers": layers_a,
+    }
+    yarn_cfg = {
+        "scale": 2.0,
+        "orig_ctx": 32,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "attn_factor": 0.0,
+    }
+    moe_a_path = work / "mini_moe_packed3d_yarn.gguf"
+    q4_a, _ = write_gguf_q4_0(
+        moe_a_path, CFG, tensors,
+        arch_name="qwen2moe",
+        moe=moe_a,
+        extra_kv=[
+            ("qwen2moe.expert_count", 4, struct.pack("<I", exp_cnt)),
+            ("qwen2moe.expert_used_count", 4, struct.pack("<I", 2)),
+            ("qwen2moe.expert_feed_forward_length", 4, struct.pack("<I", exp_h)),
+            ("qwen2moe.expert_gating_func", 4, struct.pack("<I", 1)),
+            ("qwen2moe.expert_weights_norm", 7, b"\x01"),
+            ("qwen2moe.rope.scaling.type", 8, pack_gguf_str("yarn")),
+            ("qwen2moe.rope.scaling.factor", 6, struct.pack("<f", 2.0)),
+            ("qwen2moe.rope.scaling.original_context_length", 4, struct.pack("<I", 32)),
+        ],
+    )
+    # Also grab F16 router dequant map by checking write_gguf_q4_0; write_gguf_q4_0 returned q4_a only, so compute F16 router values identically
+    dq_a = {}
+    for l in range(CFG["n_layers"]):
+        raw = layers_a[l]["gate_inp"]
+        dq_a[f"blk.{l}.ffn_gate_inp.weight"] = [f32(struct.unpack("<e", struct.pack("<e", float(v)))[0]) for v in raw]
+    py_a_ref = [
+        py_run_request(tensors, prompt, gen, q4_data=q4_a, use_q8_act=True, dequant_data=dq_a, yarn=yarn_cfg, moe_cfg=moe_a)
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, moe_a_path, py_a_ref, "moe_3d_yarn_q4", "q4_0", "q8_0", CFG["vocab_size"])
+    _, _, meta_a = parse_verify(run([exes[1][2], "verify", str(moe_a_path)]))
+    assert meta_a.get("expert_count") == "4" and meta_a.get("rope_scaling") == "yarn", meta_a
+
+    # Case B: Split experts (F32) + Sigmoid routing + routing bias + weights_scale + shared expert + F16 shared gate
+    layers_b = []
+    for _ in range(CFG["n_layers"]):
+        layers_b.append({
+            "gate_inp": gen_weights(rng, exp_cnt * dim, 0.2),
+            "bias": [f32((e - 1.5) * 0.15) for e in range(exp_cnt)],
+            "w1_exps": [gen_weights(rng, exp_h * dim, 0.08) for _ in range(exp_cnt)],
+            "w3_exps": [gen_weights(rng, exp_h * dim, 0.08) for _ in range(exp_cnt)],
+            "w2_exps": [gen_weights(rng, dim * exp_h, 0.08) for _ in range(exp_cnt)],
+            "sh_w1": gen_weights(rng, exp_h * dim, 0.08),
+            "sh_w3": gen_weights(rng, exp_h * dim, 0.08),
+            "sh_w2": gen_weights(rng, dim * exp_h, 0.08),
+            "sh_gate_inp": gen_weights(rng, dim, 0.15),
+        })
+    moe_b = {
+        "expert_count": exp_cnt,
+        "expert_used_count": 2,
+        "expert_hidden_dim": exp_h,
+        "shared_hidden_dim": exp_h,
+        "use_sigmoid": True,
+        "norm_topk": True,
+        "weights_scale": 1.5,
+        "packed_3d": False,
+        "router_f16": True,
+        "layers": layers_b,
+    }
+    moe_b_path = work / "mini_moe_split_sigmoid_shared.gguf"
+    dq_b, _ = write_gguf_q4_0(
+        moe_b_path, CFG, tensors,
+        quant_mode="f32",
+        arch_name="deepseek2",
+        moe=moe_b,
+        extra_kv=[
+            ("deepseek2.expert_count", 4, struct.pack("<I", exp_cnt)),
+            ("deepseek2.expert_used_count", 4, struct.pack("<I", 2)),
+            ("deepseek2.expert_feed_forward_length", 4, struct.pack("<I", exp_h)),
+            ("deepseek2.expert_shared_count", 4, struct.pack("<I", 1)),
+            ("deepseek2.expert_shared_feed_forward_length", 4, struct.pack("<I", exp_h)),
+            ("deepseek2.expert_gating_func", 4, struct.pack("<I", 2)),
+            ("deepseek2.expert_weights_norm", 7, b"\x01"),
+            ("deepseek2.expert_weights_scale", 6, struct.pack("<f", 1.5)),
+        ],
+    )
+    py_b_ref = [
+        py_run_request(tensors, prompt, gen, dequant_data=dq_b, moe_cfg=moe_b)
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, moe_b_path, py_b_ref, "moe_split_sigmoid_shared", "f32", "f32", CFG["vocab_size"])
+
+
+def check_hf_sharded_dir(exes, work, cfg, tensors, py_ref):
+    import json
+    hf_dir = work / "hf_sharded_model"
+    hf_dir.mkdir(parents=True, exist_ok=True)
+    dim = cfg["dim"]
+    vocab = cfg["vocab_size"]
+    n_heads = cfg["n_heads"]
+    n_kv = cfg["n_kv_heads"]
+    hidden = cfg["hidden_dim"]
+    n_layers = cfg["n_layers"]
+
+    # Map GGUF/mini tensor names to HuggingFace model.* names split across 2 shards
+    shard1 = {}
+    shard2 = {}
+    weight_map = {}
+
+    def put_tensor(shard, shard_name, hf_name, shape, vals):
+        shard[hf_name] = (shape, vals)
+        weight_map[hf_name] = shard_name
+
+    put_tensor(shard1, "model-00001-of-00002.safetensors", "model.embed_tokens.weight", [vocab, dim], tensors["embed_tokens.weight"][1])
+    for l in range(n_layers):
+        tgt = shard1 if l == 0 else shard2
+        sname = "model-00001-of-00002.safetensors" if l == 0 else "model-00002-of-00002.safetensors"
+        put_tensor(tgt, sname, f"model.layers.{l}.input_layernorm.weight", [dim], tensors[f"layers.{l}.input_layernorm.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.self_attn.q_proj.weight", [dim, dim], tensors[f"layers.{l}.self_attn.q_proj.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.self_attn.k_proj.weight", [n_kv * (dim // n_heads), dim], tensors[f"layers.{l}.self_attn.k_proj.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.self_attn.v_proj.weight", [n_kv * (dim // n_heads), dim], tensors[f"layers.{l}.self_attn.v_proj.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.self_attn.o_proj.weight", [dim, dim], tensors[f"layers.{l}.self_attn.o_proj.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.post_attention_layernorm.weight", [dim], tensors[f"layers.{l}.post_attention_layernorm.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.mlp.gate_proj.weight", [hidden, dim], tensors[f"layers.{l}.mlp.gate_proj.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.mlp.up_proj.weight", [hidden, dim], tensors[f"layers.{l}.mlp.up_proj.weight"][1])
+        put_tensor(tgt, sname, f"model.layers.{l}.mlp.down_proj.weight", [dim, hidden], tensors[f"layers.{l}.mlp.down_proj.weight"][1])
+    put_tensor(shard2, "model-00002-of-00002.safetensors", "model.norm.weight", [dim], tensors["norm.weight"][1])
+    put_tensor(shard2, "model-00002-of-00002.safetensors", "lm_head.weight", [vocab, dim], tensors["lm_head.weight"][1])
+
+    write_safetensors(hf_dir / "model-00001-of-00002.safetensors", {}, shard1)
+    write_safetensors(hf_dir / "model-00002-of-00002.safetensors", {}, shard2)
+    (hf_dir / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 0},
+        "weight_map": weight_map,
+    }))
+    (hf_dir / "config.json").write_text(json.dumps({
+        "model_type": "llama",
+        "hidden_size": dim,
+        "intermediate_size": hidden,
+        "num_hidden_layers": n_layers,
+        "num_attention_heads": n_heads,
+        "num_key_value_heads": n_kv,
+        "vocab_size": vocab,
+        "max_position_embeddings": cfg["max_seq_len"],
+        "rope_theta": cfg["rope_theta"],
+        "rms_norm_eps": 1e-5,
+        "tie_word_embeddings": False,
+        "bos_token_id": 0,
+        "eos_token_id": [2],
+    }))
+    tok_vocab = {f"tok_{i}": i for i in range(vocab)}
+    tok_vocab["<|endoftext|>"] = 0
+    tok_vocab["<|im_end|>"] = 2
+    (hf_dir / "tokenizer.json").write_text(json.dumps({
+        "model": {"type": "BPE", "vocab": tok_vocab, "merges": []},
+        "added_tokens": [],
+    }))
+    (hf_dir / "tokenizer_config.json").write_text(json.dumps({
+        "eos_token": "<|im_end|>",
+        "chat_template": "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}",
+    }))
+    check_format(exes, hf_dir, py_ref, "hf_sharded_dir", "f32", "f32", vocab)
+
+
+def check_mla_and_q8k_act(exes, work):
+    rng = random.Random(20261201)
+    # 1. DeepSeek-style MLA GGUF verification (baseline / fusion-strict / fusion-fast + CB)
+    dim = 64
+    hidden = 128
+    n_heads = 4
+    n_layers = 1
+    q_rank = 16
+    kv_rank = 16
+    qk_nope = 8
+    qk_rope = 8
+    v_hd = 8
+    head_dim = qk_nope + qk_rope
+    vocab = 32
+    max_seq = 16
+
+    def pack_raw_gguf(path, kv_entries, tensor_specs):
+        hdr = bytearray()
+        hdr.extend(b"GGUF")
+        hdr.extend(struct.pack("<IQQ", 3, len(tensor_specs), len(kv_entries)))
+        for k, vtype, vbytes in kv_entries:
+            hdr.extend(pack_gguf_str(k))
+            hdr.extend(struct.pack("<I", vtype))
+            hdr.extend(vbytes)
+        cur = 0
+        t_payload = bytearray()
+        for name, dims, gtype, raw in tensor_specs:
+            cur = (cur + 31) & ~31
+            while len(t_payload) < cur:
+                t_payload.append(0)
+            hdr.extend(pack_gguf_str(name))
+            hdr.extend(struct.pack("<I", len(dims)))
+            for d in reversed(dims):
+                hdr.extend(struct.pack("<Q", d))
+            hdr.extend(struct.pack("<IQ", gtype, cur))
+            t_payload.extend(raw)
+            cur += len(raw)
+        while len(hdr) % 32 != 0:
+            hdr.append(0)
+        path.write_bytes(bytes(hdr) + bytes(t_payload))
+
+    def f32_spec(name, dims, scale=0.05):
+        n = 1
+        for d in dims:
+            n *= d
+        vals = gen_weights(rng, n, scale)
+        return (name, dims, 0, struct.pack(f"<{n}f", *vals))
+
+    mla_path = work / "mini_mla.gguf"
+    mla_kv = [
+        ("general.architecture", 8, pack_gguf_str("deepseek2")),
+        ("general.alignment", 4, struct.pack("<I", 32)),
+        ("deepseek2.embedding_length", 4, struct.pack("<I", dim)),
+        ("deepseek2.feed_forward_length", 4, struct.pack("<I", hidden)),
+        ("deepseek2.block_count", 4, struct.pack("<I", n_layers)),
+        ("deepseek2.attention.head_count", 4, struct.pack("<I", n_heads)),
+        ("deepseek2.attention.head_count_kv", 4, struct.pack("<I", n_heads)),
+        ("deepseek2.attention.key_length", 4, struct.pack("<I", head_dim)),
+        ("deepseek2.attention.value_length", 4, struct.pack("<I", v_hd)),
+        ("deepseek2.attention.q_lora_rank", 4, struct.pack("<I", q_rank)),
+        ("deepseek2.attention.kv_lora_rank", 4, struct.pack("<I", kv_rank)),
+        ("deepseek2.attention.key_length_mla", 4, struct.pack("<I", qk_nope)),
+        ("deepseek2.attention.value_length_mla", 4, struct.pack("<I", v_hd)),
+        ("deepseek2.rope.dimension_count", 4, struct.pack("<I", qk_rope)),
+        ("deepseek2.context_length", 4, struct.pack("<I", max_seq)),
+        ("deepseek2.rope.freq_base", 6, struct.pack("<f", 10000.0)),
+        ("deepseek2.attention.layer_norm_rms_epsilon", 6, struct.pack("<f", 1e-5)),
+        ("tokenizer.ggml.tokens", 9, struct.pack("<IQ", 8, vocab) + b"".join(pack_gguf_str(f"tok_{i}") for i in range(vocab))),
+    ]
+    mla_specs = [
+        f32_spec("token_embd.weight", [vocab, dim], 0.2),
+        f32_spec("blk.0.attn_norm.weight", [dim], 1.0),
+        f32_spec("blk.0.attn_q_a.weight", [q_rank, dim]),
+        f32_spec("blk.0.attn_q_a_norm.weight", [q_rank], 1.0),
+        f32_spec("blk.0.attn_q_b.weight", [n_heads * head_dim, q_rank]),
+        f32_spec("blk.0.attn_kv_a_mqa.weight", [kv_rank + qk_rope, dim]),
+        f32_spec("blk.0.attn_kv_a_norm.weight", [kv_rank], 1.0),
+        f32_spec("blk.0.attn_kv_b.weight", [n_heads * (qk_nope + v_hd), kv_rank]),
+        f32_spec("blk.0.attn_output.weight", [dim, n_heads * v_hd]),
+        f32_spec("blk.0.ffn_norm.weight", [dim], 1.0),
+        f32_spec("blk.0.ffn_gate.weight", [hidden, dim]),
+        f32_spec("blk.0.ffn_up.weight", [hidden, dim]),
+        f32_spec("blk.0.ffn_down.weight", [dim, hidden]),
+        f32_spec("output_norm.weight", [dim], 1.0),
+        f32_spec("output.weight", [vocab, dim], 0.2),
+    ]
+    pack_raw_gguf(mla_path, mla_kv, mla_specs)
+    ref_ids = None
+    for name, _, exe, _ in exes:
+        seq, cb, meta = parse_verify(run([exe, "verify", str(mla_path)]))
+        assert seq and seq == cb, (name, seq, cb)
+        free_num, free_den = map(int, meta["kv_free_after"].split("/"))
+        assert free_num == free_den and free_den > 0, (name, meta)
+        out = strip_volatile_gen(run([exe, "generate", str(mla_path), "ids:1,2,3", "4", "0", "4"]).splitlines())
+        if ref_ids is None:
+            ref_ids = out
+        else:
+            assert out == ref_ids, (name, out, ref_ids)
+    print("DeepSeek MLA GGUF (seq/CB + baseline/fusion-strict/fusion-fast) verified")
+
+    # 2. --q8k-act path for Q4_K model (cols=256 divisible by QK_K)
+    kcfg = dict(CFG, dim=256, hidden_dim=256, n_layers=1, n_heads=4, n_kv_heads=4)
+    ktensors = generate_weight_dict(kcfg)
+    qk_path = work / "mini_q4_k_256.gguf"
+    write_gguf_q4_0(qk_path, kcfg, ktensors, kquant_mode=True)
+    out_std = strip_volatile_gen(run([exes[1][2], "generate", str(qk_path), "ids:1,2", "3", "0", "4"]).splitlines())
+    out_q8k = strip_volatile_gen(run([exes[1][2], "generate", str(qk_path), "ids:1,2", "3", "0", "4", "--q8k-act"]).splitlines())
+    assert any(l.startswith("generated_ids:") for l in out_q8k), out_q8k
+    assert out_q8k == out_std, (out_q8k, out_std)
+    seq_q8k, cb_q8k, meta_q8k = parse_verify(run([exes[1][2], "verify", str(qk_path), "--q8k-act"]))
+    assert seq_q8k and seq_q8k == cb_q8k, (seq_q8k, cb_q8k, meta_q8k)
+    print("--q8k-act integer K-quant activation dot verified")
+
+
+def check_serve_v17_protocols(exe, work, cfg, base_tensors):
+    import json
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    vocab = cfg["vocab_size"]
+    dim = cfg["dim"]
+
+    def make_chain_gguf(path, vocab_pieces, chain):
+        zero_tensors = {k: (list(s), [f32(0.0)] * len(v)) for k, (s, v) in base_tensors.items()}
+        zero_tensors["norm.weight"] = ([dim], [f32(1.0)] * dim)
+        emb = [f32(0.0)] * (vocab * dim)
+        head = [f32(0.0)] * (vocab * dim)
+        for tid in range(vocab):
+            emb[tid * dim] = f32(1.0)
+        for col_idx, (src_tok, dst_tok) in enumerate(chain, start=1):
+            emb[src_tok * dim + col_idx] = f32(1.0)
+            head[dst_tok * dim + 0] = f32(2.0)
+            head[dst_tok * dim + col_idx] = f32(5.0)
+        zero_tensors["embed_tokens.weight"] = ([vocab, dim], emb)
+        zero_tensors["lm_head.weight"] = ([vocab, dim], head)
+        write_gguf_q4_0(path, cfg, zero_tensors, vocab_pieces=vocab_pieces)
+
+    def start_srv(mpath, extra_args=()):
+        proc = subprocess.Popen(
+            [str(exe), "serve", str(mpath), "127.0.0.1:0", *extra_args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        base_url = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if line and line.strip().startswith("serving:http://"):
+                base_url = line.strip().split("serving:", 1)[1]
+                break
+        assert base_url, "server failed to start"
+        return proc, base_url
+
+    def stop_srv(proc):
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+    # Server A: <think>plan</think>Hello + x-api-key + Anthropic /v1/messages (sync + SSE)
+    pieces_a = [f"tok_{i}" for i in range(vocab)]
+    pieces_a[0] = "<|endoftext|>"
+    pieces_a[1] = "<|im_start|>"
+    pieces_a[2] = "<|im_end|>"
+    pieces_a[3] = "user"
+    pieces_a[4] = "assistant"
+    pieces_a[5] = "system"
+    pieces_a[7] = "\n"
+    pieces_a[9] = "hi"
+    pieces_a[10] = "<think>"
+    pieces_a[11] = "plan"
+    pieces_a[12] = "</think>"
+    pieces_a[13] = "Hello"
+    think_path = work / "mini_think_serve.gguf"
+    make_chain_gguf(think_path, pieces_a, [(7, 10), (10, 11), (11, 12), (12, 13), (13, 2)])
+
+    proc_a, url_a = start_srv(think_path, ("--api-key", "secret17"))
+    try:
+        # 401 when key wrong / missing
+        req_bad = urllib.request.Request(
+            url_a + "/v1/messages",
+            data=json.dumps({"model": "xu", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": "wrong"},
+            method="POST",
+        )
+        got_401 = False
+        try:
+            urllib.request.urlopen(req_bad, timeout=5)
+        except urllib.error.HTTPError as e:
+            got_401 = (e.code == 401)
+        assert got_401
+
+        # OpenAI sync <think> -> reasoning_content + content
+        req_oai = urllib.request.Request(
+            url_a + "/v1/chat/completions",
+            data=json.dumps({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 6, "temperature": 0.0}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer secret17"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_oai, timeout=5) as resp:
+            oai_d = json.loads(resp.read().decode())
+        msg = oai_d["choices"][0]["message"]
+        assert msg["reasoning_content"] == "plan" and msg["content"] == "Hello", oai_d
+
+        # OpenAI SSE <think> -> delta.reasoning_content + delta.content
+        req_oai_s = urllib.request.Request(
+            url_a + "/v1/chat/completions",
+            data=json.dumps({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 6, "temperature": 0.0, "stream": True}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer secret17"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_oai_s, timeout=5) as resp:
+            sse_lines = [l.decode() for l in resp.read().splitlines() if l.decode().startswith("data: ") and l.decode() != "data: [DONE]"]
+        r_acc, c_acc = "", ""
+        for sl in sse_lines:
+            d = json.loads(sl[6:])["choices"][0]["delta"]
+            r_acc += d.get("reasoning_content", "")
+            c_acc += d.get("content", "")
+        assert r_acc == "plan" and c_acc == "Hello", (r_acc, c_acc, sse_lines)
+
+        # Anthropic /v1/messages sync with x-api-key
+        req_ant = urllib.request.Request(
+            url_a + "/v1/messages",
+            data=json.dumps({
+                "model": "xu-local",
+                "system": "be brief",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                "max_tokens": 6,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": "secret17", "anthropic-version": "2023-06-01"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_ant, timeout=5) as resp:
+            ant_d = json.loads(resp.read().decode())
+        assert ant_d["type"] == "message" and ant_d["stop_reason"] == "end_turn", ant_d
+        assert ant_d["content"] == [
+            {"type": "thinking", "thinking": "plan"},
+            {"type": "text", "text": "Hello"},
+        ], ant_d
+
+        # Anthropic /v1/messages SSE
+        req_ant_s = urllib.request.Request(
+            url_a + "/v1/messages",
+            data=json.dumps({
+                "model": "xu-local",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 6,
+                "temperature": 0.0,
+                "stream": True,
+            }).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": "secret17"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_ant_s, timeout=5) as resp:
+            ant_sse = resp.read().decode()
+        assert "event: message_start" in ant_sse and "\"thinking_delta\"" in ant_sse and "\"text_delta\"" in ant_sse and "event: message_stop" in ant_sse, ant_sse
+    finally:
+        stop_srv(proc_a)
+
+    # Server B: tool_calls SSE delta.tool_calls & Anthropic tool_use + tool_result
+    pieces_b = list(pieces_a)
+    pieces_b[13] = "<tool_call>"
+    pieces_b[14] = "{\"name\":\"add\",\"arguments\":{\"a\":2,\"b\":3}}"
+    pieces_b[15] = "</tool_call>"
+    tool_b_path = work / "mini_tool_v17.gguf"
+    make_chain_gguf(tool_b_path, pieces_b, [(7, 10), (10, 11), (11, 12), (12, 13), (13, 14), (14, 15), (15, 2)])
+    proc_b, url_b = start_srv(tool_b_path)
+    try:
+        # OpenAI SSE delta.tool_calls
+        req_tc_s = urllib.request.Request(
+            url_b + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "add", "description": "add", "parameters": {"type": "object"}}}],
+                "max_tokens": 8,
+                "temperature": 0.0,
+                "stream": True,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_tc_s, timeout=5) as resp:
+            tc_sse = [json.loads(l.decode()[6:]) for l in resp.read().splitlines() if l.decode().startswith("data: {")]
+        got_tcs = [c["choices"][0]["delta"]["tool_calls"] for c in tc_sse if "tool_calls" in c["choices"][0]["delta"]]
+        assert len(got_tcs) == 1 and got_tcs[0][0]["function"]["name"] == "add", tc_sse
+        assert tc_sse[-1]["choices"][0]["finish_reason"] == "tool_calls", tc_sse
+
+        # Anthropic sync tool_use + stop_reason="tool_use"
+        req_ant_tc = urllib.request.Request(
+            url_b + "/v1/messages",
+            data=json.dumps({
+                "model": "xu-local",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "add", "description": "add", "input_schema": {"type": "object"}}],
+                "max_tokens": 8,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_ant_tc, timeout=5) as resp:
+            ant_tc = json.loads(resp.read().decode())
+        assert ant_tc["stop_reason"] == "tool_use", ant_tc
+        assert any(b.get("type") == "tool_use" and b.get("name") == "add" and b.get("input") == {"a": 2, "b": 3} for b in ant_tc["content"]), ant_tc
+    finally:
+        stop_srv(proc_b)
+    print("Serve v1.7.0 (<think> reasoning_content, SSE delta.tool_calls, Anthropic /v1/messages sync+SSE+x-api-key) verified")
+
+
+def check_lora_and_speculative(exes, work, cfg, base_tensors):
+    import json
+
+    dim = cfg["dim"]
+    hidden = cfg["hidden_dim"]
+    vocab = cfg["vocab_size"]
+    rank = 2
+    alpha = 4.0
+    scale = alpha / rank
+
+    base_path = work / "lora_base.safetensors"
+    write_safetensors(base_path, cfg, base_tensors)
+
+    lrng = random.Random(20261126)
+    def rand_mat(r, c, amp=0.15):
+        return [f32(lrng.uniform(-amp, amp)) for _ in range(r * c)]
+
+    specs = [
+        ("base_model.model.model.layers.0.self_attn.q_proj", "layers.0.self_attn.q_proj.weight", dim, dim),
+        ("base_model.model.model.layers.0.self_attn.o_proj", "layers.0.self_attn.o_proj.weight", dim, dim),
+        ("base_model.model.model.layers.0.mlp.down_proj", "layers.0.mlp.down_proj.weight", dim, hidden),
+        ("base_model.model.lm_head", "lm_head.weight", vocab, dim),
+    ]
+
+    lora_dir = work / "lora_adapter_dir"
+    lora_dir.mkdir(exist_ok=True)
+    (lora_dir / "adapter_config.json").write_text(json.dumps({"r": rank, "lora_alpha": alpha}))
+
+    merged = {k: (list(s), list(v)) for k, (s, v) in base_tensors.items()}
+    sf_tensors = {}
+    for lora_prefix, base_key, out_d, in_d in specs:
+        a = rand_mat(rank, in_d, 0.25)
+        b = rand_mat(out_d, rank, 0.25)
+        sf_tensors[f"{lora_prefix}.lora_A.weight"] = ([rank, in_d], a)
+        sf_tensors[f"{lora_prefix}.lora_B.weight"] = ([out_d, rank], b)
+        _, base_vals = merged[base_key]
+        new_vals = list(base_vals)
+        for i in range(out_d):
+            for j in range(in_d):
+                delta = sum(b[i * rank + r] * a[r * in_d + j] for r in range(rank))
+                new_vals[i * in_d + j] = f32(new_vals[i * in_d + j] + scale * delta)
+        merged[base_key] = ([out_d, in_d], new_vals)
+
+    # Pack PEFT adapter_model.safetensors cleanly (F32)
+    sf_hdr = {}
+    sf_payload = bytearray()
+    for tname, (shape, vals) in sf_tensors.items():
+        raw = struct.pack(f"<{len(vals)}f", *vals)
+        start = len(sf_payload)
+        sf_payload.extend(raw)
+        sf_hdr[tname] = {"dtype": "F32", "shape": shape, "data_offsets": [start, start + len(raw)]}
+    hb = json.dumps(sf_hdr).encode("utf-8")
+    (lora_dir / "adapter_model.safetensors").write_bytes(struct.pack("<Q", len(hb)) + hb + bytes(sf_payload))
+
+    py_merged = [py_run_request(merged, prompt, gen) for prompt, gen in REQUESTS]
+    for name, _, exe, _ in exes:
+        seq, cb, meta = parse_verify(run([exe, "verify", str(base_path), "--lora", str(lora_dir)]))
+        assert seq and seq == cb, (name, seq, cb)
+        free_num, free_den = map(int, meta["kv_free_after"].split("/"))
+        assert free_num == free_den and free_den > 0, (name, meta)
+        for r, (want_toks, want_logits) in enumerate(py_merged):
+            got_toks = [t for t, _ in seq[r]]
+            assert got_toks == want_toks, (name, r, got_toks, want_toks)
+            for t, (_, gbits) in enumerate(seq[r]):
+                assert abs(bits_to_f32(gbits) - want_logits[t]) < 1e-4, (name, r, t, bits_to_f32(gbits), want_logits[t])
+    print("--lora PEFT SafeTensors adapter (attn/mlp/lm_head, seq/CB, Python parity) verified")
+
+    # 2. Pure-Xu train-lora -> generate --lora
+    trained_sf = work / "trained_lm_head.safetensors"
+    tr_out = run([
+        exes[1][2], "train-lora", str(base_path), "ids:1,7,42,19", str(trained_sf),
+        "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "35", "--lr", "0.2",
+    ])
+    losses = [float(l.split("loss:", 1)[1]) for l in tr_out.splitlines() if l.startswith("step:")]
+    assert len(losses) == 35 and losses[-1] < 0.05 and losses[-1] < losses[0] * 0.1, losses
+    assert trained_sf.exists() and any(l == "kv_free_after:4/4" for l in tr_out.splitlines()), tr_out
+    gen_tr = run([exes[1][2], "generate", str(base_path), "ids:1,7", "2", "0", "40", "--lora", str(trained_sf)])
+    kv_tr = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in gen_tr.splitlines() if ":" in l}
+    assert kv_tr["generated_ids"] == "42,19", kv_tr
+    print(f"Pure-Xu train-lora verified (loss {losses[0]:.4f} -> {losses[-1]:.6f}, predicts 42,19)")
+
+    # 3. Exact Lossless Speculative Decoding (--draft same & --draft perturbed)
+    target_gen = [l for l in strip_volatile_gen(run([exes[1][2], "generate", str(base_path), "ids:1,7,42", "10", "0", "40"]).splitlines()) if not l.startswith("load_ms:")]
+    target_kv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in target_gen if ":" in l}
+
+    same_spec = run([exes[1][2], "generate", str(base_path), "ids:1,7,42", "10", "0", "40", "--draft", str(base_path), "--draft-k", "4"]).splitlines()
+    same_kv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in same_spec if ":" in l}
+    assert same_kv["generated_ids"] == target_kv["generated_ids"], (same_kv, target_kv)
+    assert same_kv["generated_text"] == target_kv["generated_text"], (same_kv, target_kv)
+    assert int(same_kv["spec_drafted"]) > 0 and same_kv["spec_accepted"] == same_kv["spec_drafted"], same_kv
+    assert same_kv["kv_free_after"] == "4/4", same_kv
+
+    # Perturbed draft model: flip sign on down_proj so draft proposes diverging tokens
+    draft_tensors = {k: (list(s), list(v)) for k, (s, v) in base_tensors.items()}
+    s_dp, v_dp = draft_tensors["layers.0.mlp.down_proj.weight"]
+    draft_tensors["layers.0.mlp.down_proj.weight"] = (s_dp, [f32(-val * 1.5) for val in v_dp])
+    draft_path = work / "draft_perturbed.safetensors"
+    write_safetensors(draft_path, cfg, draft_tensors)
+
+    pert_spec = run([exes[1][2], "generate", str(base_path), "ids:1,7,42", "10", "0", "40", "--draft", str(draft_path), "--draft-k", "4"]).splitlines()
+    pert_kv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in pert_spec if ":" in l}
+    assert pert_kv["generated_ids"] == target_kv["generated_ids"], (pert_kv, target_kv)
+    assert pert_kv["generated_text"] == target_kv["generated_text"], (pert_kv, target_kv)
+    assert int(pert_kv["spec_accepted"]) < int(pert_kv["spec_drafted"]), pert_kv
+    assert pert_kv["kv_free_after"] == "4/4", pert_kv
+
+    stoch1 = [l for l in strip_volatile_gen(run([exes[1][2], "generate", str(base_path), "ids:1,7,42", "8", "800", "40", "--draft", str(draft_path), "--draft-k", "3", "--seed", "777"]).splitlines()) if not l.startswith("load_ms:")]
+    stoch2 = [l for l in strip_volatile_gen(run([exes[1][2], "generate", str(base_path), "ids:1,7,42", "8", "800", "40", "--draft", str(draft_path), "--draft-k", "3", "--seed", "777"]).splitlines()) if not l.startswith("load_ms:")]
+    assert stoch1 == stoch2, (stoch1, stoch2)
+    stoch_kv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in stoch1 if ":" in l}
+    assert len(stoch_kv["generated_ids"].split(",")) == 8 and stoch_kv["kv_free_after"] == "4/4", stoch_kv
+    print(f"Lossless speculative decoding verified (same={same_kv['spec_accepted']}/{same_kv['spec_drafted']}, perturbed={pert_kv['spec_accepted']}/{pert_kv['spec_drafted']})")
+
+
+def check_q5_k_and_responses_api(exes, work, cfg, base_tensors):
+    import json
+    import subprocess
+    import time
+    import urllib.request
+
+    # 1. GGUF Q5_K verify + --q8k-act
+    q5k_path = work / "mini_q5_k.gguf"
+    q5k_dq, _ = write_gguf_q4_0(q5k_path, cfg, base_tensors, quant_mode="q5_k")
+    py_q5k = [py_run_request(base_tensors, prompt, gen, dequant_data=q5k_dq) for prompt, gen in REQUESTS]
+    check_format(exes, q5k_path, py_q5k, "Q5_K", "q5_k", "f32", cfg["vocab_size"],
+                 verify_cmd="verify-f32act", bench_cmd="bench-f32act")
+    seq_q8k, cb_q8k, meta_q8k = parse_verify(run([exes[1][2], "verify", str(q5k_path), "--q8k-act"]))
+    assert meta_q8k.get("format") == "q5_k" and seq_q8k and seq_q8k == cb_q8k, meta_q8k
+    assert [t for t, _ in seq_q8k[0]] == py_q5k[0][0], (seq_q8k[0], py_q5k[0][0])
+
+    # 2. train-lora with --max-grad-norm clipping
+    clip_sf = work / "trained_clip.safetensors"
+    tr_clip = run([
+        exes[1][2], "train-lora", str(work / "lora_base.safetensors"), "ids:1,7,42,19", str(clip_sf),
+        "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "20", "--lr", "0.25", "--max-grad-norm", "0.5",
+    ])
+    c_losses = [float(l.split("loss:", 1)[1]) for l in tr_clip.splitlines() if l.startswith("step:")]
+    assert len(c_losses) == 20 and c_losses[-1] < c_losses[0] * 0.5 and clip_sf.exists(), tr_clip
+
+    # 3. POST /v1/responses sync, previous_response_id continuation, tools + function_call_output, and SSE
+    vocab = cfg["vocab_size"]
+    dim = cfg["dim"]
+    pieces = [f"tok_{i}" for i in range(vocab)]
+    pieces[0] = "<|endoftext|>"
+    pieces[1] = "<|im_start|>"
+    pieces[2] = "<|im_end|>"
+    pieces[3] = "user"
+    pieces[4] = "assistant"
+    pieces[5] = "system"
+    pieces[7] = "\n"
+    pieces[9] = "hi"
+    pieces[10] = "<tool_call>"
+    pieces[11] = "{\"name\":\"add\",\"arguments\":{\"a\":2,\"b\":3}}"
+    pieces[12] = "</tool_call>"
+    pieces[13] = "Result"
+
+    zero_tensors = {k: (list(s), [f32(0.0)] * len(v)) for k, (s, v) in base_tensors.items()}
+    zero_tensors["norm.weight"] = ([dim], [f32(1.0)] * dim)
+    emb = [f32(0.0)] * (vocab * dim)
+    head = [f32(0.0)] * (vocab * dim)
+    for tid in range(vocab):
+        emb[tid * dim] = f32(1.0)
+    for col_idx, (src_tok, dst_tok) in enumerate([(7, 10), (10, 11), (11, 12), (12, 2)], start=1):
+        emb[src_tok * dim + col_idx] = f32(1.0)
+        head[dst_tok * dim + 0] = f32(2.0)
+        head[dst_tok * dim + col_idx] = f32(5.0)
+    zero_tensors["embed_tokens.weight"] = ([vocab, dim], emb)
+    zero_tensors["lm_head.weight"] = ([vocab, dim], head)
+    resp_gguf = work / "mini_responses.gguf"
+    write_gguf_q4_0(resp_gguf, cfg, zero_tensors, vocab_pieces=pieces)
+
+    proc = subprocess.Popen(
+        [str(exes[1][2]), "serve", str(resp_gguf), "127.0.0.1:0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        url = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if line and line.strip().startswith("serving:http://"):
+                url = line.strip().split("serving:", 1)[1]
+                break
+        assert url, "responses server failed to start"
+
+        def post_json(path, payload):
+            req = urllib.request.Request(
+                url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.read().decode()
+
+        # Sync tool call response
+        r1 = json.loads(post_json("/v1/responses", {
+            "model": "xu-local",
+            "instructions": "Use tools.",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "add", "description": "add", "parameters": {"type": "object"}}],
+            "max_output_tokens": 8,
+            "temperature": 0.0,
+        }))
+        assert r1["id"].startswith("resp_") and r1["status"] == "completed", r1
+        fcs = [it for it in r1["output"] if it.get("type") == "function_call"]
+        assert len(fcs) == 1 and fcs[0]["name"] == "add" and json.loads(fcs[0]["arguments"]) == {"a": 2, "b": 3}, r1
+
+        # previous_response_id continuation with function_call_output
+        r2 = json.loads(post_json("/v1/responses", {
+            "model": "xu-local",
+            "previous_response_id": r1["id"],
+            "input": [{"type": "function_call_output", "call_id": fcs[0]["call_id"], "output": "{\"sum\":5}"}],
+            "max_output_tokens": 4,
+            "temperature": 0.0,
+        }))
+        assert r2["id"] != r1["id"] and r2["status"] == "completed" and r2["usage"]["input_tokens"] > r1["usage"]["input_tokens"], (r1, r2)
+
+        # Streaming SSE /v1/responses (text deltas + tool_call output_item.done + completed)
+        sse_txt = post_json("/v1/responses", {
+            "model": "xu-local",
+            "input": "hi",
+            "max_output_tokens": 8,
+            "temperature": 0.0,
+            "stream": True,
+        })
+        assert "event: response.output_text.delta" in sse_txt and "event: response.completed" in sse_txt, sse_txt
+
+        sse_raw = post_json("/v1/responses", {
+            "model": "xu-local",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "add", "parameters": {"type": "object"}}],
+            "max_output_tokens": 8,
+            "temperature": 0.0,
+            "stream": True,
+        })
+        assert "event: response.output_item.done" in sse_raw and "event: response.completed" in sse_raw, sse_raw
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+    print("GGUF Q5_K (--q8k-act), train-lora --max-grad-norm, and POST /v1/responses (sync/previous_response_id/tools/SSE) verified")
 
 
 def main():
@@ -1591,11 +2898,19 @@ def main():
         check_q4_k_q6_k_gguf(exes, work, tensors)
         check_qk_norm_gguf(exes, work, tensors)
         check_q5_0_and_q8_0_layer_gguf(exes, work, tensors)
+        check_arch_extensions(exes, work, tensors)
+        check_moe_and_yarn_gguf(exes, work, tensors)
         spm_path = check_extended_sampling_and_spm(exes[1][2], work, CFG, tensors)
         check_serve_http(exes[1][2], gguf_path)
         check_serve_chatml(exes[1][2], work, CFG, tensors)
         check_serve_enterprise_features(exes[1][2], spm_path)
-        print("LLM engine verification passed (Safetensors F32, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M, qk_norm, ChatML/Llama-3, SPM, continuous batch HTTP serve + prefix cache)")
+        check_serve_tools_and_json_mode(exes[1][2], work, CFG, tensors)
+        check_hf_sharded_dir(exes, work, CFG, tensors, py_f32_ref)
+        check_mla_and_q8k_act(exes, work)
+        check_serve_v17_protocols(exes[1][2], work, CFG, tensors)
+        check_lora_and_speculative(exes, work, CFG, tensors)
+        check_q5_k_and_responses_api(exes, work, CFG, tensors)
+        print("LLM engine verification passed (Safetensors F32/HF-sharded, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M/Q5_K/MLA, --q8k-act, --lora, train-lora, --draft, qk_norm, arch extensions, MoE + YaRN, ChatML/Llama-3, SPM, continuous batch HTTP serve + <think>/tool_calls/Responses/Anthropic /v1/messages)")
 
 
 if __name__ == "__main__":
