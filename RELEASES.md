@@ -15,11 +15,11 @@
 - **Runtime & Standard Library**:
   - Replaces `core/map` linear probing with compact SwissTable 8-slot SWAR `CTRL_LANE_MUL` control probing and 7/8 load factor; improves `core/chan`, `compress/lzw`, and word-level byte primitives in `core/intrin`.
 - **Freestanding, Kernel & `#core` Primitives**:
-  - Adds `usize`/`isize`, packed/union/bitfield C structs, freestanding `.bss`/`.data`/`.rodata`/`@section`/`@align`/`@export` statics, `[CONST]T`, `sizeof`/`alignof`/`offsetof`, generalized const evaluation, `static_assert`, `@noreturn`, freestanding atomics/`irq_save`/GDT/IDT/CR/MSR/port-IO intrinsics, and multi-section ELF `ET_EXEC`/`ET_REL` (`.rela.<sec>`) across `x64-none`, `arm64-none`, and `riscv64-none`.
-  - Adds `#core/addr`, `#core/ds`, `#core/fmt`, `#core/mmio` and expands `#core/arch`, `#core/alloc`, `#core/mem`, `#core/sync`, `#core/virtio`.
+  - Adds `usize`/`isize`, packed/union/bitfield C structs, freestanding `.bss`/`.data`/`.rodata`/`@section`/`@align`/`@export` statics, `[CONST]T`, `sizeof`/`alignof`/`offsetof`, generalized const evaluation, `static_assert`, `@noreturn`, `@panic_handler`, freestanding atomics/`irq_save`/GDT/IDT/CR/MSR/port-IO/`cpuid`/`syscall4` intrinsics, and multi-section ELF `ET_EXEC`/`ET_REL` (`.rela.<sec>`) across `x64-none`, `arm64-none`, and `riscv64-none`.
+  - Adds `#core/addr`, `#core/ds`, `#core/elf`, `#core/fmt`, `#core/mmio` and expands `#core/arch`, `#core/alloc`, `#core/mem`, `#core/sync`, `#core/virtio` (including multi-sector `virtio-blk` reads).
 - **AI Inference, Tensor & GPU**:
-  - Adds low-precision tensor storage and inference helpers (`src/tensor`: `float`, `quant`, `view`) plus P4K4 signed Q4/Q8 kernels, `M=12` GEMM, and paged SIMD attention (`src/xu/mir/ai`).
-  - Expands GPU/SDL support (`R32_UINT`, MRT `begin_render_targets`, storage texture/buffer bindings, `draw_indirect`/`draw_indexed_indirect`, `dispatch_indirect`) and UI `TreeView` multi-selection / cursor tracking fixes.
+  - Adds low-precision tensor storage and inference support (`src/tensor`: `float`, `quant`, `view`) plus P4K4 signed Q4/Q8 kernels, `M=12` GEMM, and paged SIMD attention (`src/xu/mir/ai`).
+  - Expands GPU/SDL support (`R32_UINT`, MRT `begin_render_targets`, storage texture/buffer bindings, `draw_indirect`/`draw_indexed_indirect`, `dispatch_indirect`) and adds hostless `Screen`/`Context` support plus `TreeView` multi-selection and cursor tracking fixes in `#ui/widgets`.
 - **Platforms & Upgrade**: Upgrade the compiler, standard library, and SDK tools together. See also [Chinese release notes](https://github.com/xulang-org/xu/blob/v0.14.2/RELEASES.zh-CN.md#xu-0142).
 
 ## Xu 0.14.1
