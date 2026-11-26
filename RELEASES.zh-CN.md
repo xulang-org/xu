@@ -15,11 +15,11 @@
 - **运行时与标准库**：
   - 将运行时哈希表（`core/map`）重构为紧凑型 SwissTable 8 槽 SWAR（`CTRL_LANE_MUL`）分组探测结构（7/8 负载因子），并同步优化 `core/chan`、`compress/lzw` 与 `core/intrin` 机器字扫描路径。
 - **裸机、内核与 `#core` 原语**：
-  - 新增 `usize`/`isize`、紧缩/联合/位域 C 结构体、无宿主静态段（`.bss`/`.data`/`.rodata`/`@section`/`@align`/`@export`）、`[CONST]T`、`sizeof`/`alignof`/`offsetof`、通用常量求值、`static_assert`、`@noreturn`、原子/中断/`GDT`/`IDT`/CR/MSR/端口 I/O 内建原语，以及面向 `x64-none`、`arm64-none`、`riscv64-none` 的多节 ELF `ET_EXEC`/`ET_REL`（`.rela.<sec>`）输出。
-  - 新增 `#core/addr`、`#core/ds`、`#core/fmt`、`#core/mmio`，并扩展 `#core/arch`、`#core/alloc`、`#core/mem`、`#core/sync`、`#core/virtio`。
+  - 新增 `usize`/`isize`、紧缩/联合/位域 C 结构体、无宿主静态段（`.bss`/`.data`/`.rodata`/`@section`/`@align`/`@export`）、`[CONST]T`、`sizeof`/`alignof`/`offsetof`、通用常量求值、`static_assert`、`@noreturn`、`@panic_handler`、原子/中断/`GDT`/`IDT`/CR/MSR/端口 I/O/`cpuid`/`syscall4` 内建原语，以及面向 `x64-none`、`arm64-none`、`riscv64-none` 的多节 ELF `ET_EXEC`/`ET_REL`（`.rela.<sec>`）输出。
+  - 新增 `#core/addr`、`#core/ds`、`#core/elf`、`#core/fmt`、`#core/mmio`，并扩展 `#core/arch`、`#core/alloc`、`#core/mem`、`#core/sync`、`#core/virtio`（含多扇区 `virtio-blk` 读取）。
 - **AI 推理、张量与现代 GPU**：
   - 新增低精度张量存储与推理支持（`src/tensor`：`float`、`quant`、`view`）以及 P4K4 有符号 Q4/Q8 内核、`M=12` GEMM 与分页 SIMD 注意力内核（`src/xu/mir/ai`）。
-  - 扩展 GPU/SDL 现代资源接口（`R32_UINT`、MRT `begin_render_targets`、存储纹理/缓冲绑定、间接绘制/派发）及 UI `TreeView` 多选与光标跟踪修复。
+  - 扩展 GPU/SDL 现代资源接口（`R32_UINT`、MRT `begin_render_targets`、存储纹理/缓冲绑定、间接绘制/派发），并为 `#ui/widgets` 新增无宿主 `Screen`/`Context` 支持以及 `TreeView` 多选与光标跟踪修复。
 - **平台与升级**：请一起更新编译器、标准库和 SDK 工具。另见[英文发行说明](https://github.com/xulang-org/xu/blob/v0.14.2/RELEASES.md#xu-0142)。
 
 ## Xu 0.14.1
