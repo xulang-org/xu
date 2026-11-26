@@ -81,6 +81,27 @@ fn check_view() int {
     empty := view.slice(1, 3, 3, 1) >>>
     require(empty.element_count() == 0, "empty slice") >>>
 
+    // reshape, permute, and mutable []u8 read_f32_bytes / write_f32_bytes
+    flat_shape := [6]
+    reshaped := view.reshape(&flat_shape) >>>
+    require(reshaped.rank() == 1 && reshaped.element_count() == 6, "reshape") >>>
+    flat_coord := [5]
+    rval := reshaped.read_f32(&storage, &flat_coord) >>>
+    require(rval == f32(6), "reshape value") >>>
+    axes := [1, 0]
+    permuted := view.permute(&axes) >>>
+    perm_coord := [2, 1]
+    pval := permuted.read_f32(&storage, &perm_coord) >>>
+    require(pval == f32(6), "permute value") >>>
+
+    $mbuf := []u8{}
+    for _ in 0:12 { mbuf.push(u8(0)) }
+    mview := tensor.contiguous_view(dtype, &shape, 0, mbuf.len) >>>
+    mcoord := [1, 1]
+    _ := mview.write_f32_bytes($&mbuf, &mcoord, f32(7.5)) >>>
+    mval := mview.read_f32_bytes(&mbuf, &mcoord) >>>
+    require(mval == f32(7.5), "write_f32_bytes") >>>
+
     _ := empty.read_f32_linear(&storage, 0) >>> (err) { << 1 }
     >>> errors.new("empty read succeeded")
 }
@@ -102,6 +123,14 @@ fn check_rejections() int {
         >>> errors.new("shape overflow succeeded")
     }
     >>> errors.new("negative shape succeeded")
+}
+
+fn b_dot_ref(blk &tensor.Q8Block, x &[]f32) f32 {
+    $acc := f32(0)
+    for i in 0:32 {
+        acc += (blk.at(i) >>> (err) { << f32(0) }) * x[i]
+    }
+    << acc
 }
 
 fn check_blocks() int {
@@ -159,6 +188,40 @@ fn check_blocks() int {
     require(vals4k[0] == f32(0.0) && vals4k[32] == f32(14.75) && vals4k[160] == f32(44.25), "Q4_K decoded values") >>>
     require(math.abs(f64(blk4k.dot_f32(&x4k, 0) - ref_dot4k)) < 1e-4, "Q4_K dot_f32") >>>
 
+    // Q4_K zero-copy dot_f32 matches Q4KBlock.dot_f32
+    q4k_zc := tensor.q4_k_dot_f32(&q4k, 1, &x4k, 0) >>>
+    require(math.abs(f64(q4k_zc - ref_dot4k)) < 1e-4, "q4_k_dot_f32") >>>
+    q8_zc := tensor.q8_0_dot_f32(&q8, 1, &x4k, 0) >>>
+    require(math.abs(f64(q8_zc - b_dot_ref(&b, &x4k))) < 1e-4, "q8_0_dot_f32") >>>
+
+    // Q5_0 block check (22 bytes -> 32 values)
+    $q5 := "x" + half
+    // qh = 0x00010002 (bit 1 set for index 1, bit 16 set for index 16)
+    q5.push_str(string_from_byte(2))
+    q5.push_str(string_from_byte(0))
+    q5.push_str(string_from_byte(1))
+    q5.push_str(string_from_byte(0))
+    for i in 0:16 { q5.push_str(string_from_byte((i & 15) | (((15 - i) & 15) << 4))) }
+    blk5 := tensor.read_q5_0(&q5, 1) >>>
+    $vals5 := []f32{}
+    blk5.append_f32($&vals5)
+    require(vals5.len == tensor.GGML_BLOCK_VALUES, "Q5_0 len") >>>
+    v5_0 := blk5.at(0) >>>
+    v5_1 := blk5.at(1) >>>
+    v5_16 := blk5.at(16) >>>
+    require(v5_0 == f32(-16) * f32(0.5), "Q5_0 at(0)") >>>
+    require(v5_1 == f32(1 + 16 - 16) * f32(0.5), "Q5_0 at(1) with qh bit") >>>
+    require(v5_16 == f32(15 + 16 - 16) * f32(0.5), "Q5_0 at(16) with qh bit") >>>
+    $ref_dot5 := f32(0)
+    for i in 0:32 {
+        vi := blk5.at(i) >>>
+        require(vi == vals5[i], "Q5_0 at matches append_f32") >>>
+        ref_dot5 += vals5[i] * x4k[i]
+    }
+    require(math.abs(f64(blk5.dot_f32(&x4k, 0) - ref_dot5)) < 1e-4, "Q5_0 dot_f32") >>>
+    q5_zc := tensor.q5_0_dot_f32(&q5, 1, &x4k, 0) >>>
+    require(math.abs(f64(q5_zc - ref_dot5)) < 1e-4, "q5_0_dot_f32") >>>
+
     // Q6_K super-block check (210 bytes -> 256 values)
     $q6k := "x"
     for i in 0:128 { q6k.push_str(string_from_byte(((i * 5) & 15) | (((i * 7 + 3) & 15) << 4))) }
@@ -180,6 +243,8 @@ fn check_blocks() int {
         ref_dot6k += v * x4k[i]
     }
     require(math.abs(f64(blk6k.dot_f32(&x4k, 0) - ref_dot6k)) < 1e-4, "Q6_K dot_f32") >>>
+    q6k_zc := tensor.q6_k_dot_f32(&q6k, 1, &x4k, 0) >>>
+    require(math.abs(f64(q6k_zc - ref_dot6k)) < 1e-4, "q6_k_dot_f32") >>>
 
     _ := tensor.read_q4_k(&q4k, 2) >>> (err) {
         _ := tensor.read_q6_k(&q6k, 2) >>> (err2) {

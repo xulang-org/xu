@@ -270,8 +270,32 @@ def quantize_q6_k_matrix(vals):
     return bytes(raw), dequant
 
 
+def quantize_q5_0_matrix(vals):
+    raw = bytearray()
+    dequant = []
+    for b in range(len(vals) // 32):
+        seg = vals[b * 32:(b + 1) * 32]
+        amax = max(abs(v) for v in seg)
+        d = f32(amax / 15.0) if amax > 0 else 0.0
+        d16_b = struct.pack("<e", d)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        raw.extend(d16_b)
+        inv_d = 1.0 / d16 if d16 != 0 else 0.0
+        qs = [min(31, max(0, int(round(v * inv_d)) + 16)) for v in seg]
+        qh = 0
+        for j in range(32):
+            if qs[j] & 16:
+                qh |= 1 << j
+        raw.extend(struct.pack("<I", qh))
+        for j in range(16):
+            raw.append((qs[j] & 15) | ((qs[16 + j] & 15) << 4))
+        dequant.extend(f32((q - 16) * d16) for q in qs)
+    return bytes(raw), dequant
+
+
 def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_output=False,
-                    encode_dense=None, merges=None, vocab_pieces=None, qk_norms=None, kquant_mode=False):
+                    encode_dense=None, merges=None, vocab_pieces=None, qk_norms=None,
+                    kquant_mode=False, quant_mode=None, tok_model=None):
     dim = cfg["dim"]
     hidden = cfg["hidden_dim"]
     n_layers = cfg["n_layers"]
@@ -303,7 +327,12 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         (f"{arch}.rope.freq_base", 6, struct.pack("<f", float(cfg["rope_theta"]))),
         (f"{arch}.attention.layer_norm_rms_epsilon", 6, struct.pack("<f", 1e-5)),
     ]
-    if qwen_mode:
+    if tok_model is not None:
+        kv_entries.extend([
+            ("tokenizer.ggml.model", 8, pack_gguf_str(tok_model)),
+            ("tokenizer.ggml.eos_token_id", 4, struct.pack("<I", 2)),
+        ])
+    elif qwen_mode:
         kv_entries.extend([
             ("tokenizer.ggml.model", 8, pack_gguf_str("gpt2")),
             ("tokenizer.ggml.bos_token_id", 4, struct.pack("<I", 0)),
@@ -355,12 +384,26 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         tensor_specs.append((gname, dims, 14, raw))
         dequant_data[gname] = dq
 
+    def add_q5(gname, dims, vals):
+        raw, dq = quantize_q5_0_matrix(vals)
+        tensor_specs.append((gname, dims, 6, raw))
+        dequant_data[gname] = dq
+
+    def add_q8_dq(gname, dims, vals):
+        raw, qs, sc = quantize_q8_0_matrix(vals)
+        tensor_specs.append((gname, dims, 8, raw))
+        dequant_data[gname] = [f32(qs[i] * sc[i // 32]) for i in range(len(vals))]
+
     def add_matrix(gname, st_key, dims, vals):
         if kquant_mode:
             if gname.endswith("attn_v.weight") or gname.endswith("ffn_down.weight"):
                 add_q6k(gname, dims, vals)
             else:
                 add_q4k(gname, dims, vals)
+        elif quant_mode == "q5_0":
+            add_q5(gname, dims, vals)
+        elif quant_mode == "q8_0":
+            add_q8_dq(gname, dims, vals)
         elif encode_dense is not None:
             add_dense(gname, st_key, dims, vals)
         else:
@@ -368,6 +411,10 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
 
     if kquant_mode:
         add_q6k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q5_0":
+        add_q5("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q8_0":
+        add_q8_dq("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif encode_dense is not None:
         add_dense("token_embd.weight", "embed_tokens.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif qwen_mode or tied_output:
@@ -397,6 +444,10 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
     if not tied_output:
         if kquant_mode:
             add_q6k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q5_0":
+            add_q5("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q8_0":
+            add_q8_dq("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif encode_dense is not None:
             add_dense("output.weight", "lm_head.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif qwen_mode:
@@ -428,7 +479,7 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
     buf.extend(b"\x00" * pad)
     buf.extend(payload)
     path.write_bytes(buf)
-    if kquant_mode:
+    if kquant_mode or quant_mode in ("q5_0", "q8_0"):
         return dequant_data, None
     return q4_data, q8_data if qwen_mode else None
 
@@ -1251,6 +1302,191 @@ def check_qk_norm_gguf(exes, work, tensors):
     check_format(exes, path, py_ref, "qk_norm", "q4_0", "q8_0", CFG["vocab_size"])
 
 
+def check_q5_0_and_q8_0_layer_gguf(exes, work, tensors):
+    q5_path = work / "mini_q5_0.gguf"
+    q5_dq, _ = write_gguf_q4_0(q5_path, CFG, tensors, quant_mode="q5_0")
+    py_q5 = [py_run_request(tensors, prompt, gen, dequant_data=q5_dq) for prompt, gen in REQUESTS]
+    check_format(exes, q5_path, py_q5, "Q5_0", "q5_0", "f32", CFG["vocab_size"])
+
+    q8_path = work / "mini_q8_0_layers.gguf"
+    q8_dq, _ = write_gguf_q4_0(q8_path, CFG, tensors, quant_mode="q8_0")
+    py_q8 = [py_run_request(tensors, prompt, gen, dequant_data=q8_dq) for prompt, gen in REQUESTS]
+    check_format(exes, q8_path, py_q8, "Q8_0_layers", "q8_0", "f32", CFG["vocab_size"],
+                 verify_cmd="verify-f32act", bench_cmd="bench-f32act")
+
+
+def check_extended_sampling_and_spm(exe, work, cfg, tensors):
+    vocab = cfg["vocab_size"]
+    vocab_pieces = [f"tok_{i}" for i in range(vocab)]
+    vocab_pieces[0] = "<|endoftext|>"
+    vocab_pieces[1] = "<|begin_of_text|>"
+    vocab_pieces[2] = "<|eot_id|>"
+    vocab_pieces[3] = "<|start_header_id|>"
+    vocab_pieces[4] = "<|end_header_id|>"
+    vocab_pieces[5] = "user"
+    vocab_pieces[6] = "assistant"
+    vocab_pieces[7] = "\n"
+    vocab_pieces[8] = "\u2581hello"
+    vocab_pieces[9] = "\u2581world"
+    vocab_pieces[10] = "\u2581"
+    vocab_pieces[11] = "<0x41>"
+
+    spm_path = work / "mini_spm_llama3.gguf"
+    write_gguf_q4_0(spm_path, cfg, tensors, vocab_pieces=vocab_pieces, tok_model="llama")
+
+    # SentencePiece '▁' word boundaries + <0xHH> byte fallback
+    out1 = run([exe, "generate", str(spm_path), "hello world", "3", "0", "40", "--ignore-eos"]).splitlines()
+    kv1 = {k: v for k, v in (l.split(":", 1) for l in out1)}
+    assert kv1["prompt_ids"] == "8,9", kv1
+
+    out2 = run([exe, "generate", str(spm_path), "A", "2", "0", "40", "--ignore-eos"]).splitlines()
+    kv2 = {k: v for k, v in (l.split(":", 1) for l in out2)}
+    assert kv2["prompt_ids"] == "10,11", kv2
+
+    # Extended sampling: min_p + presence_penalty + frequency_penalty + top_k > 64
+    s1 = run([exe, "generate", str(spm_path), "hello world", "6", "900", "128",
+              "--min-p", "150", "--presence-penalty", "500", "--frequency-penalty", "250",
+              "--seed", "99", "--ignore-eos"]).splitlines()
+    s2 = run([exe, "generate", str(spm_path), "hello world", "6", "900", "128",
+              "--min-p", "150", "--presence-penalty", "500", "--frequency-penalty", "250",
+              "--seed", "99", "--ignore-eos"]).splitlines()
+    assert strip_volatile_gen(s1) == strip_volatile_gen(s2), "Extended sampling not deterministic"
+    kvs = {k: v for k, v in (l.split(":", 1) for l in s1)}
+    assert len(kvs["generated_ids"].split(",")) == 6, kvs
+    print("SentencePiece ('▁'/<0xHH>) and extended sampling (min_p/presence/frequency/top_k>64) verified")
+    return spm_path
+
+
+def check_serve_enterprise_features(exe, spm_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import json
+    import socket
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    proc = subprocess.Popen(
+        [str(exe), "serve", str(spm_path), "127.0.0.1:0", "--max-slots", "2", "--api-key", "test-key-42"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        base_url = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if line and line.strip().startswith("serving:http://"):
+                base_url = line.strip().split("serving:", 1)[1]
+                break
+        assert base_url
+
+        # 1. CORS OPTIONS preflight (unauthenticated OK) + /health max_slots=2
+        opt_req = urllib.request.Request(base_url + "/v1/chat/completions", method="OPTIONS")
+        with urllib.request.urlopen(opt_req, timeout=5) as resp:
+            assert resp.status == 204, resp.status
+            assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+            assert "Authorization" in resp.headers.get("Access-Control-Allow-Headers", "")
+
+        with urllib.request.urlopen(base_url + "/health", timeout=5) as resp:
+            hdata = json.loads(resp.read().decode())
+            assert hdata["max_slots"] == 2, hdata
+
+        # 2. --api-key Bearer authentication enforcement on /v1/*
+        try:
+            urllib.request.urlopen(base_url + "/v1/models", timeout=5)
+            raise AssertionError("Expected HTTP 401 without Authorization header")
+        except urllib.error.HTTPError as e:
+            assert e.code == 401, e.code
+        auth_headers = {"Content-Type": "application/json", "Authorization": "Bearer test-key-42"}
+        with urllib.request.urlopen(urllib.request.Request(base_url + "/v1/models", headers=auth_headers), timeout=5) as resp:
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+
+        # 3. Batch /v1/embeddings
+        emb_req = urllib.request.Request(
+            base_url + "/v1/embeddings",
+            data=json.dumps({"input": ["hello world", "A"]}).encode(),
+            headers=auth_headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(emb_req, timeout=5) as resp:
+            edata = json.loads(resp.read().decode())
+            assert len(edata["data"]) == 2, edata
+            assert edata["data"][0]["index"] == 0 and edata["data"][1]["index"] == 1
+            assert edata["usage"]["prompt_tokens"] == 4, edata
+
+        # 4. Llama-3 chat template + stream_options.include_usage
+        chat_stream_req = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": " hello world"}],
+                "max_tokens": 3,
+                "temperature": 0.0,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }).encode(),
+            headers=auth_headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(chat_stream_req, timeout=5) as resp:
+            sse_raw = resp.read().decode()
+        events = [line[6:] for line in sse_raw.splitlines() if line.startswith("data: ")]
+        assert len(events) >= 3 and events[-1] == "[DONE]", events
+        usage_chunk = json.loads(events[-2])
+        assert usage_chunk["choices"] == [], usage_chunk
+        assert usage_chunk["usage"]["prompt_tokens"] == 14, usage_chunk
+        assert usage_chunk["usage"]["completion_tokens"] == 3, usage_chunk
+
+        # 5. Client-disconnect SSE cancellation frees slot & KV blocks
+        host_port = base_url.split("http://", 1)[1]
+        host, port_str = host_port.split(":", 1)
+        sock = socket.create_connection((host, int(port_str)), timeout=5)
+        payload = json.dumps({"prompt": "ids:1,7,42", "max_tokens": 16, "temperature": 0.0, "stream": True}).encode()
+        raw_http = (
+            f"POST /v1/completions HTTP/1.1\r\nHost: {host_port}\r\n"
+            f"Authorization: Bearer test-key-42\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
+        ).encode() + payload
+        sock.sendall(raw_http)
+        first_chunk = sock.recv(512)
+        assert b"text/event-stream" in first_chunk, first_chunk
+        sock.close()
+        time.sleep(0.25)
+        with urllib.request.urlopen(base_url + "/health", timeout=5) as resp:
+            h_after = json.loads(resp.read().decode())
+            assert h_after["active_slots"] == 0, h_after
+            assert h_after["kv_free_blocks"] == h_after["kv_total_blocks"], h_after
+
+        # 6. Concurrent multi-slot batched decode in serve
+        def do_cmpl(idx):
+            req = urllib.request.Request(
+                base_url + "/v1/completions",
+                data=json.dumps({
+                    "prompt": f"ids:{1 + idx},{5 + idx}",
+                    "max_tokens": 4,
+                    "temperature": 0.0,
+                    "ignore_eos": True,
+                }).encode(),
+                headers=auth_headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())["choices"][0]["text"]
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            batch_texts = list(pool.map(do_cmpl, [0, 1, 2]))
+        seq_texts = [do_cmpl(i) for i in range(3)]
+        assert batch_texts == seq_texts, (batch_texts, seq_texts)
+        print("Enterprise serve verified (CORS, --api-key, --max-slots, batch embeddings, Llama-3 template, include_usage, SSE cancel, concurrent batched decode)")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
@@ -1354,9 +1590,12 @@ def main():
         check_bpe_and_sampling(exes[1][2], work, CFG, tensors, qwen_biases)
         check_q4_k_q6_k_gguf(exes, work, tensors)
         check_qk_norm_gguf(exes, work, tensors)
+        check_q5_0_and_q8_0_layer_gguf(exes, work, tensors)
+        spm_path = check_extended_sampling_and_spm(exes[1][2], work, CFG, tensors)
         check_serve_http(exes[1][2], gguf_path)
         check_serve_chatml(exes[1][2], work, CFG, tensors)
-        print("LLM engine verification passed (Safetensors F32, GGUF Q4_0/Q8_0/Q4_K_M, qk_norm, ChatML, continuous batch HTTP serve + prefix cache)")
+        check_serve_enterprise_features(exes[1][2], spm_path)
+        print("LLM engine verification passed (Safetensors F32, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M, qk_norm, ChatML/Llama-3, SPM, continuous batch HTTP serve + prefix cache)")
 
 
 if __name__ == "__main__":
