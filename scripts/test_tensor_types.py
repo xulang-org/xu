@@ -125,8 +125,70 @@ fn check_blocks() int {
         require(indexed4 == expected4 && values[i] == expected4, "Q4_0 layout") >>>
         require(indexed8 == expected8 && values[i + 32] == expected8, "Q8_0 signed lanes") >>>
     }
-    _ := tensor.read_q8_0(&q8, 2) >>> (err) { << 1 }
-    >>> errors.new("truncated Q8_0 block succeeded")
+
+    // Q4_K super-block check (144 bytes -> 256 values, exercising scales[0..11] & high nibbles)
+    $q4k := "x" + half + string_from_byte(0) + string_from_byte(52) // d=0.5, dmin=0.25
+    // scales[0..3]=sc0..3 (low 6 bits) + high bits of sc4..7; scales[4..7]=m0..3 + high bits of m4..7; scales[8..11]=low 4 bits
+    q4k.push_str(string_from_byte(1 | (1 << 6)))  // sc0=1, sc4_hi=1
+    q4k.push_str(string_from_byte(2 | (0 << 6)))  // sc1=2, sc5_hi=0
+    q4k.push_str(string_from_byte(3 | (2 << 6)))  // sc2=3, sc6_hi=2
+    q4k.push_str(string_from_byte(4 | (3 << 6)))  // sc3=4, sc7_hi=3
+    q4k.push_str(string_from_byte(0 | (1 << 6)))  // m0=0,  m4_hi=1
+    q4k.push_str(string_from_byte(1 | (0 << 6)))  // m1=1,  m5_hi=0
+    q4k.push_str(string_from_byte(2 | (1 << 6)))  // m2=2,  m6_hi=1
+    q4k.push_str(string_from_byte(3 | (0 << 6)))  // m3=3,  m7_hi=0
+    q4k.push_str(string_from_byte(5 | (2 << 4)))  // sc4_lo=5 -> 21, m4_lo=2 -> 18
+    q4k.push_str(string_from_byte(6 | (3 << 4)))  // sc5_lo=6 -> 6,  m5_lo=3 -> 3
+    q4k.push_str(string_from_byte(7 | (4 << 4)))  // sc6_lo=7 -> 39, m6_lo=4 -> 20
+    q4k.push_str(string_from_byte(8 | (5 << 4)))  // sc7_lo=8 -> 56, m7_lo=5 -> 5
+    for i in 0:128 { q4k.push_str(string_from_byte(((i * 3) & 15) | (((15 - (i & 15)) & 15) << 4))) }
+    blk4k := tensor.read_q4_k(&q4k, 1) >>>
+    $vals4k := []f32{}
+    blk4k.append_f32($&vals4k)
+    require(vals4k.len == tensor.QK_K, "Q4_K len") >>>
+    $x4k := []f32{}
+    $ref_dot4k := f32(0)
+    for i in 0:256 {
+        v := blk4k.at(i) >>>
+        require(v == vals4k[i], "Q4_K at matches append_f32") >>>
+        xv := f32(f64((i % 9) - 4) * 0.125)
+        x4k.push(xv)
+        ref_dot4k += v * xv
+    }
+    // Check known spots: i=0 (chunk0 lo: d=0.5,sc=1,m=0,q=0 => 0.0), i=32 (chunk0 hi: sc=2,m=1,q=15 => 14.75), i=160 (chunk2 hi: sc=6,m=3,q=15 => 44.25)
+    require(vals4k[0] == f32(0.0) && vals4k[32] == f32(14.75) && vals4k[160] == f32(44.25), "Q4_K decoded values") >>>
+    require(math.abs(f64(blk4k.dot_f32(&x4k, 0) - ref_dot4k)) < 1e-4, "Q4_K dot_f32") >>>
+
+    // Q6_K super-block check (210 bytes -> 256 values)
+    $q6k := "x"
+    for i in 0:128 { q6k.push_str(string_from_byte(((i * 5) & 15) | (((i * 7 + 3) & 15) << 4))) }
+    for i in 0:64 { q6k.push_str(string_from_byte((i * 11) & 255)) }
+    for i in 0:16 {
+        $sc := i - 8
+        if sc == 0 { sc = 3 }
+        q6k.push_str(string_from_byte(sc & 255))
+    }
+    q6k.push_str(half) // d = 0.5
+    blk6k := tensor.read_q6_k(&q6k, 1) >>>
+    $vals6k := []f32{}
+    blk6k.append_f32($&vals6k)
+    require(vals6k.len == tensor.QK_K, "Q6_K len") >>>
+    $ref_dot6k := f32(0)
+    for i in 0:256 {
+        v := blk6k.at(i) >>>
+        require(v == vals6k[i], "Q6_K at matches append_f32") >>>
+        ref_dot6k += v * x4k[i]
+    }
+    require(math.abs(f64(blk6k.dot_f32(&x4k, 0) - ref_dot6k)) < 1e-4, "Q6_K dot_f32") >>>
+
+    _ := tensor.read_q4_k(&q4k, 2) >>> (err) {
+        _ := tensor.read_q6_k(&q6k, 2) >>> (err2) {
+            _ := tensor.read_q8_0(&q8, 2) >>> (err3) { << 1 }
+            >>> errors.new("truncated Q8_0 block succeeded")
+        }
+        >>> errors.new("truncated Q6_K block succeeded")
+    }
+    >>> errors.new("truncated Q4_K block succeeded")
 }
 
 fn check_narrow() int {

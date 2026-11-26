@@ -150,8 +150,128 @@ def pack_gguf_str(s):
     return struct.pack("<Q", len(b)) + b
 
 
+def quantize_q4_k_matrix(vals):
+    assert len(vals) % 256 == 0
+    nb = len(vals) // 256
+    raw = bytearray()
+    dequant = []
+    for b in range(nb):
+        blk = vals[b * 256:(b + 1) * 256]
+        sub_scales = []
+        sub_mins = []
+        q_subs = []
+        for s in range(8):
+            sub = blk[s * 32:(s + 1) * 32]
+            lo = min(0.0, min(sub))
+            hi = max(sub)
+            rng = max(hi - lo, 0.0)
+            sc = rng / 15.0 if rng > 0.0 else 0.0
+            mn = -lo
+            sub_scales.append(sc)
+            sub_mins.append(mn)
+            q_subs.append(sub)
+        max_sc = max(sub_scales) if sub_scales else 0.0
+        max_mn = max(sub_mins) if sub_mins else 0.0
+        d = f32(max_sc / 63.0) if max_sc > 0.0 else 0.0
+        dmin = f32(max_mn / 63.0) if max_mn > 0.0 else 0.0
+        d16_b = struct.pack("<e", d)
+        dmin16_b = struct.pack("<e", dmin)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        dmin16 = f32(struct.unpack("<e", dmin16_b)[0])
+        raw.extend(d16_b)
+        raw.extend(dmin16_b)
+
+        sc_q = [min(63, max(0, int(round(s / d16)))) if d16 > 0.0 else 0 for s in sub_scales]
+        mn_q = [min(63, max(0, int(round(m / dmin16)))) if dmin16 > 0.0 else 0 for m in sub_mins]
+        scales_b = bytearray(12)
+        for j in range(4):
+            scales_b[j] = sc_q[j] & 63
+            scales_b[j + 4] = mn_q[j] & 63
+        for j in range(4, 8):
+            scales_b[j + 4] = (sc_q[j] & 15) | ((mn_q[j] & 15) << 4)
+            scales_b[j - 4] |= ((sc_q[j] >> 4) & 3) << 6
+            scales_b[j] |= ((mn_q[j] >> 4) & 3) << 6
+        raw.extend(scales_b)
+
+        qs_b = bytearray(128)
+        for chunk in range(4):
+            s_lo = chunk * 2
+            s_hi = s_lo + 1
+            d1 = f32(d16 * sc_q[s_lo])
+            m1 = f32(dmin16 * mn_q[s_lo])
+            d2 = f32(d16 * sc_q[s_hi])
+            m2 = f32(dmin16 * mn_q[s_hi])
+            sub_lo = q_subs[s_lo]
+            sub_hi = q_subs[s_hi]
+            ql_vals = []
+            qh_vals = []
+            for l in range(32):
+                q0 = min(15, max(0, int(round((sub_lo[l] + m1) / d1)))) if d1 > 0.0 else 0
+                q1 = min(15, max(0, int(round((sub_hi[l] + m2) / d2)))) if d2 > 0.0 else 0
+                qs_b[chunk * 32 + l] = (q0 & 15) | ((q1 & 15) << 4)
+                ql_vals.append(f32(f32(d1 * q0) - m1))
+                qh_vals.append(f32(f32(d2 * q1) - m2))
+            dequant.extend(ql_vals)
+            dequant.extend(qh_vals)
+        raw.extend(qs_b)
+    return bytes(raw), dequant
+
+
+def quantize_q6_k_matrix(vals):
+    assert len(vals) % 256 == 0
+    nb = len(vals) // 256
+    raw = bytearray()
+    dequant = []
+    for b in range(nb):
+        blk = vals[b * 256:(b + 1) * 256]
+        amax_subs = []
+        for s in range(16):
+            sub = blk[s * 16:(s + 1) * 16]
+            amax_subs.append(max(abs(v) for v in sub))
+        max_sub = max(amax_subs)
+        d = f32(max_sub / (31.0 * 127.0)) if max_sub > 0.0 else 0.0
+        d16_b = struct.pack("<e", d)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        sc_q = []
+        for amax in amax_subs:
+            qsc = min(127, max(1, int(round(amax / (31.0 * d16))))) if (d16 > 0.0 and amax > 0.0) else 0
+            sc_q.append(qsc)
+        ql = bytearray(128)
+        qh = bytearray(64)
+        dq_blk = [0.0] * 256
+        for h in range(2):
+            y_off = h * 128
+            ql_off = h * 64
+            qh_off = h * 32
+            sc_off = h * 8
+            for l in range(32):
+                is_idx = l // 16
+                quants = []
+                for quad, off_s in enumerate((0, 32, 64, 96)):
+                    idx = y_off + l + off_s
+                    sc_val = d16 * sc_q[sc_off + is_idx + quad * 2]
+                    q = min(31, max(-32, int(round(blk[idx] / sc_val)))) if sc_val != 0.0 else 0
+                    quants.append(q + 32)
+                    dq_blk[idx] = f32(f32(d16 * sc_q[sc_off + is_idx + quad * 2]) * q)
+                q1, q2, q3, q4 = quants
+                ql[ql_off + l] = (q1 & 15) | ((q3 & 15) << 4)
+                ql[ql_off + l + 32] = (q2 & 15) | ((q4 & 15) << 4)
+                qh[qh_off + l] = (
+                    ((q1 >> 4) & 3)
+                    | (((q2 >> 4) & 3) << 2)
+                    | (((q3 >> 4) & 3) << 4)
+                    | (((q4 >> 4) & 3) << 6)
+                )
+        raw.extend(ql)
+        raw.extend(qh)
+        raw.extend(struct.pack("<16b", *sc_q))
+        raw.extend(d16_b)
+        dequant.extend(dq_blk)
+    return bytes(raw), dequant
+
+
 def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_output=False,
-                    encode_dense=None, merges=None, vocab_pieces=None):
+                    encode_dense=None, merges=None, vocab_pieces=None, qk_norms=None, kquant_mode=False):
     dim = cfg["dim"]
     hidden = cfg["hidden_dim"]
     n_layers = cfg["n_layers"]
@@ -202,6 +322,7 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
     tensor_specs = []
     q4_data = {}
     q8_data = {}
+    dequant_data = {}
 
     def add_f32(gname, dims, vals):
         raw = struct.pack(f"<{len(vals)}f", *vals)
@@ -224,13 +345,30 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         tensor_specs.append((gname, dims, 8, raw))
         q8_data[gname] = (qs, sc)
 
+    def add_q4k(gname, dims, vals):
+        raw, dq = quantize_q4_k_matrix(vals)
+        tensor_specs.append((gname, dims, 12, raw))
+        dequant_data[gname] = dq
+
+    def add_q6k(gname, dims, vals):
+        raw, dq = quantize_q6_k_matrix(vals)
+        tensor_specs.append((gname, dims, 14, raw))
+        dequant_data[gname] = dq
+
     def add_matrix(gname, st_key, dims, vals):
-        if encode_dense is not None:
+        if kquant_mode:
+            if gname.endswith("attn_v.weight") or gname.endswith("ffn_down.weight"):
+                add_q6k(gname, dims, vals)
+            else:
+                add_q4k(gname, dims, vals)
+        elif encode_dense is not None:
             add_dense(gname, st_key, dims, vals)
         else:
             add_q4(gname, dims, vals)
 
-    if encode_dense is not None:
+    if kquant_mode:
+        add_q6k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif encode_dense is not None:
         add_dense("token_embd.weight", "embed_tokens.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif qwen_mode or tied_output:
         add_q4("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
@@ -247,6 +385,9 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
             add_f32(gp + "attn_q.bias", [dim], biases[l][0])
             add_f32(gp + "attn_k.bias", [kv_dim], biases[l][1])
             add_f32(gp + "attn_v.bias", [kv_dim], biases[l][2])
+        if qk_norms is not None:
+            add_f32(gp + "attn_q_norm.weight", [head_dim], qk_norms[l][0])
+            add_f32(gp + "attn_k_norm.weight", [head_dim], qk_norms[l][1])
         add_matrix(gp + "attn_output.weight", p + "self_attn.o_proj.weight", [dim, dim], tensors[p + "self_attn.o_proj.weight"][1])
         add_dense(gp + "ffn_norm.weight", p + "post_attention_layernorm.weight", [dim], tensors[p + "post_attention_layernorm.weight"][1])
         add_matrix(gp + "ffn_gate.weight", p + "mlp.gate_proj.weight", [dim, hidden], tensors[p + "mlp.gate_proj.weight"][1])
@@ -254,7 +395,9 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         add_matrix(gp + "ffn_down.weight", p + "mlp.down_proj.weight", [hidden, dim], tensors[p + "mlp.down_proj.weight"][1])
     add_dense("output_norm.weight", "norm.weight", [dim], tensors["norm.weight"][1])
     if not tied_output:
-        if encode_dense is not None:
+        if kquant_mode:
+            add_q6k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif encode_dense is not None:
             add_dense("output.weight", "lm_head.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif qwen_mode:
             add_q8("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
@@ -285,6 +428,8 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
     buf.extend(b"\x00" * pad)
     buf.extend(payload)
     path.write_bytes(buf)
+    if kquant_mode:
+        return dequant_data, None
     return q4_data, q8_data if qwen_mode else None
 
 
@@ -414,7 +559,19 @@ def py_rope(vec, n_heads, head_dim, pos, theta):
     return out
 
 
-def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_data=None, biases=None):
+def py_head_rmsnorm(vec, n_heads, head_dim, weight):
+    out = list(vec)
+    for h in range(n_heads):
+        off = h * head_dim
+        part = out[off:off + head_dim]
+        normed = py_rmsnorm(part, [0.0] * head_dim, weight)
+        for j in range(head_dim):
+            out[off + j] = normed[j]
+    return out
+
+
+def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_data=None,
+                   biases=None, qk_norms=None, dequant_data=None):
     dim = CFG["dim"]
     hidden = CFG["hidden_dim"]
     n_layers = CFG["n_layers"]
@@ -428,6 +585,8 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
     inv_sqrt_d = f32(1.0 / math.sqrt(head_dim))
 
     def proj(x, q8, st_name, gguf_name, rows, cols):
+        if dequant_data is not None and gguf_name in dequant_data:
+            return py_matvec(x, dequant_data[gguf_name], rows, cols)
         if q8_data is not None and gguf_name in q8_data:
             qs, sc = q8_data[gguf_name]
             assert use_q8_act
@@ -441,7 +600,9 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
             return py_matvec_q4_0_q8_0(xq, xs, qs, sc, rows, cols)
         return py_matvec_q4_0(x, qs, sc, rows, cols)
 
-    if q4_data is not None and "token_embd.weight" in q4_data:
+    if dequant_data is not None and "token_embd.weight" in dequant_data:
+        embed = dequant_data["token_embd.weight"]
+    elif q4_data is not None and "token_embd.weight" in q4_data:
         qs, sc = q4_data["token_embd.weight"]
         embed = py_dequantize_q4_0(qs, sc)
     else:
@@ -470,6 +631,9 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
                 q_raw = [f32(a + b) for a, b in zip(q_raw, bq)]
                 k_raw = [f32(a + b) for a, b in zip(k_raw, bk)]
                 v = [f32(a + b) for a, b in zip(v, bv)]
+            if qk_norms is not None:
+                q_raw = py_head_rmsnorm(q_raw, n_heads, head_dim, qk_norms[l][0])
+                k_raw = py_head_rmsnorm(k_raw, n_kv, head_dim, qk_norms[l][1])
             q = py_rope(q_raw, n_heads, head_dim, step, theta)
             k = py_rope(k_raw, n_kv, head_dim, step, theta)
             k_cache[l].append(k)
@@ -589,7 +753,7 @@ def check_format(exes, model_path, py_ref, label, want_fmt, want_act, want_vocab
             xu_toks = [t for t, _ in seq[r]]
             xu_logits = [bits_to_f32(b) for _, b in seq[r]]
             assert xu_toks == py_toks, (label, name, r, xu_toks, py_toks)
-            tol = (2e-2 if want_fmt == "q4_0" else 1e-4) if fast == "1" else 1e-5
+            tol = (2e-2 if want_fmt == "q4_0" else (1e-3 if want_fmt in ("q4_k", "q6_k") else 1e-4)) if fast == "1" else (1e-4 if want_fmt in ("q4_k", "q6_k") else 1e-5)
             for a, b in zip(xu_logits, py_logits):
                 assert abs(a - b) < tol, (label, name, r, a, b)
 
@@ -919,7 +1083,81 @@ def check_serve_http(exe, gguf_path):
             assert abs(l2 - 1.0) < 1e-3, l2
             assert e_data["usage"]["prompt_tokens"] == 3
 
-        print(f"OpenAI-compatible HTTP serve mode verified (SSE stream, stop, embeddings @ {base_url})")
+        # Test concurrent continuous batching in HTTP serve (SSE stream + completion in flight together)
+        import concurrent.futures
+
+        def do_concurrent_stream():
+            s_req = urllib.request.Request(
+                base_url + "/v1/chat/completions",
+                data=json.dumps({
+                    "messages": [{"role": "user", "content": "ids:1,7,42"}],
+                    "max_tokens": 3,
+                    "temperature": 0.0,
+                    "stream": True,
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(s_req, timeout=10) as resp:
+                assert resp.status == 200
+                return resp.read().decode()
+
+        def do_concurrent_comp():
+            c_req = urllib.request.Request(
+                base_url + "/v1/completions",
+                data=json.dumps({
+                    "prompt": "ids:5,11,23",
+                    "max_tokens": 3,
+                    "temperature": 0.0,
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(c_req, timeout=10) as resp:
+                assert resp.status == 200
+                return json.loads(resp.read().decode())
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_st = pool.submit(do_concurrent_stream)
+            f_cm = pool.submit(do_concurrent_comp)
+            sse2 = f_st.result(timeout=10)
+            cm2 = f_cm.result(timeout=10)
+        evs2 = [line[6:] for line in sse2.splitlines() if line.startswith("data: ")]
+        assert evs2 and evs2[-1] == "[DONE]", evs2
+        txt2 = "".join(json.loads(ev)["choices"][0]["delta"].get("content", "") for ev in evs2[:-1])
+        assert txt2 == c_data["choices"][0]["text"], (txt2, c_data)
+        assert cm2["usage"]["prompt_tokens"] == 3 and cm2["usage"]["completion_tokens"] == 3
+
+        # Test Prefix KV Cache reuse: same prompt prefix on subsequent requests
+        pfx_a = urllib.request.Request(
+            base_url + "/v1/completions",
+            data=json.dumps({"prompt": "ids:1,7,42,3", "max_tokens": 3, "temperature": 0.0}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(pfx_a, timeout=5) as resp:
+            out_a = json.loads(resp.read().decode())["choices"][0]["text"]
+        pfx_b = urllib.request.Request(
+            base_url + "/v1/completions",
+            data=json.dumps({"prompt": "ids:1,7,42,9", "max_tokens": 3, "temperature": 0.0}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(pfx_b, timeout=5) as resp:
+            out_b = json.loads(resp.read().decode())["choices"][0]["text"]
+        # Verify cached output on ids:1,7,42,9 equals uncached generate CLI output!
+        gen_ref = run([exe, "generate", str(gguf_path), "ids:1,7,42,9", "3", "0", "40"]).splitlines()
+        gen_kv = {k: v for k, v in (l.split(":", 1) for l in gen_ref)}
+        assert out_b == gen_kv["generated_text"], (out_b, gen_kv["generated_text"], out_a)
+
+        with urllib.request.urlopen(base_url + "/health", timeout=5) as resp:
+            h_data = json.loads(resp.read().decode())
+            assert h_data["status"] == "ok"
+            assert h_data["max_slots"] == 4, h_data
+            assert h_data["prefix_cache_hits"] >= 1, h_data
+            assert h_data["prefix_cache_tokens"] >= 3, h_data
+
+        print(f"OpenAI-compatible HTTP serve mode verified (continuous batching, prefix cache hits={h_data['prefix_cache_hits']}, SSE stream, stop, embeddings @ {base_url})")
     finally:
         proc.terminate()
         try:
@@ -927,6 +1165,90 @@ def check_serve_http(exe, gguf_path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
+
+
+def check_serve_chatml(exe, work, cfg, tensors):
+    import json
+    import subprocess
+    import time
+    import urllib.request
+
+    vocab = cfg["vocab_size"]
+    vocab_pieces = [f"tok_{i}" for i in range(vocab)]
+    vocab_pieces[0] = "<|endoftext|>"
+    vocab_pieces[1] = "<|im_start|>"
+    vocab_pieces[2] = "<|im_end|>"
+    vocab_pieces[3] = "user"
+    vocab_pieces[4] = "assistant"
+    vocab_pieces[5] = "\u0120hi"
+    vocab_pieces[6] = "\u010a"  # GPT-2 newline '\n' -> U+010A
+    chat_path = work / "mini_chatml.gguf"
+    write_gguf_q4_0(chat_path, cfg, tensors, qwen_mode=True, vocab_pieces=vocab_pieces)
+
+    # Expected ChatML prompt tokens: [<|im_start|>, user, \n, tok..., <|im_end|>, \n, <|im_start|>, assistant, \n]
+    proc = subprocess.Popen(
+        [str(exe), "serve", str(chat_path), "127.0.0.1:0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        base_url = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if line and line.strip().startswith("serving:http://"):
+                base_url = line.strip().split("serving:", 1)[1]
+                break
+        assert base_url
+        req = urllib.request.Request(
+            base_url + "/v1/chat/completions",
+            data=json.dumps({
+                "messages": [{"role": "user", "content": " hi"}],
+                "max_tokens": 2,
+                "temperature": 0.0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            assert data["usage"]["prompt_tokens"] == 9, data
+        print("ChatML template + special-token encoding verified in HTTP serve")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+
+def check_q4_k_q6_k_gguf(exes, work, tensors):
+    path = work / "mini_q4_k_m.gguf"
+    dequant_data, _ = write_gguf_q4_k_m = write_gguf_q4_0(path, CFG, tensors, kquant_mode=True)
+    py_ref = [
+        py_run_request(tensors, prompt, gen, dequant_data=dequant_data)
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, path, py_ref, "Q4_K_M", "q4_k", "f32", CFG["vocab_size"])
+
+
+def check_qk_norm_gguf(exes, work, tensors):
+    rng = random.Random(20261126)
+    head_dim = CFG["dim"] // CFG["n_heads"]
+    qk_norms = [
+        (
+            [f32(0.75 + 0.5 * rng.random()) for _ in range(head_dim)],
+            [f32(0.80 + 0.4 * rng.random()) for _ in range(head_dim)],
+        )
+        for _ in range(CFG["n_layers"])
+    ]
+    path = work / "mini_qknorm.gguf"
+    q4_data, _ = write_gguf_q4_0(path, CFG, tensors, qk_norms=qk_norms)
+    py_ref = [
+        py_run_request(tensors, prompt, gen, q4_data=q4_data, use_q8_act=True, qk_norms=qk_norms)
+        for prompt, gen in REQUESTS
+    ]
+    check_format(exes, path, py_ref, "qk_norm", "q4_0", "q8_0", CFG["vocab_size"])
 
 
 def main():
@@ -1030,8 +1352,11 @@ def main():
         check_qwen2_gguf(exes, qwen_path, tensors, qwen_biases, qwen_q4_data, qwen_q8_data)
         check_large_dim_and_head128(exes[1][2], work)
         check_bpe_and_sampling(exes[1][2], work, CFG, tensors, qwen_biases)
+        check_q4_k_q6_k_gguf(exes, work, tensors)
+        check_qk_norm_gguf(exes, work, tensors)
         check_serve_http(exes[1][2], gguf_path)
-        print("LLM engine verification passed (Safetensors F32, GGUF Q4_0xF32/Q8_0 SDOT, Qwen2.5 GGUF+BPE, dim>2048 & hd=128, generate & HTTP serve)")
+        check_serve_chatml(exes[1][2], work, CFG, tensors)
+        print("LLM engine verification passed (Safetensors F32, GGUF Q4_0/Q8_0/Q4_K_M, qk_norm, ChatML, continuous batch HTTP serve + prefix cache)")
 
 
 if __name__ == "__main__":

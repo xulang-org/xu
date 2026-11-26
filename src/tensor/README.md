@@ -11,6 +11,8 @@ and GGML quantization blocks.
 | FP8 E4M3FNUZ, E5M2FNUZ | 1 byte per element | `Fp8E4M3Fnuz`, `Fp8E5M2Fnuz` |
 | GGML Q4_0 | 18 bytes per 32 values | `Q4Block` |
 | GGML Q8_0 | 34 bytes per 32 values | `Q8Block` |
+| GGML Q4_K | 144 bytes per 256 values | `Q4KBlock` |
+| GGML Q6_K | 210 bytes per 256 values | `Q6KBlock` |
 
 Use `tensor.f16(value)`, `tensor.bf16(value)`, or a `tensor.fp8_*(value)`
 constructor to round an F32 value to storage. Each scalar exposes its raw
@@ -28,9 +30,10 @@ describes one scalar, and any zero dimension makes the view empty.
 `read_f32` takes a coordinate and `read_f32_linear` takes a logical
 row-major index, including for noncontiguous views.
 
-Use `read_q4_0` or `read_q8_0` to read a block at a byte offset.
-`at` decodes an indexed value and `append_f32` decodes a whole block.
-The block types expose their scale and packed or signed lanes for raw access.
+Use `read_q4_0`, `read_q8_0`, `read_q4_k`, or `read_q6_k` to read a block at a
+byte offset. `at` decodes an indexed value, `append_f32` decodes a whole block,
+and K-quant blocks also expose `dot_f32` for zero-allocation inner products.
+The block types expose their scales and packed lanes for raw access.
 
 ## Numerical kernels (`ops.xu`)
 

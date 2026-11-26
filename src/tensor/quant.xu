@@ -5,6 +5,9 @@
 pub const GGML_BLOCK_VALUES = 32
 pub const Q4_0_BYTES = 18
 pub const Q8_0_BYTES = 34
+pub const QK_K = 256
+pub const Q4_K_BYTES = 144
+pub const Q6_K_BYTES = 210
 
 // GGML Q4_0 stores a little-endian binary16 scale and 16 packed bytes.
 // Each byte contains a low nibble for index i and a high nibble for i+16.
@@ -17,6 +20,24 @@ pub struct Q4Block {
 pub struct Q8Block {
     pub scale F16
     pub quants [32]i8
+}
+
+// GGML Q4_K super-block encodes 256 values in 144 bytes: f16 d/dmin, 12 packed
+// 6-bit scale/min bytes, and 128 bytes of 4-bit unsigned nibbles.
+pub struct Q4KBlock {
+    pub d F16
+    pub dmin F16
+    pub scales [12]u8
+    pub qs [128]u8
+}
+
+// GGML Q6_K super-block encodes 256 values in 210 bytes: 128 low-nibble bytes,
+// 64 high-2-bit bytes, 16 signed int8 sub-scales, and a trailing f16 scale d.
+pub struct Q6KBlock {
+    pub ql [128]u8
+    pub qh [64]u8
+    pub scales [16]i8
+    pub d F16
 }
 
 fn check_block(storage &string, offset int, width int) int {
@@ -72,4 +93,186 @@ pub fn (block &Q8Block) append_f32(out $&[]f32) {
     for i in 0:32 {
         out.push(f32(int(block.quants[i])) * d)
     }
+}
+
+fn q4_k_scale(scales &[12]u8, j int) int {
+    if j < 4 { << int(scales[j]) & 63 }
+    << (int(scales[j + 4]) & 15) | ((int(scales[j - 4]) >> 6) << 4)
+}
+
+fn q4_k_min(scales &[12]u8, j int) int {
+    if j < 4 { << int(scales[j + 4]) & 63 }
+    << (int(scales[j + 4]) >> 4) | ((int(scales[j]) >> 6) << 4)
+}
+
+pub fn read_q4_k(storage &string, offset int) Q4KBlock {
+    check_block(storage, offset, Q4_K_BYTES) >>>
+    d := F16{bits: u16(scalar_bits_le(storage, offset, 2))}
+    dmin := F16{bits: u16(scalar_bits_le(storage, offset + 2, 2))}
+    $scales := [12]u8{}
+    for i in 0:12 { scales[i] = u8(storage[offset + 4 + i]) }
+    $qs := [128]u8{}
+    for i in 0:128 { qs[i] = u8(storage[offset + 16 + i]) }
+    << Q4KBlock{d: d, dmin: dmin, scales: scales, qs: qs}
+}
+
+pub fn (block &Q4KBlock) at(index int) f32 {
+    if index < 0 || index >= QK_K { >>> errors.new("Q4_K index outside block") }
+    chunk := index / 64
+    within := index % 64
+    $is_idx := chunk * 2
+    $shift := 0
+    if within >= 32 {
+        is_idx += 1
+        shift = 4
+    }
+    sc := q4_k_scale(&block.scales, is_idx)
+    m := q4_k_min(&block.scales, is_idx)
+    q := (int(block.qs[chunk * 32 + (within & 31)]) >> shift) & 15
+    << block.d.to_f32() * f32(sc) * f32(q) - block.dmin.to_f32() * f32(m)
+}
+
+pub fn (block &Q4KBlock) append_f32(out $&[]f32) {
+    d := block.d.to_f32()
+    dmin := block.dmin.to_f32()
+    for chunk in 0:4 {
+        is_idx := chunk * 2
+        d1 := d * f32(q4_k_scale(&block.scales, is_idx))
+        m1 := dmin * f32(q4_k_min(&block.scales, is_idx))
+        d2 := d * f32(q4_k_scale(&block.scales, is_idx + 1))
+        m2 := dmin * f32(q4_k_min(&block.scales, is_idx + 1))
+        q_off := chunk * 32
+        for l in 0:32 {
+            out.push(d1 * f32(int(block.qs[q_off + l]) & 15) - m1)
+        }
+        for l in 0:32 {
+            out.push(d2 * f32(int(block.qs[q_off + l]) >> 4) - m2)
+        }
+    }
+}
+
+pub fn (block &Q4KBlock) dot_f32(x &[]f32, x_off int) f32 {
+    d := block.d.to_f32()
+    dmin := block.dmin.to_f32()
+    $acc := f32(0)
+    for chunk in 0:4 {
+        is_idx := chunk * 2
+        d1 := d * f32(q4_k_scale(&block.scales, is_idx))
+        m1 := dmin * f32(q4_k_min(&block.scales, is_idx))
+        d2 := d * f32(q4_k_scale(&block.scales, is_idx + 1))
+        m2 := dmin * f32(q4_k_min(&block.scales, is_idx + 1))
+        q_off := chunk * 32
+        x_lo := x_off + chunk * 64
+        x_hi := x_lo + 32
+        $sq_lo := f32(0)
+        $sx_lo := f32(0)
+        $sq_hi := f32(0)
+        $sx_hi := f32(0)
+        for l in 0:32 {
+            qb := int(block.qs[q_off + l])
+            xl := x[x_lo + l]
+            xh := x[x_hi + l]
+            sq_lo += f32(qb & 15) * xl
+            sx_lo += xl
+            sq_hi += f32(qb >> 4) * xh
+            sx_hi += xh
+        }
+        acc += (d1 * sq_lo - m1 * sx_lo) + (d2 * sq_hi - m2 * sx_hi)
+    }
+    << acc
+}
+
+pub fn read_q6_k(storage &string, offset int) Q6KBlock {
+    check_block(storage, offset, Q6_K_BYTES) >>>
+    $ql := [128]u8{}
+    for i in 0:128 { ql[i] = u8(storage[offset + i]) }
+    $qh := [64]u8{}
+    for i in 0:64 { qh[i] = u8(storage[offset + 128 + i]) }
+    $scales := [16]i8{}
+    for i in 0:16 { scales[i] = i8(storage[offset + 192 + i]) }
+    d := F16{bits: u16(scalar_bits_le(storage, offset + 208, 2))}
+    << Q6KBlock{ql: ql, qh: qh, scales: scales, d: d}
+}
+
+pub fn (block &Q6KBlock) at(index int) f32 {
+    if index < 0 || index >= QK_K { >>> errors.new("Q6_K index outside block") }
+    h := index / 128
+    rem := index % 128
+    quad := rem / 32
+    l := rem % 32
+    is_idx := l / 16
+    ql_off := h * 64
+    qh_off := h * 32
+    sc_off := h * 8
+    qh_v := int(block.qh[qh_off + l])
+    $q := 0
+    $sc := 0
+    if quad == 0 {
+        q = ((int(block.ql[ql_off + l]) & 15) | ((qh_v & 3) << 4)) - 32
+        sc = int(block.scales[sc_off + is_idx])
+    } else if quad == 1 {
+        q = ((int(block.ql[ql_off + l + 32]) & 15) | (((qh_v >> 2) & 3) << 4)) - 32
+        sc = int(block.scales[sc_off + is_idx + 2])
+    } else if quad == 2 {
+        q = ((int(block.ql[ql_off + l]) >> 4) | (((qh_v >> 4) & 3) << 4)) - 32
+        sc = int(block.scales[sc_off + is_idx + 4])
+    } else {
+        q = ((int(block.ql[ql_off + l + 32]) >> 4) | (((qh_v >> 6) & 3) << 4)) - 32
+        sc = int(block.scales[sc_off + is_idx + 6])
+    }
+    << block.d.to_f32() * f32(sc) * f32(q)
+}
+
+pub fn (block &Q6KBlock) append_f32(out $&[]f32) {
+    d := block.d.to_f32()
+    $buf := [256]f32{}
+    for h in 0:2 {
+        y_off := h * 128
+        ql_off := h * 64
+        qh_off := h * 32
+        sc_off := h * 8
+        for l in 0:32 {
+            is_idx := l / 16
+            ql0 := int(block.ql[ql_off + l])
+            ql1 := int(block.ql[ql_off + l + 32])
+            qhv := int(block.qh[qh_off + l])
+            q1 := ((ql0 & 15) | ((qhv & 3) << 4)) - 32
+            q2 := ((ql1 & 15) | (((qhv >> 2) & 3) << 4)) - 32
+            q3 := ((ql0 >> 4) | (((qhv >> 4) & 3) << 4)) - 32
+            q4 := ((ql1 >> 4) | (((qhv >> 6) & 3) << 4)) - 32
+            buf[y_off + l] = d * f32(int(block.scales[sc_off + is_idx])) * f32(q1)
+            buf[y_off + l + 32] = d * f32(int(block.scales[sc_off + is_idx + 2])) * f32(q2)
+            buf[y_off + l + 64] = d * f32(int(block.scales[sc_off + is_idx + 4])) * f32(q3)
+            buf[y_off + l + 96] = d * f32(int(block.scales[sc_off + is_idx + 6])) * f32(q4)
+        }
+    }
+    for i in 0:256 { out.push(buf[i]) }
+}
+
+pub fn (block &Q6KBlock) dot_f32(x &[]f32, x_off int) f32 {
+    d := block.d.to_f32()
+    $sum := f32(0)
+    for h in 0:2 {
+        y_off := x_off + h * 128
+        ql_off := h * 64
+        qh_off := h * 32
+        sc_off := h * 8
+        for l in 0:32 {
+            is_idx := l / 16
+            ql0 := int(block.ql[ql_off + l])
+            ql1 := int(block.ql[ql_off + l + 32])
+            qhv := int(block.qh[qh_off + l])
+            q1 := ((ql0 & 15) | ((qhv & 3) << 4)) - 32
+            q2 := ((ql1 & 15) | (((qhv >> 2) & 3) << 4)) - 32
+            q3 := ((ql0 >> 4) | (((qhv >> 4) & 3) << 4)) - 32
+            q4 := ((ql1 >> 4) | (((qhv >> 6) & 3) << 4)) - 32
+            s1 := int(block.scales[sc_off + is_idx]) * q1
+            s2 := int(block.scales[sc_off + is_idx + 2]) * q2
+            s3 := int(block.scales[sc_off + is_idx + 4]) * q3
+            s4 := int(block.scales[sc_off + is_idx + 6]) * q4
+            sum += f32(s1) * x[y_off + l] + f32(s2) * x[y_off + l + 32] +
+                   f32(s3) * x[y_off + l + 64] + f32(s4) * x[y_off + l + 96]
+        }
+    }
+    << d * sum
 }

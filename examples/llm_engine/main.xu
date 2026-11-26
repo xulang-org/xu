@@ -22,8 +22,14 @@ const GGML_TYPE_F32 = 0
 const GGML_TYPE_F16 = 1
 const GGML_TYPE_Q4_0 = 2
 const GGML_TYPE_Q8_0 = 8
+const GGML_TYPE_Q4_K = 12
+const GGML_TYPE_Q6_K = 14
 const GGML_TYPE_BF16 = 30
 const GGML_TYPE_F8_E4M3 = 43
+
+const COMPACT_DENSE = 0
+const COMPACT_Q4_K = 12
+const COMPACT_Q6_K = 14
 
 struct ModelConfig {
     dim int
@@ -52,6 +58,7 @@ struct Model {
     embed_p4 bool
     lm_head_p4 bool
     has_qkv_bias bool
+    has_qk_norm bool
     weights []f32
     compact_weights CompactWeights
     q4_qs []u8
@@ -74,6 +81,8 @@ struct Model {
     bq [][]f32
     bk [][]f32
     bv [][]f32
+    q_norms [][]f32
+    k_norms [][]f32
     attn_norms [][]f32
     ffn_norms [][]f32
     final_norm []f32
@@ -90,10 +99,17 @@ struct Model {
 struct CompactWeights {
     data string
     views []tensor.TensorView
+    kinds []int
+    raw_starts []int
+    raw_rows []int
+    raw_cols []int
 }
 
 fn empty_compact_weights() CompactWeights {
-    << CompactWeights{data: "", views: []tensor.TensorView{}}
+    << CompactWeights{
+        data: "", views: []tensor.TensorView{},
+        kinds: []int{}, raw_starts: []int{}, raw_rows: []int{}, raw_cols: []int{}
+    }
 }
 
 struct PagedKvCache {
@@ -492,6 +508,27 @@ fn gguf_stream_f32_into(f &os.File, data_base int, info &GgufTensorInfo, expecte
             }
         }
         << 0
+    } else if info.gtype == GGML_TYPE_Q4_K || info.gtype == GGML_TYPE_Q6_K {
+        if expected % tensor.QK_K != 0 {
+            >>> errors.new("gguf length not a multiple of K-quant super-block: " + info.name)
+        }
+        blocks := expected / tensor.QK_K
+        if info.gtype == GGML_TYPE_Q4_K {
+            length := checked_size_product(blocks, tensor.Q4_K_BYTES) >>>
+            chunk := read_exact(f, length) >>>
+            for i in 0:blocks {
+                block := tensor.read_q4_k(&chunk, i * tensor.Q4_K_BYTES) >>>
+                block.append_f32(out)
+            }
+        } else {
+            length := checked_size_product(blocks, tensor.Q6_K_BYTES) >>>
+            chunk := read_exact(f, length) >>>
+            for i in 0:blocks {
+                block := tensor.read_q6_k(&chunk, i * tensor.Q6_K_BYTES) >>>
+                block.append_f32(out)
+            }
+        }
+        << 0
     }
 
     dtype := gguf_dense_dtype(info.gtype) >>>
@@ -514,8 +551,46 @@ fn gguf_stream_f32_slice(f &os.File, data_base int, info &GgufTensorInfo, expect
     << out
 }
 
-fn gguf_stream_matrix(f &os.File, data_base int, info &GgufTensorInfo, expected int,
+fn gguf_stream_kquant(f &os.File, data_base int, info &GgufTensorInfo, rows int, cols int,
+                      compact $&CompactWeights) int {
+    expected := rows * cols
+    if info.n_elems != expected || cols <= 0 || cols % tensor.QK_K != 0 {
+        >>> errors.new("gguf K-quant tensor shape mismatch for " + info.name)
+    }
+    $blk_bytes := tensor.Q4_K_BYTES
+    $kind := COMPACT_Q4_K
+    if info.gtype == GGML_TYPE_Q6_K {
+        blk_bytes = tensor.Q6_K_BYTES
+        kind = COMPACT_Q6_K
+    } else if info.gtype != GGML_TYPE_Q4_K {
+        >>> errors.new("expected Q4_K or Q6_K gguf tensor for " + info.name)
+    }
+    nb := cols / tensor.QK_K
+    row_bytes := checked_size_product(nb, blk_bytes) >>>
+    total_bytes := checked_size_product(rows, row_bytes) >>>
+    start := gguf_tensor_start(data_base, info) >>>
+    _ := f.seek(start, os.SEEK_SET) >>>
+    chunk := read_exact(f, total_bytes) >>>
+    arena_start := compact.data.len
+    backing := $&compact.data
+    backing.push_str(chunk)
+    empty_shape := [0]
+    dummy := tensor.contiguous_view(tensor.dtype_f32(), &empty_shape, 0, 0) >>>
+    index := compact.views.len
+    compact.views.push(dummy)
+    compact.kinds.push(kind)
+    compact.raw_starts.push(arena_start)
+    compact.raw_rows.push(rows)
+    compact.raw_cols.push(cols)
+    << -1 - index
+}
+
+fn gguf_stream_matrix(f &os.File, data_base int, info &GgufTensorInfo, rows int, cols int,
                       arena $&[]f32, compact $&CompactWeights) int {
+    if info.gtype == GGML_TYPE_Q4_K || info.gtype == GGML_TYPE_Q6_K {
+        << gguf_stream_kquant(f, data_base, info, rows, cols, compact) >>>
+    }
+    expected := rows * cols
     if info.gtype == GGML_TYPE_F32 || info.gtype == GGML_TYPE_Q8_0 {
         offset := arena.len
         _ := gguf_stream_f32_into(f, data_base, info, expected, arena) >>>
@@ -744,6 +819,10 @@ fn append_compact(view &tensor.TensorView, data &string, shape &[]int, arena $&C
     stored := tensor.contiguous_view(view.dtype(), shape, start, arena.data.len) >>>
     index := arena.views.len
     arena.views.push(stored)
+    arena.kinds.push(COMPACT_DENSE)
+    arena.raw_starts.push(start)
+    arena.raw_rows.push(0)
+    arena.raw_cols.push(0)
     << -1 - index
 }
 
@@ -848,13 +927,14 @@ fn load_model_safetensors(data &string, ctx_limit int) Model {
 
     << Model{
         cfg: cfg, is_q4: false, embed_q4: false, lm_head_q4: false, lm_head_q8: false,
-        layers_p4: false, embed_p4: false, lm_head_p4: false, has_qkv_bias: false,
+        layers_p4: false, embed_p4: false, lm_head_p4: false, has_qkv_bias: false, has_qk_norm: false,
         weights: weights, compact_weights: compact, q4_qs: []u8{}, q4_scales: []f32{}, q8_qs: []i8{}, q8_scales: []f32{},
         q4_p4k4_qs: []u8{}, q4_p4k4_scales: []u16{}, q8_p4k4_qs: []i8{}, q8_p4k4_scales: []u16{},
         embed_off: embed_off, lm_head_off: lm_head_off,
         wq_off: wq_off, wk_off: wk_off, wv_off: wv_off, wo_off: wo_off,
         w1_off: w1_off, w2_off: w2_off, w3_off: w3_off,
         bq: [][]f32{}, bk: [][]f32{}, bv: [][]f32{},
+        q_norms: [][]f32{}, k_norms: [][]f32{},
         attn_norms: attn_norms, ffn_norms: ffn_norms, final_norm: final_norm,
         zeros: alloc_zeros(dim), rope_cos: rope_cos, rope_sin: rope_sin,
         vocab: []string{}, vocab_map: map[string]int{}, bpe_merges: map[string]int{}
@@ -1003,6 +1083,20 @@ fn load_model_gguf_header(f &os.File, ctx_limit int, cfg_out $&ModelConfig, voca
     << data_base
 }
 
+fn load_layer_matrix(f &os.File, data_base int, info &GgufTensorInfo, rows int, cols int,
+                     is_q4 bool, layers_p4 bool,
+                     q4_qs $&[]u8, q4_scales $&[]f32,
+                     q4_p4k4_qs $&[]u8, q4_p4k4_scales $&[]u16, q4_p4k4_cur $&int,
+                     weights $&[]f32, compact $&CompactWeights) int {
+    if is_q4 && info.gtype == GGML_TYPE_Q4_0 {
+        if layers_p4 {
+            << gguf_stream_q4_0_p4k4(f, data_base, info, rows, cols, q4_p4k4_qs, q4_p4k4_scales, q4_p4k4_cur) >>>
+        }
+        << gguf_stream_q4_0(f, data_base, info, rows, cols, q4_qs, q4_scales) >>>
+    }
+    << gguf_stream_matrix(f, data_base, info, rows, cols, weights, compact) >>>
+}
+
 fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     $cfg := ModelConfig{
         dim: 0, hidden_dim: 0, n_layers: 0, n_heads: 0, n_kv_heads: 0,
@@ -1054,10 +1148,27 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
         if embed_p4 { need_p4k4_q4_gbs += emb_elems / 128 }
         else { need_q4_blks += emb_elems / 32 }
     }
-    layer_elems := n_layers * (2 * dim * dim + 2 * kv_dim * dim + 3 * hidden_dim * dim)
     if is_q4 {
-        if layers_p4 { need_p4k4_q4_gbs += layer_elems / 128 }
-        else { need_q4_blks += layer_elems / 32 }
+        for l in 0:n_layers {
+            p := "blk." + str(l) + "."
+            q_i := find_gguf_tensor(&tensors, p + "attn_q.weight")
+            k_i := find_gguf_tensor(&tensors, p + "attn_k.weight")
+            v_i := find_gguf_tensor(&tensors, p + "attn_v.weight")
+            o_i := find_gguf_tensor(&tensors, p + "attn_output.weight")
+            g_i := find_gguf_tensor(&tensors, p + "ffn_gate.weight")
+            u_i := find_gguf_tensor(&tensors, p + "ffn_up.weight")
+            d_i := find_gguf_tensor(&tensors, p + "ffn_down.weight")
+            $l_elems := 0
+            if q_i >= 0 && tensors[q_i].gtype == GGML_TYPE_Q4_0 { l_elems += dim * dim }
+            if k_i >= 0 && tensors[k_i].gtype == GGML_TYPE_Q4_0 { l_elems += kv_dim * dim }
+            if v_i >= 0 && tensors[v_i].gtype == GGML_TYPE_Q4_0 { l_elems += kv_dim * dim }
+            if o_i >= 0 && tensors[o_i].gtype == GGML_TYPE_Q4_0 { l_elems += dim * dim }
+            if g_i >= 0 && tensors[g_i].gtype == GGML_TYPE_Q4_0 { l_elems += hidden_dim * dim }
+            if u_i >= 0 && tensors[u_i].gtype == GGML_TYPE_Q4_0 { l_elems += hidden_dim * dim }
+            if d_i >= 0 && tensors[d_i].gtype == GGML_TYPE_Q4_0 { l_elems += dim * hidden_dim }
+            if layers_p4 { need_p4k4_q4_gbs += l_elems / 128 }
+            else { need_q4_blks += l_elems / 32 }
+        }
     }
     if out_i >= 0 {
         out_elems := vocab_size * dim
@@ -1106,7 +1217,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     } else if embed_q4 {
         embed_off = gguf_stream_q4_0(f, data_base, &tensors[emb_idx], vocab_size, dim, $&q4_qs, $&q4_scales) >>>
     } else {
-        embed_off = gguf_stream_matrix(f, data_base, &tensors[emb_idx], emb_elems, $&weights, $&compact) >>>
+        embed_off = gguf_stream_matrix(f, data_base, &tensors[emb_idx], vocab_size, dim, $&weights, $&compact) >>>
     }
 
     $wq_off := []int{}
@@ -1119,9 +1230,12 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     $bq := [][]f32{}
     $bk := [][]f32{}
     $bv := [][]f32{}
+    $q_norms := [][]f32{}
+    $k_norms := [][]f32{}
     $attn_norms := [][]f32{}
     $ffn_norms := [][]f32{}
     $has_qkv_bias := false
+    $has_qk_norm := false
 
     for l in 0:n_layers {
         prefix := "blk." + str(l) + "."
@@ -1160,31 +1274,40 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
             bv.push(alloc_zeros(kv_dim))
         }
 
-        if layers_p4 {
-            wq_off.push(gguf_stream_q4_0_p4k4(f, data_base, &tensors[wq_i], dim, dim, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur) >>>)
-            wk_off.push(gguf_stream_q4_0_p4k4(f, data_base, &tensors[wk_i], kv_dim, dim, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur) >>>)
-            wv_off.push(gguf_stream_q4_0_p4k4(f, data_base, &tensors[wv_i], kv_dim, dim, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur) >>>)
-            wo_off.push(gguf_stream_q4_0_p4k4(f, data_base, &tensors[wo_i], dim, dim, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur) >>>)
-            w1_off.push(gguf_stream_q4_0_p4k4(f, data_base, &tensors[w1_i], hidden_dim, dim, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur) >>>)
-            w3_off.push(gguf_stream_q4_0_p4k4(f, data_base, &tensors[w3_i], hidden_dim, dim, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur) >>>)
-            w2_off.push(gguf_stream_q4_0_p4k4(f, data_base, &tensors[w2_i], dim, hidden_dim, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur) >>>)
-        } else if is_q4 {
-            wq_off.push(gguf_stream_q4_0(f, data_base, &tensors[wq_i], dim, dim, $&q4_qs, $&q4_scales) >>>)
-            wk_off.push(gguf_stream_q4_0(f, data_base, &tensors[wk_i], kv_dim, dim, $&q4_qs, $&q4_scales) >>>)
-            wv_off.push(gguf_stream_q4_0(f, data_base, &tensors[wv_i], kv_dim, dim, $&q4_qs, $&q4_scales) >>>)
-            wo_off.push(gguf_stream_q4_0(f, data_base, &tensors[wo_i], dim, dim, $&q4_qs, $&q4_scales) >>>)
-            w1_off.push(gguf_stream_q4_0(f, data_base, &tensors[w1_i], hidden_dim, dim, $&q4_qs, $&q4_scales) >>>)
-            w3_off.push(gguf_stream_q4_0(f, data_base, &tensors[w3_i], hidden_dim, dim, $&q4_qs, $&q4_scales) >>>)
-            w2_off.push(gguf_stream_q4_0(f, data_base, &tensors[w2_i], dim, hidden_dim, $&q4_qs, $&q4_scales) >>>)
-        } else {
-            wq_off.push(gguf_stream_matrix(f, data_base, &tensors[wq_i], dim * dim, $&weights, $&compact) >>>)
-            wk_off.push(gguf_stream_matrix(f, data_base, &tensors[wk_i], kv_dim * dim, $&weights, $&compact) >>>)
-            wv_off.push(gguf_stream_matrix(f, data_base, &tensors[wv_i], kv_dim * dim, $&weights, $&compact) >>>)
-            wo_off.push(gguf_stream_matrix(f, data_base, &tensors[wo_i], dim * dim, $&weights, $&compact) >>>)
-            w1_off.push(gguf_stream_matrix(f, data_base, &tensors[w1_i], hidden_dim * dim, $&weights, $&compact) >>>)
-            w3_off.push(gguf_stream_matrix(f, data_base, &tensors[w3_i], hidden_dim * dim, $&weights, $&compact) >>>)
-            w2_off.push(gguf_stream_matrix(f, data_base, &tensors[w2_i], dim * hidden_dim, $&weights, $&compact) >>>)
+        qn_i := find_gguf_tensor(&tensors, prefix + "attn_q_norm.weight")
+        kn_i := find_gguf_tensor(&tensors, prefix + "attn_k_norm.weight")
+        if qn_i >= 0 && kn_i >= 0 {
+            if !has_qk_norm {
+                has_qk_norm = true
+                for _ in 0:l {
+                    $ones := []f32{}
+                    for _ in 0:head_dim { ones.push(f32(1.0)) }
+                    q_norms.push(~ones)
+                    $ones_k := []f32{}
+                    for _ in 0:head_dim { ones_k.push(f32(1.0)) }
+                    k_norms.push(~ones_k)
+                }
+            }
+            qnv := gguf_stream_f32_slice(f, data_base, &tensors[qn_i], head_dim) >>>
+            knv := gguf_stream_f32_slice(f, data_base, &tensors[kn_i], head_dim) >>>
+            q_norms.push(qnv)
+            k_norms.push(knv)
+        } else if has_qk_norm {
+            $ones := []f32{}
+            for _ in 0:head_dim { ones.push(f32(1.0)) }
+            q_norms.push(~ones)
+            $ones_k := []f32{}
+            for _ in 0:head_dim { ones_k.push(f32(1.0)) }
+            k_norms.push(~ones_k)
         }
+
+        wq_off.push(load_layer_matrix(f, data_base, &tensors[wq_i], dim, dim, is_q4, layers_p4, $&q4_qs, $&q4_scales, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur, $&weights, $&compact) >>>)
+        wk_off.push(load_layer_matrix(f, data_base, &tensors[wk_i], kv_dim, dim, is_q4, layers_p4, $&q4_qs, $&q4_scales, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur, $&weights, $&compact) >>>)
+        wv_off.push(load_layer_matrix(f, data_base, &tensors[wv_i], kv_dim, dim, is_q4, layers_p4, $&q4_qs, $&q4_scales, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur, $&weights, $&compact) >>>)
+        wo_off.push(load_layer_matrix(f, data_base, &tensors[wo_i], dim, dim, is_q4, layers_p4, $&q4_qs, $&q4_scales, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur, $&weights, $&compact) >>>)
+        w1_off.push(load_layer_matrix(f, data_base, &tensors[w1_i], hidden_dim, dim, is_q4, layers_p4, $&q4_qs, $&q4_scales, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur, $&weights, $&compact) >>>)
+        w3_off.push(load_layer_matrix(f, data_base, &tensors[w3_i], hidden_dim, dim, is_q4, layers_p4, $&q4_qs, $&q4_scales, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur, $&weights, $&compact) >>>)
+        w2_off.push(load_layer_matrix(f, data_base, &tensors[w2_i], dim, hidden_dim, is_q4, layers_p4, $&q4_qs, $&q4_scales, $&q4_p4k4_qs, $&q4_p4k4_scales, $&q4_p4k4_cur, $&weights, $&compact) >>>)
     }
 
     onorm_i := find_gguf_tensor(&tensors, "output_norm.weight")
@@ -1206,7 +1329,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
                 lm_head_off = gguf_stream_q8_0(f, data_base, &tensors[out_i], vocab_size, dim, $&q8_qs, $&q8_scales) >>>
             }
         } else {
-            lm_head_off = gguf_stream_matrix(f, data_base, &tensors[out_i], vocab_size * dim, $&weights, $&compact) >>>
+            lm_head_off = gguf_stream_matrix(f, data_base, &tensors[out_i], vocab_size, dim, $&weights, $&compact) >>>
         }
     }
 
@@ -1217,13 +1340,13 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     << Model{
         cfg: cfg, is_q4: is_q4, embed_q4: embed_q4, lm_head_q4: lm_head_q4, lm_head_q8: lm_head_q8,
         layers_p4: layers_p4, embed_p4: embed_p4, lm_head_p4: lm_head_p4,
-        has_qkv_bias: has_qkv_bias, weights: weights, compact_weights: compact,
+        has_qkv_bias: has_qkv_bias, has_qk_norm: has_qk_norm, weights: weights, compact_weights: compact,
         q4_qs: q4_qs, q4_scales: q4_scales, q8_qs: q8_qs, q8_scales: q8_scales,
         q4_p4k4_qs: q4_p4k4_qs, q4_p4k4_scales: q4_p4k4_scales, q8_p4k4_qs: q8_p4k4_qs, q8_p4k4_scales: q8_p4k4_scales,
         embed_off: embed_off, lm_head_off: lm_head_off,
         wq_off: wq_off, wk_off: wk_off, wv_off: wv_off, wo_off: wo_off,
         w1_off: w1_off, w2_off: w2_off, w3_off: w3_off,
-        bq: bq, bk: bk, bv: bv,
+        bq: bq, bk: bk, bv: bv, q_norms: q_norms, k_norms: k_norms,
         attn_norms: attn_norms, ffn_norms: ffn_norms, final_norm: final_norm,
         zeros: alloc_zeros(dim), rope_cos: rope_cos, rope_sin: rope_sin,
         vocab: vocab, vocab_map: vocab_map, bpe_merges: bpe_merges
@@ -1344,8 +1467,53 @@ fn kv_free_slot(kv $&PagedKvCache, slot int) {
     kv.slot_num_blocks[slot] = 0
 }
 
+fn kv_truncate_slot(kv $&PagedKvCache, slot int, keep_tokens int) {
+    $keep_blocks := 0
+    if keep_tokens > 0 { keep_blocks = 1 + (keep_tokens - 1) / kv.block_size }
+    if keep_blocks > kv.blocks_per_seq { keep_blocks = kv.blocks_per_seq }
+    base := slot * kv.blocks_per_seq
+    for lb in keep_blocks:kv.blocks_per_seq {
+        pb := kv.block_tables[base + lb]
+        if pb >= 0 {
+            kv.block_tables[base + lb] = -1
+            kv.free_stack[kv.free_top] = pb
+            kv.free_top += 1
+            kv.slot_num_blocks[slot] -= 1
+        }
+    }
+}
+
 fn load_embed_row(m &Model, token int, dst $&[]f32, dst_off int) int {
     dim := m.cfg.dim
+    if m.embed_off < 0 {
+        index := -1 - m.embed_off
+        kind := m.compact_weights.kinds[index]
+        if kind == COMPACT_Q4_K || kind == COMPACT_Q6_K {
+            if dim % tensor.QK_K != 0 { >>> errors.new("K-quant embedding dim must be divisible by 256") }
+            start := m.compact_weights.raw_starts[index]
+            nb := dim / tensor.QK_K
+            $blk_bytes := tensor.Q4_K_BYTES
+            if kind == COMPACT_Q6_K { blk_bytes = tensor.Q6_K_BYTES }
+            row_start := start + token * nb * blk_bytes
+            $tmp := []f32{}
+            tmp.reserve(dim)
+            for b in 0:nb {
+                boff := row_start + b * blk_bytes
+                if kind == COMPACT_Q4_K {
+                    blk := tensor.read_q4_k(&m.compact_weights.data, boff) >>>
+                    blk.append_f32($&tmp)
+                } else {
+                    blk := tensor.read_q6_k(&m.compact_weights.data, boff) >>>
+                    blk.append_f32($&tmp)
+                }
+            }
+            for i in 0:dim { dst[dst_off + i] = tmp[i] }
+            << 0
+        }
+        view := &m.compact_weights.views[index]
+        _ := view.copy_f32(&m.compact_weights.data, token * dim, dim, dst, dst_off) >>>
+        << 0
+    }
     if m.embed_p4 {
         nb := dim / 32
         rg := token / 4
@@ -1382,12 +1550,6 @@ fn load_embed_row(m &Model, token int, dst $&[]f32, dst_off int) int {
                 dst[ob + 16 + j] = f32(q1) * d
             }
         }
-        << 0
-    }
-    if m.embed_off < 0 {
-        index := -1 - m.embed_off
-        view := &m.compact_weights.views[index]
-        _ := view.copy_f32(&m.compact_weights.data, token * dim, dim, dst, dst_off) >>>
         << 0
     }
     emb_off := m.embed_off + token * dim
@@ -1747,9 +1909,42 @@ fn matmat_q4_0_p4k4_q8_0(out $&[]f32, qs_p &[]u8, ws_p &[]u16, p4_blk_off int,
     }
 }
 
-// Decode one compact weight row at a time and reuse it across the batch.
+// Decode one compact weight row or K-quant super-block at a time across the batch.
 fn matmat_compact(weights &CompactWeights, index int, out $&[]f32, x &[]f32,
                   batch int, rows int, cols int) int {
+    kind := weights.kinds[index]
+    if kind == COMPACT_Q4_K || kind == COMPACT_Q6_K {
+        if cols <= 0 || cols % tensor.QK_K != 0 {
+            >>> errors.new("K-quant columns must be divisible by 256")
+        }
+        start := weights.raw_starts[index]
+        nb := cols / tensor.QK_K
+        $blk_bytes := tensor.Q4_K_BYTES
+        if kind == COMPACT_Q6_K { blk_bytes = tensor.Q6_K_BYTES }
+        for m in 0:batch {
+            base := m * rows
+            for r in 0:rows { out[base + r] = f32(0) }
+        }
+        for r in 0:rows {
+            row_start := start + r * nb * blk_bytes
+            for b in 0:nb {
+                boff := row_start + b * blk_bytes
+                col_off := b * tensor.QK_K
+                if kind == COMPACT_Q4_K {
+                    blk := tensor.read_q4_k(&weights.data, boff) >>>
+                    for m in 0:batch {
+                        out[m * rows + r] += blk.dot_f32(x, m * cols + col_off)
+                    }
+                } else {
+                    blk := tensor.read_q6_k(&weights.data, boff) >>>
+                    for m in 0:batch {
+                        out[m * rows + r] += blk.dot_f32(x, m * cols + col_off)
+                    }
+                }
+            }
+        }
+        << 0
+    }
     view := &weights.views[index]
     $row := alloc_zeros(cols)
     for r in 0:rows {
@@ -1764,7 +1959,9 @@ fn matmat_compact(weights &CompactWeights, index int, out $&[]f32, x &[]f32,
 fn matvec_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act bool,
                    out $&[]f32, x &[]f32, xq &[]i8, xs &[]f32,
                    off int, rows int, cols int) int {
-    if use_q8 {
+    if off < 0 {
+        _ := matmat_compact(&m.compact_weights, -1 - off, out, x, 1, rows, cols) >>>
+    } else if use_q8 {
         if use_q8_act {
             if use_p4 {
                 matvec_q8_0_p4k4_q8_0(out, &m.q8_p4k4_qs, &m.q8_p4k4_scales, off, xq, xs, rows, cols)
@@ -1784,8 +1981,6 @@ fn matvec_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act b
         } else {
             matvec_q4_0(out, x, &m.q4_qs, &m.q4_scales, off, rows, cols)
         }
-    } else if off < 0 {
-        _ := matmat_compact(&m.compact_weights, -1 - off, out, x, 1, rows, cols) >>>
     } else {
         matvec(out, x, &m.weights, off, rows, cols)
     }
@@ -1795,7 +1990,9 @@ fn matvec_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act b
 fn matmat_dispatch(m &Model, use_q4 bool, use_p4 bool, use_q8_act bool,
                    out $&[]f32, x &[]f32, xq &[]i8, xs &[]f32,
                    off int, m_cnt int, rows int, cols int) int {
-    if use_q4 {
+    if off < 0 {
+        _ := matmat_compact(&m.compact_weights, -1 - off, out, x, m_cnt, rows, cols) >>>
+    } else if use_q4 {
         if use_q8_act {
             if use_p4 {
                 matmat_q4_0_p4k4_q8_0(out, &m.q4_p4k4_qs, &m.q4_p4k4_scales, off, xq, xs, m_cnt, rows, cols)
@@ -1805,8 +2002,6 @@ fn matmat_dispatch(m &Model, use_q4 bool, use_p4 bool, use_q8_act bool,
         } else {
             matmat_q4_0(out, x, &m.q4_qs, &m.q4_scales, off, m_cnt, rows, cols)
         }
-    } else if off < 0 {
-        _ := matmat_compact(&m.compact_weights, -1 - off, out, x, m_cnt, rows, cols) >>>
     } else {
         matmat_f32(out, x, &m.weights, off, m_cnt, rows, cols)
     }
@@ -1830,6 +2025,22 @@ fn axpy_offset(dst $&[]f32, off_d int, src &[]f32, off_s int, alpha f32, n int) 
 fn vadd_inplace(dst $&[]f32, src &[]f32, n int) {
     for i in 0:n {
         dst[i] += src[i]
+    }
+}
+
+fn apply_head_rmsnorm(vec $&[]f32, vec_base int, n_heads int, head_dim int,
+                      weight &[]f32, eps f64) {
+    for h in 0:n_heads {
+        off := vec_base + h * head_dim
+        $sum := f32(0)
+        for j in 0:head_dim {
+            v := vec[off + j]
+            sum += v * v
+        }
+        inv := f32(1.0 / math.sqrt(f64(sum) / f64(head_dim) + eps))
+        for j in 0:head_dim {
+            vec[off + j] = (vec[off + j] * inv) * weight[j]
+        }
     }
 }
 
@@ -2159,6 +2370,10 @@ fn forward_token_hidden(m &Model, kv $&PagedKvCache,
             vadd_inplace(k, &m.bk[l], kv_dim)
             vadd_inplace(v, &m.bv[l], kv_dim)
         }
+        if m.has_qk_norm {
+            apply_head_rmsnorm(q, 0, n_heads, head_dim, &m.q_norms[l], eps)
+            apply_head_rmsnorm(k, 0, cfg.n_kv_heads, head_dim, &m.k_norms[l], eps)
+        }
 
         apply_rope_offset(q, 0, n_heads, head_dim, &m.rope_cos, &m.rope_sin, rope_off)
         apply_rope_offset(k, 0, cfg.n_kv_heads, head_dim, &m.rope_cos, &m.rope_sin, rope_off)
@@ -2211,19 +2426,19 @@ fn forward_token(m &Model, kv $&PagedKvCache,
     << argmax(logits, m.cfg.vocab_size)
 }
 
-fn compute_embedding(m &Model, kv $&PagedKvCache,
-                     x $&[]f32, xb $&[]f32, xb2 $&[]f32,
-                     q $&[]f32, k $&[]f32, v $&[]f32,
-                     hb $&[]f32, hb2 $&[]f32,
-                     xq $&[]i8, xs $&[]f32,
-                     prompt_ids &[]int) []f32 {
+fn compute_embedding_slot(m &Model, kv $&PagedKvCache,
+                          x $&[]f32, xb $&[]f32, xb2 $&[]f32,
+                          q $&[]f32, k $&[]f32, v $&[]f32,
+                          hb $&[]f32, hb2 $&[]f32,
+                          xq $&[]i8, xs $&[]f32,
+                          slot int, prompt_ids &[]int) []f32 {
     dim := m.cfg.dim
     $sum_vec := alloc_zeros(dim)
     $count := 0
     for pos in 0:prompt_ids.len {
         if pos >= m.cfg.max_seq_len { <- }
-        _ := forward_token_hidden(m, kv, x, xb, xb2, q, k, v, hb, hb2, xq, xs, 0, prompt_ids[pos], pos, true) >>> (err) {
-            kv_free_slot(kv, 0)
+        _ := forward_token_hidden(m, kv, x, xb, xb2, q, k, v, hb, hb2, xq, xs, slot, prompt_ids[pos], pos, true) >>> (err) {
+            kv_free_slot(kv, slot)
             >>> err
         }
         for i in 0:dim {
@@ -2231,7 +2446,7 @@ fn compute_embedding(m &Model, kv $&PagedKvCache,
         }
         count += 1
     }
-    kv_free_slot(kv, 0)
+    kv_free_slot(kv, slot)
     if count > 0 {
         inv_cnt := f32(1.0 / f64(count))
         for i in 0:dim {
@@ -2309,6 +2524,12 @@ fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
                 axpy_offset(k, kv_base, &m.bk[l], 0, one_f32, kv_dim)
                 axpy_offset(v, kv_base, &m.bv[l], 0, one_f32, kv_dim)
             }
+            if m.has_qk_norm {
+                if all_queries {
+                    apply_head_rmsnorm(q, q_base, n_heads, head_dim, &m.q_norms[l], cfg.rms_eps)
+                }
+                apply_head_rmsnorm(k, kv_base, cfg.n_kv_heads, head_dim, &m.k_norms[l], cfg.rms_eps)
+            }
             pos_t := rows[t].pos
             rope_off := pos_t * half
             if all_queries {
@@ -2338,6 +2559,9 @@ fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
             _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, q, xb, xq, xs, m.wq_off[l], 1, dim, dim) >>>
             if m.has_qkv_bias {
                 axpy_offset(q, 0, &m.bq[l], 0, one_f32, dim)
+            }
+            if m.has_qk_norm {
+                apply_head_rmsnorm(q, 0, n_heads, head_dim, &m.q_norms[l], cfg.rms_eps)
             }
             rope_off := rows[output_start].pos * half
             apply_rope_offset(q, 0, n_heads, head_dim, &m.rope_cos, &m.rope_sin, rope_off)
@@ -2729,30 +2953,11 @@ fn push_greedy_vocab(m &Model, src &string, ids $&[]int) {
     }
 }
 
-fn encode_prompt(m &Model, input &string) []int {
-    $ids := []int{}
-    if gguf_starts_with(input, "ids:") {
-        $start := 4
-        for i in 4:input.len + 1 {
-            if i == input.len || (*input)[i] == 44 {
-                if i > start {
-                    part := (*input)[start:i]
-                    v := strconv.atoi(&part) >>> (err) {
-                        eprintln("invalid prompt token id: " + err.msg())
-                        << ids
-                    }
-                    ids.push(v)
-                }
-                start = i + 1
-            }
-        }
-        if ids.len == 0 { ids.push(0) }
-        << ids
-    }
-
-    $src := (*input) + ""
+fn encode_text_segment(m &Model, seg &string, ids $&[]int) {
+    if seg.len <= 0 { << }
+    $src := (*seg) + ""
     if m.cfg.is_gpt2_tok {
-        src = encode_gpt2_piece(input)
+        src = encode_gpt2_piece(seg)
     }
     if m.vocab.len > 0 {
         if m.bpe_merges.len() > 0 {
@@ -2786,12 +2991,70 @@ fn encode_prompt(m &Model, input &string) []int {
                 if tid >= 0 {
                     ids.push(tid)
                 } else {
-                    push_greedy_vocab(m, &pieces[i], $&ids)
+                    push_greedy_vocab(m, &pieces[i], ids)
                 }
             }
         } else {
-            push_greedy_vocab(m, &src, $&ids)
+            push_greedy_vocab(m, &src, ids)
         }
+    }
+}
+
+fn encode_prompt(m &Model, input &string) []int {
+    $ids := []int{}
+    if gguf_starts_with(input, "ids:") {
+        $start := 4
+        for i in 4:input.len + 1 {
+            if i == input.len || (*input)[i] == 44 {
+                if i > start {
+                    part := (*input)[start:i]
+                    v := strconv.atoi(&part) >>> (err) {
+                        eprintln("invalid prompt token id: " + err.msg())
+                        << ids
+                    }
+                    ids.push(v)
+                }
+                start = i + 1
+            }
+        }
+        if ids.len == 0 { ids.push(0) }
+        << ids
+    }
+
+    tok_start := "<|im_start|>"
+    tok_end := "<|im_end|>"
+    id_start := m.vocab_map.get_or(tok_start, -1)
+    id_end := m.vocab_map.get_or(tok_end, -1)
+    if id_start >= 0 || id_end >= 0 {
+        $seg_start := 0
+        $p := 0
+        while p < input.len {
+            if id_start >= 0 && str_match_at(input, p, &tok_start) {
+                if p > seg_start {
+                    seg := (*input)[seg_start:p]
+                    encode_text_segment(m, &seg, $&ids)
+                }
+                ids.push(id_start)
+                p += tok_start.len
+                seg_start = p
+            } else if id_end >= 0 && str_match_at(input, p, &tok_end) {
+                if p > seg_start {
+                    seg := (*input)[seg_start:p]
+                    encode_text_segment(m, &seg, $&ids)
+                }
+                ids.push(id_end)
+                p += tok_end.len
+                seg_start = p
+            } else {
+                p += 1
+            }
+        }
+        if seg_start < input.len {
+            tail := (*input)[seg_start:input.len]
+            encode_text_segment(m, &tail, $&ids)
+        }
+    } else {
+        encode_text_segment(m, input, $&ids)
     }
     if ids.len == 0 { ids.push(0) }
     << ids
@@ -3100,7 +3363,7 @@ struct ParsedServeReq {
 }
 
 fn parse_serve_request(path &string, body &string, def_topp int, def_rep int,
-                       def_seed int, def_ignore_eos bool) ParsedServeReq {
+                       def_seed int, def_ignore_eos bool, use_chatml bool) ParsedServeReq {
     doc := json.parse(body)
     if !doc.ok() || !doc.is_dict(doc.root()) {
         >>> errors.new("invalid json object")
@@ -3123,18 +3386,32 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_rep int,
         if !doc.is_list(msgs) || doc.count(msgs) == 0 {
             >>> errors.new("messages must be non-empty array")
         }
+        $has_content := false
         for mi in 0:doc.count(msgs) {
             mnode := doc.at(msgs, mi) >>>
             if doc.is_dict(mnode) && doc.has(mnode, "content") {
                 cnode := doc.get(mnode, "content") >>>
                 if doc.is_string(cnode) {
                     cstr := doc.as_string(cnode) >>>
-                    if prompt_text.len > 0 { prompt_text = prompt_text + "\n" }
-                    prompt_text = prompt_text + cstr
+                    $role := "user"
+                    if doc.has(mnode, "role") {
+                        rnode := doc.get(mnode, "role") >>>
+                        if doc.is_string(rnode) { role = doc.as_string(rnode) >>> }
+                    }
+                    has_content = true
+                    if use_chatml {
+                        prompt_text = prompt_text + "<|im_start|>" + role + "\n" + cstr + "<|im_end|>\n"
+                    } else {
+                        if prompt_text.len > 0 { prompt_text = prompt_text + "\n" }
+                        prompt_text = prompt_text + cstr
+                    }
                 }
             }
         }
-        if prompt_text.len == 0 { >>> errors.new("messages content is empty") }
+        if !has_content || prompt_text.len == 0 { >>> errors.new("messages content is empty") }
+        if use_chatml {
+            prompt_text = prompt_text + "<|im_start|>assistant\n"
+        }
     }
 
     $r_max := 16
@@ -3222,62 +3499,440 @@ fn format_embedding_json(emb &[]f32) string {
     << s + "]"
 }
 
-fn handle_serve_request(req &ServeRequest, model &Model, model_id &string, kv $&PagedKvCache,
-                        row_cache $&[]ForwardRow, sx $&[]f32, sxb $&[]f32, sxb2 $&[]f32,
+struct QueuedServeItem {
+    is_embed bool
+    is_chat bool
+    prompt_ids []int
+    parsed ParsedServeReq
+    reply chan ServeResponse
+    stream_ch chan string
+}
+
+fn serve_embed_response(model &Model, model_id &string, kv $&PagedKvCache,
+                        sx $&[]f32, sxb $&[]f32, sxb2 $&[]f32,
                         sq $&[]f32, sk $&[]f32, sv $&[]f32, shb $&[]f32, shb2 $&[]f32,
-                        slogits $&[]f32, sxq $&[]i8, sxs $&[]f32,
-                        top_p_milli int, repeat_penalty_milli int, seed int, ignore_eos bool) ServeResponse {
-    if req.method == "GET" && req.path == "/health" {
-        << ServeResponse{status: 200, body: "{\"status\":\"ok\"}", is_stream: false}
+                        sxq $&[]i8, sxs $&[]f32, slot int, prompt_ids &[]int) ServeResponse {
+    emb := compute_embedding_slot(model, kv, sx, sxb, sxb2, sq, sk, sv, shb, shb2, sxq, sxs, slot, prompt_ids) >>> (err) {
+        << ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false}
     }
-    if req.method == "GET" && req.path == "/v1/models" {
-        m_json := "{\"object\":\"list\",\"data\":[{\"id\":" + json.quote(model_id) + ",\"object\":\"model\"}]}"
-        << ServeResponse{status: 200, body: m_json, is_stream: false}
+    ptoks := prompt_ids.len
+    resp_body := "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":" +
+                 format_embedding_json(&emb) + "}],\"model\":" + json.quote(model_id) +
+                 ",\"usage\":{\"prompt_tokens\":" + str(ptoks) + ",\"total_tokens\":" + str(ptoks) + "}}"
+    << ServeResponse{status: 200, body: resp_body, is_stream: false}
+}
+
+fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string, kv $&PagedKvCache,
+                       row_cache $&[]ForwardRow, sx $&[]f32, sxb $&[]f32, sxb2 $&[]f32,
+                       sq $&[]f32, sk $&[]f32, sv $&[]f32, shb $&[]f32, shb2 $&[]f32,
+                       slogits $&[]f32, sxq $&[]i8, sxs $&[]f32,
+                       top_p_milli int, repeat_penalty_milli int, seed int, ignore_eos bool) {
+    active_limit := kv.max_slots
+    use_chatml := model.vocab_map.get_or("<|im_start|>", -1) >= 0 && model.vocab_map.get_or("<|im_end|>", -1) >= 0
+    dummy_reply := chan ServeResponse{cap: 1}
+    dummy_stream := chan string{cap: 1}
+
+    $slot_active := []bool{}
+    $slot_prompts := [][]int{}
+    $slot_pos := []int{}
+    $slot_gen := []int{}
+    $slot_max_gen := []int{}
+    $slot_cur_tok := []int{}
+    $slot_shared := []int{}
+    $slot_prefilled := []bool{}
+    $slot_temp := []int{}
+    $slot_topk := []int{}
+    $slot_topp := []int{}
+    $slot_rep := []int{}
+    $slot_rng := []int{}
+    $slot_ignore_eos := []bool{}
+    $slot_is_stream := []bool{}
+    $slot_is_chat := []bool{}
+    $slot_stops := [][]string{}
+    $slot_history := [][]int{}
+    $slot_out_ids := [][]int{}
+    $slot_out_text := []string{}
+    $slot_emitted_len := []int{}
+    $slot_stop_pad := []int{}
+    $slot_replies := []chan ServeResponse{}
+    $slot_streams := []chan string{}
+    $slot_cached_tokens := [][]int{}
+    $slot_cached_len := []int{}
+
+    for _ in 0:active_limit {
+        slot_active.push(false)
+        slot_prompts.push([]int{})
+        slot_pos.push(0)
+        slot_gen.push(0)
+        slot_max_gen.push(0)
+        slot_cur_tok.push(0)
+        slot_shared.push(0)
+        slot_prefilled.push(false)
+        slot_temp.push(0)
+        slot_topk.push(40)
+        slot_topp.push(1000)
+        slot_rep.push(1000)
+        slot_rng.push(seed)
+        slot_ignore_eos.push(false)
+        slot_is_stream.push(false)
+        slot_is_chat.push(false)
+        slot_stops.push([]string{})
+        slot_history.push([]int{})
+        slot_out_ids.push([]int{})
+        slot_out_text.push("")
+        slot_emitted_len.push(0)
+        slot_stop_pad.push(0)
+        slot_replies.push(dummy_reply)
+        slot_streams.push(dummy_stream)
+        slot_cached_tokens.push([]int{})
+        slot_cached_len.push(0)
     }
-    if req.method == "POST" && req.path == "/v1/embeddings" {
-        parsed := parse_serve_request(&req.path, &req.body, top_p_milli, repeat_penalty_milli, seed, ignore_eos) >>> (err) {
-            << ServeResponse{status: 400, body: json_error_body(err.msg()), is_stream: false}
+
+    $pending := []QueuedServeItem{}
+    $pending_head := 0
+    $active_count := 0
+    $prefix_cache_hits := 0
+    $prefix_cache_tokens := 0
+
+    for {
+        time.sleep(0)
+        for {
+            $has_req := false
+            $req := ServeRequest{method: "", path: "", body: "", reply: dummy_reply, stream_ch: dummy_stream}
+            if active_count == 0 && pending_head >= pending.len {
+                req = <-req_ch
+                has_req = true
+            } else {
+                select {
+                    r := <-req_ch {
+                        req = r
+                        has_req = true
+                    }
+                    else {
+                        has_req = false
+                    }
+                }
+            }
+            if !has_req { <- }
+
+            if req.method == "GET" && req.path == "/health" {
+                queued_cnt := pending.len - pending_head
+                hbody := "{\"status\":\"ok\",\"active_slots\":" + str(active_count) +
+                         ",\"max_slots\":" + str(active_limit) +
+                         ",\"queued_requests\":" + str(queued_cnt) +
+                         ",\"prefix_cache_hits\":" + str(prefix_cache_hits) +
+                         ",\"prefix_cache_tokens\":" + str(prefix_cache_tokens) +
+                         ",\"kv_free_blocks\":" + str(kv.free_top) +
+                         ",\"kv_total_blocks\":" + str(kv.num_blocks) + "}"
+                req.reply <- ServeResponse{status: 200, body: hbody, is_stream: false}
+            } else if req.method == "GET" && req.path == "/v1/models" {
+                m_json := "{\"object\":\"list\",\"data\":[{\"id\":" + json.quote(model_id) + ",\"object\":\"model\"}]}"
+                req.reply <- ServeResponse{status: 200, body: m_json, is_stream: false}
+            } else if req.method == "POST" && req.path == "/v1/embeddings" {
+                parsed := parse_serve_request(&req.path, &req.body, top_p_milli, repeat_penalty_milli, seed, ignore_eos, false) >>> (err) {
+                    req.reply <- ServeResponse{status: 400, body: json_error_body(err.msg()), is_stream: false}
+                    ->
+                }
+                pids := encode_prompt(model, &parsed.prompt_text)
+                $eslot := -1
+                for s in 0:active_limit {
+                    if !slot_active[s] && slot_cached_len[s] == 0 {
+                        eslot = s
+                        <-
+                    }
+                }
+                if eslot < 0 {
+                    for s in 0:active_limit {
+                        if !slot_active[s] {
+                            eslot = s
+                            <-
+                        }
+                    }
+                }
+                if eslot >= 0 {
+                    kv_free_slot(kv, eslot)
+                    slot_cached_len[eslot] = 0
+                    req.reply <- serve_embed_response(model, model_id, kv, sx, sxb, sxb2, sq, sk, sv, shb, shb2, sxq, sxs, eslot, &pids)
+                } else {
+                    pending.push(QueuedServeItem{
+                        is_embed: true, is_chat: false, prompt_ids: ~pids, parsed: ~parsed,
+                        reply: req.reply, stream_ch: req.stream_ch
+                    })
+                }
+            } else if req.method == "POST" && (req.path == "/v1/completions" || req.path == "/v1/chat/completions") {
+                is_chat := req.path == "/v1/chat/completions"
+                $use_tm := false
+                if is_chat && use_chatml { use_tm = true }
+                parsed := parse_serve_request(&req.path, &req.body, top_p_milli, repeat_penalty_milli, seed, ignore_eos, use_tm) >>> (err) {
+                    req.reply <- ServeResponse{status: 400, body: json_error_body(err.msg()), is_stream: false}
+                    ->
+                }
+                pids := encode_prompt(model, &parsed.prompt_text)
+                pending.push(QueuedServeItem{
+                    is_embed: false, is_chat: is_chat, prompt_ids: ~pids, parsed: ~parsed,
+                    reply: req.reply, stream_ch: req.stream_ch
+                })
+            } else {
+                req.reply <- ServeResponse{status: 404, body: json_error_body("not found"), is_stream: false}
+            }
         }
-        prompt_ids := encode_prompt(model, &parsed.prompt_text)
-        emb := compute_embedding(model, kv, sx, sxb, sxb2, sq, sk, sv, shb, shb2, sxq, sxs, &prompt_ids) >>> (err) {
-            << ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false}
+
+        while pending_head < pending.len && active_count < active_limit {
+            item := &pending[pending_head]
+            if item.is_embed {
+                $eslot := -1
+                for s in 0:active_limit {
+                    if !slot_active[s] && slot_cached_len[s] == 0 {
+                        eslot = s
+                        <-
+                    }
+                }
+                if eslot < 0 {
+                    for s in 0:active_limit {
+                        if !slot_active[s] {
+                            eslot = s
+                            <-
+                        }
+                    }
+                }
+                kv_free_slot(kv, eslot)
+                slot_cached_len[eslot] = 0
+                item.reply <- serve_embed_response(model, model_id, kv, sx, sxb, sxb2, sq, sk, sv, shb, shb2, sxq, sxs, eslot, &item.prompt_ids)
+                pending_head += 1
+                ->
+            }
+
+            $best_slot := -1
+            $best_lcp := -1
+            plen := item.prompt_ids.len
+            max_keep := plen - 1
+            for s in 0:active_limit {
+                if slot_active[s] { -> }
+                clen := slot_cached_len[s]
+                $limit := clen
+                if max_keep < limit { limit = max_keep }
+                $lcp := 0
+                while lcp < limit && slot_cached_tokens[s][lcp] == item.prompt_ids[lcp] {
+                    lcp += 1
+                }
+                if lcp > best_lcp || (lcp == 0 && best_lcp == 0 && best_slot >= 0 && slot_cached_len[best_slot] > 0 && clen == 0) {
+                    best_lcp = lcp
+                    best_slot = s
+                }
+            }
+            if best_slot < 0 { <- }
+            if best_lcp > 0 {
+                kv_truncate_slot(kv, best_slot, best_lcp)
+                prefix_cache_hits += 1
+                prefix_cache_tokens += best_lcp
+            } else {
+                kv_free_slot(kv, best_slot)
+                slot_cached_len[best_slot] = 0
+            }
+
+            $hist := []int{}
+            $pcopy := []int{}
+            for i in 0:plen {
+                tok := item.prompt_ids[i]
+                hist.push(tok)
+                pcopy.push(tok)
+            }
+            $stops_copy := []string{}
+            $max_stop_len := 0
+            for k in 0:item.parsed.stops.len {
+                st := item.parsed.stops[k] + ""
+                if st.len > max_stop_len { max_stop_len = st.len }
+                stops_copy.push(st)
+            }
+            $stop_pad := 0
+            if max_stop_len > 1 { stop_pad = max_stop_len - 1 }
+
+            slot_active[best_slot] = true
+            slot_prompts[best_slot] = ~pcopy
+            slot_pos[best_slot] = best_lcp
+            slot_gen[best_slot] = 0
+            slot_max_gen[best_slot] = item.parsed.max_tokens
+            slot_cur_tok[best_slot] = 0
+            slot_shared[best_slot] = best_lcp
+            slot_prefilled[best_slot] = false
+            slot_temp[best_slot] = item.parsed.temp_milli
+            slot_topk[best_slot] = item.parsed.top_k
+            slot_topp[best_slot] = item.parsed.top_p_milli
+            slot_rep[best_slot] = item.parsed.repeat_penalty_milli
+            slot_rng[best_slot] = item.parsed.seed
+            slot_ignore_eos[best_slot] = item.parsed.ignore_eos
+            slot_is_stream[best_slot] = item.parsed.stream
+            slot_is_chat[best_slot] = item.is_chat
+            slot_stops[best_slot] = ~stops_copy
+            slot_history[best_slot] = ~hist
+            slot_out_ids[best_slot] = []int{}
+            slot_out_text[best_slot] = ""
+            slot_emitted_len[best_slot] = 0
+            slot_stop_pad[best_slot] = stop_pad
+            slot_replies[best_slot] = item.reply
+            slot_streams[best_slot] = item.stream_ch
+            active_count += 1
+            pending_head += 1
         }
-        ptoks := prompt_ids.len
-        resp_body := "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":" +
-                     format_embedding_json(&emb) + "}],\"model\":" + json.quote(model_id) +
-                     ",\"usage\":{\"prompt_tokens\":" + str(ptoks) + ",\"total_tokens\":" + str(ptoks) + "}}"
-        << ServeResponse{status: 200, body: resp_body, is_stream: false}
+        if pending_head > 0 && pending_head == pending.len {
+            pending = []QueuedServeItem{}
+            pending_head = 0
+        }
+
+        for s in 0:active_limit {
+            if !slot_active[s] { -> }
+            $finished := false
+            $finish_reason := "length"
+            if !slot_prefilled[s] {
+                plen := slot_prompts[s].len
+                shared := slot_shared[s]
+                $suffix := []int{}
+                for k in shared:plen { suffix.push(slot_prompts[s][k]) }
+                _ := forward_prefill_batch(model, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, s, &suffix, shared, true, true) >>> (err) {
+                    kv_free_slot(kv, s)
+                    slot_cached_len[s] = 0
+                    slot_active[s] = false
+                    active_count -= 1
+                    slot_replies[s] <- ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false}
+                    ->
+                }
+                slot_prefilled[s] = true
+                slot_pos[s] = plen
+                if slot_is_stream[s] {
+                    slot_replies[s] <- ServeResponse{status: 200, body: "", is_stream: true}
+                }
+                if slot_max_gen[s] <= 0 {
+                    finished = true
+                    finish_reason = "length"
+                } else {
+                    $rng := slot_rng[s]
+                    nxt := sample_token(slogits, model.cfg.vocab_size, &slot_history[s], slot_temp[s], slot_topk[s], slot_topp[s], slot_rep[s], $&rng)
+                    slot_rng[s] = rng
+                    if !slot_ignore_eos[s] && nxt == model.cfg.eos_token_id {
+                        finished = true
+                        finish_reason = "stop"
+                    } else {
+                        piece := format_piece(model, nxt)
+                        slot_history[s].push(nxt)
+                        slot_out_ids[s].push(nxt)
+                        $txt := slot_out_text[s] + piece
+                        stopped := trim_stop_sequence($&txt, &slot_stops[s])
+                        slot_out_text[s] = txt
+                        slot_gen[s] = 1
+                        slot_cur_tok[s] = nxt
+                        if stopped {
+                            finished = true
+                            finish_reason = "stop"
+                        } else {
+                            if slot_is_stream[s] {
+                                safe_end := slot_out_text[s].len - slot_stop_pad[s]
+                                if safe_end > slot_emitted_len[s] {
+                                    delta := slot_out_text[s][slot_emitted_len[s]:safe_end]
+                                    slot_emitted_len[s] = safe_end
+                                    ch := slot_streams[s]
+                                    ch <- format_sse_chunk(slot_is_chat[s], model_id, &delta, "")
+                                }
+                            }
+                            if slot_gen[s] >= slot_max_gen[s] {
+                                finished = true
+                                finish_reason = "length"
+                            }
+                        }
+                    }
+                }
+            } else {
+                pos := slot_pos[s]
+                if pos >= model.cfg.max_seq_len {
+                    finished = true
+                    finish_reason = "length"
+                } else {
+                    _ := forward_token(model, kv, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, s, slot_cur_tok[s], pos, true) >>> (err) {
+                        kv_free_slot(kv, s)
+                        slot_cached_len[s] = 0
+                        slot_active[s] = false
+                        active_count -= 1
+                        if slot_is_stream[s] {
+                            ch := slot_streams[s]
+                            ch <- "data: [DONE]\n\n"
+                            ch <- ""
+                        } else {
+                            slot_replies[s] <- ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false}
+                        }
+                        ->
+                    }
+                    slot_pos[s] = pos + 1
+                    $rng := slot_rng[s]
+                    nxt := sample_token(slogits, model.cfg.vocab_size, &slot_history[s], slot_temp[s], slot_topk[s], slot_topp[s], slot_rep[s], $&rng)
+                    slot_rng[s] = rng
+                    if !slot_ignore_eos[s] && nxt == model.cfg.eos_token_id {
+                        finished = true
+                        finish_reason = "stop"
+                    } else {
+                        piece := format_piece(model, nxt)
+                        slot_history[s].push(nxt)
+                        slot_out_ids[s].push(nxt)
+                        $txt := slot_out_text[s] + piece
+                        stopped := trim_stop_sequence($&txt, &slot_stops[s])
+                        slot_out_text[s] = txt
+                        slot_gen[s] += 1
+                        slot_cur_tok[s] = nxt
+                        if stopped {
+                            finished = true
+                            finish_reason = "stop"
+                        } else {
+                            if slot_is_stream[s] {
+                                safe_end := slot_out_text[s].len - slot_stop_pad[s]
+                                if safe_end > slot_emitted_len[s] {
+                                    delta := slot_out_text[s][slot_emitted_len[s]:safe_end]
+                                    slot_emitted_len[s] = safe_end
+                                    ch := slot_streams[s]
+                                    ch <- format_sse_chunk(slot_is_chat[s], model_id, &delta, "")
+                                }
+                            }
+                            if slot_gen[s] >= slot_max_gen[s] {
+                                finished = true
+                                finish_reason = "length"
+                            }
+                        }
+                    }
+                }
+            }
+
+            if finished {
+                if slot_is_stream[s] {
+                    ch := slot_streams[s]
+                    if slot_out_text[s].len > slot_emitted_len[s] {
+                        tail := slot_out_text[s][slot_emitted_len[s]:slot_out_text[s].len]
+                        ch <- format_sse_chunk(slot_is_chat[s], model_id, &tail, "")
+                    }
+                    empty := ""
+                    ch <- format_sse_chunk(slot_is_chat[s], model_id, &empty, finish_reason)
+                    ch <- "data: [DONE]\n\n"
+                    ch <- ""
+                } else {
+                    ptoks := slot_prompts[s].len
+                    ctoks := slot_out_ids[s].len
+                    ttoks := ptoks + ctoks
+                    usage := "\"usage\":{\"prompt_tokens\":" + str(ptoks) + ",\"completion_tokens\":" + str(ctoks) + ",\"total_tokens\":" + str(ttoks) + "}"
+                    if !slot_is_chat[s] {
+                        resp_body := "{\"id\":\"cmpl-xu\",\"object\":\"text_completion\",\"model\":" + json.quote(model_id) +
+                                     ",\"choices\":[{\"index\":0,\"text\":" + json.quote(&slot_out_text[s]) + ",\"finish_reason\":" + json.quote(&finish_reason) + "}]," + usage + "}"
+                        slot_replies[s] <- ServeResponse{status: 200, body: resp_body, is_stream: false}
+                    } else {
+                        resp_body := "{\"id\":\"chatcmpl-xu\",\"object\":\"chat.completion\",\"model\":" + json.quote(model_id) +
+                                     ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":" + json.quote(&slot_out_text[s]) + "},\"finish_reason\":" + json.quote(&finish_reason) + "}]," + usage + "}"
+                        slot_replies[s] <- ServeResponse{status: 200, body: resp_body, is_stream: false}
+                    }
+                }
+                keep := slot_prompts[s].len
+                kv_truncate_slot(kv, s, keep)
+                slot_cached_tokens[s] = ~slot_prompts[s]
+                slot_cached_len[s] = keep
+                slot_active[s] = false
+                active_count -= 1
+            }
+        }
     }
-    if req.method == "POST" && (req.path == "/v1/completions" || req.path == "/v1/chat/completions") {
-        parsed := parse_serve_request(&req.path, &req.body, top_p_milli, repeat_penalty_milli, seed, ignore_eos) >>> (err) {
-            << ServeResponse{status: 400, body: json_error_body(err.msg()), is_stream: false}
-        }
-        prompt_ids := encode_prompt(model, &parsed.prompt_text)
-        is_chat := req.path == "/v1/chat/completions"
-        gen := run_generation_core(model, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs,
-                                   &prompt_ids, parsed.max_tokens, parsed.temp_milli, parsed.top_k,
-                                   parsed.top_p_milli, parsed.repeat_penalty_milli,
-                                   parsed.seed, parsed.ignore_eos, false, &parsed.stops,
-                                   parsed.stream, is_chat, model_id, req.reply, req.stream_ch) >>> (err) {
-            << ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false}
-        }
-        if parsed.stream {
-            << ServeResponse{status: 200, body: "", is_stream: true}
-        }
-        ptoks := prompt_ids.len
-        ctoks := gen.ids.len
-        ttoks := ptoks + ctoks
-        usage := "\"usage\":{\"prompt_tokens\":" + str(ptoks) + ",\"completion_tokens\":" + str(ctoks) + ",\"total_tokens\":" + str(ttoks) + "}"
-        if !is_chat {
-            resp_body := "{\"id\":\"cmpl-xu\",\"object\":\"text_completion\",\"model\":" + json.quote(model_id) +
-                         ",\"choices\":[{\"index\":0,\"text\":" + json.quote(&gen.text) + ",\"finish_reason\":" + json.quote(&gen.finish_reason) + "}]," + usage + "}"
-            << ServeResponse{status: 200, body: resp_body, is_stream: false}
-        }
-        resp_body := "{\"id\":\"chatcmpl-xu\",\"object\":\"chat.completion\",\"model\":" + json.quote(model_id) +
-                     ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":" + json.quote(&gen.text) + "},\"finish_reason\":" + json.quote(&gen.finish_reason) + "}]," + usage + "}"
-        << ServeResponse{status: 200, body: resp_body, is_stream: false}
-    }
-    << ServeResponse{status: 404, body: json_error_body("not found"), is_stream: false}
 }
 
 fn json_error_body(msg string) string {
@@ -3356,7 +4011,7 @@ fn main() int {
     load_ns := time.since(t_load)
 
     $kv_slots := MAX_BATCH_SLOTS
-    if mode == "generate" || mode == "serve" || ((mode == "bench" || mode == "bench-f32act") && args.len > 3 && args[3] == "single") {
+    if mode == "generate" || ((mode == "bench" || mode == "bench-f32act") && args.len > 3 && args[3] == "single") {
         kv_slots = 1
     }
     $kv := new_paged_kv_cache(&model.cfg, kv_slots, kv_dtype) >>> (err) {
@@ -3395,7 +4050,13 @@ fn main() int {
     if mode == "verify" || mode == "verify-f32act" {
         use_q8 := mode == "verify"
         $fmt := "f32"
-        if model.is_q4 { fmt = "q4_0" }
+        if model.is_q4 {
+            fmt = "q4_0"
+        } else if model.wq_off.len > 0 && model.wq_off[0] < 0 {
+            wkind := model.compact_weights.kinds[-1 - model.wq_off[0]]
+            if wkind == COMPACT_Q4_K { fmt = "q4_k" }
+            else if wkind == COMPACT_Q6_K { fmt = "q6_k" }
+        }
         $act := "f32"
         if (model.is_q4 || model.lm_head_q8) && use_q8 { act = "q8_0" }
         println("format:" + fmt)
@@ -3621,16 +4282,10 @@ fn main() int {
         println("serving:http://" + bound_addr)
         req_ch := chan ServeRequest{cap: 16}
         xu serve_http_loop(srv, req_ch)
-        for {
-            req := <-req_ch
-            resp := handle_serve_request(&req, &model, &model_id, $&kv, $&row_cache,
-                                         $&sx, $&sxb, $&sxb2, $&sq, $&sk, $&sv,
-                                         $&shb, $&shb2, $&slogits, $&sxq, $&sxs,
-                                         top_p_milli, repeat_penalty_milli, seed, ignore_eos)
-            if !resp.is_stream {
-                req.reply <- ~resp
-            }
-        }
+        run_serve_scheduler(req_ch, &model, &model_id, $&kv, $&row_cache,
+                            $&sx, $&sxb, $&sxb2, $&sq, $&sk, $&sv,
+                            $&shb, $&shb2, $&slogits, $&sxq, $&sxs,
+                            top_p_milli, repeat_penalty_milli, seed, ignore_eos)
     }
 
     eprintln("unknown mode: " + mode)
