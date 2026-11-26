@@ -10,6 +10,7 @@ and GGML quantization blocks.
 | FP8 E4M3FN, E5M2 | 1 byte per element | `Fp8E4M3Fn`, `Fp8E5M2` |
 | FP8 E4M3FNUZ, E5M2FNUZ | 1 byte per element | `Fp8E4M3Fnuz`, `Fp8E5M2Fnuz` |
 | GGML Q4_0 | 18 bytes per 32 values | `Q4Block` |
+| GGML Q5_0 | 22 bytes per 32 values | `Q5Block` |
 | GGML Q8_0 | 34 bytes per 32 values | `Q8Block` |
 | GGML Q4_K | 144 bytes per 256 values | `Q4KBlock` |
 | GGML Q6_K | 210 bytes per 256 values | `Q6KBlock` |
@@ -24,15 +25,17 @@ sign. FNUZ formats merge positive and negative zero.
 `contiguous_view` and `strided_view` validate a layout over caller-owned
 little-endian bytes. Pass the same backing bytes to read or decode methods.
 Offsets are in bytes and strides are in elements. Strides are nonnegative
-and zero supports broadcasting. `transpose` and positive-step `slice`
+and zero supports broadcasting. `transpose`, `permute`, `reshape`, and positive-step `slice`
 change the layout without copying the backing bytes. A rank-zero shape
 describes one scalar, and any zero dimension makes the view empty.
 `read_f32` takes a coordinate and `read_f32_linear` takes a logical
-row-major index, including for noncontiguous views.
+row-major index, including for noncontiguous views. `read_f32_bytes` and
+`write_f32_bytes` support zero-copy reads and writes over caller-owned `[]u8` buffers.
 
-Use `read_q4_0`, `read_q8_0`, `read_q4_k`, or `read_q6_k` to read a block at a
+Use `read_q4_0`, `read_q5_0`, `read_q8_0`, `read_q4_k`, or `read_q6_k` to read a block at a
 byte offset. `at` decodes an indexed value, `append_f32` decodes a whole block,
-and K-quant blocks also expose `dot_f32` for zero-allocation inner products.
+and `q4_k_dot_f32`, `q6_k_dot_f32`, `q5_0_dot_f32`, and `q8_0_dot_f32` perform zero-copy
+inner products directly over backing bytes.
 The block types expose their scales and packed lanes for raw access.
 
 ## Numerical kernels (`ops.xu`)

@@ -1,34 +1,49 @@
-# Local LLM inference in Xu
+# `llm_engine` — Pure-Xu LLM Inference & Serving Engine
 
-This pure-Xu CPU example runs a decoder with a paged key/value cache and a coroutine scheduler for continuous batching. Build it with the compiler and standard library from the same development checkout after Xu 0.14.0.
+A zero-dependency Transformer inference and OpenAI-compatible HTTP serving engine written in pure Xu (`xu` stdlib + `#tensor`), compiled to native machine code (`arm64` / `x86_64`).
 
-From the Xu repository root, point `XU` at the locally built compiler.
+## Supported Formats & Architectures
+
+- **Model containers**: Safetensors (`F32` weights + JSON config) and streaming GGUF (`F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q6_K`, tied or untied embeddings).
+- **Architectures**: LLaMA, Qwen2 / Qwen3 (`qkv` biases, `qk_norm`), Gemma / Gemma2 (`final_logit_softcapping`), Mistral, and custom `head_dim` / `dim` / GQA models (`rope.freq_base`, `rope.scaling.factor`).
+- **Tokenizers**: SentencePiece BPE (`▁` word boundaries + `<0xHH>` byte-fallback pieces), GPT-2 byte-level BPE with pre-tokenization chunking + merge ranks, greedy fallback, and explicit `ids:1,2,3` inputs.
+- **Chat templates & EOS**: Auto-detected from GGUF `tokenizer.chat_template` / vocabulary markers (`ChatML`, `Llama-3`, `Gemma`, `Mistral`, or raw fallback), plus multi-EOS token matching.
+
+## Build & Run
+
+Standard build:
 
 ```sh
-XU_STDLIB_ROOT="$PWD/src" XU_TENSOR_FUSION=1 "$XU" build examples/llm_engine/main.xu -o llm_engine
+xu build examples/llm_engine/main.xu -o llm_engine
 ```
 
-On macOS ARM64, sign the executable locally with `codesign -fs - ./llm_engine` before running it.
+Tensor-optimized build (fused NEON/SIMD tensor pipelines and fast-math relaxed reductions):
 
 ```sh
-./llm_engine generate ./model.gguf 'ids:1,7,42' 16 0 40 --ctx 128
+xu build --tensor-fusion --tensor-fast-math -O3 examples/llm_engine/main.xu -o llm_engine
 ```
 
-Use token IDs that exist in your model's vocabulary. The example accepts GGUF v2/v3 files with compatible F32/F16 or Q4_0 layer weights and a supported F32/F16, Q4_0 or Q8_0 output projection. It also accepts the F32 Safetensors layout used by the test fixture, including the model metadata in `__metadata__`. The example's hidden model width (`dim`) is limited to 2048.
-
-| Command | Behavior |
-| --- | --- |
-| `generate MODEL PROMPT [MAX_TOKENS] [TEMP_MILLI] [TOP_K]` | Accepts text or `ids:1,7,42`. Defaults to 16 tokens, a temperature of 0 (greedy), and top-k 40. Add `--ignore-eos` to continue after the end-of-sequence token. The text path uses greedy vocabulary matching and handles GPT-2-style token bytes. Use explicit IDs when exact tokenization is needed. |
-| `verify MODEL` / `verify-f32act MODEL` | Compare sequential and continuously batched results on fixed requests and check that KV pages are released. The `-f32act` mode uses float activations with quantized weights. |
-| `bench MODEL [STEPS] [single] [PROMPT_LEN]` / `bench-f32act` | Measure model load, prompt prefill and decode. Pass `single` to skip the continuous-batch measurement. `bench-f32act` uses float activations. |
-
-Pass `--ctx N` with a positive `N` to cap the model context. The default cap is 512 tokens. Keep prompts and requested generation within that limit.
-
-`XU_TENSOR_FUSION=1` enables pattern matching for eligible loops in optimized native ARM64 and x64 builds. The compiler can lower packed quantized GEMV/GEMM and operations such as RMSNorm, RoPE and paged attention to target-specific kernels where supported. The `__xu_tensor_*` symbols are compiler internals. Set `XU_TENSOR_FAST_MATH=1` at build time to permit floating-point reassociation or fused operations in eligible kernels. Compare output against a strict build if low-bit differences matter.
-
-The test suite creates its own model fixtures and exercises the baseline, strict fusion and fast-math builds. It covers F32 Safetensors, Q4_0 GGUF with float or Q8_0 activations, tied output weights, Qwen2.5-style GGUF with a Q8_0 output projection, batched prefill and CLI generation.
+## Subcommands & Flags
 
 ```sh
-python3 scripts/test_llm_engine.py --compiler "$XU"
-python3 scripts/test_tensor_opt.py --compiler "$XU"
+llm_engine <verify|verify-f32act|bench|bench-f32act|generate|serve> <model.safetensors|model.gguf> [args...] \
+  [--ctx N] [--kv-dtype f32|f16|q8_0] [--max-slots N] [--api-key K] \
+  [--top-p N] [--min-p N] [--repeat-penalty N] [--presence-penalty N] [--frequency-penalty N] \
+  [--seed N] [--ignore-eos]
+```
+
+- `verify` / `verify-f32act`: Compare sequential and continuous-batch outputs bit-for-bit across GQA/paged-KV slots.
+- `bench` / `bench-f32act`: Measure load time, TTFT, p50/p99 decode latency, and continuous-batch throughput.
+- `generate <model> <prompt|ids:...> [max_tokens] [temp_milli] [top_k]`: Run single-sequence generation with $O(L)$ penalties, `top_k` (unbounded), `top_p`, and `min_p`.
+- `serve <model> [host:port]`: Start an OpenAI-compatible HTTP server with paged KV prefix caching, batched multi-slot ARM64 decode, SSE client-disconnect cancellation, CORS (`OPTIONS` preflight), and optional `Authorization: Bearer <key>` enforcement (`--api-key`).
+  - `GET /health`
+  - `GET /v1/models`
+  - `POST /v1/completions` (`stream`, `stream_options.include_usage`, `stop`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`)
+  - `POST /v1/chat/completions` (auto-formatted via detected chat template)
+  - `POST /v1/embeddings` (`input` as string or batch string array)
+
+## Verification
+
+```sh
+python3 scripts/test_llm_engine.py --compiler bin/xu
 ```
