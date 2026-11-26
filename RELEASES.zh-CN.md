@@ -6,6 +6,22 @@
 
 ---
 
+## Xu 0.14.2
+
+- **编译器优化、自动向量化与代码布局**：
+  - **128-bit 基本块内 SLP 自动向量化**（`opt_slp`，可通过 `XU_NO_SLP=1` 关闭）：将循环展开后的同构数组访存/算术树及 4 路关联整数归约打包为 128 位 SIMD 指令，分别面向 ARM64 NEON（`LDUR`/`LDR Q`、`.2D`/`.16B`、`ADDP`）与基线 x86-64 SSE2（`movupd`、`addpd`/`subpd`/`mulpd`/`divpd`、`paddq`、`punpck*`），配合非逃逸 `MI_ADDR` 别名分析并严格保持 IEEE-754 从左到右计算语义。
+  - **Ext-TSP 基本块布局与相关跳跃线程化**：在 `opt_cfg` 中以 Wu–Larus 静态边权与 `cfg_exttsp_hot_order` 链合并取代原贪心 trace，并结合循环旋转改善指令局部性；新增基于支配树与符号值域的相关跳跃线程化（`opt_jump_thread`，可通过 `XU_NO_JT=1` 关闭）。
+  - **寄存器分配与循环/标量流水线升级**：在线性扫描寄存器分配（`regalloc`）中引入空洞复用、Ball–Larus 调用点权重、冷调用优先 Caller-Save 以及常量/`MI_ADDR` 零溢出槽重物化；进一步增强 GVN 跨调用复用、作用域互斥 LICM 外提与标量提升、多因子循环展开、SROA（`opt_sroa`）、`float64_bits`/`float64_from_bits` MIR 降级与 ARM64 `f64` 变址移位发射。
+- **运行时与标准库**：
+  - 将运行时哈希表（`core/map`）重构为紧凑型 SwissTable 8 槽 SWAR（`CTRL_LANE_MUL`）分组探测结构（7/8 负载因子），并同步优化 `core/chan`、`compress/lzw` 与 `core/intrin` 机器字扫描路径。
+- **裸机、内核与 `#core` 原语**：
+  - 新增 `usize`/`isize`、紧缩/联合/位域 C 结构体、无宿主静态段（`.bss`/`.data`/`.rodata`/`@section`/`@align`/`@export`）、`[CONST]T`、`sizeof`/`alignof`/`offsetof`、通用常量求值、`static_assert`、`@noreturn`、原子/中断/`GDT`/`IDT`/CR/MSR/端口 I/O 内建原语，以及面向 `x64-none`、`arm64-none`、`riscv64-none` 的多节 ELF `ET_EXEC`/`ET_REL`（`.rela.<sec>`）输出。
+  - 新增 `#core/addr`、`#core/ds`、`#core/fmt`、`#core/mmio`，并扩展 `#core/arch`、`#core/alloc`、`#core/mem`、`#core/sync`、`#core/virtio`。
+- **AI 推理、张量与现代 GPU**：
+  - 新增低精度张量存储与推理支持（`src/tensor`：`float`、`quant`、`view`）以及 P4K4 有符号 Q4/Q8 内核、`M=12` GEMM 与分页 SIMD 注意力内核（`src/xu/mir/ai`）。
+  - 扩展 GPU/SDL 现代资源接口（`R32_UINT`、MRT `begin_render_targets`、存储纹理/缓冲绑定、间接绘制/派发）及 UI `TreeView` 多选与光标跟踪修复。
+- **平台与升级**：请一起更新编译器、标准库和 SDK 工具。另见[英文发行说明](https://github.com/xulang-org/xu/blob/v0.14.2/RELEASES.md#xu-0142)。
+
 ## Xu 0.14.1
 
 - **AI 推理**。纯 Xu LLM 示例将 GGUF Q4_0 和 Q8_0 权重转换为内部 P4K4 布局，用于分组矩阵向量乘和矩阵乘内核。分页 KV 缓存支持批量预填充和逐 token 解码。示例可加载 F32 Safetensors 以及受支持的 Llama、Qwen2 架构 GGUF 模型。
