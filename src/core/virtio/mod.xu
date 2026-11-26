@@ -1,8 +1,10 @@
 @core/virtio
 
-// Zero-allocation, freestanding VirtIO driver framework (VirtIO MMIO, VirtIO-Blk, VirtIO-Net).
+// Zero-allocation, freestanding VirtIO driver framework (Split Virtqueue,
+// Modern VirtIO-MMIO v2, Legacy/Transitional VirtIO-PCI, VirtIO-Blk, VirtIO-Net).
 
 #core/arch
+#core/mem
 #core/sync
 
 // VirtIO MMIO Register Offsets
@@ -28,8 +30,9 @@ pub const VIRTIO_MMIO_QUEUE_DRIVER_LOW = 0x090
 pub const VIRTIO_MMIO_QUEUE_DRIVER_HIGH = 0x094
 pub const VIRTIO_MMIO_QUEUE_DEVICE_LOW = 0x0A0
 pub const VIRTIO_MMIO_QUEUE_DEVICE_HIGH = 0x0A4
+pub const VIRTIO_MMIO_CONFIG = 0x100
 
-// Magic constants
+// Magic & Device IDs
 pub const VIRTIO_MAGIC = 0x74726976 // "virt"
 pub const VIRTIO_DEV_NET = 1
 pub const VIRTIO_DEV_BLK = 2
@@ -51,6 +54,31 @@ pub const VIRTQ_DESC_F_NEXT = 1
 pub const VIRTQ_DESC_F_WRITE = 2
 pub const VIRTQ_DESC_F_INDIRECT = 4
 
+// VirtIO-Blk request types and status codes
+pub const VIRTIO_BLK_T_IN = 0   // Read
+pub const VIRTIO_BLK_T_OUT = 1  // Write
+pub const VIRTIO_BLK_T_FLUSH = 4
+pub const VIRTIO_BLK_S_OK = 0
+pub const VIRTIO_BLK_S_IOERR = 1
+pub const VIRTIO_BLK_S_UNSUPP = 2
+
+// x86 PCI configuration & Legacy/Transitional VirtIO-PCI BAR0 offsets
+pub const PCI_CONFIG_ADDR = 0x0CF8
+pub const PCI_CONFIG_DATA = 0x0CFC
+pub const VIRTIO_PCI_VENDOR = 0x1AF4
+pub const VIRTIO_PCI_DEV_BLK_LEGACY = 0x1001
+
+pub const VIRTIO_PCI_DEV_FEATURES = 0x00
+pub const VIRTIO_PCI_GUEST_FEATURES = 0x04
+pub const VIRTIO_PCI_QUEUE_PFN = 0x08
+pub const VIRTIO_PCI_QUEUE_NUM = 0x0C
+pub const VIRTIO_PCI_QUEUE_SEL = 0x0E
+pub const VIRTIO_PCI_QUEUE_NOTIFY = 0x10
+pub const VIRTIO_PCI_STATUS = 0x12
+pub const VIRTIO_PCI_ISR = 0x13
+pub const VIRTIO_PCI_BLK_CAP_LO = 0x14
+pub const VIRTIO_PCI_BLK_CAP_HI = 0x18
+
 // VirtqDesc: 16-byte buffer descriptor
 @repr("C")
 pub struct VirtqDesc {
@@ -67,12 +95,7 @@ pub struct VirtqUsedElem {
     pub len u32
 }
 
-// VirtIO-Blk request types
-pub const VIRTIO_BLK_T_IN = 0   // Read
-pub const VIRTIO_BLK_T_OUT = 1  // Write
-pub const VIRTIO_BLK_T_FLUSH = 4
-
-// VirtIO-Blk request header
+// VirtIO-Blk request header (16 bytes)
 @repr("C")
 pub struct VirtioBlkReq {
     pub req_type u32
@@ -92,7 +115,79 @@ pub struct VirtioNetHdr {
     pub num_buffers u16
 }
 
-// VirtioDevice: High-level hardware abstraction wrapper
+// ===== Shared Split Virtqueue Helpers =====
+
+fn align_up_4k(v u64) u64 {
+    << ((v + u64(4095)) / u64(4096)) * u64(4096)
+}
+
+fn virtq_prepare_blk(desc_addr u64, avail_addr u64, req_addr u64, status_addr u64,
+                     q_size u32, avail_idx u16, sector u64, data_phys u64, is_write bool) u16 {
+    $rtype := u32(VIRTIO_BLK_T_IN)
+    $d1_flags := u16(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE)
+    if is_write {
+        rtype = u32(VIRTIO_BLK_T_OUT)
+        d1_flags = u16(VIRTQ_DESC_F_NEXT)
+    }
+
+    unsafe {
+        req := usize(req_addr) as *raw VirtioBlkReq
+        *req = VirtioBlkReq{req_type: rtype, reserved: u32(0), sector: sector}
+
+        st := usize(status_addr) as *raw u8
+        *st = u8(0xFF)
+
+        d0 := usize(desc_addr) as *raw VirtqDesc
+        *d0 = VirtqDesc{addr: req_addr, len: u32(16), flags: u16(VIRTQ_DESC_F_NEXT), next: u16(1)}
+
+        d1 := usize(desc_addr + u64(16)) as *raw VirtqDesc
+        *d1 = VirtqDesc{addr: data_phys, len: u32(512), flags: d1_flags, next: u16(2)}
+
+        d2 := usize(desc_addr + u64(32)) as *raw VirtqDesc
+        *d2 = VirtqDesc{addr: status_addr, len: u32(1), flags: u16(VIRTQ_DESC_F_WRITE), next: u16(0)}
+
+        slot := u64(avail_idx) & u64(q_size - u32(1))
+        ring_p := usize(avail_addr + u64(4) + slot * u64(2)) as *raw u16
+        volatile_write(ring_p, u16(0))
+
+        arch.wmb()
+        new_idx := u16((u32(avail_idx) + u32(1)) & u32(0xFFFF))
+        idx_p := usize(avail_addr + u64(2)) as *raw u16
+        volatile_write(idx_p, new_idx)
+        arch.mb()
+        << new_idx
+    }
+}
+
+fn virtq_wait_used(used_addr u64, last_used u16, status_addr u64) int {
+    $spins := 0
+    $cur_used := last_used
+    unsafe {
+        idx_p := usize(used_addr + u64(2)) as *raw u16
+        while spins < 10000000 {
+            arch.rmb()
+            cur_used = volatile_read(idx_p)
+            if cur_used != last_used {
+                <-
+            }
+            arch.pause()
+            spins += 1
+        }
+        if cur_used == last_used {
+            << -1
+        }
+        arch.rmb()
+        st := volatile_read(usize(status_addr) as *raw u8)
+        if st != u8(VIRTIO_BLK_S_OK) {
+            << -2
+        }
+    }
+    << int(cur_used)
+}
+
+// ===== VirtioDevice (VirtIO-MMIO) =====
+
+@repr("C")
 pub struct VirtioDevice {
     pub base u64
 }
@@ -103,14 +198,14 @@ pub fn virtio_device_new(base u64) VirtioDevice {
 
 pub fn (dev &VirtioDevice) read_reg(offset u64) u32 {
     unsafe {
-        p := (dev.base + offset) as *raw u32
+        p := usize(dev.base + offset) as *raw u32
         << volatile_read(p)
     }
 }
 
 pub fn (dev &VirtioDevice) write_reg(offset u64, val u32) {
     unsafe {
-        p := (dev.base + offset) as *raw u32
+        p := usize(dev.base + offset) as *raw u32
         volatile_write(p, val)
     }
 }
@@ -118,43 +213,93 @@ pub fn (dev &VirtioDevice) write_reg(offset u64, val u32) {
 pub fn (dev &VirtioDevice) probe() u32 {
     magic := dev.read_reg(u64(VIRTIO_MMIO_MAGIC_VALUE))
     if magic != u32(VIRTIO_MAGIC) {
-        << 0
+        << u32(0)
     }
     version := dev.read_reg(u64(VIRTIO_MMIO_VERSION))
-    if version != 2 && version != 1 {
-        << 0
+    if version != u32(2) && version != u32(1) {
+        << u32(0)
     }
     << dev.read_reg(u64(VIRTIO_MMIO_DEVICE_ID))
 }
 
-pub fn (dev &VirtioDevice) init_device() bool {
-    // 1. Reset device
+pub fn virtio_mmio_find_blk(start_addr u64, stride u64, count int) u64 {
+    $i := 0
+    while i < count {
+        base := start_addr + u64(i) * stride
+        dev := virtio_device_new(base)
+        if dev.read_reg(u64(VIRTIO_MMIO_MAGIC_VALUE)) == u32(VIRTIO_MAGIC) {
+            if dev.read_reg(u64(VIRTIO_MMIO_VERSION)) == u32(2) {
+                if dev.read_reg(u64(VIRTIO_MMIO_DEVICE_ID)) == u32(VIRTIO_DEV_BLK) {
+                    << base
+                }
+            }
+        }
+        i += 1
+    }
+    << u64(0)
+}
+
+pub fn (dev &VirtioDevice) init_features() bool {
+    // Spec Section 3.1.1 steps 1..5: reset -> ack -> driver -> features -> features_ok
     dev.write_reg(u64(VIRTIO_MMIO_STATUS), u32(VIRTIO_STATUS_RESET))
-
-    // 2. Acknowledge device
+    arch.fence()
     dev.write_reg(u64(VIRTIO_MMIO_STATUS), u32(VIRTIO_STATUS_ACKNOWLEDGE))
-
-    // 3. Set driver status
     dev.write_reg(u64(VIRTIO_MMIO_STATUS), u32(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER))
 
-    // 4. Negotiate features
-    dev.write_reg(u64(VIRTIO_MMIO_STATUS), u32(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK))
+    ver := dev.read_reg(u64(VIRTIO_MMIO_VERSION))
+    dev.write_reg(u64(VIRTIO_MMIO_DRIVER_FEATURES_SEL), u32(0))
+    dev.write_reg(u64(VIRTIO_MMIO_DRIVER_FEATURES), u32(0))
+    if ver == u32(2) {
+        dev.write_reg(u64(VIRTIO_MMIO_DEVICE_FEATURES_SEL), u32(1))
+        hi := dev.read_reg(u64(VIRTIO_MMIO_DEVICE_FEATURES))
+        dev.write_reg(u64(VIRTIO_MMIO_DRIVER_FEATURES_SEL), u32(1))
+        dev.write_reg(u64(VIRTIO_MMIO_DRIVER_FEATURES), hi & u32(1)) // VIRTIO_F_VERSION_1
 
-    // 5. Driver OK
+        dev.write_reg(u64(VIRTIO_MMIO_STATUS), u32(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK))
+        st := dev.read_reg(u64(VIRTIO_MMIO_STATUS))
+        if (st & u32(VIRTIO_STATUS_FEATURES_OK)) == u32(0) {
+            << false
+        }
+    }
+    << true
+}
+
+pub fn (dev &VirtioDevice) init_device() bool {
+    if !dev.init_features() {
+        << false
+    }
     dev.write_reg(u64(VIRTIO_MMIO_STATUS), u32(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK))
     << true
 }
 
-// VirtIO-Blk Driver wrapper
+// ===== VirtIO-Blk MMIO v2 Driver =====
+
+@repr("C")
 pub struct VirtioBlkDriver {
     pub dev VirtioDevice
     pub capacity_sectors u64
+    pub queue_size u32
+    pub avail_idx u16
+    pub last_used_idx u16
+    pub desc_addr u64
+    pub avail_addr u64
+    pub used_addr u64
+    pub req_addr u64
+    pub status_addr u64
 }
 
 pub fn virtio_blk_new(base u64) VirtioBlkDriver {
     << VirtioBlkDriver{
         dev: virtio_device_new(base),
-        capacity_sectors: 0
+        capacity_sectors: u64(0),
+        queue_size: u32(0),
+        avail_idx: u16(0),
+        last_used_idx: u16(0),
+        desc_addr: u64(0),
+        avail_addr: u64(0),
+        used_addr: u64(0),
+        req_addr: u64(0),
+        status_addr: u64(0)
     }
 }
 
@@ -166,14 +311,261 @@ pub fn (blk $&VirtioBlkDriver) init() bool {
     if !blk.dev.init_device() {
         << false
     }
-    // Read device config space for capacity (offset 0x100)
-    low := blk.dev.read_reg(0x100)
-    high := blk.dev.read_reg(0x104)
-    blk.capacity_sectors = (u64(high) << 32) | u64(low)
+    low := blk.dev.read_reg(u64(VIRTIO_MMIO_CONFIG))
+    high := blk.dev.read_reg(u64(VIRTIO_MMIO_CONFIG + 4))
+    blk.capacity_sectors = (u64(high) << u64(32)) | u64(low)
     << true
 }
 
-// VirtIO-Net Driver wrapper
+pub fn (blk $&VirtioBlkDriver) init_with_dma(dma_base u64, dma_bytes u64) bool {
+    if dma_base == u64(0) || (dma_base & u64(4095)) != u64(0) || dma_bytes < u64(8192) {
+        << false
+    }
+    if blk.dev.probe() != u32(VIRTIO_DEV_BLK) {
+        << false
+    }
+    if blk.dev.read_reg(u64(VIRTIO_MMIO_VERSION)) != u32(2) {
+        << false
+    }
+    if !blk.dev.init_features() {
+        << false
+    }
+
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_SEL), u32(0))
+    qmax := blk.dev.read_reg(u64(VIRTIO_MMIO_QUEUE_NUM_MAX))
+    if qmax < u32(16) {
+        << false
+    }
+    q_size := u32(16)
+
+    mem.memset(usize(dma_base) as *raw u8, u8(0), 8192)
+    desc_a := dma_base
+    avail_a := dma_base + u64(256)
+    req_a := dma_base + u64(512)
+    stat_a := dma_base + u64(544)
+    used_a := dma_base + u64(4096)
+
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_NUM), q_size)
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_DESC_LOW), u32(desc_a & u64(0xFFFFFFFF)))
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_DESC_HIGH), u32(desc_a >> u64(32)))
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_DRIVER_LOW), u32(avail_a & u64(0xFFFFFFFF)))
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_DRIVER_HIGH), u32(avail_a >> u64(32)))
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_DEVICE_LOW), u32(used_a & u64(0xFFFFFFFF)))
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_DEVICE_HIGH), u32(used_a >> u64(32)))
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_READY), u32(1))
+
+    blk.dev.write_reg(u64(VIRTIO_MMIO_STATUS), u32(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK))
+
+    low := blk.dev.read_reg(u64(VIRTIO_MMIO_CONFIG))
+    high := blk.dev.read_reg(u64(VIRTIO_MMIO_CONFIG + 4))
+    blk.capacity_sectors = (u64(high) << u64(32)) | u64(low)
+    blk.queue_size = q_size
+    blk.avail_idx = u16(0)
+    blk.last_used_idx = u16(0)
+    blk.desc_addr = desc_a
+    blk.avail_addr = avail_a
+    blk.used_addr = used_a
+    blk.req_addr = req_a
+    blk.status_addr = stat_a
+    << true
+}
+
+pub fn (blk $&VirtioBlkDriver) rw_sector(sector u64, buf *raw u8, is_write bool) bool {
+    if buf == 0 as *raw u8 || blk.queue_size == u32(0) || sector >= blk.capacity_sectors {
+        << false
+    }
+    data_phys := u64(buf as usize)
+    blk.avail_idx = virtq_prepare_blk(blk.desc_addr, blk.avail_addr, blk.req_addr, blk.status_addr,
+                                      blk.queue_size, blk.avail_idx, sector, data_phys, is_write)
+    blk.dev.write_reg(u64(VIRTIO_MMIO_QUEUE_NOTIFY), u32(0))
+    res := virtq_wait_used(blk.used_addr, blk.last_used_idx, blk.status_addr)
+    isr := blk.dev.read_reg(u64(VIRTIO_MMIO_INTERRUPT_STATUS))
+    if isr != u32(0) {
+        blk.dev.write_reg(u64(VIRTIO_MMIO_INTERRUPT_ACK), isr)
+    }
+    if res < 0 {
+        << false
+    }
+    blk.last_used_idx = u16(res & 0xFFFF)
+    << true
+}
+
+pub fn (blk $&VirtioBlkDriver) read_sector(sector u64, buf *raw u8) bool {
+    << blk.rw_sector(sector, buf, false)
+}
+
+pub fn (blk $&VirtioBlkDriver) write_sector(sector u64, buf *raw u8) bool {
+    << blk.rw_sector(sector, buf, true)
+}
+
+// ===== PCI Configuration Space & Legacy/Transitional VirtIO-PCI Blk =====
+
+pub fn pci_read32(bus u8, dev u8, func u8, offset u8) u32 {
+    addr := u32(0x80000000) |
+            (u32(bus) << u32(16)) |
+            (u32(dev & u8(0x1F)) << u32(11)) |
+            (u32(func & u8(7)) << u32(8)) |
+            u32(offset & u8(0xFC))
+    unsafe {
+        arch.out32(u16(PCI_CONFIG_ADDR), addr)
+        << arch.in32(u16(PCI_CONFIG_DATA))
+    }
+}
+
+pub fn pci_write32(bus u8, dev u8, func u8, offset u8, val u32) {
+    addr := u32(0x80000000) |
+            (u32(bus) << u32(16)) |
+            (u32(dev & u8(0x1F)) << u32(11)) |
+            (u32(func & u8(7)) << u32(8)) |
+            u32(offset & u8(0xFC))
+    unsafe {
+        arch.out32(u16(PCI_CONFIG_ADDR), addr)
+        arch.out32(u16(PCI_CONFIG_DATA), val)
+    }
+}
+
+pub fn pci_find_virtio_blk() int {
+    $d := 0
+    while d < 32 {
+        id := pci_read32(u8(0), u8(d), u8(0), u8(0))
+        vendor := id & u32(0xFFFF)
+        device := (id >> u32(16)) & u32(0xFFFF)
+        if vendor == u32(VIRTIO_PCI_VENDOR) && device == u32(VIRTIO_PCI_DEV_BLK_LEGACY) {
+            << d
+        }
+        d += 1
+    }
+    << -1
+}
+
+@repr("C")
+pub struct VirtioPciBlkDriver {
+    pub io_base u16
+    pub pci_dev u8
+    pub pad0 u8
+    pub queue_size u32
+    pub avail_idx u16
+    pub last_used_idx u16
+    pub pad1 u32
+    pub capacity_sectors u64
+    pub desc_addr u64
+    pub avail_addr u64
+    pub used_addr u64
+    pub req_addr u64
+    pub status_addr u64
+}
+
+pub fn virtio_pci_blk_new() VirtioPciBlkDriver {
+    << VirtioPciBlkDriver{
+        io_base: u16(0),
+        pci_dev: u8(0),
+        pad0: u8(0),
+        queue_size: u32(0),
+        avail_idx: u16(0),
+        last_used_idx: u16(0),
+        pad1: u32(0),
+        capacity_sectors: u64(0),
+        desc_addr: u64(0),
+        avail_addr: u64(0),
+        used_addr: u64(0),
+        req_addr: u64(0),
+        status_addr: u64(0)
+    }
+}
+
+pub fn (blk $&VirtioPciBlkDriver) init_pci(dma_base u64, dma_bytes u64) bool {
+    if dma_base == u64(0) || (dma_base & u64(4095)) != u64(0) || dma_bytes < u64(16384) {
+        << false
+    }
+    dev := pci_find_virtio_blk()
+    if dev < 0 {
+        << false
+    }
+    bar0 := pci_read32(u8(0), u8(dev), u8(0), u8(0x10))
+    if (bar0 & u32(1)) == u32(0) {
+        << false
+    }
+    io := u16(bar0 & u32(0xFFFC))
+    if io == u16(0) {
+        << false
+    }
+
+    // Enable PCI I/O Space (bit 0) + Bus Master DMA (bit 2)
+    cmd := pci_read32(u8(0), u8(dev), u8(0), u8(0x04))
+    pci_write32(u8(0), u8(dev), u8(0), u8(0x04), cmd | u32(0x05))
+
+    unsafe {
+        arch.out8(io + u16(VIRTIO_PCI_STATUS), u8(VIRTIO_STATUS_RESET))
+        arch.fence()
+        arch.out8(io + u16(VIRTIO_PCI_STATUS), u8(VIRTIO_STATUS_ACKNOWLEDGE))
+        arch.out8(io + u16(VIRTIO_PCI_STATUS), u8(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER))
+        arch.out32(io + u16(VIRTIO_PCI_GUEST_FEATURES), u32(0))
+
+        arch.out16(io + u16(VIRTIO_PCI_QUEUE_SEL), u16(0))
+        q_size := u32(arch.in16(io + u16(VIRTIO_PCI_QUEUE_NUM)))
+        if q_size < u32(8) || q_size > u32(256) || (q_size & (q_size - u32(1))) != u32(0) {
+            arch.out8(io + u16(VIRTIO_PCI_STATUS), u8(VIRTIO_STATUS_FAILED))
+            << false
+        }
+
+        avail_off := u64(q_size) * u64(16)
+        used_off := align_up_4k(avail_off + u64(6) + u64(q_size) * u64(2))
+        if used_off + u64(6) + u64(q_size) * u64(8) > u64(12288) {
+            arch.out8(io + u16(VIRTIO_PCI_STATUS), u8(VIRTIO_STATUS_FAILED))
+            << false
+        }
+
+        mem.memset(usize(dma_base) as *raw u8, u8(0), 16384)
+        arch.fence()
+        arch.out32(io + u16(VIRTIO_PCI_QUEUE_PFN), u32(dma_base >> u64(12)))
+        arch.out8(io + u16(VIRTIO_PCI_STATUS), u8(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK))
+
+        cap_lo := arch.in32(io + u16(VIRTIO_PCI_BLK_CAP_LO))
+        cap_hi := arch.in32(io + u16(VIRTIO_PCI_BLK_CAP_HI))
+        blk.io_base = io
+        blk.pci_dev = u8(dev)
+        blk.queue_size = q_size
+        blk.avail_idx = u16(0)
+        blk.last_used_idx = u16(0)
+        blk.capacity_sectors = (u64(cap_hi) << u64(32)) | u64(cap_lo)
+        blk.desc_addr = dma_base
+        blk.avail_addr = dma_base + avail_off
+        blk.used_addr = dma_base + used_off
+        blk.req_addr = dma_base + u64(12288)
+        blk.status_addr = dma_base + u64(12352)
+    }
+    << true
+}
+
+pub fn (blk $&VirtioPciBlkDriver) rw_sector(sector u64, buf *raw u8, is_write bool) bool {
+    if buf == 0 as *raw u8 || blk.queue_size == u32(0) || sector >= blk.capacity_sectors {
+        << false
+    }
+    data_phys := u64(buf as usize)
+    blk.avail_idx = virtq_prepare_blk(blk.desc_addr, blk.avail_addr, blk.req_addr, blk.status_addr,
+                                      blk.queue_size, blk.avail_idx, sector, data_phys, is_write)
+    unsafe {
+        arch.out16(blk.io_base + u16(VIRTIO_PCI_QUEUE_NOTIFY), u16(0))
+        res := virtq_wait_used(blk.used_addr, blk.last_used_idx, blk.status_addr)
+        arch.in8(blk.io_base + u16(VIRTIO_PCI_ISR))
+        if res < 0 {
+            << false
+        }
+        blk.last_used_idx = u16(res & 0xFFFF)
+    }
+    << true
+}
+
+pub fn (blk $&VirtioPciBlkDriver) read_sector(sector u64, buf *raw u8) bool {
+    << blk.rw_sector(sector, buf, false)
+}
+
+pub fn (blk $&VirtioPciBlkDriver) write_sector(sector u64, buf *raw u8) bool {
+    << blk.rw_sector(sector, buf, true)
+}
+
+// ===== VirtIO-Net Driver wrapper =====
+
 pub struct VirtioNetDriver {
     pub dev VirtioDevice
     pub mac0 u8
@@ -200,13 +592,13 @@ pub fn (net $&VirtioNetDriver) init() bool {
         << false
     }
     // Read MAC address from config space (offset 0x100..0x105)
-    w0 := net.dev.read_reg(0x100)
-    w1 := net.dev.read_reg(0x104)
-    net.mac0 = u8(w0 & 0xFF)
-    net.mac1 = u8((w0 >> 8) & 0xFF)
-    net.mac2 = u8((w0 >> 16) & 0xFF)
-    net.mac3 = u8((w0 >> 24) & 0xFF)
-    net.mac4 = u8(w1 & 0xFF)
-    net.mac5 = u8((w1 >> 8) & 0xFF)
+    w0 := net.dev.read_reg(u64(VIRTIO_MMIO_CONFIG))
+    w1 := net.dev.read_reg(u64(VIRTIO_MMIO_CONFIG + 4))
+    net.mac0 = u8(w0 & u32(0xFF))
+    net.mac1 = u8((w0 >> u32(8)) & u32(0xFF))
+    net.mac2 = u8((w0 >> u32(16)) & u32(0xFF))
+    net.mac3 = u8((w0 >> u32(24)) & u32(0xFF))
+    net.mac4 = u8(w1 & u32(0xFF))
+    net.mac5 = u8((w1 >> u32(8)) & u32(0xFF))
     << true
 }
