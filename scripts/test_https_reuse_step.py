@@ -154,7 +154,7 @@ pub fn main() {{
 
     // Request 1: GET to server 1
     u1 := "https://127.0.0.1:{port1}/keepalive"
-    r1 := client.get(u1 + "") or (err) {{
+    r1 := client.get(u1 + "") >>> (err) {{
         eprintln("r1 failed: " + err.msg())
         <<< 1
     }}
@@ -169,7 +169,7 @@ pub fn main() {{
     println("OK: r1 succeeded, idle connection retained")
 
     // Request 2: GET to server 1 (should reuse connection)
-    r2 := client.get(u1 + "") or (err) {{
+    r2 := client.get(u1 + "") >>> (err) {{
         eprintln("r2 failed: " + err.msg())
         <<< 1
     }}
@@ -193,7 +193,7 @@ pub fn main() {{
 
     // Request 3: GET to server 1 /close (server specifies Connection: close)
     u_close := "https://127.0.0.1:{port1}/close"
-    r3 := client.get(u_close + "") or (err) {{
+    r3 := client.get(u_close + "") >>> (err) {{
         eprintln("r3 failed: " + err.msg())
         <<< 1
     }}
@@ -209,7 +209,7 @@ pub fn main() {{
 
     // Request 4 & 5: Target isolation
     // Re-establish idle on server 1
-    r4 := client.get(u1 + "") or (err) {{
+    r4 := client.get(u1 + "") >>> (err) {{
         eprintln("r4 failed: " + err.msg())
         <<< 1
     }}
@@ -220,7 +220,7 @@ pub fn main() {{
 
     // Make request to server 2 (different port)
     u2 := "https://127.0.0.1:{port2}/keepalive"
-    r5 := client.get(u2 + "") or (err) {{
+    r5 := client.get(u2 + "") >>> (err) {{
         eprintln("r5 failed: " + err.msg())
         <<< 1
     }}

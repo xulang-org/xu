@@ -30,7 +30,7 @@ fn main() int {
     command := "printf '%s' " + desktop_shell_quote(&expected) + " > " + desktop_shell_quote(&output)
     if desktop_system(command) != 0 { eprintln("shell execution failed")
         << 4 }
-    actual := read_file(output) or (err) { eprintln(err.msg())
+    actual := read_file(output) >>> (err) { eprintln(err.msg())
         << 5 }
     if actual != expected { eprintln("shell argument round-trip failed: " + actual)
         << 6 }

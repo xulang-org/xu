@@ -16,7 +16,7 @@ SOURCE = r'''@main
 fn main() int {
     $doc := widgets.rich_document()
     p0 := doc.append_paragraph(0)
-    doc.append_span(p0, widgets.text_span("Hello World", widgets.SPAN_NORMAL)) or (err) {
+    doc.append_span(p0, widgets.text_span("Hello World", widgets.SPAN_NORMAL)) >>> (err) {
         println("FAIL: append")
         << 1
     }

@@ -197,13 +197,13 @@ def deflate_output(xu: str, project: Path, env):
 fn run() int {
     args := os.args()
     for i in 1:args.len {
-        raw := os.read(args[i]+"") or >>
+        raw := os.read(args[i]+"") >>>
         encoded := flate.deflate(&raw)
-        write_file(args[i]+".deflate",encoded) or >>
+        write_file(args[i]+".deflate",encoded) >>>
     }
     << 0
 }
-fn main() int { << run() or(err){ eprintln(err.msg())
+fn main() int { << run() >>> (err){ eprintln(err.msg())
     << 1 } }
 ''')
     samples = [b"", b"hello hello hello", bytes(range(256))*1024,
@@ -243,39 +243,39 @@ def gpu_layout(xu: str, project: Path, env):
     (project / "gpu_layout.xu").write_text('''@main
 #gpu/layout
 fn rejects(format int, width int, height int, levels int, row int, offset int) bool {
-    layout.texture_2d(format, width, height, levels, row, offset) or (err) { << true }
+    layout.texture_2d(format, width, height, levels, row, offset) >>> (err) { << true }
     << false
 }
 fn check() int {
-    tight := layout.texture_2d(layout.RGBA8_SRGB, 3, 5, 0, 1, 1) or >>
+    tight := layout.texture_2d(layout.RGBA8_SRGB, 3, 5, 0, 1, 1) >>>
     assert(tight.level_count() == 3 && tight.total_bytes() == 72)
-    base := tight.level(0) or >>
+    base := tight.level(0) >>>
     assert(base.width == 3 && base.height == 5 && base.row_bytes == 12)
     $copy := base
     copy.row_bytes = 99
-    assert((tight.level(0) or >>).row_bytes == 12)
-    transfer := layout.texture_2d(layout.RGBA8_UNORM, 3, 5, 0, 256, 512) or >>
+    assert((tight.level(0) >>>).row_bytes == 12)
+    transfer := layout.texture_2d(layout.RGBA8_UNORM, 3, 5, 0, 256, 512) >>>
     assert(transfer.total_bytes() == 2304)
-    assert((transfer.level(1) or >>).offset == 1536)
-    assert((transfer.level(2) or >>).row_pitch == 256)
-    blocks := layout.texture_2d(layout.BC1_RGBA_UNORM, 3, 5, 0, 1, 1) or >>
-    assert(blocks.total_bytes() == 32 && (blocks.level(0) or >>).block_rows == 2)
-    largest := layout.texture_2d(layout.R8_UNORM, 9223372036854775807, 1, 1, 1, 1) or >>
+    assert((transfer.level(1) >>>).offset == 1536)
+    assert((transfer.level(2) >>>).row_pitch == 256)
+    blocks := layout.texture_2d(layout.BC1_RGBA_UNORM, 3, 5, 0, 1, 1) >>>
+    assert(blocks.total_bytes() == 32 && (blocks.level(0) >>>).block_rows == 2)
+    largest := layout.texture_2d(layout.R8_UNORM, 9223372036854775807, 1, 1, 1, 1) >>>
     assert(largest.total_bytes() == 9223372036854775807)
-    assert((layout.mip_count_2d(9223372036854775807, 1) or >>) == 63)
+    assert((layout.mip_count_2d(9223372036854775807, 1) >>>) == 63)
     assert(rejects(layout.R8_UNORM, 9223372036854775807, 1, 1, 2, 1))
     assert(rejects(layout.RGBA32_FLOAT, 9223372036854775807, 1, 1, 1, 1))
     assert(rejects(999, 1, 1, 1, 1, 1) && rejects(layout.R8_UNORM, 0, 1, 1, 1, 1))
     assert(rejects(layout.R8_UNORM, 1, 1, 2, 1, 1) && rejects(layout.R8_UNORM, 1, 1, 1, 3, 1))
     for format in 1:21 {
-        info := layout.format_info(format) or >>
+        info := layout.format_info(format) >>>
         assert(info.block_bytes > 0 && info.depth == (format == layout.DEPTH32_FLOAT))
     }
     println("GPU layout: 72/2304/32 bytes; checked int64; no device")
     << 0
 }
 fn main() int {
-    << check() or (err) { eprintln(err.msg())
+    << check() >>> (err) { eprintln(err.msg())
         << 1 }
 }
 ''')
@@ -297,62 +297,62 @@ def gpu_device_import(xu: str, project: Path, env):
 // executed without a real device; the runtime test below rejects missing SDL.
 fn invalid_texture_reference() bool {
     reference := gpu.TextureRef{}
-    reference.validate() or(err){ << true }
+    reference.validate() >>> (err){ << true }
     << false
 }
 fn invalid_device_reference() bool {
     reference := gpu.DeviceRef{}
-    reference.validate() or(err){ << true }
+    reference.validate() >>> (err){ << true }
     << false
 }
 fn reference_api(device &gpu.Device, pass &gpu.RenderPass, texture &gpu.Texture, sampler &gpu.Sampler, buffer &gpu.Buffer) int {
     owner := device.reference()
-    owner.validate() or >>
-    owner.validate_buffer(buffer.reference()) or >>
-    owner.validate_texture(texture.reference()) or >>
-    owner.validate_sampler(sampler.reference()) or >>
+    owner.validate() >>>
+    owner.validate_buffer(buffer.reference()) >>>
+    owner.validate_texture(texture.reference()) >>>
+    owner.validate_sampler(sampler.reference()) >>>
     assert(owner.same(device.reference()))
     assert(buffer.reference().size_bytes() == buffer.size_bytes())
-    pass.vertex_buffer_ref(0,buffer.reference(),0) or >>
-    pass.index_buffer_ref(buffer.reference(),0,gpu.INDEX32) or >>
-    pass.sampler_ref(gpu.FRAGMENT,0,texture.reference(),sampler.reference()) or >>
+    pass.vertex_buffer_ref(0,buffer.reference(),0) >>>
+    pass.index_buffer_ref(buffer.reference(),0,gpu.INDEX32) >>>
+    pass.sampler_ref(gpu.FRAGMENT,0,texture.reference(),sampler.reference()) >>>
     << 0
 }
 fn compute_api(device &gpu.Device) int {
     desc := gpu.ComputePipelineDesc{format: gpu.SHADER_MSL, entrypoint: "main", read_buffers: 1,
         write_buffers: 1, uniform_sizes: [16], threads_x: 64, threads_y: 1, threads_z: 1}
     code := [u8(1)]
-    $pipeline := device.compute_pipeline(&desc, &code) or >>
-    $buffer := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
-    $output := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
+    $pipeline := device.compute_pipeline(&desc, &code) >>>
+    $buffer := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_READ) >>>
+    $output := device.buffer(16, gpu.BUFFER_COMPUTE_STORAGE_WRITE) >>>
     writes := [gpu.write_buffer(&output, false)]
-    $encoder := device.command_encoder() or >>
-    $pass := encoder.begin_compute(&writes) or >>
-    pass.pipeline(&pipeline) or >>
-    pass.read_buffer(0, &buffer) or >>
+    $encoder := device.command_encoder() >>>
+    $pass := encoder.begin_compute(&writes) >>>
+    pass.pipeline(&pipeline) >>>
+    pass.read_buffer(0, &buffer) >>>
     values := [u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),
         u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0),u8(0)]
-    pass.uniform(0, &values) or >>
-    pass.dispatch(1, 1, 1) or >>
-    pass.end() or >>
-    $fence := encoder.submit() or >>
-    fence.wait() or >>
-    stats := device.stats() or >>
+    pass.uniform(0, &values) >>>
+    pass.dispatch(1, 1, 1) >>>
+    pass.end() >>>
+    $fence := encoder.submit() >>>
+    fence.wait() >>>
+    stats := device.stats() >>>
     assert(stats.compute_pass_count == 0 && stats.compute_pipeline_count == 1)
     << 0
 }
 fn check() int {
     assert(invalid_texture_reference() && invalid_device_reference())
-    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or (err) {
+    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) >>> (err) {
         message := err.msg()
         assert(strings.contains(&message, "SDL 3 runtime unavailable"))
         println("GPU device: source backend, explicit missing-runtime error")
         << 0
     }
-    compute_api(&device) or >>
+    compute_api(&device) >>>
     << 1
 }
-fn main() int { << check() or (err) { eprintln(err.msg())
+fn main() int { << check() >>> (err) { eprintln(err.msg())
     << 1 } }
 ''')
     isolated = env | {"XU_SDL_LIBRARY": str(project / "missing SDL runtime")}
@@ -384,62 +384,62 @@ def window_surface_import(xu: str, project: Path, env):
 #gpu
 #strings
 fn surface_api(target &window.Window) int {
-    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO,debug: false,shader_formats: 0}) or >>
-    $surface := device.surface(target,gpu.SurfaceOptions{present_mode: gpu.PRESENT_VSYNC}) or >>
-    surface.supports_present_mode(gpu.PRESENT_VSYNC) or >>
-    surface.set_present_mode(gpu.PRESENT_VSYNC) or >>
-    $frame := surface.acquire() or >>
+    $device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO,debug: false,shader_formats: 0}) >>>
+    $surface := device.surface(target,gpu.SurfaceOptions{present_mode: gpu.PRESENT_VSYNC}) >>>
+    surface.supports_present_mode(gpu.PRESENT_VSYNC) >>>
+    surface.set_present_mode(gpu.PRESENT_VSYNC) >>>
+    $frame := surface.acquire() >>>
     if frame.has_image() {
         assert(frame.width()>0 && frame.height()>0)
         frame.format()
         writes := []gpu.StorageBufferWrite{}
-        $compute := frame.begin_compute(&writes) or >>
-        compute.end() or >>
-        $pass := frame.begin_render(gpu.CLEAR,gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0},gpu.no_depth()) or >>
-        pass.end() or >>
-        $fence := frame.present() or >>
-        fence.close() or >>
+        $compute := frame.begin_compute(&writes) >>>
+        compute.end() >>>
+        $pass := frame.begin_render(gpu.CLEAR,gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0},gpu.no_depth()) >>>
+        pass.end() >>>
+        $fence := frame.present() >>>
+        fence.close() >>>
     }
-    frame.close() or >>
-    surface.close() or >>
+    frame.close() >>>
+    surface.close() >>>
     << 0
 }
 fn check() int {
     options := window.Options{title: "SDK window",width: 64,height: 64,resizable: false,high_pixel_density: true,hidden: true}
-    $target := window.open(&options) or (err) {
+    $target := window.open(&options) >>> (err) {
         message := err.msg()
         assert(strings.contains(&message,"SDL 3 runtime unavailable"))
         println("Window: shared source backend, explicit missing-runtime error")
         << 0
     }
-    surface_api(&target) or >>
-    state := target.state() or >>
+    surface_api(&target) >>>
+    state := target.state() >>>
     assert(state.width==64)
-    target.resize(32,32) or >>
-    target.show() or >>
-    target.hide() or >>
-    target.minimize() or >>
-    target.restore() or >>
-    window.pump() or >>
-    event := target.poll() or >>
+    target.resize(32,32) >>>
+    target.show() >>>
+    target.hide() >>>
+    target.minimize() >>>
+    target.restore() >>>
+    window.pump() >>>
+    event := target.poll() >>>
     if event.kind==events.EVENT_INPUT_RESET { assert(event.reset_reason>0) }
-    target.pending_events() or >>
-    target.key_down(events.KEY_A) or >>
-    target.pointer_state() or >>
-    target.start_text_input() or >>
-    target.text_input_active() or >>
-    target.text_input_area(0,0,32,24,4) or >>
-    target.clear_text_input_area() or >>
-    target.stop_text_input() or >>
-    target.set_relative_pointer(false) or >>
-    target.relative_pointer() or >>
-    target.set_pointer_grab(false) or >>
-    target.pointer_grab() or >>
-    target.close() or >>
-    window.live_count() or >>
+    target.pending_events() >>>
+    target.key_down(events.KEY_A) >>>
+    target.pointer_state() >>>
+    target.start_text_input() >>>
+    target.text_input_active() >>>
+    target.text_input_area(0,0,32,24,4) >>>
+    target.clear_text_input_area() >>>
+    target.stop_text_input() >>>
+    target.set_relative_pointer(false) >>>
+    target.relative_pointer() >>>
+    target.set_pointer_grab(false) >>>
+    target.pointer_grab() >>>
+    target.close() >>>
+    window.live_count() >>>
     << 1
 }
-fn main() int { << check() or (err) { eprintln(err.msg())
+fn main() int { << check() >>> (err) { eprintln(err.msg())
     << 1 } }
 ''')
     isolated = env | {"XU_SDL_LIBRARY": str(project / "missing shared SDL runtime")}
@@ -499,15 +499,15 @@ fn zeros(n int) []u8 { $out:=[]u8{}
     << out }
 fn rejects_write(data $&[]u8, kind int, off int) bool {
     for once in 0:1 {
-        if kind==0 { binary.little_endian().put_f32(data,off,0.5) or(err) { << true }
-        } else if kind==1 { binary.big_endian().put_f64(data,off,0.5) or(err) { << true }
-        } else { binary.big_endian().put_u32_bytes(data,off,255) or(err) { << true } }
+        if kind==0 { binary.little_endian().put_f32(data,off,0.5) >>> (err) { << true }
+        } else if kind==1 { binary.big_endian().put_f64(data,off,0.5) >>> (err) { << true }
+        } else { binary.big_endian().put_u32_bytes(data,off,255) >>> (err) { << true } }
     }
     << false
 }
 fn rejects_read(data &[]u8, kind int, off int) bool {
-    if kind==0 { binary.little_endian().get_f32(data,off) or(err) { << true }
-    } else { binary.big_endian().get_f64(data,off) or(err) { << true } }
+    if kind==0 { binary.little_endian().get_f32(data,off) >>> (err) { << true }
+    } else { binary.big_endian().get_f64(data,off) >>> (err) { << true } }
     << false
 }
 fn check() int {
@@ -531,16 +531,16 @@ fn check() int {
         assert(math.signbit(value)==(raw<0))
         assert(math.float64_bits(math.abs(value))==(raw&9223372036854775807))
         assert(math.float64_bits(math.copysign(value,-0.0))==(raw|(1<<63)))
-        le.put_f64($&little,1,value) or >>
-        be.put_f64($&big,1,value) or >>
+        le.put_f64($&little,1,value) >>>
+        be.put_f64($&big,1,value) >>>
         for lane in 0:8 { want:=(raw>>(lane*8))&255
             assert(int(little[1+lane])==want && int(big[8-lane])==want) }
         assert(little[0]==u8(73) && little[9]==u8(73) && big[0]==u8(73) && big[9]==u8(73))
-        lv:=le.get_f64(&little,1) or >>
-        bv:=be.get_f64(&big,1) or >>
+        lv:=le.get_f64(&little,1) >>>
+        bv:=be.get_f64(&big,1) >>>
         assert(math.float64_bits(lv)==raw && math.float64_bits(bv)==raw)
-        le.put_f32($&little,1,value) or >>
-        be.put_f32($&big,1,value) or >>
+        le.put_f32($&little,1,value) >>>
+        be.put_f32($&big,1,value) >>>
         for lane in 0:4 { want:=(expected[i]>>(lane*8))&255
             assert(int(little[1+lane])==want && int(big[4-lane])==want) }
     }
@@ -551,15 +551,15 @@ fn check() int {
         $quiet:=raw
         if (raw&2139095040)==2139095040 && (raw&8388607)!=0 { quiet=raw|4194304 }
         assert(math.float32_bits(value)==quiet)
-        le.put_u32_bytes($&little,1,raw) or >>
-        decoded:=le.get_f32(&little,1) or >>
+        le.put_u32_bytes($&little,1,raw) >>>
+        decoded:=le.get_f32(&little,1) >>>
         assert(math.float64_bits(decoded)==math.float64_bits(value))
     }
-    le.put_u16_bytes($&little,1,65535) or >>
-    signed16:=le.get_i16_bytes(&little,1) or >>
+    le.put_u16_bytes($&little,1,65535) >>>
+    signed16:=le.get_i16_bytes(&little,1) >>>
     assert(signed16==(0-1))
-    be.put_i32_bytes($&big,1,0-2147483648) or >>
-    signed32:=be.get_i32_bytes(&big,1) or >>
+    be.put_i32_bytes($&big,1,0-2147483648) >>>
+    signed32:=be.get_i32_bytes(&big,1) >>>
     assert(signed32==(0-2147483648))
     snapshot:=~big
     for kind in 0:3 { for off in [0-1,7,9,10,9223372036854775807] {
@@ -576,7 +576,7 @@ fn check() int {
     println("Binary floats: IEEE reference, tight bytes, endian, COW and failure atomicity")
     << 0
 }
-fn main() int { << check() or(err) { eprintln(err.msg())
+fn main() int { << check() >>> (err) { eprintln(err.msg())
     << 1 } }
 '''
     source = source.replace('PATTERNS', '[' + ','.join(literal(v) for v in patterns) + ']')
@@ -842,7 +842,7 @@ fn change(r $&Record) int { r.value += 11
 fn (r $&Record) bump() int { r.value += 7
  << r.value }
 fn fail_after_change(r $&Record) int { r.value += 3
- >> errors.new("expected") }
+ >>> errors.new("expected") }
 struct Packed { a i32
  b i32
  c u8 }
@@ -862,7 +862,7 @@ fn main() int {
  println(r.bump())
  f := change
  _ := f(r)
- for once in 0:1 { _ := fail_after_change(r) or (err) { println(err.msg())
+ for once in 0:1 { _ := fail_after_change(r) >>> (err) { println(err.msg())
  -> } }
  println(read(&*r))
  println(records[0].value)
@@ -955,7 +955,7 @@ fn main() {
 #time
 #errors
 fn expect(value bool,message string) int {
-    if !value { >> errors.new(message) }
+    if !value { >>> errors.new(message) }
     << 0
 }
 fn input(kind int,x f64,y f64,now time.Instant) ui.InputEvent {
@@ -967,66 +967,66 @@ fn verify() int {
     anchor := layout.Rect{x: 140.0,y: 180.0,width: 80.0,height: 40.0}
     size := layout.Size{width: 120.0,height: 60.0}
     viewport := layout.Rect{x: 0.0,y: 0.0,width: 400.0,height: 400.0}
-    $tip := widgets.tooltip(&identity,10,&anchor,&size,&viewport) or >>
+    $tip := widgets.tooltip(&identity,10,&anchor,&size,&viewport) >>>
     start := time.instant()
     move := input(ui.EV_POINTER_MOVE,160.0,200.0,start)
-    _ := tip.input(&move) or >>
-    expect(!tip.is_open(),"hover opened before delay") or >>
-    _ := tip.tick(start.add(time.milliseconds(499) or >>) or >>,true) or >>
-    expect(!tip.is_open(),"hover opened at 499ms") or >>
-    shown := start.add(time.milliseconds(500) or >>) or >>
-    _ := tip.tick(shown,true) or >>
-    expect(tip.is_open(),"hover did not open at 500ms") or >>
+    _ := tip.input(&move) >>>
+    expect(!tip.is_open(),"hover opened before delay") >>>
+    _ := tip.tick(start.add(time.milliseconds(499) >>>) >>>,true) >>>
+    expect(!tip.is_open(),"hover opened at 499ms") >>>
+    shown := start.add(time.milliseconds(500) >>>) >>>
+    _ := tip.tick(shown,true) >>>
+    expect(tip.is_open(),"hover did not open at 500ms") >>>
     bounds := tip.bounds()
-    expect(bounds.y + bounds.height <= anchor.y && bounds.x == 120.0,"default top/center placement") or >>
+    expect(bounds.y + bounds.height <= anchor.y && bounds.x == 120.0,"default top/center placement") >>>
     click := input(ui.EV_POINTER_DOWN,160.0,200.0,shown)
-    _ := tip.input(&click) or >>
-    expect(!tip.is_open(),"click did not dismiss") or >>
-    _ := tip.input(&move) or >>
-    _ := tip.tick(shown.add(time.seconds(1) or >>) or >>,true) or >>
-    expect(!tip.is_open(),"click suppression lost before leaving") or >>
+    _ := tip.input(&click) >>>
+    expect(!tip.is_open(),"click did not dismiss") >>>
+    _ := tip.input(&move) >>>
+    _ := tip.tick(shown.add(time.seconds(1) >>>) >>>,true) >>>
+    expect(!tip.is_open(),"click suppression lost before leaving") >>>
     leave := input(ui.EV_POINTER_MOVE,380.0,380.0,shown)
-    _ := tip.input(&leave) or >>
-    _ := tip.input(&move) or >>
-    _ := tip.tick(shown.add(time.seconds(1) or >>) or >>,true) or >>
-    expect(tip.is_open(),"hover did not reset after leaving") or >>
-    _ := tip.input(&leave) or >>
-    expect(!tip.is_open(),"hover leave did not close") or >>
-    tip.set_focus(true,shown) or >>
-    expect(tip.is_open(),"keyboard focus did not open") or >>
+    _ := tip.input(&leave) >>>
+    _ := tip.input(&move) >>>
+    _ := tip.tick(shown.add(time.seconds(1) >>>) >>>,true) >>>
+    expect(tip.is_open(),"hover did not reset after leaving") >>>
+    _ := tip.input(&leave) >>>
+    expect(!tip.is_open(),"hover leave did not close") >>>
+    tip.set_focus(true,shown) >>>
+    expect(tip.is_open(),"keyboard focus did not open") >>>
     $escape := input(ui.EV_KEY_DOWN,0.0,0.0,shown)
     escape.key = ui.KEY_ESCAPE
-    _ := tip.input(&escape) or >>
-    expect(!tip.is_open(),"Escape did not dismiss") or >>
-    tip.set_focus(true,shown) or >>
-    expect(!tip.is_open(),"Escape suppression lost") or >>
-    tip.set_focus(false,shown) or >>
-    tip.set_focus(true,shown) or >>
-    expect(tip.is_open(),"refocus did not reset suppression") or >>
+    _ := tip.input(&escape) >>>
+    expect(!tip.is_open(),"Escape did not dismiss") >>>
+    tip.set_focus(true,shown) >>>
+    expect(!tip.is_open(),"Escape suppression lost") >>>
+    tip.set_focus(false,shown) >>>
+    tip.set_focus(true,shown) >>>
+    expect(tip.is_open(),"refocus did not reset suppression") >>>
     for side in 0:4 {
         $placement := widgets.overlay_placement()
         placement.side = side
         placement.align = widgets.OVERLAY_CENTER
-        tip.set_placement(&placement) or >>
+        tip.set_placement(&placement) >>>
         b := tip.bounds()
-        if side == widgets.OVERLAY_BOTTOM { expect(b.y >= anchor.y + anchor.height,"bottom placement") or >> }
-        if side == widgets.OVERLAY_TOP { expect(b.y + b.height <= anchor.y,"top placement") or >> }
-        if side == widgets.OVERLAY_LEFT { expect(b.x + b.width <= anchor.x,"left placement") or >> }
-        if side == widgets.OVERLAY_RIGHT { expect(b.x >= anchor.x + anchor.width,"right placement") or >> }
+        if side == widgets.OVERLAY_BOTTOM { expect(b.y >= anchor.y + anchor.height,"bottom placement") >>> }
+        if side == widgets.OVERLAY_TOP { expect(b.y + b.height <= anchor.y,"top placement") >>> }
+        if side == widgets.OVERLAY_LEFT { expect(b.x + b.width <= anchor.x,"left placement") >>> }
+        if side == widgets.OVERLAY_RIGHT { expect(b.x >= anchor.x + anchor.width,"right placement") >>> }
     }
     $placement := widgets.overlay_placement()
     placement.side = widgets.OVERLAY_TOP
-    tip.set_placement(&placement) or >>
+    tip.set_placement(&placement) >>>
     edge := layout.Rect{x: 4.0,y: 4.0,width: 80.0,height: 40.0}
-    tip.set_geometry(&edge,&size,&viewport) or >>
+    tip.set_geometry(&edge,&size,&viewport) >>>
     flipped := tip.bounds()
-    expect(flipped.y >= edge.y + edge.height,"edge did not flip") or >>
-    tip.set_enabled(false) or >>
-    expect(!tip.is_open() && !tip.is_visible(),"disabled tooltip stayed visible") or >>
+    expect(flipped.y >= edge.y + edge.height,"edge did not flip") >>>
+    tip.set_enabled(false) >>>
+    expect(!tip.is_open() && !tip.is_visible(),"disabled tooltip stayed visible") >>>
     println("tooltip state and placement PASS")
     << 0
 }
-fn main() int { << verify() or (err) { eprintln(err.msg())
+fn main() int { << verify() >>> (err) { eprintln(err.msg())
     << 1 } }
 ''')
     run([xu, "build", "tooltip_state.xu", "-o", str(program)], cwd=tooltip_project, env=active)
@@ -1035,7 +1035,7 @@ fn main() int { << verify() or (err) { eprintln(err.msg())
     # Canonical bundled modules resolve from their installed manifest root.
     if (prefix / "packages/xu.xun").is_file():
         (project / "xu.xun").write_text('module: main\nversion: !ver 0.1.0\nrequire:\n  "github.com/xulang-org/packages": file:' + (prefix / "packages").as_posix() + '\n')
-        (project / "main.xu").write_text('@main\nredis #"github.com/xulang-org/packages/redis"\nfn main() int {\n    value := redis.int_value(42)\n    answer := value.as_int() or (err) { << 1 }\n    println(answer)\n    << 0\n}\n')
+        (project / "main.xu").write_text('@main\nredis #"github.com/xulang-org/packages/redis"\nfn main() int {\n    value := redis.int_value(42)\n    answer := value.as_int() >>> (err) { << 1 }\n    println(answer)\n    << 0\n}\n')
         assert run([xu, "run", "main.xu"], cwd=project, env=active).strip() == "42"
         example = prefix / "examples/21_standalone_redis/main.xu"
         if example.is_file():

@@ -11,7 +11,7 @@ SOURCE = r'''@main
 #strings
 
 fn test_tcp_dynamic_port_and_peer() int {
-    $ln := net.listen_on("tcp", "127.0.0.1:0") or >>
+    $ln := net.listen_on("tcp", "127.0.0.1:0") >>>
     addr := ln.addr()
     if addr.len == 0 || (addr.len >= 2 && addr[addr.len - 2:addr.len] == ":0") {
         println("ERROR: listener addr was not resolved: " + addr)
@@ -19,8 +19,8 @@ fn test_tcp_dynamic_port_and_peer() int {
     }
     println("listener bound to: " + addr)
 
-    $client := net.dial_to("tcp", addr) or >>
-    $server := ln.accept() or >>
+    $client := net.dial_to("tcp", addr) >>>
+    $server := ln.accept() >>>
 
     s_remote := server.remote_addr()
     s_local := server.local_addr()
@@ -44,16 +44,16 @@ fn test_tcp_dynamic_port_and_peer() int {
 
     // Test TCP half-close (shutdown write)
     msg := "request before half-close"
-    client.write(&msg) or >>
-    client.close_write() or >>
+    client.write(&msg) >>>
+    client.close_write() >>>
 
     // Server should read the message, then EOF ("")
-    buf1 := server.read(128) or >>
+    buf1 := server.read(128) >>>
     if buf1 != msg {
         println("ERROR: server read mismatch")
         << 5
     }
-    buf2 := server.read(128) or >>
+    buf2 := server.read(128) >>>
     if buf2.len != 0 {
         println("ERROR: expected EOF after close_write, got: " + buf2)
         << 6
@@ -62,43 +62,43 @@ fn test_tcp_dynamic_port_and_peer() int {
 
     // Server can still send data back
     reply := "response after client half-close"
-    server.write(&reply) or >>
-    server.close() or >>
+    server.write(&reply) >>>
+    server.close() >>>
 
-    buf3 := client.read(128) or >>
+    buf3 := client.read(128) >>>
     if buf3 != reply {
         println("ERROR: client read reply mismatch: " + buf3)
         << 7
     }
 
-    client.close() or >>
-    ln.close() or >>
+    client.close() >>>
+    ln.close() >>>
     println("tcp_dynamic_port_and_shutdown_passed")
     << 0
 }
 
 fn test_udp_dynamic_port() int {
-    local := net.resolve_udp_addr("udp4", "127.0.0.1:0") or >>
-    $c := net.listen_udp("udp4", local) or >>
+    local := net.resolve_udp_addr("udp4", "127.0.0.1:0") >>>
+    $c := net.listen_udp("udp4", local) >>>
     addr := c.local_addr()
     if addr.len == 0 || (addr.len >= 2 && addr[addr.len - 2:addr.len] == ":0") {
         println("ERROR: udp local_addr was not resolved: " + addr)
         << 8
     }
     println("udp bound to: " + addr)
-    c.close() or >>
+    c.close() >>>
     println("udp_dynamic_port_passed")
     << 0
 }
 
 fn main() int {
-    r1 := test_tcp_dynamic_port_and_peer() or (err) {
+    r1 := test_tcp_dynamic_port_and_peer() >>> (err) {
         println("tcp error: " + err.msg())
         << 10
     }
     if r1 != 0 { << r1 }
 
-    r2 := test_udp_dynamic_port() or (err) {
+    r2 := test_udp_dynamic_port() >>> (err) {
         println("udp error: " + err.msg())
         << 20
     }

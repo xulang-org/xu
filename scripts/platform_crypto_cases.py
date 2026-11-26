@@ -163,45 +163,45 @@ SOURCE = r'''@main
 #net
 #time
 fn bad_name(cert &x509.Certificate, roots &x509.CertPool, inter &x509.CertPool) bool {
-    cert.verify_with_pools("wrong.invalid", time.now_time(), roots, inter) or (err) { << true }
+    cert.verify_with_pools("wrong.invalid", time.now_time(), roots, inter) >>> (err) { << true }
     << false
 }
 fn crypto() int {
-    public := os.read("ecdsa-public") or >>
-    signature := os.read("ecdsa-signature") or >>
+    public := os.read("ecdsa-public") >>>
+    signature := os.read("ecdsa-signature") >>>
     digest := sha256.sum256_bytes("Xu independent ECDSA fixture")
     wrong := sha256.sum256_bytes("altered message")
     if !ecdsa.verify_asn1(&public, &digest, &signature) || ecdsa.verify_asn1(&public, &wrong, &signature) { << 2 }
-    root := x509.parse_certificate(os.read("root.der") or >>) or >>
-    intermediate := x509.parse_certificate(os.read("intermediate.der") or >>) or >>
-    cert := x509.parse_certificate(os.read("leaf.der") or >>) or >>
-    cert.check_signature_from(&intermediate) or >>
-    intermediate.check_signature_from(&root) or >>
+    root := x509.parse_certificate(os.read("root.der") >>>) >>>
+    intermediate := x509.parse_certificate(os.read("intermediate.der") >>>) >>>
+    cert := x509.parse_certificate(os.read("leaf.der") >>>) >>>
+    cert.check_signature_from(&intermediate) >>>
+    intermediate.check_signature_from(&root) >>>
     $roots := x509.new_cert_pool()
     roots.add(root)
     $inter := x509.new_cert_pool()
     inter.add(intermediate)
-    cert.verify_with_pools("localhost", time.now_time(), &roots, &inter) or >>
+    cert.verify_with_pools("localhost", time.now_time(), &roots, &inter) >>>
     if !bad_name(&cert, &roots, &inter) { << 3 }
     system := x509.system_cert_pool()
     if system.certs.len != 1 { << 4 }
-    cert.verify_with_pools("localhost", time.now_time(), &system, &inter) or >>
+    cert.verify_with_pools("localhost", time.now_time(), &system, &inter) >>>
     println("ECDSA and X509 chain/pool passed")
     << 0
 }
 fn bad_pss(key &rsa.PublicKey, digest &string, signature &string) bool {
-    oaep.verify_pss(key, rsa.SHA256, digest, signature) or (err) { << true }
+    oaep.verify_pss(key, rsa.SHA256, digest, signature) >>> (err) { << true }
     << false
 }
 fn rsa_probe() int {
     $n := big.new_int(0)
-    n.set_bytes(os.read("rsa-modulus") or >>)
+    n.set_bytes(os.read("rsa-modulus") >>>)
     $d := big.new_int(0)
-    d.set_bytes(os.read("rsa-private-exponent") or >>)
+    d.set_bytes(os.read("rsa-private-exponent") >>>)
     key := rsa.PrivateKey{public: rsa.PublicKey{n: n, e: 65537}, d: d, p: big.new_int(0), q: big.new_int(0)}
     digest := sha256.sum256_bytes("Xu independent RSA-PSS fixture")
-    signature := os.read("rsa-pss-signature") or >>
-    oaep.verify_pss(&key.public, rsa.SHA256, &digest, &signature) or >>
+    signature := os.read("rsa-pss-signature") >>>
+    oaep.verify_pss(&key.public, rsa.SHA256, &digest, &signature) >>>
     wrong := sha256.sum256_bytes("altered RSA-PSS message")
     if !bad_pss(&key.public, &wrong, &signature) { << 2 }
     $corrupt := signature + ""
@@ -210,8 +210,8 @@ fn rsa_probe() int {
     short := signature[0:signature.len - 1]
     if !bad_pss(&key.public, &digest, &short) { << 4 }
     for i in 0:2 {
-        signed := oaep.sign_pss(&key, rsa.SHA256, &digest) or >>
-        oaep.verify_pss(&key.public, rsa.SHA256, &digest, &signed) or >>
+        signed := oaep.sign_pss(&key, rsa.SHA256, &digest) >>>
+        oaep.verify_pss(&key.public, rsa.SHA256, &digest, &signed) >>>
     }
     << 0
 }
@@ -223,7 +223,7 @@ fn crypto_worker(gate chan int, done chan int) {
             <<
         }
     }
-    rc := rsa_probe() or (err) { eprintln(err.msg())
+    rc := rsa_probe() >>> (err) { eprintln(err.msg())
         done <- 6
         << }
     done <- rc
@@ -241,21 +241,21 @@ fn parallel_crypto() int {
 }
 fn pipe_serve(pc net.PipeConn, result chan int) {
     $config := tls.new_config("localhost")
-    config.cert_pem = os.read("rsa.pem") or (err) { result <- -1
+    config.cert_pem = os.read("rsa.pem") >>> (err) { result <- -1
         << }
-    config.key_pem = os.read("rsa-key.pem") or (err) { result <- -2
+    config.key_pem = os.read("rsa-key.pem") >>> (err) { result <- -2
         << }
-    $conn := tls.server_pipe(pc, &config) or (err) { eprintln(err.msg())
+    $conn := tls.server_pipe(pc, &config) >>> (err) { eprintln(err.msg())
         result <- -3
         << }
-    request := conn.read(4) or (err) { result <- -4
+    request := conn.read(4) >>> (err) { result <- -4
         << }
     if request != "ping" { result <- -5
         << }
     data := "pong"
-    n := conn.write(&data) or (err) { result <- -6
+    n := conn.write(&data) >>> (err) { result <- -6
         << }
-    conn.close() or (err) { result <- -7
+    conn.close() >>> (err) { result <- -7
         << }
     result <- n
 }
@@ -264,46 +264,46 @@ fn pipe_probe() int {
     done := chan int{cap: 1}
     xu pipe_serve(pair.c1, done)
     $config := tls.new_config("localhost")
-    pem := os.read("rsa.pem") or >>
-    x509.append_certificates($&config.root_cas, &pem) or >>
-    $conn := tls.client_pipe(pair.c2, &config) or >>
+    pem := os.read("rsa.pem") >>>
+    x509.append_certificates($&config.root_cas, &pem) >>>
+    $conn := tls.client_pipe(pair.c2, &config) >>>
     data := "ping"
-    if (conn.write(&data) or >>) != 4 { << 2 }
-    reply := conn.read(4) or >>
-    conn.close() or >>
+    if (conn.write(&data) >>>) != 4 { << 2 }
+    reply := conn.read(4) >>>
+    conn.close() >>>
     if reply != "pong" || <-done != 4 { << 3 }
     println("TLS pipe passed")
     << 0
 }
 fn interop(address string) int {
     $config := tls.new_config("localhost")
-    pem := os.read("root.pem") or >>
-    x509.append_certificates($&config.root_cas, &pem) or >>
-    $conn := tls.dial("tcp4", address, &config) or >>
+    pem := os.read("root.pem") >>>
+    x509.append_certificates($&config.root_cas, &pem) >>>
+    $conn := tls.dial("tcp4", address, &config) >>>
     state := conn.connection_state()
     if !state.handshake_complete || state.version != 771 || state.cipher_suite != 49195 { << 2 }
     data := "Xu stream probe"
-    if (conn.write(&data) or >>) != data.len { << 3 }
+    if (conn.write(&data) >>>) != data.len { << 3 }
     $reply := ""
     while reply.len < data.len {
-        part := conn.read(128) or >>
+        part := conn.read(128) >>>
         if part.len == 0 { << 4 }
         reply = reply + part
     }
-    conn.close() or >>
+    conn.close() >>>
     if reply != data { << 5 }
     println("TLS ECDHE interop passed")
     << 0
 }
 fn probe() int {
     a := args()
-    if a[1] == "crypto" { << crypto() or >> }
+    if a[1] == "crypto" { << crypto() >>> }
     if a[1] == "parallel" { << parallel_crypto() }
-    if a[1] == "pipe" { << pipe_probe() or >> }
-    << interop(a[2] + "") or >>
+    if a[1] == "pipe" { << pipe_probe() >>> }
+    << interop(a[2] + "") >>>
 }
 fn main() int {
-    << probe() or (err) { eprintln(err.msg())
+    << probe() >>> (err) { eprintln(err.msg())
         << 1 }
 }
 '''

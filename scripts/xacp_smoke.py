@@ -326,22 +326,22 @@ FALLBACK_CORE = r"""@main
 fn check_setting(name string, actual int) int {
     text := os.getenv(name)
     if text.len == 0 { << 0 }
-    expected := strconv.parse(&text, 10) or >>
-    if actual != expected { >> errors.new("unexpected XACP setting") }
+    expected := strconv.parse(&text, 10) >>>
+    if actual != expected { >>> errors.new("unexpected XACP setting") }
     << 0
 }
 
 fn check_core() int {
     limits := xacp.default_limits()
     $nonces := xacp.new_nonce_registry(xacp.DEFAULT_NONCE_CACHE, true)
-    check_setting("XACP_EXPECT_TIMEOUT_MS", xacp.request_timeout_from_env()) or >>
-    check_setting("XACP_EXPECT_HELLO_TIMEOUT_MS", xacp.hello_timeout_from_env()) or >>
-    check_setting("XACP_EXPECT_IDLE_TIMEOUT_MS", xacp.idle_timeout_from_env()) or >>
-    check_setting("XACP_EXPECT_NONCE_CACHE", xacp.nonce_cache_from_env()) or >>
+    check_setting("XACP_EXPECT_TIMEOUT_MS", xacp.request_timeout_from_env()) >>>
+    check_setting("XACP_EXPECT_HELLO_TIMEOUT_MS", xacp.hello_timeout_from_env()) >>>
+    check_setting("XACP_EXPECT_IDLE_TIMEOUT_MS", xacp.idle_timeout_from_env()) >>>
+    check_setting("XACP_EXPECT_NONCE_CACHE", xacp.nonce_cache_from_env()) >>>
     replay := os.getenv("XACP_EXPECT_NONCE_REPLAY")
     if replay.len > 0 && xacp.nonce_replay_from_env() != (replay == "1") { << 7 }
     $session := xacp.open_session()
-    hello := xacp.parse_frame("id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: fallback-core\n") or (err) {
+    hello := xacp.parse_frame("id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: fallback-core\n") >>> (err) {
         eprintln(err.msg())
         << 1
     }
@@ -350,7 +350,7 @@ fn check_core() int {
         eprintln(opened.err_msg)
         << 2
     }
-    status := xacp.parse_frame("id: !i 2\nop: proc.status\nargs: {}\n") or (err) {
+    status := xacp.parse_frame("id: !i 2\nop: proc.status\nargs: {}\n") >>> (err) {
         eprintln(err.msg())
         << 3
     }
@@ -365,7 +365,7 @@ fn check_core() int {
 }
 
 fn main() int {
-    << check_core() or (err) {
+    << check_core() >>> (err) {
         eprintln(err.msg())
         << 1
     }

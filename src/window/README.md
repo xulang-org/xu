@@ -12,16 +12,16 @@ GUI controls and rendering policy remain outside the service.
 
 options := window.Options{title: "Example",width: 640,height: 360,
     resizable: true,high_pixel_density: true,hidden: false}
-$target := window.open(&options) or >>
-window.pump() or >>
+$target := window.open(&options) >>>
+window.pump() >>>
 for i in 0:events.QUEUE_CAPACITY {
-    event := target.poll() or >>
+    event := target.poll() >>>
     if event.kind == events.EVENT_NONE { <- }
     // Feed key events to application actions; release held actions on focus
     // loss, close or INPUT_RESET. Text/IME is independent of physical keys.
 }
-state := target.state() or >>
-if state.close_requested { target.close() or >> }
+state := target.state() >>>
+if state.close_requested { target.close() >>> }
 ```
 
 Options are explicit: positive int32 logical dimensions and a title of
