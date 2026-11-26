@@ -124,7 +124,16 @@ static const XuSdlSymEntry xu_sdl_sym_table[] = {
     XU_SDL_SYM(SDL_WindowSupportsGPUPresentMode),
     XU_SDL_SYM(SDL_SetGPUSwapchainParameters),
     XU_SDL_SYM(SDL_GetGPUSwapchainTextureFormat),
-    XU_SDL_SYM(SDL_WaitAndAcquireGPUSwapchainTexture)
+    XU_SDL_SYM(SDL_WaitAndAcquireGPUSwapchainTexture),
+    XU_SDL_SYM(SDL_BindGPUVertexStorageTextures),
+    XU_SDL_SYM(SDL_BindGPUVertexStorageBuffers),
+    XU_SDL_SYM(SDL_BindGPUFragmentStorageTextures),
+    XU_SDL_SYM(SDL_BindGPUFragmentStorageBuffers),
+    XU_SDL_SYM(SDL_DrawGPUPrimitivesIndirect),
+    XU_SDL_SYM(SDL_DrawGPUIndexedPrimitivesIndirect),
+    XU_SDL_SYM(SDL_BindGPUComputeSamplers),
+    XU_SDL_SYM(SDL_BindGPUComputeStorageTextures),
+    XU_SDL_SYM(SDL_DispatchGPUComputeIndirect)
 };
 #undef XU_SDL_SYM
 

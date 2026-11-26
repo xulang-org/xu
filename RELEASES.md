@@ -6,6 +6,22 @@
 
 ---
 
+## Xu 0.14.2
+
+- **Compiler Optimizations, Vectorization & Code Layout**:
+  - **128-bit Intra-Block SLP Auto-Vectorization** (`opt_slp`, opt-out via `XU_NO_SLP=1`): Packs isomorphic unrolled array loads/ALU/stores and 4-way associative integer reductions into 128-bit SIMD lanes targeting ARM64 NEON (`LDUR`/`LDR Q`, `.2D`/`.16B`, `ADDP`) and baseline x86-64 SSE2 (`movupd`, `addpd`/`subpd`/`mulpd`/`divpd`, `paddq`, `punpck*`), with non-escaping `MI_ADDR` alias checks and strict IEEE-754 left-to-right preservation.
+  - **Ext-TSP Basic Block Layout & Correlated Jump Threading**: Replaces greedy trace ordering in `opt_cfg` with Wu–Larus static edge weights and `cfg_exttsp_hot_order` chain merging plus loop rotation alignment; adds dominator- and range-based correlated jump threading (`opt_jump_thread`, opt-out via `XU_NO_JT=1`).
+  - **Register Allocation & Loop/Scalar Pipeline**: Adds lifetime holes, Ball–Larus call-site weighting, selective caller-saved allocation across cold calls, and zero-spill constant/`MI_ADDR` rematerialization (`regalloc`); strengthens GVN load forwarding, scope-disjoint LICM hoisting and loop promotion (`opt_licm`), multi-factor loop unrolling, SROA (`opt_sroa`), `float64_bits`/`float64_from_bits` MIR lowering, and ARM64 indexed `f64` shift emission.
+- **Runtime & Standard Library**:
+  - Replaces `core/map` linear probing with compact SwissTable 8-slot SWAR `CTRL_LANE_MUL` control probing and 7/8 load factor; improves `core/chan`, `compress/lzw`, and word-level byte primitives in `core/intrin`.
+- **Freestanding, Kernel & `#core` Primitives**:
+  - Adds `usize`/`isize`, packed/union/bitfield C structs, freestanding `.bss`/`.data`/`.rodata`/`@section`/`@align`/`@export` statics, `[CONST]T`, `sizeof`/`alignof`/`offsetof`, generalized const evaluation, `static_assert`, `@noreturn`, freestanding atomics/`irq_save`/GDT/IDT/CR/MSR/port-IO intrinsics, and multi-section ELF `ET_EXEC`/`ET_REL` (`.rela.<sec>`) across `x64-none`, `arm64-none`, and `riscv64-none`.
+  - Adds `#core/addr`, `#core/ds`, `#core/fmt`, `#core/mmio` and expands `#core/arch`, `#core/alloc`, `#core/mem`, `#core/sync`, `#core/virtio`.
+- **AI Inference, Tensor & GPU**:
+  - Adds low-precision tensor storage and inference helpers (`src/tensor`: `float`, `quant`, `view`) plus P4K4 signed Q4/Q8 kernels, `M=12` GEMM, and paged SIMD attention (`src/xu/mir/ai`).
+  - Expands GPU/SDL support (`R32_UINT`, MRT `begin_render_targets`, storage texture/buffer bindings, `draw_indirect`/`draw_indexed_indirect`, `dispatch_indirect`) and UI `TreeView` multi-selection / cursor tracking fixes.
+- **Platforms & Upgrade**: Upgrade the compiler, standard library, and SDK tools together. See also [Chinese release notes](https://github.com/xulang-org/xu/blob/v0.14.2/RELEASES.zh-CN.md#xu-0142).
+
 ## Xu 0.14.1
 
 - **AI inference**. The pure-Xu LLM example packs GGUF Q4_0 and Q8_0 weights into the internal P4K4 layout for grouped matrix-vector and matrix-matrix kernels. Its paged key/value cache supports batched prefill and autoregressive decoding. The example loads F32 Safetensors and supported Llama- and Qwen2-compatible GGUF models.

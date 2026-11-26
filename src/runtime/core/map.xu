@@ -1,28 +1,32 @@
 @runtime/core
-// Native maps: open addressing with linear probing.
+// Open-addressed SwissTable map implementation with 1-byte H2 control array and
+// 64-bit SWAR 8-slot group probing.
 //
-// A map value is one word, the address of a header record. Slots live in a
-// separate buffer; each slot is [tagged hash][key][value], where the key is
-// an 8-byte int or a 24-byte string descriptor (its bytes copied on insert)
-// and the value is copied by size. Deleted slots stay as tombstones until
-// the next rehash. Iteration walks the slots in table order.
-//
-// Keys are passed by address: the int word or the string descriptor.
+// Map header offsets (M_SIZE = 72):
+//   M_LEN    = 0   number of live entries
+//   M_CAP    = 8   power-of-2 capacity >= 8
+//   M_USED   = 16  non-EMPTY slots (live + deleted)
+//   M_KSTR   = 24  non-zero for string keys ([ptr, len, cap]), 0 for int keys
+//   M_KSIZE  = 32  24 for string keys, 8 for int keys
+//   M_VSIZE  = 40  value byte size
+//   M_STRIDE = 48  ksize + ceil8(vsize) (no per-slot tag header)
+//   M_DATA   = 56  single heap buffer: [cap control bytes][cap * stride slot bytes]
+//   M_SIZE   = 72
 
 const M_LEN = 0
-const M_USED = 8
-const M_CAP = 16
-const M_SLOTS = 24
-const M_KSTR = 32
-const M_KSIZE = 40
-const M_VSIZE = 48
-const M_STRIDE = 56
-const M_SIZE = 64
+const M_CAP = 8
+const M_USED = 16
+const M_KSTR = 24
+const M_KSIZE = 32
+const M_VSIZE = 40
+const M_STRIDE = 48
+const M_DATA = 56
+const M_SIZE = 72
 
-const SLOT_EMPTY = 0
-const SLOT_DELETED = 1
-
-const MS_KEY = 8
+const CTRL_EMPTY = 128
+const CTRL_DELETED = 254
+const CTRL_EMPTY_WORD = -9187201950435737472    // 0x8080808080808080
+const CTRL_LANE_MUL = 283686952306183           // 0x0001020304050607
 
 fn mword(m int, off int) int {
     << rt_load(m + off, 8)
@@ -32,85 +36,78 @@ fn set_mword(m int, off int, v int) {
     rt_store(m + off, 8, v)
 }
 
+// 7/8 max load factor (SwissTable invariant guarantees >= cap/8 EMPTY slots).
 fn map_live_limit(cap int) int {
-    // Keep room for new entries and tombstones. Compute without multiplying
-    // the capacity, which can be near the allocation limit.
-    << cap - cap / 4 + cap / 16
+    << cap - (cap >> 3)
 }
 
-// kstr: 1 for string keys, 0 for int keys; vsize: value bytes.
-pub fn map_new(kstr int, vsize int, cap int) int {
-    if vsize < 0 || vsize > 9223372036854775807 - 128 || cap < 0 {
-        fatal_no_memory()
+fn map_alloc_data(cap int, stride int) int {
+    data := alloc_unzeroed(cap + cap * stride)
+    $i := 0
+    while i < cap {
+        rt_store(data + i, 8, CTRL_EMPTY_WORD)
+        i += 8
     }
+    << data
+}
+
+pub fn map_new(kstr int, vsize int, cap int) int {
     $ksize := 8
     if kstr != 0 {
         ksize = 24
     }
-    stride := MS_KEY + ksize + (vsize + 7) / 8 * 8
-    if stride == 0 {
-        fatal_no_memory()
-        << 0
-    }
-    if stride < 0 {
-        fatal_no_memory()
-    }
-    max_slots := (9223372036854775807 - 16399) / stride
+    vwords := (vsize + 7) / 8
+    stride := ksize + vwords * 8
     $n := 8
     while map_live_limit(n) < cap {
-        if n > max_slots / 2 {
-            fatal_no_memory()
-        }
         n = n * 2
     }
-    if n > max_slots {
-        fatal_no_memory()
-    }
+    data := map_alloc_data(n, stride)
     m := alloc(M_SIZE)
+    set_mword(m, M_LEN, 0)
+    set_mword(m, M_CAP, n)
+    set_mword(m, M_USED, 0)
     set_mword(m, M_KSTR, kstr)
     set_mword(m, M_KSIZE, ksize)
     set_mword(m, M_VSIZE, vsize)
     set_mword(m, M_STRIDE, stride)
-    map_alloc_slots(m, n)
+    set_mword(m, M_DATA, data)
     << m
 }
 
-fn map_alloc_slots(m int, n int) {
-    stride := mword(m, M_STRIDE)
-    if stride == 0 {
-        fatal_no_memory()
-        <<
-    }
-    if n <= 0 || stride < 0 {
-        fatal_no_memory()
-    }
-    if n > (9223372036854775807 - 16399) / stride {
-        fatal_no_memory()
-    }
-    set_mword(m, M_SLOTS, alloc(n * stride))
-    set_mword(m, M_CAP, n)
-    set_mword(m, M_LEN, 0)
-    set_mword(m, M_USED, 0)
-}
-
-// Live hashes use the sign bit, which is outside every valid capacity mask.
-// Zero and one mark empty slots and tombstones, respectively.
-fn map_tag_hash(h int) int {
-    << (h ^ ((h >> 32) & 4294967295)) | (1 << 63)
-}
-
 fn map_hash_str(key int) int {
-    $h := -3750763034362895579
+    if key == 0 {
+        << -7046029254386353131
+    }
     p := desc_ptr(key)
     n := desc_len(key)
-    for i in 0:n {
-        h = (h ^ rt_load(p + i, 1)) * 1099511628211
+    if n == 0 {
+        << -7046029254386353131
     }
-    << map_tag_hash(h)
+    $h := -3750763034362895579
+    $i := 0
+    if xu_target_arch() == ARCH_ARM64 || xu_target_arch() == ARCH_X64 {
+        while i + 8 <= n {
+            h = (h ^ rt_load(p + i, 8)) * -4658895280553007687
+            i += 8
+        }
+        if i + 4 <= n {
+            h = (h ^ rt_load(p + i, 4)) * -4658895280553007687
+            i += 4
+        }
+    }
+    while i < n {
+        h = (h ^ rt_load(p + i, 1)) * 1099511628211
+        i += 1
+    }
+    h = (h ^ n) * -7046029254386353131
+    << h ^ ((h >> 27) & 4294967295)
 }
 
 fn map_hash_int(kv int) int {
-    << map_tag_hash(kv * -7046029254386353131)
+    x := kv ^ -7046029254386353131
+    h := (x ^ (x >> 30)) * -4658895280553007687
+    << h ^ ((h >> 27) & 4294967295)
 }
 
 fn map_hash(m int, key int) int {
@@ -122,254 +119,240 @@ fn map_hash(m int, key int) int {
 
 fn map_key_eq(m int, slot int, key int) bool {
     if mword(m, M_KSTR) != 0 {
-        << str_eq(slot + MS_KEY, key)
+        << str_eq(slot, key)
     }
-    << rt_load(slot + MS_KEY, 8) == rt_load(key, 8)
+    << rt_load(slot, 8) == rt_load(key, 8)
 }
 
-fn map_slot_at(m int, i int) int {
-    << mword(m, M_SLOTS) + i * mword(m, M_STRIDE)
-}
-
-fn map_val_off(m int) int {
-    << MS_KEY + mword(m, M_KSIZE)
-}
-
-// Live slot holding key, or 0.
-fn map_find(m int, key int) int {
+fn map_find_idx(m int, key int) int {
     if m == 0 {
-        << 0
+        << -1
     }
-    kstr := mword(m, M_KSTR)
-    slots := mword(m, M_SLOTS)
-    stride := mword(m, M_STRIDE)
-    mask := mword(m, M_CAP) - 1
-    if kstr == 0 {
-        kv := rt_load(key, 8)
-        h := map_hash_int(kv)
-        $i := h & mask
-        while true {
-            slot := slots + i * stride
-            state := rt_load(slot, 8)
-            if state == SLOT_EMPTY {
-                << 0
-            }
-            if state == h && rt_load(slot + MS_KEY, 8) == kv {
-                << slot
-            }
-            i = (i + 1) & mask
-        }
-        << 0
-    }
-    h := map_hash_str(key)
-    $i := h & mask
-    while true {
-        slot := slots + i * stride
-        state := rt_load(slot, 8)
-        if state == SLOT_EMPTY {
-            << 0
-        }
-        if state == h && str_eq(slot + MS_KEY, key) {
-            << slot
-        }
-        i = (i + 1) & mask
-    }
-    << 0
-}
-
-fn map_rehash(m int, n int) {
-    old := mword(m, M_SLOTS)
-    ocap := mword(m, M_CAP)
-    stride := mword(m, M_STRIDE)
-    live := mword(m, M_LEN)
-    map_alloc_slots(m, n)
-    slots := mword(m, M_SLOTS)
-    mask := n - 1
-    if stride == 24 {
-        for oi in 0:ocap {
-            src := old + oi * 24
-            hash := rt_load(src, 8)
-            if hash < 0 {
-                $i := hash & mask
-                $dst := slots + i * 24
-                while rt_load(dst, 8) != SLOT_EMPTY {
-                    i = (i + 1) & mask
-                    dst = slots + i * 24
-                }
-                rt_store(dst, 8, hash)
-                rt_store(dst + 8, 8, rt_load(src + 8, 8))
-                rt_store(dst + 16, 8, rt_load(src + 16, 8))
-            }
-        }
-    } else {
-        words := stride / 8
-        for oi in 0:ocap {
-            src := old + oi * stride
-            hash := rt_load(src, 8)
-            if hash < 0 {
-                $i := hash & mask
-                $dst := slots + i * stride
-                while rt_load(dst, 8) != SLOT_EMPTY {
-                    i = (i + 1) & mask
-                    dst = slots + i * stride
-                }
-                rt_store(dst, 8, hash)
-                for wi in 1:words {
-                    off := wi * 8
-                    rt_store(dst + off, 8, rt_load(src + off, 8))
-                }
-            }
-        }
-    }
-    set_mword(m, M_LEN, live)
-    set_mword(m, M_USED, live)
-    free_owned(old)
-}
-
-fn map_nil_panic() {
-    msg := "panic: assignment to entry in nil map\n"
-    write_fd(2, str_ptr(&msg), msg.len)
-    exit_process(1)
-}
-
-// Value address for key, inserting a zeroed value when it is absent.
-// If existed_out != 0, stores 1 when key already existed and 0 when inserted.
-pub fn map_put_has(m int, key int, existed_out int) int {
-    if m == 0 {
-        map_nil_panic()
-    }
-    kstr := mword(m, M_KSTR)
-    slots := mword(m, M_SLOTS)
     cap := mword(m, M_CAP)
+    data := mword(m, M_DATA)
     stride := mword(m, M_STRIDE)
-    val_off := MS_KEY + mword(m, M_KSIZE)
-    mask := cap - 1
-    $kv := 0
+    kstr := mword(m, M_KSTR)
     $h := 0
+    $kv := 0
     if kstr == 0 {
         kv = rt_load(key, 8)
         h = map_hash_int(kv)
     } else {
         h = map_hash_str(key)
     }
-    $i := h & mask
-    $first_del := 0
+    h2 := (h >> 57) & 127
+    h2_pat := h2 * BYTE_LANES
+    g_mask := cap - 8
+    $g := h & g_mask
+    $step := 8
     while true {
-        slot := slots + i * stride
-        state := rt_load(slot, 8)
-        if state == SLOT_EMPTY {
+        cw := rt_load(data + g, 8)
+        $matches := byte_match_lanes(cw, h2_pat)
+        while matches != 0 {
+            lsb := matches & (0 - matches)
+            lane := (lsb * CTRL_LANE_MUL) >> 56
+            idx := g + lane
+            slot := data + cap + idx * stride
+            if kstr == 0 {
+                if rt_load(slot, 8) == kv {
+                    << idx
+                }
+            } else {
+                if str_eq(slot, key) {
+                    << idx
+                }
+            }
+            matches = matches & (matches - 1)
+        }
+        if byte_match_lanes(cw, CTRL_EMPTY_WORD) != 0 {
+            << -1
+        }
+        g = (g + step) & g_mask
+        step += 8
+    }
+    << -1
+}
+
+fn map_find_empty_slot(data int, cap int, h int) int {
+    g_mask := cap - 8
+    $g := h & g_mask
+    $step := 8
+    while true {
+        cw := rt_load(data + g, 8)
+        em := byte_match_lanes(cw, CTRL_EMPTY_WORD)
+        if em != 0 {
+            lsb := em & (0 - em)
+            << g + ((lsb * CTRL_LANE_MUL) >> 56)
+        }
+        g = (g + step) & g_mask
+        step += 8
+    }
+    << 0
+}
+
+fn map_rehash(m int, n int) {
+    old_data := mword(m, M_DATA)
+    old_cap := mword(m, M_CAP)
+    stride := mword(m, M_STRIDE)
+    kstr := mword(m, M_KSTR)
+    ndata := map_alloc_data(n, stride)
+    $nused := 0
+    $g := 0
+    while g < old_cap {
+        cw := rt_load(old_data + g, 8)
+        $norm := (((cw ^ -1) & CTRL_EMPTY_WORD) >> 7) & BYTE_LANES
+        while norm != 0 {
+            lsb := norm & (0 - norm)
+            lane := (lsb * CTRL_LANE_MUL) >> 56
+            oidx := g + lane
+            oslot := old_data + old_cap + oidx * stride
+            $h := 0
+            if kstr != 0 {
+                h = map_hash_str(oslot)
+            } else {
+                h = map_hash_int(rt_load(oslot, 8))
+            }
+            nh2 := (h >> 57) & 127
+            nidx := map_find_empty_slot(ndata, n, h)
+            rt_store(ndata + nidx, 1, nh2)
+            mem_copy(ndata + n + nidx * stride, oslot, stride)
+            nused += 1
+            norm = norm & (norm - 1)
+        }
+        g += 8
+    }
+    set_mword(m, M_CAP, n)
+    set_mword(m, M_USED, nused)
+    set_mword(m, M_DATA, ndata)
+    free_owned(old_data)
+}
+
+fn map_nil_panic() {
+    msg := "panic: assignment to entry in nil map\n"
+    print_desc(2, rt_addr(&msg), false)
+    exit_process(2)
+}
+
+fn map_missing_key() {
+    msg := "map key not found\n"
+    print_desc(2, rt_addr(&msg), false)
+    exit_process(2)
+}
+
+pub fn map_put_has(m int, key int, existed_out int) int {
+    if m == 0 {
+        map_nil_panic()
+    }
+    $cap := mword(m, M_CAP)
+    $data := mword(m, M_DATA)
+    stride := mword(m, M_STRIDE)
+    kstr := mword(m, M_KSTR)
+    ksize := mword(m, M_KSIZE)
+    $kv := 0
+    $kptr := 0
+    $klen := 0
+    $h := 0
+    if kstr == 0 {
+        kv = rt_load(key, 8)
+        h = map_hash_int(kv)
+    } else {
+        kptr = desc_ptr(key)
+        klen = desc_len(key)
+        h = map_hash_str(key)
+    }
+    h2 := (h >> 57) & 127
+    h2_pat := h2 * BYTE_LANES
+    g_mask := cap - 8
+    $g := h & g_mask
+    $step := 8
+    $first_avail := -1
+    while true {
+        cw := rt_load(data + g, 8)
+        $matches := byte_match_lanes(cw, h2_pat)
+        while matches != 0 {
+            lsb := matches & (0 - matches)
+            lane := (lsb * CTRL_LANE_MUL) >> 56
+            idx := g + lane
+            slot := data + cap + idx * stride
+            if kstr == 0 {
+                if rt_load(slot, 8) == kv {
+                    if existed_out != 0 { rt_store(existed_out, 8, 1) }
+                    << slot + ksize
+                }
+            } else {
+                if str_eq(slot, key) {
+                    if existed_out != 0 { rt_store(existed_out, 8, 1) }
+                    << slot + ksize
+                }
+            }
+            matches = matches & (matches - 1)
+        }
+        if first_avail < 0 {
+            avail := ((cw & CTRL_EMPTY_WORD) >> 7) & BYTE_LANES
+            if avail != 0 {
+                lsb := avail & (0 - avail)
+                first_avail = g + ((lsb * CTRL_LANE_MUL) >> 56)
+            }
+        }
+        if byte_match_lanes(cw, CTRL_EMPTY_WORD) != 0 {
             <-
         }
-        if state == SLOT_DELETED {
-            if first_del == 0 {
-                first_del = slot
-            }
-        } else if state == h {
-            if kstr == 0 {
-                if rt_load(slot + MS_KEY, 8) == kv {
-                    if existed_out != 0 {
-                        rt_store(existed_out, 8, 1)
-                    }
-                    << slot + val_off
-                }
-            } else if str_eq(slot + MS_KEY, key) {
-                if existed_out != 0 {
-                    rt_store(existed_out, 8, 1)
-                }
-                << slot + val_off
-            }
-        }
-        i = (i + 1) & mask
+        g = (g + step) & g_mask
+        step += 8
     }
-    if existed_out != 0 {
-        rt_store(existed_out, 8, 0)
-    }
-    used := mword(m, M_USED)
+
+    if existed_out != 0 { rt_store(existed_out, 8, 0) }
+    $ins_idx := first_avail
+    $was_empty := rt_load(data + ins_idx, 1) == CTRL_EMPTY
     live := mword(m, M_LEN)
-    $target := slots + i * stride
-    if first_del != 0 {
-        target = first_del
-    }
-    grow := live >= map_live_limit(cap)
-    if grow || (first_del == 0 && used >= cap - cap / 8) {
-        $n := cap
-        if grow {
-            if cap > 4611686018427387903 {
-                fatal_no_memory()
-            }
-            n = cap * 2
+    if was_empty && mword(m, M_USED) >= map_live_limit(cap) {
+        $ncap := cap
+        if live >= map_live_limit(cap) / 2 {
+            ncap = cap * 2
         }
-        map_rehash(m, n)
-        nslots := mword(m, M_SLOTS)
-        nmask := n - 1
-        $ni := h & nmask
-        while true {
-            cand := nslots + ni * stride
-            if rt_load(cand, 8) == SLOT_EMPTY {
-                target = cand
-                <-
-            }
-            ni = (ni + 1) & nmask
-        }
-        first_del = 0
+        map_rehash(m, ncap)
+        cap = mword(m, M_CAP)
+        data = mword(m, M_DATA)
+        ins_idx = map_find_empty_slot(data, cap, h)
+        was_empty = true
     }
-    if first_del == 0 {
+
+    rt_store(data + ins_idx, 1, h2)
+    slot := data + cap + ins_idx * stride
+    if kstr != 0 {
+        bytes_new(slot, kptr, klen)
+    } else {
+        rt_store(slot, 8, kv)
+    }
+    set_mword(m, M_LEN, live + 1)
+    if was_empty {
         set_mword(m, M_USED, mword(m, M_USED) + 1)
     }
-    set_mword(m, M_LEN, mword(m, M_LEN) + 1)
-    rt_store(target, 8, h)
-    if kstr != 0 {
-        bytes_new(target + MS_KEY, desc_ptr(key), desc_len(key))
-    } else {
-        rt_store(target + MS_KEY, 8, kv)
-    }
-    val := target + val_off
-    // map_alloc_slots zeroes the table. An empty slot still has its initial
-    // value bytes; a tombstone can contain a previous entry's payload.
-    if first_del == 0 {
-        << val
-    }
-    vsize := mword(m, M_VSIZE)
-    if vsize == 8 {
-        rt_store(val, 8, 0)
-    } else {
-        for b in 0:vsize {
-            rt_store(val + b, 1, 0)
-        }
-    }
-    << val
+    << slot + ksize
 }
 
 pub fn map_put(m int, key int) int {
     << map_put_has(m, key, 0)
 }
 
-// Value address for key, or 0 when absent.
 pub fn map_find_val(m int, key int) int {
-    slot := map_find(m, key)
-    if slot == 0 {
+    idx := map_find_idx(m, key)
+    if idx < 0 {
         << 0
     }
-    << slot + map_val_off(m)
+    << mword(m, M_DATA) + mword(m, M_CAP) + idx * mword(m, M_STRIDE) + mword(m, M_KSIZE)
 }
 
-// Value address for key; a missing key ends the program.
 pub fn map_val_ptr(m int, key int) int {
-    slot := map_find(m, key)
-    if slot == 0 {
+    idx := map_find_idx(m, key)
+    if idx < 0 {
         map_missing_key()
     }
-    << slot + map_val_off(m)
-}
-
-fn map_missing_key() {
-    msg := "map key not found\n"
-    write_fd(2, str_ptr(&msg), msg.len)
-    exit_process(1)
+    << mword(m, M_DATA) + mword(m, M_CAP) + idx * mword(m, M_STRIDE) + mword(m, M_KSIZE)
 }
 
 pub fn map_has(m int, key int) bool {
-    << map_find(m, key) != 0
+    << map_find_idx(m, key) >= 0
 }
 
 pub fn map_len(m int) int {
@@ -379,67 +362,96 @@ pub fn map_len(m int) int {
     << mword(m, M_LEN)
 }
 
-pub fn map_delete(m int, key int) {
-    slot := map_find(m, key)
-    if slot != 0 {
-        if mword(m, M_KSTR) != 0 {
-            str_free(slot + MS_KEY)
-        }
-        rt_store(slot, 8, SLOT_DELETED)
-        set_mword(m, M_LEN, mword(m, M_LEN) - 1)
-    }
-}
-
-pub fn map_free(m int) {
-    if m == 0 { << }
+fn map_erase_idx(m int, idx int) {
     cap := mword(m, M_CAP)
+    data := mword(m, M_DATA)
     if mword(m, M_KSTR) != 0 {
-        for i in 0:cap {
-            slot := map_slot_at(m, i)
-            if rt_load(slot, 8) < 0 {
-                str_free(slot + MS_KEY)
-            }
-        }
+        slot := data + cap + idx * mword(m, M_STRIDE)
+        str_free(slot)
     }
-    free_owned(mword(m, M_SLOTS))
-    free_owned(m)
-}
-
-// Move the value for key to dst and remove the entry; a missing key ends
-// the program.
-pub fn map_take(m int, key int, dst int) {
-    slot := map_find(m, key)
-    if slot == 0 {
-        map_missing_key()
+    g := idx & (cap - 8)
+    cw := rt_load(data + g, 8)
+    if byte_match_lanes(cw, CTRL_EMPTY_WORD) != 0 {
+        rt_store(data + idx, 1, CTRL_EMPTY)
+        set_mword(m, M_USED, mword(m, M_USED) - 1)
+    } else {
+        rt_store(data + idx, 1, CTRL_DELETED)
     }
-    mem_copy(dst, slot + map_val_off(m), mword(m, M_VSIZE))
-    if mword(m, M_KSTR) != 0 {
-        str_free(slot + MS_KEY)
-    }
-    rt_store(slot, 8, SLOT_DELETED)
     set_mword(m, M_LEN, mword(m, M_LEN) - 1)
 }
 
-// Index of the first live slot at or after i, or -1.
-pub fn map_next(m int, i int) int {
+pub fn map_delete(m int, key int) {
+    idx := map_find_idx(m, key)
+    if idx < 0 {
+        <<
+    }
+    map_erase_idx(m, idx)
+}
+
+pub fn map_free(m int) {
     if m == 0 {
+        <<
+    }
+    cap := mword(m, M_CAP)
+    data := mword(m, M_DATA)
+    if mword(m, M_KSTR) != 0 {
+        stride := mword(m, M_STRIDE)
+        $g := 0
+        while g < cap {
+            cw := rt_load(data + g, 8)
+            $norm := (((cw ^ -1) & CTRL_EMPTY_WORD) >> 7) & BYTE_LANES
+            while norm != 0 {
+                lsb := norm & (0 - norm)
+                lane := (lsb * CTRL_LANE_MUL) >> 56
+                str_free(data + cap + (g + lane) * stride)
+                norm = norm & (norm - 1)
+            }
+            g += 8
+        }
+    }
+    free_owned(data)
+    free_owned(m)
+}
+
+pub fn map_take(m int, key int, dst int) {
+    idx := map_find_idx(m, key)
+    if idx < 0 {
+        map_missing_key()
+    }
+    cap := mword(m, M_CAP)
+    data := mword(m, M_DATA)
+    stride := mword(m, M_STRIDE)
+    voff := mword(m, M_KSIZE)
+    mem_copy(dst, data + cap + idx * stride + voff, mword(m, M_VSIZE))
+    map_erase_idx(m, idx)
+}
+
+pub fn map_next(m int, i int) int {
+    if m == 0 || i >= mword(m, M_CAP) {
         << -1
     }
     cap := mword(m, M_CAP)
+    data := mword(m, M_DATA)
     $j := i
+    if j < 0 { j = 0 }
     while j < cap {
-        if rt_load(map_slot_at(m, j), 8) < 0 {
-            << j
+        g := j & (cap - 8)
+        cw := rt_load(data + g, 8)
+        live_bits := ((cw ^ -1) & CTRL_EMPTY_WORD) & ((-1) << ((j & 7) * 8))
+        if live_bits != 0 {
+            norm := (live_bits >> 7) & BYTE_LANES
+            lsb := norm & (0 - norm)
+            << g + ((lsb * CTRL_LANE_MUL) >> 56)
         }
-        j += 1
+        j = g + 8
     }
     << -1
 }
 
 pub fn map_key_at(m int, i int) int {
-    << map_slot_at(m, i) + MS_KEY
+    << mword(m, M_DATA) + mword(m, M_CAP) + i * mword(m, M_STRIDE)
 }
 
 pub fn map_val_at(m int, i int) int {
-    << map_slot_at(m, i) + map_val_off(m)
+    << mword(m, M_DATA) + mword(m, M_CAP) + i * mword(m, M_STRIDE) + mword(m, M_KSIZE)
 }
