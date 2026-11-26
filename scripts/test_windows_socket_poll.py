@@ -19,7 +19,7 @@ SOURCE = r'''@main
 #strings
 
 fn close_quiet(fd int) {
-    net.conn_close(fd) or (err) { << }
+    net.conn_close(fd) >>> (err) { << }
 }
 
 fn exchange(fd int) int {
@@ -27,41 +27,41 @@ fn exchange(fd int) int {
     $sent := 0
     while sent < request.len {
         part := request[sent:request.len]
-        n := net.conn_write(fd, &part) or >>
-        if n <= 0 || n > part.len { >> errors.new("request write made invalid progress") }
+        n := net.conn_write(fd, &part) >>>
+        if n <= 0 || n > part.len { >>> errors.new("request write made invalid progress") }
         sent += n
     }
     $response := ""
     while response.len < 8192 {
-        part := net.conn_read(fd, 1024) or >>
-        if part.len == 0 { >> errors.new("response ended before body") }
+        part := net.conn_read(fd, 1024) >>>
+        if part.len == 0 { >>> errors.new("response ended before body") }
         response = response + part
         if strings.index_of(&response, "\r\n\r\nok") >= 0 { << 1 }
     }
-    >> errors.new("response exceeded limit")
+    >>> errors.new("response exceeded limit")
 }
 
 fn request(addr string) int {
-    fd := net.dial_ns(addr, 2000000000) or >>
-    os.set_sock_timeout(fd, 2000000000) or (err) {
+    fd := net.dial_ns(addr, 2000000000) >>>
+    os.set_sock_timeout(fd, 2000000000) >>> (err) {
         close_quiet(fd)
-        >> err
+        >>> err
     }
-    result := exchange(fd) or (err) {
+    result := exchange(fd) >>> (err) {
         close_quiet(fd)
-        >> err
+        >>> err
     }
-    net.conn_close(fd) or >>
+    net.conn_close(fd) >>>
     << result
 }
 
 fn handler(c http.Context) {
-    c.text(200, "ok") or (err) { eprintln(err.msg())
+    c.text(200, "ok") >>> (err) { eprintln(err.msg())
         << }
 }
 
 fn serve(lfd int) {
-    status := http.serve_listener(lfd, handler) or (err) { eprintln(err.msg())
+    status := http.serve_listener(lfd, handler) >>> (err) { eprintln(err.msg())
         << }
     if status != 0 { eprintln("HTTP server stopped") }
 }
@@ -69,7 +69,7 @@ fn serve(lfd int) {
 fn worker(addr string, out chan int) {
     $count := 0
     for i in 0:3 {
-        count += request(addr + "") or (err) { eprintln(err.msg())
+        count += request(addr + "") >>> (err) { eprintln(err.msg())
             out <- -1
             << }
     }
@@ -77,57 +77,57 @@ fn worker(addr string, out chan int) {
 }
 
 fn invalid_socket_rejected() bool {
-    _ := os.socket_poll(0, 1) or (err) { << true }
+    _ := os.socket_poll(0, 1) >>> (err) { << true }
     << false
 }
 
 fn invalid_write_rejected() bool {
     text := "probe"
-    _ := net.conn_write(-1, &text) or (err) { << true }
+    _ := net.conn_write(-1, &text) >>> (err) { << true }
     << false
 }
 
 fn invalid_read_rejected() bool {
-    _ := net.conn_read(-1, 1) or (err) { << true }
+    _ := net.conn_read(-1, 1) >>> (err) { << true }
     << false
 }
 
 fn invalid_sendto_rejected() bool {
     address := string_from_bytes([127, 0, 0, 1, 0, 1])
-    _ := os.sendto(-1, address, "probe") or (err) { << true }
+    _ := os.sendto(-1, address, "probe") >>> (err) { << true }
     << false
 }
 
 fn invalid_recvfrom_rejected() bool {
-    _ := os.recvfrom(-1, 1) or (err) { << true }
+    _ := os.recvfrom(-1, 1) >>> (err) { << true }
     << false
 }
 
 fn invalid_timeout_rejected() bool {
-    _ := os.set_sock_timeout(-1, 1000000) or (err) { << true }
+    _ := os.set_sock_timeout(-1, 1000000) >>> (err) { << true }
     << false
 }
 
 fn probe(addr string) int {
     if !invalid_write_rejected() || !invalid_read_rejected() || !invalid_sendto_rejected() || !invalid_recvfrom_rejected() || !invalid_timeout_rejected() {
-        >> errors.new("invalid socket I/O accepted")
+        >>> errors.new("invalid socket I/O accepted")
     }
-    lfd := net.listen(addr + "") or >>
+    lfd := net.listen(addr + "") >>>
     // No client exists yet: every readiness result must be exactly zero.
     for i in 0:64 {
-        ready := os.socket_poll(lfd, 1) or (err) { close_quiet(lfd)
-            >> err }
+        ready := os.socket_poll(lfd, 1) >>> (err) { close_quiet(lfd)
+            >>> err }
         if ready != 0 { close_quiet(lfd)
-            >> errors.new("idle listener reported ready") }
+            >>> errors.new("idle listener reported ready") }
     }
     if !invalid_socket_rejected() { close_quiet(lfd)
-        >> errors.new("invalid SOCKET accepted") }
+        >>> errors.new("invalid SOCKET accepted") }
     xu serve(lfd)
     out := chan int{cap: 2}
     for i in 0:2 { xu worker(addr + "", out) }
     first := <-out
     second := <-out
-    if first != 3 || second != 3 { >> errors.new("concurrent requests failed") }
+    if first != 3 || second != 3 { >>> errors.new("concurrent requests failed") }
     // The server owns lfd until this process exits, including its worker Gs.
     println("Windows socket poll and concurrent HTTP passed")
     << 0
@@ -136,7 +136,7 @@ fn probe(addr string) int {
 fn main() int {
     arguments := args()
     if arguments.len != 2 { << 2 }
-    << probe(arguments[1] + "") or (err) { eprintln(err.msg())
+    << probe(arguments[1] + "") >>> (err) { eprintln(err.msg())
         << 1 }
 }
 '''

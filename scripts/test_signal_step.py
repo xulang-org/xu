@@ -52,7 +52,7 @@ signal #os/signal
 
 fn check_invalid_sig(sig int) bool {
     c := chan int{cap: 10}
-    signal.notify(c, sig) or (err) {
+    signal.notify(c, sig) >>> (err) {
         // verify channel ownership is preserved: write and read
         c <- 42
         $val := 0
@@ -66,7 +66,7 @@ fn check_invalid_sig(sig int) bool {
 }
 
 fn check_invalid_ignore(sig int) bool {
-    signal.ignore(sig) or (err) {
+    signal.ignore(sig) >>> (err) {
         << true
     }
     << false
@@ -99,8 +99,8 @@ fn check_invalid_all() {
 fn check_registration_and_dispatch() {
     c1 := chan int{cap: 10}
     c2 := chan int{cap: 10}
-    signal.notify(c1, signal.SIGINT) or (err) { <<< 1 }
-    signal.notify(c2, signal.SIGINT) or (err) { <<< 1 }
+    signal.notify(c1, signal.SIGINT) >>> (err) { <<< 1 }
+    signal.notify(c2, signal.SIGINT) >>> (err) { <<< 1 }
 
     n := signal.new_notifier(c1, signal.SIGINT)
     n.raise(signal.SIGINT)
@@ -118,7 +118,7 @@ fn check_registration_and_dispatch() {
         <<< 1
     }
 
-    signal.notify(c1, signal.SIGTERM) or (err) { <<< 1 }
+    signal.notify(c1, signal.SIGTERM) >>> (err) { <<< 1 }
     n_term := signal.new_notifier(c1, signal.SIGTERM)
     n_term.raise(signal.SIGTERM)
     $v_term := 0
@@ -139,7 +139,7 @@ fn check_registration_and_dispatch() {
 
 fn check_stop_semantics() {
     c := chan int{cap: 10}
-    signal.notify(c, signal.SIGINT) or (err) { <<< 1 }
+    signal.notify(c, signal.SIGINT) >>> (err) { <<< 1 }
     signal.stop(c)
 
     c <- 77
@@ -188,7 +188,7 @@ signal #os/signal
 
 pub fn main() {
     c := chan int{cap: 2}
-    signal.notify(c, signal.SIGQUIT) or (err) {
+    signal.notify(c, signal.SIGQUIT) >>> (err) {
         eprintln("notify failed")
         <<< 1
     }

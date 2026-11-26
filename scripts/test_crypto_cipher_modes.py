@@ -18,13 +18,13 @@ TEST_CODE = r'''@main
 #encoding/json
 
 fn test_cipher_cfb() {
-    key := hex.decode_string("2b7e151628aed2a6abf7158809cf4f3c") or (err) { <<< 1 }
-    iv := hex.decode_string("000102030405060708090a0b0c0d0e0f") or (err) { <<< 2 }
-    c := aes.new_cipher(&key) or (err) { <<< 3 }
+    key := hex.decode_string("2b7e151628aed2a6abf7158809cf4f3c") >>> (err) { <<< 1 }
+    iv := hex.decode_string("000102030405060708090a0b0c0d0e0f") >>> (err) { <<< 2 }
+    c := aes.new_cipher(&key) >>> (err) { <<< 3 }
 
     // Test multi-block and partial block (27 bytes)
     pt := "The quick brown fox jumps over" // 30 bytes
-    ct := cipher.encrypt_cfb(&c, &iv, &pt) or (err) {
+    ct := cipher.encrypt_cfb(&c, &iv, &pt) >>> (err) {
         eprintln("encrypt_cfb failed: " + err.msg())
         <<< 4
     }
@@ -32,7 +32,7 @@ fn test_cipher_cfb() {
         eprintln("cfb ciphertext length mismatch: " + str(ct.len) + " vs " + str(pt.len))
         <<< 5
     }
-    decrypted := cipher.decrypt_cfb(&c, &iv, &ct) or (err) {
+    decrypted := cipher.decrypt_cfb(&c, &iv, &ct) >>> (err) {
         eprintln("decrypt_cfb failed: " + err.msg())
         <<< 6
     }
@@ -43,7 +43,7 @@ fn test_cipher_cfb() {
 
     // Invalid IV
     short_iv := "short"
-    cipher.encrypt_cfb(&c, &short_iv, &pt) or (err) {
+    cipher.encrypt_cfb(&c, &short_iv, &pt) >>> (err) {
         // Expected error
         println("OK: cfb invalid IV rejected")
         <<
@@ -53,12 +53,12 @@ fn test_cipher_cfb() {
 }
 
 fn test_cipher_ofb() {
-    key := hex.decode_string("2b7e151628aed2a6abf7158809cf4f3c") or (err) { <<< 10 }
-    iv := hex.decode_string("000102030405060708090a0b0c0d0e0f") or (err) { <<< 11 }
-    c := aes.new_cipher(&key) or (err) { <<< 12 }
+    key := hex.decode_string("2b7e151628aed2a6abf7158809cf4f3c") >>> (err) { <<< 10 }
+    iv := hex.decode_string("000102030405060708090a0b0c0d0e0f") >>> (err) { <<< 11 }
+    c := aes.new_cipher(&key) >>> (err) { <<< 12 }
 
     pt := "Stream ciphers like OFB work on arbitrary byte lengths!"
-    ct := cipher.encrypt_ofb(&c, &iv, &pt) or (err) {
+    ct := cipher.encrypt_ofb(&c, &iv, &pt) >>> (err) {
         eprintln("encrypt_ofb failed: " + err.msg())
         <<< 13
     }
@@ -66,7 +66,7 @@ fn test_cipher_ofb() {
         eprintln("ofb ciphertext length mismatch: " + str(ct.len) + " vs " + str(pt.len))
         <<< 14
     }
-    decrypted := cipher.decrypt_ofb(&c, &iv, &ct) or (err) {
+    decrypted := cipher.decrypt_ofb(&c, &iv, &ct) >>> (err) {
         eprintln("decrypt_ofb failed: " + err.msg())
         <<< 15
     }
@@ -77,7 +77,7 @@ fn test_cipher_ofb() {
 
     // Invalid IV
     bad_iv := "0123456789"
-    cipher.encrypt_ofb(&c, &bad_iv, &pt) or (err) {
+    cipher.encrypt_ofb(&c, &bad_iv, &pt) >>> (err) {
         println("OK: ofb invalid IV rejected")
         <<
     }
@@ -93,11 +93,11 @@ fn test_json_parse_max() {
         <<< 20
     }
     r := doc.root()
-    k := doc.get(r, "key") or (err) {
+    k := doc.get(r, "key") >>> (err) {
         eprintln("get key failed: " + err.msg())
         <<< 24
     }
-    val := doc.as_string(k) or (err) {
+    val := doc.as_string(k) >>> (err) {
         eprintln("as_string failed: " + err.msg())
         <<< 25
     }

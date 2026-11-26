@@ -14,14 +14,14 @@ multiple render targets, multisampling and stencil are not implemented here.
 ```xu
 #gpu
 
-$device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) or >>
-$buffer := device.buffer(4, gpu.BUFFER_VERTEX) or >>
+$device := gpu.open(gpu.DeviceOptions{backend: gpu.AUTO, debug: false, shader_formats: 0}) >>>
+$buffer := device.buffer(4, gpu.BUFFER_VERTEX) >>>
 input := [u8(0), u8(127), u8(128), u8(255)]
-$uploaded := device.upload(&buffer, 0, &input) or >>
-$result := device.download(&buffer, 0, 4) or >>
-result.wait() or >>
+$uploaded := device.upload(&buffer, 0, &input) >>>
+$result := device.download(&buffer, 0, 4) >>>
+result.wait() >>>
 $output := [u8(0), u8(0), u8(0), u8(0)]
-result.read($&output) or >>
+result.read($&output) >>>
 assert(output[3] == u8(255))
 ```
 

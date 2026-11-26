@@ -18,31 +18,31 @@ SOURCE = '''@main
 #os
 
 fn native_pipe() int {
-    packed := os_pipe() or >>
+    packed := os_pipe() >>>
     rfd := packed >> 32
     wfd := packed & 4294967295
-    empty := os.fd_wait_read(rfd, -1) or >>
+    empty := os.fd_wait_read(rfd, -1) >>>
     if empty != 0 { << 10 }
-    _ := os.fd_write(wfd, "native") or >>
+    _ := os.fd_write(wfd, "native") >>>
     for _ in 0:2 {
-        ready := os.fd_wait_read(rfd, -1) or >>
+        ready := os.fd_wait_read(rfd, -1) >>>
         if ready != 1 { << 11 }
     }
-    data := os.fd_read(rfd, 64) or >>
+    data := os.fd_read(rfd, 64) >>>
     if data != "native" { << 12 }
-    drained := os.fd_wait_read(rfd, -1) or >>
+    drained := os.fd_wait_read(rfd, -1) >>>
     if drained != 0 { << 13 }
-    _ := os.fd_close(wfd) or >>
-    eof := os.fd_wait_read(rfd, -1) or >>
+    _ := os.fd_close(wfd) >>>
+    eof := os.fd_wait_read(rfd, -1) >>>
     if eof != 1 { << 14 }
     if xu_target_os() == 2 {
         // Also cover direct builtin lowering, outside the imported os wrapper.
-        direct := sys_fd_peek_read(rfd) or >>
+        direct := sys_fd_peek_read(rfd) >>>
         if direct != 1 { << 15 }
     }
-    last := os.fd_read(rfd, 64) or >>
+    last := os.fd_read(rfd, 64) >>>
     if last != "" { << 16 }
-    _ := os.fd_close(rfd) or >>
+    _ := os.fd_close(rfd) >>>
     println("native:ok")
     << 0
 }
@@ -51,13 +51,13 @@ fn main() int {
     args := os.args()
     mode := args[1]
     if mode == "native" {
-        << native_pipe() or (err) {
+        << native_pipe() >>> (err) {
             eprintln(err.msg())
             << 9
         }
     }
     if mode == "invalid" {
-        _ := os.fd_wait_read(-1, -1) or (err) {
+        _ := os.fd_wait_read(-1, -1) >>> (err) {
             println(err.msg())
             << 0
         }
@@ -66,14 +66,14 @@ fn main() int {
     $timeout := 200000000
     if mode == "probe" { timeout = -1 }
     if mode == "infinite" { timeout = 0 }
-    $ready := os.fd_wait_read(0, timeout) or (err) {
+    $ready := os.fd_wait_read(0, timeout) >>> (err) {
         eprintln(err.msg())
         << 2
     }
     if mode == "retry" {
         if ready != 0 { << 7 }
         println(ready)
-        ready = os.fd_wait_read(0, 0) or (err) {
+        ready = os.fd_wait_read(0, 0) >>> (err) {
             eprintln(err.msg())
             << 8
         }
@@ -81,17 +81,17 @@ fn main() int {
     println(ready)
     if ready == 1 {
         // A second immediate probe must not have consumed the data/EOF.
-        again := os.fd_wait_read(0, -1) or (err) {
+        again := os.fd_wait_read(0, -1) >>> (err) {
             eprintln(err.msg())
             << 3
         }
         if again != 1 { << 4 }
-        data := os.fd_read(0, 64) or (err) {
+        data := os.fd_read(0, 64) >>> (err) {
             eprintln(err.msg())
             << 5
         }
         // Exercise the same standard-handle mapping used for XACP frames.
-        _ := os.fd_write(1, "read:" + data + "\\n") or (err) {
+        _ := os.fd_write(1, "read:" + data + "\\n") >>> (err) {
             eprintln(err.msg())
             << 6
         }

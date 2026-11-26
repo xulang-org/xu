@@ -15,7 +15,7 @@ TEST_CODE = r'''@main
 #net
 
 fn test_invalid_network() {
-    _ := net.dial_to("invalid_net", "127.0.0.1") or (err) {
+    _ := net.dial_to("invalid_net", "127.0.0.1") >>> (err) {
         println("OK: invalid network rejected: " + err.msg())
         <<
     }
@@ -24,7 +24,7 @@ fn test_invalid_network() {
 }
 
 fn test_stream_listen_rejected() {
-    _ := net.listen_on("ip:icmp", "127.0.0.1") or (err) {
+    _ := net.listen_on("ip:icmp", "127.0.0.1") >>> (err) {
         if err.msg() != "net: IP listen is listen_packet or listen_ip, not Listen" {
             eprintln("unexpected listen_on error: " + err.msg())
             <<< 2
@@ -37,7 +37,7 @@ fn test_stream_listen_rejected() {
 }
 
 fn test_dial_ip_raw() {
-    _ := net.dial_to("ip:icmp", "127.0.0.1") or (err) {
+    _ := net.dial_to("ip:icmp", "127.0.0.1") >>> (err) {
         msg := err.msg()
         println("dial_ip attempted OS raw socket: " + msg)
         if msg == "net: raw IP sockets are not available on this target" {
@@ -51,7 +51,7 @@ fn test_dial_ip_raw() {
 }
 
 fn test_listen_ip_raw() {
-    _ := net.listen_packet("ip:icmp", "127.0.0.1") or (err) {
+    _ := net.listen_packet("ip:icmp", "127.0.0.1") >>> (err) {
         msg := err.msg()
         println("listen_ip attempted OS raw socket: " + msg)
         if msg == "net: raw IP sockets are not available on this target" {
@@ -65,15 +65,15 @@ fn test_listen_ip_raw() {
 }
 
 fn test_explicit_dial_ip() {
-    laddr := net.resolve_ip_addr("ip4:1", "127.0.0.1") or (err) {
+    laddr := net.resolve_ip_addr("ip4:1", "127.0.0.1") >>> (err) {
         eprintln("resolve_ip_addr failed: " + err.msg())
         <<< 5
     }
-    raddr := net.resolve_ip_addr("ip4:1", "127.0.0.1") or (err) {
+    raddr := net.resolve_ip_addr("ip4:1", "127.0.0.1") >>> (err) {
         eprintln("resolve_ip_addr failed: " + err.msg())
         <<< 6
     }
-    _ := net.dial_ip("ip4:1", laddr, raddr) or (err) {
+    _ := net.dial_ip("ip4:1", laddr, raddr) >>> (err) {
         msg := err.msg()
         if msg == "net: raw IP sockets are not available on this target" {
             eprintln("dial_ip still throwing stub message!")

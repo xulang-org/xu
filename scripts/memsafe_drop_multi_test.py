@@ -59,16 +59,16 @@ fn may(ok bool) string {
     if ok {
         << "payload_padpad"
     }
-    >> errors.new("err_padpad")
+    >>> errors.new("err_padpad")
     << ""
 }
 fn main() int {
-    a := may(true) or (e) {
+    a := may(true) >>> (e) {
         println(e.msg())
         << 1
     }
     println(a)
-    b := may(false) or (e) {
+    b := may(false) >>> (e) {
         println(e.msg())
         << 0
     }
@@ -81,14 +81,14 @@ pos("throw_propagate_str", """
 @main
 #errors
 fn inner() string {
-    >> errors.new("boom_padpad")
+    >>> errors.new("boom_padpad")
     << ""
 }
 fn outer() string {
-    << inner() or >>
+    << inner() >>>
 }
 fn main() int {
-    r := outer() or (e) {
+    r := outer() >>> (e) {
         println(e.msg())
         << 0
     }
@@ -225,8 +225,8 @@ reject("double_free_style_result", """
 @main
 fn main() int {
     r := Ok("owned_padpad")
-    a := r or (e) { << 1 }
-    b := r or (e) { << 1 }
+    a := r >>> (e) { << 1 }
+    b := r >>> (e) { << 1 }
     println(a)
     println(b)
     << 0

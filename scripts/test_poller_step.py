@@ -28,19 +28,19 @@ POLLER_TEST_CODE = r'''@main
 fn server_accept_all(listener net.Listener, n int, accepted_out chan net.Conn) {
     $l := listener
     for i in 0:n {
-        c := l.accept() or (err) {
+        c := l.accept() >>> (err) {
             accepted_out <- net.closed_conn()
-            l.close() or (err2) { << }
+            l.close() >>> (err2) { << }
             <<
         }
         accepted_out <- c
     }
-    l.close() or (err) { << }
+    l.close() >>> (err) { << }
 }
 
 fn send_after_yield(fd int, payload string) {
     sleep_ns(1000000)
-    net.conn_write(fd, &payload) or (err) { <<< 1 }
+    net.conn_write(fd, &payload) >>> (err) { <<< 1 }
 }
 
 fn main() {
@@ -52,7 +52,7 @@ fn main() {
     if no_events.len != 0 { <<< 1 }
 
     // 1. Setup local TCP listener
-    $l := net.listen_on("tcp", "127.0.0.1:0") or (err) {
+    $l := net.listen_on("tcp", "127.0.0.1:0") >>> (err) {
         eprintln("listen failed: " + err.msg())
         <<< 1
     }
@@ -65,7 +65,7 @@ fn main() {
     // Connect N client sockets
     $client_fds := []int{}
     for i in 0:n {
-        cfd := net.dial(addr + "") or (err) {
+        cfd := net.dial(addr + "") >>> (err) {
             eprintln("dial failed: " + err.msg())
             <<< 1
         }
@@ -95,11 +95,11 @@ fn main() {
     id_tail_2 := registered_ids[tail_2]
 
     msg := "ping_payload"
-    net.conn_write(client_fds[tail_1], &msg) or (err) {
+    net.conn_write(client_fds[tail_1], &msg) >>> (err) {
         eprintln("write tail 1 failed")
         <<< 1
     }
-    net.conn_write(client_fds[tail_2], &msg) or (err) {
+    net.conn_write(client_fds[tail_2], &msg) >>> (err) {
         eprintln("write tail 2 failed")
         <<< 1
     }
@@ -135,11 +135,11 @@ fn main() {
     println("OK: correct tail ready connection IDs verified: " + str(id_tail_1) + ", " + str(id_tail_2))
 
     // Drain data from tail connections
-    read1 := p.read_timeout(id_tail_1, 64, 10000000) or (err) {
+    read1 := p.read_timeout(id_tail_1, 64, 10000000) >>> (err) {
         eprintln("read tail 1 failed: " + err.msg())
         <<< 1
     }
-    read2 := p.read_timeout(id_tail_2, 64, 10000000) or (err) {
+    read2 := p.read_timeout(id_tail_2, 64, 10000000) >>> (err) {
         eprintln("read tail 2 failed: " + err.msg())
         <<< 1
     }
@@ -171,12 +171,12 @@ fn main() {
     xu send_after_yield(client_fds[tail_1], msg + "")
     delayed := p.wait(0)
     if delayed.len != 1 || delayed[0].id != id_tail_1 || (delayed[0].events & poller.EVENT_READ) == 0 { <<< 1 }
-    data := p.read_timeout(id_tail_1, 64, 100000000) or (err) { <<< 1 }
+    data := p.read_timeout(id_tail_1, 64, 100000000) >>> (err) { <<< 1 }
     if data != msg { <<< 1 }
 
     // 4. Scenario 3: Close / Remove lifecycle
     // Close id_tail_2
-    closed := p.close_id(id_tail_2) or (err) {
+    closed := p.close_id(id_tail_2) >>> (err) {
         eprintln("close_id threw: " + err.msg())
         <<< 1
     }
@@ -190,7 +190,7 @@ fn main() {
     }
 
     // Now send data to id_tail_1 again
-    net.conn_write(client_fds[tail_1], &msg) or (err) {
+    net.conn_write(client_fds[tail_1], &msg) >>> (err) {
         eprintln("write tail 1 retry failed")
         <<< 1
     }
@@ -211,7 +211,7 @@ fn main() {
         eprintln("tail 1 was not returned after tail 2 close")
         <<< 1
     }
-    tail_data := p.read_timeout(id_tail_1, 64, 100000000) or (err) { <<< 1 }
+    tail_data := p.read_timeout(id_tail_1, 64, 100000000) >>> (err) { <<< 1 }
     if tail_data != msg { <<< 1 }
     println("OK: close_id lifecycle verified, closed connection dropped cleanly")
 
@@ -221,17 +221,17 @@ fn main() {
 
     // A removed stream's peer must see EOF while the Poller is still alive.
     removed_peer := client_fds[0]
-    eof_ready := os.socket_wait(removed_peer, poller.EVENT_READ, 500000000) or (err) { <<< 1 }
+    eof_ready := os.socket_wait(removed_peer, poller.EVENT_READ, 500000000) >>> (err) { <<< 1 }
     if eof_ready == 0 { <<< 1 }
-    eof := net.conn_read(removed_peer, 1) or (err) { <<< 1 }
+    eof := net.conn_read(removed_peer, 1) >>> (err) { <<< 1 }
     if eof.len != 0 { <<< 1 }
 
     // Reuse the vacant slot and check that its previous id stays invalid.
-    replacement_peer := net.dial(addr + "") or (err) { <<< 1 }
+    replacement_peer := net.dial(addr + "") >>> (err) { <<< 1 }
     replacement := <-accepted_chan
     new_id := p.add(stream.from_tcp(replacement))
     if new_id <= id_tail_2 || p.set_interest(removed_id, poller.EVENT_WRITE) { <<< 1 }
-    net.conn_write(replacement_peer, &msg) or (err) { <<< 1 }
+    net.conn_write(replacement_peer, &msg) >>> (err) { <<< 1 }
     new_events := p.wait(500000000)
     $found_replacement := false
     for ev in new_events {
@@ -242,20 +242,20 @@ fn main() {
     if !p.set_interest(new_id, poller.EVENT_WRITE) { <<< 1 }
     writable := p.wait(500000000)
     if writable.len != 1 || writable[0].id != new_id || writable[0].events != poller.EVENT_WRITE { <<< 1 }
-    p.close_id(new_id) or (err) { <<< 1 }
-    net.conn_close(replacement_peer) or (err) { <<< 1 }
+    p.close_id(new_id) >>> (err) { <<< 1 }
+    net.conn_close(replacement_peer) >>> (err) { <<< 1 }
 
     if p.wait(10000000).len != 0 { <<< 1 }
 
     for i in 0:n {
-        p.close_id(registered_ids[i]) or (err) { <<< 1 }
+        p.close_id(registered_ids[i]) >>> (err) { <<< 1 }
     }
     drained := p.wait(0)
     if p.count() != 0 || drained.len != 0 { <<< 1 }
 
     // Clean up
     for i in 0:n {
-        net.conn_close(client_fds[i]) or (err) { << }
+        net.conn_close(client_fds[i]) >>> (err) { << }
     }
 
     println("ALL_POLLER_STEP_TESTS_PASSED")

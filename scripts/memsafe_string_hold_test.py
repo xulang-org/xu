@@ -106,16 +106,16 @@ fn may(ok bool) string {
     if ok {
         << "ok_val"
     }
-    >> errors.new("err_val")
+    >>> errors.new("err_val")
     << ""
 }
 fn main() int {
-    r := may(true) or (e) {
+    r := may(true) >>> (e) {
         println(e.msg())
         << 0
     }
     println(r)
-    e := may(false) or (err) {
+    e := may(false) >>> (err) {
         println(err.msg())
         << 0
     }

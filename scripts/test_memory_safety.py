@@ -235,12 +235,12 @@ fn main() {
         code="""@main
 #errors
 fn fallible(fail bool) int {
-    if fail { >> errors.new("boom") }
+    if fail { >>> errors.new("boom") }
     << 10
 }
 fn main() {
     $x := 1
-    x = fallible(true) or (e) {
+    x = fallible(true) >>> (e) {
         x := 99
         << x
     }
@@ -254,11 +254,11 @@ fn main() {
         code="""@main
 #errors
 fn fallible() int {
-    >> errors.new("boom")
+    >>> errors.new("boom")
     << 0
 }
 fn main() {
-    x := fallible() or (e) {
+    x := fallible() >>> (e) {
         << "bad"
     }
     println(x)
@@ -492,12 +492,12 @@ fn main() {
 struct Own { v int }
 fn (o $&Own) drop() {}
 fn maybe_take(o Own) int {
-    if o.v < 0 { >> errors.new("neg") }
+    if o.v < 0 { >>> errors.new("neg") }
     << o.v
 }
 fn run() int {
     o := Own{v: 4}
-    r := maybe_take(o) or (e) { << 0 }
+    r := maybe_take(o) >>> (e) { << 0 }
     println(o.v + r)
     << r
 }
@@ -613,13 +613,13 @@ struct Own { v int }
 fn (o $&Own) drop() {}
 fn take(o Own) { println(o.v) }
 fn fallible() int {
-    if false { >> errors.new("x") }
+    if false { >>> errors.new("x") }
     << 1
 }
 fn run() int {
     o := Own{v: 9}
     take(o)
-    _ := fallible() or (e) {
+    _ := fallible() >>> (e) {
         println(0)
         << 0
     }
@@ -801,7 +801,7 @@ fn main() {
         code="""@main
 #errors
 fn test_neg() int {
-    b := sys_random_fill(-1) or (e) {
+    b := sys_random_fill(-1) >>> (e) {
         println("neg_err")
         << 1
     }
@@ -809,7 +809,7 @@ fn test_neg() int {
     << 0
 }
 fn test_zero() string {
-    z := sys_random_fill(0) or (e) {
+    z := sys_random_fill(0) >>> (e) {
         println("unexpected_zero_err")
         << ""
     }
@@ -1206,7 +1206,7 @@ fn main() {
 #errors
 fn send_val(ch chan int, v int) int {
     ch <- v
-    if v < 0 { >> errors.new("neg") }
+    if v < 0 { >>> errors.new("neg") }
     << v
 }
 fn run() int {
@@ -1219,7 +1219,7 @@ fn run() int {
         ch <- 22
     }
     f()
-    r := send_val(ch, 33) or (e) { << 0 }
+    r := send_val(ch, 33) >>> (e) { << 0 }
     a := <-ch
     b := <-ch
     c := <-ch
@@ -1289,7 +1289,7 @@ struct Holder {
     e AnyBox
 }
 fn fail_after(g Guard) int {
-    if g.id > 0 { >> errors.new("fail") }
+    if g.id > 0 { >>> errors.new("fail") }
     << g.id
 }
 fn test_cast() {
@@ -1298,7 +1298,7 @@ fn test_cast() {
     println("cast:" + str(g.id))
 }
 fn run_or() int {
-    v := fail_after(Guard{id: 66}) or (e) {
+    v := fail_after(Guard{id: 66}) >>> (e) {
         println("caught")
         << 7
     }
@@ -1448,11 +1448,11 @@ fn main() {
 fn main() {
     $r := strings.new_reader("A中🙂" + string_from_byte(255))
     for i in 0:4 {
-        rune := r.read_rune() or (err) { <<< 1 }
+        rune := r.read_rune() >>> (err) { <<< 1 }
         println(rune.ch)
         println(rune.size)
     }
-    r.read_rune() or (err) {
+    r.read_rune() >>> (err) {
         println(err.msg())
         <<
     }
