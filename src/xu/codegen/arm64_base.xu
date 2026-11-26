@@ -284,11 +284,19 @@ fn frame_layout_ra(f &mir.MFn, reg_args int, ra &RaInfo, opt bool) A64Frame {
     for i in 0:f.temps.len {
         $in_reg := opt && i < ra.temp_reg.len && ra.temp_reg[i] >= 0
         $is_dead := opt && i < uses.len && uses[i] == 0
-        if in_reg || is_dead {
+        $is_remat := opt && ((i < ra.remat_addr.len && ra.remat_addr[i] >= 0) || (i < ra.remat_const.len && ra.remat_const[i] >= 0))
+        if in_reg || is_dead || is_remat {
             toffs.push(-1)
         } else {
+            $ns := 1
+            if i < f.temps_nslots.len && f.temps_nslots[i] > 1 {
+                ns = f.temps_nslots[i]
+            }
+            if ns > 1 && (off % 16) != 0 {
+                off += 8
+            }
             toffs.push(off)
-            off += 8
+            off += ns * 8
         }
     }
     size := (off + 15) / 16 * 16
@@ -298,7 +306,8 @@ fn frame_layout_ra(f &mir.MFn, reg_args int, ra &RaInfo, opt bool) A64Frame {
 // The frame for a backend passing the first reg_args arguments in
 // registers and the rest in the caller's outgoing area.
 fn frame_layout(f &mir.MFn, reg_args int) A64Frame {
-    << frame_layout_ra(f, reg_args, &RaInfo{temp_reg: []int{}, local_reg: []int{}, used_callee: []int{}}, false)
+    empty_ra := ra_none(f)
+    << frame_layout_ra(f, reg_args, &empty_ra, false)
 }
 
 // Frame-pointer-relative offset of each local (both backends share the
@@ -313,12 +322,20 @@ pub fn frame_local_fp_offsets(f &mir.MFn) []int {
 }
 
 // Operand (temp or constant) into register rd.
-fn a64_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, rd int, v int) {
+fn a64_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, rd int, v int) {
     if v <= -2 {
         a64_mov_imm(cb, rd, f.consts[0 - v - 2])
         <<
     }
     if v >= 0 && v < fr.temp_off.len {
+        if v < ra.remat_addr.len && ra.remat_addr[v] >= 0 {
+            a64_add_imm(cb, rd, R_SP, fr.local_off[ra.remat_addr[v]])
+            <<
+        }
+        if v < ra.remat_const.len && ra.remat_const[v] >= 0 {
+            a64_mov_imm(cb, rd, f.consts[ra.remat_const[v]])
+            <<
+        }
         if fr.temp_off[v] >= 0 {
             a64_ldr(cb, rd, R_SP, fr.temp_off[v])
         }
@@ -358,6 +375,74 @@ fn a64_fmem(cb $&mc.CodeBuffer, store bool, dt int, rn int, off int) {
     $base_reg := 0xFC606800
     if store { base_reg = 0xFC206800 }
     e32(cb, base_reg | (R_IP1 << 16) | (rn << 5) | dt)
+}
+
+fn a64_qmov(cb $&mc.CodeBuffer, vd int, vn int) {
+    if vd != vn {
+        e32(cb, 0x4EA01C00 | (vn << 16) | (vn << 5) | vd)
+    }
+}
+
+fn a64_qmem(cb $&mc.CodeBuffer, store bool, vt int, rn int, off int) {
+    if off >= 0 && (off & 15) == 0 && (off >> 4) < 4096 {
+        $opc := 0x3DC00000
+        if store { opc = 0x3D800000 }
+        e32(cb, opc | ((off >> 4) << 10) | (rn << 5) | vt)
+        <<
+    }
+    if off >= -256 && off <= 255 {
+        $opc := 0x3CC00000
+        if store { opc = 0x3C800000 }
+        e32(cb, opc | ((off & 511) << 12) | (rn << 5) | vt)
+        <<
+    }
+    a64_mov_imm(cb, R_IP1, off)
+    $opc := 0x3CE06800
+    if store { opc = 0x3CA06800 }
+    e32(cb, opc | (R_IP1 << 16) | (rn << 5) | vt)
+}
+
+fn a64_vsrc(cb $&mc.CodeBuffer, fr &A64Frame, ra &RaInfo, v int, v_scratch int) int {
+    r := a64_temp_reg(ra, v)
+    if r >= 32 {
+        << r - 32
+    }
+    if v >= 0 && v < fr.temp_off.len && fr.temp_off[v] >= 0 {
+        a64_qmem(cb, false, v_scratch, R_SP, fr.temp_off[v])
+    }
+    << v_scratch
+}
+
+fn a64_vdst(ra &RaInfo, t int, v_scratch int) int {
+    r := a64_temp_reg(ra, t)
+    if r >= 32 {
+        << r - 32
+    }
+    << v_scratch
+}
+
+fn a64_vput(cb $&mc.CodeBuffer, fr &A64Frame, ra &RaInfo, t int, vs int) {
+    r := a64_temp_reg(ra, t)
+    if r >= 32 {
+        a64_qmov(cb, r - 32, vs)
+        <<
+    }
+    if t >= 0 && t < fr.temp_off.len && fr.temp_off[t] >= 0 {
+        a64_qmem(cb, true, vs, R_SP, fr.temp_off[t])
+    }
+}
+
+fn a64_vbin(cb $&mc.CodeBuffer, op int, vd int, vn int, vm int) {
+    $opc := 0x6E201C00 // EOR.16B
+    if op == mir.BIN_FADD { opc = 0x4E60D400 }
+    else if op == mir.BIN_FSUB { opc = 0x4EE0D400 }
+    else if op == mir.BIN_FMUL { opc = 0x6E60DC00 }
+    else if op == mir.BIN_FDIV { opc = 0x6E60FC00 }
+    else if op == mir.BIN_ADD { opc = 0x4EE08400 }
+    else if op == mir.BIN_SUB { opc = 0x6EE08400 }
+    else if op == mir.BIN_AND { opc = 0x4E201C00 }
+    else if op == mir.BIN_OR { opc = 0x4EA01C00 }
+    a64_rrr(cb, opc, vd, vn, vm)
 }
 
 // rd = rn op rm on f64 bit patterns, through d0/d1.
@@ -456,7 +541,7 @@ fn a64_src(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, v int, scra
         a64_fmov_xd(cb, scratch, r - 32)
         << scratch
     }
-    a64_operand(cb, f, fr, scratch, v)
+    a64_operand(cb, f, fr, ra, scratch, v)
     << scratch
 }
 
@@ -482,6 +567,19 @@ fn a64_load_to(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, rd int,
             a64_fmov_dx(cb, fd, r)
         } else if v <= -2 && f.consts[0 - v - 2] == 0 {
             a64_fmov_dx(cb, fd, 31)
+        } else if v >= 0 && v < ra.remat_const.len && ra.remat_const[v] >= 0 {
+            c := f.consts[ra.remat_const[v]]
+            if c == 0 {
+                a64_fmov_dx(cb, fd, 31)
+            } else {
+                imm8 := a64_fp64_imm8(c)
+                if imm8 >= 0 {
+                    e32(cb, 0x1E601000 | (imm8 << 13) | fd)
+                } else {
+                    a64_mov_imm(cb, 9, c)
+                    a64_fmov_dx(cb, fd, 9)
+                }
+            }
         } else if v >= 0 && v < fr.temp_off.len {
             if fr.temp_off[v] >= 0 {
                 a64_fmem(cb, false, fd, R_SP, fr.temp_off[v])
@@ -509,7 +607,7 @@ fn a64_load_to(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, rd int,
         a64_fmov_xd(cb, rd, r - 32)
         <<
     }
-    a64_operand(cb, f, fr, rd, v)
+    a64_operand(cb, f, fr, ra, rd, v)
 }
 
 // The GPR to compute temp t into.
@@ -604,6 +702,25 @@ fn a64_fneg_operand(f &mir.MFn, ra &RaInfo, ins &mir.MInstr) int {
     << -1
 }
 
+fn a64_fabs_operand(f &mir.MFn, ra &RaInfo, ins &mir.MInstr) int {
+    if ins.b != mir.BIN_AND {
+        << -1
+    }
+    am := 9223372036854775807
+    $val := -1
+    if ins.d <= -2 && f.consts[0 - ins.d - 2] == am {
+        val = ins.c
+    } else if ins.c <= -2 && f.consts[0 - ins.c - 2] == am {
+        val = ins.d
+    } else {
+        << -1
+    }
+    if a64_temp_reg(ra, ins.a) >= 32 || a64_temp_reg(ra, val) >= 32 {
+        << val
+    }
+    << -1
+}
+
 fn a64_cond_of(op int) int {
     if op == mir.BIN_NE { << target.ARM64_COND_NE }
     if op == mir.BIN_LT { << target.ARM64_COND_LT }
@@ -686,13 +803,13 @@ fn a64_encode_bitmask64(v int) int {
     << (nbit << 12) | (immr << 6) | imms
 }
 
-// Constant operand v as a 12-bit unsigned immediate, or -1.
-fn a64_imm12(f &mir.MFn, v int) int {
-    if v <= -2 {
-        c := f.consts[0 - v - 2]
-        if c >= 0 && c < 4096 {
-            << c
-        }
+// Encode non-negative 12-bit immediate (unshifted or lsl #12) into bits [22:10], or -1.
+fn a64_imm12_enc(cv int) int {
+    if cv >= 0 && cv < 4096 {
+        << cv << 10
+    }
+    if cv > 0 && (cv & 4095) == 0 && (cv >> 12) <= 4095 {
+        << (1 << 22) | ((cv >> 12) << 10)
     }
     << -1
 }
@@ -700,7 +817,8 @@ fn a64_imm12(f &mir.MFn, v int) int {
 fn a64_can_cmp_imm(f &mir.MFn, v int) bool {
     if v <= -2 {
         c := f.consts[0 - v - 2]
-        << c >= -4095 && c < 4096
+        if a64_imm12_enc(c) >= 0 { << true }
+        if c < 0 && c >= -16773120 && a64_imm12_enc(0 - c) >= 0 { << true }
     }
     << false
 }
@@ -708,16 +826,19 @@ fn a64_can_cmp_imm(f &mir.MFn, v int) bool {
 // cmp c, d using the immediate form when d allows it.
 fn a64_cmp_vals(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, c int, d int) {
     rn := a64_src(cb, f, fr, ra, c, 9)
-    imm := a64_imm12(f, d)
-    if imm >= 0 {
-        e32(cb, 0xF100001F | (imm << 10) | (rn << 5))
-        <<
-    }
     if d <= -2 {
         cv := f.consts[0 - d - 2]
-        if cv < 0 && cv >= -4095 {
-            e32(cb, 0xB100001F | ((0 - cv) << 10) | (rn << 5))
+        enc := a64_imm12_enc(cv)
+        if enc >= 0 {
+            e32(cb, 0xF100001F | enc | (rn << 5))
             <<
+        }
+        if cv < 0 && cv >= -16773120 {
+            nenc := a64_imm12_enc(0 - cv)
+            if nenc >= 0 {
+                e32(cb, 0xB100001F | nenc | (rn << 5))
+                <<
+            }
         }
     }
     rm := a64_src(cb, f, fr, ra, d, 10)
@@ -823,7 +944,7 @@ fn a64_can_bin_imm(f &mir.MFn, op int, d int) bool {
     if d > -2 { << false }
     cv := f.consts[0 - d - 2]
     if op == mir.BIN_ADD || op == mir.BIN_SUB {
-        << cv >= -4095 && cv < 4096
+        << a64_imm12_enc(cv) >= 0 || (cv < 0 && cv >= -16773120 && a64_imm12_enc(0 - cv) >= 0)
     }
     if op == mir.BIN_MUL {
         << a64_mul_pow2_plus1(cv) > 0
@@ -849,23 +970,31 @@ fn a64_bin_imm(cb $&mc.CodeBuffer, f &mir.MFn, op int, rd int, rn int, d int) bo
     if d > -2 { << false }
     cv := f.consts[0 - d - 2]
     if op == mir.BIN_ADD {
-        if cv >= 0 && cv < 4096 {
-            e32(cb, 0x91000000 | (cv << 10) | (rn << 5) | rd)
+        enc := a64_imm12_enc(cv)
+        if enc >= 0 {
+            e32(cb, 0x91000000 | enc | (rn << 5) | rd)
             << true
         }
-        if cv < 0 && cv >= -4095 {
-            e32(cb, 0xD1000000 | ((0 - cv) << 10) | (rn << 5) | rd)
-            << true
+        if cv < 0 && cv >= -16773120 {
+            nenc := a64_imm12_enc(0 - cv)
+            if nenc >= 0 {
+                e32(cb, 0xD1000000 | nenc | (rn << 5) | rd)
+                << true
+            }
         }
     }
     if op == mir.BIN_SUB {
-        if cv >= 0 && cv < 4096 {
-            e32(cb, 0xD1000000 | (cv << 10) | (rn << 5) | rd)
+        enc := a64_imm12_enc(cv)
+        if enc >= 0 {
+            e32(cb, 0xD1000000 | enc | (rn << 5) | rd)
             << true
         }
-        if cv < 0 && cv >= -4095 {
-            e32(cb, 0x91000000 | ((0 - cv) << 10) | (rn << 5) | rd)
-            << true
+        if cv < 0 && cv >= -16773120 {
+            nenc := a64_imm12_enc(0 - cv)
+            if nenc >= 0 {
+                e32(cb, 0x91000000 | nenc | (rn << 5) | rd)
+                << true
+            }
         }
     }
     if op == mir.BIN_MUL {
@@ -926,9 +1055,24 @@ fn a64_bin_imm(cb $&mc.CodeBuffer, f &mir.MFn, op int, rd int, rn int, d int) bo
     << false
 }
 
+// Count trailing 1-bits when m == (1 << w) - 1 with 1 <= w <= 62, else 0.
+fn a64_mask_ones(m int) int {
+    if m <= 0 || (m & (m + 1)) != 0 {
+        << 0
+    }
+    $w := 0
+    $v := m
+    while v != 0 {
+        v = v >> 1
+        w += 1
+    }
+    << w
+}
+
 // Two adjacent instructions done as one, the first's result read only by
 // the second: 1 for sub-asr63, 2 for integer msub, 3 for fp fmadd,
-// 4 for fp fmsub, 5 for integer madd, 6 for 32-bit masked ALU. 0 otherwise.
+// 4 for fp fmsub, 5 for integer madd, 6 for 32-bit masked ALU,
+// 7 for ubfx, 8 for bic/orn/eon. 0 otherwise.
 fn a64_fuse2(f &mir.MFn, ins &mir.MInstr, uses &[]int, idx_mode &[]int) int {
     if ins.kind != mir.MI_BIN || ins.a < 0 || ins.a >= uses.len || uses[ins.a] != 1 || ins.next < 0 {
         << 0
@@ -939,6 +1083,30 @@ fn a64_fuse2(f &mir.MFn, ins &mir.MInstr, uses &[]int, idx_mode &[]int) int {
     nx := ~f.instrs[ins.next]
     if nx.kind != mir.MI_BIN {
         << 0
+    }
+    if ins.b == mir.BIN_SHR && ins.c >= 0 && ins.d <= -2 && nx.b == mir.BIN_AND && nx.a >= 0 {
+        sh := f.consts[0 - ins.d - 2]
+        if sh >= 1 && sh <= 63 {
+            $mv := 0
+            if nx.c == ins.a && nx.d <= -2 {
+                mv = nx.d
+            } else if nx.d == ins.a && nx.c <= -2 {
+                mv = nx.c
+            }
+            if mv <= -2 {
+                w := a64_mask_ones(f.consts[0 - mv - 2])
+                if w >= 1 && sh + w <= 64 {
+                    << 7
+                }
+            }
+        }
+    }
+    if ins.b == mir.BIN_XOR && (nx.b == mir.BIN_AND || nx.b == mir.BIN_OR || nx.b == mir.BIN_XOR) && nx.a >= 0 {
+        has_not := (ins.c >= 0 && ins.d <= -2 && f.consts[0 - ins.d - 2] == -1) ||
+                   (ins.d >= 0 && ins.c <= -2 && f.consts[0 - ins.c - 2] == -1)
+        if has_not && ((nx.c == ins.a && nx.d >= 0 && nx.d != ins.a) || (nx.d == ins.a && nx.c >= 0 && nx.c != ins.a)) {
+            << 8
+        }
     }
     if ins.b == mir.BIN_FMUL {
         if nx.b == mir.BIN_FADD && ((nx.c == ins.a && nx.d != ins.a) || (nx.d == ins.a && nx.c != ins.a)) {
@@ -1061,7 +1229,11 @@ fn a64_ra(f &mir.MFn, opt bool) RaInfo {
     for r in 0:8 {
         arg_regs.push(r)
     }
-    << ra_alloc_fp_hints(f, &callee, &caller, &fp_callee, &fp_caller, &arg_regs, 0)
+    << ra_alloc_fp_hints_ex(f, &callee, &caller, &fp_callee, &fp_caller, &arg_regs, 0, true)
+}
+
+fn a64_is_clobber_call(ins &mir.MInstr) bool {
+    << ins.kind == mir.MI_CALL_IND || (ins.kind == mir.MI_CALL && !is_noreturn_call(&ins.sval) && !bits_hw_entry(&ins.sval, true))
 }
 
 fn a64_copy_params(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo) {
@@ -1131,7 +1303,8 @@ fn a64_copy_params(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo) {
 fn a64_defines(k int) bool {
     << k == mir.MI_COPY || k == mir.MI_LOAD_LOCAL || k == mir.MI_ADDR || k == mir.MI_LOAD_PTR ||
        k == mir.MI_BIN || k == mir.MI_UN || k == mir.MI_CALL || k == mir.MI_CALL_IND ||
-       k == mir.MI_STR_CONST || k == mir.MI_LOAD_FN_ADDR || k == mir.MI_SELECT
+       k == mir.MI_STR_CONST || k == mir.MI_LOAD_FN_ADDR || k == mir.MI_SELECT ||
+       k == mir.MI_VLOAD128 || k == mir.MI_VBIN128 || k == mir.MI_VPACK128 || k == mir.MI_VEXTRACT
 }
 
 fn a64_reads_temp(f &mir.MFn, ins &mir.MInstr, t int) bool {
@@ -1146,6 +1319,11 @@ fn a64_reads_temp(f &mir.MFn, ins &mir.MInstr, t int) bool {
     if k == mir.MI_BIN { << ins.c == t || ins.d == t }
     if k == mir.MI_UN { << ins.c == t }
     if k == mir.MI_SELECT { << ins.b == t || ins.c == t || ins.d == t }
+    if k == mir.MI_VLOAD128 { << ins.b == t }
+    if k == mir.MI_VSTORE128 { << ins.a == t || ins.b == t }
+    if k == mir.MI_VBIN128 { << ins.c == t || ins.d == t }
+    if k == mir.MI_VPACK128 { << ins.b == t || (ins.d != 0 && ins.c == t) }
+    if k == mir.MI_VEXTRACT { << ins.b == t }
     if k == mir.MI_CALL || k == mir.MI_CALL_IND {
         if k == mir.MI_CALL_IND && ins.b == t { << true }
         $mi := ins.c
@@ -1158,11 +1336,12 @@ fn a64_reads_temp(f &mir.MFn, ins &mir.MInstr, t int) bool {
     << true
 }
 
-fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_base $&[]int, idx_off $&[]int, idx_shift $&[]int) {
+fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_opc $&[]int, idx_base $&[]int, idx_off $&[]int, idx_shift $&[]int) {
     ni := f.instrs.len
     nt := f.temps.len
     for _ in 0:ni {
         idx_mode.push(0)
+        idx_opc.push(0)
         idx_base.push(-1)
         idx_off.push(-1)
         idx_shift.push(0)
@@ -1304,7 +1483,7 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
                                                 <-
                                             }
                                         }
-                                        if wins.kind == mir.MI_CALL_IND || (wins.kind == mir.MI_CALL && !is_noreturn_call(&f.instrs[wi].sval)) {
+                                        if a64_is_clobber_call(&f.instrs[wi]) {
                                             if ri < 19 || (saw_add && rb < 19) {
                                                 safe = false
                                                 <-
@@ -1335,30 +1514,88 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
         ii = f.blocks[bi].head
         while ii >= 0 {
             ins := &f.instrs[ii]
-            if idx_mode[ii] == 0 && ins.kind == mir.MI_BIN && (ins.b == mir.BIN_SHL || ins.b == mir.BIN_SHR) &&
-               ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 1 && ins.c >= 0 && ins.d <= -2 {
-                $nx := ins.next
-                while nx >= 0 && f.instrs[nx].kind == mir.MI_NOP { nx = f.instrs[nx].next }
+            if idx_mode[ii] == 0 && ins.kind == mir.MI_BIN &&
+               (ins.b == mir.BIN_SHL || ins.b == mir.BIN_SHR || ins.b == mir.BIN_ROTR64) &&
+               ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 1 && ins.c >= 0 && ins.c != ins.a && ins.d <= -2 &&
+               !((tk == mir.TKIND_RETURN || tk == mir.TKIND_BRANCH) && f.blocks[bi].ta == ins.a) {
+                $first_nx := ins.next
+                while first_nx >= 0 && f.instrs[first_nx].kind == mir.MI_NOP {
+                    first_nx = f.instrs[first_nx].next
+                }
+                $nx := -1
+                if first_nx >= 0 && a64_reads_temp(f, &f.instrs[first_nx], ins.a) {
+                    nx = first_nx
+                } else {
+                    rx := a64_temp_reg(ra, ins.c)
+                    if rx >= 0 && rx < 32 {
+                        $wi := ins.next
+                        while wi >= 0 {
+                            wins := &f.instrs[wi]
+                            if a64_reads_temp(f, wins, ins.a) {
+                                nx = wi
+                                <-
+                            }
+                            if idx_mode[wi] != 1 {
+                                if a64_defines(wins.kind) && wins.a >= 0 {
+                                    if wins.a == ins.c || wins.a == ins.a || a64_temp_reg(ra, wins.a) == rx {
+                                        <-
+                                    }
+                                }
+                                if wins.kind == mir.MI_STORE_LOCAL && wins.a >= 0 && wins.a < ra.local_reg.len && ra.local_reg[wins.a] == rx {
+                                    <-
+                                }
+                                if a64_is_clobber_call(wins) && rx < 19 {
+                                    <-
+                                }
+                            }
+                            wi = wins.next
+                        }
+                    }
+                }
                 if nx >= 0 && idx_mode[nx] == 0 {
                     nins := &f.instrs[nx]
-                    if nins.kind == mir.MI_BIN && nins.b == mir.BIN_ADD && nins.a >= 0 {
-                        if (nins.c == ins.a && nins.d >= 0 && nins.d != ins.a) ||
-                           (nins.d == ins.a && nins.c >= 0 && nins.c != ins.a) {
-                            $bv := nins.d
-                            if nins.d == ins.a { bv = nins.c }
+                    if nins.kind == mir.MI_BIN && nins.a >= 0 && nins.sval != "bounds" {
+                        $bv := -1
+                        $sh_opc := 0
+                        if nins.b == mir.BIN_ADD && (ins.b == mir.BIN_SHL || ins.b == mir.BIN_SHR) {
+                            if nins.c == ins.a && nins.d >= 0 && nins.d != ins.a {
+                                bv = nins.d
+                            } else if nins.d == ins.a && nins.c >= 0 && nins.c != ins.a {
+                                bv = nins.c
+                            }
+                            if bv >= 0 {
+                                sh_opc = 0x8B000000
+                                if ins.b == mir.BIN_SHR { sh_opc = 0x8B800000 }
+                            }
+                        } else if nins.b == mir.BIN_SUB && (ins.b == mir.BIN_SHL || ins.b == mir.BIN_SHR) &&
+                                  nins.d == ins.a && nins.c >= 0 && nins.c != ins.a {
+                            bv = nins.c
+                            sh_opc = 0xCB000000
+                            if ins.b == mir.BIN_SHR { sh_opc = 0xCB800000 }
+                        } else if nins.b == mir.BIN_AND || nins.b == mir.BIN_OR || nins.b == mir.BIN_XOR {
+                            if nins.c == ins.a && nins.d >= 0 && nins.d != ins.a {
+                                bv = nins.d
+                            } else if nins.d == ins.a && nins.c >= 0 && nins.c != ins.a {
+                                bv = nins.c
+                            }
+                            if bv >= 0 {
+                                $base_op := 0x8A000000
+                                if nins.b == mir.BIN_OR { base_op = 0xAA000000 }
+                                else if nins.b == mir.BIN_XOR { base_op = 0xCA000000 }
+                                $sh_bits := 0
+                                if ins.b == mir.BIN_SHR { sh_bits = 0x00800000 }
+                                else if ins.b == mir.BIN_ROTR64 { sh_bits = 0x00C00000 }
+                                sh_opc = base_op | sh_bits
+                            }
+                        }
+                        if sh_opc != 0 && bv >= 0 {
                             idx_mode[ii] = 1
-                            if ins.b == mir.BIN_SHL { idx_mode[nx] = 3 } else { idx_mode[nx] = 7 }
+                            idx_mode[nx] = 3
+                            idx_opc[nx] = sh_opc
                             idx_base[nx] = bv
                             idx_off[nx] = ins.c
                             idx_shift[nx] = f.consts[0 - ins.d - 2] & 63
                         }
-                    } else if nins.kind == mir.MI_BIN && nins.b == mir.BIN_SUB && nins.a >= 0 &&
-                              nins.d == ins.a && nins.c >= 0 && nins.c != ins.a {
-                        idx_mode[ii] = 1
-                        if ins.b == mir.BIN_SHL { idx_mode[nx] = 8 } else { idx_mode[nx] = 9 }
-                        idx_base[nx] = nins.c
-                        idx_off[nx] = ins.c
-                        idx_shift[nx] = f.consts[0 - ins.d - 2] & 63
                     }
                 }
             }
@@ -1408,7 +1645,7 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
                                             safe = false
                                             <-
                                         }
-                                        if wins.kind == mir.MI_CALL_IND || (wins.kind == mir.MI_CALL && !is_noreturn_call(&f.instrs[wi].sval)) {
+                                        if a64_is_clobber_call(&f.instrs[wi]) {
                                             if rx < 19 {
                                                 safe = false
                                                 <-
@@ -1466,7 +1703,7 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_ba
                         safe01 = false
                         <-
                     }
-                    if wins.kind == mir.MI_CALL_IND || (wins.kind == mir.MI_CALL && !is_noreturn_call(&f.instrs[wi].sval)) {
+                    if a64_is_clobber_call(&f.instrs[wi]) {
                         if rx < 19 {
                             safe01 = false
                             <-
@@ -1547,7 +1784,7 @@ fn a64_no_reg_clobber(f &mir.MFn, ra &RaInfo, idx_mode &[]int, start_ii int, end
             if wins.kind == mir.MI_STORE_LOCAL && wins.a >= 0 && wins.a < ra.local_reg.len && ra.local_reg[wins.a] == rx {
                 << false
             }
-            if wins.kind == mir.MI_CALL_IND || (wins.kind == mir.MI_CALL && !is_noreturn_call(&f.instrs[wi].sval)) {
+            if a64_is_clobber_call(&f.instrs[wi]) {
                 if rx < 19 {
                     << false
                 }
@@ -1744,14 +1981,19 @@ fn fv_noframe_kind(k int) bool {
     << k == mir.MI_NOP || k == mir.MI_COPY || k == mir.MI_LOAD_LOCAL || k == mir.MI_STORE_LOCAL ||
        k == mir.MI_LOAD_PTR || k == mir.MI_STORE_PTR || k == mir.MI_BIN || k == mir.MI_UN ||
        k == mir.MI_STR_CONST || k == mir.MI_LOAD_FN_ADDR || k == mir.MI_SELECT ||
-       k == mir.MI_MADD || k == mir.MI_MSUB
+       k == mir.MI_MADD || k == mir.MI_MSUB ||
+       (k >= mir.MI_VLOAD128 && k <= mir.MI_VEXTRACT)
 }
 
 fn can_elide_frame(f &mir.MFn, ra &RaInfo, opt bool) bool {
+    << can_elide_frame_ex(f, ra, opt, false)
+}
+
+fn can_elide_frame_ex(f &mir.MFn, ra &RaInfo, opt bool, inline_bits bool) bool {
     if f.name == "_start" || f.label == "_start" || (f.name.len >= 6 && f.name[0:6] == "naked_") {
         << true
     }
-    if !opt || f.nparams > 8 || ra.used_callee.len > 0 {
+    if !opt || f.nparams > 8 || ra.used_callee.len > 0 || ra.max_call_saves > 0 {
         << false
     }
     if f.nparams > f.locals_nslots.len || f.nparams > ra.local_reg.len {
@@ -1807,6 +2049,21 @@ fn can_elide_frame(f &mir.MFn, ra &RaInfo, opt bool) bool {
         while ii >= 0 {
             ins := &f.instrs[ii]
             k := ins.kind
+            if inline_bits && k == mir.MI_CALL && bits_hw_entry(&f.instrs[ii].sval, true) {
+                if ins.a >= 0 && (ins.a >= nt || ra.temp_reg[ins.a] < 0 || ra.temp_reg[ins.a] >= 32) {
+                    << false
+                }
+                $ai := ins.c
+                while ai >= 0 {
+                    av := f.margs[ai].v
+                    if av >= 0 && (av >= nt || ra.temp_reg[av] < 0 || ra.temp_reg[av] >= 32) {
+                        << false
+                    }
+                    ai = f.margs[ai].next
+                }
+                ii = ins.next
+                ->
+            }
             if !fv_noframe_kind(k) {
                 << false
             }
@@ -1847,6 +2104,33 @@ fn can_elide_frame(f &mir.MFn, ra &RaInfo, opt bool) bool {
                     if (ins.b >= 0 && (ins.b >= nt || ra.temp_reg[ins.b] < 0)) ||
                        (ins.c >= 0 && (ins.c >= nt || ra.temp_reg[ins.c] < 0)) ||
                        (ins.d >= 0 && (ins.d >= nt || ra.temp_reg[ins.d] < 0)) {
+                        << false
+                    }
+                } else if k == mir.MI_VLOAD128 {
+                    if (ins.a >= 0 && (ins.a >= nt || ra.temp_reg[ins.a] < 0)) ||
+                       (ins.b >= 0 && (ins.b >= nt || ra.temp_reg[ins.b] < 0)) {
+                        << false
+                    }
+                } else if k == mir.MI_VSTORE128 {
+                    if (ins.a >= 0 && (ins.a >= nt || ra.temp_reg[ins.a] < 0)) ||
+                       (ins.b >= 0 && (ins.b >= nt || ra.temp_reg[ins.b] < 0)) {
+                        << false
+                    }
+                } else if k == mir.MI_VBIN128 {
+                    if (ins.a >= 0 && (ins.a >= nt || ra.temp_reg[ins.a] < 0)) ||
+                       (ins.c >= 0 && (ins.c >= nt || ra.temp_reg[ins.c] < 0)) ||
+                       (ins.d >= 0 && (ins.d >= nt || ra.temp_reg[ins.d] < 0)) {
+                        << false
+                    }
+                } else if k == mir.MI_VPACK128 {
+                    if (ins.a >= 0 && (ins.a >= nt || ra.temp_reg[ins.a] < 0)) ||
+                       (ins.b >= 0 && (ins.b >= nt || ra.temp_reg[ins.b] < 0)) ||
+                       (ins.d != 0 && ins.c >= 0 && (ins.c >= nt || ra.temp_reg[ins.c] < 0)) {
+                        << false
+                    }
+                } else if k == mir.MI_VEXTRACT {
+                    if (ins.a >= 0 && (ins.a >= nt || ra.temp_reg[ins.a] < 0)) ||
+                       (ins.b >= 0 && (ins.b >= nt || ra.temp_reg[ins.b] < 0)) {
                         << false
                     }
                 }
@@ -2454,9 +2738,22 @@ fn a64_emit_fast_guard(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, nodes &[]FastNod
             <<
         }
         lr := a64_eval_fast_node(cb, nodes, nd.lhs, 0)
-        if nodes[nd.rhs].kind == FV_CONST && nodes[nd.rhs].val >= 0 && nodes[nd.rhs].val <= 4095 {
-            e32(cb, 0xF100001F | (nodes[nd.rhs].val << 10) | (lr << 5))
-        } else {
+        $emitted_cmp := false
+        if nodes[nd.rhs].kind == FV_CONST {
+            cv := nodes[nd.rhs].val
+            enc := a64_imm12_enc(cv)
+            if enc >= 0 {
+                e32(cb, 0xF100001F | enc | (lr << 5))
+                emitted_cmp = true
+            } else if cv < 0 && cv >= -16773120 {
+                nenc := a64_imm12_enc(0 - cv)
+                if nenc >= 0 {
+                    e32(cb, 0xB100001F | nenc | (lr << 5))
+                    emitted_cmp = true
+                }
+            }
+        }
+        if !emitted_cmp {
             rr := a64_eval_fast_node(cb, nodes, nd.rhs, 1)
             a64_cmp(cb, lr, rr)
         }
@@ -2483,6 +2780,13 @@ fn a64_callee_save_slots(cb $&mc.CodeBuffer, regs &[]int, save_off int, store bo
             i += 2
             ->
         }
+        if r >= 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] >= 32 {
+            $fpair_op := 0x6D400000 // ldp dt1, dt2, [sp, #off]
+            if store { fpair_op = 0x6D000000 } // stp dt1, dt2, [sp, #off]
+            a64_pair(cb, fpair_op, r - 32, regs[i + 1] - 32, R_SP, off)
+            i += 2
+            ->
+        }
         if r >= 32 {
             a64_fmem(cb, store, r - 32, R_SP, off)
         } else if store {
@@ -2497,15 +2801,19 @@ fn a64_callee_save_slots(cb $&mc.CodeBuffer, regs &[]int, save_off int, store bo
 pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool) {
     ra := a64_ra(f, opt)
     $fr := a64_frame_ra(f, &ra, opt)
-    leaf_noframe := can_elide_frame(f, &ra, opt)
+    leaf_noframe := can_elide_frame_ex(f, &ra, opt, true)
     $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
     if opt && !leaf_noframe {
         fp_plan = analyze_fast_entry(f, &ra)
     }
-    // Saved callee registers sit above the locals and temps.
+    // Saved callee registers sit above the locals and temps; cold-call caller-save area sits above those.
     $save_off := fr.size
     if ra.used_callee.len > 0 {
         fr.size = (fr.size + ra.used_callee.len * 8 + 15) / 16 * 16
+    }
+    $call_save_off := fr.size
+    if ra.max_call_saves > 0 {
+        fr.size = (fr.size + ra.max_call_saves * 8 + 15) / 16 * 16
     }
     compact_frame := opt && !leaf_noframe && fr.out_area == 0 && f.nparams <= 8 && fr.size > 0 && fr.size <= 480
     if compact_frame {
@@ -2516,6 +2824,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             if fr.temp_off[ti] >= 0 { fr.temp_off[ti] = fr.temp_off[ti] + 16 }
         }
         save_off += 16
+        call_save_off += 16
         fr.size += 16
     }
     if opt {
@@ -2593,6 +2902,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     $str_aligns := []int{}
     $uses := []int{}
     $idx_mode := []int{}
+    $idx_opc := []int{}
     $idx_base := []int{}
     $idx_off := []int{}
     $idx_shift := []int{}
@@ -2601,8 +2911,17 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     $sel_mod_src := []int{}
     if opt {
         uses = temp_use_counts(f)
-        a64_prepare_idx(f, &ra, &uses, $&idx_mode, $&idx_base, $&idx_off, $&idx_shift)
+        a64_prepare_idx(f, &ra, &uses, $&idx_mode, $&idx_opc, $&idx_base, $&idx_off, $&idx_shift)
         a64_prepare_select(f, &ra, &uses, $&idx_mode, $&sel_mod_kind, $&sel_mod_side, $&sel_mod_src)
+    }
+    $fn_has_addr := false
+    if opt {
+        for ai in 0:f.instrs.len {
+            if f.instrs[ai].kind == mir.MI_ADDR {
+                fn_has_addr = true
+                <-
+            }
+        }
     }
     nb_fn := f.blocks.len
     $pred_cnt := []int{}
@@ -2648,9 +2967,11 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     for _ in 0:nb_fn { is_loop_hdr.push(false) }
     $cold := []bool{}
     $is_ret := []bool{}
+    $depth := []int{}
     $blk_pos := []int{}
     $order := []int{}
     if opt {
+        depth = mir.block_loop_depth(f)
         $slow := -1
         if inline_fast_exit {
             slow = fp_plan.slow_blk
@@ -2751,20 +3072,28 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                         tc_ok := tc >= 0 && tc < nb_fn && !placed[tc] && !cold[tc] && !is_ret[tc]
                         if tb_ok && !tc_ok { nxt = tb }
                         else if tc_ok && !tb_ok { nxt = tc }
-                        else if tb_ok && tc_ok { nxt = tb }
+                        else if tb_ok && tc_ok {
+                            if depth.len == nb_fn && depth[tc] > depth[tb] {
+                                nxt = tc
+                            } else {
+                                nxt = tb
+                            }
+                        }
                     }
                     if nxt >= 0 && f.blocks[nxt].tkind == mir.TKIND_BRANCH {
                         // Rotate single-latch branch loops ([body, header]) or 3-block scan loops ([latch, header, exit_br]).
+                        $hdr_d := 0
+                        if depth.len == nb_fn { hdr_d = depth[nxt] }
                         hb := f.blocks[nxt].tb
                         hc := f.blocks[nxt].tc
                         $latch := -1
                         if hb >= 0 && hb < nb_fn && hb != nxt && !placed[hb] && !cold[hb] && !is_ret[hb] &&
                            hot_pred[hb] == 1 && f.blocks[hb].tkind == mir.TKIND_JUMP && f.blocks[hb].ta == nxt &&
-                           (hc < 0 || hc >= nb_fn || is_ret[hc] || cold[hc] || !placed[hc]) {
+                           (hc < 0 || hc >= nb_fn || is_ret[hc] || cold[hc] || !placed[hc] || (depth.len == nb_fn && depth[hc] < hdr_d)) {
                             latch = hb
                         } else if hc >= 0 && hc < nb_fn && hc != nxt && !placed[hc] && !cold[hc] && !is_ret[hc] &&
                                   hot_pred[hc] == 1 && f.blocks[hc].tkind == mir.TKIND_JUMP && f.blocks[hc].ta == nxt &&
-                                  (hb < 0 || hb >= nb_fn || is_ret[hb] || cold[hb] || !placed[hb]) {
+                                  (hb < 0 || hb >= nb_fn || is_ret[hb] || cold[hb] || !placed[hb] || (depth.len == nb_fn && depth[hb] < hdr_d)) {
                             latch = hc
                         }
                         if latch < 0 {
@@ -2802,15 +3131,18 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                                     cand = hc
                                     exit_t = hb
                                 }
-                                if (exit_t < 0 || exit_t >= nb_fn || is_ret[exit_t] || cold[exit_t] || !placed[exit_t]) &&
+                                exit_ok := exit_t < 0 || exit_t >= nb_fn || is_ret[exit_t] || cold[exit_t] || !placed[exit_t] || (depth.len == nb_fn && depth[exit_t] < hdr_d)
+                                if exit_ok &&
                                    cand >= 0 && cand < nb_fn && cand != nxt && !placed[cand] && !cold[cand] && !is_ret[cand] &&
                                    hot_pred[cand] == 1 && f.blocks[cand].tkind == mir.TKIND_BRANCH {
                                     cb1 := f.blocks[cand].tb
                                     cc1 := f.blocks[cand].tc
+                                    cb1_ex := cb1 >= 0 && cb1 < nb_fn && (cold[cb1] || is_ret[cb1] || (depth.len == nb_fn && depth[cb1] < hdr_d))
+                                    cc1_ex := cc1 >= 0 && cc1 < nb_fn && (cold[cc1] || is_ret[cc1] || (depth.len == nb_fn && depth[cc1] < hdr_d))
                                     $b2 := -1
-                                    if cb1 >= 0 && cb1 < nb_fn && (cold[cb1] || is_ret[cb1]) && cc1 >= 0 && cc1 < nb_fn && !cold[cc1] {
+                                    if cb1_ex && !cc1_ex && cc1 >= 0 && cc1 < nb_fn && !cold[cc1] {
                                         b2 = cc1
-                                    } else if cc1 >= 0 && cc1 < nb_fn && (cold[cc1] || is_ret[cc1]) && cb1 >= 0 && cb1 < nb_fn && !cold[cb1] {
+                                    } else if cc1_ex && !cb1_ex && cb1 >= 0 && cb1 < nb_fn && !cold[cb1] {
                                         b2 = cb1
                                     }
                                     if b2 >= 0 && b2 != nxt && b2 != cand && !placed[b2] && !cold[b2] && !is_ret[b2] &&
@@ -2930,6 +3262,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         $sel_rem := 0
         $ret_t := -1
         $ret_done := false
+        $tail_done := false
         if opt && f.blocks[bi].tkind == mir.TKIND_RETURN && f.blocks[bi].ta >= 0 && f.blocks[bi].ta < uses.len && uses[f.blocks[bi].ta] == 1 {
             ret_t = f.blocks[bi].ta
         }
@@ -2945,7 +3278,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             }
             ins := ~f.instrs[ii]
             k := ins.kind
-            if opt && ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 0 && (k == mir.MI_LOAD_LOCAL || k == mir.MI_ADDR || k == mir.MI_LOAD_PTR || k == mir.MI_BIN || k == mir.MI_UN || k == mir.MI_SELECT || k == mir.MI_COPY || k == mir.MI_STR_CONST || k == mir.MI_LOAD_FN_ADDR) {
+            if opt && ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 0 && (k == mir.MI_LOAD_LOCAL || k == mir.MI_ADDR || k == mir.MI_LOAD_PTR || k == mir.MI_BIN || k == mir.MI_UN || k == mir.MI_SELECT || k == mir.MI_COPY || k == mir.MI_STR_CONST || k == mir.MI_LOAD_FN_ADDR || k == mir.MI_VLOAD128 || k == mir.MI_VBIN128 || k == mir.MI_VPACK128 || k == mir.MI_VEXTRACT) {
                 ii = ins.next
                 ->
             }
@@ -3051,8 +3384,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                     }
                     cv32 := f.consts[0 - imm_v - 2] & 4294967295
                     rn := a64_src(cb, f, &fr, &ra, arg_v, 9)
-                    if cv32 < 4096 {
-                        e32(cb, 0x11000000 | (cv32 << 10) | (rn << 5) | rd)
+                    enc32 := a64_imm12_enc(cv32)
+                    if enc32 >= 0 {
+                        e32(cb, 0x11000000 | enc32 | (rn << 5) | rd)
                     } else {
                         a64_mov_imm(cb, 10, cv32)
                         e32(cb, 0x0B000000 | (10 << 16) | (rn << 5) | rd)
@@ -3061,8 +3395,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 } else if ins.b == mir.BIN_SUB && ins.d <= -2 {
                     cv32 := f.consts[0 - ins.d - 2] & 4294967295
                     rn := a64_src(cb, f, &fr, &ra, ins.c, 9)
-                    if cv32 < 4096 {
-                        e32(cb, 0x51000000 | (cv32 << 10) | (rn << 5) | rd)
+                    enc32 := a64_imm12_enc(cv32)
+                    if enc32 >= 0 {
+                        e32(cb, 0x51000000 | enc32 | (rn << 5) | rd)
                     } else {
                         a64_mov_imm(cb, 10, cv32)
                         e32(cb, 0x4B000000 | (10 << 16) | (rn << 5) | rd)
@@ -3079,6 +3414,49 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                     else if ins.b == mir.BIN_XOR { wop = 0x4A000000 }
                     e32(cb, wop | (rm << 16) | (rn << 5) | rd)
                 }
+                if nx_ret { ret_done = true }
+                else { a64_put(cb, &fr, &ra, nx.a, rd) }
+                paired = ins.next
+            } else if pk == 7 {
+                nx := ~f.instrs[ins.next]
+                if nx.a >= 0 && nx.a < uses.len && uses[nx.a] == 0 {
+                    paired = ins.next
+                    ii = ins.next
+                    ->
+                }
+                nx_ret := opt && ret_t >= 0 && nx.a == ret_t && a64_temp_reg(&ra, nx.a) < 32 && a64_is_last_real(f, &idx_mode, ins.next)
+                sh := f.consts[0 - ins.d - 2]
+                $mv := nx.d
+                if nx.d == ins.a { mv = nx.c }
+                w := a64_mask_ones(f.consts[0 - mv - 2])
+                rn := a64_src(cb, f, &fr, &ra, ins.c, 9)
+                $rd := a64_dst(&ra, nx.a, 9)
+                if nx_ret { rd = 0 }
+                // ubfx rd, rn, #sh, #w
+                e32(cb, 0xD3400000 | (sh << 16) | ((sh + w - 1) << 10) | (rn << 5) | rd)
+                if nx_ret { ret_done = true }
+                else { a64_put(cb, &fr, &ra, nx.a, rd) }
+                paired = ins.next
+            } else if pk == 8 {
+                nx := ~f.instrs[ins.next]
+                if nx.a >= 0 && nx.a < uses.len && uses[nx.a] == 0 {
+                    paired = ins.next
+                    ii = ins.next
+                    ->
+                }
+                nx_ret := opt && ret_t >= 0 && nx.a == ret_t && a64_temp_reg(&ra, nx.a) < 32 && a64_is_last_real(f, &idx_mode, ins.next)
+                $xv := ins.c
+                if xv < 0 { xv = ins.d }
+                $yv := nx.c
+                if nx.c == ins.a { yv = nx.d }
+                rx := a64_src(cb, f, &fr, &ra, xv, 9)
+                ry := a64_src(cb, f, &fr, &ra, yv, 10)
+                $rd := a64_dst(&ra, nx.a, 9)
+                if nx_ret { rd = 0 }
+                $opc := 0x8A200000 // bic
+                if nx.b == mir.BIN_OR { opc = 0xAA200000 } // orn
+                else if nx.b == mir.BIN_XOR { opc = 0xCA200000 } // eon
+                e32(cb, opc | (rx << 16) | (ry << 5) | rd)
                 if nx_ret { ret_done = true }
                 else { a64_put(cb, &fr, &ra, nx.a, rd) }
                 paired = ins.next
@@ -3175,16 +3553,12 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 sel_cond = a64_fcond_of(ins.b)
                 sel_cond_t = ins.a
                 sel_rem = uses[ins.a]
-            } else if opt && (idx_mode[ii] == 3 || idx_mode[ii] == 7 || idx_mode[ii] == 8 || idx_mode[ii] == 9) {
+            } else if opt && idx_mode[ii] == 3 {
                 rn := a64_src(cb, f, &fr, &ra, idx_base[ii], 9)
                 rm := a64_src(cb, f, &fr, &ra, idx_off[ii], 10)
                 $rd := a64_dst(&ra, ins.a, 9)
                 if ret_direct { rd = 0 }
-                $sh_opc := 0x8B000000
-                if idx_mode[ii] == 7 { sh_opc = 0x8B800000 }
-                else if idx_mode[ii] == 8 { sh_opc = 0xCB000000 }
-                else if idx_mode[ii] == 9 { sh_opc = 0xCB800000 }
-                e32(cb, sh_opc | (rm << 16) | (idx_shift[ii] << 10) | (rn << 5) | rd)
+                e32(cb, idx_opc[ii] | (rm << 16) | (idx_shift[ii] << 10) | (rn << 5) | rd)
                 if ret_direct { ret_done = true }
                 else { a64_put(cb, &fr, &ra, ins.a, rd) }
             } else if opt && idx_mode[ii] == 5 {
@@ -3224,7 +3598,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 e32(cb, 0xCB0003E0 | (rm << 16) | rd)
                 if ret_direct { ret_done = true }
                 else { a64_put(cb, &fr, &ra, ins.a, rd) }
-            } else if opt && k == mir.MI_BIN && ((ins.c > -2 && ins.d <= -2 && a64_can_bin_imm(f, ins.b, ins.d)) || (ins.d > -2 && ins.c <= -2 && (ins.b == mir.BIN_ADD || ins.b == mir.BIN_MUL || ins.b == mir.BIN_AND || ins.b == mir.BIN_OR || ins.b == mir.BIN_XOR) && a64_can_bin_imm(f, ins.b, ins.c))) {
+            } else if opt && k == mir.MI_BIN && a64_fneg_operand(f, &ra, &ins) < 0 && a64_fabs_operand(f, &ra, &ins) < 0 && ((ins.c > -2 && ins.d <= -2 && a64_can_bin_imm(f, ins.b, ins.d)) || (ins.d > -2 && ins.c <= -2 && (ins.b == mir.BIN_ADD || ins.b == mir.BIN_MUL || ins.b == mir.BIN_AND || ins.b == mir.BIN_OR || ins.b == mir.BIN_XOR) && a64_can_bin_imm(f, ins.b, ins.c))) {
                 $lhs := ins.c
                 $rhs := ins.d
                 if ins.c <= -2 {
@@ -3281,16 +3655,23 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                     }
                 }
             } else if k == mir.MI_ADDR {
-                $rd := a64_dst(&ra, ins.a, 9)
-                if ret_direct { rd = 0 }
-                a64_add_imm(cb, rd, R_SP, fr.local_off[ins.b])
-                if ret_direct { ret_done = true }
-                else { a64_put(cb, &fr, &ra, ins.a, rd) }
+                if !ret_direct && opt && ins.a >= 0 && ins.a < ra.remat_addr.len && ra.remat_addr[ins.a] >= 0 {
+                } else {
+                    $rd := a64_dst(&ra, ins.a, 9)
+                    if ret_direct { rd = 0 }
+                    a64_add_imm(cb, rd, R_SP, fr.local_off[ins.b])
+                    if ret_direct { ret_done = true }
+                    else { a64_put(cb, &fr, &ra, ins.a, rd) }
+                }
             } else if k == mir.MI_LOAD_PTR || k == mir.MI_VOLATILE_LOAD {
                 $w := ins.d
                 if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
                 dead_def := opt && ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 0
                 $did_ldp := false
+                $rl_b := -1
+                if opt && ins.b >= 0 && ins.b < ra.remat_addr.len {
+                    rl_b = ra.remat_addr[ins.b]
+                }
                 if opt && k == mir.MI_LOAD_PTR && w == 8 && idx_mode[ii] == 0 && ins.next >= 0 && ins.next < idx_mode.len && idx_mode[ins.next] == 0 && !(bounds.len > 0 && (ins.next == bounds[0] || ins.next == bounds[1] || ins.next == bounds[2])) {
                     nx := ~f.instrs[ins.next]
                     $nw := nx.d
@@ -3314,14 +3695,41 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                             $rt2_f := dr2
                             if ldp_ret2 { rt2_f = 0 }
                             rb_reg := a64_temp_reg(&ra, ins.b)
-                            if dr1 >= 0 && dr1 < 32 && rt2_f >= 0 && rt2_f < 32 && dr1 != rt2_f && (rb_reg < 0 || rb_reg >= 32 || (dr1 != rb_reg && rt2_f != rb_reg)) {
-                                rb := a64_src(cb, f, &fr, &ra, ins.b, 10)
+                            $use_sp := false
+                            $sp_off := off
+                            if rl_b >= 0 {
+                                sp_off = fr.local_off[rl_b] + off
+                                if sp_off >= -512 && sp_off <= 504 && (sp_off & 7) == 0 {
+                                    use_sp = true
+                                }
+                            }
+                            if dr1 >= 0 && dr1 < 32 && rt2_f >= 0 && rt2_f < 32 && dr1 != rt2_f && (use_sp || rb_reg < 0 || rb_reg >= 32 || (dr1 != rb_reg && rt2_f != rb_reg)) {
+                                $rb := R_SP
+                                $poff := sp_off
+                                if !use_sp {
+                                    rb = a64_src(cb, f, &fr, &ra, ins.b, 10)
+                                    poff = off
+                                }
                                 if !swap_p {
-                                    a64_pair(cb, 0xA9400000, dr1, rt2_f, rb, off)
+                                    a64_pair(cb, 0xA9400000, dr1, rt2_f, rb, poff)
                                 } else {
-                                    a64_pair(cb, 0xA9400000, rt2_f, dr1, rb, off)
+                                    a64_pair(cb, 0xA9400000, rt2_f, dr1, rb, poff)
                                 }
                                 if ldp_ret2 { ret_done = true }
+                                paired = ins.next
+                                did_ldp = true
+                            } else if dr1 >= 32 && dr2 >= 32 && dr1 != dr2 {
+                                $rb := R_SP
+                                $poff := sp_off
+                                if !use_sp {
+                                    rb = a64_src(cb, f, &fr, &ra, ins.b, 10)
+                                    poff = off
+                                }
+                                if !swap_p {
+                                    a64_pair(cb, 0x6D400000, dr1 - 32, dr2 - 32, rb, poff)
+                                } else {
+                                    a64_pair(cb, 0x6D400000, dr2 - 32, dr1 - 32, rb, poff)
+                                }
                                 paired = ins.next
                                 did_ldp = true
                             }
@@ -3335,7 +3743,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                         rm := a64_src(cb, f, &fr, &ra, idx_off[ii], 11)
                         if w == 8 && dr >= 32 {
                             fd := dr - 32
-                            e32(cb, 0xFC607800 | (rm << 16) | (rb << 5) | fd)
+                            $fop := 0xFC606800
+                            if idx_shift[ii] > 0 { fop = 0xFC607800 }
+                            e32(cb, fop | (rm << 16) | (rb << 5) | fd)
                         } else {
                             $rd := a64_dst(&ra, ins.a, 9)
                             if ret_direct { rd = 0 }
@@ -3344,13 +3754,20 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                             else if !dead_def { a64_put(cb, &fr, &ra, ins.a, rd) }
                         }
                     } else {
-                        rb := a64_src(cb, f, &fr, &ra, ins.b, 10)
+                        $rb := 0
+                        $moff := ins.c
+                        if rl_b >= 0 && fr.local_off[rl_b] + ins.c >= 0 {
+                            rb = R_SP
+                            moff = fr.local_off[rl_b] + ins.c
+                        } else {
+                            rb = a64_src(cb, f, &fr, &ra, ins.b, 10)
+                        }
                         if w == 8 && dr >= 32 {
-                            a64_fmem(cb, false, dr - 32, rb, ins.c)
+                            a64_fmem(cb, false, dr - 32, rb, moff)
                         } else {
                             $rd := a64_dst(&ra, ins.a, 9)
                             if ret_direct { rd = 0 }
-                            a64_mem(cb, false, w, rd, rb, ins.c)
+                            a64_mem(cb, false, w, rd, rb, moff)
                             if ret_direct { ret_done = true }
                             else if !dead_def { a64_put(cb, &fr, &ra, ins.a, rd) }
                         }
@@ -3360,6 +3777,10 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 $w := ins.d
                 if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
                 $did_stp := false
+                $rl_a := -1
+                if opt && ins.a >= 0 && ins.a < ra.remat_addr.len {
+                    rl_a = ra.remat_addr[ins.a]
+                }
                 if opt && k == mir.MI_STORE_PTR && w == 8 && idx_mode[ii] == 0 && ins.next >= 0 && ins.next < idx_mode.len && idx_mode[ins.next] == 0 && !(bounds.len > 0 && (ins.next == bounds[0] || ins.next == bounds[1] || ins.next == bounds[2])) {
                     nx := ~f.instrs[ins.next]
                     $nw := nx.d
@@ -3379,8 +3800,21 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                         if adj && off >= -512 && off <= 504 && (off & 7) == 0 {
                             sr1 := a64_temp_reg(&ra, ins.b)
                             sr2 := a64_temp_reg(&ra, nx.b)
+                            $use_sp := false
+                            $sp_off := off
+                            if rl_a >= 0 {
+                                sp_off = fr.local_off[rl_a] + off
+                                if sp_off >= -512 && sp_off <= 504 && (sp_off & 7) == 0 {
+                                    use_sp = true
+                                }
+                            }
                             if sr1 < 32 && sr2 < 32 {
-                                rb := a64_src(cb, f, &fr, &ra, ins.a, 10)
+                                $rb := R_SP
+                                $poff := sp_off
+                                if !use_sp {
+                                    rb = a64_src(cb, f, &fr, &ra, ins.a, 10)
+                                    poff = off
+                                }
                                 $v1 := ins.b
                                 $v2 := nx.b
                                 if swap_p {
@@ -3395,7 +3829,21 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                                 if !a64_is_const_eq(f, v2, 0) {
                                     rt2 = a64_src(cb, f, &fr, &ra, v2, 11)
                                 }
-                                a64_pair(cb, 0xA9000000, rt1, rt2, rb, off)
+                                a64_pair(cb, 0xA9000000, rt1, rt2, rb, poff)
+                                paired = ins.next
+                                did_stp = true
+                            } else if sr1 >= 32 && sr2 >= 32 {
+                                $rb := R_SP
+                                $poff := sp_off
+                                if !use_sp {
+                                    rb = a64_src(cb, f, &fr, &ra, ins.a, 10)
+                                    poff = off
+                                }
+                                if !swap_p {
+                                    a64_pair(cb, 0x6D000000, sr1 - 32, sr2 - 32, rb, poff)
+                                } else {
+                                    a64_pair(cb, 0x6D000000, sr2 - 32, sr1 - 32, rb, poff)
+                                }
                                 paired = ins.next
                                 did_stp = true
                             }
@@ -3409,7 +3857,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                         rm := a64_src(cb, f, &fr, &ra, idx_off[ii], 11)
                         if w == 8 && sr >= 32 {
                             fd := sr - 32
-                            e32(cb, 0xFC207800 | (rm << 16) | (rb << 5) | fd)
+                            $fop := 0xFC206800
+                            if idx_shift[ii] > 0 { fop = 0xFC207800 }
+                            e32(cb, fop | (rm << 16) | (rb << 5) | fd)
                         } else {
                             $rs := 31
                             if !opt || ins.b > -2 || f.consts[0 - ins.b - 2] != 0 {
@@ -3418,15 +3868,22 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                             a64_mem_idx(cb, true, w, rs, rb, rm, idx_shift[ii])
                         }
                     } else {
-                        rb := a64_src(cb, f, &fr, &ra, ins.a, 10)
+                        $rb := 0
+                        $moff := ins.c
+                        if rl_a >= 0 && fr.local_off[rl_a] + ins.c >= 0 {
+                            rb = R_SP
+                            moff = fr.local_off[rl_a] + ins.c
+                        } else {
+                            rb = a64_src(cb, f, &fr, &ra, ins.a, 10)
+                        }
                         if w == 8 && sr >= 32 {
-                            a64_fmem(cb, true, sr - 32, rb, ins.c)
+                            a64_fmem(cb, true, sr - 32, rb, moff)
                         } else {
                             $rs := 31
                             if !opt || ins.b > -2 || f.consts[0 - ins.b - 2] != 0 {
                                 rs = a64_src(cb, f, &fr, &ra, ins.b, 9)
                             }
-                            a64_mem(cb, true, w, rs, rb, ins.c)
+                            a64_mem(cb, true, w, rs, rb, moff)
                         }
                     }
                 }
@@ -3452,13 +3909,23 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                     }
                 } else {
                     $fneg_v := -1
+                    $fabs_v := -1
                     if opt {
                         fneg_v = a64_fneg_operand(f, &ra, &ins)
+                        if fneg_v < 0 {
+                            fabs_v = a64_fabs_operand(f, &ra, &ins)
+                        }
                     }
-                    if fneg_v >= 0 {
-                        fx := a64_fsrc(cb, f, &fr, &ra, fneg_v, 0)
+                    if fneg_v >= 0 || fabs_v >= 0 {
+                        $fv := fneg_v
+                        $fopc := 0x1E614000 // fneg
+                        if fabs_v >= 0 {
+                            fv = fabs_v
+                            fopc = 0x1E60C000 // fabs
+                        }
+                        fx := a64_fsrc(cb, f, &fr, &ra, fv, 0)
                         fd := a64_fdst(&ra, ins.a, 0)
-                        e32(cb, 0x1E614000 | (fx << 5) | fd)
+                        e32(cb, fopc | (fx << 5) | fd)
                         a64_put(cb, &fr, &ra, ins.a, 32 + fd)
                     } else {
                         rn := a64_src(cb, f, &fr, &ra, ins.c, 9)
@@ -3596,8 +4063,84 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                     if ret_direct { ret_done = true }
                     else { a64_put(cb, &fr, &ra, ins.a, rd) }
                 }
+            } else if k == mir.MI_VLOAD128 {
+                rn := a64_src(cb, f, &fr, &ra, ins.b, 9)
+                vd := a64_vdst(&ra, ins.a, 0)
+                a64_qmem(cb, false, vd, rn, ins.c)
+                a64_vput(cb, &fr, &ra, ins.a, vd)
+            } else if k == mir.MI_VSTORE128 {
+                rn := a64_src(cb, f, &fr, &ra, ins.a, 9)
+                vs := a64_vsrc(cb, &fr, &ra, ins.b, 0)
+                a64_qmem(cb, true, vs, rn, ins.c)
+            } else if k == mir.MI_VBIN128 {
+                vl := a64_vsrc(cb, &fr, &ra, ins.c, 0)
+                vr := a64_vsrc(cb, &fr, &ra, ins.d, 1)
+                vd := a64_vdst(&ra, ins.a, 2)
+                a64_vbin(cb, ins.b, vd, vl, vr)
+                a64_vput(cb, &fr, &ra, ins.a, vd)
+            } else if k == mir.MI_VPACK128 {
+                vd := a64_vdst(&ra, ins.a, 2)
+                rb := a64_temp_reg(&ra, ins.b)
+                if ins.d == 0 {
+                    if rb >= 32 {
+                        e32(cb, 0x4E080400 | ((rb - 32) << 5) | vd)
+                    } else {
+                        xb := a64_src(cb, f, &fr, &ra, ins.b, 9)
+                        e32(cb, 0x4E080C00 | (xb << 5) | vd)
+                    }
+                } else {
+                    if rb >= 32 {
+                        if vd != rb - 32 {
+                            a64_fmov_dd(cb, vd, rb - 32)
+                        }
+                    } else {
+                        xb := a64_src(cb, f, &fr, &ra, ins.b, 9)
+                        e32(cb, 0x4E081C00 | (xb << 5) | vd)
+                    }
+                    rc := a64_temp_reg(&ra, ins.c)
+                    if rc >= 32 {
+                        e32(cb, 0x6E180400 | ((rc - 32) << 5) | vd)
+                    } else {
+                        xc := a64_src(cb, f, &fr, &ra, ins.c, 9)
+                        e32(cb, 0x4E181C00 | (xc << 5) | vd)
+                    }
+                }
+                a64_vput(cb, &fr, &ra, ins.a, vd)
+            } else if k == mir.MI_VEXTRACT {
+                vs := a64_vsrc(cb, &fr, &ra, ins.b, 0)
+                rd_reg := a64_temp_reg(&ra, ins.a)
+                if ins.d == 0 {
+                    rd := a64_dst(&ra, ins.a, 9)
+                    if ins.c == mir.BIN_ADD {
+                        e32(cb, 0x5EF1B800 | (vs << 5) | 1)
+                        a64_fmov_xd(cb, rd, 1)
+                    } else {
+                        a64_fmov_xd(cb, 9, vs)
+                        e32(cb, 0x4E183C00 | (vs << 5) | 10)
+                        a64_bin(cb, ins.c, rd, 9, 10)
+                    }
+                    a64_put(cb, &fr, &ra, ins.a, rd)
+                } else if rd_reg >= 32 {
+                    fd := rd_reg - 32
+                    if ins.d == 1 {
+                        if fd != vs {
+                            a64_fmov_dd(cb, fd, vs)
+                        }
+                    } else {
+                        e32(cb, 0x5E180400 | (vs << 5) | fd)
+                    }
+                } else {
+                    rd := a64_dst(&ra, ins.a, 9)
+                    if ins.d == 1 {
+                        a64_fmov_xd(cb, rd, vs)
+                    } else {
+                        e32(cb, 0x4E183C00 | (vs << 5) | rd)
+                    }
+                    a64_put(cb, &fr, &ra, ins.a, rd)
+                }
             } else if k == mir.MI_COPY {
-                if ret_direct {
+                if !ret_direct && opt && ins.a >= 0 && ins.a < ra.remat_const.len && ra.remat_const[ins.a] >= 0 {
+                } else if ret_direct {
                     a64_load_to(cb, f, &fr, &ra, 0, ins.b)
                     ret_done = true
                 } else {
@@ -3621,12 +4164,71 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                         args.push(f.margs[a].v)
                         a = f.margs[a].next
                     }
-                    a64_copy_call_args(cb, f, &fr, &ra, &args, k == mir.MI_CALL_IND, ins.b)
-                    if k == mir.MI_CALL_IND {
-                        // blr x16
-                        e32(cb, 0xD63F0000 | (R_IP0 << 5))
-                    } else if !a64_bits_call(cb, &ins.sval) {
-                        a64_branch_reloc(cb, relocs, 0x94000000, ins.sval, mc.RELOC_ARM64_CALL26)
+                    $bits_arity := 0
+                    if k == mir.MI_CALL {
+                        bits_arity = a64_bits_arity(&ins.sval)
+                    }
+                    if bits_arity > 0 && args.len == bits_arity {
+                        if !(ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 0) {
+                            rn := a64_src(cb, f, &fr, &ra, args[0], 9)
+                            $rm := 0
+                            if args.len == 2 {
+                                rm = a64_src(cb, f, &fr, &ra, args[1], 10)
+                            }
+                            $rd := a64_dst(&ra, ins.a, 9)
+                            if ret_direct { rd = 0 }
+                            a64_bits_call_regs(cb, &ins.sval, rd, rn, rm)
+                            if ret_direct { ret_done = true }
+                            else { a64_put(cb, &fr, &ra, ins.a, rd) }
+                        }
+                    } else {
+                        can_tail := k == mir.MI_CALL && !fn_has_addr && !is_noreturn_call(&ins.sval) &&
+                                    !bits_hw_entry(&ins.sval, true) && args.len <= 8 && f.nparams <= 8 &&
+                                    f.name != "_start" && f.label != "_start" && !(f.name.len >= 6 && f.name[0:6] == "naked_") &&
+                                    f.blocks[bi].tkind == mir.TKIND_RETURN && ins.a >= 0 && ins.a < uses.len &&
+                                    uses[ins.a] == 1 && f.blocks[bi].ta == ins.a && a64_is_last_real(f, &idx_mode, ii)
+                        if can_tail {
+                            a64_copy_call_args(cb, f, &fr, &ra, &args, false, -1)
+                            if !leaf_noframe {
+                                a64_callee_save_slots(cb, &ra.used_callee, save_off, false)
+                                if compact_frame {
+                                    a64_pair(cb, 0xA8C00000, 29, 30, R_SP, fr.size)
+                                } else {
+                                    if fr.size > 0 {
+                                        e32(cb, 0x910003BF)
+                                    }
+                                    e32(cb, 0xA8C17BFD)
+                                }
+                            }
+                            a64_branch_reloc(cb, relocs, 0x14000000, ins.sval, mc.RELOC_ARM64_CALL26)
+                            ret_done = true
+                            tail_done = true
+                        } else {
+                            $cs_regs := []int{}
+                            if ii < ra.call_save_len.len && ra.call_save_len[ii] > 0 {
+                                cs_off := ra.call_save_off[ii]
+                                cs_len := ra.call_save_len[ii]
+                                for ci2 in 0:cs_len {
+                                    cs_regs.push(ra.call_save_regs[cs_off + ci2])
+                                }
+                                a64_callee_save_slots(cb, &cs_regs, call_save_off, true)
+                            }
+                            a64_copy_call_args(cb, f, &fr, &ra, &args, k == mir.MI_CALL_IND, ins.b)
+                            if k == mir.MI_CALL_IND {
+                                // blr x16
+                                e32(cb, 0xD63F0000 | (R_IP0 << 5))
+                            } else if !a64_bits_call(cb, &ins.sval) {
+                                a64_branch_reloc(cb, relocs, 0x94000000, ins.sval, mc.RELOC_ARM64_CALL26)
+                            }
+                            if ret_direct {
+                                ret_done = true
+                            } else if !(ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 0) {
+                                a64_put(cb, &fr, &ra, ins.a, 0)
+                            }
+                            if cs_regs.len > 0 {
+                                a64_callee_save_slots(cb, &cs_regs, call_save_off, false)
+                            }
+                        }
                     }
                 } else {
                     $a := ins.c
@@ -3653,11 +4255,11 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                     } else {
                         a64_branch_reloc(cb, relocs, 0x94000000, ins.sval, mc.RELOC_ARM64_CALL26)
                     }
-                }
-                if ret_direct {
-                    ret_done = true
-                } else if !(opt && ins.a >= 0 && ins.a < uses.len && uses[ins.a] == 0) {
-                    a64_put(cb, &fr, &ra, ins.a, 0)
+                    if ret_direct {
+                        ret_done = true
+                    } else {
+                        a64_put(cb, &fr, &ra, ins.a, 0)
+                    }
                 }
             } else if k == mir.MI_STR_CONST {
                 strs.push(StrFix{adr_off: cb.len(), bytes: ins.sval + ""})
@@ -3704,23 +4306,27 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         if blk.tkind == mir.TKIND_BRANCH {
             invert_br = blk.tb == next_bi
             if !invert_br && opt && blk.tc != next_bi && blk_pos.len == nb_fn {
+                $cur_d := 0
+                if depth.len == nb_fn { cur_d = depth[bi] }
                 tb_back := blk.tb >= 0 && blk.tb < nb_fn && blk_pos[blk.tb] >= 0 && blk_pos[blk.tb] <= oi
                 tc_back := blk.tc >= 0 && blk.tc < nb_fn && blk_pos[blk.tc] >= 0 && blk_pos[blk.tc] <= oi
-                tb_cold := blk.tb >= 0 && blk.tb < nb_fn && (cold[blk.tb] || is_ret[blk.tb])
-                tc_cold := blk.tc >= 0 && blk.tc < nb_fn && (cold[blk.tc] || is_ret[blk.tc])
+                tb_cold := blk.tb >= 0 && blk.tb < nb_fn && (cold[blk.tb] || is_ret[blk.tb] || (depth.len == nb_fn && depth[blk.tb] < cur_d))
+                tc_cold := blk.tc >= 0 && blk.tc < nb_fn && (cold[blk.tc] || is_ret[blk.tc] || (depth.len == nb_fn && depth[blk.tc] < cur_d))
                 if (tc_back && !tb_back) || (tb_cold && !tc_cold && !tb_back) {
                     invert_br = true
                 }
             }
         }
         if blk.tkind == mir.TKIND_RETURN {
-            if !ret_done {
-                a64_load_to(cb, f, &fr, &ra, 0, blk.ta)
-            }
-            if leaf_noframe {
-                e32(cb, 0xD65F03C0)
-            } else if oi + 1 < order.len {
-                a64_branch_reloc(cb, relocs, 0x14000000, epilogue, mc.RELOC_ARM64_CALL26)
+            if !tail_done {
+                if !ret_done {
+                    a64_load_to(cb, f, &fr, &ra, 0, blk.ta)
+                }
+                if leaf_noframe {
+                    e32(cb, 0xD65F03C0)
+                } else if oi + 1 < order.len {
+                    a64_branch_reloc(cb, relocs, 0x14000000, epilogue, mc.RELOC_ARM64_CALL26)
+                }
             }
         } else if blk.tkind == mir.TKIND_JUMP {
             if blk.ta != next_bi {
@@ -4061,19 +4667,17 @@ fn a64_linux_save_hwcap(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
 
 // Dispatch shared pseudo-calls before falling through to the host bridge.
 fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, uses_ffi bool) {
-    if uses_ffi || !emit_object {
-        emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object)
-    }
     // cmn x0, #5 ; b.ne past the zeroing
     e32(cb, 0xB100141F)
     a64_branch_reloc(cb, relocs, 0x54000001, "__xu_syscall_after_zero", mc.RELOC_ARM64_COND_BR19)
     // cmp x2, #64 ; b.lt zero16
     e32(cb, 0xF101005F)
     a64_branch_reloc(cb, relocs, 0x5400000B, "__xu_syscall_zero16", mc.RELOC_ARM64_COND_BR19)
+    e32(cb, 0x6E201C00) // eor v0.16b, v0.16b, v0.16b
     syms.define_label("__xu_syscall_zero64", cb.len())
-    for _ in 0:4 {
-        e32(cb, 0xA8817C3F) // stp xzr, xzr, [x1], #16
-    }
+    e32(cb, 0xAD000020) // stp q0, q0, [x1]
+    e32(cb, 0xAD010020) // stp q0, q0, [x1, #32]
+    a64_add_imm(cb, 1, 1, 64)
     e32(cb, 0xD1010042) // sub x2, x2, #64
     e32(cb, 0xF101005F) // cmp x2, #64
     a64_branch_reloc(cb, relocs, 0x5400000A, "__xu_syscall_zero64", mc.RELOC_ARM64_COND_BR19)
@@ -4083,27 +4687,36 @@ fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[
     e32(cb, 0x54000000 | (3 << 5) | 11)
     e32(cb, 0xA8817C3F)
     e32(cb, 0x14000000 | (-3 & 0x3FFFFFF))
-    // tail: adds x2, x2, #16 ; cbz x2, done ; strb wzr, [x1], #1 ;
-    // subs x2, x2, #1 ; b.ne byte ; done: ret
+    // tail: adds x2, x2, #16 ; branchless 8/4/2/1 stores ; ret
     e32(cb, 0xB1004042)
-    e32(cb, 0xB4000000 | (4 << 5) | 2)
-    e32(cb, 0x3800143F)
-    e32(cb, 0xF1000442)
-    e32(cb, 0x54000000 | ((-2 & 0x7FFFF) << 5) | 1)
+    e32(cb, 0x36180042) // tbz x2, #3, +2
+    e32(cb, 0xF800843F) // str xzr, [x1], #8
+    e32(cb, 0x36100042) // tbz x2, #2, +2
+    e32(cb, 0xB800443F) // str wzr, [x1], #4
+    e32(cb, 0x36080042) // tbz x2, #1, +2
+    e32(cb, 0x7800243F) // strh wzr, [x1], #2
+    e32(cb, 0x36000042) // tbz x2, #0, +2
+    e32(cb, 0x3900003F) // strb wzr, [x1]
     e32(cb, 0xD65F03C0)
     syms.define_label("__xu_syscall_after_zero", cb.len())
     // cmn x0, #4 ; b.ne past the copy
     e32(cb, 0xB100101F)
     a64_branch_reloc(cb, relocs, 0x54000001, "__xu_syscall_after_copy", mc.RELOC_ARM64_COND_BR19)
+    // Skip 64B NEON when dst == src or 0 < dst - src < 64.
+    e32(cb, 0xCB020024) // sub x4, x1, x2
+    a64_branch_reloc(cb, relocs, 0xB4000004, "__xu_syscall_copy_done", mc.RELOC_ARM64_COND_BR19)
+    e32(cb, 0xF101009F) // cmp x4, #64
+    a64_branch_reloc(cb, relocs, 0x54000003, "__xu_syscall_copy16", mc.RELOC_ARM64_COND_BR19)
     // cmp x3, #64 ; b.lt copy16
     e32(cb, 0xF101007F)
     a64_branch_reloc(cb, relocs, 0x5400000B, "__xu_syscall_copy16", mc.RELOC_ARM64_COND_BR19)
     syms.define_label("__xu_syscall_copy64", cb.len())
-    // Keep each 16-byte load followed by its store in forward order.
-    for _ in 0:4 {
-        e32(cb, 0xA8C11444) // ldp x4, x5, [x2], #16
-        e32(cb, 0xA8811424) // stp x4, x5, [x1], #16
-    }
+    e32(cb, 0xAD400440) // ldp q0, q1, [x2]
+    e32(cb, 0xAD410C42) // ldp q2, q3, [x2, #32]
+    a64_add_imm(cb, 2, 2, 64)
+    e32(cb, 0xAD000420) // stp q0, q1, [x1]
+    e32(cb, 0xAD010C22) // stp q2, q3, [x1, #32]
+    a64_add_imm(cb, 1, 1, 64)
     e32(cb, 0xD1010063) // sub x3, x3, #64
     e32(cb, 0xF101007F) // cmp x3, #64
     a64_branch_reloc(cb, relocs, 0x5400000A, "__xu_syscall_copy64", mc.RELOC_ARM64_COND_BR19)
@@ -4115,16 +4728,26 @@ fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[
     e32(cb, 0xA8C11444)
     e32(cb, 0xA8811424)
     e32(cb, 0x14000000 | (-4 & 0x3FFFFFF))
-    // tail: adds x3, x3, #16 ; cbz x3, done ; ldrb w4, [x2], #1 ;
-    // strb w4, [x1], #1 ; subs x3, x3, #1 ; b.ne byte ; done: ret
+    // tail: adds x3, x3, #16 ; branchless 8/4/2/1 copy ; ret
     e32(cb, 0xB1004063)
-    e32(cb, 0xB4000000 | (5 << 5) | 3)
-    e32(cb, 0x38401444)
-    e32(cb, 0x38001424)
-    e32(cb, 0xF1000463)
-    e32(cb, 0x54000000 | ((-3 & 0x7FFFF) << 5) | 1)
+    e32(cb, 0x36180063) // tbz x3, #3, +3
+    e32(cb, 0xF8408444) // ldr x4, [x2], #8
+    e32(cb, 0xF8008424) // str x4, [x1], #8
+    e32(cb, 0x36100063) // tbz x3, #2, +3
+    e32(cb, 0xB8404444) // ldr w4, [x2], #4
+    e32(cb, 0xB8004424) // str w4, [x1], #4
+    e32(cb, 0x36080063) // tbz x3, #1, +3
+    e32(cb, 0x78402444) // ldrh w4, [x2], #2
+    e32(cb, 0x78002424) // strh w4, [x1], #2
+    e32(cb, 0x36000063) // tbz x3, #0, +3
+    e32(cb, 0x39400044) // ldrb w4, [x2]
+    e32(cb, 0x39000024) // strb w4, [x1]
+    syms.define_label("__xu_syscall_copy_done", cb.len())
     e32(cb, 0xD65F03C0)
     syms.define_label("__xu_syscall_after_copy", cb.len())
+    if uses_ffi || !emit_object {
+        emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object)
+    }
     // cmn x0, #2 ; b.ne +12 ; mov x0, x29 ; ret
     e32(cb, 0xB100081F)
     e32(cb, 0x54000061)
