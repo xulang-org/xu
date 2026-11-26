@@ -468,6 +468,62 @@ fn x64_sqrtsd(cb $&mc.CodeBuffer, xd int, xs int) {
     x64_modrm_rr(cb, xd, xs)
 }
 
+fn x64_movupd_ld(cb $&mc.CodeBuffer, xd int, base int, disp int) {
+    xb(cb, 0x66)
+    x64_rex(cb, false, xd, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x10)
+    x64_modrm_mem(cb, xd, base, disp)
+}
+
+fn x64_movupd_st(cb $&mc.CodeBuffer, xs int, base int, disp int) {
+    xb(cb, 0x66)
+    x64_rex(cb, false, xs, base, false)
+    xb(cb, 0x0F)
+    xb(cb, 0x11)
+    x64_modrm_mem(cb, xs, base, disp)
+}
+
+fn x64_vec_rr(cb $&mc.CodeBuffer, opc int, xd int, xs int) {
+    xb(cb, 0x66)
+    x64_rex(cb, false, xd, xs, false)
+    xb(cb, 0x0F)
+    xb(cb, opc)
+    x64_modrm_rr(cb, xd, xs)
+}
+
+fn x64_vsrc(cb $&mc.CodeBuffer, fr &A64Frame, ra &RaInfo, v int, scratch int) int {
+    r := x64_freg(fr, ra, v)
+    if r >= 0 { << r }
+    if v >= 0 && v < fr.temp_off.len && fr.temp_off[v] >= 0 {
+        x64_movupd_ld(cb, scratch, X_RSP, fr.temp_off[v])
+    }
+    << scratch
+}
+
+fn x64_vput(cb $&mc.CodeBuffer, fr &A64Frame, ra &RaInfo, t int, xs int) {
+    r := x64_freg(fr, ra, t)
+    if r >= 0 {
+        if r != xs { x64_movapd(cb, r, xs) }
+        <<
+    }
+    if t >= 0 && t < fr.temp_off.len && fr.temp_off[t] >= 0 {
+        x64_movupd_st(cb, xs, X_RSP, fr.temp_off[t])
+    }
+}
+
+fn x64_vec_opc(op int) int {
+    if op == mir.BIN_FADD { << 0x58 }
+    if op == mir.BIN_FSUB { << 0x5C }
+    if op == mir.BIN_FMUL { << 0x59 }
+    if op == mir.BIN_FDIV { << 0x5E }
+    if op == mir.BIN_ADD { << 0xD4 }
+    if op == mir.BIN_SUB { << 0xFB }
+    if op == mir.BIN_AND { << 0xDB }
+    if op == mir.BIN_OR { << 0xEB }
+    << 0xEF
+}
+
 // ===== frame =====
 
 fn x64_frame(f &mir.MFn) A64Frame {
@@ -495,6 +551,14 @@ fn x64_operand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, rd int,
             if r != rd {
                 x64_mov(cb, rd, r)
             }
+            <<
+        }
+        if v < ra.remat_addr.len && ra.remat_addr[v] >= 0 {
+            x64_lea(cb, rd, X_RSP, fr.local_off[ra.remat_addr[v]])
+            <<
+        }
+        if v < ra.remat_const.len && ra.remat_const[v] >= 0 {
+            x64_mov_imm(cb, rd, f.consts[ra.remat_const[v]])
             <<
         }
         if fr.temp_off[v] >= 0 {
@@ -567,6 +631,16 @@ fn x64_foperand(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, xd int
         }
         if r >= 0 {
             x64_movq_to_xmm(cb, xd, r)
+            <<
+        }
+        if v < ra.remat_const.len && ra.remat_const[v] >= 0 {
+            c := f.consts[ra.remat_const[v]]
+            if c == 0 {
+                x64_xorpd(cb, xd, xd)
+            } else {
+                x64_mov_imm(cb, X_RAX, c)
+                x64_movq_to_xmm(cb, xd, X_RAX)
+            }
             <<
         }
         if fr.temp_off[v] >= 0 {
@@ -1689,10 +1763,14 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
     if opt && !leaf_noframe {
         fp_plan = analyze_fast_entry(f, &ra)
     }
-    // Saved callee registers sit above the locals and temps.
+    // Saved callee registers sit above the locals and temps; cold-call caller-save area sits above those.
     save_off := fr.size
     if ra.used_callee.len > 0 {
         fr.size = (fr.size + ra.used_callee.len * 8 + 15) / 16 * 16
+    }
+    call_save_off := fr.size
+    if ra.max_call_saves > 0 {
+        fr.size = (fr.size + ra.max_call_saves * 8 + 15) / 16 * 16
     }
     syms.define_label(f.label, cb.len())
     $last_line := f.src_line
@@ -1829,9 +1907,11 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
     nb_fn := f.blocks.len
     $cold := []bool{}
     $is_ret := []bool{}
+    $depth := []int{}
     $blk_pos := []int{}
     $order := []int{}
     if opt {
+        depth = mir.block_loop_depth(f)
         $slow := -1
         if inline_fast_exit {
             slow = fp_plan.slow_blk
@@ -1958,12 +2038,19 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                     }
                 }
             } else if k == mir.MI_ADDR {
-                x64_lea(cb, X_RAX, X_RSP, fr.local_off[ins.b])
-                x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                if opt && ins.a >= 0 && ins.a < ra.remat_addr.len && ra.remat_addr[ins.a] >= 0 {
+                } else {
+                    x64_lea(cb, X_RAX, X_RSP, fr.local_off[ins.b])
+                    x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                }
             } else if k == mir.MI_LOAD_PTR || k == mir.MI_VOLATILE_LOAD {
                 $w := ins.d
                 if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
                 fd := x64_freg(&fr, &ra, ins.a)
+                $rl := -1
+                if opt && !(opt && idx_mode[ii] == 2) && ins.b >= 0 && ins.b < ra.remat_addr.len {
+                    rl = ra.remat_addr[ins.b]
+                }
                 if opt && idx_mode[ii] == 2 {
                     rb := x64_src(cb, f, &fr, &ra, idx_base[ii], X_RCX)
                     ri := x64_src(cb, f, &fr, &ra, idx_off[ii], X_RDX)
@@ -1973,6 +2060,15 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                         $rd := x64_vreg(&fr, &ra, ins.a)
                         if rd < 0 { rd = X_RAX }
                         x64_load_sib(cb, w, rd, rb, ri, idx_shift[ii], ins.c)
+                        x64_set_temp(cb, &fr, &ra, ins.a, rd)
+                    }
+                } else if rl >= 0 && fr.local_off[rl] + ins.c >= 0 {
+                    if w == 8 && fd >= 0 {
+                        x64_movsd_ld(cb, fd, X_RSP, fr.local_off[rl] + ins.c)
+                    } else {
+                        $rd := x64_vreg(&fr, &ra, ins.a)
+                        if rd < 0 { rd = X_RAX }
+                        x64_load(cb, w, rd, X_RSP, fr.local_off[rl] + ins.c)
                         x64_set_temp(cb, &fr, &ra, ins.a, rd)
                     }
                 } else if w == 8 && fd >= 0 {
@@ -1987,6 +2083,10 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                 $w := ins.d
                 if w != 1 && w != 2 && w != 4 && w != -4 { w = 8 }
                 fs := x64_freg(&fr, &ra, ins.b)
+                $rl := -1
+                if opt && !(opt && idx_mode[ii] == 2) && ins.a >= 0 && ins.a < ra.remat_addr.len {
+                    rl = ra.remat_addr[ins.a]
+                }
                 if opt && idx_mode[ii] == 2 {
                     rb := x64_src(cb, f, &fr, &ra, idx_base[ii], X_RCX)
                     ri := x64_src(cb, f, &fr, &ra, idx_off[ii], X_RDX)
@@ -1995,6 +2095,13 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                     } else {
                         rs := x64_src(cb, f, &fr, &ra, ins.b, X_RAX)
                         x64_store_sib(cb, w, rs, rb, ri, idx_shift[ii], ins.c)
+                    }
+                } else if rl >= 0 && fr.local_off[rl] + ins.c >= 0 {
+                    if w == 8 && fs >= 0 {
+                        x64_movsd_st(cb, fs, X_RSP, fr.local_off[rl] + ins.c)
+                    } else {
+                        rs := x64_src(cb, f, &fr, &ra, ins.b, X_RAX)
+                        x64_store(cb, w, rs, X_RSP, fr.local_off[rl] + ins.c)
                     }
                 } else if w == 8 && fs >= 0 {
                     rb := x64_src(cb, f, &fr, &ra, ins.a, X_RCX)
@@ -2018,6 +2125,102 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                     x64_operand(cb, f, &fr, &ra, X_RAX, ins.c)
                     x64_un(cb, ins.b)
                     x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                }
+            } else if k == mir.MI_VLOAD128 {
+                rb := x64_src(cb, f, &fr, &ra, ins.b, X_RCX)
+                $disp := ins.c
+                $base_r := rb
+                if disp < -2147483648 || disp > 2147483647 {
+                    x64_mov_imm(cb, X_RDX, disp)
+                    x64_rex(cb, true, rb, X_RDX, false)
+                    xb(cb, 0x01)
+                    x64_modrm_rr(cb, rb, X_RDX)
+                    base_r = X_RDX
+                    disp = 0
+                }
+                $xd := x64_freg(&fr, &ra, ins.a)
+                if xd < 0 { xd = 0 }
+                x64_movupd_ld(cb, xd, base_r, disp)
+                x64_vput(cb, &fr, &ra, ins.a, xd)
+            } else if k == mir.MI_VSTORE128 {
+                rb := x64_src(cb, f, &fr, &ra, ins.a, X_RCX)
+                xs := x64_vsrc(cb, &fr, &ra, ins.b, 0)
+                $disp := ins.c
+                $base_r := rb
+                if disp < -2147483648 || disp > 2147483647 {
+                    x64_mov_imm(cb, X_RDX, disp)
+                    x64_rex(cb, true, rb, X_RDX, false)
+                    xb(cb, 0x01)
+                    x64_modrm_rr(cb, rb, X_RDX)
+                    base_r = X_RDX
+                    disp = 0
+                }
+                x64_movupd_st(cb, xs, base_r, disp)
+            } else if k == mir.MI_VBIN128 {
+                vl := x64_vsrc(cb, &fr, &ra, ins.c, 0)
+                vr := x64_vsrc(cb, &fr, &ra, ins.d, 1)
+                dx := x64_freg(&fr, &ra, ins.a)
+                opc := x64_vec_opc(ins.b)
+                if dx >= 0 {
+                    if dx == vl {
+                        x64_vec_rr(cb, opc, dx, vr)
+                    } else if dx != vr {
+                        x64_movapd(cb, dx, vl)
+                        x64_vec_rr(cb, opc, dx, vr)
+                    } else {
+                        if vl != 0 { x64_movapd(cb, 0, vl) }
+                        x64_vec_rr(cb, opc, 0, vr)
+                        x64_movapd(cb, dx, 0)
+                    }
+                } else {
+                    if vl != 0 { x64_movapd(cb, 0, vl) }
+                    x64_vec_rr(cb, opc, 0, vr)
+                    x64_vput(cb, &fr, &ra, ins.a, 0)
+                }
+            } else if k == mir.MI_VPACK128 {
+                if ins.d == 0 {
+                    $xd := x64_freg(&fr, &ra, ins.a)
+                    if xd < 0 { xd = 0 }
+                    x64_foperand(cb, f, &fr, &ra, xd, ins.b)
+                    x64_vec_rr(cb, 0x6C, xd, xd)
+                    x64_vput(cb, &fr, &ra, ins.a, xd)
+                } else {
+                    x64_foperand(cb, f, &fr, &ra, 0, ins.b)
+                    x64_foperand(cb, f, &fr, &ra, 1, ins.c)
+                    x64_vec_rr(cb, 0x6C, 0, 1)
+                    x64_vput(cb, &fr, &ra, ins.a, 0)
+                }
+            } else if k == mir.MI_VEXTRACT {
+                xs := x64_vsrc(cb, &fr, &ra, ins.b, 0)
+                if ins.d == 0 {
+                    if xs != 0 { x64_movapd(cb, 0, xs) }
+                    x64_movapd(cb, 1, 0)
+                    x64_vec_rr(cb, 0x6D, 1, 1)
+                    x64_vec_rr(cb, x64_vec_opc(ins.c), 0, 1)
+                    x64_movq_from_xmm(cb, X_RAX, 0)
+                    x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                } else {
+                    fr_x := x64_freg(&fr, &ra, ins.a)
+                    if fr_x >= 0 {
+                        if fr_x != xs { x64_movapd(cb, fr_x, xs) }
+                        if ins.d == 2 {
+                            x64_vec_rr(cb, 0x6D, fr_x, fr_x)
+                        }
+                    } else {
+                        $src_x := xs
+                        if ins.d == 2 {
+                            if xs != 1 { x64_movapd(cb, 1, xs) }
+                            x64_vec_rr(cb, 0x6D, 1, 1)
+                            src_x = 1
+                        }
+                        dr := x64_vreg(&fr, &ra, ins.a)
+                        if dr >= 0 {
+                            x64_movq_from_xmm(cb, dr, src_x)
+                        } else {
+                            x64_movq_from_xmm(cb, X_RAX, src_x)
+                            x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                        }
+                    }
                 }
             } else if k == mir.MI_SELECT {
                 if sel_cmp_ii >= 0 {
@@ -2058,14 +2261,31 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                     x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
                 }
             } else if k == mir.MI_COPY {
-                fd := x64_freg(&fr, &ra, ins.a)
-                if fd >= 0 {
-                    x64_foperand(cb, f, &fr, &ra, fd, ins.b)
+                if opt && ins.a >= 0 && ins.a < ra.remat_const.len && ra.remat_const[ins.a] >= 0 {
                 } else {
-                    x64_operand(cb, f, &fr, &ra, X_RAX, ins.b)
-                    x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                    fd := x64_freg(&fr, &ra, ins.a)
+                    if fd >= 0 {
+                        x64_foperand(cb, f, &fr, &ra, fd, ins.b)
+                    } else {
+                        x64_operand(cb, f, &fr, &ra, X_RAX, ins.b)
+                        x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                    }
                 }
             } else if k == mir.MI_CALL || k == mir.MI_CALL_IND {
+                $cs_len := 0
+                $cs_off := 0
+                if opt && ii < ra.call_save_len.len && ra.call_save_len[ii] > 0 {
+                    cs_len = ra.call_save_len[ii]
+                    cs_off = ra.call_save_off[ii]
+                    for ci2 in 0:cs_len {
+                        r := ra.call_save_regs[cs_off + ci2]
+                        if r >= 32 {
+                            x64_movsd_st(cb, r - 32, X_RSP, call_save_off + ci2 * 8)
+                        } else {
+                            x64_str(cb, r, X_RSP, call_save_off + ci2 * 8)
+                        }
+                    }
+                }
                 $a := ins.c
                 $i := 0
                 $regs := []int{}
@@ -2098,6 +2318,14 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                     x64_call(cb, relocs, ins.sval)
                 }
                 x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
+                for ci2 in 0:cs_len {
+                    r := ra.call_save_regs[cs_off + ci2]
+                    if r >= 32 {
+                        x64_movsd_ld(cb, r - 32, X_RSP, call_save_off + ci2 * 8)
+                    } else {
+                        x64_ldr(cb, r, X_RSP, call_save_off + ci2 * 8)
+                    }
+                }
             } else if k == mir.MI_STR_CONST {
                 // lea rax, [rip + pool entry]
                 xb(cb, 0x48)
@@ -2144,10 +2372,12 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
         if blk.tkind == mir.TKIND_BRANCH {
             invert_br = blk.tb == next_bi
             if !invert_br && opt && !pgo_map && blk.tc != next_bi && blk_pos.len == nb_fn {
+                $cur_d := 0
+                if depth.len == nb_fn { cur_d = depth[bi] }
                 tb_back := blk.tb >= 0 && blk.tb < nb_fn && blk_pos[blk.tb] >= 0 && blk_pos[blk.tb] <= oi
                 tc_back := blk.tc >= 0 && blk.tc < nb_fn && blk_pos[blk.tc] >= 0 && blk_pos[blk.tc] <= oi
-                tb_cold := blk.tb >= 0 && blk.tb < nb_fn && (cold[blk.tb] || is_ret[blk.tb])
-                tc_cold := blk.tc >= 0 && blk.tc < nb_fn && (cold[blk.tc] || is_ret[blk.tc])
+                tb_cold := blk.tb >= 0 && blk.tb < nb_fn && (cold[blk.tb] || is_ret[blk.tb] || (depth.len == nb_fn && depth[blk.tb] < cur_d))
+                tc_cold := blk.tc >= 0 && blk.tc < nb_fn && (cold[blk.tc] || is_ret[blk.tc] || (depth.len == nb_fn && depth[blk.tc] < cur_d))
                 if (tc_back && !tb_back) || (tb_cold && !tc_cold && !tb_back) {
                     invert_br = true
                 }

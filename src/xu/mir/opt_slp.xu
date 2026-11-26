@@ -1,0 +1,777 @@
+@xu/mir
+// Intra-Block 128-bit Superword-Level Parallelism (SLP) Auto-Vectorization
+// (Larsen & Amarasinghe PLDI 2000).
+//
+// Operates cleanly on straight-line regions and unrolled loop bodies (after
+// opt_unroll + opt_fold_ptr_offs):
+//   1. Store-seeded trees: adjacent 8-byte MI_STORE_PTR pairs sharing a base
+//      and offset +8 pack isomorphic MI_BIN (f64 or i64) and adjacent
+//      MI_LOAD_PTR trees into 128-bit MI_VLOAD128 / MI_VBIN128 / MI_VSTORE128.
+//   2. Associative integer reduction trees: 4-way unrolled binary reductions
+//      from opt_unroll ((t0 op t1) op (t2 op t3)) pack into two-lane 128-bit
+//      vector operations followed by horizontal MI_VEXTRACT reduction.
+//   3. Forward load-pair trees: adjacent 8-byte MI_LOAD_PTR pairs feeding
+//      isomorphic MI_BIN operations (with net vector cost benefit >= 2) pack
+//      into MI_VLOAD128 / MI_VBIN128 + lane extractions while preserving exact
+//      IEEE-754 left-to-right FP accumulation order.
+
+const SLP_NODE_PACK = 0
+const SLP_NODE_SPLAT = 1
+const SLP_NODE_VLOAD = 2
+const SLP_NODE_VBIN = 3
+
+struct SlpNode {
+    kind int
+    v0 int
+    v1 int
+    ii0 int
+    ii1 int
+    op int
+    base int
+    off int
+    c0 int
+    c1 int
+    vreg int
+}
+
+fn slp_alloc_vtemp(f $&MFn) int {
+    t := f.temps.len
+    f.temps.push(0)
+    f.temps_nslots.push(2)
+    << t
+}
+
+fn slp_alloc_stemp(f $&MFn) int {
+    t := f.temps.len
+    f.temps.push(0)
+    f.temps_nslots.push(1)
+    << t
+}
+
+fn slp_is_vec_bin(op int) bool {
+    << op == BIN_FADD || op == BIN_FSUB || op == BIN_FMUL || op == BIN_FDIV ||
+       op == BIN_ADD || op == BIN_SUB || op == BIN_AND || op == BIN_OR || op == BIN_XOR
+}
+
+fn slp_is_comm(op int) bool {
+    << op == BIN_FADD || op == BIN_FMUL ||
+       op == BIN_ADD || op == BIN_AND || op == BIN_OR || op == BIN_XOR
+}
+
+fn slp_is_red_op(op int) bool {
+    // Bit-exact associative integer ops (2's complement 64-bit).
+    << op == BIN_ADD || op == BIN_AND || op == BIN_OR || op == BIN_XOR
+}
+
+fn slp_is_w8(w int) bool {
+    << w != 1 && w != 2 && w != 4 && w != -4
+}
+
+fn slp_is_barrier(k int) bool {
+    << k == MI_CALL || k == MI_CALL_IND || k == MI_VOLATILE_LOAD || k == MI_VOLATILE_STORE || k == MI_ASM ||
+       k >= MI_VLOAD128 && k <= MI_VEXTRACT
+}
+
+fn slp_defines(k int) bool {
+    << fold_defines(k) || k == MI_MADD || k == MI_MSUB || k == MI_VLOAD128 || k == MI_VBIN128 || k == MI_VPACK128 || k == MI_VEXTRACT
+}
+
+// Non-escaping MI_ADDR provenance per temp (-1 = unknown / potentially escaped).
+fn slp_compute_non_escaping_addrs(f &MFn, def_cnt &[]int, def_ii &[]int) []int {
+    nt := f.temps.len
+    nl := f.locals.len
+    $local_esc := []bool{}
+    for _ in 0:nl { local_esc.push(false) }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if k == MI_CALL || k == MI_CALL_IND {
+                if k == MI_CALL_IND && ins.b >= 0 && ins.b < nt && def_ii[ins.b] >= 0 && f.instrs[def_ii[ins.b]].kind == MI_ADDR {
+                    l := f.instrs[def_ii[ins.b]].b
+                    if l >= 0 && l < nl { local_esc[l] = true }
+                }
+                $a := ins.c
+                while a >= 0 {
+                    av := f.margs[a].v
+                    if av >= 0 && av < nt && def_ii[av] >= 0 && f.instrs[def_ii[av]].kind == MI_ADDR {
+                        l := f.instrs[def_ii[av]].b
+                        if l >= 0 && l < nl { local_esc[l] = true }
+                    }
+                    a = f.margs[a].next
+                }
+            }
+            ii = ins.next
+        }
+    }
+    $prov := []int{}
+    $non_mem := []bool{}
+    for _ in 0:nt {
+        prov.push(-1)
+        non_mem.push(false)
+    }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_VOLATILE_LOAD || k == MI_CALL_IND {
+                if ins.b >= 0 && ins.b < nt { non_mem[ins.b] = true }
+            } else if k == MI_STORE_PTR {
+                if ins.b >= 0 && ins.b < nt { non_mem[ins.b] = true }
+            } else if k == MI_VOLATILE_STORE {
+                if ins.a >= 0 && ins.a < nt { non_mem[ins.a] = true }
+                if ins.b >= 0 && ins.b < nt { non_mem[ins.b] = true }
+            } else if k == MI_UN {
+                if ins.c >= 0 && ins.c < nt { non_mem[ins.c] = true }
+            } else if k == MI_BIN && ins.b != BIN_ADD && ins.b != BIN_SUB {
+                if ins.c >= 0 && ins.c < nt { non_mem[ins.c] = true }
+                if ins.d >= 0 && ins.d < nt { non_mem[ins.d] = true }
+            } else if k == MI_SELECT {
+                if ins.b >= 0 && ins.b < nt { non_mem[ins.b] = true }
+                if ins.c >= 0 && ins.c < nt { non_mem[ins.c] = true }
+                if ins.d >= 0 && ins.d < nt { non_mem[ins.d] = true }
+            } else if k == MI_CALL {
+                $a := ins.c
+                while a >= 0 {
+                    av := f.margs[a].v
+                    if av >= 0 && av < nt { non_mem[av] = true }
+                    a = f.margs[a].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[bi].tkind
+        if (tk == TKIND_BRANCH || tk == TKIND_RETURN) && f.blocks[bi].ta >= 0 && f.blocks[bi].ta < nt {
+            non_mem[f.blocks[bi].ta] = true
+        }
+    }
+    for t in 0:nt {
+        if def_cnt[t] == 1 && !non_mem[t] && def_ii[t] >= 0 {
+            dii := def_ii[t]
+            ins := &f.instrs[dii]
+            if ins.kind == MI_ADDR && ins.b >= 0 && ins.b < nl && !local_esc[ins.b] {
+                prov[t] = ins.b
+            }
+        }
+    }
+    // Propagate non-escaping MI_ADDR provenance through ptr + const / COPY.
+    for _ in 0:4 {
+        $ch := false
+        for t in 0:nt {
+            if prov[t] >= 0 || def_cnt[t] != 1 || non_mem[t] || def_ii[t] < 0 { -> }
+            dii := def_ii[t]
+            ins := &f.instrs[dii]
+            if ins.kind == MI_COPY && ins.b >= 0 && ins.b < nt && prov[ins.b] >= 0 {
+                prov[t] = prov[ins.b]
+                ch = true
+            } else if ins.kind == MI_BIN && (ins.b == BIN_ADD || ins.b == BIN_SUB) {
+                $src := -1
+                if ins.c >= 0 && ins.c < nt && prov[ins.c] >= 0 && ins.d <= -2 {
+                    src = ins.c
+                } else if ins.b == BIN_ADD && ins.d >= 0 && ins.d < nt && prov[ins.d] >= 0 && ins.c <= -2 {
+                    src = ins.d
+                }
+                if src >= 0 {
+                    prov[t] = prov[src]
+                    ch = true
+                }
+            }
+        }
+        if !ch { <- }
+    }
+    << prov
+}
+
+fn slp_mem_may_alias(prov &[]int, b1 int, off1 int, w1 int, b2 int, off2 int, w2 int) bool {
+    if b1 == b2 {
+        << off1 < off2 + w2 && off2 < off1 + w1
+    }
+    $p1 := -1
+    $p2 := -1
+    if b1 >= 0 && b1 < prov.len { p1 = prov[b1] }
+    if b2 >= 0 && b2 < prov.len { p2 = prov[b2] }
+    if p1 >= 0 && p2 >= 0 && p1 != p2 { << false }
+    if (p1 >= 0 && p2 < 0) || (p2 >= 0 && p1 < 0) { << false }
+    << true
+}
+
+fn slp_build_dag(f &MFn, bi int, def_cnt &[]int, def_blk &[]int, def_ii &[]int, use_cnt &[]int, pos_of &[]int, seg_lo int, seg_hi int, consumed &[]bool, prov &[]int, nodes $&[]SlpNode, score_out $&[]int, tree_iis $&[]int, v0 int, v1 int, depth int) int {
+    // Reuse existing node in same tree when (v0, v1) matches cleanly.
+    for ni in 0:nodes.len {
+        if nodes[ni].v0 == v0 && nodes[ni].v1 == v1 {
+            << ni
+        }
+    }
+    if v0 == v1 {
+        idx := nodes.len
+        nodes.push(SlpNode{kind: SLP_NODE_SPLAT, v0: v0, v1: v1, ii0: -1, ii1: -1, op: -1, base: -1, off: 0, c0: -1, c1: -1, vreg: -1})
+        score_out[0] = score_out[0] - 1
+        << idx
+    }
+    if depth < 8 && v0 >= 0 && v1 >= 0 && v0 < def_cnt.len && v1 < def_cnt.len &&
+       def_cnt[v0] == 1 && def_cnt[v1] == 1 && def_blk[v0] == bi && def_blk[v1] == bi &&
+       use_cnt[v0] == 1 && use_cnt[v1] == 1 {
+        ii0 := def_ii[v0]
+        ii1 := def_ii[v1]
+        if ii0 >= 0 && ii1 >= 0 && ii0 != ii1 && !consumed[ii0] && !consumed[ii1] &&
+           pos_of[ii0] >= seg_lo && pos_of[ii0] <= seg_hi && pos_of[ii1] >= seg_lo && pos_of[ii1] <= seg_hi {
+            $dup_use := false
+            for ti in 0:tree_iis.len {
+                if tree_iis[ti] == ii0 || tree_iis[ti] == ii1 {
+                    dup_use = true
+                    <-
+                }
+            }
+            if !dup_use {
+                ins0 := &f.instrs[ii0]
+                ins1 := &f.instrs[ii1]
+                if ins0.kind == MI_LOAD_PTR && ins1.kind == MI_LOAD_PTR && slp_is_w8(ins0.d) && slp_is_w8(ins1.d) &&
+                   ins0.b == ins1.b && ins0.b >= 0 && ins1.c == ins0.c + 8 {
+                    idx := nodes.len
+                    nodes.push(SlpNode{kind: SLP_NODE_VLOAD, v0: v0, v1: v1, ii0: ii0, ii1: ii1, op: -1, base: ins0.b, off: ins0.c, c0: -1, c1: -1, vreg: -1})
+                    tree_iis.push(ii0)
+                    tree_iis.push(ii1)
+                    score_out[0] = score_out[0] + 2
+                    << idx
+                }
+                if ins0.kind == MI_BIN && ins1.kind == MI_BIN && ins0.b == ins1.b && slp_is_vec_bin(ins0.b) {
+                    orig_n := nodes.len
+                    orig_t := tree_iis.len
+                    $best_nodes := []SlpNode{}
+                    for ni in 0:orig_n { best_nodes.push(~nodes[ni]) }
+                    $best_trees := []int{}
+                    for ti in 0:orig_t { best_trees.push(tree_iis[ti]) }
+                    best_trees.push(ii0)
+                    best_trees.push(ii1)
+                    $best_sc := [score_out[0]]
+                    lc0 := slp_build_dag(f, bi, def_cnt, def_blk, def_ii, use_cnt, pos_of, seg_lo, seg_hi, consumed, prov, $&best_nodes, $&best_sc, $&best_trees, ins0.c, ins1.c, depth + 1)
+                    rc0 := slp_build_dag(f, bi, def_cnt, def_blk, def_ii, use_cnt, pos_of, seg_lo, seg_hi, consumed, prov, $&best_nodes, $&best_sc, $&best_trees, ins0.d, ins1.d, depth + 1)
+                    $pick_lc := lc0
+                    $pick_rc := rc0
+
+                    $committed := false
+                    if slp_is_comm(ins0.b) && ins0.c != ins0.d && ins1.c != ins1.d {
+                        $alt_nodes := []SlpNode{}
+                        for ni in 0:orig_n { alt_nodes.push(~nodes[ni]) }
+                        $alt_trees := []int{}
+                        for ti in 0:orig_t { alt_trees.push(tree_iis[ti]) }
+                        alt_trees.push(ii0)
+                        alt_trees.push(ii1)
+                        $alt_sc := [score_out[0]]
+                        lc1 := slp_build_dag(f, bi, def_cnt, def_blk, def_ii, use_cnt, pos_of, seg_lo, seg_hi, consumed, prov, $&alt_nodes, $&alt_sc, $&alt_trees, ins0.c, ins1.d, depth + 1)
+                        rc1 := slp_build_dag(f, bi, def_cnt, def_blk, def_ii, use_cnt, pos_of, seg_lo, seg_hi, consumed, prov, $&alt_nodes, $&alt_sc, $&alt_trees, ins0.d, ins1.c, depth + 1)
+                        if alt_sc[0] > best_sc[0] {
+                            for ni in orig_n:alt_nodes.len {
+                                nodes.push(~alt_nodes[ni])
+                            }
+                            for ti in orig_t:alt_trees.len {
+                                tree_iis.push(alt_trees[ti])
+                            }
+                            score_out[0] = alt_sc[0] + 1
+                            pick_lc = lc1
+                            pick_rc = rc1
+                            committed = true
+                        }
+                    }
+
+                    // Commit winning subtree cleanly by appending beyond orig_n/orig_t.
+                    if !committed {
+                        for ni in orig_n:best_nodes.len {
+                            nodes.push(~best_nodes[ni])
+                        }
+                        for ti in orig_t:best_trees.len {
+                            tree_iis.push(best_trees[ti])
+                        }
+                        score_out[0] = best_sc[0] + 1
+                    }
+                    idx := nodes.len
+                    nodes.push(SlpNode{kind: SLP_NODE_VBIN, v0: v0, v1: v1, ii0: ii0, ii1: ii1, op: ins0.b, base: -1, off: 0, c0: pick_lc, c1: pick_rc, vreg: -1})
+                    << idx
+                }
+            }
+        }
+    }
+    idx := nodes.len
+    nodes.push(SlpNode{kind: SLP_NODE_PACK, v0: v0, v1: v1, ii0: -1, ii1: -1, op: -1, base: -1, off: 0, c0: -1, c1: -1, vreg: -1})
+    score_out[0] = score_out[0] - 2
+    << idx
+}
+
+fn slp_in_int_list(arr &[]int, val int) bool {
+    for i in 0:arr.len {
+        if arr[i] == val { << true }
+    }
+    << false
+}
+
+fn slp_tree_schedule_safe(f &MFn, seg_iis &[]int, pos_of &[]int, consumed &[]bool, prov &[]int, nodes &[]SlpNode, tree_iis &[]int, emit_pos int, st0_ii int, st1_ii int) bool {
+    // Find earliest instruction position of any tree node inside seg_iis.
+    $min_p := emit_pos
+    for ti in 0:tree_iis.len {
+        p := pos_of[tree_iis[ti]]
+        if p < min_p { min_p = p }
+    }
+    if st0_ii >= 0 && pos_of[st0_ii] < min_p { min_p = pos_of[st0_ii] }
+
+    // Ensure no external (non-tree) instruction inside [min_p..emit_pos] reads or defines anything clobbered,
+    // and verify memory alias safety when moving VLOAD128 to emit_pos or sinking st0_ii to emit_pos:
+    // 1. Every VLOAD128 moving to emit_pos cannot move past an intervening aliasing store in [pos(ld)..emit_pos].
+    for ni in 0:nodes.len {
+        if nodes[ni].kind == SLP_NODE_VLOAD {
+            lbase := nodes[ni].base
+            loff := nodes[ni].off
+            $p_ld := pos_of[nodes[ni].ii0]
+            if pos_of[nodes[ni].ii1] < p_ld { p_ld = pos_of[nodes[ni].ii1] }
+            for p in (p_ld + 1):emit_pos {
+                m_ii := seg_iis[p]
+                if consumed[m_ii] || m_ii == st1_ii || slp_in_int_list(tree_iis, m_ii) { -> }
+                mins := &f.instrs[m_ii]
+                if mins.kind == MI_STORE_PTR {
+                    $mw := mins.d
+                    if slp_is_w8(mw) { mw = 8 } else if mw == -4 { mw = 4 }
+                    if slp_mem_may_alias(prov, lbase, loff, 16, mins.a, mins.c, mw) {
+                        << false
+                    }
+                } else if mins.kind == MI_STORE_LOCAL {
+                    // Local stores cannot alias MI_LOAD_PTR targets unless address-taken; conservatively allow only non-escaped local check.
+                }
+            }
+        }
+    }
+    // 2. If sinking st0_ii down to emit_pos (st1_ii), verify no non-tree load or store in (pos(st0_ii)..emit_pos) aliases [st0].
+    if st0_ii >= 0 {
+        st0 := &f.instrs[st0_ii]
+        p_st0 := pos_of[st0_ii]
+        for p in (p_st0 + 1):emit_pos {
+            m_ii := seg_iis[p]
+            if consumed[m_ii] || m_ii == st1_ii || slp_in_int_list(tree_iis, m_ii) { -> }
+            mins := &f.instrs[m_ii]
+            if mins.kind == MI_LOAD_PTR {
+                $mw := mins.d
+                if slp_is_w8(mw) { mw = 8 } else if mw == -4 { mw = 4 }
+                if slp_mem_may_alias(prov, st0.a, st0.c, 8, mins.b, mins.c, mw) {
+                    << false
+                }
+            } else if mins.kind == MI_STORE_PTR {
+                $mw := mins.d
+                if slp_is_w8(mw) { mw = 8 } else if mw == -4 { mw = 4 }
+                if slp_mem_may_alias(prov, st0.a, st0.c, 8, mins.a, mins.c, mw) {
+                    << false
+                }
+            }
+        }
+    }
+    // 3. Ensure every external operand read by any tree node (PACK/SPLAT/VLOAD base)
+    // is NOT defined inside tree_iis and is NOT redefined inside [min_p..emit_pos].
+    for ni in 0:nodes.len {
+        nd := &nodes[ni]
+        if nd.kind == SLP_NODE_VLOAD {
+            b := nd.base
+            if b >= 0 {
+                for ti in 0:tree_iis.len {
+                    tii := tree_iis[ti]
+                    t_ins := &f.instrs[tii]
+                    if slp_defines(t_ins.kind) && t_ins.a == b { << false }
+                }
+                for p in (min_p + 1):emit_pos {
+                    m_ii := seg_iis[p]
+                    if slp_defines(f.instrs[m_ii].kind) && f.instrs[m_ii].a == b { << false }
+                }
+            }
+        } else if nd.kind == SLP_NODE_PACK || nd.kind == SLP_NODE_SPLAT {
+            for side in 0:2 {
+                $sv := nd.v0
+                if side == 1 {
+                    if nd.kind == SLP_NODE_SPLAT { <- }
+                    sv = nd.v1
+                }
+                if sv >= 0 {
+                    for ti in 0:tree_iis.len {
+                        tii := tree_iis[ti]
+                        t_ins := &f.instrs[tii]
+                        if slp_defines(t_ins.kind) && t_ins.a == sv { << false }
+                    }
+                }
+            }
+        }
+    }
+    << true
+}
+
+fn slp_emit_nodes(f $&MFn, nodes $&[]SlpNode, out_instrs $&[]MInstr, line int) {
+    for ni in 0:nodes.len {
+        nd := ~nodes[ni]
+        vt := slp_alloc_vtemp(f)
+        nodes[ni].vreg = vt
+        if nd.kind == SLP_NODE_VLOAD {
+            $ni_ins := minstr_new(MI_VLOAD128)
+            ni_ins.a = vt
+            ni_ins.b = nd.base
+            ni_ins.c = nd.off
+            ni_ins.line = line
+            out_instrs.push(ni_ins)
+        } else if nd.kind == SLP_NODE_SPLAT {
+            $ni_ins := minstr_new(MI_VPACK128)
+            ni_ins.a = vt
+            ni_ins.b = nd.v0
+            ni_ins.c = -1
+            ni_ins.d = 0
+            ni_ins.line = line
+            out_instrs.push(ni_ins)
+        } else if nd.kind == SLP_NODE_PACK {
+            $ni_ins := minstr_new(MI_VPACK128)
+            ni_ins.a = vt
+            ni_ins.b = nd.v0
+            ni_ins.c = nd.v1
+            ni_ins.d = 1
+            ni_ins.line = line
+            out_instrs.push(ni_ins)
+        } else if nd.kind == SLP_NODE_VBIN {
+            $ni_ins := minstr_new(MI_VBIN128)
+            ni_ins.a = vt
+            ni_ins.b = nd.op
+            ni_ins.c = nodes[nd.c0].vreg
+            ni_ins.d = nodes[nd.c1].vreg
+            ni_ins.line = line
+            out_instrs.push(ni_ins)
+        }
+    }
+}
+
+fn slp_replace_at(f $&MFn, bi int, target_ii int, vec_ins &[]MInstr, kill_iis &[]int, consumed $&[]bool) {
+    for ki in 0:kill_iis.len {
+        ii := kill_iis[ki]
+        consumed[ii] = true
+        if ii != target_ii {
+            f.instrs[ii].kind = MI_NOP
+        }
+    }
+    consumed[target_ii] = true
+    if vec_ins.len == 0 {
+        f.instrs[target_ii].kind = MI_NOP
+        <<
+    }
+    // Splice vec_ins in place of target_ii while preserving block head/tail links.
+    next_after := f.instrs[target_ii].next
+    f.instrs[target_ii] = ~vec_ins[0]
+    $prev := target_ii
+    for vi in 1:vec_ins.len {
+        nid := f.instrs.len
+        $ins := ~vec_ins[vi]
+        ins.next = -1
+        f.instrs.push(ins)
+        f.instrs[prev].next = nid
+        prev = nid
+    }
+    f.instrs[prev].next = next_after
+    if f.blocks[bi].tail == target_ii {
+        f.blocks[bi].tail = prev
+    }
+}
+
+pub fn opt_slp(f $&MFn) bool {
+    if f.blocks.len == 0 || f.blocks.len > 1500 || f.instrs.len > 25000 {
+        << false
+    }
+    // Bail if any block already has unsupported opaque ops.
+    $any_changed := false
+    for round in 0:8 {
+        nt := f.temps.len
+        $def_cnt := []int{}
+        $def_blk := []int{}
+        $def_ii := []int{}
+        $use_cnt := []int{}
+        for _ in 0:nt {
+            def_cnt.push(0)
+            def_blk.push(-1)
+            def_ii.push(-1)
+            use_cnt.push(0)
+        }
+        $pos_of := []int{}
+        $consumed := []bool{}
+        for _ in 0:f.instrs.len {
+            pos_of.push(-1)
+            consumed.push(false)
+        }
+        for bi in 0:f.blocks.len {
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                k := ins.kind
+                if slp_defines(k) && ins.a >= 0 && ins.a < nt {
+                    def_cnt[ins.a] = def_cnt[ins.a] + 1
+                    def_blk[ins.a] = bi
+                    def_ii[ins.a] = ii
+                }
+                if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR || k == MI_VOLATILE_LOAD || k == MI_CALL_IND {
+                    if ins.b >= 0 && ins.b < nt { use_cnt[ins.b] = use_cnt[ins.b] + 1 }
+                } else if k == MI_STORE_PTR || k == MI_VOLATILE_STORE {
+                    if ins.a >= 0 && ins.a < nt { use_cnt[ins.a] = use_cnt[ins.a] + 1 }
+                    if ins.b >= 0 && ins.b < nt { use_cnt[ins.b] = use_cnt[ins.b] + 1 }
+                } else if k == MI_UN {
+                    if ins.c >= 0 && ins.c < nt { use_cnt[ins.c] = use_cnt[ins.c] + 1 }
+                } else if k == MI_BIN {
+                    if ins.c >= 0 && ins.c < nt { use_cnt[ins.c] = use_cnt[ins.c] + 1 }
+                    if ins.d >= 0 && ins.d < nt { use_cnt[ins.d] = use_cnt[ins.d] + 1 }
+                } else if k == MI_SELECT || k == MI_MADD || k == MI_MSUB {
+                    if ins.b >= 0 && ins.b < nt { use_cnt[ins.b] = use_cnt[ins.b] + 1 }
+                    if ins.c >= 0 && ins.c < nt { use_cnt[ins.c] = use_cnt[ins.c] + 1 }
+                    if ins.d >= 0 && ins.d < nt { use_cnt[ins.d] = use_cnt[ins.d] + 1 }
+                } else if k == MI_VLOAD128 {
+                    if ins.b >= 0 && ins.b < nt { use_cnt[ins.b] = use_cnt[ins.b] + 1 }
+                } else if k == MI_VSTORE128 {
+                    if ins.a >= 0 && ins.a < nt { use_cnt[ins.a] = use_cnt[ins.a] + 1 }
+                    if ins.b >= 0 && ins.b < nt { use_cnt[ins.b] = use_cnt[ins.b] + 1 }
+                } else if k == MI_VBIN128 {
+                    if ins.c >= 0 && ins.c < nt { use_cnt[ins.c] = use_cnt[ins.c] + 1 }
+                    if ins.d >= 0 && ins.d < nt { use_cnt[ins.d] = use_cnt[ins.d] + 1 }
+                } else if k == MI_VPACK128 {
+                    if ins.b >= 0 && ins.b < nt { use_cnt[ins.b] = use_cnt[ins.b] + 1 }
+                    if ins.d != 0 && ins.c >= 0 && ins.c < nt { use_cnt[ins.c] = use_cnt[ins.c] + 1 }
+                } else if k == MI_VEXTRACT {
+                    if ins.b >= 0 && ins.b < nt { use_cnt[ins.b] = use_cnt[ins.b] + 1 }
+                }
+                if k == MI_CALL || k == MI_CALL_IND {
+                    $ai := ins.c
+                    while ai >= 0 {
+                        av := f.margs[ai].v
+                        if av >= 0 && av < nt { use_cnt[av] = use_cnt[av] + 1 }
+                        ai = f.margs[ai].next
+                    }
+                }
+                ii = ins.next
+            }
+            tk := f.blocks[bi].tkind
+            if (tk == TKIND_BRANCH || tk == TKIND_RETURN) && f.blocks[bi].ta >= 0 && f.blocks[bi].ta < nt {
+                use_cnt[f.blocks[bi].ta] = use_cnt[f.blocks[bi].ta] + 1
+            }
+        }
+
+        prov := slp_compute_non_escaping_addrs(f, &def_cnt, &def_ii)
+        $round_changed := false
+
+        for bi in 0:f.blocks.len {
+            $seg_iis := []int{}
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                pos_of[ii] = seg_iis.len
+                seg_iis.push(ii)
+                ii = f.instrs[ii].next
+            }
+            if seg_iis.len < 4 || seg_iis.len > 384 { -> }
+
+            $blk_changed := false
+            // Process call-free segments inside block bi (at most one transformation per block per round so linked lists stay fresh).
+            $seg_start := 0
+            while seg_start < seg_iis.len && !blk_changed {
+                while seg_start < seg_iis.len && slp_is_barrier(f.instrs[seg_iis[seg_start]].kind) {
+                    seg_start += 1
+                }
+                if seg_start >= seg_iis.len { <- }
+                $seg_end := seg_start
+                while seg_end < seg_iis.len && !slp_is_barrier(f.instrs[seg_iis[seg_end]].kind) {
+                    seg_end += 1
+                }
+                seg_lo := seg_start
+                seg_hi := seg_end - 1
+                seg_start = seg_end
+                if seg_hi - seg_lo + 1 < 4 { -> }
+
+                // Seed 1: Adjacent 8-byte MI_STORE_PTR pairs in [seg_lo..seg_hi].
+                for pi in seg_lo:(seg_hi + 1) {
+                    if blk_changed { <- }
+                    s_a := seg_iis[pi]
+                    if consumed[s_a] || f.instrs[s_a].kind != MI_STORE_PTR || !slp_is_w8(f.instrs[s_a].d) { -> }
+                    for pj in (pi + 1):(seg_hi + 1) {
+                        s_b := seg_iis[pj]
+                        if consumed[s_b] || f.instrs[s_b].kind != MI_STORE_PTR || !slp_is_w8(f.instrs[s_b].d) { -> }
+                        if f.instrs[s_a].a != f.instrs[s_b].a || f.instrs[s_a].a < 0 { -> }
+                        $lo_st := -1
+                        $hi_st := -1
+                        if f.instrs[s_b].c == f.instrs[s_a].c + 8 {
+                            lo_st = s_a
+                            hi_st = s_b
+                        } else if f.instrs[s_a].c == f.instrs[s_b].c + 8 {
+                            lo_st = s_b
+                            hi_st = s_a
+                        }
+                        if lo_st < 0 { -> }
+                        $nodes := []SlpNode{}
+                        $tree_iis := []int{}
+                        $score := [2]
+                        root := slp_build_dag(f, bi, &def_cnt, &def_blk, &def_ii, &use_cnt, &pos_of, seg_lo, seg_hi, &consumed, &prov, $&nodes, $&score, $&tree_iis, f.instrs[lo_st].b, f.instrs[hi_st].b, 0)
+                        if score[0] >= 2 && tree_iis.len >= 2 &&
+                           slp_tree_schedule_safe(f, &seg_iis, &pos_of, &consumed, &prov, &nodes, &tree_iis, pj, s_a, s_b) {
+                            $vec_ins := []MInstr{}
+                            slp_emit_nodes(f, $&nodes, $&vec_ins, f.instrs[s_b].line)
+                            $vst := minstr_new(MI_VSTORE128)
+                            vst.a = f.instrs[lo_st].a
+                            vst.b = nodes[root].vreg
+                            vst.c = f.instrs[lo_st].c
+                            vst.line = f.instrs[s_b].line
+                            vec_ins.push(vst)
+                            tree_iis.push(s_a)
+                            slp_replace_at(f, bi, s_b, &vec_ins, &tree_iis, $&consumed)
+                            round_changed = true
+                            blk_changed = true
+                            <-
+                        }
+                    }
+                }
+                if blk_changed { <- }
+
+                // Seed 2: Associative 4-way unrolled integer reduction trees: comb = op(op(t0,t1), op(t2,t3)).
+                for pi in seg_lo:(seg_hi + 1) {
+                    if blk_changed { <- }
+                    c_ii := seg_iis[pi]
+                    if consumed[c_ii] { -> }
+                    cins := &f.instrs[c_ii]
+                    if cins.kind != MI_BIN || !slp_is_red_op(cins.b) || cins.c < 0 || cins.d < 0 { -> }
+                    rop := cins.b
+                    $p01 := cins.c
+                    $p23 := cins.d
+                    if p01 == p23 || p01 >= def_cnt.len || p23 >= def_cnt.len { -> }
+                    if def_cnt[p01] != 1 || def_cnt[p23] != 1 || def_blk[p01] != bi || def_blk[p23] != bi { -> }
+                    if use_cnt[p01] != 1 || use_cnt[p23] != 1 { -> }
+                    ii01 := def_ii[p01]
+                    ii23 := def_ii[p23]
+                    if ii01 < 0 || ii23 < 0 || consumed[ii01] || consumed[ii23] { -> }
+                    if pos_of[ii01] < seg_lo || pos_of[ii23] < seg_lo { -> }
+                    ins01 := &f.instrs[ii01]
+                    ins23 := &f.instrs[ii23]
+                    if ins01.kind != MI_BIN || ins23.kind != MI_BIN || ins01.b != rop || ins23.b != rop { -> }
+
+                    // Try pairing (t0, t1) + (t2, t3) cleanly into [v01] op [v23].
+                    $nodes := []SlpNode{}
+                    $tree_iis := [ii01, ii23]
+                    $score := [1]
+                    r0 := slp_build_dag(f, bi, &def_cnt, &def_blk, &def_ii, &use_cnt, &pos_of, seg_lo, seg_hi, &consumed, &prov, $&nodes, $&score, $&tree_iis, ins01.c, ins01.d, 0)
+                    r1 := slp_build_dag(f, bi, &def_cnt, &def_blk, &def_ii, &use_cnt, &pos_of, seg_lo, seg_hi, &consumed, &prov, $&nodes, $&score, $&tree_iis, ins23.c, ins23.d, 0)
+                    if score[0] >= 2 && tree_iis.len >= 4 &&
+                       slp_tree_schedule_safe(f, &seg_iis, &pos_of, &consumed, &prov, &nodes, &tree_iis, pi, -1, -1) {
+                        $vec_ins := []MInstr{}
+                        slp_emit_nodes(f, $&nodes, $&vec_ins, cins.line)
+                        vsum := slp_alloc_vtemp(f)
+                        $vb := minstr_new(MI_VBIN128)
+                        vb.a = vsum
+                        vb.b = rop
+                        vb.c = nodes[r0].vreg
+                        vb.d = nodes[r1].vreg
+                        vb.line = cins.line
+                        vec_ins.push(vb)
+                        $vx := minstr_new(MI_VEXTRACT)
+                        vx.a = cins.a
+                        vx.b = vsum
+                        vx.c = rop
+                        vx.d = 0
+                        vx.line = cins.line
+                        vec_ins.push(vx)
+                        slp_replace_at(f, bi, c_ii, &vec_ins, &tree_iis, $&consumed)
+                        round_changed = true
+                        blk_changed = true
+                        <-
+                    }
+                }
+                if blk_changed { <- }
+
+                // Seed 3: Adjacent 8-byte MI_LOAD_PTR pair driving isomorphic MI_BIN (exact bit-for-bit FP & int extract).
+                for pi in seg_lo:(seg_hi + 1) {
+                    if blk_changed { <- }
+                    l0 := seg_iis[pi]
+                    if consumed[l0] || f.instrs[l0].kind != MI_LOAD_PTR || !slp_is_w8(f.instrs[l0].d) { -> }
+                    t0 := f.instrs[l0].a
+                    if t0 < 0 || t0 >= use_cnt.len || def_cnt[t0] != 1 || use_cnt[t0] != 1 { -> }
+                    for pj in (pi + 1):(seg_hi + 1) {
+                        l1 := seg_iis[pj]
+                        if consumed[l1] || f.instrs[l1].kind != MI_LOAD_PTR || !slp_is_w8(f.instrs[l1].d) { -> }
+                        t1 := f.instrs[l1].a
+                        if t1 < 0 || t1 >= use_cnt.len || def_cnt[t1] != 1 || use_cnt[t1] != 1 { -> }
+                        if f.instrs[l0].b != f.instrs[l1].b || f.instrs[l0].b < 0 { -> }
+                        $lo_ld := -1
+                        $hi_ld := -1
+                        if f.instrs[l1].c == f.instrs[l0].c + 8 {
+                            lo_ld = l0
+                            hi_ld = l1
+                        } else if f.instrs[l0].c == f.instrs[l1].c + 8 {
+                            lo_ld = l1
+                            hi_ld = l0
+                        }
+                        if lo_ld < 0 { -> }
+                        tl := f.instrs[lo_ld].a
+                        th := f.instrs[hi_ld].a
+                        // Find single MI_BIN consumers u0, u1 of tl, th in [seg_lo..seg_hi].
+                        $u0_pos := -1
+                        $u1_pos := -1
+                        for pk in (pi + 1):(seg_hi + 1) {
+                            uk := seg_iis[pk]
+                            if consumed[uk] || f.instrs[uk].kind != MI_BIN { -> }
+                            if f.instrs[uk].c == tl || f.instrs[uk].d == tl { u0_pos = pk }
+                            if f.instrs[uk].c == th || f.instrs[uk].d == th { u1_pos = pk }
+                        }
+                        if u0_pos < 0 || u1_pos < 0 || u0_pos == u1_pos { -> }
+                        u0 := seg_iis[u0_pos]
+                        u1 := seg_iis[u1_pos]
+                        if f.instrs[u0].b != f.instrs[u1].b || !slp_is_vec_bin(f.instrs[u0].b) { -> }
+                        $first_u := u0_pos
+                        $first_a := f.instrs[u0].a
+                        $emit_p := u1_pos
+                        $second_ii := u1
+                        if u0_pos > u1_pos {
+                            first_u = u1_pos
+                            first_a = f.instrs[u1].a
+                            emit_p = u0_pos
+                            second_ii = u0
+                        }
+                        if first_a >= 0 && ((f.instrs[second_ii].c == first_a) || (f.instrs[second_ii].d == first_a)) { -> }
+                        $bad_use := false
+                        for pm in (first_u + 1):emit_p {
+                            m_ii := seg_iis[pm]
+                            mins := &f.instrs[m_ii]
+                            if (mins.kind == MI_BIN && (mins.c == first_a || mins.d == first_a)) ||
+                               (mins.kind == MI_STORE_LOCAL && mins.b == first_a) ||
+                               (mins.kind == MI_STORE_PTR && (mins.a == first_a || mins.b == first_a)) ||
+                               (mins.kind == MI_COPY && mins.b == first_a) {
+                                bad_use = true
+                                <-
+                            }
+                        }
+                        if bad_use { -> }
+                        $nodes := []SlpNode{}
+                        $tree_iis := []int{}
+                        $score := [-1] // 2 lane extracts cost 1..2; require net >= 2
+                        root := slp_build_dag(f, bi, &def_cnt, &def_blk, &def_ii, &use_cnt, &pos_of, seg_lo, seg_hi, &consumed, &prov, $&nodes, $&score, $&tree_iis, f.instrs[u0].a, f.instrs[u1].a, 0)
+                        if score[0] >= 2 && tree_iis.len >= 4 &&
+                           slp_tree_schedule_safe(f, &seg_iis, &pos_of, &consumed, &prov, &nodes, &tree_iis, emit_p, -1, -1) {
+                            emit_ii := seg_iis[emit_p]
+                            $vec_ins := []MInstr{}
+                            slp_emit_nodes(f, $&nodes, $&vec_ins, f.instrs[emit_ii].line)
+                            $ex0 := minstr_new(MI_VEXTRACT)
+                            ex0.a = f.instrs[u0].a
+                            ex0.b = nodes[root].vreg
+                            ex0.c = -1
+                            ex0.d = 1
+                            ex0.line = f.instrs[emit_ii].line
+                            $ex1 := minstr_new(MI_VEXTRACT)
+                            ex1.a = f.instrs[u1].a
+                            ex1.b = nodes[root].vreg
+                            ex1.c = -1
+                            ex1.d = 2
+                            ex1.line = f.instrs[emit_ii].line
+                            vec_ins.push(ex0)
+                            vec_ins.push(ex1)
+                            slp_replace_at(f, bi, emit_ii, &vec_ins, &tree_iis, $&consumed)
+                            round_changed = true
+                            blk_changed = true
+                            <-
+                        }
+                    }
+                }
+            }
+        }
+        if !round_changed { <- }
+        any_changed = true
+    }
+    << any_changed
+}

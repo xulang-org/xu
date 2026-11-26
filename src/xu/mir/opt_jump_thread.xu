@@ -1,0 +1,1379 @@
+@xu/mir
+// Correlated Jump Threading (Bodik, Gupta, Soffa PLDI 1997 style).
+//
+// Evaluates incoming branch and scalar-local predicates along predecessor chains
+// and dominating branch edges to redirect branches cleanly when a target block's
+// terminator condition is statically known along an incoming edge.
+// Pure guard blocks with block-local temps redirect with zero code duplication;
+// tiny non-call scalar-local guard blocks clone at most a few ops cleanly.
+
+const JT_I64_MAX = 9223372036854775807
+fn jt_i64_min() int { << -9223372036854775807 - 1 }
+const JT_MAX_CHAIN = 6
+const JT_MAX_FACTS = 24
+const JT_MAX_RELS = 16
+const JT_MAX_CLONE_JUMP = 4
+const JT_MAX_CLONE_SPLIT = 3
+const JT_MAX_SPLITS_PER_FN = 16
+
+fn jt_min(a int, b int) int {
+    if a < b { << a }
+    << b
+}
+
+fn jt_max(a int, b int) int {
+    if a > b { << a }
+    << b
+}
+
+fn jt_cval(f &MFn, v int) int {
+    << f.consts[0 - v - 2]
+}
+
+fn jt_safe_pure(ins &MInstr) bool {
+    k := ins.kind
+    if k == MI_NOP || k == MI_COPY || k == MI_LOAD_LOCAL || k == MI_ADDR ||
+       k == MI_UN || k == MI_STR_CONST || k == MI_LOAD_FN_ADDR || k == MI_SELECT {
+        << true
+    }
+    if k == MI_BIN {
+        << ins.b != BIN_DIV && ins.b != BIN_MOD
+    }
+    << false
+}
+
+fn jt_safe_clone(ins &MInstr, local_safe &[]bool, nl int) bool {
+    if jt_safe_pure(ins) {
+        // Pure cloning skips strings/fn-addrs cleanly to keep clone concise.
+        k := ins.kind
+        << k != MI_STR_CONST && k != MI_LOAD_FN_ADDR
+    }
+    if ins.kind == MI_STORE_LOCAL && ins.c == 0 && ins.a >= 0 && ins.a < nl && local_safe[ins.a] {
+        << true
+    }
+    << false
+}
+
+fn jt_defines(k int) bool {
+    << k == MI_COPY || k == MI_LOAD_LOCAL || k == MI_ADDR || k == MI_LOAD_PTR ||
+       k == MI_BIN || k == MI_UN || k == MI_CALL || k == MI_CALL_IND ||
+       k == MI_STR_CONST || k == MI_LOAD_FN_ADDR || k == MI_SELECT ||
+       k == MI_MADD || k == MI_MSUB || k == MI_CRYPTO_CRC32 || k == MI_CRYPTO_AES ||
+       k == MI_VOLATILE_LOAD || k == MI_LOAD_FIELD || k == MI_LOAD_INDEX ||
+       k == MI_ELEM_ADDR || k == MI_LOAD_BUF_PTR || k == MI_MAKE_CLOSURE ||
+       k == MI_BOX_INTERFACE || k == MI_INTERFACE_AS || k == MI_INTERFACE_METHOD ||
+       k == MI_BOX_TEMP || k == MI_RESULT_TEST
+}
+
+fn jt_mark_use(ub $&[]int, nt int, bi int, v int) {
+    if v >= 0 && v < nt {
+        if ub[v] == -1 {
+            ub[v] = bi
+        } else if ub[v] != bi {
+            ub[v] = -2
+        }
+    }
+}
+
+fn jt_known_instr(k int) bool {
+    << k == MI_NOP || k == MI_COPY || k == MI_LOAD_LOCAL || k == MI_STORE_LOCAL ||
+       k == MI_ADDR || k == MI_LOAD_PTR || k == MI_STORE_PTR || k == MI_BIN ||
+       k == MI_UN || k == MI_CALL || k == MI_CALL_IND || k == MI_STR_CONST ||
+       k == MI_LOAD_FN_ADDR || k == MI_SELECT || k == MI_MADD || k == MI_MSUB
+}
+
+fn jt_scan_uses(f &MFn, ub $&[]int, t_ndef $&[]int, t_def_ii $&[]int, l_bad $&[]bool, l_nstores $&[]int) {
+    nt := f.temps.len
+    nl := f.locals.len
+    for i in 0:nt {
+        ub[i] = -1
+        t_ndef[i] = 0
+        t_def_ii[i] = -1
+    }
+    for i in 0:nl {
+        l_bad[i] = f.locals_nslots[i] != 1
+        l_nstores[i] = 0
+    }
+    for bi in 0:f.blocks.len {
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            k := ins.kind
+            if k == MI_ADDR && ins.b >= 0 && ins.b < nl {
+                l_bad[ins.b] = true
+            }
+            if k == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl {
+                if ins.c != 0 {
+                    l_bad[ins.a] = true
+                } else {
+                    l_nstores[ins.a] = l_nstores[ins.a] + 1
+                }
+            } else if k == MI_LOAD_LOCAL && ins.b >= 0 && ins.b < nl && ins.c != 0 {
+                l_bad[ins.b] = true
+            }
+            if jt_defines(k) && ins.a >= 0 && ins.a < nt {
+                t_ndef[ins.a] = t_ndef[ins.a] + 1
+                t_def_ii[ins.a] = ii
+            }
+            if !jt_known_instr(k) {
+                jt_mark_use(ub, nt, bi, ins.a)
+                jt_mark_use(ub, nt, bi, ins.b)
+                jt_mark_use(ub, nt, bi, ins.c)
+                jt_mark_use(ub, nt, bi, ins.d)
+            } else if k == MI_COPY || k == MI_STORE_LOCAL || k == MI_LOAD_PTR || k == MI_CALL_IND {
+                jt_mark_use(ub, nt, bi, ins.b)
+            } else if k == MI_STORE_PTR {
+                jt_mark_use(ub, nt, bi, ins.a)
+                jt_mark_use(ub, nt, bi, ins.b)
+            } else if k == MI_UN {
+                jt_mark_use(ub, nt, bi, ins.c)
+            } else if k == MI_BIN {
+                jt_mark_use(ub, nt, bi, ins.c)
+                jt_mark_use(ub, nt, bi, ins.d)
+            } else if k == MI_SELECT || k == MI_MADD || k == MI_MSUB {
+                jt_mark_use(ub, nt, bi, ins.b)
+                jt_mark_use(ub, nt, bi, ins.c)
+                jt_mark_use(ub, nt, bi, ins.d)
+            }
+            if k == MI_CALL || k == MI_CALL_IND {
+                $ai := ins.c
+                while ai >= 0 {
+                    jt_mark_use(ub, nt, bi, f.margs[ai].v)
+                    ai = f.margs[ai].next
+                }
+            }
+            ii = ins.next
+        }
+        tk := f.blocks[bi].tkind
+        if tk == TKIND_BRANCH || tk == TKIND_RETURN {
+            jt_mark_use(ub, nt, bi, f.blocks[bi].ta)
+        }
+    }
+}
+
+fn jt_flip_cmp(op int) int {
+    if op == BIN_LT { << BIN_GT }
+    if op == BIN_LE { << BIN_GE }
+    if op == BIN_GT { << BIN_LT }
+    if op == BIN_GE { << BIN_LE }
+    << op
+}
+
+fn jt_invert_cmp(op int) int {
+    if op == BIN_EQ { << BIN_NE }
+    if op == BIN_NE { << BIN_EQ }
+    if op == BIN_LT { << BIN_GE }
+    if op == BIN_LE { << BIN_GT }
+    if op == BIN_GT { << BIN_LE }
+    if op == BIN_GE { << BIN_LT }
+    << op
+}
+
+fn jt_is_int_cmp(op int) bool {
+    << op >= BIN_EQ && op <= BIN_GE
+}
+
+// Returns 1 if (op1 == truth1) guarantees (op2 == true),
+// 0 if it guarantees (op2 == false), -1 if undetermined.
+fn jt_rel_implies(op1 int, truth1 bool, op2 int) int {
+    $a := op1
+    if !truth1 {
+        a = jt_invert_cmp(a)
+    }
+    if a == op2 { << 1 }
+    if a == jt_invert_cmp(op2) { << 0 }
+    if a == BIN_EQ {
+        if op2 == BIN_LE || op2 == BIN_GE { << 1 }
+        if op2 == BIN_LT || op2 == BIN_GT { << 0 }
+    } else if a == BIN_LT {
+        if op2 == BIN_LE || op2 == BIN_NE { << 1 }
+        if op2 == BIN_EQ || op2 == BIN_GT { << 0 }
+    } else if a == BIN_GT {
+        if op2 == BIN_GE || op2 == BIN_NE { << 1 }
+        if op2 == BIN_EQ || op2 == BIN_LT { << 0 }
+    }
+    << -1
+}
+
+struct JtState {
+    // Variable range/neq facts (is_local=0 for temp, 1 for local).
+    // Fixed-capacity buffers reset in O(1) via explicit lengths.
+    f_len int
+    f_is_loc []int
+    f_id []int
+    f_gen []int
+    f_has_lo []bool
+    f_lo []int
+    f_has_hi []bool
+    f_hi []int
+    f_neq_has []bool
+    f_neq_val []int
+    // Tracked local alias -> (temp_id, src_gen) and local current gen.
+    lv_len int
+    loc_val_id []int
+    loc_val_t []int
+    lg_len int
+    loc_gen_id []int
+    loc_gen_val []int
+    // Tracked temp -> local provenance (for lifting cmp(temp) onto live local).
+    tl_len int
+    t_loc_t []int
+    t_loc_l []int
+    t_loc_g []int
+    // Relational facts: op(lhs, rhs) == truth
+    r_len int
+    r_op []int
+    r_lhs_loc []int
+    r_lhs_id []int
+    r_lhs_gen []int
+    r_rhs_loc []int
+    r_rhs_id []int
+    r_rhs_gen []int
+    r_truth []bool
+}
+
+fn jt_state_new() JtState {
+    $st := JtState{
+        f_len: 0,
+        f_is_loc: []int{},
+        f_id: []int{},
+        f_gen: []int{},
+        f_has_lo: []bool{},
+        f_lo: []int{},
+        f_has_hi: []bool{},
+        f_hi: []int{},
+        f_neq_has: []bool{},
+        f_neq_val: []int{},
+        lv_len: 0,
+        loc_val_id: []int{},
+        loc_val_t: []int{},
+        lg_len: 0,
+        loc_gen_id: []int{},
+        loc_gen_val: []int{},
+        tl_len: 0,
+        t_loc_t: []int{},
+        t_loc_l: []int{},
+        t_loc_g: []int{},
+        r_len: 0,
+        r_op: []int{},
+        r_lhs_loc: []int{},
+        r_lhs_id: []int{},
+        r_lhs_gen: []int{},
+        r_rhs_loc: []int{},
+        r_rhs_id: []int{},
+        r_rhs_gen: []int{},
+        r_truth: []bool{}
+    }
+    for _ in 0:JT_MAX_FACTS {
+        st.f_is_loc.push(0)
+        st.f_id.push(0)
+        st.f_gen.push(0)
+        st.f_has_lo.push(false)
+        st.f_lo.push(0)
+        st.f_has_hi.push(false)
+        st.f_hi.push(0)
+        st.f_neq_has.push(false)
+        st.f_neq_val.push(0)
+    }
+    for _ in 0:64 {
+        st.loc_val_id.push(0)
+        st.loc_val_t.push(0)
+        st.loc_gen_id.push(0)
+        st.loc_gen_val.push(0)
+        st.t_loc_t.push(0)
+        st.t_loc_l.push(0)
+        st.t_loc_g.push(0)
+    }
+    for _ in 0:JT_MAX_RELS {
+        st.r_op.push(0)
+        st.r_lhs_loc.push(0)
+        st.r_lhs_id.push(0)
+        st.r_lhs_gen.push(0)
+        st.r_rhs_loc.push(0)
+        st.r_rhs_id.push(0)
+        st.r_rhs_gen.push(0)
+        st.r_truth.push(false)
+    }
+    << st
+}
+
+fn jt_state_clear(st $&JtState) {
+    st.f_len = 0
+    st.lv_len = 0
+    st.lg_len = 0
+    st.tl_len = 0
+    st.r_len = 0
+}
+
+fn jt_get_loc_gen(st &JtState, l int) int {
+    for i in 0:st.lg_len {
+        if st.loc_gen_id[i] == l {
+            << st.loc_gen_val[i]
+        }
+    }
+    << 0
+}
+
+fn jt_bump_loc(st $&JtState, l int, alias_t int) int {
+    $ng := 1
+    $found := false
+    for i in 0:st.lg_len {
+        if st.loc_gen_id[i] == l {
+            ng = st.loc_gen_val[i] + 1
+            st.loc_gen_val[i] = ng
+            found = true
+            <-
+        }
+    }
+    if !found && st.lg_len < 64 {
+        k := st.lg_len
+        st.loc_gen_id[k] = l
+        st.loc_gen_val[k] = 1
+        st.lg_len = k + 1
+    }
+    $vf := false
+    for i in 0:st.lv_len {
+        if st.loc_val_id[i] == l {
+            st.loc_val_t[i] = alias_t
+            vf = true
+            <-
+        }
+    }
+    if !vf && st.lv_len < 64 {
+        k := st.lv_len
+        st.loc_val_id[k] = l
+        st.loc_val_t[k] = alias_t
+        st.lv_len = k + 1
+    }
+    << ng
+}
+
+fn jt_find_fact(st &JtState, is_loc int, id int, gen int) int {
+    for i in 0:st.f_len {
+        if st.f_is_loc[i] == is_loc && st.f_id[i] == id && st.f_gen[i] == gen {
+            << i
+        }
+    }
+    << -1
+}
+
+fn jt_ensure_fact(st $&JtState, is_loc int, id int, gen int) int {
+    idx := jt_find_fact(st, is_loc, id, gen)
+    if idx >= 0 {
+        << idx
+    }
+    if st.f_len >= JT_MAX_FACTS {
+        << -1
+    }
+    k := st.f_len
+    st.f_is_loc[k] = is_loc
+    st.f_id[k] = id
+    st.f_gen[k] = gen
+    st.f_has_lo[k] = false
+    st.f_lo[k] = 0
+    st.f_has_hi[k] = false
+    st.f_hi[k] = 0
+    st.f_neq_has[k] = false
+    st.f_neq_val[k] = 0
+    st.f_len = k + 1
+    << k
+}
+
+fn jt_record_t_loc(st $&JtState, t int, l int, g int) {
+    for i in 0:st.tl_len {
+        if st.t_loc_t[i] == t {
+            st.t_loc_l[i] = l
+            st.t_loc_g[i] = g
+            <<
+        }
+    }
+    if st.tl_len < 64 {
+        k := st.tl_len
+        st.t_loc_t[k] = t
+        st.t_loc_l[k] = l
+        st.t_loc_g[k] = g
+        st.tl_len = k + 1
+    }
+}
+
+fn jt_canon_operand(f &MFn, st &JtState, t_ndef &[]int, t_def_ii &[]int, v int, out_loc $&[]int, out_id $&[]int, out_gen $&[]int) bool {
+    if v < 0 {
+        << false
+    }
+    $cur := v
+    for _ in 0:4 {
+        for i in 0:st.tl_len {
+            if st.t_loc_t[i] == cur {
+                out_loc[0] = 1
+                out_id[0] = st.t_loc_l[i]
+                out_gen[0] = st.t_loc_g[i]
+                << true
+            }
+        }
+        if cur < t_ndef.len && t_ndef[cur] == 1 {
+            dii := t_def_ii[cur]
+            if dii >= 0 && f.instrs[dii].kind == MI_COPY && f.instrs[dii].b >= 0 {
+                cur = f.instrs[dii].b
+                ->
+            }
+        }
+        <-
+    }
+    if cur >= 0 && cur < t_ndef.len && t_ndef[cur] == 1 {
+        out_loc[0] = 0
+        out_id[0] = cur
+        out_gen[0] = 0
+        << true
+    }
+    << false
+}
+
+fn jt_fact_copy(st $&JtState, dst_idx int, src_idx int) {
+    if src_idx < 0 || dst_idx < 0 || src_idx == dst_idx {
+        <<
+    }
+    if st.f_has_lo[src_idx] {
+        v := st.f_lo[src_idx]
+        if !st.f_has_lo[dst_idx] || v > st.f_lo[dst_idx] {
+            st.f_has_lo[dst_idx] = true
+            st.f_lo[dst_idx] = v
+        }
+    }
+    if st.f_has_hi[src_idx] {
+        v := st.f_hi[src_idx]
+        if !st.f_has_hi[dst_idx] || v < st.f_hi[dst_idx] {
+            st.f_has_hi[dst_idx] = true
+            st.f_hi[dst_idx] = v
+        }
+    }
+    if st.f_neq_has[src_idx] {
+        st.f_neq_has[dst_idx] = true
+        st.f_neq_val[dst_idx] = st.f_neq_val[src_idx]
+    }
+}
+
+fn jt_tighten_cmp_idx(st $&JtState, idx int, op int, c int) {
+    if idx < 0 {
+        <<
+    }
+    if op == BIN_EQ {
+        if !st.f_has_lo[idx] || c > st.f_lo[idx] {
+            st.f_has_lo[idx] = true
+            st.f_lo[idx] = c
+        }
+        if !st.f_has_hi[idx] || c < st.f_hi[idx] {
+            st.f_has_hi[idx] = true
+            st.f_hi[idx] = c
+        }
+    } else if op == BIN_NE {
+        st.f_neq_has[idx] = true
+        st.f_neq_val[idx] = c
+    } else if op == BIN_LT {
+        if c > jt_i64_min() {
+            bound := c - 1
+            if !st.f_has_hi[idx] || bound < st.f_hi[idx] {
+                st.f_has_hi[idx] = true
+                st.f_hi[idx] = bound
+            }
+        }
+    } else if op == BIN_LE {
+        if !st.f_has_hi[idx] || c < st.f_hi[idx] {
+            st.f_has_hi[idx] = true
+            st.f_hi[idx] = c
+        }
+    } else if op == BIN_GT {
+        if c < JT_I64_MAX {
+            bound := c + 1
+            if !st.f_has_lo[idx] || bound > st.f_lo[idx] {
+                st.f_has_lo[idx] = true
+                st.f_lo[idx] = bound
+            }
+        }
+    } else if op == BIN_GE {
+        if !st.f_has_lo[idx] || c > st.f_lo[idx] {
+            st.f_has_lo[idx] = true
+            st.f_lo[idx] = c
+        }
+    }
+}
+
+fn jt_tighten_var_cmp(f &MFn, st $&JtState, t_ndef &[]int, t_def_ii &[]int, v int, op int, c int) {
+    if v < 0 {
+        <<
+    }
+    ti := jt_ensure_fact(st, 0, v, 0)
+    jt_tighten_cmp_idx(st, ti, op, c)
+    for i in 0:st.tl_len {
+        if st.t_loc_t[i] == v {
+            l := st.t_loc_l[i]
+            g := st.t_loc_g[i]
+            li := jt_ensure_fact(st, 1, l, g)
+            jt_tighten_cmp_idx(st, li, op, c)
+            <-
+        }
+    }
+    if v < t_ndef.len && t_ndef[v] == 1 {
+        dii := t_def_ii[v]
+        if dii >= 0 && f.instrs[dii].kind == MI_COPY && f.instrs[dii].b >= 0 {
+            sb := f.instrs[dii].b
+            bi := jt_ensure_fact(st, 0, sb, 0)
+            jt_tighten_cmp_idx(st, bi, op, c)
+        }
+    }
+}
+
+fn jt_resolve_exact(f &MFn, st &JtState, t_ndef &[]int, t_def_ii &[]int, v int, out_val $&[]int) bool {
+    if v <= -2 {
+        out_val[0] = jt_cval(f, v)
+        << true
+    }
+    fi := jt_find_fact(st, 0, v, 0)
+    if fi >= 0 && st.f_has_lo[fi] && st.f_has_hi[fi] && st.f_lo[fi] == st.f_hi[fi] {
+        out_val[0] = st.f_lo[fi]
+        << true
+    }
+    if v >= 0 && v < t_ndef.len && t_ndef[v] == 1 {
+        dii := t_def_ii[v]
+        if dii >= 0 {
+            ins := &f.instrs[dii]
+            if ins.kind == MI_COPY && ins.b <= -2 {
+                out_val[0] = jt_cval(f, ins.b)
+                << true
+            }
+        }
+    }
+    for i in 0:st.tl_len {
+        if st.t_loc_t[i] == v {
+            lfi := jt_find_fact(st, 1, st.t_loc_l[i], st.t_loc_g[i])
+            if lfi >= 0 && st.f_has_lo[lfi] && st.f_has_hi[lfi] && st.f_lo[lfi] == st.f_hi[lfi] {
+                out_val[0] = st.f_lo[lfi]
+                << true
+            }
+        }
+    }
+    << false
+}
+
+fn jt_find_var_range(st &JtState, v int) int {
+    if v < 0 { << -1 }
+    fi := jt_find_fact(st, 0, v, 0)
+    if fi >= 0 { << fi }
+    for i in 0:st.tl_len {
+        if st.t_loc_t[i] == v {
+            << jt_find_fact(st, 1, st.t_loc_l[i], st.t_loc_g[i])
+        }
+    }
+    << -1
+}
+
+fn jt_eval_range_cmp(op int, lx int, hx int, nx_has bool, nx_val int, ly int, hy int, ny_has bool, ny_val int) int {
+    if op == BIN_EQ {
+        if lx == hx && ly == hy && lx == ly { << 1 }
+        if hx < ly || hy < lx { << 0 }
+        if ly == hy && nx_has && nx_val == ly { << 0 }
+        if lx == hx && ny_has && ny_val == lx { << 0 }
+        << -1
+    }
+    if op == BIN_NE {
+        sub := jt_eval_range_cmp(BIN_EQ, lx, hx, nx_has, nx_val, ly, hy, ny_has, ny_val)
+        if sub == 1 { << 0 }
+        if sub == 0 { << 1 }
+        << -1
+    }
+    if op == BIN_LT {
+        if hx < ly { << 1 }
+        if lx >= hy { << 0 }
+        << -1
+    }
+    if op == BIN_LE {
+        if hx <= ly { << 1 }
+        if lx > hy { << 0 }
+        << -1
+    }
+    if op == BIN_GT {
+        if lx > hy { << 1 }
+        if hx <= ly { << 0 }
+        << -1
+    }
+    if op == BIN_GE {
+        if lx >= hy { << 1 }
+        if hx < ly { << 0 }
+        << -1
+    }
+    << -1
+}
+
+fn jt_eval_cond(f &MFn, st &JtState, t_ndef &[]int, t_def_ii &[]int, cond int, depth int) int {
+    if depth > 4 { << -1 }
+    $cval := [0]
+    if jt_resolve_exact(f, st, t_ndef, t_def_ii, cond, $&cval) {
+        if cval[0] != 0 { << 1 }
+        << 0
+    }
+    if cond >= 0 {
+        fi := jt_find_var_range(st, cond)
+        if fi >= 0 {
+            if st.f_has_lo[fi] && st.f_lo[fi] > 0 { << 1 }
+            if st.f_has_hi[fi] && st.f_hi[fi] < 0 { << 1 }
+            if st.f_neq_has[fi] && st.f_neq_val[fi] == 0 { << 1 }
+            if st.f_has_lo[fi] && st.f_has_hi[fi] && st.f_lo[fi] == 0 && st.f_hi[fi] == 0 { << 0 }
+        }
+    }
+    if cond < 0 || cond >= t_ndef.len || t_ndef[cond] != 1 {
+        << -1
+    }
+    dii := t_def_ii[cond]
+    if dii < 0 { << -1 }
+    ins := &f.instrs[dii]
+    if ins.kind == MI_COPY {
+        << jt_eval_cond(f, st, t_ndef, t_def_ii, ins.b, depth + 1)
+    }
+    if ins.kind != MI_BIN {
+        << -1
+    }
+    op := ins.b
+    // Handle boolean XOR/EQ-0 inversion.
+    if op == BIN_XOR && ins.d <= -2 && jt_cval(f, ins.d) == 1 {
+        lhs_fi := jt_find_var_range(st, ins.c)
+        if lhs_fi >= 0 && st.f_has_lo[lhs_fi] && st.f_has_hi[lhs_fi] && st.f_lo[lhs_fi] >= 0 && st.f_hi[lhs_fi] <= 1 {
+            sub := jt_eval_cond(f, st, t_ndef, t_def_ii, ins.c, depth + 1)
+            if sub == 1 { << 0 }
+            if sub == 0 { << 1 }
+        }
+    }
+    if !jt_is_int_cmp(op) {
+        if op == BIN_AND {
+            s1 := jt_eval_cond(f, st, t_ndef, t_def_ii, ins.c, depth + 1)
+            if s1 == 0 { << 0 }
+        }
+        << -1
+    }
+    // Try relational fact lookup first (handles non-constant variable pairs).
+    $lloc := [0]
+    $lid := [0]
+    $lgen := [0]
+    $rloc := [0]
+    $rid := [0]
+    $rgen := [0]
+    if jt_canon_operand(f, st, t_ndef, t_def_ii, ins.c, $&lloc, $&lid, $&lgen) &&
+       jt_canon_operand(f, st, t_ndef, t_def_ii, ins.d, $&rloc, $&rid, $&rgen) {
+        if lloc[0] == rloc[0] && lid[0] == rid[0] && lgen[0] == rgen[0] {
+            if op == BIN_EQ || op == BIN_LE || op == BIN_GE { << 1 }
+            << 0
+        }
+        for ri in 0:st.r_len {
+            if st.r_lhs_loc[ri] == lloc[0] && st.r_lhs_id[ri] == lid[0] && st.r_lhs_gen[ri] == lgen[0] &&
+               st.r_rhs_loc[ri] == rloc[0] && st.r_rhs_id[ri] == rid[0] && st.r_rhs_gen[ri] == rgen[0] {
+                imp := jt_rel_implies(st.r_op[ri], st.r_truth[ri], op)
+                if imp >= 0 { << imp }
+            }
+            if st.r_lhs_loc[ri] == rloc[0] && st.r_lhs_id[ri] == rid[0] && st.r_lhs_gen[ri] == rgen[0] &&
+               st.r_rhs_loc[ri] == lloc[0] && st.r_rhs_id[ri] == lid[0] && st.r_rhs_gen[ri] == lgen[0] {
+                imp := jt_rel_implies(st.r_op[ri], st.r_truth[ri], jt_flip_cmp(op))
+                if imp >= 0 { << imp }
+            }
+        }
+    }
+    // Check interval bounds of lhs vs rhs.
+    $lx := jt_i64_min()
+    $hx := JT_I64_MAX
+    $nxh := false
+    $nxv := 0
+    $xv := [0]
+    if jt_resolve_exact(f, st, t_ndef, t_def_ii, ins.c, $&xv) {
+        lx = xv[0]
+        hx = xv[0]
+    } else {
+        xf := jt_find_var_range(st, ins.c)
+        if xf >= 0 {
+            if st.f_has_lo[xf] { lx = st.f_lo[xf] }
+            if st.f_has_hi[xf] { hx = st.f_hi[xf] }
+            nxh = st.f_neq_has[xf]
+            nxv = st.f_neq_val[xf]
+        }
+    }
+    $ly := jt_i64_min()
+    $hy := JT_I64_MAX
+    $nyh := false
+    $nyv := 0
+    $yv := [0]
+    if jt_resolve_exact(f, st, t_ndef, t_def_ii, ins.d, $&yv) {
+        ly = yv[0]
+        hy = yv[0]
+    } else {
+        yf := jt_find_var_range(st, ins.d)
+        if yf >= 0 {
+            if st.f_has_lo[yf] { ly = st.f_lo[yf] }
+            if st.f_has_hi[yf] { hy = st.f_hi[yf] }
+            nyh = st.f_neq_has[yf]
+            nyv = st.f_neq_val[yf]
+        }
+    }
+    << jt_eval_range_cmp(op, lx, hx, nxh, nxv, ly, hy, nyh, nyv)
+}
+
+fn jt_record_pred(f &MFn, st $&JtState, t_ndef &[]int, t_def_ii &[]int, cond int, truth bool, depth int) {
+    if depth > 4 || cond < 0 {
+        <<
+    }
+    if truth {
+        jt_tighten_var_cmp(f, st, t_ndef, t_def_ii, cond, BIN_NE, 0)
+    } else {
+        jt_tighten_var_cmp(f, st, t_ndef, t_def_ii, cond, BIN_EQ, 0)
+    }
+    if cond >= t_ndef.len || t_ndef[cond] != 1 {
+        <<
+    }
+    dii := t_def_ii[cond]
+    if dii < 0 { << }
+    ins := &f.instrs[dii]
+    if ins.kind == MI_COPY {
+        jt_record_pred(f, st, t_ndef, t_def_ii, ins.b, truth, depth + 1)
+        <<
+    }
+    if ins.kind != MI_BIN { << }
+    op := ins.b
+    if op == BIN_AND && truth {
+        jt_record_pred(f, st, t_ndef, t_def_ii, ins.c, true, depth + 1)
+        jt_record_pred(f, st, t_ndef, t_def_ii, ins.d, true, depth + 1)
+        <<
+    }
+    if op == BIN_OR && !truth {
+        jt_record_pred(f, st, t_ndef, t_def_ii, ins.c, false, depth + 1)
+        jt_record_pred(f, st, t_ndef, t_def_ii, ins.d, false, depth + 1)
+        <<
+    }
+    if op == BIN_XOR && ins.d <= -2 && jt_cval(f, ins.d) == 1 {
+        // Sound inversion for bool cmp values or comparison conditions [0,1].
+        if ins.c >= 0 && ins.c < t_ndef.len && t_ndef[ins.c] == 1 {
+            cii := t_def_ii[ins.c]
+            if cii >= 0 && f.instrs[cii].kind == MI_BIN && jt_is_int_cmp(f.instrs[cii].b) {
+                jt_record_pred(f, st, t_ndef, t_def_ii, ins.c, !truth, depth + 1)
+            }
+        }
+        <<
+    }
+    if !jt_is_int_cmp(op) {
+        <<
+    }
+    // Check eq/ne zero as recursive condition inversion for boolean cmp results.
+    if (op == BIN_EQ || op == BIN_NE) && ins.d <= -2 && jt_cval(f, ins.d) == 0 {
+        $sub_truth := truth
+        if op == BIN_EQ { sub_truth = !truth }
+        if ins.c >= 0 && ins.c < t_ndef.len && t_ndef[ins.c] == 1 {
+            cii := t_def_ii[ins.c]
+            if cii >= 0 && f.instrs[cii].kind == MI_BIN && jt_is_int_cmp(f.instrs[cii].b) {
+                jt_record_pred(f, st, t_ndef, t_def_ii, ins.c, sub_truth, depth + 1)
+            }
+        }
+    }
+    $eff_op := op
+    if !truth { eff_op = jt_invert_cmp(op) }
+    $cv := [0]
+    if jt_resolve_exact(f, st, t_ndef, t_def_ii, ins.d, $&cv) {
+        jt_tighten_var_cmp(f, st, t_ndef, t_def_ii, ins.c, eff_op, cv[0])
+    } else if jt_resolve_exact(f, st, t_ndef, t_def_ii, ins.c, $&cv) {
+        jt_tighten_var_cmp(f, st, t_ndef, t_def_ii, ins.d, jt_flip_cmp(eff_op), cv[0])
+    } else if st.r_len < JT_MAX_RELS {
+        $lloc := [0]
+        $lid := [0]
+        $lgen := [0]
+        $rloc := [0]
+        $rid := [0]
+        $rgen := [0]
+        if jt_canon_operand(f, st, t_ndef, t_def_ii, ins.c, $&lloc, $&lid, $&lgen) &&
+           jt_canon_operand(f, st, t_ndef, t_def_ii, ins.d, $&rloc, $&rid, $&rgen) {
+            rk := st.r_len
+            st.r_op[rk] = op
+            st.r_lhs_loc[rk] = lloc[0]
+            st.r_lhs_id[rk] = lid[0]
+            st.r_lhs_gen[rk] = lgen[0]
+            st.r_rhs_loc[rk] = rloc[0]
+            st.r_rhs_id[rk] = rid[0]
+            st.r_rhs_gen[rk] = rgen[0]
+            st.r_truth[rk] = truth
+            st.r_len = rk + 1
+        }
+    }
+}
+
+fn jt_reset_temp(st $&JtState, t int) {
+    if t < 0 { << }
+    fi := jt_find_fact(st, 0, t, 0)
+    if fi >= 0 {
+        st.f_has_lo[fi] = false
+        st.f_has_hi[fi] = false
+        st.f_neq_has[fi] = false
+    }
+    for i in 0:st.tl_len {
+        if st.t_loc_t[i] == t {
+            st.t_loc_t[i] = -1
+        }
+    }
+    for ri in 0:st.r_len {
+        if (st.r_lhs_loc[ri] == 0 && st.r_lhs_id[ri] == t) ||
+           (st.r_rhs_loc[ri] == 0 && st.r_rhs_id[ri] == t) {
+            st.r_op[ri] = -1
+        }
+    }
+}
+
+fn jt_step_block_instrs(f &MFn, st $&JtState, t_ndef &[]int, t_def_ii &[]int, local_safe &[]bool, nl int, bi int) {
+    $ii := f.blocks[bi].head
+    while ii >= 0 {
+        ins := &f.instrs[ii]
+        k := ins.kind
+        if jt_defines(k) && ins.a >= 0 {
+            jt_reset_temp(st, ins.a)
+        }
+        if k == MI_STORE_LOCAL && ins.c == 0 && ins.a >= 0 && ins.a < nl && local_safe[ins.a] {
+            l := ins.a
+            src := ins.b
+            ng := jt_bump_loc(st, l, src)
+            $sv := [0]
+            if jt_resolve_exact(f, st, t_ndef, t_def_ii, src, $&sv) {
+                li := jt_ensure_fact(st, 1, l, ng)
+                jt_tighten_cmp_idx(st, li, BIN_EQ, sv[0])
+            } else if src >= 0 {
+                sfi := jt_find_var_range(st, src)
+                if sfi >= 0 {
+                    li := jt_ensure_fact(st, 1, l, ng)
+                    jt_fact_copy(st, li, sfi)
+                }
+            }
+        } else if k == MI_LOAD_LOCAL && ins.c == 0 && ins.b >= 0 && ins.b < nl && local_safe[ins.b] && ins.a >= 0 {
+            g := jt_get_loc_gen(st, ins.b)
+            jt_record_t_loc(st, ins.a, ins.b, g)
+            lfi := jt_find_fact(st, 1, ins.b, g)
+            if lfi >= 0 {
+                ti := jt_ensure_fact(st, 0, ins.a, 0)
+                jt_fact_copy(st, ti, lfi)
+            }
+        } else if k == MI_COPY && ins.a >= 0 {
+            $cv := [0]
+            if jt_resolve_exact(f, st, t_ndef, t_def_ii, ins.b, $&cv) {
+                ti := jt_ensure_fact(st, 0, ins.a, 0)
+                jt_tighten_cmp_idx(st, ti, BIN_EQ, cv[0])
+            } else if ins.b >= 0 {
+                sfi := jt_find_var_range(st, ins.b)
+                if sfi >= 0 {
+                    ti := jt_ensure_fact(st, 0, ins.a, 0)
+                    jt_fact_copy(st, ti, sfi)
+                }
+            }
+        } else if k == MI_BIN && ins.a >= 0 {
+            if jt_is_int_cmp(ins.b) {
+                ti := jt_ensure_fact(st, 0, ins.a, 0)
+                if ti >= 0 {
+                    if !st.f_has_lo[ti] || 0 > st.f_lo[ti] {
+                        st.f_has_lo[ti] = true
+                        st.f_lo[ti] = 0
+                    }
+                    if !st.f_has_hi[ti] || 1 < st.f_hi[ti] {
+                        st.f_has_hi[ti] = true
+                        st.f_hi[ti] = 1
+                    }
+                }
+                res := jt_eval_cond(f, st, t_ndef, t_def_ii, ins.a, 0)
+                if res >= 0 && ti >= 0 {
+                    jt_tighten_cmp_idx(st, ti, BIN_EQ, res)
+                }
+            } else {
+                // Propagate simple constant arithmetic if both sides known.
+                $xv := [0]
+                $yv := [0]
+                if jt_resolve_exact(f, st, t_ndef, t_def_ii, ins.c, $&xv) &&
+                   jt_resolve_exact(f, st, t_ndef, t_def_ii, ins.d, $&yv) {
+                    $ok := [false]
+                    r := fold_bin(ins.b, xv[0], yv[0], $&ok)
+                    if ok[0] {
+                        ti := jt_ensure_fact(st, 0, ins.a, 0)
+                        jt_tighten_cmp_idx(st, ti, BIN_EQ, r)
+                    }
+                }
+            }
+        }
+        ii = ins.next
+    }
+}
+
+fn jt_intersect(idom &[]int, rpo_num &[]int, b1 int, b2 int) int {
+    $f1 := b1
+    $f2 := b2
+    $steps := 0
+    $lim := idom.len * 2 + 4
+    while f1 != f2 && steps < lim {
+        while rpo_num[f1] > rpo_num[f2] && steps < lim {
+            f1 = idom[f1]
+            steps += 1
+        }
+        while rpo_num[f2] > rpo_num[f1] && steps < lim {
+            f2 = idom[f2]
+            steps += 1
+        }
+    }
+    << f1
+}
+
+fn jt_dominates(idom &[]int, rpo_num &[]int, d int, u int) bool {
+    if d == u { << true }
+    if d < 0 || u < 0 || d >= idom.len || u >= idom.len { << false }
+    if rpo_num[d] < 0 || rpo_num[u] < 0 || rpo_num[d] > rpo_num[u] { << false }
+    $cur := u
+    $steps := 0
+    while cur > 0 && cur != d && steps < idom.len {
+        if rpo_num[cur] <= rpo_num[d] { << false }
+        cur = idom[cur]
+        steps += 1
+    }
+    << cur == d
+}
+
+fn jt_append_cloned_instrs(f $&MFn, src_b int, to_b int) bool {
+    // Only clone blocks with tiny safe sequences whose temps are dead outside src_b.
+    $orig_t := []int{}
+    $new_t := []int{}
+    $ii := f.blocks[src_b].head
+    while ii >= 0 {
+        ins := &f.instrs[ii]
+        if ins.kind != MI_NOP {
+            $a := ins.a
+            $b := ins.b
+            $c := ins.c
+            $d := ins.d
+            for ti in 0:orig_t.len {
+                if ins.kind == MI_COPY || ins.kind == MI_LOAD_PTR {
+                    if b == orig_t[ti] { b = new_t[ti] }
+                } else if ins.kind == MI_STORE_LOCAL {
+                    if b == orig_t[ti] { b = new_t[ti] }
+                } else if ins.kind == MI_UN {
+                    if c == orig_t[ti] { c = new_t[ti] }
+                } else if ins.kind == MI_BIN {
+                    if c == orig_t[ti] { c = new_t[ti] }
+                    if d == orig_t[ti] { d = new_t[ti] }
+                } else if ins.kind == MI_SELECT {
+                    if b == orig_t[ti] { b = new_t[ti] }
+                    if c == orig_t[ti] { c = new_t[ti] }
+                    if d == orig_t[ti] { d = new_t[ti] }
+                }
+            }
+            if jt_defines(ins.kind) && ins.a >= 0 {
+                nt_id := f.temps.len
+                f.temps.push(0)
+                f.temps_nslots.push(1)
+                orig_t.push(ins.a)
+                new_t.push(nt_id)
+                a = nt_id
+            }
+            $ni := minstr_new(ins.kind)
+            ni.a = a
+            ni.b = b
+            ni.c = c
+            ni.d = d
+            ni.line = ins.line
+            ni.col = ins.col
+            ni.file = ins.file
+            ni.scope_id = ins.scope_id
+            idx := f.instrs.len
+            f.instrs.push(ni)
+            if f.blocks[to_b].head < 0 {
+                f.blocks[to_b].head = idx
+                f.blocks[to_b].tail = idx
+            } else {
+                prev_tail := f.blocks[to_b].tail
+                f.instrs[prev_tail].next = idx
+                f.blocks[to_b].tail = idx
+            }
+        }
+        ii = ins.next
+    }
+    << true
+}
+
+pub fn opt_jump_thread(f $&MFn) bool {
+    nb0 := f.blocks.len
+    if nb0 <= 1 || nb0 > 2000 || f.instrs.len > 30000 {
+        << false
+    }
+    $any_changed := false
+    $st := jt_state_new()
+    $splits_done := 0
+
+    for _ in 0:6 {
+        nb := f.blocks.len
+        nt := f.temps.len
+        nl := f.locals.len
+        $reach := []bool{}
+        $rpo_num := []int{}
+        $in_deg := []int{}
+        $idom := []int{}
+        for _ in 0:nb {
+            reach.push(false)
+            rpo_num.push(-1)
+            in_deg.push(0)
+            idom.push(-1)
+        }
+
+        // Compute RPO reachable from block 0 iteratively without .pop().
+        $dfs_b := [0]
+        $dfs_s := [0]
+        $dfs_len := 1
+        reach[0] = true
+        $post := []int{}
+        while dfs_len > 0 {
+            top := dfs_len - 1
+            cb := dfs_b[top]
+            cs := dfs_s[top]
+            blk := &f.blocks[cb]
+            $nxt := -1
+            if blk.tkind == TKIND_JUMP {
+                if cs == 0 && blk.ta >= 0 && blk.ta < nb {
+                    nxt = blk.ta
+                }
+                dfs_s[top] = 2
+            } else if blk.tkind == TKIND_BRANCH {
+                if cs == 0 {
+                    dfs_s[top] = 1
+                    if blk.tb >= 0 && blk.tb < nb {
+                        nxt = blk.tb
+                    }
+                } else if cs == 1 {
+                    dfs_s[top] = 2
+                    if blk.tc >= 0 && blk.tc < nb && blk.tc != blk.tb {
+                        nxt = blk.tc
+                    }
+                }
+            } else {
+                dfs_s[top] = 2
+            }
+            if nxt >= 0 && !reach[nxt] {
+                reach[nxt] = true
+                if dfs_len < dfs_b.len {
+                    dfs_b[dfs_len] = nxt
+                    dfs_s[dfs_len] = 0
+                } else {
+                    dfs_b.push(nxt)
+                    dfs_s.push(0)
+                }
+                dfs_len += 1
+            } else if dfs_s[top] >= 2 {
+                dfs_len -= 1
+                post.push(cb)
+            }
+        }
+        $rpo := []int{}
+        $pi := post.len - 1
+        while pi >= 0 {
+            b := post[pi]
+            rpo_num[b] = rpo.len
+            rpo.push(b)
+            pi -= 1
+        }
+
+        // Build predecessor CSR list for reachable edges.
+        for bi in 0:nb {
+            if !reach[bi] { -> }
+            blk := &f.blocks[bi]
+            if blk.tkind == TKIND_JUMP && blk.ta >= 0 && blk.ta < nb {
+                in_deg[blk.ta] = in_deg[blk.ta] + 1
+            } else if blk.tkind == TKIND_BRANCH {
+                if blk.tb >= 0 && blk.tb < nb {
+                    in_deg[blk.tb] = in_deg[blk.tb] + 1
+                }
+                if blk.tc >= 0 && blk.tc < nb && blk.tc != blk.tb {
+                    in_deg[blk.tc] = in_deg[blk.tc] + 1
+                }
+            }
+        }
+        $pred_head := []int{}
+        $pred_pos := []int{}
+        $total_edges := 0
+        for bi in 0:nb {
+            pred_head.push(total_edges)
+            pred_pos.push(total_edges)
+            total_edges += in_deg[bi]
+        }
+        pred_head.push(total_edges)
+        $pred_src := []int{}
+        for _ in 0:total_edges {
+            pred_src.push(-1)
+        }
+        for bi in 0:nb {
+            if !reach[bi] { -> }
+            blk := &f.blocks[bi]
+            if blk.tkind == TKIND_JUMP && blk.ta >= 0 && blk.ta < nb {
+                tgt := blk.ta
+                pos := pred_pos[tgt]
+                pred_src[pos] = bi
+                pred_pos[tgt] = pos + 1
+            } else if blk.tkind == TKIND_BRANCH {
+                if blk.tb >= 0 && blk.tb < nb {
+                    tgt := blk.tb
+                    pos := pred_pos[tgt]
+                    pred_src[pos] = bi
+                    pred_pos[tgt] = pos + 1
+                }
+                if blk.tc >= 0 && blk.tc < nb && blk.tc != blk.tb {
+                    tgt := blk.tc
+                    pos := pred_pos[tgt]
+                    pred_src[pos] = bi
+                    pred_pos[tgt] = pos + 1
+                }
+            }
+        }
+
+        // Cooper-Harvey-Kennedy immediate dominators.
+        idom[0] = 0
+        $dom_ch := true
+        $dit := 0
+        while dom_ch && dit < 32 {
+            dom_ch = false
+            dit += 1
+            for ri in 1:rpo.len {
+                b := rpo[ri]
+                $new_idom := -1
+                $ps := pred_head[b]
+                $pe := pred_head[b + 1]
+                for pj in ps:pe {
+                    p := pred_src[pj]
+                    if idom[p] >= 0 {
+                        if new_idom < 0 {
+                            new_idom = p
+                        } else {
+                            new_idom = jt_intersect(&idom, &rpo_num, p, new_idom)
+                        }
+                    }
+                }
+                if new_idom >= 0 && idom[b] != new_idom {
+                    idom[b] = new_idom
+                    dom_ch = true
+                }
+            }
+        }
+
+        // Temp defs/uses and safe scalar locals.
+        $ub := []int{}
+        $t_ndef := []int{}
+        $t_def_ii := []int{}
+        for _ in 0:nt {
+            ub.push(-1)
+            t_ndef.push(0)
+            t_def_ii.push(-1)
+        }
+        $l_bad := []bool{}
+        $l_nstores := []int{}
+        for _ in 0:nl {
+            l_bad.push(false)
+            l_nstores.push(0)
+        }
+        jt_scan_uses(f, $&ub, $&t_ndef, $&t_def_ii, $&l_bad, $&l_nstores)
+        $local_safe := []bool{}
+        for li in 0:nl {
+            local_safe.push(!l_bad[li])
+        }
+
+        // Inspect candidate conditional merge/guard blocks.
+        $round_changed := false
+        $rewire_p := []int{}
+        $rewire_arm := []int{}
+        $rewire_b := []int{}
+        $rewire_s := []int{}
+        $rewire_clone := []bool{}
+
+        for bi in 1:nb {
+            if !reach[bi] || f.blocks[bi].tkind != TKIND_BRANCH { -> }
+            b_true := f.blocks[bi].tb
+            b_false := f.blocks[bi].tc
+            if b_true < 0 || b_false < 0 || b_true == b_false { -> }
+
+            // Check block B instructions: tiny, no side-effects beyond optional safe local store,
+            // and NO temp defined in B is used outside B.
+            $n_instrs := 0
+            $pure_only := true
+            $can_thread := true
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind != MI_NOP {
+                    n_instrs += 1
+                    if !jt_safe_clone(ins, &local_safe, nl) {
+                        can_thread = false
+                        <-
+                    }
+                    if !jt_safe_pure(ins) {
+                        pure_only = false
+                    }
+                    if jt_defines(ins.kind) && ins.a >= 0 && ins.a < nt {
+                        if ub[ins.a] != -1 && ub[ins.a] != bi {
+                            can_thread = false
+                            <-
+                        }
+                    }
+                }
+                ii = ins.next
+            }
+            if !can_thread { -> }
+            if pure_only && n_instrs > 8 { -> }
+            if !pure_only && n_instrs > JT_MAX_CLONE_JUMP { -> }
+
+            // Evaluate every incoming edge P -> bi.
+            $ps := pred_head[bi]
+            $pe := pred_head[bi + 1]
+            for pj in ps:pe {
+                p := pred_src[pj]
+                if p < 0 || p == bi { -> }
+                is_backedge := jt_dominates(&idom, &rpo_num, bi, p)
+                // For non-pure cloning, never peel loop headers (bi dominates p).
+                if !pure_only && is_backedge { -> }
+
+                jt_state_clear($&st)
+
+                // Collect unique-predecessor chain ending at p (oldest first), stopping before bi.
+                $chain := [p]
+                $cur := p
+                while in_deg[cur] == 1 && cur > 0 && chain.len < JT_MAX_CHAIN {
+                    cpred := pred_src[pred_head[cur]]
+                    if cpred == bi || (is_backedge && !jt_dominates(&idom, &rpo_num, bi, cpred)) { <- }
+                    $cyc := false
+                    for ci in 0:chain.len {
+                        if chain[ci] == cpred {
+                            cyc = true
+                            <-
+                        }
+                    }
+                    if cyc { <- }
+                    chain.push(cpred)
+                    cur = cpred
+                }
+                top_anc := chain[chain.len - 1]
+
+                // Add dominating single-pred branch facts strictly above top_anc (read-only temps / const locals).
+                $dom_edges_src := []int{}
+                $dom_edges_dir := []bool{}
+                $dc := idom[top_anc]
+                $ddepth := 0
+                while dc >= 0 && ddepth < 4 {
+                    if dc == bi || (is_backedge && !jt_dominates(&idom, &rpo_num, bi, dc)) { <- }
+                    dblk := &f.blocks[dc]
+                    if dblk.tkind == TKIND_BRANCH && dblk.tb >= 0 && dblk.tc >= 0 && dblk.tb != dblk.tc {
+                        if in_deg[dblk.tb] == 1 && jt_dominates(&idom, &rpo_num, dblk.tb, top_anc) {
+                            dom_edges_src.push(dc)
+                            dom_edges_dir.push(true)
+                        } else if in_deg[dblk.tc] == 1 && jt_dominates(&idom, &rpo_num, dblk.tc, top_anc) {
+                            dom_edges_src.push(dc)
+                            dom_edges_dir.push(false)
+                        }
+                    }
+                    if dc == 0 { <- }
+                    dc = idom[dc]
+                    ddepth += 1
+                }
+                // Replay dominating edges from outermost down cleanly for read-only locals and SSA temps.
+                $di := dom_edges_src.len - 1
+                while di >= 0 {
+                    dblk_i := dom_edges_src[di]
+                    // Step read-only MI_LOAD_LOCAL provenance cleanly from dblk_i.
+                    $dii := f.blocks[dblk_i].head
+                    while dii >= 0 {
+                        dins := &f.instrs[dii]
+                        if dins.kind == MI_LOAD_LOCAL && dins.c == 0 && dins.b >= 0 && dins.b < nl && local_safe[dins.b] && l_nstores[dins.b] == 0 && dins.a >= 0 {
+                            jt_record_t_loc($&st, dins.a, dins.b, 0)
+                        }
+                        dii = dins.next
+                    }
+                    jt_record_pred(f, $&st, &t_ndef, &t_def_ii, f.blocks[dblk_i].ta, dom_edges_dir[di], 0)
+                    di -= 1
+                }
+
+                // Step concrete linear chain from top_anc down to p -> bi.
+                $ci := chain.len - 1
+                while ci >= 0 {
+                    anc := chain[ci]
+                    jt_step_block_instrs(f, $&st, &t_ndef, &t_def_ii, &local_safe, nl, anc)
+                    $nxt_blk := bi
+                    if ci > 0 { nxt_blk = chain[ci - 1] }
+                    ablk := &f.blocks[anc]
+                    if ablk.tkind == TKIND_BRANCH && ablk.tb >= 0 && ablk.tc >= 0 && ablk.tb != ablk.tc {
+                        jt_record_pred(f, $&st, &t_ndef, &t_def_ii, ablk.ta, ablk.tb == nxt_blk, 0)
+                    }
+                    ci -= 1
+                }
+
+                // Evaluate candidate block B along this incoming edge.
+                jt_step_block_instrs(f, $&st, &t_ndef, &t_def_ii, &local_safe, nl, bi)
+                dir := jt_eval_cond(f, &st, &t_ndef, &t_def_ii, f.blocks[bi].ta, 0)
+                if dir >= 0 {
+                    $succ := b_true
+                    if dir == 0 { succ = b_false }
+                    if succ != bi {
+                        $arm := 0
+                        if f.blocks[p].tkind == TKIND_BRANCH {
+                            if f.blocks[p].tb == bi { arm = 1 }
+                            else if f.blocks[p].tc == bi { arm = 2 }
+                        }
+                        if pure_only {
+                            rewire_p.push(p)
+                            rewire_arm.push(arm)
+                            rewire_b.push(bi)
+                            rewire_s.push(succ)
+                            rewire_clone.push(false)
+                        } else if f.blocks[p].tkind == TKIND_JUMP || (n_instrs <= JT_MAX_CLONE_SPLIT && splits_done < JT_MAX_SPLITS_PER_FN) {
+                            rewire_p.push(p)
+                            rewire_arm.push(arm)
+                            rewire_b.push(bi)
+                            rewire_s.push(succ)
+                            rewire_clone.push(true)
+                            if f.blocks[p].tkind != TKIND_JUMP {
+                                splits_done += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply queued edge rewrites cleanly per specific outgoing arm.
+        for ri in 0:rewire_p.len {
+            p := rewire_p[ri]
+            arm := rewire_arm[ri]
+            bi := rewire_b[ri]
+            succ := rewire_s[ri]
+            do_clone := rewire_clone[ri]
+            if !do_clone {
+                if arm == 0 && f.blocks[p].tkind == TKIND_JUMP && f.blocks[p].ta == bi {
+                    f.blocks[p].ta = succ
+                    round_changed = true
+                } else if f.blocks[p].tkind == TKIND_BRANCH {
+                    if arm == 1 && f.blocks[p].tb == bi {
+                        f.blocks[p].tb = succ
+                        round_changed = true
+                    } else if arm == 2 && f.blocks[p].tc == bi {
+                        f.blocks[p].tc = succ
+                        round_changed = true
+                    }
+                }
+            } else if arm == 0 && f.blocks[p].tkind == TKIND_JUMP && f.blocks[p].ta == bi {
+                jt_append_cloned_instrs(f, bi, p)
+                f.blocks[p].ta = succ
+                round_changed = true
+            } else if f.blocks[p].tkind == TKIND_BRANCH && ((arm == 1 && f.blocks[p].tb == bi) || (arm == 2 && f.blocks[p].tc == bi)) {
+                $tramp := mblock_new()
+                tramp.tkind = TKIND_JUMP
+                tramp.ta = succ
+                tramp.line = f.blocks[bi].line
+                tid := f.blocks.len
+                f.blocks.push(tramp)
+                jt_append_cloned_instrs(f, bi, tid)
+                if arm == 1 { f.blocks[p].tb = tid }
+                else { f.blocks[p].tc = tid }
+                round_changed = true
+            }
+        }
+
+        if !round_changed {
+            <-
+        }
+        any_changed = true
+    }
+    << any_changed
+}
