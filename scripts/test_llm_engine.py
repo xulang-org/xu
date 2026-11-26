@@ -150,7 +150,7 @@ def pack_gguf_str(s):
     return struct.pack("<Q", len(b)) + b
 
 
-def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_output=False):
+def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_output=False, encode_dense=None):
     dim = cfg["dim"]
     hidden = cfg["hidden_dim"]
     n_layers = cfg["n_layers"]
@@ -200,6 +200,10 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         raw = struct.pack(f"<{len(vals)}f", *vals)
         tensor_specs.append((gname, dims, 0, raw))
 
+    def add_dense(gname, dims, vals):
+        code, raw = encode_dense(gname, dims, vals)
+        tensor_specs.append((gname, dims, code, raw))
+
     def add_q4(gname, dims, vals):
         raw, qs, sc = quantize_q4_0_matrix(vals)
         tensor_specs.append((gname, dims, 2, raw))
@@ -209,6 +213,11 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         raw, qs, sc = quantize_q8_0_matrix(vals)
         tensor_specs.append((gname, dims, 8, raw))
         q8_data[gname] = (qs, sc)
+
+    if encode_dense is not None:
+        add_f32 = add_dense
+        add_q4 = add_dense
+        add_q8 = add_dense
 
     if qwen_mode or tied_output:
         add_q4("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
@@ -247,6 +256,7 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
 
     payload = bytearray()
     for tname, dims, gtype, raw in tensor_specs:
+        payload.extend(b"\x00" * (-len(payload) % 32))
         off = len(payload)
         payload.extend(raw)
         buf.extend(pack_gguf_str(tname))

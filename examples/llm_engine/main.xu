@@ -6,6 +6,7 @@
 #strconv
 #errors
 #encoding/json
+#tensor
 
 const RMS_CAP = 2048
 const KV_BLOCK_SIZE = 16
@@ -18,6 +19,8 @@ const GGML_TYPE_F32 = 0
 const GGML_TYPE_F16 = 1
 const GGML_TYPE_Q4_0 = 2
 const GGML_TYPE_Q8_0 = 8
+const GGML_TYPE_BF16 = 30
+const GGML_TYPE_F8_E4M3 = 43
 
 struct ModelConfig {
     dim int
@@ -47,6 +50,7 @@ struct Model {
     lm_head_p4 bool
     has_qkv_bias bool
     weights []f32
+    compact_weights CompactWeights
     q4_qs []u8
     q4_scales []f32
     q8_qs []i8
@@ -76,6 +80,17 @@ struct Model {
     vocab []string
 }
 
+// Nonnegative matrix offsets index the f32 arena. Negative offsets encode
+// -1 minus the index of a matrix in the compact arena.
+struct CompactWeights {
+    data string
+    views []tensor.TensorView
+}
+
+fn empty_compact_weights() CompactWeights {
+    << CompactWeights{data: "", views: []tensor.TensorView{}}
+}
+
 struct PagedKvCache {
     max_slots int
     num_blocks int
@@ -85,6 +100,13 @@ struct PagedKvCache {
     layer_stride int
     block_stride int
     kv_dim int
+    dtype tensor.DType
+    storage_width int
+    storage_bytes int
+    compact_k16 []u16
+    compact_v16 []u16
+    compact_k8 []u8
+    compact_v8 []u8
     k_blocks []f32
     v_blocks []f32
     free_stack []int
@@ -191,33 +213,18 @@ fn read_u32_le(buf &string, off int) int {
     << buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)
 }
 
+fn append_f32_segment(data &string, start int, count int, out $&[]f32) {
+    for i in 0:count {
+        out.push(from_bits(read_u32_le(data, start + 4 * i)))
+    }
+}
+
 fn read_u64_le(buf &string, off int) int {
     $v := 0
     for i in 0:8 {
         v = v | (buf[off + i] << (i * 8))
     }
     << v
-}
-
-fn f16_to_f32(h int) f32 {
-    s := (h & 0x8000) << 16
-    e := (h >> 10) & 0x1F
-    m := h & 0x3FF
-    if e == 0 {
-        if m == 0 { << from_bits(s) }
-        $mv := m
-        $eb := 113
-        while (mv & 0x400) == 0 {
-            mv = mv << 1
-            eb -= 1
-        }
-        mv = mv & 0x3FF
-        << from_bits(s | (eb << 23) | (mv << 13))
-    }
-    if e == 31 {
-        << from_bits(s | 0x7F800000 | (m << 13))
-    }
-    << from_bits(s | ((e + 112) << 23) | (m << 13))
 }
 
 fn gguf_starts_with(s &string, prefix string) bool {
@@ -432,63 +439,61 @@ fn find_gguf_tensor(tensors &[]GgufTensorInfo, name string) int {
     << -1
 }
 
+fn gguf_dense_dtype(gtype int) tensor.DType {
+    if gtype == GGML_TYPE_F32 { << tensor.dtype_f32() }
+    if gtype == GGML_TYPE_F16 { << tensor.dtype_f16() }
+    if gtype == GGML_TYPE_BF16 { << tensor.dtype_bf16() }
+    if gtype == GGML_TYPE_F8_E4M3 { << tensor.dtype_fp8_e4m3fn() }
+    >> errors.new("unsupported ggml dense type: " + str(gtype))
+}
+
+fn gguf_tensor_start(data_base int, info &GgufTensorInfo) int {
+    if data_base < 0 || info.offset < 0 || info.offset > 9223372036854775807 - data_base {
+        >> errors.new("gguf tensor offset out of range: " + info.name)
+    }
+    << data_base + info.offset
+}
+
 fn gguf_stream_f32_into(f &os.File, data_base int, info &GgufTensorInfo, expected int, out $&[]f32) int {
-    if info.n_elems != expected {
+    if info.n_elems != expected || expected < 0 {
         >> errors.new("gguf tensor length mismatch for " + info.name)
     }
-    _ := f.seek(data_base + info.offset, os.SEEK_SET) or >>
-    if info.gtype == GGML_TYPE_F32 {
-        chunk := read_exact(f, expected * 4) or >>
-        $pos := 0
-        for _ in 0:expected {
-            out.push(from_bits(read_u32_le(&chunk, pos)))
-            pos += 4
+    start := gguf_tensor_start(data_base, info) or >>
+    _ := f.seek(start, os.SEEK_SET) or >>
+    if info.gtype == GGML_TYPE_Q4_0 || info.gtype == GGML_TYPE_Q8_0 {
+        if expected % tensor.GGML_BLOCK_VALUES != 0 {
+            >> errors.new("gguf length not a multiple of the quantization block: " + info.name)
         }
-        << 0
-    } else if info.gtype == GGML_TYPE_F16 {
-        chunk := read_exact(f, expected * 2) or >>
-        $pos := 0
-        for _ in 0:expected {
-            out.push(f16_to_f32(read_u16_le(&chunk, pos)))
-            pos += 2
-        }
-        << 0
-    } else if info.gtype == GGML_TYPE_Q4_0 {
-        if expected % 32 != 0 { >> errors.new("q4_0 length not multiple of 32: " + info.name) }
-        nb := expected / 32
-        chunk := read_exact(f, nb * 18) or >>
-        $pos := 0
-        for _ in 0:nb {
-            d := f16_to_f32(read_u16_le(&chunk, pos))
-            for _ in 0:32 { out.push(f32(0)) }
-            base_out := out.len - 32
-            for j in 0:16 {
-                qb := chunk[pos + 2 + j]
-                q0 := (qb & 15) - 8
-                q1 := (qb >> 4) - 8
-                out[base_out + j] = f32(q0) * d
-                out[base_out + 16 + j] = f32(q1) * d
+        blocks := expected / tensor.GGML_BLOCK_VALUES
+        if info.gtype == GGML_TYPE_Q4_0 {
+            length := checked_size_product(blocks, tensor.Q4_0_BYTES) or >>
+            chunk := read_exact(f, length) or >>
+            for i in 0:blocks {
+                block := tensor.read_q4_0(&chunk, i * tensor.Q4_0_BYTES) or >>
+                block.append_f32(out)
             }
-            pos += 18
-        }
-        << 0
-    } else if info.gtype == GGML_TYPE_Q8_0 {
-        if expected % 32 != 0 { >> errors.new("q8_0 length not multiple of 32: " + info.name) }
-        nb := expected / 32
-        chunk := read_exact(f, nb * 34) or >>
-        $pos := 0
-        for _ in 0:nb {
-            d := f16_to_f32(read_u16_le(&chunk, pos))
-            for j in 0:32 {
-                $qv := chunk[pos + 2 + j]
-                if qv >= 128 { qv -= 256 }
-                out.push(f32(qv) * d)
+        } else {
+            length := checked_size_product(blocks, tensor.Q8_0_BYTES) or >>
+            chunk := read_exact(f, length) or >>
+            for i in 0:blocks {
+                block := tensor.read_q8_0(&chunk, i * tensor.Q8_0_BYTES) or >>
+                block.append_f32(out)
             }
-            pos += 34
         }
         << 0
     }
-    >> errors.new("unsupported ggml type for f32 tensor " + info.name)
+
+    dtype := gguf_dense_dtype(info.gtype) or >>
+    length := checked_size_product(expected, dtype.element_bytes()) or >>
+    chunk := read_exact(f, length) or >>
+    if dtype.is_f32() {
+        append_f32_segment(&chunk, 0, expected, out)
+        << 0
+    }
+    shape := [expected]
+    view := tensor.contiguous_view(dtype, &shape, 0, chunk.len) or >>
+    _ := view.append_f32(&chunk, out) or >>
+    << 0
 }
 
 fn gguf_stream_f32_slice(f &os.File, data_base int, info &GgufTensorInfo, expected int) []f32 {
@@ -498,13 +503,24 @@ fn gguf_stream_f32_slice(f &os.File, data_base int, info &GgufTensorInfo, expect
     << out
 }
 
-fn gguf_stream_f32_compat(f &os.File, data_base int, info &GgufTensorInfo, expected int, arena $&[]f32) int {
-    if info.gtype != GGML_TYPE_F32 && info.gtype != GGML_TYPE_F16 {
-        >> errors.new("expected F32/F16 gguf tensor for " + info.name)
+fn gguf_stream_matrix(f &os.File, data_base int, info &GgufTensorInfo, expected int,
+                      arena $&[]f32, compact $&CompactWeights) int {
+    if info.gtype == GGML_TYPE_F32 || info.gtype == GGML_TYPE_Q8_0 {
+        offset := arena.len
+        _ := gguf_stream_f32_into(f, data_base, info, expected, arena) or >>
+        << offset
     }
-    offset := arena.len
-    _ := gguf_stream_f32_into(f, data_base, info, expected, arena) or >>
-    << offset
+    if info.n_elems != expected || expected < 0 {
+        >> errors.new("gguf tensor length mismatch for " + info.name)
+    }
+    dtype := gguf_dense_dtype(info.gtype) or >>
+    start := gguf_tensor_start(data_base, info) or >>
+    _ := f.seek(start, os.SEEK_SET) or >>
+    length := checked_size_product(expected, dtype.element_bytes()) or >>
+    chunk := read_exact(f, length) or >>
+    shape := [expected]
+    view := tensor.contiguous_view(dtype, &shape, 0, chunk.len) or >>
+    << append_compact(&view, &chunk, &shape, compact) or >>
 }
 
 fn gguf_stream_q4_0(f &os.File, data_base int, info &GgufTensorInfo, rows int, cols int,
@@ -527,11 +543,12 @@ fn gguf_stream_q4_0(f &os.File, data_base int, info &GgufTensorInfo, rows int, c
         chunk := read_exact(f, n_blks * 18) or >>
         $pos := 0
         for _ in 0:n_blks {
-            scales.push(f16_to_f32(read_u16_le(&chunk, pos)))
+            block := tensor.read_q4_0(&chunk, pos) or >>
+            scales.push(block.scale.to_f32())
             for j in 0:16 {
-                qs.push(u8(chunk[pos + 2 + j]))
+                qs.push(block.packed[j])
             }
-            pos += 18
+            pos += tensor.Q4_0_BYTES
         }
         rem -= cr
     }
@@ -558,13 +575,12 @@ fn gguf_stream_q8_0(f &os.File, data_base int, info &GgufTensorInfo, rows int, c
         chunk := read_exact(f, n_blks * 34) or >>
         $pos := 0
         for _ in 0:n_blks {
-            scales.push(f16_to_f32(read_u16_le(&chunk, pos)))
+            block := tensor.read_q8_0(&chunk, pos) or >>
+            scales.push(block.scale.to_f32())
             for j in 0:32 {
-                $qv := chunk[pos + 2 + j]
-                if qv >= 128 { qv -= 256 }
-                qs.push(i8(qv))
+                qs.push(block.quants[j])
             }
-            pos += 34
+            pos += tensor.Q8_0_BYTES
         }
         rem -= cr
     }
@@ -671,39 +687,63 @@ fn meta_int(doc &json.Doc, meta int, key string) int {
     << strconv.atoi(&s) or >>
 }
 
-fn load_tensor_slice(data &string, base int, doc &json.Doc, root int, name string, expected_len int) []f32 {
-    entry := doc.get(root, name + "")
+fn safetensor_view(data &string, base int, doc &json.Doc, root int,
+                   name &string, shape &[]int) tensor.TensorView {
+    entry := doc.get(root, (*name) + "")
+    dtype_name := doc.as_string(doc.get(entry, "dtype")) or >>
+    dtype := tensor.safetensors_dtype(&dtype_name) or (err) {
+        >> errors.new((*name) + ": " + err.msg())
+    }
+    dimensions := doc.get(entry, "shape")
+    if !doc.is_list(dimensions) || doc.count(dimensions) != shape.len {
+        >> errors.new("tensor rank mismatch for " + (*name))
+    }
+    for axis in 0:shape.len {
+        dim := doc.as_int(doc.at(dimensions, axis)) or >>
+        if dim != shape[axis] { >> errors.new("tensor shape mismatch for " + (*name)) }
+    }
     offs := doc.get(entry, "data_offsets")
-    start := doc.as_int(doc.at(offs, 0))
-    stop := doc.as_int(doc.at(offs, 1))
-    count := (stop - start) / 4
-    if count != expected_len {
-        >> errors.new("tensor length mismatch for " + name)
+    if !doc.is_list(offs) || doc.count(offs) != 2 { >> errors.new("bad tensor offsets for " + (*name)) }
+    start := doc.as_int(doc.at(offs, 0)) or >>
+    stop := doc.as_int(doc.at(offs, 1)) or >>
+    if start < 0 || stop < start || stop > data.len - base {
+        >> errors.new("tensor data outside file for " + (*name))
     }
+    view := tensor.contiguous_view(dtype, shape, base + start, base + stop) or (err) {
+        >> errors.new((*name) + ": " + err.msg())
+    }
+    if view.storage_end() != base + stop { >> errors.new("tensor byte length mismatch for " + (*name)) }
+    << view
+}
+
+fn load_tensor_slice(data &string, base int, doc &json.Doc, root int, name string, expected_len int) []f32 {
+    shape := [expected_len]
+    view := safetensor_view(data, base, doc, root, &name, &shape) or >>
     $out := []f32{}
-    $pos := base + start
-    for _ in 0:count {
-        out.push(from_bits(read_u32_le(data, pos)))
-        pos += 4
-    }
+    out.reserve(expected_len)
+    _ := view.append_f32(data, $&out) or >>
     << out
 }
 
-fn append_tensor(data &string, base int, doc &json.Doc, root int, name string, expected_len int, arena $&[]f32) int {
-    entry := doc.get(root, name + "")
-    offs := doc.get(entry, "data_offsets")
-    start := doc.as_int(doc.at(offs, 0))
-    stop := doc.as_int(doc.at(offs, 1))
-    count := (stop - start) / 4
-    if count != expected_len {
-        >> errors.new("tensor length mismatch for " + name)
-    }
+fn append_compact(view &tensor.TensorView, data &string, shape &[]int, arena $&CompactWeights) int {
+    start := arena.data.len
+    bytes := (*data)[view.storage_start():view.storage_end()]
+    backing := $&arena.data
+    backing.push_str(bytes)
+    stored := tensor.contiguous_view(view.dtype(), shape, start, arena.data.len) or >>
+    index := arena.views.len
+    arena.views.push(stored)
+    << -1 - index
+}
+
+fn append_tensor(data &string, base int, doc &json.Doc, root int, name string,
+                 rows int, columns int, arena $&[]f32, compact $&CompactWeights) int {
+    shape := [rows, columns]
+    view := safetensor_view(data, base, doc, root, &name, &shape) or >>
+    if !view.dtype().is_f32() { << append_compact(&view, data, &shape, compact) or >> }
+
     offset := arena.len
-    $pos := base + start
-    for _ in 0:count {
-        arena.push(from_bits(read_u32_le(data, pos)))
-        pos += 4
-    }
+    append_f32_segment(data, view.storage_start(), view.element_count(), arena)
     << offset
 }
 
@@ -727,7 +767,7 @@ fn build_rope_tables(head_dim int, max_seq_len int, rope_theta f64, rope_cos $&[
 fn load_model_safetensors(data &string, ctx_limit int) Model {
     if data.len < 8 { >> errors.new("truncated safetensors file") }
     header_len := read_u64_le(data, 0)
-    if header_len <= 0 || 8 + header_len > data.len { >> errors.new("invalid safetensors header length") }
+    if header_len <= 0 || header_len > data.len - 8 { >> errors.new("invalid safetensors header length") }
     header_str := (*data)[8:8 + header_len]
     doc := json.parse(&header_str) or >>
     root := doc.root()
@@ -742,7 +782,14 @@ fn load_model_safetensors(data &string, ctx_limit int) Model {
     $max_seq_len := meta_int(&doc, meta, "max_seq_len") or >>
     if ctx_limit > 0 && max_seq_len > ctx_limit { max_seq_len = ctx_limit }
     rope_theta := f64(meta_int(&doc, meta, "rope_theta") or >>)
+    if dim <= 0 || dim > RMS_CAP || hidden_dim <= 0 || n_layers <= 0 || vocab_size <= 0 || max_seq_len <= 0 {
+        >> errors.new("invalid Safetensors model dimensions")
+    }
+    if n_heads <= 0 || n_kv_heads <= 0 || dim % n_heads != 0 || n_heads % n_kv_heads != 0 {
+        >> errors.new("invalid Safetensors attention head counts")
+    }
     head_dim := dim / n_heads
+    if head_dim % 2 != 0 { >> errors.new("Safetensors attention head dimensions must be even") }
     kv_dim := n_kv_heads * head_dim
     cfg := ModelConfig{
         dim: dim, hidden_dim: hidden_dim, n_layers: n_layers, n_heads: n_heads,
@@ -753,9 +800,8 @@ fn load_model_safetensors(data &string, ctx_limit int) Model {
 
     base := 8 + header_len
     $weights := []f32{}
-    total_w := 2 * vocab_size * dim + n_layers * (2 * dim * dim + 2 * kv_dim * dim + 3 * hidden_dim * dim)
-    if total_w > 0 { weights.reserve(total_w) }
-    embed_off := append_tensor(data, base, &doc, root, "embed_tokens.weight", vocab_size * dim, $&weights) or >>
+    $compact := empty_compact_weights()
+    embed_off := append_tensor(data, base, &doc, root, "embed_tokens.weight", vocab_size, dim, $&weights, $&compact) or >>
 
     $wq_off := []int{}
     $wk_off := []int{}
@@ -773,17 +819,17 @@ fn load_model_safetensors(data &string, ctx_limit int) Model {
         attn_norms.push(an)
         fnm := load_tensor_slice(data, base, &doc, root, prefix + "post_attention_layernorm.weight", dim) or >>
         ffn_norms.push(fnm)
-        wq_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.q_proj.weight", dim * dim, $&weights) or >>)
-        wk_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.k_proj.weight", kv_dim * dim, $&weights) or >>)
-        wv_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.v_proj.weight", kv_dim * dim, $&weights) or >>)
-        wo_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.o_proj.weight", dim * dim, $&weights) or >>)
-        w1_off.push(append_tensor(data, base, &doc, root, prefix + "mlp.gate_proj.weight", hidden_dim * dim, $&weights) or >>)
-        w3_off.push(append_tensor(data, base, &doc, root, prefix + "mlp.up_proj.weight", hidden_dim * dim, $&weights) or >>)
-        w2_off.push(append_tensor(data, base, &doc, root, prefix + "mlp.down_proj.weight", dim * hidden_dim, $&weights) or >>)
+        wq_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.q_proj.weight", dim, dim, $&weights, $&compact) or >>)
+        wk_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.k_proj.weight", kv_dim, dim, $&weights, $&compact) or >>)
+        wv_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.v_proj.weight", kv_dim, dim, $&weights, $&compact) or >>)
+        wo_off.push(append_tensor(data, base, &doc, root, prefix + "self_attn.o_proj.weight", dim, dim, $&weights, $&compact) or >>)
+        w1_off.push(append_tensor(data, base, &doc, root, prefix + "mlp.gate_proj.weight", hidden_dim, dim, $&weights, $&compact) or >>)
+        w3_off.push(append_tensor(data, base, &doc, root, prefix + "mlp.up_proj.weight", hidden_dim, dim, $&weights, $&compact) or >>)
+        w2_off.push(append_tensor(data, base, &doc, root, prefix + "mlp.down_proj.weight", dim, hidden_dim, $&weights, $&compact) or >>)
     }
 
     final_norm := load_tensor_slice(data, base, &doc, root, "norm.weight", dim) or >>
-    lm_head_off := append_tensor(data, base, &doc, root, "lm_head.weight", vocab_size * dim, $&weights) or >>
+    lm_head_off := append_tensor(data, base, &doc, root, "lm_head.weight", vocab_size, dim, $&weights, $&compact) or >>
 
     $rope_cos := []f32{}
     $rope_sin := []f32{}
@@ -792,7 +838,7 @@ fn load_model_safetensors(data &string, ctx_limit int) Model {
     << Model{
         cfg: cfg, is_q4: false, embed_q4: false, lm_head_q4: false, lm_head_q8: false,
         layers_p4: false, embed_p4: false, lm_head_p4: false, has_qkv_bias: false,
-        weights: weights, q4_qs: []u8{}, q4_scales: []f32{}, q8_qs: []i8{}, q8_scales: []f32{},
+        weights: weights, compact_weights: compact, q4_qs: []u8{}, q4_scales: []f32{}, q8_qs: []i8{}, q8_scales: []f32{},
         q4_p4k4_qs: []u8{}, q4_p4k4_scales: []u16{}, q8_p4k4_qs: []i8{}, q8_p4k4_scales: []u16{},
         embed_off: embed_off, lm_head_off: lm_head_off,
         wq_off: wq_off, wk_off: wk_off, wv_off: wv_off, wo_off: wo_off,
@@ -973,21 +1019,16 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     $need_q8_blks := 0
     $need_p4k4_q4_gbs := 0
     $need_p4k4_q8_gbs := 0
-    $need_f32 := 0
 
     emb_elems := vocab_size * dim
     if embed_q4 {
         if embed_p4 { need_p4k4_q4_gbs += emb_elems / 128 }
         else { need_q4_blks += emb_elems / 32 }
-    } else {
-        need_f32 += emb_elems
     }
     layer_elems := n_layers * (2 * dim * dim + 2 * kv_dim * dim + 3 * hidden_dim * dim)
     if is_q4 {
         if layers_p4 { need_p4k4_q4_gbs += layer_elems / 128 }
         else { need_q4_blks += layer_elems / 32 }
-    } else {
-        need_f32 += layer_elems
     }
     if out_i >= 0 {
         out_elems := vocab_size * dim
@@ -997,8 +1038,6 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
         } else if lm_head_q8 {
             if lm_head_p4 { need_p4k4_q8_gbs += out_elems / 128 }
             else { need_q8_blks += out_elems / 32 }
-        } else {
-            need_f32 += out_elems
         }
     }
 
@@ -1011,6 +1050,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     $q8_p4k4_qs := []i8{}
     $q8_p4k4_scales := []u16{}
     $weights := []f32{}
+    $compact := empty_compact_weights()
     $q4_p4k4_cur := 0
     $q8_p4k4_cur := 0
 
@@ -1030,7 +1070,6 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
         q8_p4k4_qs.resize_zero(need_p4k4_q8_gbs * 128)
         q8_p4k4_scales.resize_zero(need_p4k4_q8_gbs * 4)
     }
-    if need_f32 > 0 { weights.reserve(need_f32) }
 
     $embed_off := 0
     if embed_p4 {
@@ -1038,8 +1077,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     } else if embed_q4 {
         embed_off = gguf_stream_q4_0(f, data_base, &tensors[emb_idx], vocab_size, dim, $&q4_qs, $&q4_scales) or >>
     } else {
-        embed_off = weights.len
-        _ := gguf_stream_f32_into(f, data_base, &tensors[emb_idx], emb_elems, $&weights) or >>
+        embed_off = gguf_stream_matrix(f, data_base, &tensors[emb_idx], emb_elems, $&weights, $&compact) or >>
     }
 
     $wq_off := []int{}
@@ -1110,13 +1148,13 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
             w3_off.push(gguf_stream_q4_0(f, data_base, &tensors[w3_i], hidden_dim, dim, $&q4_qs, $&q4_scales) or >>)
             w2_off.push(gguf_stream_q4_0(f, data_base, &tensors[w2_i], dim, hidden_dim, $&q4_qs, $&q4_scales) or >>)
         } else {
-            wq_off.push(gguf_stream_f32_compat(f, data_base, &tensors[wq_i], dim * dim, $&weights) or >>)
-            wk_off.push(gguf_stream_f32_compat(f, data_base, &tensors[wk_i], kv_dim * dim, $&weights) or >>)
-            wv_off.push(gguf_stream_f32_compat(f, data_base, &tensors[wv_i], kv_dim * dim, $&weights) or >>)
-            wo_off.push(gguf_stream_f32_compat(f, data_base, &tensors[wo_i], dim * dim, $&weights) or >>)
-            w1_off.push(gguf_stream_f32_compat(f, data_base, &tensors[w1_i], hidden_dim * dim, $&weights) or >>)
-            w3_off.push(gguf_stream_f32_compat(f, data_base, &tensors[w3_i], hidden_dim * dim, $&weights) or >>)
-            w2_off.push(gguf_stream_f32_compat(f, data_base, &tensors[w2_i], dim * hidden_dim, $&weights) or >>)
+            wq_off.push(gguf_stream_matrix(f, data_base, &tensors[wq_i], dim * dim, $&weights, $&compact) or >>)
+            wk_off.push(gguf_stream_matrix(f, data_base, &tensors[wk_i], kv_dim * dim, $&weights, $&compact) or >>)
+            wv_off.push(gguf_stream_matrix(f, data_base, &tensors[wv_i], kv_dim * dim, $&weights, $&compact) or >>)
+            wo_off.push(gguf_stream_matrix(f, data_base, &tensors[wo_i], dim * dim, $&weights, $&compact) or >>)
+            w1_off.push(gguf_stream_matrix(f, data_base, &tensors[w1_i], hidden_dim * dim, $&weights, $&compact) or >>)
+            w3_off.push(gguf_stream_matrix(f, data_base, &tensors[w3_i], hidden_dim * dim, $&weights, $&compact) or >>)
+            w2_off.push(gguf_stream_matrix(f, data_base, &tensors[w2_i], dim * hidden_dim, $&weights, $&compact) or >>)
         }
     }
 
@@ -1139,7 +1177,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
                 lm_head_off = gguf_stream_q8_0(f, data_base, &tensors[out_i], vocab_size, dim, $&q8_qs, $&q8_scales) or >>
             }
         } else {
-            lm_head_off = gguf_stream_f32_compat(f, data_base, &tensors[out_i], vocab_size * dim, $&weights) or >>
+            lm_head_off = gguf_stream_matrix(f, data_base, &tensors[out_i], vocab_size * dim, $&weights, $&compact) or >>
         }
     }
 
@@ -1150,7 +1188,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
     << Model{
         cfg: cfg, is_q4: is_q4, embed_q4: embed_q4, lm_head_q4: lm_head_q4, lm_head_q8: lm_head_q8,
         layers_p4: layers_p4, embed_p4: embed_p4, lm_head_p4: lm_head_p4,
-        has_qkv_bias: has_qkv_bias, weights: weights,
+        has_qkv_bias: has_qkv_bias, weights: weights, compact_weights: compact,
         q4_qs: q4_qs, q4_scales: q4_scales, q8_qs: q8_qs, q8_scales: q8_scales,
         q4_p4k4_qs: q4_p4k4_qs, q4_p4k4_scales: q4_p4k4_scales, q8_p4k4_qs: q8_p4k4_qs, q8_p4k4_scales: q8_p4k4_scales,
         embed_off: embed_off, lm_head_off: lm_head_off,
@@ -1186,11 +1224,37 @@ fn load_model(path string, ctx_limit int, use_p4 bool) Model {
     << load_model_safetensors(&data, ctx_limit) or >>
 }
 
-fn new_paged_kv_cache(cfg &ModelConfig, max_slots int, num_blocks int) PagedKvCache {
-    blocks_per_seq := (cfg.max_seq_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE
-    layer_stride := KV_BLOCK_SIZE * cfg.kv_dim
-    block_stride := cfg.n_layers * layer_stride
-    pool_elems := num_blocks * block_stride
+fn checked_size_product(a int, b int) int {
+    if a < 0 || b < 0 { >> errors.new("negative tensor size") }
+    if b > 0 && a > 9223372036854775807 / b { >> errors.new("tensor storage size overflow") }
+    << a * b
+}
+
+fn new_paged_kv_cache(cfg &ModelConfig, max_slots int, dtype tensor.DType) PagedKvCache {
+    if cfg.max_seq_len <= 0 { >> errors.new("KV cache requires a positive context length") }
+    blocks_per_seq := 1 + (cfg.max_seq_len - 1) / KV_BLOCK_SIZE
+    num_blocks := checked_size_product(max_slots, blocks_per_seq) or >>
+    layer_stride := checked_size_product(KV_BLOCK_SIZE, cfg.kv_dim) or >>
+    block_stride := checked_size_product(cfg.n_layers, layer_stride) or >>
+    pool_elems := checked_size_product(num_blocks, block_stride) or >>
+    width := dtype.element_bytes()
+    storage_bytes := checked_size_product(pool_elems, 2 * width) or >>
+    $f32_keys := []f32{}
+    $f32_values := []f32{}
+    $keys16 := []u16{}
+    $values16 := []u16{}
+    $keys8 := []u8{}
+    $values8 := []u8{}
+    if width == 4 {
+        f32_keys.resize_zero(pool_elems)
+        f32_values.resize_zero(pool_elems)
+    } else if width == 2 {
+        keys16.resize_zero(pool_elems)
+        values16.resize_zero(pool_elems)
+    } else {
+        keys8.resize_zero(pool_elems)
+        values8.resize_zero(pool_elems)
+    }
 
     $free_stack := []int{}
     $b := num_blocks - 1
@@ -1199,7 +1263,7 @@ fn new_paged_kv_cache(cfg &ModelConfig, max_slots int, num_blocks int) PagedKvCa
         b -= 1
     }
     $block_tables := []int{}
-    for _ in 0:max_slots * blocks_per_seq { block_tables.push(-1) }
+    for _ in 0:num_blocks { block_tables.push(-1) }
     $slot_num_blocks := []int{}
     for _ in 0:max_slots { slot_num_blocks.push(0) }
 
@@ -1212,8 +1276,10 @@ fn new_paged_kv_cache(cfg &ModelConfig, max_slots int, num_blocks int) PagedKvCa
         layer_stride: layer_stride,
         block_stride: block_stride,
         kv_dim: cfg.kv_dim,
-        k_blocks: alloc_zeros(pool_elems),
-        v_blocks: alloc_zeros(pool_elems),
+        dtype: dtype, storage_width: width, storage_bytes: storage_bytes,
+        k_blocks: f32_keys, v_blocks: f32_values,
+        compact_k16: keys16, compact_v16: values16,
+        compact_k8: keys8, compact_v8: values8,
         free_stack: free_stack,
         free_top: num_blocks,
         alloc_count: 0,
@@ -1254,7 +1320,7 @@ fn kv_free_slot(kv $&PagedKvCache, slot int) {
     kv.slot_num_blocks[slot] = 0
 }
 
-fn load_embed_row(m &Model, token int, dst $&[]f32, dst_off int) {
+fn load_embed_row(m &Model, token int, dst $&[]f32, dst_off int) int {
     dim := m.cfg.dim
     if m.embed_p4 {
         nb := dim / 32
@@ -1274,7 +1340,7 @@ fn load_embed_row(m &Model, token int, dst $&[]f32, dst_off int) {
                 dst[ob + 16 + j] = f32(q1) * d
             }
         }
-        <<
+        << 0
     }
     if m.embed_q4 {
         nb := dim / 32
@@ -1292,12 +1358,19 @@ fn load_embed_row(m &Model, token int, dst $&[]f32, dst_off int) {
                 dst[ob + 16 + j] = f32(q1) * d
             }
         }
-        <<
+        << 0
+    }
+    if m.embed_off < 0 {
+        index := -1 - m.embed_off
+        view := &m.compact_weights.views[index]
+        _ := view.copy_f32(&m.compact_weights.data, token * dim, dim, dst, dst_off) or >>
+        << 0
     }
     emb_off := m.embed_off + token * dim
     for i in 0:dim {
         dst[dst_off + i] = m.weights[emb_off + i]
     }
+    << 0
 }
 
 // Canonical ResidualAdd + Weighted RMSNorm triggering MIR dynamic output reuse + NEON SIMD.
@@ -1637,9 +1710,23 @@ fn matmat_q4_0_p4k4_q8_0(out $&[]f32, qs_p &[]u8, ws_p &[]u16, p4_blk_off int,
     }
 }
 
+// Decode one compact weight row at a time and reuse it across the batch.
+fn matmat_compact(weights &CompactWeights, index int, out $&[]f32, x &[]f32,
+                  batch int, rows int, cols int) int {
+    view := &weights.views[index]
+    $row := alloc_zeros(cols)
+    for r in 0:rows {
+        _ := view.copy_f32(&weights.data, r * cols, cols, $&row, 0) or >>
+        for b in 0:batch {
+            out[b * rows + r] = dot_offset(x, b * cols, &row, 0, cols)
+        }
+    }
+    << 0
+}
+
 fn matvec_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act bool,
                    out $&[]f32, x &[]f32, xq &[]i8, xs &[]f32,
-                   off int, rows int, cols int) {
+                   off int, rows int, cols int) int {
     if use_q8 {
         if use_q8_act {
             if use_p4 {
@@ -1660,14 +1747,17 @@ fn matvec_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act b
         } else {
             matvec_q4_0(out, x, &m.q4_qs, &m.q4_scales, off, rows, cols)
         }
+    } else if off < 0 {
+        _ := matmat_compact(&m.compact_weights, -1 - off, out, x, 1, rows, cols) or >>
     } else {
         matvec(out, x, &m.weights, off, rows, cols)
     }
+    << 0
 }
 
 fn matmat_dispatch(m &Model, use_q4 bool, use_p4 bool, use_q8_act bool,
                    out $&[]f32, x &[]f32, xq &[]i8, xs &[]f32,
-                   off int, m_cnt int, rows int, cols int) {
+                   off int, m_cnt int, rows int, cols int) int {
     if use_q4 {
         if use_q8_act {
             if use_p4 {
@@ -1678,9 +1768,12 @@ fn matmat_dispatch(m &Model, use_q4 bool, use_p4 bool, use_q8_act bool,
         } else {
             matmat_q4_0(out, x, &m.q4_qs, &m.q4_scales, off, m_cnt, rows, cols)
         }
+    } else if off < 0 {
+        _ := matmat_compact(&m.compact_weights, -1 - off, out, x, m_cnt, rows, cols) or >>
     } else {
         matmat_f32(out, x, &m.weights, off, m_cnt, rows, cols)
     }
+    << 0
 }
 
 fn dot_offset(a &[]f32, off_a int, b &[]f32, off_b int, n int) f32 {
@@ -1833,12 +1926,64 @@ fn attn_vsum_paged(out $&[]f32, scores &[]f32, v_blocks &[]f32, bt &[]int,
     }
 }
 
+fn kv_write(kv $&PagedKvCache, destination int, keys &[]f32, values &[]f32, source int, count int) {
+    if kv.storage_width == 4 {
+        for i in 0:count {
+            kv.k_blocks[destination + i] = keys[source + i]
+            kv.v_blocks[destination + i] = values[source + i]
+        }
+    } else if kv.storage_width == 2 {
+        for i in 0:count {
+            kv.compact_k16[destination + i] = u16(kv.dtype.encode_bits(keys[source + i]))
+            kv.compact_v16[destination + i] = u16(kv.dtype.encode_bits(values[source + i]))
+        }
+    } else {
+        for i in 0:count {
+            kv.compact_k8[destination + i] = u8(kv.dtype.encode_bits(keys[source + i]))
+            kv.compact_v8[destination + i] = u8(kv.dtype.encode_bits(values[source + i]))
+        }
+    }
+}
+
+fn kv_key_dot(kv &PagedKvCache, keys_offset int, q &[]f32, q_offset int, count int) f32 {
+    if kv.storage_width == 4 { << dot_offset(q, q_offset, &kv.k_blocks, keys_offset, count) }
+    $acc := f32(0)
+    if kv.storage_width == 2 {
+        for i in 0:count {
+            key := kv.dtype.decode_bits(int(kv.compact_k16[keys_offset + i]))
+            acc += q[q_offset + i] * key
+        }
+    } else {
+        for i in 0:count {
+            key := kv.dtype.decode_bits(int(kv.compact_k8[keys_offset + i]))
+            acc += q[q_offset + i] * key
+        }
+    }
+    << acc
+}
+
+fn kv_value_at(kv &PagedKvCache, index int) f32 {
+    if kv.storage_width == 4 { << kv.v_blocks[index] }
+    if kv.storage_width == 2 { << kv.dtype.decode_bits(int(kv.compact_v16[index])) }
+    << kv.dtype.decode_bits(int(kv.compact_v8[index]))
+}
+
+fn kv_add_values(kv &PagedKvCache, off int, out $&[]f32, out_off int, weight f32, count int) {
+    if kv.storage_width == 4 {
+        axpy_offset(out, out_off, &kv.v_blocks, off, weight, count)
+        <<
+    }
+    for i in 0:count {
+        out[out_off + i] += weight * kv_value_at(kv, off + i)
+    }
+}
+
 // Reuse the feed-forward scratch for attention scores until the FFN starts.
 fn attention_head(kv &PagedKvCache, q &[]f32, xb $&[]f32, scores $&[]f32, q_off int, kv_head_off int,
                   bt_slot_off int, layer_off int, t0_pb int, pos int, head_dim int, inv_sqrt_d f32) {
     one_f32 := f32(1.0)
     k0_off := t0_pb * kv.block_stride + layer_off + kv_head_off
-    if xu_target_arch() == ARCH_ARM64 && head_dim == 64 && pos >= 4 && pos < scores.len {
+    if kv.storage_width == 4 && xu_target_arch() == ARCH_ARM64 && head_dim == 64 && pos >= 4 && pos < scores.len {
         attention_scores_paged(q, &kv.k_blocks, &kv.block_tables, scores, q_off,
                                bt_slot_off, kv.block_stride, layer_off + kv_head_off, kv.kv_dim, head_dim, pos + 1)
         softmax_scaled(scores, pos + 1, inv_sqrt_d)
@@ -1846,11 +1991,11 @@ fn attention_head(kv &PagedKvCache, q &[]f32, xb $&[]f32, scores $&[]f32, q_off 
                         bt_slot_off, kv.block_stride, layer_off + kv_head_off, kv.kv_dim, head_dim, pos + 1)
         <<
     }
-    score0 := dot_offset(q, q_off, &kv.k_blocks, k0_off, head_dim)
+    score0 := kv_key_dot(kv, k0_off, q, q_off, head_dim)
     $m_val := f64(score0 * inv_sqrt_d)
     $l_val := 1.0
     for d in 0:head_dim {
-        xb[q_off + d] = kv.v_blocks[k0_off + d]
+        xb[q_off + d] = kv_value_at(kv, k0_off + d)
     }
     // Token zero seeds the online softmax. Visit the remaining keys in order.
     $first := 1
@@ -1864,7 +2009,7 @@ fn attention_head(kv &PagedKvCache, q &[]f32, xb $&[]f32, scores $&[]f32, q_off 
         base := pb * kv.block_stride + layer_off + kv_head_off + in_page * kv.kv_dim
         for i in 0:count {
             kv_t_off := base + i * kv.kv_dim
-            raw_score := dot_offset(q, q_off, &kv.k_blocks, kv_t_off, head_dim)
+            raw_score := kv_key_dot(kv, kv_t_off, q, q_off, head_dim)
             score := f64(raw_score * inv_sqrt_d)
             if score > m_val {
                 alpha := f32(fast_exp_neg(m_val - score))
@@ -1873,11 +2018,11 @@ fn attention_head(kv &PagedKvCache, q &[]f32, xb $&[]f32, scores $&[]f32, q_off 
                 }
                 l_val = l_val * f64(alpha) + 1.0
                 m_val = score
-                axpy_offset(xb, q_off, &kv.v_blocks, kv_t_off, one_f32, head_dim)
+                kv_add_values(kv, kv_t_off, xb, q_off, one_f32, head_dim)
             } else {
                 w := f32(fast_exp_neg(score - m_val))
                 l_val = l_val + f64(w)
-                axpy_offset(xb, q_off, &kv.v_blocks, kv_t_off, w, head_dim)
+                kv_add_values(kv, kv_t_off, xb, q_off, w, head_dim)
             }
         }
         first += count
@@ -1895,7 +2040,7 @@ fn project_next_token(m &Model, x &[]f32, xb $&[]f32, xb2 &[]f32,
     eps := cfg.rms_eps
     rmsnorm_add_fused(dim, x, xb2, &m.final_norm, xb, eps)
     if (m.lm_head_q4 || m.lm_head_q8) && use_q8_act { quantize_q8_0(xb, xq, xs, dim) }
-    matvec_dispatch(m, m.lm_head_q4, m.lm_head_q8, m.lm_head_p4, use_q8_act, logits, xb, xq, xs, m.lm_head_off, cfg.vocab_size, dim)
+    _ := matvec_dispatch(m, m.lm_head_q4, m.lm_head_q8, m.lm_head_p4, use_q8_act, logits, xb, xq, xs, m.lm_head_off, cfg.vocab_size, dim) or >>
     << argmax(logits, cfg.vocab_size)
 }
 
@@ -1922,16 +2067,16 @@ fn forward_token(m &Model, kv $&PagedKvCache,
     pb_base := pb * kv.block_stride + in_blk * kv.kv_dim
     bt_slot_off := slot * kv.blocks_per_seq
 
-    load_embed_row(m, token, x, 0)
+    _ := load_embed_row(m, token, x, 0) or >>
     inv_sqrt_d := f32(1.0 / math.sqrt(f64(head_dim)))
 
     for l in 0:cfg.n_layers {
         rmsnorm_add_fused(dim, x, &m.zeros, &m.attn_norms[l], xb, eps)
 
         if use_q4 && use_q8_act { quantize_q8_0(xb, xq, xs, dim) }
-        matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, q, xb, xq, xs, m.wq_off[l], dim, dim)
-        matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, k, xb, xq, xs, m.wk_off[l], kv_dim, dim)
-        matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, v, xb, xq, xs, m.wv_off[l], kv_dim, dim)
+        _ := matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, q, xb, xq, xs, m.wq_off[l], dim, dim) or >>
+        _ := matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, k, xb, xq, xs, m.wk_off[l], kv_dim, dim) or >>
+        _ := matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, v, xb, xq, xs, m.wv_off[l], kv_dim, dim) or >>
         if m.has_qkv_bias {
             vadd_inplace(q, &m.bq[l], dim)
             vadd_inplace(k, &m.bk[l], kv_dim)
@@ -1942,10 +2087,7 @@ fn forward_token(m &Model, kv $&PagedKvCache,
         apply_rope_offset(k, 0, cfg.n_kv_heads, head_dim, &m.rope_cos, &m.rope_sin, rope_off)
 
         kv_write_off := pb_base + l * kv.layer_stride
-        for i in 0:kv_dim {
-            kv.k_blocks[kv_write_off + i] = k[i]
-            kv.v_blocks[kv_write_off + i] = v[i]
-        }
+        kv_write(kv, kv_write_off, k, v, 0, kv_dim)
 
         layer_off := l * kv.layer_stride
         t0_pb := kv.block_tables[bt_slot_off]
@@ -1956,26 +2098,26 @@ fn forward_token(m &Model, kv $&PagedKvCache,
         }
 
         if use_q4 && use_q8_act { quantize_q8_0(xb, xq, xs, dim) }
-        matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, xb2, xb, xq, xs, m.wo_off[l], dim, dim)
+        _ := matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, xb2, xb, xq, xs, m.wo_off[l], dim, dim) or >>
         vadd_inplace(x, xb2, dim)
 
         rmsnorm_add_fused(dim, x, &m.zeros, &m.ffn_norms[l], xb, eps)
         if use_q4 && use_q8_act { quantize_q8_0(xb, xq, xs, dim) }
-        matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, hb, xb, xq, xs, m.w1_off[l], hidden, dim)
-        matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, hb2, xb, xq, xs, m.w3_off[l], hidden, dim)
+        _ := matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, hb, xb, xq, xs, m.w1_off[l], hidden, dim) or >>
+        _ := matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, hb2, xb, xq, xs, m.w3_off[l], hidden, dim) or >>
         for i in 0:hidden {
             g := hb[i]
             silu := f32(f64(g) / (1.0 + math.exp(f64(-g))))
             hb[i] = silu * hb2[i]
         }
         if use_q4 && use_q8_act { quantize_q8_0(hb, xq, xs, hidden) }
-        matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, xb2, hb, xq, xs, m.w2_off[l], dim, hidden)
+        _ := matvec_dispatch(m, use_q4, false, m.layers_p4, use_q8_act, xb2, hb, xq, xs, m.w2_off[l], dim, hidden) or >>
         if l + 1 < cfg.n_layers {
             vadd_inplace(x, xb2, dim)
         }
     }
 
-    << project_next_token(m, x, xb, xb2, xq, xs, logits, use_q8_act)
+    << project_next_token(m, x, xb, xb2, xq, xs, logits, use_q8_act) or >>
 }
 
 fn prepare_forward_row(kv $&PagedKvCache, slot int, pos int) ForwardRow {
@@ -2009,7 +2151,7 @@ fn rmsnorm_forward_rows(m &Model, count int, x &[]f32, weight &[]f32, out $&[]f3
 fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
                 final_start int, final_count int, use_q8_act bool, decoding bool,
                 x $&[]f32, xb $&[]f32, xb2 $&[]f32, q $&[]f32, k $&[]f32, v $&[]f32,
-                hb $&[]f32, hb2 $&[]f32, xq $&[]i8, xs $&[]f32) {
+                hb $&[]f32, hb2 $&[]f32, xq $&[]i8, xs $&[]f32) int {
     cfg := &m.cfg
     dim := cfg.dim
     hidden := cfg.hidden_dim
@@ -2028,10 +2170,10 @@ fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
         rmsnorm_forward_rows(m, m_cnt, x, &m.attn_norms[l], xb, q, xb2, decoding)
         if use_q4 && use_q8_act { quantize_q8_0(xb, xq, xs, m_cnt * dim) }
         if all_queries {
-            matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, q, xb, xq, xs, m.wq_off[l], m_cnt, dim, dim)
+            _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, q, xb, xq, xs, m.wq_off[l], m_cnt, dim, dim) or >>
         }
-        matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, k, xb, xq, xs, m.wk_off[l], m_cnt, kv_dim, dim)
-        matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, v, xb, xq, xs, m.wv_off[l], m_cnt, kv_dim, dim)
+        _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, k, xb, xq, xs, m.wk_off[l], m_cnt, kv_dim, dim) or >>
+        _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, v, xb, xq, xs, m.wv_off[l], m_cnt, kv_dim, dim) or >>
 
         layer_off := l * kv.layer_stride
         for t in 0:m_cnt {
@@ -2051,10 +2193,7 @@ fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
             }
             apply_rope_offset(k, kv_base, cfg.n_kv_heads, head_dim, &m.rope_cos, &m.rope_sin, rope_off)
             kv_woff := rows[t].kv_offset + layer_off
-            for i in 0:kv_dim {
-                kv.k_blocks[kv_woff + i] = k[kv_base + i]
-                kv.v_blocks[kv_woff + i] = v[kv_base + i]
-            }
+            kv_write(kv, kv_woff, k, v, kv_base, kv_dim)
         }
 
         // Later chunks need the final layer's K/V, and only the final
@@ -2073,7 +2212,7 @@ fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
                 }
             }
             if use_q4 && use_q8_act { quantize_q8_0(xb, xq, xs, dim) }
-            matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, q, xb, xq, xs, m.wq_off[l], 1, dim, dim)
+            _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, q, xb, xq, xs, m.wq_off[l], 1, dim, dim) or >>
             if m.has_qkv_bias {
                 axpy_offset(q, 0, &m.bq[l], 0, one_f32, dim)
             }
@@ -2096,13 +2235,13 @@ fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
         }
 
         if use_q4 && use_q8_act { quantize_q8_0(xb, xq, xs, output_count * dim) }
-        matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, xb2, xb, xq, xs, m.wo_off[l], output_count, dim, dim)
+        _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, xb2, xb, xq, xs, m.wo_off[l], output_count, dim, dim) or >>
         vadd_inplace(x, xb2, output_count * dim)
 
         rmsnorm_forward_rows(m, output_count, x, &m.ffn_norms[l], xb, q, xb2, decoding)
         if use_q4 && use_q8_act { quantize_q8_0(xb, xq, xs, output_count * dim) }
-        matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, hb, xb, xq, xs, m.w1_off[l], output_count, hidden, dim)
-        matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, hb2, xb, xq, xs, m.w3_off[l], output_count, hidden, dim)
+        _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, hb, xb, xq, xs, m.w1_off[l], output_count, hidden, dim) or >>
+        _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, hb2, xb, xq, xs, m.w3_off[l], output_count, hidden, dim) or >>
         total_h := output_count * hidden
         for i in 0:total_h {
             g := hb[i]
@@ -2110,11 +2249,12 @@ fn forward_rows(m &Model, kv $&PagedKvCache, rows &[]ForwardRow, m_cnt int,
             hb[i] = silu * hb2[i]
         }
         if use_q4 && use_q8_act { quantize_q8_0(hb, xq, xs, total_h) }
-        matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, xb2, hb, xq, xs, m.w2_off[l], output_count, dim, hidden)
+        _ := matmat_dispatch(m, use_q4, m.layers_p4, use_q8_act, xb2, hb, xq, xs, m.w2_off[l], output_count, dim, hidden) or >>
         if !final_layer {
             vadd_inplace(x, xb2, output_count * dim)
         }
     }
+    << 0
 }
 
 fn forward_prefill_batch(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
@@ -2132,15 +2272,15 @@ fn forward_prefill_batch(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
         if count > row_cache.len { count = row_cache.len }
         is_last := off + count == tokens.len
         for t in 0:count {
-            load_embed_row(m, tokens[off + t], x, t * cfg.dim)
+            _ := load_embed_row(m, tokens[off + t], x, t * cfg.dim) or >>
             row := prepare_forward_row(kv, slot, pos_base + off + t) or >>
             row_cache[t] = row
         }
         $final_count := 0
         if is_last && compute_logits { final_count = 1 }
-        forward_rows(m, kv, row_cache, count, count - 1, final_count, use_q8_act, false, x, xb, xb2, q, k, v, hb, hb2, xq, xs)
+        _ := forward_rows(m, kv, row_cache, count, count - 1, final_count, use_q8_act, false, x, xb, xb2, q, k, v, hb, hb2, xq, xs) or >>
         if final_count > 0 {
-            last_tok = project_next_token(m, x, xb, xb2, xq, xs, logits, use_q8_act)
+            last_tok = project_next_token(m, x, xb, xb2, xq, xs, logits, use_q8_act) or >>
         }
         off += count
     }
@@ -2208,11 +2348,11 @@ fn forward_decode_batch(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
     batch_head := m.lm_head_q8 && m.lm_head_p4 && logits.len >= count * vocab
     for t in 0:count {
         input := &inputs[t]
-        load_embed_row(m, input.token, x, t * dim)
+        _ := load_embed_row(m, input.token, x, t * dim) or >>
         row := prepare_forward_row(kv, input.slot, input.pos) or >>
         row_cache[t] = row
     }
-    forward_rows(m, kv, row_cache, count, 0, count, true, true, x, xb, xb2, q, k, v, hb, hb2, xq, xs)
+    _ := forward_rows(m, kv, row_cache, count, 0, count, true, true, x, xb, xb2, q, k, v, hb, hb2, xq, xs) or >>
     for t in 0:count {
         if t > 0 {
             offset := t * dim
@@ -2227,7 +2367,7 @@ fn forward_decode_batch(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
             for i in 0:dim { q[base + i] = xb[i] }
             ->
         }
-        token := project_next_token(m, x, xb, xb2, xq, xs, logits, true)
+        token := project_next_token(m, x, xb, xb2, xq, xs, logits, true) or >>
         predictions[inputs[t].slot] = DecodePrediction{token: token, logit_bits: bits(logits[token])}
     }
     if batch_head {
@@ -2518,6 +2658,7 @@ fn main() int {
     $args := []string{}
     $ctx_limit := DEFAULT_CTX_LIMIT
     $ignore_eos := false
+    $kv_dtype := tensor.dtype_f32()
     $ai := 1
     while ai < raw_args.len {
         arg := raw_args[ai]
@@ -2525,6 +2666,16 @@ fn main() int {
             ns := raw_args[ai + 1]
             ctx_limit = strconv.atoi(&ns) or (err) {
                 eprintln("invalid --ctx: " + err.msg())
+                << 1
+            }
+            ai += 2
+        } else if arg == "--kv-dtype" {
+            if ai + 1 >= raw_args.len { eprintln("--kv-dtype requires a dtype")
+                << 1 }
+            dtype_index := ai + 1
+            dtype_name := &raw_args[dtype_index]
+            kv_dtype = tensor.dtype_named(dtype_name) or (err) {
+                eprintln(err.msg())
                 << 1
             }
             ai += 2
@@ -2538,7 +2689,7 @@ fn main() int {
     }
 
     if args.len < 2 {
-        eprintln("usage: llm_engine <verify|verify-f32act|bench|bench-f32act|generate> <model.safetensors|model.gguf> ... [--ctx N] [--ignore-eos]")
+        eprintln("usage: llm_engine <verify|verify-f32act|bench|bench-f32act|generate> <model.safetensors|model.gguf> ... [--ctx N] [--kv-dtype DTYPE] [--ignore-eos]")
         << 1
     }
     mode := args[0]
@@ -2559,8 +2710,10 @@ fn main() int {
     if mode == "generate" || ((mode == "bench" || mode == "bench-f32act") && args.len > 3 && args[3] == "single") {
         kv_slots = 1
     }
-    blocks_per_seq := (model.cfg.max_seq_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE
-    $kv := new_paged_kv_cache(&model.cfg, kv_slots, kv_slots * blocks_per_seq)
+    $kv := new_paged_kv_cache(&model.cfg, kv_slots, kv_dtype) or (err) {
+        eprintln("KV cache: " + err.msg())
+        << 1
+    }
     $row_cache := []ForwardRow{}
     for _ in 0:PREFILL_CHUNK {
         row_cache.push(ForwardRow{pos: 0, kv_offset: 0, table_offset: 0})
@@ -2627,6 +2780,8 @@ fn main() int {
         }
         println("kv_free_after:" + str(kv.free_top) + "/" + str(kv.num_blocks))
         println("kv_allocs:" + str(kv.alloc_count))
+        println("kv_storage_bytes:" + str(kv.storage_bytes))
+        println("compact_weight_bytes:" + str(model.compact_weights.data.len))
         if kv.free_top != kv.num_blocks { << 4 }
         << 0
     }
