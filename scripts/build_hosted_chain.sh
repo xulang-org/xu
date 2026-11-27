@@ -276,6 +276,7 @@ BRIDGE_EXEC_SHA256=SKIPPED
 BRIDGE_SEED_SHA256=SKIPPED
 BRIDGE_CONST_SOURCE_SHA256=SKIPPED
 BRIDGE_MATH_SOURCE_SHA256=SKIPPED
+BRIDGE_ERROR_SYNTAX_SOURCE_SHA256=SKIPPED
 # shellcheck disable=SC2086
 set +u
 if "$SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT" >"$tmp/seed-build.log" 2>&1; then
@@ -285,6 +286,31 @@ else
 fi
 set -u
 cat "$tmp/seed-build.log"
+if [ "$seed_build_rc" -ne 0 ] && grep -Eq "error: expected expression, found 'gt'|atomic_(load|store|add|cas) expects" "$tmp/seed-build.log"; then
+    FAILED_STAGE="error_syntax_seed_bridge"
+    set +u
+    python3 scripts/seed_error_syntax_bridge.py --seed "$SEED" --source "$ROOT" \
+        --destination "$tmp/error-syntax-bridge" \
+        --output "$tmp_native/error-syntax-bootstrap$CHAIN_BIN_EXT" -- "${HOSTED_ARGS[@]}"
+    set -u
+    BRIDGE_SEED=$(pick_bin "$tmp/error-syntax-bootstrap$CHAIN_BIN_EXT")
+    BRIDGE_SEED_SHA256=$(sha256_file "$BRIDGE_SEED")
+    BRIDGE_ERROR_SYNTAX_SOURCE_SHA256=$(cat "$tmp/error-syntax-bridge/source.sha256")
+    SEED_MANIFEST_BRIDGE=error_syntax_v1
+    FAILED_STAGE="bridged_seed_to_gen1"
+    # This transition compiler is disposable and never installed; restart Gen1
+    # against the complete, unchanged source tree.
+    set +u
+    if "$BRIDGE_SEED" build "${HOSTED_ARGS[@]}" $GEN1_SRCS -o "$tmp_native/gen1$CHAIN_BIN_EXT" >"$tmp/error-syntax-build.log" 2>&1; then
+        seed_build_rc=0
+    else
+        seed_build_rc=$?
+    fi
+    set -u
+    cat "$tmp/error-syntax-build.log"
+    cp "$tmp/error-syntax-build.log" "$tmp/seed-build.log"
+    SEED=$BRIDGE_SEED
+fi
 if [ "$seed_build_rc" -ne 0 ] && grep -Eq "const '[A-Z_][A-Z0-9_]*' must be snake_case" "$tmp/seed-build.log"; then
     FAILED_STAGE="const_naming_seed_bridge"
     set +u
@@ -577,6 +603,7 @@ bridge_exec_sha256=$BRIDGE_EXEC_SHA256
 bridge_seed_sha256=$BRIDGE_SEED_SHA256
 bridge_const_source_sha256=$BRIDGE_CONST_SOURCE_SHA256
 bridge_math_source_sha256=$BRIDGE_MATH_SOURCE_SHA256
+bridge_error_syntax_source_sha256=$BRIDGE_ERROR_SYNTAX_SOURCE_SHA256
 source_seed_files=$SOURCE_SEED_FILES
 source_seed_sha256=$SOURCE_SEED_SHA256
 source_closure_files=$SOURCE_CLOSURE_FILES
