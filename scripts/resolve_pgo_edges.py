@@ -14,7 +14,10 @@ from pathlib import Path
 
 
 def executable_segments(image):
-    if image[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<HH", image, 16) != (2, 62):
+    if image[:6] != b"\x7fELF\x02\x01":
+        raise ValueError("expected a little-endian x86-64 ELF executable")
+    etype, machine = struct.unpack_from("<HH", image, 16)
+    if etype not in (2, 3) or machine != 62:
         raise ValueError("expected a little-endian x86-64 ELF executable")
     offset = struct.unpack_from("<Q", image, 32)[0]
     size, count = struct.unpack_from("<HH", image, 54)

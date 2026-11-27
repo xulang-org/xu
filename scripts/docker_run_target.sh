@@ -39,8 +39,8 @@ xu_docker_ok() { docker image inspect "$1" >/dev/null 2>&1; }
 xu_linux_elf_ok() {
     local target=$1 bin=$2
     case "$target" in
-        linux-arm64) file "$bin" | grep -q "ELF 64-bit LSB executable, ARM aarch64" ;;
-        linux-x64)   file "$bin" | grep -q "ELF 64-bit LSB executable, x86-64" ;;
+        linux-arm64) file "$bin" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), ARM aarch64" ;;
+        linux-x64)   file "$bin" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), x86-64" ;;
         *) return 1 ;;
     esac
 }

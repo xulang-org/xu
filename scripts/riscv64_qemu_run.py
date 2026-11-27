@@ -400,7 +400,9 @@ def build_shim(entry):
 def read_elf(path):
     d = open(path, 'rb').read()
     assert d[:4] == b'\x7fELF'
-    entry = struct.unpack_from('<Q', d, 24)[0]
+    etype = struct.unpack_from('<H', d, 16)[0]
+    bias = 0x80400000 if etype == 3 else 0
+    entry = struct.unpack_from('<Q', d, 24)[0] + bias
     phoff = struct.unpack_from('<Q', d, 32)[0]
     phnum = struct.unpack_from('<H', d, 56)[0]
     segs = []
@@ -409,7 +411,7 @@ def read_elf(path):
         t, fl = struct.unpack_from('<II', d, off)
         po, pv, _pp, fs, ms, _al = struct.unpack_from('<QQQQQQ', d, off + 8)
         if t == 1:
-            segs.append((po, pv, fs, ms, fl))
+            segs.append((po, pv + bias, fs, ms, fl))
     return entry, segs, d
 
 
