@@ -27,7 +27,7 @@ endif()
 if(ANDROID)
   add_library(main SHARED ${GAME_SOURCES})
   set(GAME_TARGET main)
-  target_link_options(main PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,--no-undefined")
+  target_link_options(main PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,--no-undefined" "-Wl,-z,relro" "-Wl,-z,now" "-Wl,-z,noexecstack")
 else()
   add_executable(XuPhoneGame ${GAME_SOURCES})
   set_target_properties(XuPhoneGame PROPERTIES

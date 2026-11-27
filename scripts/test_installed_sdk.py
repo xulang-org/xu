@@ -842,7 +842,7 @@ fn change(r $&Record) int { r.value += 11
 fn (r $&Record) bump() int { r.value += 7
  << r.value }
 fn fail_after_change(r $&Record) int { r.value += 3
- >>> errors.new("expected") }
+ >> errors.new("expected") }
 struct Packed { a i32
  b i32
  c u8 }
@@ -955,7 +955,7 @@ fn main() {
 #time
 #errors
 fn expect(value bool,message string) int {
-    if !value { >>> errors.new(message) }
+    if !value { >> errors.new(message) }
     << 0
 }
 fn input(kind int,x f64,y f64,now time.Instant) ui.InputEvent {

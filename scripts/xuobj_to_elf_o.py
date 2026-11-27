@@ -23,6 +23,7 @@ SHF_WRITE = 0x1
 SHF_ALLOC = 0x2
 SHF_EXECINSTR = 0x4
 SHF_INFO_LINK = 0x40
+STB_LOCAL = 0
 STB_GLOBAL = 1
 STT_NOTYPE = 0
 STT_FUNC = 2
@@ -208,12 +209,12 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
         elif lab not in local:
             undef.add(lab)
 
-    # ELF symbols: [0]=null, then section symbols, then defined, then undef
+    # ELF symbols: [0]=null, [1..2]=local section symbols, then global defined, then undef
     # shndx: 1=.text 2=.data
     syms: list[tuple[str, int, int, int, int]] = []  # name, value, size, info, shndx
     syms.append(("", 0, 0, 0, 0))
-    syms.append((".text", 0, 0, (STB_GLOBAL << 4) | STT_SECTION, 1))
-    syms.append((".data", 0, 0, (STB_GLOBAL << 4) | STT_SECTION, 2))
+    syms.append((".text", 0, 0, (STB_LOCAL << 4) | STT_SECTION, 1))
+    syms.append((".data", 0, 0, (STB_LOCAL << 4) | STT_SECTION, 2))
     for name, shndx, val in defined:
         stt = STT_OBJECT if shndx == 2 else STT_FUNC
         syms.append((name, val, 0, (STB_GLOBAL << 4) | stt, shndx))
@@ -248,14 +249,14 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
             else:
                 raise SystemExit(f"unknown arm64 reloc kind {kind}")
 
-    shstr_names = ["", ".text", ".data", ".shstrtab", ".symtab", ".strtab", ".rela.text"]
+    shstr_names = ["", ".text", ".data", ".shstrtab", ".symtab", ".strtab", ".rela.text", ".note.GNU-stack"]
     shstr, shstr_idx = elf_hash_strtab(shstr_names)
     strtab, str_idx = elf_hash_strtab([n for n, *_ in syms])
 
-    # Layout: Ehdr + Shdr[7] + .text + .data + .shstrtab + .symtab + .strtab + .rela.text
+    # Layout: Ehdr + Shdr[8] + .text + .data + .shstrtab + .symtab + .strtab + .rela.text
     ehdr_sz = 64
     shdr_sz = 64
-    nsh = 7
+    nsh = 8
     text_off = align(ehdr_sz + shdr_sz * nsh, 16)
     data_off = align(text_off + len(code), 16)
     shstr_off = align(data_off + len(data), 8)
@@ -313,8 +314,8 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
     out += shdr(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 0, text_off, len(code), 0, 0, 16, 0)
     out += shdr(".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, 0, data_off, len(data), 0, 0, 8, 0)
     out += shdr(".shstrtab", SHT_STRTAB, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0)
-    # .symtab link=.strtab(5) info=first non-local (all global → 1)
-    out += shdr(".symtab", SHT_SYMTAB, 0, 0, sym_off, 24 * len(syms), 5, 1, 8, 24)
+    # .symtab link=.strtab(5) info=3 (first non-local after null + 2 STB_LOCAL section syms)
+    out += shdr(".symtab", SHT_SYMTAB, 0, 0, sym_off, 24 * len(syms), 5, 3, 8, 24)
     out += shdr(".strtab", SHT_STRTAB, 0, 0, str_off, len(strtab), 0, 0, 1, 0)
     out += shdr(
         ".rela.text",
@@ -328,6 +329,8 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
         8,
         24,
     )
+    # Non-executable stack marker (prevents GNU ld from emitting PT_GNU_STACK RWE)
+    out += shdr(".note.GNU-stack", SHT_PROGBITS, 0, 0, rela_off + 24 * len(relas), 0, 0, 0, 1, 0)
 
     out += b"\0" * (text_off - len(out))
     out += code

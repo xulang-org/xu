@@ -112,6 +112,7 @@ def parse_pe(path: Path) -> dict:
     imp_rva, imp_sz = struct.unpack_from("<II", raw, opt + 112 + 1 * 8)
     exc_rva, exc_sz = struct.unpack_from("<II", raw, opt + 112 + 3 * 8)
     reloc_rva, reloc_sz = struct.unpack_from("<II", raw, opt + 112 + 5 * 8)
+    load_cfg_rva, load_cfg_sz = struct.unpack_from("<II", raw, opt + 112 + 10 * 8)
     iat_rva, iat_sz = struct.unpack_from("<II", raw, opt + 112 + 12 * 8)
     tbl = opt + opt_size
     sections = []
@@ -136,6 +137,7 @@ def parse_pe(path: Path) -> dict:
         "imp": (imp_rva, imp_sz),
         "exc": (exc_rva, exc_sz),
         "basereloc": (reloc_rva, reloc_sz),
+        "load_cfg": (load_cfg_rva, load_cfg_sz),
         "iat": (iat_rva, iat_sz),
         "sections": sections,
     }
@@ -170,15 +172,37 @@ def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int
     imp_rva, imp_sz = pe["imp"]
     exc_rva, exc_sz = pe["exc"]
     reloc_rva, reloc_sz = pe["basereloc"]
+    lc_rva, lc_sz = pe["load_cfg"]
     iat_rva, iat_sz = pe["iat"]
     assert imp_sz > 0 and iat_sz > 0, (pe["imp"], pe["iat"])
     assert rdata["vaddr"] <= imp_rva and imp_rva + imp_sz <= rdata["vaddr"] + rdata["vsize"], (pe["imp"], rdata)
     assert rdata["vaddr"] <= iat_rva and iat_rva + iat_sz <= rdata["vaddr"] + rdata["vsize"], (pe["iat"], rdata)
     assert exc_rva == pdata["vaddr"] and exc_sz == pdata["vsize"] and exc_sz > 0, (pe["exc"], pdata)
+
+    # IMAGE_LOAD_CONFIG_DIRECTORY64 inside .rdata with DIR64-relocated SecurityCookie in .data
+    assert lc_sz == 320, (lc_rva, lc_sz)
+    assert rdata["vaddr"] <= lc_rva and lc_rva + lc_sz <= rdata["vaddr"] + rdata["vsize"], (pe["load_cfg"], rdata)
+    lc_off = lc_rva - rdata["vaddr"]
+    assert struct.unpack_from("<I", rdata["raw"], lc_off)[0] == 320
+    cookie_va = struct.unpack_from("<Q", rdata["raw"], lc_off + 88)[0]
+    assert cookie_va == 0x140000000 + data["vaddr"] + 32, hex(cookie_va)
+    assert struct.unpack_from("<Q", data["raw"], 32)[0] == 0x00002B992DDFA232
+
     assert reloc_rva == reloc["vaddr"] and reloc_sz == reloc["vsize"] == 12, (pe["basereloc"], reloc)
     blk_page_rva, blk_size, e0, e1 = struct.unpack_from("<IIHH", reloc["raw"], 0)
-    assert (blk_page_rva, blk_size, e0, e1) == (text["vaddr"], 12, 0, 0), (blk_page_rva, blk_size, e0, e1)
+    cookie_field_rva = lc_rva + 88
+    assert blk_page_rva == (cookie_field_rva & 0xFFFFF000) and blk_size == 12, (hex(blk_page_rva), blk_size)
+    assert e0 == (0xA000 | (cookie_field_rva & 0xFFF)) and e1 == 0, (hex(e0), hex(e1))
     return text["vaddr"], rdata["vaddr"], data["vaddr"], pdata["vaddr"]
+
+
+def can_execute_target(target: str) -> bool:
+    if os.name != "nt":
+        return False
+    arch = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
+    if "ARM64" in arch:
+        return target in ("windows-arm64", "windows-x64")
+    return target == "windows-x64"
 
 
 def main() -> int:
@@ -200,6 +224,7 @@ def main() -> int:
         src.write_text(SOURCE, encoding="utf-8", newline="\n")
 
         for target in ("windows-arm64", "windows-x64"):
+            run_live = (not args.headers_only) and can_execute_target(target)
             for mode, flags in (("default", ()), ("no-opt", ("--no-opt",))):
                 exe = work / f"probe-{target}-{mode}.exe"
                 subprocess.run(
@@ -213,7 +238,7 @@ def main() -> int:
                 pe = parse_pe(exe)
                 t_rva, r_rva, d_rva, p_rva = check_wx_headers(pe, expect_rsrc=False)
 
-                if not args.headers_only:
+                if run_live:
                     run_env = dict(env, XU_DEBUG_FREE="1")
                     res = subprocess.run(
                         [str(exe), str(t_rva), str(r_rva), str(d_rva), str(p_rva)],
@@ -231,7 +256,7 @@ def main() -> int:
                 embed_invoker_manifest(mexe)
                 pe_m = parse_pe(mexe)
                 mt_rva, mr_rva, md_rva, mp_rva = check_wx_headers(pe_m, expect_rsrc=True)
-                if not args.headers_only:
+                if run_live:
                     res_m = subprocess.run(
                         [str(mexe), str(mt_rva), str(mr_rva), str(md_rva), str(mp_rva)],
                         env=run_env,
@@ -240,7 +265,7 @@ def main() -> int:
                         timeout=30,
                     )
                     assert res_m.returncode == 0 and res_m.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res_m)
-                print(f"  [PASS] {target} {mode}: W^X + .pdata + .reloc + manifest" + ("" if args.headers_only else " + live VirtualQuery + FFI"))
+                print(f"  [PASS] {target} {mode}: W^X + .pdata + .reloc + manifest" + (" + live VirtualQuery + FFI" if run_live else " (headers)"))
 
     print("Windows PE W^X verification passed")
     return 0

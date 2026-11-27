@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Build a disposable transition compiler before `>>>` error-handling syntax.
 
-An older published seed (such as v0.14.2) only lexes legacy `>>` throws and
+An older published seed (such as v0.14.2) only lexes `>>` throws and legacy
 `or` / `or >>` error handlers. Rewrite only non-string, non-comment `>>>`
-error-handling tokens in a private copy of `src/` to compile a temporary
-transition compiler once, then restart Gen1 on the complete, unchanged current
-source tree and require the normal fixed point.
+error-handling tokens (and any legacy `>>>` throws if present) in a private
+copy of `src/` to compile a temporary transition compiler once, then restart
+Gen1 on the complete, unchanged current source tree and require the normal
+fixed point.
 """
 import argparse
 import hashlib

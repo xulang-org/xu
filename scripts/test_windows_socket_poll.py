@@ -28,28 +28,28 @@ fn exchange(fd int) int {
     while sent < request.len {
         part := request[sent:request.len]
         n := net.conn_write(fd, &part) >>>
-        if n <= 0 || n > part.len { >>> errors.new("request write made invalid progress") }
+        if n <= 0 || n > part.len { >> errors.new("request write made invalid progress") }
         sent += n
     }
     $response := ""
     while response.len < 8192 {
         part := net.conn_read(fd, 1024) >>>
-        if part.len == 0 { >>> errors.new("response ended before body") }
+        if part.len == 0 { >> errors.new("response ended before body") }
         response = response + part
         if strings.index_of(&response, "\r\n\r\nok") >= 0 { << 1 }
     }
-    >>> errors.new("response exceeded limit")
+    >> errors.new("response exceeded limit")
 }
 
 fn request(addr string) int {
     fd := net.dial_ns(addr, 2000000000) >>>
     os.set_sock_timeout(fd, 2000000000) >>> (err) {
         close_quiet(fd)
-        >>> err
+        >> err
     }
     result := exchange(fd) >>> (err) {
         close_quiet(fd)
-        >>> err
+        >> err
     }
     net.conn_close(fd) >>>
     << result
@@ -110,24 +110,24 @@ fn invalid_timeout_rejected() bool {
 
 fn probe(addr string) int {
     if !invalid_write_rejected() || !invalid_read_rejected() || !invalid_sendto_rejected() || !invalid_recvfrom_rejected() || !invalid_timeout_rejected() {
-        >>> errors.new("invalid socket I/O accepted")
+        >> errors.new("invalid socket I/O accepted")
     }
     lfd := net.listen(addr + "") >>>
     // No client exists yet: every readiness result must be exactly zero.
     for i in 0:64 {
         ready := os.socket_poll(lfd, 1) >>> (err) { close_quiet(lfd)
-            >>> err }
+            >> err }
         if ready != 0 { close_quiet(lfd)
-            >>> errors.new("idle listener reported ready") }
+            >> errors.new("idle listener reported ready") }
     }
     if !invalid_socket_rejected() { close_quiet(lfd)
-        >>> errors.new("invalid SOCKET accepted") }
+        >> errors.new("invalid SOCKET accepted") }
     xu serve(lfd)
     out := chan int{cap: 2}
     for i in 0:2 { xu worker(addr + "", out) }
     first := <-out
     second := <-out
-    if first != 3 || second != 3 { >>> errors.new("concurrent requests failed") }
+    if first != 3 || second != 3 { >> errors.new("concurrent requests failed") }
     // The server owns lfd until this process exits, including its worker Gs.
     println("Windows socket poll and concurrent HTTP passed")
     << 0

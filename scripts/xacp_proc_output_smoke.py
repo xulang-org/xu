@@ -34,7 +34,7 @@ fn write_all(fd int,data &string) int {
     $offset := 0
     while offset < data.len {
         n := os.fd_write(fd,data[offset:data.len]) >>>
-        if n <= 0 { >>> errors.new("output made no progress") }
+        if n <= 0 { >> errors.new("output made no progress") }
         offset += n
     }
     << 0
