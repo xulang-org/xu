@@ -56,10 +56,16 @@ const G_SIGNAL_PENDING = 101
 const G_SIGNAL_EVENT = 102
 const G_SIGNAL_LOCK = 103
 const G_SIGNAL_INTEREST = 104
-const G_HEAP_LOCK = 105
 const G_MT_ACTIVE = 106
-const G_FFI_LOCK = 107
-const G_SCHED_LOCK = 108
+// Cache-line-separated spinlocks (words 256..288 = bytes 2048..2367),
+// clear of WASI scratch (128..159) and FFI closure slots (384+).
+const G_HEAP_LOCK = 256
+const G_SCHED_LOCK = 264
+const G_IO_LOCK = 272
+const G_PRINT_LOCK = 280
+const G_FFI_LOCK = 288
+
+const SYS_CPU_PAUSE = -15
 
 const OS_MACOS = 0
 const OS_LINUX = 1
@@ -125,17 +131,49 @@ pub fn rt_mt_enable() {
     atomic_store(c_ptr(rt_globals() + G_MT_ACTIVE * 8), 1)
 }
 
+fn rt_mt_disable() {
+    atomic_store(c_ptr(rt_globals() + G_MT_ACTIVE * 8), 0)
+}
+
 fn rt_mt_active() bool {
     << rt_load(rt_globals() + G_MT_ACTIVE * 8, 8) != 0
 }
 
+fn spin_lock_addr(addr int) {
+    lk := c_ptr(addr)
+    if atomic_cas(lk, 0, 1) { << }
+    $spins := 0
+    while true {
+        while atomic_load(lk) != 0 {
+            rt_syscall(SYS_CPU_PAUSE, 0, 0, 0, 0, 0, 0)
+            spins += 1
+            if (spins & 255) == 0 {
+                os := xu_target_os()
+                if os == OS_LINUX {
+                    _ := rt_syscall(124, 0, 0, 0, 0, 0, 0) // sched_yield
+                } else if os == OS_WINDOWS {
+                    _ := win_call(W_SLEEP, 0, 0, 0, 0, 0, 0)
+                } else {
+                    rt_syscall(SYS_CPU_PAUSE, 0, 0, 0, 0, 0, 0)
+                    rt_syscall(SYS_CPU_PAUSE, 0, 0, 0, 0, 0, 0)
+                    rt_syscall(SYS_CPU_PAUSE, 0, 0, 0, 0, 0, 0)
+                }
+            }
+        }
+        if atomic_cas(lk, 0, 1) { << }
+    }
+}
+
+fn spin_unlock_addr(addr int) {
+    atomic_store(c_ptr(addr), 0)
+}
+
 fn spin_lock(slot int) {
-    lk := c_ptr(rt_globals() + slot * 8)
-    while !atomic_cas(lk, 0, 1) {}
+    spin_lock_addr(rt_globals() + slot * 8)
 }
 
 fn spin_unlock(slot int) {
-    atomic_store(c_ptr(rt_globals() + slot * 8), 0)
+    spin_unlock_addr(rt_globals() + slot * 8)
 }
 
 pub fn exit_process(code int) {
@@ -206,6 +244,186 @@ const DEBUG_FREE_ENABLED = 2
 const MEDIUM_MAX = 262144
 const MEDIUM_LIMIT = 16
 
+// Per-M thread-local small-object cache (mcache) constants; layout lives inside
+// each M slot in chan.xu (offsets MT_M_MCACHE_*). Zero locks on hot path.
+const MCACHE_SLAB = 65536
+const MCACHE_MAX = 64
+const MCACHE_FLUSH = 32
+const MCACHE_REFILL = 16
+const MCACHE_LARGE_MAX = 8
+const MCACHE_LARGE_FLUSH = 4
+const MCACHE_LARGE_REFILL = 4
+
+fn mcache_max(c int) int {
+    if c >= 6 { << MCACHE_LARGE_MAX }
+    << MCACHE_MAX
+}
+
+fn mcache_flush_cnt(c int) int {
+    if c >= 6 { << MCACHE_LARGE_FLUSH }
+    << MCACHE_FLUSH
+}
+
+fn mcache_refill_cnt(c int) int {
+    if c >= 6 { << MCACHE_LARGE_REFILL }
+    << MCACHE_REFILL
+}
+
+fn mcache_alloc_small(mc int, c int, zero bool, n int) int {
+    fslot := mc + MT_M_MCACHE_FREE + c * 8
+    cslot := mc + MT_M_MCACHE_CNT + c * 8
+    $head := rt_load(fslot, 8)
+    if head != 0 {
+        rt_store(fslot, 8, rt_load(head, 8))
+        rt_store(cslot, 8, rt_load(cslot, 8) - 1)
+        rt_store(head - 8, 8, TAG_LIVE)
+        if zero {
+            if c <= 2 {
+                rt_store(head, 8, 0)
+                rt_store(head + 8, 8, 0)
+                if c >= 1 {
+                    rt_store(head + 16, 8, 0)
+                    rt_store(head + 24, 8, 0)
+                }
+                if c == 2 {
+                    rt_store(head + 32, 8, 0)
+                    rt_store(head + 40, 8, 0)
+                    rt_store(head + 48, 8, 0)
+                    rt_store(head + 56, 8, 0)
+                }
+            } else {
+                mem_zero(head, (n + 15) / 16 * 16)
+            }
+        }
+        << head
+    }
+    need := 16 + (16 << c)
+    cur := rt_load(mc + MT_M_MCACHE_CUR, 8)
+    end := rt_load(mc + MT_M_MCACHE_END, 8)
+    if cur != 0 && cur + need <= end {
+        rt_store(mc + MT_M_MCACHE_CUR, 8, cur + need)
+        p := cur + 16
+        rt_store(p - 16, 8, c)
+        rt_store(p - 8, 8, TAG_LIVE)
+        << p
+    }
+    << mcache_refill(mc, c, zero, n)
+}
+
+fn mcache_refill(mc int, c int, zero bool, n int) int {
+    g := rt_globals()
+    gslot := g + (G_FREE + c) * 8
+    fslot := mc + MT_M_MCACHE_FREE + c * 8
+    cslot := mc + MT_M_MCACHE_CNT + c * 8
+    need := 16 + (16 << c)
+    spin_lock(G_HEAP_LOCK)
+    $first := rt_load(gslot, 8)
+    if first != 0 {
+        $cur := rt_load(first, 8)
+        rt_store(first - 8, 8, TAG_LIVE)
+        $batch_head := 0
+        $batch_cnt := 0
+        refill_lim := mcache_refill_cnt(c)
+        while cur != 0 && batch_cnt < refill_lim {
+            nxt := rt_load(cur, 8)
+            rt_store(cur, 8, batch_head)
+            batch_head = cur
+            batch_cnt += 1
+            cur = nxt
+        }
+        rt_store(gslot, 8, cur)
+        spin_unlock(G_HEAP_LOCK)
+        if batch_cnt > 0 {
+            rt_store(fslot, 8, batch_head)
+            rt_store(cslot, 8, batch_cnt)
+        }
+        if zero {
+            if c <= 2 {
+                rt_store(first, 8, 0)
+                rt_store(first + 8, 8, 0)
+                if c >= 1 {
+                    rt_store(first + 16, 8, 0)
+                    rt_store(first + 24, 8, 0)
+                }
+                if c == 2 {
+                    rt_store(first + 32, 8, 0)
+                    rt_store(first + 40, 8, 0)
+                    rt_store(first + 48, 8, 0)
+                    rt_store(first + 56, 8, 0)
+                }
+            } else {
+                mem_zero(first, (n + 15) / 16 * 16)
+            }
+        }
+        << first
+    }
+    if need > 4096 {
+        // Carve large small-classes (4KB..16KB) directly without clobbering
+        // the per-M small-object bump slab.
+        slab := heap_carve(need)
+        spin_unlock(G_HEAP_LOCK)
+        p := slab + 16
+        rt_store(p - 16, 8, c)
+        rt_store(p - 8, 8, TAG_LIVE)
+        << p
+    }
+    slab := heap_carve(MCACHE_SLAB)
+    spin_unlock(G_HEAP_LOCK)
+    rt_store(mc + MT_M_MCACHE_CUR, 8, slab + need)
+    rt_store(mc + MT_M_MCACHE_END, 8, slab + MCACHE_SLAB)
+    p := slab + 16
+    rt_store(p - 16, 8, c)
+    rt_store(p - 8, 8, TAG_LIVE)
+    << p
+}
+
+fn mcache_flush_half(mc int, c int) {
+    fslot := mc + MT_M_MCACHE_FREE + c * 8
+    cslot := mc + MT_M_MCACHE_CNT + c * 8
+    $head := rt_load(fslot, 8)
+    $tail := head
+    $k := 1
+    lim := mcache_flush_cnt(c)
+    while k < lim && tail != 0 {
+        nx := rt_load(tail, 8)
+        if nx == 0 { <- }
+        tail = nx
+        k += 1
+    }
+    if tail == 0 { << }
+    rem := rt_load(tail, 8)
+    rt_store(fslot, 8, rem)
+    rt_store(cslot, 8, rt_load(cslot, 8) - k)
+    gslot := rt_globals() + (G_FREE + c) * 8
+    spin_lock(G_HEAP_LOCK)
+    rt_store(tail, 8, rt_load(gslot, 8))
+    rt_store(gslot, 8, head)
+    spin_unlock(G_HEAP_LOCK)
+}
+
+fn mcache_flush_all(mc int) {
+    if mc == 0 { << }
+    g := rt_globals()
+    spin_lock(G_HEAP_LOCK)
+    for c in 0:NCLASS {
+        fslot := mc + MT_M_MCACHE_FREE + c * 8
+        cslot := mc + MT_M_MCACHE_CNT + c * 8
+        head := rt_load(fslot, 8)
+        if head != 0 {
+            $tail := head
+            while rt_load(tail, 8) != 0 {
+                tail = rt_load(tail, 8)
+            }
+            gslot := g + (G_FREE + c) * 8
+            rt_store(tail, 8, rt_load(gslot, 8))
+            rt_store(gslot, 8, head)
+            rt_store(fslot, 8, 0)
+            rt_store(cslot, 8, 0)
+        }
+    }
+    spin_unlock(G_HEAP_LOCK)
+}
+
 // Zeroed, 16-byte aligned block of at least size bytes.
 pub fn alloc(size int) int {
     $n := size
@@ -229,9 +447,15 @@ pub fn alloc(size int) int {
             c += 1
         }
     }
+    mt := rt_mt_active()
+    if mt {
+        mc := rt_mcache_current()
+        if mc != 0 {
+            << mcache_alloc_small(mc, c, true, n)
+        }
+    }
     g := rt_globals()
     slot := g + (G_FREE + c) * 8
-    mt := rt_mt_active()
     if mt { spin_lock(G_HEAP_LOCK) }
     head := rt_load(slot, 8)
     if head != 0 {
@@ -263,9 +487,15 @@ pub fn alloc(size int) int {
 }
 
 fn alloc_small_raw(c int) int {
+    mt := rt_mt_active()
+    if mt {
+        mc := rt_mcache_current()
+        if mc != 0 {
+            << mcache_alloc_small(mc, c, false, 16 << c)
+        }
+    }
     g := rt_globals()
     slot := g + (G_FREE + c) * 8
-    mt := rt_mt_active()
     if mt { spin_lock(G_HEAP_LOCK) }
     $p := rt_load(slot, 8)
     if p != 0 {
@@ -317,9 +547,15 @@ fn alloc_unzeroed(size int) int {
             c += 1
         }
     }
+    mt := rt_mt_active()
+    if mt {
+        mc := rt_mcache_current()
+        if mc != 0 {
+            << mcache_alloc_small(mc, c, false, n)
+        }
+    }
     g := rt_globals()
     slot := g + (G_FREE + c) * 8
-    mt := rt_mt_active()
     if mt { spin_lock(G_HEAP_LOCK) }
     head := rt_load(slot, 8)
     if head != 0 {
@@ -417,6 +653,32 @@ fn free_checked(p int, strict bool) {
         df = debug_free()
     }
     mt := rt_mt_active()
+    if mt && !df {
+        mc := rt_mcache_current()
+        if mc != 0 {
+            tag := rt_load(p - 8, 8)
+            if tag != TAG_LIVE {
+                if strict {
+                    free_fatal(p)
+                }
+                <<
+            }
+            c := rt_load(p - 16, 8)
+            if c >= 0 && c < NCLASS {
+                rt_store(p - 8, 8, TAG_FREED)
+                fslot := mc + MT_M_MCACHE_FREE + c * 8
+                cslot := mc + MT_M_MCACHE_CNT + c * 8
+                rt_store(p, 8, rt_load(fslot, 8))
+                rt_store(fslot, 8, p)
+                cnt := rt_load(cslot, 8) + 1
+                rt_store(cslot, 8, cnt)
+                if cnt >= mcache_max(c) {
+                    mcache_flush_half(mc, c)
+                }
+                <<
+            }
+        }
+    }
     if mt { spin_lock(G_HEAP_LOCK) }
     tag := rt_load(p - 8, 8)
     if tag != TAG_LIVE {
@@ -1009,16 +1271,40 @@ pub fn str_runes(out int, s int) {
 // ===== printing =====
 
 pub fn print_desc(fd int, d int, newline bool) {
-    write_fd(fd, desc_ptr(d), desc_len(d))
+    p := desc_ptr(d)
+    n := desc_len(d)
+    if newline && n <= 255 {
+        $buf := [32]int{
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        }
+        bp := rt_addr($&buf)
+        if n > 0 {
+            mem_copy(bp, p, n)
+        }
+        rt_store(bp + n, 1, 10)
+        write_fd(fd, bp, n + 1)
+        <<
+    }
+    mt := rt_mt_active()
+    if mt { spin_lock(G_PRINT_LOCK) }
+    write_fd(fd, p, n)
     if newline {
         $nl := 10
         write_fd(fd, rt_addr(&nl), 1)
     }
+    if mt { spin_unlock(G_PRINT_LOCK) }
 }
 
 pub fn print_int(fd int, v int, newline bool) {
-    base := alloc(24)
-    $pos := 24
+    $buf := [4]int{0, 0, 0, 0}
+    base := rt_addr($&buf)
+    $end := 31
+    if newline {
+        rt_store(base + 31, 1, 10)
+        end = 32
+    }
+    $pos := 31
     $x := v
     if x == 0 {
         pos -= 1
@@ -1037,12 +1323,7 @@ pub fn print_int(fd int, v int, newline bool) {
         pos -= 1
         rt_store(base + pos, 1, 45)
     }
-    write_fd(fd, base + pos, 24 - pos)
-    free(base)
-    if newline {
-        $nl := 10
-        write_fd(fd, rt_addr(&nl), 1)
-    }
+    write_fd(fd, base + pos, end - pos)
 }
 
 pub fn print_bool(fd int, b bool, newline bool) {
