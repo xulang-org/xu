@@ -333,7 +333,19 @@ def audit_elf(target: str, opt: str, elf: Path, symmap_path: Path) -> None:
         fail(f"{elf.name} is not an ELF binary")
     e_entry = struct.unpack_from("<Q", raw, 24)[0]
     e_phoff = struct.unpack_from("<Q", raw, 32)[0]
-    p_offset, p_vaddr = struct.unpack_from("<QQ", raw, e_phoff + 8)
+    e_phentsize = struct.unpack_from("<H", raw, 54)[0]
+    e_phnum = struct.unpack_from("<H", raw, 56)[0]
+    text_seg: tuple[int, int, int] | None = None
+    for i in range(e_phnum):
+        p_type, _p_flags, p_offset, p_vaddr, _p_paddr, p_filesz = struct.unpack_from(
+            "<IIQQQQ", raw, e_phoff + i * e_phentsize
+        )
+        if p_type == 1 and p_vaddr <= e_entry < p_vaddr + p_filesz:
+            text_seg = (p_offset, p_vaddr, p_filesz)
+            break
+    if text_seg is None:
+        fail(f"{target}/{opt}: no PT_LOAD segment contains e_entry={e_entry:#x}")
+    p_offset, p_vaddr, p_filesz = text_seg
 
     start_sym = 0
     fn_offsets: list[tuple[int, str]] = []
@@ -347,9 +359,10 @@ def audit_elf(target: str, opt: str, elf: Path, symmap_path: Path) -> None:
                 fn_offsets.append((off, parts[1]))
     fn_offsets.sort()
     code_base = (e_entry - p_vaddr + p_offset) - start_sym
+    code_end_off = (p_offset + p_filesz) - code_base
     ranges: dict[str, bytes] = {}
     for i, (off, name) in enumerate(fn_offsets):
-        nxt = fn_offsets[i + 1][0] if i + 1 < len(fn_offsets) else len(raw) - code_base
+        nxt = fn_offsets[i + 1][0] if i + 1 < len(fn_offsets) else code_end_off
         ranges[name] = raw[code_base + off : code_base + nxt]
 
     for label, (sym, required, strictly_branchless) in FUNCTIONS.items():
