@@ -301,6 +301,15 @@ class ElfHardeningTest(unittest.TestCase):
         self.assertEqual(len(relros), 1)
         relro = relros[0]
         self.assertEqual((relro["vaddr"] + relro["memsz"]) % page, 0, "PT_GNU_RELRO end must be page-aligned")
+        # PT_GNU_RELRO must be strictly contained within a PT_LOAD segment (eu-elflint / ld.so invariant).
+        self.assertTrue(
+            any(
+                seg["vaddr"] <= relro["vaddr"]
+                and relro["vaddr"] + relro["memsz"] <= seg["vaddr"] + seg["memsz"]
+                for seg in loads
+            ),
+            f"PT_GNU_RELRO {relro} not strictly contained in any PT_LOAD {loads}",
+        )
         dyn_map = dict(info["dyn"])
         self.assertEqual(dyn_map.get(DT_FLAGS, 0) & DF_BIND_NOW, DF_BIND_NOW)
         self.assertEqual(dyn_map.get(DT_FLAGS_1, 0) & (DF_1_NOW | DF_1_PIE), DF_1_NOW | DF_1_PIE)
