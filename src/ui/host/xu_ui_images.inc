@@ -115,6 +115,9 @@ const unsigned char *xu_ui_bitmap_pixels(const XuUiBitmap *bitmap, unsigned *wid
   if (height) *height = bitmap ? bitmap->height : 0;
   return bitmap ? bitmap->pixels : NULL;
 }
+unsigned xu_ui_bitmap_revision(const XuUiBitmap *bitmap) {
+  return bitmap ? bitmap->revision : 0u;
+}
 static bool image_size(unsigned width, unsigned height, unsigned stride, unsigned length, unsigned *bytes) {
   if (!width || !height || width > XU_UI_IMAGE_MAX_DIMENSION || height > XU_UI_IMAGE_MAX_DIMENSION || stride < width * 4u) return false;
   uint64_t dense = (uint64_t)width * height * 4u, source = (uint64_t)stride * height;

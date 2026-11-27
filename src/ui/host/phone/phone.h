@@ -4,12 +4,18 @@
 extern "C" {
 #endif
 void xu_phone_start(const char *platform);
+void xu_phone_set_paths(const char *data_root, const char *resource_root);
+void xu_phone_set_network_env(const char *dns_servers, const char *ca_bundle_path);
 void xu_phone_resize(double width, double height, double scale);
 void xu_phone_insets(double top, double bottom, double left, double right, double ime_bottom);
 void xu_phone_reduced_motion(int enabled);
+void xu_phone_system_appearance(int dark);
+void xu_phone_font_scale(double scale);
 void xu_phone_input(int kind, double x, double y, int buttons);
 void xu_phone_input_event(int kind, double x, double y, int button, int buttons, int modifiers, int click_count);
 void xu_phone_active(int active);
+void xu_phone_wake(void);
+void xu_phone_renderer_reset(void);
 void xu_phone_stop(void);
 void xu_phone_redraw(void);
 int xu_phone_back(void);

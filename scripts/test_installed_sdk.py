@@ -982,26 +982,30 @@ fn verify() int {
     click := input(ui.EV_POINTER_DOWN,160.0,200.0,shown)
     _ := tip.input(&click) >>>
     expect(!tip.is_open(),"click did not dismiss") >>>
+    after_click := shown.add(time.seconds(1) >>>) >>>
     _ := tip.input(&move) >>>
-    _ := tip.tick(shown.add(time.seconds(1) >>>) >>>,true) >>>
+    _ := tip.tick(after_click,true) >>>
     expect(!tip.is_open(),"click suppression lost before leaving") >>>
-    leave := input(ui.EV_POINTER_MOVE,380.0,380.0,shown)
+    leave := input(ui.EV_POINTER_MOVE,380.0,380.0,after_click)
+    reenter := input(ui.EV_POINTER_MOVE,160.0,200.0,after_click)
+    reopen := after_click.add(time.seconds(1) >>>) >>>
     _ := tip.input(&leave) >>>
-    _ := tip.input(&move) >>>
-    _ := tip.tick(shown.add(time.seconds(1) >>>) >>>,true) >>>
+    _ := tip.input(&reenter) >>>
+    _ := tip.tick(reopen,true) >>>
     expect(tip.is_open(),"hover did not reset after leaving") >>>
-    _ := tip.input(&leave) >>>
+    leave2 := input(ui.EV_POINTER_MOVE,380.0,380.0,reopen)
+    _ := tip.input(&leave2) >>>
     expect(!tip.is_open(),"hover leave did not close") >>>
-    tip.set_focus(true,shown) >>>
+    tip.set_focus(true,reopen) >>>
     expect(tip.is_open(),"keyboard focus did not open") >>>
-    $escape := input(ui.EV_KEY_DOWN,0.0,0.0,shown)
+    $escape := input(ui.EV_KEY_DOWN,0.0,0.0,reopen)
     escape.key = ui.KEY_ESCAPE
     _ := tip.input(&escape) >>>
     expect(!tip.is_open(),"Escape did not dismiss") >>>
-    tip.set_focus(true,shown) >>>
+    tip.set_focus(true,reopen) >>>
     expect(!tip.is_open(),"Escape suppression lost") >>>
-    tip.set_focus(false,shown) >>>
-    tip.set_focus(true,shown) >>>
+    tip.set_focus(false,reopen) >>>
+    tip.set_focus(true,reopen) >>>
     expect(tip.is_open(),"refocus did not reset suppression") >>>
     for side in 0:4 {
         $placement := widgets.overlay_placement()

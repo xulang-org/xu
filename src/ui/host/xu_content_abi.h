@@ -37,7 +37,7 @@ typedef struct XuContentVTable {
 const XuContentVTable *xu_webview_plugin_vtable(void);
 const XuContentVTable *xu_draw_plugin_vtable(void);
 
-/* App-provided content plugin: the app's own native/<os>/*.cc, compiled into
+/* App-provided content plugin: the app's own native/<os>/<name>.cc, compiled into
    the host by the packer. It serves CONTENT_NATIVE (kind 3), the role macOS
    fills by resolving the bootstrap name at runtime. Weak in the shell so an
    app without a native plugin still links. */

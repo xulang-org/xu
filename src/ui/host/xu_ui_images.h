@@ -23,6 +23,7 @@ int xu_ui_image_info(uint64_t id, unsigned *width, unsigned *height, unsigned *g
 /* Pixels are tightly packed top-left premultiplied BGRA8. The caller must hold
  * a bitmap reference (or an owned frame lease) while accessing this pointer. */
 const unsigned char *xu_ui_bitmap_pixels(const XuUiBitmap *, unsigned *width, unsigned *height);
+unsigned xu_ui_bitmap_revision(const XuUiBitmap *);
 void xu_ui_bitmap_retain(XuUiBitmap *);
 void xu_ui_bitmap_release(XuUiBitmap *);
 unsigned xu_ui_image_live_bytes(void);

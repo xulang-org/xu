@@ -1,19 +1,81 @@
 @xu/obj
-// Dynamically linked ELF executable for programs that use the C FFI.
+// Hardened dynamically linked PIE ELF64 executable for programs using C FFI.
 //
-// Same image as elf_write_executable (one RWX PT_LOAD, code at
-// ELF_CODE_OFFSET), followed by the program headers and the dynamic
-// section the system loader needs: PT_INTERP, DT_NEEDED libc (and libdl
-// for glibc before 2.34) and GLOB_DAT relocations that bind the loader
-// slots at got_offset in the code to dlopen, dlsym and dlerror. Every
-// other C symbol is found at run time through dlsym.
+// Strict W^X + PIE (ET_DYN, DF_1_PIE) + Full RELRO (PT_GNU_RELRO + DF_BIND_NOW)
+// + GNU Build-ID (PT_NOTE / .note.gnu.build-id) + non-executable stack
+// (PT_GNU_STACK RW) + Section Header Table:
+//   PT_LOAD #1 (R)  : ELF header, program headers, .interp, .note.gnu.build-id,
+//                     .hash, .dynsym, .dynstr, .rela.dyn
+//   PT_LOAD #2 (RX) : .text (machine code only; no writable slots)
+//   PT_LOAD #3 (RW) : RELRO page(s) (.dynamic + .got for dlopen/dlsym/dlerror),
+//                     followed on the next page by .bss (__xu_ffi_state, 8B)
+//   PT_GNU_RELRO    : covers [rw_vaddr, relro_end) page-aligned so ld.so
+//                     mprotects .dynamic + .got to R-- before _start while
+//                     keeping __xu_ffi_state writable at run time.
 
 #xu/mc
 
 const PT_DYNAMIC = 2
 const PT_INTERP = 3
+const PT_NOTE = 4
 const PT_PHDR = 6
 const PT_GNU_STACK = 0x6474e551
+const PT_GNU_RELRO = 0x6474e552
+
+const ELF_BUILD_ID_SIZE = 36
+
+const ET_DYN = 3
+const DF_BIND_NOW = 8
+const DF_1_NOW = 1
+const DF_1_PIE = 0x08000000
+
+fn elf_emit_build_id(buf $&mc.CodeBuffer, code_bytes &[]int) {
+    digest := obj_sha256_bytes(code_bytes)
+    buf.emit_u32_le(4)  // n_namesz ("GNU\0")
+    buf.emit_u32_le(20) // n_descsz (20-byte Build-ID)
+    buf.emit_u32_le(3)  // NT_GNU_BUILD_ID
+    buf.emit_u8(71)     // 'G'
+    buf.emit_u8(78)     // 'N'
+    buf.emit_u8(85)     // 'U'
+    buf.emit_u8(0)
+    for i in 0:20 {
+        buf.emit_u8(digest[i] & 255)
+    }
+}
+
+pub fn elf_page_size(machine int) int {
+    // 64 KiB max page size on arm64/loongarch64 ensures distinct segment
+    // permissions and the RELRO/.bss boundary never share a physical page on
+    // 4K, 16K, or 64K Linux kernels.
+    if machine == ELF_EM_AARCH64 || machine == ELF_EM_LOONGARCH { << 65536 }
+    << 4096
+}
+
+fn elf_align_up(n int, align int) int {
+    if align <= 1 { << n }
+    << (n + align - 1) / align * align
+}
+
+fn elf_next_seg_vaddr(prev_end_vaddr int, seg_off int, page int) int {
+    if page <= 1 { << prev_end_vaddr }
+    min_va := elf_align_up(prev_end_vaddr, page)
+    << min_va + (seg_off % page)
+}
+
+fn elf_flags_for_machine(machine int) int {
+    if machine == ELF_EM_LOONGARCH { << 0x43 }
+    if machine == ELF_EM_RISCV { << 5 } // RVC | double-float ABI
+    << 0
+}
+
+fn elf_pad_to(buf $&mc.CodeBuffer, target int) {
+    while buf.len() < target { buf.emit_u8(0) }
+}
+
+fn elf_patch_u16_le(buf $&mc.CodeBuffer, off int, v int) {
+    buf.patch_u8(off, v & 255)
+    buf.patch_u8(off + 1, (v >> 8) & 255)
+}
 
 pub fn elf_dyn_interp(machine int) string {
     if machine == ELF_EM_X86_64 { << "/lib64/ld-linux-x86-64.so.2" }
@@ -33,15 +95,19 @@ fn elf_cstr(buf $&mc.CodeBuffer, s &string) {
     buf.emit_u8(0)
 }
 
-fn elf_phdr(buf $&mc.CodeBuffer, typ int, flags int, off int, vaddr int, size int, align int) {
+fn elf_phdr_sized(buf $&mc.CodeBuffer, typ int, flags int, off int, vaddr int, filesz int, memsz int, align int) {
     buf.emit_u32_le(typ)
     buf.emit_u32_le(flags)
     buf.emit_u64_le(off)
     buf.emit_u64_le(vaddr)
     buf.emit_u64_le(vaddr)
-    buf.emit_u64_le(size)
-    buf.emit_u64_le(size)
+    buf.emit_u64_le(filesz)
+    buf.emit_u64_le(memsz)
     buf.emit_u64_le(align)
+}
+
+fn elf_phdr(buf $&mc.CodeBuffer, typ int, flags int, off int, vaddr int, size int, align int) {
+    elf_phdr_sized(buf, typ, flags, off, vaddr, size, size, align)
 }
 
 fn elf_dyn(buf $&mc.CodeBuffer, tag int, val int) {
@@ -49,20 +115,129 @@ fn elf_dyn(buf $&mc.CodeBuffer, tag int, val int) {
     buf.emit_u64_le(val)
 }
 
-pub fn elf_write_dynamic_executable(code_bytes &[]int, machine int, entry_offset int, got_offset int, interp string) mc.CodeBuffer {
-    base := ELF_BASE_VADDR
-    code_off := ELF_CODE_OFFSET
+pub struct ElfDynLayout {
+    pub page         int
+    pub nph          int
+    pub ph_off       int
+    pub ph_size      int
+    pub interp_off   int
+    pub interp_size  int
+    pub note_off     int
+    pub note_size    int
+    pub hash_off     int
+    pub hash_size    int
+    pub sym_off      int
+    pub sym_size     int
+    pub str_off      int
+    pub str_size     int
+    pub rela_off     int
+    pub rela_size    int
+    pub ro_end       int
+    pub code_off     int
+    pub code_vaddr   int
+    pub rw_off       int
+    pub rw_vaddr     int
+    pub dyn_off      int
+    pub dyn_vaddr    int
+    pub dyn_size     int
+    pub got_off      int
+    pub got_vaddr    int
+    pub got_size     int
+    pub relro_filesz int
+    pub relro_memsz  int
+    pub state_vaddr  int
+    pub rw_memsz     int
+}
+
+pub fn elf_dyn_layout(code_len int, machine int, interp &string) ElfDynLayout {
+    page := elf_page_size(machine)
     imports := ["dlopen", "dlsym", "dlerror"]
     needed := ["libdl.so.2", "libc.so.6"]
-    nph := 5
-    // Tail layout, from the end of the code (8-aligned).
-    $off := code_off + code_bytes.len
-    off = (off + 7) / 8 * 8
-    ph_off := off
-    off += nph * 56
-    interp_off := off
-    off += interp.len + 1
-    str_off := off
+    nsym := imports.len + 1
+    nph := 9
+
+    ph_off := 64
+    ph_size := nph * 56
+    interp_off := ph_off + ph_size
+    interp_size := interp.len + 1
+    note_off := elf_align_up(interp_off + interp_size, 4)
+    note_size := ELF_BUILD_ID_SIZE
+    hash_off := elf_align_up(note_off + note_size, 4)
+    hash_size := (2 + 1 + nsym) * 4
+    sym_off := elf_align_up(hash_off + hash_size, 8)
+    sym_size := nsym * 24
+    str_off := sym_off + sym_size
+    $str_size := 1
+    for i in 0:needed.len { str_size += needed[i].len + 1 }
+    for i in 0:imports.len { str_size += imports[i].len + 1 }
+    rela_off := elf_align_up(str_off + str_size, 8)
+    rela_size := imports.len * 24
+    ro_end := rela_off + rela_size
+
+    code_off := elf_align_up(ro_end, 4096)
+    code_vaddr := elf_next_seg_vaddr(ro_end, code_off, page)
+
+    rw_off := elf_align_up(code_off + code_len, 4096)
+    rw_vaddr := elf_next_seg_vaddr(code_vaddr + code_len, rw_off, page)
+    ndyn := needed.len + 12
+    dyn_off := rw_off
+    dyn_vaddr := rw_vaddr
+    dyn_size := ndyn * 16
+    got_off := dyn_off + dyn_size
+    got_vaddr := dyn_vaddr + dyn_size
+    got_size := imports.len * 8
+    relro_filesz := dyn_size + got_size
+    relro_end_vaddr := elf_align_up(rw_vaddr + relro_filesz, page)
+    relro_memsz := relro_end_vaddr - rw_vaddr
+    state_vaddr := relro_end_vaddr
+    rw_memsz := relro_memsz + 8
+
+    << ElfDynLayout{
+        page: page,
+        nph: nph,
+        ph_off: ph_off,
+        ph_size: ph_size,
+        interp_off: interp_off,
+        interp_size: interp_size,
+        note_off: note_off,
+        note_size: note_size,
+        hash_off: hash_off,
+        hash_size: hash_size,
+        sym_off: sym_off,
+        sym_size: sym_size,
+        str_off: str_off,
+        str_size: str_size,
+        rela_off: rela_off,
+        rela_size: rela_size,
+        ro_end: ro_end,
+        code_off: code_off,
+        code_vaddr: code_vaddr,
+        rw_off: rw_off,
+        rw_vaddr: rw_vaddr,
+        dyn_off: dyn_off,
+        dyn_vaddr: dyn_vaddr,
+        dyn_size: dyn_size,
+        got_off: got_off,
+        got_vaddr: got_vaddr,
+        got_size: got_size,
+        relro_filesz: relro_filesz,
+        relro_memsz: relro_memsz,
+        state_vaddr: state_vaddr,
+        rw_memsz: rw_memsz
+    }
+}
+
+pub fn elf_write_dynamic_executable(code_bytes &[]int, machine int, entry_offset int, interp string) mc.CodeBuffer {
+    dbg := debug_sections_empty()
+    << elf_write_dynamic_executable_debug(code_bytes, machine, entry_offset, interp, &dbg)
+}
+
+pub fn elf_write_dynamic_executable_debug(code_bytes &[]int, machine int, entry_offset int, interp string, dbg &DebugSections) mc.CodeBuffer {
+    imports := ["dlopen", "dlsym", "dlerror"]
+    needed := ["libdl.so.2", "libc.so.6"]
+    nsym := imports.len + 1
+    lo := elf_dyn_layout(code_bytes.len, machine, &interp)
+
     $strtab := mc.code_buffer_new()
     strtab.emit_u8(0)
     $need_name := []int{}
@@ -75,51 +250,51 @@ pub fn elf_write_dynamic_executable(code_bytes &[]int, machine int, entry_offset
         sym_name.push(strtab.len())
         elf_cstr($&strtab, &imports[i])
     }
-    off += strtab.len()
-    off = (off + 7) / 8 * 8
-    sym_off := off
-    nsym := imports.len + 1
-    off += nsym * 24
-    hash_off := off
-    off += (2 + 1 + nsym) * 4
-    off = (off + 7) / 8 * 8
-    rela_off := off
-    off += imports.len * 24
-    dyn_off := off
-    ndyn := needed.len + 12
-    off += ndyn * 16
-    file_size := off
 
     $buf := mc.code_buffer_new()
+    // 1. ELF64 Header (ET_DYN PIE, link base 0)
     elf64_ident($&buf)
-    buf.emit_u16_le(2) // ET_EXEC
+    buf.emit_u16_le(ET_DYN)
     buf.emit_u16_le(machine)
     buf.emit_u32_le(1)
-    buf.emit_u64_le(base + code_off + entry_offset)
-    buf.emit_u64_le(ph_off)
+    buf.emit_u64_le(lo.code_vaddr + entry_offset)
+    buf.emit_u64_le(lo.ph_off)
+    shoff_at := buf.len()
     buf.emit_u64_le(0)
-    $flags := 0
-    if machine == ELF_EM_LOONGARCH { flags = 0x43 }
-    if machine == ELF_EM_RISCV { flags = 5 } // RVC | double-float ABI
-    buf.emit_u32_le(flags)
+    buf.emit_u32_le(elf_flags_for_machine(machine))
     buf.emit_u16_le(64)
     buf.emit_u16_le(56)
-    buf.emit_u16_le(nph)
+    buf.emit_u16_le(lo.nph)
     buf.emit_u16_le(64)
+    shnum_at := buf.len()
     buf.emit_u16_le(0)
     buf.emit_u16_le(0)
-    while buf.len() < code_off { buf.emit_u8(0) }
-    buf.emit_bytes(code_bytes)
-    while buf.len() < ph_off { buf.emit_u8(0) }
-    elf_phdr($&buf, PT_PHDR, PF_R, ph_off, base + ph_off, nph * 56, 8)
-    elf_phdr($&buf, PT_INTERP, PF_R, interp_off, base + interp_off, interp.len + 1, 1)
-    elf_phdr($&buf, PT_LOAD, PF_R | PF_W | PF_X, 0, base, file_size, 4096)
-    elf_phdr($&buf, PT_DYNAMIC, PF_R | PF_W, dyn_off, base + dyn_off, ndyn * 16, 8)
+
+    // 2. Program Headers (strictly ascending PT_LOAD vaddrs, zero RWX)
+    elf_phdr($&buf, PT_PHDR, PF_R, lo.ph_off, lo.ph_off, lo.ph_size, 8)
+    elf_phdr($&buf, PT_INTERP, PF_R, lo.interp_off, lo.interp_off, lo.interp_size, 1)
+    elf_phdr($&buf, PT_LOAD, PF_R, 0, 0, lo.ro_end, lo.page)
+    elf_phdr($&buf, PT_LOAD, PF_R | PF_X, lo.code_off, lo.code_vaddr, code_bytes.len, lo.page)
+    elf_phdr_sized($&buf, PT_LOAD, PF_R | PF_W, lo.rw_off, lo.rw_vaddr, lo.relro_filesz, lo.rw_memsz, lo.page)
+    elf_phdr($&buf, PT_DYNAMIC, PF_R | PF_W, lo.dyn_off, lo.dyn_vaddr, lo.dyn_size, 8)
+    elf_phdr($&buf, PT_NOTE, PF_R, lo.note_off, lo.note_off, lo.note_size, 4)
+    elf_phdr_sized($&buf, PT_GNU_RELRO, PF_R, lo.rw_off, lo.rw_vaddr, lo.relro_filesz, lo.relro_memsz, 1)
     elf_phdr($&buf, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 16)
+
+    // 3. PT_LOAD #1 (R): .interp, .note.gnu.build-id, .hash, .dynsym, .dynstr, .rela.dyn
+    elf_pad_to($&buf, lo.interp_off)
     elf_cstr($&buf, &interp)
-    buf.emit_bytes(&strtab.bytes)
-    while buf.len() < sym_off { buf.emit_u8(0) }
-    for i in 0:24 { buf.emit_u8(0) }
+    elf_pad_to($&buf, lo.note_off)
+    elf_emit_build_id($&buf, code_bytes)
+    elf_pad_to($&buf, lo.hash_off)
+    // DT_HASH: one bucket chaining every symbol.
+    buf.emit_u32_le(1)
+    buf.emit_u32_le(nsym)
+    buf.emit_u32_le(nsym - 1)
+    buf.emit_u32_le(0)
+    for i in 1:nsym { buf.emit_u32_le(i - 1) }
+    elf_pad_to($&buf, lo.sym_off)
+    for i in 0:24 { buf.emit_u8(0) } // STN_UNDEF
     for i in 0:imports.len {
         buf.emit_u32_le(sym_name[i])
         buf.emit_u8(0x12) // STB_GLOBAL, STT_FUNC
@@ -128,30 +303,89 @@ pub fn elf_write_dynamic_executable(code_bytes &[]int, machine int, entry_offset
         buf.emit_u64_le(0)
         buf.emit_u64_le(0)
     }
-    // DT_HASH: one bucket chaining every symbol (lookups into this image).
-    buf.emit_u32_le(1)
-    buf.emit_u32_le(nsym)
-    buf.emit_u32_le(nsym - 1)
-    buf.emit_u32_le(0)
-    for i in 1:nsym { buf.emit_u32_le(i - 1) }
-    while buf.len() < rela_off { buf.emit_u8(0) }
+    elf_pad_to($&buf, lo.str_off)
+    buf.emit_bytes(&strtab.bytes)
+    elf_pad_to($&buf, lo.rela_off)
     for i in 0:imports.len {
-        buf.emit_u64_le(base + code_off + got_offset + i * 8)
+        buf.emit_u64_le(lo.got_vaddr + i * 8)
         buf.emit_u64_le(((i + 1) << 32) | elf_dyn_glob_dat(machine))
         buf.emit_u64_le(0)
     }
+
+    // 4. PT_LOAD #2 (RX): .text
+    elf_pad_to($&buf, lo.code_off)
+    buf.emit_bytes(code_bytes)
+
+    // 5. PT_LOAD #3 (RW -> RELRO page + writable .bss page for __xu_ffi_state)
+    elf_pad_to($&buf, lo.dyn_off)
     for i in 0:needed.len { elf_dyn($&buf, 1, need_name[i]) } // DT_NEEDED
-    elf_dyn($&buf, 4, base + hash_off) // DT_HASH
-    elf_dyn($&buf, 5, base + str_off) // DT_STRTAB
-    elf_dyn($&buf, 6, base + sym_off) // DT_SYMTAB
-    elf_dyn($&buf, 10, strtab.len()) // DT_STRSZ
+    elf_dyn($&buf, 4, lo.hash_off) // DT_HASH
+    elf_dyn($&buf, 5, lo.str_off) // DT_STRTAB
+    elf_dyn($&buf, 6, lo.sym_off) // DT_SYMTAB
+    elf_dyn($&buf, 10, lo.str_size) // DT_STRSZ
     elf_dyn($&buf, 11, 24) // DT_SYMENT
-    elf_dyn($&buf, 7, base + rela_off) // DT_RELA
-    elf_dyn($&buf, 8, imports.len * 24) // DT_RELASZ
+    elf_dyn($&buf, 7, lo.rela_off) // DT_RELA
+    elf_dyn($&buf, 8, lo.rela_size) // DT_RELASZ
     elf_dyn($&buf, 9, 24) // DT_RELAENT
-    elf_dyn($&buf, 30, 8) // DT_FLAGS: DF_BIND_NOW
-    elf_dyn($&buf, 0x6ffffffb, 1) // DT_FLAGS_1: DF_1_NOW
+    elf_dyn($&buf, 30, DF_BIND_NOW) // DT_FLAGS: DF_BIND_NOW
+    elf_dyn($&buf, 0x6ffffffb, DF_1_NOW | DF_1_PIE) // DT_FLAGS_1: DF_1_NOW | DF_1_PIE
     elf_dyn($&buf, 21, 0) // DT_DEBUG
-    elf_dyn($&buf, 0, 0)
+    elf_dyn($&buf, 0, 0) // DT_NULL
+    for i in 0:imports.len { buf.emit_u64_le(0) } // .got slots (dlopen, dlsym, dlerror)
+    rw_end_off := buf.len()
+
+    // 6. Optional DWARF debug sections, .shstrtab, and Section Header Table
+    has_dbg := dbg.present()
+    $dbg_offs := []int{}
+    $dbg_sizes := []int{}
+    if has_dbg {
+        elf_section_bytes($&buf, $&dbg_offs, $&dbg_sizes, &dbg.line)
+        elf_section_bytes($&buf, $&dbg_offs, $&dbg_sizes, &dbg.info)
+        elf_section_bytes($&buf, $&dbg_offs, $&dbg_sizes, &dbg.abbrev)
+        elf_section_bytes($&buf, $&dbg_offs, $&dbg_sizes, &dbg.str)
+    }
+
+    $sec_names := ["", ".interp", ".note.gnu.build-id", ".hash", ".dynsym", ".dynstr", ".rela.dyn", ".text", ".dynamic", ".got", ".bss"]
+    if has_dbg {
+        sec_names.push(".debug_line")
+        sec_names.push(".debug_info")
+        sec_names.push(".debug_abbrev")
+        sec_names.push(".debug_str")
+    }
+    sec_names.push(".shstrtab")
+
+    $name_off := []int{}
+    shstr_off := buf.len()
+    for i in 0:sec_names.len {
+        name_off.push(buf.len() - shstr_off)
+        elf_cstr($&buf, &sec_names[i])
+    }
+    shstr_size := buf.len() - shstr_off
+    elf_pad8($&buf)
+    shoff := buf.len()
+
+    elf_shdr($&buf, 0, 0, 0, 0, 0, 0, 0) // [0] SHT_NULL
+    elf_shdr($&buf, name_off[1], 1, 2, lo.interp_off, lo.interp_off, lo.interp_size, 1) // [1] .interp
+    elf_shdr($&buf, name_off[2], 7, 2, lo.note_off, lo.note_off, lo.note_size, 4) // [2] .note.gnu.build-id
+    elf_shdr_link($&buf, name_off[3], 5, 2, lo.hash_off, lo.hash_off, lo.hash_size, 4, 0, 4, 4) // [3] .hash
+    elf_shdr_link($&buf, name_off[4], 11, 2, lo.sym_off, lo.sym_off, lo.sym_size, 5, 1, 8, 24) // [4] .dynsym
+    elf_shdr($&buf, name_off[5], 3, 2, lo.str_off, lo.str_off, lo.str_size, 1) // [5] .dynstr
+    elf_shdr_link($&buf, name_off[6], 4, 2, lo.rela_off, lo.rela_off, lo.rela_size, 4, 0, 8, 24) // [6] .rela.dyn
+    elf_shdr($&buf, name_off[7], 1, 6, lo.code_vaddr, lo.code_off, code_bytes.len, 16) // [7] .text
+    elf_shdr_link($&buf, name_off[8], 6, 3, lo.dyn_vaddr, lo.dyn_off, lo.dyn_size, 5, 0, 8, 16) // [8] .dynamic
+    elf_shdr_link($&buf, name_off[9], 1, 3, lo.got_vaddr, lo.got_off, lo.got_size, 0, 0, 8, 8) // [9] .got
+    elf_shdr($&buf, name_off[10], 8, 3, lo.state_vaddr, rw_end_off, 8, 8) // [10] .bss (__xu_ffi_state)
+    $ni := 11
+    if has_dbg {
+        for i in 0:4 {
+            elf_shdr($&buf, name_off[ni + i], 1, 0, 0, dbg_offs[i], dbg_sizes[i], 1)
+        }
+        ni += 4
+    }
+    elf_shdr($&buf, name_off[ni], 3, 0, 0, shstr_off, shstr_size, 1) // .shstrtab
+
+    buf.patch_u64_le(shoff_at, shoff)
+    elf_patch_u16_le($&buf, shnum_at, sec_names.len)
+    elf_patch_u16_le($&buf, shnum_at + 2, ni)
     << buf
 }

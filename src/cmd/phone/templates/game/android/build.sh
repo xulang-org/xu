@@ -28,7 +28,14 @@ printf '%s\n' MainActivity.java >> build/java-sources.txt
 "$tools/d8" --min-api 26 --lib "$android" --output build/dex build/classes.jar
 mkdir -p build/assets/resources
 cp -R resources/. build/assets/resources/
-"$tools/aapt2" link -I "$android" --manifest AndroidManifest.xml -A build/assets -o build/unsigned.apk
+if [ -d res ]; then
+  "$tools/aapt2" compile --dir res -o build/res.zip
+  "$tools/aapt2" link -I "$android" --manifest AndroidManifest.xml -A build/assets \
+    --version-code '@VERSION_CODE@' --version-name '@APP_VERSION@' -o build/unsigned.apk build/res.zip
+else
+  "$tools/aapt2" link -I "$android" --manifest AndroidManifest.xml -A build/assets \
+    --version-code '@VERSION_CODE@' --version-name '@APP_VERSION@' -o build/unsigned.apk
+fi
 cp build/native/libmain.so build/apk/lib/arm64-v8a/
 cp build/native/native/SDL/libSDL3.so build/apk/lib/arm64-v8a/
 cp build/dex/classes.dex build/apk/

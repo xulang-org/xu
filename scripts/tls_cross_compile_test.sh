@@ -47,8 +47,8 @@ for target in $targets; do
     "$PRODUCT_COMPILER_RUNNER" "$XU" build "$fixture" --target "$target" -o "$out"
     description=$(file "$out")
     case "$target" in
-        linux-arm64) echo "$description" | grep -q "ELF 64-bit LSB executable, ARM aarch64" ;;
-        linux-x64) echo "$description" | grep -q "ELF 64-bit LSB executable, x86-64" ;;
+        linux-arm64) echo "$description" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), ARM aarch64" ;;
+        linux-x64) echo "$description" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), x86-64" ;;
         windows-x64) echo "$description" | grep -q "PE32+ executable.*x86-64" ;;
         windows-arm64) echo "$description" | grep -qiE 'PE32\+.*(Aarch64|ARM64|aarch64)' ;;
     esac

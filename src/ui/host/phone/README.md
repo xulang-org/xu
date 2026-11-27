@@ -36,10 +36,13 @@ Release signing and store submission remain platform-toolchain operations.
 
 The generated project includes its native object and host source closure; it
 can build independently of the originating SDK checkout. Input is a module
-directory with `xu.xun`. The destination must not exist. Generation uses a
-staging directory and publishes it only after compilation and copying succeed.
-Rebuild Xu sources by generating into another directory. The initial package
-uses a fixed XuPhone application name and the supplied bundle/application ID.
+directory with `xu.xun`. The destination must not exist unless `--force` is
+passed (staging replaces the existing directory atomically only after
+compilation and copying succeed). Supply `--app-name` and `--version` (or
+`--app-version`) to customize the mobile display name and version string;
+an optional `phone.resources` file in the application module directory packages
+assets for both `ui` and `game` profiles. For the `game` profile, `XU_PHONE_SDL_SOURCE` accepts either a
+git checkout or an unpacked SDL 3.4.14 source tree.
 
 ## UI profile
 
@@ -48,8 +51,11 @@ record complete `draw.Frame` values. The host retains the previous frame while
 idle. Native iOS and Android shells render **edge-to-edge**; `ui.metrics_of`
 reports the full logical viewport and the host pushes safe-area cutouts plus
 soft-keyboard (`ime_bottom`) insets (`xu_phone_insets`, readable via `#ui/phone`
-`host_insets()`) and accessibility reduced-motion state (`xu_phone_reduced_motion`,
-readable via `reduced_motion()` or `EV_CANVAS_PREFERENCES`). Rotation and IME changes
+`host_insets()`), accessibility reduced-motion state (`xu_phone_reduced_motion`,
+readable via `reduced_motion()` or `EV_CANVAS_PREFERENCES`), system dark mode
+and font scale (`xu_phone_system_appearance` -> `system_dark()`,
+`xu_phone_font_scale` -> `font_scale()`), and writable data/resource roots
+(`xu_phone_set_paths` -> `data_dir()`, `resource_dir()`). Rotation and IME changes
 update metrics without recreating the Xu application. Single-finger input maps
 to the existing pointer down/move/up/cancel events with monotonic timestamps for
 kinetic scrolling and left-edge swipe back. Focus/blur follow the mobile
@@ -57,10 +63,11 @@ application lifecycle. See [the Phone UI design guide](../../phone/README.md).
 `xu_target_os()` retains the Darwin/Linux runtime ABI; use `phone.platform()` for
 the application platform.
 
-This profile supports shapes, transforms, clipping, paths, images, display lists,
-single-line and wrapped multiline text layout/caret/hit queries, lightweight
-haptic cues (`xu_phone_haptic` / `xu_phone_haptic_take`), host clipboard read/write
-via `#ui/requests` (`xu_phone_set_clipboard` backed by `UIPasteboard` on iOS and
+This profile supports shapes, transforms, clipping, paths, images (Base64 RGBA
+transfer in `XDF_IMAGE`), display lists, single-line and wrapped multiline text
+layout/caret/hit queries, lightweight haptic cues (`xu_phone_haptic` /
+`xu_phone_haptic_take`), host clipboard read/write via `#ui/requests`
+(`xu_phone_set_clipboard` backed by `UIPasteboard` on iOS and
 `ClipboardManager` on Android), and native soft-keyboard IME sessions (`TextInput`
 via iOS `UITextInput` and Android `InputConnection`, `xu_phone_key`, and
 `xu_phone_text_input_*`). Text uses system fonts, font weights, alignment,
@@ -72,14 +79,26 @@ are not implemented; unsupported asynchronous services (other than clipboard)
 complete with `REQUEST_UNSUPPORTED`. Legacy string drawing commands are not the
 Phone frame API.
 
-The mobile runtime translates its supported memory, clock, file descriptor and
-sleep calls to public libc APIs. It emits no private iOS `svc` syscall path.
-The full desktop process, filesystem and network API surface is not yet a
-mobile compatibility promise; unavailable services return `ENOSYS`.
+The mobile runtime (`runtime.cc`) translates memory, clock, file descriptor,
+directory enumeration (`getdirentries64`/`getdents64`), entropy (`arc4random_buf`
+on iOS, `getrandom`/urandom on Android), sockets, `kqueue`/`epoll`/`poll` event
+waits, and sleep calls to public POSIX/BSD/Bionic libc APIs. It emits no private
+iOS `svc` syscall path. Unavailable syscalls return `-ENOSYS`.
 
 The three packaging targets are `ios-arm64`, `ios-simulator-arm64` and
-`android-arm64`. x86 simulators, physical-device interaction, release credentials
-and store acceptance require separate validation.
+`android-arm64`. `android-x64` is not currently supported because Phone runtime
+code generation (`emit_phone_arm64_runtime`), syscall stubs and `game_context.S`
+target ARM64 only. Physical-device interaction, release credentials and store
+acceptance require separate validation.
+
+## Developer CLI & Packaging Flags
+
+- `xu phone doctor [--strict]` — checks Xcode iOS/Simulator SDKs, Android SDK/NDK/CMake, JDK 17+, `sips`, and `XU_PHONE_SDL_SOURCE`.
+- `xu phone devices` — lists available iOS Simulators (`xcrun simctl`) and connected ADB devices (`adb devices -l`).
+- `xu phone run APP --target TARGET [...]` — packages, builds, and installs/launches onto iOS Simulator or Android device (pass `--build-only` to stop after building).
+- `--internet` — opts in `android.permission.INTERNET` / `ACCESS_NETWORK_STATE` and bundles CA roots (`ca-bundle.pem`) on iOS.
+- `--icon PNG` — slices an app PNG into iOS `AppIcon*.png` and Android `mipmap-*/ic_launcher.png`.
+- `--orientation auto|portrait|landscape` & `--version-code N` — configure mobile orientation locks and bundle build numbers / Android `versionCode`.
 
 The minimal `examples/phone_counter` remains available for the host/frame
 round-trip. Use `examples/phone_gallery` to start from a designed mobile UI.

@@ -101,10 +101,33 @@ static std::string copy_utf8(JNIEnv *env, jbyteArray arr) {
   return out;
 }
 
+static std::string copy_jstring(JNIEnv *env, jstring str) {
+  if (!str) return {};
+  const char *utf = env->GetStringUTFChars(str, nullptr);
+  if (!utf) return {};
+  std::string out(utf);
+  env->ReleaseStringUTFChars(str, utf);
+  return out;
+}
+
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_start(JNIEnv *,jclass) { xu_phone_start("android"); }
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_stop(JNIEnv *,jclass) { xu_phone_stop(); }
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_rendererReset(JNIEnv *,jclass) { xu_phone_renderer_reset(); }
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_setPaths(JNIEnv *env,jclass,jstring dataRoot,jstring resourceRoot) {
+  std::string dr = copy_jstring(env, dataRoot);
+  std::string rr = copy_jstring(env, resourceRoot);
+  xu_phone_set_paths(dr.c_str(), rr.c_str());
+}
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_setNetworkEnv(JNIEnv *env,jclass,jstring dnsServers,jstring caBundlePath) {
+  std::string dns = copy_jstring(env, dnsServers);
+  std::string ca = copy_jstring(env, caBundlePath);
+  xu_phone_set_network_env(dns.c_str(), ca.c_str());
+}
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_resize(JNIEnv *,jclass,jdouble w,jdouble h,jdouble scale) { xu_phone_resize(w,h,scale); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_insets(JNIEnv *,jclass,jdouble top,jdouble bottom,jdouble left,jdouble right,jdouble ime) { xu_phone_insets(top,bottom,left,right,ime); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_reducedMotion(JNIEnv *,jclass,jboolean on) { xu_phone_reduced_motion(on?1:0); }
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_systemAppearance(JNIEnv *,jclass,jboolean dark) { xu_phone_system_appearance(dark?1:0); }
+extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_fontScale(JNIEnv *,jclass,jdouble scale) { xu_phone_font_scale(scale); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_input(JNIEnv *,jclass,jint kind,jdouble x,jdouble y,jint buttons) { xu_phone_input(kind,x,y,buttons); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_inputEvent(JNIEnv *,jclass,jint kind,jdouble x,jdouble y,jint button,jint buttons,jint modifiers,jint clickCount) { xu_phone_input_event(kind,x,y,button,buttons,modifiers,clickCount); }
 extern "C" JNIEXPORT void JNICALL Java_org_xulang_phone_MainActivity_key(JNIEnv *,jclass,jint kind,jint key,jint repeat,jint modifiers) { xu_phone_key(kind,key,repeat,modifiers); }

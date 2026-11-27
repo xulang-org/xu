@@ -47,19 +47,19 @@ light/dark appearance and destructive-action confirmation.
 
 | API | Purpose |
 | --- | --- |
-| `host_insets()`, `reduced_motion()` | OS safe-area/IME insets and accessibility reduced-motion state |
-| `scaffold(w, h)`, `scaffold_with(w, h, safe)` | Edge-to-edge header, body, navigation and primary-action rectangles |
-| `tab_bounds`, `sheet_bounds_with`, `snackbar_bounds`, `dialog_bounds`, `dialog_button_bounds`, `segmented_item_bounds`, `slider_value_at`, `intersection` | Shared paint/hit geometry (`switch_width/height`, `slider_thumb`, `progress_height`, `dialog_radius`) |
-| `RouteStack`, `Snackbar` | Single-source detail stack (`push`/`pop`/`can_pop`) and transient feedback strip |
+| `host_insets()`, `reduced_motion()`, `system_dark()`, `font_scale()`, `data_dir()`, `resource_dir()` | OS safe-area/IME insets, accessibility/appearance/font-scale settings, and host storage paths |
+| `scaffold(w, h)`, `scaffold_with(w, h, safe)`, `host_theme()`, `scaled_font(base)` | Edge-to-edge layout regions, host-synced light/dark theme and dynamic font scaling |
+| `tab_bounds`, `tab_bounds_n`, `app_bar_back_bounds`, `app_bar_action_bounds`, `sheet_bounds_with`, `snackbar_bounds`, `dialog_bounds`, `dialog_button_bounds`, `segmented_item_bounds`, `slider_value_at`, `intersection` | Shared paint/hit geometry (`switch_width/height`, `slider_thumb`, `progress_height`, `dialog_radius`, 2–5 nav items) |
+| `RouteStack`, `Snackbar` | Detail stack (`push`/`pop`/`replace`/`pop_until`/`can_pop`) and transient feedback strip |
 | `Canvas` / `canvas(context)` | Frame recording plus temporary text-layout ownership |
-| `Canvas.label`, `paragraph`, `measure_paragraph`, `card`, `button`, `chip`, `row`, `icon` | Single-line & wrapped multiline typography, danger tone and component appearance |
-| `Canvas.toggle_switch`, `switch_row`, `check_row`, `radio_row`, `progress_bar`, `badge`, `badge_count`, `divider`, `empty_state`, `segmented`, `slider`, `confirm_dialog`, `scrim` | Reusable mobile primitives aligned with Paper/Obsidian/Cinnabar tokens (`BADGE_*` semantic tones, `48`-point hit rows) |
-| `Canvas.navigation`, `sheet`, `scrollbar`, `refresh_indicator`, `snackbar` | Bottom navigation / rail, modal sheets, edge indicator, pull-to-refresh cue and toast |
-| `Touch` / `touch(identity)` | Canvas-generation-scoped press, kinetic fling, overscroll, pull-to-refresh and edge swipe state |
+| `Canvas.label`, `paragraph`, `measure_paragraph`, `card`, `button`, `chip`, `row`, `list_tile`, `section_header`, `icon` | Single-line & wrapped multiline typography, danger tone, tiles/headers and component appearance |
+| `Canvas.toggle_switch`, `switch_row`, `check_row`, `radio_row`, `progress_bar`, `badge`, `badge_count`, `divider`, `empty_state`, `segmented`, `slider`, `confirm_dialog`, `scrim`, `app_bar`, `fab` | Reusable mobile primitives aligned with Paper/Obsidian/Cinnabar tokens (`BADGE_*` semantic tones, `48`-point hit rows, app bar & FAB) |
+| `NavItem`, `Canvas.navigation`, `navigation_items`, `sheet`, `scrollbar`, `refresh_indicator`, `refresh_indicator_labeled`, `snackbar` | Bottom navigation / rail (up to 5 items with badges), modal sheets, edge indicator, pull-to-refresh cue and toast |
+| `Touch` / `touch(identity)` | Canvas-generation-scoped press, kinetic fling, overscroll, pull-to-refresh and edge swipe state (up to 512 hit targets) |
 | `Touch.begin`, `target`, `event`, `pressed`, `step_at`, `animating` | Register in paint order, dispatch actions and step momentum |
 | `Touch.scroll_region`, `offset`, `block_scroll`, `set_edge_back`, `set_refresh_enabled` | Bounded scrolling, modal suspension, pull-to-refresh and left-edge swipe back |
 | `Touch.swipe_down`, `swipe_back` | Sheet header dismissal and left-edge back navigation before pointer-up |
-| `TextField`, `text_field`, `text_field_height` | 48-point mobile text input with native IME preedit, caret, clear button and inline errors |
+| `TextField`, `text_field`, `text_field_height`, `TextField.set_multiline` | 48-point single-line or wrapped multiline mobile text input with native IME preedit, caret, clear button and inline errors |
 | `set_back_enabled`, `set_dark_appearance`, `set_overlay`, `haptic` | Native Back ownership, system-bar appearance and haptic cues |
 
 Record one complete frame with `Canvas.begin()` and `Canvas.present()`. Labels
