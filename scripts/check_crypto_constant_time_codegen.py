@@ -285,6 +285,8 @@ def decode_x64(chunk: bytes) -> tuple[list[tuple[int, int, str]], set[str], int]
                 branches.append((start, pos + rel, f"jcc_0f{op2:02x}"))
             elif 0x90 <= op2 <= 0x9F or op2 in (0xB6, 0xB7, 0xBE, 0xBF, 0xAF):
                 pos = _skip_modrm(chunk, pos)
+            elif op2 == 0x1E and pos < n and chunk[pos] == 0xFA:
+                pos += 1  # endbr64 (F3 0F 1E FA) Intel CET IBT landing pad
             else:
                 fail(f"unrecognized x64 0F opcode 0x0f {op2:#04x} at offset {start:#x}")
         elif op in (0x01, 0x03, 0x09, 0x0B, 0x21, 0x23, 0x29, 0x2B, 0x31, 0x33,

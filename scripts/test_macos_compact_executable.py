@@ -63,6 +63,9 @@ def check_macho(binary, page, keep_symbols, dwarf=False):
     uuid_bytes = None
     build_ver = None
     code_sig = None
+    chained_fixups = None
+    exports_trie = None
+    has_legacy_dyld_info = False
     offset = 32
     for _ in range(ncmds):
         command, size = struct.unpack_from("<II", image, offset)
@@ -76,9 +79,8 @@ def check_macho(binary, page, keep_symbols, dwarf=False):
                 assert flags == 0x10, hex(flags)  # SG_READ_ONLY
                 section = offset + 72
                 assert image[section:section + 16].rstrip(b"\0") == b"__got"
-                if not dwarf:
-                    assert struct.unpack_from("<I", image, section + 48)[0] == 0
-                    assert struct.unpack_from("<I", image, section + 64)[0] == 1  # S_ZEROFILL
+                assert struct.unpack_from("<I", image, section + 48)[0] == file
+                assert struct.unpack_from("<I", image, section + 64)[0] == 0  # regular file-backed slots
             if seg_name == b"__DATA":
                 assert flags == 0, hex(flags)
                 section = offset + 72
@@ -91,6 +93,12 @@ def check_macho(binary, page, keep_symbols, dwarf=False):
         if command == 0xB:  # LC_DYSYMTAB
             nlocals, _, _, undef, nundef = struct.unpack_from("<IIIII", image, offset + 12)
             assert (nlocals > 0) == keep_symbols and nundef == 4 and undef == nlocals
+        if command == 0x80000022:  # LC_DYLD_INFO_ONLY (legacy)
+            has_legacy_dyld_info = True
+        if command == 0x80000034:  # LC_DYLD_CHAINED_FIXUPS
+            chained_fixups = struct.unpack_from("<II", image, offset + 8)
+        if command == 0x80000033:  # LC_DYLD_EXPORTS_TRIE
+            exports_trie = struct.unpack_from("<II", image, offset + 8)
         if command == 0x1B:  # LC_UUID
             uuid_bytes = image[offset + 8:offset + 24]
         if command == 0x32:  # LC_BUILD_VERSION
@@ -99,16 +107,19 @@ def check_macho(binary, page, keep_symbols, dwarf=False):
             code_sig = struct.unpack_from("<II", image, offset + 8)
         offset += size
 
+    assert not has_legacy_dyld_info, "expected LC_DYLD_CHAINED_FIXUPS instead of legacy LC_DYLD_INFO_ONLY"
+    assert chained_fixups is not None and chained_fixups[1] > 0, "missing LC_DYLD_CHAINED_FIXUPS"
+    assert exports_trie is not None and exports_trie[1] > 0, "missing LC_DYLD_EXPORTS_TRIE"
     assert uuid_bytes is not None and any(uuid_bytes), "missing or zero LC_UUID"
     assert (uuid_bytes[6] & 0xF0) == 0x50 and (uuid_bytes[8] & 0xC0) == 0x80, uuid_bytes.hex()
-    assert build_ver == (1, 0x000B0000, 0x000E0000, 0), build_ver
+    assert build_ver == (1, 0x000C0000, 0x000E0000, 0), build_ver
     assert code_sig is not None, "missing LC_CODE_SIGNATURE"
     assert code_sig[0] + code_sig[1] == len(image), (code_sig, len(image))
 
     _, _, text_off, text_size, text_max, text_init, _, _ = segments[b"__TEXT"]
     assert text_max == 5 and text_init == 5
     dc_vm, dc_space, dc_off, dc_size, dc_max, dc_init, _, _ = segments[b"__DATA_CONST"]
-    assert dc_max == 3 and dc_init == 3 and dc_space == page
+    assert dc_max == 3 and dc_init == 3 and dc_space == page and dc_size == page
     data_vm, data_space, data_off, data_size, data_max, data_init, _, _ = segments[b"__DATA"]
     assert data_max == 3 and data_init == 3 and data_space == page
     link_vm, _, link_off, link_size, link_max, link_init, _, _ = segments[b"__LINKEDIT"]
@@ -117,19 +128,18 @@ def check_macho(binary, page, keep_symbols, dwarf=False):
 
     assert text_off + text_size == dc_off
     assert data_vm == dc_vm + page
-    assert dc_size == (page if dwarf else 0)
+    assert data_off == dc_off + dc_size
     assert data_size == (page if dwarf else 0)
     assert (b"__DWARF" in segments) == dwarf
     if dwarf:
         dw_vm, dw_space, dw_off, dw_size, dw_max, dw_init, dw_nsects, _ = segments[b"__DWARF"]
         assert dw_max == 0 and dw_init == 0 and dw_nsects == 4
         assert dw_vm == data_vm + page and link_vm == dw_vm + dw_space
-        assert data_off == dc_off + dc_size
         assert dw_off == data_off + data_size
         assert link_off == dw_off + dw_size
     else:
         assert link_vm == data_vm + page
-        assert data_off == dc_off and link_off == dc_off
+        assert link_off == data_off
 
 
 def main():
@@ -153,16 +163,18 @@ def main():
                 native = "x64" if platform.machine() == "x86_64" else platform.machine()
                 if platform.system() == "Darwin" and native == arch:
                     subprocess.run(["codesign", "--verify", "--strict", output], check=True)
+                    dyld_out = subprocess.check_output(["dyld_info", "-fixups", "-exports", output], text=True)
+                    assert "__mh_execute_header" in dyld_out and "_clock_gettime" in dyld_out and "_dlopen" in dyld_out, dyld_out
                     result = subprocess.check_output([output], text=True, timeout=15)
                     assert result == "clock and C imports ready\n", result
-            # Verify deterministic LC_UUID + ad-hoc code signature across rebuilds.
+            # Verify deterministic LC_UUID + chained fixups + ad-hoc code signature across rebuilds.
             output_b = work / f"probe-{arch}-release-b"
             env = dict(os.environ, XU_STDLIB_ROOT=str(root / "src"), XU_CACHE=str(work / "cache"),
                        XU_KEEP_SYMBOLS="0")
             subprocess.run([compiler, "build", src, "--target", f"macos-{arch}", "-o", output_b],
                            env=env, check=True)
             assert (work / f"probe-{arch}-release").read_bytes() == output_b.read_bytes()
-    print("Mach-O hardened layout (__DATA_CONST, LC_UUID, LC_BUILD_VERSION, debug codesign) passed")
+    print("Mach-O hardened layout (__DATA_CONST, chained fixups, exports trie, LC_UUID, LC_BUILD_VERSION, debug codesign) passed")
 
 
 if __name__ == "__main__":

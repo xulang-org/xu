@@ -12,7 +12,10 @@ pub const PE_MACHINE_ARM64 = 0xaa64
 pub const PE_TEXT_RVA = 4096
 pub const PE_SECTION_ALIGN = 4096
 pub const PE_FILE_ALIGN = 512
+pub const PE_IMAGE_BASE = 0x140000000
 pub const PE_UEFI_IMAGE_BASE = 0
+pub const PE_LOAD_CONFIG_SIZE = 320
+pub const PE_LOAD_CONFIG_COOKIE_OFF = 88 // offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie)
 
 pub fn pe_align(n int, align int) int {
     if n <= 0 { << 0 }
@@ -70,14 +73,16 @@ pub fn pe_write_dos_stub(buf $&mc.CodeBuffer, pe_offset int) {
 }
 
 // Writes a W^X-compliant PE32+ executable with separate .text (RX), .rdata (R),
-// optional .data (RW), optional .pdata (R), and a minimal .reloc (R, discardable)
-// section so DYNAMIC_BASE | HIGH_ENTROPY_VA ASLR has a valid Base Relocation directory.
-pub fn pe_write_executable_wx(code_bytes &[]int, rdata_bytes &[]int, data_bytes &[]int, pdata_bytes &[]int, machine int, entry_offset int, rdata_import_off int, import_size int, rdata_iat_off int, iat_size int) mc.CodeBuffer {
+// optional .data (RW), optional .pdata (R), optional IMAGE_LOAD_CONFIG_DIRECTORY64
+// (Data Directory #10 inside .rdata), and .reloc (R, discardable) so
+// DYNAMIC_BASE | HIGH_ENTROPY_VA ASLR has a valid Base Relocation directory.
+pub fn pe_write_executable_wx(code_bytes &[]int, rdata_bytes &[]int, data_bytes &[]int, pdata_bytes &[]int, reloc_bytes &[]int, machine int, entry_offset int, rdata_import_off int, import_size int, rdata_iat_off int, iat_size int, rdata_load_cfg_off int, load_cfg_size int) mc.CodeBuffer {
     $buf := mc.code_buffer_new()
 
     has_rdata := rdata_bytes.len > 0
     has_data := data_bytes.len > 0
     has_pdata := pdata_bytes.len > 0
+    has_real_reloc := reloc_bytes.len > 0
     $num_secs := 2 // .text + .reloc
     if has_rdata { num_secs += 1 }
     if has_data { num_secs += 1 }
@@ -131,9 +136,12 @@ pub fn pe_write_executable_wx(code_bytes &[]int, rdata_bytes &[]int, data_bytes 
         last_vsize = pdata_bytes.len
     }
 
-    // Minimal valid base relocation block (12 bytes): 2 IMAGE_REL_BASED_ABSOLUTE
-    // (no-op) entries on PE_TEXT_RVA because Xu codegen is fully RIP-relative.
-    reloc_vsize := 12
+    // Use real DIR64 base relocations (e.g., SecurityCookie in Load Config),
+    // falling back to a minimal 12-byte IMAGE_REL_BASED_ABSOLUTE block.
+    $reloc_vsize := 12
+    if has_real_reloc {
+        reloc_vsize = reloc_bytes.len
+    }
     reloc_rva := pe_next_section_rva(last_rva, last_vsize)
     reloc_raw_off := next_raw_off
     reloc_raw_size := pe_align(reloc_vsize, file_align)
@@ -168,7 +176,7 @@ pub fn pe_write_executable_wx(code_bytes &[]int, rdata_bytes &[]int, data_bytes 
     buf.emit_u32_le(0)      // SizeOfUninitializedData
     buf.emit_u32_le(entry_rva)
     buf.emit_u32_le(text_rva)
-    buf.emit_u64_le(0x140000000)
+    buf.emit_u64_le(PE_IMAGE_BASE)
     buf.emit_u32_le(sec_align)
     buf.emit_u32_le(file_align)
     buf.emit_u16_le(6)
@@ -190,7 +198,7 @@ pub fn pe_write_executable_wx(code_bytes &[]int, rdata_bytes &[]int, data_bytes 
     buf.emit_u32_le(0)
     buf.emit_u32_le(16)
 
-    // 16 Data Directories
+    // 16 Data Directories: #1 Import, #3 Exception, #5 BaseReloc, #10 LoadConfig, #12 IAT
     for i in 0:16 {
         if i == 1 && has_rdata && rdata_import_off >= 0 {
             buf.emit_u32_le(rdata_rva + rdata_import_off)
@@ -201,6 +209,9 @@ pub fn pe_write_executable_wx(code_bytes &[]int, rdata_bytes &[]int, data_bytes 
         } else if i == 5 {
             buf.emit_u32_le(reloc_rva)
             buf.emit_u32_le(reloc_vsize)
+        } else if i == 10 && has_rdata && rdata_load_cfg_off >= 0 && load_cfg_size > 0 {
+            buf.emit_u32_le(rdata_rva + rdata_load_cfg_off)
+            buf.emit_u32_le(load_cfg_size)
         } else if i == 12 && has_rdata && rdata_iat_off >= 0 {
             buf.emit_u32_le(rdata_rva + rdata_iat_off)
             buf.emit_u32_le(iat_size)
@@ -258,11 +269,15 @@ pub fn pe_write_executable_wx(code_bytes &[]int, rdata_bytes &[]int, data_bytes 
         }
     }
 
-    // 11. Emit .reloc block (PageRVA=PE_TEXT_RVA, BlockSize=12, 2x IMAGE_REL_BASED_ABSOLUTE)
-    buf.emit_u32_le(PE_TEXT_RVA)
-    buf.emit_u32_le(reloc_vsize)
-    buf.emit_u16_le(0)
-    buf.emit_u16_le(0)
+    // 11. Emit .reloc
+    if has_real_reloc {
+        buf.emit_bytes(reloc_bytes)
+    } else {
+        buf.emit_u32_le(PE_TEXT_RVA)
+        buf.emit_u32_le(12)
+        buf.emit_u16_le(0)
+        buf.emit_u16_le(0)
+    }
     while buf.len() < reloc_raw_off + reloc_raw_size {
         buf.emit_u8(0)
     }
@@ -320,15 +335,16 @@ pub fn pe_build_base_relocs(rvas &[]int) mc.CodeBuffer {
 }
 
 // Writes a UEFI PE32+ application image (Subsystem=10) with .text (RX),
-// optional .data (RW), and optional .reloc (relocatable base relocations).
+// optional .data (RW), and always-present .reloc (relocatable base relocations,
+// falling back to a minimal 12-byte IMAGE_REL_BASED_ABSOLUTE block when empty
+// so DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT always has a valid directory).
 pub fn pe_write_uefi_app(code_bytes &[]int, data_bytes &[]int, reloc_bytes &[]int, machine int, entry_offset int) mc.CodeBuffer {
     $buf := mc.code_buffer_new()
 
     has_data := data_bytes.len > 0
-    has_reloc := reloc_bytes.len > 0
-    $num_secs := 1
+    has_real_reloc := reloc_bytes.len > 0
+    $num_secs := 2 // .text + .reloc
     if has_data { num_secs += 1 }
-    if has_reloc { num_secs += 1 }
 
     file_align := PE_FILE_ALIGN
     sec_align := PE_SECTION_ALIGN
@@ -357,17 +373,16 @@ pub fn pe_write_uefi_app(code_bytes &[]int, data_bytes &[]int, reloc_bytes &[]in
         last_vsize = data_bytes.len
     }
 
-    $reloc_rva := 0
-    $reloc_raw_off := 0
-    $reloc_raw_size := 0
-    if has_reloc {
-        reloc_rva = pe_next_section_rva(last_rva, last_vsize)
-        reloc_raw_off = next_raw_off
-        reloc_raw_size = pe_align(reloc_bytes.len, file_align)
-        next_raw_off += reloc_raw_size
-        last_rva = reloc_rva
-        last_vsize = reloc_bytes.len
+    $reloc_vsize := 12
+    if has_real_reloc {
+        reloc_vsize = reloc_bytes.len
     }
+    reloc_rva := pe_next_section_rva(last_rva, last_vsize)
+    reloc_raw_off := next_raw_off
+    reloc_raw_size := pe_align(reloc_vsize, file_align)
+    next_raw_off += reloc_raw_size
+    last_rva = reloc_rva
+    last_vsize = reloc_vsize
 
     image_size := pe_next_section_rva(last_rva, last_vsize)
     entry_rva := text_rva + entry_offset
@@ -407,7 +422,7 @@ pub fn pe_write_uefi_app(code_bytes &[]int, data_bytes &[]int, reloc_bytes &[]in
     buf.emit_u32_le(hdr_size)
     buf.emit_u32_le(0)
     buf.emit_u16_le(PE_SUBSYSTEM_EFI_APP)
-    buf.emit_u16_le(0x0140) // DYNAMIC_BASE | NX_COMPAT
+    buf.emit_u16_le(0x0160) // DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT
     buf.emit_u64_le(0x100000)
     buf.emit_u64_le(0x1000)
     buf.emit_u64_le(0x100000)
@@ -416,9 +431,9 @@ pub fn pe_write_uefi_app(code_bytes &[]int, data_bytes &[]int, reloc_bytes &[]in
     buf.emit_u32_le(16)
 
     for i in 0:16 {
-        if i == 5 && has_reloc {
+        if i == 5 {
             buf.emit_u32_le(reloc_rva)
-            buf.emit_u32_le(reloc_bytes.len)
+            buf.emit_u32_le(reloc_vsize)
         } else {
             buf.emit_u32_le(0)
             buf.emit_u32_le(0)
@@ -429,9 +444,7 @@ pub fn pe_write_uefi_app(code_bytes &[]int, data_bytes &[]int, reloc_bytes &[]in
     if has_data {
         pe_emit_sec_hdr($&buf, ".data", data_bytes.len, data_rva, data_raw_size, data_raw_off, 0xC0000040)
     }
-    if has_reloc {
-        pe_emit_sec_hdr($&buf, ".reloc", reloc_bytes.len, reloc_rva, reloc_raw_size, reloc_raw_off, 0x42000040)
-    }
+    pe_emit_sec_hdr($&buf, ".reloc", reloc_vsize, reloc_rva, reloc_raw_size, reloc_raw_off, 0x42000040)
 
     while buf.len() < hdr_size {
         buf.emit_u8(0)
@@ -446,11 +459,16 @@ pub fn pe_write_uefi_app(code_bytes &[]int, data_bytes &[]int, reloc_bytes &[]in
             buf.emit_u8(0)
         }
     }
-    if has_reloc {
+    if has_real_reloc {
         buf.emit_bytes(reloc_bytes)
-        while buf.len() < reloc_raw_off + reloc_raw_size {
-            buf.emit_u8(0)
-        }
+    } else {
+        buf.emit_u32_le(PE_TEXT_RVA)
+        buf.emit_u32_le(12)
+        buf.emit_u16_le(0)
+        buf.emit_u16_le(0)
+    }
+    while buf.len() < reloc_raw_off + reloc_raw_size {
+        buf.emit_u8(0)
     }
     << buf
 }
