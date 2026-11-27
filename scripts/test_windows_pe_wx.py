@@ -196,6 +196,15 @@ def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int
     return text["vaddr"], rdata["vaddr"], data["vaddr"], pdata["vaddr"]
 
 
+def can_execute_target(target: str) -> bool:
+    if os.name != "nt":
+        return False
+    arch = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
+    if "ARM64" in arch:
+        return target in ("windows-arm64", "windows-x64")
+    return target == "windows-x64"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
@@ -215,6 +224,7 @@ def main() -> int:
         src.write_text(SOURCE, encoding="utf-8", newline="\n")
 
         for target in ("windows-arm64", "windows-x64"):
+            run_live = (not args.headers_only) and can_execute_target(target)
             for mode, flags in (("default", ()), ("no-opt", ("--no-opt",))):
                 exe = work / f"probe-{target}-{mode}.exe"
                 subprocess.run(
@@ -228,7 +238,7 @@ def main() -> int:
                 pe = parse_pe(exe)
                 t_rva, r_rva, d_rva, p_rva = check_wx_headers(pe, expect_rsrc=False)
 
-                if not args.headers_only:
+                if run_live:
                     run_env = dict(env, XU_DEBUG_FREE="1")
                     res = subprocess.run(
                         [str(exe), str(t_rva), str(r_rva), str(d_rva), str(p_rva)],
@@ -246,7 +256,7 @@ def main() -> int:
                 embed_invoker_manifest(mexe)
                 pe_m = parse_pe(mexe)
                 mt_rva, mr_rva, md_rva, mp_rva = check_wx_headers(pe_m, expect_rsrc=True)
-                if not args.headers_only:
+                if run_live:
                     res_m = subprocess.run(
                         [str(mexe), str(mt_rva), str(mr_rva), str(md_rva), str(mp_rva)],
                         env=run_env,
@@ -255,7 +265,7 @@ def main() -> int:
                         timeout=30,
                     )
                     assert res_m.returncode == 0 and res_m.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res_m)
-                print(f"  [PASS] {target} {mode}: W^X + .pdata + .reloc + manifest" + ("" if args.headers_only else " + live VirtualQuery + FFI"))
+                print(f"  [PASS] {target} {mode}: W^X + .pdata + .reloc + manifest" + (" + live VirtualQuery + FFI" if run_live else " (headers)"))
 
     print("Windows PE W^X verification passed")
     return 0
