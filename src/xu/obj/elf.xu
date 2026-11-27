@@ -45,10 +45,11 @@ pub fn elf_image_vaddr() int {
 pub struct ElfSyms {
     pub names []string
     pub offs []int
+    pub weak []bool
 }
 
 pub fn elf_syms_empty() ElfSyms {
-    << ElfSyms{names: []string{}, offs: []int{}}
+    << ElfSyms{names: []string{}, offs: []int{}, weak: []bool{}}
 }
 
 pub struct ElfBss {
@@ -84,6 +85,7 @@ pub struct ElfDataSym {
     pub sec_idx int
     pub off     int
     pub size    int
+    pub is_weak bool
 }
 
 pub struct ElfDataLayout {
@@ -358,7 +360,8 @@ pub fn elf_write_relocatable_bss(code_bytes &[]int, machine int, esyms &ElfSyms,
                 name: ebss.names[bi] + "",
                 sec_idx: 0,
                 off: ebss.offs[bi],
-                size: ebss.sizes[bi]
+                size: ebss.sizes[bi],
+                is_weak: false
             })
         }
     }
@@ -388,7 +391,28 @@ fn elf_resolve_sym_idx(nm &string, esyms &ElfSyms, edata &ElfDataLayout, first_g
     << base_undef_idx + found
 }
 
+fn elf_read_u32_le(bytes &[]int, off int) int {
+    $v := 0
+    for i in 0:4 {
+        v = v | ((bytes[off + i] & 255) << (i * 8))
+    }
+    << v
+}
+
+fn elf_read_u64_le(bytes &[]int, off int) int {
+    $v := 0
+    for i in 0:8 {
+        v = v | ((bytes[off + i] & 255) << (i * 8))
+    }
+    << v
+}
+
 pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms, edata &ElfDataLayout, ext_relocs &[]mc.Reloc) mc.CodeBuffer {
+    empty_dbg := debug_sections_empty()
+    << elf_write_relocatable_data_debug(code_bytes, machine, esyms, edata, ext_relocs, &empty_dbg)
+}
+
+pub fn elf_write_relocatable_data_debug(code_bytes &[]int, machine int, esyms &ElfSyms, edata &ElfDataLayout, ext_relocs &[]mc.Reloc, dbg &DebugSections) mc.CodeBuffer {
     n_data := edata.secs.len
     $rela_data_secs := []int{}
     for di in 0:n_data {
@@ -397,11 +421,16 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
         }
     }
     n_rela_data := rela_data_secs.len
+    has_dbg := dbg.present()
+    $n_dbg_secs := 0
+    if has_dbg { n_dbg_secs = 6 }
+
     rela_sec := 2 + n_data
-    sym_sec := 3 + n_data + n_rela_data
-    str_sec := 4 + n_data + n_rela_data
-    shstr_sec := 5 + n_data + n_rela_data
-    shnum := 7 + n_data + n_rela_data
+    dbg_base_sec := rela_sec + 1 + n_rela_data
+    sym_sec := dbg_base_sec + n_dbg_secs
+    str_sec := sym_sec + 1
+    shstr_sec := sym_sec + 2
+    shnum := sym_sec + 4
 
     $out := mc.code_buffer_new()
     elf64_ident($&out)
@@ -442,6 +471,49 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
         }
     }
 
+    // Emit optional DWARF sections (.debug_line, .debug_info, .debug_abbrev, .debug_str)
+    $dbg_line_off := 0
+    $dbg_info_off := 0
+    $dbg_abbrev_off := 0
+    $dbg_str_off := 0
+    $dbg_line_addends := []int{}
+    $dbg_info_addr_addends := []int{}
+    $dbg_info_str_addends := []int{}
+    if has_dbg {
+        $lbytes := []int{}
+        for bi in 0:dbg.line.len { lbytes.push(dbg.line[bi]) }
+        for ai in 0:dbg.line_addresses.len {
+            p := dbg.line_addresses[ai]
+            dbg_line_addends.push(elf_read_u64_le(&lbytes, p))
+            for k in 0:8 { lbytes[p + k] = 0 }
+        }
+        $ibytes := []int{}
+        for bi in 0:dbg.info.len { ibytes.push(dbg.info[bi]) }
+        if ibytes.len >= 36 {
+            for k in 0:4 { ibytes[6 + k] = 0 }
+            for k in 0:4 { ibytes[32 + k] = 0 }
+        }
+        for ai in 0:dbg.info_addresses.len {
+            p := dbg.info_addresses[ai]
+            dbg_info_addr_addends.push(elf_read_u64_le(&ibytes, p))
+            for k in 0:8 { ibytes[p + k] = 0 }
+        }
+        for si in 0:dbg.info_strings.len {
+            p := dbg.info_strings[si]
+            dbg_info_str_addends.push(elf_read_u32_le(&ibytes, p))
+            for k in 0:4 { ibytes[p + k] = 0 }
+        }
+        dbg_line_off = out.len()
+        out.emit_bytes(&lbytes)
+        dbg_info_off = out.len()
+        out.emit_bytes(&ibytes)
+        dbg_abbrev_off = out.len()
+        out.emit_bytes(&dbg.abbrev)
+        dbg_str_off = out.len()
+        out.emit_bytes(&dbg.str)
+        elf_pad8($&out)
+    }
+
     // Count RISC-V PC-relative HI20 entries needing local anchor symbols for LO12_I.
     $local_pcrel_sym := []int{}
     $local_offs := []int{}
@@ -455,7 +527,19 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
             local_pcrel_sym.push(-1)
         }
     }
-    first_global := 1 + local_cnt
+    $dbg_local_cnt := 0
+    $dbg_text_sym := 0
+    $dbg_line_sym := 0
+    $dbg_abbrev_sym := 0
+    $dbg_str_sym := 0
+    if has_dbg {
+        dbg_local_cnt = 4
+        dbg_text_sym = 1 + local_cnt
+        dbg_line_sym = dbg_text_sym + 1
+        dbg_abbrev_sym = dbg_text_sym + 2
+        dbg_str_sym = dbg_text_sym + 3
+    }
+    first_global := 1 + local_cnt + dbg_local_cnt
 
     // Resolve relocations for .text and all data sections first to populate SHN_UNDEF.
     $undefs := []string{}
@@ -518,8 +602,14 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
     rela_size := out.len() - rela_off
 
     $abs64_rtype := 1 // R_X86_64_64
-    if machine == ELF_EM_AARCH64 { abs64_rtype = 257 } // R_AARCH64_ABS64
-    else if machine == ELF_EM_RISCV { abs64_rtype = 2 } // R_RISCV_64
+    $abs32_rtype := 10 // R_X86_64_32
+    if machine == ELF_EM_AARCH64 {
+        abs64_rtype = 257 // R_AARCH64_ABS64
+        abs32_rtype = 258 // R_AARCH64_ABS32
+    } else if machine == ELF_EM_RISCV {
+        abs64_rtype = 2 // R_RISCV_64
+        abs32_rtype = 1 // R_RISCV_32
+    }
 
     $data_rela_offs := []int{}
     $data_rela_sizes := []int{}
@@ -536,6 +626,41 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
         data_rela_sizes.push(out.len() - droff)
     }
 
+    $dbg_rela_line_off := 0
+    $dbg_rela_line_size := 0
+    $dbg_rela_info_off := 0
+    $dbg_rela_info_size := 0
+    if has_dbg {
+        dbg_rela_line_off = out.len()
+        for ai in 0:dbg.line_addresses.len {
+            out.emit_u64_le(dbg.line_addresses[ai])
+            out.emit_u64_le((dbg_text_sym << 32) | abs64_rtype)
+            out.emit_u64_le(dbg_line_addends[ai])
+        }
+        dbg_rela_line_size = out.len() - dbg_rela_line_off
+
+        dbg_rela_info_off = out.len()
+        if dbg.info.len >= 36 {
+            out.emit_u64_le(6)
+            out.emit_u64_le((dbg_abbrev_sym << 32) | abs32_rtype)
+            out.emit_u64_le(0)
+            out.emit_u64_le(32)
+            out.emit_u64_le((dbg_line_sym << 32) | abs32_rtype)
+            out.emit_u64_le(0)
+        }
+        for ai in 0:dbg.info_addresses.len {
+            out.emit_u64_le(dbg.info_addresses[ai])
+            out.emit_u64_le((dbg_text_sym << 32) | abs64_rtype)
+            out.emit_u64_le(dbg_info_addr_addends[ai])
+        }
+        for si in 0:dbg.info_strings.len {
+            out.emit_u64_le(dbg.info_strings[si])
+            out.emit_u64_le((dbg_str_sym << 32) | abs32_rtype)
+            out.emit_u64_le(dbg_info_str_addends[si])
+        }
+        dbg_rela_info_size = out.len() - dbg_rela_info_off
+    }
+
     $strtab := mc.code_buffer_new()
     strtab.emit_u8(0)
     sym_off := out.len()
@@ -543,14 +668,24 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
     for li in 0:local_offs.len {
         elf_emit_sym($&out, 0, 0, 1, local_offs[li], 0) // STB_LOCAL | STT_NOTYPE in .text
     }
+    if has_dbg {
+        elf_emit_sym($&out, 0, 0x03, 1, 0, 0)                // STT_SECTION .text
+        elf_emit_sym($&out, 0, 0x03, dbg_base_sec, 0, 0)     // STT_SECTION .debug_line
+        elf_emit_sym($&out, 0, 0x03, dbg_base_sec + 2, 0, 0) // STT_SECTION .debug_abbrev
+        elf_emit_sym($&out, 0, 0x03, dbg_base_sec + 3, 0, 0) // STT_SECTION .debug_str
+    }
     for si in 0:esyms.names.len {
         noff := elf_obj_cstr($&strtab, &esyms.names[si])
-        elf_emit_sym($&out, noff, 0x12, 1, esyms.offs[si], 0) // STB_GLOBAL | STT_FUNC in .text
+        $sinfo := 0x12 // STB_GLOBAL | STT_FUNC
+        if si < esyms.weak.len && esyms.weak[si] { sinfo = 0x22 } // STB_WEAK | STT_FUNC
+        elf_emit_sym($&out, noff, sinfo, 1, esyms.offs[si], 0)
     }
     for di in 0:edata.syms.len {
         ds := &edata.syms[di]
         noff := elf_obj_cstr($&strtab, &ds.name)
-        elf_emit_sym($&out, noff, 0x11, 2 + ds.sec_idx, ds.off, ds.size) // STB_GLOBAL | STT_OBJECT in data/.bss section
+        $sinfo := 0x11 // STB_GLOBAL | STT_OBJECT
+        if ds.is_weak { sinfo = 0x21 } // STB_WEAK | STT_OBJECT
+        elf_emit_sym($&out, noff, sinfo, 2 + ds.sec_idx, ds.off, ds.size)
     }
     for ui in 0:undefs.len {
         noff := elf_obj_cstr($&strtab, &undefs[ui])
@@ -569,6 +704,14 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
     for ki in 0:n_rela_data {
         di := rela_data_secs[ki]
         sec_names.push(".rela" + edata.secs[di].name)
+    }
+    if has_dbg {
+        sec_names.push(".debug_line")
+        sec_names.push(".debug_info")
+        sec_names.push(".debug_abbrev")
+        sec_names.push(".debug_str")
+        sec_names.push(".rela.debug_line")
+        sec_names.push(".rela.debug_info")
     }
     sec_names.push(".symtab")
     sec_names.push(".strtab")
@@ -599,6 +742,14 @@ pub fn elf_write_relocatable_data(code_bytes &[]int, machine int, esyms &ElfSyms
     for ki in 0:n_rela_data {
         di := rela_data_secs[ki]
         elf_shdr_link($&out, sec_offs[rela_sec + 1 + ki], 4, 0x40, 0, data_rela_offs[ki], data_rela_sizes[ki], sym_sec, 2 + di, 8, 24)
+    }
+    if has_dbg {
+        elf_shdr($&out, sec_offs[dbg_base_sec],     1, 0, 0, dbg_line_off,   dbg.line.len,   1)
+        elf_shdr($&out, sec_offs[dbg_base_sec + 1], 1, 0, 0, dbg_info_off,   dbg.info.len,   1)
+        elf_shdr($&out, sec_offs[dbg_base_sec + 2], 1, 0, 0, dbg_abbrev_off, dbg.abbrev.len, 1)
+        elf_shdr($&out, sec_offs[dbg_base_sec + 3], 1, 0, 0, dbg_str_off,    dbg.str.len,    1)
+        elf_shdr_link($&out, sec_offs[dbg_base_sec + 4], 4, 0x40, 0, dbg_rela_line_off, dbg_rela_line_size, sym_sec, dbg_base_sec,     8, 24)
+        elf_shdr_link($&out, sec_offs[dbg_base_sec + 5], 4, 0x40, 0, dbg_rela_info_off, dbg_rela_info_size, sym_sec, dbg_base_sec + 1, 8, 24)
     }
     elf_shdr_link($&out, sec_offs[sym_sec], 2, 0, 0, sym_off, sym_size, str_sec, first_global, 8, 24)
     elf_shdr($&out, sec_offs[str_sec], 3, 0, 0, str_off, strtab.len(), 1)
