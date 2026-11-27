@@ -20,9 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PT_LOAD = 1
 PT_DYNAMIC = 2
 PT_INTERP = 3
+PT_NOTE = 4
 PT_PHDR = 6
 PT_GNU_STACK = 0x6474E551
 PT_GNU_RELRO = 0x6474E552
+
+SHT_NOTE = 7
+NT_GNU_BUILD_ID = 3
 
 PF_X = 1
 PF_W = 2
@@ -300,9 +304,30 @@ class ElfHardeningTest(unittest.TestCase):
 
         sec_by_name = {s["name"]: s for s in info["shdrs"]}
         self.assertGreater(len(info["shdrs"]), 0, "expected Section Header Table")
+        self.assertIn(".note.gnu.build-id", sec_by_name)
         self.assertIn(".text", sec_by_name)
         self.assertIn(".dynamic", sec_by_name)
         self.assertIn(".shstrtab", sec_by_name)
+
+        # Deterministic 20-byte GNU Build-ID (PT_NOTE + SHT_NOTE).
+        notes = [p for p in info["phdrs"] if p["type"] == PT_NOTE]
+        self.assertEqual(len(notes), 1)
+        note_ph = notes[0]
+        note_sec = sec_by_name[".note.gnu.build-id"]
+        self.assertEqual(note_ph["flags"], PF_R)
+        self.assertEqual(note_ph["align"], 4)
+        self.assertEqual(note_ph["filesz"], 36)
+        self.assertEqual(note_ph["memsz"], 36)
+        self.assertEqual(note_sec["type"], SHT_NOTE)
+        self.assertEqual(note_sec["addr"], note_ph["vaddr"])
+        self.assertEqual(note_sec["offset"], note_ph["offset"])
+        self.assertEqual(note_sec["size"], 36)
+        namesz, descsz, ntype = struct.unpack_from("<III", data, note_sec["offset"])
+        self.assertEqual((namesz, descsz, ntype), (4, 20, NT_GNU_BUILD_ID))
+        self.assertEqual(data[note_sec["offset"] + 12 : note_sec["offset"] + 16], b"GNU\x00")
+        build_id = data[note_sec["offset"] + 16 : note_sec["offset"] + 36]
+        self.assertTrue(any(build_id), "expected non-zero Build-ID")
+
         if dwarf:
             for dsec in (".debug_line", ".debug_info", ".debug_abbrev", ".debug_str"):
                 self.assertIn(dsec, sec_by_name)
@@ -335,8 +360,9 @@ class ElfHardeningTest(unittest.TestCase):
                 self.assertEqual(r_addend, 0)
 
         if self.readelf:
-            res = subprocess.run([self.readelf, "-h", "-l", "-S", "-d", str(path)], capture_output=True, text=True)
+            res = subprocess.run([self.readelf, "-h", "-l", "-S", "-d", "-n", str(path)], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("Build ID:", res.stdout)
             self.assertNotIn("Warning:", res.stderr)
 
         return info
