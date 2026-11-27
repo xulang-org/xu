@@ -37,7 +37,7 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${XU_STAGE}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${XU_STAGE}"
     COMMAND "${CMAKE_COMMAND}" -E copy ${XU_SRCS} "${XU_STAGE}"
-    COMMAND "${XU_BIN}" build --target xtensa-esp32-none --emit-obj -o "${XU_OBJ}" ${XU_STAGED}
+    COMMAND "${CMAKE_COMMAND}" -E env "XUPATH=${XU_REPO}/src" "${XU_BIN}" build --target xtensa-esp32-none --emit-obj -o "${XU_OBJ}" ${XU_STAGED}
     WORKING_DIRECTORY "${XU_REPO}"
     DEPENDS ${XU_SRCS} "${XU_BIN}"
     COMMENT "Compiling Xu sources to ${XU_OBJ}"
