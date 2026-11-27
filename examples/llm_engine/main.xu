@@ -10,6 +10,10 @@
 #tensor
 #net
 #net/http
+#gbnf
+#models
+#quantize
+#vision
 
 const RMS_CAP = 2048
 const KV_BLOCK_SIZE = 16
@@ -158,6 +162,8 @@ struct Model {
     is_mamba bool
     use_q8k_act bool
     lora LoraState
+    vision vision.VisionEncoder
+    gbnf_vocab gbnf.VocabIndex
     chat_template_kind int
     eos_ids []int
     weights []f32
@@ -1205,7 +1211,7 @@ fn load_model_safetensors(data &string, ctx_limit int) Model {
     << Model{
         cfg: cfg, is_q4: false, is_q8: false, embed_q4: false, lm_head_q4: false, lm_head_q8: false,
         layers_p4: false, embed_p4: false, lm_head_p4: false, has_qkv_bias: false, has_qk_norm: false,
-        has_post_norms: false, is_moe: false, is_mla: false, is_mamba: false, use_q8k_act: false, lora: empty_lora_state(n_layers),
+        has_post_norms: false, is_moe: false, is_mla: false, is_mamba: false, use_q8k_act: false, lora: empty_lora_state(n_layers), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
         chat_template_kind: TEMPLATE_RAW, eos_ids: [2],
         weights: weights, compact_weights: compact, q4_qs: []u8{}, q4_scales: []f32{}, q8_qs: []i8{}, q8_scales: []f32{},
         q4_p4k4_qs: []u8{}, q4_p4k4_scales: []u16{}, q8_p4k4_qs: []i8{}, q8_p4k4_scales: []u16{},
@@ -2417,7 +2423,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
         cfg: cfg, is_q4: is_q4, is_q8: is_q8, embed_q4: embed_q4, lm_head_q4: lm_head_q4, lm_head_q8: lm_head_q8,
         layers_p4: layers_p4, embed_p4: embed_p4, lm_head_p4: lm_head_p4,
         has_qkv_bias: has_qkv_bias, has_qk_norm: has_qk_norm, has_post_norms: has_post_norms,
-        is_moe: is_moe, is_mla: is_mla, is_mamba: is_mamba, use_q8k_act: false, lora: empty_lora_state(lora_nl),
+        is_moe: is_moe, is_mla: is_mla, is_mamba: is_mamba, use_q8k_act: false, lora: empty_lora_state(lora_nl), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
         chat_template_kind: tmpl_kind, eos_ids: eos_ids,
         weights: weights, compact_weights: compact,
         q4_qs: q4_qs, q4_scales: q4_scales, q8_qs: q8_qs, q8_scales: q8_scales,
@@ -3051,7 +3057,7 @@ fn load_model_hf_dir(dir &string, cfg_text &string, ctx_limit int) Model {
         cfg: cfg, is_q4: false, is_q8: false, embed_q4: false, lm_head_q4: false, lm_head_q8: false,
         layers_p4: false, embed_p4: false, lm_head_p4: false,
         has_qkv_bias: has_qkv_bias, has_qk_norm: has_qk_norm, has_post_norms: has_post_norms,
-        is_moe: is_moe, is_mla: false, is_mamba: false, use_q8k_act: false, lora: empty_lora_state(lora_nl),
+        is_moe: is_moe, is_mla: false, is_mamba: false, use_q8k_act: false, lora: empty_lora_state(lora_nl), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
         chat_template_kind: tmpl_kind, eos_ids: eos_ids,
         weights: weights, compact_weights: compact,
         q4_qs: []u8{}, q4_scales: []f32{}, q8_qs: []i8{}, q8_scales: []f32{},
@@ -5079,6 +5085,126 @@ fn forward_prefill_batch(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
     << last_tok
 }
 
+fn forward_prefill_embeddings(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
+                              x $&[]f32, xb $&[]f32, xb2 $&[]f32,
+                              q $&[]f32, k $&[]f32, v $&[]f32,
+                              hb $&[]f32, hb2 $&[]f32, logits $&[]f32,
+                              xq $&[]i8, xs $&[]f32,
+                              slot int, embeds &[]f32, n_tokens int, pos_base int, use_q8_act bool, compute_logits bool) int {
+    if n_tokens <= 0 { << 0 }
+    cfg := &m.cfg
+    dim := cfg.dim
+    $last_tok := 0
+    $off := 0
+    while off < n_tokens {
+        $count := n_tokens - off
+        if count > row_cache.len { count = row_cache.len }
+        is_last := off + count == n_tokens
+        for t in 0:count {
+            src_off := (off + t) * dim
+            dst_off := t * dim
+            for i in 0:dim { x[dst_off + i] = embeds[src_off + i] }
+            row := prepare_forward_row(kv, slot, pos_base + off + t) >>>
+            row_cache[t] = row
+        }
+        $final_count := 0
+        if is_last && compute_logits { final_count = 1 }
+        _ := forward_rows(m, kv, row_cache, count, count - 1, final_count, use_q8_act, false, x, xb, xb2, q, k, v, hb, hb2, xq, xs) >>>
+        if final_count > 0 {
+            last_tok = project_next_token(m, x, xb, xb2, xq, xs, logits, use_q8_act) >>>
+        }
+        off += count
+    }
+    << last_tok
+}
+
+fn build_model_gbnf_vocab(m &Model) gbnf.VocabIndex {
+    $pieces := []string{}
+    vocab := m.cfg.vocab_size
+    if vocab > 0 { pieces.reserve(vocab) }
+    for i in 0:vocab {
+        pieces.push(format_piece(m, i))
+    }
+    << gbnf.build_vocab_index(&pieces, &m.eos_ids)
+}
+
+fn split_on_image_marker(text &string) []string {
+    marker := "<image>"
+    $out := []string{}
+    $pos := 0
+    for {
+        idx := find_substr_from(text, &marker, pos)
+        if idx < 0 {
+            out.push((*text)[pos:text.len])
+            <-
+        }
+        out.push((*text)[pos:idx])
+        pos = idx + marker.len
+    }
+    << out
+}
+
+fn prefill_multimodal_segments(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
+                               sx $&[]f32, sxb $&[]f32, sxb2 $&[]f32,
+                               sq $&[]f32, sk $&[]f32, sv $&[]f32,
+                               shb $&[]f32, shb2 $&[]f32, slogits $&[]f32,
+                               sxq $&[]i8, sxs $&[]f32,
+                               slot int, text_chunks &[][]int, img_list &[][]f32,
+                               use_q8_act bool, compute_logits bool) int {
+    dim := m.cfg.dim
+    $n_markers := 0
+    if text_chunks.len > 1 { n_markers = text_chunks.len - 1 }
+    $prepend_imgs := img_list.len
+    if n_markers > 0 {
+        prepend_imgs = img_list.len - n_markers
+        if prepend_imgs < 0 { prepend_imgs = 0 }
+    }
+
+    // Build ordered execution plan: kind 0 = image idx, kind 1 = text chunk idx
+    $seg_kind := []int{}
+    $seg_idx := []int{}
+    for ii in 0:prepend_imgs {
+        if img_list[ii].len > 0 {
+            seg_kind.push(0)
+            seg_idx.push(ii)
+        }
+    }
+    $img_cursor := prepend_imgs
+    for ti in 0:text_chunks.len {
+        if text_chunks[ti].len > 0 {
+            seg_kind.push(1)
+            seg_idx.push(ti)
+        }
+        if ti + 1 < text_chunks.len && img_cursor < img_list.len {
+            if img_list[img_cursor].len > 0 {
+                seg_kind.push(0)
+                seg_idx.push(img_cursor)
+            }
+            img_cursor += 1
+        }
+    }
+
+    $pos := 0
+    $last_tok := 0
+    for si in 0:seg_kind.len {
+        is_last := (si + 1 == seg_kind.len) && compute_logits
+        idx := seg_idx[si]
+        if seg_kind[si] == 0 {
+            emb := &img_list[idx]
+            nt := emb.len / dim
+            t_emb := forward_prefill_embeddings(m, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, slot, emb, nt, pos, use_q8_act, is_last) >>>
+            last_tok = t_emb
+            pos += nt
+        } else {
+            chk := &text_chunks[idx]
+            t_txt := forward_prefill_batch(m, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, slot, chk, pos, use_q8_act, is_last) >>>
+            last_tok = t_txt
+            pos += chk.len
+        }
+    }
+    << last_tok
+}
+
 fn run_single_request(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
                       x $&[]f32, xb $&[]f32, xb2 $&[]f32,
                       q $&[]f32, k $&[]f32, v $&[]f32,
@@ -5969,651 +6095,29 @@ fn format_ant_sse_event(ev &string, data_json &string) string {
     << "event: " + (*ev) + "\ndata: " + (*data_json) + "\n\n"
 }
 
-struct GbnfElem {
-    kind int
-    lit string
-    lo []int
-    hi []int
-    negated bool
-    ref_idx int
-}
-
-struct GbnfAlt {
-    elems []GbnfElem
-}
-
-struct GbnfRule {
-    name string
-    alts []GbnfAlt
-}
-
-struct GbnfGrammar {
-    active bool
-    rules []GbnfRule
-    root_idx int
-}
-
-struct GbnfFrame {
-    rule_idx int
-    alt_idx int
-    elem_pos int
-    lit_off int
-}
-
-struct GbnfBranch {
-    frames []GbnfFrame
-}
-
-struct GbnfState {
-    branches []GbnfBranch
-}
-
-fn gbnf_empty_grammar() GbnfGrammar {
-    << GbnfGrammar{active: false, rules: []GbnfRule{}, root_idx: 0}
-}
-
-fn gbnf_copy_ints(src &[]int) []int {
-    $out := []int{}
-    out.reserve(src.len)
-    for i in 0:src.len { out.push(src[i]) }
-    << out
-}
-
-fn gbnf_copy_elem(e &GbnfElem) GbnfElem {
-    << GbnfElem{
-        kind: e.kind,
-        lit: e.lit + "",
-        lo: gbnf_copy_ints(&e.lo),
-        hi: gbnf_copy_ints(&e.hi),
-        negated: e.negated,
-        ref_idx: e.ref_idx
-    }
-}
-
-fn gbnf_copy_alt(a &GbnfAlt) GbnfAlt {
-    $elems := []GbnfElem{}
-    for i in 0:a.elems.len { elems.push(gbnf_copy_elem(&a.elems[i])) }
-    << GbnfAlt{elems: elems}
-}
-
-fn gbnf_copy_rule(r &GbnfRule) GbnfRule {
-    $alts := []GbnfAlt{}
-    for i in 0:r.alts.len { alts.push(gbnf_copy_alt(&r.alts[i])) }
-    << GbnfRule{name: r.name + "", alts: alts}
-}
-
-fn gbnf_copy_grammar(g &GbnfGrammar) GbnfGrammar {
-    $rs := []GbnfRule{}
-    for i in 0:g.rules.len { rs.push(gbnf_copy_rule(&g.rules[i])) }
-    << GbnfGrammar{active: g.active, rules: rs, root_idx: g.root_idx}
-}
-
-fn gbnf_copy_frame(f &GbnfFrame) GbnfFrame {
-    << GbnfFrame{rule_idx: f.rule_idx, alt_idx: f.alt_idx, elem_pos: f.elem_pos, lit_off: f.lit_off}
-}
-
-fn gbnf_copy_elems(xs &[]GbnfElem) []GbnfElem {
-    $out := []GbnfElem{}
-    for i in 0:xs.len { out.push(gbnf_copy_elem(&xs[i])) }
-    << out
-}
-
-fn gbnf_copy_branch(b &GbnfBranch) GbnfBranch {
-    $fs := []GbnfFrame{}
-    for i in 0:b.frames.len { fs.push(gbnf_copy_frame(&b.frames[i])) }
-    << GbnfBranch{frames: fs}
-}
-
-fn gbnf_copy_state(s &GbnfState) GbnfState {
-    $bs := []GbnfBranch{}
-    for i in 0:s.branches.len { bs.push(gbnf_copy_branch(&s.branches[i])) }
-    << GbnfState{branches: bs}
-}
-
-fn gbnf_find_rule(rnames &[]string, name &string) int {
-    for i in 0:rnames.len {
-        if rnames[i] == *name { << i }
-    }
-    << -1
-}
-
-fn gbnf_ensure_rule(rules $&[]GbnfRule, rnames $&[]string, name string) int {
-    idx := gbnf_find_rule(rnames, &name)
-    if idx >= 0 { << idx }
-    nidx := rules.len
-    rnames.push(name + "")
-    rules.push(GbnfRule{name: name + "", alts: []GbnfAlt{}})
-    << nidx
-}
-
-fn gbnf_is_ident_start(ch int) bool {
-    << (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95
-}
-
-fn gbnf_is_ident_cont(ch int) bool {
-    << gbnf_is_ident_start(ch) || (ch >= 48 && ch <= 57) || ch == 45
-}
-
-fn gbnf_skip_ws(src &string, pos $&int) {
-    while *pos < src.len {
-        ch := (*src)[*pos] & 255
-        if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
-            *pos += 1
-        } else if ch == 35 {
-            while *pos < src.len && ((*src)[*pos] & 255) != 10 { *pos += 1 }
-        } else {
-            <-
-        }
-    }
-}
-
-fn gbnf_parse_escape(src &string, pos $&int) int {
-    if *pos >= src.len { << 92 }
-    c := (*src)[*pos] & 255
-    *pos += 1
-    if c == 110 { << 10 }
-    if c == 114 { << 13 }
-    if c == 116 { << 9 }
-    << c
-}
-
-fn gbnf_parse_string(src &string, pos $&int) string {
-    *pos += 1
-    $out := ""
-    while *pos < src.len {
-        c := (*src)[*pos] & 255
-        if c == 34 {
-            *pos += 1
-            << out
-        }
-        if c == 92 {
-            *pos += 1
-            ev := gbnf_parse_escape(src, pos)
-            out.push_str(string_from_byte(ev))
-        } else {
-            out.push_str(string_from_byte(c))
-            *pos += 1
-        }
-    }
-    >>> errors.new("gbnf: unterminated string literal")
-}
-
-fn gbnf_parse_class(src &string, pos $&int) GbnfElem {
-    *pos += 1
-    $neg := false
-    if *pos < src.len && ((*src)[*pos] & 255) == 94 {
-        neg = true
-        *pos += 1
-    }
-    $lo := []int{}
-    $hi := []int{}
-    $closed := false
-    while *pos < src.len {
-        c := (*src)[*pos] & 255
-        if c == 93 {
-            *pos += 1
-            closed = true
-            <-
-        }
-        $start_c := c
-        *pos += 1
-        if start_c == 92 { start_c = gbnf_parse_escape(src, pos) }
-        if *pos + 1 < src.len && ((*src)[*pos] & 255) == 45 && ((*src)[*pos + 1] & 255) != 93 {
-            *pos += 1
-            $end_c := (*src)[*pos] & 255
-            *pos += 1
-            if end_c == 92 { end_c = gbnf_parse_escape(src, pos) }
-            lo.push(start_c)
-            hi.push(end_c)
-        } else {
-            lo.push(start_c)
-            hi.push(start_c)
-        }
-    }
-    if !closed {
-        >>> errors.new("gbnf: unterminated character class")
-    }
-    << GbnfElem{kind: 1, lit: "", lo: lo, hi: hi, negated: neg, ref_idx: -1}
-}
-
-fn gbnf_parse_alts(src &string, pos $&int, stop_ch int, rules $&[]GbnfRule, rnames $&[]string) []GbnfAlt {
-    $alts := []GbnfAlt{}
-    $cur := []GbnfElem{}
-    for {
-        gbnf_skip_ws(src, pos)
-        if *pos >= src.len {
-            alts.push(GbnfAlt{elems: gbnf_copy_elems(&cur)})
-            << alts
-        }
-        ch := (*src)[*pos] & 255
-        if stop_ch > 0 && ch == stop_ch {
-            *pos += 1
-            alts.push(GbnfAlt{elems: gbnf_copy_elems(&cur)})
-            << alts
-        }
-        if ch == 124 {
-            *pos += 1
-            alts.push(GbnfAlt{elems: gbnf_copy_elems(&cur)})
-            cur = []GbnfElem{}
-            ->
-        }
-        $has_atom := false
-        $atom := GbnfElem{kind: 0, lit: "", lo: []int{}, hi: []int{}, negated: false, ref_idx: -1}
-        if ch == 34 {
-            lit := gbnf_parse_string(src, pos) >>>
-            atom = GbnfElem{kind: 0, lit: lit, lo: []int{}, hi: []int{}, negated: false, ref_idx: -1}
-            has_atom = true
-        } else if ch == 91 {
-            atom = gbnf_parse_class(src, pos) >>>
-            has_atom = true
-        } else if ch == 40 {
-            *pos += 1
-            gidx := gbnf_ensure_rule(rules, rnames, "_grp_" + str(rules.len))
-            sub_alts := gbnf_parse_alts(src, pos, 41, rules, rnames) >>>
-            rules[gidx] = GbnfRule{name: rnames[gidx] + "", alts: sub_alts}
-            atom = GbnfElem{kind: 2, lit: "", lo: []int{}, hi: []int{}, negated: false, ref_idx: gidx}
-            has_atom = true
-        } else if gbnf_is_ident_start(ch) {
-            st := *pos
-            *pos += 1
-            while *pos < src.len && gbnf_is_ident_cont((*src)[*pos] & 255) { *pos += 1 }
-            rname := (*src)[st:*pos]
-            ridx := gbnf_ensure_rule(rules, rnames, rname)
-            atom = GbnfElem{kind: 2, lit: "", lo: []int{}, hi: []int{}, negated: false, ref_idx: ridx}
-            has_atom = true
-        } else {
-            alts.push(GbnfAlt{elems: gbnf_copy_elems(&cur)})
-            << alts
-        }
-        if has_atom {
-            gbnf_skip_ws(src, pos)
-            if *pos < src.len {
-                q := (*src)[*pos] & 255
-                if q == 42 || q == 43 || q == 63 {
-                    *pos += 1
-                    hidx := gbnf_ensure_rule(rules, rnames, "_q_" + str(rules.len))
-                    $halts := []GbnfAlt{}
-                    if q == 63 {
-                        $a1 := []GbnfElem{}
-                        a1.push(gbnf_copy_elem(&atom))
-                        halts.push(GbnfAlt{elems: a1})
-                        halts.push(GbnfAlt{elems: []GbnfElem{}})
-                    } else if q == 42 {
-                        $a1 := []GbnfElem{}
-                        a1.push(gbnf_copy_elem(&atom))
-                        a1.push(GbnfElem{kind: 2, lit: "", lo: []int{}, hi: []int{}, negated: false, ref_idx: hidx})
-                        halts.push(GbnfAlt{elems: a1})
-                        halts.push(GbnfAlt{elems: []GbnfElem{}})
-                    } else {
-                        $a1 := []GbnfElem{}
-                        a1.push(gbnf_copy_elem(&atom))
-                        a1.push(GbnfElem{kind: 2, lit: "", lo: []int{}, hi: []int{}, negated: false, ref_idx: hidx})
-                        $a2 := []GbnfElem{}
-                        a2.push(gbnf_copy_elem(&atom))
-                        halts.push(GbnfAlt{elems: a1})
-                        halts.push(GbnfAlt{elems: a2})
-                    }
-                    rules[hidx] = GbnfRule{name: rnames[hidx] + "", alts: halts}
-                    atom = GbnfElem{kind: 2, lit: "", lo: []int{}, hi: []int{}, negated: false, ref_idx: hidx}
-                }
-            }
-            cur.push(gbnf_copy_elem(&atom))
-        }
-    }
-    << alts
-}
-
-fn gbnf_strip_comments(raw &string) string {
-    $out := ""
-    $in_str := false
-    $in_cls := false
-    $esc := false
-    $in_cmt := false
-    for i in 0:raw.len {
-        c := (*raw)[i] & 255
-        if in_cmt {
-            if c == 10 {
-                in_cmt = false
-                out.push_str("\n")
-            }
-            ->
-        }
-        if esc {
-            esc = false
-            out.push_str(string_from_byte(c))
-            ->
-        }
-        if in_str {
-            if c == 92 { esc = true } else if c == 34 { in_str = false }
-            out.push_str(string_from_byte(c))
-            ->
-        }
-        if in_cls {
-            if c == 92 { esc = true } else if c == 93 { in_cls = false }
-            out.push_str(string_from_byte(c))
-            ->
-        }
-        if c == 35 {
-            in_cmt = true
-            ->
-        }
-        if c == 34 { in_str = true } else if c == 91 { in_cls = true }
-        out.push_str(string_from_byte(c))
-    }
-    << out
-}
-
-fn gbnf_compile(raw &string) GbnfGrammar {
-    clean := gbnf_strip_comments(raw)
-    lines := split_lines_trim(&clean)
-    $logical := []string{}
-    for i in 0:lines.len {
-        ln := &lines[i]
-        if find_substr(ln, &"::=") >= 0 {
-            logical.push((*ln) + "")
-        } else if logical.len > 0 {
-            logical[logical.len - 1] = logical[logical.len - 1] + " " + (*ln)
-        }
-    }
-    if logical.len == 0 {
-        >>> errors.new("gbnf: no rule definitions found")
-    }
-    $rules := []GbnfRule{}
-    $rnames := []string{}
-    $rhs_list := []string{}
-    $lhs_list := []string{}
-    for i in 0:logical.len {
-        ln := &logical[i]
-        sep := find_substr(ln, &"::=")
-        if sep <= 0 { >>> errors.new("gbnf: invalid rule definition") }
-        lhs := trim_ascii_ws(&(*ln)[0:sep])
-        rhs := (*ln)[(sep + 3):ln.len]
-        _ := gbnf_ensure_rule($&rules, $&rnames, lhs + "")
-        lhs_list.push(lhs)
-        rhs_list.push(rhs)
-    }
-    for i in 0:lhs_list.len {
-        ridx := gbnf_find_rule(&rnames, &lhs_list[i])
-        $p := 0
-        alts := gbnf_parse_alts(&rhs_list[i], $&p, 0, $&rules, $&rnames) >>>
-        rules[ridx] = GbnfRule{name: lhs_list[i] + "", alts: alts}
-    }
-    $root_idx := gbnf_find_rule(&rnames, &"root")
-    if root_idx < 0 { root_idx = 0 }
-    if rules[root_idx].alts.len == 0 {
-        >>> errors.new("gbnf: root rule has no alternatives")
-    }
-    << GbnfGrammar{active: true, rules: rules, root_idx: root_idx}
-}
-
-fn gbnf_branch_key(b &GbnfBranch) string {
-    if b.frames.len == 0 { << "FIN" }
-    $s := ""
-    for i in 0:b.frames.len {
-        f := &b.frames[i]
-        if i > 0 { s = s + ";" }
-        s = s + str(f.rule_idx) + ":" + str(f.alt_idx) + ":" + str(f.elem_pos) + ":" + str(f.lit_off)
-    }
-    << s
-}
-
-fn gbnf_has_str(xs &[]string, target &string) bool {
-    for i in 0:xs.len {
-        if xs[i] == *target { << true }
-    }
-    << false
-}
-
-fn gbnf_normalize(g &GbnfGrammar, in_branches $&[]GbnfBranch) GbnfState {
-    $work := []GbnfBranch{}
-    for i in 0:in_branches.len { work.push(gbnf_copy_branch(&in_branches[i])) }
-    $kept := []GbnfBranch{}
-    $seen_kept := []string{}
-    $seen_work := []string{}
-    $wi := 0
-    while wi < work.len && kept.len < 64 && wi < 512 {
-        $br := gbnf_copy_branch(&work[wi])
-        wi += 1
-        while br.frames.len > 0 {
-            top_i := br.frames.len - 1
-            fr := &br.frames[top_i]
-            ri := fr.rule_idx
-            ai := fr.alt_idx
-            r := &g.rules[ri]
-            alt := &r.alts[ai]
-            if fr.elem_pos >= alt.elems.len {
-                $nfs := []GbnfFrame{}
-                for fi in 0:top_i { nfs.push(gbnf_copy_frame(&br.frames[fi])) }
-                br.frames = nfs
-            } else {
-                <-
-            }
-        }
-        if br.frames.len == 0 {
-            if !gbnf_has_str(&seen_kept, &"FIN") {
-                seen_kept.push("FIN")
-                kept.push(gbnf_copy_branch(&br))
-            }
-            ->
-        }
-        bk := gbnf_branch_key(&br)
-        if gbnf_has_str(&seen_work, &bk) { -> }
-        seen_work.push(bk + "")
-
-        top_i := br.frames.len - 1
-        top_f := &br.frames[top_i]
-        tri := top_f.rule_idx
-        tai := top_f.alt_idx
-        tep := top_f.elem_pos
-        toff := top_f.lit_off
-        tr := &g.rules[tri]
-        talt := &tr.alts[tai]
-        el := &talt.elems[tep]
-        if el.kind == 0 && toff >= el.lit.len {
-            br.frames[top_i].elem_pos += 1
-            br.frames[top_i].lit_off = 0
-            work.push(gbnf_copy_branch(&br))
-        } else if el.kind == 2 {
-            ref_id := el.ref_idx
-            br.frames[top_i].elem_pos += 1
-            br.frames[top_i].lit_off = 0
-            if br.frames.len < 48 {
-                ref_rule := &g.rules[ref_id]
-                nalts := ref_rule.alts.len
-                for ai in 0:nalts {
-                    $nb := gbnf_copy_branch(&br)
-                    nb.frames.push(GbnfFrame{rule_idx: ref_id, alt_idx: ai, elem_pos: 0, lit_off: 0})
-                    work.push(nb)
-                }
-            }
-        } else {
-            if !gbnf_has_str(&seen_kept, &bk) {
-                seen_kept.push(bk)
-                kept.push(gbnf_copy_branch(&br))
-            }
-        }
-    }
-    << GbnfState{branches: kept}
-}
-
-fn gbnf_init_state(g &GbnfGrammar) GbnfState {
-    if !g.active || g.rules.len == 0 { << GbnfState{branches: []GbnfBranch{}} }
-    $init_bs := []GbnfBranch{}
-    root_i := g.root_idx
-    root := &g.rules[root_i]
-    for ai in 0:root.alts.len {
-        $fs := []GbnfFrame{}
-        fs.push(GbnfFrame{rule_idx: root_i, alt_idx: ai, elem_pos: 0, lit_off: 0})
-        init_bs.push(GbnfBranch{frames: fs})
-    }
-    << gbnf_normalize(g, $&init_bs)
-}
-
-fn gbnf_can_finish(st &GbnfState) bool {
-    for i in 0:st.branches.len {
-        if st.branches[i].frames.len == 0 { << true }
-    }
-    << false
-}
-
-fn gbnf_elem_matches_byte(el &GbnfElem, lit_off int, b int) bool {
-    if el.kind == 0 {
-        if lit_off < el.lit.len {
-            << (el.lit[lit_off] & 255) == b
-        }
-        << false
-    }
-    if el.kind == 1 {
-        $hit := false
-        for i in 0:el.lo.len {
-            if b >= el.lo[i] && b <= el.hi[i] {
-                hit = true
-                <-
-            }
-        }
-        if el.negated { << !hit }
-        << hit
-    }
-    << false
-}
-
-fn gbnf_fill_allowed_bytes(g &GbnfGrammar, st &GbnfState, allowed $&[]bool) {
-    for i in 0:st.branches.len {
-        b := &st.branches[i]
-        if b.frames.len == 0 { -> }
-        last_f := b.frames.len - 1
-        fr := &b.frames[last_f]
-        ri := fr.rule_idx
-        ai := fr.alt_idx
-        epos := fr.elem_pos
-        r := &g.rules[ri]
-        alt := &r.alts[ai]
-        el := &alt.elems[epos]
-        if el.kind == 0 {
-            if fr.lit_off < el.lit.len {
-                allowed[el.lit[fr.lit_off] & 255] = true
-            }
-        } else if el.kind == 1 {
-            if !el.negated {
-                for r in 0:el.lo.len {
-                    $lo_v := el.lo[r]
-                    $hi_v := el.hi[r]
-                    if lo_v < 0 { lo_v = 0 }
-                    if hi_v > 255 { hi_v = 255 }
-                    for ch in lo_v:(hi_v + 1) { allowed[ch] = true }
-                }
-            } else {
-                for ch in 0:256 {
-                    if gbnf_elem_matches_byte(el, 0, ch) { allowed[ch] = true }
-                }
-            }
-        }
-    }
-}
-
-fn gbnf_step_byte(g &GbnfGrammar, st &GbnfState, b int) GbnfState {
-    $next_bs := []GbnfBranch{}
-    for i in 0:st.branches.len {
-        br := &st.branches[i]
-        if br.frames.len == 0 { -> }
-        top_i := br.frames.len - 1
-        fr := &br.frames[top_i]
-        ri := fr.rule_idx
-        ai := fr.alt_idx
-        epos := fr.elem_pos
-        r := &g.rules[ri]
-        alt := &r.alts[ai]
-        el := &alt.elems[epos]
-        if !gbnf_elem_matches_byte(el, fr.lit_off, b) { -> }
-        $nb := gbnf_copy_branch(br)
-        if el.kind == 0 {
-            nb.frames[top_i].lit_off += 1
-            if nb.frames[top_i].lit_off >= el.lit.len {
-                nb.frames[top_i].elem_pos += 1
-                nb.frames[top_i].lit_off = 0
-            }
-        } else {
-            nb.frames[top_i].elem_pos += 1
-            nb.frames[top_i].lit_off = 0
-        }
-        next_bs.push(nb)
-    }
-    << gbnf_normalize(g, $&next_bs)
-}
-
-fn gbnf_advance_piece(g &GbnfGrammar, st &GbnfState, piece &string) GbnfState {
-    if !g.active || piece.len == 0 { << gbnf_copy_state(st) }
-    $cur := gbnf_copy_state(st)
-    for i in 0:piece.len {
-        cur = gbnf_step_byte(g, &cur, (*piece)[i] & 255)
-        if cur.branches.len == 0 { << cur }
-    }
-    << cur
-}
-
-fn apply_gbnf_logit_mask(logits $&[]f32, off int, model &Model, g &GbnfGrammar, st &GbnfState) {
-    if !g.active { << }
-    vocab := model.cfg.vocab_size
-    $allowed_b := []bool{}
-    allowed_b.reserve(256)
-    for _ in 0:256 { allowed_b.push(false) }
-    gbnf_fill_allowed_bytes(g, st, $&allowed_b)
-    can_fin := gbnf_can_finish(st)
-
-    $disallowed := []int{}
-    $kept := 0
-    for i in 0:vocab {
-        if logits[off + i] <= f32(-1e8) { -> }
-        if is_eos_token(model, i) {
-            if can_fin {
-                kept += 1
-            } else {
-                disallowed.push(i)
-            }
-            ->
-        }
-        piece := format_piece(model, i)
-        if piece.len == 0 {
-            disallowed.push(i)
-            ->
-        }
-        if !allowed_b[piece[0] & 255] {
-            disallowed.push(i)
-            ->
-        }
-        if piece.len == 1 {
-            kept += 1
-        } else {
-            nxt_st := gbnf_advance_piece(g, st, &piece)
-            if nxt_st.branches.len > 0 {
-                kept += 1
-            } else {
-                disallowed.push(i)
-            }
-        }
-    }
-    if kept > 0 {
-        for di in 0:disallowed.len {
-            logits[off + disallowed[di]] = f32(-1e9)
-        }
-    }
-}
-
 fn run_generation_core(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
                        sx $&[]f32, sxb $&[]f32, sxb2 $&[]f32,
                        sq $&[]f32, sk $&[]f32, sv $&[]f32,
                        shb $&[]f32, shb2 $&[]f32, slogits $&[]f32,
                        sxq $&[]i8, sxs $&[]f32,
-                       prompt_ids &[]int, max_tokens int, temp_milli int, top_k int,
+                       img_list &[][]f32, text_chunks &[][]int,
+                       max_tokens int, temp_milli int, top_k int,
                        top_p_milli int, min_p_milli int, repeat_penalty_milli int,
                        presence_penalty_milli int, frequency_penalty_milli int,
                        seed int, ignore_eos bool, verbose bool, stops &[]string,
                        is_stream bool, is_chat bool, model_id &string,
                        reply_ch chan ServeResponse, stream_ch chan string,
-                       gbnf &GbnfGrammar) GenOutput {
+                       gbnf_gr &gbnf.GbnfGrammar) GenOutput {
     $rng := seed
     $history := []int{}
-    for i in 0:prompt_ids.len { history.push(prompt_ids[i]) }
+    for ci in 0:text_chunks.len {
+        chk := &text_chunks[ci]
+        for i in 0:chk.len { history.push(chk[i]) }
+    }
+    $n_img_tokens := 0
+    for ii in 0:img_list.len {
+        n_img_tokens += img_list[ii].len / m.cfg.dim
+    }
     $out_ids := []int{}
     $out_text := ""
     $emitted_len := 0
@@ -6626,28 +6130,30 @@ fn run_generation_core(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
     $finish_reason := "length"
     $decode_ns := 0
     t_pref := time.now()
-    _ := forward_prefill_batch(m, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, 0, prompt_ids, 0, true, true) >>> (err) {
-        kv_free_slot(kv, 0)
-        >>> err
+    if n_img_tokens > 0 || history.len > 0 {
+        _ := prefill_multimodal_segments(m, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, 0, text_chunks, img_list, true, true) >>> (err) {
+            kv_free_slot(kv, 0)
+            >>> err
+        }
     }
     pref_ns := time.since(t_pref)
     if is_stream {
         reply_ch <- ServeResponse{status: 200, body: "", is_stream: true, content_type: ""}
     }
-    $pos := prompt_ids.len
+    $pos := n_img_tokens + history.len
     $gen_id := "cmpl-xu"
     if is_chat { gen_id = "chatcmpl-xu" }
     empty_lp := ""
-    $gst := gbnf_init_state(gbnf)
+    $gst := gbnf.init_state(gbnf_gr)
 
     if max_tokens > 0 {
-        if gbnf.active { apply_gbnf_logit_mask(slogits, 0, m, gbnf, &gst) }
+        if gbnf_gr.active { gbnf.apply_logit_mask(slogits, 0, &m.gbnf_vocab, gbnf_gr, &gst) }
         next0 := sample_token(slogits, m.cfg.vocab_size, &history, temp_milli, top_k, top_p_milli, min_p_milli, repeat_penalty_milli, presence_penalty_milli, frequency_penalty_milli, $&rng)
         if !ignore_eos && is_eos_token(m, next0) {
             finish_reason = "stop"
         } else {
             piece0 := format_piece(m, next0)
-            if gbnf.active { gst = gbnf_advance_piece(gbnf, &gst, &piece0) }
+            if gbnf_gr.active { gst = gbnf.advance_piece(gbnf_gr, &gst, &piece0) }
             history.push(next0)
             out_ids.push(next0)
             out_text = out_text + piece0
@@ -6682,14 +6188,14 @@ fn run_generation_core(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
                         >>> err
                     }
                     pos += 1
-                    if gbnf.active { apply_gbnf_logit_mask(slogits, 0, m, gbnf, &gst) }
+                    if gbnf_gr.active { gbnf.apply_logit_mask(slogits, 0, &m.gbnf_vocab, gbnf_gr, &gst) }
                     next_tok := sample_token(slogits, m.cfg.vocab_size, &history, temp_milli, top_k, top_p_milli, min_p_milli, repeat_penalty_milli, presence_penalty_milli, frequency_penalty_milli, $&rng)
                     if !ignore_eos && is_eos_token(m, next_tok) {
                         finish_reason = "stop"
                         <-
                     }
                     piece := format_piece(m, next_tok)
-                    if gbnf.active { gst = gbnf_advance_piece(gbnf, &gst, &piece) }
+                    if gbnf_gr.active { gst = gbnf.advance_piece(gbnf_gr, &gst, &piece) }
                     history.push(next_tok)
                     out_ids.push(next_tok)
                     out_text = out_text + piece
@@ -6731,19 +6237,21 @@ fn run_generation_seq(m &Model, kv $&PagedKvCache, row_cache $&[]ForwardRow,
                       sq $&[]f32, sk $&[]f32, sv $&[]f32,
                       shb $&[]f32, shb2 $&[]f32, slogits $&[]f32,
                       sxq $&[]i8, sxs $&[]f32,
-                      prompt_ids &[]int, max_tokens int, temp_milli int, top_k int,
+                      img_list &[][]f32, text_chunks &[][]int,
+                      max_tokens int, temp_milli int, top_k int,
                       top_p_milli int, min_p_milli int, repeat_penalty_milli int,
                       presence_penalty_milli int, frequency_penalty_milli int,
-                      seed int, ignore_eos bool, verbose bool, gbnf &GbnfGrammar) GenOutput {
+                      seed int, ignore_eos bool, verbose bool, gbnf_gr &gbnf.GbnfGrammar) GenOutput {
     no_stops := []string{}
     dummy_id := ""
     dummy_reply := chan ServeResponse{cap: 1}
     dummy_stream := chan string{cap: 1}
     << run_generation_core(m, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs,
-                           prompt_ids, max_tokens, temp_milli, top_k, top_p_milli, min_p_milli,
+                           img_list, text_chunks,
+                           max_tokens, temp_milli, top_k, top_p_milli, min_p_milli,
                            repeat_penalty_milli, presence_penalty_milli, frequency_penalty_milli,
                            seed, ignore_eos, verbose, &no_stops, false, false, &dummy_id,
-                           dummy_reply, dummy_stream, gbnf) >>>
+                           dummy_reply, dummy_stream, gbnf_gr) >>>
 }
 
 struct ParsedServeReq {
@@ -6774,7 +6282,8 @@ struct ParsedServeReq {
     stops []string
     bias_ids []int
     bias_vals []f32
-    grammar GbnfGrammar
+    grammar gbnf.GbnfGrammar
+    images []string
 }
 
 struct TokenLogprobRecord {
@@ -7199,7 +6708,7 @@ fn tag_holdback_len(text &string, start int, end int, check_open_think bool, che
     << best
 }
 
-fn format_chat_messages(doc &json.Doc, msgs int, tmpl_kind int, tools_sys &string) string {
+fn format_chat_messages(doc &json.Doc, msgs int, tmpl_kind int, tools_sys &string, out_images $&[]string) string {
     $out := ""
     $sys_buf := ""
     $has_content := false
@@ -7237,11 +6746,29 @@ fn format_chat_messages(doc &json.Doc, msgs int, tmpl_kind int, tools_sys &strin
                     parts_cnt := doc.count(cnode)
                     for pi in 0:parts_cnt {
                         pnode := doc.at(cnode, pi) >>>
-                        if doc.is_dict(pnode) && doc.has(pnode, "text") {
-                            ptn := doc.get(pnode, "text") >>>
-                            if doc.is_string(ptn) {
-                                tpart := doc.as_string(ptn) >>>
-                                cstr = cstr + tpart
+                        if doc.is_dict(pnode) {
+                            $ptype := llm_doc_str(doc, llm_doc_get(doc, pnode, "type", -1), "")
+                            if ptype == "image_url" || doc.has(pnode, "image_url") {
+                                iun := llm_doc_get(doc, pnode, "image_url", -1)
+                                $iurl := ""
+                                if iun >= 0 {
+                                    if doc.is_string(iun) {
+                                        iurl = llm_doc_str(doc, iun, "")
+                                    } else if doc.is_dict(iun) && doc.has(iun, "url") {
+                                        iurl = llm_doc_str(doc, llm_doc_get(doc, iun, "url", -1), "")
+                                    }
+                                }
+                                if iurl.len > 0 {
+                                    out_images.push(iurl)
+                                    has_content = true
+                                    cstr = cstr + "<image>"
+                                }
+                            } else if doc.has(pnode, "text") {
+                                ptn := doc.get(pnode, "text") >>>
+                                if doc.is_string(ptn) {
+                                    tpart := doc.as_string(ptn) >>>
+                                    cstr = cstr + tpart
+                                }
                             }
                         }
                     }
@@ -7658,6 +7185,22 @@ fn format_responses_sync_body(rid &string, created int, model_id &string, out_te
        ",\"output_tokens\":" + str(ctoks) + ",\"total_tokens\":" + str(ttoks) + "}}"
 }
 
+fn schema_has_constraints(doc &json.Doc, scn int) bool {
+    if !doc.is_dict(scn) { << false }
+    if doc.has(scn, "properties") || doc.has(scn, "enum") || doc.has(scn, "const") ||
+       doc.has(scn, "items") || doc.has(scn, "anyOf") || doc.has(scn, "oneOf") {
+        << true
+    }
+    if doc.has(scn, "type") {
+        tn := doc.get(scn, "type") >>> (_) { << false }
+        if doc.is_string(tn) {
+            ts := doc.as_string(tn) >>> (_) { << false }
+            if ts.len > 0 && ts != "object" { << true }
+        }
+    }
+    << false
+}
+
 fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, def_rep int,
                        def_pres int, def_freq int, def_seed int, def_ignore_eos bool,
                        tmpl_kind int, resp_hist_ids &[]string, resp_hist_ctx &[]string) ParsedServeReq {
@@ -7676,6 +7219,7 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, d
     $r_prev_resp_id := ""
     $r_resp_prefix := ""
     $r_stream := false
+    $r_images := []string{}
     if *path == "/v1/completions" {
         if !doc.has(root, "prompt") { >>> errors.new("missing prompt") }
         pnode := doc.get(root, "prompt") >>>
@@ -7761,7 +7305,7 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, d
             >>> errors.new("messages must be non-empty array")
         }
         $tools_sys := ""
-        prompt_text = format_chat_messages(&doc, msgs, tmpl_kind, &tools_sys) >>>
+        prompt_text = format_chat_messages(&doc, msgs, tmpl_kind, &tools_sys, $&r_images) >>>
     } else {
         if !doc.has(root, "messages") { >>> errors.new("missing messages") }
         msgs := doc.get(root, "messages") >>>
@@ -7776,7 +7320,7 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, d
                 tools_sys = format_tools_prompt(&doc, tnode)
             }
         }
-        prompt_text = format_chat_messages(&doc, msgs, tmpl_kind, &tools_sys) >>>
+        prompt_text = format_chat_messages(&doc, msgs, tmpl_kind, &tools_sys, $&r_images) >>>
     }
 
     $r_max := 16
@@ -7796,13 +7340,13 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, d
     $r_stops := []string{}
     $r_bias_ids := []int{}
     $r_bias_vals := []f32{}
-    $r_grammar := gbnf_empty_grammar()
+    $r_grammar := gbnf.empty_grammar()
     if doc.has(root, "grammar") {
         gn := doc.get(root, "grammar") >>>
         if doc.is_string(gn) {
             gs := doc.as_string(gn) >>>
             if gs.len > 0 {
-                r_grammar = gbnf_compile(&gs) >>>
+                r_grammar = gbnf.compile(&gs) >>>
             }
         }
     }
@@ -7932,6 +7476,18 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, d
             if doc.is_string(tn) {
                 tstr := doc.as_string(tn) >>>
                 if tstr == "json_object" || tstr == "json_schema" { r_json_mode = true }
+                if tstr == "json_schema" && !r_grammar.active && doc.has(rfn, "json_schema") {
+                    jsn := doc.get(rfn, "json_schema") >>>
+                    if doc.is_dict(jsn) && doc.has(jsn, "schema") {
+                        scn := doc.get(jsn, "schema") >>>
+                        if doc.is_dict(scn) && schema_has_constraints(&doc, scn) {
+                            sstr := llm_doc_encode(&doc, scn, "")
+                            if sstr.len > 0 {
+                                r_grammar = gbnf.compile_json_schema(&sstr) >>>
+                            }
+                        }
+                    }
+                }
             }
         }
     } else if doc.has(root, "text") {
@@ -7943,6 +7499,15 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, d
                 if doc.is_string(tn) {
                     tstr := doc.as_string(tn) >>>
                     if tstr == "json_object" || tstr == "json_schema" { r_json_mode = true }
+                    if tstr == "json_schema" && !r_grammar.active && doc.has(fmtn, "schema") {
+                        scn := doc.get(fmtn, "schema") >>>
+                        if doc.is_dict(scn) && schema_has_constraints(&doc, scn) {
+                            sstr := llm_doc_encode(&doc, scn, "")
+                            if sstr.len > 0 {
+                                r_grammar = gbnf.compile_json_schema(&sstr) >>>
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -8002,7 +7567,7 @@ fn parse_serve_request(path &string, body &string, def_topp int, def_minp int, d
         is_responses: r_is_responses, is_ollama_gen: r_is_ollama_gen, is_ollama_chat: r_is_ollama_chat,
         prev_resp_id: r_prev_resp_id, resp_prefix: r_resp_prefix,
         stops: ~r_stops, bias_ids: ~r_bias_ids, bias_vals: ~r_bias_vals,
-        grammar: ~r_grammar
+        grammar: ~r_grammar, images: ~r_images
     }
 }
 
@@ -8018,6 +7583,11 @@ fn format_embedding_json(emb &[]f32) string {
     << s + "]"
 }
 
+struct SlotMultimodal {
+    text_chunks [][]int
+    img_embeds [][]f32
+}
+
 struct QueuedServeItem {
     is_embed bool
     is_chat bool
@@ -8029,6 +7599,9 @@ struct QueuedServeItem {
     req_id string
     created int
     prompt_ids []int
+    text_chunks [][]int
+    img_embed_list [][]f32
+    img_tokens int
     embed_pids [][]int
     parsed ParsedServeReq
     reply chan ServeResponse
@@ -8285,7 +7858,7 @@ fn finalize_serve_slot(model_id &string, kv $&PagedKvCache, s int, finish_reason
                        slot_is_stream &[]bool, slot_is_chat &[]bool,
                        slot_include_usage &[]bool, slot_want_lp &[]bool, slot_lp_recs &[][]TokenLogprobRecord,
                        slot_has_tools &[]bool, slot_sstate $&[]ServeStreamState, slot_resp_prefix &[]string,
-                       slot_prompts $&[][]int,
+                       slot_prompts $&[][]int, slot_img_tokens $&[]int, slot_mm $&[]SlotMultimodal,
                        slot_out_ids &[]int, slot_out_text &[]string,
                        slot_emitted_len $&[]int, slot_replies &[]chan ServeResponse,
                        slot_streams &[]chan string, slot_cancels &[]chan int,
@@ -8294,7 +7867,7 @@ fn finalize_serve_slot(model_id &string, kv $&PagedKvCache, s int, finish_reason
                        total_reqs $&int, total_ptoks $&int, total_ctoks $&int) {
     rid := &slot_req_ids[s]
     ts := slot_created[s]
-    ptoks := slot_prompts[s].len
+    ptoks := slot_prompts[s].len + slot_img_tokens[s]
     ctoks := slot_out_ids.len
     ttoks := ptoks + ctoks
     *total_reqs += 1
@@ -8517,10 +8090,18 @@ fn finalize_serve_slot(model_id &string, kv $&PagedKvCache, s int, finish_reason
             resp_hist_ctx.push(full_ctx)
         }
     }
-    keep := slot_prompts[s].len
-    kv_truncate_slot(kv, s, keep)
-    slot_cached_tokens[s] = ~slot_prompts[s]
-    slot_cached_len[s] = keep
+    if slot_img_tokens[s] > 0 {
+        kv_free_slot(kv, s)
+        slot_cached_tokens[s] = []int{}
+        slot_cached_len[s] = 0
+        slot_img_tokens[s] = 0
+        slot_mm[s] = SlotMultimodal{text_chunks: [][]int{}, img_embeds: [][]f32{}}
+    } else {
+        keep := slot_prompts[s].len
+        kv_truncate_slot(kv, s, keep)
+        slot_cached_tokens[s] = ~slot_prompts[s]
+        slot_cached_len[s] = keep
+    }
     slot_active[s] = false
     *active_count -= 1
 }
@@ -8613,8 +8194,8 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
     $slot_json_started := []bool{}
     $slot_json_in_str := []bool{}
     $slot_json_esc := []bool{}
-    $slot_grammar := []GbnfGrammar{}
-    $slot_gstate := []GbnfState{}
+    $slot_grammar := []gbnf.GbnfGrammar{}
+    $slot_gstate := []gbnf.GbnfState{}
     $slot_has_tools := []bool{}
     $slot_sstate := []ServeStreamState{}
     $slot_resp_prefix := []string{}
@@ -8631,6 +8212,8 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
     $slot_cancels := []chan int{}
     $slot_cached_tokens := [][]int{}
     $slot_cached_len := []int{}
+    $slot_mm := []SlotMultimodal{}
+    $slot_img_tokens := []int{}
     $predictions := []DecodePrediction{}
 
     for _ in 0:active_limit {
@@ -8665,8 +8248,8 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
         slot_json_started.push(false)
         slot_json_in_str.push(false)
         slot_json_esc.push(false)
-        slot_grammar.push(gbnf_empty_grammar())
-        slot_gstate.push(GbnfState{branches: []GbnfBranch{}})
+        slot_grammar.push(gbnf.empty_grammar())
+        slot_gstate.push(gbnf.GbnfState{branches: []gbnf.GbnfBranch{}})
         slot_has_tools.push(false)
         slot_sstate.push(new_serve_stream_state(false, false, false, false))
         slot_resp_prefix.push("")
@@ -8683,6 +8266,8 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
         slot_cancels.push(dummy_cancel)
         slot_cached_tokens.push([]int{})
         slot_cached_len.push(0)
+        slot_mm.push(SlotMultimodal{text_chunks: [][]int{}, img_embeds: [][]f32{}})
+        slot_img_tokens.push(0)
         predictions.push(DecodePrediction{token: 0, logit_bits: 0})
     }
 
@@ -8785,7 +8370,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                         is_embed: true, is_chat: false, is_anthropic: false, is_responses: false,
                         is_ollama_gen: false, is_ollama_chat: false, resp_prefix: "",
                         req_id: "", created: 0,
-                        prompt_ids: []int{}, embed_pids: ~epids,
+                        prompt_ids: []int{}, text_chunks: [][]int{}, img_embed_list: [][]f32{}, img_tokens: 0, embed_pids: ~epids,
                         parsed: ~parsed, reply: req.reply, stream_ch: req.stream_ch, cancel_ch: req.cancel_ch
                     })
                 }
@@ -8801,6 +8386,21 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                     req.reply <- ServeResponse{status: 400, body: json_error_body(err.msg()), is_stream: false, content_type: ""}
                     ->
                 }
+                $req_img_list := [][]f32{}
+                $req_img_toks := 0
+                if parsed.images.len > 0 {
+                    if !model.vision.active {
+                        req.reply <- ServeResponse{status: 400, body: json_error_body("vision requests require --mmproj"), is_stream: false, content_type: ""}
+                        ->
+                    }
+                    req_img_list = vision.encode_spec_list(&model.vision, &parsed.images) >>> (err) {
+                        req.reply <- ServeResponse{status: 400, body: json_error_body(err.msg()), is_stream: false, content_type: ""}
+                        ->
+                    }
+                    for ii in 0:req_img_list.len {
+                        req_img_toks += req_img_list[ii].len / model.cfg.dim
+                    }
+                }
                 req_seq += 1
                 created_ts := time.now_time().unix()
                 $prefix := "cmpl-"
@@ -8808,13 +8408,28 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 else if is_ant { prefix = "msg_" }
                 else if is_resp { prefix = "resp_" }
                 rid := prefix + str(created_ts) + "-" + str(req_seq)
-                pids := encode_prompt(model, &parsed.prompt_text)
+                $tchunks := [][]int{}
+                $pids := []int{}
+                if req_img_toks > 0 {
+                    str_parts := split_on_image_marker(&parsed.prompt_text)
+                    for pi in 0:str_parts.len {
+                        if str_parts[pi].len == 0 {
+                            tchunks.push([]int{})
+                        } else {
+                            cids := encode_prompt(model, &str_parts[pi])
+                            for ti in 0:cids.len { pids.push(cids[ti]) }
+                            tchunks.push(~cids)
+                        }
+                    }
+                } else {
+                    pids = encode_prompt(model, &parsed.prompt_text)
+                }
                 rpref := parsed.resp_prefix + ""
                 pending.push(QueuedServeItem{
                     is_embed: false, is_chat: is_chat, is_anthropic: is_ant, is_responses: is_resp,
                     is_ollama_gen: is_ogen, is_ollama_chat: is_ochat, resp_prefix: rpref,
                     req_id: rid, created: created_ts,
-                    prompt_ids: ~pids, embed_pids: [][]int{},
+                    prompt_ids: ~pids, text_chunks: ~tchunks, img_embed_list: ~req_img_list, img_tokens: req_img_toks, embed_pids: [][]int{},
                     parsed: ~parsed, reply: req.reply, stream_ch: req.stream_ch, cancel_ch: req.cancel_ch
                 })
             } else {
@@ -8858,8 +8473,10 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 $limit := clen
                 if max_keep < limit { limit = max_keep }
                 $lcp := 0
-                while lcp < limit && slot_cached_tokens[s][lcp] == item.prompt_ids[lcp] {
-                    lcp += 1
+                if item.img_tokens == 0 {
+                    while lcp < limit && slot_cached_tokens[s][lcp] == item.prompt_ids[lcp] {
+                        lcp += 1
+                    }
                 }
                 if lcp > best_lcp || (lcp == 0 && best_lcp == 0 && best_slot >= 0 && slot_cached_len[best_slot] > 0 && clen == 0) {
                     best_lcp = lcp
@@ -8875,6 +8492,22 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 kv_free_slot(kv, best_slot)
                 slot_cached_len[best_slot] = 0
             }
+            $tcc := [][]int{}
+            for ci in 0:item.text_chunks.len {
+                $c := []int{}
+                src_c := &item.text_chunks[ci]
+                for cj in 0:src_c.len { c.push(src_c[cj]) }
+                tcc.push(~c)
+            }
+            $ilc := [][]f32{}
+            for ii in 0:item.img_embed_list.len {
+                $v := []f32{}
+                src_v := &item.img_embed_list[ii]
+                for ij in 0:src_v.len { v.push(src_v[ij]) }
+                ilc.push(~v)
+            }
+            slot_mm[best_slot] = SlotMultimodal{text_chunks: ~tcc, img_embeds: ~ilc}
+            slot_img_tokens[best_slot] = item.img_tokens
 
             $hist := []int{}
             $pcopy := []int{}
@@ -8923,8 +8556,8 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
             slot_json_started[best_slot] = false
             slot_json_in_str[best_slot] = false
             slot_json_esc[best_slot] = false
-            slot_grammar[best_slot] = gbnf_copy_grammar(&item.parsed.grammar)
-            slot_gstate[best_slot] = gbnf_init_state(&slot_grammar[best_slot])
+            slot_grammar[best_slot] = gbnf.copy_grammar(&item.parsed.grammar)
+            slot_gstate[best_slot] = gbnf.init_state(&slot_grammar[best_slot])
             slot_has_tools[best_slot] = item.parsed.has_tools
             slot_sstate[best_slot] = new_serve_stream_state(item.is_anthropic, item.is_responses, item.is_ollama_gen, item.is_ollama_chat)
             slot_resp_prefix[best_slot] = item.resp_prefix + ""
@@ -8968,15 +8601,30 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
             $finish_reason := "length"
             plen := slot_prompts[s].len
             shared := slot_shared[s]
-            $suffix := []int{}
-            for k in shared:plen { suffix.push(slot_prompts[s][k]) }
-            _ := forward_prefill_batch(model, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, s, &suffix, shared, true, true) >>> (err) {
-                cancel_serve_slot(kv, s, $&slot_active, $&active_count, $&slot_cached_len)
-                slot_replies[s] <- ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false, content_type: ""}
-                ->
+            n_img := slot_img_tokens[s]
+            if n_img > 0 {
+                _ := prefill_multimodal_segments(model, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, s, &slot_mm[s].text_chunks, &slot_mm[s].img_embeds, true, true) >>> (err) {
+                    cancel_serve_slot(kv, s, $&slot_active, $&active_count, $&slot_cached_len)
+                    slot_img_tokens[s] = 0
+                    slot_mm[s] = SlotMultimodal{text_chunks: [][]int{}, img_embeds: [][]f32{}}
+                    slot_replies[s] <- ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false, content_type: ""}
+                    ->
+                }
+            } else {
+                $suffix := []int{}
+                for k in shared:plen { suffix.push(slot_prompts[s][k]) }
+                if suffix.len > 0 {
+                    _ := forward_prefill_batch(model, kv, row_cache, sx, sxb, sxb2, sq, sk, sv, shb, shb2, slogits, sxq, sxs, s, &suffix, shared, true, true) >>> (err) {
+                        cancel_serve_slot(kv, s, $&slot_active, $&active_count, $&slot_cached_len)
+                        slot_img_tokens[s] = 0
+                        slot_mm[s] = SlotMultimodal{text_chunks: [][]int{}, img_embeds: [][]f32{}}
+                        slot_replies[s] <- ServeResponse{status: 500, body: json_error_body(err.msg()), is_stream: false, content_type: ""}
+                        ->
+                    }
+                }
             }
             slot_prefilled[s] = true
-            slot_pos[s] = plen
+            slot_pos[s] = n_img + plen
             if slot_is_stream[s] {
                 $sct := ""
                 if slot_sstate[s].is_ollama_gen || slot_sstate[s].is_ollama_chat {
@@ -8990,7 +8638,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
             } else {
                 if slot_bias_ids[s].len > 0 { apply_logit_bias(slogits, 0, vocab, &slot_bias_ids[s], &slot_bias_vals[s]) }
                 if slot_json_mode[s] { apply_json_logit_mask(slogits, 0, model, slot_json_started[s]) }
-                if slot_grammar[s].active { apply_gbnf_logit_mask(slogits, 0, model, &slot_grammar[s], &slot_gstate[s]) }
+                if slot_grammar[s].active { gbnf.apply_logit_mask(slogits, 0, &model.gbnf_vocab, &slot_grammar[s], &slot_gstate[s]) }
                 $lp_vec := []f32{}
                 if slot_want_lp[s] { lp_vec = compute_logprobs_vec(slogits, 0, vocab) }
                 $rng := slot_rng[s]
@@ -9008,7 +8656,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 $ids_s := ~slot_out_ids[s]
                 $txt_s := slot_out_text[s]
                 $ss_s := slot_sstate[s]
-                pt_s := slot_prompts[s].len
+                pt_s := slot_prompts[s].len + slot_img_tokens[s]
                 finished = accept_generated_piece(model, &slot_req_ids[s], slot_created[s], model_id, slot_is_stream[s], slot_is_chat[s],
                                                   slot_has_tools[s], pt_s,
                                                   slot_ignore_eos[s], &slot_stops[s], slot_stop_pad[s],
@@ -9025,7 +8673,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 slot_json_esc[s] = jesc
                 if slot_grammar[s].active && !finished {
                     pg := format_piece(model, nxt)
-                    slot_gstate[s] = gbnf_advance_piece(&slot_grammar[s], &slot_gstate[s], &pg)
+                    slot_gstate[s] = gbnf.advance_piece(&slot_grammar[s], &slot_gstate[s], &pg)
                 }
                 slot_lp_recs[s] = ~lp_s
                 slot_history[s] = ~hist_s
@@ -9043,7 +8691,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                                     $&slot_active, $&active_count,
                                     &slot_is_stream, &slot_is_chat, &slot_include_usage,
                                     &slot_want_lp, &slot_lp_recs, &slot_has_tools, $&slot_sstate, &slot_resp_prefix,
-                                    $&slot_prompts, &dummy_ids, &slot_out_text, $&slot_emitted_len,
+                                    $&slot_prompts, $&slot_img_tokens, $&slot_mm, &dummy_ids, &slot_out_text, $&slot_emitted_len,
                                     &slot_replies, &slot_streams, &slot_cancels,
                                     $&slot_cached_tokens, $&slot_cached_len, $&resp_hist_ids, $&resp_hist_ctx,
                                     $&total_reqs, $&total_ptoks, $&total_ctoks)
@@ -9062,7 +8710,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                                     $&slot_active, $&active_count,
                                     &slot_is_stream, &slot_is_chat, &slot_include_usage,
                                     &slot_want_lp, &slot_lp_recs, &slot_has_tools, $&slot_sstate, &slot_resp_prefix,
-                                    $&slot_prompts, &dummy_ids, &slot_out_text, $&slot_emitted_len,
+                                    $&slot_prompts, $&slot_img_tokens, $&slot_mm, &dummy_ids, &slot_out_text, $&slot_emitted_len,
                                     &slot_replies, &slot_streams, &slot_cancels,
                                     $&slot_cached_tokens, $&slot_cached_len, $&resp_hist_ids, $&resp_hist_ctx,
                                     $&total_reqs, $&total_ptoks, $&total_ctoks)
@@ -9086,7 +8734,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                     log_off := ti * vocab
                     if slot_bias_ids[s].len > 0 { apply_logit_bias(slogits, log_off, vocab, &slot_bias_ids[s], &slot_bias_vals[s]) }
                     if slot_json_mode[s] { apply_json_logit_mask(slogits, log_off, model, slot_json_started[s]) }
-                    if slot_grammar[s].active { apply_gbnf_logit_mask(slogits, log_off, model, &slot_grammar[s], &slot_gstate[s]) }
+                    if slot_grammar[s].active { gbnf.apply_logit_mask(slogits, log_off, &model.gbnf_vocab, &slot_grammar[s], &slot_gstate[s]) }
                     $lp_vec := []f32{}
                     if slot_want_lp[s] { lp_vec = compute_logprobs_vec(slogits, log_off, vocab) }
                     $rng := slot_rng[s]
@@ -9106,7 +8754,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                     $ids_s := ~slot_out_ids[s]
                     $txt_s := slot_out_text[s]
                     $ss_s := slot_sstate[s]
-                    pt_s := slot_prompts[s].len
+                    pt_s := slot_prompts[s].len + slot_img_tokens[s]
                     finished := accept_generated_piece(model, &slot_req_ids[s], slot_created[s], model_id, slot_is_stream[s], slot_is_chat[s],
                                                       slot_has_tools[s], pt_s,
                                                       slot_ignore_eos[s], &slot_stops[s], slot_stop_pad[s],
@@ -9123,7 +8771,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                     slot_json_esc[s] = jesc
                     if slot_grammar[s].active && !finished {
                         pg := format_piece(model, nxt)
-                        slot_gstate[s] = gbnf_advance_piece(&slot_grammar[s], &slot_gstate[s], &pg)
+                        slot_gstate[s] = gbnf.advance_piece(&slot_grammar[s], &slot_gstate[s], &pg)
                     }
                     slot_lp_recs[s] = ~lp_s
                     slot_history[s] = ~hist_s
@@ -9140,7 +8788,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                                             $&slot_active, $&active_count,
                                             &slot_is_stream, &slot_is_chat, &slot_include_usage,
                                             &slot_want_lp, &slot_lp_recs, &slot_has_tools, $&slot_sstate, &slot_resp_prefix,
-                                            $&slot_prompts, &dummy_ids, &slot_out_text, $&slot_emitted_len,
+                                            $&slot_prompts, $&slot_img_tokens, $&slot_mm, &dummy_ids, &slot_out_text, $&slot_emitted_len,
                                             &slot_replies, &slot_streams, &slot_cancels,
                                             $&slot_cached_tokens, $&slot_cached_len, $&resp_hist_ids, $&resp_hist_ctx,
                                             $&total_reqs, $&total_ptoks, $&total_ctoks)
@@ -9165,7 +8813,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 slot_pos[s] = pos + 1
                 if slot_bias_ids[s].len > 0 { apply_logit_bias(slogits, 0, vocab, &slot_bias_ids[s], &slot_bias_vals[s]) }
                 if slot_json_mode[s] { apply_json_logit_mask(slogits, 0, model, slot_json_started[s]) }
-                if slot_grammar[s].active { apply_gbnf_logit_mask(slogits, 0, model, &slot_grammar[s], &slot_gstate[s]) }
+                if slot_grammar[s].active { gbnf.apply_logit_mask(slogits, 0, &model.gbnf_vocab, &slot_grammar[s], &slot_gstate[s]) }
                 $lp_vec := []f32{}
                 if slot_want_lp[s] { lp_vec = compute_logprobs_vec(slogits, 0, vocab) }
                 $rng := slot_rng[s]
@@ -9185,7 +8833,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 $ids_s := ~slot_out_ids[s]
                 $txt_s := slot_out_text[s]
                 $ss_s := slot_sstate[s]
-                pt_s := slot_prompts[s].len
+                pt_s := slot_prompts[s].len + slot_img_tokens[s]
                 finished := accept_generated_piece(model, &slot_req_ids[s], slot_created[s], model_id, slot_is_stream[s], slot_is_chat[s],
                                                   slot_has_tools[s], pt_s,
                                                   slot_ignore_eos[s], &slot_stops[s], slot_stop_pad[s],
@@ -9202,7 +8850,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                 slot_json_esc[s] = jesc
                 if slot_grammar[s].active && !finished {
                     pg := format_piece(model, nxt)
-                    slot_gstate[s] = gbnf_advance_piece(&slot_grammar[s], &slot_gstate[s], &pg)
+                    slot_gstate[s] = gbnf.advance_piece(&slot_grammar[s], &slot_gstate[s], &pg)
                 }
                 slot_lp_recs[s] = ~lp_s
                 slot_history[s] = ~hist_s
@@ -9219,7 +8867,7 @@ fn run_serve_scheduler(req_ch chan ServeRequest, model &Model, model_id &string,
                                         $&slot_active, $&active_count,
                                         &slot_is_stream, &slot_is_chat, &slot_include_usage,
                                         &slot_want_lp, &slot_lp_recs, &slot_has_tools, $&slot_sstate, &slot_resp_prefix,
-                                        $&slot_prompts, &dummy_ids, &slot_out_text, $&slot_emitted_len,
+                                        $&slot_prompts, $&slot_img_tokens, $&slot_mm, &dummy_ids, &slot_out_text, $&slot_emitted_len,
                                         &slot_replies, &slot_streams, &slot_cancels,
                                         $&slot_cached_tokens, $&slot_cached_len, $&resp_hist_ids, $&resp_hist_ctx,
                                         $&total_reqs, $&total_ptoks, $&total_ctoks)
@@ -10915,6 +10563,13 @@ fn run_inspect(m &Model, model_path &string, load_ns int) int {
         println("ssm_state_size:" + str(c.ssm_state_size))
         println("ssm_conv_kernel:" + str(c.ssm_conv_kernel))
     }
+    println("vision_encoder:" + str(m.vision.active))
+    if m.vision.active {
+        grid := m.vision.cfg.image_size / m.vision.cfg.patch_size
+        println("vision_image_size:" + str(m.vision.cfg.image_size))
+        println("vision_patch_size:" + str(m.vision.cfg.patch_size))
+        println("vision_tokens:" + str(grid * grid))
+    }
     println("quant:" + qname)
     println("est_params:" + str(est_params))
     println("kv_bytes_per_tok_f32:" + str(kv_f32))
@@ -11266,417 +10921,6 @@ fn run_speculative_generation(m &Model, kv $&PagedKvCache, row_cache $&[]Forward
     }
 }
 
-fn is_safe_model_name(name &string) bool {
-    if name.len == 0 { << false }
-    if find_substr(name, &"/") >= 0 || find_substr(name, &"\\") >= 0 || find_substr(name, &"..") >= 0 {
-        << false
-    }
-    << true
-}
-
-fn default_models_dir(override_dir &string) string {
-    if override_dir.len > 0 { << (*override_dir) + "" }
-    env_dir := os.getenv("XU_MODELS_DIR")
-    if env_dir.len > 0 { << env_dir }
-    home := os.getenv("HOME")
-    if home.len > 0 { << home + "/.xu/models" }
-    << ".xu/models"
-}
-
-fn resolve_pull_url(src &string) string {
-    if !gguf_starts_with(src, "hf://") { << (*src) + "" }
-    rest := (*src)[5:src.len]
-    $s1 := -1
-    $s2 := -1
-    for i in 0:rest.len {
-        if (rest[i] & 255) == 47 {
-            if s1 < 0 {
-                s1 = i
-            } else if s2 < 0 {
-                s2 = i
-                <-
-            }
-        }
-    }
-    if s1 <= 0 || s2 <= s1 + 1 || s2 + 1 >= rest.len { << (*src) + "" }
-    repo := rest[0:s2]
-    fpath := rest[(s2 + 1):rest.len]
-    $base := os.getenv("XU_HF_BASE_URL")
-    if base.len == 0 { base = "https://huggingface.co" }
-    while base.len > 0 && (base[base.len - 1] & 255) == 47 {
-        base = base[0:(base.len - 1)]
-    }
-    << base + "/" + repo + "/resolve/main/" + fpath
-}
-
-fn run_models_cmd(args &[]string, models_dir_arg &string) int {
-    if args.len < 2 {
-        eprintln("usage: llm_engine models <list|rm|pull> ... [--models-dir DIR]")
-        << 1
-    }
-    sub := args[1] + ""
-    mdir := default_models_dir(models_dir_arg)
-    if sub == "list" {
-        if !os.is_dir(mdir + "") {
-            println("models_dir:" + mdir)
-            println("count:0")
-            << 0
-        }
-        listing := os.read_dir(mdir + "") >>> (err) {
-            eprintln("models list error: " + err.msg())
-            << 1
-        }
-        entries := split_lines_trim(&listing)
-        println("models_dir:" + mdir)
-        $cnt := 0
-        for i in 0:entries.len {
-            en := &entries[i]
-            if *en == "." || *en == ".." || en.len == 0 { -> }
-            fp := mdir + "/" + (*en)
-            info := os.stat(fp + "") >>> (err) { -> }
-            if info.is_dir {
-                println("model:" + (*en) + " kind:dir")
-            } else {
-                println("model:" + (*en) + " bytes:" + str(info.size))
-            }
-            cnt += 1
-        }
-        println("count:" + str(cnt))
-        << 0
-    }
-    if sub == "rm" {
-        if args.len < 3 {
-            eprintln("usage: llm_engine models rm <name> [--models-dir DIR]")
-            << 1
-        }
-        mname := args[2] + ""
-        if !is_safe_model_name(&mname) {
-            eprintln("invalid model name: " + mname)
-            << 1
-        }
-        fp := mdir + "/" + mname
-        _ := os.remove(fp) >>> (err) {
-            eprintln("models rm error: " + err.msg())
-            << 1
-        }
-        println("removed:" + mname)
-        << 0
-    }
-    if sub == "pull" {
-        if args.len < 4 {
-            eprintln("usage: llm_engine models pull <url|hf://org/repo/file> <local_name> [--models-dir DIR]")
-            << 1
-        }
-        src_spec := args[2] + ""
-        mname := args[3] + ""
-        if !is_safe_model_name(&mname) {
-            eprintln("invalid model name: " + mname)
-            << 1
-        }
-        url := resolve_pull_url(&src_spec)
-        _ := os.mkdir_all(mdir + "") >>> (err) {
-            eprintln("mkdir error: " + err.msg())
-            << 1
-        }
-        $hc := http.new_client()
-        resp := hc.get(url) >>> (err) {
-            eprintln("models pull error: " + err.msg())
-            << 1
-        }
-        if resp.status_code != 200 {
-            eprintln("models pull HTTP " + str(resp.status_code))
-            << 1
-        }
-        dest := mdir + "/" + mname
-        body := resp.body()
-        _ := os.write(dest + "", body + "") >>> (err) {
-            eprintln("models write error: " + err.msg())
-            << 1
-        }
-        println("pulled:" + dest + " bytes:" + str(body.len))
-        << 0
-    }
-    eprintln("unknown models subcommand: " + sub)
-    << 1
-}
-
-fn push_gguf_str(buf $&string, s &string) {
-    push_u64_le(buf, s.len)
-    if s.len > 0 { buf.push_str((*s) + "") }
-}
-
-fn push_gguf_kv_str(buf $&string, k string, v string) {
-    push_gguf_str(buf, &k)
-    push_u32_le(buf, 8)
-    push_gguf_str(buf, &v)
-}
-
-fn push_gguf_kv_u32(buf $&string, k string, v int) {
-    push_gguf_str(buf, &k)
-    push_u32_le(buf, 4)
-    push_u32_le(buf, v)
-}
-
-fn push_gguf_kv_f32(buf $&string, k string, v f32) {
-    push_gguf_str(buf, &k)
-    push_u32_le(buf, 6)
-    push_u32_le(buf, bits(v))
-}
-
-fn push_u16_le(buf $&string, val int) {
-    buf.push_str(string_from_byte(val & 255))
-    buf.push_str(string_from_byte((val >> 8) & 255))
-}
-
-fn quant_round_i(v f64) int {
-    if v >= 0.0 { << int(v + 0.5) }
-    << -int(0.5 - v)
-}
-
-fn quantize_f32_bytes_to_q4_0(raw &string, start int, n_elems int) string {
-    nb := n_elems / 32
-    $out := ""
-    for b in 0:nb {
-        base := start + b * 32 * 4
-        $vals := []f64{}
-        $amax := 0.0
-        for i in 0:32 {
-            fv := f64(from_bits(read_u32_le(raw, base + i * 4)))
-            vals.push(fv)
-            $av := fv
-            if av < 0.0 { av = -av }
-            if av > amax { amax = av }
-        }
-        $d := 0.0
-        if amax > 0.0 { d = amax / 7.0 }
-        f16d := tensor.f16(f32(d))
-        push_u16_le($&out, int(f16d.bits))
-        d16 := f64(f16d.to_f32())
-        $inv_d := 0.0
-        if d16 != 0.0 { inv_d = 1.0 / d16 }
-        for j in 0:16 {
-            $q0 := quant_round_i(vals[j] * inv_d) + 8
-            if q0 < 0 { q0 = 0 }
-            else if q0 > 15 { q0 = 15 }
-            $q1 := quant_round_i(vals[16 + j] * inv_d) + 8
-            if q1 < 0 { q1 = 0 }
-            else if q1 > 15 { q1 = 15 }
-            out.push_str(string_from_byte((q0 & 15) | ((q1 & 15) << 4)))
-        }
-    }
-    << out
-}
-
-fn quantize_f32_bytes_to_q8_0(raw &string, start int, n_elems int) string {
-    nb := n_elems / 32
-    $out := ""
-    for b in 0:nb {
-        base := start + b * 32 * 4
-        $vals := []f64{}
-        $amax := 0.0
-        for i in 0:32 {
-            fv := f64(from_bits(read_u32_le(raw, base + i * 4)))
-            vals.push(fv)
-            $av := fv
-            if av < 0.0 { av = -av }
-            if av > amax { amax = av }
-        }
-        $d := 0.0
-        if amax > 0.0 { d = amax / 127.0 }
-        f16d := tensor.f16(f32(d))
-        push_u16_le($&out, int(f16d.bits))
-        d16 := f64(f16d.to_f32())
-        $inv_d := 0.0
-        if d16 != 0.0 { inv_d = 1.0 / d16 }
-        for i in 0:32 {
-            $q := quant_round_i(vals[i] * inv_d)
-            if q > 127 { q = 127 }
-            else if q < -127 { q = -127 }
-            out.push_str(string_from_byte(q & 255))
-        }
-    }
-    << out
-}
-
-fn sf_to_gguf_name(sfk &string) string {
-    $k := (*sfk) + ""
-    if gguf_starts_with(&k, "model.") {
-        k = k[6:k.len]
-    }
-    if k == "embed_tokens.weight" { << "token_embd.weight" }
-    if k == "norm.weight" { << "output_norm.weight" }
-    if k == "lm_head.weight" { << "output.weight" }
-    if gguf_starts_with(&k, "layers.") {
-        lidx := parse_lora_layer_idx(&k, &"layers.")
-        if lidx >= 0 {
-            lp := "blk." + str(lidx) + "."
-            if gguf_ends_with(&k, ".input_layernorm.weight") { << lp + "attn_norm.weight" }
-            if gguf_ends_with(&k, ".post_attention_layernorm.weight") { << lp + "ffn_norm.weight" }
-            if gguf_ends_with(&k, ".self_attn.q_proj.weight") { << lp + "attn_q.weight" }
-            if gguf_ends_with(&k, ".self_attn.k_proj.weight") { << lp + "attn_k.weight" }
-            if gguf_ends_with(&k, ".self_attn.v_proj.weight") { << lp + "attn_v.weight" }
-            if gguf_ends_with(&k, ".self_attn.o_proj.weight") { << lp + "attn_output.weight" }
-            if gguf_ends_with(&k, ".mlp.gate_proj.weight") { << lp + "ffn_gate.weight" }
-            if gguf_ends_with(&k, ".mlp.up_proj.weight") { << lp + "ffn_up.weight" }
-            if gguf_ends_with(&k, ".mlp.down_proj.weight") { << lp + "ffn_down.weight" }
-        }
-    }
-    << k
-}
-
-struct QuantGgufSpec {
-    name string
-    dims []int
-    gtype int
-    offset int
-    data string
-}
-
-fn run_quantize_cmd(in_path &string, out_path &string, qtype_str &string) int {
-    $qtype_id := GGML_TYPE_Q4_0
-    $qname := "q4_0"
-    if *qtype_str == "q8_0" || *qtype_str == "Q8_0" {
-        qtype_id = GGML_TYPE_Q8_0
-        qname = "q8_0"
-    } else if *qtype_str != "" && *qtype_str != "q4_0" && *qtype_str != "Q4_0" {
-        >>> errors.new("quantize supports --type q4_0|q8_0 (got: " + (*qtype_str) + ")")
-    }
-    raw := os.read((*in_path) + "") >>>
-    if raw.len < 8 { >>> errors.new("quantize: invalid safetensors file") }
-    hlen := read_u64_le(&raw, 0)
-    if hlen <= 0 || hlen > raw.len - 8 { >>> errors.new("quantize: invalid safetensors header") }
-    base := 8 + hlen
-    hstr := raw[8:base]
-    doc := json.parse(&hstr) >>>
-    root := doc.root()
-    if !doc.is_dict(root) { >>> errors.new("quantize: invalid safetensors JSON header") }
-    meta := llm_doc_get(&doc, root, "__metadata__", -1)
-    if meta < 0 || !doc.is_dict(meta) { >>> errors.new("quantize: safetensors missing __metadata__") }
-    dim := meta_int(&doc, meta, "dim") >>>
-    hidden_dim := meta_int(&doc, meta, "hidden_dim") >>>
-    n_layers := meta_int(&doc, meta, "n_layers") >>>
-    n_heads := meta_int(&doc, meta, "n_heads") >>>
-    n_kv_heads := meta_int(&doc, meta, "n_kv_heads") >>>
-    vocab_size := meta_int(&doc, meta, "vocab_size") >>>
-    max_seq_len := meta_int(&doc, meta, "max_seq_len") >>>
-    rope_theta := try_parse_f64_or(&hf_str_or(&doc, meta, "rope_theta", "10000"), 10000.0)
-
-    keys := doc.dict_keys(root)
-    $specs := []QuantGgufSpec{}
-    $cur_data_off := 0
-    for ki in 0:keys.len {
-        k := keys[ki] + ""
-        if k == "__metadata__" { -> }
-        entry := doc.get(root, k + "")
-        dt_s := llm_doc_str(&doc, llm_doc_get(&doc, entry, "dtype", -1), "")
-        if dt_s != "F32" { >>> errors.new("quantize expects F32 SafeTensors tensor: " + k) }
-        sh_n := llm_doc_get(&doc, entry, "shape", -1)
-        if sh_n < 0 || !doc.is_list(sh_n) { >>> errors.new("quantize: invalid shape for " + k) }
-        nd := doc.count(sh_n)
-        $dims_ggml := []int{}
-        $n_elems := 1
-        // Reverse PyTorch [rows, cols] -> GGML [cols, rows]
-        $di := nd - 1
-        while di >= 0 {
-            dv := doc.as_int(doc.at(sh_n, di) >>>) >>>
-            dims_ggml.push(dv)
-            n_elems = n_elems * dv
-            di -= 1
-        }
-        offs := llm_doc_get(&doc, entry, "data_offsets", -1)
-        start := base + (doc.as_int(doc.at(offs, 0) >>>) >>>)
-        stop := base + (doc.as_int(doc.at(offs, 1) >>>) >>>)
-        if stop - start != n_elems * 4 || stop > raw.len {
-            >>> errors.new("quantize: tensor byte size mismatch for " + k)
-        }
-        gname := sf_to_gguf_name(&k)
-        $gtype := GGML_TYPE_F32
-        $tdata := ""
-        cols := dims_ggml[0]
-        if nd == 2 && cols % 32 == 0 && gname != "token_embd.weight" {
-            gtype = qtype_id
-            if qtype_id == GGML_TYPE_Q4_0 {
-                tdata = quantize_f32_bytes_to_q4_0(&raw, start, n_elems)
-            } else {
-                tdata = quantize_f32_bytes_to_q8_0(&raw, start, n_elems)
-            }
-        } else {
-            tdata = raw[start:stop]
-        }
-        pad := (32 - (cur_data_off % 32)) % 32
-        cur_data_off += pad
-        toff := cur_data_off
-        cur_data_off += tdata.len
-        specs.push(QuantGgufSpec{name: gname, dims: ~dims_ggml, gtype: gtype, offset: toff, data: tdata})
-    }
-
-    $hdr := ""
-    hdr.push_str("GGUF")
-    push_u32_le($&hdr, 3)
-    push_u64_le($&hdr, specs.len)
-    push_u64_le($&hdr, 12)
-    push_gguf_kv_str($&hdr, "general.architecture", "llama")
-    push_gguf_kv_u32($&hdr, "llama.embedding_length", dim)
-    push_gguf_kv_u32($&hdr, "llama.feed_forward_length", hidden_dim)
-    push_gguf_kv_u32($&hdr, "llama.block_count", n_layers)
-    push_gguf_kv_u32($&hdr, "llama.attention.head_count", n_heads)
-    push_gguf_kv_u32($&hdr, "llama.attention.head_count_kv", n_kv_heads)
-    push_gguf_kv_u32($&hdr, "llama.context_length", max_seq_len)
-    push_gguf_kv_f32($&hdr, "llama.rope.freq_base", f32(rope_theta))
-    push_gguf_kv_f32($&hdr, "llama.attention.layer_norm_rms_epsilon", f32(0.00001))
-    push_gguf_kv_u32($&hdr, "tokenizer.ggml.bos_token_id", 1)
-    push_gguf_kv_u32($&hdr, "tokenizer.ggml.eos_token_id", 2)
-    tok_key := "tokenizer.ggml.tokens"
-    push_gguf_str($&hdr, &tok_key)
-    push_u32_le($&hdr, 9)
-    push_u32_le($&hdr, 8)
-    push_u64_le($&hdr, vocab_size)
-    for vi in 0:vocab_size {
-        $piece := "t" + str(vi)
-        if vi == 0 { piece = "<unk>" }
-        else if vi == 1 { piece = "<s>" }
-        else if vi == 2 { piece = "</s>" }
-        push_gguf_str($&hdr, &piece)
-    }
-
-    for si in 0:specs.len {
-        sp := &specs[si]
-        push_gguf_str($&hdr, &sp.name)
-        push_u32_le($&hdr, sp.dims.len)
-        for di in 0:sp.dims.len {
-            push_u64_le($&hdr, sp.dims[di])
-        }
-        push_u32_le($&hdr, sp.gtype)
-        push_u64_le($&hdr, sp.offset)
-    }
-
-    hpad := (32 - (hdr.len % 32)) % 32
-    for _ in 0:hpad { hdr.push_str(string_from_byte(0)) }
-
-    $written_data := 0
-    for si in 0:specs.len {
-        sp := &specs[si]
-        while written_data < sp.offset {
-            hdr.push_str(string_from_byte(0))
-            written_data += 1
-        }
-        hdr.push_str(sp.data)
-        written_data += sp.data.len
-    }
-
-    total_bytes := hdr.len
-    _ := os.write((*out_path) + "", ~hdr) >>>
-    println("quantized_tensors:" + str(specs.len))
-    println("quant_type:" + qname)
-    println("saved_gguf:" + (*out_path))
-    println("bytes:" + str(total_bytes))
-    << 0
-}
-
-fn read_grammar_arg(arg &string) string {
-    << os.read((*arg) + "") >>> (_) { << (*arg) + "" }
-}
-
 fn main() int {
     raw_args := os.argv()
     $args := []string{}
@@ -11714,6 +10958,7 @@ fn main() int {
     $kl_beta := 0.04
     $clip_eps := 0.2
     $grammar_arg := ""
+    $json_schema_arg := ""
     $save_ckpt_arg := ""
     $resume_ckpt_arg := ""
     $models_dir_arg := ""
@@ -11722,6 +10967,8 @@ fn main() int {
     $gen_tokens_arg := 8
     $rlvr_temp_milli := 800
     $qtype_arg := "q4_0"
+    $mmproj_arg := ""
+    $image_args := []string{}
     $ai := 1
     while ai < raw_args.len {
         arg := raw_args[ai]
@@ -11936,6 +11183,9 @@ fn main() int {
         } else if arg == "--grammar" && ai + 1 < raw_args.len {
             grammar_arg = raw_args[ai + 1] + ""
             ai += 2
+        } else if arg == "--json-schema" && ai + 1 < raw_args.len {
+            json_schema_arg = raw_args[ai + 1] + ""
+            ai += 2
         } else if arg == "--save-ckpt" && ai + 1 < raw_args.len {
             save_ckpt_arg = raw_args[ai + 1] + ""
             ai += 2
@@ -11974,6 +11224,12 @@ fn main() int {
         } else if arg == "--type" && ai + 1 < raw_args.len {
             qtype_arg = raw_args[ai + 1] + ""
             ai += 2
+        } else if arg == "--mmproj" && ai + 1 < raw_args.len {
+            mmproj_arg = raw_args[ai + 1] + ""
+            ai += 2
+        } else if arg == "--image" && ai + 1 < raw_args.len {
+            image_args.push(raw_args[ai + 1] + "")
+            ai += 2
         } else {
             args.push(~arg)
             ai += 1
@@ -11986,16 +11242,16 @@ fn main() int {
     }
     mode := args[0]
     if mode == "models" {
-        << run_models_cmd(&args, &models_dir_arg)
+        << models.run_models_cmd(&args, &models_dir_arg)
     }
     if mode == "quantize" {
         if args.len < 3 {
-            eprintln("usage: llm_engine quantize <in.safetensors> <out.gguf> [--type q4_0|q8_0]")
+            eprintln("usage: llm_engine quantize <in.safetensors|in.gguf|hf_dir> <out.gguf> [--type q4_0|q8_0|q4_k|q5_k|q6_k|q4_k_m|q5_k_m]")
             << 1
         }
         in_sf := args[1]
         out_gg := args[2]
-        _ := run_quantize_cmd(&in_sf, &out_gg, &qtype_arg) >>> (err) {
+        _ := quantize.run_quantize_cmd(&in_sf, &out_gg, &qtype_arg) >>> (err) {
             eprintln("quantize error: " + err.msg())
             << 1
         }
@@ -12010,6 +11266,13 @@ fn main() int {
         << 1
     }
     model.use_q8k_act = use_q8k_act
+    if mmproj_arg.len > 0 {
+        ve := vision.load_mmproj(mmproj_arg, model.cfg.dim) >>> (err) {
+            eprintln("mmproj error: " + err.msg())
+            << 1
+        }
+        model.vision = ~ve
+    }
     if lora_arg.len > 0 {
         _ := load_lora_adapter($&model, lora_arg, lora_scale) >>> (err) {
             eprintln("lora error: " + err.msg())
@@ -12122,6 +11385,48 @@ fn main() int {
         println("kv_storage_bytes:" + str(kv.storage_bytes))
         println("compact_weight_bytes:" + str(model.compact_weights.data.len))
         if kv.free_top != kv.num_blocks { << 4 }
+        if model.vision.active && image_args.len > 0 {
+            mm_emb := vision.encode_specs(&model.vision, &image_args) >>> (err) {
+                eprintln("vision error: " + err.msg())
+                << 1
+            }
+            n_img := mm_emb.len / model.cfg.dim
+            println("vision_tokens:" + str(n_img))
+            $mm_toks := []int{}
+            $mm_bits := []int{}
+            first_mm := forward_prefill_embeddings(&model, $&kv, $&row_cache, $&sx, $&sxb, $&sxb2, $&sq, $&sk, $&sv, $&shb, $&shb2, $&slogits, $&sxq, $&sxs, 0, &mm_emb, n_img, 0, use_q8, prompts[0].len == 0) >>> (err) {
+                kv_free_slot($&kv, 0)
+                eprintln("mm prefill error: " + err.msg())
+                << 1
+            }
+            $nxt_mm := first_mm
+            if prompts[0].len > 0 {
+                nxt_mm = forward_prefill_batch(&model, $&kv, $&row_cache, $&sx, $&sxb, $&sxb2, $&sq, $&sk, $&sv, $&shb, $&shb2, $&slogits, $&sxq, $&sxs, 0, &prompts[0], n_img, use_q8, true) >>> (err) {
+                    kv_free_slot($&kv, 0)
+                    eprintln("mm prompt prefill error: " + err.msg())
+                    << 1
+                }
+            }
+            mm_toks.push(nxt_mm)
+            mm_bits.push(bits(slogits[nxt_mm]))
+            $mm_pos := n_img + prompts[0].len
+            for step in 1:gens[0] {
+                if mm_pos >= model.cfg.max_seq_len { <- }
+                nxt_mm = forward_token(&model, $&kv, $&sx, $&sxb, $&sxb2, $&sq, $&sk, $&sv, $&shb, $&shb2, $&slogits, $&sxq, $&sxs, 0, nxt_mm, mm_pos, use_q8) >>> (err) {
+                    kv_free_slot($&kv, 0)
+                    eprintln("mm decode error: " + err.msg())
+                    << 1
+                }
+                mm_toks.push(nxt_mm)
+                mm_bits.push(bits(slogits[nxt_mm]))
+                mm_pos += 1
+            }
+            kv_free_slot($&kv, 0)
+            mm_res := ClientResult{req_id: 0, tokens: ~mm_toks, logit_bits: ~mm_bits}
+            println(format_result("mm_seq", &mm_res))
+            println("mm_kv_free_after:" + str(kv.free_top) + "/" + str(kv.num_blocks))
+            if kv.free_top != kv.num_blocks { << 4 }
+        }
         << 0
     }
 
@@ -12505,17 +11810,52 @@ fn main() int {
             << 0
         }
 
-        $gen_grammar := gbnf_empty_grammar()
+        $gen_grammar := gbnf.empty_grammar()
         if grammar_arg.len > 0 {
-            gtxt := read_grammar_arg(&grammar_arg)
-            gen_grammar = gbnf_compile(&gtxt) >>> (err) {
+            gtxt := gbnf.read_grammar_arg(&grammar_arg)
+            gen_grammar = gbnf.compile(&gtxt) >>> (err) {
                 eprintln("grammar error: " + err.msg())
                 << 1
             }
+        } else if json_schema_arg.len > 0 {
+            stxt := gbnf.read_grammar_arg(&json_schema_arg)
+            gen_grammar = gbnf.compile_json_schema(&stxt) >>> (err) {
+                eprintln("json-schema error: " + err.msg())
+                << 1
+            }
+        }
+        if gen_grammar.active {
+            model.gbnf_vocab = build_model_gbnf_vocab(&model)
+        }
+        $gen_img_list := [][]f32{}
+        $gen_n_img := 0
+        if image_args.len > 0 {
+            gen_img_list = vision.encode_spec_list(&model.vision, &image_args) >>> (err) {
+                eprintln("vision error: " + err.msg())
+                << 1
+            }
+            for ii in 0:gen_img_list.len {
+                gen_n_img += gen_img_list[ii].len / model.cfg.dim
+            }
+            println("vision_tokens:" + str(gen_n_img))
+        }
+        $gen_text_chunks := [][]int{}
+        if gen_n_img > 0 && !gguf_starts_with(&args[2], "ids:") && find_substr_from(&args[2], &"<image>", 0) >= 0 {
+            str_parts := split_on_image_marker(&args[2])
+            for pi in 0:str_parts.len {
+                if str_parts[pi].len == 0 {
+                    gen_text_chunks.push([]int{})
+                } else {
+                    gen_text_chunks.push(encode_prompt(&model, &str_parts[pi]))
+                }
+            }
+        } else {
+            gen_text_chunks.push(~prompt_ids)
         }
         gen := run_generation_seq(&model, $&kv, $&row_cache, $&sx, $&sxb, $&sxb2,
                                   $&sq, $&sk, $&sv, $&shb, $&shb2, $&slogits, $&sxq, $&sxs,
-                                  &prompt_ids, max_tokens, temp_milli, top_k,
+                                  &gen_img_list, &gen_text_chunks,
+                                  max_tokens, temp_milli, top_k,
                                   top_p_milli, min_p_milli, repeat_penalty_milli,
                                   presence_penalty_milli, frequency_penalty_milli,
                                   seed, ignore_eos, true, &gen_grammar) >>> (err) {
@@ -12532,6 +11872,7 @@ fn main() int {
     }
 
     if mode == "serve" {
+        model.gbnf_vocab = build_model_gbnf_vocab(&model)
         _ := signal.ignore(signal.SIGPIPE) >>> (err) {
             eprintln("signal ignore error: " + err.msg())
             << 1
