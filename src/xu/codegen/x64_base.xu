@@ -1022,7 +1022,7 @@ fn x64_bin_direct(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, ins 
     << true
 }
 
-fn x64_ra(f &mir.MFn, opt bool) RaInfo {
+fn x64_ra(f &mir.MFn, opt bool, no_sse bool) RaInfo {
     if !opt {
         << ra_none(f)
     }
@@ -1040,12 +1040,14 @@ fn x64_ra(f &mir.MFn, opt bool) RaInfo {
     // callee-saved (matching Win64 ABI and arm64's d8..d15; saved across
     // System V C FFI/UI calls and __xu_task_switch).
     $fp_callee := []int{}
-    for r in 8:16 {
-        fp_callee.push(32 + r)
-    }
     $fp_caller := []int{}
-    for r in 2:6 {
-        fp_caller.push(32 + r)
+    if !no_sse {
+        for r in 8:16 {
+            fp_callee.push(32 + r)
+        }
+        for r in 2:6 {
+            fp_caller.push(32 + r)
+        }
     }
     $arg_regs := []int{}
     for i in 0:8 {
@@ -1844,7 +1846,17 @@ fn x64_emit_fast_guard(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc, nodes &[]FastNod
 // lines receives (code offset, source line) pairs where the line changes.
 // opt keeps values in registers (ra_alloc); otherwise every value lives in
 // its frame slot.
-pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool, pgo_map bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
+fn x64_push_gpr(cb $&mc.CodeBuffer, r int) {
+    if r >= 8 { xb(cb, 0x41) }
+    xb(cb, 0x50 + (r & 7))
+}
+
+fn x64_pop_gpr(cb $&mc.CodeBuffer, r int) {
+    if r >= 8 { xb(cb, 0x41) }
+    xb(cb, 0x58 + (r & 7))
+}
+
+pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool, pgo_map bool, no_sse bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     if f.is_naked {
         syms.define_label(f.label, cb.len())
         if f.src_line > 0 {
@@ -1867,11 +1879,11 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
         }
         <<
     }
-    ra := x64_ra(f, opt)
+    ra := x64_ra(f, opt, no_sse)
     $fr := x64_frame_ra(f, &ra, opt)
-    leaf_noframe := can_elide_frame(f, &ra, opt)
+    leaf_noframe := !f.is_interrupt && can_elide_frame(f, &ra, opt)
     $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
-    if opt && !leaf_noframe {
+    if opt && !leaf_noframe && !f.is_interrupt {
         fp_plan = analyze_fast_entry(f, &ra)
     }
     // Saved callee registers sit above the locals and temps; cold-call caller-save area sits above those.
@@ -1883,8 +1895,46 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
     if ra.max_call_saves > 0 {
         fr.size = (fr.size + ra.max_call_saves * 8 + 15) / 16 * 16
     }
+    $body_label := f.label + ""
+    if f.is_interrupt {
+        syms.define_label(f.label, cb.len())
+        if f.src_line > 0 {
+            lines.push(cb.len())
+            lines.push(f.src_line)
+        }
+        push_order := [0, 1, 2, 6, 7, 8, 9, 10, 11, 3, 5, 12, 13, 14, 15]
+        for pi in 0:push_order.len {
+            x64_push_gpr(cb, push_order[pi])
+        }
+        if f.nparams == 1 {
+            x64_lea(cb, X_RDI, X_RSP, 120)
+        } else if f.nparams >= 2 {
+            x64_ldr(cb, X_RSI, X_RSP, 120)
+            x64_lea(cb, X_RDI, X_RSP, 128)
+        }
+        xb(cb, 0xFC) // cld
+        x64_mov(cb, X_RBP, X_RSP)
+        // and rsp, -16
+        xb(cb, 0x48)
+        xb(cb, 0x83)
+        xb(cb, 0xE4)
+        xb(cb, 0xF0)
+        body_label = f.label + ".__isr_body"
+        x64_call(cb, relocs, body_label)
+        x64_mov(cb, X_RSP, X_RBP)
+        $pi := push_order.len - 1
+        while pi >= 0 {
+            x64_pop_gpr(cb, push_order[pi])
+            pi -= 1
+        }
+        if f.nparams >= 2 {
+            x64_add_rsp(cb, 8)
+        }
+        xb(cb, 0x48)
+        xb(cb, 0xCF) // iretq
+    }
     fn_start := cb.len()
-    syms.define_label(f.label, fn_start)
+    syms.define_label(body_label, fn_start)
     $last_line := f.src_line
     if last_line > 0 {
         lines.push(cb.len())
@@ -2484,7 +2534,11 @@ pub fn isel_fn_x64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, r
                 }
                 x64_set_temp(cb, &fr, &ra, ins.a, X_RAX)
             } else if k == mir.MI_ASM {
-                x64_emit_asm_insn(cb, ins.sval)
+                if asm_starts_with(&ins.sval, "@ops:") {
+                    x64_emit_asm_with_ops(cb, f, &fr, &ra, &ins)
+                } else {
+                    x64_emit_asm_insn(cb, ins.sval)
+                }
             } else {
                 // Unknown kinds are a lowering bug; trap loudly at run time.
                 x64_ud2(cb)
@@ -2735,6 +2789,179 @@ fn x64_linux_nr(n int) int {
 
 const X64_NR_TABLE = 300
 
+fn x64_asm_split_char(s &string, delim int) []string {
+    $out := []string{}
+    $start := 0
+    for i in 0:s.len {
+        if int(s[i]) == delim {
+            out.push(s[start:i])
+            start = i + 1
+        }
+    }
+    out.push(s[start:s.len])
+    << out
+}
+
+fn x64_asm_parse_int(s &string) int {
+    if s.len == 0 { << -1 }
+    if s.len >= 3 && s[0] == 48 && (s[1] == 120 || s[1] == 88) {
+        $v := 0
+        for i in 2:s.len {
+            ch := int(s[i])
+            $d := -1
+            if ch >= 48 && ch <= 57 { d = ch - 48 }
+            else if ch >= 97 && ch <= 102 { d = 10 + ch - 97 }
+            else if ch >= 65 && ch <= 70 { d = 10 + ch - 65 }
+            else { << -1 }
+            v = v * 16 + d
+        }
+        << v
+    }
+    $v := 0
+    for i in 0:s.len {
+        ch := int(s[i])
+        if ch < 48 || ch > 57 { << -1 }
+        v = v * 10 + (ch - 48)
+    }
+    << v
+}
+
+fn x64_parse_asm_reg(reg &string) int {
+    if *reg == "rax" || *reg == "eax" || *reg == "ax" || *reg == "al" { << X_RAX }
+    if *reg == "rcx" || *reg == "ecx" || *reg == "cx" || *reg == "cl" { << X_RCX }
+    if *reg == "rdx" || *reg == "edx" || *reg == "dx" || *reg == "dl" { << X_RDX }
+    if *reg == "rbx" || *reg == "ebx" || *reg == "bx" || *reg == "bl" { << X_RBX }
+    if *reg == "rsi" || *reg == "esi" || *reg == "si" || *reg == "sil" { << X_RSI }
+    if *reg == "rdi" || *reg == "edi" || *reg == "di" || *reg == "dil" { << X_RDI }
+    if *reg == "r8" || *reg == "r8d" || *reg == "r8w" || *reg == "r8b" { << X_R8 }
+    if *reg == "r9" || *reg == "r9d" || *reg == "r9w" || *reg == "r9b" { << X_R9 }
+    if *reg == "r10" || *reg == "r10d" || *reg == "r10w" || *reg == "r10b" { << X_R10 }
+    if *reg == "r11" || *reg == "r11d" || *reg == "r11w" || *reg == "r11b" { << X_R11 }
+    if *reg == "r12" || *reg == "r12d" || *reg == "r12w" || *reg == "r12b" { << X_R12 }
+    if *reg == "r13" || *reg == "r13d" || *reg == "r13w" || *reg == "r13b" { << X_R13 }
+    if *reg == "r14" || *reg == "r14d" || *reg == "r14w" || *reg == "r14b" { << X_R14 }
+    if *reg == "r15" || *reg == "r15d" || *reg == "r15w" || *reg == "r15b" { << X_R15 }
+    << -1
+}
+
+fn x64_reg_default_width(reg &string) int {
+    if *reg == "al" || *reg == "cl" || *reg == "dl" || *reg == "bl" || *reg == "sil" || *reg == "dil" ||
+       *reg == "r8b" || *reg == "r9b" || *reg == "r10b" || *reg == "r11b" || *reg == "r12b" || *reg == "r13b" || *reg == "r14b" || *reg == "r15b" {
+        << 1
+    }
+    if *reg == "ax" || *reg == "cx" || *reg == "dx" || *reg == "bx" || *reg == "si" || *reg == "di" ||
+       *reg == "r8w" || *reg == "r9w" || *reg == "r10w" || *reg == "r11w" || *reg == "r12w" || *reg == "r13w" || *reg == "r14w" || *reg == "r15w" {
+        << 2
+    }
+    if *reg == "eax" || *reg == "ecx" || *reg == "edx" || *reg == "ebx" || *reg == "esi" || *reg == "edi" ||
+       *reg == "r8d" || *reg == "r9d" || *reg == "r10d" || *reg == "r11d" || *reg == "r12d" || *reg == "r13d" || *reg == "r14d" || *reg == "r15d" {
+        << 4
+    }
+    << 8
+}
+
+fn x64_emit_asm_with_ops(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, ins &mir.MInstr) {
+    $bar := -1
+    for i in 5:ins.sval.len {
+        if ins.sval[i] == 124 {
+            bar = i
+            <-
+        }
+    }
+    if bar < 0 {
+        x64_emit_asm_insn(cb, ins.sval)
+        <<
+    }
+    spec := ins.sval[5:bar]
+    tmpl := ins.sval[bar + 1:ins.sval.len]
+    $op_kinds := []int{} // 0=in, 1=out, 2=inout
+    $op_regs := []int{}
+    $op_widths := []int{}
+    $op_margs := []int{}
+    $ai := ins.c
+    if spec.len > 0 {
+        items := x64_asm_split_char(&spec, 44)
+        for ii in 0:items.len {
+            parts := x64_asm_split_char(&items[ii], 58)
+            if parts.len < 2 { -> }
+            okind := parts[0] + ""
+            if okind == "clob" { -> }
+            $arg_v := 0
+            if ai >= 0 {
+                arg_v = f.margs[ai].v
+                ai = f.margs[ai].next
+            }
+            rk := x64_parse_asm_reg(&parts[1])
+            if rk < 0 { -> }
+            $w := x64_reg_default_width(&parts[1])
+            if parts.len >= 3 {
+                pw := x64_asm_parse_int(&parts[2])
+                if pw == 1 || pw == 2 || pw == 4 || pw == 8 {
+                    w = pw
+                }
+            }
+            $kcode := 0
+            if okind == "out" { kcode = 1 }
+            else if okind == "inout" { kcode = 2 }
+            op_kinds.push(kcode)
+            op_regs.push(rk)
+            op_widths.push(w)
+            op_margs.push(arg_v)
+        }
+    }
+    if op_kinds.len == 0 || fr.asm_save_off < 0 {
+        x64_emit_asm_insn(cb, tmpl)
+        <<
+    }
+    base := fr.asm_save_off
+    nargs := op_kinds.len
+    save_regs := [X_RBX, X_R12, X_R13, X_R14, X_R15]
+    // Phase 0: preserve callee-saved GPRs in scratch area.
+    for si in 0:5 {
+        x64_str(cb, save_regs[si], X_RSP, base + si * 8)
+    }
+    // Phase 1: evaluate all margs before any operand register is touched.
+    for k in 0:nargs {
+        x64_operand(cb, f, fr, ra, X_RAX, op_margs[k])
+        x64_str(cb, X_RAX, X_RSP, base + 40 + k * 8)
+    }
+    // Phase 2a: load initial value of each inout operand through its saved pointer.
+    for k in 0:nargs {
+        if op_kinds[k] == 2 {
+            x64_ldr(cb, X_RAX, X_RSP, base + 40 + k * 8)
+            x64_load(cb, op_widths[k], X_RAX, X_RAX, 0)
+            x64_str(cb, X_RAX, X_RSP, base + 40 + (nargs + k) * 8)
+        }
+    }
+    // Phase 2b: populate every in and inout physical register without cross-clobbering.
+    for k in 0:nargs {
+        if op_kinds[k] == 0 {
+            x64_ldr(cb, op_regs[k], X_RSP, base + 40 + k * 8)
+        } else if op_kinds[k] == 2 {
+            x64_ldr(cb, op_regs[k], X_RSP, base + 40 + (nargs + k) * 8)
+        }
+    }
+    x64_emit_asm_insn(cb, tmpl)
+    // Phase 3: capture every out/inout physical register into its out slot.
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            x64_str(cb, op_regs[k], X_RSP, base + 40 + (nargs + k) * 8)
+        }
+    }
+    // Phase 4: store out/inout results back to destination pointers.
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            x64_ldr(cb, X_RCX, X_RSP, base + 40 + k * 8)
+            x64_ldr(cb, X_RAX, X_RSP, base + 40 + (nargs + k) * 8)
+            x64_store(cb, op_widths[k], X_RAX, X_RCX, 0)
+        }
+    }
+    // Phase 5: restore preserved callee-saved GPRs.
+    for si in 0:5 {
+        x64_ldr(cb, save_regs[si], X_RSP, base + si * 8)
+    }
+}
+
 fn x64_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
     stmts := asm_split_stmts(&raw)
     for si in 0:stmts.len {
@@ -2753,10 +2980,120 @@ fn x64_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
         } else if s == "pause" || s == "yield" || s == "wfe" {
             xb(cb, 0xF3)
             xb(cb, 0x90)
-        } else if s == "out dx, al" || s == "out dx,al" {
+        } else if s == "out dx, al" || s == "out dx,al" || s == "outb" {
             xb(cb, 0xEE)
-        } else if s == "in al, dx" || s == "in al,dx" {
+        } else if s == "out dx, ax" || s == "out dx,ax" || s == "outw" {
+            xb(cb, 0x66)
+            xb(cb, 0xEF)
+        } else if s == "out dx, eax" || s == "out dx,eax" || s == "outl" {
+            xb(cb, 0xEF)
+        } else if s == "in al, dx" || s == "in al,dx" || s == "inb" {
             xb(cb, 0xEC)
+        } else if s == "in ax, dx" || s == "in ax,dx" || s == "inw" {
+            xb(cb, 0x66)
+            xb(cb, 0xED)
+        } else if s == "in eax, dx" || s == "in eax,dx" || s == "inl" {
+            xb(cb, 0xED)
+        } else if s == "cpuid" {
+            xb(cb, 0x0F)
+            xb(cb, 0xA2)
+        } else if s == "rdtsc" {
+            xb(cb, 0x0F)
+            xb(cb, 0x31)
+        } else if s == "rdtscp" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0xF9)
+        } else if s == "rdmsr" {
+            xb(cb, 0x0F)
+            xb(cb, 0x32)
+        } else if s == "wrmsr" {
+            xb(cb, 0x0F)
+            xb(cb, 0x30)
+        } else if s == "xgetbv" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0xD0)
+        } else if s == "xsetbv" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0xD1)
+        } else if s == "invlpg [rdi]" || s == "invlpg (%rdi)" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0x3F)
+        } else if s == "invlpg [rax]" || s == "invlpg (%rax)" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0x38)
+        } else if s == "lgdt [rdi]" || s == "lgdt (%rdi)" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0x17)
+        } else if s == "lgdt [rax]" || s == "lgdt (%rax)" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0x10)
+        } else if s == "lidt [rdi]" || s == "lidt (%rdi)" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0x1F)
+        } else if s == "lidt [rax]" || s == "lidt (%rax)" {
+            xb(cb, 0x0F)
+            xb(cb, 0x01)
+            xb(cb, 0x18)
+        } else if s == "rdfsbase rax" {
+            xb(cb, 0xF3)
+            xb(cb, 0x48)
+            xb(cb, 0x0F)
+            xb(cb, 0xAE)
+            xb(cb, 0xC0)
+        } else if s == "wrfsbase rax" {
+            xb(cb, 0xF3)
+            xb(cb, 0x48)
+            xb(cb, 0x0F)
+            xb(cb, 0xAE)
+            xb(cb, 0xD0)
+        } else if s == "rdgsbase rax" {
+            xb(cb, 0xF3)
+            xb(cb, 0x48)
+            xb(cb, 0x0F)
+            xb(cb, 0xAE)
+            xb(cb, 0xC8)
+        } else if s == "wrgsbase rax" {
+            xb(cb, 0xF3)
+            xb(cb, 0x48)
+            xb(cb, 0x0F)
+            xb(cb, 0xAE)
+            xb(cb, 0xD8)
+        } else if s == "mov rax, cr0" || s == "mov rax,cr0" {
+            xb(cb, 0x0F)
+            xb(cb, 0x20)
+            xb(cb, 0xC0)
+        } else if s == "mov rax, cr2" || s == "mov rax,cr2" {
+            xb(cb, 0x0F)
+            xb(cb, 0x20)
+            xb(cb, 0xD0)
+        } else if s == "mov rax, cr3" || s == "mov rax,cr3" {
+            xb(cb, 0x0F)
+            xb(cb, 0x20)
+            xb(cb, 0xD8)
+        } else if s == "mov rax, cr4" || s == "mov rax,cr4" {
+            xb(cb, 0x0F)
+            xb(cb, 0x20)
+            xb(cb, 0xE0)
+        } else if s == "mov cr0, rax" || s == "mov cr0,rax" {
+            xb(cb, 0x0F)
+            xb(cb, 0x22)
+            xb(cb, 0xC0)
+        } else if s == "mov cr3, rax" || s == "mov cr3,rax" {
+            xb(cb, 0x0F)
+            xb(cb, 0x22)
+            xb(cb, 0xD8)
+        } else if s == "mov cr4, rax" || s == "mov cr4,rax" {
+            xb(cb, 0x0F)
+            xb(cb, 0x22)
+            xb(cb, 0xE0)
         } else if s == "wbinvd" {
             xb(cb, 0x0F)
             xb(cb, 0x09)
@@ -2811,6 +3148,18 @@ fn x64_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
             xb(cb, 0x0F)
             xb(cb, 0x01)
             xb(cb, 0xCA)
+        } else if asm_starts_with(&s, "int ") {
+            $imm_s := s[4:s.len]
+            if imm_s.len > 0 && imm_s[0] == 36 {
+                imm_s = imm_s[1:imm_s.len]
+            }
+            vec := x64_asm_parse_int(&imm_s)
+            if vec >= 0 && vec <= 255 {
+                xb(cb, 0xCD)
+                xb(cb, vec)
+            } else {
+                xb(cb, 0x90)
+            }
         } else {
             xb(cb, 0x90)
         }
@@ -2820,7 +3169,7 @@ fn x64_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
 // Task context layout (runtime/core chan.xu, named after arm64 registers):
 // rbx at 0, r12 at 8, r13 at 16, r14 at 24, r15 at 72, rbp at 80, resume
 // address at 88, rsp at 96, xmm8-xmm15 at 104.
-fn emit_x64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+fn emit_x64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, no_sse bool) {
     syms.define_label("switch_context", cb.len())
     x64_mov(cb, X_RDX, X_RSI)
     x64_mov(cb, X_RSI, X_RDI)
@@ -2837,8 +3186,10 @@ fn emit_x64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     x64_str(cb, X_RAX, X_RSI, 88)
     x64_lea(cb, X_RAX, X_RSP, 8)
     x64_str(cb, X_RAX, X_RSI, 96)
-    for i in 0:8 {
-        x64_movsd_st(cb, 8 + i, X_RSI, 104 + i * 8)
+    if !no_sse {
+        for i in 0:8 {
+            x64_movsd_st(cb, 8 + i, X_RSI, 104 + i * 8)
+        }
     }
     x64_ldr(cb, X_RBX, X_RDX, 0)
     x64_ldr(cb, X_R12, X_RDX, 8)
@@ -2847,8 +3198,10 @@ fn emit_x64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     x64_ldr(cb, X_R15, X_RDX, 72)
     x64_ldr(cb, X_RBP, X_RDX, 80)
     x64_ldr(cb, X_RSP, X_RDX, 96)
-    for i in 0:8 {
-        x64_movsd_ld(cb, 8 + i, X_RDX, 104 + i * 8)
+    if !no_sse {
+        for i in 0:8 {
+            x64_movsd_ld(cb, 8 + i, X_RDX, 104 + i * 8)
+        }
     }
     // jmp [rdx + 88]
     xb(cb, 0xFF)
@@ -3646,42 +3999,103 @@ pub fn emit_x64_none_boot(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]
 
 // Process entry, raw system call and runtime-state accessor shared by all
 // functions. tgt_os uses target.OS_* codes.
-pub fn emit_x64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, uses_ffi bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
-    if tgt_os == target.OS_NONE {
-        syms.define_label("__xu_start", cb.len())
-        if !emit_object {
-            syms.define_label("_start", cb.len())
-            // Own boot stack (emit_x64_none_boot) and SSE: Xu code and
-            // switch_context use xmm registers.
-            x64_lea_label(cb, relocs, X_RSP, "__xu_boot_stack_top")
+pub fn emit_x64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, uses_ffi bool, no_sse bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
+    if tgt_os == target.OS_NONE || tgt_os == target.OS_UEFI {
+        if tgt_os == target.OS_UEFI {
+            syms.define_label("__xu_start", cb.len())
+            syms.define_label("efi_main", cb.len())
+            push_ms := [X_RBX, X_RBP, X_RDI, X_RSI, X_R12, X_R13, X_R14, X_R15]
+            for pi in 0:push_ms.len {
+                x64_push_gpr(cb, push_ms[pi])
+            }
+            x64_add_rsp(cb, -8)
+            x64_lea_label(cb, relocs, X_RAX, "__xu_uefi_handles")
+            x64_str(cb, X_RCX, X_RAX, 0)
+            x64_str(cb, X_RDX, X_RAX, 8)
+            x64_mov(cb, X_RDI, X_RCX)
+            x64_mov(cb, X_RSI, X_RDX)
+            x64_call(cb, relocs, main_label)
+            x64_mov_imm(cb, X_RAX, 0)
+            x64_add_rsp(cb, 8)
+            $pi := push_ms.len - 1
+            while pi >= 0 {
+                x64_pop_gpr(cb, push_ms[pi])
+                pi -= 1
+            }
+            x64_ret(cb)
+
+            syms.define_label("uefi_image_handle", cb.len())
+            x64_lea_label(cb, relocs, X_RAX, "__xu_uefi_handles")
+            x64_ldr(cb, X_RAX, X_RAX, 0)
+            x64_ret(cb)
+
+            syms.define_label("uefi_system_table", cb.len())
+            x64_lea_label(cb, relocs, X_RAX, "__xu_uefi_handles")
+            x64_ldr(cb, X_RAX, X_RAX, 8)
+            x64_ret(cb)
+
+            // MS-x64 ABI call bridge: efi_callN(func rdi, a0 rsi, a1 rdx, a2 rcx, a3 r8, a4 r9, a5 r10)
+            syms.define_label("efi_call0", cb.len())
+            syms.define_label("efi_call1", cb.len())
+            syms.define_label("efi_call2", cb.len())
+            syms.define_label("efi_call3", cb.len())
+            syms.define_label("efi_call4", cb.len())
+            syms.define_label("efi_call5", cb.len())
+            syms.define_label("efi_call6", cb.len())
+            xb(cb, 0x55) // push rbp
+            x64_mov(cb, X_RBP, X_RSP)
+            x64_add_rsp(cb, -48)
+            x64_mov(cb, X_RAX, X_RDI)
+            x64_str(cb, X_R9, X_RSP, 32)
+            x64_str(cb, X_R10, X_RSP, 40)
+            x64_mov(cb, X_R9, X_R8)
+            x64_mov(cb, X_R8, X_RCX)
+            x64_mov(cb, X_RCX, X_RSI)
+            x64_call_reg(cb, X_RAX)
+            x64_mov(cb, X_RSP, X_RBP)
+            xb(cb, 0x5D) // pop rbp
+            x64_ret(cb)
+        } else {
+            syms.define_label("__xu_start", cb.len())
+            if !emit_object {
+                syms.define_label("_start", cb.len())
+                // Own boot stack (emit_x64_none_boot) and SSE: Xu code and
+                // switch_context use xmm registers.
+                x64_lea_label(cb, relocs, X_RSP, "__xu_boot_stack_top")
+            }
+            xb(cb, 0x0F)                   // mov rax, cr0
+            xb(cb, 0x20)
+            xb(cb, 0xC0)
+            xb(cb, 0x48)                   // and rax, ~CR0.EM
+            xb(cb, 0x83)
+            xb(cb, 0xE0)
+            xb(cb, 0xFB)
+            xb(cb, 0x48)                   // or rax, CR0.MP
+            xb(cb, 0x83)
+            xb(cb, 0xC8)
+            xb(cb, 0x02)
+            xb(cb, 0x0F)                   // mov cr0, rax
+            xb(cb, 0x22)
+            xb(cb, 0xC0)
+            xb(cb, 0x0F)                   // mov rax, cr4
+            xb(cb, 0x20)
+            xb(cb, 0xE0)
+            xb(cb, 0x48)                   // or rax, OSFXSR|OSXMMEXCPT
+            xb(cb, 0x0D)
+            x64_u32(cb, 0x600)
+            xb(cb, 0x0F)                   // mov cr4, rax
+            xb(cb, 0x22)
+            xb(cb, 0xE0)
+            x64_call(cb, relocs, main_label)
+            syms.define_label("__xu_halt", cb.len())
+            xb(cb, 0xF4) // hlt
+            x64_jmp(cb, relocs, "__xu_halt")
         }
-        xb(cb, 0x0F)                   // mov rax, cr0
-        xb(cb, 0x20)
-        xb(cb, 0xC0)
-        xb(cb, 0x48)                   // and rax, ~CR0.EM
-        xb(cb, 0x83)
-        xb(cb, 0xE0)
-        xb(cb, 0xFB)
-        xb(cb, 0x48)                   // or rax, CR0.MP
-        xb(cb, 0x83)
-        xb(cb, 0xC8)
-        xb(cb, 0x02)
-        xb(cb, 0x0F)                   // mov cr0, rax
-        xb(cb, 0x22)
-        xb(cb, 0xC0)
-        xb(cb, 0x0F)                   // mov rax, cr4
-        xb(cb, 0x20)
-        xb(cb, 0xE0)
-        xb(cb, 0x48)                   // or rax, OSFXSR|OSXMMEXCPT
-        xb(cb, 0x0D)
-        x64_u32(cb, 0x600)
-        xb(cb, 0x0F)                   // mov cr4, rax
-        xb(cb, 0x22)
-        xb(cb, 0xE0)
-        x64_call(cb, relocs, main_label)
-        syms.define_label("__xu_halt", cb.len())
-        xb(cb, 0xF4) // hlt
-        x64_jmp(cb, relocs, "__xu_halt")
+        if tgt_os == target.OS_UEFI {
+            syms.define_label("__xu_halt", cb.len())
+            xb(cb, 0xF4)
+            x64_jmp(cb, relocs, "__xu_halt")
+        }
         syms.define_label("__xu_globals", cb.len())
         x64_mov_imm(cb, X_RAX, 0)
         x64_ret(cb)
@@ -3757,7 +4171,7 @@ pub fn emit_x64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs 
         xb(cb, 0xFB)                   // sti
         x64_ret(cb)
         syms.define_label("boot_magic", cb.len())
-        if emit_object {
+        if emit_object || tgt_os == target.OS_UEFI {
             x64_mov_imm(cb, X_RAX, 0)
         } else {
             xb(cb, 0x48)                   // mov rax, [rip + __xu_boot_magic]
@@ -3767,7 +4181,7 @@ pub fn emit_x64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs 
         }
         x64_ret(cb)
         syms.define_label("boot_info_addr", cb.len())
-        if emit_object {
+        if emit_object || tgt_os == target.OS_UEFI {
             x64_mov_imm(cb, X_RAX, 0)
         } else {
             xb(cb, 0x48)                   // mov rax, [rip + __xu_boot_info]
@@ -3776,7 +4190,7 @@ pub fn emit_x64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs 
             x64_rel32(cb, relocs, "__xu_boot_info")
         }
         x64_ret(cb)
-        emit_x64_task_stubs(cb, syms)
+        emit_x64_task_stubs(cb, syms, no_sse)
         <<
     }
     if tgt_os == target.OS_WINDOWS {
@@ -3937,7 +4351,7 @@ pub fn emit_x64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs 
         x64_land(cb, ok)
     }
     x64_ret(cb)
-    emit_x64_task_stubs(cb, syms)
+    emit_x64_task_stubs(cb, syms, false)
     syms.define_label("__xu_globals", cb.len())
     x64_mov(cb, X_RAX, X_R15)
     x64_ret(cb)
