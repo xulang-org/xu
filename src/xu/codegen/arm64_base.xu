@@ -5512,6 +5512,67 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     e32(cb, 0xD4200000)
 }
 
+fn emit_arm64_mt_entries(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, unwinds $&[]WinUnwindEntry, collect_unwind bool, emit_cfi bool) {
+    if syms.lookup_offset("_xu_runtime_core_sched_worker_run") >= 0 {
+        // __xu_thread_entry(void *arg): C-ABI OS thread start routine.
+        // arg[0] = rt_globals (loaded into x28), arg[1] = wid.
+        th_beg := cb.len()
+        syms.define_label("__xu_thread_entry", th_beg)
+        if emit_cfi { a64_bti_jc(cb) }
+        e32(cb, 0xA9B67BFD) // stp x29, x30, [sp, #-160]!
+        e32(cb, 0x910003FD) // mov x29, sp
+        for i in 0:5 {
+            a64_pair(cb, 0xA9000000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16)
+        }
+        for i in 0:4 {
+            a64_pair(cb, 0x6D000000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16)
+        }
+        a64_ldr(cb, R_STATE, 0, 0)
+        a64_ldr(cb, 0, 0, 8)
+        a64_branch_reloc(cb, relocs, 0x94000000, "_xu_runtime_core_sched_worker_run", mc.RELOC_ARM64_CALL26)
+        a64_mov_imm(cb, 0, 0)
+        for i in 0:4 {
+            a64_pair(cb, 0x6D400000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16)
+        }
+        for i in 0:5 {
+            a64_pair(cb, 0xA9400000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16)
+        }
+        e32(cb, 0xA8CA7BFD) // ldp x29, x30, [sp], #160
+        e32(cb, 0xD65F03C0) // ret
+        th_end := cb.len()
+        if collect_unwind {
+            unwinds.push(WinUnwindEntry{
+                beg: th_beg,
+                end: th_end,
+                kind: UNW_A64_FFI_THUNK,
+                prolog_len: 0,
+                frame_size: 160,
+                compact: false,
+                sub_sp_insns: 0,
+                save_insns: 0,
+                save_off: 0,
+                epilog_off: -1,
+                callee_regs: []int{},
+                save_end_offs: []int{}
+            })
+        }
+    }
+
+    if syms.lookup_offset("_xu_runtime_core_sched_m0_entry") >= 0 {
+        // __xu_m0_g0_entry: initial LR for M0's scheduler stack (g0).
+        m0_beg := cb.len()
+        syms.define_label("__xu_m0_g0_entry", m0_beg)
+        if emit_cfi { a64_bti_jc(cb) }
+        a64_mov_imm(cb, R_FP, 0)
+        a64_branch_reloc(cb, relocs, 0x94000000, "_xu_runtime_core_sched_m0_entry", mc.RELOC_ARM64_CALL26)
+        e32(cb, 0xD4200000)
+        m0_end := cb.len()
+        if collect_unwind {
+            unwinds.push(win_unwind_leaf(m0_beg, m0_end))
+        }
+    }
+}
+
 // Process entry, raw system call and runtime-state accessor shared by all
 // functions. tgt_os uses target.OS_* codes.
 pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, uses_ffi bool, no_fp bool, boot_stack_bytes int) {
@@ -5745,7 +5806,11 @@ pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, reloc
         e32(cb, 0xD4000001)
     } else {
         e32(cb, 0xD4001001)
-        // fork and pipe return a second word in x1 (runtime G_SYS_R1).
+        // fork, pipe and gettimeofday return a second word in x1 (G_SYS_R1).
+        // Under M:N multi-core (G_MT_ACTIVE != 0 at offset 848), callers use
+        // pseudo-call -14 with a stack out-pointer, avoiding shared writes here.
+        e32(cb, 0xF941AB89) // ldr x9, [x28, #848]
+        e32(cb, 0xB5000049) // cbnz x9, +8
         a64_str(cb, 1, R_STATE, 40)
         // b.cc +8 ; neg x0, x0  (carry set means x0 holds errno)
         e32(cb, 0x54000043)
@@ -5859,6 +5924,114 @@ fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[
     if uses_ffi || (tgt_os != target.OS_LINUX && !emit_object) {
         emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object, unwinds, collect_unwind)
     }
+    // nr -15: CPU pause/yield hint for TTAS spinlocks.
+    e32(cb, 0xB1003C1F) // cmn x0, #15
+    e32(cb, 0x54000061) // b.ne +12
+    e32(cb, 0xD503203F) // yield
+    e32(cb, 0xD65F03C0) // ret
+    // nr -10: O(1) OS thread identifier from hardware TLS register.
+    e32(cb, 0xB100281F) // cmn x0, #10
+    if tgt_os == target.OS_MACOS {
+        e32(cb, 0x54000081) // b.ne +16
+        e32(cb, 0xD53BD060) // mrs x0, tpidrro_el0
+        e32(cb, 0xD343FC00) // lsr x0, x0, #3
+        e32(cb, 0xD65F03C0) // ret
+    } else if tgt_os == target.OS_LINUX {
+        e32(cb, 0x540000C1) // b.ne +24
+        e32(cb, 0xD53BD040) // mrs x0, tpidr_el0
+        e32(cb, 0xB5000060) // cbnz x0, +12
+        e32(cb, 0xD2801648) // mov x8, #178 (SYS_gettid)
+        e32(cb, 0xD4000001) // svc #0
+        e32(cb, 0xD65F03C0) // ret
+    } else {
+        e32(cb, 0x54000061) // b.ne +12
+        a64_mov(cb, 0, 18)  // Windows ARM64 TEB pointer
+        e32(cb, 0xD65F03C0) // ret
+    }
+    // nr -11: address of __xu_thread_entry (0 when not emitted).
+    e32(cb, 0xB1002C1F) // cmn x0, #11
+    skip11 := cb.len()
+    e32(cb, 0x54000001) // b.ne (patched)
+    if syms.lookup_offset("_xu_runtime_core_sched_worker_run") >= 0 {
+        a64_fn_addr(cb, relocs, 0, "__xu_thread_entry")
+    } else {
+        a64_mov_imm(cb, 0, 0)
+    }
+    e32(cb, 0xD65F03C0) // ret
+    cb.patch_u32_le(skip11, 0x54000001 | ((((cb.len() - skip11) / 4) & 0x7FFFF) << 5))
+    // nr -13: address of __xu_m0_g0_entry (0 when not emitted).
+    e32(cb, 0xB100341F) // cmn x0, #13
+    skip13 := cb.len()
+    e32(cb, 0x54000001) // b.ne (patched)
+    if syms.lookup_offset("_xu_runtime_core_sched_m0_entry") >= 0 {
+        a64_fn_addr(cb, relocs, 0, "__xu_m0_g0_entry")
+    } else {
+        a64_mov_imm(cb, 0, 0)
+    }
+    e32(cb, 0xD65F03C0) // ret
+    cb.patch_u32_le(skip13, 0x54000001 | ((((cb.len() - skip13) / 4) & 0x7FFFF) << 5))
+    // nr -14 (macOS): dual-return syscall (nr=x1, a0=x2, a1=x3, out_r1=x4).
+    if tgt_os == target.OS_MACOS {
+        e32(cb, 0xB100381F) // cmn x0, #14
+        skip14 := cb.len()
+        e32(cb, 0x54000001) // b.ne (patched)
+        e32(cb, 0xA9BE7BFD) // stp x29, x30, [sp, #-32]!
+        a64_str(cb, 4, R_SP, 16)
+        a64_mov(cb, 16, 1)
+        a64_mov(cb, 0, 2)
+        a64_mov(cb, 1, 3)
+        e32(cb, 0xD4001001) // svc #0x80
+        a64_ldr(cb, 9, R_SP, 16)
+        e32(cb, 0xB4000049) // cbz x9, +8
+        a64_str(cb, 1, 9, 0)
+        e32(cb, 0x54000043) // b.cc +8
+        e32(cb, 0xCB0003E0) // neg x0, x0
+        e32(cb, 0xA8C27BFD) // ldp x29, x30, [sp], #32
+        e32(cb, 0xD65F03C0) // ret
+        cb.patch_u32_le(skip14, 0x54000001 | ((((cb.len() - skip14) / 4) & 0x7FFFF) << 5))
+    }
+    // Linux static-PIE thread primitives: -16 clone, -17 get/set tpidr_el0.
+    if tgt_os == target.OS_LINUX {
+        // nr -16: clone(flags=x1, stack_top=x2, ctid_ptr=x3, tls=x4, entry=x5, arg=x6).
+        e32(cb, 0xB100401F) // cmn x0, #16
+        skip16 := cb.len()
+        e32(cb, 0x54000001) // b.ne (patched)
+        e32(cb, 0xD1004049) // sub x9, x2, #16
+        a64_str(cb, 5, 9, 0)
+        a64_str(cb, 6, 9, 8)
+        a64_mov(cb, 0, 1)   // flags
+        a64_mov(cb, 1, 9)   // child_stack = stack_top - 16
+        a64_mov(cb, 2, 3)   // ptid = ctid_ptr
+        a64_mov(cb, 9, 3)   // save ctid_ptr
+        a64_mov(cb, 3, 4)   // tls
+        a64_mov(cb, 4, 9)   // ctid = ctid_ptr
+        a64_mov_imm(cb, 8, 220) // SYS_clone
+        e32(cb, 0xD4000001) // svc #0
+        e32(cb, 0xB4000040) // cbz x0, +8 (child)
+        e32(cb, 0xD65F03C0) // ret (parent)
+        a64_mov_imm(cb, R_FP, 0)
+        a64_ldr(cb, 16, R_SP, 0)
+        a64_ldr(cb, 0, R_SP, 8)
+        a64_add_imm(cb, R_SP, R_SP, 16)
+        e32(cb, 0xD63F0200) // blr x16
+        a64_mov_imm(cb, 0, 0)
+        a64_mov_imm(cb, 8, 93) // SYS_exit (thread-only exit)
+        e32(cb, 0xD4000001) // svc #0
+        e32(cb, 0xD4200000) // brk #0
+        cb.patch_u32_le(skip16, 0x54000001 | ((((cb.len() - skip16) / 4) & 0x7FFFF) << 5))
+
+        // nr -17: get (x1==0) or set (x1!=0) tpidr_el0.
+        e32(cb, 0xB100441F) // cmn x0, #17
+        skip17 := cb.len()
+        e32(cb, 0x54000001) // b.ne (patched)
+        e32(cb, 0xB5000061) // cbnz x1, +12
+        e32(cb, 0xD53BD040) // mrs x0, tpidr_el0
+        e32(cb, 0xD65F03C0) // ret
+        e32(cb, 0xD51BD041) // msr tpidr_el0, x1
+        a64_mov_imm(cb, 0, 0)
+        e32(cb, 0xD65F03C0) // ret
+        cb.patch_u32_le(skip17, 0x54000001 | ((((cb.len() - skip17) / 4) & 0x7FFFF) << 5))
+    }
     // cmn x0, #2 ; b.ne +12 ; mov x0, x29 ; ret
     e32(cb, 0xB100081F)
     e32(cb, 0x54000061)
@@ -5874,7 +6047,9 @@ fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[
     a64_branch_reloc(cb, relocs, 0x54000001, "__xu_syscall_os", mc.RELOC_ARM64_COND_BR19)
     a64_mov(cb, 0, 1)
     a64_mov(cb, 1, 2)
-    emit_arm64_task_stubs(cb, syms, relocs, false, tgt_os == target.OS_LINUX && !emit_object)
+    emit_cfi := tgt_os == target.OS_LINUX && !emit_object
+    emit_arm64_task_stubs(cb, syms, relocs, false, emit_cfi)
+    emit_arm64_mt_entries(cb, syms, relocs, unwinds, collect_unwind, emit_cfi)
     syms.define_label("__xu_syscall_os", cb.len())
 }
 
