@@ -10,6 +10,8 @@
 #tensor
 #net
 #net/http
+#ffi
+#sync/pool as sync_pool
 #gbnf
 #models
 #quantize
@@ -169,6 +171,8 @@ struct Model {
     is_mla bool
     is_mamba bool
     use_q8k_act bool
+    n_threads int
+    pool sync_pool.ThreadPool
     lora LoraState
     vision vision.VisionEncoder
     gbnf_vocab gbnf.VocabIndex
@@ -1264,7 +1268,7 @@ fn load_model_safetensors(data &string, ctx_limit int) Model {
     << Model{
         cfg: cfg, is_q4: false, is_q8: false, embed_q4: false, lm_head_q4: false, lm_head_q8: false,
         layers_p4: false, embed_p4: false, lm_head_p4: false, has_qkv_bias: false, has_qk_norm: false,
-        has_post_norms: false, is_moe: false, is_mla: false, is_mamba: false, use_q8k_act: false, lora: empty_lora_state(n_layers), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
+        has_post_norms: false, is_moe: false, is_mla: false, is_mamba: false, use_q8k_act: false, n_threads: 1, pool: sync_pool.empty_thread_pool(), lora: empty_lora_state(n_layers), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
         chat_template_kind: TEMPLATE_RAW, eos_ids: [2],
         weights: weights, compact_weights: compact, q4_qs: []u8{}, q4_scales: []f32{}, q8_qs: []i8{}, q8_scales: []f32{},
         q4_p4k4_qs: []u8{}, q4_p4k4_scales: []u16{}, q8_p4k4_qs: []i8{}, q8_p4k4_scales: []u16{},
@@ -2480,7 +2484,7 @@ fn load_model_gguf_file(f &os.File, ctx_limit int, use_p4 bool) Model {
         cfg: cfg, is_q4: is_q4, is_q8: is_q8, embed_q4: embed_q4, lm_head_q4: lm_head_q4, lm_head_q8: lm_head_q8,
         layers_p4: layers_p4, embed_p4: embed_p4, lm_head_p4: lm_head_p4,
         has_qkv_bias: has_qkv_bias, has_qk_norm: has_qk_norm, has_post_norms: has_post_norms,
-        is_moe: is_moe, is_mla: is_mla, is_mamba: is_mamba, use_q8k_act: false, lora: empty_lora_state(lora_nl), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
+        is_moe: is_moe, is_mla: is_mla, is_mamba: is_mamba, use_q8k_act: false, n_threads: 1, pool: sync_pool.empty_thread_pool(), lora: empty_lora_state(lora_nl), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
         chat_template_kind: tmpl_kind, eos_ids: eos_ids,
         weights: weights, compact_weights: compact,
         q4_qs: q4_qs, q4_scales: q4_scales, q8_qs: q8_qs, q8_scales: q8_scales,
@@ -3114,7 +3118,7 @@ fn load_model_hf_dir(dir &string, cfg_text &string, ctx_limit int) Model {
         cfg: cfg, is_q4: false, is_q8: false, embed_q4: false, lm_head_q4: false, lm_head_q8: false,
         layers_p4: false, embed_p4: false, lm_head_p4: false,
         has_qkv_bias: has_qkv_bias, has_qk_norm: has_qk_norm, has_post_norms: has_post_norms,
-        is_moe: is_moe, is_mla: false, is_mamba: false, use_q8k_act: false, lora: empty_lora_state(lora_nl), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
+        is_moe: is_moe, is_mla: false, is_mamba: false, use_q8k_act: false, n_threads: 1, pool: sync_pool.empty_thread_pool(), lora: empty_lora_state(lora_nl), vision: vision.empty_encoder(), gbnf_vocab: gbnf.empty_vocab_index(),
         chat_template_kind: tmpl_kind, eos_ids: eos_ids,
         weights: weights, compact_weights: compact,
         q4_qs: []u8{}, q4_scales: []f32{}, q8_qs: []i8{}, q8_scales: []f32{},
@@ -3941,9 +3945,226 @@ fn matmat_compact(weights &CompactWeights, index int, out $&[]f32, x &[]f32,
     << 0
 }
 
+fn close_model_pool(m $&Model) {
+    p := $&m.pool
+    p.close()
+    m.n_threads = 1
+}
+
+// Zero-loop OS-thread row-slice workers (actual loop/microkernel stays inside @tensor).
+fn worker_f32_rows(ctx c_ptr, r0 int, r1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        w_p := ffi.read_ptr(ctx, 8)
+        x_p := ffi.read_ptr(ctx, 24)
+        cols := ffi.read_i64(ctx, 40)
+        off := ffi.read_i64(ctx, 48)
+        tensor.raw_gemv4_f32(ffi.offset(out_p, r0 * 4), ffi.offset(w_p, (off + r0 * cols) * 4), x_p, r1 - r0, cols)
+    }
+}
+
+fn worker_q4_p4k4_rows(ctx c_ptr, r0 int, r1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        qs_p := ffi.read_ptr(ctx, 8)
+        ws_p := ffi.read_ptr(ctx, 16)
+        xq_p := ffi.read_ptr(ctx, 24)
+        xs_p := ffi.read_ptr(ctx, 32)
+        nb := ffi.read_i64(ctx, 40)
+        off := ffi.read_i64(ctx, 48)
+        gb0 := off + (r0 / 4) * nb
+        tensor.raw_gemv4_q4_0_p4k4_f16_q8_0(
+            ffi.offset(out_p, r0 * 4), ffi.offset(qs_p, gb0 * 64), ffi.offset(ws_p, gb0 * 8),
+            xq_p, xs_p, (r1 - r0) / 4, nb
+        )
+    }
+}
+
+fn worker_q8_p4k4_rows(ctx c_ptr, r0 int, r1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        qs_p := ffi.read_ptr(ctx, 8)
+        ws_p := ffi.read_ptr(ctx, 16)
+        xq_p := ffi.read_ptr(ctx, 24)
+        xs_p := ffi.read_ptr(ctx, 32)
+        nb := ffi.read_i64(ctx, 40)
+        off := ffi.read_i64(ctx, 48)
+        gb0 := off + (r0 / 4) * nb
+        tensor.raw_gemv4_q8_0_p4k4_f16_q8_0(
+            ffi.offset(out_p, r0 * 4), ffi.offset(qs_p, gb0 * 128), ffi.offset(ws_p, gb0 * 8),
+            xq_p, xs_p, (r1 - r0) / 4, nb
+        )
+    }
+}
+
+fn worker_q4k_q8k_rows(ctx c_ptr, r0 int, r1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        w_p := ffi.read_ptr(ctx, 8)
+        bs_p := ffi.read_ptr(ctx, 16)
+        qs_p := ffi.read_ptr(ctx, 24)
+        d_p := ffi.read_ptr(ctx, 32)
+        nb := ffi.read_i64(ctx, 40)
+        off := ffi.read_i64(ctx, 48)
+        tensor.raw_gemv_q4_k_q8_k(ffi.offset(out_p, r0 * 4), ffi.offset(w_p, off + r0 * nb * tensor.Q4_K_BYTES), qs_p, d_p, bs_p, r1 - r0, nb)
+    }
+}
+
+fn worker_q5k_q8k_rows(ctx c_ptr, r0 int, r1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        w_p := ffi.read_ptr(ctx, 8)
+        bs_p := ffi.read_ptr(ctx, 16)
+        qs_p := ffi.read_ptr(ctx, 24)
+        d_p := ffi.read_ptr(ctx, 32)
+        nb := ffi.read_i64(ctx, 40)
+        off := ffi.read_i64(ctx, 48)
+        tensor.raw_gemv_q5_k_q8_k(ffi.offset(out_p, r0 * 4), ffi.offset(w_p, off + r0 * nb * tensor.Q5_K_BYTES), qs_p, d_p, bs_p, r1 - r0, nb)
+    }
+}
+
+fn worker_q6k_q8k_rows(ctx c_ptr, r0 int, r1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        w_p := ffi.read_ptr(ctx, 8)
+        qs_p := ffi.read_ptr(ctx, 24)
+        d_p := ffi.read_ptr(ctx, 32)
+        nb := ffi.read_i64(ctx, 40)
+        off := ffi.read_i64(ctx, 48)
+        tensor.raw_gemv_q6_k_q8_k(ffi.offset(out_p, r0 * 4), ffi.offset(w_p, off + r0 * nb * tensor.Q6_K_BYTES), qs_p, d_p, r1 - r0, nb)
+    }
+}
+
+fn worker_f32_gemm(ctx c_ptr, m0 int, m1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        w_p := ffi.read_ptr(ctx, 8)
+        x_p := ffi.read_ptr(ctx, 24)
+        cols := ffi.read_i64(ctx, 40)
+        rows := ffi.read_i64(ctx, 56)
+        tensor.raw_gemm4x4_f32(ffi.offset(out_p, m0 * rows * 4), w_p, ffi.offset(x_p, m0 * cols * 4), m1 - m0, rows, cols)
+    }
+}
+
+fn worker_q4_p4k4_gemm(ctx c_ptr, m0 int, m1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        qs_p := ffi.read_ptr(ctx, 8)
+        ws_p := ffi.read_ptr(ctx, 16)
+        xq_p := ffi.read_ptr(ctx, 24)
+        xs_p := ffi.read_ptr(ctx, 32)
+        nb := ffi.read_i64(ctx, 40)
+        rows := ffi.read_i64(ctx, 56)
+        tensor.raw_gemm4x8_q4_0_p4k4_signed_f16_q8_0(
+            ffi.offset(out_p, m0 * rows * 4), qs_p, ws_p,
+            ffi.offset(xq_p, m0 * nb * 32), ffi.offset(xs_p, m0 * nb * 4),
+            m1 - m0, rows / 4, nb
+        )
+    }
+}
+
+fn worker_q8_p4k4_gemm(ctx c_ptr, m0 int, m1 int) {
+    unsafe {
+        out_p := ffi.read_ptr(ctx, 0)
+        qs_p := ffi.read_ptr(ctx, 8)
+        ws_p := ffi.read_ptr(ctx, 16)
+        xq_p := ffi.read_ptr(ctx, 24)
+        xs_p := ffi.read_ptr(ctx, 32)
+        nb := ffi.read_i64(ctx, 40)
+        rows := ffi.read_i64(ctx, 56)
+        tensor.raw_gemm4x8_q8_0_p4k4_f16_q8_0(
+            ffi.offset(out_p, m0 * rows * 4), qs_p, ws_p,
+            ffi.offset(xq_p, m0 * nb * 32), ffi.offset(xs_p, m0 * nb * 4),
+            m1 - m0, rows / 4, nb
+        )
+    }
+}
+
+fn parallel_compact_kquant(m &Model, idx int, out $&[]f32, x &[]f32,
+                           batch int, rows int, cols int) int {
+    kind := m.compact_weights.kinds[idx]
+    if cols <= 0 || cols % tensor.QK_K != 0 {
+        >>> errors.new("K-quant columns must be divisible by 256")
+    }
+    start := m.compact_weights.raw_starts[idx]
+    nb := cols / tensor.QK_K
+    $q8k_qs := alloc_i8_zeros(cols)
+    $q8k_d := alloc_zeros(nb)
+    $q8k_bsums := alloc_ints(nb * 16, 0)
+    unsafe {
+        ctx := m.pool.scratch()
+        out_base := ffi.f32_mut_ptr(out)
+        w_base := ffi.str_ptr(&m.compact_weights.data)
+        qs_p := ffi.i8_ptr(&q8k_qs)
+        d_p := ffi.f32_ptr(&q8k_d)
+        bs_p := ffi.int_ptr(&q8k_bsums)
+        $wfn := c_callback(worker_q4k_q8k_rows)
+        if kind == COMPACT_Q5_K { wfn = c_callback(worker_q5k_q8k_rows) }
+        else if kind == COMPACT_Q6_K { wfn = c_callback(worker_q6k_q8k_rows) }
+        ffi.write_ptr(ctx, 8, w_base)
+        ffi.write_ptr(ctx, 16, bs_p)
+        ffi.write_ptr(ctx, 24, qs_p)
+        ffi.write_ptr(ctx, 32, d_p)
+        ffi.write_i64(ctx, 40, nb)
+        ffi.write_i64(ctx, 48, start)
+        for mi in 0:batch {
+            _ := tensor.quantize_q8_k_row(x, mi * cols, $&q8k_qs, $&q8k_d, $&q8k_bsums, nb) >>>
+            ffi.write_ptr(ctx, 0, ffi.offset(out_base, mi * rows * 4))
+            m.pool.parallel_for_raw(rows, 4, ctx, wfn)
+        }
+    }
+    << 0
+}
+
 fn matvec_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act bool,
                    out $&[]f32, x &[]f32, xq &[]i8, xs &[]f32,
                    off int, rows int, cols int) int {
+    if m.n_threads > 1 && rows >= 64 && rows % 4 == 0 {
+        if off < 0 {
+            idx := -1 - off
+            kind := m.compact_weights.kinds[idx]
+            if m.use_q8k_act && (kind == COMPACT_Q4_K || kind == COMPACT_Q5_K || kind == COMPACT_Q6_K) {
+                << parallel_compact_kquant(m, idx, out, x, 1, rows, cols) >>>
+            }
+        } else if use_q8 && use_q8_act && use_p4 && cols % 32 == 0 {
+            unsafe {
+                ctx := m.pool.scratch()
+                ffi.write_ptr(ctx, 0, ffi.f32_mut_ptr(out))
+                ffi.write_ptr(ctx, 8, ffi.i8_ptr(&m.q8_p4k4_qs))
+                ffi.write_ptr(ctx, 16, ffi.u16_ptr(&m.q8_p4k4_scales))
+                ffi.write_ptr(ctx, 24, ffi.i8_ptr(xq))
+                ffi.write_ptr(ctx, 32, ffi.f32_ptr(xs))
+                ffi.write_i64(ctx, 40, cols / 32)
+                ffi.write_i64(ctx, 48, off)
+                m.pool.parallel_for_raw(rows, 4, ctx, c_callback(worker_q8_p4k4_rows))
+            }
+            << 0
+        } else if use_q4 && use_q8_act && use_p4 && cols % 32 == 0 {
+            unsafe {
+                ctx := m.pool.scratch()
+                ffi.write_ptr(ctx, 0, ffi.f32_mut_ptr(out))
+                ffi.write_ptr(ctx, 8, ffi.bytes_ptr(&m.q4_p4k4_qs))
+                ffi.write_ptr(ctx, 16, ffi.u16_ptr(&m.q4_p4k4_scales))
+                ffi.write_ptr(ctx, 24, ffi.i8_ptr(xq))
+                ffi.write_ptr(ctx, 32, ffi.f32_ptr(xs))
+                ffi.write_i64(ctx, 40, cols / 32)
+                ffi.write_i64(ctx, 48, off)
+                m.pool.parallel_for_raw(rows, 4, ctx, c_callback(worker_q4_p4k4_rows))
+            }
+            << 0
+        } else if !use_q4 && !use_q8 {
+            unsafe {
+                ctx := m.pool.scratch()
+                ffi.write_ptr(ctx, 0, ffi.f32_mut_ptr(out))
+                ffi.write_ptr(ctx, 8, ffi.f32_ptr(&m.weights))
+                ffi.write_ptr(ctx, 24, ffi.f32_ptr(x))
+                ffi.write_i64(ctx, 40, cols)
+                ffi.write_i64(ctx, 48, off)
+                m.pool.parallel_for_raw(rows, 4, ctx, c_callback(worker_f32_rows))
+            }
+            << 0
+        }
+    }
     if off < 0 {
         _ := matmat_compact(&m.compact_weights, -1 - off, out, x, 1, rows, cols, m.use_q8k_act) >>>
     } else if use_q8 {
@@ -3975,6 +4196,108 @@ fn matvec_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act b
 fn matmat_dispatch(m &Model, use_q4 bool, use_q8 bool, use_p4 bool, use_q8_act bool,
                    out $&[]f32, x &[]f32, xq &[]i8, xs &[]f32,
                    off int, m_cnt int, rows int, cols int) int {
+    if m.n_threads > 1 && rows >= 64 && rows % 4 == 0 && m_cnt > 0 {
+        if off < 0 {
+            idx := -1 - off
+            kind := m.compact_weights.kinds[idx]
+            if m.use_q8k_act && (kind == COMPACT_Q4_K || kind == COMPACT_Q5_K || kind == COMPACT_Q6_K) {
+                << parallel_compact_kquant(m, idx, out, x, m_cnt, rows, cols) >>>
+            }
+        } else if use_q8 && use_q8_act && use_p4 && cols % 32 == 0 {
+            nb := cols / 32
+            unsafe {
+                ctx := m.pool.scratch()
+                out_base := ffi.f32_mut_ptr(out)
+                xq_base := ffi.i8_ptr(xq)
+                xs_base := ffi.f32_ptr(xs)
+                if m_cnt >= m.n_threads {
+                    $mg := 1
+                    if m_cnt >= 4 * m.n_threads { mg = 4 }
+                    ffi.write_ptr(ctx, 0, out_base)
+                    ffi.write_ptr(ctx, 8, ffi.offset(ffi.i8_ptr(&m.q8_p4k4_qs), off * 128))
+                    ffi.write_ptr(ctx, 16, ffi.offset(ffi.u16_ptr(&m.q8_p4k4_scales), off * 8))
+                    ffi.write_ptr(ctx, 24, xq_base)
+                    ffi.write_ptr(ctx, 32, xs_base)
+                    ffi.write_i64(ctx, 40, nb)
+                    ffi.write_i64(ctx, 56, rows)
+                    m.pool.parallel_for_raw(m_cnt, mg, ctx, c_callback(worker_q8_p4k4_gemm))
+                } else {
+                    ffi.write_ptr(ctx, 8, ffi.i8_ptr(&m.q8_p4k4_qs))
+                    ffi.write_ptr(ctx, 16, ffi.u16_ptr(&m.q8_p4k4_scales))
+                    ffi.write_i64(ctx, 40, nb)
+                    ffi.write_i64(ctx, 48, off)
+                    wfn := c_callback(worker_q8_p4k4_rows)
+                    for mi in 0:m_cnt {
+                        ffi.write_ptr(ctx, 0, ffi.offset(out_base, mi * rows * 4))
+                        ffi.write_ptr(ctx, 24, ffi.offset(xq_base, mi * nb * 32))
+                        ffi.write_ptr(ctx, 32, ffi.offset(xs_base, mi * nb * 4))
+                        m.pool.parallel_for_raw(rows, 4, ctx, wfn)
+                    }
+                }
+            }
+            << 0
+        } else if use_q4 && use_q8_act && use_p4 && cols % 32 == 0 {
+            nb := cols / 32
+            unsafe {
+                ctx := m.pool.scratch()
+                out_base := ffi.f32_mut_ptr(out)
+                xq_base := ffi.i8_ptr(xq)
+                xs_base := ffi.f32_ptr(xs)
+                if m_cnt >= m.n_threads {
+                    $mg := 1
+                    if m_cnt >= 4 * m.n_threads { mg = 4 }
+                    ffi.write_ptr(ctx, 0, out_base)
+                    ffi.write_ptr(ctx, 8, ffi.offset(ffi.bytes_ptr(&m.q4_p4k4_qs), off * 64))
+                    ffi.write_ptr(ctx, 16, ffi.offset(ffi.u16_ptr(&m.q4_p4k4_scales), off * 8))
+                    ffi.write_ptr(ctx, 24, xq_base)
+                    ffi.write_ptr(ctx, 32, xs_base)
+                    ffi.write_i64(ctx, 40, nb)
+                    ffi.write_i64(ctx, 56, rows)
+                    m.pool.parallel_for_raw(m_cnt, mg, ctx, c_callback(worker_q4_p4k4_gemm))
+                } else {
+                    ffi.write_ptr(ctx, 8, ffi.bytes_ptr(&m.q4_p4k4_qs))
+                    ffi.write_ptr(ctx, 16, ffi.u16_ptr(&m.q4_p4k4_scales))
+                    ffi.write_i64(ctx, 40, nb)
+                    ffi.write_i64(ctx, 48, off)
+                    wfn := c_callback(worker_q4_p4k4_rows)
+                    for mi in 0:m_cnt {
+                        ffi.write_ptr(ctx, 0, ffi.offset(out_base, mi * rows * 4))
+                        ffi.write_ptr(ctx, 24, ffi.offset(xq_base, mi * nb * 32))
+                        ffi.write_ptr(ctx, 32, ffi.offset(xs_base, mi * nb * 4))
+                        m.pool.parallel_for_raw(rows, 4, ctx, wfn)
+                    }
+                }
+            }
+            << 0
+        } else if !use_q4 && !use_q8 {
+            unsafe {
+                ctx := m.pool.scratch()
+                out_base := ffi.f32_mut_ptr(out)
+                x_base := ffi.f32_ptr(x)
+                if m_cnt >= m.n_threads {
+                    $mg := 1
+                    if m_cnt >= 4 * m.n_threads { mg = 4 }
+                    ffi.write_ptr(ctx, 0, out_base)
+                    ffi.write_ptr(ctx, 8, ffi.offset(ffi.f32_ptr(&m.weights), off * 4))
+                    ffi.write_ptr(ctx, 24, x_base)
+                    ffi.write_i64(ctx, 40, cols)
+                    ffi.write_i64(ctx, 56, rows)
+                    m.pool.parallel_for_raw(m_cnt, mg, ctx, c_callback(worker_f32_gemm))
+                } else {
+                    ffi.write_ptr(ctx, 8, ffi.f32_ptr(&m.weights))
+                    ffi.write_i64(ctx, 40, cols)
+                    ffi.write_i64(ctx, 48, off)
+                    wfn := c_callback(worker_f32_rows)
+                    for mi in 0:m_cnt {
+                        ffi.write_ptr(ctx, 0, ffi.offset(out_base, mi * rows * 4))
+                        ffi.write_ptr(ctx, 24, ffi.offset(x_base, mi * cols * 4))
+                        m.pool.parallel_for_raw(rows, 4, ctx, wfn)
+                    }
+                }
+            }
+            << 0
+        }
+    }
     if off < 0 {
         _ := matmat_compact(&m.compact_weights, -1 - off, out, x, m_cnt, rows, cols, m.use_q8k_act) >>>
     } else if use_q8 {
@@ -11048,6 +11371,7 @@ fn main() int {
     $seed := 20261124
     $ignore_eos := false
     $use_q8k_act := false
+    $threads_arg := 1
     $rope_type_arg := "auto"
     $lora_arg := ""
     $lora_scale := 0.0
@@ -11158,6 +11482,14 @@ fn main() int {
         } else if arg == "--q8k-act" {
             use_q8k_act = true
             ai += 1
+        } else if arg == "--threads" && ai + 1 < raw_args.len {
+            ts := raw_args[ai + 1]
+            threads_arg = strconv.atoi(&ts) >>> (err) {
+                eprintln("invalid --threads: " + err.msg())
+                << 1
+            }
+            if threads_arg <= 0 { threads_arg = sync_pool.cpu_count() }
+            ai += 2
         } else if arg == "--rope-type" && ai + 1 < raw_args.len {
             rt := raw_args[ai + 1]
             if rt != "auto" && rt != "norm" && rt != "neox" {
@@ -11387,6 +11719,10 @@ fn main() int {
         << 1
     }
     model.use_q8k_act = use_q8k_act
+    if threads_arg > 1 {
+        model.pool = sync_pool.new_thread_pool(threads_arg)
+        model.n_threads = model.pool.num_threads()
+    }
     if mmproj_arg.len > 0 {
         ve := vision.load_mmproj(mmproj_arg, model.cfg.dim) >>> (err) {
             eprintln("mmproj error: " + err.msg())
@@ -11677,6 +12013,7 @@ fn main() int {
         println("cb_total_ns:" + str(cb_ns))
         println("cb_steps:" + str(cb_steps))
         println("tokens:" + join_ints(&gen_toks))
+        close_model_pool($&model)
         << 0
     }
 
@@ -11717,7 +12054,11 @@ fn main() int {
             eprintln("train-grpo error: " + err.msg())
             << 1
         }
-        if kv.free_top != kv.num_blocks { << 4 }
+        if kv.free_top != kv.num_blocks {
+            close_model_pool($&model)
+            << 4
+        }
+        close_model_pool($&model)
         << 0
     }
 
@@ -11736,7 +12077,11 @@ fn main() int {
             eprintln("train-rlvr error: " + err.msg())
             << 1
         }
-        if kv.free_top != kv.num_blocks { << 4 }
+        if kv.free_top != kv.num_blocks {
+            close_model_pool($&model)
+            << 4
+        }
+        close_model_pool($&model)
         << 0
     }
 
@@ -11768,7 +12113,11 @@ fn main() int {
             eprintln("train-distill error: " + err.msg())
             << 1
         }
-        if kv.free_top != kv.num_blocks { << 4 }
+        if kv.free_top != kv.num_blocks {
+            close_model_pool($&model)
+            << 4
+        }
+        close_model_pool($&model)
         << 0
     }
 
@@ -11792,7 +12141,11 @@ fn main() int {
             eprintln("perplexity error: " + err.msg())
             << 1
         }
-        if kv.free_top != kv.num_blocks { << 4 }
+        if kv.free_top != kv.num_blocks {
+            close_model_pool($&model)
+            << 4
+        }
+        close_model_pool($&model)
         << 0
     }
 
@@ -11810,7 +12163,11 @@ fn main() int {
             eprintln("train-dpo error: " + err.msg())
             << 1
         }
-        if kv.free_top != kv.num_blocks { << 4 }
+        if kv.free_top != kv.num_blocks {
+            close_model_pool($&model)
+            << 4
+        }
+        close_model_pool($&model)
         << 0
     }
 
@@ -11843,7 +12200,11 @@ fn main() int {
             eprintln("train-lora error: " + err.msg())
             << 1
         }
-        if kv.free_top != kv.num_blocks { << 4 }
+        if kv.free_top != kv.num_blocks {
+            close_model_pool($&model)
+            << 4
+        }
+        close_model_pool($&model)
         << 0
     }
 
@@ -11994,7 +12355,11 @@ fn main() int {
         println("generated_ids:" + join_ints(&gen.ids))
         println("generated_text:" + gen.text)
         println("kv_free_after:" + str(kv.free_top) + "/" + str(kv.num_blocks))
-        if kv.free_top != kv.num_blocks { << 4 }
+        if kv.free_top != kv.num_blocks {
+            close_model_pool($&model)
+            << 4
+        }
+        close_model_pool($&model)
         << 0
     }
 
