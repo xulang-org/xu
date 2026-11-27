@@ -44,7 +44,7 @@ The block types expose their scales and packed lanes for raw access.
 
 ## Numerical kernels (`ops.xu`)
 
-`#tensor` also provides 37 composable pure-Xu numerical primitives in `ops.xu`:
+`#tensor` also provides 47 composable pure-Xu numerical primitives in `ops.xu`:
 `dot_f32`, `axpy_f32`, `vadd_f32`, `vsub_f32`, `vmul_f32`, `vscale_f32`,
 `silu_f32`, `gelu_f32`, `rmsnorm_f32`, `add_rmsnorm_f32`, `layernorm_f32`,
 `l2_normalize_f32`, `cosine_similarity_f32`, `topk_f32`, `topk_cosine_f32`,
@@ -53,7 +53,10 @@ The block types expose their scales and packed lanes for raw access.
 `argmax_f32`, `quantize_q8_0`, `quantize_q4_0_row`, `cross_entropy_grad_f32`,
 `adamw_step_f32`, `lora_add_f32`, `lora_backward_f32`, `rmsnorm_backward_f32`,
 `swiglu_backward_f32`, `layernorm_backward_f32`, `softmax_backward_f32`,
-and `grad_clip_norm_f32`. Each
+`grad_clip_norm_f32`, `kl_div_grad_f32`, `dpo_loss_grad_f32`,
+`grpo_advantages_f32`, `conv1d_causal_step_f32`, `ssm_scan_step_f32`,
+`linear_attn_step_f32`, `ppo_clip_grad_f32`, `conv2d_patch_embed_f32`,
+`mha_sdpa_f32`, and `avg_pool2d_f32`. Each
 core loop uses the canonical shape recognized by `XU_TENSOR_FUSION=1` so the
 compiler lowers eligible kernels directly to ARM64 NEON / x86-64 SSE2 stubs
 when bounds and aliasing checks pass.

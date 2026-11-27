@@ -804,7 +804,8 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
                    biases=None, qk_norms=None, dequant_data=None,
                    rope_dim=None, rope_interleaved=False, sliding_window=0,
                    attn_softcap=0.0, final_softcap=0.0, use_geglu=False,
-                   embed_scale=1.0, post_norms=None, yarn=None, moe_cfg=None):
+                   embed_scale=1.0, post_norms=None, yarn=None, moe_cfg=None,
+                   return_last_logits=False):
     dim = CFG["dim"]
     hidden = CFG["hidden_dim"]
     n_layers = CFG["n_layers"]
@@ -1016,6 +1017,8 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
         if step + 1 < len(prompt):
             cur = prompt[step + 1]
         else:
+            if return_last_logits:
+                return tokens + [nxt], logits_out + [logits[nxt]], list(logits)
             tokens.append(nxt)
             logits_out.append(logits[nxt])
             cur = nxt
@@ -1145,7 +1148,7 @@ def check_qwen2_gguf(exes, qwen_path, tensors, biases, q4_data, q8_data):
     ]
     check_format(exes, qwen_path, py_qwen_ref, "qwen2_gguf", "q4_0", "q8_0", CFG["vocab_size"])
 
-    exe = exes[1][2]  # fusion-strict
+    exe = exes[1][2] if len(exes) > 1 else exes[0][2]  # fusion-strict
     # Test GPT-2 unicode 'Ġ' space decoding & encoding ("Hi Paris world" -> [1, 5, 7])
     out = run([exe, "generate", str(qwen_path), "Hi Paris world", "4", "0", "40", "--ignore-eos"]).splitlines()
     kv = {k: v for k, v in (l.split(":", 1) for l in out)}
@@ -2620,7 +2623,7 @@ def check_lora_and_speculative(exes, work, cfg, base_tensors):
         exes[1][2], "train-lora", str(base_path), "ids:1,7,42,19", str(trained_sf),
         "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "35", "--lr", "0.2",
     ])
-    losses = [float(l.split("loss:", 1)[1]) for l in tr_out.splitlines() if l.startswith("step:")]
+    losses = [float(l.split("loss:", 1)[1].split()[0]) for l in tr_out.splitlines() if l.startswith("step:")]
     assert len(losses) == 35 and losses[-1] < 0.05 and losses[-1] < losses[0] * 0.1, losses
     assert trained_sf.exists() and any(l == "kv_free_after:4/4" for l in tr_out.splitlines()), tr_out
     gen_tr = run([exes[1][2], "generate", str(base_path), "ids:1,7", "2", "0", "40", "--lora", str(trained_sf)])
@@ -2683,7 +2686,7 @@ def check_q5_k_and_responses_api(exes, work, cfg, base_tensors):
         exes[1][2], "train-lora", str(work / "lora_base.safetensors"), "ids:1,7,42,19", str(clip_sf),
         "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "20", "--lr", "0.25", "--max-grad-norm", "0.5",
     ])
-    c_losses = [float(l.split("loss:", 1)[1]) for l in tr_clip.splitlines() if l.startswith("step:")]
+    c_losses = [float(l.split("loss:", 1)[1].split()[0]) for l in tr_clip.splitlines() if l.startswith("step:")]
     assert len(c_losses) == 20 and c_losses[-1] < c_losses[0] * 0.5 and clip_sf.exists(), tr_clip
 
     # 3. POST /v1/responses sync, previous_response_id continuation, tools + function_call_output, and SSE
@@ -2792,6 +2795,761 @@ def check_q5_k_and_responses_api(exes, work, cfg, base_tensors):
             proc.kill()
             proc.wait(timeout=3)
     print("GGUF Q5_K (--q8k-act), train-lora --max-grad-norm, and POST /v1/responses (sync/previous_response_id/tools/SSE) verified")
+
+
+def check_v10_perplexity_sft_dpo_ollama_metrics(exes, work, cfg, tensors):
+    import json
+    import subprocess
+    import urllib.request
+
+    exe = exes[1][2] if len(exes) > 1 else exes[0][2]
+    st_path = work / "v10_base.safetensors"
+    write_safetensors(st_path, cfg, tensors)
+
+    # 1. Sliding-window perplexity vs independent Python reference
+    ppl_seq = [1, 7, 42, 3, 19, 5, 11, 23, 9]
+    win, stride = 6, 2
+    ppl_out = run([
+        exe, "perplexity", str(st_path), "ids:" + ",".join(map(str, ppl_seq)),
+        "--ctx", str(win), "--stride", str(stride),
+    ])
+    pkv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in ppl_out.splitlines() if ":" in l}
+    assert pkv["tokens"] == str(len(ppl_seq) - 1), pkv
+    fnum, fden = map(int, pkv["kv_free_after"].split("/"))
+    assert fnum == fden and fden > 0, pkv
+
+    def py_token_nll(logits, target):
+        mx = max(logits)
+        lse = mx + math.log(sum(math.exp(v - mx) for v in logits))
+        return lse - logits[target]
+
+    py_nll_sum = 0.0
+    scored_until = 1
+    begin = 0
+    while True:
+        end = min(begin + win, len(ppl_seq))
+        sub = ppl_seq[begin:end]
+        if len(sub) >= 2:
+            for k in range(len(sub) - 1):
+                gpos = begin + k + 1
+                if gpos >= scored_until:
+                    _, _, logits_k = py_run_request(tensors, sub[:k + 1], 1, return_last_logits=True)
+                    py_nll_sum += py_token_nll(logits_k, ppl_seq[gpos])
+        if end >= len(ppl_seq):
+            break
+        scored_until = end
+        begin = end - (win - stride)
+    py_ppl = math.exp(py_nll_sum / (len(ppl_seq) - 1))
+    assert abs(float(pkv["perplexity"]) - py_ppl) < 1e-4, (pkv, py_ppl)
+
+    # 2. Full JSONL SFT with loss masking, grad accumulation, warmup + cosine LR
+    sft_jsonl = work / "sft_train.jsonl"
+    sft_jsonl.write_text(
+        json.dumps({"prompt_ids": [1, 7], "completion_ids": [42, 3, 19]}) + "\n" +
+        json.dumps({"prompt": "ids:3,19", "completion": "ids:5,11"}) + "\n"
+    )
+    sft_lora = work / "sft_lora.safetensors"
+    sft_out = run([
+        exe, "train-lora", str(st_path), str(sft_lora),
+        "--dataset", str(sft_jsonl),
+        "--grad-accum", "2", "--warmup-steps", "2", "--lr-schedule", "cosine",
+        "--lora-rank", "4", "--lora-alpha", "8.0", "--steps", "12", "--lr", "0.08", "--max-grad-norm", "1.0",
+    ])
+    losses = []
+    lrs = []
+    for line in sft_out.splitlines():
+        if line.startswith("step:"):
+            parts = {p.split(":", 1)[0]: p.split(":", 1)[1] for p in line.split()}
+            losses.append(float(parts["loss"]))
+            lrs.append(float(parts["lr"]))
+    assert len(losses) == 12 and losses[-1] < losses[0], losses
+    assert lrs[0] < lrs[1] and lrs[-1] < lrs[1], lrs
+    assert sft_lora.is_file()
+    ver_sft = run([exe, "verify", str(st_path), "--lora", str(sft_lora)])
+    assert "kv_free_after:" in ver_sft
+
+    # 3. Direct Preference Optimization (train-dpo)
+    dpo_jsonl = work / "dpo_pairs.jsonl"
+    dpo_jsonl.write_text(
+        json.dumps({"prompt_ids": [1, 7], "chosen_ids": [42, 3], "rejected_ids": [19, 5]}) + "\n"
+    )
+    dpo_lora = work / "dpo_lora.safetensors"
+    dpo_out = run([
+        exe, "train-dpo", str(st_path), str(dpo_jsonl), str(dpo_lora),
+        "--dpo-beta", "0.25", "--lora-rank", "4", "--lora-alpha", "8.0",
+        "--steps", "12", "--lr", "0.08", "--max-grad-norm", "1.0",
+    ])
+    dpo_losses, dpo_margins = [], []
+    for line in dpo_out.splitlines():
+        if line.startswith("step:"):
+            parts = {p.split(":", 1)[0]: p.split(":", 1)[1] for p in line.split()}
+            dpo_losses.append(float(parts["dpo_loss"]))
+            dpo_margins.append(float(parts["margin"]))
+    assert len(dpo_losses) == 12 and dpo_losses[-1] < dpo_losses[0], dpo_losses
+    assert dpo_margins[-1] > dpo_margins[0] and dpo_margins[-1] > 0.0, dpo_margins
+    assert dpo_lora.is_file()
+
+    # 4. Ollama (/api/tags, /api/generate, /api/chat) + Prometheus /metrics
+    gguf_ollama = work / "ollama_v10.gguf"
+    pieces = [f"tok_{i}" for i in range(cfg["vocab_size"])]
+    pieces[0], pieces[1], pieces[2] = "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+    pieces[3], pieces[4], pieces[7], pieces[9] = "user", "assistant", "\n", "hello"
+    write_gguf_q4_0(gguf_ollama, cfg, tensors, vocab_pieces=pieces)
+
+    proc = subprocess.Popen(
+        [str(exe), "serve", str(gguf_ollama), "127.0.0.1:0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        base_url = None
+        for _ in range(100):
+            ln = proc.stdout.readline()
+            if ln and ln.strip().startswith("serving:http://"):
+                base_url = ln.strip().split("serving:", 1)[1]
+                break
+        assert base_url is not None
+
+        def req_http(path, payload=None):
+            data = None if payload is None else json.dumps(payload).encode()
+            headers = {"Content-Type": "application/json"} if data is not None else {}
+            req = urllib.request.Request(base_url + path, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.headers.get("Content-Type", ""), resp.read().decode()
+
+        st, _, tags_raw = req_http("/api/tags")
+        assert st == 200 and json.loads(tags_raw)["models"][0]["name"] == str(gguf_ollama)
+
+        st, _, gen_sync = req_http("/api/generate", {"model": "local", "prompt": "hello", "stream": False, "options": {"num_predict": 3, "temperature": 0}})
+        gs_obj = json.loads(gen_sync)
+        assert st == 200 and gs_obj["done"] is True and gs_obj["eval_count"] >= 1, gs_obj
+
+        st, ct, gen_nd = req_http("/api/generate", {"model": "local", "prompt": "hello", "options": {"num_predict": 3}})
+        nd_lines = [json.loads(l) for l in gen_nd.splitlines() if l.strip()]
+        assert st == 200 and "ndjson" in ct and len(nd_lines) >= 2 and nd_lines[-1]["done"] is True, (ct, nd_lines)
+
+        st, _, chat_sync = req_http("/api/chat", {"model": "local", "messages": [{"role": "user", "content": "hello"}], "stream": False, "options": {"num_predict": 3}})
+        cs_obj = json.loads(chat_sync)
+        assert st == 200 and cs_obj["done"] is True and cs_obj["message"]["role"] == "assistant", cs_obj
+
+        st, ct, metrics_raw = req_http("/metrics")
+        assert st == 200 and "text/plain" in ct and "xu_llm_requests_total " in metrics_raw and "xu_llm_completion_tokens_total " in metrics_raw, (ct, metrics_raw)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+    print("perplexity, JSONL SFT (--dataset/--grad-accum/--lr-schedule cosine), train-dpo, Ollama /api/*, and Prometheus /metrics verified")
+
+
+def check_v11_inspect_merge_grpo_distill(exes, work, cfg, tensors):
+    exe = exes[1][2] if len(exes) > 1 else exes[0][2]
+    st_path = work / "v11_base.safetensors"
+    write_safetensors(st_path, cfg, tensors)
+
+    # 1. inspect diagnostics
+    insp_out = run([exe, "inspect", str(st_path)])
+    ikv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in insp_out.splitlines() if ":" in l}
+    assert ikv["dim"] == str(cfg["dim"]) and ikv["n_layers"] == str(cfg["n_layers"])
+    assert ikv["vocab_size"] == str(cfg["vocab_size"])
+    assert int(ikv["est_params"]) > 0
+    kv32 = int(ikv["kv_bytes_per_tok_f32"])
+    kv16 = int(ikv["kv_bytes_per_tok_f16"])
+    kv8 = int(ikv["kv_bytes_per_tok_fp8"])
+    assert kv32 == kv16 * 2 and kv32 == kv8 * 4 and kv32 > 0, ikv
+
+    # 2. train-lora -> merge-lora parity
+    lora_sf = work / "v11_lora.safetensors"
+    run([exe, "train-lora", str(st_path), "ids:1,7,42,19", str(lora_sf), "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "20", "--lr", "0.2"])
+    merged_sf = work / "v11_merged.safetensors"
+    m_out = run([exe, "merge-lora", str(st_path), str(lora_sf), str(merged_sf)])
+    assert "merged_tensors:1" in m_out and merged_sf.is_file(), m_out
+    g_lora = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in run([exe, "generate", str(st_path), "ids:1,7", "3", "0", "40", "--lora", str(lora_sf)]).splitlines() if ":" in l}
+    g_merged = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in run([exe, "generate", str(merged_sf), "ids:1,7", "3", "0", "40"]).splitlines() if ":" in l}
+    assert g_lora["generated_ids"] == g_merged["generated_ids"], (g_lora, g_merged)
+
+    # 3. train-grpo RL fine-tuning
+    grpo_jsonl = work / "grpo_groups.jsonl"
+    grpo_jsonl.write_text(json.dumps({
+        "prompt_ids": [1, 7],
+        "completions": [
+            {"ids": [42, 3], "reward": 2.0},
+            {"ids": [19, 5], "reward": 0.0},
+            {"ids": [11, 23], "reward": 1.0},
+        ],
+    }) + "\n")
+    grpo_lora = work / "v11_grpo.safetensors"
+    grpo_out = run([
+        exe, "train-grpo", str(st_path), str(grpo_jsonl), str(grpo_lora),
+        "--clip-eps", "0.2", "--kl-beta", "0.04", "--lora-rank", "4", "--lora-alpha", "8.0",
+        "--steps", "12", "--lr", "0.008", "--max-grad-norm", "1.0",
+    ])
+    g_losses, g_advs = [], []
+    for ln in grpo_out.splitlines():
+        if ln.startswith("step:"):
+            parts = {p.split(":", 1)[0]: p.split(":", 1)[1] for p in ln.split()}
+            g_losses.append(float(parts["grpo_loss"]))
+            g_advs.append(float(parts["avg_adv_logp"]))
+    assert len(g_losses) == 12 and g_losses[-1] < g_losses[0], g_losses
+    assert g_advs[-1] > g_advs[0], g_advs
+    assert "kv_free_after:4/4" in grpo_out and grpo_lora.is_file(), grpo_out
+
+    # 4. train-distill knowledge distillation
+    teacher_tensors = {k: (shape, list(vals)) for k, (shape, vals) in tensors.items()}
+    lm_shape, lm_vals = tensors["lm_head.weight"]
+    teacher_tensors["lm_head.weight"] = (lm_shape, [v * 6.0 for v in lm_vals])
+    teacher_sf = work / "v11_teacher.safetensors"
+    write_safetensors(teacher_sf, cfg, teacher_tensors)
+    distill_lora = work / "v11_distill.safetensors"
+    dist_out = run([
+        exe, "train-distill", str(st_path), "ids:1,7,42,19", str(distill_lora),
+        "--teacher", str(teacher_sf), "--distill-temp", "2.0", "--distill-alpha", "0.7",
+        "--lora-rank", "4", "--lora-alpha", "8.0", "--steps", "12", "--lr", "0.02", "--max-grad-norm", "1.0",
+    ])
+    d_losses, d_kls = [], []
+    for ln in dist_out.splitlines():
+        if ln.startswith("step:"):
+            parts = {p.split(":", 1)[0]: p.split(":", 1)[1] for p in ln.split()}
+            d_losses.append(float(parts["distill_loss"]))
+            d_kls.append(float(parts["kl"]))
+    assert len(d_losses) == 12 and d_losses[-1] < d_losses[0] and d_kls[-1] < d_kls[0], (d_losses, d_kls)
+    assert "kv_free_after:4/4" in dist_out and distill_lora.is_file(), dist_out
+    print("inspect, merge-lora, train-grpo, and train-distill verified")
+
+
+def check_v12_gbnf_ckpt_models(exes, work, cfg, tensors):
+    import http.server
+    import json
+    import subprocess
+    import threading
+    import urllib.request
+
+    exe = exes[1][2] if len(exes) > 1 else exes[0][2]
+
+    # 1. Generic GBNF grammar constrained decoding (CLI + HTTP serve)
+    gguf_gbnf = work / "gbnf_v12.gguf"
+    pieces = [f"tok_{i}" for i in range(cfg["vocab_size"])]
+    pieces[0] = "<|endoftext|>"
+    pieces[2] = "<|im_end|>"
+    write_gguf_q4_0(gguf_gbnf, cfg, tensors, vocab_pieces=pieces)
+
+    gbnf_file = work / "choice.gbnf"
+    gbnf_file.write_text('root ::= ("tok_1" | "tok_5") ("tok_3" | "tok_4")\n')
+
+    cli_file_out = run([exe, "generate", str(gguf_gbnf), "ids:1,5", "4", "0", "40", "--grammar", str(gbnf_file)])
+    gkv1 = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in cli_file_out.splitlines() if ":" in l}
+    gids1 = [int(x) for x in gkv1["generated_ids"].split(",") if x]
+    assert len(gids1) == 2 and gids1[0] in (1, 5) and gids1[1] in (3, 4), (gids1, gkv1)
+    assert gkv1["generated_text"] in ("tok_1tok_3", "tok_1tok_4", "tok_5tok_3", "tok_5tok_4"), gkv1
+
+    cli_inline_out = run([exe, "generate", str(gguf_gbnf), "ids:1,3", "4", "0", "40", "--grammar", 'root ::= ("tok_6" | "tok_7")'])
+    gkv2 = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in cli_inline_out.splitlines() if ":" in l}
+    gids2 = [int(x) for x in gkv2["generated_ids"].split(",") if x]
+    assert len(gids2) == 1 and gids2[0] in (6, 7), (gids2, gkv2)
+    assert gkv2["generated_text"] in ("tok_6", "tok_7"), gkv2
+
+    proc = subprocess.Popen(
+        [str(exe), "serve", str(gguf_gbnf), "127.0.0.1:0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        base_url = None
+        for _ in range(100):
+            ln = proc.stdout.readline()
+            if ln and ln.strip().startswith("serving:http://"):
+                base_url = ln.strip().split("serving:", 1)[1]
+                break
+        assert base_url is not None
+
+        def post_srv(path, payload):
+            req = urllib.request.Request(
+                base_url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read().decode())
+
+        st1, obj1 = post_srv("/v1/completions", {
+            "model": "local",
+            "prompt": "tok_1",
+            "max_tokens": 4,
+            "temperature": 0,
+            "grammar": 'root ::= ("tok_1" | "tok_5") ("tok_3" | "tok_4")',
+        })
+        assert st1 == 200 and obj1["choices"][0]["text"] in ("tok_1tok_3", "tok_1tok_4", "tok_5tok_3", "tok_5tok_4"), obj1
+
+        st2, obj2 = post_srv("/v1/chat/completions", {
+            "model": "local",
+            "messages": [{"role": "user", "content": "tok_1"}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "grammar": 'root ::= ("tok_8" | "tok_9")',
+        })
+        assert st2 == 200 and obj2["choices"][0]["message"]["content"] in ("tok_8", "tok_9"), obj2
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+    # 2. SFT LoRA optimizer + weight checkpoint save & resume
+    st_path = work / "v12_base.safetensors"
+    write_safetensors(st_path, cfg, tensors)
+    lora_full = work / "v12_full.safetensors"
+    full_out = run([
+        exe, "train-lora", str(st_path), "ids:1,7,42,19", str(lora_full),
+        "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "10", "--lr", "0.1",
+    ])
+    full_losses = {}
+    for ln in full_out.splitlines():
+        if ln.startswith("step:"):
+            kv = {p.split(":", 1)[0]: p.split(":", 1)[1] for p in ln.split()}
+            full_losses[int(kv["step"])] = float(kv["loss"])
+    assert len(full_losses) == 10, full_out
+
+    ckpt_path = work / "v12_sft.ckpt.safetensors"
+    lora_p1 = work / "v12_part1.safetensors"
+    p1_out = run([
+        exe, "train-lora", str(st_path), "ids:1,7,42,19", str(lora_p1),
+        "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "5", "--lr", "0.1",
+        "--save-ckpt", str(ckpt_path),
+    ])
+    assert f"saved_ckpt:{ckpt_path}" in p1_out and ckpt_path.is_file(), p1_out
+
+    lora_resumed = work / "v12_resumed.safetensors"
+    p2_out = run([
+        exe, "train-lora", str(st_path), "ids:1,7,42,19", str(lora_resumed),
+        "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "10", "--lr", "0.1",
+        "--resume-ckpt", str(ckpt_path),
+    ])
+    assert "resumed_step:5" in p2_out, p2_out
+    res_losses = {}
+    for ln in p2_out.splitlines():
+        if ln.startswith("step:"):
+            kv = {p.split(":", 1)[0]: p.split(":", 1)[1] for p in ln.split()}
+            res_losses[int(kv["step"])] = float(kv["loss"])
+    assert list(sorted(res_losses.keys())) == [6, 7, 8, 9, 10], res_losses
+    for s in range(6, 11):
+        assert abs(res_losses[s] - full_losses[s]) < 1e-6, (s, res_losses[s], full_losses[s])
+    assert lora_resumed.read_bytes() == lora_full.read_bytes(), "resumed LoRA SafeTensors mismatch"
+
+    # 3. Local model cache manager (models pull / list / rm + path traversal check)
+    demo_payload = b"GGUF_DEMO_PAYLOAD_V12"
+    seen_paths = []
+
+    class HfMockHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            seen_paths.append(self.path)
+            if self.path == "/org/repo/resolve/main/demo.gguf":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(demo_payload)))
+                self.end_headers()
+                self.wfile.write(demo_payload)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HfMockHandler)
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        port = srv.server_address[1]
+        models_dir = work / "models_cache"
+        hf_env = dict(os.environ, XU_HF_BASE_URL=f"http://127.0.0.1:{port}")
+        pull_out = subprocess.run(
+            [str(exe), "models", "pull", "hf://org/repo/demo.gguf", "demo.gguf", "--models-dir", str(models_dir)],
+            env=hf_env, check=True, capture_output=True, text=True,
+        ).stdout
+        assert "pulled:" in pull_out and f"bytes:{len(demo_payload)}" in pull_out, pull_out
+        assert seen_paths == ["/org/repo/resolve/main/demo.gguf"], seen_paths
+        assert (models_dir / "demo.gguf").read_bytes() == demo_payload
+
+        list1 = run([exe, "models", "list", "--models-dir", str(models_dir)])
+        assert "model:demo.gguf" in list1 and f"bytes:{len(demo_payload)}" in list1 and "count:1" in list1, list1
+
+        bad_rm = subprocess.run(
+            [str(exe), "models", "rm", "../escape", "--models-dir", str(models_dir)],
+            check=False, capture_output=True, text=True,
+        )
+        assert bad_rm.returncode != 0, bad_rm
+
+        rm_out = run([exe, "models", "rm", "demo.gguf", "--models-dir", str(models_dir)])
+        assert "removed:demo.gguf" in rm_out and not (models_dir / "demo.gguf").exists(), rm_out
+
+        list2 = run([exe, "models", "list", "--models-dir", str(models_dir)])
+        assert "count:0" in list2, list2
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    print("GBNF constrained decoding (CLI + HTTP), SFT --save-ckpt/--resume-ckpt, and models pull/list/rm verified")
+
+
+def check_v13_mamba_rlvr_quantize(exes, work, cfg, tensors):
+    rng = random.Random(20261126)
+
+    def write_custom_gguf(path, extra_kv, tensor_specs, vocab_pieces):
+        kv_entries = list(extra_kv)
+        kv_entries.append((
+            "tokenizer.ggml.tokens", 9,
+            struct.pack("<IQ", 8, len(vocab_pieces)) + b"".join(pack_gguf_str(p) for p in vocab_pieces),
+        ))
+        kv_data = bytearray()
+        for k, vtype, vbytes in kv_entries:
+            kv_data.extend(pack_gguf_str(k))
+            kv_data.extend(struct.pack("<I", vtype))
+            kv_data.extend(vbytes)
+
+        cur_off = 0
+        t_infos = []
+        payload = bytearray()
+        for gname, dims, gtype, raw in tensor_specs:
+            pad = (32 - (cur_off % 32)) % 32
+            if pad:
+                payload.extend(b"\x00" * pad)
+                cur_off += pad
+            t_infos.append((gname, dims, gtype, cur_off))
+            payload.extend(raw)
+            cur_off += len(raw)
+
+        hdr = bytearray()
+        hdr.extend(b"GGUF")
+        hdr.extend(struct.pack("<IQQ", 3, len(t_infos), len(kv_entries)))
+        hdr.extend(kv_data)
+        for gname, dims, gtype, toff in t_infos:
+            hdr.extend(pack_gguf_str(gname))
+            hdr.extend(struct.pack("<I", len(dims)))
+            for d in dims:
+                hdr.extend(struct.pack("<Q", d))
+            hdr.extend(struct.pack("<IQ", gtype, toff))
+        hpad = (32 - (len(hdr) % 32)) % 32
+        if hpad:
+            hdr.extend(b"\x00" * hpad)
+        path.write_bytes(bytes(hdr) + bytes(payload))
+
+    def silu_f(v):
+        if v >= 0.0:
+            return v / (1.0 + math.exp(-v))
+        ev = math.exp(v)
+        return v * ev / (1.0 + ev)
+
+    def softplus_f(u):
+        if u > 20.0:
+            return u
+        if u < -20.0:
+            return math.exp(u)
+        return math.log(1.0 + math.exp(u))
+
+    def matvec_f32_py(mat, x_vec, rows, cols):
+        out = []
+        for r in range(rows):
+            row_b = r * cols
+            acc = 0.0
+            for c in range(cols):
+                acc += float(mat[row_b + c]) * float(x_vec[c])
+            out.append(f32(acc))
+        return out
+
+    def py_mamba_and_hybrid_eval(model_cfg, layer_defs, emb_w, final_norm_w, lm_w, prompt, max_gen):
+        dim = model_cfg["dim"]
+        n_layers = model_cfg["n_layers"]
+        vocab = model_cfg["vocab_size"]
+        d_inner = model_cfg["d_inner"]
+        d_conv = model_cfg["d_conv"]
+        d_state = model_cfg["d_state"]
+        dt_rank = model_cfg["dt_rank"]
+        n_heads = model_cfg.get("n_heads", 1)
+        n_kv_heads = model_cfg.get("n_kv_heads", 1)
+        head_dim = model_cfg.get("head_dim", dim)
+        hidden = model_cfg.get("hidden_dim", d_inner)
+
+        conv_states = [[f32(0.0)] * (d_inner * (d_conv - 1)) for _ in range(n_layers)]
+        ssm_states = [[f32(0.0)] * (d_inner * d_state) for _ in range(n_layers)]
+        k_cache = [[] for _ in range(n_layers)]
+        v_cache = [[] for _ in range(n_layers)]
+
+        def step(tok, pos):
+            x = [emb_w[tok * dim + i] for i in range(dim)]
+            zeros_dim = [f32(0.0)] * dim
+            xb2 = [f32(0.0)] * dim
+            for l in range(n_layers):
+                ld = layer_defs[l]
+                xb = py_rmsnorm(x, zeros_dim, ld["attn_norm"])
+                if ld["kind"] == "mamba":
+                    xz = matvec_f32_py(ld["ssm_in"], xb, 2 * d_inner, dim)
+                    x_proj = xz[:d_inner]
+                    z = xz[d_inner:]
+                    cs = conv_states[l]
+                    cw = ld["ssm_conv1d_w"]
+                    cb = ld["ssm_conv1d_b"]
+                    x_conv = [f32(0.0)] * d_inner
+                    for d in range(d_inner):
+                        acc = float(cb[d])
+                        wbase = d * d_conv
+                        sbase = d * (d_conv - 1)
+                        for j in range(d_conv - 1):
+                            acc += float(cs[sbase + j]) * float(cw[wbase + j])
+                        acc += float(x_proj[d]) * float(cw[wbase + d_conv - 1])
+                        for j in range(d_conv - 2):
+                            cs[sbase + j] = cs[sbase + j + 1]
+                        cs[sbase + d_conv - 2] = x_proj[d]
+                        x_conv[d] = f32(silu_f(acc))
+                    xdbl = matvec_f32_py(ld["ssm_x"], x_conv, dt_rank + 2 * d_state, d_inner)
+                    dt_raw = xdbl[:dt_rank]
+                    b_vec = xdbl[dt_rank:dt_rank + d_state]
+                    c_vec = xdbl[dt_rank + d_state:]
+                    dt_p = matvec_f32_py(ld["ssm_dt"], dt_raw, d_inner, dt_rank)
+                    dtb = ld["ssm_dt_b"]
+                    dt_vec = [f32(softplus_f(float(dt_p[d]) + float(dtb[d]))) for d in range(d_inner)]
+                    ss = ssm_states[l]
+                    sa = ld["ssm_a"]
+                    sd = ld["ssm_d"]
+                    y_ssm = [f32(0.0)] * d_inner
+                    for d in range(d_inner):
+                        xv = float(x_conv[d])
+                        dtv = float(dt_vec[d])
+                        sbase = d * d_state
+                        y = 0.0
+                        for s in range(d_state):
+                            da = math.exp(dtv * float(sa[sbase + s]))
+                            h_new = f32(da * float(ss[sbase + s]) + dtv * float(b_vec[s]) * xv)
+                            ss[sbase + s] = h_new
+                            y += float(h_new) * float(c_vec[s])
+                        y += float(sd[d]) * xv
+                        y_ssm[d] = f32(y * silu_f(float(z[d])))
+                    xb2 = matvec_f32_py(ld["ssm_out"], y_ssm, dim, d_inner)
+                else:
+                    kv_dim = n_kv_heads * head_dim
+                    kv_mul = n_heads // n_kv_heads
+                    q = py_rope(matvec_f32_py(ld["wq"], xb, dim, dim), n_heads, head_dim, pos, 10000.0)
+                    k = py_rope(matvec_f32_py(ld["wk"], xb, kv_dim, dim), n_kv_heads, head_dim, pos, 10000.0)
+                    v = matvec_f32_py(ld["wv"], xb, kv_dim, dim)
+                    k_cache[l].append(k)
+                    v_cache[l].append(v)
+                    attn_out = [f32(0.0)] * dim
+                    scale = 1.0 / math.sqrt(head_dim)
+                    for h in range(n_heads):
+                        qh = q[h * head_dim:(h + 1) * head_dim]
+                        kvh = (h // kv_mul) * head_dim
+                        scores = []
+                        for kp in range(pos + 1):
+                            kh = k_cache[l][kp][kvh:kvh + head_dim]
+                            scores.append(sum(qh[d] * kh[d] for d in range(head_dim)) * scale)
+                        mx = max(scores)
+                        exps = [math.exp(s - mx) for s in scores]
+                        denom = sum(exps)
+                        probs = [e / denom for e in exps]
+                        for d in range(head_dim):
+                            attn_out[h * head_dim + d] = f32(
+                                sum(probs[kp] * v_cache[l][kp][kvh + d] for kp in range(pos + 1))
+                            )
+                    xb2 = matvec_f32_py(ld["wo"], attn_out, dim, dim)
+                    x = [f32(x[i] + xb2[i]) for i in range(dim)]
+                    xb_f = py_rmsnorm(x, zeros_dim, ld["ffn_norm"])
+                    hb1 = matvec_f32_py(ld["w1"], xb_f, hidden, dim)
+                    hb3 = matvec_f32_py(ld["w3"], xb_f, hidden, dim)
+                    act = [f32(silu_f(hb1[i]) * hb3[i]) for i in range(hidden)]
+                    xb2 = matvec_f32_py(ld["w2"], act, dim, hidden)
+                if l + 1 < n_layers:
+                    x = [f32(x[i] + xb2[i]) for i in range(dim)]
+
+            xn = py_rmsnorm(x, xb2, final_norm_w)
+            logits = matvec_f32_py(lm_w, xn, vocab, dim)
+            best = max(range(vocab), key=lambda i: logits[i])
+            return best, logits[best]
+
+        pos = 0
+        tok = 0
+        for p in prompt:
+            tok, best_logit = step(p, pos)
+            pos += 1
+        out_toks = [tok]
+        out_logits = [best_logit]
+        for _ in range(1, max_gen):
+            tok, best_logit = step(tok, pos)
+            pos += 1
+            out_toks.append(tok)
+            out_logits.append(best_logit)
+        return out_toks, out_logits
+
+    def build_mamba_or_hybrid_fixture(path, hybrid):
+        m_dim, d_inner, d_conv, d_state, dt_rank, m_vocab = 16, 32, 4, 8, 4, 64
+        m_layers = 2
+        n_heads, n_kv_heads = (2, 1) if hybrid else (1, 1)
+        head_dim = m_dim // n_heads
+        hidden = 32
+        emb_w = gen_weights(rng, m_vocab * m_dim, 0.25)
+        final_w = [f32(0.9 + 0.2 * rng.random()) for _ in range(m_dim)]
+        lm_w = gen_weights(rng, m_vocab * m_dim, 0.2)
+        pieces = [f"t{i}" for i in range(m_vocab)]
+        pieces[0], pieces[1], pieces[2] = "<unk>", "<s>", "</s>"
+
+        tspecs = [("token_embd.weight", [m_dim, m_vocab], 0, struct.pack(f"<{len(emb_w)}f", *emb_w))]
+        layer_defs = []
+        for l in range(m_layers):
+            gp = f"blk.{l}."
+            an = [f32(0.9 + 0.2 * rng.random()) for _ in range(m_dim)]
+            tspecs.append((gp + "attn_norm.weight", [m_dim], 0, struct.pack(f"<{len(an)}f", *an)))
+            if not hybrid or l == 0:
+                s_in = gen_weights(rng, 2 * d_inner * m_dim, 0.25)
+                cw = gen_weights(rng, d_inner * d_conv, 0.2)
+                cb = gen_weights(rng, d_inner, 0.05)
+                sx = gen_weights(rng, (dt_rank + 2 * d_state) * d_inner, 0.25)
+                sdt = gen_weights(rng, d_inner * dt_rank, 0.25)
+                sdt_b = gen_weights(rng, d_inner, 0.1)
+                sa = [f32(-math.exp(rng.uniform(-1.5, 0.2))) for _ in range(d_inner * d_state)]
+                sd = gen_weights(rng, d_inner, 0.2)
+                sout = gen_weights(rng, m_dim * d_inner, 0.25)
+                tspecs.extend([
+                    (gp + "ssm_in.weight", [m_dim, 2 * d_inner], 0, struct.pack(f"<{len(s_in)}f", *s_in)),
+                    (gp + "ssm_conv1d.weight", [d_conv, d_inner], 0, struct.pack(f"<{len(cw)}f", *cw)),
+                    (gp + "ssm_conv1d.bias", [d_inner], 0, struct.pack(f"<{len(cb)}f", *cb)),
+                    (gp + "ssm_x.weight", [d_inner, dt_rank + 2 * d_state], 0, struct.pack(f"<{len(sx)}f", *sx)),
+                    (gp + "ssm_dt.weight", [dt_rank, d_inner], 0, struct.pack(f"<{len(sdt)}f", *sdt)),
+                    (gp + "ssm_dt.bias", [d_inner], 0, struct.pack(f"<{len(sdt_b)}f", *sdt_b)),
+                    (gp + "ssm_a", [d_state, d_inner], 0, struct.pack(f"<{len(sa)}f", *sa)),
+                    (gp + "ssm_d", [d_inner], 0, struct.pack(f"<{len(sd)}f", *sd)),
+                    (gp + "ssm_out.weight", [d_inner, m_dim], 0, struct.pack(f"<{len(sout)}f", *sout)),
+                ])
+                layer_defs.append({
+                    "kind": "mamba", "attn_norm": an, "ssm_in": s_in, "ssm_conv1d_w": cw, "ssm_conv1d_b": cb,
+                    "ssm_x": sx, "ssm_dt": sdt, "ssm_dt_b": sdt_b, "ssm_a": sa, "ssm_d": sd, "ssm_out": sout,
+                })
+            else:
+                kv_dim = n_kv_heads * head_dim
+                wq = gen_weights(rng, m_dim * m_dim, 0.25)
+                wk = gen_weights(rng, kv_dim * m_dim, 0.25)
+                wv = gen_weights(rng, kv_dim * m_dim, 0.25)
+                wo = gen_weights(rng, m_dim * m_dim, 0.25)
+                fn_w = [f32(0.9 + 0.2 * rng.random()) for _ in range(m_dim)]
+                w1 = gen_weights(rng, hidden * m_dim, 0.25)
+                w3 = gen_weights(rng, hidden * m_dim, 0.25)
+                w2 = gen_weights(rng, m_dim * hidden, 0.25)
+                tspecs.extend([
+                    (gp + "ffn_norm.weight", [m_dim], 0, struct.pack(f"<{len(fn_w)}f", *fn_w)),
+                    (gp + "attn_q.weight", [m_dim, m_dim], 0, struct.pack(f"<{len(wq)}f", *wq)),
+                    (gp + "attn_k.weight", [m_dim, kv_dim], 0, struct.pack(f"<{len(wk)}f", *wk)),
+                    (gp + "attn_v.weight", [m_dim, kv_dim], 0, struct.pack(f"<{len(wv)}f", *wv)),
+                    (gp + "attn_output.weight", [m_dim, m_dim], 0, struct.pack(f"<{len(wo)}f", *wo)),
+                    (gp + "ffn_gate.weight", [m_dim, hidden], 0, struct.pack(f"<{len(w1)}f", *w1)),
+                    (gp + "ffn_up.weight", [m_dim, hidden], 0, struct.pack(f"<{len(w3)}f", *w3)),
+                    (gp + "ffn_down.weight", [hidden, m_dim], 0, struct.pack(f"<{len(w2)}f", *w2)),
+                ])
+                layer_defs.append({
+                    "kind": "attn", "attn_norm": an, "ffn_norm": fn_w,
+                    "wq": wq, "wk": wk, "wv": wv, "wo": wo, "w1": w1, "w3": w3, "w2": w2,
+                })
+        tspecs.append(("output_norm.weight", [m_dim], 0, struct.pack(f"<{len(final_w)}f", *final_w)))
+        tspecs.append(("output.weight", [m_dim, m_vocab], 0, struct.pack(f"<{len(lm_w)}f", *lm_w)))
+
+        arch = "jamba" if hybrid else "mamba"
+        extra_kv = [
+            ("general.architecture", 8, pack_gguf_str(arch)),
+            (f"{arch}.embedding_length", 4, struct.pack("<I", m_dim)),
+            (f"{arch}.block_count", 4, struct.pack("<I", m_layers)),
+            (f"{arch}.context_length", 4, struct.pack("<I", 64)),
+            (f"{arch}.attention.layer_norm_rms_epsilon", 6, struct.pack("<f", 1e-5)),
+            (f"{arch}.ssm.conv_kernel", 4, struct.pack("<I", d_conv)),
+            (f"{arch}.ssm.inner_size", 4, struct.pack("<I", d_inner)),
+            (f"{arch}.ssm.state_size", 4, struct.pack("<I", d_state)),
+            (f"{arch}.ssm.time_step_rank", 4, struct.pack("<I", dt_rank)),
+        ]
+        if hybrid:
+            extra_kv.extend([
+                (f"{arch}.feed_forward_length", 4, struct.pack("<I", hidden)),
+                (f"{arch}.attention.head_count", 4, struct.pack("<I", n_heads)),
+                (f"{arch}.attention.head_count_kv", 4, struct.pack("<I", n_kv_heads)),
+                (f"{arch}.rope.freq_base", 6, struct.pack("<f", 10000.0)),
+            ])
+        write_custom_gguf(path, extra_kv, tspecs, pieces)
+        m_cfg = {
+            "dim": m_dim, "n_layers": m_layers, "vocab_size": m_vocab,
+            "d_inner": d_inner, "d_conv": d_conv, "d_state": d_state, "dt_rank": dt_rank,
+            "n_heads": n_heads, "n_kv_heads": n_kv_heads, "head_dim": head_dim, "hidden_dim": hidden,
+        }
+        return [py_mamba_and_hybrid_eval(m_cfg, layer_defs, emb_w, final_w, lm_w, p, g) for p, g in REQUESTS]
+
+    # 1. Pure Mamba GGUF + Hybrid Attention+Mamba GGUF parity across all modes (seq & cb)
+    mamba_gguf = work / "v13_mamba.gguf"
+    hybrid_gguf = work / "v13_hybrid_mamba.gguf"
+    py_mamba_ref = build_mamba_or_hybrid_fixture(mamba_gguf, False)
+    py_hybrid_ref = build_mamba_or_hybrid_fixture(hybrid_gguf, True)
+
+    exe = exes[1][2] if len(exes) > 1 else exes[0][2]
+    insp_mamba = run([exe, "inspect", str(mamba_gguf)])
+    assert "is_mamba:true" in insp_mamba and "ssm_inner_size:32" in insp_mamba and "ssm_state_size:8" in insp_mamba, insp_mamba
+
+    for label, gpath, ref in (("pure-mamba", mamba_gguf, py_mamba_ref), ("hybrid-mamba-attn", hybrid_gguf, py_hybrid_ref)):
+        for name, _fast, mode_exe, _kb in exes:
+            vout = run([mode_exe, "verify", str(gpath)])
+            assert "is_mamba:true" in vout and "kv_free_after:16/16" in vout, f"{label}/{name}: {vout}"
+            seq_rows, cb_rows, _meta = parse_verify(vout)
+            assert len(seq_rows) == len(REQUESTS) and cb_rows == seq_rows, f"{label}/{name} seq!=cb"
+            for r, (py_toks, py_logits) in enumerate(ref):
+                xu_pairs = seq_rows[r]
+                xu_toks = [t for t, _b in xu_pairs]
+                xu_bits = [b for _t, b in xu_pairs]
+                assert xu_toks == py_toks, f"{label}/{name} req {r} tok mismatch: {xu_toks} vs {py_toks}"
+                for b, p in zip(xu_bits, py_logits):
+                    assert abs(bits_to_f32(b) - p) < 1e-4, f"{label}/{name} logit mismatch: {bits_to_f32(b)} vs {p}"
+
+    # 2. Online RLVR (train-rlvr) verifiable-reward GRPO
+    st_path = work / "v13_base.safetensors"
+    write_safetensors(st_path, cfg, tensors)
+    rlvr_jsonl = work / "v13_rlvr_tasks.jsonl"
+    # Pick target token 5 so verifiable reward triggers cleanly when sampled
+    rlvr_jsonl.write_text(
+        '{"prompt_ids": [1, 7], "expected_ids": [5]}\n'
+        '{"prompt_ids": [3, 19], "expected_ids": [5]}\n'
+    )
+    rlvr_lora = work / "v13_rlvr.safetensors"
+    rlvr_out = run([
+        exe, "train-rlvr", str(st_path), str(rlvr_jsonl), str(rlvr_lora),
+        "--verifier", "contains", "--group-size", "4", "--gen-tokens", "4",
+        "--temp", "1200", "--clip-eps", "0.2", "--kl-beta", "0.02",
+        "--lora-rank", "4", "--lora-alpha", "16.0", "--steps", "8", "--lr", "0.05", "--max-grad-norm", "1.0",
+    ])
+    rlvr_steps = [ln for ln in rlvr_out.splitlines() if ln.startswith("step:")]
+    assert len(rlvr_steps) == 8 and rlvr_lora.is_file() and "kv_free_after:4/4" in rlvr_out, rlvr_out
+    assert all("avg_reward:" in s and "rlvr_loss:" in s for s in rlvr_steps), rlvr_steps
+    rlvr_gen = run([exe, "generate", str(st_path), "ids:1,7", "3", "0", "40", "--lora", str(rlvr_lora)])
+    assert "generated_ids:" in rlvr_gen, rlvr_gen
+
+    # 3. Offline GGUF quantizer (quantize --type q4_0 & q8_0 + merge-lora -> quantize roundtrip)
+    q4_gguf = work / "v13_quant_q4_0.gguf"
+    q8_gguf = work / "v13_quant_q8_0.gguf"
+    q4_out = run([exe, "quantize", str(st_path), str(q4_gguf), "--type", "q4_0"])
+    assert "quant_type:q4_0" in q4_out and "quantized_tensors:" in q4_out and q4_gguf.is_file(), q4_out
+    v_q4 = run([exe, "verify", str(q4_gguf)])
+    assert "format:q4_0" in v_q4 and "kv_free_after:16/16" in v_q4, v_q4
+    s4, c4, _ = parse_verify(v_q4)
+    assert s4 == c4
+
+    q8_out = run([exe, "quantize", str(st_path), str(q8_gguf), "--type", "q8_0"])
+    assert "quant_type:q8_0" in q8_out and q8_gguf.is_file(), q8_out
+    v_q8 = run([exe, "verify", str(q8_gguf)])
+    assert "format:q8_0" in v_q8 and "kv_free_after:16/16" in v_q8, v_q8
+    s8, c8, _ = parse_verify(v_q8)
+    assert s8 == c8
+    g_q8 = run([exe, "generate", str(q8_gguf), "ids:1,7,42", "4", "0", "40"])
+    assert "generated_ids:" in g_q8 and "kv_free_after:4/4" in g_q8, g_q8
+
+    merged_sf = work / "v13_merged.safetensors"
+    run([exe, "merge-lora", str(st_path), str(rlvr_lora), str(merged_sf)])
+    merged_q4 = work / "v13_merged_q4_0.gguf"
+    mq4_out = run([exe, "quantize", str(merged_sf), str(merged_q4), "--type", "q4_0"])
+    assert "quant_type:q4_0" in mq4_out and merged_q4.is_file(), mq4_out
+    assert "format:q4_0" in run([exe, "verify", str(merged_q4)])
+
+    print("Mamba SSM + Hybrid Attention+SSM GGUF, train-rlvr, and offline GGUF quantizer (q4_0/q8_0) verified")
 
 
 def main():
@@ -2910,7 +3668,11 @@ def main():
         check_serve_v17_protocols(exes[1][2], work, CFG, tensors)
         check_lora_and_speculative(exes, work, CFG, tensors)
         check_q5_k_and_responses_api(exes, work, CFG, tensors)
-        print("LLM engine verification passed (Safetensors F32/HF-sharded, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M/Q5_K/MLA, --q8k-act, --lora, train-lora, --draft, qk_norm, arch extensions, MoE + YaRN, ChatML/Llama-3, SPM, continuous batch HTTP serve + <think>/tool_calls/Responses/Anthropic /v1/messages)")
+        check_v10_perplexity_sft_dpo_ollama_metrics(exes, work, CFG, tensors)
+        check_v11_inspect_merge_grpo_distill(exes, work, CFG, tensors)
+        check_v12_gbnf_ckpt_models(exes, work, CFG, tensors)
+        check_v13_mamba_rlvr_quantize(exes, work, CFG, tensors)
+        print("LLM engine verification passed (Safetensors F32/HF-sharded, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M/Q5_K/MLA/Mamba-SSM/Hybrid, --q8k-act, --lora, merge-lora, quantize, train-lora SFT/DPO/GRPO/RLVR/distill, --save-ckpt/--resume-ckpt, --grammar GBNF, models pull/list/rm, perplexity, inspect, --draft, qk_norm, arch extensions, MoE + YaRN, ChatML/Llama-3, SPM, continuous batch HTTP serve + Ollama + Prometheus /metrics)")
 
 
 if __name__ == "__main__":
