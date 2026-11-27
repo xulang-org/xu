@@ -511,6 +511,8 @@ def main():
             if error:
                 assert not out.exists(), f'{name}: failed build produced executable'
             elif output is not None:
+                if sys.platform == 'darwin' and not runner and out.exists():
+                    subprocess.run(['codesign', '--force', '--sign', '-', str(out)], check=True, capture_output=True)
                 assert run([*runner, out], env=env).stdout == output, name
             print('PASS', name, flush=True)
             return out

@@ -3552,6 +3552,1010 @@ def check_v13_mamba_rlvr_quantize(exes, work, cfg, tensors):
     print("Mamba SSM + Hybrid Attention+SSM GGUF, train-rlvr, and offline GGUF quantizer (q4_0/q8_0) verified")
 
 
+def check_v14_vlm_and_q4k_quantize(exes, work: Path, cfg: dict, tensors: dict):
+    import base64
+    import json as pyjson
+    import subprocess
+    import urllib.request
+
+    def vlm_post_json(url, payload):
+        req = urllib.request.Request(
+            url,
+            data=pyjson.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, pyjson.loads(resp.read().decode("utf-8"))
+
+    exe = exes[1][2] if len(exes) > 1 else exes[0][2]
+
+    # 1. Native Multimodal VLM (--mmproj ViT+MLP, --image PPM/BMP/rgb:, and HTTP /v1/chat/completions image_url)
+    st_path = work / "v14_llm.safetensors"
+    write_safetensors(st_path, cfg, tensors)
+    gguf_path = work / "v14_llm.gguf"
+    pieces = [f"tok_{i}" for i in range(cfg["vocab_size"])]
+    write_gguf_q4_0(gguf_path, cfg, tensors, vocab_pieces=pieces)
+
+    img_sz = 8
+    patch_sz = 4
+    in_c = 3
+    hid = 16
+    nl = 1
+    nh = 2
+    head_dim = hid // nh
+    ffn_d = 32
+    proj_d = cfg["dim"]
+    grid = img_sz // patch_sz
+    n_patches = grid * grid
+    rng = random.Random(20261127)
+
+    v_tensors = {
+        "v.patch_embd.weight": [f32(rng.uniform(-0.3, 0.3)) for _ in range(hid * in_c * patch_sz * patch_sz)],
+        "v.patch_embd.bias": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.position_embd.weight": [f32(rng.uniform(-0.1, 0.1)) for _ in range(n_patches * hid)],
+        "v.blk.0.ln1_w": [f32(rng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.blk.0.ln1_b": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wq": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bq": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wk": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bk": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wv": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bv": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wo": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bo": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.ln2_w": [f32(rng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.blk.0.ln2_b": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.w1": [f32(rng.uniform(-0.2, 0.2)) for _ in range(ffn_d * hid)],
+        "v.blk.0.b1": [f32(rng.uniform(-0.05, 0.05)) for _ in range(ffn_d)],
+        "v.blk.0.w2": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * ffn_d)],
+        "v.blk.0.b2": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.post_ln_w": [f32(rng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.post_ln_b": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "mm.0.weight": [f32(rng.uniform(-0.2, 0.2)) for _ in range(proj_d * hid)],
+        "mm.0.bias": [f32(rng.uniform(-0.05, 0.05)) for _ in range(proj_d)],
+        "mm.2.weight": [f32(rng.uniform(-0.2, 0.2)) for _ in range(proj_d * proj_d)],
+        "mm.2.bias": [f32(rng.uniform(-0.05, 0.05)) for _ in range(proj_d)],
+    }
+
+    mmproj_path = work / "v14_mmproj.safetensors"
+    v_meta = {
+        "vision.image_size": str(img_sz),
+        "vision.patch_size": str(patch_sz),
+        "vision.in_channels": str(in_c),
+        "vision.hidden_size": str(hid),
+        "vision.num_layers": str(nl),
+        "vision.num_heads": str(nh),
+        "vision.ffn_dim": str(ffn_d),
+        "vision.proj_dim": str(proj_d),
+        "vision.ln_eps": "1e-5",
+    }
+    v_header = {"__metadata__": v_meta}
+    v_off = 0
+    v_chunks = []
+    for k, arr in v_tensors.items():
+        raw = b"".join(struct.pack("<f", v) for v in arr)
+        v_header[k] = {"dtype": "F32", "shape": [len(arr)], "data_offsets": [v_off, v_off + len(raw)]}
+        v_chunks.append(raw)
+        v_off += len(raw)
+    vh_bytes = pyjson.dumps(v_header).encode("utf-8")
+    mmproj_path.write_bytes(struct.pack("<Q", len(vh_bytes)) + vh_bytes + b"".join(v_chunks))
+
+    def py_layernorm(vec, w, b, eps=1e-5):
+        n = len(vec)
+        mean = sum(float(x) for x in vec) / n
+        var = sum((float(x) - mean) ** 2 for x in vec) / n
+        inv = 1.0 / math.sqrt(var + eps)
+        return [f32(((float(vec[i]) - mean) * inv) * float(w[i]) + float(b[i])) for i in range(n)]
+
+    def py_linear_rows(rows_vecs, w, b, out_d, in_d):
+        out = []
+        for rv in rows_vecs:
+            row = []
+            for oi in range(out_d):
+                acc = float(b[oi])
+                wb = oi * in_d
+                for ii in range(in_d):
+                    acc += float(rv[ii]) * float(w[wb + ii])
+                row.append(f32(acc))
+            out.append(row)
+        return out
+
+    def py_gelu(v):
+        k = 0.7978845608028654
+        fv = float(v)
+        return f32(0.5 * fv * (1.0 + math.tanh(k * (fv + 0.044715 * fv * fv * fv))))
+
+    def py_encode_vision(img_chw):
+        pw = v_tensors["v.patch_embd.weight"]
+        pb = v_tensors["v.patch_embd.bias"]
+        pos_emb = v_tensors["v.position_embd.weight"]
+        hw = img_sz * img_sz
+        p2 = patch_sz * patch_sz
+        h = []
+        for py_y in range(grid):
+            for py_x in range(grid):
+                tok = py_y * grid + py_x
+                row = []
+                for oc in range(hid):
+                    acc = float(pb[oc])
+                    for ic in range(in_c):
+                        for dy in range(patch_sz):
+                            for dx in range(patch_sz):
+                                pix = img_chw[ic * hw + (py_y * patch_sz + dy) * img_sz + (py_x * patch_sz + dx)]
+                                wv = pw[((oc * in_c + ic) * patch_sz + dy) * patch_sz + dx]
+                                acc += float(pix) * float(wv)
+                    row.append(f32(f32(acc) + pos_emb[tok * hid + oc]))
+                h.append(row)
+        n1 = [py_layernorm(r, v_tensors["v.blk.0.ln1_w"], v_tensors["v.blk.0.ln1_b"]) for r in h]
+        qv = py_linear_rows(n1, v_tensors["v.blk.0.wq"], v_tensors["v.blk.0.bq"], hid, hid)
+        kv = py_linear_rows(n1, v_tensors["v.blk.0.wk"], v_tensors["v.blk.0.bk"], hid, hid)
+        vv = py_linear_rows(n1, v_tensors["v.blk.0.wv"], v_tensors["v.blk.0.bv"], hid, hid)
+        attn = [[f32(0.0)] * hid for _ in range(n_patches)]
+        sc = 1.0 / math.sqrt(head_dim)
+        for qi in range(n_patches):
+            for hd in range(nh):
+                ho = hd * head_dim
+                scs = [sum(float(qv[qi][ho + d]) * float(kv[ki][ho + d]) for d in range(head_dim)) * sc for ki in range(n_patches)]
+                mx = max(scs)
+                ex = [math.exp(s - mx) for s in scs]
+                dn = sum(ex)
+                for ki in range(n_patches):
+                    wgt = ex[ki] / dn
+                    for d in range(head_dim):
+                        attn[qi][ho + d] = f32(float(attn[qi][ho + d]) + wgt * float(vv[ki][ho + d]))
+        proj = py_linear_rows(attn, v_tensors["v.blk.0.wo"], v_tensors["v.blk.0.bo"], hid, hid)
+        h = [[f32(h[i][j] + proj[i][j]) for j in range(hid)] for i in range(n_patches)]
+        n2 = [py_layernorm(r, v_tensors["v.blk.0.ln2_w"], v_tensors["v.blk.0.ln2_b"]) for r in h]
+        fc1 = py_linear_rows(n2, v_tensors["v.blk.0.w1"], v_tensors["v.blk.0.b1"], ffn_d, hid)
+        fc1a = [[py_gelu(x) for x in r] for r in fc1]
+        fc2 = py_linear_rows(fc1a, v_tensors["v.blk.0.w2"], v_tensors["v.blk.0.b2"], hid, ffn_d)
+        h = [[f32(h[i][j] + fc2[i][j]) for j in range(hid)] for i in range(n_patches)]
+        post = [py_layernorm(r, v_tensors["v.post_ln_w"], v_tensors["v.post_ln_b"]) for r in h]
+        mm1 = py_linear_rows(post, v_tensors["mm.0.weight"], v_tensors["mm.0.bias"], proj_d, hid)
+        mm1a = [[py_gelu(x) for x in r] for r in mm1]
+        return py_linear_rows(mm1a, v_tensors["mm.2.weight"], v_tensors["mm.2.bias"], proj_d, proj_d)
+
+    def py_eval_vlm(img_chw, prompt_toks, max_gen):
+        dim = cfg["dim"]
+        vis_vecs = py_encode_vision(img_chw)
+        emb_w = tensors["embed_tokens.weight"][1]
+        all_vecs = vis_vecs + [emb_w[tok * dim:(tok + 1) * dim] for tok in prompt_toks]
+        n_layers = cfg["n_layers"]
+        n_heads = cfg["n_heads"]
+        n_kv_heads = cfg["n_kv_heads"]
+        hdim = dim // n_heads
+        kv_dim = n_kv_heads * hdim
+        kv_mul = n_heads // n_kv_heads
+        hidden_dim = cfg["hidden_dim"]
+        vocab = cfg["vocab_size"]
+        k_cache = [[] for _ in range(n_layers)]
+        v_cache = [[] for _ in range(n_layers)]
+
+        def mv(mat, vec, rows, cols):
+            return [f32(sum(float(mat[r * cols + c]) * float(vec[c]) for c in range(cols))) for r in range(rows)]
+
+        def fwd(vec, pos):
+            x = list(vec)
+            zeros = [f32(0.0)] * dim
+            inv_sqrt_d = 1.0 / math.sqrt(hdim)
+            for l in range(n_layers):
+                p = f"layers.{l}."
+                xb = py_rmsnorm(x, zeros, tensors[p + "input_layernorm.weight"][1])
+                q = py_rope(mv(tensors[p + "self_attn.q_proj.weight"][1], xb, dim, dim), n_heads, hdim, pos, cfg["rope_theta"])
+                k = py_rope(mv(tensors[p + "self_attn.k_proj.weight"][1], xb, kv_dim, dim), n_kv_heads, hdim, pos, cfg["rope_theta"])
+                v = mv(tensors[p + "self_attn.v_proj.weight"][1], xb, kv_dim, dim)
+                k_cache[l].append(k)
+                v_cache[l].append(v)
+                att = [f32(0.0)] * dim
+                for h in range(n_heads):
+                    qh = q[h * hdim:(h + 1) * hdim]
+                    kvh = (h // kv_mul) * hdim
+                    scs = [sum(float(qh[d]) * float(k_cache[l][kp][kvh + d]) for d in range(hdim)) * inv_sqrt_d for kp in range(pos + 1)]
+                    mx = max(scs)
+                    ex = [math.exp(s - mx) for s in scs]
+                    dn = sum(ex)
+                    for kp in range(pos + 1):
+                        wgt = ex[kp] / dn
+                        for d in range(hdim):
+                            att[h * hdim + d] = f32(float(att[h * hdim + d]) + wgt * float(v_cache[l][kp][kvh + d]))
+                xb2 = mv(tensors[p + "self_attn.o_proj.weight"][1], att, dim, dim)
+                x = [f32(x[i] + xb2[i]) for i in range(dim)]
+                xb = py_rmsnorm(x, zeros, tensors[p + "post_attention_layernorm.weight"][1])
+                g = mv(tensors[p + "mlp.gate_proj.weight"][1], xb, hidden_dim, dim)
+                u = mv(tensors[p + "mlp.up_proj.weight"][1], xb, hidden_dim, dim)
+                act = [f32((float(g[i]) / (1.0 + math.exp(-float(g[i])))) * float(u[i])) for i in range(hidden_dim)]
+                down = mv(tensors[p + "mlp.down_proj.weight"][1], act, dim, hidden_dim)
+                x = [f32(x[i] + down[i]) for i in range(dim)]
+            out_n = py_rmsnorm(x, zeros, tensors["norm.weight"][1])
+            logits = mv(tensors["lm_head.weight"][1], out_n, vocab, dim)
+            best = max(range(vocab), key=lambda i: float(logits[i]))
+            return best, float(logits[best])
+
+        pos = 0
+        nxt, lg = 0, 0.0
+        for vec in all_vecs:
+            nxt, lg = fwd(vec, pos)
+            pos += 1
+        out_toks, out_lgs = [nxt], [lg]
+        for _ in range(1, max_gen):
+            emb = emb_w[nxt * dim:(nxt + 1) * dim]
+            nxt, lg = fwd(emb, pos)
+            pos += 1
+            out_toks.append(nxt)
+            out_lgs.append(lg)
+        return out_toks, out_lgs
+
+    img_rng = random.Random(7714)
+    img_vals = [f32(img_rng.uniform(0.0, 1.0)) for _ in range(in_c * img_sz * img_sz)]
+    rgb_spec = "rgb:" + str(img_sz) + "," + str(img_sz) + "," + ",".join(f"{float(v):.6f}" for v in img_vals)
+    py_mm_toks, py_mm_lgs = py_eval_vlm(img_vals, REQUESTS[0][0], REQUESTS[0][1])
+
+    insp_vlm = run([exe, "inspect", str(st_path), "--mmproj", str(mmproj_path)])
+    assert "vision_encoder:true" in insp_vlm and "vision_tokens:4" in insp_vlm, insp_vlm
+
+    for name, _fast, mode_exe, _kb in exes:
+        v_mm = run([mode_exe, "verify", str(st_path), "--mmproj", str(mmproj_path), "--image", rgb_spec])
+        assert "vision_tokens:4" in v_mm and "mm_kv_free_after:16/16" in v_mm, f"{name}: {v_mm}"
+        mm_line = [ln for ln in v_mm.splitlines() if ln.startswith("mm_seq:")][0]
+        _, _, pairs_s = mm_line.split(":", 2)
+        pairs = [(int(tok), int(b)) for tok, b in (p.split("@") for p in pairs_s.split(","))]
+        xu_toks = [t for t, _ in pairs]
+        xu_bits = [b for _, b in pairs]
+        assert xu_toks == py_mm_toks, f"{name} mm toks {xu_toks} != {py_mm_toks}"
+        for b, p in zip(xu_bits, py_mm_lgs):
+            assert abs(bits_to_f32(b) - p) < 1e-4, f"{name} mm logit diff {bits_to_f32(b)} vs {p}"
+
+    ppm_a = work / "img_a.ppm"
+    ppm_b = work / "img_b.ppm"
+    raw_a = b"P6\n8 8\n255\n" + bytes([250, 10, 10] * (8 * 8))
+    raw_b = b"P6\n8 8\n255\n" + bytes([10, 20, 250] * (8 * 8))
+    ppm_a.write_bytes(raw_a)
+    ppm_b.write_bytes(raw_b)
+    ga = run([exe, "generate", str(st_path), "ids:1,7", "3", "0", "40", "--mmproj", str(mmproj_path), "--image", str(ppm_a)])
+    gb = run([exe, "generate", str(st_path), "ids:1,7", "3", "0", "40", "--mmproj", str(mmproj_path), "--image", str(ppm_b)])
+    assert "vision_tokens:4" in ga and "generated_ids:" in ga and "kv_free_after:4/4" in ga, ga
+    assert "vision_tokens:4" in gb and "generated_ids:" in gb and "kv_free_after:4/4" in gb, gb
+
+    b64_a = "data:image/x-portable-pixmap;base64," + base64.b64encode(raw_a).decode("ascii")
+    b64_b = "data:image/x-portable-pixmap;base64," + base64.b64encode(raw_b).decode("ascii")
+    srv = subprocess.Popen(
+        [str(exe), "serve", str(gguf_path), "127.0.0.1:0", "--mmproj", str(mmproj_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        base_url = None
+        for _ in range(100):
+            line = srv.stdout.readline()
+            if line.startswith("serving:"):
+                base_url = line.strip()[len("serving:"):]
+                break
+        assert base_url, "VLM server did not start"
+        req_a = {
+            "model": "vlm-test",
+            "max_tokens": 4,
+            "temperature": 0,
+            "logprobs": True,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": b64_a}}]}],
+        }
+        req_b = {
+            "model": "vlm-test",
+            "max_tokens": 4,
+            "temperature": 0,
+            "logprobs": True,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": b64_b}}]}],
+        }
+        st_a, body_a = vlm_post_json(base_url + "/v1/chat/completions", req_a)
+        st_b, body_b = vlm_post_json(base_url + "/v1/chat/completions", req_b)
+        assert st_a == 200 and st_b == 200, (st_a, body_a, st_b, body_b)
+        assert body_a["usage"]["prompt_tokens"] >= 5 and body_b["usage"]["prompt_tokens"] >= 5, (body_a, body_b)
+        assert body_a["choices"][0]["logprobs"] != body_b["choices"][0]["logprobs"] or body_a["choices"][0]["message"]["content"] != body_b["choices"][0]["message"]["content"]
+    finally:
+        srv.terminate()
+        srv.wait(timeout=5)
+
+    # 2. Offline GGUF Q4_K quantizer (quantize --type q4_k -> verify --q8k-act)
+    q4k_cfg = {
+        "dim": 256,
+        "hidden_dim": 256,
+        "n_layers": 1,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "vocab_size": 64,
+        "max_seq_len": 32,
+        "rope_theta": 10000,
+    }
+    q4k_tensors = generate_weight_dict(q4k_cfg)
+    q4k_sf = work / "v14_q4k_base.safetensors"
+    write_safetensors(q4k_sf, q4k_cfg, q4k_tensors)
+    q4k_gguf = work / "v14_quant_q4_k.gguf"
+    qk_out = run([exe, "quantize", str(q4k_sf), str(q4k_gguf), "--type", "q4_k"])
+    assert "quant_type:q4_k" in qk_out and q4k_gguf.is_file(), qk_out
+
+    v_f32 = run([exe, "verify", str(q4k_sf)])
+    v_q4k = run([exe, "verify", str(q4k_gguf), "--q8k-act"])
+    assert "format:q4_k" in v_q4k and "kv_free_after:8/8" in v_q4k, v_q4k
+    s_f32, _, _ = parse_verify(v_f32)
+    s_q4k, c_q4k, _ = parse_verify(v_q4k)
+    assert s_q4k == c_q4k and len(s_q4k) == len(s_f32)
+    all_diffs = [
+        abs(bits_to_f32(b1) - bits_to_f32(b2))
+        for r_idx in s_f32
+        for (_, b1), (_, b2) in zip(s_f32[r_idx], s_q4k[r_idx])
+    ]
+    mean_diff = sum(all_diffs) / len(all_diffs)
+    assert mean_diff < 0.5, f"q4_k quantized logit mean_diff too high: {mean_diff}"
+
+    print("VLM (--mmproj + PPM/BMP/rgb:/image_url) and offline Q4_K GGUF quantizer (quantize --type q4_k) verified")
+
+
+def check_v15_engine_hardening(exes, work: Path, cfg: dict, tensors: dict, compiler: Path, build_env: dict):
+    import http.server
+    import json as pyjson
+    import subprocess
+    import threading
+    import urllib.request
+    import zlib
+
+    exe = exes[1][2] if len(exes) > 1 else exes[0][2]
+
+    def make_png_rgb(w: int, h: int, rgb: tuple[int, int, int]) -> bytes:
+        def png_chunk(ctype: bytes, payload: bytes) -> bytes:
+            body = ctype + payload
+            return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+        r, g, b = rgb
+        row = b"\x00" + bytes([r, g, b] * w)
+        raw = row * h
+        ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", ihdr)
+            + png_chunk(b"IDAT", zlib.compress(raw))
+            + png_chunk(b"IEND", b"")
+        )
+
+    def post_json(url: str, payload: dict):
+        req = urllib.request.Request(
+            url,
+            data=pyjson.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, pyjson.loads(resp.read().decode("utf-8"))
+
+    # 1. Hardened VLM: PNG/JPEG + bilinear resize + image_mean/std + HTTP URL + inline <image> splicing
+    img_sz = 8
+    patch_sz = 4
+    in_c = 3
+    hid = 16
+    nl = 1
+    nh = 2
+    head_dim = hid // nh
+    ffn_d = 32
+    proj_d = cfg["dim"]
+    grid = img_sz // patch_sz
+    n_patches = grid * grid
+    rng = random.Random(20261128)
+    mean_vals = [0.5, 0.25, 0.1]
+    std_vals = [0.5, 0.5, 0.5]
+
+    v_tensors = {
+        "v.patch_embd.weight": [f32(rng.uniform(-0.3, 0.3)) for _ in range(hid * in_c * patch_sz * patch_sz)],
+        "v.patch_embd.bias": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.position_embd.weight": [f32(rng.uniform(-0.1, 0.1)) for _ in range(n_patches * hid)],
+        "v.blk.0.ln1_w": [f32(rng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.blk.0.ln1_b": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wq": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bq": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wk": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bk": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wv": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bv": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.wo": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.bo": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.ln2_w": [f32(rng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.blk.0.ln2_b": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.w1": [f32(rng.uniform(-0.2, 0.2)) for _ in range(ffn_d * hid)],
+        "v.blk.0.b1": [f32(rng.uniform(-0.05, 0.05)) for _ in range(ffn_d)],
+        "v.blk.0.w2": [f32(rng.uniform(-0.2, 0.2)) for _ in range(hid * ffn_d)],
+        "v.blk.0.b2": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.post_ln_w": [f32(rng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.post_ln_b": [f32(rng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "mm.0.weight": [f32(rng.uniform(-0.2, 0.2)) for _ in range(proj_d * hid)],
+        "mm.0.bias": [f32(rng.uniform(-0.05, 0.05)) for _ in range(proj_d)],
+        "mm.2.weight": [f32(rng.uniform(-0.2, 0.2)) for _ in range(proj_d * proj_d)],
+        "mm.2.bias": [f32(rng.uniform(-0.05, 0.05)) for _ in range(proj_d)],
+    }
+    mmproj_v15 = work / "v15_mmproj.safetensors"
+    v_meta = {
+        "vision.image_size": str(img_sz),
+        "vision.patch_size": str(patch_sz),
+        "vision.in_channels": str(in_c),
+        "vision.hidden_size": str(hid),
+        "vision.num_layers": str(nl),
+        "vision.num_heads": str(nh),
+        "vision.ffn_dim": str(ffn_d),
+        "vision.proj_dim": str(proj_d),
+        "vision.ln_eps": "1e-5",
+        "vision.image_mean": ",".join(str(v) for v in mean_vals),
+        "vision.image_std": ",".join(str(v) for v in std_vals),
+    }
+    v_hdr = {"__metadata__": v_meta}
+    v_off = 0
+    v_chunks = []
+    for k, arr in v_tensors.items():
+        raw = b"".join(struct.pack("<f", v) for v in arr)
+        v_hdr[k] = {"dtype": "F32", "shape": [len(arr)], "data_offsets": [v_off, v_off + len(raw)]}
+        v_chunks.append(raw)
+        v_off += len(raw)
+    vh_bytes = pyjson.dumps(v_hdr).encode("utf-8")
+    mmproj_v15.write_bytes(struct.pack("<Q", len(vh_bytes)) + vh_bytes + b"".join(v_chunks))
+
+    vlm_st = work / "v15_vlm.safetensors"
+    write_safetensors(vlm_st, cfg, tensors)
+    vlm_gguf = work / "v15_vlm.gguf"
+    vlm_pieces = [f"tok_{i}" for i in range(cfg["vocab_size"])]
+    write_gguf_q4_0(vlm_gguf, cfg, tensors, vocab_pieces=vlm_pieces)
+
+    png_red = work / "v15_red.png"
+    png_blue = work / "v15_blue.png"
+    png_red.write_bytes(make_png_rgb(12, 12, (245, 15, 15)))
+    png_blue.write_bytes(make_png_rgb(12, 12, (15, 25, 245)))
+
+    # Generate a real baseline JPEG via stdlib #image/jpeg
+    jpg_path = work / "v15_img.jpg"
+    jpg_gen_src = work / "make_jpg.xu"
+    jpg_gen_exe = work / "make_jpg"
+    jpg_gen_src.write_text(
+        "@main\n#os\n#image\n#image/color\n#image/jpeg\n"
+        "fn main() int {\n"
+        "    args := os.args()\n"
+        "    $img := image.new_rgba(image.rect(0, 0, 10, 10))\n"
+        "    for y in 0:10 {\n"
+        "        for x in 0:10 {\n"
+        "            img.set_rgba(x, y, color.rgba8(40 + x * 10, 180, 70 + y * 10, 255))\n"
+        "        }\n"
+        "    }\n"
+        "    enc := jpeg.encode_rgba(&img) >>> (err) { << 1 }\n"
+        "    _ := os.write(args[1] + \"\", enc) >>> (err) { << 2 }\n"
+        "    << 0\n"
+        "}\n"
+    )
+    jpg_env = dict(build_env, XU_TENSOR_FUSION="0", XU_TENSOR_FAST_MATH="0")
+    jpg_env.pop("XU_DUMP_MIR", None)
+    build(compiler, jpg_env, jpg_gen_src, jpg_gen_exe)
+    run([jpg_gen_exe, str(jpg_path)])
+    assert jpg_path.is_file() and jpg_path.read_bytes()[:2] == b"\xff\xd8"
+
+    for img_p in (png_red, png_blue, jpg_path):
+        g_img = run([exe, "generate", str(vlm_st), "tok_4", "2", "0", "40", "--mmproj", str(mmproj_v15), "--image", str(img_p)])
+        assert "vision_tokens:4" in g_img and "kv_free_after:4/4" in g_img, g_img
+
+    # Python reference for inline <image> placement + image_mean/std normalization
+    def py_layernorm(vec, w, b, eps=1e-5):
+        n = len(vec)
+        mean = sum(float(v) for v in vec) / n
+        var = sum((float(v) - mean) ** 2 for v in vec) / n
+        inv = 1.0 / math.sqrt(var + eps)
+        return [f32((float(vec[i]) - mean) * inv * float(w[i]) + float(b[i])) for i in range(n)]
+
+    def py_linear_rows(rows, w, b, out_d, in_d):
+        out = []
+        for r in rows:
+            row = []
+            for oi in range(out_d):
+                acc = float(b[oi])
+                for ii in range(in_d):
+                    acc += float(r[ii]) * float(w[oi * in_d + ii])
+                row.append(f32(acc))
+            out.append(row)
+        return out
+
+    def py_gelu(x):
+        return f32(0.5 * float(x) * (1.0 + math.erf(float(x) / math.sqrt(2.0))))
+
+    def py_encode_vision(img_chw):
+        pw = v_tensors["v.patch_embd.weight"]
+        pb = v_tensors["v.patch_embd.bias"]
+        pos_emb = v_tensors["v.position_embd.weight"]
+        hw = img_sz * img_sz
+        h = []
+        for py_y in range(grid):
+            for py_x in range(grid):
+                tok = py_y * grid + py_x
+                row = []
+                for oc in range(hid):
+                    acc = float(pb[oc])
+                    for ic in range(in_c):
+                        for dy in range(patch_sz):
+                            for dx in range(patch_sz):
+                                pix = img_chw[ic * hw + (py_y * patch_sz + dy) * img_sz + (py_x * patch_sz + dx)]
+                                wv = pw[((oc * in_c + ic) * patch_sz + dy) * patch_sz + dx]
+                                acc += float(pix) * float(wv)
+                    row.append(f32(f32(acc) + pos_emb[tok * hid + oc]))
+                h.append(row)
+        n1 = [py_layernorm(r, v_tensors["v.blk.0.ln1_w"], v_tensors["v.blk.0.ln1_b"]) for r in h]
+        qv = py_linear_rows(n1, v_tensors["v.blk.0.wq"], v_tensors["v.blk.0.bq"], hid, hid)
+        kv = py_linear_rows(n1, v_tensors["v.blk.0.wk"], v_tensors["v.blk.0.bk"], hid, hid)
+        vv = py_linear_rows(n1, v_tensors["v.blk.0.wv"], v_tensors["v.blk.0.bv"], hid, hid)
+        attn = [[f32(0.0)] * hid for _ in range(n_patches)]
+        sc = 1.0 / math.sqrt(head_dim)
+        for qi in range(n_patches):
+            for hd in range(nh):
+                ho = hd * head_dim
+                scs = [sum(float(qv[qi][ho + d]) * float(kv[ki][ho + d]) for d in range(head_dim)) * sc for ki in range(n_patches)]
+                mx = max(scs)
+                ex = [math.exp(s - mx) for s in scs]
+                dn = sum(ex)
+                for ki in range(n_patches):
+                    wgt = ex[ki] / dn
+                    for d in range(head_dim):
+                        attn[qi][ho + d] = f32(float(attn[qi][ho + d]) + wgt * float(vv[ki][ho + d]))
+        proj = py_linear_rows(attn, v_tensors["v.blk.0.wo"], v_tensors["v.blk.0.bo"], hid, hid)
+        h = [[f32(h[i][j] + proj[i][j]) for j in range(hid)] for i in range(n_patches)]
+        n2 = [py_layernorm(r, v_tensors["v.blk.0.ln2_w"], v_tensors["v.blk.0.ln2_b"]) for r in h]
+        fc1 = py_linear_rows(n2, v_tensors["v.blk.0.w1"], v_tensors["v.blk.0.b1"], ffn_d, hid)
+        fc1a = [[py_gelu(x) for x in r] for r in fc1]
+        fc2 = py_linear_rows(fc1a, v_tensors["v.blk.0.w2"], v_tensors["v.blk.0.b2"], hid, ffn_d)
+        h = [[f32(h[i][j] + fc2[i][j]) for j in range(hid)] for i in range(n_patches)]
+        post = [py_layernorm(r, v_tensors["v.post_ln_w"], v_tensors["v.post_ln_b"]) for r in h]
+        mm1 = py_linear_rows(post, v_tensors["mm.0.weight"], v_tensors["mm.0.bias"], proj_d, hid)
+        mm1a = [[py_gelu(x) for x in r] for r in mm1]
+        return py_linear_rows(mm1a, v_tensors["mm.2.weight"], v_tensors["mm.2.bias"], proj_d, proj_d)
+
+    def py_eval_vlm_segments(segments, max_gen):
+        dim = cfg["dim"]
+        emb_w = tensors["embed_tokens.weight"][1]
+        all_vecs = []
+        for kind, payload in segments:
+            if kind == "img":
+                all_vecs.extend(payload)
+            else:
+                all_vecs.extend(emb_w[tok * dim:(tok + 1) * dim] for tok in payload)
+        n_layers = cfg["n_layers"]
+        n_heads = cfg["n_heads"]
+        n_kv_heads = cfg["n_kv_heads"]
+        hdim = dim // n_heads
+        kv_dim = n_kv_heads * hdim
+        kv_mul = n_heads // n_kv_heads
+        hidden_dim = cfg["hidden_dim"]
+        vocab = cfg["vocab_size"]
+        k_cache = [[] for _ in range(n_layers)]
+        v_cache = [[] for _ in range(n_layers)]
+
+        def mv(mat, vec, rows, cols):
+            return [f32(sum(float(mat[r * cols + c]) * float(vec[c]) for c in range(cols))) for r in range(rows)]
+
+        def fwd(vec, pos):
+            x = list(vec)
+            zeros = [f32(0.0)] * dim
+            inv_sqrt_d = 1.0 / math.sqrt(hdim)
+            for l in range(n_layers):
+                p = f"layers.{l}."
+                xb = py_rmsnorm(x, zeros, tensors[p + "input_layernorm.weight"][1])
+                q = py_rope(mv(tensors[p + "self_attn.q_proj.weight"][1], xb, dim, dim), n_heads, hdim, pos, cfg["rope_theta"])
+                k = py_rope(mv(tensors[p + "self_attn.k_proj.weight"][1], xb, kv_dim, dim), n_kv_heads, hdim, pos, cfg["rope_theta"])
+                v = mv(tensors[p + "self_attn.v_proj.weight"][1], xb, kv_dim, dim)
+                k_cache[l].append(k)
+                v_cache[l].append(v)
+                att = [f32(0.0)] * dim
+                for h in range(n_heads):
+                    qh = q[h * hdim:(h + 1) * hdim]
+                    kvh = (h // kv_mul) * hdim
+                    scs = [sum(float(qh[d]) * float(k_cache[l][kp][kvh + d]) for d in range(hdim)) * inv_sqrt_d for kp in range(pos + 1)]
+                    mx = max(scs)
+                    ex = [math.exp(s - mx) for s in scs]
+                    dn = sum(ex)
+                    for kp in range(pos + 1):
+                        wgt = ex[kp] / dn
+                        for d in range(hdim):
+                            att[h * hdim + d] = f32(float(att[h * hdim + d]) + wgt * float(v_cache[l][kp][kvh + d]))
+                xb2 = mv(tensors[p + "self_attn.o_proj.weight"][1], att, dim, dim)
+                x = [f32(x[i] + xb2[i]) for i in range(dim)]
+                xb = py_rmsnorm(x, zeros, tensors[p + "post_attention_layernorm.weight"][1])
+                g = mv(tensors[p + "mlp.gate_proj.weight"][1], xb, hidden_dim, dim)
+                u = mv(tensors[p + "mlp.up_proj.weight"][1], xb, hidden_dim, dim)
+                act = [f32((float(g[i]) / (1.0 + math.exp(-float(g[i])))) * float(u[i])) for i in range(hidden_dim)]
+                down = mv(tensors[p + "mlp.down_proj.weight"][1], act, dim, hidden_dim)
+                x = [f32(x[i] + down[i]) for i in range(dim)]
+            out_n = py_rmsnorm(x, zeros, tensors["norm.weight"][1])
+            logits = mv(tensors["lm_head.weight"][1], out_n, vocab, dim)
+            best = max(range(vocab), key=lambda i: float(logits[i]))
+            return best
+
+        pos = 0
+        nxt = 0
+        for vec in all_vecs:
+            nxt = fwd(vec, pos)
+            pos += 1
+        out_toks = [nxt]
+        for _ in range(1, max_gen):
+            nxt = fwd(emb_w[nxt * dim:(nxt + 1) * dim], pos)
+            pos += 1
+            out_toks.append(nxt)
+        return out_toks
+
+    ppm_norm = work / "v15_norm.ppm"
+    prng = random.Random(9015)
+    raw_pix = bytes([prng.randrange(0, 256) for _ in range(3 * img_sz * img_sz)])
+    ppm_norm.write_bytes(b"P6\n8 8\n255\n" + raw_pix)
+    chw_norm = []
+    hw8 = img_sz * img_sz
+    for ch in range(3):
+        for i in range(hw8):
+            val = (raw_pix[i * 3 + ch] / 255.0 - mean_vals[ch]) / std_vals[ch]
+            chw_norm.append(f32(val))
+    vis_norm = py_encode_vision(chw_norm)
+
+    # Note: write_gguf_q4_0 isn't needed for vlm_st; build an F32 SafeTensors with string vocab tokens?
+    # generate only encodes raw vocab pieces for GGUF! So test inline <image> on a GGUF built from zero_tensors/real vocab or vlm_st? Wait: vlm_st doesn't load custom vocab pieces, vlm_gguf DOES! Wait: tensors inside vlm_gguf are q4_0 quantized, whereas if we write an F32 GGUF OR use vlm_gguf with inline vs prepended! Even simpler: write a tiny F32 GGUF? Or run Python py_eval_vlm_segments against q4_0 dequantized weights! We ALREADY have py_run_request / q4_data from write_gguf_q4_0!
+    _, _ = None, None
+    # Actually vlm_st uses encode_prompt? Let's check: tok_4 only works with GGUF vocab, whereas vlm_st uses default fallback! So let's test BOTH:
+    # A) vlm_gguf generate with "tok_4<image>tok_7" vs "<image>tok_4tok_7" using Q4_0 dequantized tensors OR just check parity on F32 GGUF! Let's write a 20-line F32 GGUF helper for exact < 1e-4 Python parity!
+    def write_f32_gguf(out_p: Path, pieces_list: list[str]):
+        kv_entries = [
+            ("general.architecture", 8, "llama"),
+            ("llama.embedding_length", 4, cfg["dim"]),
+            ("llama.feed_forward_length", 4, cfg["hidden_dim"]),
+            ("llama.block_count", 4, cfg["n_layers"]),
+            ("llama.attention.head_count", 4, cfg["n_heads"]),
+            ("llama.attention.head_count_kv", 4, cfg["n_kv_heads"]),
+            ("llama.context_length", 4, cfg["max_seq_len"]),
+            ("llama.rope.freq_base", 6, float(cfg["rope_theta"])),
+            ("llama.attention.layer_norm_rms_epsilon", 6, 1e-5),
+            ("tokenizer.ggml.bos_token_id", 4, 1),
+            ("tokenizer.ggml.eos_token_id", 4, 2),
+        ]
+        gname_map = {
+            "embed_tokens.weight": "token_embd.weight",
+            "norm.weight": "output_norm.weight",
+            "lm_head.weight": "output.weight",
+        }
+        t_list = []
+        cur_off = 0
+        for sfk, (sh, vals) in tensors.items():
+            gk = gname_map.get(sfk)
+            if gk is None and sfk.startswith("layers."):
+                parts = sfk.split(".")
+                lp = f"blk.{parts[1]}."
+                tail = ".".join(parts[2:])
+                m_map = {
+                    "input_layernorm.weight": "attn_norm.weight",
+                    "post_attention_layernorm.weight": "ffn_norm.weight",
+                    "self_attn.q_proj.weight": "attn_q.weight",
+                    "self_attn.k_proj.weight": "attn_k.weight",
+                    "self_attn.v_proj.weight": "attn_v.weight",
+                    "self_attn.o_proj.weight": "attn_output.weight",
+                    "mlp.gate_proj.weight": "ffn_gate.weight",
+                    "mlp.up_proj.weight": "ffn_up.weight",
+                    "mlp.down_proj.weight": "ffn_down.weight",
+                }
+                gk = lp + m_map[tail]
+            cur_off += (32 - (cur_off % 32)) % 32
+            raw_b = b"".join(struct.pack("<f", v) for v in vals)
+            t_list.append((gk, list(reversed(sh)), 0, cur_off, raw_b))
+            cur_off += len(raw_b)
+
+        def pstr(s: str) -> bytes:
+            b = s.encode("utf-8")
+            return struct.pack("<Q", len(b)) + b
+
+        buf = bytearray()
+        buf.extend(b"GGUF")
+        buf.extend(struct.pack("<IQQ", 3, len(t_list), len(kv_entries) + 1))
+        for k, vt, val in kv_entries:
+            buf.extend(pstr(k))
+            buf.extend(struct.pack("<I", vt))
+            if vt == 8:
+                buf.extend(pstr(val))
+            elif vt == 4:
+                buf.extend(struct.pack("<I", val))
+            elif vt == 6:
+                buf.extend(struct.pack("<f", val))
+        buf.extend(pstr("tokenizer.ggml.tokens"))
+        buf.extend(struct.pack("<IIQ", 9, 8, len(pieces_list)))
+        for pc in pieces_list:
+            buf.extend(pstr(pc))
+        for gk, dims, gt, toff, _ in t_list:
+            buf.extend(pstr(gk))
+            buf.extend(struct.pack("<I", len(dims)))
+            for d in dims:
+                buf.extend(struct.pack("<Q", d))
+            buf.extend(struct.pack("<IQ", gt, toff))
+        buf.extend(b"\x00" * ((32 - (len(buf) % 32)) % 32))
+        data_start = len(buf)
+        for _, _, _, toff, raw_b in t_list:
+            while len(buf) - data_start < toff:
+                buf.append(0)
+            buf.extend(raw_b)
+        out_p.write_bytes(bytes(buf))
+
+    vlm_f32_gguf = work / "v15_vlm_f32.gguf"
+    f32_pieces = [f"tok_{i}" for i in range(cfg["vocab_size"])]
+    f32_pieces[0], f32_pieces[1], f32_pieces[2] = "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+    write_f32_gguf(vlm_f32_gguf, f32_pieces)
+
+    g_inline = run([exe, "generate", str(vlm_f32_gguf), "tok_4<image>tok_7", "3", "0", "40", "--mmproj", str(mmproj_v15), "--image", str(ppm_norm)])
+    ikv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in g_inline.splitlines() if ":" in l}
+    xu_inline_ids = [int(x) for x in ikv["generated_ids"].split(",") if x]
+    py_inline_ids = py_eval_vlm_segments([("txt", [4]), ("img", vis_norm), ("txt", [7])], 3)
+    assert xu_inline_ids == py_inline_ids, (xu_inline_ids, py_inline_ids, g_inline)
+
+    class ImgHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/red.png":
+                data = png_red.read_bytes()
+            elif self.path == "/blue.png":
+                data = png_blue.read_bytes()
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, format, *args):
+            return
+
+    img_httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ImgHandler)
+    img_port = img_httpd.server_address[1]
+    threading.Thread(target=img_httpd.serve_forever, daemon=True).start()
+
+    vlm_srv = subprocess.Popen(
+        [str(exe), "serve", str(vlm_gguf), "127.0.0.1:0", "--mmproj", str(mmproj_v15)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        vlm_url = None
+        for _ in range(100):
+            ln = vlm_srv.stdout.readline()
+            if ln.startswith("serving:"):
+                vlm_url = ln.strip()[len("serving:"):]
+                break
+        assert vlm_url, "v15 VLM server did not start"
+        st_r, body_r = post_json(vlm_url + "/v1/chat/completions", {
+            "model": "v15-vlm", "max_tokens": 3, "temperature": 0, "logprobs": True,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "tok_4"},
+                {"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{img_port}/red.png"}},
+            ]}],
+        })
+        st_b, body_b = post_json(vlm_url + "/v1/chat/completions", {
+            "model": "v15-vlm", "max_tokens": 3, "temperature": 0, "logprobs": True,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "tok_4"},
+                {"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{img_port}/blue.png"}},
+            ]}],
+        })
+        assert st_r == 200 and st_b == 200
+        assert body_r["choices"][0]["logprobs"] != body_b["choices"][0]["logprobs"]
+
+        st_m, body_m = post_json(vlm_url + "/v1/chat/completions", {
+            "model": "v15-vlm", "max_tokens": 2, "temperature": 0,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{img_port}/red.png"}},
+                {"type": "text", "text": "tok_4"},
+                {"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{img_port}/blue.png"}},
+            ]}],
+        })
+        assert st_m == 200 and body_m["usage"]["prompt_tokens"] >= 9, body_m
+    finally:
+        vlm_srv.terminate()
+        vlm_srv.wait(timeout=5)
+        img_httpd.shutdown()
+        img_httpd.server_close()
+
+    # 2. Indexed GBNF VocabIndex + JSON Schema -> GBNF (--json-schema CLI + HTTP response_format/text.format)
+    s_vocab = cfg["vocab_size"]
+    s_dim = cfg["dim"]
+    s_tensors = {k: (list(sh), [f32(0.0)] * len(v)) for k, (sh, v) in tensors.items()}
+    s_tensors["norm.weight"] = ([s_dim], [f32(1.0)] * s_dim)
+    s_emb = [f32(0.0)] * (s_vocab * s_dim)
+    s_head = [f32(0.0)] * (s_vocab * s_dim)
+    for tid in range(s_vocab):
+        s_emb[tid * s_dim] = f32(1.0)
+    biases_q4 = {
+        21: 49.0,  # INVALID_TEXT (distractor must be blocked by GBNF)
+        2: 42.0,   # <|im_end|> (EOS blocked until object finishes)
+        10: 35.0,  # {
+        11: 35.0,  # }
+        13: 28.0,  # ,
+        12: 28.0,  # :
+        14: 28.0,  # "
+        15: 21.0,  # status
+        18: 21.0,  # count
+        16: 14.0,  # ok
+        17: 7.0,   # err
+        19: 14.0,  # 4
+        20: 7.0,   # 2
+    }
+    for tid, bv in biases_q4.items():
+        s_head[tid * s_dim] = f32(bv)
+    s_tensors["embed_tokens.weight"] = ([s_vocab, s_dim], s_emb)
+    s_tensors["lm_head.weight"] = ([s_vocab, s_dim], s_head)
+
+    s_pieces = [f"tok_{i}" for i in range(s_vocab)]
+    s_pieces[0], s_pieces[1], s_pieces[2] = "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+    s_pieces[3], s_pieces[4], s_pieces[5], s_pieces[6] = "user", "assistant", "system", "\n"
+    s_pieces[10], s_pieces[11], s_pieces[12], s_pieces[13], s_pieces[14] = "{", "}", ":", ",", "\""
+    s_pieces[15], s_pieces[16], s_pieces[17], s_pieces[18], s_pieces[19], s_pieces[20] = "status", "ok", "err", "count", "4", "2"
+    s_pieces[21] = "INVALID_TEXT"
+
+    schema_gguf = work / "v15_schema.gguf"
+    write_gguf_q4_0(schema_gguf, cfg, s_tensors, vocab_pieces=s_pieces)
+
+    target_schema = {
+        "type": "object",
+        "properties": {
+            "status": {"enum": ["ok", "err"]},
+            "count": {"type": "integer"},
+        },
+        "required": ["status", "count"],
+    }
+    schema_file = work / "v15_schema.json"
+    schema_file.write_text(pyjson.dumps(target_schema))
+
+    unconstrained = run([exe, "generate", str(schema_gguf), "ids:3", "3", "0", "40"])
+    assert "INVALID_TEXT" in unconstrained, unconstrained
+
+    constrained = run([exe, "generate", str(schema_gguf), "ids:3", "24", "0", "40", "--json-schema", str(schema_file)])
+    ckv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in constrained.splitlines() if ":" in l}
+    cli_obj = pyjson.loads(ckv["generated_text"])
+    assert cli_obj["status"] == "ok" and isinstance(cli_obj["count"], int) and set(cli_obj.keys()) == {"status", "count"}, cli_obj
+
+    sch_srv = subprocess.Popen(
+        [str(exe), "serve", str(schema_gguf), "127.0.0.1:0"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        sch_url = None
+        for _ in range(100):
+            ln = sch_srv.stdout.readline()
+            if ln.startswith("serving:"):
+                sch_url = ln.strip()[len("serving:"):]
+                break
+        assert sch_url
+        st_c, body_c = post_json(sch_url + "/v1/chat/completions", {
+            "model": "schema-test",
+            "messages": [{"role": "user", "content": "user"}],
+            "max_tokens": 24,
+            "temperature": 0,
+            "response_format": {"type": "json_schema", "json_schema": {"name": "res", "schema": target_schema}},
+        })
+        assert st_c == 200
+        chat_obj = pyjson.loads(body_c["choices"][0]["message"]["content"])
+        assert chat_obj["status"] in ("ok", "err") and isinstance(chat_obj["count"], int), (chat_obj, body_c)
+
+        st_rs, body_rs = post_json(sch_url + "/v1/responses", {
+            "model": "schema-test",
+            "input": "user",
+            "max_output_tokens": 24,
+            "temperature": 0,
+            "text": {"format": {"type": "json_schema", "schema": target_schema}},
+        })
+        assert st_rs == 200
+        resp_obj = pyjson.loads(body_rs["output_text"])
+        assert resp_obj["status"] in ("ok", "err") and isinstance(resp_obj["count"], int), (resp_obj, body_rs)
+    finally:
+        sch_srv.terminate()
+        sch_srv.wait(timeout=5)
+
+    # 3. Hardened Offline Quantizer: HF sharded F16/BF16 dir -> Q5_K/Q6_K/Q4_K_M/Q5_K_M + GGUF->GGUF
+    qcfg = {
+        "dim": 256, "hidden_dim": 256, "n_layers": 1, "n_heads": 4,
+        "n_kv_heads": 2, "vocab_size": 64, "max_seq_len": 32, "rope_theta": 10000,
+    }
+    qtensors = generate_weight_dict(qcfg)
+    qbase_st = work / "v15_q256_f32.safetensors"
+    write_safetensors(qbase_st, qcfg, qtensors)
+    v_f32 = run([exe, "verify", str(qbase_st)])
+    s_f32, _, _ = parse_verify(v_f32)
+
+    hf_dir = work / "v15_hf_dir"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text(pyjson.dumps({
+        "model_type": "qwen2",
+        "hidden_size": qcfg["dim"],
+        "intermediate_size": qcfg["hidden_dim"],
+        "num_hidden_layers": qcfg["n_layers"],
+        "num_attention_heads": qcfg["n_heads"],
+        "num_key_value_heads": qcfg["n_kv_heads"],
+        "vocab_size": qcfg["vocab_size"],
+        "max_position_embeddings": qcfg["max_seq_len"],
+        "rope_theta": qcfg["rope_theta"],
+        "rms_norm_eps": 1e-5,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+    }))
+    (hf_dir / "tokenizer_config.json").write_text(pyjson.dumps({"chat_template": "<|im_start|>"}))
+    hf_vocab = {f"tok_{i}": i for i in range(qcfg["vocab_size"])}
+    hf_vocab["<unk>"], hf_vocab["<s>"], hf_vocab["</s>"] = 0, 1, 2
+    hf_vocab["hello_xu"], hf_vocab["world_xu"] = 10, 11
+    (hf_dir / "tokenizer.json").write_text(pyjson.dumps({"model": {"vocab": hf_vocab, "merges": []}}))
+
+    def pack_f16_vals(vals):
+        return b"".join(struct.pack("<e", float(v)) for v in vals)
+
+    def pack_bf16_vals(vals):
+        out_b = bytearray()
+        for v in vals:
+            u32 = struct.unpack("<I", struct.pack("<f", float(v)))[0]
+            out_b.extend(struct.pack("<H", (u32 >> 16) & 0xFFFF))
+        return bytes(out_b)
+
+    def write_typed_shard(path: Path, items):
+        hdr = {}
+        off = 0
+        chunks = []
+        for name, sh, vals, dtype_tag in items:
+            raw_b = pack_f16_vals(vals) if dtype_tag == "F16" else pack_bf16_vals(vals)
+            hdr[name] = {"dtype": dtype_tag, "shape": list(sh), "data_offsets": [off, off + len(raw_b)]}
+            chunks.append(raw_b)
+            off += len(raw_b)
+        hb = pyjson.dumps(hdr).encode("utf-8")
+        path.write_bytes(struct.pack("<Q", len(hb)) + hb + b"".join(chunks))
+
+    sh1_items, sh2_items, wmap = [], [], {}
+    for idx_t, (sfk, (sh, vals)) in enumerate(qtensors.items()):
+        hf_name = sfk if sfk == "lm_head.weight" else ("model." + sfk)
+        if idx_t % 2 == 0:
+            sh1_items.append((hf_name, sh, vals, "F16"))
+            wmap[hf_name] = "model-00001-of-00002.safetensors"
+        else:
+            sh2_items.append((hf_name, sh, vals, "BF16"))
+            wmap[hf_name] = "model-00002-of-00002.safetensors"
+    write_typed_shard(hf_dir / "model-00001-of-00002.safetensors", sh1_items)
+    write_typed_shard(hf_dir / "model-00002-of-00002.safetensors", sh2_items)
+    (hf_dir / "model.safetensors.index.json").write_text(pyjson.dumps({"weight_map": wmap}))
+
+    q_modes = [
+        ("q5_k", "format:q5_k", 0.35),
+        ("q6_k", "format:q6_k", 0.25),
+        ("q4_k_m", "format:q4_k", 0.45),
+        ("q5_k_m", "format:q5_k", 0.35),
+    ]
+    q6k_gguf = None
+    for qt, expected_fmt, max_diff in q_modes:
+        out_gg = work / f"v15_hf_{qt}.gguf"
+        q_out = run([exe, "quantize", str(hf_dir), str(out_gg), "--type", qt])
+        assert "source_format:hf_dir" in q_out and f"quant_type:{qt}" in q_out and out_gg.is_file(), q_out
+        if qt == "q6_k":
+            q6k_gguf = out_gg
+        vq = run([exe, "verify", str(out_gg), "--q8k-act"])
+        assert expected_fmt in vq and "kv_free_after:8/8" in vq, (qt, vq)
+        sq, cq, _ = parse_verify(vq)
+        assert sq == cq and len(sq) == len(s_f32), qt
+        diffs = [abs(bits_to_f32(b1) - bits_to_f32(b2)) for r in s_f32 for (_, b1), (_, b2) in zip(s_f32[r], sq[r])]
+        mdiff = sum(diffs) / len(diffs)
+        assert mdiff < max_diff, f"{qt} mean_diff {mdiff} >= {max_diff}"
+
+    insp_hf = run([exe, "inspect", str(q6k_gguf)])
+    assert "arch:qwen2" in insp_hf, insp_hf
+    gen_vocab = run([exe, "generate", str(q6k_gguf), "hello_xuworld_xu", "2", "0", "40"])
+    assert "prompt_ids:10,11" in gen_vocab, gen_vocab
+
+    re_q5k = work / "v15_re_q5k.gguf"
+    req_out = run([exe, "quantize", str(q6k_gguf), str(re_q5k), "--type", "q5_k"])
+    assert "source_format:gguf" in req_out and "quant_type:q5_k" in req_out and re_q5k.is_file(), req_out
+    insp_re = run([exe, "inspect", str(re_q5k)])
+    assert "arch:qwen2" in insp_re, insp_re
+    v_re = run([exe, "verify", str(re_q5k), "--q8k-act"])
+    assert "format:q5_k" in v_re and "kv_free_after:8/8" in v_re, v_re
+    sr, cr, _ = parse_verify(v_re)
+    assert sr == cr
+    rdiffs = [abs(bits_to_f32(b1) - bits_to_f32(b2)) for r in s_f32 for (_, b1), (_, b2) in zip(s_f32[r], sr[r])]
+    assert (sum(rdiffs) / len(rdiffs)) < 0.40
+
+    print("v1.15 engine hardening (PNG/JPEG+bilinear+mean/std+HTTP+<image> VLM, VocabIndex JSON-Schema GBNF, HF-dir/GGUF quantize q5_k/q6_k/q4_k_m/q5_k_m) verified")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
@@ -3672,7 +4676,9 @@ def main():
         check_v11_inspect_merge_grpo_distill(exes, work, CFG, tensors)
         check_v12_gbnf_ckpt_models(exes, work, CFG, tensors)
         check_v13_mamba_rlvr_quantize(exes, work, CFG, tensors)
-        print("LLM engine verification passed (Safetensors F32/HF-sharded, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M/Q5_K/MLA/Mamba-SSM/Hybrid, --q8k-act, --lora, merge-lora, quantize, train-lora SFT/DPO/GRPO/RLVR/distill, --save-ckpt/--resume-ckpt, --grammar GBNF, models pull/list/rm, perplexity, inspect, --draft, qk_norm, arch extensions, MoE + YaRN, ChatML/Llama-3, SPM, continuous batch HTTP serve + Ollama + Prometheus /metrics)")
+        check_v14_vlm_and_q4k_quantize(exes, work, CFG, tensors)
+        check_v15_engine_hardening(exes, work, CFG, tensors, compiler, env)
+        print("LLM engine verification passed (Safetensors F32/HF-sharded, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M/Q5_K/Q6_K/MLA/Mamba-SSM/Hybrid/VLM --mmproj PNG+JPEG+inline, --q8k-act, --lora, merge-lora, quantize HF+GGUF q4_0/q8_0/q4_k/q5_k/q6_k/q4_k_m/q5_k_m, train-lora SFT/DPO/GRPO/RLVR/distill, --save-ckpt/--resume-ckpt, VocabIndex --grammar/--json-schema GBNF, models pull/list/rm, perplexity, inspect, --draft, qk_norm, arch extensions, MoE + YaRN, ChatML/Llama-3, SPM, continuous batch HTTP serve + Ollama + Prometheus /metrics)")
 
 
 if __name__ == "__main__":
