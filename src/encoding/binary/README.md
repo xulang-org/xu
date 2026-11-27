@@ -10,8 +10,8 @@ No native library, C compiler, GPU or UI dependency is required.
 
 $bytes := [u8(0), u8(0), u8(0), u8(0)]
 order := binary.little_endian()
-order.put_f32($&bytes, 0, 0.5) or >>
-value := order.get_f32(&bytes, 0) or >>
+order.put_f32($&bytes, 0, 0.5) >>>
+value := order.get_f32(&bytes, 0) >>>
 assert(value == 0.5)
 ```
 

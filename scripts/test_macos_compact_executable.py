@@ -30,6 +30,7 @@ def check_macho(binary, page, keep_symbols, dwarf=False):
     magic, _, _, _, ncmds = struct.unpack_from("<IIIII", image)
     assert magic == 0xFEEDFACF
     segments = {}
+    has_code_sig = False
     offset = 32
     for _ in range(ncmds):
         command, size = struct.unpack_from("<II", image, offset)
@@ -44,7 +45,10 @@ def check_macho(binary, page, keep_symbols, dwarf=False):
         if command == 0xB:  # LC_DYSYMTAB
             nlocals, _, _, undef, nundef = struct.unpack_from("<IIIII", image, offset + 12)
             assert (nlocals > 0) == keep_symbols and nundef == 4 and undef == nlocals
+        if command == 0x1D:  # LC_CODE_SIGNATURE
+            has_code_sig = True
         offset += size
+    assert has_code_sig == (not dwarf)
     data_vm, data_space, data_off, data_size = segments[b"__DATA"]
     link_vm, _, link_off, _ = segments[b"__LINKEDIT"]
     _, _, text_off, text_size = segments[b"__TEXT"]
@@ -74,8 +78,7 @@ def main():
                 assert " _xu_main\n" in (work / "symbols").read_text()
                 check_macho(output, page, mode != "release", dwarf=mode == "debug")
                 native = "x64" if platform.machine() == "x86_64" else platform.machine()
-                if platform.system() == "Darwin" and native == arch and mode == "release":
-                    subprocess.run(["codesign", "-fs", "-", output], check=True)
+                if platform.system() == "Darwin" and native == arch and mode in ("release", "symbols", "no-opt"):
                     subprocess.run(["codesign", "--verify", "--strict", output], check=True)
                     result = subprocess.check_output([output], text=True, timeout=15)
                     assert result == "clock and C imports ready\n", result

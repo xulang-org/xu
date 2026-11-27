@@ -6,6 +6,25 @@
 
 ---
 
+## Xu 0.14.3
+
+- **Language & Error-Handling Syntax**:
+  - Migrated throw/catch syntax from `>>` / `or (err) { }` / `or >>` to `>>>` / `>>> (err) { }` across the compiler, CLI tools, standard library, examples, and test suites (legacy `>>` / `or` remains accepted as a deprecated alias; nested `>>>` generic closing is handled automatically in the parser).
+- **Compiler Optimizations, Diagnostics & Codegen Parity**:
+  - Added Phase 5–7 general MIR/codegen optimizations: single-caller inlining, 1-block and countdown-loop unrolling, non-negative GVN value-range propagation across `div`/`mod`/guarded subtraction, canonical-offset state promotion, cold-call constant hoisting, ARM64 `CCMP`/`CCMN` branch fusion and shift-add constant multiplication, plus x86-64 `mul_const`/`imul`/`madd` parity.
+  - Hardened Windows PE32+ binaries with strict 3-section W^X permissions (`.text` RX, `.rdata` R, `.data` RW) and `.pdata`/`.xdata` OS unwind tables across `windows-arm64` and `windows-x64`, plus fixed three x86-64 tensor stub bugs and Windows PE cleanup portability across test runners.
+  - Added multi-error checker & per-function borrow recovery (up to `MAX_DIAG_ERRORS = 25` across declarations and functions with `ERROR_TY`/`fn_failed()` cascade suppression) alongside regression suite `scripts/test_checker_multi_error.py`.
+- **Runtime, Concurrency, OS Substrate & Standard Library**:
+  - Added `@interrupt`, `@weak`, `@naked`, `extern static`, strict `--no-sse`, `--stack-size`, relocatable DWARF, `x64-uefi` and `arm64-uefi`, parameterized x64 inline asm, `arm64`/`rv64` inline asm operands, `#core/acpi`, `#core/fdt`, `#core/pci`, `#core/uefi`, VirtIO 1.0 Modern MMIO, HPET, UEFI MemMap, and built-in Mach-O ad-hoc code signing.
+  - Added thread-safe heap/FFI locking and the M:N multi-core coroutine scheduler (`#sync/pool`) on Linux and macOS, plus hardware `u8`/`u16`/`u32`/`u64` atomic intrinsics and fixes for `resize_zero` heap zeroing and `net/poller` wakeup scheduling.
+- **AI Inference, Tensor, UI, Tooling & Embedded**:
+  - Expanded `#tensor` and `examples/llm_engine` with Q4_K/Q6_K/Q4_1/Q5_1/Q2_K/Q3_K/Q5_0 kernels, `M=12` GEMM, paged SIMD attention, `--threads N` CPU parallelism, training backward ops, GBNF Trie/schema support, and `mmproj.gguf` VLM vision support.
+  - Upgraded `#ui/widgets` with responsive layout, style classes, FLIP transitions, DnD, shortcuts, focus zones, and Rounds 12–14 productivity, virtualization, forms, shell, and inspector capabilities (`screen_aria`, `screen_virtual`, `screen_forms`, `screen_commands`, `screen_canvas_tools`, etc.).
+  - Strengthened `xu doctor` SDK, desktop, and mobile phone diagnostics, and updated ESP32 BLE HID / ESP-IDF CYD support.
+- **Release & Bootstrap Policy**:
+  - Updated CI/release workflows (`release.yml`, `restore_product_seed.py`) so every release always seeds from the immediately preceding published release rather than a static version or cache, with one-time `>>>` syntax and runtime atomic bridging (`seed_error_syntax_bridge.py`) when bootstrapping from `v0.14.2`.
+- **Platforms & Upgrade**: Upgrade the compiler, standard library, and SDK tools together. See also [Chinese release notes](https://github.com/xulang-org/xu/blob/v0.14.3/RELEASES.zh-CN.md#xu-0143).
+
 ## Xu 0.14.2
 
 - **Compiler Optimizations, Vectorization & Code Layout**:

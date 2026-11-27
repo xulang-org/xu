@@ -16,16 +16,16 @@ SOURCE = r'''@main
 fn main() int {
     $doc := widgets.rich_document()
     p0 := doc.append_paragraph(0)
-    doc.append_span(p0, widgets.text_span("Hello ", widgets.SPAN_NORMAL)) or (err) {
+    doc.append_span(p0, widgets.text_span("Hello ", widgets.SPAN_NORMAL)) >>> (err) {
         println("FAIL: append hello")
         << 1
     }
-    doc.append_span(p0, widgets.text_span("World", widgets.SPAN_BOLD)) or (err) {
+    doc.append_span(p0, widgets.text_span("World", widgets.SPAN_BOLD)) >>> (err) {
         println("FAIL: append world")
         << 1
     }
     p1 := doc.append_paragraph(0)
-    doc.append_span(p1, widgets.text_span("Next", widgets.SPAN_NORMAL)) or (err) {
+    doc.append_span(p1, widgets.text_span("Next", widgets.SPAN_NORMAL)) >>> (err) {
         println("FAIL: append next")
         << 1
     }

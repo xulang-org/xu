@@ -300,8 +300,60 @@ fn rv_bin(cb $&mc.CodeBuffer, op int) {
 
 // lines receives (code offset, source line) pairs where the line changes.
 pub fn isel_fn_rv64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int) {
+    if f.is_naked {
+        syms.define_label(f.label, cb.len())
+        if f.src_line > 0 {
+            lines.push(cb.len())
+            lines.push(f.src_line)
+        }
+        for bi in 0:f.blocks.len {
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind == mir.MI_ASM {
+                    if ins.line > 0 {
+                        lines.push(cb.len())
+                        lines.push(ins.line)
+                    }
+                    rv_emit_asm_insn(cb, ins.sval)
+                }
+                ii = ins.next
+            }
+        }
+        <<
+    }
     fr := a64_frame(f)
-    syms.define_label(f.label, cb.len())
+    $body_label := f.label + ""
+    if f.is_interrupt {
+        syms.define_label(f.label, cb.len())
+        if f.src_line > 0 {
+            lines.push(cb.len())
+            lines.push(f.src_line)
+        }
+        rv_add_imm(cb, RV_SP, RV_SP, -256)
+        for ri in 1:32 {
+            if ri != RV_SP {
+                rv_sd(cb, ri, RV_SP, ri * 8)
+            }
+        }
+        if f.nparams >= 1 {
+            rv_mv(cb, RV_A0, RV_SP)
+        }
+        body_label = f.label + ".__isr_body"
+        rv_call(cb, relocs, body_label)
+        for ri in 1:32 {
+            if ri != RV_SP {
+                rv_ld(cb, ri, RV_SP, ri * 8)
+            }
+        }
+        rv_add_imm(cb, RV_SP, RV_SP, 256)
+        if f.is_interrupt_machine {
+            e32(cb, 0x30200073) // mret
+        } else {
+            e32(cb, 0x10200073) // sret
+        }
+    }
+    syms.define_label(body_label, cb.len())
     $last_line := f.src_line
     if last_line > 0 {
         lines.push(cb.len())
@@ -402,23 +454,10 @@ pub fn isel_fn_rv64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, 
                 rv_pcrel_pair(cb, relocs, RV_T0, ins.sval, false)
                 rv_set_temp(cb, &fr, ins.a, RV_T0)
             } else if k == mir.MI_ASM {
-                s := ins.sval
-                if s == "wfi" || s == "hlt" {
-                    e32(cb, 0x10500073)
-                } else if s == "cli" {
-                    e32(cb, 0x10017073) // csrci sstatus, 2
-                } else if s == "sti" {
-                    e32(cb, 0x10016073) // csrsi sstatus, 2
-                } else if s == "pause" || s == "yield" || s == "wfe" {
-                    e32(cb, 0x0100000F)
-                } else if s == "lfence" || s == "rmb" || s == "dmb ld" {
-                    e32(cb, 0x0AA0000F) // fence ir, ir
-                } else if s == "sfence" || s == "wmb" || s == "dmb st" {
-                    e32(cb, 0x0550000F) // fence ow, ow
-                } else if s == "fence" || s == "dsb sy" || s == "dmb sy" || s == "mfence" || s == "mb" {
-                    e32(cb, 0x0FF0000F) // fence iorw, iorw
+                if asm_starts_with(&ins.sval, "@ops:") {
+                    rv_emit_asm_with_ops(cb, f, &fr, &ins)
                 } else {
-                    e32(cb, 0x00000013)
+                    rv_emit_asm_insn(cb, ins.sval)
                 }
             } else {
                 rv_trap(cb)
@@ -477,7 +516,313 @@ fn rv_task_reg(i int) int {
     << 17 + i
 }
 
-fn emit_rv64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+fn rv_parse_asm_reg(reg &string) int {
+    if *reg == "a0" { << 10 }
+    if *reg == "a1" { << 11 }
+    if *reg == "a2" { << 12 }
+    if *reg == "a3" { << 13 }
+    if *reg == "a4" { << 14 }
+    if *reg == "a5" { << 15 }
+    if *reg == "a6" { << 16 }
+    if *reg == "a7" { << 17 }
+    if *reg == "t0" { << 5 }
+    if *reg == "t1" { << 6 }
+    if *reg == "t2" { << 7 }
+    if *reg == "t5" { << 30 }
+    if *reg == "t6" { << 31 }
+    if *reg == "s1" { << 9 }
+    if *reg == "s2" { << 18 }
+    if *reg == "s3" { << 19 }
+    if *reg == "s4" { << 20 }
+    if *reg == "s5" { << 21 }
+    if *reg == "s6" { << 22 }
+    if *reg == "s7" { << 23 }
+    if *reg == "s8" { << 24 }
+    if *reg == "s9" { << 25 }
+    if *reg == "s10" { << 26 }
+    if *reg == "s11" { << 27 }
+    if reg.len >= 2 && reg[0] == 120 { // 'x'
+        num_s := reg[1:reg.len]
+        n := x64_asm_parse_int(&num_s)
+        if (n >= 5 && n <= 7) || (n >= 9 && n <= 27) || n == 30 || n == 31 {
+            << n
+        }
+    }
+    << -1
+}
+
+fn rv_emit_asm_with_ops(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ins &mir.MInstr) {
+    $bar := -1
+    for i in 5:ins.sval.len {
+        if ins.sval[i] == 124 {
+            bar = i
+            <-
+        }
+    }
+    if bar < 0 {
+        rv_emit_asm_insn(cb, ins.sval)
+        <<
+    }
+    spec := ins.sval[5:bar]
+    tmpl := ins.sval[bar + 1:ins.sval.len]
+    $op_kinds := []int{}
+    $op_regs := []int{}
+    $op_widths := []int{}
+    $op_margs := []int{}
+    $ai := ins.c
+    if spec.len > 0 {
+        items := x64_asm_split_char(&spec, 44)
+        for ii in 0:items.len {
+            parts := x64_asm_split_char(&items[ii], 58)
+            if parts.len < 2 { -> }
+            okind := parts[0] + ""
+            if okind == "clob" { -> }
+            $arg_v := 0
+            if ai >= 0 {
+                arg_v = f.margs[ai].v
+                ai = f.margs[ai].next
+            }
+            rk := rv_parse_asm_reg(&parts[1])
+            if rk < 0 { -> }
+            $w := 8
+            if parts.len >= 3 {
+                pw := x64_asm_parse_int(&parts[2])
+                if pw == 1 || pw == 2 || pw == 4 || pw == 8 { w = pw }
+            }
+            $kcode := 0
+            if okind == "out" { kcode = 1 }
+            else if okind == "inout" { kcode = 2 }
+            op_kinds.push(kcode)
+            op_regs.push(rk)
+            op_widths.push(w)
+            op_margs.push(arg_v)
+        }
+    }
+    if op_kinds.len == 0 || fr.asm_save_off < 0 {
+        rv_emit_asm_insn(cb, tmpl)
+        <<
+    }
+    base := fr.asm_save_off
+    nargs := op_kinds.len
+    save_regs := [9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    for si in 0:save_regs.len {
+        rv_sd(cb, save_regs[si], RV_SP, base + si * 8)
+    }
+    for k in 0:nargs {
+        rv_operand(cb, f, fr, RV_T3, op_margs[k])
+        rv_sd(cb, RV_T3, RV_SP, base + 96 + k * 8)
+    }
+    for k in 0:nargs {
+        if op_kinds[k] == 2 {
+            rv_ld(cb, RV_T3, RV_SP, base + 96 + k * 8)
+            rv_mem(cb, false, op_widths[k], RV_T3, RV_T3, 0)
+            rv_sd(cb, RV_T3, RV_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    for k in 0:nargs {
+        if op_kinds[k] == 0 {
+            rv_ld(cb, op_regs[k], RV_SP, base + 96 + k * 8)
+        } else if op_kinds[k] == 2 {
+            rv_ld(cb, op_regs[k], RV_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    rv_emit_asm_insn(cb, tmpl)
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            rv_sd(cb, op_regs[k], RV_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            rv_ld(cb, RV_T3, RV_SP, base + 96 + k * 8)
+            rv_ld(cb, RV_T4, RV_SP, base + 96 + (nargs + k) * 8)
+            rv_mem(cb, true, op_widths[k], RV_T4, RV_T3, 0)
+        }
+    }
+    for si in 0:save_regs.len {
+        rv_ld(cb, save_regs[si], RV_SP, base + si * 8)
+    }
+}
+
+fn rv_parse_gpr_any(s &string) int {
+    t := asm_trim(*s)
+    if t == "zero" || t == "x0" { << 0 }
+    if t == "ra" || t == "x1" { << 1 }
+    if t == "sp" || t == "x2" { << 2 }
+    if t == "gp" || t == "x3" { << 3 }
+    if t == "tp" || t == "x4" { << 4 }
+    if t == "t0" { << 5 }
+    if t == "t1" { << 6 }
+    if t == "t2" { << 7 }
+    if t == "s0" || t == "fp" { << 8 }
+    if t == "s1" { << 9 }
+    if t == "a0" { << 10 }
+    if t == "a1" { << 11 }
+    if t == "a2" { << 12 }
+    if t == "a3" { << 13 }
+    if t == "a4" { << 14 }
+    if t == "a5" { << 15 }
+    if t == "a6" { << 16 }
+    if t == "a7" { << 17 }
+    if t == "s2" { << 18 }
+    if t == "s3" { << 19 }
+    if t == "s4" { << 20 }
+    if t == "s5" { << 21 }
+    if t == "s6" { << 22 }
+    if t == "s7" { << 23 }
+    if t == "s8" { << 24 }
+    if t == "s9" { << 25 }
+    if t == "s10" { << 26 }
+    if t == "s11" { << 27 }
+    if t == "t3" { << 28 }
+    if t == "t4" { << 29 }
+    if t == "t5" { << 30 }
+    if t == "t6" { << 31 }
+    if t.len >= 2 && t[0] == 120 {
+        num := t[1:t.len]
+        n := x64_asm_parse_int(&num)
+        if n >= 0 && n <= 31 { << n }
+    }
+    << -1
+}
+
+fn rv_csr_code(name &string) int {
+    k := asm_trim(*name)
+    if k == "mstatus" { << 0x300 }
+    if k == "misa" { << 0x301 }
+    if k == "mie" { << 0x304 }
+    if k == "mtvec" { << 0x305 }
+    if k == "mscratch" { << 0x340 }
+    if k == "mepc" { << 0x341 }
+    if k == "mcause" { << 0x342 }
+    if k == "mtval" { << 0x343 }
+    if k == "mip" { << 0x344 }
+    if k == "mhartid" { << 0xF14 }
+    if k == "sstatus" { << 0x100 }
+    if k == "sie" { << 0x104 }
+    if k == "stvec" { << 0x105 }
+    if k == "sscratch" { << 0x140 }
+    if k == "sepc" { << 0x141 }
+    if k == "scause" { << 0x142 }
+    if k == "stval" { << 0x143 }
+    if k == "sip" { << 0x144 }
+    if k == "satp" { << 0x180 }
+    if k == "cycle" { << 0xC00 }
+    if k == "time" { << 0xC01 }
+    if k == "instret" { << 0xC02 }
+    << -1
+}
+
+fn rv_emit_one_asm(cb $&mc.CodeBuffer, s string) bool {
+    if s == "compiler_fence" {
+        // Compiler optimization/scheduling barrier only; emits zero bytes.
+    } else if s == "wfi" || s == "hlt" {
+        e32(cb, 0x10500073)
+    } else if s == "nop" {
+        e32(cb, 0x00000013)
+    } else if s == "cli" {
+        e32(cb, 0x10017073) // csrci sstatus, 2
+    } else if s == "sti" {
+        e32(cb, 0x10016073) // csrsi sstatus, 2
+    } else if s == "pause" || s == "yield" || s == "wfe" {
+        e32(cb, 0x0100000F)
+    } else if s == "lfence" || s == "rmb" || s == "dmb ld" {
+        e32(cb, 0x0AA0000F) // fence ir, ir
+    } else if s == "sfence" || s == "wmb" || s == "dmb st" {
+        e32(cb, 0x0550000F) // fence ow, ow
+    } else if s == "fence" || s == "dsb sy" || s == "dmb sy" || s == "mfence" || s == "mb" {
+        e32(cb, 0x0FF0000F) // fence iorw, iorw
+    } else if s == "ret" {
+        e32(cb, 0x00008067)
+    } else if s == "sret" {
+        e32(cb, 0x10200073)
+    } else if s == "mret" {
+        e32(cb, 0x30200073)
+    } else if s == "ecall" {
+        e32(cb, 0x00000073)
+    } else if s == "ebreak" {
+        e32(cb, 0x00100073)
+    } else if s == "sfence.vma" {
+        e32(cb, 0x12000073)
+    } else if s == "fence.i" {
+        e32(cb, 0x0000100F)
+    } else {
+        $sp := -1
+        for i in 0:s.len {
+            if s[i] == 32 || s[i] == 9 {
+                sp = i
+                <-
+            }
+        }
+        if sp <= 0 { << false }
+        op := s[0:sp]
+        rest := asm_trim(s[sp + 1:s.len])
+        args := x64_asm_split_char(&rest, 44)
+        if op == "csrr" && args.len == 2 {
+            rd := rv_parse_gpr_any(&args[0])
+            csr := rv_csr_code(&args[1])
+            if rd < 0 || csr < 0 { << false }
+            e32(cb, ((csr & 0xFFF) << 20) | (2 << 12) | (rd << 7) | 0x73)
+        } else if (op == "csrw" || op == "csrs" || op == "csrc") && args.len == 2 {
+            csr := rv_csr_code(&args[0])
+            rs1 := rv_parse_gpr_any(&args[1])
+            if csr < 0 || rs1 < 0 { << false }
+            $f3 := 1
+            if op == "csrs" { f3 = 2 }
+            else if op == "csrc" { f3 = 3 }
+            e32(cb, ((csr & 0xFFF) << 20) | (rs1 << 15) | (f3 << 12) | 0x73)
+        } else if op == "mv" && args.len == 2 {
+            rd := rv_parse_gpr_any(&args[0])
+            rs1 := rv_parse_gpr_any(&args[1])
+            if rd < 0 || rs1 < 0 { << false }
+            rv_mv(cb, rd, rs1)
+        } else if op == "sfence.vma" && args.len == 2 {
+            rs1 := rv_parse_gpr_any(&args[0])
+            rs2 := rv_parse_gpr_any(&args[1])
+            if rs1 < 0 || rs2 < 0 { << false }
+            e32(cb, (0x09 << 25) | (rs2 << 20) | (rs1 << 15) | 0x73)
+        } else if (op == "add" || op == "sub" || op == "xor" || op == "or" || op == "and") && args.len == 3 {
+            rd := rv_parse_gpr_any(&args[0])
+            rs1 := rv_parse_gpr_any(&args[1])
+            rs2 := rv_parse_gpr_any(&args[2])
+            if rd < 0 || rs1 < 0 || rs2 < 0 { << false }
+            $f7 := 0
+            $f3 := 0
+            if op == "sub" { f7 = 0x20 }
+            else if op == "xor" { f3 = 4 }
+            else if op == "or" { f3 = 6 }
+            else if op == "and" { f3 = 7 }
+            e32(cb, (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | 0x33)
+        } else {
+            << false
+        }
+    }
+    << true
+}
+
+fn rv_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
+    stmts := asm_split_stmts(&raw)
+    for si in 0:stmts.len {
+        s := stmts[si] + ""
+        if asm_emit_directive(cb, s + "") { -> }
+        rv_emit_one_asm(cb, s)
+    }
+}
+
+pub fn rv64_validate_asm(raw string) string {
+    $tmp := mc.code_buffer_new()
+    stmts := asm_split_stmts(&raw)
+    for si in 0:stmts.len {
+        s := stmts[si] + ""
+        if asm_emit_directive($&tmp, s + "") { -> }
+        if !rv_emit_one_asm($&tmp, s + "") {
+            << s
+        }
+    }
+    << ""
+}
+
+fn emit_rv64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, save_boot bool) {
     // __xu_task_switch(from a0, to a1)
     syms.define_label("switch_context", cb.len())
     syms.define_label("__xu_task_switch", cb.len())
@@ -499,11 +844,24 @@ fn emit_rv64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     syms.define_label("in8", cb.len())
     syms.define_label("in16", cb.len())
     syms.define_label("in32", cb.len())
-    syms.define_label("read_cr2", cb.len())
-    syms.define_label("read_cr3", cb.len())
     syms.define_label("read_cr0", cb.len())
     syms.define_label("read_cr4", cb.len())
     syms.define_label("rdmsr", cb.len())
+    syms.define_label("gs_read_u64", cb.len())
+    syms.define_label("fs_read_u64", cb.len())
+    syms.define_label("arm64_read_sctlr_el1", cb.len())
+    syms.define_label("arm64_read_ttbr0_el1", cb.len())
+    syms.define_label("arm64_read_ttbr1_el1", cb.len())
+    syms.define_label("arm64_read_tcr_el1", cb.len())
+    syms.define_label("arm64_read_mair_el1", cb.len())
+    syms.define_label("arm64_read_esr_el1", cb.len())
+    syms.define_label("arm64_read_far_el1", cb.len())
+    syms.define_label("arm64_read_elr_el1", cb.len())
+    syms.define_label("arm64_read_spsr_el1", cb.len())
+    syms.define_label("arm64_read_tpidr_el1", cb.len())
+    syms.define_label("arm64_read_mpidr_el1", cb.len())
+    syms.define_label("arm64_cntfrq", cb.len())
+    syms.define_label("arm64_cntpct", cb.len())
     rv_li(cb, RV_A0, 0)
     rv_ret(cb)
 
@@ -511,8 +869,6 @@ fn emit_rv64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     syms.define_label("out16", cb.len())
     syms.define_label("out32", cb.len())
     syms.define_label("load_idt", cb.len())
-    syms.define_label("write_cr3", cb.len())
-    syms.define_label("invlpg", cb.len())
     syms.define_label("set_vbar", cb.len())
     syms.define_label("write_cr0", cb.len())
     syms.define_label("write_cr4", cb.len())
@@ -520,14 +876,103 @@ fn emit_rv64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     syms.define_label("load_tr", cb.len())
     syms.define_label("wrmsr", cb.len())
     syms.define_label("swapgs", cb.len())
+    syms.define_label("fxsave", cb.len())
+    syms.define_label("fxrstor", cb.len())
+    syms.define_label("gs_write_u64", cb.len())
+    syms.define_label("fs_write_u64", cb.len())
+    syms.define_label("stac", cb.len())
+    syms.define_label("clac", cb.len())
+    syms.define_label("arm64_write_sctlr_el1", cb.len())
+    syms.define_label("arm64_write_ttbr0_el1", cb.len())
+    syms.define_label("arm64_write_ttbr1_el1", cb.len())
+    syms.define_label("arm64_write_tcr_el1", cb.len())
+    syms.define_label("arm64_write_mair_el1", cb.len())
+    syms.define_label("arm64_write_elr_el1", cb.len())
+    syms.define_label("arm64_write_spsr_el1", cb.len())
+    syms.define_label("arm64_write_tpidr_el1", cb.len())
+    syms.define_label("arm64_tlbi_vmalle1", cb.len())
+    syms.define_label("arm64_tlbi_vae1", cb.len())
+    syms.define_label("arm64_isb", cb.len())
+    syms.define_label("arm64_dsb_sy", cb.len())
+    rv_ret(cb)
+
+    syms.define_label("read_rsp", cb.len())
+    e32(cb, 0x00010513) // mv a0, sp
+    rv_ret(cb)
+    syms.define_label("read_rbp", cb.len())
+    e32(cb, 0x00040513) // mv a0, s0
+    rv_ret(cb)
+
+    // RISC-V 64 S-mode CSRs & SFENCE.VMA (plus x64-compat CR/invlpg aliases).
+    syms.define_label("read_cr3", cb.len())
+    syms.define_label("rv64_read_satp", cb.len())
+    e32(cb, 0x18002573)
+    rv_ret(cb)
+    syms.define_label("write_cr3", cb.len())
+    syms.define_label("rv64_write_satp", cb.len())
+    e32(cb, 0x18051073)
+    e32(cb, 0x12000073)
+    rv_ret(cb)
+    syms.define_label("rv64_read_sstatus", cb.len())
+    e32(cb, 0x10002573)
+    rv_ret(cb)
+    syms.define_label("rv64_write_sstatus", cb.len())
+    e32(cb, 0x10051073)
+    rv_ret(cb)
+    syms.define_label("rv64_read_sie", cb.len())
+    e32(cb, 0x10402573)
+    rv_ret(cb)
+    syms.define_label("rv64_write_sie", cb.len())
+    e32(cb, 0x10451073)
+    rv_ret(cb)
+    syms.define_label("rv64_read_sip", cb.len())
+    e32(cb, 0x14402573)
+    rv_ret(cb)
+    syms.define_label("rv64_write_sip", cb.len())
+    e32(cb, 0x14451073)
+    rv_ret(cb)
+    syms.define_label("rv64_read_stvec", cb.len())
+    e32(cb, 0x10502573)
+    rv_ret(cb)
+    syms.define_label("set_trap_vector", cb.len())
+    syms.define_label("rv64_write_stvec", cb.len())
+    e32(cb, 0x10551073)
+    rv_ret(cb)
+    syms.define_label("rv64_read_scause", cb.len())
+    e32(cb, 0x14202573)
+    rv_ret(cb)
+    syms.define_label("read_cr2", cb.len())
+    syms.define_label("rv64_read_stval", cb.len())
+    e32(cb, 0x14302573)
+    rv_ret(cb)
+    syms.define_label("rv64_read_sepc", cb.len())
+    e32(cb, 0x14102573)
+    rv_ret(cb)
+    syms.define_label("rv64_write_sepc", cb.len())
+    e32(cb, 0x14151073)
+    rv_ret(cb)
+    syms.define_label("rv64_read_sscratch", cb.len())
+    e32(cb, 0x14002573)
+    rv_ret(cb)
+    syms.define_label("rv64_write_sscratch", cb.len())
+    e32(cb, 0x14051073)
+    rv_ret(cb)
+    syms.define_label("rv64_read_tp", cb.len())
+    e32(cb, 0x00020513)
+    rv_ret(cb)
+    syms.define_label("rv64_write_tp", cb.len())
+    e32(cb, 0x00050213)
+    rv_ret(cb)
+    syms.define_label("rv64_sfence_vma", cb.len())
+    e32(cb, 0x12000073)
+    rv_ret(cb)
+    syms.define_label("invlpg", cb.len())
+    syms.define_label("rv64_sfence_vma_addr", cb.len())
+    e32(cb, 0x12050073)
     rv_ret(cb)
 
     syms.define_label("rdtsc", cb.len())
     e32(cb, 0xC0002573) // csrr a0, cycle
-    rv_ret(cb)
-
-    syms.define_label("set_trap_vector", cb.len())
-    e32(cb, 0x10551073) // csrw stvec, a0
     rv_ret(cb)
 
     syms.define_label("syscall_entry", cb.len())
@@ -561,8 +1006,20 @@ fn emit_rv64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     e32(cb, 0x10052073) // csrs sstatus, a0
     rv_ret(cb)
     syms.define_label("boot_magic", cb.len())
+    if save_boot {
+        rv_pcrel_pair(cb, relocs, RV_A0, "__xu_boot_slots", false)
+        rv_ld(cb, RV_A0, RV_A0, 0)
+    } else {
+        rv_li(cb, RV_A0, 0)
+    }
+    rv_ret(cb)
     syms.define_label("boot_info_addr", cb.len())
-    rv_li(cb, RV_A0, 0)
+    if save_boot {
+        rv_pcrel_pair(cb, relocs, RV_A0, "__xu_boot_slots", false)
+        rv_ld(cb, RV_A0, RV_A0, 8)
+    } else {
+        rv_li(cb, RV_A0, 0)
+    }
     rv_ret(cb)
 
     // Hardware atomic primitives (RV64A + acquire/release fences; a0=ptr, a1=val/exp/delta, a2=desired).
@@ -614,6 +1071,164 @@ fn emit_rv64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     rv_ret(cb)
     syms.define_label("atomic_fetch_add_u64", cb.len())
     e32(cb, 0x06B5352F)                // amoadd.d.aqrl a0, a1, (a0)
+    rv_ret(cb)
+
+    // Expanded RV64 atomics (subword LL/SC, bitwise AMO, relaxed & seq_cst).
+    syms.define_label("atomic_load_u8", cb.len())
+    e32(cb, 0x00054503)
+    e32(cb, 0x0230000F)
+    rv_ret(cb)
+    syms.define_label("atomic_store_u8", cb.len())
+    e32(cb, 0x0310000F)
+    e32(cb, 0x00B50023)
+    rv_ret(cb)
+    syms.define_label("atomic_xchg_u8", cb.len())
+    e32(cb, 0xFFC57293)
+    e32(cb, 0x00357313)
+    e32(cb, 0x00331313)
+    e32(cb, 0x0FF00393)
+    e32(cb, 0x0075F5B3)
+    e32(cb, 0x006595B3)
+    e32(cb, 0x006393B3)
+    e32(cb, 0xFFF3C393)
+    e32(cb, 0x1602AE2F)
+    e32(cb, 0x007E7EB3)
+    e32(cb, 0x00BEEEB3)
+    e32(cb, 0x1FD2AF2F)
+    e32(cb, 0xFE0F18E3)
+    e32(cb, 0x006E5533)
+    e32(cb, 0x0FF57513)
+    rv_ret(cb)
+    syms.define_label("atomic_cas_u8", cb.len())
+    e32(cb, 0xFFC57293)
+    e32(cb, 0x00357313)
+    e32(cb, 0x00331313)
+    e32(cb, 0x0FF00393)
+    e32(cb, 0x0075F5B3)
+    e32(cb, 0x00767633)
+    e32(cb, 0x00661633)
+    e32(cb, 0x006393B3)
+    e32(cb, 0xFFF3C393)
+    e32(cb, 0x1602AE2F)
+    e32(cb, 0x006E5EB3)
+    e32(cb, 0x0FFEFE93)
+    e32(cb, 0x00BE9A63)
+    e32(cb, 0x007E7F33)
+    e32(cb, 0x00CF6F33)
+    e32(cb, 0x1FE2AFAF)
+    e32(cb, 0xFE0F92E3)
+    e32(cb, 0x000E8513)
+    rv_ret(cb)
+
+    syms.define_label("atomic_load_u16", cb.len())
+    e32(cb, 0x00055503)
+    e32(cb, 0x0230000F)
+    rv_ret(cb)
+    syms.define_label("atomic_store_u16", cb.len())
+    e32(cb, 0x0310000F)
+    e32(cb, 0x00B51023)
+    rv_ret(cb)
+    syms.define_label("atomic_xchg_u16", cb.len())
+    e32(cb, 0xFFC57293)
+    e32(cb, 0x00357313)
+    e32(cb, 0x00331313)
+    e32(cb, 0x00100393)
+    e32(cb, 0x01039393)
+    e32(cb, 0xFFF38393)
+    e32(cb, 0x0075F5B3)
+    e32(cb, 0x006595B3)
+    e32(cb, 0x006393B3)
+    e32(cb, 0xFFF3C393)
+    e32(cb, 0x1602AE2F)
+    e32(cb, 0x007E7EB3)
+    e32(cb, 0x00BEEEB3)
+    e32(cb, 0x1FD2AF2F)
+    e32(cb, 0xFE0F18E3)
+    e32(cb, 0x006E5533)
+    e32(cb, 0x03051513)
+    e32(cb, 0x03055513)
+    rv_ret(cb)
+    syms.define_label("atomic_cas_u16", cb.len())
+    e32(cb, 0xFFC57293)
+    e32(cb, 0x00357313)
+    e32(cb, 0x00331313)
+    e32(cb, 0x00100393)
+    e32(cb, 0x01039393)
+    e32(cb, 0xFFF38393)
+    e32(cb, 0x0075F5B3)
+    e32(cb, 0x00767633)
+    e32(cb, 0x00661633)
+    e32(cb, 0x006393B3)
+    e32(cb, 0xFFF3C393)
+    e32(cb, 0x1602AE2F)
+    e32(cb, 0x006E5EB3)
+    e32(cb, 0x030E9E93)
+    e32(cb, 0x030EDE93)
+    e32(cb, 0x00BE9A63)
+    e32(cb, 0x007E7F33)
+    e32(cb, 0x00CF6F33)
+    e32(cb, 0x1FE2AFAF)
+    e32(cb, 0xFC0F9EE3)
+    e32(cb, 0x000E8513)
+    rv_ret(cb)
+
+    syms.define_label("atomic_fetch_sub_u32", cb.len())
+    e32(cb, 0x40B005BB)
+    e32(cb, 0x06B5252F)
+    e32(cb, 0x02051513)
+    e32(cb, 0x02055513)
+    rv_ret(cb)
+    syms.define_label("atomic_fetch_and_u32", cb.len())
+    e32(cb, 0x66B5252F)
+    e32(cb, 0x02051513)
+    e32(cb, 0x02055513)
+    rv_ret(cb)
+    syms.define_label("atomic_fetch_or_u32", cb.len())
+    e32(cb, 0x46B5252F)
+    e32(cb, 0x02051513)
+    e32(cb, 0x02055513)
+    rv_ret(cb)
+    syms.define_label("atomic_fetch_xor_u32", cb.len())
+    e32(cb, 0x26B5252F)
+    e32(cb, 0x02051513)
+    e32(cb, 0x02055513)
+    rv_ret(cb)
+
+    syms.define_label("atomic_fetch_sub_u64", cb.len())
+    e32(cb, 0x40B005B3)
+    e32(cb, 0x06B5352F)
+    rv_ret(cb)
+    syms.define_label("atomic_fetch_and_u64", cb.len())
+    e32(cb, 0x66B5352F)
+    rv_ret(cb)
+    syms.define_label("atomic_fetch_or_u64", cb.len())
+    e32(cb, 0x46B5352F)
+    rv_ret(cb)
+    syms.define_label("atomic_fetch_xor_u64", cb.len())
+    e32(cb, 0x26B5352F)
+    rv_ret(cb)
+
+    syms.define_label("atomic_load_relaxed_u32", cb.len())
+    e32(cb, 0x00056503)
+    rv_ret(cb)
+    syms.define_label("atomic_store_relaxed_u32", cb.len())
+    e32(cb, 0x00B52023)
+    rv_ret(cb)
+    syms.define_label("atomic_load_relaxed_u64", cb.len())
+    e32(cb, 0x00053503)
+    rv_ret(cb)
+    syms.define_label("atomic_store_relaxed_u64", cb.len())
+    e32(cb, 0x00B53023)
+    rv_ret(cb)
+    syms.define_label("atomic_store_seqcst_u32", cb.len())
+    e32(cb, 0x0330000F)
+    e32(cb, 0x00B52023)
+    e32(cb, 0x0330000F)
+    rv_ret(cb)
+    syms.define_label("atomic_store_seqcst_u64", cb.len())
+    e32(cb, 0x0330000F)
+    e32(cb, 0x00B53023)
+    e32(cb, 0x0330000F)
     rv_ret(cb)
 
     // __xu_task_entry: s1 = task, s2 = function, s3 = 16 argument words,
@@ -775,20 +1390,25 @@ pub fn emit_rv64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&
 }
 
 pub fn emit_rv64_runtime_stubs_object(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string, emit_object bool) {
-    emit_rv64_runtime_stubs_os(cb, syms, relocs, target.OS_LINUX, main_label, emit_object)
+    emit_rv64_runtime_stubs_os(cb, syms, relocs, target.OS_LINUX, main_label, emit_object, false, 65536)
 }
 
-pub fn emit_rv64_runtime_stubs_os(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, emit_object bool) {
+pub fn emit_rv64_runtime_stubs_os(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, emit_object bool, no_fp bool, boot_stack_bytes int) {
     if tgt_os == target.OS_NONE {
         syms.define_label("__xu_start", cb.len())
         if !emit_object {
             syms.define_label("_start", cb.len())
             rv_pcrel_pair(cb, relocs, RV_SP, "__xu_boot_stack_top", false)
+            rv_pcrel_pair(cb, relocs, RV_T0, "__xu_boot_slots", false)
+            rv_sd(cb, RV_A0, RV_T0, 0)
+            rv_sd(cb, RV_A0 + 1, RV_T0, 8)
         }
         rv_li(cb, RV_S0, 0)
-        // Enable supervisor floating-point state (sstatus.FS = Initial).
-        e32(cb, 0x000022B7) // lui t0, 2 (0x2000)
-        e32(cb, 0x1002A073) // csrs sstatus, t0
+        if !no_fp {
+            // Enable supervisor floating-point state (sstatus.FS = Initial).
+            e32(cb, 0x000022B7) // lui t0, 2 (0x2000)
+            e32(cb, 0x1002A073) // csrs sstatus, t0
+        }
         rv_call(cb, relocs, main_label)
         syms.define_label("__xu_hang", cb.len())
         e32(cb, 0x10500073) // wfi
@@ -836,12 +1456,18 @@ pub fn emit_rv64_runtime_stubs_os(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, rel
         rv_ret(cb)
         rv_addi(cb, RV_A0, RV_ZERO, 0)
         rv_ret(cb)
-        emit_rv64_task_stubs(cb, syms)
+        emit_rv64_task_stubs(cb, syms, relocs, !emit_object)
         if !emit_object {
             while cb.len() % 16 != 0 {
                 e32(cb, 0)
             }
-            for bi in 0:16384 {
+            syms.define_label("__xu_boot_slots", cb.len())
+            for _ in 0:4 {
+                e32(cb, 0)
+            }
+            $swords := boot_stack_bytes / 4
+            if swords < 1024 { swords = 1024 }
+            for bi in 0:swords {
                 e32(cb, 0)
             }
             syms.define_label("__xu_boot_stack_top", cb.len())
@@ -949,5 +1575,5 @@ pub fn emit_rv64_runtime_stubs_os(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, rel
     syms.define_label("_runtime_core_missing_u64_div", cb.len())
     e32(cb, 0x02B55533) // divu a0, a0, a1
     rv_ret(cb)
-    emit_rv64_task_stubs(cb, syms)
+    emit_rv64_task_stubs(cb, syms, relocs, false)
 }

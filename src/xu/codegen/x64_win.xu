@@ -98,12 +98,14 @@ fn emit_win_x64_ui_dispatch(cb $&mc.CodeBuffer, relocs $&[]mc.Reloc) {
     win_x64_ui_case(cb, relocs, uiabi.WRITE, "xu_ui_mem_try_write")
 }
 
-fn emit_x64_windows_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string, link_ui bool, emit_object bool, uses_ffi bool) {
+fn emit_x64_windows_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, main_label string, link_ui bool, emit_object bool, uses_ffi bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     // __xu_start: the loader enters with rsp = 8 mod 16. The state block
     // comes from VirtualAlloc(0, 64K, MEM_COMMIT | MEM_RESERVE,
     // PAGE_READWRITE); argc/argv/envp stay 0 (the runtime builds them).
-    syms.define_label("__xu_start", cb.len())
+    start_beg := cb.len()
+    syms.define_label("__xu_start", start_beg)
     x64_add_rsp(cb, -8)
+    start_prolog := cb.len() - start_beg
     x64_mov_imm(cb, X_RDI, WIN_SLOT_BASE + WIN_SLOT_VIRTUAL_ALLOC)
     x64_mov_imm(cb, X_RSI, 0)
     x64_mov_imm(cb, X_RDX, 65536)
@@ -121,6 +123,23 @@ fn emit_x64_windows_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]
     x64_mov_imm(cb, X_RDI, WIN_SLOT_BASE + WIN_SLOT_EXIT_PROCESS)
     x64_call(cb, relocs, "__xu_syscall")
     x64_ud2(cb)
+    start_end := cb.len()
+    if collect_unwind {
+        unwinds.push(WinUnwindEntry{
+            beg: start_beg,
+            end: start_end,
+            kind: UNW_X64_ALLOC_ONLY,
+            prolog_len: start_prolog,
+            frame_size: 8,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: -1,
+            callee_regs: []int{},
+            save_end_offs: []int{}
+        })
+    }
 
     if link_ui {
         syms.define_label("__xu_ui_tick", cb.len())
@@ -129,7 +148,7 @@ fn emit_x64_windows_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]
 
     syms.define_label("__xu_syscall", cb.len())
     if uses_ffi || !emit_object {
-        emit_x64_win_ffi_call(cb, syms, relocs, emit_object)
+        emit_x64_win_ffi_call(cb, syms, relocs, emit_object, unwinds, collect_unwind)
     }
     x64_cmp_imm8(cb, X_RDI, -5)
     not5 := x64_jshort(cb, CC_NE)
@@ -167,8 +186,11 @@ fn emit_x64_windows_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]
     }
     // push rbp; mov rbp, rsp; and rsp, -16; 32 bytes of shadow space and
     // eight stack arguments.
+    bridge_beg := cb.len()
     xb(cb, 0x55)
+    bp1 := cb.len() - bridge_beg
     x64_mov(cb, X_RBP, X_RSP)
+    bp2 := cb.len() - bridge_beg
     xb(cb, 0x48)
     xb(cb, 0x83)
     xb(cb, 0xE4)
@@ -224,14 +246,34 @@ fn emit_x64_windows_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]
     x64_mov(cb, X_R8, X_RCX)
     x64_mov(cb, X_RCX, X_RSI)
     x64_win_call_r11(cb)
-    emit_x64_task_stubs(cb, syms)
+    bridge_end := cb.len()
+    if collect_unwind {
+        $bregs := []int{}
+        bregs.push(X_RBP)
+        $boffs := []int{}
+        boffs.push(bp1)
+        boffs.push(bp2)
+        unwinds.push(WinUnwindEntry{
+            beg: bridge_beg,
+            end: bridge_end,
+            kind: UNW_X64_FP_SAVES,
+            prolog_len: bp2,
+            frame_size: 0,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: -1,
+            callee_regs: ~bregs,
+            save_end_offs: ~boffs
+        })
+    }
+    emit_x64_task_stubs(cb, syms, false)
     syms.define_label("__xu_globals", cb.len())
     x64_mov(cb, X_RAX, X_R15)
     x64_ret(cb)
     if emit_object {
         emit_win_import_thunks(cb, syms, relocs)
-    } else {
-        emit_win_imports(cb, syms)
     }
 }
 
@@ -284,18 +326,20 @@ fn emit_win_import_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]
 }
 
 // IAT, import lookup table (same contents), import directory, hint/name
-// entries and DLL names, in that order. The IAT starts 8-byte aligned and
-// the section is writable so the loader can bind it.
-fn emit_win_imports(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
-    while cb.len() % 8 != 0 {
-        xb(cb, 0xCC)
+// entries and DLL names in that order, emitted into `.rdata` at `rdata_rva`.
+// Labels are offset by (rdata_rva - PE_TEXT_RVA) so PC-relative relocs in `.text`
+// land on the mapped `.rdata` bytes.
+pub fn emit_win_imports_section(rdata $&mc.CodeBuffer, syms $&mc.SymbolTable, rdata_rva int) {
+    while rdata.len() % 8 != 0 {
+        rdata.emit_u8(0)
     }
+    sym_base := rdata_rva - PE_TEXT_RVA
     dlls := win_import_dlls()
     $nslots := 0
     for d in 0:dlls.len {
         nslots += win_import_names(d).len + 1
     }
-    iat := cb.len()
+    iat := rdata.len()
     ilt := iat + nslots * 8
     dir := ilt + nslots * 8
     names := dir + (dlls.len + 1) * 20
@@ -316,51 +360,51 @@ fn emit_win_imports(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
         dll_name.push(pos)
         pos += dlls[d].len + 1
     }
-    syms.define_label("__pe_iat", iat)
+    syms.define_label("__pe_iat", sym_base + iat)
     for pass in 0:2 {
         for s in 0:nslots {
             $v := 0
             if hint[s] != 0 {
-                v = PE_TEXT_RVA + hint[s]
+                v = rdata_rva + hint[s]
             }
-            cb.emit_u64_le(v)
+            rdata.emit_u64_le(v)
         }
         if pass == 0 {
-            syms.define_label("__pe_iat_end", cb.len())
+            syms.define_label("__pe_iat_end", sym_base + rdata.len())
         }
     }
-    syms.define_label("__pe_import_dir", dir)
+    syms.define_label("__pe_import_dir", sym_base + dir)
     $slot := 0
     for d in 0:dlls.len {
-        cb.emit_u32_le(PE_TEXT_RVA + ilt + slot * 8)
-        cb.emit_u32_le(0)
-        cb.emit_u32_le(0)
-        cb.emit_u32_le(PE_TEXT_RVA + dll_name[d])
-        cb.emit_u32_le(PE_TEXT_RVA + iat + slot * 8)
+        rdata.emit_u32_le(rdata_rva + ilt + slot * 8)
+        rdata.emit_u32_le(0)
+        rdata.emit_u32_le(0)
+        rdata.emit_u32_le(rdata_rva + dll_name[d])
+        rdata.emit_u32_le(rdata_rva + iat + slot * 8)
         slot += win_import_names(d).len + 1
     }
-    for i in 0:20 {
-        xb(cb, 0)
+    for _ in 0:20 {
+        rdata.emit_u8(0)
     }
-    syms.define_label("__pe_import_dir_end", cb.len())
+    syms.define_label("__pe_import_dir_end", sym_base + rdata.len())
     for d in 0:dlls.len {
         fns := win_import_names(d)
         for f in 0:fns.len {
-            cb.emit_u16_le(0)
+            rdata.emit_u16_le(0)
             for b in 0:fns[f].len {
-                xb(cb, fns[f][b])
+                rdata.emit_u8(fns[f][b])
             }
-            xb(cb, 0)
-            if cb.len() % 2 != 0 {
-                xb(cb, 0)
+            rdata.emit_u8(0)
+            if rdata.len() % 2 != 0 {
+                rdata.emit_u8(0)
             }
         }
     }
     for d in 0:dlls.len {
         for b in 0:dlls[d].len {
-            xb(cb, dlls[d][b])
+            rdata.emit_u8(dlls[d][b])
         }
-        xb(cb, 0)
+        rdata.emit_u8(0)
     }
 }
 
@@ -368,14 +412,19 @@ fn emit_win_imports(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
 // stack argument words above a 32-byte shadow space, load rcx, rdx, r8, r9
 // and xmm0-xmm3, call rsi, store rax and xmm0 back. r15 (the runtime state)
 // is published for C callbacks first.
-fn emit_x64_win_ffi_call(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, emit_object bool) {
+fn emit_x64_win_ffi_call(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, emit_object bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     x64_cmp_imm8(cb, X_RDI, -8)
     x64_jcc(cb, relocs, CC_NE, "__xu_ffi_not8")
-    xb(cb, 0x55) // push rbp
-    x64_mov(cb, X_RBP, X_RSP)
+    ffi_beg := cb.len()
     xb(cb, 0x53) // push rbx
+    p1 := cb.len() - ffi_beg
     xb(cb, 0x41)
     xb(cb, 0x54) // push r12
+    p2 := cb.len() - ffi_beg
+    xb(cb, 0x55) // push rbp
+    p3 := cb.len() - ffi_beg
+    x64_mov(cb, X_RBP, X_RSP)
+    p4 := cb.len() - ffi_beg
     x64_lea_ffi_state(cb, relocs, X_R11, emit_object)
     x64_str(cb, X_R15, X_R11, 0)
     x64_mov(cb, X_RBX, X_RDX)
@@ -405,12 +454,38 @@ fn emit_x64_win_ffi_call(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     xb(cb, 0x0F)
     xb(cb, 0xD6)
     x64_modrm_mem(cb, 0, X_RBX, 168)
-    x64_lea(cb, X_RSP, X_RBP, -16)
+    x64_mov(cb, X_RSP, X_RBP)
+    xb(cb, 0x5D) // pop rbp
     xb(cb, 0x41)
     xb(cb, 0x5C) // pop r12
     xb(cb, 0x5B) // pop rbx
-    xb(cb, 0x5D) // pop rbp
     x64_ret(cb)
+    ffi_end := cb.len()
+    if collect_unwind {
+        $fregs := []int{}
+        fregs.push(X_RBX)
+        fregs.push(X_R12)
+        fregs.push(X_RBP)
+        $foffs := []int{}
+        foffs.push(p1)
+        foffs.push(p2)
+        foffs.push(p3)
+        foffs.push(p4)
+        unwinds.push(WinUnwindEntry{
+            beg: ffi_beg,
+            end: ffi_end,
+            kind: UNW_X64_FP_SAVES,
+            prolog_len: p4,
+            frame_size: 0,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: -1,
+            callee_regs: ~fregs,
+            save_end_offs: ~foffs
+        })
+    }
     syms.define_label("__xu_ffi_not8", cb.len())
     x64_cmp_imm8(cb, X_RDI, -9)
     x64_jcc(cb, relocs, CC_NE, "__xu_ffi_not9")
@@ -421,23 +496,33 @@ fn emit_x64_win_ffi_call(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     syms.define_label("__xu_ffi_not9", cb.len())
 }
 
-fn emit_x64_win_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, regs &[]int, label string, adapter string, is_clos bool, emit_object bool) {
+fn emit_x64_win_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, regs &[]int, label string, adapter string, is_clos bool, emit_object bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     while cb.len() % 16 != 0 { xb(cb, 0xCC) }
-    syms.define_label(label + "", cb.len())
+    th_beg := cb.len()
+    syms.define_label(label + "", th_beg)
     xb(cb, 0x55) // push rbp
+    o0 := cb.len() - th_beg
     x64_mov(cb, X_RBP, X_RSP)
     xb(cb, 0x53) // push rbx
+    o1 := cb.len() - th_beg
     xb(cb, 0x57) // push rdi
+    o2 := cb.len() - th_beg
     xb(cb, 0x56) // push rsi
+    o3 := cb.len() - th_beg
     xb(cb, 0x41)
     xb(cb, 0x54) // push r12
+    o4 := cb.len() - th_beg
     xb(cb, 0x41)
     xb(cb, 0x55) // push r13
+    o5 := cb.len() - th_beg
     xb(cb, 0x41)
     xb(cb, 0x56) // push r14
+    o6 := cb.len() - th_beg
     xb(cb, 0x41)
     xb(cb, 0x57) // push r15
+    o7 := cb.len() - th_beg
     x64_add_rsp(cb, -376)
+    alloc_off := cb.len() - th_beg
     for i in 0:10 {
         // movdqu [rsp + 208 + 16i], xmm(6+i)
         xb(cb, 0xF3)
@@ -486,19 +571,38 @@ fn emit_x64_win_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs 
     xb(cb, 0x5B) // pop rbx
     xb(cb, 0x5D) // pop rbp
     x64_ret(cb)
+    th_end := cb.len()
+    if collect_unwind {
+        $tregs := [X_RBP, X_RBX, X_RDI, X_RSI, X_R12, X_R13, X_R14, X_R15]
+        $toffs := [o0, o1, o2, o3, o4, o5, o6, o7]
+        unwinds.push(WinUnwindEntry{
+            beg: th_beg,
+            end: th_end,
+            kind: UNW_X64_PUSH_ALLOC,
+            prolog_len: alloc_off,
+            frame_size: 376,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: -1,
+            callee_regs: ~tregs,
+            save_end_offs: ~toffs
+        })
+    }
 }
 
 // C-ABI (Win64) entry points for Xu functions passed as C callbacks: save
 // the Win64 callee-saved registers (rbx, rbp, rdi, rsi, r12-r15,
 // xmm6-xmm15), spill rcx, rdx, r8, r9 and xmm0-xmm3 into a call block and
 // point it at the caller's stack arguments (above the shadow space).
-pub fn emit_x64_win_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, emit_object bool, emit_clos bool) {
+pub fn emit_x64_win_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, emit_object bool, emit_clos bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     regs := [X_RCX, X_RDX, X_R8, X_R9]
     for t in 0:thunks.len {
-        emit_x64_win_ffi_thunk_one(cb, syms, relocs, &regs, thunks[t] + "", adapters[t] + "", false, emit_object)
+        emit_x64_win_ffi_thunk_one(cb, syms, relocs, &regs, thunks[t] + "", adapters[t] + "", false, emit_object, unwinds, collect_unwind)
     }
     if emit_clos {
-        emit_x64_win_ffi_thunk_one(cb, syms, relocs, &regs, "__xu_ffi_clos_dispatch", "", true, emit_object)
+        emit_x64_win_ffi_thunk_one(cb, syms, relocs, &regs, "__xu_ffi_clos_dispatch", "", true, emit_object, unwinds, collect_unwind)
         x64_emit_ffi_clos_stubs(cb, syms, relocs)
     }
 }

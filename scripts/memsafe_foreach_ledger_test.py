@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Array / struct / chan foreach ledger battery."""
+"""Array / struct / chan foreach memory-safety battery (opt & --no-opt under XU_DEBUG_FREE=1)."""
 from __future__ import annotations
 import os, re, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,7 +7,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
-XU = os.environ.get('XU', '/tmp/xu_prod.xin')
+DEFAULT_XU = ROOT / "bin" / ("xu.exe" if os.name == "nt" else "xu")
+XU = os.environ.get("XU", str(DEFAULT_XU))
 P = 'padpadpadpad'
 
 CASES = [
@@ -160,43 +161,48 @@ def parse(err):
 
 def run_case(name, src, expect, balanced):
     td = Path(tempfile.mkdtemp(prefix=f"xuFE_{name}_"))
-    (td/"main.xu").write_text(src.lstrip("\n"))
-    out = td/"a.out"
+    (td / "main.xu").write_text(src.lstrip("\n"), encoding="utf-8")
     env = os.environ.copy()
-    env["XUPATH"] = str(ROOT/"src")
+    env["XU_ROOT"] = str(ROOT)
+    env["XU_STDLIB_ROOT"] = str(ROOT / "src")
+    env["XUPATH"] = str(ROOT / "src")
+    env["XU_DEBUG_FREE"] = "1"
     env["XU_GEN1_HEAP_LEDGER"] = "1"
     env["XU_HEAP_STATS"] = "1"
-    try:
-        p = subprocess.run([XU,"build",str(td/"main.xu"),"-o",str(out)],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           env=env, timeout=25)
-    except subprocess.TimeoutExpired:
-        return name, False, "compile-timeout"
-    if p.returncode != 0:
-        return name, False, f"compile {(p.stderr.decode().splitlines() or [''])[0][:120]}"
-    binp = out if out.is_file() else Path(str(out) + ".exe")
-    if not binp.is_file():
-        return name, False, "no-bin"
-    try:
-        r = subprocess.run([str(binp)], stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=10, env=env)
-    except subprocess.TimeoutExpired:
-        return name, False, "run-timeout"
-    if r.returncode != 0:
-        return name, False, f"run rc={r.returncode} {r.stderr.decode()[:80]!r}"
-    got = r.stdout.decode()
-    if expect is not None and got != expect:
-        return name, False, f"stdout {got!r} want {expect!r}"
-    st = parse(r.stderr.decode())
-    if not st:
-        return name, False, f"no-stats {r.stderr.decode()[:60]!r}"
-    if st.get("unknown_frees",0) or st.get("double_frees",0):
-        return name, False, f"bad-free {st}"
-    if balanced and st.get("live_bytes",-1) != 0:
-        return name, False, f"live!=0 {st}"
-    if balanced and st.get("allocs") != st.get("frees"):
-        return name, False, f"A!=F {st}"
-    return name, True, f"ok {st}"
+    last_st = {}
+    for mode, flags in (("opt", []), ("no-opt", ["--no-opt"])):
+        out = td / f"a_{mode}.out"
+        try:
+            p = subprocess.run([XU, "build", *flags, str(td / "main.xu"), "-o", str(out)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=env, timeout=25)
+        except subprocess.TimeoutExpired:
+            return name, False, f"{mode}:compile-timeout"
+        if p.returncode != 0:
+            return name, False, f"{mode}:compile {(p.stderr.decode(errors='replace').splitlines() or [''])[0][:120]}"
+        binp = out if out.is_file() else Path(str(out) + ".exe")
+        if not binp.is_file():
+            return name, False, f"{mode}:no-bin"
+        try:
+            r = subprocess.run([str(binp)], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=10, env=env)
+        except subprocess.TimeoutExpired:
+            return name, False, f"{mode}:run-timeout"
+        if r.returncode != 0:
+            return name, False, f"{mode}:run rc={r.returncode} {r.stderr.decode(errors='replace')[:80]!r}"
+        got = r.stdout.decode(errors="replace").replace("\r\n", "\n")
+        if expect is not None and got != expect:
+            return name, False, f"{mode}:stdout {got!r} want {expect!r}"
+        st = parse(r.stderr.decode(errors="replace"))
+        if st:
+            if st.get("unknown_frees", 0) or st.get("double_frees", 0):
+                return name, False, f"{mode}:bad-free {st}"
+            if balanced and st.get("live_bytes", -1) != 0:
+                return name, False, f"{mode}:live!=0 {st}"
+            if balanced and st.get("allocs") != st.get("frees"):
+                return name, False, f"{mode}:A!=F {st}"
+            last_st = st
+    return name, True, f"ok {last_st or 'debug_free'}"
 
 
 def main():

@@ -17,20 +17,20 @@ def main():
 
 fn main() {
     // Read up to 256 bytes from stdin (fd 0)
-    data := os_fd_read(0, 256) or (err) {
+    data := os_fd_read(0, 256) >>> (err) {
         println("child read failed: " + err.msg())
         <<< 1
     }
     
     // Write marker to stdout (fd 1)
     msg_out := "STDOUT_MARKER:" + data
-    w1 := os_fd_write(1, msg_out) or (err) {
+    w1 := os_fd_write(1, msg_out) >>> (err) {
         <<< 1
     }
     
     // Write marker to stderr (fd 2)
     msg_err := "STDERR_MARKER:" + data
-    w2 := os_fd_write(2, msg_err) or (err) {
+    w2 := os_fd_write(2, msg_err) >>> (err) {
         <<< 1
     }
     
@@ -46,7 +46,7 @@ fn main() {
 fn drain_file(f $&os.File) string {
     $out := ""
     while true {
-        chunk := f.read(1024) or (err) {
+        chunk := f.read(1024) >>> (err) {
             <-
         }
         if chunk.len == 0 {
@@ -54,19 +54,19 @@ fn drain_file(f $&os.File) string {
         }
         out = out + chunk
     }
-    f.close() or (err) { << out }
+    f.close() >>> (err) { << out }
     << out
 }
 
 fn call_stdout_pipe_expect_error(c $&exec.Cmd) bool {
-    _ := c.stdout_pipe() or (err) {
+    _ := c.stdout_pipe() >>> (err) {
         << true
     }
     << false
 }
 
 fn call_start_expect_error(c $&exec.Cmd) bool {
-    _ := c.start() or (err) {
+    _ := c.start() >>> (err) {
         << true
     }
     << false
@@ -75,20 +75,20 @@ fn call_start_expect_error(c $&exec.Cmd) bool {
 fn test_three_pipes(child_exe string) {
     $cmd := exec.command(child_exe)
     
-    $sin := cmd.stdin_pipe() or (err) {
+    $sin := cmd.stdin_pipe() >>> (err) {
         println("ERROR: stdin_pipe failed: " + err.msg())
         <<< 1
     }
-    $sout := cmd.stdout_pipe() or (err) {
+    $sout := cmd.stdout_pipe() >>> (err) {
         println("ERROR: stdout_pipe failed: " + err.msg())
         <<< 1
     }
-    $serr := cmd.stderr_pipe() or (err) {
+    $serr := cmd.stderr_pipe() >>> (err) {
         println("ERROR: stderr_pipe failed: " + err.msg())
         <<< 1
     }
 
-    cmd.start() or (err) {
+    cmd.start() >>> (err) {
         println("ERROR: start failed: " + err.msg())
         <<< 1
     }
@@ -101,11 +101,11 @@ fn test_three_pipes(child_exe string) {
 
     // Write to stdin and close write end
     msg := "echo_payload_42"
-    wr := sin.write(msg) or (err) {
+    wr := sin.write(msg) >>> (err) {
         println("ERROR: write to child stdin failed: " + err.msg())
         <<< 1
     }
-    sin.close() or (err) {
+    sin.close() >>> (err) {
         println("ERROR: close child stdin failed: " + err.msg())
         <<< 1
     }
@@ -129,7 +129,7 @@ fn test_three_pipes(child_exe string) {
     println("OK: stderr pipe verified: " + stderr_data)
 
     // Wait for child exit
-    cmd.wait() or (err) {
+    cmd.wait() >>> (err) {
         println("ERROR: cmd.wait failed: " + err.msg())
         <<< 1
     }
@@ -138,15 +138,15 @@ fn test_three_pipes(child_exe string) {
 
 fn test_close_unstarted() {
     $cmd := exec.command("non_existent_binary_xyz_12345")
-    $sin := cmd.stdin_pipe() or (err) {
+    $sin := cmd.stdin_pipe() >>> (err) {
         println("ERROR: stdin_pipe failed: " + err.msg())
         <<< 1
     }
-    $sout := cmd.stdout_pipe() or (err) {
+    $sout := cmd.stdout_pipe() >>> (err) {
         println("ERROR: stdout_pipe failed: " + err.msg())
         <<< 1
     }
-    $serr := cmd.stderr_pipe() or (err) {
+    $serr := cmd.stderr_pipe() >>> (err) {
         println("ERROR: stderr_pipe failed: " + err.msg())
         <<< 1
     }

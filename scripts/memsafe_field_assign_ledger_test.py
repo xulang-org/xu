@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""FieldAssign / DropField heap-ledger multi-instance battery.
-
-Compiles each case with XU_GEN1_HEAP_LEDGER=1 and requires:
-  - stdout contract
-  - unknown_frees=0, double_frees=0
-  - live_bytes=0 and allocs==frees when `balanced` is set
-"""
+"""FieldAssign / DropField memory-safety battery (opt & --no-opt under XU_DEBUG_FREE=1)."""
 from __future__ import annotations
 import os, re, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +7,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
-XU = os.environ.get("XU", "/tmp/xu_prod")
+DEFAULT_XU = ROOT / "bin" / ("xu.exe" if os.name == "nt" else "xu")
+XU = os.environ.get("XU", str(DEFAULT_XU))
 
 # name, src, expect_stdout, balanced
 CASES = [
@@ -36,7 +31,7 @@ fn main() int {
 struct U { s string }
 fn main() int {
     $u := U{s: "init_" + "padpadpadpad"}
-    for i in 0 -< 20 {
+    for i in 0:20 {
         u.s = "v" + str(i) + "_" + "padpadpadpad"
     }
     println(u.s)
@@ -49,7 +44,7 @@ fn main() int {
 struct U { a string b string }
 fn main() int {
     $u := U{a: "a0_" + "padpadpadpad", b: "b0_" + "padpadpadpad"}
-    for i in 0 -< 12 {
+    for i in 0:12 {
         u.a = "a" + str(i) + "_" + "padpadpadpad"
         u.b = "b" + str(i) + "_" + "padpadpadpad"
     }
@@ -65,7 +60,7 @@ struct Leaf { s string }
 struct Root { a Leaf b Leaf }
 fn main() int {
     $r := Root{a: Leaf{s: "A0_" + "padpadpadpad"}, b: Leaf{s: "B0_" + "padpadpadpad"}}
-    for i in 0 -< 8 {
+    for i in 0:8 {
         r.a.s = "A" + str(i) + "_" + "padpadpadpad"
         r.b.s = "B" + str(i) + "_" + "padpadpadpad"
     }
@@ -79,10 +74,10 @@ fn main() int {
 @main
 fn main() int {
     $a := []string{}
-    for i in 0 -< 6 {
+    for i in 0:6 {
         a.push("s" + str(i) + "_" + "padpadpadpad")
     }
-    for i in 0 -< 6 {
+    for i in 0:6 {
         a[i] = "r" + str(i) + "_" + "padpadpadpad"
     }
     println(a[0])
@@ -96,10 +91,10 @@ fn main() int {
 struct P { name string id int }
 fn main() int {
     $ps := []P{}
-    for i in 0 -< 8 {
+    for i in 0:8 {
         ps.push(P{name: "n" + str(i) + "_" + "padpadpadpad", id: i})
     }
-    for i in 0 -< 8 {
+    for i in 0:8 {
         ps[i].name = "m" + str(i) + "_" + "padpadpadpad"
     }
     println(ps[0].name)
@@ -112,10 +107,10 @@ fn main() int {
 @main
 fn main() int {
     $m := map[string]string{}
-    for i in 0 -< 8 {
+    for i in 0:8 {
         m["k" + str(i)] = "v" + str(i) + "_" + "padpadpadpad"
     }
-    for i in 0 -< 8 {
+    for i in 0:8 {
         m["k" + str(i)] = "w" + str(i) + "_" + "padpadpadpad"
     }
     println(m["k0"])
@@ -169,7 +164,7 @@ fn main() int {
 struct U { s string }
 fn main() int {
     $u := U{s: ""}
-    for i in 0 -< 10 {
+    for i in 0:10 {
         u.s = "x" + str(i) + "_" + "padpadpadpad"
         u.s = u.s + "_tailpadpad"
     }
@@ -210,7 +205,7 @@ fn main() int {
 @main
 fn main() int {
     $m := map[string]string{}
-    for i in 0 -< 4 {
+    for i in 0:4 {
         m["k" + str(i)] = "v" + str(i) + "_" + "padpadpadpad"
     }
     println(m["k0"])
@@ -233,48 +228,46 @@ def parse_stats(err: str) -> dict:
 
 def run_case(name, src, expect, balanced):
     td = Path(tempfile.mkdtemp(prefix=f"xuFA_{name}_"))
-    (td / "main.xu").write_text(src.lstrip("\n"))
-    out = td / "a.out"
+    (td / "main.xu").write_text(src.lstrip("\n"), encoding="utf-8")
     env = os.environ.copy()
+    env["XU_ROOT"] = str(ROOT)
+    env["XU_STDLIB_ROOT"] = str(ROOT / "src")
     env["XUPATH"] = str(ROOT / "src")
+    env["XU_DEBUG_FREE"] = "1"
     env["XU_GEN1_HEAP_LEDGER"] = "1"
     env["XU_HEAP_STATS"] = "1"
-    try:
-        p = subprocess.run([XU, "build", str(td / "main.xu"), "-o", str(out)],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           env=env, timeout=25)
-    except subprocess.TimeoutExpired:
-        return name, False, "compile-timeout"
-    if p.returncode != 0:
-        return name, False, f"compile {(p.stderr.decode().splitlines() or [''])[0][:100]}"
-    binp = out if out.is_file() else Path(str(out) + ".exe")
-    if not binp.is_file():
-        return name, False, "no-bin"
-    try:
-        r = subprocess.run([str(binp)], stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=10, env=env)
-    except subprocess.TimeoutExpired:
-        return name, False, "run-timeout"
-    if r.returncode != 0:
-        return name, False, f"run rc={r.returncode} {r.stderr.decode()[:80]!r}"
-    got = r.stdout.decode()
-    if got != expect:
-        return name, False, f"stdout {got!r} want {expect!r}"
-    st = parse_stats(r.stderr.decode())
-    if not st:
-        return name, False, f"no-stats {r.stderr.decode()[:80]!r}"
-    if st.get("unknown_frees", 0) != 0:
-        return name, False, f"unknown_frees {st}"
-    if st.get("double_frees", 0) != 0:
-        return name, False, f"double_frees {st}"
-    if st.get("ledger_overflows", 0) != 0:
-        return name, False, f"overflow {st}"
-    if balanced:
-        if st.get("live_bytes", -1) != 0:
-            return name, False, f"live_bytes!=0 {st}"
-        if st.get("allocs") != st.get("frees"):
-            return name, False, f"allocs!=frees {st}"
-    return name, True, f"ok {st}"
+    last_st = {}
+    for mode, flags in (("opt", []), ("no-opt", ["--no-opt"])):
+        out = td / f"a_{mode}.out"
+        try:
+            p = subprocess.run([XU, "build", *flags, str(td / "main.xu"), "-o", str(out)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=env, timeout=25)
+        except subprocess.TimeoutExpired:
+            return name, False, f"{mode}:compile-timeout"
+        if p.returncode != 0:
+            return name, False, f"{mode}:compile {(p.stderr.decode(errors='replace').splitlines() or [''])[0][:100]}"
+        binp = out if out.is_file() else Path(str(out) + ".exe")
+        if not binp.is_file():
+            return name, False, f"{mode}:no-bin"
+        try:
+            r = subprocess.run([str(binp)], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=10, env=env)
+        except subprocess.TimeoutExpired:
+            return name, False, f"{mode}:run-timeout"
+        if r.returncode != 0:
+            return name, False, f"{mode}:run rc={r.returncode} {r.stderr.decode(errors='replace')[:80]!r}"
+        got = r.stdout.decode(errors="replace").replace("\r\n", "\n")
+        if got != expect:
+            return name, False, f"{mode}:stdout {got!r} want {expect!r}"
+        st = parse_stats(r.stderr.decode(errors="replace"))
+        if st:
+            if st.get("unknown_frees", 0) != 0 or st.get("double_frees", 0) != 0 or st.get("ledger_overflows", 0) != 0:
+                return name, False, f"{mode}:bad stats {st}"
+            if balanced and (st.get("live_bytes", -1) != 0 or st.get("allocs") != st.get("frees")):
+                return name, False, f"{mode}:unbalanced {st}"
+            last_st = st
+    return name, True, f"ok {last_st or 'debug_free'}"
 
 
 def main():

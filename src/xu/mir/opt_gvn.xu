@@ -196,6 +196,9 @@ pub struct GvnWork {
     bucket_mask int
     l_cand []bool
     l_nonneg []bool
+    l_has_ub []bool
+    l_ub []int
+    call_noesc LabelIndex
     l_stores []int
     l_store_blk []int
     local_blk []int
@@ -307,6 +310,9 @@ pub fn gvn_work_new() GvnWork {
         bucket_mask: 63,
         l_cand: []bool{},
         l_nonneg: []bool{},
+        l_has_ub: []bool{},
+        l_ub: []int{},
+        call_noesc: label_index_new(0),
         l_stores: []int{},
         l_store_blk: []int{},
         local_blk: []int{},
@@ -622,7 +628,7 @@ fn gvn_body_writes(f &MFn, effects &LabelIndex, groups &[][]GvnParamWrite, compo
     $sl_o := []int{}
     $sl_top := 0
     $empty_rpo := []int{}
-    gvn_collect_struct_slices(f, &defs, &empty_rpo, true, false, $&sl_k, $&sl_i, $&sl_o, $&sl_top)
+    gvn_collect_struct_slices_all(f, &defs, &empty_rpo, true, false, $&sl_k, $&sl_i, $&sl_o, $&sl_top)
     $budget := GVN_MAX_INSTRS
     for ii in 0:f.instrs.len {
         ins := &f.instrs[ii]
@@ -631,8 +637,8 @@ fn gvn_body_writes(f &MFn, effects &LabelIndex, groups &[][]GvnParamWrite, compo
             if write.param != -1 {
                 if !gvn_add_param_write(writes, write) { << false }
             } else {
-                // Only proven offset-0 slice-data backing writes qualify as buf_write.
-                if ins.c != 0 { << false }
+                // Proven slice-data backing writes (including struct-element fields) qualify as buf_write.
+                if ins.c < 0 || ins.c >= 4096 { << false }
                 $trace_budget := 32
                 bt := gvn_trace_buf_ptr(f, &defs, ins.a, ii, false, &sl_k, &sl_i, &sl_o, sl_top, 0, $&trace_budget)
                 if bt.kind != GVN_MEM_PARAM { << false }
@@ -698,7 +704,7 @@ fn gvn_propagate_bad(start int, bad $&[]bool, fn_effect $&[]int, effects $&Label
 pub fn gvn_summarize_call_effects(w $&GvnWork, unit &Mir, overridden &[]bool) {
     nf := unit.fns.len
     $labels := label_index_new(nf)
-    $effects := label_index_new(nf)
+    $effects := label_index_new(nf + 24)
     $writes := [][]GvnParamWrite{}
     // Summary zero represents a call with no writes visible to its caller.
     writes.push([]GvnParamWrite{})
@@ -723,7 +729,7 @@ pub fn gvn_summarize_call_effects(w $&GvnWork, unit &Mir, overridden &[]bool) {
     $callers := []GvnCallEdge{}
     for fi in 0:nf {
         f := &unit.fns[fi]
-        if overridden[fi] || f.is_extern || f.blocks.len == 0 || f.instrs.len > GVN_MAX_INSTRS {
+        if overridden[fi] || f.is_extern || f.is_naked || f.is_interrupt || f.blocks.len == 0 || f.instrs.len > GVN_MAX_INSTRS {
             bad[fi] = true
             ->
         }
@@ -746,7 +752,7 @@ pub fn gvn_summarize_call_effects(w $&GvnWork, unit &Mir, overridden &[]bool) {
             }
             if gvn_is_noreturn(&ins.sval) { -> }
             callee := labels.get(&ins.sval)
-            if callee < 0 || overridden[callee] || unit.fns[callee].is_extern || unit.fns[callee].blocks.len == 0 {
+            if callee < 0 || overridden[callee] || unit.fns[callee].is_extern || unit.fns[callee].is_naked || unit.fns[callee].is_interrupt || unit.fns[callee].blocks.len == 0 {
                 bad[fi] = true
                 <-
             }
@@ -847,8 +853,317 @@ pub fn gvn_summarize_call_effects(w $&GvnWork, unit &Mir, overridden &[]bool) {
         }
     }
 
+    rt := gvn_seed_rt_effects($&effects, $&writes)
+    gvn_refine_rt_callers(unit, overridden, $&bad, $&effects, $&writes, &rt)
     w.call_effects = ~effects
     w.call_writes = ~writes
+    gvn_compute_call_noesc(w, unit, &bad, &effects)
+}
+
+fn gvn_collect_struct_slices_all(f &MFn, defs &[]int, rpo_idx &[]int, use_before bool, allow_frame bool, kinds $&[]int, ids $&[]int, offs $&[]int, top $&int) {
+    gvn_collect_struct_slices(f, defs, rpo_idx, use_before, allow_frame, kinds, ids, offs, top)
+    for bi in 0:f.blocks.len {
+        if !use_before && (bi >= rpo_idx.len || rpo_idx[bi] < 0) { -> }
+        $ii := f.blocks[bi].head
+        while ii >= 0 {
+            ins := &f.instrs[ii]
+            if ins.kind == MI_CALL &&
+               (ins.sval == "_xu_runtime_core_slice_push" ||
+                ins.sval == "_xu_runtime_core_str_push_byte" ||
+                ins.sval == "_xu_runtime_core_str_push" ||
+                ins.sval == "_xu_runtime_core_desc_reserve" ||
+                ins.sval == "_xu_runtime_core_intrin_make_ints" ||
+                ins.sval == "_xu_runtime_core_intrin_make_string") {
+                arg0 := gvn_call_arg(f, ins.c, 0)
+                if arg0 >= 0 {
+                    tb := gvn_trace_addr(f, defs, arg0, 0, 8, -1, allow_frame)
+                    if tb.kind == GVN_MEM_FRAME || tb.kind == GVN_MEM_PARAM {
+                        gvn_push_struct_slice(kinds, ids, offs, top, tb.kind, tb.id, tb.off)
+                    }
+                }
+            }
+            ii = ins.next
+        }
+    }
+}
+
+fn gvn_seed_rt_effects(effects $&LabelIndex, writes $&[][]GvnParamWrite) LabelIndex {
+    $rt := label_index_new(24)
+    $w_buf := []GvnParamWrite{}
+    w_buf.push(GvnParamWrite{param: 0, off: 0, width: 8, is_buf: true})
+    eff_buf := writes.len
+    writes.push(~w_buf)
+    $w_slice := []GvnParamWrite{}
+    w_slice.push(GvnParamWrite{param: 0, off: 0, width: 24, is_buf: false})
+    w_slice.push(GvnParamWrite{param: 0, off: 0, width: 8, is_buf: true})
+    eff_slice := writes.len
+    writes.push(~w_slice)
+
+    vec_buf_names := [
+        "__xu_vec_fill8", "__xu_vec_fill16", "__xu_vec_fill32", "__xu_vec_fill64",
+        "__xu_vec_copy8", "__xu_vec_copy16", "__xu_vec_copy32", "__xu_vec_copy64"
+    ]
+    for i in 0:vec_buf_names.len {
+        n := vec_buf_names[i]
+        effects.put(&n, eff_buf)
+        rt.put(&n, 1)
+    }
+    sum_n := "__xu_vec_sum64"
+    effects.put(&sum_n, 0)
+    rt.put(&sum_n, 1)
+
+    slice_names := [
+        "_xu_runtime_core_slice_push",
+        "_xu_runtime_core_str_push_byte",
+        "_xu_runtime_core_str_push",
+        "_xu_runtime_core_desc_reserve",
+        "_xu_runtime_core_intrin_make_ints",
+        "_xu_runtime_core_intrin_make_string"
+    ]
+    for i in 0:slice_names.len {
+        n := slice_names[i]
+        effects.put(&n, eff_slice)
+        rt.put(&n, 1)
+    }
+    << rt
+}
+
+fn gvn_refine_rt_callers(unit &Mir, overridden &[]bool, bad $&[]bool, effects $&LabelIndex, writes $&[][]GvnParamWrite, rt &LabelIndex) {
+    nf := unit.fns.len
+    if nf == 0 { << }
+    $fn_known := label_index_new(nf)
+    for fi in 0:nf {
+        fn_known.put(&unit.fns[fi].label, fi + 1)
+    }
+    for _ in 0:4 {
+        $prog := false
+        for fi in 0:nf {
+            if !bad[fi] || (fi < overridden.len && overridden[fi]) { -> }
+            f := &unit.fns[fi]
+            if f.is_extern || f.is_naked || f.is_interrupt || f.blocks.len == 0 || f.instrs.len > GVN_MAX_INSTRS { -> }
+            $calls_ok := true
+            for bi in 0:f.blocks.len {
+                $ii := f.blocks[bi].head
+                while ii >= 0 {
+                    ins := &f.instrs[ii]
+                    if ins.kind == MI_CALL_IND {
+                        calls_ok = false
+                        <-
+                    }
+                    if ins.kind == MI_CALL && !gvn_is_noreturn(&ins.sval) {
+                        if rt.get(&ins.sval) != 1 {
+                            cid := fn_known.get(&ins.sval) - 1
+                            if cid < 0 || cid >= nf || bad[cid] || effects.get(&ins.sval) < 0 {
+                                calls_ok = false
+                                <-
+                            }
+                        }
+                    }
+                    ii = ins.next
+                }
+                if !calls_ok { <- }
+            }
+            if !calls_ok { -> }
+            $ranges := []GvnParamWrite{}
+            if gvn_body_writes(f, effects, writes, true, $&ranges) {
+                $new_eff := 0
+                if ranges.len > 0 {
+                    new_eff = writes.len
+                    writes.push(~ranges)
+                }
+                bad[fi] = false
+                effects.put(&f.label, new_eff)
+                prog = true
+            }
+        }
+        if !prog { <- }
+    }
+}
+
+fn gvn_call_noesc_op_mask(f &MFn, p_masks &[]int, op int) int {
+    if op >= 0 && op < p_masks.len { << p_masks[op] }
+    << 0
+}
+
+fn gvn_compute_call_noesc(w $&GvnWork, unit &Mir, bad &[]bool, effects &LabelIndex) {
+    nf := unit.fns.len
+    $noesc_idx := label_index_new(nf)
+    if nf == 0 {
+        w.call_noesc = ~noesc_idx
+        <<
+    }
+    $fn_ids := label_index_new(nf)
+    $masks := []int{}
+    for fi in 0:nf {
+        fn_ids.put(&unit.fns[fi].label, fi + 1)
+        if bad[fi] {
+            masks.push(0)
+        } else {
+            $np := unit.fns[fi].nparams
+            if np > 58 { np = 58 }
+            $m := 0
+            for pi in 0:np { m = m | (1 << pi) }
+            masks.push(m)
+        }
+    }
+    for _ in 0:4 {
+        $shrunk := false
+        for fi in 0:nf {
+            if bad[fi] || masks[fi] == 0 { -> }
+            f := &unit.fns[fi]
+            nt := f.temps.len
+            nl := f.locals.len
+            np := f.nparams
+            $p_mask := []int{}
+            for _ in 0:nt { p_mask.push(0) }
+            $l_mask := []int{}
+            for _ in 0:nl { l_mask.push(0) }
+            for _ in 0:3 {
+                $prog := false
+                for bi in 0:f.blocks.len {
+                    $ii := f.blocks[bi].head
+                    while ii >= 0 {
+                        ins := &f.instrs[ii]
+                        k := ins.kind
+                        if k == MI_LOAD_LOCAL && ins.a >= 0 && ins.a < nt && ins.c == 0 && ins.b >= 0 && ins.b < nl {
+                            $m := l_mask[ins.b]
+                            if ins.b < np && ins.b < 58 { m = m | (1 << ins.b) }
+                            if (p_mask[ins.a] & m) != m {
+                                p_mask[ins.a] = p_mask[ins.a] | m
+                                prog = true
+                            }
+                        } else if k == MI_ADDR && ins.a >= 0 && ins.a < nt && ins.b >= 0 && ins.b < nl {
+                            $m := l_mask[ins.b]
+                            if ins.b < np && ins.b < 58 { m = m | (1 << ins.b) }
+                            if (p_mask[ins.a] & m) != m {
+                                p_mask[ins.a] = p_mask[ins.a] | m
+                                prog = true
+                            }
+                        } else if k == MI_COPY && ins.a >= 0 && ins.a < nt {
+                            m := gvn_call_noesc_op_mask(f, &p_mask, ins.b)
+                            if (p_mask[ins.a] & m) != m {
+                                p_mask[ins.a] = p_mask[ins.a] | m
+                                prog = true
+                            }
+                        } else if k == MI_BIN && (ins.b == BIN_ADD || ins.b == BIN_SUB) && ins.a >= 0 && ins.a < nt {
+                            m := gvn_call_noesc_op_mask(f, &p_mask, ins.c) | gvn_call_noesc_op_mask(f, &p_mask, ins.d)
+                            if (p_mask[ins.a] & m) != m {
+                                p_mask[ins.a] = p_mask[ins.a] | m
+                                prog = true
+                            }
+                        } else if k == MI_SELECT && ins.a >= 0 && ins.a < nt {
+                            m := gvn_call_noesc_op_mask(f, &p_mask, ins.c) | gvn_call_noesc_op_mask(f, &p_mask, ins.d)
+                            if (p_mask[ins.a] & m) != m {
+                                p_mask[ins.a] = p_mask[ins.a] | m
+                                prog = true
+                            }
+                        } else if k == MI_STORE_LOCAL && ins.a >= 0 && ins.a < nl {
+                            m := gvn_call_noesc_op_mask(f, &p_mask, ins.b)
+                            if (l_mask[ins.a] & m) != m {
+                                l_mask[ins.a] = l_mask[ins.a] | m
+                                prog = true
+                            }
+                        }
+                        ii = ins.next
+                    }
+                }
+                if !prog { <- }
+            }
+            $esc := 0
+            for bi in 0:f.blocks.len {
+                $ii := f.blocks[bi].head
+                while ii >= 0 {
+                    ins := &f.instrs[ii]
+                    k := ins.kind
+                    if k == MI_STORE_PTR || k == MI_VOLATILE_STORE {
+                        esc = esc | gvn_call_noesc_op_mask(f, &p_mask, ins.b)
+                    } else if k == MI_STORE_LOCAL && ins.c != 0 {
+                        esc = esc | gvn_call_noesc_op_mask(f, &p_mask, ins.b)
+                    } else if k == MI_CALL_IND {
+                        esc = esc | gvn_call_noesc_op_mask(f, &p_mask, ins.b)
+                        $a := ins.c
+                        while a >= 0 && a < f.margs.len {
+                            esc = esc | gvn_call_noesc_op_mask(f, &p_mask, f.margs[a].v)
+                            a = f.margs[a].next
+                        }
+                    } else if k == MI_CALL && !gvn_is_noreturn(&ins.sval) {
+                        c_id := fn_ids.get(&ins.sval) - 1
+                        is_append := ins.sval == "_xu_runtime_core_slice_push" ||
+                                     ins.sval == "_xu_runtime_core_str_push_byte" ||
+                                     ins.sval == "_xu_runtime_core_str_push"
+                        is_make := ins.sval == "_xu_runtime_core_intrin_make_ints" ||
+                                   ins.sval == "_xu_runtime_core_intrin_make_string"
+                        $cm := 0
+                        if c_id >= 0 && c_id < nf && effects.get(&ins.sval) >= 0 {
+                            cm = masks[c_id]
+                        }
+                        $a := ins.c
+                        $ai := 0
+                        while a >= 0 && a < f.margs.len {
+                            av := f.margs[a].v
+                            am := gvn_call_noesc_op_mask(f, &p_mask, av)
+                            if am != 0 {
+                                if is_append || is_make {
+                                    if ai > 0 { esc = esc | am }
+                                } else if ai >= 58 || (cm & (1 << ai)) == 0 {
+                                    esc = esc | am
+                                }
+                            }
+                            ai += 1
+                            a = f.margs[a].next
+                        }
+                    }
+                    ii = ins.next
+                }
+                if f.blocks[bi].tkind == TKIND_RETURN {
+                    esc = esc | gvn_call_noesc_op_mask(f, &p_mask, f.blocks[bi].ta)
+                }
+            }
+            new_m := masks[fi] & (0 - 1 - esc)
+            if new_m != masks[fi] {
+                masks[fi] = new_m
+                shrunk = true
+            }
+        }
+        if !shrunk { <- }
+    }
+    for fi in 0:nf {
+        if !bad[fi] {
+            noesc_idx.put(&unit.fns[fi].label, (masks[fi] << 1) | 1)
+        }
+    }
+    w.call_noesc = ~noesc_idx
+}
+
+pub fn gvn_call_effect_of(w &GvnWork, ins &MInstr) int {
+    << gvn_call_effect(w, ins)
+}
+
+pub fn gvn_call_noesc_mask(w &GvnWork, label &string) int {
+    raw := w.call_noesc.get(label)
+    if (raw & 1) == 0 { << 0 }
+    << raw >> 1
+}
+
+pub fn gvn_call_write_count(w &GvnWork, effect int) int {
+    if effect <= 0 || effect >= w.call_writes.len { << 0 }
+    << w.call_writes[effect].len
+}
+
+pub fn gvn_call_write_param(w &GvnWork, effect int, wi int) int {
+    << w.call_writes[effect][wi].param
+}
+
+pub fn gvn_call_write_is_buf(w &GvnWork, effect int, wi int) bool {
+    << w.call_writes[effect][wi].is_buf
+}
+
+pub fn gvn_call_write_off(w &GvnWork, effect int, wi int) int {
+    << w.call_writes[effect][wi].off
+}
+
+pub fn gvn_call_write_width(w &GvnWork, effect int, wi int) int {
+    << w.call_writes[effect][wi].width
 }
 
 fn gvn_fill_int(a $&[]int, n int, v int) {
@@ -1576,7 +1891,7 @@ fn gvn_resolve_mem_write(w &GvnWork, f &MFn, ptr int, off int, width int, is_buf
     if tb.kind == GVN_MEM_PARAM && tb.id < w.nl && w.l_cand[tb.id] && w.l_stores[tb.id] == 0 {
         << GvnMemWrite{kind: GVN_MEM_PARAM, id: tb.id, base_vid: -1, off: tb.off, width: width, is_buf: is_buf, root_safe: true}
     }
-    if try_buf_trace && off == 0 {
+    if try_buf_trace && off >= 0 && off < 4096 {
         if ptr >= 0 && ptr < w.nt && w.buf_owner[ptr] >= 0 && gvn_has_slice_loc(w, w.buf_owner[ptr], w.buf_owner_off[ptr]) {
             oloc := gvn_location(w, f, w.buf_owner[ptr], w.buf_owner_off[ptr])
             oslot := gvn_frame_slot(w, f, &oloc, 8)
@@ -1614,7 +1929,10 @@ fn gvn_preserve_disjoint_hdrs(w $&GvnWork, f &MFn, writes &[]GvnMemWrite, old_g 
         if writes.len > 0 {
             hdr := &w.hdrs[hi]
             h_loc := GvnLocation{base_vid: hdr.root_vid, off: hdr.root_off}
-            h_slot := gvn_frame_slot(w, f, &h_loc, 8)
+            $h_slot := gvn_frame_slot(w, f, &h_loc, 8)
+            if h_slot < 0 && hdr.frame_slot >= 0 && gvn_range_in_frame(f, hdr.frame_slot, hdr.root_off, 8) {
+                h_slot = hdr.frame_slot
+            }
             h_param := gvn_param_of_vid(w, f, hdr.root_vid)
             h_root_safe := h_slot >= 0 || h_param >= 0
             $h_slice := -1
@@ -1679,11 +1997,25 @@ fn gvn_preserve_call_hdrs(w $&GvnWork, f &MFn, head int, effect int, old_g int) 
         cw := &w.call_writes[effect][i]
         arg := gvn_call_arg(f, head, cw.param)
         if arg < 0 { << }
-        mw := gvn_resolve_mem_write(w, f, arg, cw.off, cw.width, cw.is_buf, false)
+        mw := gvn_resolve_mem_write(w, f, arg, cw.off, cw.width, cw.is_buf, cw.is_buf)
         if mw.kind == GVN_MEM_NONE { << }
         writes.push(mw)
     }
     gvn_preserve_disjoint_hdrs(w, f, &writes, old_g)
+}
+
+fn gvn_add_mem_write(writes $&[]GvnMemWrite, mw GvnMemWrite) bool {
+    for i in 0:writes.len {
+        e := &writes[i]
+        if e.kind == mw.kind && e.id == mw.id && e.base_vid == mw.base_vid &&
+           e.off == mw.off && e.width == mw.width && e.is_buf == mw.is_buf &&
+           e.root_safe == mw.root_safe {
+            << true
+        }
+    }
+    if writes.len >= 96 { << false }
+    writes.push(mw)
+    << true
 }
 
 fn gvn_preserve_region_hdrs(w $&GvnWork, f &MFn, qt int, old_g int) {
@@ -1698,27 +2030,25 @@ fn gvn_preserve_region_hdrs(w $&GvnWork, f &MFn, qt int, old_g int) {
             if gvn_readonly_instr(k) {
                 if k == MI_STORE_LOCAL && !gvn_scalar_local_store(w, ins.a, ins.c) {
                     if ins.a < 0 || ins.a >= w.nl || ins.c < 0 || !gvn_range_in_frame(f, ins.a, ins.c * 8, 8) { << }
-                    if writes.len >= GVN_MAX_COMPOSED_WRITES { << }
-                    writes.push(GvnMemWrite{kind: GVN_MEM_FRAME, id: ins.a, base_vid: -1, off: ins.c * 8, width: 8, is_buf: false, root_safe: true})
+                    mw := GvnMemWrite{kind: GVN_MEM_FRAME, id: ins.a, base_vid: -1, off: ins.c * 8, width: 8, is_buf: false, root_safe: true}
+                    if !gvn_add_mem_write($&writes, mw) { << }
                 }
             } else if k == MI_STORE_PTR {
                 mw := gvn_resolve_mem_write(w, f, ins.a, ins.c, gvn_norm_width(ins.d), false, true)
                 if mw.kind == GVN_MEM_NONE { << }
-                if writes.len >= GVN_MAX_COMPOSED_WRITES { << }
-                writes.push(mw)
+                if !gvn_add_mem_write($&writes, mw) { << }
             } else if k == MI_CALL {
                 ceff := gvn_call_effect(w, ins)
                 if ceff < 0 { << }
                 if ceff > 0 {
                     count := w.call_writes[ceff].len
-                    if count > GVN_MAX_COMPOSED_WRITES - writes.len { << }
                     for i in 0:count {
                         cw := &w.call_writes[ceff][i]
                         arg := gvn_call_arg(f, ins.c, cw.param)
                         if arg < 0 { << }
-                        mw := gvn_resolve_mem_write(w, f, arg, cw.off, cw.width, cw.is_buf, false)
+                        mw := gvn_resolve_mem_write(w, f, arg, cw.off, cw.width, cw.is_buf, cw.is_buf)
                         if mw.kind == GVN_MEM_NONE { << }
-                        writes.push(mw)
+                        if !gvn_add_mem_write($&writes, mw) { << }
                     }
                 }
             } else {
@@ -1787,6 +2117,7 @@ fn gvn_record_call_writes(w $&GvnWork, f &MFn, head int, effect int, has_buf $&b
 }
 
 fn gvn_call_effect(w &GvnWork, ins &MInstr) int {
+    if w.call_writes.len == 0 { << -1 }
     if ins.kind == MI_CALL_IND { << -1 }
     if gvn_is_noreturn(&ins.sval) { << 0 }
     << w.call_effects.get(&ins.sval)
@@ -2032,8 +2363,415 @@ fn gvn_get_const_255(w $&GvnWork, f $&MFn) int {
     << w.const_255
 }
 
+fn gvn_get_const(w $&GvnWork, f $&MFn, val int) int {
+    cid := alloc_const(f, val)
+    ci := 0 - cid - 2
+    while w.nc <= ci {
+        c := 0 - w.nc - 2
+        if w.nc < w.const_canon.len {
+            w.const_canon[w.nc] = c
+        } else {
+            w.const_canon.push(c)
+        }
+        w.nc = w.nc + 1
+    }
+    << cid
+}
+
+fn gvn_push_slice_len_facts(w $&GvnWork, f $&MFn, base_vid int, slot int, len_c int) {
+    if len_c < 0 { << }
+    if base_vid != -1 {
+        gvn_mark_slice_loc(w, f, base_vid, 0)
+    }
+    lv := gvn_get_const(w, f, len_c)
+    gvn_push_exact(w, GvnExact{
+        frame_slot: slot,
+        param_id: -1,
+        buf_owner: -1,
+        buf_owner_off: 0,
+        base_vid: base_vid,
+        off: 8,
+        width: 8,
+        val_vid: lv,
+        epoch: w.exact_epoch,
+        is_store: false
+    })
+    if base_vid >= 0 || slot >= 0 {
+        gvn_push_hdr(w, GvnHdr{
+            desc_vid: base_vid,
+            root_vid: base_vid,
+            root_off: 8,
+            frame_slot: slot,
+            off: 8,
+            val_vid: lv,
+            epoch: w.gen_epoch
+        })
+    }
+}
+
+fn gvn_trace_loop_addr_local(w &GvnWork, f &MFn, blk int, v int) int {
+    $cur := v
+    for _ in 0:4 {
+        if cur < 0 || cur >= w.nt || w.ndef[cur] != 1 { << -1 }
+        ii := w.tdef[cur]
+        if ii < 0 { << -1 }
+        ins := &f.instrs[ii]
+        if ins.kind == MI_ADDR && ins.c <= 0 && ins.b >= 0 && ins.b < w.nl {
+            << ins.b
+        }
+        if ins.kind == MI_COPY {
+            cur = ins.b
+            ->
+        }
+        << -1
+    }
+    << -1
+}
+
+fn gvn_match_diamond_push(w &GvnWork, f &MFn, cur_b int, lh int, out_loc $&int, out_next $&int) bool {
+    tb := f.blocks[cur_b].tb
+    tc := f.blocks[cur_b].tc
+    if f.blocks[cur_b].tkind != TKIND_BRANCH || tb < 0 || tc < 0 || tb == tc || tb == cur_b || tc == cur_b || tb == lh || tc == lh {
+        << false
+    }
+    if tb >= w.nb || tc >= w.nb || w.n_eff_preds[tb] != 1 || w.n_eff_preds[tc] != 1 {
+        << false
+    }
+    if f.blocks[tb].tkind != TKIND_JUMP || f.blocks[tc].tkind != TKIND_JUMP {
+        << false
+    }
+    jb := f.blocks[tb].ta
+    if jb != f.blocks[tc].ta || jb < 0 || jb >= w.nb || jb == cur_b || jb == lh {
+        << false
+    }
+    // Check cur_b itself has no memory stores or calls before branching.
+    $cii := f.blocks[cur_b].head
+    while cii >= 0 {
+        ck := f.instrs[cii].kind
+        if ck == MI_STORE_PTR || ck == MI_STORE_LOCAL || ck == MI_CALL || ck == MI_CALL_IND || ck == MI_VOLATILE_STORE {
+            << false
+        }
+        cii = f.instrs[cii].next
+    }
+    // Expect cmp(cur_len, cap) in cur_b: tb = fast path (len += 1), tc = slow path (slice_push).
+    $cdef := -1
+    if f.blocks[cur_b].ta >= 0 && f.blocks[cur_b].ta < w.nt && w.ndef[f.blocks[cur_b].ta] == 1 {
+        cdef = w.tdef[f.blocks[cur_b].ta]
+    }
+    if cdef < 0 || f.instrs[cdef].kind != MI_BIN || f.instrs[cdef].b != BIN_LT {
+        << false
+    }
+    len_t := f.instrs[cdef].c
+    cap_t := f.instrs[cdef].d
+    if len_t < 0 || len_t >= w.nt || w.ndef[len_t] != 1 || cap_t < 0 || cap_t >= w.nt || w.ndef[cap_t] != 1 {
+        << false
+    }
+    len_ii := w.tdef[len_t]
+    cap_ii := w.tdef[cap_t]
+    if f.instrs[len_ii].kind != MI_LOAD_PTR || f.instrs[len_ii].c != 8 || gvn_norm_width(f.instrs[len_ii].d) != 8 ||
+       f.instrs[cap_ii].kind != MI_LOAD_PTR || f.instrs[cap_ii].c != 16 || gvn_norm_width(f.instrs[cap_ii].d) != 8 {
+        << false
+    }
+    d_loc := gvn_trace_loop_addr_local(w, f, cur_b, f.instrs[len_ii].b)
+    if d_loc < 0 || d_loc != gvn_trace_loop_addr_local(w, f, cur_b, f.instrs[cap_ii].b) {
+        << false
+    }
+    // Check fast_b: stores old_len + 1 to [addr(d_loc) + 8], zero calls, optional element store to [elem_buf].
+    $fast_len_stored := false
+    $fii := f.blocks[tb].head
+    while fii >= 0 {
+        fins := &f.instrs[fii]
+        fk := fins.kind
+        if fk == MI_CALL || fk == MI_CALL_IND || fk == MI_VOLATILE_STORE {
+            << false
+        }
+        if fk == MI_STORE_LOCAL && fins.a == d_loc {
+            << false
+        }
+        if fk == MI_STORE_PTR {
+            if fins.c == 8 && gvn_norm_width(fins.d) == 8 && gvn_trace_loop_addr_local(w, f, tb, fins.a) == d_loc {
+                $sv_ii := -1
+                if fins.b >= 0 && fins.b < w.nt && w.ndef[fins.b] == 1 { sv_ii = w.tdef[fins.b] }
+                if sv_ii >= 0 && f.instrs[sv_ii].kind == MI_BIN && f.instrs[sv_ii].b == BIN_ADD &&
+                   ((f.instrs[sv_ii].c == len_t && gvn_is_const_one(f, f.instrs[sv_ii].d)) ||
+                    (f.instrs[sv_ii].d == len_t && gvn_is_const_one(f, f.instrs[sv_ii].c))) {
+                    fast_len_stored = true
+                } else {
+                    << false
+                }
+            }
+        }
+        fii = fins.next
+    }
+    if !fast_len_stored { << false }
+    // Check slow_b: calls slice_push/str_push_byte on addr(d_loc), no other calls or desc-header stores.
+    $slow_pushed := false
+    $sii := f.blocks[tc].head
+    while sii >= 0 {
+        sins := &f.instrs[sii]
+        sk := sins.kind
+        if sk == MI_CALL_IND || sk == MI_VOLATILE_STORE || (sk == MI_STORE_LOCAL && sins.a == d_loc) {
+            << false
+        }
+        if sk == MI_STORE_PTR && gvn_trace_loop_addr_local(w, f, tc, sins.a) == d_loc {
+            << false
+        }
+        if sk == MI_CALL {
+            if !slow_pushed && (sins.sval == "_xu_runtime_core_slice_push" || sins.sval == "_xu_runtime_core_str_push_byte") {
+                a0 := gvn_call_arg(f, sins.c, 0)
+                if gvn_trace_loop_addr_local(w, f, tc, a0) == d_loc {
+                    slow_pushed = true
+                } else {
+                    << false
+                }
+            } else {
+                << false
+            }
+        }
+        sii = sins.next
+    }
+    if !slow_pushed { << false }
+    *out_loc = d_loc
+    *out_next = jb
+    << true
+}
+
+fn gvn_is_const_one(f &MFn, op int) bool {
+    if op > -2 { << false }
+    ci := 0 - op - 2
+    << ci >= 0 && ci < f.consts.len && f.consts[ci] == 1
+}
+
+fn gvn_propagate_loop_push_lens(w $&GvnWork, f $&MFn, exit_b int) {
+    if exit_b <= 0 || exit_b >= w.nb || w.n_eff_preds[exit_b] != 1 { << }
+    pe := w.pred_head[exit_b]
+    if pe < 0 || w.pred_next[pe] >= 0 { << }
+    latch := w.pred_from[pe]
+    if latch < 0 || latch >= w.nb || f.blocks[latch].tkind != TKIND_BRANCH || w.rpo_idx[latch] < 0 { << }
+    $lh := -1
+    $lt_is_tb := false
+    if f.blocks[latch].tc == exit_b && f.blocks[latch].tb >= 0 && f.blocks[latch].tb != exit_b {
+        lh = f.blocks[latch].tb
+        lt_is_tb = true
+    } else if f.blocks[latch].tb == exit_b && f.blocks[latch].tc >= 0 && f.blocks[latch].tc != exit_b {
+        lh = f.blocks[latch].tc
+        lt_is_tb = false
+    } else {
+        <<
+    }
+    if w.rpo_idx[lh] < 0 || w.rpo_idx[lh] > w.rpo_idx[latch] { << }
+    // Find unique external predecessor ph of lh.
+    $ph := -1
+    $n_ext := 0
+    $lpe := w.pred_head[lh]
+    while lpe >= 0 {
+        p := w.pred_from[lpe]
+        if p != latch {
+            if w.rpo_idx[p] < 0 || w.rpo_idx[p] >= w.rpo_idx[lh] { << }
+            ph = p
+            n_ext += 1
+        }
+        lpe = w.pred_next[lpe]
+    }
+    if n_ext != 1 || ph < 0 || w.idom[lh] != ph { << }
+    // Match trailing IV update + compare in latch.
+    cond_t := f.blocks[latch].ta
+    if cond_t < 0 || cond_t >= w.nt || w.ndef[cond_t] != 1 { << }
+    c_ii := w.tdef[cond_t]
+    cins := &f.instrs[c_ii]
+    if cins.kind != MI_BIN { << }
+    $trip_hi := 0
+    $iv_next_t := -1
+    $has_cmp := false
+    if lt_is_tb && (cins.b == BIN_LT || cins.b == BIN_LE) && cins.d <= -2 {
+        iv_next_t = cins.c
+        hci := 0 - cins.d - 2
+        if hci >= 0 && hci < f.consts.len {
+            trip_hi = f.consts[hci]
+            if cins.b == BIN_LE { trip_hi += 1 }
+            has_cmp = true
+        }
+    } else if !lt_is_tb && (cins.b == BIN_GE || cins.b == BIN_GT) && cins.d <= -2 {
+        iv_next_t = cins.c
+        hci := 0 - cins.d - 2
+        if hci >= 0 && hci < f.consts.len {
+            trip_hi = f.consts[hci]
+            if cins.b == BIN_GT { trip_hi += 1 }
+            has_cmp = true
+        }
+    }
+    if !has_cmp || iv_next_t < 0 || iv_next_t >= w.nt || w.ndef[iv_next_t] != 1 { << }
+    // Find store iv = iv_next_t in latch where iv_next_t = load(iv) + 1.
+    step_ii := w.tdef[iv_next_t]
+    if f.instrs[step_ii].kind != MI_BIN || f.instrs[step_ii].b != BIN_ADD { << }
+    $iv_ld_t := -1
+    if gvn_is_const_one(f, f.instrs[step_ii].d) { iv_ld_t = f.instrs[step_ii].c }
+    else if gvn_is_const_one(f, f.instrs[step_ii].c) { iv_ld_t = f.instrs[step_ii].d }
+    if iv_ld_t < 0 || iv_ld_t >= w.nt || w.ndef[iv_ld_t] != 1 { << }
+    iv_ld_ii := w.tdef[iv_ld_t]
+    if f.instrs[iv_ld_ii].kind != MI_LOAD_LOCAL || f.instrs[iv_ld_ii].c != 0 { << }
+    l_iv := f.instrs[iv_ld_ii].b
+    $has_iv_st := false
+    $lii := f.blocks[latch].head
+    while lii >= 0 {
+        lins := &f.instrs[lii]
+        lk := lins.kind
+        if lk == MI_CALL || lk == MI_CALL_IND || lk == MI_STORE_PTR || lk == MI_VOLATILE_STORE {
+            <<
+        }
+        if lk == MI_STORE_LOCAL {
+            if lins.a == l_iv && lins.c == 0 && lins.b == iv_next_t && !has_iv_st {
+                has_iv_st = true
+            } else {
+                <<
+            }
+        }
+        lii = lins.next
+    }
+    if !has_iv_st { << }
+    // Trace acyclic chain lh -> ... -> latch collecting per-iteration slice_push locs.
+    $push_locs := []int{}
+    $push_cnts := []int{}
+    $cur := lh
+    $steps := 0
+    while cur != latch {
+        if steps >= 32 || cur < 0 || cur >= w.nb { << }
+        steps += 1
+        tk := f.blocks[cur].tkind
+        if tk == TKIND_JUMP {
+            $bii := f.blocks[cur].head
+            while bii >= 0 {
+                bins := &f.instrs[bii]
+                bk := bins.kind
+                if bk == MI_CALL_IND || bk == MI_VOLATILE_STORE || (bk == MI_STORE_LOCAL && bins.a == l_iv) { << }
+                if bk == MI_STORE_PTR { << }
+                if bk == MI_CALL {
+                    if bins.sval == "_xu_runtime_core_slice_push" || bins.sval == "_xu_runtime_core_str_push_byte" {
+                        dl := gvn_trace_loop_addr_local(w, f, cur, gvn_call_arg(f, bins.c, 0))
+                        if dl < 0 { << }
+                        $found_d := false
+                        for di in 0:push_locs.len {
+                            if push_locs[di] == dl {
+                                push_cnts[di] = push_cnts[di] + 1
+                                found_d = true
+                                <-
+                            }
+                        }
+                        if !found_d {
+                            push_locs.push(dl)
+                            push_cnts.push(1)
+                        }
+                    } else {
+                        <<
+                    }
+                }
+                bii = bins.next
+            }
+            nxt := f.blocks[cur].ta
+            if nxt == lh { << }
+            cur = nxt
+        } else if tk == TKIND_BRANCH {
+            $dl := -1
+            $nxt := -1
+            if !gvn_match_diamond_push(w, f, cur, lh, $&dl, $&nxt) { << }
+            $found_d := false
+            for di in 0:push_locs.len {
+                if push_locs[di] == dl {
+                    push_cnts[di] = push_cnts[di] + 1
+                    found_d = true
+                    <-
+                }
+            }
+            if !found_d {
+                push_locs.push(dl)
+                push_cnts.push(1)
+            }
+            cur = nxt
+        } else {
+            <<
+        }
+    }
+    if push_locs.len == 0 { << }
+    // Verify preheader ph initializes l_iv and tracked slice lengths cleanly.
+    $iv0 := 0
+    $has_iv0 := false
+    $init_len := []int{}
+    for _ in 0:push_locs.len { init_len.push(-1) }
+    $pii := f.blocks[ph].head
+    while pii >= 0 {
+        pins := &f.instrs[pii]
+        pk := pins.kind
+        if pk == MI_STORE_LOCAL && pins.a == l_iv && pins.c == 0 {
+            if pins.b <= -2 {
+                ici := 0 - pins.b - 2
+                if ici >= 0 && ici < f.consts.len {
+                    iv0 = f.consts[ici]
+                    has_iv0 = true
+                } else {
+                    has_iv0 = false
+                }
+            } else {
+                has_iv0 = false
+            }
+        } else if pk == MI_STORE_PTR && pins.c == 8 && gvn_norm_width(pins.d) == 8 {
+            dl := gvn_trace_loop_addr_local(w, f, ph, pins.a)
+            if dl >= 0 {
+                for di in 0:push_locs.len {
+                    if push_locs[di] == dl {
+                        if pins.b <= -2 && (0 - pins.b - 2) < f.consts.len {
+                            init_len[di] = f.consts[0 - pins.b - 2]
+                        } else {
+                            init_len[di] = -1
+                        }
+                    }
+                }
+            } else if gvn_trace_loop_addr_local(w, f, ph, pins.a) < 0 {
+                // Non-tracked store to header/unknown? Allow stores to [addr other + off] if off == 0/16 or disjoint struct.
+                $other_dl := gvn_trace_loop_addr_local(w, f, ph, pins.a)
+                if other_dl < 0 {
+                    // Check if ptr is frame local addr(other)
+                    $p_ii := -1
+                    if pins.a >= 0 && pins.a < w.nt && w.ndef[pins.a] == 1 { p_ii = w.tdef[pins.a] }
+                    if p_ii < 0 || f.instrs[p_ii].kind != MI_ADDR {
+                        for di in 0:push_locs.len { init_len[di] = -1 }
+                    }
+                }
+            }
+        } else if pk == MI_CALL || pk == MI_CALL_IND {
+            if pk == MI_CALL && (pins.sval == "_xu_runtime_core_slice_push" || pins.sval == "_xu_runtime_core_str_push_byte") {
+                dl := gvn_trace_loop_addr_local(w, f, ph, gvn_call_arg(f, pins.c, 0))
+                $matched := false
+                for di in 0:push_locs.len {
+                    if push_locs[di] == dl {
+                        if init_len[di] >= 0 { init_len[di] = init_len[di] + 1 }
+                        matched = true
+                    }
+                }
+                if !matched {
+                    for di in 0:push_locs.len { init_len[di] = -1 }
+                }
+            } else {
+                for di in 0:push_locs.len { init_len[di] = -1 }
+            }
+        }
+        pii = pins.next
+    }
+    if !has_iv0 || trip_hi <= iv0 || trip_hi - iv0 > 1048576 { << }
+    trips := trip_hi - iv0
+    for di in 0:push_locs.len {
+        l_desc := push_locs[di]
+        l0 := init_len[di]
+        if l0 >= 0 && gvn_range_in_frame(f, l_desc, 8, 8) {
+            gvn_push_slice_len_facts(w, f, -1, l_desc, l0 + push_cnts[di] * trips)
+        }
+    }
+}
+
 // Visits a single block in dominator-tree GVN and returns its terminator kind.
 fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
+    if b > 0 && w.n_eff_preds[b] == 1 {
+        gvn_propagate_loop_push_lens(w, f, b)
+    }
     // At merge blocks (more than one reachable non-panic predecessor), only
     // locals never written or written solely by a single store strictly
     // dominating this block stay valid.
@@ -2050,7 +2788,7 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                 }
             }
         }
-        need_hdr_check := !w.join_keeps_memory[b] && w.join_is_forward[b] && w.hdr_top > 0
+        need_hdr_check := !w.join_keeps_memory[b] && w.hdr_top > 0
         $bad_region := false
         $rgen := 0
         $qt := 0
@@ -2062,10 +2800,15 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                 bad_region = true
             } else {
                 $qh := 0
+                w.loc_region_mark[b] = rgen
+                if !w.join_is_forward[b] {
+                    if qt < w.loc_region_q.len { w.loc_region_q[qt] = b } else { w.loc_region_q.push(b) }
+                    qt += 1
+                }
                 $pe := w.pred_head[b]
                 while pe >= 0 {
                     p := w.pred_from[pe]
-                    if p != dom && w.rpo_idx[p] >= 0 && !w.is_panic[p] {
+                    if p != dom && p != b && w.rpo_idx[p] >= 0 && !w.is_panic[p] {
                         if p == 0 && dom != 0 {
                             bad_region = true
                             <-
@@ -2090,21 +2833,23 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                             ui = f.instrs[ui].next
                         }
                     }
-                    $upe := w.pred_head[u]
-                    while upe >= 0 {
-                        up := w.pred_from[upe]
-                        if up != dom && w.rpo_idx[up] >= 0 && !w.is_panic[up] {
-                            if up == 0 && dom != 0 {
-                                bad_region = true
-                                <-
+                    if u != b {
+                        $upe := w.pred_head[u]
+                        while upe >= 0 {
+                            up := w.pred_from[upe]
+                            if up != dom && w.rpo_idx[up] >= 0 && !w.is_panic[up] {
+                                if up == 0 && dom != 0 {
+                                    bad_region = true
+                                    <-
+                                }
+                                if w.loc_region_mark[up] != rgen {
+                                    w.loc_region_mark[up] = rgen
+                                    if qt < w.loc_region_q.len { w.loc_region_q[qt] = up } else { w.loc_region_q.push(up) }
+                                    qt += 1
+                                }
                             }
-                            if w.loc_region_mark[up] != rgen {
-                                w.loc_region_mark[up] = rgen
-                                if qt < w.loc_region_q.len { w.loc_region_q[qt] = up } else { w.loc_region_q.push(up) }
-                                qt += 1
-                            }
+                            upe = w.pred_next[upe]
                         }
-                        upe = w.pred_next[upe]
                     }
                 }
             }
@@ -2162,6 +2907,8 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
             l := ib
             if ic == 0 && l >= 0 && l < w.nl && w.l_cand[l] {
                 is_nn := w.l_nonneg[l]
+                has_ub := w.l_has_ub[l]
+                lub := w.l_ub[l]
                 if w.local_vid[l] != -1 {
                     lvid := w.local_vid[l]
                     rep := gvn_rep_of_vid(w, lvid)
@@ -2181,6 +2928,9 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                             if is_nn && lvid >= 0 {
                                 gvn_add_nn(w, lvid)
                             }
+                            if has_ub && lvid >= 0 {
+                                gvn_add_le(w, lvid, gvn_get_const(w, f, lub))
+                            }
                         } else if ia >= 0 && w.ndef[ia] == 1 {
                             gvn_bind_temp(w, ia, lvid)
                             if rep >= 0 && rep < w.nt && w.buf_owner[rep] >= 0 {
@@ -2190,6 +2940,9 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                                 gvn_set_vid_rep(w, lvid, ia)
                                 if is_nn {
                                     gvn_add_nn(w, lvid)
+                                }
+                                if has_ub {
+                                    gvn_add_le(w, lvid, gvn_get_const(w, f, lub))
                                 }
                             }
                             gvn_set_local(w, l, lvid, b)
@@ -2203,6 +2956,9 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                     gvn_set_local(w, l, nv, b)
                     if is_nn {
                         gvn_add_nn(w, nv)
+                    }
+                    if has_ub {
+                        gvn_add_le(w, nv, gvn_get_const(w, f, lub))
                     }
                 }
             } else if ia >= 0 && w.ndef[ia] == 1 {
@@ -2606,6 +3362,14 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                                 gvn_add_nn(w, nv)
                                 gvn_add_le(w, nv, vc)
                             }
+                        } else if op == BIN_MOD {
+                            if gvn_is_nonneg(w, f, vc) {
+                                gvn_add_nn(w, nv)
+                            }
+                        } else if op == BIN_DIV {
+                            if gvn_is_nonneg(w, f, vc) && gvn_is_nonneg(w, f, vd) {
+                                gvn_add_nn(w, nv)
+                            }
                         }
                     }
                 }
@@ -2670,6 +3434,29 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                 nv := gvn_fresh_vid(w, ia)
                 gvn_bind_temp(w, ia, nv)
             }
+            $push_base := -1
+            $push_slot := -1
+            $push_next_len := -1
+            if k == MI_CALL && (f.instrs[ii].sval == "_xu_runtime_core_slice_push" || f.instrs[ii].sval == "_xu_runtime_core_str_push_byte") {
+                parg0 := gvn_call_arg(f, ic, 0)
+                push_base = gvn_vid_of(w, parg0)
+                if push_base != -1 {
+                    ploc := gvn_location(w, f, push_base, 8)
+                    push_slot = gvn_frame_slot(w, f, &ploc, 8)
+                    $ppid := -1
+                    if push_slot < 0 { ppid = gvn_param_of_vid(w, f, ploc.base_vid) }
+                    $old_lv := gvn_find_hdr(w, push_base, 8, push_slot, ploc.off)
+                    if old_lv == -1 {
+                        old_lv = gvn_find_exact(w, &ploc, 8, push_slot, ppid, -1, 0)
+                    }
+                    if old_lv <= -2 {
+                        oci := 0 - old_lv - 2
+                        if oci >= 0 && oci < f.consts.len && f.consts[oci] >= 0 && f.consts[oci] < 4611686018427387904 {
+                            push_next_len = f.consts[oci] + 1
+                        }
+                    }
+                }
+            }
             effect := gvn_call_effect(w, &f.instrs[ii])
             if effect != 0 {
                 old_g := w.gen_epoch
@@ -2686,6 +3473,9 @@ fn gvn_visit_block(w $&GvnWork, f $&MFn, b int) int {
                 if effect > 0 {
                     gvn_preserve_call_hdrs(w, f, ic, effect, old_g)
                 }
+            }
+            if push_next_len >= 0 && push_base != -1 {
+                gvn_push_slice_len_facts(w, f, push_base, push_slot, push_next_len)
             }
             if k == MI_CALL && (f.instrs[ii].sval == "_xu_runtime_core_intrin_make_ints" || f.instrs[ii].sval == "_xu_runtime_core_intrin_make_string") {
                 arg0 := gvn_call_arg(f, ic, 0)
@@ -3001,15 +3791,329 @@ fn gvn_no_store_on_path(w &GvnWork, f &MFn, par int, cmp_ii int, bi int, base_ii
     << true
 }
 
-fn gvn_val_nonneg_at(w &GvnWork, f &MFn, bi int, l int, init_val int) bool {
-    $val := init_val
-    for _ in 0:4 {
-        if val >= 0 && val < w.nt && w.tdef[val] >= 0 && f.instrs[w.tdef[val]].kind == MI_COPY {
-            val = f.instrs[w.tdef[val]].b
+fn gvn_peel_copy(w &GvnWork, f &MFn, init_v int) int {
+    $v := init_v
+    for _ in 0:3 {
+        if v >= 0 && v < w.nt && w.tdef[v] >= 0 && f.instrs[w.tdef[v]].kind == MI_COPY {
+            v = f.instrs[w.tdef[v]].b
         } else {
             <-
         }
     }
+    << v
+}
+
+fn gvn_edge_proves_lb(f &MFn, cop int, lc int, ld int, is_true bool, min_k int, cmp_x_out $&int) bool {
+    *cmp_x_out = -1
+    if min_k < 1 || min_k > 1024 {
+        << false
+    }
+    $ok := false
+    $cx := -1
+    if is_true {
+        if cop == BIN_GE && ld <= -2 && (0 - ld - 2) < f.consts.len && f.consts[0 - ld - 2] >= min_k {
+            cx = lc
+            ok = true
+        } else if cop == BIN_GT && ld <= -2 && (0 - ld - 2) < f.consts.len && f.consts[0 - ld - 2] >= min_k - 1 {
+            cx = lc
+            ok = true
+        } else if cop == BIN_LE && lc <= -2 && (0 - lc - 2) < f.consts.len && f.consts[0 - lc - 2] >= min_k {
+            cx = ld
+            ok = true
+        } else if cop == BIN_LT && lc <= -2 && (0 - lc - 2) < f.consts.len && f.consts[0 - lc - 2] >= min_k - 1 {
+            cx = ld
+            ok = true
+        } else if cop == BIN_EQ {
+            if ld <= -2 && (0 - ld - 2) < f.consts.len && f.consts[0 - ld - 2] >= min_k {
+                cx = lc
+                ok = true
+            } else if lc <= -2 && (0 - lc - 2) < f.consts.len && f.consts[0 - lc - 2] >= min_k {
+                cx = ld
+                ok = true
+            }
+        }
+    } else {
+        if cop == BIN_LT && ld <= -2 && (0 - ld - 2) < f.consts.len && f.consts[0 - ld - 2] >= min_k {
+            cx = lc
+            ok = true
+        } else if cop == BIN_LE && ld <= -2 && (0 - ld - 2) < f.consts.len && f.consts[0 - ld - 2] >= min_k - 1 {
+            cx = lc
+            ok = true
+        } else if cop == BIN_GT && lc <= -2 && (0 - lc - 2) < f.consts.len && f.consts[0 - lc - 2] >= min_k {
+            cx = ld
+            ok = true
+        } else if cop == BIN_GE && lc <= -2 && (0 - lc - 2) < f.consts.len && f.consts[0 - lc - 2] >= min_k - 1 {
+            cx = ld
+            ok = true
+        }
+    }
+    if ok && cx >= 0 {
+        *cmp_x_out = cx
+        << true
+    }
+    << false
+}
+
+fn gvn_edge_cond_proves_local_lb(w &GvnWork, f &MFn, par int, cur int, l int, min_k int) bool {
+    if par < 0 || par >= w.nb || f.blocks[par].tkind != TKIND_BRANCH || f.blocks[par].tb == f.blocks[par].tc {
+        << false
+    }
+    is_true := cur == f.blocks[par].tb
+    if !is_true && cur != f.blocks[par].tc {
+        << false
+    }
+    cond := f.blocks[par].ta
+    cond_ii := w.tdef[cond]
+    if f.instrs[cond_ii].kind != MI_BIN {
+        << false
+    }
+    cins := &f.instrs[cond_ii]
+    $cx := -1
+    if cins.b == BIN_OR && !is_true {
+        $ok_or := false
+        if cins.c >= 0 && cins.c < w.nt && w.tdef[cins.c] >= 0 {
+            c1_ii := w.tdef[cins.c]
+            if f.instrs[c1_ii].kind == MI_BIN {
+                ci1 := &f.instrs[c1_ii]
+                if gvn_edge_proves_lb(f, ci1.b, ci1.c, ci1.d, false, min_k, $&cx) {
+                    ok_or = true
+                }
+            }
+        }
+        if !ok_or && cins.d >= 0 && cins.d < w.nt && w.tdef[cins.d] >= 0 {
+            c2_ii := w.tdef[cins.d]
+            if f.instrs[c2_ii].kind == MI_BIN {
+                ci2 := &f.instrs[c2_ii]
+                if gvn_edge_proves_lb(f, ci2.b, ci2.c, ci2.d, false, min_k, $&cx) {
+                    ok_or = true
+                }
+            }
+        }
+        if !ok_or { << false }
+    } else if cins.b == BIN_AND && is_true {
+        $ok_and := false
+        if cins.c >= 0 && cins.c < w.nt && w.tdef[cins.c] >= 0 {
+            c1_ii := w.tdef[cins.c]
+            if f.instrs[c1_ii].kind == MI_BIN {
+                ci1 := &f.instrs[c1_ii]
+                if gvn_edge_proves_lb(f, ci1.b, ci1.c, ci1.d, true, min_k, $&cx) {
+                    ok_and = true
+                }
+            }
+        }
+        if !ok_and && cins.d >= 0 && cins.d < w.nt && w.tdef[cins.d] >= 0 {
+            c2_ii := w.tdef[cins.d]
+            if f.instrs[c2_ii].kind == MI_BIN {
+                ci2 := &f.instrs[c2_ii]
+                if gvn_edge_proves_lb(f, ci2.b, ci2.c, ci2.d, true, min_k, $&cx) {
+                    ok_and = true
+                }
+            }
+        }
+        if !ok_and { << false }
+    } else {
+        if !gvn_edge_proves_lb(f, cins.b, cins.c, cins.d, is_true, min_k, $&cx) {
+            << false
+        }
+    }
+    cx = gvn_peel_copy(w, f, cx)
+    if cx < 0 || cx >= w.nt || w.tdef[cx] < 0 {
+        << false
+    }
+    // Verify cx represents local l at exit of par.
+    if w.tdef_blk[cx] == par {
+        cxi := w.tdef[cx]
+        cxins := &f.instrs[cxi]
+        if cxins.kind == MI_LOAD_LOCAL && cxins.c == 0 && cxins.b == l {
+            $ni := cxins.next
+            $stored_after := false
+            while ni >= 0 {
+                if f.instrs[ni].kind == MI_STORE_LOCAL && f.instrs[ni].a == l {
+                    stored_after = true
+                    <-
+                }
+                ni = f.instrs[ni].next
+            }
+            if !stored_after {
+                << true
+            }
+        }
+    }
+    $last_st := -1
+    $pi := f.blocks[par].head
+    while pi >= 0 {
+        pins := &f.instrs[pi]
+        if pins.kind == MI_STORE_LOCAL && pins.a == l {
+            last_st = pins.b
+        }
+        pi = pins.next
+    }
+    if last_st != -1 && gvn_peel_copy(w, f, last_st) == cx {
+        << true
+    }
+    << false
+}
+
+fn gvn_local_at_least_at(w &GvnWork, f &MFn, target_b int, target_store_ii int, l int, min_k int) bool {
+    if target_b < 0 || target_b >= w.nb || min_k < 1 || min_k > 1024 {
+        << false
+    }
+    $last_st := -1
+    $ii := f.blocks[target_b].head
+    while ii >= 0 && ii != target_store_ii {
+        ins := &f.instrs[ii]
+        if ins.kind == MI_STORE_LOCAL && ins.a == l {
+            last_st = ins.b
+        }
+        ii = ins.next
+    }
+    if last_st != -1 {
+        pv := gvn_peel_copy(w, f, last_st)
+        if pv <= -2 && (0 - pv - 2) < w.nc {
+            << f.consts[0 - pv - 2] >= min_k
+        }
+        << false
+    }
+    if target_b == 0 {
+        << false
+    }
+    $vis := []bool{}
+    for _ in 0:w.nb { vis.push(false) }
+    $q := []int{}
+    vis[target_b] = true
+    q.push(target_b)
+    $qh := 0
+    while qh < q.len {
+        cur := q[qh]
+        qh += 1
+        $pe := w.pred_head[cur]
+        if pe < 0 {
+            << false
+        }
+        while pe >= 0 {
+            p := w.pred_from[pe]
+            if p < 0 || p >= w.nb || w.rpo_idx[p] < 0 {
+                pe = w.pred_next[pe]
+                ->
+            }
+            if !gvn_edge_cond_proves_local_lb(w, f, p, cur, l, min_k) {
+                $p_last := -1
+                $pii := f.blocks[p].head
+                while pii >= 0 {
+                    pins := &f.instrs[pii]
+                    if pins.kind == MI_STORE_LOCAL && pins.a == l {
+                        p_last = pins.b
+                    }
+                    pii = pins.next
+                }
+                if p_last != -1 {
+                    pv := gvn_peel_copy(w, f, p_last)
+                    if !(pv <= -2 && (0 - pv - 2) < w.nc && f.consts[0 - pv - 2] >= min_k) {
+                        << false
+                    }
+                } else {
+                    if p == 0 {
+                        << false
+                    }
+                    if !vis[p] {
+                        if q.len >= 64 {
+                            << false
+                        }
+                        vis[p] = true
+                        q.push(p)
+                    }
+                }
+            }
+            pe = w.pred_next[pe]
+        }
+    }
+    << true
+}
+
+fn gvn_branch_ub_proves_nowrap(w &GvnWork, f &MFn, par int, bi int, l int, base_t int, base_ii int, cop int, cc int, cd int, is_true bool, step_c int) bool {
+    $cmp_x := -1
+    $u_op := -1
+    $strict := false
+    $has_ub := false
+    if is_true {
+        if cop == BIN_LT {
+            cmp_x = cc
+            u_op = cd
+            strict = true
+            has_ub = true
+        } else if cop == BIN_GT {
+            cmp_x = cd
+            u_op = cc
+            strict = true
+            has_ub = true
+        } else if cop == BIN_LE {
+            cmp_x = cc
+            u_op = cd
+            strict = false
+            has_ub = true
+        } else if cop == BIN_GE {
+            cmp_x = cd
+            u_op = cc
+            strict = false
+            has_ub = true
+        }
+    } else {
+        if cop == BIN_GE {
+            cmp_x = cc
+            u_op = cd
+            strict = true
+            has_ub = true
+        } else if cop == BIN_LE {
+            cmp_x = cd
+            u_op = cc
+            strict = true
+            has_ub = true
+        } else if cop == BIN_GT {
+            cmp_x = cc
+            u_op = cd
+            strict = false
+            has_ub = true
+        } else if cop == BIN_LT {
+            cmp_x = cd
+            u_op = cc
+            strict = false
+            has_ub = true
+        }
+    }
+    if !has_ub { << false }
+    $no_wrap := false
+    if strict && step_c == 1 {
+        no_wrap = true
+    } else if u_op <= -2 && (0 - u_op - 2) < w.nc {
+        uval := f.consts[0 - u_op - 2]
+        if strict {
+            no_wrap = uval <= 9223372036854775807 - (step_c - 1)
+        } else {
+            no_wrap = uval <= 9223372036854775807 - step_c
+        }
+    }
+    if !no_wrap { << false }
+    cmp_x = gvn_peel_copy(w, f, cmp_x)
+    if cmp_x == base_t {
+        << true
+    }
+    if cmp_x >= 0 && cmp_x < w.nt && w.tdef[cmp_x] >= 0 &&
+       w.tdef_blk[cmp_x] == par && w.tdef_blk[base_t] == bi {
+        cx_ii := w.tdef[cmp_x]
+        cx_ins := &f.instrs[cx_ii]
+        if cx_ins.kind == MI_LOAD_LOCAL && cx_ins.c == 0 && cx_ins.b == l &&
+           gvn_no_store_on_path(w, f, par, cx_ii, bi, base_ii, l) {
+            << true
+        }
+    }
+    << false
+}
+
+fn gvn_val_nonneg_at_depth(w &GvnWork, f &MFn, bi int, l int, init_val int, store_ii int, depth int) bool {
+    if depth > 4 {
+        << false
+    }
+    $val := gvn_peel_copy(w, f, init_val)
     if val <= -2 {
         ci := 0 - val - 2
         << ci >= 0 && ci < w.nc && f.consts[ci] >= 0
@@ -3028,6 +4132,13 @@ fn gvn_val_nonneg_at(w &GvnWork, f &MFn, bi int, l int, init_val int) bool {
            (dins.d <= -2 && (0 - dins.d - 2) < w.nc && f.consts[0 - dins.d - 2] >= 0) {
             << true
         }
+    }
+    if dk == MI_BIN && dins.b == BIN_MOD {
+        << gvn_val_nonneg_at_depth(w, f, bi, l, dins.c, -1, depth + 1)
+    }
+    if dk == MI_BIN && dins.b == BIN_DIV {
+        << gvn_val_nonneg_at_depth(w, f, bi, l, dins.c, -1, depth + 1) &&
+           gvn_val_nonneg_at_depth(w, f, bi, l, dins.d, -1, depth + 1)
     }
     if dk == MI_LOAD_LOCAL && dins.c == 0 && dins.b >= 0 && dins.b < w.nl && w.l_nonneg[dins.b] {
         << true
@@ -3057,6 +4168,54 @@ fn gvn_val_nonneg_at(w &GvnWork, f &MFn, bi int, l int, init_val int) bool {
             << true
         }
     }
+    if dk == MI_BIN && dins.b == BIN_SUB && dins.c >= 0 && dins.d <= -2 && (0 - dins.d - 2) < w.nc {
+        step_c := f.consts[0 - dins.d - 2]
+        if step_c >= 1 && step_c <= 1024 {
+            base_t := gvn_peel_copy(w, f, dins.c)
+            if base_t >= 0 && base_t < w.nt && w.tdef[base_t] >= 0 {
+                base_ii := w.tdef[base_t]
+                base_ins := &f.instrs[base_ii]
+                is_self_l := base_ins.kind == MI_LOAD_LOCAL && base_ins.c == 0 && base_ins.b == l
+                if is_self_l && store_ii >= 0 && gvn_local_at_least_at(w, f, bi, store_ii, l, step_c) {
+                    << true
+                }
+                if w.tdef_blk[base_t] == bi {
+                    $child := bi
+                    for _ in 0:32 {
+                        if child <= 0 || child >= w.nb { <- }
+                        par := w.idom[child]
+                        if par < 0 || par >= w.nb || par == child { <- }
+                        if w.n_eff_preds[child] == 1 && f.blocks[par].tkind == TKIND_BRANCH && f.blocks[par].tb != f.blocks[par].tc {
+                            cond := f.blocks[par].ta
+                            if cond >= 0 && cond < w.nt && w.tdef[cond] >= 0 {
+                                cond_ii := w.tdef[cond]
+                                if f.instrs[cond_ii].kind == MI_BIN {
+                                    cins := &f.instrs[cond_ii]
+                                    is_true := child == f.blocks[par].tb
+                                    $cx := -1
+                                    if gvn_edge_proves_lb(f, cins.b, cins.c, cins.d, is_true, step_c, $&cx) {
+                                        cx = gvn_peel_copy(w, f, cx)
+                                        if cx == base_t {
+                                            << true
+                                        }
+                                        if is_self_l && cx >= 0 && cx < w.nt && w.tdef[cx] >= 0 && w.tdef_blk[cx] == par {
+                                            cx_ii := w.tdef[cx]
+                                            cx_ins := &f.instrs[cx_ii]
+                                            if cx_ins.kind == MI_LOAD_LOCAL && cx_ins.c == 0 && cx_ins.b == l &&
+                                               gvn_no_store_on_path(w, f, par, cx_ii, bi, base_ii, l) {
+                                                << true
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        child = par
+                    }
+                }
+            }
+        }
+    }
     if dk == MI_BIN && dins.b == BIN_ADD {
         $base_t := -1
         $step_c := 0
@@ -3068,13 +4227,7 @@ fn gvn_val_nonneg_at(w &GvnWork, f &MFn, bi int, l int, init_val int) bool {
             step_c = f.consts[0 - dins.c - 2]
         }
         if step_c >= 1 && step_c <= 1024 && base_t >= 0 {
-            for _ in 0:2 {
-                if base_t >= 0 && base_t < w.nt && w.tdef[base_t] >= 0 && f.instrs[w.tdef[base_t]].kind == MI_COPY {
-                    base_t = f.instrs[w.tdef[base_t]].b
-                } else {
-                    <-
-                }
-            }
+            base_t = gvn_peel_copy(w, f, base_t)
             if base_t >= 0 && base_t < w.nt && w.tdef[base_t] >= 0 {
                 base_ii := w.tdef[base_t]
                 base_ins := &f.instrs[base_ii]
@@ -3090,101 +4243,46 @@ fn gvn_val_nonneg_at(w &GvnWork, f &MFn, bi int, l int, init_val int) bool {
                                 cond_ii := w.tdef[cond]
                                 if f.instrs[cond_ii].kind == MI_BIN {
                                     cins := &f.instrs[cond_ii]
-                                cop := cins.b
-                                is_true := child == f.blocks[par].tb
-                                $cmp_x := -1
-                                $u_op := -1
-                                $strict := false
-                                $has_ub := false
-                                if is_true {
-                                    if cop == BIN_LT {
-                                        cmp_x = cins.c
-                                        u_op = cins.d
-                                        strict = true
-                                        has_ub = true
-                                    } else if cop == BIN_GT {
-                                        cmp_x = cins.d
-                                        u_op = cins.c
-                                        strict = true
-                                        has_ub = true
-                                    } else if cop == BIN_LE {
-                                        cmp_x = cins.c
-                                        u_op = cins.d
-                                        strict = false
-                                        has_ub = true
-                                    } else if cop == BIN_GE {
-                                        cmp_x = cins.d
-                                        u_op = cins.c
-                                        strict = false
-                                        has_ub = true
-                                    }
-                                } else {
-                                    if cop == BIN_GE {
-                                        cmp_x = cins.c
-                                        u_op = cins.d
-                                        strict = true
-                                        has_ub = true
-                                    } else if cop == BIN_LE {
-                                        cmp_x = cins.d
-                                        u_op = cins.c
-                                        strict = true
-                                        has_ub = true
-                                    } else if cop == BIN_GT {
-                                        cmp_x = cins.c
-                                        u_op = cins.d
-                                        strict = false
-                                        has_ub = true
-                                    } else if cop == BIN_LT {
-                                        cmp_x = cins.d
-                                        u_op = cins.c
-                                        strict = false
-                                        has_ub = true
-                                    }
-                                }
-                                if has_ub {
-                                    $no_wrap := false
-                                    if strict && step_c == 1 {
-                                        no_wrap = true
-                                    } else if u_op <= -2 && (0 - u_op - 2) < w.nc {
-                                        uval := f.consts[0 - u_op - 2]
-                                        if strict {
-                                            no_wrap = uval <= 9223372036854775807 - (step_c - 1)
-                                        } else {
-                                            no_wrap = uval <= 9223372036854775807 - step_c
-                                        }
-                                    }
-                                    if no_wrap {
-                                        for _ in 0:2 {
-                                            if cmp_x >= 0 && cmp_x < w.nt && w.tdef[cmp_x] >= 0 && f.instrs[w.tdef[cmp_x]].kind == MI_COPY {
-                                                cmp_x = f.instrs[w.tdef[cmp_x]].b
-                                            } else {
-                                                <-
+                                    cop := cins.b
+                                    is_true := child == f.blocks[par].tb
+                                    if !is_true && cop == BIN_OR {
+                                        if cins.c >= 0 && cins.c < w.nt && w.tdef[cins.c] >= 0 {
+                                            c1_ii := w.tdef[cins.c]
+                                            if f.instrs[c1_ii].kind == MI_BIN {
+                                                ci1 := &f.instrs[c1_ii]
+                                                if gvn_branch_ub_proves_nowrap(w, f, par, bi, l, base_t, base_ii, ci1.b, ci1.c, ci1.d, false, step_c) {
+                                                    << true
+                                                }
                                             }
                                         }
-                                        if cmp_x == base_t {
+                                        if cins.d >= 0 && cins.d < w.nt && w.tdef[cins.d] >= 0 {
+                                            c2_ii := w.tdef[cins.d]
+                                            if f.instrs[c2_ii].kind == MI_BIN {
+                                                ci2 := &f.instrs[c2_ii]
+                                                if gvn_branch_ub_proves_nowrap(w, f, par, bi, l, base_t, base_ii, ci2.b, ci2.c, ci2.d, false, step_c) {
+                                                    << true
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        if gvn_branch_ub_proves_nowrap(w, f, par, bi, l, base_t, base_ii, cop, cins.c, cins.d, is_true, step_c) {
                                             << true
-                                        }
-                                        if cmp_x >= 0 && cmp_x < w.nt && w.tdef[cmp_x] >= 0 &&
-                                           w.tdef_blk[cmp_x] == par && w.tdef_blk[base_t] == bi {
-                                            cx_ii := w.tdef[cmp_x]
-                                            cx_ins := &f.instrs[cx_ii]
-                                            if cx_ins.kind == MI_LOAD_LOCAL && cx_ins.c == 0 && cx_ins.b == l &&
-                                               gvn_no_store_on_path(w, f, par, cx_ii, bi, base_ii, l) {
-                                                << true
-                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                        child = par
                     }
-                    child = par
                 }
             }
         }
     }
-    }
     << false
+}
+
+fn gvn_val_nonneg_at(w &GvnWork, f &MFn, bi int, l int, init_val int) bool {
+    << gvn_val_nonneg_at_depth(w, f, bi, l, init_val, -1, 0)
 }
 
 fn gvn_compute_nonneg_locals(w $&GvnWork, f &MFn, reachable int) {
@@ -3207,7 +4305,7 @@ fn gvn_compute_nonneg_locals(w $&GvnWork, f &MFn, reachable int) {
             while ii >= 0 {
                 ins := &f.instrs[ii]
                 if ins.kind == MI_STORE_LOCAL && ins.a >= 0 && ins.a < w.nl && w.l_nonneg[ins.a] {
-                    if !gvn_val_nonneg_at(w, f, bi, ins.a, ins.b) {
+                    if !gvn_val_nonneg_at_depth(w, f, bi, ins.a, ins.b, ii, 0) {
                         w.l_nonneg[ins.a] = false
                         shrunk = true
                     }
@@ -3217,6 +4315,143 @@ fn gvn_compute_nonneg_locals(w $&GvnWork, f &MFn, reachable int) {
         }
         if !shrunk {
             <-
+        }
+    }
+}
+
+fn gvn_val_ub_at(w &GvnWork, f &MFn, bi int, l int, init_val int, grounded &[]bool, out_ub $&int) bool {
+    $cur := init_val
+    for _ in 0:6 {
+        if cur <= -2 {
+            ci := 0 - cur - 2
+            if ci >= 0 && ci < f.consts.len {
+                *out_ub = f.consts[ci]
+                << true
+            }
+            << false
+        }
+        if cur < 0 || cur >= w.nt || w.ndef[cur] != 1 || w.tdef_blk[cur] != bi {
+            << false
+        }
+        di := w.tdef[cur]
+        dins := &f.instrs[di]
+        dk := dins.kind
+        if dk == MI_COPY {
+            cur = dins.b
+            ->
+        }
+        if dk == MI_LOAD_LOCAL && dins.c == 0 && dins.b >= 0 && dins.b < w.nl && w.l_has_ub[dins.b] && grounded[dins.b] {
+            *out_ub = w.l_ub[dins.b]
+            << true
+        }
+        if dk == MI_LOAD_PTR && gvn_norm_width(dins.d) == 1 {
+            *out_ub = 255
+            << true
+        }
+        if dk == MI_BIN {
+            if dins.b == BIN_AND {
+                if dins.d <= -2 && (0 - dins.d - 2) < f.consts.len && f.consts[0 - dins.d - 2] >= 0 {
+                    *out_ub = f.consts[0 - dins.d - 2]
+                    << true
+                }
+                if dins.c <= -2 && (0 - dins.c - 2) < f.consts.len && f.consts[0 - dins.c - 2] >= 0 {
+                    *out_ub = f.consts[0 - dins.c - 2]
+                    << true
+                }
+            } else if dins.b == BIN_SHR && dins.d <= -2 && (0 - dins.d - 2) < f.consts.len {
+                sh := f.consts[0 - dins.d - 2]
+                if sh >= 0 && sh <= 63 && gvn_val_nonneg_at(w, f, bi, l, dins.c) {
+                    $sub_u := 0
+                    if gvn_val_ub_at(w, f, bi, l, dins.c, grounded, $&sub_u) && sub_u >= 0 {
+                        *out_ub = sub_u >> sh
+                        << true
+                    }
+                    *out_ub = 9223372036854775807 >> sh
+                    << true
+                }
+            }
+        }
+        if dk == MI_SELECT {
+            $uc := 0
+            $ud := 0
+            if gvn_val_ub_at(w, f, bi, l, dins.c, grounded, $&uc) &&
+               gvn_val_ub_at(w, f, bi, l, dins.d, grounded, $&ud) {
+                if ud > uc { uc = ud }
+                *out_ub = uc
+                << true
+            }
+        }
+        << false
+    }
+    << false
+}
+
+fn gvn_compute_ub_locals(w $&GvnWork, f &MFn, reachable int) {
+    gvn_fill_bool($&w.l_has_ub, w.nl, false)
+    gvn_fill_int($&w.l_ub, w.nl, 0)
+    $cand := []bool{}
+    $grounded := []bool{}
+    for _ in 0:w.nl {
+        cand.push(false)
+        grounded.push(false)
+    }
+    $has_any := false
+    for l in f.nparams:w.nl {
+        if l >= 0 && l < w.nl && w.l_cand[l] && w.l_stores[l] > 0 {
+            w.l_has_ub[l] = true
+            cand[l] = true
+            has_any = true
+        }
+    }
+    if !has_any { << }
+    $seen := []bool{}
+    $pass_ub := []int{}
+    for _ in 0:w.nl {
+        seen.push(false)
+        pass_ub.push(0)
+    }
+    for _ in 0:8 {
+        for l in 0:w.nl {
+            seen[l] = false
+            pass_ub[l] = 0
+        }
+        for ri in 0:reachable {
+            bi := w.rpo[ri]
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind == MI_STORE_LOCAL && ins.a >= 0 && ins.a < w.nl && cand[ins.a] {
+                    $su := 0
+                    if !gvn_val_ub_at(w, f, bi, ins.a, ins.b, &grounded, $&su) {
+                        cand[ins.a] = false
+                        w.l_has_ub[ins.a] = false
+                    } else if !seen[ins.a] {
+                        seen[ins.a] = true
+                        pass_ub[ins.a] = su
+                    } else if su > pass_ub[ins.a] {
+                        pass_ub[ins.a] = su
+                    }
+                }
+                ii = ins.next
+            }
+        }
+        $changed := false
+        for l in f.nparams:w.nl {
+            if !cand[l] { -> }
+            if !seen[l] {
+                cand[l] = false
+                w.l_has_ub[l] = false
+            } else if !grounded[l] || pass_ub[l] > w.l_ub[l] {
+                grounded[l] = true
+                w.l_ub[l] = pass_ub[l]
+                changed = true
+            }
+        }
+        if !changed { <- }
+    }
+    for l in f.nparams:w.nl {
+        if !cand[l] || !grounded[l] {
+            w.l_has_ub[l] = false
         }
     }
 }
@@ -3488,10 +4723,11 @@ pub fn opt_gvn_with(f $&MFn, w $&GvnWork) bool {
         }
     }
     gvn_compute_nonneg_locals(w, f, reachable)
+    gvn_compute_ub_locals(w, f, reachable)
     if has_multi_pred {
         gvn_prepare_memory_joins(w, f, reachable)
     }
-    gvn_collect_struct_slices(f, &w.tdef, &w.rpo_idx, false, true, $&w.struct_sl_kind, $&w.struct_sl_id, $&w.struct_sl_off, $&w.struct_sl_top)
+    gvn_collect_struct_slices_all(f, &w.tdef, &w.rpo_idx, false, true, $&w.struct_sl_kind, $&w.struct_sl_id, $&w.struct_sl_off, $&w.struct_sl_top)
 
     nc := w.nc
     gvn_ensure_int($&w.const_canon, nc, 0)
