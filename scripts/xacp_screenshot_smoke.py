@@ -25,8 +25,8 @@ from xacp_screen_marshal_smoke import checked
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(command):
-    result = subprocess.run([str(x) for x in command], cwd=ROOT,
+def run(command, env=None):
+    result = subprocess.run([str(x) for x in command], cwd=ROOT, env=env,
                             capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, (command, result.stdout, result.stderr)
     return result.stdout
@@ -35,7 +35,61 @@ def run(command):
 def build_fixture(xu, directory):
     obj = directory / "screen.xuobj"
     run([ROOT / "scripts/run_product_compiler.sh", xu, "build", "--xacp", "--emit-obj",
-         example_path("attach/main.xu"), "-o", obj])
+         example_path("attach/main.xu"), "-o", obj],
+        env={**os.environ, "XU_UI_PACK": "1"})
+    if sys.platform == "darwin":
+        run([sys.executable, ROOT / "scripts/xuobj_to_macho_o.py", obj, directory / "screen.o"])
+        host_o_dir = directory / "host"
+        host_o_dir.mkdir()
+        host_srcs = [str(ROOT / "src/ui/host/macos_host.swift"), str(ROOT / "src/ui/host/macos_draw.swift")]
+        run(["swiftc", "-parse-as-library", "-c", "-O", "-D", "XU_UI_STATIC", "-module-name", "XuUIHost",
+             *host_srcs, "-working-directory", str(host_o_dir),
+             "-framework", "AppKit", "-framework", "UserNotifications", "-framework", "QuartzCore"])
+        host_objs = sorted(host_o_dir.glob("*.o"))
+        if not host_objs:
+            host_objs = []
+            for src in host_srcs:
+                o = directory / (Path(src).stem + ".o")
+                run(["swiftc", "-parse-as-library", "-c", "-O", "-D", "XU_UI_STATIC", "-module-name", "XuUIHost",
+                     src, "-o", str(o), "-framework", "AppKit", "-framework", "UserNotifications", "-framework", "QuartzCore"])
+                host_objs.append(o)
+        run(["clang++", "-std=c++17", "-O2", "-DXU_UI_STATIC", "-Isrc/ui/host", "-c",
+             ROOT / "src/ui/host/xu_ui_mem.cc", "-o", directory / "xu_ui_mem.o"])
+        for cname in ("xu_pack_assets", "xu_pack_assets_weak"):
+            run(["clang", "-O2", "-Isrc/ui/host", "-c",
+                 ROOT / f"src/ui/host/{cname}.c", "-o", directory / f"{cname}.o"])
+        shim = directory / "host.cc"
+        shim.write_text(r'''
+#include "xu_ui_mem.h"
+#include "xu_ui_windows.h"
+#include "xu_ui_text.h"
+#include <cstdlib>
+#include <cstring>
+extern "C" void xu_app_start(int, char **);
+int main(int argc, char **argv) {
+    setenv("XU_UI_PACK", "1", 1); unsetenv("XU_UI_TMP");
+    xu_draw_text_init();
+    unsigned identity[2];
+    if (!xu_ui_window_reserve(identity) || identity[0] != 1 || identity[1] != 1) return 90;
+    unsigned char packet[39] = {}; memcpy(packet, "XUW1", 4);
+    auto word = [&](unsigned offset, unsigned value) {
+        for (unsigned i = 0; i < 4; ++i) packet[offset + i] = (unsigned char)(value >> (i * 8));
+    };
+    word(4, 1); word(8, 1); word(12, 1); word(16, 400); word(20, 240); word(24, 2); word(28, 7);
+    memcpy(packet + 32, "private", 7); unsigned written = 0;
+    xu_ui_mem_try_write(":xu:/__window_open", packet, sizeof(packet), &written);
+    if (written != sizeof(packet) || !xu_ui_window_claim(1, 1) || !xu_ui_window_ready(1, 1)) return 91;
+    xu_app_start(argc, argv);
+    return 0;
+}
+''')
+        run(["clang++", "-std=c++17", "-O2", "-Isrc/ui/host", "-c", shim, "-o", directory / "host.o"])
+        app = directory / "screen"
+        run(["swiftc", "-O", "-o", app, directory / "host.o", directory / "screen.o",
+             directory / "xu_ui_mem.o", directory / "xu_pack_assets.o", directory / "xu_pack_assets_weak.o",
+             *host_objs, "-lc++", "-framework", "AppKit", "-framework", "UserNotifications", "-framework", "QuartzCore",
+             "-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"])
+        return app
     run([sys.executable, ROOT / "scripts/xuobj_to_elf_o.py", obj, directory / "screen.o"])
     flags = shlex.split(run(["pkg-config", "--cflags", "--libs", "gtk4", "pangocairo"]))
     cxx = shlex.split(os.environ.get("CXX", "c++"))
@@ -322,8 +376,8 @@ def exercise(app, launcher, runtime):
 
 
 def main():
-    if not sys.platform.startswith("linux"):
-        print("XACP screenshot smoke: SKIP (fixture uses Linux Cairo/Pango host)")
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("XACP screenshot smoke: SKIP (fixture uses Linux/macOS native raster host)")
         return
     xu = Path(os.environ.get("XU", ROOT / "bin/xu")).resolve()
     tool = xu.with_name("xu-xacp" + xu.suffix)

@@ -21,7 +21,8 @@ make xacp-test
 `--xacp` 是构建选项；单独导入 `#xacp` 不会生成启动发现入口。
 `--xacp-port PORT`（或 `--xacp-port=PORT`）会同时启用 XACP，端口范围为
 0..65535。端口 0 禁用 TCP；非零端口由显式 `--xacp-tcp` 入口在 `127.0.0.1` 监听。
-另一个终端运行 `xu xacp connect PORT`，通过 stdin/stdout 逐帧请求/响应。
+另一个终端运行 `xu xacp connect PORT`，通过 stdin/stdout 逐帧请求/响应；
+或直接运行 `xu xacp call PORT OP [ARGS]` 自动完成 hello 握手并发送单次请求（可用 `XU_XACP_TOKEN` 传 token）。
 TCP 与 `--xacp-stdio` 均独占控制、不运行业务 main；`--` 前首个控制标志优先。
 每条连接独立会话，连接顺序处理；结束服务可终止进程。普通启动不监听。
 生成器目前只允许 hosted native 可执行程序，拒绝 lib/shared/test、嵌入式和
@@ -138,9 +139,10 @@ XU_UI_SIM=1 XU_XACP_TOKEN=local-control-token XACP_EXAMPLE_TCP=4321 ./bin/xacp-s
 请求正文、权限、注册 generation，不持有 `$&Screen`。UI 协程执行
 `dispatch_screen`，把数据序列化进 `ControlReply.data` 后回复。
 `ui.tree` 返回真实节点 id/kind/parent、位置、大小、可见/启用/焦点和转义后的 text；
-支持 `start: !i`（默认 0，>=0）和 `max_table_rows: !i`（默认
-`min(512, limits.max_table_rows)`，范围 1..limits.max_table_rows）。节点按
-`include_hidden` 过滤后的现有顺序分页，响应 data 包含 `win`、`generation`、
+支持 `start: !i`（默认 0，>=0）、`max_table_rows: !i`（默认
+`min(512, limits.max_table_rows)`，范围 1..limits.max_table_rows）、可选子树过滤 `node: !i`
+以及 `focused_only: !b true`。节点按
+`include_hidden` 与过滤条件后的现有顺序分页，响应 data 包含 `win`、`generation`、`revision`、
 `start`、`count`、`total`、`truncated: !b`、`next_start: !i`、`nodes`。
 下一页用 `start = next_start`；未截断时 `next_start == total`。
 `start == total` 返回空页，`start > total` 返回 `adapter_error`；负 start 或
@@ -191,8 +193,8 @@ UI 超时后到达的回复不能写文件；未链接原生文件桥接或不�
 及 `duration_ms: !i`（默认 0，范围 0..request_timeout_ms-1）。0 表示立即采样一次，
 正数窗口内重复采样，采样间最多等待 10 ms；排队时间计入请求超时。
 成功 data 含 `mode`、`records`、`bytes`、`truncated` 和带引号的 XAR1 `payload`。
-`frames` 使用截图的尺寸元数据；Screen 未公开输入事件历史/订阅，故 `events` 如实返回
-标记 `state=true` 的当前 `window/canvas/generation/open` 状态，不注入输入，不要求 UI_MUTATE。
+`frames` 使用截图的尺寸元数据；`events` 优先排出近期脱敏后的真实交互/动作记录（最多 128 条），
+无缓冲事件时回退返回标记 `state=true` 的当前 `window/canvas/generation/open` 状态，不注入输入，不要求 UI_MUTATE。
 采样占用 UI-owner 的本次 poll，不推进业务事件循环，也不补录请求间的事件。
 无 Screen 为 `not_implemented`，窗口不符为 `stale_window`；`stream_required` 仅保留给
 未提供 sink/采样能力的适配器，常规 Screen 路径不再返回。

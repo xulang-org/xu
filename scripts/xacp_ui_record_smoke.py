@@ -211,12 +211,30 @@ def exercise(app, launcher):
         peer.finish()
     finally:
         peer.stop()
+
+    # Real UI events/actions are recorded into XAR1 and redacted for secret inputs.
+    peer = Attached(app, launcher)
+    try:
+        peer.request(hello(), 1)
+        peer.request(frame(2, "ui.act", "\n  win: !i 1\n  node: !i 2\n  act: focus"), 2)
+        peer.request(frame(3, "ui.act", "\n  win: !i 1\n  node: !i 2\n  act: click"), 3)
+        peer.request(frame(4, "ui.act", '\n  win: !i 1\n  node: !i 3\n  act: set_text\n  text: "super-secret-val"'), 4)
+        _, bodies = segment(record(peer, 5, "events", "\n  max_records: !i 8"), "events", None, False)
+        joined = "\n".join(bodies)
+        assert "act=focus" in joined and "kind=" in joined and "act=set_text" in joined, bodies
+        assert "super-secret-val" not in joined, bodies
+        # Once drained, an idle screen falls back to state=true snapshot.
+        _, idle = segment(record(peer, 6), "events", 1, False)
+        assert idle == ["state=true\twindow=1\tcanvas=1\tgeneration=1\topen=true"], idle
+        peer.finish()
+    finally:
+        peer.stop()
     print(f"XACP ui.record ({'stdio' if launcher is None else 'attach'}): PASS", flush=True)
 
 
 def main():
-    if not sys.platform.startswith("linux"):
-        print("XACP ui.record smoke: SKIP (fixture uses Linux Cairo/Pango host)")
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        print("XACP ui.record smoke: SKIP (fixture uses Linux/macOS native raster host)")
         return
     xu = Path(os.environ.get("XU", ROOT / "bin/xu")).resolve()
     tool = xu.with_name("xu-xacp" + xu.suffix)
