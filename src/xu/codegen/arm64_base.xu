@@ -322,7 +322,7 @@ fn frame_layout_ra(f &mir.MFn, reg_args int, ra &RaInfo, opt bool) A64Frame {
             off += 8
         }
         asm_save_off = off
-        off += 40 + 2 * max_asm_args * 8
+        off += 96 + 2 * max_asm_args * 8
     }
     size := (off + 15) / 16 * 16
     << A64Frame{out_area: out_area, size: size, local_off: loffs, temp_off: toffs, asm_save_off: asm_save_off}
@@ -4567,7 +4567,11 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 if ret_direct { ret_done = true }
                 else { a64_put(cb, &fr, &ra, ins.a, rd) }
             } else if k == mir.MI_ASM {
-                a64_emit_asm_insn(cb, ins.sval)
+                if asm_starts_with(&ins.sval, "@ops:") {
+                    a64_emit_asm_with_ops(cb, f, &fr, &ra, &ins)
+                } else {
+                    a64_emit_asm_insn(cb, ins.sval)
+                }
             } else {
                 // Unknown kinds are a lowering bug; trap loudly at run time.
                 e32(cb, 0xD4200000)
@@ -4790,6 +4794,121 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     }
 }
 
+fn a64_parse_asm_reg(reg &string) int {
+    if reg.len < 2 { << -1 }
+    if reg[0] != 120 && reg[0] != 119 { << -1 } // 'x' or 'w'
+    num_s := reg[1:reg.len]
+    n := x64_asm_parse_int(&num_s)
+    if (n >= 0 && n <= 15) || (n >= 19 && n <= 28) {
+        << n
+    }
+    << -1
+}
+
+fn a64_reg_default_width(reg &string) int {
+    if reg.len >= 2 && reg[0] == 119 { << 4 } // 'w'
+    << 8
+}
+
+fn a64_emit_asm_with_ops(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, ins &mir.MInstr) {
+    $bar := -1
+    for i in 5:ins.sval.len {
+        if ins.sval[i] == 124 {
+            bar = i
+            <-
+        }
+    }
+    if bar < 0 {
+        a64_emit_asm_insn(cb, ins.sval)
+        <<
+    }
+    spec := ins.sval[5:bar]
+    tmpl := ins.sval[bar + 1:ins.sval.len]
+    $op_kinds := []int{}
+    $op_regs := []int{}
+    $op_widths := []int{}
+    $op_margs := []int{}
+    $ai := ins.c
+    if spec.len > 0 {
+        items := x64_asm_split_char(&spec, 44)
+        for ii in 0:items.len {
+            parts := x64_asm_split_char(&items[ii], 58)
+            if parts.len < 2 { -> }
+            okind := parts[0] + ""
+            if okind == "clob" { -> }
+            $arg_v := 0
+            if ai >= 0 {
+                arg_v = f.margs[ai].v
+                ai = f.margs[ai].next
+            }
+            rk := a64_parse_asm_reg(&parts[1])
+            if rk < 0 { -> }
+            $w := a64_reg_default_width(&parts[1])
+            if parts.len >= 3 {
+                pw := x64_asm_parse_int(&parts[2])
+                if pw == 1 || pw == 2 || pw == 4 || pw == 8 { w = pw }
+            }
+            $kcode := 0
+            if okind == "out" { kcode = 1 }
+            else if okind == "inout" { kcode = 2 }
+            op_kinds.push(kcode)
+            op_regs.push(rk)
+            op_widths.push(w)
+            op_margs.push(arg_v)
+        }
+    }
+    if op_kinds.len == 0 || fr.asm_save_off < 0 {
+        a64_emit_asm_insn(cb, tmpl)
+        <<
+    }
+    base := fr.asm_save_off
+    nargs := op_kinds.len
+    // Phase 0: save x19..x28 (10 callee-saved GPRs).
+    for si in 0:10 {
+        a64_str(cb, 19 + si, R_SP, base + si * 8)
+    }
+    // Phase 1: evaluate all operands to stack slots via R_IP0 (x16).
+    for k in 0:nargs {
+        a64_load_to(cb, f, fr, ra, R_IP0, op_margs[k])
+        a64_str(cb, R_IP0, R_SP, base + 96 + k * 8)
+    }
+    // Phase 2a: load initial value of inout pointers.
+    for k in 0:nargs {
+        if op_kinds[k] == 2 {
+            a64_ldr(cb, R_IP0, R_SP, base + 96 + k * 8)
+            a64_mem(cb, false, op_widths[k], R_IP0, R_IP0, 0)
+            a64_str(cb, R_IP0, R_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    // Phase 2b: populate physical in/inout registers directly from stack slots.
+    for k in 0:nargs {
+        if op_kinds[k] == 0 {
+            a64_ldr(cb, op_regs[k], R_SP, base + 96 + k * 8)
+        } else if op_kinds[k] == 2 {
+            a64_ldr(cb, op_regs[k], R_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    a64_emit_asm_insn(cb, tmpl)
+    // Phase 3: save out/inout physical registers before restoring/storing.
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            a64_str(cb, op_regs[k], R_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    // Phase 4: store out/inout results through destination pointers.
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            a64_ldr(cb, R_IP0, R_SP, base + 96 + k * 8)
+            a64_ldr(cb, R_IP1, R_SP, base + 96 + (nargs + k) * 8)
+            a64_mem(cb, true, op_widths[k], R_IP1, R_IP0, 0)
+        }
+    }
+    // Phase 5: restore callee-saved GPRs x19..x28.
+    for si in 0:10 {
+        a64_ldr(cb, 19 + si, R_SP, base + si * 8)
+    }
+}
+
 fn a64_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
     stmts := asm_split_stmts(&raw)
     for si in 0:stmts.len {
@@ -4831,12 +4950,42 @@ fn a64_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
             e32(cb, 0xD69F03E0)
         } else if s == "svc #0" {
             e32(cb, 0xD4000001)
+        } else if s == "hvc #0" {
+            e32(cb, 0xD4000002)
+        } else if s == "smc #0" {
+            e32(cb, 0xD4000003)
         } else if s == "brk #0" {
             e32(cb, 0xD4200000)
         } else if s == "tlbi vmalle1" {
             e32(cb, 0xD508871F)
         } else if s == "tlbi vmalle1is" {
             e32(cb, 0xD508831F)
+        } else if s == "mrs x0, mpidr_el1" || s == "mrs x0,mpidr_el1" {
+            e32(cb, 0xD53800A0)
+        } else if s == "mrs x0, currentel" || s == "mrs x0,currentel" {
+            e32(cb, 0xD5384240)
+        } else if s == "mrs x0, cntpct_el0" || s == "mrs x0,cntpct_el0" {
+            e32(cb, 0xD53BE020)
+        } else if s == "mrs x0, cntfrq_el0" || s == "mrs x0,cntfrq_el0" {
+            e32(cb, 0xD53BE000)
+        } else if s == "mrs x0, daif" || s == "mrs x0,daif" {
+            e32(cb, 0xD53B4220)
+        } else if s == "msr daif, x0" || s == "msr daif,x0" {
+            e32(cb, 0xD51B4220)
+        } else if s == "mrs x0, sctlr_el1" || s == "mrs x0,sctlr_el1" {
+            e32(cb, 0xD5381000)
+        } else if s == "mrs x0, tpidr_el1" || s == "mrs x0,tpidr_el1" {
+            e32(cb, 0xD538D080)
+        } else if s == "msr tpidr_el1, x0" || s == "msr tpidr_el1,x0" {
+            e32(cb, 0xD518D080)
+        } else if s == "mrs x0, vbar_el1" || s == "mrs x0,vbar_el1" {
+            e32(cb, 0xD538C000)
+        } else if s == "msr vbar_el1, x0" || s == "msr vbar_el1,x0" {
+            e32(cb, 0xD518C000)
+        } else if s == "add x0, x0, x1" || s == "add x0,x0,x1" {
+            e32(cb, 0x8B010000)
+        } else if s == "eor x0, x0, x1" || s == "eor x0,x0,x1" {
+            e32(cb, 0xCA010000)
         } else {
             e32(cb, 0xD503201F)
         }
@@ -5265,19 +5414,59 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
 // Process entry, raw system call and runtime-state accessor shared by all
 // functions. tgt_os uses target.OS_* codes.
 pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, uses_ffi bool) {
-    if tgt_os == target.OS_NONE {
-        syms.define_label("__xu_start", cb.len())
-        if !emit_object {
-            syms.define_label("_start", cb.len())
-            // Load 64 KiB boot stack when building a standalone kernel ELF.
-            a64_fn_addr(cb, relocs, 9, "__xu_boot_stack_top")
-            a64_add_imm(cb, R_SP, 9, 0)
+    if tgt_os == target.OS_NONE || tgt_os == target.OS_UEFI {
+        if tgt_os == target.OS_UEFI {
+            syms.define_label("__xu_start", cb.len())
+            syms.define_label("efi_main", cb.len())
+            e32(cb, 0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+            e32(cb, 0x910003FD) // mov x29, sp
+            a64_fn_addr(cb, relocs, 9, "__xu_uefi_handles")
+            a64_str(cb, 0, 9, 0)
+            a64_str(cb, 1, 9, 8)
+            a64_branch_reloc(cb, relocs, 0x94000000, main_label, mc.RELOC_ARM64_CALL26)
+            a64_mov_imm(cb, 0, 0)
+            e32(cb, 0xA8C17BFD) // ldp x29, x30, [sp], #16
+            e32(cb, 0xD65F03C0) // ret
+
+            syms.define_label("uefi_image_handle", cb.len())
+            a64_fn_addr(cb, relocs, 0, "__xu_uefi_handles")
+            a64_ldr(cb, 0, 0, 0)
+            e32(cb, 0xD65F03C0)
+
+            syms.define_label("uefi_system_table", cb.len())
+            a64_fn_addr(cb, relocs, 0, "__xu_uefi_handles")
+            a64_ldr(cb, 0, 0, 8)
+            e32(cb, 0xD65F03C0)
+
+            syms.define_label("efi_call0", cb.len())
+            syms.define_label("efi_call1", cb.len())
+            syms.define_label("efi_call2", cb.len())
+            syms.define_label("efi_call3", cb.len())
+            syms.define_label("efi_call4", cb.len())
+            syms.define_label("efi_call5", cb.len())
+            syms.define_label("efi_call6", cb.len())
+            a64_mov(cb, 16, 0)
+            a64_mov(cb, 0, 1)
+            a64_mov(cb, 1, 2)
+            a64_mov(cb, 2, 3)
+            a64_mov(cb, 3, 4)
+            a64_mov(cb, 4, 5)
+            a64_mov(cb, 5, 6)
+            e32(cb, 0xD61F0200) // br x16
+        } else {
+            syms.define_label("__xu_start", cb.len())
+            if !emit_object {
+                syms.define_label("_start", cb.len())
+                // Load 64 KiB boot stack when building a standalone kernel ELF.
+                a64_fn_addr(cb, relocs, 9, "__xu_boot_stack_top")
+                a64_add_imm(cb, R_SP, 9, 0)
+            }
+            // Enable EL1 FP/SIMD (CPACR_EL1.FPEN = 0b11) so switch_context never traps.
+            e32(cb, 0xD2A00609) // movz x9, #0x30, lsl #16
+            e32(cb, 0xD5181049) // msr cpacr_el1, x9
+            e32(cb, 0xD5033FDF) // isb
+            a64_branch_reloc(cb, relocs, 0x94000000, main_label, mc.RELOC_ARM64_CALL26)
         }
-        // Enable EL1 FP/SIMD (CPACR_EL1.FPEN = 0b11) so switch_context never traps.
-        e32(cb, 0xD2A00609) // movz x9, #0x30, lsl #16
-        e32(cb, 0xD5181049) // msr cpacr_el1, x9
-        e32(cb, 0xD5033FDF) // isb
-        a64_branch_reloc(cb, relocs, 0x94000000, main_label, mc.RELOC_ARM64_CALL26)
         syms.define_label("__xu_hang", cb.len())
         e32(cb, 0xD503207F) // wfi
         a64_branch_reloc(cb, relocs, 0x14000000, "__xu_hang", mc.RELOC_ARM64_CALL26)
@@ -5336,7 +5525,7 @@ pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, reloc
         a64_mov_imm(cb, 0, 0)
         e32(cb, 0xD65F03C0) // ret
         emit_arm64_task_stubs(cb, syms, relocs)
-        if !emit_object {
+        if !emit_object && tgt_os == target.OS_NONE {
             while cb.len() % 16 != 0 {
                 e32(cb, 0)
             }
