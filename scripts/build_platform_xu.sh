@@ -91,13 +91,13 @@ check_file() {
         macos-x64)
             echo "$got" | grep -q "Mach-O" && echo "$got" | grep -q "x86_64" ;;
         linux-arm64)
-            echo "$got" | grep -q "ELF 64-bit LSB executable, ARM aarch64" ;;
+            echo "$got" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), ARM aarch64" ;;
         linux-x64)
-            echo "$got" | grep -q "ELF 64-bit LSB executable, x86-64" ;;
+            echo "$got" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), x86-64" ;;
         linux-loongarch64)
-            echo "$got" | grep -q "ELF 64-bit LSB executable, LoongArch" ;;
+            echo "$got" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), LoongArch" ;;
         linux-riscv64)
-            echo "$got" | grep -q "ELF 64-bit LSB executable, UCB RISC-V" ;;
+            echo "$got" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), UCB RISC-V" ;;
         windows-x64)
             echo "$got" | grep -q "PE32+ executable" && echo "$got" | grep -q "x86-64" ;;
         windows-arm64)

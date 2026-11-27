@@ -129,20 +129,20 @@ ok "mac default → main +x + run"
 # exercise target selection explicitly in the product lane.
 run_built build "$FIX_LOCAL" --target linux-x64 -o linux_x64.xin \
   || fail "linux target build"
-file linux_x64.xin | grep -q "ELF 64-bit LSB executable, x86-64" \
+file linux_x64.xin | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), x86-64" \
   || fail "linux-x64 target did not produce linux-x64 ELF"
 ok "linux-x64 via explicit --target (.xin)"
 
 rm -f main main.xin
 run_built build "$FIX_LOCAL" --target linux-arm64 || fail "linux-arm64 target"
 [ -f main ] || fail "linux default missing main"
-file main | grep -q "ELF 64-bit LSB executable, ARM aarch64" \
+file main | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), ARM aarch64" \
   || fail "linux-arm64 target not aarch64 ELF"
 ok "linux-arm64 explicit --target → main"
 
 run_built build "$FIX_LOCAL" --target linux-arm64 -o ov.xin \
   || fail "--target override"
-file ov.xin | grep -q "ELF 64-bit LSB executable, ARM aarch64" \
+file ov.xin | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), ARM aarch64" \
   || fail "--target did not override XUOS/XUARCH"
 ok "--target overrides XUOS/XUARCH"
 

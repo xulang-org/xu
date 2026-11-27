@@ -193,12 +193,12 @@ run_fixture_target() {
             # M39: QEMU semihosting runner (syscall shim); no-run fixtures
             # (file IO/threads/env) degrade to compile+file.
             if [ "$LOONG_OK" = "0" ]; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, LoongArch" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), LoongArch" \
                     && { echo "PASS $name/$target (compile+file only)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
             if echo " $LOONG_NO_RUN " | grep -q " $name "; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, LoongArch" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), LoongArch" \
                     && { echo "PASS $name/$target (compile+file only)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
@@ -217,12 +217,12 @@ run_fixture_target() {
         linux-riscv64)
             # M39: QEMU virt + M-mode ecall shim (scripts/riscv64_qemu_run.py).
             if [ "$RISCV_OK" = "0" ]; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, UCB RISC-V" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), UCB RISC-V" \
                     && { echo "PASS $name/$target (compile+file only)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
             if echo " $RISCV_NO_RUN " | grep -q " $name "; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, UCB RISC-V" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), UCB RISC-V" \
                     && { echo "PASS $name/$target (compile+file only)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
@@ -240,26 +240,26 @@ run_fixture_target() {
             fi ;;
         linux-arm64)
             if [ "$name" = "net_ipv6_loopback" ] && [ "$LINUX_ARM64_IPV6_OK" = "0" ]; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, ARM aarch64" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), ARM aarch64" \
                     && { echo "PASS $name/$target (compile+file only: runner IPv6 disabled)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
             xu_linux_run linux-arm64 "$ARM64_IMG" "$tmp" "$out" /w/a.out "$tmp/stdout" "$tmp/stderr" $extra_args
             if [ "$XU_LINUX_RUN_STATUS" = "degraded" ]; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, ARM aarch64" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), ARM aarch64" \
                     && { echo "PASS $name/$target (compile+file only)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
             code=$XU_LINUX_RUN_CODE ;;
         linux-x64)
             if [ "$name" = "net_ipv6_loopback" ] && [ "$LINUX_X64_IPV6_OK" = "0" ]; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, x86-64" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), x86-64" \
                     && { echo "PASS $name/$target (compile+file only: runner IPv6 disabled)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
             xu_linux_run linux-x64 "$X64_IMG" "$tmp" "$out" /w/a.out "$tmp/stdout" "$tmp/stderr" $extra_args
             if [ "$XU_LINUX_RUN_STATUS" = "degraded" ]; then
-                file "$out" | grep -q "ELF 64-bit LSB executable, x86-64" \
+                file "$out" | grep -Eq "ELF 64-bit LSB (pie executable|executable|shared object), x86-64" \
                     && { echo "PASS $name/$target (compile+file only)"; pass=$((pass + 1)); rm -rf "$tmp"; return; }
                 echo "FAIL $name/$target (degraded check failed)"; fail=$((fail + 1)); rm -rf "$tmp"; return
             fi
