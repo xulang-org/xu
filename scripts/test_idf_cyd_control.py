@@ -25,7 +25,7 @@ fn show(bytes string) {
     command := control.parse(&bytes)
     $line := "0"
     if command.valid { line = "1" }
-    line = line + " " + str(command.op) + " " + str(command.report.len)
+    line = line + " " + str(command.op) + " " + str(command.target) + " " + str(command.report.len)
     for i in 0:command.report.len { line = line + " " + str(command.report[i]) }
     println(line)
 }
@@ -37,6 +37,8 @@ fn main() {
 
 CASES = [
     '{"id":"tap-1","op":"hid.mouse","report":[1,255,63,255,63]}',
+    '{"id":"tap-t2","op":"hid.mouse","target":2,"report":[1,255,63,255,63]}',
+    '{"id":"bad-target","op":"hid.mouse","target":4,"report":[1,255,63,255,63]}',
     '{"id":"over","op":"hid.mouse","report":[0,0,128,0,0]}',
     '{"id":"status-1","op":"status"}',
     '{"id":"key-1","op":"hid.keyboard","report":[0,0,115,0,0,0,0,0]}',
@@ -74,10 +76,12 @@ def check_app_object() -> None:
 
 
 def main() -> int:
-    tap, over, status, key = parse_cases()
-    assert tap[:3] == [1, 7, 5], "absolute mouse must parse"
-    x = tap[4] | (tap[5] << 8)
-    y = tap[6] | (tap[7] << 8)
+    tap, tap_t2, bad_target, over, status, key = parse_cases()
+    assert tap[:4] == [1, 7, -1, 5], "absolute mouse must parse with default target -1"
+    assert tap_t2[:4] == [1, 7, 2, 5], "explicit target 2 must parse"
+    assert bad_target[0] == 0, "target >= 4 must be rejected"
+    x = tap[5] | (tap[6] << 8)
+    y = tap[7] | (tap[8] << 8)
     assert x == 16383 and y == 16383
     assert over[0] == 0, "axis above 32767 must be rejected"
     assert status[0] == 1
