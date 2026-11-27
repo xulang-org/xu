@@ -163,11 +163,23 @@ def stdio_checks(app, tool):
             for field in ("start: !i 3\n", "count: !i 0\n", "total: !i 3\n",
                           "truncated: !b false\n", "next_start: !i 3\n", "nodes: []\n"):
                 assert "  " + field in empty, empty
-            peer.request(frame(12, "ui.tree", "\n  start: !i 4"), 12, "adapter_error")
-            peer.request(frame(13, "ui.act", "\n  win: !i 1\n  node: !i 99\n  act: click"), 13, "adapter_error")
+            # Filtered tree (subtree node & focused_only) and monotonic revision.
+            rev_before = int(next(line.removeprefix("  revision: !i ")
+                                  for line in first.splitlines() if line.startswith("  revision: !i ")))
+            sub_tree = peer.request(frame(12, "ui.tree", "\n  node: !i 2"), 12)
+            assert "  total: !i 1\n" in sub_tree and "  count: !i 1\n" in sub_tree and "    - id: !i 2\n" in sub_tree, sub_tree
+            peer.request(frame(13, "ui.act", "\n  win: !i 1\n  node: !i 2\n  act: focus"), 13)
+            focused_tree = peer.request(frame(14, "ui.tree", "\n  focused_only: !b true"), 14)
+            assert "  total: !i 1\n" in focused_tree and "    - id: !i 2\n" in focused_tree, focused_tree
+            rev_after = int(next(line.removeprefix("  revision: !i ")
+                                 for line in focused_tree.splitlines() if line.startswith("  revision: !i ")))
+            assert rev_after >= rev_before, (rev_before, rev_after)
+            peer.request(frame(15, "ui.tree", "\n  node: !i 999"), 15, "adapter_error")
+            peer.request(frame(16, "ui.tree", "\n  start: !i 4"), 16, "adapter_error")
+            peer.request(frame(17, "ui.act", "\n  win: !i 1\n  node: !i 99\n  act: click"), 17, "adapter_error")
             # A valid session limit above the widget node cap is still legal.
-            peer.request(frame(14, "ui.tree", "\n  max_table_rows: !i 10000"), 14)
-            response = peer.request(frame(15, "proc.status"), 15)
+            peer.request(frame(18, "ui.tree", "\n  max_table_rows: !i 10000"), 18)
+            response = peer.request(frame(19, "proc.status"), 19)
             if launcher is None:
                 assert f"pid: !i {peer.child.pid}\n" in response, response
             peer.finish()

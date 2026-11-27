@@ -685,6 +685,19 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
                 assert p.returncode == 0, (p.stdout, p.stderr)
                 checked_responses(p.stdout.decode(), token, nonce)
                 assert f"pid: !i {server.pid}" in p.stdout.decode()
+            # One-shot `xu xacp call` helper handles hello + request framing.
+            call_env = dict(BASE_ENV)
+            if token:
+                call_env["XU_XACP_TOKEN"] = token
+            c_hello = subprocess.run([str(TOOL), "call", str(port), "xacp.hello"],
+                                     capture_output=True, text=True, timeout=10, env=call_env)
+            assert c_hello.returncode == 0 and "ok: !b true" in c_hello.stdout and "state: OPEN" in c_hello.stdout, (c_hello.stdout, c_hello.stderr)
+            c_status = subprocess.run([str(TOOL), "call", str(port), "proc.status"],
+                                      capture_output=True, text=True, timeout=10, env=call_env)
+            assert c_status.returncode == 0 and f"pid: !i {server.pid}" in c_status.stdout, (c_status.stdout, c_status.stderr)
+            c_bad = subprocess.run([str(TOOL), "call", str(port), "unknown.op"],
+                                   capture_output=True, text=True, timeout=10, env=call_env)
+            assert c_bad.returncode != 0
             # Fragmented TCP writes must return responses before write-side EOF.
             with socket.create_connection(("127.0.0.1", port), timeout=5) as peer:
                 for request in (hello(token=token or None, nonce="fragmented"), frame(2, "proc.status"),
