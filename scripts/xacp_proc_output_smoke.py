@@ -33,8 +33,8 @@ FIXTURE = r'''@main
 fn write_all(fd int,data &string) int {
     $offset := 0
     while offset < data.len {
-        n := os.fd_write(fd,data[offset:data.len]) or >>
-        if n <= 0 { >> errors.new("output made no progress") }
+        n := os.fd_write(fd,data[offset:data.len]) >>>
+        if n <= 0 { >>> errors.new("output made no progress") }
         offset += n
     }
     << 0
@@ -42,23 +42,23 @@ fn write_all(fd int,data &string) int {
 
 fn worker(done chan int) {
     for i in 0:1000 {
-        _ := os.fd_write(2,"worker-line\n") or (err) { done <- 1
+        _ := os.fd_write(2,"worker-line\n") >>> (err) { done <- 1
             << }
     }
     done <- 0
 }
 
 fn main() int {
-    out := read_file(os.getenv("XACP_OUTPUT_STDOUT")) or (err) { << 90 }
-    err := read_file(os.getenv("XACP_OUTPUT_STDERR")) or (err) { << 91 }
+    out := read_file(os.getenv("XACP_OUTPUT_STDOUT")) >>> (err) { << 90 }
+    err := read_file(os.getenv("XACP_OUTPUT_STDERR")) >>> (err) { << 91 }
     println("stdout-print")
-    write_all(1,&out) or (err) { << 92 }
+    write_all(1,&out) >>> (err) { << 92 }
     eprintln("stderr-print")
-    write_all(2,&err) or (err) { << 93 }
+    write_all(2,&err) >>> (err) { << 93 }
     port := os.getenv("XACP_OUTPUT_TCP")
     if port.len > 0 {
-        number := parse_int(port) or (err) { << 94 }
-        control := xacp.attach_tcp(number) or (err) { << 95 }
+        number := parse_int(port) >>> (err) { << 94 }
+        control := xacp.attach_tcp(number) >>> (err) { << 95 }
         << <-control.done
     }
     control := xacp.attach_stdio()

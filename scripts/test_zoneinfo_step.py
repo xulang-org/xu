@@ -16,7 +16,7 @@ TEST_CODE = r'''@main
 
 fn test_builtin_zones() {
     // 1. Asia/Shanghai (+8h, 28800s, no DST)
-    sh := time.load_location("Asia/Shanghai") or (err) {
+    sh := time.load_location("Asia/Shanghai") >>> (err) {
         eprintln("load Asia/Shanghai failed: " + err.msg())
         <<< 1
     }
@@ -27,7 +27,7 @@ fn test_builtin_zones() {
     println("OK: builtin Asia/Shanghai verified")
 
     // 2. America/New_York (-5h, -18000s, has DST)
-    ny := time.load_location("America/New_York") or (err) {
+    ny := time.load_location("America/New_York") >>> (err) {
         eprintln("load America/New_York failed: " + err.msg())
         <<< 3
     }
@@ -38,7 +38,7 @@ fn test_builtin_zones() {
     println("OK: builtin America/New_York verified")
 
     // 3. Unknown location rejected
-    time.load_location("Unknown/Not_Exists") or (err) {
+    time.load_location("Unknown/Not_Exists") >>> (err) {
         println("OK: unknown location rejected")
         <<
     }
@@ -48,7 +48,7 @@ fn test_builtin_zones() {
 
 fn test_custom_tzif() {
     // 4. Custom/Auckland loaded via ZONEINFO
-    ak := time.load_location("Custom/Auckland") or (err) {
+    ak := time.load_location("Custom/Auckland") >>> (err) {
         eprintln("load Custom/Auckland via ZONEINFO failed: " + err.msg())
         <<< 6
     }

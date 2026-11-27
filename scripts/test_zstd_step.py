@@ -28,7 +28,7 @@ fn test_roundtrip(size int) {
     }
 
     comp := zstd.compress(&s)
-    decomp := zstd.decompress(&comp) or (err) {
+    decomp := zstd.decompress(&comp) >>> (err) {
         println("ERROR: decompress failed for size " + str(size) + ": " + err.msg())
         <<< 1
     }
@@ -100,7 +100,7 @@ fn test_fhd_bytes() {
 }
 
 fn check_decompress(data &string) bool {
-    _ := zstd.decompress(data) or (err) {
+    _ := zstd.decompress(data) >>> (err) {
         << false
     }
     << true
@@ -159,7 +159,7 @@ fn test_rle_decoding() {
     frame.push(65) // 'A'
 
     rle_str := string_from_bytes(frame)
-    decoded := zstd.decompress(&rle_str) or (err) {
+    decoded := zstd.decompress(&rle_str) >>> (err) {
         println("ERROR: RLE decompress threw: " + err.msg())
         <<< 1
     }
@@ -239,12 +239,12 @@ fn main() {
 #os
 
 fn main() {{
-    data := os.read("{tar_path.replace('\\', '/')}") or (err) {{
+    data := os.read("{tar_path.replace('\\', '/')}") >>> (err) {{
         println("read failed: " + err.msg())
         <<< 1
     }}
     comp := zstd.compress(&data)
-    _ := os.write("{tar_path.replace('\\', '/')}.zst", comp) or (err) {{
+    _ := os.write("{tar_path.replace('\\', '/')}.zst", comp) >>> (err) {{
         println("write failed: " + err.msg())
         <<< 1
     }}

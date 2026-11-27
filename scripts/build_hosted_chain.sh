@@ -194,6 +194,9 @@ pick_bin() {
         fi
     fi
     if [ -x "$1" ]; then
+        if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+            codesign --force --sign - --identifier xu-selfhost "$1" >/dev/null 2>&1
+        fi
         echo "$1"
         return 0
     fi

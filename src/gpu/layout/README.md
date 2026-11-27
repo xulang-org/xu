@@ -6,11 +6,11 @@ window, creating a GPU device, loading SDL, or allocating pixel payloads.
 ```xu
 #gpu/layout
 
-storage := layout.texture_2d(layout.RGBA8_SRGB, 2048, 2048, 0, 1, 1) or >>
+storage := layout.texture_2d(layout.RGBA8_SRGB, 2048, 2048, 0, 1, 1) >>>
 assert(storage.level_count() == 12 && storage.total_bytes() == 22369620)
-transfer := layout.texture_2d(layout.RGBA8_UNORM, 3, 5, 0, 256, 512) or >>
-assert((transfer.level(0) or >>).row_pitch == 256)
-assert((transfer.level(1) or >>).offset == 1536)
+transfer := layout.texture_2d(layout.RGBA8_UNORM, 3, 5, 0, 256, 512) >>>
+assert((transfer.level(0) >>>).row_pitch == 256)
+assert((transfer.level(1) >>>).offset == 1536)
 ```
 
 `levels=0` requests a full mip chain. Explicit counts range from one to the

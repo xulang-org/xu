@@ -511,6 +511,8 @@ def main():
             if error:
                 assert not out.exists(), f'{name}: failed build produced executable'
             elif output is not None:
+                if sys.platform == 'darwin' and not runner and out.exists():
+                    subprocess.run(['codesign', '--force', '--sign', '-', str(out)], check=True, capture_output=True)
                 assert run([*runner, out], env=env).stdout == output, name
             print('PASS', name, flush=True)
             return out
@@ -699,11 +701,11 @@ def main():
             for spelling, label in (('p', 'implicit'), ('&*p', 'explicit')):
                 fixture('spec34_H33_fallback_temporary_' + label,
                         loan_fns + 'fn value() int { << 0 }\n'
-                        'fn check(p $&int) { consume(' + spelling + ', value() or (err) { write(p) }) }\nfn main() {}',
+                        'fn check(p $&int) { consume(' + spelling + ', value() >>> (err) { write(p) }) }\nfn main() {}',
                         'conflicting temporary call loans')
             fixture('spec34_H33_fallback_shared_and_statement_end', loan_fns +
                     'fn value() int { << 0 }\n'
-                    'fn check(p $&int, q $&int) { consume(p, value() or (err) { read(p)\n r := &*q\n println(*r)\n write(q) }) }\n'
+                    'fn check(p $&int, q $&int) { consume(p, value() >>> (err) { read(p)\n r := &*q\n println(*r)\n write(q) }) }\n'
                     'fn main() { $x := 1\n $y := 2\n check($&x, $&y) }', output='1\n')
             fixture('spec34_F26_function_value_execution', read_fn +
                     'fn check(p $&int) { f := read\n println(f(p))\n *p = 2 }\n'
@@ -873,7 +875,7 @@ def main():
             fixture('branch_reborrow_freezes_all_parents', 'fn bad(flag bool) { $x := 1\n $y := 2\n p := $&x\n q := $&y\n $r := &*p\n if flag { r = &*q }\n h := &*r\n *q = 3\n println(*h)\n}\nfn main() { bad(true) }', 'mutably borrowed')
             fixture('loop_tail_branch_loan', 'fn bad(flag bool) { $xs := [1]\n r := &xs[0]\n for i in 0:2 { if flag { xs.push(2) } else { println(*r) } }\n}\nfn main() { bad(true) }', 'element is borrowed')
             fixture('nested_loop_tail_branch_loan', 'fn bad(flag bool) { for j in 0:2 { $xs := [1]\n r := &xs[0]\n for i in 0:2 { if flag { xs.push(2) } else { println(*r) } }\n} }\nfn main() { bad(true) }', 'element is borrowed')
-            fixture('fallback_rebind_reject', 'fn value() int { << 1 }\nfn main() { x := 1\n y := 2\n $r := &x\n v := value() or (err) { r = &y }\n println(*r)\n}', 'error fallback without expression-level loan tracking')
+            fixture('fallback_rebind_reject', 'fn value() int { << 1 }\nfn main() { x := 1\n y := 2\n $r := &x\n v := value() >>> (err) { r = &y }\n println(*r)\n}', 'error fallback without expression-level loan tracking')
             fixture('nested_branch_safe_rebind', 'fn check(a bool, b bool) { $xs := [1]\n ys := [2]\n zs := [3]\n $r := &xs[0]\n if a { if b { r = &ys[0] } else { r = &zs[0] } } else { r = &ys[0] }\n xs.push(4)\n println(*r)\n}\nfn main() { check(true, false)\n check(false, true)\n}', output='3\n2\n')
             fixture('nested_loan', 'struct Inner { r &int }\nstruct Outer { inner Inner }\nfn main() { $x := 1\n h := Outer{inner: Inner{r: &x}}\n x = 2\n println(*h.inner.r)\n}', 'because it is borrowed')
             fixture('nested_assign_loan', 'struct Inner { r &int }\nstruct Outer { inner Inner }\nfn main() { $x := 1\n y := 2\n $h := Outer{inner: Inner{r: &y}}\n h.inner = Inner{r: &x}\n x = 3\n println(*h.inner.r)\n}', 'because it is borrowed')

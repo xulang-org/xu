@@ -62,16 +62,16 @@ fn smoke() int {
     identity := ui.CanvasEvent{window_id: 1,canvas_id: 1,generation: 1}
     bounds := box(20.0,20.0,120.0,36.0)
     items := [widgets.menu_item(1,"Open"),widgets.menu_item(2,"Save"),widgets.menu_item(3,"Exit")]
-    $m := widgets.menu(&context,&identity,1,&bounds,"File",&items,widgets.MENU_DROPDOWN,0) or >>
+    $m := widgets.menu(&context,&identity,1,&bounds,"File",&items,widgets.MENU_DROPDOWN,0) >>>
     assert(!m.is_open())
-    m.apply_styles(&dark) or >>
+    m.apply_styles(&dark) >>>
 
     println("menu-hover-smoke: PASS")
     << 0
 }
 
 fn main() int {
-    << smoke() or (err) {
+    << smoke() >>> (err) {
         eprintln(err.msg())
         << 1
     }

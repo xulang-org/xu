@@ -11,7 +11,7 @@ execution stack on the SDL application thread. Errors propagate normally.
 fn update() int {
     $frames := 0
     while true {
-        ready := app.next_frame() or >>
+        ready := app.next_frame() >>>
         if !ready { <- }
         frames += 1
         // Update and draw one bounded frame.
