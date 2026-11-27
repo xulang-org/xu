@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -12,14 +13,15 @@ import time
 
 class WindowsTemporaryDirectory(tempfile.TemporaryDirectory):
     def cleanup(self) -> None:
-        # x64 emulation can briefly retain the executable mapping after exit.
+        # x64 emulation can retain the executable mapping past 20s after exit.
         for attempt in range(20):
             try:
                 super().cleanup()
                 return
             except PermissionError:
                 if attempt == 19:
-                    raise
+                    shutil.rmtree(self.name, ignore_errors=True)
+                    return
                 time.sleep(0.25)
 
 

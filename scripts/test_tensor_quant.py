@@ -523,7 +523,7 @@ def main():
     args = parser.parse_args()
     compiler = args.compiler.resolve()
     root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         work = Path(td)
         src = work / "tensor_quant.xu"
         src.write_text(test_source())
