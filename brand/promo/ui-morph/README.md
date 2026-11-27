@@ -9,7 +9,7 @@ One shape, never cut. Cursor-driven morph with **deepened** copy from [xulang.or
 | Loader | Detect arch → fetch SDK 0.11.2 → register PATH |
 | Check | Ownership checked · deterministic cleanup · no GC |
 | Island | AOT · macos-arm64 · `xu build` |
-| Player | Clear intent. + `xu worker` / `or (err)` snippet |
+| Player | Clear intent. + `xu worker` / `>>> (err)` snippet |
 | Peak load | EventSet ceiling · conn count · no GC at peak |
 | Toggle | Garbage collector Off · compile-time ownership |
 | Tabs | CLI / HTTP / UI panes with APIs from the site |

@@ -13,27 +13,27 @@ SOURCE = r"""@main
 fn test_listen_config_tcp() bool {
     lc := net.new_listen_config()
     $ctx := context.background()
-    $l := lc.listen(&ctx, "tcp4", "127.0.0.1:0") or >>
+    $l := lc.listen(&ctx, "tcp4", "127.0.0.1:0") >>>
     loc := l.addr()
     println("ListenConfig tcp bound to: " + loc)
     if loc.len < 10 {
         << false
     }
 
-    $c := net.dial_to("tcp4", loc + "") or >>
-    $s := l.accept() or >>
+    $c := net.dial_to("tcp4", loc + "") >>>
+    $s := l.accept() >>>
 
     msg := "testing listen config"
-    c.write(&msg) or >>
-    rec := s.read(128) or >>
+    c.write(&msg) >>>
+    rec := s.read(128) >>>
     if rec != msg {
         println("ListenConfig rec mismatch: " + rec)
         << false
     }
 
-    c.close() or >>
-    s.close() or >>
-    l.close() or >>
+    c.close() >>>
+    s.close() >>>
+    l.close() >>>
     println("test_listen_config_tcp_passed")
     << true
 }
@@ -41,35 +41,35 @@ fn test_listen_config_tcp() bool {
 fn test_listen_config_udp() bool {
     lc := net.new_listen_config()
     $ctx := context.background()
-    $s := lc.listen_packet(&ctx, "udp4", "127.0.0.1:0") or >>
+    $s := lc.listen_packet(&ctx, "udp4", "127.0.0.1:0") >>>
     s_addr := s.local_addr()
     println("ListenConfig udp bound to: " + s_addr)
-    s_udp := net.resolve_udp_addr("udp4", s_addr + "") or >>
+    s_udp := net.resolve_udp_addr("udp4", s_addr + "") >>>
 
-    $c := net.listen_packet("udp4", "127.0.0.1:0") or >>
+    $c := net.listen_packet("udp4", "127.0.0.1:0") >>>
     msg := "testing listen_packet udp"
-    c.write_to(&msg, &s_udp) or >>
+    c.write_to(&msg, &s_udp) >>>
 
-    pkt := s.read_from(128) or >>
+    pkt := s.read_from(128) >>>
     if pkt.data != msg {
         println("ListenConfig udp rec mismatch: " + pkt.data)
         << false
     }
 
-    s.close() or >>
-    c.close() or >>
+    s.close() >>>
+    c.close() >>>
     println("test_listen_config_udp_passed")
     << true
 }
 
 fn main() int {
-    ok1 := test_listen_config_tcp() or (err) {
+    ok1 := test_listen_config_tcp() >>> (err) {
         eprintln("listen config tcp error: " + err.msg())
         <<< 1
     }
     if !ok1 { <<< 1 }
 
-    ok2 := test_listen_config_udp() or (err) {
+    ok2 := test_listen_config_udp() >>> (err) {
         eprintln("listen config udp error: " + err.msg())
         <<< 2
     }

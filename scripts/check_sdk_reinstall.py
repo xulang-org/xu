@@ -58,7 +58,7 @@ def rollback_probe(compiler, work, env):
 #internal/sdk
 fn main() int {
     args := os.argv()
-    sdk.commit_install(&args[1], &args[2], &args[3]) or (err) {
+    sdk.commit_install(&args[1], &args[2], &args[3]) >>> (err) {
         eprintln(err.msg())
         << 7
     }

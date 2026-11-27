@@ -11,19 +11,19 @@ SOURCE = r"""@main
 #net
 
 fn test_ipv4_udp() bool {
-    $srv := net.listen_udp("udp4", net.resolve_udp_addr("udp4", "127.0.0.1:0") or >>) or >>
+    $srv := net.listen_udp("udp4", net.resolve_udp_addr("udp4", "127.0.0.1:0") >>>) >>>
     srv_addr := srv.local_addr()
     println("ipv4 srv bound to: " + srv_addr)
-    srv_udp := net.resolve_udp_addr("udp4", srv_addr + "") or >>
+    srv_udp := net.resolve_udp_addr("udp4", srv_addr + "") >>>
 
-    $cli := net.listen_udp("udp4", net.resolve_udp_addr("udp4", "127.0.0.1:0") or >>) or >>
+    $cli := net.listen_udp("udp4", net.resolve_udp_addr("udp4", "127.0.0.1:0") >>>) >>>
     cli_addr := cli.local_addr()
-    cli_udp := net.resolve_udp_addr("udp4", cli_addr + "") or >>
+    cli_udp := net.resolve_udp_addr("udp4", cli_addr + "") >>>
 
     msg := "hello ipv4 udp"
-    cli.write_to(&msg, &srv_udp) or >>
+    cli.write_to(&msg, &srv_udp) >>>
 
-    pkt := srv.read_from(128) or >>
+    pkt := srv.read_from(128) >>>
     if pkt.data != msg {
         println("srv data mismatch: " + pkt.data)
         << false
@@ -34,9 +34,9 @@ fn test_ipv4_udp() bool {
     }
 
     reply := "echo ipv4: " + pkt.data
-    srv.write_to(&reply, &pkt.addr) or >>
+    srv.write_to(&reply, &pkt.addr) >>>
 
-    cli_pkt := cli.read_from(128) or >>
+    cli_pkt := cli.read_from(128) >>>
     if cli_pkt.data != reply {
         println("cli data mismatch: " + cli_pkt.data)
         << false
@@ -46,26 +46,26 @@ fn test_ipv4_udp() bool {
         << false
     }
 
-    srv.close() or >>
-    cli.close() or >>
+    srv.close() >>>
+    cli.close() >>>
     println("test_ipv4_udp_passed")
     << true
 }
 
 fn test_ipv6_udp() bool {
-    $srv := net.listen_udp("udp6", net.resolve_udp_addr("udp6", "[::1]:0") or >>) or >>
+    $srv := net.listen_udp("udp6", net.resolve_udp_addr("udp6", "[::1]:0") >>>) >>>
     srv_addr := srv.local_addr()
     println("ipv6 srv bound to: " + srv_addr)
-    srv_udp := net.resolve_udp_addr("udp6", srv_addr + "") or >>
+    srv_udp := net.resolve_udp_addr("udp6", srv_addr + "") >>>
 
-    $cli := net.listen_udp("udp6", net.resolve_udp_addr("udp6", "[::1]:0") or >>) or >>
+    $cli := net.listen_udp("udp6", net.resolve_udp_addr("udp6", "[::1]:0") >>>) >>>
     cli_addr := cli.local_addr()
-    cli_udp := net.resolve_udp_addr("udp6", cli_addr + "") or >>
+    cli_udp := net.resolve_udp_addr("udp6", cli_addr + "") >>>
 
     msg := "hello ipv6 udp datagram"
-    cli.write_to(&msg, &srv_udp) or >>
+    cli.write_to(&msg, &srv_udp) >>>
 
-    pkt := srv.read_from(128) or >>
+    pkt := srv.read_from(128) >>>
     if pkt.data != msg {
         println("ipv6 srv data mismatch: " + pkt.data)
         << false
@@ -76,9 +76,9 @@ fn test_ipv6_udp() bool {
     }
 
     reply := "echo ipv6: " + pkt.data
-    srv.write_to(&reply, &pkt.addr) or >>
+    srv.write_to(&reply, &pkt.addr) >>>
 
-    cli_pkt := cli.read_from(128) or >>
+    cli_pkt := cli.read_from(128) >>>
     if cli_pkt.data != reply {
         println("ipv6 cli data mismatch: " + cli_pkt.data)
         << false
@@ -88,46 +88,46 @@ fn test_ipv6_udp() bool {
         << false
     }
 
-    srv.close() or >>
-    cli.close() or >>
+    srv.close() >>>
+    cli.close() >>>
     println("test_ipv6_udp_unconnected_passed")
     << true
 }
 
 fn test_ipv6_udp_connected() bool {
-    $srv := net.listen_udp("udp6", net.resolve_udp_addr("udp6", "[::1]:0") or >>) or >>
+    $srv := net.listen_udp("udp6", net.resolve_udp_addr("udp6", "[::1]:0") >>>) >>>
     srv_addr := srv.local_addr()
-    srv_udp := net.resolve_udp_addr("udp6", srv_addr + "") or >>
+    srv_udp := net.resolve_udp_addr("udp6", srv_addr + "") >>>
 
-    local_udp := net.resolve_udp_addr("udp6", "[::1]:0") or >>
-    $cli := net.dial_udp("udp6", local_udp, srv_udp.clone()) or >>
+    local_udp := net.resolve_udp_addr("udp6", "[::1]:0") >>>
+    $cli := net.dial_udp("udp6", local_udp, srv_udp.clone()) >>>
 
     msg := "connected ipv6 udp"
-    cli.write(&msg) or >>
+    cli.write(&msg) >>>
 
-    pkt := srv.read_from(128) or >>
+    pkt := srv.read_from(128) >>>
     if pkt.data != msg {
         println("conn ipv6 srv data mismatch: " + pkt.data)
         << false
     }
 
     reply := "ack connected ipv6"
-    srv.write_to(&reply, &pkt.addr) or >>
+    srv.write_to(&reply, &pkt.addr) >>>
 
-    rep := cli.read(128) or >>
+    rep := cli.read(128) >>>
     if rep != reply {
         println("conn ipv6 cli read mismatch: " + rep)
         << false
     }
 
-    srv.close() or >>
-    cli.close() or >>
+    srv.close() >>>
+    cli.close() >>>
     println("test_ipv6_udp_connected_passed")
     << true
 }
 
 fn main() int {
-    ok1 := test_ipv4_udp() or (err) {
+    ok1 := test_ipv4_udp() >>> (err) {
         eprintln("ipv4 udp threw: " + err.msg())
         <<< 1
     }
@@ -135,7 +135,7 @@ fn main() int {
         eprintln("ipv4 udp failed")
         <<< 1
     }
-    ok2 := test_ipv6_udp() or (err) {
+    ok2 := test_ipv6_udp() >>> (err) {
         eprintln("ipv6 udp threw: " + err.msg())
         <<< 2
     }
@@ -143,7 +143,7 @@ fn main() int {
         eprintln("ipv6 udp failed")
         <<< 2
     }
-    ok3 := test_ipv6_udp_connected() or (err) {
+    ok3 := test_ipv6_udp_connected() >>> (err) {
         eprintln("ipv6 udp connected threw: " + err.msg())
         <<< 3
     }

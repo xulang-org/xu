@@ -187,8 +187,8 @@ fn main() int {
 pos("parse_int_or", """
 @main
 fn main() int {
-    println(parse_int("42") or (err) { << 1 })
-    println(parse_int("-7") or (err) { << 1 })
+    println(parse_int("42") >>> (err) { << 1 })
+    println(parse_int("-7") >>> (err) { << 1 })
     << 0
 }
 """, "42\n-7\n")
@@ -513,8 +513,8 @@ reject("unwrap_after_move", """
 @main
 fn main() int {
     r := Ok("owned_string_xx")
-    s := r or (err) { << 1 }
-    t := r or (err) { << 1 }
+    s := r >>> (err) { << 1 }
+    t := r >>> (err) { << 1 }
     println(s)
     println(t)
     << 0

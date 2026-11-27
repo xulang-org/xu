@@ -9,14 +9,14 @@ use the same factory and registration rules.
 ```xu
 fn save(model $&Model,screen $&widgets.Screen,action &widgets.Action) string {
     model.saved = true
-    screen.set_text(model.status,"Saved") or (err) { << err.msg() }
+    screen.set_text(model.status,"Saved") >>> (err) { << err.msg() }
     << ""
 }
 
 $actions := widgets.action_dispatcher(&model,&screen)
-actions.on(save_button,widgets.ACTION_ACTIVATE,save) or >>
-actions.on_any(other_control,inspect) or >>
-handled := actions.dispatch(&action,$&model,$&screen) or >>
+actions.on(save_button,widgets.ACTION_ACTIVATE,save) >>>
+actions.on_any(other_control,inspect) >>>
+handled := actions.dispatch(&action,$&model,$&screen) >>>
 ```
 
 Handlers return `""` on success or an error message. Catch errors inside the
@@ -51,8 +51,8 @@ dispose the Screen on close and callback failure. Custom loops call
 
 ```xu
 styles := widgets.dark_styles()
-appearance := widgets.screen_appearance(&styles,true) or >>
-screen.apply_appearance(&appearance) or >>
+appearance := widgets.screen_appearance(&styles,true) >>>
+screen.apply_appearance(&appearance) >>>
 ```
 
 Applying appearance validates and copies style tokens, updates reduced motion,

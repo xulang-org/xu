@@ -1,0 +1,300 @@
+@sync/pool
+
+// Bounded OS-thread worker pool over pthread + hardware atomics for parallel CPU kernels.
+// Workers never mutate runtime/core allocator or FFI symbol caches: all C symbols are
+// resolved on the creating thread and passed directly via function pointers inside the
+// C state block.
+
+#ffi
+
+extern "C" {
+    fn c_sysconf(name c_int) c_long = "sysconf"
+    fn c_pthread_mutex_init(mu c_ptr, attr c_ptr) c_int = "pthread_mutex_init"
+    fn c_pthread_mutex_lock(mu c_ptr) c_int = "pthread_mutex_lock"
+    fn c_pthread_mutex_unlock(mu c_ptr) c_int = "pthread_mutex_unlock"
+    fn c_pthread_mutex_destroy(mu c_ptr) c_int = "pthread_mutex_destroy"
+    fn c_pthread_cond_init(cv c_ptr, attr c_ptr) c_int = "pthread_cond_init"
+    fn c_pthread_cond_broadcast(cv c_ptr) c_int = "pthread_cond_broadcast"
+    fn c_pthread_cond_destroy(cv c_ptr) c_int = "pthread_cond_destroy"
+    fn c_pthread_create(th c_ptr, attr c_ptr, start c_ptr, arg c_ptr) c_int = "pthread_create"
+    fn c_pthread_join(th c_ptr, retval c_ptr) c_int = "pthread_join"
+    fn c_sched_yield() c_int = "sched_yield"
+}
+
+extern "C" {
+    fn c_dyn_mutex_lock(fp c_ptr, mu c_ptr) c_int = dynamic
+    fn c_dyn_mutex_unlock(fp c_ptr, mu c_ptr) c_int = dynamic
+    fn c_dyn_cond_wait(fp c_ptr, cv c_ptr, mu c_ptr) c_int = dynamic
+    fn c_dyn_yield(fp c_ptr) c_int = dynamic
+    fn c_dyn_work_fn(fp c_ptr, ctx c_ptr, r0 int, r1 int) = dynamic
+}
+
+const OFF_MUTEX = 0
+const OFF_CV = 128
+const OFF_GEN = 256
+const OFF_DONE = 264
+const OFF_STOP = 272
+const OFF_SLEEPING = 280
+const OFF_NTHREADS = 288
+const OFF_TOTAL = 296
+const OFF_GRAIN = 304
+const OFF_WORK_FN = 312
+const OFF_WORK_CTX = 320
+const OFF_FP_LOCK = 328
+const OFF_FP_UNLOCK = 336
+const OFF_FP_COND_WAIT = 344
+const OFF_FP_YIELD = 352
+const OFF_SCRATCH = 512
+const OFF_THREADS = 1024
+const OFF_WARGS = 1536
+const STATE_BYTES = 4096
+const MAX_THREADS = 64
+
+struct ChunkRange {
+    start int
+    end int
+}
+
+pub struct ThreadPool {
+    state c_ptr
+    n_threads int
+}
+
+// Query online OS hardware threads (clamped to [1, 256]); 1 on unsupported OS.
+pub fn cpu_count() int {
+    os := xu_target_os()
+    if os != 0 && os != 1 { << 1 }
+    // macOS _SC_NPROCESSORS_ONLN = 58; Linux _SC_NPROCESSORS_ONLN = 84.
+    $sc := 84
+    if os == 0 { sc = 58 }
+    $n := 1
+    unsafe { n = int(c_sysconf(i32(sc))) }
+    if n < 1 { << 1 }
+    if n > 256 { << 256 }
+    << n
+}
+
+pub fn empty_thread_pool() ThreadPool {
+    << ThreadPool{state: ffi.null(), n_threads: 1}
+}
+
+fn chunk_range(total int, grain int, n_threads int, wid int) ChunkRange {
+    $g := grain
+    if g < 1 { g = 1 }
+    blocks := (total + g - 1) / g
+    base := blocks / n_threads
+    rem := blocks % n_threads
+    $b0 := wid * base + rem
+    if wid < rem { b0 = wid * (base + 1) }
+    $cnt := base
+    if wid < rem { cnt = base + 1 }
+    $s := b0 * g
+    $e := (b0 + cnt) * g
+    if s > total { s = total }
+    if e > total { e = total }
+    << ChunkRange{start: s, end: e}
+}
+
+fn pool_worker_main(arg c_ptr) c_ptr {
+    unsafe {
+        state := ffi.read_ptr(arg, 0)
+        wid := ffi.read_i64(arg, 8)
+        mu := ffi.offset(state, OFF_MUTEX)
+        cv := ffi.offset(state, OFF_CV)
+        p_gen := ffi.offset(state, OFF_GEN)
+        p_done := ffi.offset(state, OFF_DONE)
+        p_stop := ffi.offset(state, OFF_STOP)
+        p_sleep := ffi.offset(state, OFF_SLEEPING)
+        fp_lock := ffi.read_ptr(state, OFF_FP_LOCK)
+        fp_unlock := ffi.read_ptr(state, OFF_FP_UNLOCK)
+        fp_wait := ffi.read_ptr(state, OFF_FP_COND_WAIT)
+        fp_yield := ffi.read_ptr(state, OFF_FP_YIELD)
+        n_threads := ffi.read_i64(state, OFF_NTHREADS)
+
+        $last_gen := 0
+        $spin := 0
+        $running := true
+        while running {
+            g := atomic_load(p_gen)
+            if atomic_load(p_stop) != 0 {
+                running = false
+            } else if g != last_gen {
+                last_gen = g
+                spin = 0
+                total := ffi.read_i64(state, OFF_TOTAL)
+                grain := ffi.read_i64(state, OFF_GRAIN)
+                wfn := ffi.read_ptr(state, OFF_WORK_FN)
+                wctx := ffi.read_ptr(state, OFF_WORK_CTX)
+                rng := chunk_range(total, grain, n_threads, wid)
+                if rng.start < rng.end {
+                    c_dyn_work_fn(wfn, wctx, rng.start, rng.end)
+                }
+                _ := atomic_add(p_done, 1)
+            } else if spin < 500000 {
+                spin += 1
+            } else {
+                _ := c_dyn_mutex_lock(fp_lock, mu)
+                _ := atomic_add(p_sleep, 1)
+                while atomic_load(p_gen) == last_gen && atomic_load(p_stop) == 0 {
+                    _ := c_dyn_cond_wait(fp_wait, cv, mu)
+                }
+                _ := atomic_add(p_sleep, -1)
+                _ := c_dyn_mutex_unlock(fp_unlock, mu)
+                spin = 0
+            }
+        }
+    }
+    << ffi.null()
+}
+
+pub fn new_thread_pool(num_threads int) ThreadPool {
+    $n := num_threads
+    if n <= 0 { n = cpu_count() }
+    if n > MAX_THREADS { n = MAX_THREADS }
+    os := xu_target_os()
+    if n <= 1 || (os != 0 && os != 1) {
+        << empty_thread_pool()
+    }
+    unsafe {
+        st := ffi.calloc(STATE_BYTES)
+        if ffi.is_null(st) { << empty_thread_pool() }
+        mu := ffi.offset(st, OFF_MUTEX)
+        cv := ffi.offset(st, OFF_CV)
+        if c_pthread_mutex_init(mu, ffi.null()) != 0 {
+            ffi.free(st)
+            << empty_thread_pool()
+        }
+        if c_pthread_cond_init(cv, ffi.null()) != 0 {
+            _ := c_pthread_mutex_destroy(mu)
+            ffi.free(st)
+            << empty_thread_pool()
+        }
+
+        // Resolve C symbols on the main thread before spawning workers so
+        // runtime FFI symbol tables are never touched from background threads.
+        fp_lock := ffi.dlsym_default(&"pthread_mutex_lock")
+        fp_unlock := ffi.dlsym_default(&"pthread_mutex_unlock")
+        fp_wait := ffi.dlsym_default(&"pthread_cond_wait")
+        fp_yield := ffi.dlsym_default(&"sched_yield")
+        if ffi.is_null(fp_lock) || ffi.is_null(fp_unlock) || ffi.is_null(fp_wait) || ffi.is_null(fp_yield) {
+            _ := c_pthread_cond_destroy(cv)
+            _ := c_pthread_mutex_destroy(mu)
+            ffi.free(st)
+            << empty_thread_pool()
+        }
+        _ := c_pthread_mutex_lock(mu)
+        _ := c_pthread_cond_broadcast(cv)
+        _ := c_pthread_mutex_unlock(mu)
+        _ := c_sched_yield()
+
+        ffi.write_ptr(st, OFF_FP_LOCK, fp_lock)
+        ffi.write_ptr(st, OFF_FP_UNLOCK, fp_unlock)
+        ffi.write_ptr(st, OFF_FP_COND_WAIT, fp_wait)
+        ffi.write_ptr(st, OFF_FP_YIELD, fp_yield)
+        ffi.write_i64(st, OFF_NTHREADS, n)
+
+        worker_entry := c_callback(pool_worker_main)
+        $created := 0
+        for wid in 1:n {
+            warg := ffi.offset(st, OFF_WARGS + (wid - 1) * 16)
+            ffi.write_ptr(warg, 0, st)
+            ffi.write_i64(warg, 8, wid)
+            th := ffi.offset(st, OFF_THREADS + (wid - 1) * 8)
+            if c_pthread_create(th, ffi.null(), worker_entry, warg) != 0 {
+                <-
+            }
+            created += 1
+        }
+        if created != n - 1 {
+            atomic_store(ffi.offset(st, OFF_STOP), 1)
+            _ := atomic_add(ffi.offset(st, OFF_GEN), 1)
+            _ := c_pthread_mutex_lock(mu)
+            _ := c_pthread_cond_broadcast(cv)
+            _ := c_pthread_mutex_unlock(mu)
+            for j in 0:created {
+                th := ffi.read_ptr(st, OFF_THREADS + j * 8)
+                _ := c_pthread_join(th, ffi.null())
+            }
+            _ := c_pthread_cond_destroy(cv)
+            _ := c_pthread_mutex_destroy(mu)
+            ffi.free(st)
+            << empty_thread_pool()
+        }
+        << ThreadPool{state: st, n_threads: n}
+    }
+}
+
+pub fn (p &ThreadPool) num_threads() int {
+    << p.n_threads
+}
+
+pub unsafe fn (p &ThreadPool) scratch() c_ptr {
+    if ffi.is_null(p.state) { << ffi.null() }
+    << ffi.offset(p.state, OFF_SCRATCH)
+}
+
+pub unsafe fn (p &ThreadPool) parallel_for_raw(total int, grain int, ctx c_ptr, work_fn c_ptr) {
+    if total <= 0 { << }
+    $g := grain
+    if g < 1 { g = 1 }
+    if p.n_threads <= 1 || ffi.is_null(p.state) || total <= g {
+        c_dyn_work_fn(work_fn, ctx, 0, total)
+        <<
+    }
+    st := p.state
+    workers := p.n_threads - 1
+    ffi.write_i64(st, OFF_TOTAL, total)
+    ffi.write_i64(st, OFF_GRAIN, g)
+    ffi.write_ptr(st, OFF_WORK_FN, work_fn)
+    ffi.write_ptr(st, OFF_WORK_CTX, ctx)
+    p_done := ffi.offset(st, OFF_DONE)
+    atomic_store(p_done, 0)
+    _ := atomic_add(ffi.offset(st, OFF_GEN), 1)
+
+    if atomic_load(ffi.offset(st, OFF_SLEEPING)) > 0 {
+        mu := ffi.offset(st, OFF_MUTEX)
+        cv := ffi.offset(st, OFF_CV)
+        _ := c_pthread_mutex_lock(mu)
+        _ := c_pthread_cond_broadcast(cv)
+        _ := c_pthread_mutex_unlock(mu)
+    }
+
+    rng0 := chunk_range(total, g, p.n_threads, 0)
+    if rng0.start < rng0.end {
+        c_dyn_work_fn(work_fn, ctx, rng0.start, rng0.end)
+    }
+    $spins := 0
+    while atomic_load(p_done) < workers {
+        spins += 1
+        if spins > 500000 && (spins & 16383) == 0 {
+            _ := c_sched_yield()
+        }
+    }
+}
+
+pub fn (p $&ThreadPool) close() {
+    if ffi.is_null(p.state) {
+        p.n_threads = 1
+        <<
+    }
+    st := p.state
+    workers := p.n_threads - 1
+    p.state = ffi.null()
+    p.n_threads = 1
+    unsafe {
+        mu := ffi.offset(st, OFF_MUTEX)
+        cv := ffi.offset(st, OFF_CV)
+        atomic_store(ffi.offset(st, OFF_STOP), 1)
+        _ := atomic_add(ffi.offset(st, OFF_GEN), 1)
+        _ := c_pthread_mutex_lock(mu)
+        _ := c_pthread_cond_broadcast(cv)
+        _ := c_pthread_mutex_unlock(mu)
+        for i in 0:workers {
+            th := ffi.read_ptr(st, OFF_THREADS + i * 8)
+            _ := c_pthread_join(th, ffi.null())
+        }
+        _ := c_pthread_cond_destroy(cv)
+        _ := c_pthread_mutex_destroy(mu)
+        ffi.free(st)
+    }
+}

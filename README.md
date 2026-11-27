@@ -41,15 +41,15 @@ No complex boilerplate. No convoluted lifetime annotation gymnastics. Experience
 @main
 #errors
 
-// Symbolic flow control: `<<` returns, `>>` throws; no nested Result/unwrap boilerplate
+// Symbolic flow control: `<<` returns, `>>>` throws; no nested Result/unwrap boilerplate
 fn fetch_metric(task string) int {
-    if task.len == 0 { >> errors.new("empty task name") }
+    if task.len == 0 { >>> errors.new("empty task name") }
     << task.len * 42
 }
 
 fn worker(task string, ch chan int) {
-    val := fetch_metric(task) or (err) { << } // Mandatory safe local handling without `if err != nil`
-    ch <- val                                 // Type-safe channel messaging
+    val := fetch_metric(task) >>> (err) { << } // Mandatory safe local handling without `if err != nil`
+    ch <- val                                  // Type-safe channel messaging
 }
 
 fn main() int {
@@ -62,8 +62,8 @@ fn main() int {
 ```
 
 > **Why Developers Love It**:
-> 1. **Symbolic Flow Control**: `<<` returns, `>>` throws, `<<<` exits. Goodbye verbose legacy keywords.
-> 2. **Ergonomic Error Flow**: Handled at the call site with `or (err) { ... }`. Eliminates screen-cluttering `if err != nil` and catastrophic runtime `unwrap()` panics.
+> 1. **Symbolic Flow Control**: `<<` returns, `>>>` throws, `<<<` exits. Goodbye verbose legacy keywords.
+> 2. **Ergonomic Error Flow**: Handled at the call site with `>>> (err) { ... }` (or propagated with `>>>`). Eliminates screen-cluttering `if err != nil` and catastrophic runtime `unwrap()` panics.
 > 3. **Native Lightweight Concurrency**: `xu worker()` coroutines + `chan` channels provide effortless Go-like concurrency.
 > 4. **Compile-time Static Safety**: Tracked via ownership & borrow inference. **Zero garbage collection (Zero-GC)**, zero pauses, and ultra-lean deterministic memory consumption.
 
@@ -97,7 +97,7 @@ As software engineers building high-performance systems and services, we are con
   - *The Xu Fix*: **Implicit Ownership Inference & Borrow Checking**. No explicit lifetime annotations in application code. Natural value semantics for slices give you both safety and velocity.
 - **Pain Point 3: Screen-Filling Boilerplate & Nested Error Wrappers**
   - *Status Quo*: Go codebases are flooded with repetitive `if err != nil`. Rust wraps types inside multiple `Result<T, E>` / `Option` layers.
-  - *The Xu Fix*: **Symbolic `>>` combined with mandatory `or (err) { ... }`**, providing lightweight, clean, and safe error propagation.
+  - *The Xu Fix*: **Symbolic `>>>` combined with mandatory `>>> (err) { ... }`**, providing lightweight, clean, and safe error propagation.
 - **Pain Point 4: Fragmented Toolchains & Setup Friction**
   - *Status Quo*: Stitching together CMake, Make, package managers, and platform linkers is notoriously fragile.
   - *The Xu Fix*: **Single-Binary Closed Loop**. Everything—compiler, test runner, formatter (`xu fmt`), documentation generator (`xu doc`), and self-rendered GUI setup wizards—is built right in.
@@ -110,8 +110,8 @@ As software engineers building high-performance systems and services, we are con
 | **Runtime Overhead** | Zero-cost abstractions | Heavy (GC engine + scheduler runtime) | Zero-cost abstractions | **Zero-cost (No GC engine / Pure native machine code)** |
 | **Cognitive Load** | Vulnerable to UB & race conditions | Simple, but `nil` panics persist | Steep learning curve (Borrow checker fights) | **Minimal (No lifetime annotations / Clean symbolic flow)** |
 | **Concurrency Model** | OS threads / External libraries | CSP coroutines (`go`) + channels (`chan`) | Threads / Async runtimes (Function coloring) | **Native lightweight coroutines (`xu`) + typed `chan`** |
-| **Error Handling** | Error codes / Exceptions *(Implicit)* | `if err != nil` *(Cluttered boilerplate)* | `Result<T, E>` + `?` operator | **Symbolic flow: `>>` throw + `or` mandatory handling** |
-| **Flow Control** | `return` / `break` / `continue` | `return` / `break` / `continue` | `return` / Tail expressions | **Symbolic flow: `<<` return / `>>` throw / `<-` break** |
+| **Error Handling** | Error codes / Exceptions *(Implicit)* | `if err != nil` *(Cluttered boilerplate)* | `Result<T, E>` + `?` operator | **Symbolic flow: `>>>` throw + `>>> (err)` mandatory handling** |
+| **Flow Control** | `return` / `break` / `continue` | `return` / `break` / `continue` | `return` / Tail expressions | **Symbolic flow: `<<` return / `>>>` throw / `<-` break** |
 | **Toolchain Cohesion**| Fragmented (CMake/Make/Conan) | Integrated out-of-the-box | Integrated (Cargo) | **Single-binary loop (Built-in build/test/fmt/doc)** |
 | **Cross-Platform Setup**| Complex toolchain & linker dependencies | Official installer / manual PATH config | Requires rustup & external network scripts | **Standalone GUI Setup wizards / One-click setup** |
 | **Baremetal & Kernel Dev**| Manual linkage & inline asm, unsafe | Unsupported (Tied to GC & runtime) | Supported (`no_std`), but heavy lifetimes | **Native support (`freestanding` / `#core`)<br>Zero-GC deterministic drops + Inferred lifetimes** |
@@ -176,6 +176,7 @@ xu build main.xu -o myapp
 - [CLI reference](https://xulang.org/docs/cli/), including optimization, testing, and XACP
 - [Standard library and package API](https://xulang.org/api/)
 - [Native modules and borrowed spans](https://xulang.org/docs/native/)
+- [Local LLM inference example](examples/llm_engine/README.md) for the development compiler
 
 The documentation and API source live in [xulang-org/xulang-org](https://github.com/xulang-org/xulang-org).
 
@@ -239,7 +240,7 @@ The published SDK is the baseline for this roadmap. See [Status & Limitations](h
 - [x] **Compile-Time Ownership and Borrow Inference**: Deterministic resource cleanup; 0.9.4 completes checking for nested expressions and loop back edges
 - [x] **Native Coroutines & Channels**: `xu` keyword scheduling paired with typed `chan` communication; 100/100 multi-task select concurrency gate closed
 - [x] **Cryptographic Suite Completeness**: SM2/SM3/SM4/SM9 full-suite conformance; SM9 pairing stack frame reduced by 71.5% with zero compile warnings
-- [x] **Symbolic Flow & Error Handling**: `<<` return, `>>` throw, and mandatory local `or (err) { ... }` guards
+- [x] **Symbolic Flow & Error Handling**: `<<` return, `>>>` throw, and mandatory local `>>> (err) { ... }` guards
 - [x] **Multi-Platform Code Generation**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM, and bare-metal targets
 - [x] **Operating System Kernel & Bare-Metal Support**: Freestanding compilation profile, `#core` pure static subsystem (arch/mem/sync/task/alloc/virtio), interrupt-safe spinlocks, atomic context switching, VirtIO driver framework, and one-command scaffolding (`xu init --baremetal`)
 - [x] **SDK Installation and Self-Updates**: Windows wizard, macOS PKG, cross-platform single-file Setup, and `xu up/update`

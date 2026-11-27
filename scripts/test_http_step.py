@@ -49,7 +49,7 @@ fn handle_req(c http.Context) {
     qv := c.query_value("item")
     fv := c.form_value("user")
     reply := "ack: " + rem + " item=" + qv + " user=" + fv
-    _ := c.text(200, reply) or (err) { << }
+    _ := c.text(200, reply) >>> (err) { << }
 }
 
 fn run_server(s http.Server) {
@@ -58,7 +58,7 @@ fn run_server(s http.Server) {
 
 fn test_http_server() bool {
     $s := http.new_server()
-    s.listen("127.0.0.1:0") or (err) {
+    s.listen("127.0.0.1:0") >>> (err) {
         eprintln("listen error: " + err.msg())
         << false
     }
@@ -79,7 +79,7 @@ fn test_http_server() bool {
     form.set("user", "bob")
     form.set("extra", "123")
     
-    resp := client.post_form(url_str + "", &form) or (err) {
+    resp := client.post_form(url_str + "", &form) >>> (err) {
         eprintln("client post_form error: " + err.msg())
         << false
     }

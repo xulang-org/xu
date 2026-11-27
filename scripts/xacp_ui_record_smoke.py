@@ -29,57 +29,57 @@ fn screen_bounds(s $&widgets.Screen) int {
     $session := xacp.open_session()
     session.state = xacp.STATE_OPEN
     session.permissions = xacp.PERM_UI_READ
-    request := xacp.parse_frame("id: !i 1\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n  max_bytes: !i 1024\n  duration_ms: !i 200\n") or >>
-    reply := xacp.dispatch_screen(&*s,$&session,&request,&limits,$&nonces) or >>
+    request := xacp.parse_frame("id: !i 1\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n  max_bytes: !i 1024\n  duration_ms: !i 200\n") >>>
+    reply := xacp.dispatch_screen(&*s,$&session,&request,&limits,$&nonces) >>>
     if !reply.outcome.ok || reply.data.len + ("id: !i 1\nok: !b true\ndata:\n").len > limits.max_frame_bytes { << 11 }
-    doc := xacp.parse_frame("data:\n" + reply.data) or >>
+    doc := xacp.parse_frame("data:\n" + reply.data) >>>
     data := doc.get(doc.root(),"data")
     bytes := doc.as_int(doc.get(data,"bytes"))
     if bytes > (limits.max_frame_bytes - 256) / 2 || bytes != doc.as_str(doc.get(data,"payload")).len ||
        doc.as_int(doc.get(data,"records")) < 2 || !doc.as_bool(doc.get(data,"truncated")) { << 12 }
     // Even an envelope too small for one record must abort and release its id.
     limits.max_frame_bytes = 128
-    small := xacp.parse_frame("id: !i 2\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n") or >>
-    failed := xacp.dispatch_screen(&*s,$&session,&small,&limits,$&nonces) or >>
+    small := xacp.parse_frame("id: !i 2\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n") >>>
+    failed := xacp.dispatch_screen(&*s,$&session,&small,&limits,$&nonces) >>>
     if failed.outcome.ok || failed.outcome.err_code != "adapter_error" || session.active_id != 0 { << 13 }
     limits.max_frame_bytes = 1024
-    next := xacp.parse_frame("id: !i 3\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n") or >>
-    recovered := xacp.dispatch_screen(&*s,$&session,&next,&limits,$&nonces) or >>
+    next := xacp.parse_frame("id: !i 3\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n") >>>
+    recovered := xacp.dispatch_screen(&*s,$&session,&next,&limits,$&nonces) >>>
     if !recovered.outcome.ok || session.active_id != 0 || session.next_id != 4 { << 14 }
     << 0
 }
 
 fn overflows(b $&xacp.RecordBuffer) bool {
-    _ := b.write_str("0123456789012345678901234567890123456789") or (err) { << true }
+    _ := b.write_str("0123456789012345678901234567890123456789") >>> (err) { << true }
     << false
 }
 
 fn record_overflows(r $&xacp.Recorder,b $&xacp.RecordBuffer) bool {
-    _ := xacp.write_record(r,b,"event","01234567890123456789") or (err) { << true }
+    _ := xacp.write_record(r,b,"event","01234567890123456789") >>> (err) { << true }
     << false
 }
 
 fn main() int {
     limits := xacp.default_limits()
-    $sink := xacp.record_buffer(32) or (err) { << 1 }
+    $sink := xacp.record_buffer(32) >>> (err) { << 1 }
     $session := xacp.open_session()
     session.state = xacp.STATE_OPEN
     session.permissions = xacp.PERM_UI_READ
-    $recorder := xacp.start_recorder($&session,1,"events",32,&limits) or (err) { << 2 }
-    n := xacp.write_record($&recorder,$&sink,"event","a") or (err) { << 3 }
+    $recorder := xacp.start_recorder($&session,1,"events",32,&limits) >>> (err) { << 2 }
+    n := xacp.write_record($&recorder,$&sink,"event","a") >>> (err) { << 3 }
     before := sink.text()
     if n != before.len || recorder.bytes != n || recorder.sequence != 2 { << 4 }
     if !overflows($&sink) || !record_overflows($&recorder,$&sink) { << 5 }
     if sink.text() != before || recorder.bytes != n || recorder.sequence != 2 { << 6 }
-    _ := xacp.finish_recorder($&session,$&recorder) or (err) { << 7 }
+    _ := xacp.finish_recorder($&session,$&recorder) >>> (err) { << 7 }
     if recorder.is_open() || session.active_id != 0 || session.next_id != 2 { << 8 }
-    $next := xacp.start_recorder($&session,2,"events",32,&limits) or (err) { << 9 }
+    $next := xacp.start_recorder($&session,2,"events",32,&limits) >>> (err) { << 9 }
     xacp.abort_recorder($&session,$&next)
     if next.is_open() || session.active_id != 0 || session.next_id != 3 { << 10 }
     ready := ui.Event{kind: ui.EV_CANVAS_READY,window_id: 1,menu_id: "canvas_ready\t1\t1\t1",width: 640,height: 480}
-    $screen := widgets.screen(&ready) or (err) { eprintln(err.msg())
+    $screen := widgets.screen(&ready) >>> (err) { eprintln(err.msg())
         << 15 }
-    result := screen_bounds($&screen) or (err) { screen.dispose()
+    result := screen_bounds($&screen) >>> (err) { screen.dispose()
         eprintln(err.msg())
         << 16 }
     screen.dispose()
