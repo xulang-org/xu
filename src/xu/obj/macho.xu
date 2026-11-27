@@ -18,8 +18,11 @@ pub const LC_LOAD_DYLIB = 0x0c
 pub const LC_MAIN = 0x80000028
 pub const LC_SYMTAB = 0x2
 pub const LC_DYSYMTAB = 0xb
-const LC_DYLD_INFO_ONLY = 0x80000022
+const LC_UUID = 0x1b
 const LC_CODE_SIGNATURE = 0x1d
+const LC_BUILD_VERSION = 0x32
+const LC_DYLD_INFO_ONLY = 0x80000022
+const SG_READ_ONLY = 0x10
 const S_ZEROFILL = 1
 const MACHO_CLOCK_SYMBOL = "_clock_gettime"
 
@@ -64,17 +67,14 @@ pub fn macho_syms_empty() MachoSyms {
     << MachoSyms{names: []string{}, offs: []int{}}
 }
 
-// Load commands: PAGEZERO (72), TEXT and DATA with one section each
-// (152 each), LINKEDIT (72), SYMTAB (24), DYSYMTAB (80), DYLD_INFO (48),
-// DYLINKER (32), MAIN (24), DYLIB (56),
-// plus LC_CODE_SIGNATURE (16) for ad-hoc signed executables, OR the
-// __DWARF segment with four sections (72 + 4 * 80) when debug sections exist.
+// Load commands: PAGEZERO (72), TEXT (152), DATA_CONST (152), DATA (152),
+// LINKEDIT (72), SYMTAB (24), DYSYMTAB (80), DYLD_INFO (48), DYLINKER (32),
+// DYLIB (56), MAIN (24), UUID (24), BUILD_VERSION (24), CODE_SIGNATURE (16),
+// plus __DWARF with four sections (72 + 4 * 80) when debug sections exist.
 fn macho_cmds_size(debug bool) int {
-    $n := 72 + 152 + 152 + 72 + 24 + 80 + 48 + 32 + 24 + 56
+    $n := 72 + 152 + 152 + 152 + 72 + 24 + 80 + 48 + 32 + 56 + 24 + 24 + 24 + 16
     if debug {
         n += 72 + 4 * 80
-    } else {
-        n += 16
     }
     << n
 }
@@ -107,13 +107,21 @@ fn macho_page_size(cpu_type int) int {
     << 16384
 }
 
-// Code relocations address the first data word relative to __text.
+// Offset from __text start to the first __DATA_CONST pointer (clock_gettime,
+// followed by dlopen, dlsym, dlerror). __DATA_CONST is locked read-only by
+// dyld right after binding (SG_READ_ONLY).
 pub fn macho_clock_slot_offset(code_len int, cpu_type int, debug bool) int {
     text_off := macho_text_file_offset(debug)
     << page_up(text_off + code_len, macho_page_size(cpu_type)) - text_off
 }
 
-// __DATA pointers bound from libSystem: clock_gettime, then the C FFI
+// Offset from __text start to __DATA (one page after __DATA_CONST), where
+// runtime-written __xu_ffi_state lives so __DATA_CONST can stay read-only.
+pub fn macho_ffi_state_slot_offset(code_len int, cpu_type int, debug bool) int {
+    << macho_clock_slot_offset(code_len, cpu_type, debug) + macho_page_size(cpu_type)
+}
+
+// __DATA_CONST pointers bound from libSystem: clock_gettime, then the C FFI
 // loader entry points (core ffi.xu reads them through the codegen label).
 fn macho_imports() []string {
     << [MACHO_CLOCK_SYMBOL, "_dlopen", "_dlsym", "_dlerror"]
@@ -127,12 +135,22 @@ fn macho_clock_bind() mc.CodeBuffer {
         bind.emit_u8(0x40) // SET_SYMBOL_TRAILING_FLAGS_IMM
         emit_fixed_string($&bind, imports[i], imports[i].len + 1)
         bind.emit_u8(0x51) // SET_TYPE_IMM, pointer
-        bind.emit_u8(0x72) // SET_SEGMENT_AND_OFFSET_ULEB, __DATA (2)
+        bind.emit_u8(0x72) // SET_SEGMENT_AND_OFFSET_ULEB, __DATA_CONST (2)
         bind.emit_u8(i * 8) // offset of the pointer
         bind.emit_u8(0x90) // DO_BIND
     }
     bind.emit_u8(0)    // DONE
     << bind
+}
+
+// Deterministic 32-byte SHA-256 digest of a byte slice for LC_UUID and
+// ELF .note.gnu.build-id (preserves byte-identical self-host builds).
+fn obj_sha256_bytes(bytes &[]int) string {
+    $s := make_string(bytes.len)
+    for i in 0:bytes.len {
+        s[i] = bytes[i] & 255
+    }
+    << sha256.sum256_bytes(s)
 }
 
 fn align8(n int) int {
@@ -315,7 +333,7 @@ fn macho_emit_adhoc_sig(buf $&mc.CodeBuffer, cs_off int, text_file_size int) {
     buf.emit_bytes(&hashes)
 }
 
-fn macho_segment(buf $&mc.CodeBuffer, name string, nsects int, vmaddr int, vmsize int, fileoff int, filesize int, prot int) {
+fn macho_segment_flags(buf $&mc.CodeBuffer, name string, nsects int, vmaddr int, vmsize int, fileoff int, filesize int, prot int, flags int) {
     buf.emit_u32_le(LC_SEGMENT_64)
     buf.emit_u32_le(72 + 80 * nsects)
     emit_fixed_string(buf, name, 16)
@@ -326,7 +344,11 @@ fn macho_segment(buf $&mc.CodeBuffer, name string, nsects int, vmaddr int, vmsiz
     buf.emit_u32_le(prot) // maxprot
     buf.emit_u32_le(prot) // initprot
     buf.emit_u32_le(nsects)
-    buf.emit_u32_le(0) // flags
+    buf.emit_u32_le(flags)
+}
+
+fn macho_segment(buf $&mc.CodeBuffer, name string, nsects int, vmaddr int, vmsize int, fileoff int, filesize int, prot int) {
+    macho_segment_flags(buf, name, nsects, vmaddr, vmsize, fileoff, filesize, prot, 0)
 }
 
 fn macho_section(buf $&mc.CodeBuffer, sect string, seg string, addr int, size int, off int, align int, flags int) {
@@ -360,9 +382,15 @@ pub fn macho_write_executable_arm64(code_bytes &[]int, entry_offset int) mc.Code
     << macho_write_executable(code_bytes, MACHO_CPU_TYPE_ARM64, entry_offset)
 }
 
-// The loader zero-fills clock and FFI slots in __DATA before binding.
-// __LINKEDIT starts one page later in memory, with no gap in the file.
-// Keep the debugger layout when emitting a separate __DWARF segment.
+// Hardened Mach-O 64-bit executable:
+//   __PAGEZERO   (---): 4 GiB null guard
+//   __TEXT       (R-X): headers + __text
+//   __DATA_CONST (RW- -> R-- via SG_READ_ONLY): dyld-bound clock & FFI pointers
+//   __DATA       (RW-): runtime-writable __xu_ffi_state
+//   __DWARF      (---, optional when -g): placed before __LINKEDIT so the
+//                       embedded ad-hoc LC_CODE_SIGNATURE always terminates the
+//                       file cleanly on Apple Silicon.
+//   __LINKEDIT   (R--): bind opcodes, symtab, strtab, LC_CODE_SIGNATURE
 pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offset int, syms &MachoSyms, dbg &DebugSections) mc.CodeBuffer {
     $buf := mc.code_buffer_new()
     debug := dbg.present()
@@ -371,8 +399,11 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
     base := 0x100000000
     text_off := macho_text_file_offset(debug)
     text_vmaddr := base + text_off
-    data_off := text_off + macho_clock_slot_offset(code_bytes.len, cpu_type, debug)
+    data_const_off := text_off + macho_clock_slot_offset(code_bytes.len, cpu_type, debug)
+    data_const_vm := base + data_const_off
+    data_vm := data_const_vm + page
     bind := macho_clock_bind()
+    code_digest := obj_sha256_bytes(code_bytes)
 
     // Symbol and string tables.
     $strtab := []int{}
@@ -410,45 +441,70 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
         strtab.push(0)
     }
     nlocals := syms.names.len
-    $le_off := data_off
-    if debug { le_off += page }
-    le_vm := base + data_off + page
+
+    // Layout after __TEXT:
+    //   release: __DATA_CONST and __DATA are zero-fill (0 file bytes), then __LINKEDIT.
+    //   debug  : __DATA_CONST (1 page), __DATA (1 page), __DWARF (page-aligned), then __LINKEDIT.
+    $dw_off := 0
+    $dw_vm := data_vm + page
+    $line_off := 0
+    $info_off := 0
+    $abbrev_off := 0
+    $dstr_off := 0
+    $dw_size := 0
+    $dw_seg_size := 0
+    $le_off := data_const_off
+    $le_vm := data_vm + page
+    if debug {
+        dw_off = data_const_off + 2 * page
+        line_off = dw_off
+        info_off = align8(line_off + dbg.line.len)
+        abbrev_off = align8(info_off + dbg.info.len)
+        dstr_off = align8(abbrev_off + dbg.abbrev.len)
+        dw_size = dstr_off + dbg.str.len - dw_off
+        dw_seg_size = page_up(dw_size, page)
+        if dw_seg_size == 0 {
+            dw_seg_size = page
+        }
+        le_off = dw_off + dw_seg_size
+        le_vm = dw_vm + dw_seg_size
+    }
+
     sym_off := align8(le_off + bind.bytes.len)
     str_off := sym_off + nlist.len
-    $cs_off := 0
-    $cs_size := 0
-    $le_size := str_off + strtab.len - le_off
-    if !debug {
-        cs_off = align16(str_off + strtab.len)
-        cs_size = macho_adhoc_sig_size(cs_off)
-        le_size = (cs_off + cs_size) - le_off
-    }
+    cs_off := align16(str_off + strtab.len)
+    cs_size := macho_adhoc_sig_size(cs_off)
+    le_size := (cs_off + cs_size) - le_off
     $le_seg_size := page_up(le_size, page)
     if le_seg_size == 0 {
         le_seg_size = page
     }
 
-    dw_off := le_off + le_seg_size
-    line_off := dw_off
-    info_off := align8(line_off + dbg.line.len)
-    abbrev_off := align8(info_off + dbg.info.len)
-    dstr_off := align8(abbrev_off + dbg.abbrev.len)
-    dw_size := dstr_off + dbg.str.len - dw_off
-    dw_vm := le_vm + le_seg_size
-
-    $ncmds := 11
+    $ncmds := 14
+    if debug {
+        ncmds = 15
+    }
     macho_write_header($&buf, cpu_type, MACHO_FILETYPE_EXECUTE, ncmds, macho_cmds_size(debug))
 
     macho_segment($&buf, "__PAGEZERO", 0, 0, base, 0, 0, 0)
-    macho_segment($&buf, "__TEXT", 1, base, data_off, 0, data_off, 5)
+    macho_segment($&buf, "__TEXT", 1, base, data_const_off, 0, data_const_off, 5)
     // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
     macho_section($&buf, "__text", "__TEXT", text_vmaddr, code_bytes.len, text_off, 4, 0x80000400)
     if debug {
-        macho_segment($&buf, "__DATA", 1, base + data_off, page, data_off, page, 3)
-        macho_section($&buf, "__data", "__DATA", base + data_off, 40, data_off, 3, 0)
+        macho_segment_flags($&buf, "__DATA_CONST", 1, data_const_vm, page, data_const_off, page, 3, SG_READ_ONLY)
+        macho_section($&buf, "__got", "__DATA_CONST", data_const_vm, 32, data_const_off, 3, 0)
+        macho_segment($&buf, "__DATA", 1, data_vm, page, data_const_off + page, page, 3)
+        macho_section($&buf, "__data", "__DATA", data_vm, 8, data_const_off + page, 3, 0)
+        macho_segment($&buf, "__DWARF", 4, dw_vm, dw_seg_size, dw_off, dw_seg_size, 0)
+        macho_section($&buf, "__debug_line", "__DWARF", dw_vm, dbg.line.len, line_off, 0, 0)
+        macho_section($&buf, "__debug_info", "__DWARF", dw_vm + (info_off - dw_off), dbg.info.len, info_off, 0, 0)
+        macho_section($&buf, "__debug_abbrev", "__DWARF", dw_vm + (abbrev_off - dw_off), dbg.abbrev.len, abbrev_off, 0, 0)
+        macho_section($&buf, "__debug_str", "__DWARF", dw_vm + (dstr_off - dw_off), dbg.str.len, dstr_off, 0, 0)
     } else {
-        macho_segment($&buf, "__DATA", 1, base + data_off, page, data_off, 0, 3)
-        macho_section($&buf, "__bss", "__DATA", base + data_off, 40, 0, 3, S_ZEROFILL)
+        macho_segment_flags($&buf, "__DATA_CONST", 1, data_const_vm, page, data_const_off, 0, 3, SG_READ_ONLY)
+        macho_section($&buf, "__got", "__DATA_CONST", data_const_vm, 32, 0, 3, S_ZEROFILL)
+        macho_segment($&buf, "__DATA", 1, data_vm, page, data_const_off, 0, 3)
+        macho_section($&buf, "__bss", "__DATA", data_vm, 8, 0, 3, S_ZEROFILL)
     }
     macho_segment($&buf, "__LINKEDIT", 0, le_vm, le_seg_size, le_off, le_size, 1)
 
@@ -497,26 +553,29 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
     buf.emit_u64_le(text_off + entry_offset) // entryoff from __TEXT start
     buf.emit_u64_le(0) // stacksize
 
-    if debug {
-        macho_segment($&buf, "__DWARF", 4, dw_vm, page_up(dw_size, page), dw_off, dw_size, 0)
-        macho_section($&buf, "__debug_line", "__DWARF", dw_vm, dbg.line.len, line_off, 0, 0)
-        macho_section($&buf, "__debug_info", "__DWARF", dw_vm + (info_off - dw_off), dbg.info.len, info_off, 0, 0)
-        macho_section($&buf, "__debug_abbrev", "__DWARF", dw_vm + (abbrev_off - dw_off), dbg.abbrev.len, abbrev_off, 0, 0)
-        macho_section($&buf, "__debug_str", "__DWARF", dw_vm + (dstr_off - dw_off), dbg.str.len, dstr_off, 0, 0)
-    } else {
-        buf.emit_u32_le(LC_CODE_SIGNATURE)
-        buf.emit_u32_le(16)
-        buf.emit_u32_le(cs_off)
-        buf.emit_u32_le(cs_size)
+    buf.emit_u32_le(LC_UUID)
+    buf.emit_u32_le(24)
+    for ui in 0:16 {
+        $b := code_digest[ui] & 255
+        if ui == 6 { b = (b & 0x0f) | 0x50 } // RFC 4122 version 5
+        if ui == 8 { b = (b & 0x3f) | 0x80 } // RFC 4122 variant
+        buf.emit_u8(b)
     }
+
+    buf.emit_u32_le(LC_BUILD_VERSION)
+    buf.emit_u32_le(24)
+    buf.emit_u32_le(1)          // PLATFORM_MACOS
+    buf.emit_u32_le(0x000b0000) // minos 11.0.0
+    buf.emit_u32_le(0x000e0000) // sdk 14.0.0
+    buf.emit_u32_le(0)          // ntools
+
+    buf.emit_u32_le(LC_CODE_SIGNATURE)
+    buf.emit_u32_le(16)
+    buf.emit_u32_le(cs_off)
+    buf.emit_u32_le(cs_size)
 
     pad_to($&buf, text_off)
     buf.emit_bytes(code_bytes)
-    pad_to($&buf, le_off)
-    buf.emit_bytes(&bind.bytes)
-    pad_to($&buf, sym_off)
-    buf.emit_bytes(&nlist)
-    buf.emit_bytes(&strtab)
     if debug {
         pad_to($&buf, line_off)
         buf.emit_bytes(&dbg.line)
@@ -526,9 +585,13 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
         buf.emit_bytes(&dbg.abbrev)
         pad_to($&buf, dstr_off)
         buf.emit_bytes(&dbg.str)
-    } else {
-        pad_to($&buf, cs_off)
-        macho_emit_adhoc_sig($&buf, cs_off, data_off)
     }
+    pad_to($&buf, le_off)
+    buf.emit_bytes(&bind.bytes)
+    pad_to($&buf, sym_off)
+    buf.emit_bytes(&nlist)
+    buf.emit_bytes(&strtab)
+    pad_to($&buf, cs_off)
+    macho_emit_adhoc_sig($&buf, cs_off, data_const_off)
     << buf
 }
