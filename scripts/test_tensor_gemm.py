@@ -13,6 +13,7 @@ import tempfile
 
 from test_tensor_dynamic import mir_functions
 from test_tensor_fusion import PRELUDE, build, run
+from test_windows_workers import WindowsTemporaryDirectory
 
 
 M_COUNTS = [0, 1, 2, 3, 4, 5, 16]
@@ -778,7 +779,7 @@ def main():
     args = parser.parse_args()
     compiler = args.compiler.resolve()
     root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory() as td:
+    with WindowsTemporaryDirectory(prefix="xu-tensor-gemm-") as td:
         work = Path(td)
         src = work / "tensor_gemm.xu"
         src.write_text(test_source())
