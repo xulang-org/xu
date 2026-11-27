@@ -383,6 +383,7 @@ def main() -> None:
             str(host_a),
             "-Wl,--no-whole-archive",
             "-Wl,--allow-multiple-definition",
+            "-Wl,-z,relro,-z,now,-z,noexecstack",
             "-o",
             str(out),
             *gtk_flags(),

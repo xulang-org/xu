@@ -112,6 +112,7 @@ def parse_pe(path: Path) -> dict:
     imp_rva, imp_sz = struct.unpack_from("<II", raw, opt + 112 + 1 * 8)
     exc_rva, exc_sz = struct.unpack_from("<II", raw, opt + 112 + 3 * 8)
     reloc_rva, reloc_sz = struct.unpack_from("<II", raw, opt + 112 + 5 * 8)
+    load_cfg_rva, load_cfg_sz = struct.unpack_from("<II", raw, opt + 112 + 10 * 8)
     iat_rva, iat_sz = struct.unpack_from("<II", raw, opt + 112 + 12 * 8)
     tbl = opt + opt_size
     sections = []
@@ -136,6 +137,7 @@ def parse_pe(path: Path) -> dict:
         "imp": (imp_rva, imp_sz),
         "exc": (exc_rva, exc_sz),
         "basereloc": (reloc_rva, reloc_sz),
+        "load_cfg": (load_cfg_rva, load_cfg_sz),
         "iat": (iat_rva, iat_sz),
         "sections": sections,
     }
@@ -170,14 +172,27 @@ def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int
     imp_rva, imp_sz = pe["imp"]
     exc_rva, exc_sz = pe["exc"]
     reloc_rva, reloc_sz = pe["basereloc"]
+    lc_rva, lc_sz = pe["load_cfg"]
     iat_rva, iat_sz = pe["iat"]
     assert imp_sz > 0 and iat_sz > 0, (pe["imp"], pe["iat"])
     assert rdata["vaddr"] <= imp_rva and imp_rva + imp_sz <= rdata["vaddr"] + rdata["vsize"], (pe["imp"], rdata)
     assert rdata["vaddr"] <= iat_rva and iat_rva + iat_sz <= rdata["vaddr"] + rdata["vsize"], (pe["iat"], rdata)
     assert exc_rva == pdata["vaddr"] and exc_sz == pdata["vsize"] and exc_sz > 0, (pe["exc"], pdata)
+
+    # IMAGE_LOAD_CONFIG_DIRECTORY64 inside .rdata with DIR64-relocated SecurityCookie in .data
+    assert lc_sz == 320, (lc_rva, lc_sz)
+    assert rdata["vaddr"] <= lc_rva and lc_rva + lc_sz <= rdata["vaddr"] + rdata["vsize"], (pe["load_cfg"], rdata)
+    lc_off = lc_rva - rdata["vaddr"]
+    assert struct.unpack_from("<I", rdata["raw"], lc_off)[0] == 320
+    cookie_va = struct.unpack_from("<Q", rdata["raw"], lc_off + 88)[0]
+    assert cookie_va == 0x140000000 + data["vaddr"] + 32, hex(cookie_va)
+    assert struct.unpack_from("<Q", data["raw"], 32)[0] == 0x00002B992DDFA232
+
     assert reloc_rva == reloc["vaddr"] and reloc_sz == reloc["vsize"] == 12, (pe["basereloc"], reloc)
     blk_page_rva, blk_size, e0, e1 = struct.unpack_from("<IIHH", reloc["raw"], 0)
-    assert (blk_page_rva, blk_size, e0, e1) == (text["vaddr"], 12, 0, 0), (blk_page_rva, blk_size, e0, e1)
+    cookie_field_rva = lc_rva + 88
+    assert blk_page_rva == (cookie_field_rva & 0xFFFFF000) and blk_size == 12, (hex(blk_page_rva), blk_size)
+    assert e0 == (0xA000 | (cookie_field_rva & 0xFFF)) and e1 == 0, (hex(e0), hex(e1))
     return text["vaddr"], rdata["vaddr"], data["vaddr"], pdata["vaddr"]
 
 

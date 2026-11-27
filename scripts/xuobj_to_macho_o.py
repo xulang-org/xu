@@ -199,11 +199,12 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
         if is_data and name.startswith("_iat_"):
             undef.add(iat_target(name))
 
+    data_addr = align(len(code), 8)
     defined: list[tuple[str, int, int, int]] = []
     for name, off, is_data in sorted(labs, key=lambda x: (x[2], x[1], x[0])):
         if name in HOST_SYMS:
             continue
-        defined.append((name, 2 if is_data else 1, 0, off))
+        defined.append((name, 2 if is_data else 1, 0, data_addr + off if is_data else off))
     if "_start" in local and not any(n == "_xu_app_start" for n, *_ in defined):
         defined.append(("_xu_app_start", 1, 0, local["_start"][0]))
 
@@ -261,8 +262,8 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
     sizeofcmds = seg_cmd + 24 + 24 + 80  # + BUILD_VER + SYMTAB + DYSYMTAB
     header = 32
     text_off = header + sizeofcmds
-    text_off = align(text_off, 8)
-    data_off = align(text_off + len(code), 8)
+    text_off = align(text_off, 16)
+    data_off = text_off + data_addr
     text_reloff = align(data_off + len(data), 8)
     data_reloff = text_reloff + 8 * len(text_relocs)
     symoff = align(data_reloff + 8 * len(data_relocs), 8)
@@ -298,7 +299,7 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
         0,
         len(code),
         text_off,
-        2,
+        4,
         text_reloff if text_relocs else 0,
         len(text_relocs),
         0x80000400,
@@ -310,7 +311,7 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
     buf += b"__data".ljust(16, b"\0") + b"__DATA".ljust(16, b"\0")
     buf += struct.pack(
         "<QQIIIIIIii",
-        0,
+        data_addr,
         len(data),
         data_off,
         3,
@@ -321,9 +322,9 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
         0,
         0,
     )
-    # LC_BUILD_VERSION (macOS 11.0)
+    # LC_BUILD_VERSION (macOS 11.0 / SDK 14.0)
     buf += struct.pack("<II", LC_BUILD_VERSION, 24)
-    buf += struct.pack("<IIII", 1, 0x000B0000, 0x000B0000, 0)
+    buf += struct.pack("<IIII", 1, 0x000B0000, 0x000E0000, 0)
     # LC_SYMTAB
     buf += struct.pack("<II", LC_SYMTAB, 24)
     buf += struct.pack("<IIII", symoff, len(syms), stroff, len(strings))

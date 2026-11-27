@@ -14,7 +14,9 @@ SCN_MEM_EXECUTE = 0x20000000
 SCN_MEM_READ = 0x40000000
 SCN_MEM_WRITE = 0x80000000
 SCN_ALIGN_1 = 0x00100000
-SCN_ALIGN_8 = 0x00D00000
+SCN_ALIGN_8 = 0x00400000
+SCN_ALIGN_16 = 0x00500000
+IMAGE_SYM_DTYPE_FUNCTION = 0x20
 C_EXT = 2
 IMAGE_REL_AMD64_REL32 = 4
 FK_REL32 = 0
@@ -171,7 +173,8 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
     undef_list = sorted(undef)
     syms: list[tuple[str, int, int, int, int]] = []
     for name, sect, val in defined:
-        syms.append((name, val, sect, 0, C_EXT))
+        sym_type = IMAGE_SYM_DTYPE_FUNCTION if sect == 1 else 0
+        syms.append((name, val, sect, sym_type, C_EXT))
     for name in undef_list:
         syms.append((name, 0, 0, 0, C_EXT))
     sym_index = {n: i for i, (n, *_) in enumerate(syms)}
@@ -220,13 +223,14 @@ def convert(xuobj_path: Path, out_path: Path) -> None:
     reloc_bytes = 10 * len(text_relocs)
     symtab_off = align((text_reloc_off or data_off + len(data)) + reloc_bytes, 4)
 
-    text_chars = SCN_CNT_CODE | SCN_MEM_EXECUTE | SCN_MEM_READ | SCN_ALIGN_1
+    text_chars = SCN_CNT_CODE | SCN_MEM_EXECUTE | SCN_MEM_READ | SCN_ALIGN_16
     data_chars = SCN_CNT_INIT_DATA | SCN_MEM_READ | SCN_MEM_WRITE | SCN_ALIGN_8
 
     def sec_hdr(name: str, size: int, raw_off: int, reloc_off: int, nreloc: int, chars: int) -> bytes:
+        # Per Microsoft PE/COFF spec, VirtualSize MUST be 0 in object files.
         return name.encode().ljust(8, b"\0")[:8] + struct.pack(
             "<IIIIIIHHI",
-            size,
+            0,
             0,
             size,
             raw_off,
