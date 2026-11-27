@@ -24,8 +24,8 @@ pub const PF_W = 2
 pub const PF_R = 4
 
 const ELF_BASE_VADDR = 0x400000
-// ELF header and one program header (64 + 56), aligned to 16.
-const ELF_CODE_OFFSET = 128
+// ELF header and two program headers (64 + 2 * 56 = 176), aligned to 16.
+const ELF_CODE_OFFSET = 192
 
 // Virtual address of the first code byte.
 pub fn elf_code_vaddr() int {
@@ -147,28 +147,48 @@ fn elf_section_bytes(buf $&mc.CodeBuffer, offs $&[]int, sizes $&[]int, bytes &[]
 
 // Hardened Linux static-PIE executable (no PT_INTERP):
 //   PT_LOAD #1 (R)  : ELF header, program headers, .note.gnu.build-id,
+//                     optional .note.gnu.property (CET IBT / ARM64 BTI),
 //                     read-only .dynamic (DF_1_PIE)
 //   PT_LOAD #2 (RX) : .text (machine code only; zero writable segments)
 //   PT_NOTE         : deterministic 20-byte GNU Build-ID
+//   PT_GNU_PROPERTY : Intel CET IBT (x86_64) / ARM64 BTI (aarch64)
 //   PT_GNU_RELRO    : covers PT_LOAD #1
 //   PT_GNU_STACK    : RW (non-executable stack)
-//   Section headers : .note.gnu.build-id, .dynamic, .text, optional .debug_*, .shstrtab
+//   Section headers : .note.gnu.build-id, optional .note.gnu.property,
+//                     .dynamic, .text, optional .debug_*, .shstrtab
 pub fn elf_linux_static_code_vaddr(machine int) int {
     page := elf_page_size(machine)
-    note_off := 64 + 7 * 56
-    dyn_off := elf_align_up(note_off + ELF_BUILD_ID_SIZE, 8)
+    has_prop := elf_has_gnu_property(machine)
+    $nph := 7
+    if has_prop { nph = 8 }
+    note_off := 64 + nph * 56
+    $after_notes := note_off + ELF_BUILD_ID_SIZE
+    if has_prop {
+        after_notes = elf_align_up(after_notes, 8) + ELF_GNU_PROP_SIZE
+    }
+    dyn_off := elf_align_up(after_notes, 8)
     ro_end := dyn_off + 48
     << elf_next_seg_vaddr(ro_end, 4096, page)
 }
 
 pub fn elf_write_linux_static_executable(code_bytes &[]int, machine int, entry_offset int, dbg &DebugSections) mc.CodeBuffer {
     page := elf_page_size(machine)
-    nph := 7
+    has_prop := elf_has_gnu_property(machine)
+    $nph := 7
+    if has_prop { nph = 8 }
     ph_off := 64
     ph_size := nph * 56
     note_off := ph_off + ph_size
     note_size := ELF_BUILD_ID_SIZE
-    dyn_off := elf_align_up(note_off + note_size, 8)
+    $prop_off := 0
+    $prop_size := 0
+    $after_notes := note_off + note_size
+    if has_prop {
+        prop_off = elf_align_up(after_notes, 8)
+        prop_size = ELF_GNU_PROP_SIZE
+        after_notes = prop_off + prop_size
+    }
+    dyn_off := elf_align_up(after_notes, 8)
     dyn_size := 3 * 16
     ro_end := dyn_off + dyn_size
     code_off := 4096
@@ -199,12 +219,19 @@ pub fn elf_write_linux_static_executable(code_bytes &[]int, machine int, entry_o
     elf_phdr($&buf, PT_LOAD, PF_R | PF_X, code_off, code_vaddr, code_bytes.len, page)
     elf_phdr($&buf, PT_DYNAMIC, PF_R, dyn_off, dyn_off, dyn_size, 8)
     elf_phdr($&buf, PT_NOTE, PF_R, note_off, note_off, note_size, 4)
+    if has_prop {
+        elf_phdr($&buf, PT_GNU_PROPERTY, PF_R, prop_off, prop_off, prop_size, 8)
+    }
     elf_phdr_sized($&buf, PT_GNU_RELRO, PF_R, 0, 0, ro_end, page, 1)
     elf_phdr($&buf, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 16)
 
-    // 3. PT_LOAD #1 (R): .note.gnu.build-id + minimal .dynamic advertising PIE + BIND_NOW
+    // 3. PT_LOAD #1 (R): .note.gnu.build-id, optional .note.gnu.property, minimal .dynamic
     elf_pad_to($&buf, note_off)
     elf_emit_build_id($&buf, code_bytes)
+    if has_prop {
+        elf_pad_to($&buf, prop_off)
+        elf_emit_gnu_property($&buf, machine)
+    }
     elf_pad_to($&buf, dyn_off)
     elf_dyn($&buf, 30, DF_BIND_NOW)
     elf_dyn($&buf, 0x6ffffffb, DF_1_NOW | DF_1_PIE)
@@ -225,7 +252,10 @@ pub fn elf_write_linux_static_executable(code_bytes &[]int, machine int, entry_o
         elf_section_bytes($&buf, $&offs, $&sizes, &dbg.str)
     }
 
-    $sec_names := ["", ".note.gnu.build-id", ".dynamic", ".text"]
+    $sec_names := ["", ".note.gnu.build-id"]
+    if has_prop { sec_names.push(".note.gnu.property") }
+    sec_names.push(".dynamic")
+    sec_names.push(".text")
     if has_dbg {
         sec_names.push(".debug_line")
         sec_names.push(".debug_info")
@@ -246,9 +276,14 @@ pub fn elf_write_linux_static_executable(code_bytes &[]int, machine int, entry_o
 
     elf_shdr($&buf, 0, 0, 0, 0, 0, 0, 0) // [0] SHT_NULL
     elf_shdr($&buf, name_off[1], 7, 2, note_off, note_off, note_size, 4) // [1] .note.gnu.build-id
-    elf_shdr_link($&buf, name_off[2], 6, 2, dyn_off, dyn_off, dyn_size, 0, 0, 8, 16) // [2] .dynamic
-    elf_shdr($&buf, name_off[3], 1, 6, code_vaddr, code_off, code_bytes.len, 16) // [3] .text
-    $ni := 4
+    $ni := 2
+    if has_prop {
+        elf_shdr($&buf, name_off[2], 7, 2, prop_off, prop_off, prop_size, 8) // [2] .note.gnu.property
+        ni = 3
+    }
+    elf_shdr_link($&buf, name_off[ni], 6, 2, dyn_off, dyn_off, dyn_size, 0, 0, 8, 16) // .dynamic
+    elf_shdr($&buf, name_off[ni + 1], 1, 6, code_vaddr, code_off, code_bytes.len, 16) // .text
+    ni += 2
     if has_dbg {
         for i in 0:4 {
             elf_shdr($&buf, name_off[ni + i], 1, 0, 0, offs[i], sizes[i], 1)
@@ -304,30 +339,19 @@ pub fn elf_write_executable_full(code_bytes &[]int, machine int, entry_offset in
     buf.emit_u64_le(entry_vaddr) // e_entry
     buf.emit_u64_le(ehdr_size)   // e_phoff (64)
     shoff_at := buf.len()
-    buf.emit_u64_le(0)           // e_shoff (patched when section headers follow)
-    // e_flags: LoongArch needs its ABI (LP64D, object ABI v1).
-    $flags := 0
-    if machine == ELF_EM_LOONGARCH {
-        flags = 0x43
-    }
-    buf.emit_u32_le(flags)
+    buf.emit_u64_le(0)           // e_shoff (patched below)
+    buf.emit_u32_le(elf_flags_for_machine(machine))
     buf.emit_u16_le(ehdr_size)   // e_ehsize (64)
     buf.emit_u16_le(phdr_size)   // e_phentsize (56)
-    buf.emit_u16_le(1)           // e_phnum (1 PT_LOAD segment)
+    buf.emit_u16_le(2)           // e_phnum (PT_LOAD + PT_GNU_STACK)
     buf.emit_u16_le(64)          // e_shentsize
     shnum_at := buf.len()
     buf.emit_u16_le(0)           // e_shnum
     buf.emit_u16_le(0)           // e_shstrndx
 
-    // 2. Program Header (56 bytes, PT_LOAD RXW)
-    buf.emit_u32_le(PT_LOAD)
-    buf.emit_u32_le(PF_R | PF_W | PF_X)
-    buf.emit_u64_le(p_offset)    // p_offset
-    buf.emit_u64_le(base_vaddr)  // p_vaddr
-    buf.emit_u64_le(base_vaddr)  // p_paddr
-    buf.emit_u64_le(p_filesz)    // p_filesz
-    buf.emit_u64_le(p_filesz)    // p_memsz
-    buf.emit_u64_le(4096)        // p_align
+    // 2. Program Headers: single bare-metal PT_LOAD + non-executable PT_GNU_STACK
+    elf_phdr($&buf, PT_LOAD, PF_R | PF_W | PF_X, p_offset, base_vaddr, p_filesz, 4096)
+    elf_phdr($&buf, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 16)
 
     // 3. Padding up to code_offset
     while buf.len() < code_offset {
@@ -338,11 +362,15 @@ pub fn elf_write_executable_full(code_bytes &[]int, machine int, entry_offset in
     buf.emit_bytes(code_bytes)
     has_dbg := dbg.present()
     has_syms := esyms.names.len > 0
-    if !has_dbg && !has_syms {
-        << buf
-    }
 
-    // 5. Optional debug sections, optional .symtab/.strtab, .shstrtab and section headers.
+    // 5. Non-ALLOC deterministic GNU Build-ID (keeps objcopy -O binary clean),
+    // optional debug sections, optional .symtab/.strtab, .shstrtab and section headers.
+    while buf.len() % 4 != 0 {
+        buf.emit_u8(0)
+    }
+    note_off := buf.len()
+    elf_emit_build_id($&buf, code_bytes)
+
     $offs := []int{}
     $sizes := []int{}
     if has_dbg {
@@ -386,7 +414,7 @@ pub fn elf_write_executable_full(code_bytes &[]int, machine int, entry_offset in
         buf.emit_bytes(&strtab.bytes)
     }
 
-    $sec_names := ["", ".text"]
+    $sec_names := ["", ".text", ".note.gnu.build-id"]
     if has_dbg {
         sec_names.push(".debug_line")
         sec_names.push(".debug_info")
@@ -414,7 +442,9 @@ pub fn elf_write_executable_full(code_bytes &[]int, machine int, entry_offset in
     elf_shdr($&buf, 0, 0, 0, 0, 0, 0, 0)
     // SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR
     elf_shdr($&buf, name_off[1], 1, 6, code_vaddr, code_offset, code_bytes.len, 16)
-    $ni := 2
+    // SHT_NOTE, non-ALLOC (does not alter loaded address space or objcopy -O binary)
+    elf_shdr($&buf, name_off[2], 7, 0, 0, note_off, ELF_BUILD_ID_SIZE, 4)
+    $ni := 3
     if has_dbg {
         for i in 0:4 {
             elf_shdr($&buf, name_off[ni + i], 1, 0, 0, offs[i], sizes[i], 1)
@@ -432,8 +462,8 @@ pub fn elf_write_executable_full(code_bytes &[]int, machine int, entry_offset in
     shstrndx := ni
     shnum := sec_names.len
     buf.patch_u64_le(shoff_at, shoff)
-    buf.patch_u8(shnum_at, shnum)
-    buf.patch_u8(shnum_at + 2, shstrndx)
+    elf_patch_u16_le($&buf, shnum_at, shnum)
+    elf_patch_u16_le($&buf, shnum_at + 2, shstrndx)
     << buf
 }
 
@@ -559,7 +589,7 @@ pub fn elf_write_relocatable_data_debug(code_bytes &[]int, machine int, esyms &E
     out.emit_u64_le(0) // e_phoff
     shoff_at := out.len()
     out.emit_u64_le(0) // e_shoff
-    out.emit_u32_le(0) // e_flags
+    out.emit_u32_le(elf_flags_for_machine(machine)) // e_flags
     out.emit_u16_le(64) // e_ehsize
     out.emit_u16_le(0) // e_phentsize
     out.emit_u16_le(0) // e_phnum

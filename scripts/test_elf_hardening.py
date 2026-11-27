@@ -24,9 +24,11 @@ PT_NOTE = 4
 PT_PHDR = 6
 PT_GNU_STACK = 0x6474E551
 PT_GNU_RELRO = 0x6474E552
+PT_GNU_PROPERTY = 0x6474E553
 
 SHT_NOTE = 7
 NT_GNU_BUILD_ID = 3
+NT_GNU_PROPERTY_TYPE_0 = 5
 
 PF_X = 1
 PF_W = 2
@@ -328,6 +330,31 @@ class ElfHardeningTest(unittest.TestCase):
         build_id = data[note_sec["offset"] + 16 : note_sec["offset"] + 36]
         self.assertTrue(any(build_id), "expected non-zero Build-ID")
 
+        # Hardware CFI: Intel CET IBT (x86_64) & ARM64 BTI (aarch64) via PT_GNU_PROPERTY.
+        props = [p for p in info["phdrs"] if p["type"] == PT_GNU_PROPERTY]
+        if machine in (62, 183):
+            self.assertEqual(len(props), 1)
+            prop_ph = props[0]
+            self.assertEqual(prop_ph["flags"], PF_R)
+            self.assertEqual(prop_ph["align"], 8)
+            self.assertEqual(prop_ph["filesz"], 32)
+            self.assertIn(".note.gnu.property", sec_by_name)
+            prop_sec = sec_by_name[".note.gnu.property"]
+            self.assertEqual(prop_sec["type"], SHT_NOTE)
+            self.assertEqual(prop_sec["align"], 8)
+            self.assertEqual(prop_sec["offset"], prop_ph["offset"])
+            p_nsz, p_dsz, p_type = struct.unpack_from("<III", data, prop_sec["offset"])
+            self.assertEqual((p_nsz, p_dsz, p_type), (4, 16, NT_GNU_PROPERTY_TYPE_0))
+            self.assertEqual(data[prop_sec["offset"] + 12 : prop_sec["offset"] + 16], b"GNU\x00")
+            pr_type, pr_datasz, pr_val = struct.unpack_from("<III", data, prop_sec["offset"] + 16)
+            expected_pr_type = 0xC0000002 if machine == 62 else 0xC0000000
+            self.assertEqual((pr_type, pr_datasz, pr_val), (expected_pr_type, 4, 1))
+            entry_file_off = loads[1]["offset"] + (info["entry"] - loads[1]["vaddr"])
+            expected_pad = b"\xf3\x0f\x1e\xfa" if machine == 62 else b"\xdf\x24\x03\xd5"
+            self.assertEqual(data[entry_file_off : entry_file_off + 4], expected_pad, "missing CET/BTI landing pad at e_entry")
+        else:
+            self.assertEqual(len(props), 0)
+
         if dwarf:
             for dsec in (".debug_line", ".debug_info", ".debug_abbrev", ".debug_str"):
                 self.assertIn(dsec, sec_by_name)
@@ -363,6 +390,10 @@ class ElfHardeningTest(unittest.TestCase):
             res = subprocess.run([self.readelf, "-h", "-l", "-S", "-d", "-n", str(path)], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn("Build ID:", res.stdout)
+            if machine == 62:
+                self.assertIn("IBT", res.stdout)
+            elif machine == 183:
+                self.assertIn("BTI", res.stdout)
             self.assertNotIn("Warning:", res.stderr)
 
         return info
