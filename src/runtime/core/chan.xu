@@ -45,7 +45,8 @@ const T_WAIT_REVENTS = 224
 const T_WAIT_DEADLINE = 232
 const T_WAIT_NEXT = 240
 const T_IS_TINY = 248
-const T_SIZE = 256
+const T_SEEN_EPOCH = 256
+const T_SIZE = 272
 
 // Scheduler record, reached through G_SCHED.
 const S_CUR = 0
@@ -72,7 +73,8 @@ const S_TINY_FREE = 160
 // The task entry trampoline always reads 16 words, even for a zero-argument
 // target. These zeroed words are read-only for the scheduler's lifetime.
 const S_EMPTY_ARGS = 176
-const S_SIZE = 304
+const S_MT_STATE = 304
+const S_SIZE = 320
 
 // Channel record.
 const C_CAP = 0
@@ -91,7 +93,44 @@ const C_RC = 72
 const C_WAITER = 80
 const C_RDST = 88
 const C_DIRECT = 96
-const C_SIZE = 104
+const C_LOCK = 104
+const C_SIZE = 112
+
+// M:N multi-core scheduler state (allocated lazily when max_procs > 1).
+const MT_MAX_M = 64
+const MT_NPROCS = 0
+const MT_ACTIVE_M = 8
+const MT_MAIN_TASK = 16
+const MT_MAIN_READY = 24
+const MT_BLK_HEAD = 40
+const MT_BLK_TAIL = 48
+const MT_BLK_COUNT = 56
+const MT_WAKE_SEQ = 64
+const MT_SLEEPING = 72
+const MT_STOP = 80
+const MT_POLLING = 88
+const MT_DRAIN_WAITER = 96
+const MT_MU = 104
+const MT_CV = 112
+const MT_FP_LOCK = 120
+const MT_FP_UNLOCK = 128
+const MT_FP_WAIT = 136
+const MT_FP_BROADCAST = 144
+const MT_FP_YIELD = 152
+const MT_HDR_SIZE = 192
+const MT_M_STRIDE = 256
+const MT_M_G0 = 0
+const MT_M_CUR = 8
+const MT_M_PARK_TASK = 16
+const MT_M_PARK_MODE = 24
+const MT_M_PARK_EPOCH = 32
+const MT_M_FFI_BLK = 48
+
+const PARK_YIELD = 1
+const PARK_BLOCK = 2
+const PARK_WAIT_IO = 3
+const PARK_EXIT = 4
+const PARK_DRAIN = 5
 
 fn ld(addr int) int {
     << rt_load(addr, 8)
@@ -113,12 +152,143 @@ fn sched() int {
     << s
 }
 
+fn sched_m_state() int {
+    s := gword(G_SCHED)
+    if s == 0 { << 0 }
+    mt := ld(s + S_MT_STATE)
+    if mt != 0 && ld(mt + MT_NPROCS) > 1 { << mt }
+    << 0
+}
+
+fn m_slot(mt int, wid int) int {
+    << mt + MT_HDR_SIZE + wid * MT_M_STRIDE
+}
+
+fn task_stack_bytes(t int) int {
+    if ld(t + T_IS_TINY) != 0 { << TASK_TINY_STACK }
+    << task_stack()
+}
+
+// Identify which M is currently running the calling green thread using the
+// caller's frame pointer. M[0] owns t_main (T_STACK == 0); all other green
+// threads run on dedicated mapped stacks recorded in M[wid].cur.
+fn current_m(mt int) int {
+    fp := rt_syscall(-2, 0, 0, 0, 0, 0, 0)
+    n := ld(mt + MT_NPROCS)
+    for k in 0:n {
+        t := atomic_load(c_ptr(m_slot(mt, k) + MT_M_CUR))
+        if t != 0 {
+            stk := ld(t + T_STACK)
+            if stk != 0 && fp >= stk && fp < stk + task_stack_bytes(t) {
+                << k
+            }
+        }
+    }
+    << 0
+}
+
+fn current_task_mt(s int, mt int) int {
+    if mt == 0 { << ld(s + S_CUR) }
+    << atomic_load(c_ptr(m_slot(mt, current_m(mt)) + MT_M_CUR))
+}
+
+fn mt_ccall1(blk int, fp int, a0 int) int {
+    mem_zero(blk, 200)
+    rt_store(blk, 8, a0)
+    ffi_call(fp, blk)
+    << rt_load(blk + 19 * 8, 8)
+}
+
+fn mt_ccall2(blk int, fp int, a0 int, a1 int) int {
+    mem_zero(blk, 200)
+    rt_store(blk, 8, a0)
+    rt_store(blk + 8, 8, a1)
+    ffi_call(fp, blk)
+    << rt_load(blk + 19 * 8, 8)
+}
+
+fn mt_wake_all_seq(mt int, wid int) int {
+    seq := atomic_add(c_ptr(mt + MT_WAKE_SEQ), 1) + 1
+    if atomic_load(c_ptr(mt + MT_SLEEPING)) > 0 {
+        blk := m_slot(mt, wid) + MT_M_FFI_BLK
+        mu := ld(mt + MT_MU)
+        cv := ld(mt + MT_CV)
+        _ := mt_ccall1(blk, ld(mt + MT_FP_LOCK), mu)
+        _ := mt_ccall1(blk, ld(mt + MT_FP_BROADCAST), cv)
+        _ := mt_ccall1(blk, ld(mt + MT_FP_UNLOCK), mu)
+    }
+    << seq
+}
+
+fn mt_wake_all(mt int, wid int) {
+    _ := mt_wake_all_seq(mt, wid)
+}
+
+fn mt_park_m(mt int, wid int, seq int) {
+    $spin := 0
+    while spin < 4000 {
+        if atomic_load(c_ptr(mt + MT_WAKE_SEQ)) != seq || atomic_load(c_ptr(mt + MT_STOP)) != 0 {
+            <<
+        }
+        spin += 1
+    }
+    blk := m_slot(mt, wid) + MT_M_FFI_BLK
+    mu := ld(mt + MT_MU)
+    cv := ld(mt + MT_CV)
+    fp_lock := ld(mt + MT_FP_LOCK)
+    fp_unlock := ld(mt + MT_FP_UNLOCK)
+    fp_wait := ld(mt + MT_FP_WAIT)
+    _ := mt_ccall1(blk, fp_lock, mu)
+    _ := atomic_add(c_ptr(mt + MT_SLEEPING), 1)
+    while atomic_load(c_ptr(mt + MT_WAKE_SEQ)) == seq && atomic_load(c_ptr(mt + MT_STOP)) == 0 {
+        _ := mt_ccall2(blk, fp_wait, cv, mu)
+    }
+    _ := atomic_add(c_ptr(mt + MT_SLEEPING), -1)
+    _ := mt_ccall1(blk, fp_unlock, mu)
+}
+
 pub fn task_empty_args() int {
     << sched() + S_EMPTY_ARGS
 }
 
+fn progress_locked(s int, mt int) {
+    atomic_store(c_ptr(s + S_EPOCH), ld(s + S_EPOCH) + 1)
+    st(s + S_NBLOCKED, 0)
+    st(s + S_IO_IDLE, 0)
+    if mt != 0 {
+        $b := ld(mt + MT_BLK_HEAD)
+        while b != 0 {
+            nx := ld(b + T_NEXT)
+            st(b + T_NEXT, 0)
+            st(b + T_SEEN_EPOCH, 0)
+            if b == ld(mt + MT_MAIN_TASK) {
+                st(mt + MT_MAIN_READY, 1)
+            } else {
+                queue_push(s, b)
+            }
+            b = nx
+        }
+        st(mt + MT_BLK_HEAD, 0)
+        st(mt + MT_BLK_TAIL, 0)
+        st(mt + MT_BLK_COUNT, 0)
+        if ld(mt + MT_DRAIN_WAITER) != 0 && ld(s + S_NTASKS) <= 1 {
+            st(mt + MT_DRAIN_WAITER, 0)
+            st(mt + MT_MAIN_READY, 1)
+        }
+    }
+}
+
 fn progress() {
     s := sched()
+    mt := sched_m_state()
+    if mt != 0 {
+        wid := current_m(mt)
+        spin_lock(G_SCHED_LOCK)
+        progress_locked(s, mt)
+        spin_unlock(G_SCHED_LOCK)
+        mt_wake_all(mt, wid)
+        <<
+    }
     st(s + S_EPOCH, ld(s + S_EPOCH) + 1)
     st(s + S_NBLOCKED, 0)
     st(s + S_IO_IDLE, 0)
@@ -127,6 +297,15 @@ fn progress() {
 pub fn task_io_progress() {
     s := gword(G_SCHED)
     if s != 0 {
+        mt := sched_m_state()
+        if mt != 0 {
+            wid := current_m(mt)
+            spin_lock(G_SCHED_LOCK)
+            progress_locked(s, mt)
+            spin_unlock(G_SCHED_LOCK)
+            mt_wake_all(mt, wid)
+            <<
+        }
         progress()
     }
 }
@@ -229,8 +408,358 @@ fn fatal_deadlock() {
     exit_process(2)
 }
 
+fn enqueue_runnable_locked(s int, mt int, t int) {
+    st(t + T_NEXT, 0)
+    st(t + T_SEEN_EPOCH, 0)
+    if t == ld(mt + MT_MAIN_TASK) {
+        st(mt + MT_MAIN_READY, 1)
+    } else {
+        queue_push(s, t)
+    }
+}
+
+fn blk_push_locked(mt int, t int) {
+    st(t + T_NEXT, 0)
+    tail := ld(mt + MT_BLK_TAIL)
+    if tail == 0 {
+        st(mt + MT_BLK_HEAD, t)
+    } else {
+        st(tail + T_NEXT, t)
+    }
+    st(mt + MT_BLK_TAIL, t)
+    st(mt + MT_BLK_COUNT, ld(mt + MT_BLK_COUNT) + 1)
+}
+
+fn recycle_exited_task_locked(s int, t int) {
+    args := ld(t + T_ARGS)
+    if args != s + S_EMPTY_ARGS {
+        free_owned(args)
+    }
+    st(t + T_ARGS, 0)
+    if ld(t + T_IS_TINY) != 0 {
+        st(t + T_NEXT, ld(s + S_TINY_FREE))
+        st(s + S_TINY_FREE, t)
+    } else {
+        $head := ld(s + S_FREE)
+        cached := ld(s + S_FREE_COUNT)
+        os := xu_target_os()
+        if cached >= TASK_STACK_CACHE_LIMIT && (os == OS_LINUX || os == OS_MACOS || os == OS_WINDOWS) {
+            old := head
+            head = ld(old + T_NEXT)
+            unmap_pages(ld(old + T_STACK), task_stack())
+            free_owned(old)
+        } else {
+            st(s + S_FREE_COUNT, cached + 1)
+        }
+        st(t + T_NEXT, head)
+        st(s + S_FREE, t)
+    }
+}
+
+fn pick_next_locked(s int, mt int, wid int) int {
+    if wid == 0 && ld(mt + MT_MAIN_READY) != 0 && ld(mt + MT_DRAIN_WAITER) == 0 {
+        if ld(s + S_DRAIN) == 0 || ld(s + S_NTASKS) <= 1 || ld(s + S_HEAD) == 0 {
+            st(mt + MT_MAIN_READY, 0)
+            << ld(mt + MT_MAIN_TASK)
+        }
+    }
+    << queue_pop(s)
+}
+
+fn sched_poll_waiters_mt(s int, mt int, wid int, blocking bool) bool {
+    cnt := ld(s + S_WAIT_COUNT)
+    if cnt <= 0 || ld(mt + MT_POLLING) != 0 {
+        << false
+    }
+    st(mt + MT_POLLING, 1)
+    $cap := ld(s + S_POLL_CAP)
+    $pfd := ld(s + S_POLL_PFD)
+    $tasks := ld(s + S_POLL_TASKS)
+    if cnt > cap {
+        ncap := max_int(cnt, 32)
+        if pfd != 0 { free(pfd) }
+        if tasks != 0 { free(tasks) }
+        pfd = alloc(ncap * 8)
+        tasks = alloc(ncap * 8)
+        st(s + S_POLL_PFD, pfd)
+        st(s + S_POLL_TASKS, tasks)
+        st(s + S_POLL_CAP, ncap)
+    }
+    $curr := ld(s + S_WAIT_HEAD)
+    $i := 0
+    $earliest_deadline := 0
+    $now := host_now_ns()
+    while curr != 0 && i < cnt {
+        fd := ld(curr + T_WAIT_FD)
+        events := ld(curr + T_WAIT_EVENTS)
+        deadline := ld(curr + T_WAIT_DEADLINE)
+        rt_store(pfd + i * 8, 8, fd | ((events & 65535) << 32))
+        rt_store(tasks + i * 8, 8, curr)
+        if deadline > 0 {
+            if earliest_deadline == 0 || deadline < earliest_deadline {
+                earliest_deadline = deadline
+            }
+        }
+        curr = ld(curr + T_WAIT_NEXT)
+        i += 1
+    }
+    actual_cnt := i
+    st(s + S_WAIT_HEAD, 0)
+    st(s + S_WAIT_TAIL, 0)
+    st(s + S_WAIT_COUNT, 0)
+    if actual_cnt == 0 {
+        st(mt + MT_POLLING, 0)
+        << false
+    }
+    $timeout_ms := 0
+    if blocking {
+        if earliest_deadline > 0 {
+            rem_ns := earliest_deadline - now
+            if rem_ns <= 0 {
+                timeout_ms = 0
+            } else {
+                timeout_ms = min_int((rem_ns + 999999) / 1000000, 2147483647)
+            }
+        } else {
+            timeout_ms = -1
+        }
+        if ld(mt + MT_ACTIVE_M) > 0 || wid > 0 {
+            if timeout_ms < 0 || timeout_ms > 10 { timeout_ms = 10 }
+        }
+    }
+    spin_unlock(G_SCHED_LOCK)
+    r := host_poll_batch(pfd, tasks, actual_cnt, timeout_ms)
+    spin_lock(G_SCHED_LOCK)
+    st(mt + MT_POLLING, 0)
+    if r < 0 && r != 0 - EINTR {
+        for j in 0:actual_cnt {
+            t := rt_load(tasks + j * 8, 8)
+            st(t + T_WAIT_REVENTS, r)
+            enqueue_runnable_locked(s, mt, t)
+        }
+        progress_locked(s, mt)
+        << true
+    }
+    now = host_now_ns()
+    $woken := 0
+    for j in 0:actual_cnt {
+        t := rt_load(tasks + j * 8, 8)
+        pollfd := rt_load(pfd + j * 8, 8)
+        revents := (pollfd >> 48) & 65535
+        deadline := ld(t + T_WAIT_DEADLINE)
+        $ready := -1
+        if (revents & 32) != 0 {
+            ready = 0 - EBADF
+        } else if revents != 0 {
+            ready = revents
+        } else if deadline > 0 && now >= deadline {
+            ready = 0
+        }
+        if ready != -1 {
+            st(t + T_WAIT_REVENTS, ready)
+            enqueue_runnable_locked(s, mt, t)
+            woken += 1
+        } else {
+            st(t + T_WAIT_NEXT, 0)
+            waiter_add(s, t, ld(t + T_WAIT_FD), ld(t + T_WAIT_EVENTS), deadline)
+        }
+    }
+    if woken > 0 { progress_locked(s, mt) }
+    << woken > 0
+}
+
+fn sched_m_loop(wid int) {
+    s := sched()
+    mt := ld(s + S_MT_STATE)
+    ms := m_slot(mt, wid)
+    g0 := ld(ms + MT_M_G0)
+    while true {
+        spin_lock(G_SCHED_LOCK)
+        atomic_store(c_ptr(ms + MT_M_CUR), 0)
+        $wake_peers := false
+        pt := ld(ms + MT_M_PARK_TASK)
+        if pt != 0 {
+            st(ms + MT_M_PARK_TASK, 0)
+            st(mt + MT_ACTIVE_M, ld(mt + MT_ACTIVE_M) - 1)
+            pm := ld(ms + MT_M_PARK_MODE)
+            if pm == PARK_YIELD {
+                enqueue_runnable_locked(s, mt, pt)
+            } else if pm == PARK_BLOCK {
+                bep := ld(ms + MT_M_PARK_EPOCH)
+                if bep != ld(s + S_EPOCH) {
+                    enqueue_runnable_locked(s, mt, pt)
+                } else {
+                    blk_push_locked(mt, pt)
+                }
+            } else if pm == PARK_DRAIN {
+                if ld(s + S_NTASKS) <= 1 || (ld(mt + MT_ACTIVE_M) == 0 && ld(s + S_HEAD) == 0 && ld(s + S_WAIT_COUNT) == 0 && ld(mt + MT_POLLING) == 0) {
+                    st(mt + MT_MAIN_READY, 1)
+                    wake_peers = true
+                } else {
+                    st(mt + MT_DRAIN_WAITER, 1)
+                }
+            } else if pm == PARK_WAIT_IO {
+                waiter_add(s, pt, ld(pt + T_WAIT_FD), ld(pt + T_WAIT_EVENTS), ld(pt + T_WAIT_DEADLINE))
+            } else if pm == PARK_EXIT {
+                st(s + S_NTASKS, ld(s + S_NTASKS) - 1)
+                recycle_exited_task_locked(s, pt)
+                progress_locked(s, mt)
+                wake_peers = true
+            }
+        }
+        if wid > 0 && atomic_load(c_ptr(mt + MT_STOP)) != 0 {
+            spin_unlock(G_SCHED_LOCK)
+            if wake_peers { mt_wake_all(mt, wid) }
+            <<
+        }
+        if ld(mt + MT_DRAIN_WAITER) != 0 {
+            if ld(s + S_NTASKS) <= 1 || (ld(mt + MT_ACTIVE_M) == 0 && ld(s + S_HEAD) == 0 && ld(s + S_WAIT_COUNT) == 0 && ld(mt + MT_POLLING) == 0) {
+                st(mt + MT_DRAIN_WAITER, 0)
+                st(mt + MT_MAIN_READY, 1)
+                wake_peers = true
+            }
+        }
+        $nx := pick_next_locked(s, mt, wid)
+        if nx != 0 {
+            st(nx + T_SEEN_EPOCH, 0)
+            st(mt + MT_ACTIVE_M, ld(mt + MT_ACTIVE_M) + 1)
+            atomic_store(c_ptr(ms + MT_M_CUR), nx)
+            if wid == 0 { st(s + S_CUR, nx) }
+            has_more := ld(s + S_HEAD) != 0 || (ld(mt + MT_MAIN_READY) != 0 && ld(mt + MT_DRAIN_WAITER) == 0)
+            spin_unlock(G_SCHED_LOCK)
+            if has_more || wake_peers {
+                mt_wake_all(mt, wid)
+            }
+            rt_syscall(SYS_TASK_SWITCH, g0, nx, 0, 0, 0, 0)
+        } else {
+            if ld(s + S_WAIT_COUNT) > 0 && ld(mt + MT_POLLING) == 0 {
+                woke := sched_poll_waiters_mt(s, mt, wid, true)
+                spin_unlock(G_SCHED_LOCK)
+                if woke || wake_peers { mt_wake_all(mt, wid) }
+            } else if ld(mt + MT_ACTIVE_M) == 0 && ld(s + S_HEAD) == 0 && ld(mt + MT_MAIN_READY) == 0 && ld(s + S_WAIT_COUNT) == 0 && ld(mt + MT_POLLING) == 0 && ld(s + S_DRAIN) == 0 && ld(mt + MT_BLK_COUNT) >= ld(s + S_NTASKS) {
+                spin_unlock(G_SCHED_LOCK)
+                fatal_deadlock()
+            } else {
+                need_wake := wake_peers || (wid > 0 && ld(mt + MT_MAIN_READY) != 0)
+                $seq := atomic_load(c_ptr(mt + MT_WAKE_SEQ))
+                spin_unlock(G_SCHED_LOCK)
+                if need_wake { seq = mt_wake_all_seq(mt, wid) }
+                if wid > 0 && atomic_load(c_ptr(mt + MT_STOP)) != 0 {
+                    <<
+                }
+                mt_park_m(mt, wid, seq)
+            }
+        }
+    }
+}
+
+fn m_park_switch(mt int, t int, mode int, bep int) {
+    wid := current_m(mt)
+    ms := m_slot(mt, wid)
+    st(ms + MT_M_PARK_TASK, t)
+    st(ms + MT_M_PARK_MODE, mode)
+    st(ms + MT_M_PARK_EPOCH, bep)
+    rt_syscall(SYS_TASK_SWITCH, t, ld(ms + MT_M_G0), 0, 0, 0, 0)
+}
+
+pub fn sched_prepare_mt() int {
+    s := sched()
+    $mt := ld(s + S_MT_STATE)
+    if mt == 0 {
+        mt = alloc(MT_HDR_SIZE + MT_MAX_M * MT_M_STRIDE)
+        st(mt + MT_NPROCS, 1)
+        st(mt + MT_MAIN_TASK, ld(s + S_CUR))
+        st(s + S_MT_STATE, mt)
+    }
+    if ld(m_slot(mt, 0) + MT_M_G0) == 0 { << 1 }
+    << 0
+}
+
+pub fn sched_run_m0_g0() {
+    s := sched()
+    mt := ld(s + S_MT_STATE)
+    t_g0 := ld(s + S_CUR)
+    t_main := ld(mt + MT_MAIN_TASK)
+    _ := queue_unlink(s, t_main)
+    st(s + S_NTASKS, ld(s + S_NTASKS) - 1)
+    ms0 := m_slot(mt, 0)
+    st(ms0 + MT_M_G0, t_g0)
+    atomic_store(c_ptr(ms0 + MT_M_CUR), t_main)
+    st(s + S_CUR, t_main)
+    rt_syscall(SYS_TASK_SWITCH, t_g0, t_main, 0, 0, 0, 0)
+    sched_m_loop(0)
+}
+
+pub fn sched_enable_mt(nprocs int, mu int, cv int, fp_lock int, fp_unlock int, fp_wait int, fp_broadcast int, fp_yield int) int {
+    s := sched()
+    mt := ld(s + S_MT_STATE)
+    if mt == 0 { << 1 }
+    st(mt + MT_MU, mu)
+    st(mt + MT_CV, cv)
+    st(mt + MT_FP_LOCK, fp_lock)
+    st(mt + MT_FP_UNLOCK, fp_unlock)
+    st(mt + MT_FP_WAIT, fp_wait)
+    st(mt + MT_FP_BROADCAST, fp_broadcast)
+    st(mt + MT_FP_YIELD, fp_yield)
+    st(mt + MT_ACTIVE_M, 1)
+    st(mt + MT_STOP, 0)
+    atomic_store(c_ptr(mt + MT_NPROCS), nprocs)
+    << nprocs
+}
+
+pub fn sched_worker_run(wid int) {
+    s := sched()
+    mt := ld(s + S_MT_STATE)
+    g0 := alloc(T_SIZE)
+    ms := m_slot(mt, wid)
+    st(ms + MT_M_G0, g0)
+    atomic_store(c_ptr(ms + MT_M_CUR), 0)
+    sched_m_loop(wid)
+    free_owned(g0)
+}
+
+pub fn sched_stop_mt() {
+    mt := sched_m_state()
+    if mt == 0 { << }
+    atomic_store(c_ptr(mt + MT_STOP), 1)
+    mt_wake_all(mt, current_m(mt))
+}
+
+pub fn sched_finish_stop_mt() {
+    s := gword(G_SCHED)
+    if s == 0 { << }
+    mt := ld(s + S_MT_STATE)
+    if mt == 0 { << }
+    atomic_store(c_ptr(mt + MT_NPROCS), 1)
+    st(mt + MT_STOP, 0)
+    st(mt + MT_ACTIVE_M, 0)
+    st(mt + MT_DRAIN_WAITER, 0)
+    st(mt + MT_MAIN_READY, 0)
+    st(mt + MT_MU, 0)
+    st(mt + MT_CV, 0)
+}
+
+pub fn sched_max_procs() int {
+    mt := sched_m_state()
+    if mt == 0 { << 1 }
+    << ld(mt + MT_NPROCS)
+}
+
 // The current task cannot proceed: let the others run.
 pub fn task_block() {
+    mt := sched_m_state()
+    if mt != 0 {
+        s := sched()
+        t := current_task_mt(s, mt)
+        $bep := ld(t + T_SEEN_EPOCH)
+        st(t + T_SEEN_EPOCH, 0)
+        if bep != 0 && bep != atomic_load(c_ptr(s + S_EPOCH)) {
+            <<
+        }
+        if bep == 0 { bep = atomic_load(c_ptr(s + S_EPOCH)) }
+        m_park_switch(mt, t, PARK_BLOCK, bep)
+        <<
+    }
     if rt_signal_poll(0) { << }
     s := sched()
     t := ld(s + S_CUR)
@@ -307,6 +836,53 @@ fn map_tiny_stack() int {
 // register word. args records which allocation task_exit needs to release.
 fn task_start(entry int, fn_addr int, exit_addr int, arg int, args int, tiny bool) {
     s := sched()
+    mt := sched_m_state()
+    if mt != 0 {
+        wid := current_m(mt)
+        spin_lock(G_SCHED_LOCK)
+        $free_slot := S_FREE
+        $stack_size := TASK_TINY_STACK
+        if tiny {
+            free_slot = S_TINY_FREE
+        } else {
+            stack_size = task_stack()
+        }
+        $t := ld(s + free_slot)
+        if t != 0 {
+            st(s + free_slot, ld(t + T_NEXT))
+            if !tiny {
+                st(s + S_FREE_COUNT, ld(s + S_FREE_COUNT) - 1)
+            }
+        } else {
+            t = alloc(T_SIZE)
+            if tiny {
+                st(t + T_STACK, map_tiny_stack())
+            } else {
+                st(t + T_STACK, map_task_stack())
+            }
+        }
+        words := T_SIZE / 8
+        for i in 0:words {
+            if i * 8 != T_STACK {
+                st(t + i * 8, 0)
+            }
+        }
+        if tiny { st(t + T_IS_TINY, 1) }
+        st(t + T_X19, t)
+        st(t + T_X20, fn_addr)
+        st(t + T_X21, arg)
+        st(t + T_ARGS, args)
+        st(t + T_X22, exit_addr)
+        st(t + T_X28, rt_globals())
+        st(t + T_LR, entry)
+        st(t + T_SP, ld(t + T_STACK) + stack_size)
+        st(s + S_NTASKS, ld(s + S_NTASKS) + 1)
+        queue_push(s, t)
+        progress_locked(s, mt)
+        spin_unlock(G_SCHED_LOCK)
+        mt_wake_all(mt, wid)
+        <<
+    }
     $free_slot := S_FREE
     $stack_size := TASK_TINY_STACK
     if tiny {
@@ -575,6 +1151,19 @@ pub fn task_poll_wait(fd int, events int, timeout_ms int) int {
         deadline = host_now_ns() + timeout_ms * 1000000
     }
 
+    mt := sched_m_state()
+    if mt != 0 {
+        t := current_task_mt(s, mt)
+        st(t + T_WAIT_FD, fd)
+        st(t + T_WAIT_EVENTS, events)
+        st(t + T_WAIT_REVENTS, 0)
+        st(t + T_WAIT_DEADLINE, deadline)
+        m_park_switch(mt, t, PARK_WAIT_IO, 0)
+        rev := ld(t + T_WAIT_REVENTS)
+        if rev > 0 { task_io_progress() }
+        << rev
+    }
+
     t := ld(s + S_CUR)
     waiter_add(s, t, fd, events, deadline)
 
@@ -600,6 +1189,13 @@ pub fn task_poll_wait(fd int, events int, timeout_ms int) int {
 // it does count: a task only waiting on the outside world must not keep
 // the process alive, as a thread would be killed at exit.
 pub fn task_yield() {
+    mt := sched_m_state()
+    if mt != 0 {
+        s := sched()
+        t := current_task_mt(s, mt)
+        m_park_switch(mt, t, PARK_YIELD, 0)
+        <<
+    }
     rt_signal_poll(0)
     s := sched()
     if ld(s + S_WAIT_COUNT) > 0 {
@@ -619,6 +1215,14 @@ pub fn task_yield() {
 
 // A compiler-inserted loop poll only enters the scheduler when a peer exists.
 pub fn task_poll() {
+    mt := sched_m_state()
+    if mt != 0 {
+        s := gword(G_SCHED)
+        if atomic_load(c_ptr(s + S_HEAD)) != 0 || atomic_load(c_ptr(mt + MT_MAIN_READY)) != 0 {
+            task_yield()
+        }
+        <<
+    }
     if task_others() {
         task_yield()
     }
@@ -635,6 +1239,19 @@ pub fn task_drain() {
     ffi_flush()
     s := gword(G_SCHED)
     if s == 0 {
+        <<
+    }
+    mt := sched_m_state()
+    if mt != 0 {
+        spin_lock(G_SCHED_LOCK)
+        st(s + S_DRAIN, 1)
+        nt := ld(s + S_NTASKS)
+        spin_unlock(G_SCHED_LOCK)
+        if nt > 1 {
+            t := ld(mt + MT_MAIN_TASK)
+            m_park_switch(mt, t, PARK_DRAIN, 0)
+        }
+        sched_stop_mt()
         <<
     }
     st(s + S_DRAIN, 1)
@@ -660,6 +1277,11 @@ pub fn task_drain() {
 // Called by __xu_task_entry when the task function returns.
 pub fn task_exit(t int) {
     s := sched()
+    mt := sched_m_state()
+    if mt != 0 {
+        m_park_switch(mt, t, PARK_EXIT, 0)
+        <<
+    }
     st(s + S_NTASKS, ld(s + S_NTASKS) - 1)
     progress()
     args := ld(t + T_ARGS)
@@ -714,10 +1336,35 @@ pub fn chan_new(cap int) int {
     << ch
 }
 
+fn chan_lock(ch int) {
+    lk := c_ptr(ch + C_LOCK)
+    while !atomic_cas(lk, 0, 1) {}
+}
+
+fn chan_unlock(ch int) {
+    atomic_store(c_ptr(ch + C_LOCK), 0)
+}
+
+fn chan_record_epoch(s int, mt int, ep int) {
+    t := current_task_mt(s, mt)
+    if ld(t + T_SEEN_EPOCH) == 0 {
+        st(t + T_SEEN_EPOCH, ep)
+    }
+}
+
+fn chan_clear_epoch(s int, mt int) {
+    t := current_task_mt(s, mt)
+    st(t + T_SEEN_EPOCH, 0)
+}
+
 // Add a holder to channel ch (0 is no channel).
 pub fn chan_retain(ch int) {
     if ch != 0 {
-        st(ch + C_RC, ld(ch + C_RC) + 1)
+        if rt_mt_active() {
+            _ := atomic_add(c_ptr(ch + C_RC), 1)
+        } else {
+            st(ch + C_RC, ld(ch + C_RC) + 1)
+        }
     }
 }
 
@@ -726,6 +1373,11 @@ pub fn chan_retain(ch int) {
 pub fn chan_release(ch int) int {
     if ch == 0 {
         << 0
+    }
+    if rt_mt_active() {
+        old := atomic_add(c_ptr(ch + C_RC), -1)
+        if old > 0 { << 0 }
+        << 1
     }
     rc := ld(ch + C_RC)
     if rc > 0 {
@@ -842,10 +1494,71 @@ fn panic_send_closed() {
     exit_process(1)
 }
 
+fn chan_put_ring(ch int, src int, esize int) {
+    buf := chan_buf(ch, esize)
+    n := chan_slots(ch)
+    count := ld(ch + C_COUNT)
+    $at := ld(ch + C_HEAD) + count
+    if at >= n {
+        at -= n
+    }
+    if esize == 8 {
+        rt_store(buf + at * 8, 8, rt_load(src, 8))
+    } else {
+        mem_copy(buf + at * esize, src, esize)
+    }
+    st(ch + C_COUNT, count + 1)
+    st(ch + C_SENT, ld(ch + C_SENT) + 1)
+}
+
+fn chan_take_ring(ch int, dst int, esize int) {
+    buf := chan_buf(ch, esize)
+    head := ld(ch + C_HEAD)
+    if esize == 8 {
+        rt_store(dst, 8, rt_load(buf + head * 8, 8))
+    } else {
+        mem_copy(dst, buf + head * esize, esize)
+    }
+    $nh := head + 1
+    if nh >= chan_slots(ch) {
+        nh = 0
+    }
+    st(ch + C_HEAD, nh)
+    st(ch + C_COUNT, ld(ch + C_COUNT) - 1)
+    st(ch + C_RECVD, ld(ch + C_RECVD) + 1)
+}
+
 // 1 when the value was sent, 0 when the send would block.
 pub fn chan_try_send(ch int, src int, esize int) int {
     if ch == 0 {
         << 0
+    }
+    mt := sched_m_state()
+    if mt != 0 {
+        s := sched()
+        ep := atomic_load(c_ptr(s + S_EPOCH))
+        chan_lock(ch)
+        if ld(ch + C_CLOSED) != 0 {
+            chan_unlock(ch)
+            panic_send_closed()
+        }
+        count := ld(ch + C_COUNT)
+        if ld(ch + C_CAP) == 0 {
+            if count != 0 || ld(ch + C_RWAIT) == 0 {
+                chan_unlock(ch)
+                chan_record_epoch(s, mt, ep)
+                << 0
+            }
+        } else if count >= ld(ch + C_CAP) {
+            chan_unlock(ch)
+            chan_record_epoch(s, mt, ep)
+            << 0
+        }
+        chan_put_ring(ch, src, esize)
+        chan_unlock(ch)
+        chan_clear_epoch(s, mt)
+        progress()
+        << 1
     }
     if ld(ch + C_CLOSED) != 0 {
         panic_send_closed()
@@ -894,6 +1607,28 @@ pub fn chan_try_recv(ch int, dst int, esize int) int {
     if ch == 0 {
         << 0
     }
+    mt := sched_m_state()
+    if mt != 0 {
+        s := sched()
+        ep := atomic_load(c_ptr(s + S_EPOCH))
+        chan_lock(ch)
+        if ld(ch + C_COUNT) > 0 {
+            chan_take_ring(ch, dst, esize)
+            chan_unlock(ch)
+            chan_clear_epoch(s, mt)
+            progress()
+            << 1
+        }
+        if ld(ch + C_CLOSED) != 0 {
+            chan_unlock(ch)
+            for i in 0:esize { rt_store(dst + i, 1, 0) }
+            chan_clear_epoch(s, mt)
+            << 2
+        }
+        chan_unlock(ch)
+        chan_record_epoch(s, mt, ep)
+        << 0
+    }
     if ld(ch + C_DIRECT) != 0 {
         st(ch + C_DIRECT, 0)
         st(ch + C_COUNT, 0)
@@ -921,6 +1656,43 @@ pub fn chan_try_recv(ch int, dst int, esize int) int {
 
 // Unbuffered sends complete once a receiver has taken the value.
 pub fn chan_send(ch int, src int, esize int) {
+    mt := sched_m_state()
+    if mt != 0 {
+        s := sched()
+        while true {
+            if ch != 0 {
+                ep := atomic_load(c_ptr(s + S_EPOCH))
+                chan_lock(ch)
+                if ld(ch + C_CLOSED) != 0 {
+                    chan_unlock(ch)
+                    panic_send_closed()
+                }
+                if ld(ch + C_COUNT) < chan_slots(ch) {
+                    chan_put_ring(ch, src, esize)
+                    is_unbuf := ld(ch + C_CAP) == 0
+                    mine := ld(ch + C_SENT)
+                    chan_unlock(ch)
+                    chan_clear_epoch(s, mt)
+                    progress()
+                    if is_unbuf {
+                        while true {
+                            ep2 := atomic_load(c_ptr(s + S_EPOCH))
+                            chan_lock(ch)
+                            done := ld(ch + C_RECVD) >= mine || ld(ch + C_CLOSED) != 0
+                            chan_unlock(ch)
+                            if done { << }
+                            chan_record_epoch(s, mt, ep2)
+                            task_block()
+                        }
+                    }
+                    <<
+                }
+                chan_unlock(ch)
+                chan_record_epoch(s, mt, ep)
+            }
+            task_block()
+        }
+    }
     while true {
         if ch != 0 {
             if ld(ch + C_CLOSED) != 0 {
@@ -980,6 +1752,44 @@ pub fn chan_send(ch int, src int, esize int) {
 
 // Receive into dst; false when the channel is closed and drained.
 pub fn chan_recv(ch int, dst int, esize int) bool {
+    mt := sched_m_state()
+    if mt != 0 {
+        s := sched()
+        if ch != 0 {
+            chan_lock(ch)
+            st(ch + C_RWAIT, ld(ch + C_RWAIT) + 1)
+            chan_unlock(ch)
+            progress()
+        }
+        while true {
+            ep := atomic_load(c_ptr(s + S_EPOCH))
+            $r := 0
+            if ch != 0 {
+                chan_lock(ch)
+                if ld(ch + C_COUNT) > 0 {
+                    chan_take_ring(ch, dst, esize)
+                    st(ch + C_RWAIT, ld(ch + C_RWAIT) - 1)
+                    r = 1
+                } else if ld(ch + C_CLOSED) != 0 {
+                    st(ch + C_RWAIT, ld(ch + C_RWAIT) - 1)
+                    r = 2
+                }
+                chan_unlock(ch)
+            }
+            if r != 0 {
+                if r == 2 {
+                    for i in 0:esize { rt_store(dst + i, 1, 0) }
+                } else {
+                    progress()
+                }
+                chan_clear_epoch(s, mt)
+                << r == 1
+            }
+            chan_record_epoch(s, mt, ep)
+            task_block()
+        }
+        << false
+    }
     if ch != 0 {
         st(ch + C_RWAIT, ld(ch + C_RWAIT) + 1)
         st(ch + C_RDST, dst)
@@ -1000,6 +1810,15 @@ pub fn chan_recv(ch int, dst int, esize int) bool {
 
 pub fn chan_close(ch int) {
     if ch == 0 {
+        <<
+    }
+    mt := sched_m_state()
+    if mt != 0 {
+        chan_lock(ch)
+        st(ch + C_CLOSED, 1)
+        st(ch + C_RDST, 0)
+        chan_unlock(ch)
+        progress()
         <<
     }
     st(ch + C_CLOSED, 1)
