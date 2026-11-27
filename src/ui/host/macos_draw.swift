@@ -883,7 +883,7 @@ private func paintDrawOps(_ displayOps: [DrawOp],_ ctx: CGContext) {
         paintPath(p, fill, stroke, w)
       case .arc(let c, let r, let a0, let a1, let col, let w):
         let p = NSBezierPath()
-        p.appendArc(withCenter: c, radius: r, startAngle: a0, endAngle: a1, clockwise: true)
+        p.appendArc(withCenter: c, radius: r, startAngle: a0, endAngle: a1, clockwise: false)
         col.setStroke()
         p.lineWidth = w
         p.lineCapStyle = .round
@@ -1797,18 +1797,31 @@ private func colorHex(_ hex: String) -> NSColor? {
   var h = hex.trimmingCharacters(in: .whitespacesAndNewlines)
   if h.isEmpty || h == "-" { return nil }
   if h.hasPrefix("#") { h = String(h.dropFirst()) }
+  if h.count == 3, let n = UInt32(h, radix: 16) {
+    let r = CGFloat(((n >> 8) & 0xf) * 17) / 255
+    let g = CGFloat(((n >> 4) & 0xf) * 17) / 255
+    let b = CGFloat((n & 0xf) * 17) / 255
+    return NSColor(srgbRed: r, green: g, blue: b, alpha: 1)
+  }
+  if h.count == 4, let n = UInt32(h, radix: 16) {
+    let r = CGFloat(((n >> 12) & 0xf) * 17) / 255
+    let g = CGFloat(((n >> 8) & 0xf) * 17) / 255
+    let b = CGFloat(((n >> 4) & 0xf) * 17) / 255
+    let a = CGFloat((n & 0xf) * 17) / 255
+    return NSColor(srgbRed: r, green: g, blue: b, alpha: a)
+  }
   if h.count == 6, let n = UInt32(h, radix: 16) {
     let r = CGFloat((n >> 16) & 0xff) / 255
     let g = CGFloat((n >> 8) & 0xff) / 255
     let b = CGFloat(n & 0xff) / 255
-    return NSColor(calibratedRed: r, green: g, blue: b, alpha: 1)
+    return NSColor(srgbRed: r, green: g, blue: b, alpha: 1)
   }
   if h.count == 8, let n = UInt32(h, radix: 16) {
     let r = CGFloat((n >> 24) & 0xff) / 255
     let g = CGFloat((n >> 16) & 0xff) / 255
     let b = CGFloat((n >> 8) & 0xff) / 255
     let a = CGFloat(n & 0xff) / 255
-    return NSColor(calibratedRed: r, green: g, blue: b, alpha: a)
+    return NSColor(srgbRed: r, green: g, blue: b, alpha: a)
   }
   return nil
 }

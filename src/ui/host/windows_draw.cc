@@ -241,13 +241,19 @@ static void paint_round(Graphics *g, Op *o) {
   GraphicsPath path;
   REAL r = (REAL)o->radius;
   REAL x = (REAL)o->x, y = (REAL)o->y, w = (REAL)o->w, h = (REAL)o->h;
+  if (w <= 0.0f || h <= 0.0f) return;
+  if (r < 0.0f) r = 0.0f;
   if (r * 2 > w) r = w * 0.5f;
   if (r * 2 > h) r = h * 0.5f;
-  path.AddArc(x, y, r * 2, r * 2, 180, 90);
-  path.AddArc(x + w - r * 2, y, r * 2, r * 2, 270, 90);
-  path.AddArc(x + w - r * 2, y + h - r * 2, r * 2, r * 2, 0, 90);
-  path.AddArc(x, y + h - r * 2, r * 2, r * 2, 90, 90);
-  path.CloseFigure();
+  if (r <= 0.0f) {
+    path.AddRectangle(RectF(x, y, w, h));
+  } else {
+    path.AddArc(x, y, r * 2, r * 2, 180, 90);
+    path.AddArc(x + w - r * 2, y, r * 2, r * 2, 270, 90);
+    path.AddArc(x + w - r * 2, y + h - r * 2, r * 2, r * 2, 0, 90);
+    path.AddArc(x, y + h - r * 2, r * 2, r * 2, 90, 90);
+    path.CloseFigure();
+  }
   if (o->fill.on) {
     SolidBrush br(gp(o->fill));
     g->FillPath(&br, &path);
