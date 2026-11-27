@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import platform
 import shutil
 import struct
 import subprocess
@@ -438,6 +439,25 @@ class ElfHardeningTest(unittest.TestCase):
             self.assertIn("r--p", perms[rx_idx + 1 :], f"RELRO page not mprotected R--:\n{maps_text}")
 
     def test_docker_linux_execution_and_maps(self) -> None:
+        if platform.system() == "Linux":
+            mach = platform.machine().lower()
+            host_target = "linux-x64" if mach in ("x86_64", "amd64") else ("linux-arm64" if mach in ("aarch64", "arm64") else "")
+            if host_target:
+                with tempfile.TemporaryDirectory() as td:
+                    work = Path(td)
+                    st = self.build(work, STATIC_SOURCE, host_target, f"run_static_{host_target}")
+                    st_res = subprocess.run([str(st)], capture_output=True, text=True, timeout=30)
+                    self.assertEqual(st_res.returncode, 0, f"{host_target} static failed:\n{st_res.stdout}\n{st_res.stderr}")
+                    self.assertIn("STATIC_OK", st_res.stdout)
+                    self.assert_proc_maps_hardened(st_res.stdout, st.name, expect_rw_bss=False)
+
+                    dy = self.build(work, FFI_SOURCE, host_target, f"run_ffi_{host_target}")
+                    dy_res = subprocess.run([str(dy)], capture_output=True, text=True, timeout=30)
+                    self.assertEqual(dy_res.returncode, 0, f"{host_target} ffi failed:\n{dy_res.stdout}\n{dy_res.stderr}")
+                    self.assertIn("FFI_OK 42 10,20,30,40", dy_res.stdout)
+                    self.assert_proc_maps_hardened(dy_res.stdout, dy.name, expect_rw_bss=True)
+                return
+
         lanes = [
             ("linux-x64", "linux/amd64", "ubuntu:22.04"),
             ("linux-arm64", "linux/arm64", "ubuntu:latest"),
@@ -445,13 +465,13 @@ class ElfHardeningTest(unittest.TestCase):
         ran_any = False
         with tempfile.TemporaryDirectory() as td:
             work = Path(td)
-            for target, platform, image in lanes:
-                if not docker_image_available(image, platform):
+            for target, docker_platform, image in lanes:
+                if not docker_image_available(image, docker_platform):
                     continue
                 ran_any = True
                 st = self.build(work, STATIC_SOURCE, target, f"run_static_{target}")
                 st_res = subprocess.run(
-                    ["docker", "run", "--rm", "--pull=never", "--platform", platform, "-v", f"{work}:/w", image, f"/w/{st.name}"],
+                    ["docker", "run", "--rm", "--pull=never", "--platform", docker_platform, "-v", f"{work}:/w", image, f"/w/{st.name}"],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -462,7 +482,7 @@ class ElfHardeningTest(unittest.TestCase):
 
                 dy = self.build(work, FFI_SOURCE, target, f"run_ffi_{target}")
                 dy_res = subprocess.run(
-                    ["docker", "run", "--rm", "--pull=never", "--platform", platform, "-v", f"{work}:/w", image, f"/w/{dy.name}"],
+                    ["docker", "run", "--rm", "--pull=never", "--platform", docker_platform, "-v", f"{work}:/w", image, f"/w/{dy.name}"],
                     capture_output=True,
                     text=True,
                     timeout=30,

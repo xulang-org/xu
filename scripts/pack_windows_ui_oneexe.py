@@ -965,6 +965,7 @@ def link_static(
             "-static",
             "-static-libgcc",
             "-static-libstdc++",
+            "-Wl,--nxcompat,--dynamicbase,--high-entropy-va,--tsaware",
             # Force-pull libstdc++ definition if stub is optimized out.
             "-Wl,-u,__cxa_pure_virtual",
             *libs,
