@@ -2954,12 +2954,12 @@ fn a64_callee_save_slots(cb $&mc.CodeBuffer, regs &[]int, save_off int, store bo
         off := save_off + i * 8
         // Register pairs use a signed seven-bit offset scaled by eight.
         // Both registers must already have slots in the allocated frame.
-        if r < 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] < 32 {
+        if r < 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] == r + 1 {
             a64_pair(cb, pair_op, r, regs[i + 1], R_SP, off)
             i += 2
             ->
         }
-        if r >= 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] >= 32 {
+        if r >= 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] == r + 1 {
             $fpair_op := 0x6D400000 // ldp dt1, dt2, [sp, #off]
             if store { fpair_op = 0x6D000000 } // stp dt1, dt2, [sp, #off]
             a64_pair(cb, fpair_op, r - 32, regs[i + 1] - 32, R_SP, off)
@@ -2977,7 +2977,7 @@ fn a64_callee_save_slots(cb $&mc.CodeBuffer, regs &[]int, save_off int, store bo
     }
 }
 
-pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool) {
+pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     ra := a64_ra(f, opt)
     $fr := a64_frame_ra(f, &ra, opt)
     leaf_noframe := can_elide_frame_ex(f, &ra, opt, true)
@@ -3011,7 +3011,8 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             e32(cb, 0xD503201F)
         }
     }
-    syms.define_label(f.label, cb.len())
+    fn_start := cb.len()
+    syms.define_label(f.label, fn_start)
     $last_line := f.src_line
     if last_line > 0 {
         lines.push(cb.len())
@@ -3047,6 +3048,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
     }
     // Prologue.
+    prolog_start := cb.len()
+    $sub_sp_insns := 0
+    $save_insns := 0
     if !leaf_noframe {
         if compact_frame {
             a64_pair(cb, 0xA9800000, 29, 30, R_SP, 0 - fr.size)
@@ -3055,10 +3059,14 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             e32(cb, 0xA9BF7BFD)
             e32(cb, 0x910003FD)
             if fr.size > 0 {
+                sub_sp_beg := cb.len()
                 a64_sub_sp(cb, fr.size)
+                sub_sp_insns = (cb.len() - sub_sp_beg) / 4
             }
         }
+        save_beg := cb.len()
         a64_callee_save_slots(cb, &ra.used_callee, save_off, true)
+        save_insns = (cb.len() - save_beg) / 4
     }
     a64_copy_params(cb, f, &fr, &ra)
     if fp_plan.slow_blk > 0 {
@@ -4659,7 +4667,8 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             }
         }
     }
-    syms.define_label(epilogue, cb.len())
+    epilog_start := cb.len()
+    syms.define_label(epilogue, epilog_start)
     if !leaf_noframe {
         a64_callee_save_slots(cb, &ra.used_callee, save_off, false)
         if compact_frame {
@@ -4672,11 +4681,43 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
     }
     e32(cb, 0xD65F03C0)
+    body_end := cb.len()
     if !inline_fast_exit {
         for ei in 0:fp_plan.exits.len {
             syms.define_label(f.label + ".fp" + str(ei), cb.len())
             a64_emit_fast_ret(cb, &fp_plan.nodes, fp_plan.exits[ei].ret_node)
             e32(cb, 0xD65F03C0)
+        }
+    }
+    code_end := cb.len()
+    if collect_unwind {
+        if leaf_noframe {
+            unwinds.push(win_unwind_leaf(fn_start, code_end))
+        } else {
+            if fn_start < prolog_start {
+                unwinds.push(win_unwind_leaf(fn_start, prolog_start))
+            }
+            $cregs := []int{}
+            for ci in 0:ra.used_callee.len {
+                cregs.push(ra.used_callee[ci])
+            }
+            unwinds.push(WinUnwindEntry{
+                beg: prolog_start,
+                end: body_end,
+                kind: UNW_A64_FRAME,
+                prolog_len: 0,
+                frame_size: fr.size,
+                compact: compact_frame,
+                sub_sp_insns: sub_sp_insns,
+                save_insns: save_insns,
+                save_off: save_off,
+                epilog_off: epilog_start,
+                callee_regs: ~cregs,
+                save_end_offs: []int{}
+            })
+            if body_end < code_end {
+                unwinds.push(win_unwind_leaf(body_end, code_end))
+            }
         }
     }
     // String literal pool, patched into the ADR instructions above.
@@ -5030,7 +5071,8 @@ pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, reloc
     if !linux {
         emit_macos_arm64_clock(cb, syms, relocs, emit_object)
     }
-    emit_arm64_pseudo_calls(cb, syms, relocs, tgt_os, emit_object, uses_ffi)
+    $dummy_uw := []WinUnwindEntry{}
+    emit_arm64_pseudo_calls(cb, syms, relocs, tgt_os, emit_object, uses_ffi, $&dummy_uw, false)
     if linux {
         a64_mov(cb, 8, 0)
     } else {
@@ -5075,7 +5117,7 @@ fn a64_linux_save_hwcap(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
 }
 
 // Dispatch shared pseudo-calls before falling through to the host bridge.
-fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, uses_ffi bool) {
+fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, uses_ffi bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     // cmn x0, #5 ; b.ne past the zeroing
     e32(cb, 0xB100141F)
     a64_branch_reloc(cb, relocs, 0x54000001, "__xu_syscall_after_zero", mc.RELOC_ARM64_COND_BR19)
@@ -5155,7 +5197,7 @@ fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[
     e32(cb, 0xD65F03C0)
     syms.define_label("__xu_syscall_after_copy", cb.len())
     if uses_ffi || !emit_object {
-        emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object)
+        emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object, unwinds, collect_unwind)
     }
     // cmn x0, #2 ; b.ne +12 ; mov x0, x29 ; ret
     e32(cb, 0xB100081F)
@@ -5221,13 +5263,14 @@ fn emit_arm64_ffi_tramps(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     }
 }
 
-fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool) {
+fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     e32(cb, 0xB100201F) // cmn x0, #8
     skip6 := cb.len()
     e32(cb, 0x54000001) // b.ne (patched)
+    ffi_prolog_beg := cb.len()
     e32(cb, 0xA9BE7BFD) // stp x29, x30, [sp, #-32]!
-    e32(cb, 0x910003FD) // mov x29, sp
     a64_pair(cb, 0xA9000000, 19, 20, R_SP, 16)
+    e32(cb, 0x910003FD) // mov x29, sp
     // Publish the runtime state register for C callbacks: C code between
     // here and a callback may use x28 for its own values.
     a64_ffi_state_addr(cb, relocs, 9, emit_object)
@@ -5254,10 +5297,28 @@ fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
     a64_pair(cb, 0xA9000000, 0, 1, 19, 152)
     a64_pair(cb, 0x6D000000, 0, 1, 19, 168)
     a64_pair(cb, 0x6D000000, 2, 3, 19, 184)
+    ffi_epilog_off := cb.len()
     e32(cb, 0x910003BF) // mov sp, x29
     a64_pair(cb, 0xA9400000, 19, 20, R_SP, 16)
     e32(cb, 0xA8C27BFD) // ldp x29, x30, [sp], #32
     e32(cb, 0xD65F03C0)
+    ffi_body_end := cb.len()
+    if collect_unwind {
+        unwinds.push(WinUnwindEntry{
+            beg: ffi_prolog_beg,
+            end: ffi_body_end,
+            kind: UNW_A64_FFI_CALL,
+            prolog_len: 0,
+            frame_size: 32,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: ffi_epilog_off,
+            callee_regs: []int{},
+            save_end_offs: []int{}
+        })
+    }
     cb.patch_u32_le(skip6, 0x54000001 | ((((cb.len() - skip6) / 4) & 0x7FFFF) << 5))
     e32(cb, 0xB100241F) // cmn x0, #9
     skip7 := cb.len()
@@ -5291,9 +5352,10 @@ pub fn emit_arm64_ffi_slots(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     for i in 0:8 { e32(cb, 0) }
 }
 
-fn emit_arm64_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, label string, adapter string, is_clos bool, emit_object bool) {
+fn emit_arm64_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, label string, adapter string, is_clos bool, emit_object bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     while cb.len() % 16 != 0 { e32(cb, 0xD503201F) }
-    syms.define_label(label + "", cb.len())
+    th_beg := cb.len()
+    syms.define_label(label + "", th_beg)
     e32(cb, 0xA9800000 | ((-50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // stp x29, x30, [sp, #-400]!
     e32(cb, 0x910003FD) // mov x29, sp
     for i in 0:5 { a64_pair(cb, 0xA9000000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16) }
@@ -5330,18 +5392,35 @@ fn emit_arm64_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&
     for i in 0:4 { a64_pair(cb, 0x6D400000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16) }
     e32(cb, 0xA8C00000 | ((50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // ldp x29, x30, [sp], #400
     e32(cb, 0xD65F03C0)
+    th_end := cb.len()
+    if collect_unwind {
+        unwinds.push(WinUnwindEntry{
+            beg: th_beg,
+            end: th_end,
+            kind: UNW_A64_FFI_THUNK,
+            prolog_len: 0,
+            frame_size: 400,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: -1,
+            callee_regs: []int{},
+            save_end_offs: []int{}
+        })
+    }
 }
 
 // C-ABI entry points for Xu functions passed as C callbacks: save the C
 // callee-saved registers, spill x0-x7 / d0-d7 and the caller's stack
 // argument address into a call block on the stack, call the adapter with
 // the block, load x0, x1, d0-d3 from it and return (layout: core ffi.xu).
-pub fn emit_arm64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, emit_object bool, emit_clos bool) {
+pub fn emit_arm64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, emit_object bool, emit_clos bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     for t in 0:thunks.len {
-        emit_arm64_ffi_thunk_one(cb, syms, relocs, thunks[t] + "", adapters[t] + "", false, emit_object)
+        emit_arm64_ffi_thunk_one(cb, syms, relocs, thunks[t] + "", adapters[t] + "", false, emit_object, unwinds, collect_unwind)
     }
     if emit_clos {
-        emit_arm64_ffi_thunk_one(cb, syms, relocs, "__xu_ffi_clos_dispatch", "", true, emit_object)
+        emit_arm64_ffi_thunk_one(cb, syms, relocs, "__xu_ffi_clos_dispatch", "", true, emit_object, unwinds, collect_unwind)
         while cb.len() % 16 != 0 { e32(cb, 0xD503201F) }
         syms.define_label("__xu_ffi_clos_stubs", cb.len())
         for k in 0:64 {
