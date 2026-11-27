@@ -12,6 +12,7 @@ import tempfile
 
 from test_tensor_dynamic import mir_functions
 from test_tensor_fusion import PRELUDE, build, run
+from test_windows_workers import WindowsTemporaryDirectory
 
 
 def xu_source():
@@ -1334,7 +1335,7 @@ def main():
     compiler = args.compiler.resolve()
     root = Path(__file__).resolve().parents[1]
 
-    with tempfile.TemporaryDirectory() as td:
+    with WindowsTemporaryDirectory(prefix="xu-tensor-opt-") as td:
         work = Path(td)
         src = work / "tensor_opt.xu"
         src.write_text(xu_source())
@@ -1382,7 +1383,8 @@ def main():
                 assert f"call __xu_tensor_attn_scores_paged{suf}_f32(" in funcs["kernel_attn_scores_paged"], mode
                 assert f"call __xu_tensor_softmax_scaled{suf}_f32(" in funcs["kernel_softmax_scaled"], mode
                 assert f"call __xu_tensor_attn_vsum_paged{suf}_f32(" in funcs["kernel_attn_vsum_paged"], mode
-                if platform.machine().lower() in ("arm64", "aarch64"):
+                target_arch = (os.environ.get("XU_TARGET") or os.environ.get("XUARCH") or platform.machine()).lower()
+                if "arm64" in target_arch or "aarch64" in target_arch:
                     assert f"call __xu_tensor_gemm4x8_q8_0_p4k4_f16_q8_0{suf}_f32(" in funcs["kernel_gemm_q8_p4k4"], mode
                 copy_mir = funcs["kernel_copy16_32"]
                 assert copy_mir.count("load8 [") >= 6 and copy_mir.count("store8 [") >= 6, copy_mir
