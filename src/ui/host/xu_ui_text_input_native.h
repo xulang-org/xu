@@ -14,6 +14,8 @@ struct XuTextInputSnapshot {
   bool composing() const { return (flags&4)!=0; }
   bool ready() const { return (flags&2)!=0; }
   bool password() const { return (flags&8)!=0; }
+  unsigned keyboard_type() const { return (flags >> 4) & 0xFu; }
+  unsigned return_key() const { return (flags >> 8) & 0x7u; }
   static bool boundary(const std::string &text,unsigned at) {
     return at<=text.size() && (at==text.size() || ((unsigned char)text[at]&0xc0)!=0x80);
   }
@@ -38,7 +40,8 @@ struct XuTextInputSnapshot {
     next.revision=(uint64_t)xdf_u32(p+32)|((uint64_t)xdf_u32(p+36)<<32);
     next.window=xdf_u32(p+16); next.canvas=xdf_u32(p+20); next.generation=xdf_u32(p+24);
     unsigned size=xdf_u32(p+80),marked=xdf_u32(p+84);
-    if(next.flags>15 || (next.flags&9)==9 || !next.id || next.id>INT64_MAX || !next.revision || next.revision>INT64_MAX ||
+    if(next.flags>0x07FFu || (next.flags&9)==9 || ((next.flags>>4)&0xFu)>6u || ((next.flags>>8)&0x7u)>5u ||
+       !next.id || next.id>INT64_MAX || !next.revision || next.revision>INT64_MAX ||
        !next.window || next.window>INT32_MAX || !next.canvas || next.canvas>INT32_MAX || !next.generation ||
        size>16384 || marked>16384 || length!=112+size+marked || !xdf_utf8(p+112,size) || !xdf_utf8(p+112+size,marked)) return false;
     next.source.assign((const char *)p+112,size); next.preedit.assign((const char *)p+112+size,marked);

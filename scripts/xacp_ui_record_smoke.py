@@ -29,7 +29,7 @@ fn screen_bounds(s $&widgets.Screen) int {
     $session := xacp.open_session()
     session.state = xacp.STATE_OPEN
     session.permissions = xacp.PERM_UI_READ
-    request := xacp.parse_frame("id: !i 1\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n  max_bytes: !i 1024\n  duration_ms: !i 200\n") >>>
+    request := xacp.parse_frame("id: !i 1\nop: ui.record\nargs:\n  win: !i 1\n  mode: events\n  max_bytes: !i 1024\n  duration_ms: !i 1500\n") >>>
     reply := xacp.dispatch_screen(&*s,$&session,&request,&limits,$&nonces) >>>
     if !reply.outcome.ok || reply.data.len + ("id: !i 1\nok: !b true\ndata:\n").len > limits.max_frame_bytes { << 11 }
     doc := xacp.parse_frame("data:\n" + reply.data) >>>

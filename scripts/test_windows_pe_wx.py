@@ -111,6 +111,7 @@ def parse_pe(path: Path) -> dict:
     assert ndirs >= 13
     imp_rva, imp_sz = struct.unpack_from("<II", raw, opt + 112 + 1 * 8)
     exc_rva, exc_sz = struct.unpack_from("<II", raw, opt + 112 + 3 * 8)
+    reloc_rva, reloc_sz = struct.unpack_from("<II", raw, opt + 112 + 5 * 8)
     iat_rva, iat_sz = struct.unpack_from("<II", raw, opt + 112 + 12 * 8)
     tbl = opt + opt_size
     sections = []
@@ -125,6 +126,7 @@ def parse_pe(path: Path) -> dict:
             "rsize": rsize,
             "rptr": rptr,
             "chars": chars,
+            "raw": raw[rptr:rptr + min(vsize, rsize)],
         })
     return {
         "machine": machine,
@@ -133,6 +135,7 @@ def parse_pe(path: Path) -> dict:
         "dll_chars": dll_chars,
         "imp": (imp_rva, imp_sz),
         "exc": (exc_rva, exc_sz),
+        "basereloc": (reloc_rva, reloc_sz),
         "iat": (iat_rva, iat_sz),
         "sections": sections,
     }
@@ -140,7 +143,7 @@ def parse_pe(path: Path) -> dict:
 
 def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int, int]:
     secs = pe["sections"]
-    expected_names = [".text", ".rdata", ".data", ".pdata"] + ([".rsrc"] if expect_rsrc else [])
+    expected_names = [".text", ".rdata", ".data", ".pdata", ".reloc"] + ([".rsrc"] if expect_rsrc else [])
     assert [s["name"] for s in secs] == expected_names, (expected_names, [s["name"] for s in secs])
     assert pe["hdr_size"] == 1024, pe["hdr_size"]
 
@@ -149,13 +152,14 @@ def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int
         # IMAGE_SCN_MEM_EXECUTE (0x20000000) and IMAGE_SCN_MEM_WRITE (0x80000000) must never both be set.
         assert (chars & 0xA0000000) != 0xA0000000, f"W^X violation in {s['name']}: {hex(chars)}"
 
-    text, rdata, data, pdata = secs[0], secs[1], secs[2], secs[3]
+    text, rdata, data, pdata, reloc = secs[0], secs[1], secs[2], secs[3], secs[4]
     assert text["chars"] == 0x60000020, hex(text["chars"])
     assert rdata["chars"] == 0x40000040, hex(rdata["chars"])
     assert data["chars"] == 0xC0000040, hex(data["chars"])
     assert pdata["chars"] == 0x40000040, hex(pdata["chars"])
+    assert reloc["chars"] == 0x42000040, hex(reloc["chars"])
     if expect_rsrc:
-        assert secs[4]["chars"] == 0x40000040, hex(secs[4]["chars"])
+        assert secs[5]["chars"] == 0x40000040, hex(secs[5]["chars"])
 
     # NX_COMPAT (0x100) | DYNAMIC_BASE (0x40) | HIGH_ENTROPY_VA (0x20)
     assert (pe["dll_chars"] & 0x0160) == 0x0160, hex(pe["dll_chars"])
@@ -165,20 +169,26 @@ def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int
 
     imp_rva, imp_sz = pe["imp"]
     exc_rva, exc_sz = pe["exc"]
+    reloc_rva, reloc_sz = pe["basereloc"]
     iat_rva, iat_sz = pe["iat"]
     assert imp_sz > 0 and iat_sz > 0, (pe["imp"], pe["iat"])
     assert rdata["vaddr"] <= imp_rva and imp_rva + imp_sz <= rdata["vaddr"] + rdata["vsize"], (pe["imp"], rdata)
     assert rdata["vaddr"] <= iat_rva and iat_rva + iat_sz <= rdata["vaddr"] + rdata["vsize"], (pe["iat"], rdata)
     assert exc_rva == pdata["vaddr"] and exc_sz == pdata["vsize"] and exc_sz > 0, (pe["exc"], pdata)
+    assert reloc_rva == reloc["vaddr"] and reloc_sz == reloc["vsize"] == 12, (pe["basereloc"], reloc)
+    blk_page_rva, blk_size, e0, e1 = struct.unpack_from("<IIHH", reloc["raw"], 0)
+    assert (blk_page_rva, blk_size, e0, e1) == (text["vaddr"], 12, 0, 0), (blk_page_rva, blk_size, e0, e1)
     return text["vaddr"], rdata["vaddr"], data["vaddr"], pdata["vaddr"]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
+    parser.add_argument("--headers-only", action="store_true",
+                        help="Verify cross-compiled PE headers and manifest embedding without executing")
     args = parser.parse_args()
-    if os.name != "nt":
-        parser.error("requires a Windows host")
+    if os.name != "nt" and not args.headers_only:
+        parser.error("requires a Windows host (or pass --headers-only)")
 
     compiler = args.compiler.resolve()
     root = Path(__file__).resolve().parents[1]
@@ -203,32 +213,34 @@ def main() -> int:
                 pe = parse_pe(exe)
                 t_rva, r_rva, d_rva, p_rva = check_wx_headers(pe, expect_rsrc=False)
 
-                run_env = dict(env, XU_DEBUG_FREE="1")
-                res = subprocess.run(
-                    [str(exe), str(t_rva), str(r_rva), str(d_rva), str(p_rva)],
-                    env=run_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                assert res.returncode == 0, (target, mode, res.returncode, res.stdout, res.stderr)
-                assert res.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res.stdout, res.stderr)
+                if not args.headers_only:
+                    run_env = dict(env, XU_DEBUG_FREE="1")
+                    res = subprocess.run(
+                        [str(exe), str(t_rva), str(r_rva), str(d_rva), str(p_rva)],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    assert res.returncode == 0, (target, mode, res.returncode, res.stdout, res.stderr)
+                    assert res.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res.stdout, res.stderr)
 
-                # Verify manifest embedding preserves W^X and adds .rsrc cleanly.
+                # Verify manifest embedding preserves W^X and .reloc and adds .rsrc cleanly.
                 mexe = work / f"probe-{target}-{mode}-rsrc.exe"
                 shutil.copy2(exe, mexe)
                 embed_invoker_manifest(mexe)
                 pe_m = parse_pe(mexe)
                 mt_rva, mr_rva, md_rva, mp_rva = check_wx_headers(pe_m, expect_rsrc=True)
-                res_m = subprocess.run(
-                    [str(mexe), str(mt_rva), str(mr_rva), str(md_rva), str(mp_rva)],
-                    env=run_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                assert res_m.returncode == 0 and res_m.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res_m)
-                print(f"  [PASS] {target} {mode}: W^X + .pdata static + live VirtualQuery + FFI + manifest")
+                if not args.headers_only:
+                    res_m = subprocess.run(
+                        [str(mexe), str(mt_rva), str(mr_rva), str(md_rva), str(mp_rva)],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    assert res_m.returncode == 0 and res_m.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res_m)
+                print(f"  [PASS] {target} {mode}: W^X + .pdata + .reloc + manifest" + ("" if args.headers_only else " + live VirtualQuery + FFI"))
 
     print("Windows PE W^X verification passed")
     return 0
