@@ -885,6 +885,100 @@ fn main() int {
     println("GC_NORM:" + str(math.float32_bits(f64(gc_norm))))
     for i in 0:3 { println("GC_G" + str(i) + ":" + str(math.float32_bits(f64(gc[i])))) }
 
+    // kl_div_grad_f32, dpo_loss_grad_f32, grpo_advantages_f32
+    kl_s := [f32(1.2), f32(-0.4), f32(0.8)]
+    kl_t := [f32(0.5), f32(1.5), f32(-0.5)]
+    $kl_g := [f32(0), f32(0), f32(0)]
+    kl_val := tensor.kl_div_grad_f32($&kl_g, &kl_s, &kl_t, 3, f32(2.0))
+    println("KL_VAL:" + str(math.float32_bits(f64(kl_val))))
+    for i in 0:3 { println("KL_G" + str(i) + ":" + str(math.float32_bits(f64(kl_g[i])))) }
+
+    $dpo_g1 := [f32(0), f32(0)]
+    dpo_l1 := tensor.dpo_loss_grad_f32(f32(-1.2), f32(-2.4), f32(-1.5), f32(-1.0), f32(0.25), $&dpo_g1)
+    println("DPO_L1:" + str(math.float32_bits(f64(dpo_l1))))
+    println("DPO_G1_0:" + str(math.float32_bits(f64(dpo_g1[0]))))
+    println("DPO_G1_1:" + str(math.float32_bits(f64(dpo_g1[1]))))
+
+    $dpo_g2 := [f32(0), f32(0)]
+    dpo_l2 := tensor.dpo_loss_grad_f32(f32(-3.0), f32(-1.0), f32(-1.2), f32(-2.0), f32(0.5), $&dpo_g2)
+    println("DPO_L2:" + str(math.float32_bits(f64(dpo_l2))))
+    println("DPO_G2_0:" + str(math.float32_bits(f64(dpo_g2[0]))))
+    println("DPO_G2_1:" + str(math.float32_bits(f64(dpo_g2[1]))))
+
+    grpo_r := [f32(1.0), f32(2.0), f32(4.0), f32(5.0)]
+    $grpo_a := [f32(0), f32(0), f32(0), f32(0)]
+    tensor.grpo_advantages_f32($&grpo_a, &grpo_r, 4, f32(1e-6))
+    for i in 0:4 { println("GRPO_A" + str(i) + ":" + str(math.float32_bits(f64(grpo_a[i])))) }
+
+    // 1) Causal Conv1D 2-step state shift check (d_inner=2, k_size=3)
+    $c_st := [f32(0.5), f32(-1.0), f32(1.5), f32(0.25)]
+    c_w := [f32(0.2), f32(0.3), f32(0.5), f32(-0.4), f32(0.1), f32(0.8)]
+    c_b := [f32(0.1), f32(-0.2)]
+    $c_out := [f32(0), f32(0)]
+    tensor.conv1d_causal_step_f32($&c_out, $&c_st, &[f32(2.0), f32(-0.5)], &c_w, &c_b, 2, 3)
+    tensor.conv1d_causal_step_f32($&c_out, $&c_st, &[f32(-1.0), f32(1.5)], &c_w, &c_b, 2, 3)
+    println("C1D_0:" + str(math.float32_bits(f64(c_out[0]))))
+    println("C1D_1:" + str(math.float32_bits(f64(c_out[1]))))
+    println("C1D_S0:" + str(math.float32_bits(f64(c_st[0]))))
+    println("C1D_S3:" + str(math.float32_bits(f64(c_st[3]))))
+
+    // 2) SSM Mamba scan 2-step check (d_inner=2, d_state=2)
+    $ssm_st := [f32(0), f32(0), f32(0), f32(0)]
+    $ssm_out := [f32(0), f32(0)]
+    ssm_dt := [f32(0.2), f32(0.5)]
+    ssm_a := [f32(-1.0), f32(-2.0), f32(-0.5), f32(-1.5)]
+    ssm_d := [f32(0.25), f32(-0.5)]
+    tensor.ssm_scan_step_f32($&ssm_out, $&ssm_st, &[f32(1.5), f32(-0.5)], &ssm_dt, &ssm_a, &[f32(0.4), f32(-0.2)], &[f32(0.8), f32(0.5)], &ssm_d, 2, 2)
+    tensor.ssm_scan_step_f32($&ssm_out, $&ssm_st, &[f32(-0.8), f32(1.2)], &ssm_dt, &ssm_a, &[f32(-0.3), f32(0.6)], &[f32(0.2), f32(-0.7)], &ssm_d, 2, 2)
+    println("SSM_0:" + str(math.float32_bits(f64(ssm_out[0]))))
+    println("SSM_1:" + str(math.float32_bits(f64(ssm_out[1]))))
+
+    // 3) Linear Attention 2-step check (n_heads=2, head_dim=2)
+    $la_st := [f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0)]
+    $la_z := [f32(0), f32(0), f32(0), f32(0)]
+    $la_out := [f32(0), f32(0), f32(0), f32(0)]
+    tensor.linear_attn_step_f32($&la_out, $&la_st, $&la_z, &[f32(1.0), f32(0.5), f32(-0.5), f32(1.0)], &[f32(0.6), f32(0.8), f32(0.4), f32(-0.4)], &[f32(1.5), f32(-0.5), f32(2.0), f32(1.0)], f32(0.9), 2, 2, f32(1e-5))
+    tensor.linear_attn_step_f32($&la_out, $&la_st, $&la_z, &[f32(0.4), f32(1.2), f32(1.0), f32(0.2)], &[f32(0.3), f32(-0.5), f32(0.9), f32(0.1)], &[f32(-1.0), f32(2.0), f32(0.5), f32(-1.5)], f32(0.9), 2, 2, f32(1e-5))
+    for i in 0:4 { println("LA_" + str(i) + ":" + str(math.float32_bits(f64(la_out[i])))) }
+
+    // 4) PPO/GRPO clip + Schulman KL grad check (unclipped + clipped branches)
+    $ppo_g1 := [f32(0)]
+    ppo_l1 := tensor.ppo_clip_grad_f32(f32(-1.1), f32(-1.2), f32(-1.3), f32(1.5), f32(0.2), f32(0.05), $&ppo_g1)
+    println("PPO_L1:" + str(math.float32_bits(f64(ppo_l1))))
+    println("PPO_G1:" + str(math.float32_bits(f64(ppo_g1[0]))))
+    $ppo_g2 := [f32(0)]
+    ppo_l2 := tensor.ppo_clip_grad_f32(f32(-0.5), f32(-1.5), f32(-1.4), f32(1.5), f32(0.2), f32(0.05), $&ppo_g2)
+    println("PPO_L2:" + str(math.float32_bits(f64(ppo_l2))))
+    println("PPO_G2:" + str(math.float32_bits(f64(ppo_g2[0]))))
+
+    // 5) conv2d_patch_embed_f32 (in_c=2, img=4x4, out_c=2, patch=2 -> 4 tokens x 2)
+    $cv_img := []f32{}
+    for i in 0:32 { cv_img.push(f32(i + 1) * f32(0.1)) }
+    $cv_w := []f32{}
+    for i in 0:16 { cv_w.push(f32((i % 5) - 2) * f32(0.25)) }
+    cv_b := [f32(0.5), f32(-0.25)]
+    $cv_out := []f32{}
+    for _ in 0:8 { cv_out.push(f32(0)) }
+    tensor.conv2d_patch_embed_f32($&cv_out, &cv_img, &cv_w, &cv_b, 2, 4, 4, 2, 2)
+    for i in 0:8 { println("CV_" + str(i) + ":" + str(math.float32_bits(f64(cv_out[i])))) }
+
+    // 6) mha_sdpa_f32 (seq=2, n_heads=2, head_dim=2, bidir & causal)
+    mq := [f32(1.0), f32(0.5), f32(-0.5), f32(1.0), f32(0.2), f32(0.8), f32(1.0), f32(-0.2)]
+    mk := [f32(0.5), f32(-0.5), f32(1.0), f32(0.0), f32(-0.3), f32(0.7), f32(0.4), f32(0.9)]
+    mv := [f32(1.0), f32(2.0), f32(-1.0), f32(0.5), f32(0.25), f32(-0.75), f32(1.5), f32(2.5)]
+    $mha_bi := [f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0)]
+    $mha_ca := [f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0)]
+    tensor.mha_sdpa_f32($&mha_bi, &mq, &mk, &mv, 2, 2, 2, 2, false)
+    tensor.mha_sdpa_f32($&mha_ca, &mq, &mk, &mv, 2, 2, 2, 2, true)
+    for i in 0:8 { println("MHAB_" + str(i) + ":" + str(math.float32_bits(f64(mha_bi[i])))) }
+    for i in 0:8 { println("MHAC_" + str(i) + ":" + str(math.float32_bits(f64(mha_ca[i])))) }
+
+    // 7) avg_pool2d_f32 (channels=2, h=4, w=4, k=2, s=2 -> 2x2x2=8)
+    $ap_out := []f32{}
+    for _ in 0:8 { ap_out.push(f32(0)) }
+    tensor.avg_pool2d_f32($&ap_out, &cv_img, 2, 4, 4, 2, 2)
+    for i in 0:8 { println("AP_" + str(i) + ":" + str(math.float32_bits(f64(ap_out[i])))) }
+
     println("ROUND3:OK")
     _ := bias4
     << 0
@@ -1051,6 +1145,158 @@ def check_ops(compiler, env, work):
     assert abs(bits_to_f32(int(kv["GC_G0"])) - 1.5) < 1e-5
     assert abs(bits_to_f32(int(kv["GC_G1"])) - 2.0) < 1e-5
     assert abs(bits_to_f32(int(kv["GC_G2"])) - 0.0) < 1e-5
+
+    # Verify kl_div_grad_f32 (scalar KL and T^2*KL gradient via central finite differences)
+    kl_s, kl_t, temp = [1.2, -0.4, 0.8], [0.5, 1.5, -0.5], 2.0
+    def kl_fn(zs, zt, T):
+        mxs = max(v / T for v in zs)
+        mxt = max(v / T for v in zt)
+        ls = [v / T - mxs for v in zs]
+        lt = [v / T - mxt for v in zt]
+        lse_s = math.log(sum(math.exp(x) for x in ls))
+        lse_t = math.log(sum(math.exp(x) for x in lt))
+        return sum(math.exp(lt[j] - lse_t) * ((lt[j] - lse_t) - (ls[j] - lse_s)) for j in range(len(zs)))
+    assert abs(bits_to_f32(int(kv["KL_VAL"])) - kl_fn(kl_s, kl_t, temp)) < 1e-5
+    for i in range(3):
+        zp, zm = list(kl_s), list(kl_s)
+        zp[i] += h_fd
+        zm[i] -= h_fd
+        fd_kl = (temp * temp) * (kl_fn(zp, kl_t, temp) - kl_fn(zm, kl_t, temp)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"KL_G{i}"])) - fd_kl) < 1e-4
+
+    # Verify dpo_loss_grad_f32 for both h > 0 and h < 0
+    for tag, pc, pr, rc, rr, beta in [
+        ("1", -1.2, -2.4, -1.5, -1.0, 0.25),
+        ("2", -3.0, -1.0, -1.2, -2.0, 0.5),
+    ]:
+        def dpo_fn(wc, wr):
+            h = beta * ((wc - rc) - (wr - rr))
+            return math.log(1.0 + math.exp(-h)) if h >= 0 else -h + math.log(1.0 + math.exp(h))
+        assert abs(bits_to_f32(int(kv[f"DPO_L{tag}"])) - dpo_fn(pc, pr)) < 1e-5
+        fd_wc = (dpo_fn(pc + h_fd, pr) - dpo_fn(pc - h_fd, pr)) / (2.0 * h_fd)
+        fd_wr = (dpo_fn(pc, pr + h_fd) - dpo_fn(pc, pr - h_fd)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"DPO_G{tag}_0"])) - fd_wc) < 1e-4
+        assert abs(bits_to_f32(int(kv[f"DPO_G{tag}_1"])) - fd_wr) < 1e-4
+
+    # Verify grpo_advantages_f32
+    grpo_r = [1.0, 2.0, 4.0, 5.0]
+    g_mean = sum(grpo_r) / 4.0
+    g_std = math.sqrt(sum((x - g_mean) ** 2 for x in grpo_r) / 4.0 + 1e-6)
+    for i in range(4):
+        assert abs(bits_to_f32(int(kv[f"GRPO_A{i}"])) - (grpo_r[i] - g_mean) / g_std) < 1e-5
+
+    # Verify conv1d_causal_step_f32
+    py_cst = [0.5, -1.0, 1.5, 0.25]
+    py_cw = [0.2, 0.3, 0.5, -0.4, 0.1, 0.8]
+    py_cb = [0.1, -0.2]
+    for xv in ([2.0, -0.5], [-1.0, 1.5]):
+        cout = []
+        for d in range(2):
+            acc = py_cb[d] + py_cst[d * 2] * py_cw[d * 3] + py_cst[d * 2 + 1] * py_cw[d * 3 + 1] + xv[d] * py_cw[d * 3 + 2]
+            cout.append(acc)
+            py_cst[d * 2] = py_cst[d * 2 + 1]
+            py_cst[d * 2 + 1] = xv[d]
+    assert abs(bits_to_f32(int(kv["C1D_0"])) - cout[0]) < 1e-5
+    assert abs(bits_to_f32(int(kv["C1D_1"])) - cout[1]) < 1e-5
+    assert abs(bits_to_f32(int(kv["C1D_S0"])) - py_cst[0]) < 1e-5
+    assert abs(bits_to_f32(int(kv["C1D_S3"])) - py_cst[3]) < 1e-5
+
+    # Verify ssm_scan_step_f32
+    py_sst = [0.0] * 4
+    py_sa = [-1.0, -2.0, -0.5, -1.5]
+    py_sdt = [0.2, 0.5]
+    py_sd = [0.25, -0.5]
+    for xv, bv, cv in (([1.5, -0.5], [0.4, -0.2], [0.8, 0.5]), ([-0.8, 1.2], [-0.3, 0.6], [0.2, -0.7])):
+        sout = []
+        for d in range(2):
+            y = py_sd[d] * xv[d]
+            for s in range(2):
+                da = math.exp(py_sdt[d] * py_sa[d * 2 + s])
+                hnew = da * py_sst[d * 2 + s] + py_sdt[d] * bv[s] * xv[d]
+                py_sst[d * 2 + s] = hnew
+                y += hnew * cv[s]
+            sout.append(y)
+    assert abs(bits_to_f32(int(kv["SSM_0"])) - sout[0]) < 1e-5
+    assert abs(bits_to_f32(int(kv["SSM_1"])) - sout[1]) < 1e-5
+
+    # Verify linear_attn_step_f32
+    py_ls = [0.0] * 8
+    py_lz = [0.0] * 4
+    for qv, kv_v, vv in (
+        ([1.0, 0.5, -0.5, 1.0], [0.6, 0.8, 0.4, -0.4], [1.5, -0.5, 2.0, 1.0]),
+        ([0.4, 1.2, 1.0, 0.2], [0.3, -0.5, 0.9, 0.1], [-1.0, 2.0, 0.5, -1.5]),
+    ):
+        lout = [0.0] * 4
+        for h in range(2):
+            vb, sb = h * 2, h * 4
+            for i in range(2):
+                py_lz[vb + i] = 0.9 * py_lz[vb + i] + kv_v[vb + i]
+                for j in range(2):
+                    py_ls[sb + i * 2 + j] = 0.9 * py_ls[sb + i * 2 + j] + kv_v[vb + i] * vv[vb + j]
+            den = sum(qv[vb + i] * py_lz[vb + i] for i in range(2))
+            for j in range(2):
+                num = sum(qv[vb + i] * py_ls[sb + i * 2 + j] for i in range(2))
+                lout[vb + j] = num / den
+    for i in range(4):
+        assert abs(bits_to_f32(int(kv[f"LA_{i}"])) - lout[i]) < 1e-5
+
+    # Verify ppo_clip_grad_f32 (unclipped branch + upper-clipped branch)
+    def ppo_fn(new_lp, old_lp, ref_lp, adv, eps, beta):
+        r = math.exp(new_lp - old_lp)
+        rc = min(max(r, 1.0 - eps), 1.0 + eps)
+        surr = min(r * adv, rc * adv)
+        er = math.exp(ref_lp - new_lp)
+        kl = er - (ref_lp - new_lp) - 1.0
+        return -surr + beta * kl
+    for tag, nlp, olp, rlp, adv, eps, beta in (
+        ("1", -1.1, -1.2, -1.3, 1.5, 0.2, 0.05),
+        ("2", -0.5, -1.5, -1.4, 1.5, 0.2, 0.05),
+    ):
+        assert abs(bits_to_f32(int(kv[f"PPO_L{tag}"])) - ppo_fn(nlp, olp, rlp, adv, eps, beta)) < 1e-5
+        fd_p = (ppo_fn(nlp + h_fd, olp, rlp, adv, eps, beta) - ppo_fn(nlp - h_fd, olp, rlp, adv, eps, beta)) / (2.0 * h_fd)
+        assert abs(bits_to_f32(int(kv[f"PPO_G{tag}"])) - fd_p) < 1e-4
+
+    # Verify conv2d_patch_embed_f32
+    cv_img = [(i + 1) * 0.1 for i in range(32)]
+    cv_w = [((i % 5) - 2) * 0.25 for i in range(16)]
+    cv_b = [0.5, -0.25]
+    for py in range(2):
+        for px in range(2):
+            tok = py * 2 + px
+            for oc in range(2):
+                acc = cv_b[oc]
+                for ic in range(2):
+                    for dy in range(2):
+                        for dx in range(2):
+                            iy, ix = py * 2 + dy, px * 2 + dx
+                            acc += cv_img[ic * 16 + iy * 4 + ix] * cv_w[((oc * 2 + ic) * 2 + dy) * 2 + dx]
+                assert abs(bits_to_f32(int(kv[f"CV_{tok * 2 + oc}"])) - acc) < 1e-5
+
+    # Verify mha_sdpa_f32 (bidirectional & causal)
+    mq = [1.0, 0.5, -0.5, 1.0, 0.2, 0.8, 1.0, -0.2]
+    mk = [0.5, -0.5, 1.0, 0.0, -0.3, 0.7, 0.4, 0.9]
+    mv = [1.0, 2.0, -1.0, 0.5, 0.25, -0.75, 1.5, 2.5]
+    for tag, causal in (("MHAB", False), ("MHAC", True)):
+        sc_f = 1.0 / math.sqrt(2.0)
+        for qi in range(2):
+            eff_k = min(2, qi + 1) if causal else 2
+            for h in range(2):
+                qb = qi * 4 + h * 2
+                scs = [sum(mq[qb + d] * mk[ki * 4 + h * 2 + d] for d in range(2)) * sc_f for ki in range(eff_k)]
+                mx = max(scs)
+                ws = [math.exp(s - mx) for s in scs]
+                den = sum(ws)
+                for d in range(2):
+                    want = sum((ws[ki] / den) * mv[ki * 4 + h * 2 + d] for ki in range(eff_k))
+                    assert abs(bits_to_f32(int(kv[f"{tag}_{qb + d}"])) - want) < 1e-5, (tag, qi, h, d, bits_to_f32(int(kv[f"{tag}_{qb + d}"])), want)
+
+    # Verify avg_pool2d_f32
+    for c in range(2):
+        for oy in range(2):
+            for ox in range(2):
+                s = sum(cv_img[c * 16 + (oy * 2 + ky) * 4 + (ox * 2 + kx)] for ky in range(2) for kx in range(2))
+                assert abs(bits_to_f32(int(kv[f"AP_{(c * 4) + oy * 2 + ox}"])) - (s / 4.0)) < 1e-5
+
     parts = re.split(r"(?m)^fn _xu_tensor_(\w+) ", mir)
     funcs = {name: body.split("\nBuild complete:", 1)[0] for name, body in zip(parts[1::2], parts[2::2])}
     expected_calls = {
