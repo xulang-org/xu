@@ -37,7 +37,7 @@ help:
 	@echo "  product compiler consumers use scripts/run_product_compiler.sh (XUPATH/cache isolated)"
 	@echo "  make xu-desktop      desktop pack → $(BIN)/xu-desktop"
 	@echo "  make xu-phone        iOS / Android project generator → $(BIN)/xu-phone"
-	@echo "  make xu-doctor       desktop toolchain check → $(BIN)/xu-doctor"
+	@echo "  make xu-doctor       SDK, desktop & phone toolchain check → $(BIN)/xu-doctor"
 	@echo "  make xu-fmt          formatter → $(BIN)/xu-fmt"
 	@echo "  make xu-map          source path map → $(BIN)/xu-map"
 	@echo "  make xu-doc          declaration docs → $(BIN)/xu-doc"
