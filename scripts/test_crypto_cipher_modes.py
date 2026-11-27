@@ -132,7 +132,7 @@ def main() -> int:
     env["XU_STDLIB_ROOT"] = str(ROOT / "src")
     env["XU_ROOT"] = str(ROOT)
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         src = Path(td) / "test_cipher.xu"
         exe = Path(td) / "test_cipher.exe"
         src.write_text(TEST_CODE, encoding="utf-8")

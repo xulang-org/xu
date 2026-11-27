@@ -10,7 +10,7 @@ Exit 0 only when every instance matches its contract:
   reject  — must fail compile
 """
 from __future__ import annotations
-import argparse, os, subprocess, tempfile, textwrap
+import argparse, os, shutil, subprocess, sys, tempfile, textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -605,56 +605,60 @@ fn main() int {
 
 def run_one(xu: str, env: dict, name: str, src: str, kind: str, expect: str | None):
     td = Path(tempfile.mkdtemp(prefix=f"xuMS_{name}_"))
-    srcp = td / "main.xu"
-    srcp.write_text(src)
-    out = td / "a.out"
     try:
-        p = subprocess.run(
-            [xu, "build", str(srcp), "-o", str(out)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=25,
-        )
-    except subprocess.TimeoutExpired:
-        return name, kind, False, "compile-timeout"
-    if kind == "reject" or kind == "loud":
-        if kind == "reject":
-            if p.returncode == 0:
-                return name, kind, False, "ACCEPTED"
-            return name, kind, True, (p.stderr.decode().splitlines() or ["err"])[0][:70]
-        # loud: compile reject is acceptable fail-closed; else runtime non-zero
+        srcp = td / "main.xu"
+        srcp.write_text(src)
+        out = td / "a.out"
+        try:
+            p = subprocess.run(
+                [xu, "build", str(srcp), "-o", str(out)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=25,
+            )
+        except subprocess.TimeoutExpired:
+            return name, kind, False, "compile-timeout"
+        if kind == "reject" or kind == "loud":
+            if kind == "reject":
+                if p.returncode == 0:
+                    return name, kind, False, "ACCEPTED"
+                return name, kind, True, (p.stderr.decode(errors="replace").splitlines() or ["err"])[0][:70]
+            # loud: compile reject is acceptable fail-closed; else runtime non-zero
+            if p.returncode != 0:
+                return name, kind, True, "compile-reject"
+            binp = out if out.is_file() else Path(str(out) + ".exe")
+            if not binp.is_file():
+                return name, kind, False, "no-bin"
+            try:
+                r = subprocess.run([str(binp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            except subprocess.TimeoutExpired:
+                return name, kind, False, "run-timeout"
+            if r.returncode == 0:
+                return name, kind, False, f"not-loud out={r.stdout[:40]!r}"
+            return name, kind, True, f"exit={r.returncode}"
+        # stdout
         if p.returncode != 0:
-            return name, kind, True, "compile-reject"
+            return name, kind, False, f"compile: {(p.stderr.decode(errors='replace').splitlines() or [''])[0][:100]}"
         binp = out if out.is_file() else Path(str(out) + ".exe")
         if not binp.is_file():
             return name, kind, False, "no-bin"
         try:
-            r = subprocess.run([str(binp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            r = subprocess.run([str(binp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
         except subprocess.TimeoutExpired:
             return name, kind, False, "run-timeout"
-        if r.returncode == 0:
-            return name, kind, False, f"not-loud out={r.stdout[:40]!r}"
-        return name, kind, True, f"exit={r.returncode}"
-    # stdout
-    if p.returncode != 0:
-        return name, kind, False, f"compile: {(p.stderr.decode().splitlines() or [''])[0][:100]}"
-    binp = out if out.is_file() else Path(str(out) + ".exe")
-    if not binp.is_file():
-        return name, kind, False, "no-bin"
-    try:
-        r = subprocess.run([str(binp)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-    except subprocess.TimeoutExpired:
-        return name, kind, False, "run-timeout"
-    if r.returncode != 0:
-        return name, kind, False, f"run-rc={r.returncode} {r.stderr.decode()[:80]!r}"
-    got = r.stdout.decode()
-    if expect is not None and expect != "":
-        if got != expect:
-            return name, kind, False, f"stdout {got!r} want {expect!r}"
-    return name, kind, True, "ok"
+        if r.returncode != 0:
+            return name, kind, False, f"run-rc={r.returncode} {r.stderr.decode(errors='replace')[:80]!r}"
+        got = r.stdout.decode(errors="replace").replace("\r\n", "\n")
+        if expect is not None and expect != "":
+            if got != expect:
+                return name, kind, False, f"stdout {got!r} want {expect!r}"
+        return name, kind, True, "ok"
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--xu", default="/tmp/xu_prod")
+    default_xu = os.environ.get("XU") or str(ROOT / "bin" / ("xu.exe" if sys.platform == "win32" else "xu"))
+    ap.add_argument("--xu", default=default_xu)
     ap.add_argument("--jobs", type=int, default=6)
     args = ap.parse_args()
     os.chdir(ROOT)
