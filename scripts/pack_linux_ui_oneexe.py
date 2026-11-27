@@ -113,7 +113,7 @@ def gtk_flags() -> list[str]:
 
 
 def build_host_a(*, with_webview: bool, td: pathlib.Path, cxx: str) -> pathlib.Path:
-    common = [cxx, "-O2", "-std=c++17", "-c", "-DXU_UI_STATIC", "-Isrc/ui/host"]
+    common = [cxx, "-O2", "-fPIE", "-std=c++17", "-c", "-DXU_UI_STATIC", "-Isrc/ui/host"]
     gtk = gtk_flags()
     host_o = td / "linux_host.o"
     subprocess.check_call(
@@ -123,7 +123,7 @@ def build_host_a(*, with_webview: bool, td: pathlib.Path, cxx: str) -> pathlib.P
     objs = [host_o]
     mem_o = td / "xu_ui_mem.o"
     subprocess.check_call(
-        [cxx, "-O2", "-std=c++17", "-c", "-Isrc/ui/host", "src/ui/host/xu_ui_mem.cc", "-o", str(mem_o)],
+        [cxx, "-O2", "-fPIE", "-std=c++17", "-c", "-Isrc/ui/host", "src/ui/host/xu_ui_mem.cc", "-o", str(mem_o)],
         cwd=str(ROOT),
     )
     objs.append(mem_o)
@@ -134,7 +134,7 @@ def build_host_a(*, with_webview: bool, td: pathlib.Path, cxx: str) -> pathlib.P
         ("src/ui/host/xu_pack_assets_weak.c", assets_weak_o),
     ):
         subprocess.check_call(
-            [cxx, "-O2", "-x", "c", "-c", "-Isrc/ui/host", src, "-o", str(dst)],
+            [cxx, "-O2", "-fPIE", "-x", "c", "-c", "-Isrc/ui/host", src, "-o", str(dst)],
             cwd=str(ROOT),
         )
     objs.append(assets_o)
@@ -332,7 +332,7 @@ def main() -> None:
             comment="Embedded brand/xu_app_logo.png — in-memory",
         )
         icon_o = td / "icon_blob.o"
-        subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", str(icon_c), "-o", str(icon_o)])
+        subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", "-fPIE", str(icon_c), "-o", str(icon_o)])
 
         extra_o: list[str] = [str(icon_o)]
         if www is not None:
@@ -340,7 +340,7 @@ def main() -> None:
             extra = brand_www_extras(xu_src, icon_png) if cfg["need_webview"] else None
             n = write_www_blob_c(www, www_c, extra=extra)
             www_o = td / "www_blob.o"
-            subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", str(www_c), "-o", str(www_o)])
+            subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", "-fPIE", str(www_c), "-o", str(www_o)])
             extra_o.append(str(www_o))
             print(f"www: embed {n} files from {www} (in-memory xu://)")
 
@@ -370,11 +370,12 @@ def main() -> None:
             encoding="utf-8",
         )
         shim_o = td / "shim.o"
-        subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", "-Isrc/ui/host", str(shim), "-o", str(shim_o)])
+        subprocess.check_call([args.cxx, "-x", "c", "-c", "-O2", "-fPIE", "-Isrc/ui/host", str(shim), "-o", str(shim_o)])
 
         link = [
             args.cxx,
             "-O2",
+            "-pie",
             str(shim_o),
             str(xu_o),
             *extra_o,

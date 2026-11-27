@@ -57,8 +57,9 @@ fn main() int {
 
 def check_macho(binary, page, keep_symbols, dwarf=False):
     image = binary.read_bytes()
-    magic, _, _, _, ncmds = struct.unpack_from("<IIIII", image)
+    magic, _, _, _, ncmds, _, hdr_flags = struct.unpack_from("<IIIIIII", image)
     assert magic == 0xFEEDFACF
+    assert hdr_flags == 0x01200084, hex(hdr_flags)  # MH_DYLDLINK | MH_TWOLEVEL | MH_PIE | MH_NO_HEAP_EXECUTION
     segments = {}
     uuid_bytes = None
     build_ver = None
