@@ -58,13 +58,14 @@ fn query_prot(base int, rva int) int {
 
 fn main() int {
     av := os.argv()
-    if av.len != 4 {
-        eprintln("usage: probe text_rva rdata_rva data_rva")
+    if av.len != 5 {
+        eprintln("usage: probe text_rva rdata_rva data_rva pdata_rva")
         << 2
     }
     text_rva := parse_dec(&av[1])
     rdata_rva := parse_dec(&av[2])
     data_rva := parse_dec(&av[3])
+    pdata_rva := parse_dec(&av[4])
 
     $pid := 0
     $abs_val := 0
@@ -82,12 +83,13 @@ fn main() int {
     p_text := query_prot(base, text_rva)
     p_rdata := query_prot(base, rdata_rva)
     p_data := query_prot(base, data_rva)
+    p_pdata := query_prot(base, pdata_rva)
     // PAGE_EXECUTE_READ=0x20, PAGE_READONLY=0x02, PAGE_READWRITE=0x04
-    if p_text != 0x20 || p_rdata != 0x02 || p_data != 0x04 {
-        eprintln("unexpected protections: text=" + str(p_text) + " rdata=" + str(p_rdata) + " data=" + str(p_data))
+    if p_text != 0x20 || p_rdata != 0x02 || p_data != 0x04 || p_pdata != 0x02 {
+        eprintln("unexpected protections: text=" + str(p_text) + " rdata=" + str(p_rdata) + " data=" + str(p_data) + " pdata=" + str(p_pdata))
         << 4
     }
-    println("WX_OK:" + str(p_text) + ":" + str(p_rdata) + ":" + str(p_data) + ":" + str(abs_val))
+    println("WX_OK:" + str(p_text) + ":" + str(p_rdata) + ":" + str(p_data) + ":" + str(p_pdata) + ":" + str(abs_val))
     << 0
 }
 '''
@@ -103,10 +105,12 @@ def parse_pe(path: Path) -> dict:
     magic = struct.unpack_from("<H", raw, opt)[0]
     assert magic == 0x20B, f"not PE32+: {hex(magic)}"
     entry_rva = struct.unpack_from("<I", raw, opt + 16)[0]
+    hdr_size = struct.unpack_from("<I", raw, opt + 60)[0]
     dll_chars = struct.unpack_from("<H", raw, opt + 70)[0]
     ndirs = struct.unpack_from("<I", raw, opt + 108)[0]
     assert ndirs >= 13
     imp_rva, imp_sz = struct.unpack_from("<II", raw, opt + 112 + 1 * 8)
+    exc_rva, exc_sz = struct.unpack_from("<II", raw, opt + 112 + 3 * 8)
     iat_rva, iat_sz = struct.unpack_from("<II", raw, opt + 112 + 12 * 8)
     tbl = opt + opt_size
     sections = []
@@ -125,29 +129,33 @@ def parse_pe(path: Path) -> dict:
     return {
         "machine": machine,
         "entry_rva": entry_rva,
+        "hdr_size": hdr_size,
         "dll_chars": dll_chars,
         "imp": (imp_rva, imp_sz),
+        "exc": (exc_rva, exc_sz),
         "iat": (iat_rva, iat_sz),
         "sections": sections,
     }
 
 
-def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int]:
+def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int, int]:
     secs = pe["sections"]
-    expected_names = [".text", ".rdata", ".data"] + ([".rsrc"] if expect_rsrc else [])
+    expected_names = [".text", ".rdata", ".data", ".pdata"] + ([".rsrc"] if expect_rsrc else [])
     assert [s["name"] for s in secs] == expected_names, (expected_names, [s["name"] for s in secs])
+    assert pe["hdr_size"] == 1024, pe["hdr_size"]
 
     for s in secs:
         chars = s["chars"]
         # IMAGE_SCN_MEM_EXECUTE (0x20000000) and IMAGE_SCN_MEM_WRITE (0x80000000) must never both be set.
         assert (chars & 0xA0000000) != 0xA0000000, f"W^X violation in {s['name']}: {hex(chars)}"
 
-    text, rdata, data = secs[0], secs[1], secs[2]
+    text, rdata, data, pdata = secs[0], secs[1], secs[2], secs[3]
     assert text["chars"] == 0x60000020, hex(text["chars"])
     assert rdata["chars"] == 0x40000040, hex(rdata["chars"])
     assert data["chars"] == 0xC0000040, hex(data["chars"])
+    assert pdata["chars"] == 0x40000040, hex(pdata["chars"])
     if expect_rsrc:
-        assert secs[3]["chars"] == 0x40000040, hex(secs[3]["chars"])
+        assert secs[4]["chars"] == 0x40000040, hex(secs[4]["chars"])
 
     # NX_COMPAT (0x100) | DYNAMIC_BASE (0x40) | HIGH_ENTROPY_VA (0x20)
     assert (pe["dll_chars"] & 0x0160) == 0x0160, hex(pe["dll_chars"])
@@ -156,11 +164,13 @@ def check_wx_headers(pe: dict, expect_rsrc: bool = False) -> tuple[int, int, int
     assert text["vaddr"] <= entry < text["vaddr"] + text["vsize"], (hex(entry), text)
 
     imp_rva, imp_sz = pe["imp"]
+    exc_rva, exc_sz = pe["exc"]
     iat_rva, iat_sz = pe["iat"]
     assert imp_sz > 0 and iat_sz > 0, (pe["imp"], pe["iat"])
     assert rdata["vaddr"] <= imp_rva and imp_rva + imp_sz <= rdata["vaddr"] + rdata["vsize"], (pe["imp"], rdata)
     assert rdata["vaddr"] <= iat_rva and iat_rva + iat_sz <= rdata["vaddr"] + rdata["vsize"], (pe["iat"], rdata)
-    return text["vaddr"], rdata["vaddr"], data["vaddr"]
+    assert exc_rva == pdata["vaddr"] and exc_sz == pdata["vsize"] and exc_sz > 0, (pe["exc"], pdata)
+    return text["vaddr"], rdata["vaddr"], data["vaddr"], pdata["vaddr"]
 
 
 def main() -> int:
@@ -174,7 +184,7 @@ def main() -> int:
     root = Path(__file__).resolve().parents[1]
     env = dict(os.environ, XU_ROOT=str(root), XU_STDLIB_ROOT=str(root / "src"), XUPATH="")
 
-    with WindowsTemporaryDirectory(prefix="xu-pe-wx-") as td:
+    with WindowsTemporaryDirectory(prefix="xu-pe-wx-", ignore_cleanup_errors=True) as td:
         work = Path(td)
         src = work / "wx_probe.xu"
         src.write_text(SOURCE, encoding="utf-8", newline="\n")
@@ -191,34 +201,34 @@ def main() -> int:
                 )
                 validate_binary(exe, target)
                 pe = parse_pe(exe)
-                t_rva, r_rva, d_rva = check_wx_headers(pe, expect_rsrc=False)
+                t_rva, r_rva, d_rva, p_rva = check_wx_headers(pe, expect_rsrc=False)
 
                 run_env = dict(env, XU_DEBUG_FREE="1")
                 res = subprocess.run(
-                    [str(exe), str(t_rva), str(r_rva), str(d_rva)],
+                    [str(exe), str(t_rva), str(r_rva), str(d_rva), str(p_rva)],
                     env=run_env,
                     capture_output=True,
                     text=True,
                     timeout=30,
                 )
                 assert res.returncode == 0, (target, mode, res.returncode, res.stdout, res.stderr)
-                assert res.stdout.strip() == "WX_OK:32:2:4:42", (target, mode, res.stdout, res.stderr)
+                assert res.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res.stdout, res.stderr)
 
                 # Verify manifest embedding preserves W^X and adds .rsrc cleanly.
                 mexe = work / f"probe-{target}-{mode}-rsrc.exe"
                 shutil.copy2(exe, mexe)
                 embed_invoker_manifest(mexe)
                 pe_m = parse_pe(mexe)
-                mt_rva, mr_rva, md_rva = check_wx_headers(pe_m, expect_rsrc=True)
+                mt_rva, mr_rva, md_rva, mp_rva = check_wx_headers(pe_m, expect_rsrc=True)
                 res_m = subprocess.run(
-                    [str(mexe), str(mt_rva), str(mr_rva), str(md_rva)],
+                    [str(mexe), str(mt_rva), str(mr_rva), str(md_rva), str(mp_rva)],
                     env=run_env,
                     capture_output=True,
                     text=True,
                     timeout=30,
                 )
-                assert res_m.returncode == 0 and res_m.stdout.strip() == "WX_OK:32:2:4:42", (target, mode, res_m)
-                print(f"  [PASS] {target} {mode}: W^X static + live VirtualQuery + FFI + manifest")
+                assert res_m.returncode == 0 and res_m.stdout.strip() == "WX_OK:32:2:4:2:42", (target, mode, res_m)
+                print(f"  [PASS] {target} {mode}: W^X + .pdata static + live VirtualQuery + FFI + manifest")
 
     print("Windows PE W^X verification passed")
     return 0
