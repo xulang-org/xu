@@ -56,6 +56,10 @@ const G_SIGNAL_PENDING = 101
 const G_SIGNAL_EVENT = 102
 const G_SIGNAL_LOCK = 103
 const G_SIGNAL_INTEREST = 104
+const G_HEAP_LOCK = 105
+const G_MT_ACTIVE = 106
+const G_FFI_LOCK = 107
+const G_SCHED_LOCK = 108
 
 const OS_MACOS = 0
 const OS_LINUX = 1
@@ -114,6 +118,24 @@ fn gword(i int) int {
 
 fn set_gword(i int, v int) {
     rt_store(rt_globals() + i * 8, 8, v)
+}
+
+pub fn rt_mt_enable() {
+    _ := debug_free()
+    atomic_store(c_ptr(rt_globals() + G_MT_ACTIVE * 8), 1)
+}
+
+fn rt_mt_active() bool {
+    << rt_load(rt_globals() + G_MT_ACTIVE * 8, 8) != 0
+}
+
+fn spin_lock(slot int) {
+    lk := c_ptr(rt_globals() + slot * 8)
+    while !atomic_cas(lk, 0, 1) {}
+}
+
+fn spin_unlock(slot int) {
+    atomic_store(c_ptr(rt_globals() + slot * 8), 0)
 }
 
 pub fn exit_process(code int) {
@@ -209,10 +231,13 @@ pub fn alloc(size int) int {
     }
     g := rt_globals()
     slot := g + (G_FREE + c) * 8
+    mt := rt_mt_active()
+    if mt { spin_lock(G_HEAP_LOCK) }
     head := rt_load(slot, 8)
     if head != 0 {
         rt_store(slot, 8, rt_load(head, 8))
         rt_store(head - 8, 8, TAG_LIVE)
+        if mt { spin_unlock(G_HEAP_LOCK) }
         if c <= 2 {
             // These stores stay within the recycled size class.
             rt_store(head, 8, 0)
@@ -232,7 +257,26 @@ pub fn alloc(size int) int {
         }
         << head
     }
-    << alloc_fresh_small(g, c)
+    fresh := alloc_fresh_small(g, c)
+    if mt { spin_unlock(G_HEAP_LOCK) }
+    << fresh
+}
+
+fn alloc_small_raw(c int) int {
+    g := rt_globals()
+    slot := g + (G_FREE + c) * 8
+    mt := rt_mt_active()
+    if mt { spin_lock(G_HEAP_LOCK) }
+    $p := rt_load(slot, 8)
+    if p != 0 {
+        rt_store(slot, 8, rt_load(p, 8))
+        rt_store(p - 8, 8, TAG_LIVE)
+        if mt { spin_unlock(G_HEAP_LOCK) }
+        << p
+    }
+    p = alloc_fresh_small(g, c)
+    if mt { spin_unlock(G_HEAP_LOCK) }
+    << p
 }
 
 fn alloc_fresh_small(g int, c int) int {
@@ -273,14 +317,18 @@ fn alloc_big(n int, clear bool) int {
     }
     total := (n + 16 + 16383) / 16384 * 16384
     if total == MEDIUM_MAPPING {
+        mt := rt_mt_active()
+        if mt { spin_lock(G_HEAP_LOCK) }
         head := gword(G_MEDIUM_FREE)
         if head != 0 {
             set_gword(G_MEDIUM_FREE, rt_load(head, 8))
             set_gword(G_MEDIUM_COUNT, gword(G_MEDIUM_COUNT) - 1)
             rt_store(head - 8, 8, TAG_LIVE)
+            if mt { spin_unlock(G_HEAP_LOCK) }
             if clear { mem_zero(head, n) }
             << head
         }
+        if mt { spin_unlock(G_HEAP_LOCK) }
     }
     m := map_pages(total)
     rt_store(m, 8, 0 - total)
@@ -291,30 +339,46 @@ fn alloc_big(n int, clear bool) int {
 // Returns block p from alloc to the heap. p must be live: freeing it
 // twice, or freeing a pointer alloc did not return, is fatal.
 pub fn free(p int) {
+    free_checked(p, true)
+}
+
+// Frees p if it is a live alloc block; buffers that never came from alloc
+// are left alone. Under XU_DEBUG_FREE a second free is still fatal.
+fn free_owned(p int) {
+    free_checked(p, false)
+}
+
+fn free_checked(p int, strict bool) {
     if p == 0 {
         <<
     }
-    if rt_load(p - 8, 8) != TAG_LIVE {
-        free_fatal(p)
+    g := rt_globals()
+    $df := false
+    if rt_load(g + G_DEBUG_FREE * 8, 8) != DEBUG_FREE_DISABLED {
+        df = debug_free()
     }
-    free_live(p)
-}
-
-// Enter only after the caller has verified the live tag.
-fn free_live(p int) {
+    mt := rt_mt_active()
+    if mt { spin_lock(G_HEAP_LOCK) }
+    tag := rt_load(p - 8, 8)
+    if tag != TAG_LIVE {
+        if mt { spin_unlock(G_HEAP_LOCK) }
+        if strict || (tag == TAG_FREED && df) {
+            free_fatal(p)
+        }
+        <<
+    }
     c := rt_load(p - 16, 8)
     if c >= NCLASS || (c < 0 && c >= -16) {
+        if mt { spin_unlock(G_HEAP_LOCK) }
         free_fatal(p)
     }
     rt_store(p - 8, 8, TAG_FREED)
-    g := rt_globals()
-    // The debug flag stays cached after its first lookup. Only the disabled
-    // state can go directly to normal reclamation.
-    if rt_load(g + G_DEBUG_FREE * 8, 8) != DEBUG_FREE_DISABLED && debug_free() {
+    if df {
         $size := 16 << c
         if c < 0 {
             size = 0 - c - 16
         }
+        if mt { spin_unlock(G_HEAP_LOCK) }
         mem_poison(p, size)
         <<
     }
@@ -323,28 +387,17 @@ fn free_live(p int) {
             rt_store(p, 8, gword(G_MEDIUM_FREE))
             set_gword(G_MEDIUM_FREE, p)
             set_gword(G_MEDIUM_COUNT, gword(G_MEDIUM_COUNT) + 1)
+            if mt { spin_unlock(G_HEAP_LOCK) }
             <<
         }
+        if mt { spin_unlock(G_HEAP_LOCK) }
         unmap_pages(p - 16, 0 - c)
         <<
     }
     slot := g + (G_FREE + c) * 8
     rt_store(p, 8, rt_load(slot, 8))
     rt_store(slot, 8, p)
-}
-
-// Frees p if it is a live alloc block; buffers that never came from alloc
-// are left alone. Under XU_DEBUG_FREE a second free is still fatal.
-fn free_owned(p int) {
-    if p == 0 {
-        <<
-    }
-    tag := rt_load(p - 8, 8)
-    if tag == TAG_LIVE {
-        free_live(p)
-    } else if tag == TAG_FREED && debug_free() {
-        free_fatal(p)
-    }
+    if mt { spin_unlock(G_HEAP_LOCK) }
 }
 
 fn debug_free() bool {
@@ -502,17 +555,9 @@ pub fn bytes_new(out int, src int, n int) {
     if n <= 63 && (xu_target_arch() == ARCH_ARM64 || xu_target_arch() == ARCH_X64) {
         // Copy the whole logical payload and the terminator before exposing
         // the descriptor. The rest of a recycled block remains private.
-        g := rt_globals()
         $c := n >> 4
         if c > 2 { c = 2 }
-        slot := g + (G_FREE + c) * 8
-        $buf := rt_load(slot, 8)
-        if buf != 0 {
-            rt_store(slot, 8, rt_load(buf, 8))
-            rt_store(buf - 8, 8, TAG_LIVE)
-        } else {
-            buf = alloc_fresh_small(g, c)
-        }
+        buf := alloc_small_raw(c)
         copy_short_bytes(buf, src, n)
         rt_store(buf + n, 1, 0)
         set_desc(out, buf, n, n)
