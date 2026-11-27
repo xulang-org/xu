@@ -1,0 +1,565 @@
+@xu/codegen
+// Windows PE32+ (.pdata / .xdata) exception and stack unwind table encoder.
+//
+// Generates RUNTIME_FUNCTION records (.pdata) and UNWIND_INFO records (.xdata)
+// for both x86-64 (0x8664) and ARM64 (0xAA64) Windows executables so that OS
+// stack walkers (RtlLookupFunctionEntry / RtlVirtualUnwind / RtlCaptureStackBackTrace)
+// and debuggers unwind Xu frames and C FFI callback boundaries accurately.
+
+#xu/mc
+#xu/target
+
+pub const UNW_LEAF = 0
+pub const UNW_X64_FRAME = 1       // push rbp; mov rbp, rsp; [sub rsp, frame_size]; [saves at rsp+save_off]
+pub const UNW_X64_ALLOC_ONLY = 2  // sub rsp, frame_size (__xu_start)
+pub const UNW_X64_FP_SAVES = 3    // push callee_regs[0..k-1]; mov rbp, rsp; [dynamic sub rsp]
+pub const UNW_X64_PUSH_ALLOC = 4  // push callee_regs[0..k-1]; sub rsp, frame_size
+pub const UNW_A64_FRAME = 5       // compact_frame OR standard (stp x29,x30; mov x29,sp; [a64_sub_sp]; [callee saves])
+pub const UNW_A64_START = 6       // stp x29, x30, [sp, #-16]! (__xu_start)
+pub const UNW_A64_FFI_CALL = 7    // stp x29,x30,[sp,#-32]!; stp x19,x20,[sp,#16]; mov x29,sp; [dynamic sub sp, x9]
+pub const UNW_A64_WIN_WORDS = 8   // sub sp, #48; stp x29,x30,[sp,#32]; add x29,sp,#32 (__xu_win_call_words)
+pub const UNW_A64_FFI_THUNK = 9   // stp x29,x30,[sp,#-400]!; mov x29,sp; stp x19..x28; stp d8..d15
+
+pub struct WinUnwindEntry {
+    pub beg int
+    pub end int
+    pub kind int
+    pub prolog_len int
+    pub frame_size int
+    pub compact bool
+    pub sub_sp_insns int
+    pub save_insns int
+    pub save_off int
+    pub epilog_off int
+    pub callee_regs []int
+    pub save_end_offs []int
+}
+
+pub fn win_unwind_leaf(beg int, end int) WinUnwindEntry {
+    << WinUnwindEntry{
+        beg: beg,
+        end: end,
+        kind: UNW_LEAF,
+        prolog_len: 0,
+        frame_size: 0,
+        compact: false,
+        sub_sp_insns: 0,
+        save_insns: 0,
+        save_off: 0,
+        epilog_off: -1,
+        callee_regs: []int{},
+        save_end_offs: []int{}
+    }
+}
+
+fn align_buf4(buf $&mc.CodeBuffer) {
+    while buf.len() % 4 != 0 {
+        buf.emit_u8(0)
+    }
+}
+
+// =========================================================================
+// Windows x64 (.xdata UNWIND_INFO & 12-byte .pdata RUNTIME_FUNCTION)
+// =========================================================================
+
+fn x64_uw_slot(codes $&[]int, code_off int, op int, info int) {
+    codes.push((code_off & 0xFF) | (((op & 0xF) | ((info & 0xF) << 4)) << 8))
+}
+
+fn x64_uw_alloc(codes $&[]int, code_off int, sz int) {
+    if sz <= 0 || (sz % 8) != 0 {
+        <<
+    }
+    if sz <= 128 {
+        x64_uw_slot(codes, code_off, 2, (sz / 8) - 1) // UWOP_ALLOC_SMALL
+        <<
+    }
+    if sz <= 524280 {
+        x64_uw_slot(codes, code_off, 1, 0) // UWOP_ALLOC_LARGE (OpInfo=0)
+        codes.push((sz / 8) & 0xFFFF)
+        <<
+    }
+    x64_uw_slot(codes, code_off, 1, 1) // UWOP_ALLOC_LARGE (OpInfo=1)
+    codes.push(sz & 0xFFFF)
+    codes.push((sz >> 16) & 0xFFFF)
+}
+
+fn x64_uw_save_nonvol(codes $&[]int, code_off int, reg int, off int) {
+    // Only record GP non-volatile registers (0..15). XMM callee saves use
+    // 64-bit movsd at 8-byte aligned slots rather than 16-byte aligned movdqa.
+    if reg < 0 || reg >= 16 || off < 0 || (off % 8) != 0 {
+        <<
+    }
+    if off <= 524280 {
+        x64_uw_slot(codes, code_off, 4, reg) // UWOP_SAVE_NONVOL
+        codes.push((off / 8) & 0xFFFF)
+        <<
+    }
+    x64_uw_slot(codes, code_off, 5, reg) // UWOP_SAVE_NONVOL_FAR
+    codes.push(off & 0xFFFF)
+    codes.push((off >> 16) & 0xFFFF)
+}
+
+fn emit_x64_win_unwind(rdata $&mc.CodeBuffer, pdata $&mc.CodeBuffer, entries &[]WinUnwindEntry, order &[]int, text_rva int, rdata_rva int) {
+    align_buf4(rdata)
+    leaf_off := rdata.len()
+    // Shared Version=1, Flags=0, SizeOfProlog=0, CountOfCodes=0, FrameReg=0.
+    rdata.emit_u8(1)
+    rdata.emit_u8(0)
+    rdata.emit_u8(0)
+    rdata.emit_u8(0)
+    leaf_xdata_rva := rdata_rva + leaf_off
+
+    for oi in 0:order.len {
+        idx := order[oi]
+        e := &entries[idx]
+        $xdata_rva := leaf_xdata_rva
+        if e.kind != UNW_LEAF {
+            align_buf4(rdata)
+            xdata_rva = rdata_rva + rdata.len()
+            $codes := []int{}
+            $frame_reg := 0
+            $prolog := e.prolog_len
+            if e.kind == UNW_X64_FRAME {
+                // RSP-relative unwind keeps FrameRegister=0 so UWOP_SAVE_NONVOL
+                // offsets stay relative to the lowest RSP for any frame size.
+                $max_off := 1
+                if e.frame_size > 0 && e.epilog_off > 0 && e.epilog_off <= 255 {
+                    max_off = e.epilog_off
+                }
+                $ci := e.callee_regs.len - 1
+                while ci >= 0 {
+                    r := e.callee_regs[ci]
+                    $soff := 0
+                    if ci < e.save_end_offs.len {
+                        soff = e.save_end_offs[ci]
+                    }
+                    if r >= 0 && r < 16 && soff > 0 && soff <= 255 {
+                        x64_uw_save_nonvol($&codes, soff, r, e.save_off + ci * 8)
+                        if soff > max_off {
+                            max_off = soff
+                        }
+                    }
+                    ci -= 1
+                }
+                if prolog > 255 {
+                    prolog = max_off
+                }
+                if e.frame_size > 0 && e.epilog_off > 0 && e.epilog_off <= 255 {
+                    x64_uw_alloc($&codes, e.epilog_off, e.frame_size)
+                }
+                x64_uw_slot($&codes, 1, 0, 5) // UWOP_PUSH_NONVOL rbp (5)
+            } else if e.kind == UNW_X64_ALLOC_ONLY {
+                if prolog > 255 { prolog = 255 }
+                if e.frame_size > 0 {
+                    x64_uw_alloc($&codes, prolog, e.frame_size)
+                }
+            } else if e.kind == UNW_X64_FP_SAVES {
+                k := e.callee_regs.len
+                frame_reg = 5 // X_RBP, FrameOffset=0
+                $set_fp_off := prolog
+                if k < e.save_end_offs.len {
+                    set_fp_off = e.save_end_offs[k]
+                }
+                if set_fp_off > 0 && set_fp_off <= 255 {
+                    x64_uw_slot($&codes, set_fp_off, 3, 0) // UWOP_SET_FPREG
+                }
+                $ci := k - 1
+                while ci >= 0 {
+                    $poff := 0
+                    if ci < e.save_end_offs.len {
+                        poff = e.save_end_offs[ci]
+                    }
+                    r := e.callee_regs[ci]
+                    if r >= 0 && r < 16 && poff > 0 && poff <= 255 {
+                        x64_uw_slot($&codes, poff, 0, r) // UWOP_PUSH_NONVOL
+                    }
+                    ci -= 1
+                }
+                if prolog > 255 { prolog = 255 }
+            } else if e.kind == UNW_X64_PUSH_ALLOC {
+                if prolog > 255 { prolog = 255 }
+                if e.frame_size > 0 {
+                    x64_uw_alloc($&codes, prolog, e.frame_size)
+                }
+                $ci := e.callee_regs.len - 1
+                while ci >= 0 {
+                    $poff := 0
+                    if ci < e.save_end_offs.len {
+                        poff = e.save_end_offs[ci]
+                    }
+                    r := e.callee_regs[ci]
+                    if r >= 0 && r < 16 && poff > 0 && poff <= 255 {
+                        x64_uw_slot($&codes, poff, 0, r) // UWOP_PUSH_NONVOL
+                    }
+                    ci -= 1
+                }
+            }
+            rdata.emit_u8(1)
+            rdata.emit_u8(prolog & 0xFF)
+            rdata.emit_u8(codes.len & 0xFF)
+            rdata.emit_u8(frame_reg & 0xFF)
+            for wi in 0:codes.len {
+                rdata.emit_u16_le(codes[wi])
+            }
+            if (codes.len % 2) != 0 {
+                rdata.emit_u16_le(0)
+            }
+        }
+        pdata.emit_u32_le(text_rva + e.beg)
+        pdata.emit_u32_le(text_rva + e.end)
+        pdata.emit_u32_le(xdata_rva)
+    }
+}
+
+// =========================================================================
+// Windows ARM64 (.xdata unwind records & 8-byte .pdata RUNTIME_FUNCTION)
+// =========================================================================
+
+fn a64_uw_alloc(codes $&[]int, sz int) {
+    if sz <= 0 || (sz % 16) != 0 {
+        <<
+    }
+    z := sz / 16
+    if z < 32 {
+        codes.push(z & 0x1F)
+        <<
+    }
+    if z < 2048 {
+        codes.push(0xC0 | ((z >> 8) & 7))
+        codes.push(z & 0xFF)
+        <<
+    }
+    codes.push(0xE0)
+    codes.push((z >> 16) & 0xFF)
+    codes.push((z >> 8) & 0xFF)
+    codes.push(z & 0xFF)
+}
+
+fn a64_uw_save_fplr_x(codes $&[]int, sz int) {
+    if sz < 8 || sz > 512 || (sz % 8) != 0 {
+        <<
+    }
+    codes.push(0x80 | (((sz / 8) - 1) & 0x3F))
+}
+
+fn a64_uw_save_fplr(codes $&[]int, off int) {
+    if off < 0 || off > 504 || (off % 8) != 0 {
+        <<
+    }
+    codes.push(0x40 | ((off / 8) & 0x3F))
+}
+
+fn a64_uw_set_fp(codes $&[]int) {
+    codes.push(0xE1)
+}
+
+fn a64_uw_add_fp(codes $&[]int, off int) {
+    codes.push(0xE2)
+    codes.push((off / 8) & 0xFF)
+}
+
+fn a64_uw_nop(codes $&[]int) {
+    codes.push(0xE3)
+}
+
+fn a64_uw_end(codes $&[]int) {
+    codes.push(0xE4)
+}
+
+fn a64_uw_save_regp(codes $&[]int, reg int, off int) {
+    r := reg - 19
+    z := off / 8
+    codes.push(0xC8 | ((r >> 2) & 3))
+    codes.push(((r & 3) << 6) | (z & 0x3F))
+}
+
+fn a64_uw_save_reg(codes $&[]int, reg int, off int) {
+    r := reg - 19
+    z := off / 8
+    codes.push(0xD0 | ((r >> 2) & 3))
+    codes.push(((r & 3) << 6) | (z & 0x3F))
+}
+
+fn a64_uw_save_fregp(codes $&[]int, dreg int, off int) {
+    r := dreg - 8
+    z := off / 8
+    codes.push(0xD8 | ((r >> 2) & 1))
+    codes.push(((r & 3) << 6) | (z & 0x3F))
+}
+
+fn a64_uw_save_freg(codes $&[]int, dreg int, off int) {
+    r := dreg - 8
+    z := off / 8
+    codes.push(0xDC | ((r >> 2) & 1))
+    codes.push(((r & 3) << 6) | (z & 0x3F))
+}
+
+fn a64_uw_emit_save_op(codes $&[]int, kind int, reg int, off int) {
+    if kind == 0 {
+        a64_uw_save_regp(codes, reg, off)
+    } else if kind == 1 {
+        a64_uw_save_reg(codes, reg, off)
+    } else if kind == 2 {
+        a64_uw_save_fregp(codes, reg - 32, off)
+    } else {
+        a64_uw_save_freg(codes, reg - 32, off)
+    }
+}
+
+// Mirrors a64_callee_save_slots pairing exactness: consecutive integer or FP
+// registers with stack offset <= 504 emit paired unwind codes; otherwise single.
+fn a64_uw_callee_saves(codes $&[]int, regs &[]int, save_off int, reverse bool) {
+    $kinds := []int{}
+    $sregs := []int{}
+    $soffs := []int{}
+    $i := 0
+    while i < regs.len {
+        r := regs[i]
+        off := save_off + i * 8
+        if r < 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] == r + 1 {
+            kinds.push(0)
+            sregs.push(r)
+            soffs.push(off)
+            i += 2
+            ->
+        }
+        if r >= 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] == r + 1 {
+            kinds.push(2)
+            sregs.push(r)
+            soffs.push(off)
+            i += 2
+            ->
+        }
+        if r >= 32 {
+            kinds.push(3)
+        } else {
+            kinds.push(1)
+        }
+        sregs.push(r)
+        soffs.push(off)
+        i += 1
+    }
+    if reverse {
+        $j := kinds.len - 1
+        while j >= 0 {
+            a64_uw_emit_save_op(codes, kinds[j], sregs[j], soffs[j])
+            j -= 1
+        }
+    } else {
+        for j in 0:kinds.len {
+            a64_uw_emit_save_op(codes, kinds[j], sregs[j], soffs[j])
+        }
+    }
+}
+
+fn a64_emit_xdata_chunk(rdata $&mc.CodeBuffer, pdata $&mc.CodeBuffer, text_rva int, rdata_rva int, beg int, end int, codes &[]int, ep_off int, ep_code_idx int) {
+    align_buf4(rdata)
+    xdata_rva := rdata_rva + rdata.len()
+
+    $padded := []int{}
+    for i in 0:codes.len {
+        padded.push(codes[i])
+    }
+    if padded.len == 0 {
+        padded.push(0xE4)
+    }
+    while (padded.len % 4) != 0 {
+        padded.push(0xE3) // nop padding
+    }
+    cw := padded.len / 4
+    fn_insns := (end - beg) / 4
+    has_ep := ep_off >= beg && ep_off < end && ((ep_off - beg) / 4) < 0x40000 && ep_code_idx >= 0 && ep_code_idx < 1024
+    $ep_cnt := 0
+    if has_ep {
+        ep_cnt = 1
+    }
+
+    if cw <= 31 {
+        hdr := (fn_insns & 0x3FFFF) | ((ep_cnt & 0x1F) << 22) | ((cw & 0x1F) << 27)
+        rdata.emit_u32_le(hdr)
+    } else {
+        hdr0 := fn_insns & 0x3FFFF
+        hdr1 := (ep_cnt & 0xFFFF) | ((cw & 0xFF) << 16)
+        rdata.emit_u32_le(hdr0)
+        rdata.emit_u32_le(hdr1)
+    }
+    if has_ep {
+        ep_word := (((ep_off - beg) / 4) & 0x3FFFF) | ((ep_code_idx & 0x3FF) << 22)
+        rdata.emit_u32_le(ep_word)
+    }
+    for i in 0:padded.len {
+        rdata.emit_u8(padded[i])
+    }
+    pdata.emit_u32_le(text_rva + beg)
+    pdata.emit_u32_le(xdata_rva)
+}
+
+fn a64_emit_xdata_record(rdata $&mc.CodeBuffer, pdata $&mc.CodeBuffer, text_rva int, rdata_rva int, beg int, end int, codes &[]int, ep_off int, ep_code_idx int) {
+    total_insns := (end - beg) / 4
+    if total_insns <= 0 {
+        <<
+    }
+    max_chunk_bytes := 0x3FF00 * 4
+    if end - beg <= max_chunk_bytes {
+        a64_emit_xdata_chunk(rdata, pdata, text_rva, rdata_rva, beg, end, codes, ep_off, ep_code_idx)
+        <<
+    }
+    // Split > 1 MiB functions into <= 0x3FF00-instruction fragments.
+    $cur := beg
+    $first := true
+    while cur < end {
+        $nxt := cur + max_chunk_bytes
+        if nxt > end {
+            nxt = end
+        }
+        $cep := -1
+        $cepi := -1
+        if first && ep_off >= cur && ep_off < nxt {
+            cep = ep_off
+            cepi = ep_code_idx
+        }
+        a64_emit_xdata_chunk(rdata, pdata, text_rva, rdata_rva, cur, nxt, codes, cep, cepi)
+        first = false
+        cur = nxt
+    }
+}
+
+fn emit_a64_win_unwind(rdata $&mc.CodeBuffer, pdata $&mc.CodeBuffer, entries &[]WinUnwindEntry, order &[]int, text_rva int, rdata_rva int) {
+    for oi in 0:order.len {
+        idx := order[oi]
+        e := &entries[idx]
+        if (e.beg % 4) != 0 || (e.end % 4) != 0 || e.end <= e.beg {
+            ->
+        }
+        $codes := []int{}
+        $ep_off := -1
+        $ep_idx := -1
+        if e.kind == UNW_LEAF {
+            a64_uw_end($&codes)
+        } else if e.kind == UNW_A64_START {
+            a64_uw_set_fp($&codes)
+            a64_uw_save_fplr_x($&codes, 16)
+            a64_uw_end($&codes)
+        } else if e.kind == UNW_A64_FFI_CALL {
+            a64_uw_set_fp($&codes)
+            a64_uw_save_regp($&codes, 19, 16)
+            a64_uw_save_fplr_x($&codes, 32)
+            a64_uw_end($&codes)
+            if e.epilog_off >= e.beg && e.epilog_off < e.end {
+                ep_off = e.epilog_off
+                ep_idx = 0
+            }
+        } else if e.kind == UNW_A64_WIN_WORDS {
+            a64_uw_add_fp($&codes, 32)
+            a64_uw_save_fplr($&codes, 32)
+            a64_uw_alloc($&codes, 48)
+            a64_uw_end($&codes)
+        } else if e.kind == UNW_A64_FFI_THUNK {
+            a64_uw_save_fregp($&codes, 14, 144)
+            a64_uw_save_fregp($&codes, 12, 128)
+            a64_uw_save_fregp($&codes, 10, 112)
+            a64_uw_save_fregp($&codes, 8, 96)
+            a64_uw_save_regp($&codes, 27, 80)
+            a64_uw_save_regp($&codes, 25, 64)
+            a64_uw_save_regp($&codes, 23, 48)
+            a64_uw_save_regp($&codes, 21, 32)
+            a64_uw_save_regp($&codes, 19, 16)
+            a64_uw_set_fp($&codes)
+            a64_uw_save_fplr_x($&codes, 400)
+            a64_uw_end($&codes)
+        } else if e.kind == UNW_A64_FRAME {
+            saves_fit := e.callee_regs.len == 0 || (e.save_off + (e.callee_regs.len - 1) * 8 <= 504)
+            if e.compact {
+                a64_uw_callee_saves($&codes, &e.callee_regs, e.save_off, true)
+                a64_uw_set_fp($&codes)
+                a64_uw_save_fplr_x($&codes, e.frame_size)
+                a64_uw_end($&codes)
+                if saves_fit && e.epilog_off >= e.beg && e.epilog_off < e.end {
+                    ep_off = e.epilog_off
+                    ep_idx = codes.len
+                    a64_uw_callee_saves($&codes, &e.callee_regs, e.save_off, false)
+                    a64_uw_save_fplr_x($&codes, e.frame_size)
+                    a64_uw_end($&codes)
+                }
+            } else {
+                if saves_fit {
+                    a64_uw_callee_saves($&codes, &e.callee_regs, e.save_off, true)
+                } else {
+                    for _ in 0:e.save_insns {
+                        a64_uw_nop($&codes)
+                    }
+                }
+                if e.frame_size > 0 {
+                    a64_uw_alloc($&codes, e.frame_size)
+                    $n := 1
+                    while n < e.sub_sp_insns {
+                        a64_uw_nop($&codes)
+                        n += 1
+                    }
+                }
+                a64_uw_set_fp($&codes)
+                a64_uw_save_fplr_x($&codes, 16)
+                a64_uw_end($&codes)
+                if saves_fit && e.epilog_off >= e.beg && e.epilog_off < e.end {
+                    ep_off = e.epilog_off
+                    ep_idx = codes.len
+                    a64_uw_callee_saves($&codes, &e.callee_regs, e.save_off, false)
+                    if e.frame_size > 0 {
+                        a64_uw_set_fp($&codes)
+                    }
+                    a64_uw_save_fplr_x($&codes, 16)
+                    a64_uw_end($&codes)
+                }
+            }
+        }
+        a64_emit_xdata_record(rdata, pdata, text_rva, rdata_rva, e.beg, e.end, &codes, ep_off, ep_idx)
+    }
+}
+
+pub fn emit_win_unwind_tables(rdata $&mc.CodeBuffer, pdata $&mc.CodeBuffer, entries &[]WinUnwindEntry, tgt_arch int, text_rva int, rdata_rva int) {
+    $raw_order := []int{}
+    for i in 0:entries.len {
+        e := &entries[i]
+        if e.beg < 0 || e.end <= e.beg {
+            ->
+        }
+        if tgt_arch == target.ARCH_ARM64 && ((e.beg % 4) != 0 || (e.end % 4) != 0) {
+            ->
+        }
+        raw_order.push(i)
+    }
+    if raw_order.len == 0 {
+        <<
+    }
+    // Insertion sort by ascending BeginAddress.
+    for i in 1:raw_order.len {
+        key := raw_order[i]
+        kbeg := entries[key].beg
+        $j := i - 1
+        while j >= 0 && entries[raw_order[j]].beg > kbeg {
+            raw_order[j + 1] = raw_order[j]
+            j -= 1
+        }
+        raw_order[j + 1] = key
+    }
+    // Guarantee strictly non-overlapping ranges.
+    $order := []int{}
+    $prev_end := -1
+    for i in 0:raw_order.len {
+        idx := raw_order[i]
+        e := &entries[idx]
+        if e.beg >= prev_end {
+            order.push(idx)
+            prev_end = e.end
+        }
+    }
+    if order.len == 0 {
+        <<
+    }
+    if tgt_arch == target.ARCH_X64 {
+        emit_x64_win_unwind(rdata, pdata, entries, &order, text_rva, rdata_rva)
+    } else if tgt_arch == target.ARCH_ARM64 {
+        emit_a64_win_unwind(rdata, pdata, entries, &order, text_rva, rdata_rva)
+    }
+}

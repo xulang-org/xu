@@ -54,21 +54,21 @@ fn file_read_boundary(size int) bool {
         want[0] = 255
         want[size - 1] = 129
     }
-    written := os.write("file-read-boundary", want + "") or (err) { << false }
+    written := os.write("file-read-boundary", want + "") >>> (err) { << false }
     if written != size { << false }
-    $body := os.read("file-read-boundary") or (err) { << false }
+    $body := os.read("file-read-boundary") >>> (err) { << false }
     if body != want { << false }
     body.push_byte(128)
     if body.len != size + 1 || body[size] != 128 || body[0:size] != want { << false }
     fs := os.dir_fs(".")
-    $relative := iofs.read_file(&fs, "file-read-boundary") or (err) { << false }
+    $relative := iofs.read_file(&fs, "file-read-boundary") >>> (err) { << false }
     if relative != want { << false }
     relative.push_byte(129)
     << relative.len == size + 1 && relative[size] == 129 && relative[0:size] == want
 }
 fn dirfs_rejects_directory() bool {
     fs := os.dir_fs(".")
-    _ := fs.read_file(".") or (err) { << true }
+    _ := fs.read_file(".") >>> (err) { << true }
     << false
 }
 fn main() int {
@@ -83,9 +83,9 @@ fn main() int {
     if third[0] != 0 || third[7] != 7 || first[7] != 7 { << 13 }
     third.push(8)
     if third.len != 9 || third[8] != 8 || second[7] != 88 { << 14 }
-    os.write("roundtrip", "Xu\nbytes") or (err) { eprintln(err.msg())
+    os.write("roundtrip", "Xu\nbytes") >>> (err) { eprintln(err.msg())
         << 1 }
-    body := os.read("roundtrip") or (err) { eprintln(err.msg())
+    body := os.read("roundtrip") >>> (err) { eprintln(err.msg())
         << 2 }
     if body != "Xu\nbytes" { << 3 }
     for _ in 0:3 {
@@ -99,13 +99,13 @@ fn main() int {
     slash := filepath.to_slash(&clean)
     if slash != "b/c" { << 4 }
     if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" { << 5 }
-    bytes := rand.read(32) or (err) { eprintln(err.msg())
+    bytes := rand.read(32) >>> (err) { eprintln(err.msg())
         << 6 }
     if bytes.len != 32 { << 7 }
     text := "{\"value\":42}"
     doc := json.parse(&text)
     if !doc.ok() { << 8 }
-    value := doc.as_int(doc.get(doc.root(), "value")) or (err) { << 10 }
+    value := doc.as_int(doc.get(doc.root(), "value")) >>> (err) { << 10 }
     if value != 42 { << 11 }
     if time.now() <= 0 { << 9 }
     println("library passed")
@@ -238,12 +238,12 @@ fn check_fnval_cases(flag bool) bool {
 }
 
 fn rejects_invalid_hex() bool {
-    _ := hex.decode_string("0123456789ABCDEFg123456789abcdef") or (err) { << true }
+    _ := hex.decode_string("0123456789ABCDEFg123456789abcdef") >>> (err) { << true }
     << false
 }
 
 fn rejects_invalid_base64(src string) bool {
-    _ := base64.decode_string(~src) or (err) { << err.msg() == "encoding/base64: invalid padding" }
+    _ := base64.decode_string(~src) >>> (err) { << err.msg() == "encoding/base64: invalid padding" }
     << false
 }
 
@@ -380,12 +380,12 @@ fn (e ZstEmptyErr) msg() string { << "zst-empty-err" }
 fn zst_pass(v ZstVal) int { << v.tag() }
 
 fn zst_may_fail(flag bool) int {
-    if flag { >> ZstEmptyErr{} }
+    if flag { >>> ZstEmptyErr{} }
     << 99
 }
 
 fn zst_catch(flag bool) string {
-    v := zst_may_fail(flag) or (err) { << err.msg() }
+    v := zst_may_fail(flag) >>> (err) { << err.msg() }
     << str(v)
 }
 
@@ -653,16 +653,16 @@ fn main() int {
     if bits.rotate_left(1, -1) != (1 << 63) || bits.rotate_right(1, 64) != 1 { << 5 }
 
     // Exercise a SIMD block plus a scalar tail, mixed case and bad bytes.
-    bytes := hex.decode_string("0123456789ABCDEF0123456789abcdefF0") or (err) { << 6 }
+    bytes := hex.decode_string("0123456789ABCDEF0123456789abcdefF0") >>> (err) { << 6 }
     if hex.encode_to_string(bytes + "") != "0123456789abcdef0123456789abcdeff0" { << 7 }
     if !rejects_invalid_hex() { << 8 }
 
-    key := hex.decode_string("000102030405060708090a0b0c0d0e0f") or (err) { << 9 }
-    plain := hex.decode_string("00112233445566778899aabbccddeeff") or (err) { << 10 }
-    cipher := aes.new_cipher(&key) or (err) { << 11 }
-    encrypted := cipher.encrypt(&plain) or (err) { << 12 }
+    key := hex.decode_string("000102030405060708090a0b0c0d0e0f") >>> (err) { << 9 }
+    plain := hex.decode_string("00112233445566778899aabbccddeeff") >>> (err) { << 10 }
+    cipher := aes.new_cipher(&key) >>> (err) { << 11 }
+    encrypted := cipher.encrypt(&plain) >>> (err) { << 12 }
     if hex.encode_to_string(encrypted + "") != "69c4e0d86a7b0430d8cdb78070b4c55a" { << 13 }
-    recovered := cipher.decrypt(&encrypted) or (err) { << 14 }
+    recovered := cipher.decrypt(&encrypted) >>> (err) { << 14 }
     if recovered != plain { << 15 }
     if sha256.sum256("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" { << 17 }
     if md5.sum("") != "d41d8cd98f00b204e9800998ecf8427e" { << 21 }
@@ -703,7 +703,7 @@ fn main() int {
     if strings.count(&"banana", "a") != 3 || strings.count(&"banana", "z") != 0 || strings.count(&"", "a") != 0 { << 46 }
     prefix := "/+7d"
     block := strings.repeat(&prefix, 33)
-    original := base64.decode_string(block + "/g==") or (err) { << 31 }
+    original := base64.decode_string(block + "/g==") >>> (err) { << 31 }
     if original.len != 100 || original[0] != 255 || original[99] != 254 { << 32 }
     if base64.encode_to_string(original + "") != block + "/g==" { << 33 }
     if !rejects_invalid_base64(block + "AA=A") { << 34 }
@@ -737,7 +737,7 @@ fn probe(capacity int) int {
     $total := 0
     for i in 0:32 {
         value := <-ch
-        n := parse_int(value) or (err) { << -1 }
+        n := parse_int(value) >>> (err) { << -1 }
         total += n
     }
     << total
@@ -795,29 +795,29 @@ fn main() int {
 STREAM = r'''@main
 #net
 fn probe(network string, address string) int {
-    $conn := net.dial_to(network, address) or >>
+    $conn := net.dial_to(network, address) >>>
     data := "Xu stream probe"
     $sent := 0
     while sent < data.len {
         part := data[sent:data.len]
-        n := conn.write(&part) or >>
+        n := conn.write(&part) >>>
         if n <= 0 || n > part.len { << 2 }
         sent += n
     }
     $reply := ""
     while reply.len < data.len {
-        part := conn.read(data.len - reply.len) or >>
+        part := conn.read(data.len - reply.len) >>>
         if part.len == 0 { << 3 }
         reply = reply + part
     }
-    conn.close() or >>
+    conn.close() >>>
     if reply != data { << 4 }
     println("stream passed")
     << 0
 }
 fn main() int {
     a := args()
-    << probe(a[1] + "", a[2] + "") or (err) { eprintln(err.msg())
+    << probe(a[1] + "", a[2] + "") >>> (err) { eprintln(err.msg())
         << 1 }
 }
 '''
@@ -825,20 +825,20 @@ fn main() int {
 UDP = r'''@main
 #net
 fn probe(address string, connected bool) int {
-    remote := net.resolve_udp_addr("udp4", address) or >>
+    remote := net.resolve_udp_addr("udp4", address) >>>
     local := net.UDPAddr{ip: net.ipv4(127, 0, 0, 1), port: 0, zone: ""}
     data := "Xu datagram"
     if connected {
-        $c := net.dial_udp("udp4", local.clone(), remote.clone()) or >>
-        if (c.write(&data) or >>) != data.len { << 2 }
-        reply := c.read(128) or >>
-        c.close() or >>
+        $c := net.dial_udp("udp4", local.clone(), remote.clone()) >>>
+        if (c.write(&data) >>>) != data.len { << 2 }
+        reply := c.read(128) >>>
+        c.close() >>>
         if reply != data { << 3 }
     } else {
-        $c := net.listen_udp("udp4", local.clone()) or >>
-        if (c.write_to(&data, &remote) or >>) != data.len { << 4 }
-        reply := c.read_from(128) or >>
-        c.close() or >>
+        $c := net.listen_udp("udp4", local.clone()) >>>
+        if (c.write_to(&data, &remote) >>>) != data.len { << 4 }
+        reply := c.read_from(128) >>>
+        c.close() >>>
         if reply.data != data || reply.addr.port != remote.port { << 5 }
     }
     println("udp passed")
@@ -846,7 +846,7 @@ fn probe(address string, connected bool) int {
 }
 fn main() int {
     a := args()
-    << probe(a[1] + "", a[2] == "connected") or (err) { eprintln(err.msg())
+    << probe(a[1] + "", a[2] == "connected") >>> (err) { eprintln(err.msg())
         << 1 }
 }
 '''
@@ -854,15 +854,15 @@ fn main() int {
 INTERFACES = r'''@main
 #net
 fn probe() int {
-    all := net.interfaces() or >>
+    all := net.interfaces() >>>
     if all.len == 0 { << 2 }
     $addresses := 0
     for i in 0:all.len {
         item := all[i]
         if item.name.len == 0 || item.index <= 0 { << 3 }
-        found := net.interface_by_name(item.name + "") or >>
+        found := net.interface_by_name(item.name + "") >>>
         if found.index != item.index { << 4 }
-        ips := item.addrs() or >>
+        ips := item.addrs() >>>
         addresses += ips.len
     }
     if addresses == 0 { << 5 }
@@ -870,7 +870,7 @@ fn probe() int {
     << 0
 }
 fn main() int {
-    << probe() or (err) { eprintln(err.msg())
+    << probe() >>> (err) { eprintln(err.msg())
         << 1 }
 }
 '''
@@ -878,7 +878,7 @@ fn main() int {
 WINDOWS_UNIX = r'''@main
 #net
 fn main() int {
-    _ := net.dial_to("unix", "unsupported.sock") or (err) {
+    _ := net.dial_to("unix", "unsupported.sock") >>> (err) {
         if err.msg() != "net: unix sockets are not available on this target" { eprintln(err.msg())
             << 2 }
         println("unsupported Unix socket rejected")
@@ -891,16 +891,16 @@ fn main() int {
 NET_CONTRACT = r'''@main
 #net
 fn invalid_network() bool {
-    _ := net.dial_to("invalid", "127.0.0.1:1") or (err) { << true }
+    _ := net.dial_to("invalid", "127.0.0.1:1") >>> (err) { << true }
     << false
 }
 fn invalid_socket() bool {
-    _ := net.conn_read(-1, 1) or (err) { << true }
+    _ := net.conn_read(-1, 1) >>> (err) { << true }
     << false
 }
 fn probe() int {
-    port := net.lookup_port("tcp", "http") or >>
-    protocol := net.lookup_protocol("tcp") or >>
+    port := net.lookup_port("tcp", "http") >>>
+    protocol := net.lookup_protocol("tcp") >>>
     if port != 80 { << 2 }
     if protocol != 6 { << 3 }
     if !invalid_network() || !invalid_socket() { << 4 }
@@ -908,7 +908,7 @@ fn probe() int {
     << 0
 }
 fn main() int {
-    << probe() or (err) { eprintln(err.msg())
+    << probe() >>> (err) { eprintln(err.msg())
         << 1 }
 }
 '''
@@ -918,7 +918,7 @@ HTTP_EVENT_SET = r'''@main
 #net/http
 fn serve_task(lfd int, srv_done chan int) {
     _ := http.serve_listener(lfd, fn(c http.Context) {
-        c.text(200, "pong:" + c.path()) or (err) { << }
+        c.text(200, "pong:" + c.path()) >>> (err) { << }
     })
     srv_done <- 1
 }
@@ -928,7 +928,7 @@ fn client_worker(base_url string, base_seq int, out chan int) {
     $ok := 0
     for i in 0:8 {
         path := "/r/" + str(base_seq + i)
-        resp := c.get(base_url + path) or (err) {
+        resp := c.get(base_url + path) >>> (err) {
             out <- -1
             <<
         }
@@ -941,7 +941,7 @@ fn client_worker(base_url string, base_seq int, out chan int) {
     out <- ok
 }
 fn try_listen(addr string) int {
-    << net.listen(addr) or (err) { << -1 }
+    << net.listen(addr) >>> (err) { << -1 }
 }
 fn main() int {
     $port := 23401
@@ -972,7 +972,7 @@ fn main() int {
         if v < 0 { << 2 }
         total += v
     }
-    net.conn_close(lfd) or (err) { << 3 }
+    net.conn_close(lfd) >>> (err) { << 3 }
     if <-srv_done != 1 { << 4 }
     if total != 64 { << 5 }
     println("http event set passed")
@@ -989,11 +989,11 @@ fn upload(c http.Context) {
     body := c.body()
     for i in 0:body.len {
         if body[i] != 120 {
-            c.text(400, "bad body") or (err) { << }
+            c.text(400, "bad body") >>> (err) { << }
             <<
         }
     }
-    c.text(200, str(body.len)) or (err) { << }
+    c.text(200, str(body.len)) >>> (err) { << }
 }
 fn main() int {
     args := os.args()
@@ -1002,9 +1002,9 @@ fn main() int {
     options.max_buffer_bytes = 32768
     options.read_timeout_ns = 3000000000
     options.sync_handlers = args[1] == "sync"
-    lfd := net.listen("127.0.0.1:0") or (err) { << 1 }
+    lfd := net.listen("127.0.0.1:0") >>> (err) { << 1 }
     println(net.socket_local_addr(lfd))
-    http.serve_listener_with_options(lfd, upload, options) or (err) { << 2 }
+    http.serve_listener_with_options(lfd, upload, options) >>> (err) { << 2 }
     << 0
 }
 '''
@@ -1018,7 +1018,7 @@ fn files(c http.Context) {
     server.serve_context(c)
 }
 fn main() int {
-    lfd := net.listen("127.0.0.1:0") or (err) { << 1 }
+    lfd := net.listen("127.0.0.1:0") >>> (err) { << 1 }
     println(net.socket_local_addr(lfd))
     << http.serve_listener(lfd, files)
 }
@@ -1246,7 +1246,7 @@ fn valid_body(data &string, size int) bool {
 }
 
 fn get_error(client $&http.Client, url string) string {
-    _ := client.get(url) or (err) { << err.msg() }
+    _ := client.get(url) >>> (err) { << err.msg() }
     << ""
 }
 
@@ -1263,19 +1263,19 @@ fn main() int {
     $client := http.new_client()
     client.set_timeout(30000000000)
     client.insecure_skip_verify = true
-    client.max_response_bytes = strconv.atoi(&args[2]) or (err) { << 6 }
-    first := client.get(base + "/fixed") or (err) { << 7 }
+    client.max_response_bytes = strconv.atoi(&args[2]) >>> (err) { << 6 }
+    first := client.get(base + "/fixed") >>> (err) { << 7 }
     if first.status_code != 200 || !valid_body(&first.body, 16384) || !client.has_idle_connection() { << 1 }
-    chunk_limit := strconv.atoi(&args[4]) or (err) { << 12 }
+    chunk_limit := strconv.atoi(&args[4]) >>> (err) { << 12 }
     client.max_response_bytes = chunk_limit
     client.set_download_progress(chunk_progress)
-    chunked := client.get(base + "/chunked") or (err) { << 8 }
+    chunked := client.get(base + "/chunked") >>> (err) { << 8 }
     client.set_download_progress(ignore_progress)
     if chunked.status_code != 200 || !valid_body(&chunked.body, 12288) || !client.has_idle_connection() { << 2 }
     client.max_response_bytes = 9223372036854775807
-    continued := client.get(base + "/continued") or (err) { << 13 }
+    continued := client.get(base + "/continued") >>> (err) { << 13 }
     if continued.status_code != 200 || !valid_body(&continued.body, 17) { << 14 }
-    client.max_response_bytes = strconv.atoi(&args[3]) or (err) { << 9 }
+    client.max_response_bytes = strconv.atoi(&args[3]) >>> (err) { << 9 }
     limit_failure := get_error($&client, base + "/over-limit")
     if !strings.contains(&limit_failure, "message too large") || client.has_idle_connection() { << 3 }
     client.max_response_bytes = 0
@@ -1287,7 +1287,7 @@ fn main() int {
     client.max_response_bytes = 0
     trailer_failure := get_error($&client, base + "/truncated-trailer")
     if trailer_failure.len == 0 || client.has_idle_connection() { << 16 }
-    fresh := client.get(base + "/fresh") or (err) { << 10 }
+    fresh := client.get(base + "/fresh") >>> (err) { << 10 }
     if fresh.status_code != 200 || !valid_body(&fresh.body, 8192) || !valid_body(&first.body, 16384) { << 5 }
     if !valid_body(&chunked.body, 12288) { << 17 }
     client.close_idle_connections()
@@ -1364,7 +1364,7 @@ WINDOWS_MEMORY = r'''@main
 #os
 fn checkpoint(label string) {
     println(label)
-    os_fd_read(0, 1) or (err) { <<< 1 }
+    os_fd_read(0, 1) >>> (err) { <<< 1 }
 }
 fn empty_lengths(s string) int {
     joined := s + s
@@ -1395,18 +1395,18 @@ fn churn(p $&poller.Poller, n int) {
     }
 }
 fn missing_stat() bool {
-    _ := os.stat("metadata-missing") or (err) { << true }
+    _ := os.stat("metadata-missing") >>> (err) { << true }
     << false
 }
 fn stat_churn(n int) {
     for _ in 0:n {
-        info := os.stat("metadata-file") or (err) { <<< 7 }
+        info := os.stat("metadata-file") >>> (err) { <<< 7 }
         if info.size != 1 || !missing_stat() { <<< 8 }
     }
 }
 fn dir_churn(path string, n int, exists bool) {
     for _ in 0:n {
-        names := os.read_dir(path + "") or (err) {
+        names := os.read_dir(path + "") >>> (err) {
             if exists { <<< 10 }
             ->
         }
@@ -1430,13 +1430,13 @@ fn main() {
     churn($&p, 65536)
     checkpoint("poller churn")
     if p.count() != 0 { <<< 6 }
-    _ := os.write("metadata-file", "x") or (err) { <<< 9 }
+    _ := os.write("metadata-file", "x") >>> (err) { <<< 9 }
     stat_churn(1024)
     checkpoint("stat warm")
     stat_churn(32768)
     checkpoint("stat churn")
-    _ := os.mkdir("dir-enum") or (err) { <<< 12 }
-    _ := os.write("dir-enum/entry.txt", "x") or (err) { <<< 13 }
+    _ := os.mkdir("dir-enum") >>> (err) { <<< 12 }
+    _ := os.write("dir-enum/entry.txt", "x") >>> (err) { <<< 13 }
     dir_churn("dir-enum", 256, true)
     dir_churn("dir-enum/missing", 256, false)
     checkpoint("dir warm")

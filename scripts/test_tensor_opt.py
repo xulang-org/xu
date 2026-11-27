@@ -12,6 +12,7 @@ import tempfile
 
 from test_tensor_dynamic import mir_functions
 from test_tensor_fusion import PRELUDE, build, run
+from test_windows_workers import WindowsTemporaryDirectory
 
 
 def xu_source():
@@ -1145,6 +1146,66 @@ fn kernel_attn_vsum_paged(out $&[]f32, scores &[]f32, v_blocks &[]f32, bt &[]int
     }
 }
 
+fn kernel_vmul(out $&[]f32, a &[]f32, b &[]f32, n int) {
+    for i in 0:n {
+        out[i] = a[i] * b[i]
+    }
+}
+
+fn kernel_vmul_inplace(a $&[]f32, b &[]f32, n int) {
+    for i in 0:n {
+        a[i] = a[i] * b[i]
+    }
+}
+
+fn kernel_vsub(out $&[]f32, a &[]f32, b &[]f32, n int) {
+    for i in 0:n {
+        out[i] = a[i] - b[i]
+    }
+}
+
+fn kernel_vsub_inplace(a $&[]f32, b &[]f32, n int) {
+    for i in 0:n {
+        a[i] = a[i] - b[i]
+    }
+}
+
+fn check_vmul() int {
+    sizes := [1, 3, 4, 7, 17]
+    for si in 0:sizes.len {
+        n := sizes[si]
+        $a := []f32{}
+        $b := []f32{}
+        $out := []f32{}
+        $sub_out := []f32{}
+        for i in 0:n {
+            a.push(f32(f64((i * 5 + 1) % 13 - 6) * 0.25))
+            b.push(f32(f64((i * 7 + 3) % 11 - 5) * 0.5))
+            out.push(f32(0))
+            sub_out.push(f32(0))
+        }
+        kernel_vmul($&out, &a, &b, n)
+        for i in 0:n {
+            println("P7F32:VMUL:" + str(n) + ":" + str(i) + ":" + str(bits(out[i])))
+        }
+        kernel_vsub($&sub_out, &a, &b, n)
+        for i in 0:n {
+            println("P7F32:VSUB:" + str(n) + ":" + str(i) + ":" + str(bits(sub_out[i])))
+        }
+        kernel_vmul_inplace($&a, &b, n)
+        for i in 0:n {
+            println("P7F32:VMULIP:" + str(n) + ":" + str(i) + ":" + str(bits(a[i])))
+            if bits(a[i]) != bits(out[i]) { << 1 }
+        }
+        for i in 0:n { a[i] = f32(f64((i * 5 + 1) % 13 - 6) * 0.25) }
+        kernel_vsub_inplace($&a, &b, n)
+        for i in 0:n {
+            if bits(a[i]) != bits(sub_out[i]) { << 2 }
+        }
+    }
+    << 0
+}
+
 fn check_phase7() int {
     // 1) Test p4k4_signed (Q4) and p4k4 (Q8) packing + GEMV + GEMM across rows/nb/m_cnt
     rows := 8
@@ -1223,8 +1284,8 @@ fn check_phase7() int {
         println("P7F32:GMQ8:" + str(i) + ":" + str(bits(om8[i])))
     }
 
-    // 2) Test paged attention (head_dim=64 and head_dim=40) across >1 page (seq_len=23)
-    hds := [64, 40]
+    // 2) Test paged attention (head_dim=64, 128, and 40) across >1 page (seq_len=23)
+    hds := [64, 128, 40]
     for hi in 0:hds.len {
         hd := hds[hi]
         seq_len := 23
@@ -1295,6 +1356,7 @@ fn main() int {
     if check_vscale() != 0 { << 8 }
     if check_rope() != 0 { << 9 }
     if check_p4_f16() != 0 { << 10 }
+    if check_vmul() != 0 { << 11 }
     << 0
 }
 """
@@ -1334,7 +1396,7 @@ def main():
     compiler = args.compiler.resolve()
     root = Path(__file__).resolve().parents[1]
 
-    with tempfile.TemporaryDirectory() as td:
+    with WindowsTemporaryDirectory(prefix="xu-tensor-opt-") as td:
         work = Path(td)
         src = work / "tensor_opt.xu"
         src.write_text(xu_source())
@@ -1382,7 +1444,12 @@ def main():
                 assert f"call __xu_tensor_attn_scores_paged{suf}_f32(" in funcs["kernel_attn_scores_paged"], mode
                 assert f"call __xu_tensor_softmax_scaled{suf}_f32(" in funcs["kernel_softmax_scaled"], mode
                 assert f"call __xu_tensor_attn_vsum_paged{suf}_f32(" in funcs["kernel_attn_vsum_paged"], mode
-                if platform.machine().lower() in ("arm64", "aarch64"):
+                assert "call __xu_tensor_vmul_f32(" in funcs["kernel_vmul"], mode
+                assert "call __xu_tensor_vmul_f32(" in funcs["kernel_vmul_inplace"], mode
+                assert "call __xu_tensor_vsub_f32(" in funcs["kernel_vsub"], mode
+                assert "call __xu_tensor_vsub_f32(" in funcs["kernel_vsub_inplace"], mode
+                target_arch = (os.environ.get("XU_TARGET") or os.environ.get("XUARCH") or platform.machine()).lower()
+                if "arm64" in target_arch or "aarch64" in target_arch:
                     assert f"call __xu_tensor_gemm4x8_q8_0_p4k4_f16_q8_0{suf}_f32(" in funcs["kernel_gemm_q8_p4k4"], mode
                 copy_mir = funcs["kernel_copy16_32"]
                 assert copy_mir.count("load8 [") >= 6 and copy_mir.count("store8 [") >= 6, copy_mir
@@ -1409,6 +1476,8 @@ def main():
                         f"___xu_tensor_attn_scores_paged{suf}_f32",
                         f"___xu_tensor_softmax_scaled{suf}_f32",
                         f"___xu_tensor_attn_vsum_paged{suf}_f32",
+                        "___xu_tensor_vmul_f32",
+                        "___xu_tensor_vsub_f32",
                     ]
                     for sym in expected_syms:
                         assert f"{sym}:" in asm, (mode, sym)
@@ -1474,6 +1543,9 @@ def main():
             assert "call __xu_tensor_attn_scores_paged_f32(" in x64_mir
             assert "call __xu_tensor_softmax_scaled_f32(" in x64_mir
             assert "call __xu_tensor_attn_vsum_paged_f32(" in x64_mir
+            assert "call __xu_tensor_vmul_f32(" in x64_mir
+            assert "call __xu_tensor_vsub_f32(" in x64_mir
+            assert "call __xu_tensor_gemm4x8_q8_0_p4k4_f16_q8_0_f32(" in x64_mir
             x64_asm = run(["otool", "-tV", x64_exe])
             for sym in ("___xu_tensor_swiglu_f32", "___xu_tensor_argmax_f32", "___xu_tensor_rope_f32",
                         "___xu_tensor_gemv4_q4_0_p4_q8_0_f32",
@@ -1487,11 +1559,26 @@ def main():
                         "___xu_tensor_gemv4_q4_0_p4k4_signed_f16_q8_0_f32",
                         "___xu_tensor_gemv4_q8_0_p4k4_f16_q8_0_f32",
                         "___xu_tensor_gemm4x8_q4_0_p4k4_signed_f16_q8_0_f32",
+                        "___xu_tensor_gemm4x8_q8_0_p4k4_f16_q8_0_f32",
                         "___xu_tensor_attn_scores_paged_f32",
                         "___xu_tensor_softmax_scaled_f32",
-                        "___xu_tensor_attn_vsum_paged_f32"):
+                        "___xu_tensor_attn_vsum_paged_f32",
+                        "___xu_tensor_vmul_f32",
+                        "___xu_tensor_vsub_f32"):
                 assert f"{sym}:" in x64_asm, ("macos-x64", sym)
             print("macos-x64 cross-compile and SSE stub disassembly passed")
+
+        # Verify --tensor-fusion and --tensor-fast-math CLI flags without env vars
+        cli_strict_exe = work / "opt-cli-strict"
+        cli_strict_mir = build(compiler, dict(env, XU_TASK_POLL="0"), src, cli_strict_exe, flags=("--tensor-fusion",))
+        cli_strict_funcs = mir_functions(cli_strict_mir)
+        assert "call __xu_tensor_vsub_f32(" in cli_strict_funcs["kernel_vsub"]
+        assert "call __xu_tensor_swiglu_f32(" in cli_strict_funcs["kernel_swiglu"]
+        cli_fast_exe = work / "opt-cli-fast"
+        cli_fast_mir = build(compiler, dict(env, XU_TASK_POLL="0"), src, cli_fast_exe, flags=("--tensor-fast-math",))
+        cli_fast_funcs = mir_functions(cli_fast_mir)
+        assert "call __xu_tensor_swiglu_fast_f32(" in cli_fast_funcs["kernel_swiglu"]
+        print("CLI --tensor-fusion and --tensor-fast-math flags passed")
 
         if args.benchmark:
             bench = {}

@@ -297,14 +297,20 @@ static void diamond_path(cairo_t *cr, double x, double y, double w, double h) {
 }
 
 static void round_path(cairo_t *cr, double x, double y, double w, double h, double r) {
-  if (r < 0) r = 0;
+  if (w <= 0.0 || h <= 0.0) { cairo_new_path(cr); return; }
+  if (r < 0.0) r = 0.0;
   if (r * 2 > w) r = w * 0.5;
   if (r * 2 > h) r = h * 0.5;
   cairo_new_path(cr);
-  cairo_arc(cr, x + w - r, y + r, r, -1.5708, 0);
-  cairo_arc(cr, x + w - r, y + h - r, r, 0, 1.5708);
-  cairo_arc(cr, x + r, y + h - r, r, 1.5708, 3.1416);
-  cairo_arc(cr, x + r, y + r, r, 3.1416, 4.7124);
+  if (r <= 0.0) {
+    cairo_rectangle(cr, x, y, w, h);
+    return;
+  }
+  constexpr double kPi = 3.14159265358979323846;
+  cairo_arc(cr, x + w - r, y + r, r, -kPi * 0.5, 0.0);
+  cairo_arc(cr, x + w - r, y + h - r, r, 0.0, kPi * 0.5);
+  cairo_arc(cr, x + r, y + h - r, r, kPi * 0.5, kPi);
+  cairo_arc(cr, x + r, y + r, r, kPi, kPi * 1.5);
   cairo_close_path(cr);
 }
 

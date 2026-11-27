@@ -10,26 +10,26 @@ SOURCE = r'''@main
 #net
 
 fn test_tcp_options() int {
-    $ln := net.listen_on("tcp", "127.0.0.1:0") or >>
+    $ln := net.listen_on("tcp", "127.0.0.1:0") >>>
     // Even if ln.addr is :0, we can dial directly to loopback with known port or accept
-    ln.close() or >>
+    ln.close() >>>
     << 0
 }
 
 fn test_udp_deadline() int {
-    local := net.resolve_udp_addr("udp4", "127.0.0.1:0") or >>
-    $c := net.listen_udp("udp4", local) or >>
-    c.set_read_buffer(65536) or >>
-    c.set_write_buffer(65536) or >>
-    c.set_broadcast(true) or >>
+    local := net.resolve_udp_addr("udp4", "127.0.0.1:0") >>>
+    $c := net.listen_udp("udp4", local) >>>
+    c.set_read_buffer(65536) >>>
+    c.set_write_buffer(65536) >>>
+    c.set_broadcast(true) >>>
 
     // Set 50ms read deadline in the future
     start := now_ns()
     deadline := start + 50000000 // 50ms
-    c.set_read_deadline(deadline) or >>
+    c.set_read_deadline(deadline) >>>
 
-    pkt := c.read_from(128) or (err) {
-        c.close() or (e2) { << 0 }
+    pkt := c.read_from(128) >>> (err) {
+        c.close() >>> (e2) { << 0 }
         msg := err.msg()
         if msg == "i/o timeout" || msg == "recvfrom: connection timed out" || msg == "recvfrom: Resource temporarily unavailable" {
             println("udp_deadline_passed")
@@ -38,47 +38,47 @@ fn test_udp_deadline() int {
         println("unexpected error: " + err.msg())
         << 1
     }
-    c.close() or >>
+    c.close() >>>
     println("ERROR: read_from did not timeout")
     << 2
 }
 
 fn test_conn_options() int {
-    $ln := net.listen_on("tcp", "127.0.0.1:19876") or >>
-    $client := net.dial_to("tcp", "127.0.0.1:19876") or >>
-    $server := ln.accept() or >>
+    $ln := net.listen_on("tcp", "127.0.0.1:19876") >>>
+    $client := net.dial_to("tcp", "127.0.0.1:19876") >>>
+    $server := ln.accept() >>>
 
-    client.set_nodelay(true) or >>
-    client.set_keepalive(true) or >>
-    client.set_read_buffer(65536) or >>
-    client.set_write_buffer(65536) or >>
+    client.set_nodelay(true) >>>
+    client.set_keepalive(true) >>>
+    client.set_read_buffer(65536) >>>
+    client.set_write_buffer(65536) >>>
 
-    server.set_nodelay(true) or >>
-    server.set_keepalive(true) or >>
+    server.set_nodelay(true) >>>
+    server.set_keepalive(true) >>>
 
     msg := "hello socket options"
-    client.write(&msg) or >>
-    recv := server.read(128) or >>
+    client.write(&msg) >>>
+    recv := server.read(128) >>>
     if recv != msg {
         println("ERROR: echo mismatch")
         << 2
     }
 
-    client.close() or >>
-    server.close() or >>
-    ln.close() or >>
+    client.close() >>>
+    server.close() >>>
+    ln.close() >>>
     println("tcp_options_passed")
     << 0
 }
 
 fn main() int {
-    r1 := test_udp_deadline() or (err) {
+    r1 := test_udp_deadline() >>> (err) {
         println("udp error: " + err.msg())
         << 10
     }
     if r1 != 0 { << r1 }
 
-    r2 := test_conn_options() or (err) {
+    r2 := test_conn_options() >>> (err) {
         println("tcp error: " + err.msg())
         << 20
     }

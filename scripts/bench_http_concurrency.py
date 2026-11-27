@@ -29,10 +29,10 @@ fn handle_stress(c http.Context) {
         for i in 0:512 {
             data = data + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         }
-        c.text(200, data) or (err) { << }
+        c.text(200, data) >>> (err) { << }
         <<
     }
-    c.text(200, "ok:" + p) or (err) { << }
+    c.text(200, "ok:" + p) >>> (err) { << }
 }
 
 fn serve_stress(lfd int, srv_done chan int) {
@@ -41,7 +41,7 @@ fn serve_stress(lfd int, srv_done chan int) {
     opts.read_timeout_ns = 10000000000
     opts.write_timeout_ns = 10000000000
     opts.max_buffer_bytes = 67108864
-    _ := http.serve_listener_with_options(lfd, handle_stress, opts) or (err) {
+    _ := http.serve_listener_with_options(lfd, handle_stress, opts) >>> (err) {
         srv_done <- 1
         <<
     }
@@ -60,7 +60,7 @@ fn worker_loop(base_url string, worker_id int, reqs_per_worker int, out chan int
         } else if mod4 == 2 {
             path = "/static_file.txt"
         }
-        resp := c.get(base_url + path) or (err) {
+        resp := c.get(base_url + path) >>> (err) {
             out <- success
             <<
         }
@@ -77,7 +77,7 @@ fn worker_burst(base_url string, burst_count int, out chan int) {
     for i in 0:burst_count {
         $c := http.new_client()
         c.set_timeout(5000000000)
-        resp := c.get(base_url + "/ping") or (err) {
+        resp := c.get(base_url + "/ping") >>> (err) {
             ->
         }
         if resp.status_code() == 200 {
@@ -92,7 +92,7 @@ fn main() int {
     $lfd := -1
     for p in 0:32 {
         addr := "127.0.0.1:" + strconv.itoa(port + p)
-        fd := net.listen(addr) or (err) { -> }
+        fd := net.listen(addr) >>> (err) { -> }
         lfd = fd
         port = port + p
         <-
@@ -121,7 +121,7 @@ fn main() int {
     }
     if total1 != expected_stage1 {
         eprintln("stage 1 failed: expected " + strconv.itoa(expected_stage1) + " got " + strconv.itoa(total1))
-        net.conn_close(lfd) or (err) { << 3 }
+        net.conn_close(lfd) >>> (err) { << 3 }
         << 2
     }
     println("stage 1 (keep-alive 1600 reqs) passed")
@@ -142,13 +142,13 @@ fn main() int {
     }
     if total2 != expected_stage2 {
         eprintln("stage 2 failed: expected " + strconv.itoa(expected_stage2) + " got " + strconv.itoa(total2))
-        net.conn_close(lfd) or (err) { << 3 }
+        net.conn_close(lfd) >>> (err) { << 3 }
         << 3
     }
     println("stage 2 (burst connection churn 200 conns) passed")
 
     // Stage 3: Teardown verification
-    net.conn_close(lfd) or (err) { << 4 }
+    net.conn_close(lfd) >>> (err) { << 4 }
     if <-srv_done != 1 {
         eprintln("stage 3 failed: server did not shut down cleanly")
         << 5

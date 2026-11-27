@@ -5,6 +5,7 @@
 // Completely decoupled from assembler or code generation internals.
 
 #xu/mc
+#crypto/sha256
 
 pub const MACHO_MAGIC_64 = 0xfeedfacf
 pub const MACHO_CPU_TYPE_ARM64 = 0x0100000c
@@ -19,6 +20,7 @@ pub const LC_MAIN = 0x80000028
 pub const LC_SYMTAB = 0x2
 pub const LC_DYSYMTAB = 0xb
 const LC_DYLD_INFO_ONLY = 0x80000022
+const LC_CODE_SIGNATURE = 0x1d
 const S_ZEROFILL = 1
 const MACHO_CLOCK_SYMBOL = "_clock_gettime"
 
@@ -66,12 +68,14 @@ pub fn macho_syms_empty() MachoSyms {
 // Load commands: PAGEZERO (72), TEXT and DATA with one section each
 // (152 each), LINKEDIT (72), SYMTAB (24), DYSYMTAB (80), DYLD_INFO (48),
 // DYLINKER (32), MAIN (24), DYLIB (56),
-// plus the __DWARF segment with four sections (72 + 4 * 80) when debug
-// sections are present.
+// plus LC_CODE_SIGNATURE (16) for ad-hoc signed executables, OR the
+// __DWARF segment with four sections (72 + 4 * 80) when debug sections exist.
 fn macho_cmds_size(debug bool) int {
     $n := 72 + 152 + 152 + 72 + 24 + 80 + 48 + 32 + 24 + 56
     if debug {
         n += 72 + 4 * 80
+    } else {
+        n += 16
     }
     << n
 }
@@ -134,6 +138,80 @@ fn macho_clock_bind() mc.CodeBuffer {
 
 fn align8(n int) int {
     << (n + 7) / 8 * 8
+}
+
+fn align16(n int) int {
+    << (n + 15) / 16 * 16
+}
+
+fn emit_u64_be(buf $&mc.CodeBuffer, v int) {
+    buf.emit_u32_be((v >> 32) & 0xffffffff)
+    buf.emit_u32_be(v & 0xffffffff)
+}
+
+// Compute the embedded CS_ADHOC SuperBlob byte size for an executable with
+// code signature starting at `cs_off`.
+fn macho_adhoc_sig_size(cs_off int) int {
+    n_slots := (cs_off + 4095) / 4096
+    cd_len := 88 + 6 + n_slots * 32
+    << 20 + cd_len
+}
+
+// Emit an Apple CS_ADHOC SuperBlob covering buf[0:cs_off] with 4KB SHA-256 pages.
+fn macho_emit_adhoc_sig(buf $&mc.CodeBuffer, cs_off int, text_file_size int) {
+    n_slots := (cs_off + 4095) / 4096
+    cd_len := 88 + 6 + n_slots * 32
+    sb_len := 20 + cd_len
+
+    $hashes := []int{}
+    for p in 0:n_slots {
+        start := p * 4096
+        $end := start + 4096
+        if end > cs_off {
+            end = cs_off
+        }
+        $chunk := ""
+        for k in start:end {
+            chunk.push_byte(buf.bytes[k] & 255)
+        }
+        digest := sha256.sum256_bytes(chunk)
+        for j in 0:32 {
+            hashes.push(digest[j] & 255)
+        }
+    }
+
+    // SuperBlob header + 1 CodeDirectory BlobIndex
+    buf.emit_u32_be(0xfade0cc0) // CSMAGIC_EMBEDDED_SIGNATURE
+    buf.emit_u32_be(sb_len)
+    buf.emit_u32_be(1)          // count
+    buf.emit_u32_be(0)          // CSSLOT_CODEDIRECTORY
+    buf.emit_u32_be(20)         // offset
+
+    // CodeDirectory v0x20400 (CS_SUPPORTSEXECSEG) with adhoc + linker-signed flags
+    buf.emit_u32_be(0xfade0c02) // CSMAGIC_CODEDIRECTORY
+    buf.emit_u32_be(cd_len)
+    buf.emit_u32_be(0x20400)
+    buf.emit_u32_be(0x20002)    // CS_ADHOC | CS_LINKER_SIGNED
+    buf.emit_u32_be(88 + 6)     // hashOffset
+    buf.emit_u32_be(88)         // identOffset
+    buf.emit_u32_be(0)          // nSpecialSlots
+    buf.emit_u32_be(n_slots)    // nCodeSlots
+    buf.emit_u32_be(cs_off)     // codeLimit
+    buf.emit_u8(32)             // hashSize (SHA-256)
+    buf.emit_u8(2)              // CS_HASHTYPE_SHA256
+    buf.emit_u8(0)              // platform
+    buf.emit_u8(12)             // pageSize (2^12 = 4096)
+    buf.emit_u32_be(0)          // spare2
+    buf.emit_u32_be(0)          // scatterOffset
+    buf.emit_u32_be(0)          // teamOffset
+    buf.emit_u32_be(0)          // spare3
+    emit_u64_be(buf, 0)         // codeLimit64
+    emit_u64_be(buf, 0)         // execSegBase
+    emit_u64_be(buf, text_file_size) // execSegLimit
+    emit_u64_be(buf, 1)         // CS_EXECSEG_MAIN_BINARY
+
+    emit_fixed_string(buf, "a.out", 6)
+    buf.emit_bytes(&hashes)
 }
 
 fn macho_segment(buf $&mc.CodeBuffer, name string, nsects int, vmaddr int, vmsize int, fileoff int, filesize int, prot int) {
@@ -236,7 +314,14 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
     le_vm := base + data_off + page
     sym_off := align8(le_off + bind.bytes.len)
     str_off := sym_off + nlist.len
-    le_size := str_off + strtab.len - le_off
+    $cs_off := 0
+    $cs_size := 0
+    $le_size := str_off + strtab.len - le_off
+    if !debug {
+        cs_off = align16(str_off + strtab.len)
+        cs_size = macho_adhoc_sig_size(cs_off)
+        le_size = (cs_off + cs_size) - le_off
+    }
     $le_seg_size := page_up(le_size, page)
     if le_seg_size == 0 {
         le_seg_size = page
@@ -250,10 +335,7 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
     dw_size := dstr_off + dbg.str.len - dw_off
     dw_vm := le_vm + le_seg_size
 
-    $ncmds := 10
-    if debug {
-        ncmds += 1
-    }
+    $ncmds := 11
     macho_write_header($&buf, cpu_type, MACHO_FILETYPE_EXECUTE, ncmds, macho_cmds_size(debug))
 
     macho_segment($&buf, "__PAGEZERO", 0, 0, base, 0, 0, 0)
@@ -320,6 +402,11 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
         macho_section($&buf, "__debug_info", "__DWARF", dw_vm + (info_off - dw_off), dbg.info.len, info_off, 0, 0)
         macho_section($&buf, "__debug_abbrev", "__DWARF", dw_vm + (abbrev_off - dw_off), dbg.abbrev.len, abbrev_off, 0, 0)
         macho_section($&buf, "__debug_str", "__DWARF", dw_vm + (dstr_off - dw_off), dbg.str.len, dstr_off, 0, 0)
+    } else {
+        buf.emit_u32_le(LC_CODE_SIGNATURE)
+        buf.emit_u32_le(16)
+        buf.emit_u32_le(cs_off)
+        buf.emit_u32_le(cs_size)
     }
 
     pad_to($&buf, text_off)
@@ -339,7 +426,8 @@ pub fn macho_write_executable_debug(code_bytes &[]int, cpu_type int, entry_offse
         pad_to($&buf, dstr_off)
         buf.emit_bytes(&dbg.str)
     } else {
-        pad_to($&buf, le_off + le_size)
+        pad_to($&buf, cs_off)
+        macho_emit_adhoc_sig($&buf, cs_off, data_off)
     }
     << buf
 }

@@ -36,6 +36,7 @@ struct A64Frame {
     size int
     local_off []int
     temp_off []int
+    asm_save_off int
 }
 
 // ===== encoders =====
@@ -231,6 +232,7 @@ fn a64_frame_ra(f &mir.MFn, ra &RaInfo, opt bool) A64Frame {
 
 fn frame_layout_ra(f &mir.MFn, reg_args int, ra &RaInfo, opt bool) A64Frame {
     $max_args := 0
+    $max_asm_args := 0
     for i in 0:f.instrs.len {
         if f.instrs[i].kind == mir.MI_CALL || f.instrs[i].kind == mir.MI_CALL_IND {
             $n := 0
@@ -241,6 +243,16 @@ fn frame_layout_ra(f &mir.MFn, reg_args int, ra &RaInfo, opt bool) A64Frame {
             }
             if n > max_args {
                 max_args = n
+            }
+        } else if f.instrs[i].kind == mir.MI_ASM && f.instrs[i].c >= 0 {
+            $n := 0
+            $a := f.instrs[i].c
+            while a >= 0 {
+                n += 1
+                a = f.margs[a].next
+            }
+            if n > max_asm_args {
+                max_asm_args = n
             }
         }
     }
@@ -304,8 +316,16 @@ fn frame_layout_ra(f &mir.MFn, reg_args int, ra &RaInfo, opt bool) A64Frame {
             off += ns * 8
         }
     }
+    $asm_save_off := -1
+    if max_asm_args > 0 {
+        if (off % 16) != 0 {
+            off += 8
+        }
+        asm_save_off = off
+        off += 96 + 2 * max_asm_args * 8
+    }
     size := (off + 15) / 16 * 16
-    << A64Frame{out_area: out_area, size: size, local_off: loffs, temp_off: toffs}
+    << A64Frame{out_area: out_area, size: size, local_off: loffs, temp_off: toffs, asm_save_off: asm_save_off}
 }
 
 // The frame for a backend passing the first reg_args arguments in
@@ -1196,6 +1216,170 @@ fn a64_bounds_check(f &mir.MFn, bi int, uses &[]int, opt bool) []int {
     << out
 }
 
+fn a64_ccmp_nzcv(cond int, want_true bool) int {
+    // AArch64 NZCV = N(8)|Z(4)|C(2)|V(1).
+    if cond == target.ARM64_COND_EQ {
+        if want_true { << 4 }
+        << 0
+    }
+    if cond == target.ARM64_COND_NE {
+        if want_true { << 0 }
+        << 4
+    }
+    if cond == target.ARM64_COND_GE {
+        if want_true { << 0 }
+        << 8
+    }
+    if cond == target.ARM64_COND_LT {
+        if want_true { << 8 }
+        << 0
+    }
+    if cond == target.ARM64_COND_GT {
+        if want_true { << 0 }
+        << 4
+    }
+    // ARM64_COND_LE
+    if want_true { << 4 }
+    << 0
+}
+
+fn a64_can_ccmp_imm(f &mir.MFn, v int) bool {
+    if v <= -2 {
+        cv := f.consts[0 - v - 2]
+        << cv >= -31 && cv <= 31
+    }
+    << false
+}
+
+fn a64_ccmp_vals(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, c int, d int, nzcv int, cc_cond int) {
+    rn := a64_src(cb, f, fr, ra, c, 9)
+    if d <= -2 {
+        cv := f.consts[0 - d - 2]
+        if cv >= 0 && cv <= 31 {
+            // ccmp xn, #imm5, #nzcv, cond
+            e32(cb, 0xFA400800 | (cv << 16) | (cc_cond << 12) | (rn << 5) | nzcv)
+            <<
+        }
+        if cv < 0 && cv >= -31 {
+            ncv := 0 - cv
+            // ccmn xn, #imm5, #nzcv, cond
+            e32(cb, 0xBA400800 | (ncv << 16) | (cc_cond << 12) | (rn << 5) | nzcv)
+            <<
+        }
+    }
+    rm := a64_src(cb, f, fr, ra, d, 10)
+    // ccmp xn, xm, #nzcv, cond
+    e32(cb, 0xFA400000 | (rm << 16) | (cc_cond << 12) | (rn << 5) | nzcv)
+}
+
+fn a64_ccmp_check(f &mir.MFn, bi int, uses &[]int, idx_mode &[]int, opt bool) []int {
+    $out := []int{}
+    blk := ~f.blocks[bi]
+    if !opt || blk.tkind != mir.TKIND_BRANCH {
+        << out
+    }
+    $ids := []int{}
+    $ii := blk.head
+    while ii >= 0 {
+        if f.instrs[ii].kind != mir.MI_NOP {
+            ids.push(ii)
+        }
+        ii = f.instrs[ii].next
+    }
+    if ids.len < 3 {
+        << out
+    }
+    id1 := ids[ids.len - 3]
+    id2 := ids[ids.len - 2]
+    id3 := ids[ids.len - 1]
+    if (id1 < idx_mode.len && idx_mode[id1] != 0) ||
+       (id2 < idx_mode.len && idx_mode[id2] != 0) ||
+       (id3 < idx_mode.len && idx_mode[id3] != 0) {
+        << out
+    }
+    i1 := ~f.instrs[id1]
+    i2 := ~f.instrs[id2]
+    i3 := ~f.instrs[id3]
+    if i3.kind != mir.MI_BIN || (i3.b != mir.BIN_AND && i3.b != mir.BIN_OR) || i3.a != blk.ta {
+        << out
+    }
+    if i1.kind != mir.MI_BIN || !a64_is_icmp(i1.b) || i2.kind != mir.MI_BIN || !a64_is_icmp(i2.b) {
+        << out
+    }
+    if i1.a < 0 || i1.a >= uses.len || i2.a < 0 || i2.a >= uses.len || i3.a < 0 || i3.a >= uses.len {
+        << out
+    }
+    if uses[i1.a] != 1 || uses[i2.a] != 1 || uses[i3.a] != 1 {
+        << out
+    }
+    if !((i3.c == i1.a && i3.d == i2.a) || (i3.c == i2.a && i3.d == i1.a)) {
+        << out
+    }
+    if i2.c == i1.a || i2.d == i1.a {
+        << out
+    }
+    out.push(id1)
+    out.push(id2)
+    out.push(id3)
+    << out
+}
+
+fn a64_ctz_pow2(x int) int {
+    $v := x
+    $k := 0
+    while (v & 1) == 0 {
+        v = v >> 1
+        k += 1
+    }
+    << k
+}
+
+fn a64_emit_mul_const(cb $&mc.CodeBuffer, rd int, rn int, cv int) bool {
+    if cv <= 2 { << false }
+    // Family 1: cv = 2^k - 1 (k in 2..62)
+    if (cv & 1) == 1 && cv <= 4611686018427387903 {
+        p1 := cv + 1
+        if (p1 & cv) == 0 {
+            k := a64_ctz_pow2(p1)
+            if k >= 2 && k <= 62 {
+                // lsl x10, rn, #k ; sub rd, x10, rn
+                e32(cb, 0xD3400000 | (((64 - k) & 63) << 16) | ((63 - k) << 10) | (rn << 5) | 10)
+                e32(cb, 0xCB000000 | (rn << 16) | (10 << 5) | rd)
+                << true
+            }
+        }
+    }
+    // Family 2: cv = (2^k + 1) << s (k in 1..61, s in 1..61, k + s <= 62)
+    if (cv & 1) == 0 {
+        s := a64_ctz_pow2(cv)
+        base := cv >> s
+        k := a64_mul_pow2_plus1(base)
+        if s >= 1 && s <= 61 && k >= 1 && k + s <= 62 {
+            // add x10, rn, rn, lsl #k ; lsl rd, x10, #s
+            e32(cb, 0x8B000000 | (rn << 16) | (k << 10) | (rn << 5) | 10)
+            e32(cb, 0xD3400000 | (((64 - s) & 63) << 16) | ((63 - s) << 10) | (10 << 5) | rd)
+            << true
+        }
+    }
+    // Family 3: cv = 2^a + 2^b + 1 (1 <= b < a <= 62)
+    if (cv & 1) == 1 {
+        rem := cv - 1
+        lsb := rem & (0 - rem)
+        hi := rem - lsb
+        if hi > lsb && (hi & (hi - 1)) == 0 {
+            b := a64_ctz_pow2(lsb)
+            a := a64_ctz_pow2(hi)
+            if b >= 1 && a > b && a <= 62 {
+                // add x10, rn, rn, lsl #b ; add rd, x10, rn, lsl #a
+                e32(cb, 0x8B000000 | (rn << 16) | (b << 10) | (rn << 5) | 10)
+                e32(cb, 0x8B000000 | (rn << 16) | (a << 10) | (10 << 5) | rd)
+                << true
+            }
+        }
+    }
+    << false
+}
+
 struct StrFix {
     adr_off int
     bytes string
@@ -1204,7 +1388,7 @@ struct StrFix {
 // lines receives (code offset, source line) pairs where the line changes.
 // Registers for allocated values: callee-saved x19-x27 (x28 is the state
 // block) and the scratch registers no sequence below uses.
-fn a64_ra(f &mir.MFn, opt bool) RaInfo {
+fn a64_ra(f &mir.MFn, opt bool, no_fp bool) RaInfo {
     if !opt {
         << ra_none(f)
     }
@@ -1220,15 +1404,17 @@ fn a64_ra(f &mir.MFn, opt bool) RaInfo {
         caller.push(r)
     }
     $fp_callee := []int{}
-    for r in 8:16 {
-        fp_callee.push(32 + r)
-    }
     $fp_caller := []int{}
-    for r in 3:8 {
-        fp_caller.push(32 + r)
-    }
-    for r in 16:32 {
-        fp_caller.push(32 + r)
+    if !no_fp {
+        for r in 8:16 {
+            fp_callee.push(32 + r)
+        }
+        for r in 3:8 {
+            fp_caller.push(32 + r)
+        }
+        for r in 16:32 {
+            fp_caller.push(32 + r)
+        }
     }
     $arg_regs := []int{}
     for r in 0:8 {
@@ -1351,6 +1537,8 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_op
         idx_off.push(-1)
         idx_shift.push(0)
     }
+    $shl_fold_cnt := []int{}
+    for _ in 0:ni { shl_fold_cnt.push(0) }
     $def_cnt := []int{}
     $def_blk := []int{}
     $def_ii := []int{}
@@ -1393,13 +1581,13 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_op
                         $idx_v := off_v
                         $s := 0
                         if off_v < nt && def_cnt[off_v] == 1 && def_blk[off_v] == bi &&
-                           off_v < uses.len && uses[off_v] == 1 {
+                           off_v < uses.len && uses[off_v] >= 1 && uses[off_v] <= 8 {
                             sii := def_ii[off_v]
                             sins := &f.instrs[sii]
                             if idx_mode[sii] == 0 && sins.kind == mir.MI_BIN && sins.b == mir.BIN_SHL &&
                                sins.c >= 0 && sins.d <= -2 {
                                 sc := f.consts[0 - sins.d - 2]
-                                if sc >= 0 && sc <= 3 {
+                                if sc >= 0 && sc <= 3 && (uses[off_v] == 1 || a64_temp_reg(ra, off_v) != a64_temp_reg(ra, sins.c)) {
                                     shl_ii = sii
                                     idx_v = sins.c
                                     s = sc
@@ -1500,7 +1688,12 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_op
                             }
                         }
                         if safe {
-                            if shl_ii >= 0 { idx_mode[shl_ii] = 1 }
+                            if shl_ii >= 0 {
+                                shl_fold_cnt[shl_ii] = shl_fold_cnt[shl_ii] + 1
+                                if shl_fold_cnt[shl_ii] == uses[off_v] {
+                                    idx_mode[shl_ii] = 1
+                                }
+                            }
                             idx_mode[ii] = 1
                             for ci in 0:cand_mems.len {
                                 m := cand_mems[ci]
@@ -1594,7 +1787,10 @@ fn a64_prepare_idx(f &mir.MFn, ra &RaInfo, uses &[]int, idx_mode $&[]int, idx_op
                             }
                         }
                         if sh_opc != 0 && bv >= 0 {
-                            idx_mode[ii] = 1
+                            shl_fold_cnt[ii] = shl_fold_cnt[ii] + 1
+                            if shl_fold_cnt[ii] == uses[ins.a] {
+                                idx_mode[ii] = 1
+                            }
                             idx_mode[nx] = 3
                             idx_opc[nx] = sh_opc
                             idx_base[nx] = bv
@@ -1998,6 +2194,9 @@ fn can_elide_frame_ex(f &mir.MFn, ra &RaInfo, opt bool, inline_bits bool) bool {
     if f.name.len >= 6 && f.name[0:6] == "naked_" {
         << true
     }
+    if f.is_interrupt {
+        << false
+    }
     if !opt || f.nparams > 8 || ra.used_callee.len > 0 || ra.max_call_saves > 0 {
         << false
     }
@@ -2068,6 +2267,9 @@ fn can_elide_frame_ex(f &mir.MFn, ra &RaInfo, opt bool, inline_bits bool) bool {
                 }
                 ii = ins.next
                 ->
+            }
+            if k == mir.MI_ASM && ins.c >= 0 {
+                << false
             }
             if !fv_noframe_kind(k) {
                 << false
@@ -2780,12 +2982,12 @@ fn a64_callee_save_slots(cb $&mc.CodeBuffer, regs &[]int, save_off int, store bo
         off := save_off + i * 8
         // Register pairs use a signed seven-bit offset scaled by eight.
         // Both registers must already have slots in the allocated frame.
-        if r < 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] < 32 {
+        if r < 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] == r + 1 {
             a64_pair(cb, pair_op, r, regs[i + 1], R_SP, off)
             i += 2
             ->
         }
-        if r >= 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] >= 32 {
+        if r >= 32 && off <= 504 && i + 1 < regs.len && regs[i + 1] == r + 1 {
             $fpair_op := 0x6D400000 // ldp dt1, dt2, [sp, #off]
             if store { fpair_op = 0x6D000000 } // stp dt1, dt2, [sp, #off]
             a64_pair(cb, fpair_op, r - 32, regs[i + 1] - 32, R_SP, off)
@@ -2803,12 +3005,34 @@ fn a64_callee_save_slots(cb $&mc.CodeBuffer, regs &[]int, save_off int, store bo
     }
 }
 
-pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool) {
-    ra := a64_ra(f, opt)
+pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, lines $&[]int, opt bool, no_fp bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
+    if f.is_naked {
+        syms.define_label(f.label, cb.len())
+        if f.src_line > 0 {
+            lines.push(cb.len())
+            lines.push(f.src_line)
+        }
+        for bi in 0:f.blocks.len {
+            $ii := f.blocks[bi].head
+            while ii >= 0 {
+                ins := &f.instrs[ii]
+                if ins.kind == mir.MI_ASM {
+                    if ins.line > 0 {
+                        lines.push(cb.len())
+                        lines.push(ins.line)
+                    }
+                    a64_emit_asm_insn(cb, ins.sval)
+                }
+                ii = ins.next
+            }
+        }
+        <<
+    }
+    ra := a64_ra(f, opt, no_fp)
     $fr := a64_frame_ra(f, &ra, opt)
     leaf_noframe := can_elide_frame_ex(f, &ra, opt, true)
     $fp_plan := FastPlan{nodes: []FastNode{}, exits: []FastExit{}, slow_blk: -1, init_locals: []int{}, init_vals: []int{}}
-    if opt && !leaf_noframe {
+    if opt && !leaf_noframe && !f.is_interrupt {
         fp_plan = analyze_fast_entry(f, &ra)
     }
     // Saved callee registers sit above the locals and temps; cold-call caller-save area sits above those.
@@ -2837,7 +3061,32 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             e32(cb, 0xD503201F)
         }
     }
-    syms.define_label(f.label, cb.len())
+    $body_label := f.label + ""
+    if f.is_interrupt {
+        syms.define_label(f.label, cb.len())
+        if f.src_line > 0 {
+            lines.push(cb.len())
+            lines.push(f.src_line)
+        }
+        a64_sub_sp(cb, 256)
+        for pi in 0:15 {
+            a64_pair(cb, 0xA9000000, pi * 2, pi * 2 + 1, R_SP, pi * 16)
+        }
+        a64_str(cb, 30, R_SP, 240)
+        if f.nparams >= 1 {
+            a64_add_imm(cb, 0, R_SP, 0)
+        }
+        body_label = f.label + ".__isr_body"
+        a64_branch_reloc(cb, relocs, 0x94000000, body_label, mc.RELOC_ARM64_CALL26)
+        a64_ldr(cb, 30, R_SP, 240)
+        for pi in 0:15 {
+            a64_pair(cb, 0xA9400000, pi * 2, pi * 2 + 1, R_SP, pi * 16)
+        }
+        a64_add_imm(cb, R_SP, R_SP, 256)
+        e32(cb, 0xD69F03E0) // eret
+    }
+    fn_start := cb.len()
+    syms.define_label(body_label, fn_start)
     $last_line := f.src_line
     if last_line > 0 {
         lines.push(cb.len())
@@ -2873,6 +3122,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
     }
     // Prologue.
+    prolog_start := cb.len()
+    $sub_sp_insns := 0
+    $save_insns := 0
     if !leaf_noframe {
         if compact_frame {
             a64_pair(cb, 0xA9800000, 29, 30, R_SP, 0 - fr.size)
@@ -2881,10 +3133,14 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             e32(cb, 0xA9BF7BFD)
             e32(cb, 0x910003FD)
             if fr.size > 0 {
+                sub_sp_beg := cb.len()
                 a64_sub_sp(cb, fr.size)
+                sub_sp_insns = (cb.len() - sub_sp_beg) / 4
             }
         }
+        save_beg := cb.len()
         a64_callee_save_slots(cb, &ra.used_callee, save_off, true)
+        save_insns = (cb.len() - save_beg) / 4
     }
     a64_copy_params(cb, f, &fr, &ra)
     if fp_plan.slow_blk > 0 {
@@ -2905,6 +3161,7 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
     }
     $strs := []StrFix{}
     $str_aligns := []int{}
+    $str_rds := []int{}
     $uses := []int{}
     $idx_mode := []int{}
     $idx_opc := []int{}
@@ -3260,6 +3517,10 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         // A tagged bounds check (idx < 0 || idx >= len) ending the block
         // becomes one unsigned compare.
         bounds := a64_bounds_check(f, bi, &uses, opt)
+        $ccmp := []int{}
+        if bounds.len == 0 {
+            ccmp = a64_ccmp_check(f, bi, &uses, &idx_mode, opt)
+        }
         // A compare read only by one or more MI_SELECTs in this block leaves its
         // condition in NZCV across flag-preserving instructions for csel.
         $sel_cond := -1
@@ -3277,7 +3538,9 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         // An instruction already emitted together with its predecessor.
         $paired := -1
         while ii >= 0 {
-            if (bounds.len > 0 && (ii == bounds[0] || ii == bounds[1] || ii == bounds[2])) || ii == paired || (opt && idx_mode[ii] == 1) {
+            if (bounds.len > 0 && (ii == bounds[0] || ii == bounds[1] || ii == bounds[2])) ||
+               (ccmp.len > 0 && (ii == ccmp[0] || ii == ccmp[1] || ii == ccmp[2])) ||
+               ii == paired || (opt && idx_mode[ii] == 1) {
                 ii = f.instrs[ii].next
                 ->
             }
@@ -3933,13 +4196,37 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                         e32(cb, fopc | (fx << 5) | fd)
                         a64_put(cb, &fr, &ra, ins.a, 32 + fd)
                     } else {
-                        rn := a64_src(cb, f, &fr, &ra, ins.c, 9)
-                        rm := a64_src(cb, f, &fr, &ra, ins.d, 10)
-                        $rd := a64_dst(&ra, ins.a, 9)
-                        if ret_direct { rd = 0 }
-                        a64_bin(cb, ins.b, rd, rn, rm)
-                        if ret_direct { ret_done = true }
-                        else { a64_put(cb, &fr, &ra, ins.a, rd) }
+                        $done_mc := false
+                        if opt && ins.b == mir.BIN_MUL {
+                            $mc_lhs := -1
+                            $mc_cv := 0
+                            if ins.c > -2 && ins.d <= -2 {
+                                mc_lhs = ins.c
+                                mc_cv = f.consts[0 - ins.d - 2]
+                            } else if ins.d > -2 && ins.c <= -2 {
+                                mc_lhs = ins.d
+                                mc_cv = f.consts[0 - ins.c - 2]
+                            }
+                            if mc_lhs != -1 {
+                                rn := a64_src(cb, f, &fr, &ra, mc_lhs, 9)
+                                $rd := a64_dst(&ra, ins.a, 9)
+                                if ret_direct { rd = 0 }
+                                if a64_emit_mul_const(cb, rd, rn, mc_cv) {
+                                    if ret_direct { ret_done = true }
+                                    else { a64_put(cb, &fr, &ra, ins.a, rd) }
+                                    done_mc = true
+                                }
+                            }
+                        }
+                        if !done_mc {
+                            rn := a64_src(cb, f, &fr, &ra, ins.c, 9)
+                            rm := a64_src(cb, f, &fr, &ra, ins.d, 10)
+                            $rd := a64_dst(&ra, ins.a, 9)
+                            if ret_direct { rd = 0 }
+                            a64_bin(cb, ins.b, rd, rn, rm)
+                            if ret_direct { ret_done = true }
+                            else { a64_put(cb, &fr, &ra, ins.a, rd) }
+                        }
                     }
                 }
             } else if k == mir.MI_UN {
@@ -4267,10 +4554,14 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                     }
                 }
             } else if k == mir.MI_STR_CONST {
+                $rd := a64_dst(&ra, ins.a, 9)
+                if ret_direct { rd = 0 }
                 strs.push(StrFix{adr_off: cb.len(), bytes: ins.sval + ""})
                 str_aligns.push(ins.d)
-                e32(cb, 0x10000000 | 9)
-                a64_put(cb, &fr, &ra, ins.a, 9)
+                str_rds.push(rd)
+                e32(cb, 0x10000000 | rd)
+                if ret_direct { ret_done = true }
+                else { a64_put(cb, &fr, &ra, ins.a, rd) }
             } else if k == mir.MI_LOAD_FN_ADDR {
                 $rd := 9
                 if ret_direct { rd = 0 }
@@ -4278,39 +4569,50 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
                 if ret_direct { ret_done = true }
                 else { a64_put(cb, &fr, &ra, ins.a, rd) }
             } else if k == mir.MI_ASM {
-                s := ins.sval
-                if s == "wfi" || s == "hlt" {
-                    e32(cb, 0xD503207F)
-                } else if s == "wfe" {
-                    e32(cb, 0xD503205F)
-                } else if s == "nop" {
-                    e32(cb, 0xD503201F)
-                } else if s == "pause" || s == "yield" {
-                    e32(cb, 0xD503203F)
-                } else if s == "cli" {
-                    e32(cb, 0xD50342DF) // msr daifset, #2
-                } else if s == "sti" {
-                    e32(cb, 0xD503425F) // msr daifclr, #2
-                } else if s == "isb" {
-                    e32(cb, 0xD5033FDF)
-                } else if s == "dmb sy" || s == "mfence" || s == "fence" || s == "mb" {
-                    e32(cb, 0xD5033FBF)
-                } else if s == "dmb ld" || s == "lfence" || s == "rmb" {
-                    e32(cb, 0xD5033DBF)
-                } else if s == "dmb st" || s == "sfence" || s == "wmb" {
-                    e32(cb, 0xD5033EBF)
-                } else if s == "dsb sy" {
-                    e32(cb, 0xD5033F9F)
-                } else if s == "clrex" {
-                    e32(cb, 0xD5033F5F)
+                if asm_starts_with(&ins.sval, "@ops:") {
+                    a64_emit_asm_with_ops(cb, f, &fr, &ra, &ins)
                 } else {
-                    e32(cb, 0xD503201F)
+                    a64_emit_asm_insn(cb, ins.sval)
                 }
             } else {
                 // Unknown kinds are a lowering bug; trap loudly at run time.
                 e32(cb, 0xD4200000)
             }
             ii = ins.next
+        }
+        if ccmp.len > 0 {
+            ins1 := ~f.instrs[ccmp[0]]
+            ins2 := ~f.instrs[ccmp[1]]
+            ins3 := ~f.instrs[ccmp[2]]
+            $c1_l := ins1.c
+            $c1_r := ins1.d
+            $c1_op := ins1.b
+            if !a64_can_cmp_imm(f, c1_r) && a64_can_cmp_imm(f, c1_l) {
+                c1_l = ins1.d
+                c1_r = ins1.c
+                c1_op = a64_swap_cmp_op(ins1.b)
+            }
+            $c2_l := ins2.c
+            $c2_r := ins2.d
+            $c2_op := ins2.b
+            if !a64_can_ccmp_imm(f, c2_r) && a64_can_ccmp_imm(f, c2_l) {
+                c2_l = ins2.d
+                c2_r = ins2.c
+                c2_op = a64_swap_cmp_op(ins2.b)
+            }
+            cond1 := a64_cond_of(c1_op)
+            cond2 := a64_cond_of(c2_op)
+            $cc_cond := cond1
+            $nzcv := a64_ccmp_nzcv(cond2, false)
+            if ins3.b == mir.BIN_OR {
+                cc_cond = cond1 ^ 1
+                nzcv = a64_ccmp_nzcv(cond2, true)
+            }
+            a64_cmp_vals(cb, f, &fr, &ra, c1_l, c1_r)
+            a64_ccmp_vals(cb, f, &fr, &ra, c2_l, c2_r, nzcv, cc_cond)
+            fused = cond2
+            fused_cbz_v = -1
+            last_cmp_kind = 0
         }
         blk := ~f.blocks[bi]
         $invert_br := false
@@ -4416,7 +4718,8 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
             }
         }
     }
-    syms.define_label(epilogue, cb.len())
+    epilog_start := cb.len()
+    syms.define_label(epilogue, epilog_start)
     if !leaf_noframe {
         a64_callee_save_slots(cb, &ra.used_callee, save_off, false)
         if compact_frame {
@@ -4429,11 +4732,43 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
     }
     e32(cb, 0xD65F03C0)
+    body_end := cb.len()
     if !inline_fast_exit {
         for ei in 0:fp_plan.exits.len {
             syms.define_label(f.label + ".fp" + str(ei), cb.len())
             a64_emit_fast_ret(cb, &fp_plan.nodes, fp_plan.exits[ei].ret_node)
             e32(cb, 0xD65F03C0)
+        }
+    }
+    code_end := cb.len()
+    if collect_unwind {
+        if leaf_noframe {
+            unwinds.push(win_unwind_leaf(fn_start, code_end))
+        } else {
+            if fn_start < prolog_start {
+                unwinds.push(win_unwind_leaf(fn_start, prolog_start))
+            }
+            $cregs := []int{}
+            for ci in 0:ra.used_callee.len {
+                cregs.push(ra.used_callee[ci])
+            }
+            unwinds.push(WinUnwindEntry{
+                beg: prolog_start,
+                end: body_end,
+                kind: UNW_A64_FRAME,
+                prolog_len: 0,
+                frame_size: fr.size,
+                compact: compact_frame,
+                sub_sp_insns: sub_sp_insns,
+                save_insns: save_insns,
+                save_off: save_off,
+                epilog_off: epilog_start,
+                callee_regs: ~cregs,
+                save_end_offs: []int{}
+            })
+            if body_end < code_end {
+                unwinds.push(win_unwind_leaf(body_end, code_end))
+            }
         }
     }
     // String literal pool, patched into the ADR instructions above.
@@ -4454,9 +4789,289 @@ pub fn isel_fn_arm64_base(f &mir.MFn, cb $&mc.CodeBuffer, syms $&mc.SymbolTable,
         }
         at := strs[si].adr_off
         disp := pos - at
-        word := 0x10000000 | ((disp & 3) << 29) | (((disp >> 2) & 0x7ffff) << 5) | 9
+        $srd := 9
+        if si < str_rds.len { srd = str_rds[si] & 31 }
+        word := 0x10000000 | ((disp & 3) << 29) | (((disp >> 2) & 0x7ffff) << 5) | srd
         cb.patch_u32_le(at, word)
     }
+}
+
+fn a64_parse_asm_reg(reg &string) int {
+    if reg.len < 2 { << -1 }
+    if reg[0] != 120 && reg[0] != 119 { << -1 } // 'x' or 'w'
+    num_s := reg[1:reg.len]
+    n := x64_asm_parse_int(&num_s)
+    if (n >= 0 && n <= 15) || (n >= 19 && n <= 28) {
+        << n
+    }
+    << -1
+}
+
+fn a64_reg_default_width(reg &string) int {
+    if reg.len >= 2 && reg[0] == 119 { << 4 } // 'w'
+    << 8
+}
+
+fn a64_emit_asm_with_ops(cb $&mc.CodeBuffer, f &mir.MFn, fr &A64Frame, ra &RaInfo, ins &mir.MInstr) {
+    $bar := -1
+    for i in 5:ins.sval.len {
+        if ins.sval[i] == 124 {
+            bar = i
+            <-
+        }
+    }
+    if bar < 0 {
+        a64_emit_asm_insn(cb, ins.sval)
+        <<
+    }
+    spec := ins.sval[5:bar]
+    tmpl := ins.sval[bar + 1:ins.sval.len]
+    $op_kinds := []int{}
+    $op_regs := []int{}
+    $op_widths := []int{}
+    $op_margs := []int{}
+    $ai := ins.c
+    if spec.len > 0 {
+        items := x64_asm_split_char(&spec, 44)
+        for ii in 0:items.len {
+            parts := x64_asm_split_char(&items[ii], 58)
+            if parts.len < 2 { -> }
+            okind := parts[0] + ""
+            if okind == "clob" { -> }
+            $arg_v := 0
+            if ai >= 0 {
+                arg_v = f.margs[ai].v
+                ai = f.margs[ai].next
+            }
+            rk := a64_parse_asm_reg(&parts[1])
+            if rk < 0 { -> }
+            $w := a64_reg_default_width(&parts[1])
+            if parts.len >= 3 {
+                pw := x64_asm_parse_int(&parts[2])
+                if pw == 1 || pw == 2 || pw == 4 || pw == 8 { w = pw }
+            }
+            $kcode := 0
+            if okind == "out" { kcode = 1 }
+            else if okind == "inout" { kcode = 2 }
+            op_kinds.push(kcode)
+            op_regs.push(rk)
+            op_widths.push(w)
+            op_margs.push(arg_v)
+        }
+    }
+    if op_kinds.len == 0 || fr.asm_save_off < 0 {
+        a64_emit_asm_insn(cb, tmpl)
+        <<
+    }
+    base := fr.asm_save_off
+    nargs := op_kinds.len
+    // Phase 0: save x19..x28 (10 callee-saved GPRs).
+    for si in 0:10 {
+        a64_str(cb, 19 + si, R_SP, base + si * 8)
+    }
+    // Phase 1: evaluate all operands to stack slots via R_IP0 (x16).
+    for k in 0:nargs {
+        a64_load_to(cb, f, fr, ra, R_IP0, op_margs[k])
+        a64_str(cb, R_IP0, R_SP, base + 96 + k * 8)
+    }
+    // Phase 2a: load initial value of inout pointers.
+    for k in 0:nargs {
+        if op_kinds[k] == 2 {
+            a64_ldr(cb, R_IP0, R_SP, base + 96 + k * 8)
+            a64_mem(cb, false, op_widths[k], R_IP0, R_IP0, 0)
+            a64_str(cb, R_IP0, R_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    // Phase 2b: populate physical in/inout registers directly from stack slots.
+    for k in 0:nargs {
+        if op_kinds[k] == 0 {
+            a64_ldr(cb, op_regs[k], R_SP, base + 96 + k * 8)
+        } else if op_kinds[k] == 2 {
+            a64_ldr(cb, op_regs[k], R_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    a64_emit_asm_insn(cb, tmpl)
+    // Phase 3: save out/inout physical registers before restoring/storing.
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            a64_str(cb, op_regs[k], R_SP, base + 96 + (nargs + k) * 8)
+        }
+    }
+    // Phase 4: store out/inout results through destination pointers.
+    for k in 0:nargs {
+        if op_kinds[k] == 1 || op_kinds[k] == 2 {
+            a64_ldr(cb, R_IP0, R_SP, base + 96 + k * 8)
+            a64_ldr(cb, R_IP1, R_SP, base + 96 + (nargs + k) * 8)
+            a64_mem(cb, true, op_widths[k], R_IP1, R_IP0, 0)
+        }
+    }
+    // Phase 5: restore callee-saved GPRs x19..x28.
+    for si in 0:10 {
+        a64_ldr(cb, 19 + si, R_SP, base + si * 8)
+    }
+}
+
+fn a64_parse_gpr_any(s &string) int {
+    t := asm_trim(*s)
+    if t == "xzr" || t == "wzr" { << 31 }
+    if t.len >= 2 && (t[0] == 120 || t[0] == 119) {
+        num := t[1:t.len]
+        n := x64_asm_parse_int(&num)
+        if n >= 0 && n <= 30 { << n }
+    }
+    << -1
+}
+
+fn a64_sysreg_code(name &string) int {
+    k := asm_trim(*name)
+    if k == "mpidr_el1" { << 0x800A0 }
+    if k == "currentel" { << 0x84240 }
+    if k == "cntfrq_el0" { << 0xBE000 }
+    if k == "cntpct_el0" { << 0xBE020 }
+    if k == "cntvct_el0" { << 0xBE040 }
+    if k == "cntp_tval_el0" { << 0xBE200 }
+    if k == "cntp_ctl_el0" { << 0xBE220 }
+    if k == "daif" { << 0xB4220 }
+    if k == "sctlr_el1" { << 0x81000 }
+    if k == "cpacr_el1" { << 0x81040 }
+    if k == "ttbr0_el1" { << 0x82000 }
+    if k == "ttbr1_el1" { << 0x82020 }
+    if k == "tcr_el1" { << 0x82040 }
+    if k == "spsr_el1" { << 0x84000 }
+    if k == "elr_el1" { << 0x84020 }
+    if k == "sp_el0" { << 0x84100 }
+    if k == "esr_el1" { << 0x85200 }
+    if k == "far_el1" { << 0x86000 }
+    if k == "mair_el1" { << 0x8A200 }
+    if k == "vbar_el1" { << 0x8C000 }
+    if k == "tpidr_el1" { << 0x8D080 }
+    if k == "tpidr_el0" { << 0xBD040 }
+    << -1
+}
+
+fn a64_emit_one_asm(cb $&mc.CodeBuffer, s string) bool {
+    if s == "compiler_fence" {
+        // Compiler optimization/scheduling barrier only; emits zero bytes.
+    } else if s == "wfi" || s == "hlt" {
+        e32(cb, 0xD503207F)
+    } else if s == "wfe" {
+        e32(cb, 0xD503205F)
+    } else if s == "nop" {
+        e32(cb, 0xD503201F)
+    } else if s == "pause" || s == "yield" {
+        e32(cb, 0xD503203F)
+    } else if s == "cli" {
+        e32(cb, 0xD50342DF) // msr daifset, #2
+    } else if s == "sti" {
+        e32(cb, 0xD503425F) // msr daifclr, #2
+    } else if s == "isb" {
+        e32(cb, 0xD5033FDF)
+    } else if s == "dmb ish" {
+        e32(cb, 0xD5033BBF)
+    } else if s == "dsb ish" {
+        e32(cb, 0xD5033B9F)
+    } else if s == "dmb sy" || s == "mfence" || s == "fence" || s == "mb" {
+        e32(cb, 0xD5033FBF)
+    } else if s == "dmb ld" || s == "lfence" || s == "rmb" {
+        e32(cb, 0xD5033DBF)
+    } else if s == "dmb st" || s == "sfence" || s == "wmb" {
+        e32(cb, 0xD5033EBF)
+    } else if s == "dsb sy" {
+        e32(cb, 0xD5033F9F)
+    } else if s == "clrex" {
+        e32(cb, 0xD5033F5F)
+    } else if s == "ret" {
+        e32(cb, 0xD65F03C0)
+    } else if s == "eret" {
+        e32(cb, 0xD69F03E0)
+    } else if s == "svc #0" {
+        e32(cb, 0xD4000001)
+    } else if s == "hvc #0" {
+        e32(cb, 0xD4000002)
+    } else if s == "smc #0" {
+        e32(cb, 0xD4000003)
+    } else if s == "brk #0" {
+        e32(cb, 0xD4200000)
+    } else if s == "tlbi vmalle1" {
+        e32(cb, 0xD508871F)
+    } else if s == "tlbi vmalle1is" {
+        e32(cb, 0xD508831F)
+    } else {
+        $sp := -1
+        for i in 0:s.len {
+            if s[i] == 32 || s[i] == 9 {
+                sp = i
+                <-
+            }
+        }
+        if sp <= 0 { << false }
+        op := s[0:sp]
+        rest := asm_trim(s[sp + 1:s.len])
+        args := x64_asm_split_char(&rest, 44)
+        if op == "mrs" && args.len == 2 {
+            rd := a64_parse_gpr_any(&args[0])
+            code := a64_sysreg_code(&args[1])
+            if rd < 0 || code < 0 { << false }
+            e32(cb, 0xD5300000 | code | rd)
+        } else if op == "msr" && args.len == 2 {
+            code := a64_sysreg_code(&args[0])
+            rt := a64_parse_gpr_any(&args[1])
+            if code < 0 || rt < 0 { << false }
+            e32(cb, 0xD5100000 | code | rt)
+        } else if op == "tlbi" && args.len == 2 {
+            subop := asm_trim(args[0])
+            rt := a64_parse_gpr_any(&args[1])
+            if rt < 0 { << false }
+            if subop == "vae1" {
+                e32(cb, 0xD5088720 | rt)
+            } else if subop == "vae1is" {
+                e32(cb, 0xD5088320 | rt)
+            } else {
+                << false
+            }
+        } else if op == "mov" && args.len == 2 {
+            rd := a64_parse_gpr_any(&args[0])
+            rm := a64_parse_gpr_any(&args[1])
+            if rd < 0 || rm < 0 { << false }
+            e32(cb, 0xAA0003E0 | (rm << 16) | rd)
+        } else if (op == "add" || op == "sub" || op == "and" || op == "orr" || op == "eor") && args.len == 3 {
+            rd := a64_parse_gpr_any(&args[0])
+            rn := a64_parse_gpr_any(&args[1])
+            rm := a64_parse_gpr_any(&args[2])
+            if rd < 0 || rn < 0 || rm < 0 { << false }
+            $base := 0x8B000000
+            if op == "sub" { base = 0xCB000000 }
+            else if op == "and" { base = 0x8A000000 }
+            else if op == "orr" { base = 0xAA000000 }
+            else if op == "eor" { base = 0xCA000000 }
+            e32(cb, base | (rm << 16) | (rn << 5) | rd)
+        } else {
+            << false
+        }
+    }
+    << true
+}
+
+fn a64_emit_asm_insn(cb $&mc.CodeBuffer, raw string) {
+    stmts := asm_split_stmts(&raw)
+    for si in 0:stmts.len {
+        s := stmts[si] + ""
+        if asm_emit_directive(cb, s + "") { -> }
+        a64_emit_one_asm(cb, s)
+    }
+}
+
+pub fn arm64_validate_asm(raw string) string {
+    $tmp := mc.code_buffer_new()
+    stmts := asm_split_stmts(&raw)
+    for si in 0:stmts.len {
+        s := stmts[si] + ""
+        if asm_emit_directive($&tmp, s + "") { -> }
+        if !a64_emit_one_asm($&tmp, s + "") {
+            << s
+        }
+    }
+    << ""
 }
 
 fn a64_pair(cb $&mc.CodeBuffer, base int, rt int, rt2 int, rn int, off int) {
@@ -4465,7 +5080,7 @@ fn a64_pair(cb $&mc.CodeBuffer, base int, rt int, rt2 int, rn int, off int) {
 
 // Task context layout (runtime/core chan.xu): x19-x28 at 0, fp/lr at 80,
 // sp at 96, d8-d15 at 104.
-fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc) {
+fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, no_fp bool) {
     // __xu_task_switch(from x0, to x1): save the callee-saved state into
     // from, resume to.
     syms.define_label("switch_context", cb.len())
@@ -4475,16 +5090,20 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     }
     a64_add_imm(cb, 9, R_SP, 0)
     a64_str(cb, 9, 0, 96)
-    for i in 0:4 {
-        a64_pair(cb, 0x6D000000, 8 + i * 2, 9 + i * 2, 0, 104 + i * 16)
+    if !no_fp {
+        for i in 0:4 {
+            a64_pair(cb, 0x6D000000, 8 + i * 2, 9 + i * 2, 0, 104 + i * 16)
+        }
     }
     for i in 0:6 {
         a64_pair(cb, 0xA9400000, 19 + i * 2, 20 + i * 2, 1, i * 16)
     }
     a64_ldr(cb, 9, 1, 96)
     a64_add_imm(cb, R_SP, 9, 0)
-    for i in 0:4 {
-        a64_pair(cb, 0x6D400000, 8 + i * 2, 9 + i * 2, 1, 104 + i * 16)
+    if !no_fp {
+        for i in 0:4 {
+            a64_pair(cb, 0x6D400000, 8 + i * 2, 9 + i * 2, 1, 104 + i * 16)
+        }
     }
     e32(cb, 0xD65F03C0)
 
@@ -4492,11 +5111,21 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     syms.define_label("in8", cb.len())
     syms.define_label("in16", cb.len())
     syms.define_label("in32", cb.len())
-    syms.define_label("read_cr2", cb.len())
-    syms.define_label("read_cr3", cb.len())
     syms.define_label("read_cr0", cb.len())
     syms.define_label("read_cr4", cb.len())
     syms.define_label("rdmsr", cb.len())
+    syms.define_label("gs_read_u64", cb.len())
+    syms.define_label("fs_read_u64", cb.len())
+    syms.define_label("rv64_read_satp", cb.len())
+    syms.define_label("rv64_read_sstatus", cb.len())
+    syms.define_label("rv64_read_sie", cb.len())
+    syms.define_label("rv64_read_sip", cb.len())
+    syms.define_label("rv64_read_stvec", cb.len())
+    syms.define_label("rv64_read_scause", cb.len())
+    syms.define_label("rv64_read_stval", cb.len())
+    syms.define_label("rv64_read_sepc", cb.len())
+    syms.define_label("rv64_read_sscratch", cb.len())
+    syms.define_label("rv64_read_tp", cb.len())
     a64_mov_imm(cb, 0, 0)
     e32(cb, 0xD65F03C0) // ret
 
@@ -4504,8 +5133,6 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     syms.define_label("out16", cb.len())
     syms.define_label("out32", cb.len())
     syms.define_label("load_idt", cb.len())
-    syms.define_label("write_cr3", cb.len())
-    syms.define_label("invlpg", cb.len())
     syms.define_label("set_trap_vector", cb.len())
     syms.define_label("write_cr0", cb.len())
     syms.define_label("write_cr4", cb.len())
@@ -4513,7 +5140,121 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     syms.define_label("load_tr", cb.len())
     syms.define_label("wrmsr", cb.len())
     syms.define_label("swapgs", cb.len())
+    syms.define_label("fxsave", cb.len())
+    syms.define_label("fxrstor", cb.len())
+    syms.define_label("gs_write_u64", cb.len())
+    syms.define_label("fs_write_u64", cb.len())
+    syms.define_label("stac", cb.len())
+    syms.define_label("clac", cb.len())
+    syms.define_label("rv64_write_satp", cb.len())
+    syms.define_label("rv64_write_sstatus", cb.len())
+    syms.define_label("rv64_write_sie", cb.len())
+    syms.define_label("rv64_write_sip", cb.len())
+    syms.define_label("rv64_write_stvec", cb.len())
+    syms.define_label("rv64_write_sepc", cb.len())
+    syms.define_label("rv64_write_sscratch", cb.len())
+    syms.define_label("rv64_write_tp", cb.len())
+    syms.define_label("rv64_sfence_vma", cb.len())
+    syms.define_label("rv64_sfence_vma_addr", cb.len())
     e32(cb, 0xD65F03C0) // ret
+
+    syms.define_label("read_rsp", cb.len())
+    e32(cb, 0x910003E0) // mov x0, sp
+    e32(cb, 0xD65F03C0) // ret
+    syms.define_label("read_rbp", cb.len())
+    e32(cb, 0xAA1D03E0) // mov x0, x29
+    e32(cb, 0xD65F03C0) // ret
+
+    // ARM64 EL1 system register & TLBI primitives (plus x64-compat CR/invlpg aliases).
+    syms.define_label("arm64_read_sctlr_el1", cb.len())
+    e32(cb, 0xD5381000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_write_sctlr_el1", cb.len())
+    e32(cb, 0xD5181000)
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("read_cr3", cb.len())
+    syms.define_label("arm64_read_ttbr0_el1", cb.len())
+    e32(cb, 0xD5382000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("write_cr3", cb.len())
+    syms.define_label("arm64_write_ttbr0_el1", cb.len())
+    e32(cb, 0xD5182000)
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_ttbr1_el1", cb.len())
+    e32(cb, 0xD5382020)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_write_ttbr1_el1", cb.len())
+    e32(cb, 0xD5182020)
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_tcr_el1", cb.len())
+    e32(cb, 0xD5382040)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_write_tcr_el1", cb.len())
+    e32(cb, 0xD5182040)
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_mair_el1", cb.len())
+    e32(cb, 0xD538A200)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_write_mair_el1", cb.len())
+    e32(cb, 0xD518A200)
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_esr_el1", cb.len())
+    e32(cb, 0xD5385200)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("read_cr2", cb.len())
+    syms.define_label("arm64_read_far_el1", cb.len())
+    e32(cb, 0xD5386000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_elr_el1", cb.len())
+    e32(cb, 0xD5384020)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_write_elr_el1", cb.len())
+    e32(cb, 0xD5184020)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_spsr_el1", cb.len())
+    e32(cb, 0xD5384000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_write_spsr_el1", cb.len())
+    e32(cb, 0xD5184000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_tpidr_el1", cb.len())
+    e32(cb, 0xD538D080)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_write_tpidr_el1", cb.len())
+    e32(cb, 0xD518D080)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_read_mpidr_el1", cb.len())
+    e32(cb, 0xD53800A0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_cntfrq", cb.len())
+    e32(cb, 0xD53BE000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_cntpct", cb.len())
+    e32(cb, 0xD53BE020)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_tlbi_vmalle1", cb.len())
+    e32(cb, 0xD508871F)
+    e32(cb, 0xD5033F9F)
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("invlpg", cb.len())
+    syms.define_label("arm64_tlbi_vae1", cb.len())
+    e32(cb, 0xD34CFC00)
+    e32(cb, 0xD5088320)
+    e32(cb, 0xD5033B9F)
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_isb", cb.len())
+    e32(cb, 0xD5033FDF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("arm64_dsb_sy", cb.len())
+    e32(cb, 0xD5033F9F)
+    e32(cb, 0xD65F03C0)
 
     syms.define_label("rdtsc", cb.len())
     e32(cb, 0xD53BE040) // mrs x0, cntvct_el0
@@ -4606,6 +5347,136 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     e32(cb, 0xAA0303E0) // mov x0, x3
     e32(cb, 0xD65F03C0) // ret
 
+    // Expanded ARM64 atomics (8/16-bit, bitwise RMW, relaxed & seq_cst).
+    syms.define_label("atomic_load_u8", cb.len())
+    e32(cb, 0x08DFFC00)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_store_u8", cb.len())
+    e32(cb, 0x089FFC01)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_xchg_u8", cb.len())
+    e32(cb, 0x085FFC03)
+    e32(cb, 0x0804FC01)
+    e32(cb, 0x35FFFFC4)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_cas_u8", cb.len())
+    e32(cb, 0x53001C21)
+    e32(cb, 0x085FFC03)
+    e32(cb, 0x6B01007F)
+    e32(cb, 0x540000A1)
+    e32(cb, 0x0804FC02)
+    e32(cb, 0x35FFFF84)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+    e32(cb, 0xD5033F5F)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+
+    syms.define_label("atomic_load_u16", cb.len())
+    e32(cb, 0x48DFFC00)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_store_u16", cb.len())
+    e32(cb, 0x489FFC01)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_xchg_u16", cb.len())
+    e32(cb, 0x485FFC03)
+    e32(cb, 0x4804FC01)
+    e32(cb, 0x35FFFFC4)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_cas_u16", cb.len())
+    e32(cb, 0x53003C21)
+    e32(cb, 0x485FFC03)
+    e32(cb, 0x6B01007F)
+    e32(cb, 0x540000A1)
+    e32(cb, 0x4804FC02)
+    e32(cb, 0x35FFFF84)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+    e32(cb, 0xD5033F5F)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+
+    syms.define_label("atomic_fetch_sub_u32", cb.len())
+    e32(cb, 0x885FFC03)
+    e32(cb, 0x4B010065)
+    e32(cb, 0x8804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_fetch_and_u32", cb.len())
+    e32(cb, 0x885FFC03)
+    e32(cb, 0x0A010065)
+    e32(cb, 0x8804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_fetch_or_u32", cb.len())
+    e32(cb, 0x885FFC03)
+    e32(cb, 0x2A010065)
+    e32(cb, 0x8804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_fetch_xor_u32", cb.len())
+    e32(cb, 0x885FFC03)
+    e32(cb, 0x4A010065)
+    e32(cb, 0x8804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0x2A0303E0)
+    e32(cb, 0xD65F03C0)
+
+    syms.define_label("atomic_fetch_sub_u64", cb.len())
+    e32(cb, 0xC85FFC03)
+    e32(cb, 0xCB010065)
+    e32(cb, 0xC804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0xAA0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_fetch_and_u64", cb.len())
+    e32(cb, 0xC85FFC03)
+    e32(cb, 0x8A010065)
+    e32(cb, 0xC804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0xAA0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_fetch_or_u64", cb.len())
+    e32(cb, 0xC85FFC03)
+    e32(cb, 0xAA010065)
+    e32(cb, 0xC804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0xAA0303E0)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_fetch_xor_u64", cb.len())
+    e32(cb, 0xC85FFC03)
+    e32(cb, 0xCA010065)
+    e32(cb, 0xC804FC05)
+    e32(cb, 0x35FFFFA4)
+    e32(cb, 0xAA0303E0)
+    e32(cb, 0xD65F03C0)
+
+    syms.define_label("atomic_load_relaxed_u32", cb.len())
+    e32(cb, 0xB9400000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_store_relaxed_u32", cb.len())
+    e32(cb, 0xB9000001)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_load_relaxed_u64", cb.len())
+    e32(cb, 0xF9400000)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_store_relaxed_u64", cb.len())
+    e32(cb, 0xF9000001)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_store_seqcst_u32", cb.len())
+    e32(cb, 0x889FFC01)
+    e32(cb, 0xD5033BBF)
+    e32(cb, 0xD65F03C0)
+    syms.define_label("atomic_store_seqcst_u64", cb.len())
+    e32(cb, 0xC89FFC01)
+    e32(cb, 0xD5033BBF)
+    e32(cb, 0xD65F03C0)
+
     // __xu_task_entry: first frame of a task. x19 = task, x20 = function,
     // x21 = 16 argument words, x22 = exit function (never returns).
     syms.define_label("__xu_task_entry", cb.len())
@@ -4634,20 +5505,65 @@ fn emit_arm64_task_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
 
 // Process entry, raw system call and runtime-state accessor shared by all
 // functions. tgt_os uses target.OS_* codes.
-pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, uses_ffi bool) {
-    if tgt_os == target.OS_NONE {
-        syms.define_label("__xu_start", cb.len())
-        if !emit_object {
-            syms.define_label("_start", cb.len())
-            // Load 64 KiB boot stack when building a standalone kernel ELF.
-            a64_fn_addr(cb, relocs, 9, "__xu_boot_stack_top")
-            a64_add_imm(cb, R_SP, 9, 0)
+pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, main_label string, link_ui bool, emit_object bool, uses_ffi bool, no_fp bool, boot_stack_bytes int) {
+    if tgt_os == target.OS_NONE || tgt_os == target.OS_UEFI {
+        if tgt_os == target.OS_UEFI {
+            syms.define_label("__xu_start", cb.len())
+            syms.define_label("efi_main", cb.len())
+            e32(cb, 0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+            e32(cb, 0x910003FD) // mov x29, sp
+            a64_fn_addr(cb, relocs, 9, "__xu_uefi_handles")
+            a64_str(cb, 0, 9, 0)
+            a64_str(cb, 1, 9, 8)
+            a64_branch_reloc(cb, relocs, 0x94000000, main_label, mc.RELOC_ARM64_CALL26)
+            a64_mov_imm(cb, 0, 0)
+            e32(cb, 0xA8C17BFD) // ldp x29, x30, [sp], #16
+            e32(cb, 0xD65F03C0) // ret
+
+            syms.define_label("uefi_image_handle", cb.len())
+            a64_fn_addr(cb, relocs, 0, "__xu_uefi_handles")
+            a64_ldr(cb, 0, 0, 0)
+            e32(cb, 0xD65F03C0)
+
+            syms.define_label("uefi_system_table", cb.len())
+            a64_fn_addr(cb, relocs, 0, "__xu_uefi_handles")
+            a64_ldr(cb, 0, 0, 8)
+            e32(cb, 0xD65F03C0)
+
+            syms.define_label("efi_call0", cb.len())
+            syms.define_label("efi_call1", cb.len())
+            syms.define_label("efi_call2", cb.len())
+            syms.define_label("efi_call3", cb.len())
+            syms.define_label("efi_call4", cb.len())
+            syms.define_label("efi_call5", cb.len())
+            syms.define_label("efi_call6", cb.len())
+            a64_mov(cb, 16, 0)
+            a64_mov(cb, 0, 1)
+            a64_mov(cb, 1, 2)
+            a64_mov(cb, 2, 3)
+            a64_mov(cb, 3, 4)
+            a64_mov(cb, 4, 5)
+            a64_mov(cb, 5, 6)
+            e32(cb, 0xD61F0200) // br x16
+        } else {
+            syms.define_label("__xu_start", cb.len())
+            if !emit_object {
+                syms.define_label("_start", cb.len())
+                // Load 64 KiB boot stack and persist entry x0 (DTB) / x1.
+                a64_fn_addr(cb, relocs, 9, "__xu_boot_stack_top")
+                a64_add_imm(cb, R_SP, 9, 0)
+                a64_fn_addr(cb, relocs, 9, "__xu_boot_slots")
+                a64_str(cb, 0, 9, 0)
+                a64_str(cb, 1, 9, 8)
+            }
+            if !no_fp {
+                // Enable EL1 FP/SIMD (CPACR_EL1.FPEN = 0b11) so switch_context never traps.
+                e32(cb, 0xD2A00609) // movz x9, #0x30, lsl #16
+                e32(cb, 0xD5181049) // msr cpacr_el1, x9
+                e32(cb, 0xD5033FDF) // isb
+            }
+            a64_branch_reloc(cb, relocs, 0x94000000, main_label, mc.RELOC_ARM64_CALL26)
         }
-        // Enable EL1 FP/SIMD (CPACR_EL1.FPEN = 0b11) so switch_context never traps.
-        e32(cb, 0xD2A00609) // movz x9, #0x30, lsl #16
-        e32(cb, 0xD5181049) // msr cpacr_el1, x9
-        e32(cb, 0xD5033FDF) // isb
-        a64_branch_reloc(cb, relocs, 0x94000000, main_label, mc.RELOC_ARM64_CALL26)
         syms.define_label("__xu_hang", cb.len())
         e32(cb, 0xD503207F) // wfi
         a64_branch_reloc(cb, relocs, 0x14000000, "__xu_hang", mc.RELOC_ARM64_CALL26)
@@ -4701,16 +5617,34 @@ pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, reloc
         syms.define_label("irq_restore", cb.len())
         e32(cb, 0xD51B4220) // msr daif, x0
         e32(cb, 0xD65F03C0) // ret
-        syms.define_label("boot_magic", cb.len())
         syms.define_label("boot_info_addr", cb.len())
-        a64_mov_imm(cb, 0, 0)
+        if tgt_os == target.OS_NONE && !emit_object {
+            a64_fn_addr(cb, relocs, 0, "__xu_boot_slots")
+            a64_ldr(cb, 0, 0, 0)
+        } else {
+            a64_mov_imm(cb, 0, 0)
+        }
         e32(cb, 0xD65F03C0) // ret
-        emit_arm64_task_stubs(cb, syms, relocs)
-        if !emit_object {
+        syms.define_label("boot_magic", cb.len())
+        if tgt_os == target.OS_NONE && !emit_object {
+            a64_fn_addr(cb, relocs, 0, "__xu_boot_slots")
+            a64_ldr(cb, 0, 0, 8)
+        } else {
+            a64_mov_imm(cb, 0, 0)
+        }
+        e32(cb, 0xD65F03C0) // ret
+        emit_arm64_task_stubs(cb, syms, relocs, no_fp)
+        if !emit_object && tgt_os == target.OS_NONE {
             while cb.len() % 16 != 0 {
                 e32(cb, 0)
             }
-            for bi in 0:16384 {
+            syms.define_label("__xu_boot_slots", cb.len())
+            for _ in 0:4 {
+                e32(cb, 0)
+            }
+            $swords := boot_stack_bytes / 4
+            if swords < 1024 { swords = 1024 }
+            for bi in 0:swords {
                 e32(cb, 0)
             }
             syms.define_label("__xu_boot_stack_top", cb.len())
@@ -4785,7 +5719,8 @@ pub fn emit_arm64_runtime_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, reloc
     if !linux {
         emit_macos_arm64_clock(cb, syms, relocs, emit_object)
     }
-    emit_arm64_pseudo_calls(cb, syms, relocs, tgt_os, emit_object, uses_ffi)
+    $dummy_uw := []WinUnwindEntry{}
+    emit_arm64_pseudo_calls(cb, syms, relocs, tgt_os, emit_object, uses_ffi, $&dummy_uw, false)
     if linux {
         a64_mov(cb, 8, 0)
     } else {
@@ -4830,7 +5765,7 @@ fn a64_linux_save_hwcap(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
 }
 
 // Dispatch shared pseudo-calls before falling through to the host bridge.
-fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, uses_ffi bool) {
+fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, uses_ffi bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     // cmn x0, #5 ; b.ne past the zeroing
     e32(cb, 0xB100141F)
     a64_branch_reloc(cb, relocs, 0x54000001, "__xu_syscall_after_zero", mc.RELOC_ARM64_COND_BR19)
@@ -4910,7 +5845,7 @@ fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[
     e32(cb, 0xD65F03C0)
     syms.define_label("__xu_syscall_after_copy", cb.len())
     if uses_ffi || !emit_object {
-        emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object)
+        emit_arm64_ffi_calls(cb, syms, relocs, tgt_os, emit_object, unwinds, collect_unwind)
     }
     // cmn x0, #2 ; b.ne +12 ; mov x0, x29 ; ret
     e32(cb, 0xB100081F)
@@ -4927,7 +5862,7 @@ fn emit_arm64_pseudo_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[
     a64_branch_reloc(cb, relocs, 0x54000001, "__xu_syscall_os", mc.RELOC_ARM64_COND_BR19)
     a64_mov(cb, 0, 1)
     a64_mov(cb, 1, 2)
-    emit_arm64_task_stubs(cb, syms, relocs)
+    emit_arm64_task_stubs(cb, syms, relocs, false)
     syms.define_label("__xu_syscall_os", cb.len())
 }
 
@@ -4976,13 +5911,14 @@ fn emit_arm64_ffi_tramps(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]m
     }
 }
 
-fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool) {
+fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, tgt_os int, emit_object bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     e32(cb, 0xB100201F) // cmn x0, #8
     skip6 := cb.len()
     e32(cb, 0x54000001) // b.ne (patched)
+    ffi_prolog_beg := cb.len()
     e32(cb, 0xA9BE7BFD) // stp x29, x30, [sp, #-32]!
-    e32(cb, 0x910003FD) // mov x29, sp
     a64_pair(cb, 0xA9000000, 19, 20, R_SP, 16)
+    e32(cb, 0x910003FD) // mov x29, sp
     // Publish the runtime state register for C callbacks: C code between
     // here and a callback may use x28 for its own values.
     a64_ffi_state_addr(cb, relocs, 9, emit_object)
@@ -5009,10 +5945,28 @@ fn emit_arm64_ffi_calls(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc
     a64_pair(cb, 0xA9000000, 0, 1, 19, 152)
     a64_pair(cb, 0x6D000000, 0, 1, 19, 168)
     a64_pair(cb, 0x6D000000, 2, 3, 19, 184)
+    ffi_epilog_off := cb.len()
     e32(cb, 0x910003BF) // mov sp, x29
     a64_pair(cb, 0xA9400000, 19, 20, R_SP, 16)
     e32(cb, 0xA8C27BFD) // ldp x29, x30, [sp], #32
     e32(cb, 0xD65F03C0)
+    ffi_body_end := cb.len()
+    if collect_unwind {
+        unwinds.push(WinUnwindEntry{
+            beg: ffi_prolog_beg,
+            end: ffi_body_end,
+            kind: UNW_A64_FFI_CALL,
+            prolog_len: 0,
+            frame_size: 32,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: ffi_epilog_off,
+            callee_regs: []int{},
+            save_end_offs: []int{}
+        })
+    }
     cb.patch_u32_le(skip6, 0x54000001 | ((((cb.len() - skip6) / 4) & 0x7FFFF) << 5))
     e32(cb, 0xB100241F) // cmn x0, #9
     skip7 := cb.len()
@@ -5046,9 +6000,10 @@ pub fn emit_arm64_ffi_slots(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
     for i in 0:8 { e32(cb, 0) }
 }
 
-fn emit_arm64_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, label string, adapter string, is_clos bool, emit_object bool) {
+fn emit_arm64_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, label string, adapter string, is_clos bool, emit_object bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     while cb.len() % 16 != 0 { e32(cb, 0xD503201F) }
-    syms.define_label(label + "", cb.len())
+    th_beg := cb.len()
+    syms.define_label(label + "", th_beg)
     e32(cb, 0xA9800000 | ((-50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // stp x29, x30, [sp, #-400]!
     e32(cb, 0x910003FD) // mov x29, sp
     for i in 0:5 { a64_pair(cb, 0xA9000000, 19 + i * 2, 20 + i * 2, R_SP, 16 + i * 16) }
@@ -5085,18 +6040,35 @@ fn emit_arm64_ffi_thunk_one(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&
     for i in 0:4 { a64_pair(cb, 0x6D400000, 8 + i * 2, 9 + i * 2, R_SP, 96 + i * 16) }
     e32(cb, 0xA8C00000 | ((50 & 0x7F) << 15) | (30 << 10) | (31 << 5) | 29) // ldp x29, x30, [sp], #400
     e32(cb, 0xD65F03C0)
+    th_end := cb.len()
+    if collect_unwind {
+        unwinds.push(WinUnwindEntry{
+            beg: th_beg,
+            end: th_end,
+            kind: UNW_A64_FFI_THUNK,
+            prolog_len: 0,
+            frame_size: 400,
+            compact: false,
+            sub_sp_insns: 0,
+            save_insns: 0,
+            save_off: 0,
+            epilog_off: -1,
+            callee_regs: []int{},
+            save_end_offs: []int{}
+        })
+    }
 }
 
 // C-ABI entry points for Xu functions passed as C callbacks: save the C
 // callee-saved registers, spill x0-x7 / d0-d7 and the caller's stack
 // argument address into a call block on the stack, call the adapter with
 // the block, load x0, x1, d0-d3 from it and return (layout: core ffi.xu).
-pub fn emit_arm64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, emit_object bool, emit_clos bool) {
+pub fn emit_arm64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $&[]mc.Reloc, thunks &[]string, adapters &[]string, emit_object bool, emit_clos bool, unwinds $&[]WinUnwindEntry, collect_unwind bool) {
     for t in 0:thunks.len {
-        emit_arm64_ffi_thunk_one(cb, syms, relocs, thunks[t] + "", adapters[t] + "", false, emit_object)
+        emit_arm64_ffi_thunk_one(cb, syms, relocs, thunks[t] + "", adapters[t] + "", false, emit_object, unwinds, collect_unwind)
     }
     if emit_clos {
-        emit_arm64_ffi_thunk_one(cb, syms, relocs, "__xu_ffi_clos_dispatch", "", true, emit_object)
+        emit_arm64_ffi_thunk_one(cb, syms, relocs, "__xu_ffi_clos_dispatch", "", true, emit_object, unwinds, collect_unwind)
         while cb.len() % 16 != 0 { e32(cb, 0xD503201F) }
         syms.define_label("__xu_ffi_clos_stubs", cb.len())
         for k in 0:64 {
@@ -5112,4 +6084,36 @@ pub fn emit_arm64_ffi_thunks(cb $&mc.CodeBuffer, syms $&mc.SymbolTable, relocs $
 fn a64_patch_adr_at(cb $&mc.CodeBuffer, at int, rd int, target int) {
     disp := target - at
     cb.patch_u32_le(at, 0x10000000 | ((disp & 3) << 29) | (((disp >> 2) & 0x7FFFF) << 5) | rd)
+}
+
+pub fn emit_arm64_atomic_stubs(cb $&mc.CodeBuffer, syms $&mc.SymbolTable) {
+    while cb.len() % 4 != 0 { e32(cb, 0xD503201F) }
+    syms.define_label("__xu_atomic_load_i64", cb.len())
+    e32(cb, 0xC8DFFC00) // ldar x0, [x0]
+    e32(cb, 0xD65F03C0) // ret
+
+    syms.define_label("__xu_atomic_store_i64", cb.len())
+    e32(cb, 0xC89FFC01) // stlr x1, [x0]
+    e32(cb, 0xD65F03C0) // ret
+
+    syms.define_label("__xu_atomic_add_i64", cb.len())
+    e32(cb, 0xAA0003E2) // mov x2, x0
+    e32(cb, 0xC85FFC40) // ldaxr x0, [x2]
+    e32(cb, 0x8B010003) // add x3, x0, x1
+    e32(cb, 0xC804FC43) // stlxr w4, x3, [x2]
+    e32(cb, 0x35FFFFA4) // cbnz w4, -3
+    e32(cb, 0xD65F03C0) // ret
+
+    syms.define_label("__xu_atomic_cas_i64", cb.len())
+    e32(cb, 0xAA0003E3) // mov x3, x0
+    e32(cb, 0xC85FFC64) // ldaxr x4, [x3]
+    e32(cb, 0xEB01009F) // cmp x4, x1
+    e32(cb, 0x540000A1) // b.ne +5
+    e32(cb, 0xC805FC62) // stlxr w5, x2, [x3]
+    e32(cb, 0x35FFFF85) // cbnz w5, -4
+    e32(cb, 0xD2800020) // mov x0, #1
+    e32(cb, 0xD65F03C0) // ret
+    e32(cb, 0xD5033F5F) // clrex
+    e32(cb, 0xD2800000) // mov x0, #0
+    e32(cb, 0xD65F03C0) // ret
 }

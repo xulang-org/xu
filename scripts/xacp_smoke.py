@@ -326,22 +326,22 @@ FALLBACK_CORE = r"""@main
 fn check_setting(name string, actual int) int {
     text := os.getenv(name)
     if text.len == 0 { << 0 }
-    expected := strconv.parse(&text, 10) or >>
-    if actual != expected { >> errors.new("unexpected XACP setting") }
+    expected := strconv.parse(&text, 10) >>>
+    if actual != expected { >>> errors.new("unexpected XACP setting") }
     << 0
 }
 
 fn check_core() int {
     limits := xacp.default_limits()
     $nonces := xacp.new_nonce_registry(xacp.DEFAULT_NONCE_CACHE, true)
-    check_setting("XACP_EXPECT_TIMEOUT_MS", xacp.request_timeout_from_env()) or >>
-    check_setting("XACP_EXPECT_HELLO_TIMEOUT_MS", xacp.hello_timeout_from_env()) or >>
-    check_setting("XACP_EXPECT_IDLE_TIMEOUT_MS", xacp.idle_timeout_from_env()) or >>
-    check_setting("XACP_EXPECT_NONCE_CACHE", xacp.nonce_cache_from_env()) or >>
+    check_setting("XACP_EXPECT_TIMEOUT_MS", xacp.request_timeout_from_env()) >>>
+    check_setting("XACP_EXPECT_HELLO_TIMEOUT_MS", xacp.hello_timeout_from_env()) >>>
+    check_setting("XACP_EXPECT_IDLE_TIMEOUT_MS", xacp.idle_timeout_from_env()) >>>
+    check_setting("XACP_EXPECT_NONCE_CACHE", xacp.nonce_cache_from_env()) >>>
     replay := os.getenv("XACP_EXPECT_NONCE_REPLAY")
     if replay.len > 0 && xacp.nonce_replay_from_env() != (replay == "1") { << 7 }
     $session := xacp.open_session()
-    hello := xacp.parse_frame("id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: fallback-core\n") or (err) {
+    hello := xacp.parse_frame("id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: fallback-core\n") >>> (err) {
         eprintln(err.msg())
         << 1
     }
@@ -350,7 +350,7 @@ fn check_core() int {
         eprintln(opened.err_msg)
         << 2
     }
-    status := xacp.parse_frame("id: !i 2\nop: proc.status\nargs: {}\n") or (err) {
+    status := xacp.parse_frame("id: !i 2\nop: proc.status\nargs: {}\n") >>> (err) {
         eprintln(err.msg())
         << 3
     }
@@ -365,7 +365,7 @@ fn check_core() int {
 }
 
 fn main() int {
-    << check_core() or (err) {
+    << check_core() >>> (err) {
         eprintln(err.msg())
         << 1
     }
@@ -685,6 +685,19 @@ with tempfile.TemporaryDirectory(prefix="xu-xacp-smoke-") as tmp:
                 assert p.returncode == 0, (p.stdout, p.stderr)
                 checked_responses(p.stdout.decode(), token, nonce)
                 assert f"pid: !i {server.pid}" in p.stdout.decode()
+            # One-shot `xu xacp call` helper handles hello + request framing.
+            call_env = dict(BASE_ENV)
+            if token:
+                call_env["XU_XACP_TOKEN"] = token
+            c_hello = subprocess.run([str(TOOL), "call", str(port), "xacp.hello"],
+                                     capture_output=True, text=True, timeout=10, env=call_env)
+            assert c_hello.returncode == 0 and "ok: !b true" in c_hello.stdout and "state: OPEN" in c_hello.stdout, (c_hello.stdout, c_hello.stderr)
+            c_status = subprocess.run([str(TOOL), "call", str(port), "proc.status"],
+                                      capture_output=True, text=True, timeout=10, env=call_env)
+            assert c_status.returncode == 0 and f"pid: !i {server.pid}" in c_status.stdout, (c_status.stdout, c_status.stderr)
+            c_bad = subprocess.run([str(TOOL), "call", str(port), "unknown.op"],
+                                   capture_output=True, text=True, timeout=10, env=call_env)
+            assert c_bad.returncode != 0
             # Fragmented TCP writes must return responses before write-side EOF.
             with socket.create_connection(("127.0.0.1", port), timeout=5) as peer:
                 for request in (hello(token=token or None, nonce="fragmented"), frame(2, "proc.status"),

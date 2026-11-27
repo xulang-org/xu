@@ -495,7 +495,7 @@ function renderContent(t) {{
           <img src="${{LOGO}}" width="64" height="64" style="border-radius:14px;display:block;flex-shrink:0"/>
           <div style="min-width:0">
             <div style="font-weight:600;font-size:22px;color:${{WHITE}}">Clear intent. Native code.</div>
-            <div style="font-size:13px;color:${{mute}};margin-top:4px;font-family:ui-monospace,monospace">xu worker() · chan T · or (err)</div>
+            <div style="font-size:13px;color:${{mute}};margin-top:4px;font-family:ui-monospace,monospace">xu worker() · chan T · >>> (err)</div>
           </div>
         </div>
         <div style="margin-top:14px;padding:12px 14px;border-radius:12px;background:rgba(250,249,246,0.06);font-family:ui-monospace,monospace;font-size:13px;color:${{mute}};line-height:1.55">
@@ -675,7 +675,7 @@ function renderContent(t) {{
         {{t: 'Coroutines & channels', k: 'coroutines channels', d: 'xu f() · chan T · Go-like concurrency'}},
         {{t: 'Native UI & WebView', k: 'native ui webview', d: 'Draw · layout · controls · IME'}},
         {{t: 'WebAssembly AOT', k: 'webassembly wasm aot', d: 'Native + wasm32 · no VM runtime'}},
-        {{t: 'Explicit errors', k: 'errors explicit', d: '<< return · >> raise · or (err)'}},
+        {{t: 'Explicit errors', k: 'errors explicit', d: '<< return · >>> raise · >>> (err)'}},
         {{t: 'Install XU', k: 'install sdk', d: 'One command · PATH · full SDK'}},
       ];
       const items = !q ? catalog : catalog.filter(s =>
