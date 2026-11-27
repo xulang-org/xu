@@ -50,7 +50,11 @@ pub struct VisionEncoder {
     pub cfg VisionConfig
     pub patch_w []f32
     pub patch_b []f32
+    pub class_embd []f32
     pub pos_emb []f32
+    pub pre_ln_w []f32
+    pub pre_ln_b []f32
+    pub has_pre_ln bool
     pub layers []VisionLayer
     pub post_ln_w []f32
     pub post_ln_b []f32
@@ -58,6 +62,8 @@ pub struct VisionEncoder {
     pub mm0_b []f32
     pub mm2_w []f32
     pub mm2_b []f32
+    pub proj_hidden int
+    pub has_mlp2 bool
 }
 
 fn alloc_zeros(n int) []f32 {
@@ -166,9 +172,11 @@ pub fn empty_encoder() VisionEncoder {
             image_mean: [f32(0), f32(0), f32(0)],
             image_std: [f32(1), f32(1), f32(1)]
         },
-        patch_w: []f32{}, patch_b: []f32{}, pos_emb: []f32{},
+        patch_w: []f32{}, patch_b: []f32{}, class_embd: []f32{}, pos_emb: []f32{},
+        pre_ln_w: []f32{}, pre_ln_b: []f32{}, has_pre_ln: false,
         layers: []VisionLayer{}, post_ln_w: []f32{}, post_ln_b: []f32{},
-        mm0_w: []f32{}, mm0_b: []f32{}, mm2_w: []f32{}, mm2_b: []f32{}
+        mm0_w: []f32{}, mm0_b: []f32{}, mm2_w: []f32{}, mm2_b: []f32{},
+        proj_hidden: 0, has_mlp2: true
     }
 }
 
@@ -206,8 +214,466 @@ fn load_f32_safetensor_opt(data &string, base int, doc &json.Doc, root int, name
     << load_f32_safetensor_flat(data, base, doc, root, name + "", expected_len) >>>
 }
 
+struct GgufVisTensor {
+    name string
+    dims []int
+    gtype int
+    n_elems int
+    offset int
+}
+
+fn vis_gguf_read_str(raw &string, pos $&int) string {
+    if *pos + 8 > raw.len { >>> errors.new("mmproj.gguf: truncated string length") }
+    slen := read_u64_le(raw, *pos)
+    *pos += 8
+    if slen < 0 || slen > raw.len - *pos { >>> errors.new("mmproj.gguf: truncated string payload") }
+    s := (*raw)[(*pos):((*pos) + slen)]
+    *pos += slen
+    << s
+}
+
+fn vis_gguf_scalar_bytes(vtype int) int {
+    if vtype == 0 || vtype == 1 || vtype == 7 { << 1 }
+    if vtype == 2 || vtype == 3 { << 2 }
+    if vtype == 4 || vtype == 5 || vtype == 6 { << 4 }
+    if vtype == 10 || vtype == 11 || vtype == 12 { << 8 }
+    << -1
+}
+
+fn vis_gguf_read_int(raw &string, pos $&int, vtype int) int {
+    if vtype == 0 {
+        v := (*raw)[*pos] & 255
+        *pos += 1
+        << v
+    }
+    if vtype == 1 {
+        v := int(i8((*raw)[*pos]))
+        *pos += 1
+        << v
+    }
+    if vtype == 2 {
+        v := read_u16_le(raw, *pos)
+        *pos += 2
+        << v
+    }
+    if vtype == 3 {
+        u := read_u16_le(raw, *pos)
+        *pos += 2
+        if u >= 32768 { << u - 65536 }
+        << u
+    }
+    if vtype == 4 {
+        v := read_u32_le(raw, *pos)
+        *pos += 4
+        << v
+    }
+    if vtype == 5 {
+        u := read_u32_le(raw, *pos)
+        *pos += 4
+        if u > 0x7fffffff { << u - 0x100000000 }
+        << u
+    }
+    if vtype == 10 || vtype == 11 {
+        v := read_u64_le(raw, *pos)
+        *pos += 8
+        << v
+    }
+    if vtype == 7 {
+        v := (*raw)[*pos] & 255
+        *pos += 1
+        << v
+    }
+    >>> errors.new("mmproj.gguf: unexpected int value type " + str(vtype))
+}
+
+fn vis_gguf_read_f32(raw &string, pos $&int, vtype int) f32 {
+    if vtype == 6 {
+        v := from_bits(read_u32_le(raw, *pos))
+        *pos += 4
+        << v
+    }
+    if vtype == 12 {
+        bits := read_u64_le(raw, *pos)
+        *pos += 8
+        << f32(math.float64_from_bits(bits))
+    }
+    iv := vis_gguf_read_int(raw, pos, vtype) >>>
+    << f32(iv)
+}
+
+fn vis_gguf_skip_val(raw &string, pos $&int, vtype int) int {
+    if vtype == 8 {
+        _ := vis_gguf_read_str(raw, pos) >>>
+        << 0
+    }
+    if vtype == 9 {
+        if *pos + 12 > raw.len { >>> errors.new("mmproj.gguf: truncated array header") }
+        etype := read_u32_le(raw, *pos)
+        *pos += 4
+        cnt := read_u64_le(raw, *pos)
+        *pos += 8
+        if cnt < 0 { >>> errors.new("mmproj.gguf: negative array length") }
+        sb := vis_gguf_scalar_bytes(etype)
+        if sb > 0 {
+            if cnt > (raw.len - *pos) / sb { >>> errors.new("mmproj.gguf: truncated array") }
+            *pos += cnt * sb
+            << 0
+        }
+        for _ in 0:cnt {
+            vis_gguf_skip_val(raw, pos, etype) >>>
+        }
+        << 0
+    }
+    sb := vis_gguf_scalar_bytes(vtype)
+    if sb <= 0 || *pos + sb > raw.len { >>> errors.new("mmproj.gguf: unsupported/truncated metadata value") }
+    *pos += sb
+    << 0
+}
+
+fn vis_gguf_find_tensor(ts &[]GgufVisTensor, name string) int {
+    for i in 0:ts.len {
+        if ts[i].name == name { << i }
+    }
+    << -1
+}
+
+fn vis_gguf_decode_tensor(raw &string, data_base int, info &GgufVisTensor) []f32 {
+    n := info.n_elems
+    $out := []f32{}
+    if n <= 0 { << out }
+    out.reserve(n)
+    start := data_base + info.offset
+    if info.gtype == 0 {
+        if start < 0 || n * 4 > raw.len - start {
+            >>> errors.new("mmproj.gguf: truncated F32 tensor " + info.name)
+        }
+        for i in 0:n {
+            out.push(from_bits(read_u32_le(raw, start + i * 4)))
+        }
+        << out
+    }
+    if info.gtype == 1 {
+        if start < 0 || n * 2 > raw.len - start {
+            >>> errors.new("mmproj.gguf: truncated F16 tensor " + info.name)
+        }
+        for i in 0:n {
+            bits := u16(read_u16_le(raw, start + i * 2))
+            out.push((tensor.F16{bits: bits}).to_f32())
+        }
+        << out
+    }
+    if info.gtype == 30 {
+        if start < 0 || n * 2 > raw.len - start {
+            >>> errors.new("mmproj.gguf: truncated BF16 tensor " + info.name)
+        }
+        for i in 0:n {
+            bits := u16(read_u16_le(raw, start + i * 2))
+            out.push((tensor.BF16{bits: bits}).to_f32())
+        }
+        << out
+    }
+    >>> errors.new("mmproj.gguf: unsupported tensor dtype " + str(info.gtype) + " for " + info.name + " (supported: F32/F16/BF16)")
+}
+
+fn vis_gguf_load_req(raw &string, data_base int, ts &[]GgufVisTensor, name string, expected_len int) []f32 {
+    idx := vis_gguf_find_tensor(ts, "" + name)
+    if idx < 0 { >>> errors.new("mmproj.gguf: missing tensor " + name) }
+    t := &ts[idx]
+    if expected_len > 0 && t.n_elems != expected_len {
+        >>> errors.new("mmproj.gguf: tensor length mismatch for " + name + " (got " + str(t.n_elems) + ", expected " + str(expected_len) + ")")
+    }
+    << vis_gguf_decode_tensor(raw, data_base, t) >>>
+}
+
+fn vis_gguf_load_opt(raw &string, data_base int, ts &[]GgufVisTensor, name string, expected_len int, default_val f32) []f32 {
+    idx := vis_gguf_find_tensor(ts, "" + name)
+    if idx < 0 {
+        $v := []f32{}
+        if expected_len > 0 { v.reserve(expected_len) }
+        for _ in 0:expected_len { v.push(default_val) }
+        << v
+    }
+    t := &ts[idx]
+    if expected_len > 0 && t.n_elems != expected_len {
+        >>> errors.new("mmproj.gguf: tensor length mismatch for " + name + " (got " + str(t.n_elems) + ", expected " + str(expected_len) + ")")
+    }
+    << vis_gguf_decode_tensor(raw, data_base, t) >>>
+}
+
+fn vis_slice_f32(src &[]f32, off int, n int) []f32 {
+    $out := []f32{}
+    if n > 0 { out.reserve(n) }
+    for i in 0:n { out.push(src[off + i]) }
+    << out
+}
+
+fn load_mmproj_gguf(raw &string, expected_proj_dim int) VisionEncoder {
+    if raw.len < 24 { >>> errors.new("mmproj.gguf: truncated header") }
+    ver := read_u32_le(raw, 4)
+    if ver < 2 || ver > 3 { >>> errors.new("mmproj.gguf: unsupported version " + str(ver)) }
+    n_tensors := read_u64_le(raw, 8)
+    n_kv := read_u64_le(raw, 16)
+    if n_tensors <= 0 || n_kv < 0 { >>> errors.new("mmproj.gguf: invalid tensor/kv counts") }
+    $pos := 24
+    $align := 32
+    $img_sz := 0
+    $patch_sz := 0
+    $in_c := 3
+    $hid := 0
+    $nl := 0
+    $nh := 0
+    $ffn_d := 0
+    $proj_d := 0
+    $ln_eps := f32(1e-5)
+    $img_mean := [f32(0), f32(0), f32(0)]
+    $img_std := [f32(1), f32(1), f32(1)]
+
+    for _ in 0:n_kv {
+        k := vis_gguf_read_str(raw, $&pos) >>>
+        if pos + 4 > raw.len { >>> errors.new("mmproj.gguf: truncated kv value type") }
+        vt := read_u32_le(raw, pos)
+        pos += 4
+        if k == "general.alignment" {
+            a := vis_gguf_read_int(raw, $&pos, vt) >>>
+            if a > 0 { align = a }
+        } else if k == "clip.vision.image_size" || k == "vision.image_size" {
+            img_sz = vis_gguf_read_int(raw, $&pos, vt) >>>
+        } else if k == "clip.vision.patch_size" || k == "vision.patch_size" {
+            patch_sz = vis_gguf_read_int(raw, $&pos, vt) >>>
+        } else if k == "clip.vision.embedding_length" || k == "vision.hidden_size" {
+            hid = vis_gguf_read_int(raw, $&pos, vt) >>>
+        } else if k == "clip.vision.block_count" || k == "vision.num_layers" {
+            nl = vis_gguf_read_int(raw, $&pos, vt) >>>
+        } else if k == "clip.vision.attention.head_count" || k == "vision.num_heads" {
+            nh = vis_gguf_read_int(raw, $&pos, vt) >>>
+        } else if k == "clip.vision.feed_forward_length" || k == "vision.ffn_dim" {
+            ffn_d = vis_gguf_read_int(raw, $&pos, vt) >>>
+        } else if k == "clip.vision.projection_dim" || k == "vision.proj_dim" {
+            proj_d = vis_gguf_read_int(raw, $&pos, vt) >>>
+        } else if k == "clip.vision.attention.layer_norm_epsilon" || k == "vision.ln_eps" {
+            ln_eps = vis_gguf_read_f32(raw, $&pos, vt) >>>
+        } else if (k == "clip.vision.image_mean" || k == "clip.vision.image_std") && vt == 9 {
+            etype := read_u32_le(raw, pos)
+            pos += 4
+            cnt := read_u64_le(raw, pos)
+            pos += 8
+            $vals := []f32{}
+            for _ in 0:cnt {
+                fv := vis_gguf_read_f32(raw, $&pos, etype) >>>
+                vals.push(fv)
+            }
+            if k == "clip.vision.image_mean" { img_mean = ~vals }
+            else { img_std = ~vals }
+        } else {
+            vis_gguf_skip_val(raw, $&pos, vt) >>>
+        }
+    }
+
+    $ts := []GgufVisTensor{}
+    ts.reserve(n_tensors)
+    for _ in 0:n_tensors {
+        tname := vis_gguf_read_str(raw, $&pos) >>>
+        if pos + 4 > raw.len { >>> errors.new("mmproj.gguf: truncated tensor ndims") }
+        nd := read_u32_le(raw, pos)
+        pos += 4
+        if nd <= 0 || nd > 4 { >>> errors.new("mmproj.gguf: invalid tensor ndims for " + tname) }
+        $dims := []int{}
+        $nelems := 1
+        for _ in 0:nd {
+            if pos + 8 > raw.len { >>> errors.new("mmproj.gguf: truncated tensor dim") }
+            d := read_u64_le(raw, pos)
+            pos += 8
+            dims.push(d)
+            nelems = nelems * d
+        }
+        if pos + 12 > raw.len { >>> errors.new("mmproj.gguf: truncated tensor header") }
+        gt := read_u32_le(raw, pos)
+        off := read_u64_le(raw, pos + 4)
+        pos += 12
+        ts.push(GgufVisTensor{name: ~tname, dims: ~dims, gtype: gt, n_elems: nelems, offset: off})
+    }
+    data_base := ((pos + align - 1) / align) * align
+    if data_base > raw.len { >>> errors.new("mmproj.gguf: truncated data section") }
+
+    // Infer dimensions from tensors if metadata omitted them
+    pw_i := vis_gguf_find_tensor(&ts, "v.patch_embd.weight")
+    if pw_i >= 0 && ts[pw_i].dims.len == 4 {
+        if patch_sz <= 0 { patch_sz = ts[pw_i].dims[0] }
+        in_c = ts[pw_i].dims[2]
+        if hid <= 0 { hid = ts[pw_i].dims[3] }
+    }
+    if hid <= 0 && pw_i >= 0 && patch_sz > 0 && in_c > 0 {
+        hid = ts[pw_i].n_elems / (in_c * patch_sz * patch_sz)
+    }
+    if nl <= 0 {
+        $cnt_l := 0
+        while vis_gguf_find_tensor(&ts, "v.blk." + str(cnt_l) + ".ln1.weight") >= 0 { cnt_l += 1 }
+        nl = cnt_l
+    }
+    if ffn_d <= 0 && nl > 0 {
+        fu_i := vis_gguf_find_tensor(&ts, "v.blk.0.ffn_up.weight")
+        if fu_i >= 0 && hid > 0 { ffn_d = ts[fu_i].n_elems / hid }
+    }
+    $mm0_i := vis_gguf_find_tensor(&ts, "mm.0.weight")
+    $mm0_name := "mm.0.weight"
+    $mm0_bname := "mm.0.bias"
+    $mm2_name := "mm.2.weight"
+    $mm2_bname := "mm.2.bias"
+    if mm0_i < 0 {
+        mm0_i = vis_gguf_find_tensor(&ts, "mm.a.0.weight")
+        if mm0_i >= 0 {
+            mm0_name = "mm.a.0.weight"
+            mm0_bname = "mm.a.0.bias"
+            mm2_name = "mm.a.2.weight"
+            mm2_bname = "mm.a.2.bias"
+        }
+    }
+    if mm0_i < 0 { >>> errors.new("mmproj.gguf: missing mm.0.weight projector tensor") }
+    $proj_hid := 0
+    if ts[mm0_i].dims.len >= 2 { proj_hid = ts[mm0_i].dims[1] }
+    else if hid > 0 { proj_hid = ts[mm0_i].n_elems / hid }
+    mm2_i := vis_gguf_find_tensor(&ts, "" + mm2_name)
+    has_mlp2 := mm2_i >= 0
+    if proj_d <= 0 {
+        if has_mlp2 && ts[mm2_i].dims.len >= 2 { proj_d = ts[mm2_i].dims[1] }
+        else if has_mlp2 && proj_hid > 0 { proj_d = ts[mm2_i].n_elems / proj_hid }
+        else { proj_d = proj_hid }
+    }
+    if img_sz <= 0 && patch_sz > 0 {
+        pe_i := vis_gguf_find_tensor(&ts, "v.position_embd.weight")
+        if pe_i >= 0 && hid > 0 {
+            npos := ts[pe_i].n_elems / hid
+            $g := 1
+            while g * g < npos - 1 { g += 1 }
+            if g * g == npos || g * g == npos - 1 { img_sz = g * patch_sz }
+        }
+    }
+    if img_sz <= 0 || patch_sz <= 0 || img_sz % patch_sz != 0 || in_c <= 0 || hid <= 0 || nl <= 0 || nh <= 0 || hid % nh != 0 || ffn_d <= 0 || proj_hid <= 0 {
+        >>> errors.new("mmproj.gguf: invalid or incomplete vision dimensions")
+    }
+    if expected_proj_dim > 0 && proj_d != expected_proj_dim {
+        >>> errors.new("mmproj proj_dim (" + str(proj_d) + ") != model dim (" + str(expected_proj_dim) + ")")
+    }
+    for ci in 0:img_std.len {
+        if f64(img_std[ci]) == 0.0 {
+            >>> errors.new("mmproj.gguf: image_std cannot contain 0")
+        }
+    }
+
+    grid := img_sz / patch_sz
+    n_patches := grid * grid
+    patch_w := vis_gguf_load_req(raw, data_base, &ts, "v.patch_embd.weight", hid * in_c * patch_sz * patch_sz) >>>
+    patch_b := vis_gguf_load_opt(raw, data_base, &ts, "v.patch_embd.bias", hid, f32(0)) >>>
+    cls_i := vis_gguf_find_tensor(&ts, "v.class_embd")
+    $class_embd := []f32{}
+    if cls_i >= 0 {
+        class_embd = vis_gguf_load_req(raw, data_base, &ts, "v.class_embd", hid) >>>
+    }
+    $pos_cnt := n_patches
+    pe_idx := vis_gguf_find_tensor(&ts, "v.position_embd.weight")
+    if pe_idx >= 0 && hid > 0 && ts[pe_idx].n_elems == (n_patches + 1) * hid {
+        pos_cnt = n_patches + 1
+        if class_embd.len == 0 { class_embd = alloc_zeros(hid) }
+    }
+    pos_emb := vis_gguf_load_req(raw, data_base, &ts, "v.position_embd.weight", pos_cnt * hid) >>>
+    has_pre_ln := vis_gguf_find_tensor(&ts, "v.pre_ln.weight") >= 0
+    pre_ln_w := vis_gguf_load_opt(raw, data_base, &ts, "v.pre_ln.weight", hid, f32(1)) >>>
+    pre_ln_b := vis_gguf_load_opt(raw, data_base, &ts, "v.pre_ln.bias", hid, f32(0)) >>>
+
+    $layers := []VisionLayer{}
+    for l in 0:nl {
+        lp := "v.blk." + str(l) + "."
+        ln1_w := vis_gguf_load_req(raw, data_base, &ts, lp + "ln1.weight", hid) >>>
+        ln1_b := vis_gguf_load_opt(raw, data_base, &ts, lp + "ln1.bias", hid, f32(0)) >>>
+        $wq := []f32{}
+        $bq := []f32{}
+        $wk := []f32{}
+        $bk := []f32{}
+        $wv := []f32{}
+        $bv := []f32{}
+        if vis_gguf_find_tensor(&ts, lp + "attn_q.weight") >= 0 {
+            wq = vis_gguf_load_req(raw, data_base, &ts, lp + "attn_q.weight", hid * hid) >>>
+            bq = vis_gguf_load_opt(raw, data_base, &ts, lp + "attn_q.bias", hid, f32(0)) >>>
+            wk = vis_gguf_load_req(raw, data_base, &ts, lp + "attn_k.weight", hid * hid) >>>
+            bk = vis_gguf_load_opt(raw, data_base, &ts, lp + "attn_k.bias", hid, f32(0)) >>>
+            wv = vis_gguf_load_req(raw, data_base, &ts, lp + "attn_v.weight", hid * hid) >>>
+            bv = vis_gguf_load_opt(raw, data_base, &ts, lp + "attn_v.bias", hid, f32(0)) >>>
+        } else if vis_gguf_find_tensor(&ts, lp + "attn_qkv.weight") >= 0 {
+            qkv_w := vis_gguf_load_req(raw, data_base, &ts, lp + "attn_qkv.weight", 3 * hid * hid) >>>
+            qkv_b := vis_gguf_load_opt(raw, data_base, &ts, lp + "attn_qkv.bias", 3 * hid, f32(0)) >>>
+            wq = vis_slice_f32(&qkv_w, 0, hid * hid)
+            wk = vis_slice_f32(&qkv_w, hid * hid, hid * hid)
+            wv = vis_slice_f32(&qkv_w, 2 * hid * hid, hid * hid)
+            bq = vis_slice_f32(&qkv_b, 0, hid)
+            bk = vis_slice_f32(&qkv_b, hid, hid)
+            bv = vis_slice_f32(&qkv_b, 2 * hid, hid)
+        } else {
+            >>> errors.new("mmproj.gguf: missing attn_q/attn_qkv weight in layer " + str(l))
+        }
+        $wo_name := lp + "attn_out.weight"
+        $bo_name := lp + "attn_out.bias"
+        if vis_gguf_find_tensor(&ts, "" + wo_name) < 0 {
+            wo_name = lp + "attn_o.weight"
+            bo_name = lp + "attn_o.bias"
+        }
+        wo := vis_gguf_load_req(raw, data_base, &ts, wo_name, hid * hid) >>>
+        bo := vis_gguf_load_opt(raw, data_base, &ts, bo_name, hid, f32(0)) >>>
+        ln2_w := vis_gguf_load_req(raw, data_base, &ts, lp + "ln2.weight", hid) >>>
+        ln2_b := vis_gguf_load_opt(raw, data_base, &ts, lp + "ln2.bias", hid, f32(0)) >>>
+
+        // Detect llama.cpp CLIP swapped naming vs standard naming by ne[0]/ne[1]:
+        // fc1 maps hid -> ffn_d (GGML dims [hid, ffn_d]); fc2 maps ffn_d -> hid (GGML dims [ffn_d, hid]).
+        $fc1_wname := lp + "ffn_up.weight"
+        $fc1_bname := lp + "ffn_up.bias"
+        $fc2_wname := lp + "ffn_down.weight"
+        $fc2_bname := lp + "ffn_down.bias"
+        down_i := vis_gguf_find_tensor(&ts, lp + "ffn_down.weight")
+        if down_i >= 0 && ts[down_i].dims.len >= 2 && ts[down_i].dims[0] == hid && ts[down_i].dims[1] == ffn_d {
+            fc1_wname = lp + "ffn_down.weight"
+            fc1_bname = lp + "ffn_down.bias"
+            fc2_wname = lp + "ffn_up.weight"
+            fc2_bname = lp + "ffn_up.bias"
+        }
+        w1 := vis_gguf_load_req(raw, data_base, &ts, fc1_wname, ffn_d * hid) >>>
+        b1 := vis_gguf_load_opt(raw, data_base, &ts, fc1_bname, ffn_d, f32(0)) >>>
+        w2 := vis_gguf_load_req(raw, data_base, &ts, fc2_wname, hid * ffn_d) >>>
+        b2 := vis_gguf_load_opt(raw, data_base, &ts, fc2_bname, hid, f32(0)) >>>
+        layers.push(VisionLayer{
+            ln1_w: ~ln1_w, ln1_b: ~ln1_b, wq: ~wq, bq: ~bq, wk: ~wk, bk: ~bk,
+            wv: ~wv, bv: ~bv, wo: ~wo, bo: ~bo, ln2_w: ~ln2_w, ln2_b: ~ln2_b,
+            w1: ~w1, b1: ~b1, w2: ~w2, b2: ~b2
+        })
+    }
+    post_ln_w := vis_gguf_load_opt(raw, data_base, &ts, "v.post_ln.weight", hid, f32(1)) >>>
+    post_ln_b := vis_gguf_load_opt(raw, data_base, &ts, "v.post_ln.bias", hid, f32(0)) >>>
+    mm0_w := vis_gguf_load_req(raw, data_base, &ts, mm0_name, proj_hid * hid) >>>
+    mm0_b := vis_gguf_load_opt(raw, data_base, &ts, mm0_bname, proj_hid, f32(0)) >>>
+    $mm2_w := []f32{}
+    $mm2_b := []f32{}
+    if has_mlp2 {
+        mm2_w = vis_gguf_load_req(raw, data_base, &ts, mm2_name, proj_d * proj_hid) >>>
+        mm2_b = vis_gguf_load_opt(raw, data_base, &ts, mm2_bname, proj_d, f32(0)) >>>
+    }
+    << VisionEncoder{
+        active: true,
+        cfg: VisionConfig{
+            image_size: img_sz, patch_size: patch_sz, in_channels: in_c, hidden_size: hid,
+            num_layers: nl, num_heads: nh, ffn_dim: ffn_d, proj_dim: proj_d, ln_eps: ln_eps,
+            image_mean: ~img_mean, image_std: ~img_std
+        },
+        patch_w: ~patch_w, patch_b: ~patch_b, class_embd: ~class_embd, pos_emb: ~pos_emb,
+        pre_ln_w: ~pre_ln_w, pre_ln_b: ~pre_ln_b, has_pre_ln: has_pre_ln,
+        layers: ~layers, post_ln_w: ~post_ln_w, post_ln_b: ~post_ln_b,
+        mm0_w: ~mm0_w, mm0_b: ~mm0_b, mm2_w: ~mm2_w, mm2_b: ~mm2_b,
+        proj_hidden: proj_hid, has_mlp2: has_mlp2
+    }
+}
+
 pub fn load_mmproj(path string, expected_proj_dim int) VisionEncoder {
     raw := os.read(path + "") >>>
+    if raw.len >= 4 && (raw[0] & 255) == 71 && (raw[1] & 255) == 71 && (raw[2] & 255) == 85 && (raw[3] & 255) == 70 {
+        << load_mmproj_gguf(&raw, expected_proj_dim) >>>
+    }
     if raw.len < 8 { >>> errors.new("mmproj: invalid safetensors file") }
     hlen := read_u64_le(&raw, 0)
     if hlen <= 0 || hlen > raw.len - 8 { >>> errors.new("mmproj: invalid safetensors header") }
@@ -283,9 +749,11 @@ pub fn load_mmproj(path string, expected_proj_dim int) VisionEncoder {
             num_layers: nl, num_heads: nh, ffn_dim: ffn_d, proj_dim: proj_d, ln_eps: ln_eps_f,
             image_mean: ~img_mean, image_std: ~img_std
         },
-        patch_w: ~patch_w, patch_b: ~patch_b, pos_emb: ~pos_emb,
+        patch_w: ~patch_w, patch_b: ~patch_b, class_embd: []f32{}, pos_emb: ~pos_emb,
+        pre_ln_w: []f32{}, pre_ln_b: []f32{}, has_pre_ln: false,
         layers: ~layers, post_ln_w: ~post_ln_w, post_ln_b: ~post_ln_b,
-        mm0_w: ~mm0_w, mm0_b: ~mm0_b, mm2_w: ~mm2_w, mm2_b: ~mm2_b
+        mm0_w: ~mm0_w, mm0_b: ~mm0_b, mm2_w: ~mm2_w, mm2_b: ~mm2_b,
+        proj_hidden: proj_d, has_mlp2: true
     }
 }
 
@@ -588,48 +1056,69 @@ pub fn encode_image(ve &VisionEncoder, img_chw &[]f32) []f32 {
     hid := cfg.hidden_size
     ffn_d := cfg.ffn_dim
     proj_d := cfg.proj_dim
+    $proj_hid := ve.proj_hidden
+    if proj_hid <= 0 { proj_hid = proj_d }
     head_dim := hid / cfg.num_heads
     eps := f64(cfg.ln_eps)
 
-    $h := alloc_zeros(n_patches * hid)
-    tensor.conv2d_patch_embed_f32($&h, img_chw, &ve.patch_w, &ve.patch_b, cfg.in_channels, cfg.image_size, cfg.image_size, hid, cfg.patch_size)
-    for i in 0:(n_patches * hid) {
-        h[i] = h[i] + ve.pos_emb[i]
+    $patch_out := alloc_zeros(n_patches * hid)
+    tensor.conv2d_patch_embed_f32($&patch_out, img_chw, &ve.patch_w, &ve.patch_b, cfg.in_channels, cfg.image_size, cfg.image_size, hid, cfg.patch_size)
+    has_cls := ve.class_embd.len == hid && ve.pos_emb.len == (n_patches + 1) * hid
+    $n_seq := n_patches
+    if has_cls { n_seq = n_patches + 1 }
+    $h := alloc_zeros(n_seq * hid)
+    if has_cls {
+        for i in 0:hid { h[i] = ve.class_embd[i] + ve.pos_emb[i] }
+        for i in 0:(n_patches * hid) { h[hid + i] = patch_out[i] + ve.pos_emb[hid + i] }
+    } else {
+        for i in 0:(n_patches * hid) { h[i] = patch_out[i] + ve.pos_emb[i] }
     }
 
-    $norm_buf := alloc_zeros(n_patches * hid)
-    $q := alloc_zeros(n_patches * hid)
-    $k := alloc_zeros(n_patches * hid)
-    $v := alloc_zeros(n_patches * hid)
-    $attn := alloc_zeros(n_patches * hid)
-    $proj := alloc_zeros(n_patches * hid)
-    $fc1 := alloc_zeros(n_patches * ffn_d)
-    $fc1_act := alloc_zeros(n_patches * ffn_d)
+    $norm_buf := alloc_zeros(n_seq * hid)
+    if ve.has_pre_ln {
+        vision_layernorm_rows($&norm_buf, &h, &ve.pre_ln_w, &ve.pre_ln_b, n_seq, hid, eps)
+        for i in 0:(n_seq * hid) { h[i] = norm_buf[i] }
+    }
+    $q := alloc_zeros(n_seq * hid)
+    $k := alloc_zeros(n_seq * hid)
+    $v := alloc_zeros(n_seq * hid)
+    $attn := alloc_zeros(n_seq * hid)
+    $proj := alloc_zeros(n_seq * hid)
+    $fc1 := alloc_zeros(n_seq * ffn_d)
+    $fc1_act := alloc_zeros(n_seq * ffn_d)
 
     for l in 0:ve.layers.len {
         vl := &ve.layers[l]
-        vision_layernorm_rows($&norm_buf, &h, &vl.ln1_w, &vl.ln1_b, n_patches, hid, eps)
-        vision_linear_rows($&q, &norm_buf, &vl.wq, &vl.bq, n_patches, hid, hid)
-        vision_linear_rows($&k, &norm_buf, &vl.wk, &vl.bk, n_patches, hid, hid)
-        vision_linear_rows($&v, &norm_buf, &vl.wv, &vl.bv, n_patches, hid, hid)
-        tensor.mha_sdpa_f32($&attn, &q, &k, &v, n_patches, n_patches, cfg.num_heads, head_dim, false)
-        vision_linear_rows($&proj, &attn, &vl.wo, &vl.bo, n_patches, hid, hid)
-        for i in 0:(n_patches * hid) { h[i] = h[i] + proj[i] }
+        vision_layernorm_rows($&norm_buf, &h, &vl.ln1_w, &vl.ln1_b, n_seq, hid, eps)
+        vision_linear_rows($&q, &norm_buf, &vl.wq, &vl.bq, n_seq, hid, hid)
+        vision_linear_rows($&k, &norm_buf, &vl.wk, &vl.bk, n_seq, hid, hid)
+        vision_linear_rows($&v, &norm_buf, &vl.wv, &vl.bv, n_seq, hid, hid)
+        tensor.mha_sdpa_f32($&attn, &q, &k, &v, n_seq, n_seq, cfg.num_heads, head_dim, false)
+        vision_linear_rows($&proj, &attn, &vl.wo, &vl.bo, n_seq, hid, hid)
+        for i in 0:(n_seq * hid) { h[i] = h[i] + proj[i] }
 
-        vision_layernorm_rows($&norm_buf, &h, &vl.ln2_w, &vl.ln2_b, n_patches, hid, eps)
-        vision_linear_rows($&fc1, &norm_buf, &vl.w1, &vl.b1, n_patches, ffn_d, hid)
-        tensor.gelu_f32($&fc1_act, &fc1, n_patches * ffn_d)
-        vision_linear_rows($&proj, &fc1_act, &vl.w2, &vl.b2, n_patches, hid, ffn_d)
-        for i in 0:(n_patches * hid) { h[i] = h[i] + proj[i] }
+        vision_layernorm_rows($&norm_buf, &h, &vl.ln2_w, &vl.ln2_b, n_seq, hid, eps)
+        vision_linear_rows($&fc1, &norm_buf, &vl.w1, &vl.b1, n_seq, ffn_d, hid)
+        tensor.gelu_f32($&fc1_act, &fc1, n_seq * ffn_d)
+        vision_linear_rows($&proj, &fc1_act, &vl.w2, &vl.b2, n_seq, hid, ffn_d)
+        for i in 0:(n_seq * hid) { h[i] = h[i] + proj[i] }
     }
 
-    vision_layernorm_rows($&norm_buf, &h, &ve.post_ln_w, &ve.post_ln_b, n_patches, hid, eps)
-    $mm1 := alloc_zeros(n_patches * proj_d)
-    $mm1_act := alloc_zeros(n_patches * proj_d)
+    vision_layernorm_rows($&norm_buf, &h, &ve.post_ln_w, &ve.post_ln_b, n_seq, hid, eps)
+    $post_patches := alloc_zeros(n_patches * hid)
+    $cls_off := 0
+    if has_cls { cls_off = hid }
+    for i in 0:(n_patches * hid) { post_patches[i] = norm_buf[cls_off + i] }
+
+    $mm1 := alloc_zeros(n_patches * proj_hid)
+    vision_linear_rows($&mm1, &post_patches, &ve.mm0_w, &ve.mm0_b, n_patches, proj_hid, hid)
+    if !ve.has_mlp2 {
+        << mm1
+    }
+    $mm1_act := alloc_zeros(n_patches * proj_hid)
     $out := alloc_zeros(n_patches * proj_d)
-    vision_linear_rows($&mm1, &norm_buf, &ve.mm0_w, &ve.mm0_b, n_patches, proj_d, hid)
-    tensor.gelu_f32($&mm1_act, &mm1, n_patches * proj_d)
-    vision_linear_rows($&out, &mm1_act, &ve.mm2_w, &ve.mm2_b, n_patches, proj_d, proj_d)
+    tensor.gelu_f32($&mm1_act, &mm1, n_patches * proj_hid)
+    vision_linear_rows($&out, &mm1_act, &ve.mm2_w, &ve.mm2_b, n_patches, proj_d, proj_hid)
     << out
 }
 

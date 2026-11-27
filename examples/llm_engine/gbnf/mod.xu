@@ -2,6 +2,7 @@
 
 #os
 #errors
+#strconv
 #encoding/json
 
 pub struct GbnfElem {
@@ -22,10 +23,25 @@ pub struct GbnfRule {
     pub alts []GbnfAlt
 }
 
+pub struct GbnfLimits {
+    pub max_branches int
+    pub max_work int
+    pub max_depth int
+    pub strict bool
+}
+
+pub fn default_limits() GbnfLimits {
+    << GbnfLimits{max_branches: 64, max_work: 512, max_depth: 48, strict: false}
+}
+
 pub struct GbnfGrammar {
     pub active bool
     pub rules []GbnfRule
     pub root_idx int
+    pub max_branches int
+    pub max_work int
+    pub max_depth int
+    pub strict_limits bool
 }
 
 pub struct GbnfFrame {
@@ -41,6 +57,9 @@ pub struct GbnfBranch {
 
 pub struct GbnfState {
     pub branches []GbnfBranch
+    pub truncated bool
+    pub truncated_reason string
+    pub peak_branches int
 }
 
 pub struct VocabIndex {
@@ -49,17 +68,86 @@ pub struct VocabIndex {
     pub is_eos []bool
     pub eos_tokens []int
     pub by_first_byte [][]int
+    pub empty_tokens []int
+    pub trie_edge_byte []int
+    pub trie_edge_child []int
+    pub trie_edge_start []int
+    pub trie_edge_len []int
+    pub trie_tok_start []int
+    pub trie_tok_len []int
+    pub trie_toks []int
+    pub trie_nodes int
+}
+
+pub struct GbnfMaskCache {
+    pub keys []string
+    pub masks [][]int
+    pub kept_counts []int
+    pub key_idx map[string]int
+    pub max_entries int
+    pub hits int
+    pub misses int
+}
+
+struct TrieBuildNode {
+    e_byte []int
+    e_child []int
+    toks []int
 }
 
 pub fn empty_grammar() GbnfGrammar {
-    << GbnfGrammar{active: false, rules: []GbnfRule{}, root_idx: 0}
+    << GbnfGrammar{
+        active: false, rules: []GbnfRule{}, root_idx: 0,
+        max_branches: 64, max_work: 512, max_depth: 48, strict_limits: false
+    }
+}
+
+pub fn empty_state() GbnfState {
+    << GbnfState{branches: []GbnfBranch{}, truncated: false, truncated_reason: "", peak_branches: 0}
+}
+
+pub fn (gr $&GbnfGrammar) set_limits(lim GbnfLimits) {
+    if lim.max_branches > 0 { gr.max_branches = lim.max_branches }
+    if lim.max_work > 0 { gr.max_work = lim.max_work }
+    if lim.max_depth > 0 { gr.max_depth = lim.max_depth }
+    gr.strict_limits = lim.strict
+}
+
+pub fn (st &GbnfState) is_truncated() bool {
+    << st.truncated
+}
+
+pub fn (st &GbnfState) warning() string {
+    if !st.truncated { << "" }
+    << "gbnf warning: NFA state truncated at " + st.truncated_reason + " (raise --gbnf-max-branches or simplify grammar)"
 }
 
 pub fn empty_vocab_index() VocabIndex {
     << VocabIndex{
         vocab_size: 0, pieces: []string{}, is_eos: []bool{},
-        eos_tokens: []int{}, by_first_byte: [][]int{}
+        eos_tokens: []int{}, by_first_byte: [][]int{},
+        empty_tokens: []int{},
+        trie_edge_byte: []int{}, trie_edge_child: []int{},
+        trie_edge_start: []int{}, trie_edge_len: []int{},
+        trie_tok_start: []int{}, trie_tok_len: []int{},
+        trie_toks: []int{}, trie_nodes: 0
     }
+}
+
+pub fn new_mask_cache(max_entries int) GbnfMaskCache {
+    $cap_n := max_entries
+    if cap_n <= 0 { cap_n = 512 }
+    << GbnfMaskCache{
+        keys: []string{}, masks: [][]int{}, kept_counts: []int{},
+        key_idx: map[string]int{}, max_entries: cap_n, hits: 0, misses: 0
+    }
+}
+
+fn trie_find_child(node &TrieBuildNode, b int) int {
+    for i in 0:node.e_byte.len {
+        if node.e_byte[i] == b { << node.e_child[i] }
+    }
+    << -1
 }
 
 pub fn build_vocab_index(pieces &[]string, eos_ids &[]int) VocabIndex {
@@ -69,9 +157,12 @@ pub fn build_vocab_index(pieces &[]string, eos_ids &[]int) VocabIndex {
     $eos_flags := []bool{}
     eos_flags.reserve(vsize)
     $eos_toks := []int{}
+    $empty_toks := []int{}
     $buckets := [][]int{}
     buckets.reserve(256)
     for _ in 0:256 { buckets.push([]int{}) }
+    $nodes := []TrieBuildNode{}
+    nodes.push(TrieBuildNode{e_byte: []int{}, e_child: []int{}, toks: []int{}})
     for i in 0:vsize {
         $is_e := false
         for ei in 0:eos_ids.len {
@@ -84,20 +175,74 @@ pub fn build_vocab_index(pieces &[]string, eos_ids &[]int) VocabIndex {
         p_nonempty := p.len > 0
         $first_b := 0
         if p_nonempty { first_b = p[0] & 255 }
-        ps.push(~p)
-        eos_flags.push(is_e)
         if is_e {
             eos_toks.push(i)
         } else if p_nonempty {
             buckets[first_b].push(i)
+            $cur := 0
+            for k in 0:p.len {
+                b := p[k] & 255
+                nxt := trie_find_child(&nodes[cur], b)
+                if nxt >= 0 {
+                    cur = nxt
+                } else {
+                    nid := nodes.len
+                    nodes.push(TrieBuildNode{e_byte: []int{}, e_child: []int{}, toks: []int{}})
+                    nodes[cur].e_byte.push(b)
+                    nodes[cur].e_child.push(nid)
+                    cur = nid
+                }
+            }
+            nodes[cur].toks.push(i)
+        } else {
+            empty_toks.push(i)
+        }
+        ps.push(~p)
+        eos_flags.push(is_e)
+    }
+
+    nc := nodes.len
+    $edge_b := []int{}
+    $edge_c := []int{}
+    $edge_st := []int{}
+    $edge_ln := []int{}
+    $tok_st := []int{}
+    $tok_ln := []int{}
+    $toks := []int{}
+    edge_st.reserve(nc)
+    edge_ln.reserve(nc)
+    tok_st.reserve(nc)
+    tok_ln.reserve(nc)
+    for ni in 0:nc {
+        nd := &nodes[ni]
+        edge_st.push(edge_b.len)
+        edge_ln.push(nd.e_byte.len)
+        for ei in 0:nd.e_byte.len {
+            edge_b.push(nd.e_byte[ei])
+            edge_c.push(nd.e_child[ei])
+        }
+        tok_st.push(toks.len)
+        tok_ln.push(nd.toks.len)
+        for ti in 0:nd.toks.len {
+            toks.push(nd.toks[ti])
         }
     }
+
     << VocabIndex{
         vocab_size: vsize,
         pieces: ~ps,
         is_eos: ~eos_flags,
         eos_tokens: ~eos_toks,
-        by_first_byte: ~buckets
+        by_first_byte: ~buckets,
+        empty_tokens: ~empty_toks,
+        trie_edge_byte: ~edge_b,
+        trie_edge_child: ~edge_c,
+        trie_edge_start: ~edge_st,
+        trie_edge_len: ~edge_ln,
+        trie_tok_start: ~tok_st,
+        trie_tok_len: ~tok_ln,
+        trie_toks: ~toks,
+        trie_nodes: nc
     }
 }
 
@@ -180,7 +325,11 @@ fn gbnf_copy_rule(r &GbnfRule) GbnfRule {
 pub fn copy_grammar(g &GbnfGrammar) GbnfGrammar {
     $rs := []GbnfRule{}
     for i in 0:g.rules.len { rs.push(gbnf_copy_rule(&g.rules[i])) }
-    << GbnfGrammar{active: g.active, rules: rs, root_idx: g.root_idx}
+    << GbnfGrammar{
+        active: g.active, rules: rs, root_idx: g.root_idx,
+        max_branches: g.max_branches, max_work: g.max_work,
+        max_depth: g.max_depth, strict_limits: g.strict_limits
+    }
 }
 
 fn gbnf_copy_frame(f &GbnfFrame) GbnfFrame {
@@ -202,7 +351,12 @@ fn gbnf_copy_branch(b &GbnfBranch) GbnfBranch {
 fn gbnf_copy_state(s &GbnfState) GbnfState {
     $bs := []GbnfBranch{}
     for i in 0:s.branches.len { bs.push(gbnf_copy_branch(&s.branches[i])) }
-    << GbnfState{branches: bs}
+    << GbnfState{
+        branches: bs,
+        truncated: s.truncated,
+        truncated_reason: s.truncated_reason + "",
+        peak_branches: s.peak_branches
+    }
 }
 
 fn gbnf_find_rule(rnames &[]string, name &string) int {
@@ -438,7 +592,7 @@ fn gbnf_strip_comments(raw &string) string {
     << out
 }
 
-pub fn compile(raw &string) GbnfGrammar {
+pub fn compile_with_limits(raw &string, lim GbnfLimits) GbnfGrammar {
     clean := gbnf_strip_comments(raw)
     lines := split_lines_trim(&clean)
     $logical := []string{}
@@ -478,7 +632,20 @@ pub fn compile(raw &string) GbnfGrammar {
     if rules[root_idx].alts.len == 0 {
         >>> errors.new("gbnf: root rule has no alternatives")
     }
-    << GbnfGrammar{active: true, rules: rules, root_idx: root_idx}
+    $mb := lim.max_branches
+    $mw := lim.max_work
+    $md := lim.max_depth
+    if mb <= 0 { mb = 64 }
+    if mw <= 0 { mw = 512 }
+    if md <= 0 { md = 48 }
+    << GbnfGrammar{
+        active: true, rules: rules, root_idx: root_idx,
+        max_branches: mb, max_work: mw, max_depth: md, strict_limits: lim.strict
+    }
+}
+
+pub fn compile(raw &string) GbnfGrammar {
+    << compile_with_limits(raw, default_limits()) >>>
 }
 
 fn gbnf_branch_key(b &GbnfBranch) string {
@@ -500,13 +667,21 @@ fn gbnf_has_str(xs &[]string, target &string) bool {
 }
 
 fn gbnf_normalize(g &GbnfGrammar, in_branches $&[]GbnfBranch) GbnfState {
+    $max_b := g.max_branches
+    $max_w := g.max_work
+    $max_d := g.max_depth
+    if max_b <= 0 { max_b = 64 }
+    if max_w <= 0 { max_w = 512 }
+    if max_d <= 0 { max_d = 48 }
     $work := []GbnfBranch{}
     for i in 0:in_branches.len { work.push(gbnf_copy_branch(&in_branches[i])) }
     $kept := []GbnfBranch{}
     $seen_kept := []string{}
     $seen_work := []string{}
     $wi := 0
-    while wi < work.len && kept.len < 64 && wi < 512 {
+    $trunc := false
+    $reason := ""
+    while wi < work.len && kept.len < max_b && wi < max_w {
         $br := gbnf_copy_branch(&work[wi])
         wi += 1
         while br.frames.len > 0 {
@@ -552,7 +727,7 @@ fn gbnf_normalize(g &GbnfGrammar, in_branches $&[]GbnfBranch) GbnfState {
             ref_id := el.ref_idx
             br.frames[top_i].elem_pos += 1
             br.frames[top_i].lit_off = 0
-            if br.frames.len < 48 {
+            if br.frames.len < max_d {
                 ref_rule := &g.rules[ref_id]
                 nalts := ref_rule.alts.len
                 for ai in 0:nalts {
@@ -560,6 +735,9 @@ fn gbnf_normalize(g &GbnfGrammar, in_branches $&[]GbnfBranch) GbnfState {
                     nb.frames.push(GbnfFrame{rule_idx: ref_id, alt_idx: ai, elem_pos: 0, lit_off: 0})
                     work.push(nb)
                 }
+            } else if !trunc {
+                trunc = true
+                reason = "max_depth (" + str(max_d) + ")"
             }
         } else {
             if !gbnf_has_str(&seen_kept, &bk) {
@@ -568,11 +746,26 @@ fn gbnf_normalize(g &GbnfGrammar, in_branches $&[]GbnfBranch) GbnfState {
             }
         }
     }
-    << GbnfState{branches: kept}
+    if wi < work.len && !trunc {
+        if kept.len >= max_b {
+            trunc = true
+            reason = "max_branches (" + str(max_b) + ")"
+        } else if wi >= max_w {
+            trunc = true
+            reason = "max_work (" + str(max_w) + ")"
+        }
+    }
+    peak_b := kept.len
+    << GbnfState{
+        branches: ~kept,
+        truncated: trunc,
+        truncated_reason: reason,
+        peak_branches: peak_b
+    }
 }
 
 pub fn init_state(g &GbnfGrammar) GbnfState {
-    if !g.active || g.rules.len == 0 { << GbnfState{branches: []GbnfBranch{}} }
+    if !g.active || g.rules.len == 0 { << empty_state() }
     $init_bs := []GbnfBranch{}
     root_i := g.root_idx
     root := &g.rules[root_i]
@@ -676,7 +869,15 @@ fn gbnf_step_byte(g &GbnfGrammar, st &GbnfState, b int) GbnfState {
             next_bs.push(nb)
         }
     }
-    << gbnf_normalize(g, $&next_bs)
+    $out := gbnf_normalize(g, $&next_bs)
+    if st.truncated && !out.truncated {
+        out.truncated = true
+        out.truncated_reason = st.truncated_reason + ""
+    }
+    if st.peak_branches > out.peak_branches {
+        out.peak_branches = st.peak_branches
+    }
+    << out
 }
 
 pub fn advance_piece(g &GbnfGrammar, st &GbnfState, piece &string) GbnfState {
@@ -688,58 +889,127 @@ pub fn advance_piece(g &GbnfGrammar, st &GbnfState, piece &string) GbnfState {
     << cur
 }
 
-pub fn apply_logit_mask(logits $&[]f32, off int, vidx &VocabIndex, g &GbnfGrammar, st &GbnfState) {
-    if !g.active { << }
-    vocab := vidx.vocab_size
-    if vocab <= 0 { << }
+pub fn state_fingerprint(st &GbnfState) string {
+    if st.branches.len == 0 { << "" }
+    $s := ""
+    for i in 0:st.branches.len {
+        if i > 0 { s = s + "|" }
+        s = s + gbnf_branch_key(&st.branches[i])
+    }
+    << s
+}
+
+fn mask_set(mask $&[]int, tid int) {
+    w := tid >> 6
+    bit := 1 << (tid & 63)
+    mask[w] = mask[w] | bit
+}
+
+fn mask_has(mask &[]int, tid int) bool {
+    w := tid >> 6
+    bit := 1 << (tid & 63)
+    << (mask[w] & bit) != 0
+}
+
+fn gbnf_trie_dfs(vidx &VocabIndex, g &GbnfGrammar, st &GbnfState, nid int, mask $&[]int, kept_cnt $&int) {
+    if nid < 0 || nid >= vidx.trie_nodes { << }
+    tstart := vidx.trie_tok_start[nid]
+    tlen := vidx.trie_tok_len[nid]
+    for ti in 0:tlen {
+        tid := vidx.trie_toks[tstart + ti]
+        mask_set(mask, tid)
+        *kept_cnt += 1
+    }
+    elen := vidx.trie_edge_len[nid]
+    if elen <= 0 { << }
     $allowed_b := []bool{}
     allowed_b.reserve(256)
     for _ in 0:256 { allowed_b.push(false) }
     gbnf_fill_allowed_bytes(g, st, $&allowed_b)
-    can_fin := can_finish(st)
-
-    $keep := []bool{}
-    keep.reserve(vocab)
-    for _ in 0:vocab { keep.push(false) }
-    $kept := 0
-
-    if can_fin {
-        for ei in 0:vidx.eos_tokens.len {
-            tid := vidx.eos_tokens[ei]
-            if logits[off + tid] > f32(-1e8) {
-                keep[tid] = true
-                kept += 1
-            }
-        }
-    }
-
-    for b in 0:256 {
+    estart := vidx.trie_edge_start[nid]
+    for ei in 0:elen {
+        b := vidx.trie_edge_byte[estart + ei]
         if !allowed_b[b] { -> }
-        bucket := &vidx.by_first_byte[b]
-        for bi in 0:bucket.len {
-            tid := bucket[bi]
-            if logits[off + tid] <= f32(-1e8) { -> }
-            piece := &vidx.pieces[tid]
-            if piece.len == 1 {
-                keep[tid] = true
-                kept += 1
-            } else {
-                nxt_st := advance_piece(g, st, piece)
-                if nxt_st.branches.len > 0 {
-                    keep[tid] = true
-                    kept += 1
-                }
-            }
-        }
+        child := vidx.trie_edge_child[estart + ei]
+        nxt := gbnf_step_byte(g, st, b)
+        if nxt.branches.len == 0 { -> }
+        gbnf_trie_dfs(vidx, g, &nxt, child, mask, kept_cnt)
     }
+}
 
-    if kept > 0 {
-        for i in 0:vocab {
-            if !keep[i] && logits[off + i] > f32(-1e8) {
-                logits[off + i] = f32(-1e9)
-            }
+pub fn compute_token_mask(vidx &VocabIndex, g &GbnfGrammar, st &GbnfState, kept_out $&int) []int {
+    vocab := vidx.vocab_size
+    words := (vocab + 63) / 64
+    $mask := []int{}
+    mask.resize_zero(words)
+    *kept_out = 0
+    if can_finish(st) {
+        for ei in 0:vidx.eos_tokens.len {
+            mask_set($&mask, vidx.eos_tokens[ei])
+            *kept_out += 1
         }
     }
+    if vidx.trie_nodes > 0 {
+        gbnf_trie_dfs(vidx, g, st, 0, $&mask, kept_out)
+    }
+    << mask
+}
+
+fn apply_mask_to_logits(logits $&[]f32, off int, vocab int, mask &[]int, kept_cnt int) {
+    if kept_cnt <= 0 { << }
+    // Ensure at least one unmasked logit survives before applying mask
+    $any_live := false
+    for i in 0:vocab {
+        if mask_has(mask, i) && logits[off + i] > f32(-1e8) {
+            any_live = true
+            <-
+        }
+    }
+    if !any_live { << }
+    for i in 0:vocab {
+        if !mask_has(mask, i) && logits[off + i] > f32(-1e8) {
+            logits[off + i] = f32(-1e9)
+        }
+    }
+}
+
+pub fn apply_logit_mask(logits $&[]f32, off int, vidx &VocabIndex, g &GbnfGrammar, st &GbnfState) {
+    if !g.active { << }
+    vocab := vidx.vocab_size
+    if vocab <= 0 { << }
+    $kept := 0
+    mask := compute_token_mask(vidx, g, st, $&kept)
+    apply_mask_to_logits(logits, off, vocab, &mask, kept)
+}
+
+pub fn apply_logit_mask_cached(logits $&[]f32, off int, vidx &VocabIndex, g &GbnfGrammar, st &GbnfState, cache $&GbnfMaskCache) {
+    if !g.active { << }
+    vocab := vidx.vocab_size
+    if vocab <= 0 { << }
+    fp := str(vocab) + "|" + str(g.rules.len) + "|" + state_fingerprint(st)
+    if cache.key_idx.has(fp) {
+        idx := cache.key_idx[fp]
+        if idx >= 0 && idx < cache.masks.len {
+            cache.hits += 1
+            apply_mask_to_logits(logits, off, vocab, &cache.masks[idx], cache.kept_counts[idx])
+            <<
+        }
+    }
+    cache.misses += 1
+    $kept := 0
+    mask := compute_token_mask(vidx, g, st, $&kept)
+    apply_mask_to_logits(logits, off, vocab, &mask, kept)
+    if cache.keys.len >= cache.max_entries {
+        cache.keys = []string{}
+        cache.masks = [][]int{}
+        cache.kept_counts = []int{}
+        cache.key_idx = map[string]int{}
+    }
+    nidx := cache.keys.len
+    cache.keys.push(fp + "")
+    cache.masks.push(~mask)
+    cache.kept_counts.push(kept)
+    cache.key_idx[fp] = nidx
 }
 
 pub fn read_grammar_arg(arg &string) string {
@@ -789,65 +1059,756 @@ fn emit_optional_prop_chain(rules_out $&string, keys &[]string, rrefs &[]string,
     << rname
 }
 
-fn emit_schema_rule(doc &json.Doc, node int, rname string, rules_out $&string, next_id $&int) string {
+struct SchemaCtx {
+    root int
+    ref_rules map[string]string
+    visiting map[string]bool
+}
+
+fn schema_int_opt(doc &json.Doc, obj int, key string, found $&bool) int {
+    *found = false
+    if obj < 0 || !doc.is_dict(obj) || !doc.has(obj, key) { << 0 }
+    n := doc.get(obj, key) >>> (_) { << 0 }
+    if doc.is_number(n) {
+        *found = true
+        << doc.as_int(n) >>> (_) {
+            *found = false
+            << 0
+        }
+    }
+    << 0
+}
+
+fn schema_f64_opt(doc &json.Doc, obj int, key string, found $&bool) f64 {
+    *found = false
+    if obj < 0 || !doc.is_dict(obj) || !doc.has(obj, key) { << 0.0 }
+    n := doc.get(obj, key) >>> (_) { << 0.0 }
+    if doc.is_number(n) {
+        *found = true
+        << doc.as_f64(n) >>> (_) {
+            *found = false
+            << 0.0
+        }
+    }
+    << 0.0
+}
+
+fn f64_floor(x f64) int {
+    t := int(x)
+    if f64(t) > x { << t - 1 }
+    << t
+}
+
+fn f64_ceil(x f64) int {
+    t := int(x)
+    if f64(t) < x { << t + 1 }
+    << t
+}
+
+fn unescape_json_ptr_seg(seg &string) string {
+    $out := ""
+    $i := 0
+    while i < seg.len {
+        c := (*seg)[i] & 255
+        if c == 126 && i + 1 < seg.len {
+            nc := (*seg)[i + 1] & 255
+            if nc == 49 {
+                out.push_str("/")
+                i += 2
+                ->
+            } else if nc == 48 {
+                out.push_str("~")
+                i += 2
+                ->
+            }
+        }
+        out.push_str(string_from_byte(c))
+        i += 1
+    }
+    << out
+}
+
+fn resolve_json_pointer(doc &json.Doc, root int, ptr &string) int {
+    if *ptr == "#" || *ptr == "" { << root }
+    if ptr.len < 2 || (*ptr)[0] != 35 || (*ptr)[1] != 47 {
+        >>> errors.new("json_schema: unsupported $$ref URI: " + (*ptr))
+    }
+    $cur := root
+    $st := 2
+    for i in 2:(ptr.len + 1) {
+        if i == ptr.len || ((*ptr)[i] & 255) == 47 {
+            seg := unescape_json_ptr_seg(&(*ptr)[st:i])
+            if doc.is_dict(cur) && doc.has(cur, seg + "") {
+                cur = doc.get(cur, seg + "") >>>
+            } else if doc.is_list(cur) {
+                idx := strconv.atoi(&seg) >>> (_) {
+                    >>> errors.new("json_schema: invalid array index in $$ref: " + (*ptr))
+                }
+                if idx < 0 || idx >= doc.count(cur) {
+                    >>> errors.new("json_schema: $$ref index out of range: " + (*ptr))
+                }
+                cur = doc.at(cur, idx) >>>
+            } else {
+                >>> errors.new("json_schema: unresolved $$ref: " + (*ptr))
+            }
+            st = i + 1
+        }
+    }
+    << cur
+}
+
+fn emit_repeat_tail(rules_out $&string, elem string, opt_rem int, unbounded bool, next_id $&int) string {
+    if unbounded { << "( " + elem + " )*" }
+    if opt_rem <= 0 { << "" }
+    $cur_rule := "jrep_" + str(*next_id)
+    *next_id += 1
+    *rules_out = *rules_out + cur_rule + " ::= ( " + elem + " )?\n"
+    for _ in 1:opt_rem {
+        nxt_rule := "jrep_" + str(*next_id)
+        *next_id += 1
+        *rules_out = *rules_out + nxt_rule + " ::= ( " + elem + " " + cur_rule + " )?\n"
+        cur_rule = nxt_rule
+    }
+    << cur_rule
+}
+
+fn emit_bounded_elems(rules_out $&string, elem string, min_c int, max_c int, has_max bool, next_id $&int) string {
+    if min_c < 0 { >>> errors.new("json_schema: negative min bound") }
+    if has_max && max_c < min_c { >>> errors.new("json_schema: max bound < min bound") }
+    $parts := []string{}
+    for _ in 0:min_c { parts.push(elem + "") }
+    if !has_max {
+        parts.push("( " + elem + " )*")
+    } else if max_c > min_c {
+        tail := emit_repeat_tail(rules_out, elem, max_c - min_c, false, next_id)
+        if tail.len > 0 { parts.push(tail) }
+    }
+    if parts.len == 0 { << "\"\"" }
+    $out := ""
+    for i in 0:parts.len {
+        if i > 0 { out = out + " " }
+        out = out + parts[i]
+    }
+    << out
+}
+
+fn decimal_digit_class(d0 int, d1 int) string {
+    if d0 == d1 { << "\"" + str(d0) + "\"" }
+    << "[" + str(d0) + "-" + str(d1) + "]"
+}
+
+fn pow10_int(k int) int {
+    $v := 1
+    for _ in 0:k { v = v * 10 }
+    << v
+}
+
+fn pos_range_same_len(lo int, hi int, out $&[]string) {
+    $cur := lo
+    while cur <= hi {
+        $p := 1
+        $k := 0
+        while cur % (p * 10) == 0 && cur + p * 10 - 1 <= hi {
+            p = p * 10
+            k += 1
+        }
+        while cur + p - 1 > hi {
+            p = p / 10
+            k -= 1
+        }
+        prefix_val := cur / (p * 10)
+        d_start := (cur / p) % 10
+        $d_end := d_start
+        while d_end < 9 && (cur + (d_end - d_start + 2) * p - 1) <= hi {
+            d_end += 1
+        }
+        $term := ""
+        if prefix_val > 0 {
+            term = "\"" + str(prefix_val) + "\""
+        }
+        dc := decimal_digit_class(d_start, d_end)
+        if term.len > 0 { term = term + " " + dc } else { term = dc }
+        for _ in 0:k { term = term + " [0-9]" }
+        out.push(term)
+        cur += (d_end - d_start + 1) * p
+    }
+}
+
+fn pos_int_range_parts(lo int, hi int, out $&[]string) {
+    if lo == 0 {
+        out.push("\"0\"")
+        if hi == 0 { << }
+    }
+    $cur := lo
+    if cur == 0 { cur = 1 }
+    $len_d := 1
+    $limit := 9
+    while cur > limit {
+        len_d += 1
+        limit = limit * 10 + 9
+    }
+    while cur <= hi {
+        $seg_hi := hi
+        if limit < seg_hi { seg_hi = limit }
+        pos_range_same_len(cur, seg_hi, out)
+        cur = seg_hi + 1
+        limit = limit * 10 + 9
+    }
+}
+
+fn int_range_to_gbnf(lo int, hi int) string {
+    if lo > hi { >>> errors.new("json_schema: empty integer range") }
+    if hi - lo <= 24 {
+        $s := "( "
+        for v in lo:(hi + 1) {
+            if v > lo { s = s + " | " }
+            s = s + "\"" + str(v) + "\""
+        }
+        << s + " )"
+    }
+    $alts := []string{}
+    if lo < 0 {
+        $neg_lo := 1
+        if hi < 0 { neg_lo = -hi }
+        neg_hi := -lo
+        $neg_parts := []string{}
+        pos_int_range_parts(neg_lo, neg_hi, $&neg_parts)
+        for i in 0:neg_parts.len {
+            alts.push("\"-\" " + neg_parts[i])
+        }
+    }
+    if hi >= 0 {
+        $pos_lo := 0
+        if lo > 0 { pos_lo = lo }
+        pos_int_range_parts(pos_lo, hi, $&alts)
+    }
+    $rhs := "( "
+    for i in 0:alts.len {
+        if i > 0 { rhs = rhs + " | " }
+        rhs = rhs + alts[i]
+    }
+    << rhs + " )"
+}
+
+fn json_string_char_lit(ch int) string {
+    if ch == 34 { << "\"\\\\\\\"\"" }
+    if ch == 92 { << "\"\\\\\\\\\"" }
+    if ch == 10 { << "\"\\\\n\"" }
+    if ch == 13 { << "\"\\\\r\"" }
+    if ch == 9 { << "\"\\\\t\"" }
+    if ch < 32 { >>> errors.new("json_schema: control character in pattern") }
+    << "\"" + string_from_byte(ch) + "\""
+}
+
+fn regex_parse_class(pat &string, pos $&int) string {
+    *pos += 1
+    $neg := false
+    if *pos < pat.len && ((*pat)[*pos] & 255) == 94 {
+        neg = true
+        *pos += 1
+    }
+    $cls := "["
+    if neg { cls = "[^\"\\\\\\n\\r" }
+    $closed := false
+    $first := true
+    while *pos < pat.len {
+        c := (*pat)[*pos] & 255
+        if c == 93 && !first {
+            *pos += 1
+            closed = true
+            <-
+        }
+        first = false
+        *pos += 1
+        if c == 92 && *pos < pat.len {
+            ec := (*pat)[*pos] & 255
+            *pos += 1
+            if ec == 100 { cls = cls + "0-9" }
+            else if ec == 119 { cls = cls + "a-zA-Z0-9_" }
+            else if ec == 115 { cls = cls + " " }
+            else if ec == 92 { cls = cls + "\\\\" }
+            else if ec == 93 { cls = cls + "\\]" }
+            else if ec == 45 { cls = cls + "\\-" }
+            else { cls = cls + string_from_byte(ec) }
+        } else if c == 34 || c == 92 {
+            // Skip raw unescaped quote/backslash inside class unless neg already excluded them
+            ->
+        } else {
+            cls = cls + string_from_byte(c)
+        }
+    }
+    if !closed { >>> errors.new("json_schema: unterminated regex [...] in pattern") }
+    << cls + "]"
+}
+
+fn regex_parse_brace(pat &string, pos $&int, min_out $&int, max_out $&int, has_max_out $&bool) bool {
+    save := *pos
+    if *pos >= pat.len || ((*pat)[*pos] & 255) != 123 { << false }
+    *pos += 1
+    $d1 := *pos
+    while *pos < pat.len && ((*pat)[*pos] & 255) >= 48 && ((*pat)[*pos] & 255) <= 57 { *pos += 1 }
+    if *pos == d1 {
+        *pos = save
+        << false
+    }
+    smin := (*pat)[d1:(*pos)]
+    mv := strconv.atoi(&smin) >>> (_) {
+        *pos = save
+        << false
+    }
+    *min_out = mv
+    if *pos < pat.len && ((*pat)[*pos] & 255) == 125 {
+        *pos += 1
+        *max_out = mv
+        *has_max_out = true
+        << true
+    }
+    if *pos < pat.len && ((*pat)[*pos] & 255) == 44 {
+        *pos += 1
+        if *pos < pat.len && ((*pat)[*pos] & 255) == 125 {
+            *pos += 1
+            *max_out = mv
+            *has_max_out = false
+            << true
+        }
+        $d2 := *pos
+        while *pos < pat.len && ((*pat)[*pos] & 255) >= 48 && ((*pat)[*pos] & 255) <= 57 { *pos += 1 }
+        if *pos > d2 && *pos < pat.len && ((*pat)[*pos] & 255) == 125 {
+            smax := (*pat)[d2:(*pos)]
+            *pos += 1
+            xv := strconv.atoi(&smax) >>> (_) {
+                *pos = save
+                << false
+            }
+            *max_out = xv
+            *has_max_out = true
+            << true
+        }
+    }
+    *pos = save
+    << false
+}
+
+fn regex_parse_alt(pat &string, pos $&int, stop_paren bool, rules_out $&string, next_id $&int) string {
+    $branches := []string{}
+    $seq := []string{}
+    while *pos < pat.len {
+        c := (*pat)[*pos] & 255
+        if stop_paren && c == 41 {
+            *pos += 1
+            <-
+        }
+        if c == 124 {
+            *pos += 1
+            $bs := "\"\""
+            if seq.len > 0 {
+                bs = ""
+                for si in 0:seq.len {
+                    if si > 0 { bs = bs + " " }
+                    bs = bs + seq[si]
+                }
+            }
+            branches.push(bs)
+            seq = []string{}
+            ->
+        }
+        $atom := ""
+        if c == 94 || c == 36 {
+            >>> errors.new("json_schema: unescaped internal anchor in pattern")
+        } else if c == 40 {
+            *pos += 1
+            if *pos + 1 < pat.len && ((*pat)[*pos] & 255) == 63 {
+                nc := (*pat)[*pos + 1] & 255
+                if nc == 58 {
+                    *pos += 2
+                } else {
+                    >>> errors.new("json_schema: lookaround/named group in pattern unsupported")
+                }
+            }
+            sub := regex_parse_alt(pat, pos, true, rules_out, next_id) >>>
+            gname := "jrex_" + str(*next_id)
+            *next_id += 1
+            *rules_out = *rules_out + gname + " ::= " + sub + "\n"
+            atom = gname
+        } else if c == 91 {
+            atom = regex_parse_class(pat, pos) >>>
+        } else if c == 46 {
+            *pos += 1
+            atom = "jchar"
+        } else if c == 92 {
+            *pos += 1
+            if *pos >= pat.len { >>> errors.new("json_schema: trailing backslash in pattern") }
+            ec := (*pat)[*pos] & 255
+            *pos += 1
+            if ec == 100 { atom = "[0-9]" }
+            else if ec == 68 { atom = "[^0-9\"\\\\\\n\\r]" }
+            else if ec == 119 { atom = "[a-zA-Z0-9_]" }
+            else if ec == 87 { atom = "[^a-zA-Z0-9_\"\\\\\\n\\r]" }
+            else if ec == 115 { atom = "( \" \" | \"\\\\t\" )" }
+            else if ec == 83 { atom = "[^ \\t\"\\\\\\n\\r]" }
+            else if ec >= 49 && ec <= 57 { >>> errors.new("json_schema: backreferences in pattern unsupported") }
+            else if ec == 110 { atom = "\"\\\\n\"" }
+            else if ec == 114 { atom = "\"\\\\r\"" }
+            else if ec == 116 { atom = "\"\\\\t\"" }
+            else { atom = json_string_char_lit(ec) >>> }
+        } else {
+            *pos += 1
+            atom = json_string_char_lit(c) >>>
+        }
+
+        if *pos < pat.len {
+            qc := (*pat)[*pos] & 255
+            if qc == 42 || qc == 43 || qc == 63 {
+                *pos += 1
+                atom = atom + string_from_byte(qc)
+            } else if qc == 123 {
+                $qmin := 0
+                $qmax := 0
+                $qhm := false
+                if regex_parse_brace(pat, pos, $&qmin, $&qmax, $&qhm) {
+                    atom = emit_bounded_elems(rules_out, atom, qmin, qmax, qhm, next_id) >>>
+                }
+            }
+        }
+        seq.push(atom)
+    }
+    $last_b := "\"\""
+    if seq.len > 0 {
+        last_b = ""
+        for si in 0:seq.len {
+            if si > 0 { last_b = last_b + " " }
+            last_b = last_b + seq[si]
+        }
+    }
+    branches.push(last_b)
+    if branches.len == 1 { << branches[0] }
+    $out := "( "
+    for bi in 0:branches.len {
+        if bi > 0 { out = out + " | " }
+        out = out + branches[bi]
+    }
+    << out + " )"
+}
+
+fn pattern_to_gbnf(pat &string, rules_out $&string, next_id $&int) string {
+    $s := 0
+    $e := pat.len
+    $anch_start := false
+    $anch_end := false
+    if s < e && ((*pat)[s] & 255) == 94 {
+        anch_start = true
+        s += 1
+    }
+    if e > s && ((*pat)[e - 1] & 255) == 36 {
+        // Check not escaped \$
+        if e - 1 == s || ((*pat)[e - 2] & 255) != 92 {
+            anch_end = true
+            e -= 1
+        }
+    }
+    inner := (*pat)[s:e]
+    $pos := 0
+    body := regex_parse_alt(&inner, $&pos, false, rules_out, next_id) >>>
+    $res := body
+    if !anch_start { res = "jchar* " + res }
+    if !anch_end { res = res + " jchar*" }
+    << "\"\\\"\" " + res + " \"\\\"\""
+}
+
+fn collect_effective_schemas(doc &json.Doc, ctx $&SchemaCtx, node int, seen_ptrs $&[]string, out $&[]int) int {
+    if node < 0 || !doc.is_dict(node) { << 0 }
+    if doc.has(node, "$$ref") {
+        rn := doc.get(node, "$$ref") >>>
+        if doc.is_string(rn) {
+            ptr := doc.as_string(rn) >>>
+            $already := false
+            for i in 0:seen_ptrs.len {
+                if seen_ptrs[i] == ptr {
+                    already = true
+                    <-
+                }
+            }
+            if !already {
+                seen_ptrs.push(ptr + "")
+                target := resolve_json_pointer(doc, ctx.root, &ptr) >>>
+                _ := collect_effective_schemas(doc, ctx, target, seen_ptrs, out) >>>
+            }
+        }
+    }
+    if doc.has(node, "allOf") {
+        ao := doc.get(node, "allOf") >>>
+        if doc.is_list(ao) {
+            cnt := doc.count(ao)
+            for i in 0:cnt {
+                sub := doc.at(ao, i) >>>
+                _ := collect_effective_schemas(doc, ctx, sub, seen_ptrs, out) >>>
+            }
+        }
+    }
+    out.push(node)
+    << 0
+}
+
+fn emit_schema_rule(doc &json.Doc, ctx $&SchemaCtx, node int, rname string, rules_out $&string, next_id $&int) string {
     if node < 0 || !doc.is_dict(node) {
         *rules_out = *rules_out + rname + " ::= jvalue\n"
         << rname
     }
-    if doc.has(node, "const") {
-        cn := doc.get(node, "const") >>>
-        cjson := doc.encode(cn) >>>
-        *rules_out = *rules_out + rname + " ::= " + escape_gbnf_lit(&cjson) + "\n"
-        << rname
-    }
-    if doc.has(node, "enum") {
-        en := doc.get(node, "enum") >>>
-        if doc.is_list(en) && doc.count(en) > 0 {
-            $rhs := ""
-            cnt := doc.count(en)
-            for i in 0:cnt {
-                if i > 0 { rhs = rhs + " | " }
-                item := doc.at(en, i) >>>
-                ijson := doc.encode(item) >>>
-                rhs = rhs + escape_gbnf_lit(&ijson)
+    // Pure $ref memoization (supports shared and recursive $defs/$ref!)
+    if doc.has(node, "$$ref") && !doc.has(node, "allOf") && !doc.has(node, "properties") && !doc.has(node, "type") {
+        rn := doc.get(node, "$$ref") >>>
+        if doc.is_string(rn) {
+            ptr := doc.as_string(rn) >>>
+            if ctx.ref_rules.has(ptr) {
+                *rules_out = *rules_out + rname + " ::= " + ctx.ref_rules[ptr] + "\n"
+                << rname
             }
-            *rules_out = *rules_out + rname + " ::= " + rhs + "\n"
-            << rname
-        }
-    }
-    if doc.has(node, "anyOf") || doc.has(node, "oneOf") {
-        $key := "anyOf"
-        if !doc.has(node, "anyOf") { key = "oneOf" }
-        an := doc.get(node, key) >>>
-        if doc.is_list(an) && doc.count(an) > 0 {
-            $rhs := ""
-            cnt := doc.count(an)
-            for i in 0:cnt {
-                if i > 0 { rhs = rhs + " | " }
-                sub := doc.at(an, i) >>>
-                sub_name := "jsub_" + str(*next_id)
-                *next_id += 1
-                _ := emit_schema_rule(doc, sub, sub_name + "", rules_out, next_id) >>>
-                rhs = rhs + sub_name
-            }
-            *rules_out = *rules_out + rname + " ::= " + rhs + "\n"
+            target := resolve_json_pointer(doc, ctx.root, &ptr) >>>
+            def_rule := "jref_" + str(*next_id)
+            *next_id += 1
+            ctx.ref_rules[ptr] = def_rule + ""
+            _ := emit_schema_rule(doc, ctx, target, def_rule + "", rules_out, next_id) >>>
+            *rules_out = *rules_out + rname + " ::= " + def_rule + "\n"
             << rname
         }
     }
 
-    $typ := schema_str_or(doc, node, "type", "")
-    if typ.len == 0 && doc.has(node, "properties") { typ = "object" }
-    if typ.len == 0 && doc.has(node, "items") { typ = "array" }
+    $eff := []int{}
+    $seen_p := []string{}
+    _ := collect_effective_schemas(doc, ctx, node, $&seen_p, $&eff) >>>
+
+    // Check const / enum / anyOf / oneOf across flattened nodes (first wins or own node)
+    for ei in 0:eff.len {
+        enode := eff[ei]
+        if doc.has(enode, "const") {
+            cn := doc.get(enode, "const") >>>
+            cjson := doc.encode(cn) >>>
+            *rules_out = *rules_out + rname + " ::= " + escape_gbnf_lit(&cjson) + "\n"
+            << rname
+        }
+        if doc.has(enode, "enum") {
+            en := doc.get(enode, "enum") >>>
+            if doc.is_list(en) && doc.count(en) > 0 {
+                $rhs := ""
+                cnt := doc.count(en)
+                for i in 0:cnt {
+                    if i > 0 { rhs = rhs + " | " }
+                    item := doc.at(en, i) >>>
+                    ijson := doc.encode(item) >>>
+                    rhs = rhs + escape_gbnf_lit(&ijson)
+                }
+                *rules_out = *rules_out + rname + " ::= " + rhs + "\n"
+                << rname
+            }
+        }
+        if doc.has(enode, "anyOf") || doc.has(enode, "oneOf") {
+            $key := "anyOf"
+            if !doc.has(enode, "anyOf") { key = "oneOf" }
+            an := doc.get(enode, key) >>>
+            if doc.is_list(an) && doc.count(an) > 0 {
+                $rhs := ""
+                cnt := doc.count(an)
+                for i in 0:cnt {
+                    if i > 0 { rhs = rhs + " | " }
+                    sub := doc.at(an, i) >>>
+                    sub_name := "jsub_" + str(*next_id)
+                    *next_id += 1
+                    _ := emit_schema_rule(doc, ctx, sub, sub_name + "", rules_out, next_id) >>>
+                    rhs = rhs + sub_name
+                }
+                *rules_out = *rules_out + rname + " ::= " + rhs + "\n"
+                << rname
+            }
+        }
+    }
+
+    // Merge object properties, required, type, items, and numeric/string/array constraints across eff (e.g. allOf)
+    $typ := ""
+    $has_props := false
+    $prop_keys := []string{}
+    $prop_nodes := []int{}
+    $prop_idx := map[string]int{}
+    $req_names := []string{}
+    $req_seen := map[string]bool{}
+    $items_node := -1
+    $has_min_len := false
+    $min_len := 0
+    $has_max_len := false
+    $max_len := 0
+    $pat_str := ""
+    $has_pat := false
+    $has_min_items := false
+    $min_items := 0
+    $has_max_items := false
+    $max_items := 0
+    $has_num_min := false
+    $num_min := 0.0
+    $exc_min := false
+    $has_num_max := false
+    $num_max := 0.0
+    $exc_max := false
+
+    for ei in 0:eff.len {
+        enode := eff[ei]
+        et := schema_str_or(doc, enode, "type", "")
+        if et.len > 0 { typ = et }
+        if doc.has(enode, "properties") {
+            props := doc.get(enode, "properties") >>>
+            if doc.is_dict(props) {
+                has_props = true
+                pkeys := doc.dict_keys(props)
+                for ki in 0:pkeys.len {
+                    pk := pkeys[ki] + ""
+                    pn := doc.get(props, pk + "") >>>
+                    if prop_idx.has(pk) {
+                        prop_nodes[prop_idx[pk]] = pn
+                    } else {
+                        prop_idx[pk] = prop_keys.len
+                        prop_keys.push(pk)
+                        prop_nodes.push(pn)
+                    }
+                }
+            }
+        }
+        if doc.has(enode, "required") {
+            rn := doc.get(enode, "required") >>>
+            if doc.is_list(rn) {
+                rc := doc.count(rn)
+                for ri in 0:rc {
+                    item := doc.at(rn, ri) >>>
+                    if doc.is_string(item) {
+                        rk := doc.as_string(item) >>>
+                        if !req_seen.has(rk) {
+                            req_seen[rk] = true
+                            req_names.push(rk)
+                        }
+                    }
+                }
+            }
+        }
+        if doc.has(enode, "items") {
+            it_n := doc.get(enode, "items") >>>
+            if doc.is_dict(it_n) { items_node = it_n }
+        }
+        $hf := false
+        vml := schema_int_opt(doc, enode, "minLength", $&hf)
+        if hf && (!has_min_len || vml > min_len) {
+            has_min_len = true
+            min_len = vml
+        }
+        vx := schema_int_opt(doc, enode, "maxLength", $&hf)
+        if hf && (!has_max_len || vx < max_len) {
+            has_max_len = true
+            max_len = vx
+        }
+        p_s := schema_str_or(doc, enode, "pattern", "")
+        if p_s.len > 0 {
+            has_pat = true
+            pat_str = p_s
+        }
+        vmi := schema_int_opt(doc, enode, "minItems", $&hf)
+        if hf && (!has_min_items || vmi > min_items) {
+            has_min_items = true
+            min_items = vmi
+        }
+        vxi := schema_int_opt(doc, enode, "maxItems", $&hf)
+        if hf && (!has_max_items || vxi < max_items) {
+            has_max_items = true
+            max_items = vxi
+        }
+
+        vmin := schema_f64_opt(doc, enode, "minimum", $&hf)
+        if hf {
+            if !has_num_min || vmin > num_min {
+                has_num_min = true
+                num_min = vmin
+                exc_min = false
+            }
+        }
+        vex_min := schema_f64_opt(doc, enode, "exclusiveMinimum", $&hf)
+        if hf {
+            if !has_num_min || vex_min >= num_min {
+                has_num_min = true
+                num_min = vex_min
+                exc_min = true
+            }
+        }
+        vmax := schema_f64_opt(doc, enode, "maximum", $&hf)
+        if hf {
+            if !has_num_max || vmax < num_max {
+                has_num_max = true
+                num_max = vmax
+                exc_max = false
+            }
+        }
+        vex_max := schema_f64_opt(doc, enode, "exclusiveMaximum", $&hf)
+        if hf {
+            if !has_num_max || vex_max <= num_max {
+                has_num_max = true
+                num_max = vex_max
+                exc_max = true
+            }
+        }
+    }
+
+    if typ.len == 0 && has_props { typ = "object" }
+    if typ.len == 0 && items_node >= 0 { typ = "array" }
+    if typ.len == 0 && (has_min_len || has_max_len || has_pat) { typ = "string" }
+    if typ.len == 0 && (has_min_items || has_max_items) { typ = "array" }
+    if typ.len == 0 && (has_num_min || has_num_max) { typ = "number" }
 
     if typ == "string" {
+        if has_pat {
+            pat_rhs := pattern_to_gbnf(&pat_str, rules_out, next_id) >>>
+            *rules_out = *rules_out + rname + " ::= " + pat_rhs + "\n"
+            << rname
+        }
+        if has_min_len || has_max_len {
+            rep := emit_bounded_elems(rules_out, "jchar", min_len, max_len, has_max_len, next_id) >>>
+            *rules_out = *rules_out + rname + " ::= \"\\\"\" " + rep + " \"\\\"\"\n"
+            << rname
+        }
         *rules_out = *rules_out + rname + " ::= jstring\n"
         << rname
     }
     if typ == "integer" {
+        if has_num_min && has_num_max {
+            $ilo := f64_ceil(num_min)
+            if exc_min && f64(ilo) == num_min { ilo += 1 }
+            $ihi := f64_floor(num_max)
+            if exc_max && f64(ihi) == num_max { ihi -= 1 }
+            irhs := int_range_to_gbnf(ilo, ihi) >>>
+            *rules_out = *rules_out + rname + " ::= " + irhs + "\n"
+            << rname
+        }
+        if has_num_min {
+            $ilo := f64_ceil(num_min)
+            if exc_min && f64(ilo) == num_min { ilo += 1 }
+            if ilo >= 0 {
+                *rules_out = *rules_out + rname + " ::= ( \"0\" | [1-9] [0-9]* )\n"
+                << rname
+            }
+        }
+        if has_num_max {
+            $ihi := f64_floor(num_max)
+            if exc_max && f64(ihi) == num_max { ihi -= 1 }
+            if ihi < 0 {
+                *rules_out = *rules_out + rname + " ::= \"-\" [1-9] [0-9]*\n"
+                << rname
+            }
+        }
         *rules_out = *rules_out + rname + " ::= jinteger\n"
         << rname
     }
     if typ == "number" {
+        if has_num_min && ((exc_min && num_min >= 0.0) || (!exc_min && num_min >= 0.0)) {
+            *rules_out = *rules_out + rname + " ::= ( \"0\" | [1-9] [0-9]* ) ( \".\" [0-9]+ )? ( [eE] [+-]? [0-9]+ )?\n"
+            << rname
+        }
+        if has_num_max && ((exc_max && num_max <= 0.0) || num_max < 0.0) {
+            *rules_out = *rules_out + rname + " ::= \"-\" ( \"0\" | [1-9] [0-9]* ) ( \".\" [0-9]+ )? ( [eE] [+-]? [0-9]+ )?\n"
+            << rname
+        }
         *rules_out = *rules_out + rname + " ::= jnumber\n"
         << rname
     }
@@ -860,82 +1821,82 @@ fn emit_schema_rule(doc &json.Doc, node int, rname string, rules_out $&string, n
         << rname
     }
     if typ == "array" {
-        if doc.has(node, "items") {
-            it_node := doc.get(node, "items") >>>
-            if doc.is_dict(it_node) {
-                it_name := "jit_" + str(*next_id)
-                *next_id += 1
-                _ := emit_schema_rule(doc, it_node, it_name + "", rules_out, next_id) >>>
-                *rules_out = *rules_out + rname + " ::= \"[\" ws ( " + it_name + " ( ws \",\" ws " + it_name + " )* )? ws \"]\"\n"
+        $it_name := "jvalue"
+        if items_node >= 0 {
+            inm := "jit_" + str(*next_id)
+            *next_id += 1
+            _ := emit_schema_rule(doc, ctx, items_node, inm + "", rules_out, next_id) >>>
+            it_name = inm
+        }
+        if has_min_items || has_max_items {
+            if has_max_items && max_items < min_items { >>> errors.new("json_schema: maxItems < minItems") }
+            if has_max_items && max_items == 0 {
+                *rules_out = *rules_out + rname + " ::= \"[\" ws \"]\"\n"
                 << rname
             }
+            if min_items == 0 {
+                $tail := emit_repeat_tail(rules_out, "ws \",\" ws " + it_name, max_items - 1, !has_max_items, next_id)
+                if tail.len > 0 { tail = " " + tail }
+                *rules_out = *rules_out + rname + " ::= \"[\" ws ( " + it_name + tail + " )? ws \"]\"\n"
+                << rname
+            }
+            $body := "\"[\" ws " + it_name
+            for _ in 1:min_items {
+                body = body + " ws \",\" ws " + it_name
+            }
+            if !has_max_items {
+                body = body + " ( ws \",\" ws " + it_name + " )*"
+            } else if max_items > min_items {
+                tail := emit_repeat_tail(rules_out, "ws \",\" ws " + it_name, max_items - min_items, false, next_id)
+                if tail.len > 0 { body = body + " " + tail }
+            }
+            *rules_out = *rules_out + rname + " ::= " + body + " ws \"]\"\n"
+            << rname
+        }
+        if items_node >= 0 {
+            *rules_out = *rules_out + rname + " ::= \"[\" ws ( " + it_name + " ( ws \",\" ws " + it_name + " )* )? ws \"]\"\n"
+            << rname
         }
         *rules_out = *rules_out + rname + " ::= jarray\n"
         << rname
     }
     if typ == "object" {
-        if doc.has(node, "properties") {
-            props := doc.get(node, "properties") >>>
-            if doc.is_dict(props) {
-                pkeys := doc.dict_keys(props)
-                if pkeys.len > 0 {
-                    $req_names := []string{}
-                    if doc.has(node, "required") {
-                        rn := doc.get(node, "required") >>>
-                        if doc.is_list(rn) {
-                            rc := doc.count(rn)
-                            for ri in 0:rc {
-                                item := doc.at(rn, ri) >>>
-                                if doc.is_string(item) {
-                                    req_names.push(doc.as_string(item) >>>)
-                                }
-                            }
-                        }
-                    }
-                    $req_keys := []string{}
-                    $req_refs := []string{}
-                    $opt_keys := []string{}
-                    $opt_refs := []string{}
-                    for ki in 0:pkeys.len {
-                        pk := pkeys[ki] + ""
-                        pnode := doc.get(props, pk + "") >>>
-                        pr_name := "jprop_" + str(*next_id)
-                        *next_id += 1
-                        _ := emit_schema_rule(doc, pnode, pr_name + "", rules_out, next_id) >>>
-                        $is_req := false
-                        for ri in 0:req_names.len {
-                            if req_names[ri] == pk {
-                                is_req = true
-                                <-
-                            }
-                        }
-                        if is_req {
-                            req_keys.push(pk)
-                            req_refs.push(pr_name)
-                        } else {
-                            opt_keys.push(pk)
-                            opt_refs.push(pr_name)
-                        }
-                    }
-                    $body := "\"{\" ws "
-                    for i in 0:req_keys.len {
-                        if i > 0 { body = body + " ws \",\" ws " }
-                        kjson := json.quote(&req_keys[i])
-                        body = body + escape_gbnf_lit(&kjson) + " ws \":\" ws " + req_refs[i]
-                    }
-                    if opt_keys.len > 0 {
-                        chain_ref := emit_optional_prop_chain(rules_out, &opt_keys, &opt_refs, 0, next_id)
-                        if req_keys.len > 0 {
-                            body = body + " ( ws \",\" ws " + chain_ref + " )?"
-                        } else {
-                            body = body + " ( " + chain_ref + " )?"
-                        }
-                    }
-                    body = body + " ws \"}\""
-                    *rules_out = *rules_out + rname + " ::= " + body + "\n"
-                    << rname
+        if prop_keys.len > 0 {
+            $req_keys := []string{}
+            $req_refs := []string{}
+            $opt_keys := []string{}
+            $opt_refs := []string{}
+            for ki in 0:prop_keys.len {
+                pk := prop_keys[ki] + ""
+                pnode := prop_nodes[ki]
+                pr_name := "jprop_" + str(*next_id)
+                *next_id += 1
+                _ := emit_schema_rule(doc, ctx, pnode, pr_name + "", rules_out, next_id) >>>
+                if req_seen.has(pk) {
+                    req_keys.push(pk)
+                    req_refs.push(pr_name)
+                } else {
+                    opt_keys.push(pk)
+                    opt_refs.push(pr_name)
                 }
             }
+            $body := "\"{\" ws "
+            for i in 0:req_keys.len {
+                if i > 0 { body = body + " ws \",\" ws " }
+                kjson := json.quote(&req_keys[i])
+                body = body + escape_gbnf_lit(&kjson) + " ws \":\" ws " + req_refs[i]
+            }
+            if opt_keys.len > 0 {
+                chain_ref := emit_optional_prop_chain(rules_out, &opt_keys, &opt_refs, 0, next_id)
+                if req_keys.len > 0 {
+                    body = body + " ( ws \",\" ws " + chain_ref + " )?"
+                } else {
+                    body = body + " ( " + chain_ref + " )?"
+                }
+            }
+            body = body + " ws \"}\""
+            *rules_out = *rules_out + rname + " ::= " + body + "\n"
+            << rname
         }
         *rules_out = *rules_out + rname + " ::= jobject\n"
         << rname
@@ -951,7 +1912,8 @@ pub fn json_schema_to_gbnf(schema_json &string) string {
     }
     $rules := ""
     $next_id := 0
-    _ := emit_schema_rule(&doc, doc.root(), "root", $&rules, $&next_id) >>>
+    $ctx := SchemaCtx{root: doc.root(), ref_rules: map[string]string{}, visiting: map[string]bool{}}
+    _ := emit_schema_rule(&doc, $&ctx, doc.root(), "root", $&rules, $&next_id) >>>
     base := "ws ::= [ \\t\\n\\r]*\n" +
             "jchar ::= [^\"\\\\\\n\\r] | \"\\\\\" ( \"\\\"\" | \"\\\\\" | \"/\" | \"b\" | \"f\" | \"n\" | \"r\" | \"t\" )\n" +
             "jstring ::= \"\\\"\" jchar* \"\\\"\"\n" +
@@ -964,6 +1926,11 @@ pub fn json_schema_to_gbnf(schema_json &string) string {
             "jobject ::= \"{\" ws ( jpair ( ws \",\" ws jpair )* )? ws \"}\"\n" +
             "jarray ::= \"[\" ws ( jvalue ( ws \",\" ws jvalue )* )? ws \"]\"\n"
     << rules + base
+}
+
+pub fn compile_json_schema_with_limits(schema_json &string, lim GbnfLimits) GbnfGrammar {
+    gtxt := json_schema_to_gbnf(schema_json) >>>
+    << compile_with_limits(&gtxt, lim) >>>
 }
 
 pub fn compile_json_schema(schema_json &string) GbnfGrammar {

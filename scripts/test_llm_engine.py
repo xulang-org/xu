@@ -366,6 +366,178 @@ def quantize_q5_0_matrix(vals):
     return bytes(raw), dequant
 
 
+def quantize_q4_1_matrix(vals):
+    assert len(vals) % 32 == 0
+    nb = len(vals) // 32
+    raw = bytearray()
+    dequant = []
+    for b in range(nb):
+        seg = vals[b * 32:(b + 1) * 32]
+        lo = min(seg)
+        hi = max(seg)
+        m16_b = struct.pack("<e", f32(lo))
+        m16 = f32(struct.unpack("<e", m16_b)[0])
+        d = f32((hi - m16) / 15.0) if hi > m16 else 0.0
+        d16_b = struct.pack("<e", d)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        raw.extend(d16_b)
+        raw.extend(m16_b)
+        inv_d = 1.0 / d16 if d16 > 0.0 else 0.0
+        qs = [min(15, max(0, int(round((v - m16) * inv_d)))) if d16 > 0.0 else 0 for v in seg]
+        for j in range(16):
+            raw.append((qs[j] & 15) | ((qs[16 + j] & 15) << 4))
+        dequant.extend(f32(q * d16 + m16) for q in qs)
+    return bytes(raw), dequant
+
+
+def quantize_q5_1_matrix(vals):
+    assert len(vals) % 32 == 0
+    nb = len(vals) // 32
+    raw = bytearray()
+    dequant = []
+    for b in range(nb):
+        seg = vals[b * 32:(b + 1) * 32]
+        lo = min(seg)
+        hi = max(seg)
+        m16_b = struct.pack("<e", f32(lo))
+        m16 = f32(struct.unpack("<e", m16_b)[0])
+        d = f32((hi - m16) / 31.0) if hi > m16 else 0.0
+        d16_b = struct.pack("<e", d)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        raw.extend(d16_b)
+        raw.extend(m16_b)
+        inv_d = 1.0 / d16 if d16 > 0.0 else 0.0
+        qs = [min(31, max(0, int(round((v - m16) * inv_d)))) if d16 > 0.0 else 0 for v in seg]
+        qh = 0
+        for j in range(32):
+            if qs[j] & 16:
+                qh |= 1 << j
+        raw.extend(struct.pack("<I", qh))
+        for j in range(16):
+            raw.append((qs[j] & 15) | ((qs[16 + j] & 15) << 4))
+        dequant.extend(f32(q * d16 + m16) for q in qs)
+    return bytes(raw), dequant
+
+
+def quantize_q2_k_matrix(vals):
+    assert len(vals) % 256 == 0
+    nb = len(vals) // 256
+    raw = bytearray()
+    dequant = []
+    for b in range(nb):
+        blk = vals[b * 256:(b + 1) * 256]
+        sub_scales, sub_mins = [], []
+        for s in range(16):
+            sub = blk[s * 16:(s + 1) * 16]
+            lo = min(0.0, min(sub))
+            hi = max(sub)
+            rng = max(hi - lo, 0.0)
+            sub_scales.append(rng / 3.0 if rng > 0.0 else 0.0)
+            sub_mins.append(-lo)
+        max_sc = max(sub_scales) if sub_scales else 0.0
+        max_mn = max(sub_mins) if sub_mins else 0.0
+        d = f32(max_sc / 15.0) if max_sc > 0.0 else 0.0
+        dmin = f32(max_mn / 15.0) if max_mn > 0.0 else 0.0
+        d16_b = struct.pack("<e", d)
+        dmin16_b = struct.pack("<e", dmin)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        dmin16 = f32(struct.unpack("<e", dmin16_b)[0])
+        sc_q = [min(15, max(0, int(round(sc / d16)))) if d16 > 0.0 else 0 for sc in sub_scales]
+        mn_q = [min(15, max(0, int(round(mn / dmin16)))) if dmin16 > 0.0 else 0 for mn in sub_mins]
+        scales_b = bytearray((sc_q[s] & 15) | ((mn_q[s] & 15) << 4) for s in range(16))
+        qs_b = bytearray(64)
+        for n in range(2):
+            q_off = n * 32
+            for j in range(4):
+                shift = j * 2
+                s0 = n * 8 + j * 2
+                s1 = s0 + 1
+                dl0, ml0 = f32(d16 * sc_q[s0]), f32(dmin16 * mn_q[s0])
+                dl1, ml1 = f32(d16 * sc_q[s1]), f32(dmin16 * mn_q[s1])
+                for l in range(16):
+                    v0 = blk[s0 * 16 + l]
+                    q0 = min(3, max(0, int(round((v0 + ml0) / dl0)))) if dl0 > 0.0 else 0
+                    qs_b[q_off + l] |= (q0 & 3) << shift
+                    dequant.append(f32(f32(dl0 * q0) - ml0))
+                for l in range(16):
+                    v1 = blk[s1 * 16 + l]
+                    q1 = min(3, max(0, int(round((v1 + ml1) / dl1)))) if dl1 > 0.0 else 0
+                    qs_b[q_off + 16 + l] |= (q1 & 3) << shift
+                    dequant.append(f32(f32(dl1 * q1) - ml1))
+        raw.extend(scales_b)
+        raw.extend(qs_b)
+        raw.extend(d16_b)
+        raw.extend(dmin16_b)
+    return bytes(raw), dequant
+
+
+def quantize_q3_k_matrix(vals):
+    assert len(vals) % 256 == 0
+    nb = len(vals) // 256
+    raw = bytearray()
+    dequant = []
+    for b in range(nb):
+        blk = vals[b * 256:(b + 1) * 256]
+        amax_subs = [max(abs(v) for v in blk[s * 16:(s + 1) * 16]) for s in range(16)]
+        max_amax = max(amax_subs) if amax_subs else 0.0
+        d = f32(max_amax / (4.0 * 31.0)) if max_amax > 0.0 else 0.0
+        d16_b = struct.pack("<e", d)
+        d16 = f32(struct.unpack("<e", d16_b)[0])
+        sc_q = []
+        for amax in amax_subs:
+            if d16 > 0.0 and amax > 0.0:
+                qsc = min(63, max(33, 32 + int(round(amax / (4.0 * d16)))))
+            else:
+                qsc = 32
+            sc_q.append(qsc)
+        scales_b = bytearray(12)
+        for idx in range(16):
+            v = sc_q[idx]
+            if idx < 4:
+                scales_b[idx] |= v & 15
+                scales_b[8 + idx] |= (v >> 4) & 3
+            elif idx < 8:
+                scales_b[idx] |= v & 15
+                scales_b[4 + idx] |= ((v >> 4) & 3) << 2
+            elif idx < 12:
+                scales_b[idx - 8] |= (v & 15) << 4
+                scales_b[idx] |= ((v >> 4) & 3) << 4
+            else:
+                scales_b[idx - 8] |= (v & 15) << 4
+                scales_b[idx - 4] |= ((v >> 4) & 3) << 6
+        hmask_b = bytearray(32)
+        qs_b = bytearray(64)
+        m = 1
+        for n in range(2):
+            q_off = n * 32
+            for j in range(4):
+                shift = j * 2
+                s0 = n * 8 + j * 2
+                s1 = s0 + 1
+                dl0 = f32(d16 * (sc_q[s0] - 32))
+                dl1 = f32(d16 * (sc_q[s1] - 32))
+                for l in range(16):
+                    qs_signed = min(3, max(-4, int(round(blk[s0 * 16 + l] / dl0)))) if dl0 != 0.0 else 0
+                    ql = qs_signed + 4 if qs_signed < 0 else qs_signed
+                    qs_b[q_off + l] |= (ql & 3) << shift
+                    if qs_signed >= 0:
+                        hmask_b[l] |= m
+                    dequant.append(f32(dl0 * qs_signed))
+                for l in range(16):
+                    qs_signed = min(3, max(-4, int(round(blk[s1 * 16 + l] / dl1)))) if dl1 != 0.0 else 0
+                    ql = qs_signed + 4 if qs_signed < 0 else qs_signed
+                    qs_b[q_off + 16 + l] |= (ql & 3) << shift
+                    if qs_signed >= 0:
+                        hmask_b[16 + l] |= m
+                    dequant.append(f32(dl1 * qs_signed))
+                m <<= 1
+        raw.extend(hmask_b)
+        raw.extend(qs_b)
+        raw.extend(scales_b)
+        raw.extend(d16_b)
+    return bytes(raw), dequant
+
+
 def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_output=False,
                     encode_dense=None, merges=None, vocab_pieces=None, qk_norms=None,
                     kquant_mode=False, quant_mode=None, tok_model=None,
@@ -470,6 +642,26 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         tensor_specs.append((gname, dims, 13, raw))
         dequant_data[gname] = dq
 
+    def add_q41(gname, dims, vals):
+        raw, dq = quantize_q4_1_matrix(vals)
+        tensor_specs.append((gname, dims, 3, raw))
+        dequant_data[gname] = dq
+
+    def add_q51(gname, dims, vals):
+        raw, dq = quantize_q5_1_matrix(vals)
+        tensor_specs.append((gname, dims, 7, raw))
+        dequant_data[gname] = dq
+
+    def add_q2k(gname, dims, vals):
+        raw, dq = quantize_q2_k_matrix(vals)
+        tensor_specs.append((gname, dims, 10, raw))
+        dequant_data[gname] = dq
+
+    def add_q3k(gname, dims, vals):
+        raw, dq = quantize_q3_k_matrix(vals)
+        tensor_specs.append((gname, dims, 11, raw))
+        dequant_data[gname] = dq
+
     def add_q8_dq(gname, dims, vals):
         raw, qs, sc = quantize_q8_0_matrix(vals)
         tensor_specs.append((gname, dims, 8, raw))
@@ -482,10 +674,22 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
                 add_q6k(gname, dims, vals)
             else:
                 add_q4k(gname, dims, vals)
+        elif quant_mode == "q4_1":
+            add_q41(gname, dims, vals)
         elif quant_mode == "q5_0":
             add_q5(gname, dims, vals)
+        elif quant_mode == "q5_1":
+            add_q51(gname, dims, vals)
+        elif quant_mode == "q2_k":
+            add_q2k(gname, dims, vals)
+        elif quant_mode == "q3_k":
+            add_q3k(gname, dims, vals)
+        elif quant_mode == "q4_k":
+            add_q4k(gname, dims, vals)
         elif quant_mode == "q5_k":
             add_q5k(gname, dims, vals)
+        elif quant_mode == "q6_k":
+            add_q6k(gname, dims, vals)
         elif quant_mode == "q8_0":
             add_q8_dq(gname, dims, vals)
         elif quant_mode == "f32":
@@ -501,10 +705,20 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
         tensor_specs.append((gname, dims, 1, raw))
         dequant_data[gname] = [f32(struct.unpack("<e", struct.pack("<e", float(v)))[0]) for v in vals]
 
-    if kquant_mode:
+    if kquant_mode or quant_mode == "q6_k":
         add_q6k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q4_1":
+        add_q41("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif quant_mode == "q5_0":
         add_q5("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q5_1":
+        add_q51("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q2_k":
+        add_q2k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q3_k":
+        add_q3k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
+    elif quant_mode == "q4_k":
+        add_q4k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif quant_mode == "q5_k":
         add_q5k("token_embd.weight", [dim, vocab], tensors["embed_tokens.weight"][1])
     elif quant_mode == "q8_0":
@@ -585,10 +799,20 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
             add_matrix(gp + "ffn_down.weight", p + "mlp.down_proj.weight", [hidden, dim], tensors[p + "mlp.down_proj.weight"][1])
     add_dense("output_norm.weight", "norm.weight", [dim], tensors["norm.weight"][1])
     if not tied_output:
-        if kquant_mode:
+        if kquant_mode or quant_mode == "q6_k":
             add_q6k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q4_1":
+            add_q41("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif quant_mode == "q5_0":
             add_q5("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q5_1":
+            add_q51("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q2_k":
+            add_q2k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q3_k":
+            add_q3k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
+        elif quant_mode == "q4_k":
+            add_q4k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif quant_mode == "q5_k":
             add_q5k("output.weight", [dim, vocab], tensors["lm_head.weight"][1])
         elif quant_mode == "q8_0":
@@ -629,7 +853,7 @@ def write_gguf_q4_0(path, cfg, tensors, biases=None, qwen_mode=False, tied_outpu
     path.write_bytes(buf)
     if return_q8_all:
         return dequant_data, q8_data
-    if kquant_mode or quant_mode in ("q5_0", "q5_k", "q8_0", "f32"):
+    if kquant_mode or quant_mode in ("q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0", "f32"):
         return dequant_data, None
     return q4_data, q8_data if qwen_mode else None
 
@@ -805,17 +1029,18 @@ def py_run_request(tensors, prompt, max_gen, q4_data=None, use_q8_act=False, q8_
                    rope_dim=None, rope_interleaved=False, sliding_window=0,
                    attn_softcap=0.0, final_softcap=0.0, use_geglu=False,
                    embed_scale=1.0, post_norms=None, yarn=None, moe_cfg=None,
-                   return_last_logits=False):
-    dim = CFG["dim"]
-    hidden = CFG["hidden_dim"]
-    n_layers = CFG["n_layers"]
-    n_heads = CFG["n_heads"]
-    n_kv = CFG["n_kv_heads"]
+                   return_last_logits=False, cfg=None):
+    _c = cfg or CFG
+    dim = _c["dim"]
+    hidden = _c["hidden_dim"]
+    n_layers = _c["n_layers"]
+    n_heads = _c["n_heads"]
+    n_kv = _c["n_kv_heads"]
     head_dim = dim // n_heads
     kv_dim = n_kv * head_dim
     kv_mul = n_heads // n_kv
-    vocab = CFG["vocab_size"]
-    theta = CFG["rope_theta"]
+    vocab = _c["vocab_size"]
+    theta = _c["rope_theta"]
     inv_sqrt_d = f32(1.0 / math.sqrt(head_dim))
 
     def proj(x, q8, st_name, gguf_name, rows, cols):
@@ -4556,6 +4781,480 @@ def check_v15_engine_hardening(exes, work: Path, cfg: dict, tensors: dict, compi
     print("v1.15 engine hardening (PNG/JPEG+bilinear+mean/std+HTTP+<image> VLM, VocabIndex JSON-Schema GBNF, HF-dir/GGUF quantize q5_k/q6_k/q4_k_m/q5_k_m) verified")
 
 
+def check_v16_batch2_engine(exes, work: Path, cfg: dict, tensors: dict, compiler: Path, build_env: dict):
+    import json as pyjson
+    import shutil
+    import subprocess
+
+    exe_base = exes[0][2]
+    exe_strict = exes[1][2] if len(exes) > 1 else exe_base
+    exe_fast = exes[2][2] if len(exes) > 2 else exe_strict
+
+    # 1. K-quant ARM64 NEON SIMD (Q4_K / Q5_K / Q6_K) symbols, parity, and speedup
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        asm_fast = run(["otool", "-tV", exe_fast])
+        for sym in (
+            "___xu_tensor_dot_q4_k_q8_k_f32",
+            "___xu_tensor_dot_q5_k_q8_k_f32",
+            "___xu_tensor_dot_q6_k_q8_k_f32",
+        ):
+            assert f"{sym}:" in asm_fast, f"Missing ARM64 SIMD stub {sym}"
+            body = re.search(rf"^{re.escape(sym)}:[\s\S]*?(?=^___|\Z)", asm_fast, re.M)[0]
+            assert "sdot" in body and "addv" in body, f"Expected sdot+addv in {sym}:\n{body[:400]}"
+
+    kcfg = dict(cfg, dim=256, hidden_dim=512, n_layers=4, n_heads=4, n_kv_heads=4, vocab_size=512, max_seq_len=128)
+    ktensors = generate_weight_dict(kcfg)
+
+    print("--- Batch 2 K-quant Q8_K activation SIMD benchmark & parity ---")
+    for fmt in ("q4_k", "q5_k", "q6_k"):
+        kpath = work / f"v16_{fmt}_256.gguf"
+        kdq, _ = write_gguf_q4_0(kpath, kcfg, ktensors, quant_mode=fmt)
+        py_kref = [py_run_request(ktensors, prompt, gen, dequant_data=kdq, cfg=kcfg) for prompt, gen in REQUESTS]
+
+        base_f32_seq = None
+        for bname, fast, bexe, _ in exes:
+            v_f32 = run([bexe, "verify", str(kpath)])
+            seq_f, cb_f, meta_f = parse_verify(v_f32)
+            assert meta_f.get("format") == fmt and seq_f == cb_f, (fmt, bname, meta_f)
+            if bname == "baseline":
+                base_f32_seq = seq_f
+            elif bname == "fusion-strict":
+                assert seq_f == base_f32_seq, (fmt, "F32-act fusion-strict mismatch vs baseline")
+            tol_f = 1e-3 if fast == "1" else 1e-4
+            for r, (py_t, py_l) in enumerate(py_kref):
+                xu_t = [t for t, _ in seq_f[r]]
+                xu_l = [bits_to_f32(b) for _, b in seq_f[r]]
+                assert xu_t == py_t, (fmt, bname, "f32-act", r, xu_t, py_t)
+                for a, b in zip(xu_l, py_l):
+                    assert abs(a - b) < tol_f, (fmt, bname, "f32-act", r, a, b)
+
+        base_seq = None
+        for bname, _, bexe, _ in exes:
+            v_out = run([bexe, "verify", str(kpath), "--q8k-act"])
+            seq, cb, meta = parse_verify(v_out)
+            assert meta.get("format") == fmt, (fmt, bname, meta)
+            assert seq == cb, (fmt, bname, "CB mismatch")
+            if bname == "baseline":
+                base_seq = seq
+            else:
+                for r in range(len(REQUESTS)):
+                    xu_t = [t for t, _ in seq[r]]
+                    base_t = [t for t, _ in base_seq[r]]
+                    assert xu_t == base_t, (fmt, bname, r, xu_t, base_t)
+                    for (_, b1), (_, b2) in zip(seq[r], base_seq[r]):
+                        diff = abs(bits_to_f32(b1) - bits_to_f32(b2))
+                        tol = 1e-4 if bname == "fusion-strict" else 2e-2
+                        assert diff < tol, (fmt, bname, r, diff)
+            for r, (_, py_l) in enumerate(py_kref):
+                xu_l = [bits_to_f32(b) for _, b in seq[r]]
+                for a, b in zip(xu_l, py_l):
+                    assert abs(a - b) < 0.15, (fmt, bname, "q8k-vs-f32", r, a, b)
+
+        b0 = parse_bench(run([exe_base, "bench", str(kpath), "64", "single", "--q8k-act"]))
+        bf = parse_bench(run([exe_fast, "bench", str(kpath), "64", "single", "--q8k-act"]))
+        tps0 = b0["decode_steps"] * 1e9 / b0["decode_total_ns"]
+        tpsf = bf["decode_steps"] * 1e9 / bf["decode_total_ns"]
+        speedup = tpsf / tps0 if tps0 > 0 else 0.0
+        print(f"[K-quant {fmt:4} Q8_K] baseline={tps0:7.1f} tok/s | SIMD={tpsf:7.1f} tok/s | speedup={speedup:.2f}x")
+        if platform.system() == "Darwin" and platform.machine() == "arm64":
+            assert speedup > 1.5, (fmt, tps0, tpsf, speedup)
+
+    # 2. Missing GGUF formats: Q4_1, Q5_1, Q2_K, Q3_K
+    for fmt in ("q4_1", "q5_1", "q2_k", "q3_k"):
+        fpath = work / f"v16_{fmt}.gguf"
+        fdq, _ = write_gguf_q4_0(fpath, kcfg, ktensors, quant_mode=fmt)
+        py_fref = [py_run_request(ktensors, prompt, gen, dequant_data=fdq, cfg=kcfg) for prompt, gen in REQUESTS]
+        base_seq = None
+        for bname, fast, bexe, _ in exes:
+            seq, cb, meta = parse_verify(run([bexe, "verify", str(fpath)]))
+            assert meta.get("format") == fmt, (fmt, bname, meta)
+            assert seq == cb, (fmt, bname, "CB mismatch")
+            if bname == "baseline":
+                base_seq = seq
+            elif bname == "fusion-strict":
+                assert seq == base_seq, (fmt, "fusion-strict mismatch vs baseline")
+            tol = 1e-3 if fast == "1" else 1e-4
+            for r, (py_t, py_l) in enumerate(py_fref):
+                xu_t = [t for t, _ in seq[r]]
+                xu_l = [bits_to_f32(b) for _, b in seq[r]]
+                assert xu_t == py_t, (fmt, bname, r, xu_t, py_t)
+                for a, b in zip(xu_l, py_l):
+                    assert abs(a - b) < tol, (fmt, bname, r, a, b)
+        if fmt in ("q2_k", "q3_k"):
+            seq_q8_b, _, _ = parse_verify(run([exe_base, "verify", str(fpath), "--q8k-act"]))
+            seq_q8, cb_q8, meta_q8 = parse_verify(run([exe_fast, "verify", str(fpath), "--q8k-act"]))
+            assert meta_q8.get("format") == fmt and seq_q8 == cb_q8, (fmt, meta_q8)
+            for r, (_, py_l) in enumerate(py_fref):
+                xu_l = [bits_to_f32(b) for _, b in seq_q8[r]]
+                base_l = [bits_to_f32(b) for _, b in seq_q8_b[r]]
+                for a, b in zip(xu_l, base_l):
+                    assert abs(a - b) < 2e-2, (fmt, "q8k-act-vs-base", r, a, b)
+                for a, b in zip(xu_l, py_l):
+                    assert abs(a - b) < 0.25, (fmt, "q8k-act-vs-f32", r, a, b)
+    print("GGUF Q4_1 / Q5_1 / Q2_K / Q3_K (F32-act + Q8_K-act + CB parity) verified")
+
+    # 3. Upstream mmproj-*.gguf VLM loader (clip.vision.*, class_embd, pre_ln, swapped llama.cpp ffn_down/up, F32 & F16)
+    img_sz, patch_sz, in_c, hid, nl, nh, ffn_d = 8, 4, 3, 16, 1, 2, 32
+    head_dim = hid // nh
+    proj_d = cfg["dim"]
+    n_patches = (img_sz // patch_sz) ** 2
+    vrng = random.Random(20261129)
+    mean_v = [0.5, 0.25, 0.1]
+    std_v = [0.5, 0.5, 0.5]
+    vt = {
+        "v.patch_embd.weight": [f32(vrng.uniform(-0.25, 0.25)) for _ in range(hid * in_c * patch_sz * patch_sz)],
+        "v.patch_embd.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.class_embd": [f32(vrng.uniform(-0.1, 0.1)) for _ in range(hid)],
+        "v.position_embd.weight": [f32(vrng.uniform(-0.1, 0.1)) for _ in range((n_patches + 1) * hid)],
+        "v.pre_ln.weight": [f32(vrng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.pre_ln.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.ln1.weight": [f32(vrng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.blk.0.ln1.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.attn_q.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.attn_q.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.attn_k.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.attn_k.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.attn_v.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.attn_v.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.attn_out.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(hid * hid)],
+        "v.blk.0.attn_out.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.blk.0.ln2.weight": [f32(vrng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.blk.0.ln2.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        # Swapped llama.cpp naming: ffn_down=[hid, ffn_d] is fc1; ffn_up=[ffn_d, hid] is fc2
+        "v.blk.0.ffn_down.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(ffn_d * hid)],
+        "v.blk.0.ffn_down.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(ffn_d)],
+        "v.blk.0.ffn_up.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(hid * ffn_d)],
+        "v.blk.0.ffn_up.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "v.post_ln.weight": [f32(vrng.uniform(0.8, 1.2)) for _ in range(hid)],
+        "v.post_ln.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(hid)],
+        "mm.0.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(proj_d * hid)],
+        "mm.0.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(proj_d)],
+        "mm.2.weight": [f32(vrng.uniform(-0.2, 0.2)) for _ in range(proj_d * proj_d)],
+        "mm.2.bias": [f32(vrng.uniform(-0.05, 0.05)) for _ in range(proj_d)],
+    }
+    vdims = {
+        "v.patch_embd.weight": [patch_sz, patch_sz, in_c, hid],
+        "v.patch_embd.bias": [hid],
+        "v.class_embd": [hid],
+        "v.position_embd.weight": [hid, n_patches + 1],
+        "v.pre_ln.weight": [hid],
+        "v.pre_ln.bias": [hid],
+        "v.blk.0.ln1.weight": [hid],
+        "v.blk.0.ln1.bias": [hid],
+        "v.blk.0.attn_q.weight": [hid, hid],
+        "v.blk.0.attn_q.bias": [hid],
+        "v.blk.0.attn_k.weight": [hid, hid],
+        "v.blk.0.attn_k.bias": [hid],
+        "v.blk.0.attn_v.weight": [hid, hid],
+        "v.blk.0.attn_v.bias": [hid],
+        "v.blk.0.attn_out.weight": [hid, hid],
+        "v.blk.0.attn_out.bias": [hid],
+        "v.blk.0.ln2.weight": [hid],
+        "v.blk.0.ln2.bias": [hid],
+        "v.blk.0.ffn_down.weight": [hid, ffn_d],
+        "v.blk.0.ffn_down.bias": [ffn_d],
+        "v.blk.0.ffn_up.weight": [ffn_d, hid],
+        "v.blk.0.ffn_up.bias": [hid],
+        "v.post_ln.weight": [hid],
+        "v.post_ln.bias": [hid],
+        "mm.0.weight": [hid, proj_d],
+        "mm.0.bias": [proj_d],
+        "mm.2.weight": [proj_d, proj_d],
+        "mm.2.bias": [proj_d],
+    }
+
+    def write_mmproj_gguf(out_path: Path, gtype: int):
+        kv_list = [
+            ("general.alignment", 4, struct.pack("<I", 32)),
+            ("clip.vision.image_size", 4, struct.pack("<I", img_sz)),
+            ("clip.vision.patch_size", 4, struct.pack("<I", patch_sz)),
+            ("clip.vision.embedding_length", 4, struct.pack("<I", hid)),
+            ("clip.vision.block_count", 4, struct.pack("<I", nl)),
+            ("clip.vision.attention.head_count", 4, struct.pack("<I", nh)),
+            ("clip.vision.feed_forward_length", 4, struct.pack("<I", ffn_d)),
+            ("clip.vision.projection_dim", 4, struct.pack("<I", proj_d)),
+            ("clip.vision.attention.layer_norm_epsilon", 6, struct.pack("<f", 1e-5)),
+            ("clip.vision.image_mean", 9, struct.pack("<IQ3f", 6, 3, *mean_v)),
+            ("clip.vision.image_std", 9, struct.pack("<IQ3f", 6, 3, *std_v)),
+        ]
+        buf = bytearray(b"GGUF")
+        buf.extend(struct.pack("<IQQ", 3, len(vt), len(kv_list)))
+        for k, vtype, vb in kv_list:
+            buf.extend(pack_gguf_str(k))
+            buf.extend(struct.pack("<I", vtype))
+            buf.extend(vb)
+        payload = bytearray()
+        for tname, vals in vt.items():
+            tpad = (32 - (len(payload) % 32)) % 32
+            payload.extend(b"\x00" * tpad)
+            off = len(payload)
+            if gtype == 1:
+                payload.extend(struct.pack(f"<{len(vals)}e", *[float(v) for v in vals]))
+            else:
+                payload.extend(struct.pack(f"<{len(vals)}f", *[float(v) for v in vals]))
+            dims = vdims[tname]
+            buf.extend(pack_gguf_str(tname))
+            buf.extend(struct.pack("<I", len(dims)))
+            for dv in dims:
+                buf.extend(struct.pack("<Q", dv))
+            buf.extend(struct.pack("<IQ", gtype, off))
+        hpad = (32 - (len(buf) % 32)) % 32
+        buf.extend(b"\x00" * hpad)
+        buf.extend(payload)
+        out_path.write_bytes(bytes(buf))
+
+    mm_f32 = work / "v16_mmproj_f32.gguf"
+    mm_f16 = work / "v16_mmproj_f16.gguf"
+    write_mmproj_gguf(mm_f32, 0)
+    write_mmproj_gguf(mm_f16, 1)
+
+    vlm_st = work / "v16_vlm.safetensors"
+    write_safetensors(vlm_st, cfg, tensors)
+    ppm_path = work / "v16_test.ppm"
+    pix = bytearray()
+    for y in range(img_sz):
+        for x in range(img_sz):
+            pix.extend([(x * 30 + 20) & 255, (y * 28 + 40) & 255, 180])
+    ppm_path.write_bytes(f"P6\n{img_sz} {img_sz}\n255\n".encode("ascii") + bytes(pix))
+
+    def py_ln(vec, w, b):
+        n = len(vec)
+        mean = sum(float(v) for v in vec) / n
+        var = sum((float(v) - mean) ** 2 for v in vec) / n
+        inv = 1.0 / math.sqrt(var + 1e-5)
+        return [f32((float(vec[i]) - mean) * inv * float(w[i]) + float(b[i])) for i in range(n)]
+
+    def py_lin(rows, w, b, out_d, in_d):
+        return [
+            [f32(float(b[oi]) + sum(float(r[ii]) * float(w[oi * in_d + ii]) for ii in range(in_d))) for oi in range(out_d)]
+            for r in rows
+        ]
+
+    def py_gelu(v):
+        k = 0.7978845608028654
+        fv = float(v)
+        return f32(0.5 * fv * (1.0 + math.tanh(k * (fv + 0.044715 * fv * fv * fv))))
+
+    grid = img_sz // patch_sz
+    img_chw = [0.0] * (in_c * img_sz * img_sz)
+    hw = img_sz * img_sz
+    for y in range(img_sz):
+        for x in range(img_sz):
+            base = (y * img_sz + x) * 3
+            for c in range(3):
+                img_chw[c * hw + y * img_sz + x] = f32(((pix[base + c] / 255.0) - mean_v[c]) / std_v[c])
+    pw, pb = vt["v.patch_embd.weight"], vt["v.patch_embd.bias"]
+    pos_e, cls_e = vt["v.position_embd.weight"], vt["v.class_embd"]
+    seq_v = [[f32(cls_e[i] + pos_e[i]) for i in range(hid)]]
+    for py_y in range(grid):
+        for py_x in range(grid):
+            tok = py_y * grid + py_x + 1
+            row = []
+            for oc in range(hid):
+                acc = float(pb[oc])
+                for ic in range(in_c):
+                    for dy in range(patch_sz):
+                        for dx in range(patch_sz):
+                            px = img_chw[ic * hw + (py_y * patch_sz + dy) * img_sz + (py_x * patch_sz + dx)]
+                            wv = pw[((oc * in_c + ic) * patch_sz + dy) * patch_sz + dx]
+                            acc += float(px) * float(wv)
+                row.append(f32(f32(acc) + pos_e[tok * hid + oc]))
+            seq_v.append(row)
+    seq_v = [py_ln(r, vt["v.pre_ln.weight"], vt["v.pre_ln.bias"]) for r in seq_v]
+    n1 = [py_ln(r, vt["v.blk.0.ln1.weight"], vt["v.blk.0.ln1.bias"]) for r in seq_v]
+    qv = py_lin(n1, vt["v.blk.0.attn_q.weight"], vt["v.blk.0.attn_q.bias"], hid, hid)
+    kv = py_lin(n1, vt["v.blk.0.attn_k.weight"], vt["v.blk.0.attn_k.bias"], hid, hid)
+    vv = py_lin(n1, vt["v.blk.0.attn_v.weight"], vt["v.blk.0.attn_v.bias"], hid, hid)
+    attn = [[f32(0.0)] * hid for _ in range(n_patches + 1)]
+    sc = 1.0 / math.sqrt(head_dim)
+    for qi in range(n_patches + 1):
+        for hd in range(nh):
+            ho = hd * head_dim
+            scs = [sum(float(qv[qi][ho + d]) * float(kv[ki][ho + d]) for d in range(head_dim)) * sc for ki in range(n_patches + 1)]
+            mx = max(scs)
+            ex = [math.exp(s - mx) for s in scs]
+            dn = sum(ex)
+            for ki in range(n_patches + 1):
+                wgt = ex[ki] / dn
+                for d in range(head_dim):
+                    attn[qi][ho + d] = f32(float(attn[qi][ho + d]) + wgt * float(vv[ki][ho + d]))
+    proj = py_lin(attn, vt["v.blk.0.attn_out.weight"], vt["v.blk.0.attn_out.bias"], hid, hid)
+    seq_v = [[f32(seq_v[i][j] + proj[i][j]) for j in range(hid)] for i in range(n_patches + 1)]
+    n2 = [py_ln(r, vt["v.blk.0.ln2.weight"], vt["v.blk.0.ln2.bias"]) for r in seq_v]
+    fc1 = [[py_gelu(x) for x in r] for r in py_lin(n2, vt["v.blk.0.ffn_down.weight"], vt["v.blk.0.ffn_down.bias"], ffn_d, hid)]
+    fc2 = py_lin(fc1, vt["v.blk.0.ffn_up.weight"], vt["v.blk.0.ffn_up.bias"], hid, ffn_d)
+    seq_v = [[f32(seq_v[i][j] + fc2[i][j]) for j in range(hid)] for i in range(n_patches + 1)]
+    post = [py_ln(r, vt["v.post_ln.weight"], vt["v.post_ln.bias"]) for r in seq_v][1:]
+    mm1 = [[py_gelu(x) for x in r] for r in py_lin(post, vt["mm.0.weight"], vt["mm.0.bias"], proj_d, hid)]
+    vis_vecs = py_lin(mm1, vt["mm.2.weight"], vt["mm.2.bias"], proj_d, proj_d)
+
+    # Full forward reference using vision tokens + prompt token 3
+    dim = cfg["dim"]
+    emb_w = tensors["embed_tokens.weight"][1]
+    all_vecs = vis_vecs + [emb_w[3 * dim:4 * dim]]
+    k_c, v_c = [[] for _ in range(cfg["n_layers"])], [[] for _ in range(cfg["n_layers"])]
+    zeros = [f32(0.0)] * dim
+    hd_l = dim // cfg["n_heads"]
+    kv_dim_l = cfg["n_kv_heads"] * hd_l
+    kv_mul_l = cfg["n_heads"] // cfg["n_kv_heads"]
+    inv_l = 1.0 / math.sqrt(hd_l)
+
+    def mv_l(m, v, rows, cols):
+        return [f32(sum(float(m[r * cols + c]) * float(v[c]) for c in range(cols))) for r in range(rows)]
+
+    nxt_ref = 0
+    for pos_i, vec in enumerate(all_vecs):
+        x = list(vec)
+        for li in range(cfg["n_layers"]):
+            lp = f"layers.{li}."
+            xb = py_rmsnorm(x, zeros, tensors[lp + "input_layernorm.weight"][1])
+            ql = py_rope(mv_l(tensors[lp + "self_attn.q_proj.weight"][1], xb, dim, dim), cfg["n_heads"], hd_l, pos_i, cfg["rope_theta"])
+            kl = py_rope(mv_l(tensors[lp + "self_attn.k_proj.weight"][1], xb, kv_dim_l, dim), cfg["n_kv_heads"], hd_l, pos_i, cfg["rope_theta"])
+            vl = mv_l(tensors[lp + "self_attn.v_proj.weight"][1], xb, kv_dim_l, dim)
+            k_c[li].append(kl)
+            v_c[li].append(vl)
+            att = [f32(0.0)] * dim
+            for hi in range(cfg["n_heads"]):
+                qh = ql[hi * hd_l:(hi + 1) * hd_l]
+                kvh = (hi // kv_mul_l) * hd_l
+                scs = [sum(float(qh[d]) * float(k_c[li][kp][kvh + d]) for d in range(hd_l)) * inv_l for kp in range(pos_i + 1)]
+                mx = max(scs)
+                ex = [math.exp(s - mx) for s in scs]
+                dn = sum(ex)
+                for kp in range(pos_i + 1):
+                    wgt = ex[kp] / dn
+                    for d in range(hd_l):
+                        att[hi * hd_l + d] = f32(float(att[hi * hd_l + d]) + wgt * float(v_c[li][kp][kvh + d]))
+            x2 = mv_l(tensors[lp + "self_attn.o_proj.weight"][1], att, dim, dim)
+            x = [f32(x[i] + x2[i]) for i in range(dim)]
+            xb = py_rmsnorm(x, zeros, tensors[lp + "post_attention_layernorm.weight"][1])
+            g = mv_l(tensors[lp + "mlp.gate_proj.weight"][1], xb, cfg["hidden_dim"], dim)
+            u = mv_l(tensors[lp + "mlp.up_proj.weight"][1], xb, cfg["hidden_dim"], dim)
+            act = [f32((float(g[i]) / (1.0 + math.exp(-float(g[i])))) * float(u[i])) for i in range(cfg["hidden_dim"])]
+            dn_l = mv_l(tensors[lp + "mlp.down_proj.weight"][1], act, dim, cfg["hidden_dim"])
+            x = [f32(x[i] + dn_l[i]) for i in range(dim)]
+        out_n = py_rmsnorm(x, zeros, tensors["norm.weight"][1])
+        logits = mv_l(tensors["lm_head.weight"][1], out_n, cfg["vocab_size"], dim)
+        nxt_ref = max(range(cfg["vocab_size"]), key=lambda idx: float(logits[idx]))
+
+    out_f32 = run([exe_fast, "generate", str(vlm_st), "ids:3", "1", "0", "40", "--mmproj", str(mm_f32), "--image", str(ppm_path)])
+    kv_f32 = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in out_f32.splitlines() if ":" in l}
+    assert kv_f32.get("vision_tokens") == str(n_patches), kv_f32
+    assert int(kv_f32["generated_ids"].split(",")[0]) == nxt_ref, (kv_f32, nxt_ref)
+
+    out_f16 = run([exe_fast, "generate", str(vlm_st), "ids:3", "1", "0", "40", "--mmproj", str(mm_f16), "--image", str(ppm_path)])
+    kv_f16 = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in out_f16.splitlines() if ":" in l}
+    assert kv_f16.get("vision_tokens") == str(n_patches), kv_f16
+    assert int(kv_f16["generated_ids"].split(",")[0]) == nxt_ref, (kv_f16, nxt_ref)
+    print("Upstream mmproj-*.gguf VLM loader (clip.vision.*, class_embd, pre_ln, swapped ffn_down/up, F32+F16) verified")
+
+    # 4. GBNF upgrade: $ref/$defs, allOf, minLength/maxLength, minItems/maxItems, minimum/maximum, pattern, warning, GbnfMaskCache
+    svoc = cfg["vocab_size"]
+    sdim = cfg["dim"]
+    stens = {k: (list(sh), [f32(0.0)] * len(v)) for k, (sh, v) in tensors.items()}
+    stens["norm.weight"] = ([sdim], [f32(1.0)] * sdim)
+    semb = [f32(0.0)] * (svoc * sdim)
+    shead = [f32(0.0)] * (svoc * sdim)
+    for tid in range(svoc):
+        semb[tid * sdim] = f32(1.0)
+    biases = {
+        26: 60.0,  # INVALID
+        2: 50.0,   # <|im_end|>
+        10: 40.0, 11: 40.0, 12: 40.0, 13: 40.0, 14: 40.0, 15: 40.0, 16: 40.0,
+        17: 30.0, 18: 30.0, 19: 30.0,  # code, tags, num
+        20: 25.0, 21: 20.0,            # AB, a
+        22: 24.0, 23: 22.0,            # x, 1
+        24: 18.0, 25: 10.0,            # 5, 12 (99 blocked by maximum=20)
+    }
+    for tid, bv in biases.items():
+        shead[tid * sdim] = f32(bv)
+    stens["embed_tokens.weight"] = ([svoc, sdim], semb)
+    stens["lm_head.weight"] = ([svoc, sdim], shead)
+    spieces = [f"tok_{i}" for i in range(svoc)]
+    spieces[0], spieces[1], spieces[2] = "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+    spieces[3] = "user"
+    spieces[10], spieces[11], spieces[12], spieces[13], spieces[14], spieces[15], spieces[16] = "{", "}", ":", ",", "\"", "[", "]"
+    spieces[17], spieces[18], spieces[19] = "code", "tags", "num"
+    spieces[20], spieces[21], spieces[22], spieces[23], spieces[24], spieces[25] = "AB", "a", "x", "1", "5", "99"
+    spieces[26] = "INVALID"
+    gbnf_gguf = work / "v16_gbnf_schema.gguf"
+    write_gguf_q4_0(gbnf_gguf, cfg, stens, vocab_pieces=spieces)
+
+    adv_schema = {
+        "$defs": {
+            "CodeStr": {"type": "string", "pattern": "^[A-Z]{2}$", "minLength": 2, "maxLength": 2}
+        },
+        "type": "object",
+        "allOf": [
+            {"properties": {"code": {"$ref": "#/$defs/CodeStr"}}, "required": ["code"]},
+            {
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1, "maxLength": 1},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
+                    "num": {"type": "integer", "minimum": 10, "maximum": 20},
+                },
+                "required": ["tags", "num"],
+            },
+        ],
+    }
+    adv_schema_file = work / "v16_adv_schema.json"
+    adv_schema_file.write_text(pyjson.dumps(adv_schema))
+    adv_out = run([exe_fast, "generate", str(gbnf_gguf), "ids:3", "32", "0", "40", "--json-schema", str(adv_schema_file)])
+    adv_kv = {l.split(":", 1)[0]: l.split(":", 1)[1] for l in adv_out.splitlines() if ":" in l}
+    adv_obj = pyjson.loads(adv_kv["generated_text"])
+    assert re.fullmatch(r"[A-Z]{2}", adv_obj["code"]), adv_obj
+    assert isinstance(adv_obj["tags"], list) and len(adv_obj["tags"]) == 2 and all(len(x) == 1 for x in adv_obj["tags"]), adv_obj
+    assert 10 <= adv_obj["num"] <= 20, adv_obj
+
+    branch_gbnf = work / "v16_branch.gbnf"
+    branch_gbnf.write_text('root ::= ("x" | "y" | "z")\n')
+    warn_res = subprocess.run(
+        [str(exe_fast), "generate", str(gbnf_gguf), "ids:3", "4", "0", "40", "--grammar", str(branch_gbnf), "--gbnf-max-branches", "1"],
+        capture_output=True, text=True,
+    )
+    assert warn_res.returncode == 0, warn_res.stdout + warn_res.stderr
+    assert "gbnf warning:" in warn_res.stderr, warn_res.stderr
+
+    # Direct unit test of Trie + GbnfMaskCache (hits > 0 & mask parity)
+    gbnf_dir = work / "v16_gbnf_unit"
+    (gbnf_dir / "gbnf").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(__file__).resolve().parents[1] / "examples/llm_engine/gbnf/mod.xu", gbnf_dir / "gbnf/mod.xu")
+    (gbnf_dir / "main.xu").write_text(
+        "@main\n#gbnf\n"
+        "fn main() int {\n"
+        "    pieces := [\"<eos>\", \"{\", \"}\", \"\\\"a\\\"\", \":\", \"1\", \"2\", \"BAD\"]\n"
+        "    eos := [0]\n"
+        "    vidx := gbnf.build_vocab_index(&pieces, &eos)\n"
+        "    raw := \"root ::= \\\"{\\\" \\\"\\\\\\\"a\\\\\\\"\\\" \\\":\\\" (\\\"1\\\" | \\\"2\\\") \\\"}\\\"\"\n"
+        "    g := gbnf.compile(&raw) >>> (_) { << 1 }\n"
+        "    st := gbnf.init_state(&g)\n"
+        "    $cache := gbnf.new_mask_cache(16)\n"
+        "    $l1 := [f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0)]\n"
+        "    $l2 := [f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0)]\n"
+        "    $l3 := [f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0), f32(0)]\n"
+        "    gbnf.apply_logit_mask($&l1, 0, &vidx, &g, &st)\n"
+        "    gbnf.apply_logit_mask_cached($&l2, 0, &vidx, &g, &st, $&cache)\n"
+        "    gbnf.apply_logit_mask_cached($&l3, 0, &vidx, &g, &st, $&cache)\n"
+        "    if cache.misses != 1 || cache.hits != 1 { << 2 }\n"
+        "    for i in 0:8 {\n"
+        "        if l1[i] != l2[i] || l1[i] != l3[i] { << 3 }\n"
+        "    }\n"
+        "    if l1[1] < f32(-1.0) || l1[7] > f32(-1.0) { << 4 }\n"
+        "    << 0\n"
+        "}\n"
+    )
+    gbnf_exe = gbnf_dir / "gbnf_unit"
+    g_env = dict(build_env, XU_TENSOR_FUSION="0", XU_TENSOR_FAST_MATH="0")
+    g_env.pop("XU_DUMP_MIR", None)
+    build(compiler, g_env, gbnf_dir / "main.xu", gbnf_exe)
+    run([gbnf_exe])
+    print("GBNF ($ref/$defs, allOf, min/max bounds, pattern, --gbnf-max-branches warning, Trie+GbnfMaskCache) verified")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
@@ -4678,6 +5377,7 @@ def main():
         check_v13_mamba_rlvr_quantize(exes, work, CFG, tensors)
         check_v14_vlm_and_q4k_quantize(exes, work, CFG, tensors)
         check_v15_engine_hardening(exes, work, CFG, tensors, compiler, env)
+        check_v16_batch2_engine(exes, work, CFG, tensors, compiler, env)
         print("LLM engine verification passed (Safetensors F32/HF-sharded, GGUF Q4_0/Q5_0/Q8_0/Q4_K_M/Q5_K/Q6_K/MLA/Mamba-SSM/Hybrid/VLM --mmproj PNG+JPEG+inline, --q8k-act, --lora, merge-lora, quantize HF+GGUF q4_0/q8_0/q4_k/q5_k/q6_k/q4_k_m/q5_k_m, train-lora SFT/DPO/GRPO/RLVR/distill, --save-ckpt/--resume-ckpt, VocabIndex --grammar/--json-schema GBNF, models pull/list/rm, perplexity, inspect, --draft, qk_norm, arch extensions, MoE + YaRN, ChatML/Llama-3, SPM, continuous batch HTTP serve + Ollama + Prometheus /metrics)")
 
 
