@@ -148,7 +148,8 @@ void xu_ui_text_input_abort(uint64_t id) {
 }
 int xu_ui_text_input_start(uint64_t id,unsigned canvas,unsigned generation,const char *text,unsigned length,
                             unsigned anchor,unsigned focus,const double *caret,unsigned flags) {
-  if (!input_caret(caret) || (flags & ~9u) || flags == 9u) return 0;
+  if (!input_caret(caret) || (flags & ~0x07F9u) || (flags & 9u) == 9u ||
+      ((flags >> 4) & 0xFu) > 6u || ((flags >> 8) & 0x7u) > 5u) return 0;
   std::unique_ptr<XuUiEditModel> model;
   try { model.reset(new XuUiEditModel); if(!model->initialize(text,length,anchor,focus)) return 0; }
   catch (...) { return 0; }
