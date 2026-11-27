@@ -59,7 +59,7 @@ fn may(ok bool) string {
     if ok {
         << "payload_padpad"
     }
-    >>> errors.new("err_padpad")
+    >> errors.new("err_padpad")
     << ""
 }
 fn main() int {
@@ -81,7 +81,7 @@ pos("throw_propagate_str", """
 @main
 #errors
 fn inner() string {
-    >>> errors.new("boom_padpad")
+    >> errors.new("boom_padpad")
     << ""
 }
 fn outer() string {

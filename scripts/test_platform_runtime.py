@@ -380,7 +380,7 @@ fn (e ZstEmptyErr) msg() string { << "zst-empty-err" }
 fn zst_pass(v ZstVal) int { << v.tag() }
 
 fn zst_may_fail(flag bool) int {
-    if flag { >>> ZstEmptyErr{} }
+    if flag { >> ZstEmptyErr{} }
     << 99
 }
 

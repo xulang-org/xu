@@ -327,7 +327,7 @@ fn check_setting(name string, actual int) int {
     text := os.getenv(name)
     if text.len == 0 { << 0 }
     expected := strconv.parse(&text, 10) >>>
-    if actual != expected { >>> errors.new("unexpected XACP setting") }
+    if actual != expected { >> errors.new("unexpected XACP setting") }
     << 0
 }
 

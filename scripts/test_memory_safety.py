@@ -235,7 +235,7 @@ fn main() {
         code="""@main
 #errors
 fn fallible(fail bool) int {
-    if fail { >>> errors.new("boom") }
+    if fail { >> errors.new("boom") }
     << 10
 }
 fn main() {
@@ -254,7 +254,7 @@ fn main() {
         code="""@main
 #errors
 fn fallible() int {
-    >>> errors.new("boom")
+    >> errors.new("boom")
     << 0
 }
 fn main() {
@@ -492,7 +492,7 @@ fn main() {
 struct Own { v int }
 fn (o $&Own) drop() {}
 fn maybe_take(o Own) int {
-    if o.v < 0 { >>> errors.new("neg") }
+    if o.v < 0 { >> errors.new("neg") }
     << o.v
 }
 fn run() int {
@@ -613,7 +613,7 @@ struct Own { v int }
 fn (o $&Own) drop() {}
 fn take(o Own) { println(o.v) }
 fn fallible() int {
-    if false { >>> errors.new("x") }
+    if false { >> errors.new("x") }
     << 1
 }
 fn run() int {
@@ -1206,7 +1206,7 @@ fn main() {
 #errors
 fn send_val(ch chan int, v int) int {
     ch <- v
-    if v < 0 { >>> errors.new("neg") }
+    if v < 0 { >> errors.new("neg") }
     << v
 }
 fn run() int {
@@ -1289,7 +1289,7 @@ struct Holder {
     e AnyBox
 }
 fn fail_after(g Guard) int {
-    if g.id > 0 { >>> errors.new("fail") }
+    if g.id > 0 { >> errors.new("fail") }
     << g.id
 }
 fn test_cast() {

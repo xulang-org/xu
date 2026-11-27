@@ -35,7 +35,7 @@ XU_CHECKS = """@main
 #tensor
 
 fn require(ok bool, message string) int {
-    if !ok { >>> errors.new(message) }
+    if !ok { >> errors.new(message) }
     << 0
 }
 
@@ -103,7 +103,7 @@ fn check_view() int {
     require(mval == f32(7.5), "write_f32_bytes") >>>
 
     _ := empty.read_f32_linear(&storage, 0) >>> (err) { << 1 }
-    >>> errors.new("empty read succeeded")
+    >> errors.new("empty read succeeded")
 }
 
 fn check_rejections() int {
@@ -116,13 +116,13 @@ fn check_rejections() int {
         _ := tensor.contiguous_view(dtype, &huge_shape, 0, 12) >>> (err) {
             _ := tensor.strided_view(dtype, &shape, &strides, 0, 12) >>> (err) {
                 _ := tensor.contiguous_view(dtype, &shape, 1, 12) >>> (err) { << 4 }
-                >>> errors.new("short backing succeeded")
+                >> errors.new("short backing succeeded")
             }
-            >>> errors.new("stride overflow succeeded")
+            >> errors.new("stride overflow succeeded")
         }
-        >>> errors.new("shape overflow succeeded")
+        >> errors.new("shape overflow succeeded")
     }
-    >>> errors.new("negative shape succeeded")
+    >> errors.new("negative shape succeeded")
 }
 
 fn b_dot_ref(blk &tensor.Q8Block, x &[]f32) f32 {
@@ -294,11 +294,11 @@ fn check_blocks() int {
     _ := tensor.read_q4_k(&q4k, 2) >>> (err) {
         _ := tensor.read_q6_k(&q6k, 2) >>> (err2) {
             _ := tensor.read_q8_0(&q8, 2) >>> (err3) { << 1 }
-            >>> errors.new("truncated Q8_0 block succeeded")
+            >> errors.new("truncated Q8_0 block succeeded")
         }
-        >>> errors.new("truncated Q6_K block succeeded")
+        >> errors.new("truncated Q6_K block succeeded")
     }
-    >>> errors.new("truncated Q4_K block succeeded")
+    >> errors.new("truncated Q4_K block succeeded")
 }
 
 fn check_narrow() int {

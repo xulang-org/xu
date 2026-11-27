@@ -675,7 +675,7 @@ function renderContent(t) {{
         {{t: 'Coroutines & channels', k: 'coroutines channels', d: 'xu f() · chan T · Go-like concurrency'}},
         {{t: 'Native UI & WebView', k: 'native ui webview', d: 'Draw · layout · controls · IME'}},
         {{t: 'WebAssembly AOT', k: 'webassembly wasm aot', d: 'Native + wasm32 · no VM runtime'}},
-        {{t: 'Explicit errors', k: 'errors explicit', d: '<< return · >>> raise · >>> (err)'}},
+        {{t: 'Explicit errors', k: 'errors explicit', d: '<< return · >> raise · >>> (err)'}},
         {{t: 'Install XU', k: 'install sdk', d: 'One command · PATH · full SDK'}},
       ];
       const items = !q ? catalog : catalog.filter(s =>

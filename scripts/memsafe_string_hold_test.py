@@ -107,7 +107,7 @@ fn may(ok bool) string {
     if ok {
         << "ok_val"
     }
-    >>> errors.new("err_val")
+    >> errors.new("err_val")
     << ""
 }
 fn main() int {

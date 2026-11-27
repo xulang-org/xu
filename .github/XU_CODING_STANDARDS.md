@@ -48,7 +48,7 @@ cmp path/to/file.xu /tmp/xu-file-formatted.xu
 
 ## 3. 语法与控制流
 
-- **XU-FLOW-01**：使用 `<<` 返回、`>>>` 抛错、`>>> (err) {}` / `>>>` 处理与传播错误、`->` 继续、`<-` 跳出；进程退出使用 `<<<`，不引入其他语言的 `return`、`break`、`continue` 或 `?` 写法。`>>` 仅用于表达式右移。
+- **XU-FLOW-01**：使用 `<<` 返回、`>>` 抛错、`>>> (err) {}` / `>>>` 处理与传播错误、`->` 继续、`<-` 跳出；进程退出使用 `<<<`，不引入其他语言的 `return`、`break`、`continue` 或 `?` 写法。
 - **XU-FLOW-02**：包导入使用 `#path` 和受支持的别名语法；泛型使用 `fn f#T` 等实际语言形式，方法集使用 `struct@`。不重新引入语言面已移除的 `Result`、`Ok`、`Err` 或错误双返回值。
 - **XU-FLOW-03**：默认不可变，只在需要修改的绑定声明处加 `$`（例如 `$x := 0`）。优先用 guard 减少嵌套，但提前返回须保持资源与错误契约。
 - **XU-FLOW-04**：外部输入决定循环次数时，说明终止条件与合理的上限；持续服务循环须有可解释的退出、取消或关闭路径。
@@ -72,7 +72,7 @@ cmp path/to/file.xu /tmp/xu-file-formatted.xu
 // checked_size rejects negative sizes before allocation.
 fn checked_size(n int) int {
     if n < 0 {
-        >>> errors.new("negative size")
+        >> errors.new("negative size")
     }
     << n
 }
