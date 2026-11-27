@@ -92,7 +92,7 @@ def _has_usable_bash() -> bool:
 
 def _resolve_hosted_seed(explicit: str | None) -> Path:
     """Resolve a hosted seed without ever falling through to the primer."""
-    if os.name == "nt" and not _has_usable_bash():
+    if os.name == "nt":
         default_name = "xu.exe"
         raw = explicit if explicit is not None else os.environ.get("XU_SEED", str(ROOT / "bin" / default_name))
         compiler = _absolute_candidate(raw)
@@ -136,7 +136,7 @@ def resolve_compiler(explicit: str | None, lane: str = LANE) -> Path:
     """Resolve the hosted compiler for the product code-generation audit."""
     if lane != "product":
         raise SystemExit(f"crypto codegen: invalid compiler lane {lane!r}")
-    if not (os.name == "nt" and not _has_usable_bash()) and not is_executable(PRODUCT_COMPILER_RUNNER):
+    if os.name != "nt" and not is_executable(PRODUCT_COMPILER_RUNNER):
         fail(f"missing executable product compiler wrapper: {PRODUCT_COMPILER_RUNNER}")
     return _resolve_hosted_seed(explicit)
 
@@ -161,7 +161,7 @@ def compile_argv(
     src = src_path if src_path is not None else FIXTURE
     flags = ["--no-opt"] if opt == "no-opt" else []
     extra = ["--emit-obj"] if emit_obj else []
-    if os.name == "nt" and not _has_usable_bash():
+    if os.name == "nt":
         return [str(compiler), "build", str(src), "--target", target, *flags, *extra, "-o", str(out_path)]
     return [str(PRODUCT_COMPILER_RUNNER), str(compiler), "build", str(src),
             "--target", target, *flags, *extra, "-o", str(out_path)]
@@ -418,7 +418,7 @@ def main() -> int:
                 env["XU_ROOT"] = str(ROOT)
                 env["XU_STDLIB_ROOT"] = str(ROOT / "src")
                 env["XU_SYMMAP"] = str(symmap_path)
-                if os.name == "nt" and not _has_usable_bash():
+                if os.name == "nt":
                     env["XUPATH"] = str(empty_xupath)
 
                 run(compile_argv(xu, lane, target, opt, elf, src_path=src_path, emit_obj=False), env=env)
