@@ -607,7 +607,7 @@ def run_one(xu: str, env: dict, name: str, src: str, kind: str, expect: str | No
     td = Path(tempfile.mkdtemp(prefix=f"xuMS_{name}_"))
     try:
         srcp = td / "main.xu"
-        srcp.write_text(src)
+        srcp.write_text(src, encoding="utf-8")
         out = td / "a.out"
         try:
             p = subprocess.run(

@@ -1399,7 +1399,7 @@ def main():
     with WindowsTemporaryDirectory(prefix="xu-tensor-opt-") as td:
         work = Path(td)
         src = work / "tensor_opt.xu"
-        src.write_text(xu_source())
+        src.write_text(xu_source(), encoding="utf-8")
         env = dict(os.environ, XU_STDLIB_ROOT=str(root / "src"), XU_CACHE=str(work / "cache"),
                    XU_MIR_BORROW_GATE="1", XU_DUMP_MIR="_xu_main_kernel_", XU_KEEP_SYMBOLS="1")
 

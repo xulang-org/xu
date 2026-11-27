@@ -9,10 +9,10 @@
 ## Xu 0.14.3
 
 - **语言与错误处理语法**：
-  - 将抛出与捕获语法从 `>>` / `or (err) { }` / `or >>` 全面迁移至 `>>>` / `>>> (err) { }`，覆盖编译器、CLI 工具、标准库、示例与测试集（旧版 `>>` / `or` 作为弃用别名继续兼容，解析器同步支持三重泛型闭合 `>>>`）。
+  - 全面更新编译器、CLI 工具、标准库、示例与测试集的错误处理语法：使用 `>>` 抛出错误，使用 `>>>` 与 `>>> (err) { }` 进行错误传播与捕获处理，并在解析器中完善三重泛型闭合 `>>>` 消歧。
 - **编译器优化、多错误诊断与后端对齐**：
   - 合并 Phase 5–7 通用优化：单调用点内联、单块与递减计数循环展开、面向 `div`/`mod`/受护减法的非负 GVN 值域传播、规范偏移标量提升、冷调用常量外提、ARM64 `CCMP`/`CCMN` 分支融合与移位加常量乘法，以及 x86-64 常量乘法/`imul`/`madd` 对齐。
-  - 加固 Windows PE32+ W^X 严格分节（`.text` RX、`.rdata` R、`.data` RW）、基址重定位元数据（`.reloc`）与 `windows-arm64` / `windows-x64` `.pdata`/`.xdata` 系统栈展开表；加固 Linux AOT ELF（`linux-x64`、`linux-arm64`、`linux-riscv64`、`linux-loongarch64`）支持严格 W^X、`ET_DYN` PIE、Full RELRO（`DF_BIND_NOW`）、`.note.gnu.build-id` 与完整节头表；标准化 macOS Mach-O 二进制（`__DATA_CONST`、`LC_UUID`、`LC_BUILD_VERSION` 及发布/调试全模式内建 `LC_CODE_SIGNATURE`）；同时修复 3 个 x86-64 张量存根缺陷与 Windows 测试清理稳定性问题。
+  - 全面标准化与加固各平台二进制格式：Windows PE32+ W^X 严格分节（`.text` RX、`.rdata` R、`.data` RW）、`.reloc` 基址重定位、PE Load Config / Security Cookie 及 `windows-arm64` / `windows-x64` `.pdata`/`.xdata` 系统栈展开表；Linux ELF32/ELF64（`linux-x64`、`linux-arm64`、`linux-riscv64`、`linux-loongarch64`、`linux-riscv32`）严格 W^X、`ET_DYN` PIE、Full RELRO（`DF_BIND_NOW`）、`.note.gnu.build-id`、Intel CET IBT（`endbr64`）、CFI 栈展开与节头表；macOS Mach-O 标准化（`__DATA_CONST`、`LC_UUID`、`LC_BUILD_VERSION` 及发布/调试全模式内建 `LC_CODE_SIGNATURE`）；同步加固 COFF/ELF/Mach-O `.xuobj` 转换与 WASM，修复 3 个 x86-64 张量存根缺陷与 Windows 测试清理稳定性问题。
   - 实现编译器跨声明/跨函数多错误与借用恢复（上限 `MAX_DIAG_ERRORS = 25`，通过 `ERROR_TY`/`fn_failed()` 抑制单函数内级联误报），并新增 `scripts/test_checker_multi_error.py` 回归测试。
 - **运行时、并发、OS 原语与标准库**：
   - 新增 `@interrupt`、`@weak`、`@naked`、`extern static`、严格 `--no-sse`、`--stack-size`、可重定位 DWARF、`x64-uefi` 与 `arm64-uefi`、参数化 x64 内联汇编、`arm64`/`rv64` 内联汇编操作数、`#core/acpi`、`#core/fdt`、`#core/pci`、`#core/uefi`、VirtIO 1.0 Modern MMIO、HPET、UEFI MemMap 以及内置 Mach-O Ad-hoc 签名。
