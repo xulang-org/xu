@@ -9,8 +9,11 @@ mkdir -p build/XuPhone.app
 xcrun --sdk "$sdk" clang++ -std=c++17 -O2 -target "$triple" -isysroot "$sdkroot" \
   -fno-omit-frame-pointer -fobjc-arc App.mm native/host/phone/host.cc native/host/phone/runtime.cc \
   native/host/xu_ui_mem.cc native/app.o -framework UIKit -framework WebKit \
-  -framework Foundation -framework CoreGraphics -framework QuartzCore -o build/XuPhone.app/XuPhone
+  -framework Foundation -framework CoreGraphics -framework QuartzCore -lresolv -o build/XuPhone.app/XuPhone
 cp Info.plist canvas.html build/XuPhone.app/
+if [ -f ca-bundle.pem ]; then cp ca-bundle.pem build/XuPhone.app/; fi
+if [ -d icons ]; then cp icons/AppIcon*.png build/XuPhone.app/; fi
+if [ -d resources ]; then mkdir -p build/XuPhone.app/xu-resources && cp -R resources/. build/XuPhone.app/xu-resources/; fi
 if [ "$sdk" = iphonesimulator ]; then codesign --force --sign - build/XuPhone.app;
 else
   : "${CODE_SIGN_IDENTITY:?Set CODE_SIGN_IDENTITY and embed a matching provisioning profile before installing on a device}"

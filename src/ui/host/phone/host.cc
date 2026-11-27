@@ -18,19 +18,26 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static std::mutex host_lock;
 static unsigned generation;
 static double width = 390, height = 844, scale = 1;
 static double inset_top = 0, inset_bottom = 0, inset_left = 0, inset_right = 0, inset_ime = 0;
-static bool input_enabled, redraw, reduced_motion;
+static bool input_enabled, redraw, reduced_motion, system_dark;
+static double font_scale_val = 1.0;
 static uint64_t active_input_id = 0;
 static std::string last_frame, last_insets;
+static std::unordered_map<uint64_t, unsigned> uploaded_images;
 static XuContentHost content{};
 static std::atomic<xu_phone_clipboard_read_fn> g_clipboard_read{nullptr};
 static std::atomic<xu_phone_clipboard_write_fn> g_clipboard_write{nullptr};
-static void event(const char *line) { xu_ui_mem_append("xu_ui_shell_event.txt", line, 1); }
+extern "C" __attribute__((weak)) void xu_phone_wake(void) {}
+static void event(const char *line) {
+  xu_ui_mem_append("xu_ui_shell_event.txt", line, 1);
+  xu_phone_wake();
+}
 static std::string number(double n) { char b[64]; snprintf(b, sizeof(b), "%.17g", n); return b; }
 static std::string quote(const char *s, unsigned n) {
   std::string out="\"";
@@ -310,6 +317,22 @@ static int text_query_native(void *pointer, unsigned mode, unsigned index, unsig
   }
   return 0;
 }
+static std::string base64_encode(const unsigned char *data, size_t len) {
+  static constexpr char kTab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+  for (size_t i = 0; i < len; i += 3) {
+    unsigned b0 = data[i];
+    unsigned b1 = (i + 1 < len) ? data[i + 1] : 0;
+    unsigned b2 = (i + 2 < len) ? data[i + 2] : 0;
+    unsigned v = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kTab[(v >> 18) & 63]);
+    out.push_back(kTab[(v >> 12) & 63]);
+    out.push_back(i + 1 < len ? kTab[(v >> 6) & 63] : '=');
+    out.push_back(i + 2 < len ? kTab[v & 63] : '=');
+  }
+  return out;
+}
 static std::string frame(const XuUiFrameLease *lease, unsigned depth=0);
 static void *list_create(const XuUiFrameLease *lease) { return new std::string(frame(lease,1)); }
 static void list_destroy(void *p) { delete (std::string *)p; }
@@ -350,18 +373,61 @@ static std::string frame(const XuUiFrameLease *lease, unsigned depth) {
     } else if(c.opcode==XDF_IMAGE) {
       unsigned w=0,h=0; auto *bitmap=xu_ui_frame_bitmap(lease,c.image_id);
       const auto *pixels=xu_ui_bitmap_pixels(bitmap,&w,&h);
-      out+=",["+std::to_string(w)+','+std::to_string(h)+",[";
-      if(pixels)for(unsigned i=0;i<w*h*4;++i){if(i)out+=',';out+=std::to_string(pixels[i]);}
-      out+="]]";
+      unsigned rev=xu_ui_bitmap_revision(bitmap);
+      if(pixels && w>0 && h>0) {
+        bool cached=false;
+        if(depth==0) {
+          auto it=uploaded_images.find(c.image_id);
+          if(it!=uploaded_images.end() && it->second==rev) cached=true;
+          else uploaded_images[c.image_id]=rev;
+        }
+        if(cached) {
+          out+=",["+std::to_string(w)+','+std::to_string(h)+','+std::to_string(c.image_id)+']';
+        } else {
+          size_t total=(size_t)w*(size_t)h*4u;
+          std::vector<unsigned char> rgba(total);
+          for(size_t i=0;i<total;i+=4) {
+            unsigned a=pixels[i+3];
+            rgba[i]=(unsigned char)(a?std::min(255u,(unsigned)pixels[i+2]*255u/a):0u);
+            rgba[i+1]=(unsigned char)(a?std::min(255u,(unsigned)pixels[i+1]*255u/a):0u);
+            rgba[i+2]=(unsigned char)(a?std::min(255u,(unsigned)pixels[i]*255u/a):0u);
+            rgba[i+3]=(unsigned char)a;
+          }
+          std::string b64=base64_encode(rgba.data(),rgba.size());
+          out+=",["+std::to_string(w)+','+std::to_string(h)+','+std::to_string(c.image_id)+",\""+b64+"\"]";
+        }
+      } else {
+        out+=",[0,0,0,\"\"]";
+      }
     }
     out+=']';
+  }
+  if(depth==0 && !uploaded_images.empty()) {
+    std::vector<uint64_t> evicted;
+    for(auto it=uploaded_images.begin();it!=uploaded_images.end();) {
+      if(!xu_ui_image_info(it->first,nullptr,nullptr,nullptr)) {
+        evicted.push_back(it->first);
+        it=uploaded_images.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if(!evicted.empty()) {
+      if(!first)out+=',';
+      out+="[26,0,0,0,0,0,0,0,0,0,[";
+      for(size_t i=0;i<evicted.size();++i) {
+        if(i)out+=',';
+        out+=std::to_string(evicted[i]);
+      }
+      out+="]]";
+    }
   }
   return out+']';
 }
 extern "C" void xu_phone_resize(double w,double h,double s) {
   if(!std::isfinite(w)||!std::isfinite(h)||!std::isfinite(s)||w<=0||h<=0||s<=0)return;
   std::lock_guard<std::mutex> guard(host_lock);width=w;height=h;scale=s;
-  if(generation)xu_ui_canvas_metrics(&content,w,h,(unsigned)(w*s),(unsigned)(h*s),s,s);
+  if(generation){xu_ui_canvas_metrics(&content,w,h,(unsigned)(w*s),(unsigned)(h*s),s,s);xu_phone_wake();}
 }
 static double clamp_inset(double v) {
   if(!std::isfinite(v)||v<=0.0)return 0.0;
@@ -375,7 +441,7 @@ extern "C" void xu_phone_insets(double top,double bottom,double left,double righ
   bool changed=encoded!=last_insets;
   last_insets=encoded;
   xu_ui_mem_set("phone_insets",encoded.c_str());
-  if(changed&&generation)xu_ui_canvas_metrics(&content,width,height,(unsigned)(width*scale),(unsigned)(height*scale),scale,scale);
+  if(changed&&generation){xu_ui_canvas_metrics(&content,width,height,(unsigned)(width*scale),(unsigned)(height*scale),scale,scale);xu_phone_wake();}
 }
 extern "C" void xu_phone_reduced_motion(int enabled) {
   bool on=enabled!=0;
@@ -385,10 +451,32 @@ extern "C" void xu_phone_reduced_motion(int enabled) {
   xu_ui_mem_set("phone_reduced_motion",on?"1":"0");
   if(changed&&generation)event(("canvas_preferences\t1\t1\t"+std::to_string(generation)+(on?"\t1":"\t0")).c_str());
 }
+extern "C" void xu_phone_system_appearance(int dark) {
+  bool on=dark!=0;
+  std::lock_guard<std::mutex> guard(host_lock);
+  bool changed=on!=system_dark;
+  system_dark=on;
+  xu_ui_mem_set("phone_system_dark",on?"1":"0");
+  if(changed&&generation)event(("canvas_preferences\t1\t1\t"+std::to_string(generation)+(reduced_motion?"\t1":"\t0")).c_str());
+}
+extern "C" void xu_phone_font_scale(double s) {
+  double v=(!std::isfinite(s)||s<=0.0)?1.0:std::max(0.5,std::min(3.0,s));
+  v=std::round(v*100.0)/100.0;
+  std::lock_guard<std::mutex> guard(host_lock);
+  bool changed=std::fabs(v-font_scale_val)>0.005;
+  font_scale_val=v;
+  xu_ui_mem_set("phone_font_scale",number(v).c_str());
+  if(changed&&generation){
+    xu_ui_canvas_metrics(&content,width,height,(unsigned)(width*scale),(unsigned)(height*scale),scale,scale);
+    event(("canvas_preferences\t1\t1\t"+std::to_string(generation)+(reduced_motion?"\t1":"\t0")).c_str());
+  }
+}
 extern "C" void xu_phone_input_event(int kind,double x,double y,int button,int buttons,int modifiers,int click_count) {
   std::lock_guard<std::mutex> guard(host_lock);
-  if(input_enabled && generation && kind>=72 && kind<=77)
+  if(input_enabled && generation && kind>=72 && kind<=77) {
     xu_ui_input_emit(&content,(unsigned)kind,x,y,0,0,(unsigned)button,(unsigned)buttons,(unsigned)modifiers,0,0,0,(unsigned)click_count);
+    xu_phone_wake();
+  }
 }
 extern "C" void xu_phone_input(int kind,double x,double y,int buttons) {
   xu_phone_input_event(kind,x,y,1,buttons,0,kind==73?1:0);
@@ -438,8 +526,10 @@ static uint64_t resolve_input_id(uint64_t id, unsigned *out_gen) {
 }
 extern "C" void xu_phone_key(int kind, int key, int repeat, int modifiers) {
   std::lock_guard<std::mutex> guard(host_lock);
-  if (generation && (kind == XUI_KEY_DOWN || kind == XUI_KEY_UP))
+  if (generation && (kind == XUI_KEY_DOWN || kind == XUI_KEY_UP)) {
     xu_ui_input_emit(&content, (unsigned)kind, 0, 0, 0, 0, 0, 0, (unsigned)modifiers, (unsigned)key, 0, (unsigned)repeat, 0);
+    xu_phone_wake();
+  }
 }
 extern "C" char *xu_phone_text_input_state() {
   unsigned gen = 0;
@@ -466,6 +556,8 @@ extern "C" char *xu_phone_text_input_state() {
   out += ",\"flags\":" + std::to_string(snap.flags);
   out += std::string(",\"multiline\":") + ((snap.flags & 1u) ? "true" : "false");
   out += std::string(",\"password\":") + (snap.password() ? "true" : "false");
+  out += ",\"keyboard\":" + std::to_string(snap.keyboard_type());
+  out += ",\"return_key\":" + std::to_string(snap.return_key());
   out += std::string(",\"composing\":") + (snap.composing() ? "true" : "false");
   out += ",\"text\":" + quote(snap.source.data(), (unsigned)snap.source.size());
   out += ",\"preedit\":" + quote(snap.preedit.data(), (unsigned)snap.preedit.size());
@@ -487,8 +579,10 @@ extern "C" int xu_phone_text_input_commit(uint64_t id, uint64_t revision, const 
   uint64_t target = resolve_input_id(id, &gen);
   if (!target || (len && !utf8)) return 0;
   const char *data = utf8 ? utf8 : "";
-  if (!revision) return xu_ui_text_input_commit(target, data, len, UINT_MAX, UINT_MAX);
-  return xu_ui_text_input_commit_at(target, revision, data, len, UINT_MAX, UINT_MAX);
+  int rc = !revision ? xu_ui_text_input_commit(target, data, len, UINT_MAX, UINT_MAX)
+                     : xu_ui_text_input_commit_at(target, revision, data, len, UINT_MAX, UINT_MAX);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_compose(uint64_t id, uint64_t revision, const char *utf8, unsigned len,
                                            unsigned anchor16, unsigned focus16) {
@@ -499,8 +593,10 @@ extern "C" int xu_phone_text_input_compose(uint64_t id, uint64_t revision, const
   if (!xdf_utf8((const unsigned char *)pre.data(), (unsigned)pre.size())) return 0;
   unsigned a8 = utf16_to_utf8_pos(pre, anchor16, false);
   unsigned f8 = utf16_to_utf8_pos(pre, focus16, false);
-  if (!revision) return xu_ui_text_input_compose(target, pre.data(), (unsigned)pre.size(), a8, f8, UINT_MAX, UINT_MAX);
-  return xu_ui_text_input_compose_at(target, revision, pre.data(), (unsigned)pre.size(), a8, f8, UINT_MAX, UINT_MAX);
+  int rc = !revision ? xu_ui_text_input_compose(target, pre.data(), (unsigned)pre.size(), a8, f8, UINT_MAX, UINT_MAX)
+                     : xu_ui_text_input_compose_at(target, revision, pre.data(), (unsigned)pre.size(), a8, f8, UINT_MAX, UINT_MAX);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_finish_composing(uint64_t id, uint64_t revision) {
   unsigned gen = 0;
@@ -510,7 +606,9 @@ extern "C" int xu_phone_text_input_finish_composing(uint64_t id, uint64_t revisi
   if (!xu_text_input_read(target, 1, gen, true, &snap)) return 0;
   if (revision && snap.revision != revision) return 0;
   if (!snap.composing()) return 1;
-  return xu_ui_text_input_commit_at(target, snap.revision, snap.preedit.data(), (unsigned)snap.preedit.size(), UINT_MAX, UINT_MAX);
+  int rc = xu_ui_text_input_commit_at(target, snap.revision, snap.preedit.data(), (unsigned)snap.preedit.size(), UINT_MAX, UINT_MAX);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_compose_region(uint64_t id, uint64_t revision, unsigned start16, unsigned end16) {
   unsigned gen = 0;
@@ -530,7 +628,9 @@ extern "C" int xu_phone_text_input_compose_region(uint64_t id, uint64_t revision
   if (s8 > e8) std::swap(s8, e8);
   std::string slice = snap.source.substr(s8, e8 - s8);
   unsigned caret = (snap.focus >= s8 && snap.focus <= e8) ? (snap.focus - s8) : (unsigned)slice.size();
-  return xu_ui_text_input_compose_at(target, snap.revision, slice.data(), (unsigned)slice.size(), caret, caret, s8, e8);
+  int rc = xu_ui_text_input_compose_at(target, snap.revision, slice.data(), (unsigned)slice.size(), caret, caret, s8, e8);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_replace(uint64_t id, uint64_t revision, unsigned start16, unsigned end16,
                                            const char *utf8, unsigned len) {
@@ -547,7 +647,9 @@ extern "C" int xu_phone_text_input_replace(uint64_t id, uint64_t revision, unsig
   unsigned s8 = 0, e8 = 0;
   if (!snap.source_index(d_s8, false, &s8) || !snap.source_index(d_e8, true, &e8)) return 0;
   if (s8 > e8) std::swap(s8, e8);
-  return xu_ui_text_input_commit_at(target, snap.revision, utf8 ? utf8 : "", len, s8, e8);
+  int rc = xu_ui_text_input_commit_at(target, snap.revision, utf8 ? utf8 : "", len, s8, e8);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_select(uint64_t id, uint64_t revision, unsigned anchor16, unsigned focus16) {
   unsigned gen = 0;
@@ -562,8 +664,10 @@ extern "C" int xu_phone_text_input_select(uint64_t id, uint64_t revision, unsign
   if (snap.composing()) {
     unsigned pre_end = snap.start + (unsigned)snap.preedit.size();
     if (d_a8 >= snap.start && d_a8 <= pre_end && d_f8 >= snap.start && d_f8 <= pre_end) {
-      return xu_ui_text_input_compose_at(target, snap.revision, snap.preedit.data(), (unsigned)snap.preedit.size(),
-                                         d_a8 - snap.start, d_f8 - snap.start, UINT_MAX, UINT_MAX);
+      int rc = xu_ui_text_input_compose_at(target, snap.revision, snap.preedit.data(), (unsigned)snap.preedit.size(),
+                                           d_a8 - snap.start, d_f8 - snap.start, UINT_MAX, UINT_MAX);
+      if (rc) xu_phone_wake();
+      return rc;
     }
     if (!xu_ui_text_input_commit_at(target, snap.revision, snap.preedit.data(), (unsigned)snap.preedit.size(), UINT_MAX, UINT_MAX))
       return 0;
@@ -574,7 +678,9 @@ extern "C" int xu_phone_text_input_select(uint64_t id, uint64_t revision, unsign
   }
   unsigned s_a8 = 0, s_f8 = 0;
   if (!snap.source_index(d_a8, false, &s_a8) || !snap.source_index(d_f8, false, &s_f8)) return 0;
-  return xu_ui_text_input_select(target, s_a8, s_f8);
+  int rc = xu_ui_text_input_select(target, s_a8, s_f8);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_delete_surrounding(uint64_t id, uint64_t revision, unsigned before16, unsigned after16) {
   unsigned gen = 0;
@@ -604,6 +710,7 @@ extern "C" int xu_phone_text_input_delete_surrounding(uint64_t id, uint64_t revi
       if (!xu_ui_text_input_delete_surrounding_at(target, cur_rev, del_start, pivot_before)) return 0;
     }
   }
+  xu_phone_wake();
   return 1;
 }
 extern "C" int xu_phone_text_input_erase(uint64_t id, uint64_t revision, int backward) {
@@ -615,17 +722,27 @@ extern "C" int xu_phone_text_input_erase(uint64_t id, uint64_t revision, int bac
   if (revision && snap.revision != revision) return 0;
   if (snap.composing()) {
     if (!backward) return 0;
-    if (snap.preedit.empty()) return xu_ui_text_input_cancel(target);
+    if (snap.preedit.empty()) {
+      int rc = xu_ui_text_input_cancel(target);
+      if (rc) xu_phone_wake();
+      return rc;
+    }
     std::vector<unsigned> stops;
     if (xu_ui_grapheme::boundaries(snap.preedit.data(), (unsigned)snap.preedit.size(), &stops) && stops.size() >= 2) {
       unsigned next_len = stops[stops.size() - 2];
-      if (!next_len) return xu_ui_text_input_cancel(target);
-      return xu_ui_text_input_compose_at(target, snap.revision, snap.preedit.data(), next_len,
-                                         next_len, next_len, UINT_MAX, UINT_MAX);
+      int rc = !next_len ? xu_ui_text_input_cancel(target)
+                         : xu_ui_text_input_compose_at(target, snap.revision, snap.preedit.data(), next_len,
+                                                       next_len, next_len, UINT_MAX, UINT_MAX);
+      if (rc) xu_phone_wake();
+      return rc;
     }
-    return xu_ui_text_input_cancel(target);
+    int rc = xu_ui_text_input_cancel(target);
+    if (rc) xu_phone_wake();
+    return rc;
   }
-  return xu_ui_text_input_erase(target, backward ? 1 : 0);
+  int rc = xu_ui_text_input_erase(target, backward ? 1 : 0);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_move(uint64_t id, uint64_t revision, int backward, int extend) {
   unsigned gen = 0;
@@ -635,7 +752,9 @@ extern "C" int xu_phone_text_input_move(uint64_t id, uint64_t revision, int back
     XuTextInputSnapshot snap;
     if (!xu_text_input_read(target, 1, gen, true, &snap) || snap.revision != revision) return 0;
   }
-  return xu_ui_text_input_move(target, backward ? 1 : 0, extend ? 1 : 0);
+  int rc = xu_ui_text_input_move(target, backward ? 1 : 0, extend ? 1 : 0);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_text_input_stop(uint64_t id) {
   unsigned gen = 0;
@@ -645,7 +764,9 @@ extern "C" int xu_phone_text_input_stop(uint64_t id) {
     std::lock_guard<std::mutex> guard(host_lock);
     if (active_input_id == target) active_input_id = 0;
   }
-  return xu_ui_text_input_stop(target, 1, gen, XUTI_STOPPED);
+  int rc = xu_ui_text_input_stop(target, 1, gen, XUTI_STOPPED);
+  if (rc) xu_phone_wake();
+  return rc;
 }
 extern "C" int xu_phone_overlay() {
   char enabled[4]{};
@@ -668,6 +789,7 @@ extern "C" int xu_phone_back() {
   }
   if (input_id) {
     xu_ui_text_input_stop(input_id, 1, gen, XUTI_STOPPED);
+    xu_phone_wake();
     return 1;
   }
   char enabled[4]{};
@@ -691,7 +813,25 @@ extern "C" void xu_phone_set_clipboard(xu_phone_clipboard_read_fn read_fn, xu_ph
   g_clipboard_read.store(read_fn, std::memory_order_release);
   g_clipboard_write.store(write_fn, std::memory_order_release);
 }
-extern "C" void xu_phone_redraw() { std::lock_guard<std::mutex> guard(host_lock);redraw=true; }
+extern "C" void xu_phone_redraw() {
+  {
+    std::lock_guard<std::mutex> guard(host_lock);
+    redraw=true;
+  }
+  xu_phone_wake();
+}
+extern "C" void xu_phone_renderer_reset() {
+  {
+    std::lock_guard<std::mutex> guard(host_lock);
+    uploaded_images.clear();
+    last_frame.clear();
+    redraw=true;
+    if(generation) {
+      xu_ui_canvas_metrics(&content,width,height,(unsigned)(width*scale),(unsigned)(height*scale),scale,scale);
+    }
+  }
+  xu_phone_wake();
+}
 extern "C" char *xu_phone_poll() {
   struct PendingClipboard { uint64_t id; unsigned kind; std::string text; };
   std::vector<PendingClipboard> clipboard_ops;
