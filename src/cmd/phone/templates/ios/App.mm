@@ -1,5 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#include <arpa/inet.h>
+#include <resolv.h>
+#include <stdlib.h>
 #include <string.h>
 #include "native/host/phone/phone.h"
 
@@ -72,6 +75,8 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
 @property (nonatomic, assign) uint64_t revision;
 @property (nonatomic, assign) BOOL multiline;
 @property (nonatomic, assign) BOOL secureEntry;
+@property (nonatomic, assign) NSInteger keyboardKind;
+@property (nonatomic, assign) NSInteger returnKeyKind;
 @property (nonatomic, copy) NSString *displayText;
 @property (nonatomic, assign) NSRange selectedRange16;
 @property (nonatomic, assign) NSRange markedRange16;
@@ -128,6 +133,8 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   uint64_t nextRev = [dict[@"revision"] unsignedLongLongValue];
   BOOL nextMultiline = [dict[@"multiline"] boolValue];
   BOOL nextPassword = [dict[@"password"] boolValue];
+  NSInteger nextKeyboard = [dict[@"keyboard"] integerValue];
+  NSInteger nextReturnKey = [dict[@"return_key"] integerValue];
   BOOL composing = [dict[@"composing"] boolValue];
   NSString *nextDisplay = [dict[@"display"] isKindOfClass:NSString.class] ? dict[@"display"] : @"";
   NSInteger a16 = [dict[@"display_anchor16"] integerValue];
@@ -150,6 +157,9 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
     nextCaret = CGRectMake([caretArr[0] doubleValue], [caretArr[1] doubleValue],
                            MAX(2.0, [caretArr[2] doubleValue]), MAX(20.0, [caretArr[3] doubleValue]));
   }
+  BOOL traitsChanged = (self.sessionActive && self.sessionId == nextId &&
+                        (self.multiline != nextMultiline || self.secureEntry != nextPassword ||
+                         self.keyboardKind != nextKeyboard || self.returnKeyKind != nextReturnKey));
   BOOL changed = (!self.sessionActive || self.sessionId != nextId ||
                   ![self.displayText isEqualToString:nextDisplay] ||
                   !NSEqualRanges(self.selectedRange16, nextSel) ||
@@ -163,10 +173,15 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   self.revision = nextRev;
   self.multiline = nextMultiline;
   self.secureEntry = nextPassword;
+  self.keyboardKind = nextKeyboard;
+  self.returnKeyKind = nextReturnKey;
   self.displayText = nextDisplay;
   self.selectedRange16 = nextSel;
   self.markedRange16 = nextMarked;
   self.caretRect16 = nextCaret;
+  if (traitsChanged && self.isFirstResponder) {
+    [self reloadInputViews];
+  }
   if (notify && changed) {
     [self.inputDelegate textDidChange:self];
     [self.inputDelegate selectionDidChange:self];
@@ -181,6 +196,10 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   self.sessionActive = NO;
   self.sessionId = 0;
   self.revision = 0;
+  self.multiline = NO;
+  self.secureEntry = NO;
+  self.keyboardKind = 0;
+  self.returnKeyKind = 0;
   self.displayText = @"";
   self.selectedRange16 = NSMakeRange(0, 0);
   self.markedRange16 = NSMakeRange(NSNotFound, 0);
@@ -198,11 +217,37 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   [self applyStateDict:dict notifyDelegate:NO];
 }
 #pragma mark - UITextInputTraits
-- (UIKeyboardType)keyboardType { return UIKeyboardTypeDefault; }
-- (UIReturnKeyType)returnKeyType { return self.multiline ? UIReturnKeyDefault : UIReturnKeyDone; }
+- (UIKeyboardType)keyboardType {
+  switch (self.keyboardKind) {
+    case 1: return UIKeyboardTypeEmailAddress;
+    case 2: return UIKeyboardTypeURL;
+    case 3: return UIKeyboardTypeNumberPad;
+    case 4: return UIKeyboardTypeDecimalPad;
+    case 5: return UIKeyboardTypePhonePad;
+    case 6: return UIKeyboardTypeWebSearch;
+    default: return UIKeyboardTypeDefault;
+  }
+}
+- (UIReturnKeyType)returnKeyType {
+  switch (self.returnKeyKind) {
+    case 1: return UIReturnKeyDone;
+    case 2: return UIReturnKeyGo;
+    case 3: return UIReturnKeyNext;
+    case 4: return UIReturnKeySearch;
+    case 5: return UIReturnKeySend;
+    default: return self.multiline ? UIReturnKeyDefault : UIReturnKeyDone;
+  }
+}
 - (BOOL)isSecureTextEntry { return self.secureEntry; }
 - (UITextAutocorrectionType)autocorrectionType {
-  return self.secureEntry ? UITextAutocorrectionTypeNo : UITextAutocorrectionTypeDefault;
+  return (self.secureEntry || self.keyboardKind == 1 || self.keyboardKind == 2)
+    ? UITextAutocorrectionTypeNo
+    : UITextAutocorrectionTypeDefault;
+}
+- (UITextAutocapitalizationType)autocapitalizationType {
+  return (self.secureEntry || self.keyboardKind == 1 || self.keyboardKind == 2)
+    ? UITextAutocapitalizationTypeNone
+    : UITextAutocapitalizationTypeSentences;
 }
 #pragma mark - UIKeyInput
 - (BOOL)hasText { return self.displayText.length > 0; }
@@ -323,7 +368,7 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   return self.bounds;
 }
 - (CGRect)caretRectForPosition:(UITextPosition *)position {
-  return CGRectMake(0, 0, MAX(2.0, self.bounds.size.width), MAX(20.0, self.bounds.size.height));
+  return CGRectMake(0, 0, MAX(2.0, self.caretRect16.size.width), MAX(20.0, self.caretRect16.size.height));
 }
 - (NSArray<UITextSelectionRect *> *)selectionRectsForRange:(UITextRange *)range {
   return @[];
@@ -383,7 +428,7 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
       if ((mods & (2 | 8)) != 0) {
         NSString *ch = [key.charactersIgnoringModifiers uppercaseString];
         int code = ch.length == 1 ? [ch characterAtIndex:0] : 0;
-        if (code == 65 || code == 67 || code == 86 || code == 88) {
+        if (code == 65 || code == 67 || code == 86 || code == 88 || code == 89 || code == 90) {
           xu_phone_key(78, code, 0, mods);
           xu_phone_key(79, code, 0, mods);
           [self refreshFromHost];
@@ -435,17 +480,84 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
 }
 @end
 
-@interface XuController : UIViewController <WKScriptMessageHandler, WKNavigationDelegate>
+@protocol XuDisplayTarget <NSObject>
+- (void)tick;
+@end
+
+@interface XuDisplayProxy : NSObject
+@property (nonatomic, weak) id<XuDisplayTarget> target;
+- (void)onTick:(CADisplayLink *)link;
+@end
+@implementation XuDisplayProxy
+- (void)onTick:(CADisplayLink *)link {
+  (void)link;
+  [self.target tick];
+}
+@end
+
+@interface XuController : UIViewController <WKScriptMessageHandler, WKNavigationDelegate, XuDisplayTarget>
 @property WKWebView *web;
 @property XuTextInputView *textInputView;
 @property CADisplayLink *display;
+@property (nonatomic, strong) XuDisplayProxy *displayProxy;
+@property (nonatomic, strong) UISelectionFeedbackGenerator *selectionHaptic;
+@property (nonatomic, strong) UIImpactFeedbackGenerator *impactHaptic;
+@property (nonatomic, strong) UINotificationFeedbackGenerator *notifyHaptic;
 @property BOOL evaluating;
 @property BOOL darkAppearance;
 @property BOOL overlayVisible;
 @property BOOL imeVisible;
 @property CGFloat imeBottom;
+- (void)detachDisplay;
 @end
 @implementation XuController
+- (NSString *)xuDataRootPath {
+  NSString *appSupport = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+  NSString *bundleId = NSBundle.mainBundle.bundleIdentifier ?: @"org.xulang.phone";
+  return appSupport ? [appSupport stringByAppendingPathComponent:bundleId] : NSTemporaryDirectory();
+}
+- (void)configurePaths {
+  NSString *dataRoot = [self xuDataRootPath];
+  [NSFileManager.defaultManager createDirectoryAtPath:dataRoot withIntermediateDirectories:YES attributes:nil error:nil];
+  NSString *resRoot = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"xu-resources"];
+  xu_phone_set_paths(dataRoot.UTF8String, resRoot.UTF8String);
+}
+- (void)configureNetworkEnv {
+  NSMutableArray<NSString *> *servers = [NSMutableArray array];
+  res_state res = (res_state)calloc(1, sizeof(*res));
+  if (res && res_ninit(res) == 0) {
+    union res_sockaddr_union addrs[8];
+    int count = res_getservers(res, addrs, 8);
+    for (int i = 0; i < count && i < 8; ++i) {
+      if (addrs[i].sin.sin_family == AF_INET) {
+        char buf[INET_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET, &addrs[i].sin.sin_addr, buf, sizeof(buf))) {
+          NSString *ip = [NSString stringWithUTF8String:buf];
+          if (ip.length > 0 && ![servers containsObject:ip]) {
+            [servers addObject:ip];
+          }
+        }
+      }
+    }
+    res_ndestroy(res);
+  }
+  free(res);
+  NSString *dns = [servers componentsJoinedByString:@","];
+  NSFileManager *fm = NSFileManager.defaultManager;
+  NSArray<NSString *> *caCandidates = @[
+    [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"xu-resources/ca-bundle.pem"],
+    [NSBundle.mainBundle pathForResource:@"ca-bundle" ofType:@"pem"] ?: @"",
+    [[self xuDataRootPath] stringByAppendingPathComponent:@"ca-bundle.pem"]
+  ];
+  NSString *caPath = @"";
+  for (NSString *cand in caCandidates) {
+    if (cand.length > 0 && [fm isReadableFileAtPath:cand]) {
+      caPath = cand;
+      break;
+    }
+  }
+  xu_phone_set_network_env(dns.UTF8String, caPath.UTF8String);
+}
 - (void)syncInsets {
   UIEdgeInsets safe = self.view.safeAreaInsets;
   xu_phone_insets(safe.top, safe.bottom, safe.left, safe.right, self.imeBottom);
@@ -453,6 +565,25 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
 - (void)syncMotion {
   xu_phone_reduced_motion(UIAccessibilityIsReduceMotionEnabled() ? 1 : 0);
 }
+- (void)syncSystemPreferences {
+  UITraitCollection *tc = self.view.window ? self.view.window.traitCollection : self.traitCollection;
+  xu_phone_system_appearance(tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 1 : 0);
+  double fontScale = [UIFontMetrics.defaultMetrics scaledValueForValue:100.0] / 100.0;
+  xu_phone_font_scale(fontScale);
+}
+- (void)contentSizeChanged:(NSNotification *)note {
+  [self syncSystemPreferences];
+}
+- (void)viewDidMoveToWindow:(UIWindow *)window shouldAppearOrDisappear:(BOOL)appear {
+  [self syncSystemPreferences];
+}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+  [super traitCollectionDidChange:previousTraitCollection];
+  [self syncSystemPreferences];
+}
+#pragma clang diagnostic pop
 - (void)keyboardChanged:(NSNotification *)note {
   CGRect endFrame = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
   CGRect local = [self.view convertRect:endFrame fromView:nil];
@@ -476,26 +607,39 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
 - (void)reduceMotionChanged:(NSNotification *)note {
   [self syncMotion];
 }
+- (void)detachDisplay {
+  [self.display invalidate];
+  self.display = nil;
+  self.displayProxy = nil;
+  xu_phone_active(0);
+}
 - (void)dealloc {
+  [self.display invalidate];
   xu_phone_set_clipboard(nullptr, nullptr);
   [NSNotificationCenter.defaultCenter removeObserver:self];
 }
 - (void)performHaptic:(int)kind {
   if (kind == XU_HAPTIC_SELECTION) {
-    UISelectionFeedbackGenerator *gen = [UISelectionFeedbackGenerator new];
-    [gen prepare];
-    [gen selectionChanged];
+    if (!self.selectionHaptic) self.selectionHaptic = [UISelectionFeedbackGenerator new];
+    [self.selectionHaptic prepare];
+    [self.selectionHaptic selectionChanged];
   } else if (kind == XU_HAPTIC_IMPACT) {
-    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [gen prepare];
-    [gen impactOccurred];
+    if (!self.impactHaptic) self.impactHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [self.impactHaptic prepare];
+    [self.impactHaptic impactOccurred];
   } else if (kind == XU_HAPTIC_SUCCESS || kind == XU_HAPTIC_ERROR) {
-    UINotificationFeedbackGenerator *gen = [UINotificationFeedbackGenerator new];
-    [gen prepare];
-    [gen notificationOccurred:(kind == XU_HAPTIC_SUCCESS ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError)];
+    if (!self.notifyHaptic) self.notifyHaptic = [UINotificationFeedbackGenerator new];
+    [self.notifyHaptic prepare];
+    [self.notifyHaptic notificationOccurred:(kind == XU_HAPTIC_SUCCESS ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError)];
   }
 }
+- (void)loadCanvasHTML {
+  NSURL *url = [NSBundle.mainBundle URLForResource:@"canvas" withExtension:@"html"];
+  [self.web loadFileURL:url allowingReadAccessToURL:url];
+}
 - (void)loadView {
+  [self configurePaths];
+  [self configureNetworkEnv];
   xu_phone_set_clipboard(xu_ios_clipboard_read, xu_ios_clipboard_write);
   self.view = [UIView new];
   self.view.backgroundColor = [UIColor colorWithRed:246.0/255 green:243.0/255 blue:239.0/255 alpha:1];
@@ -521,10 +665,13 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
   [nc addObserver:self selector:@selector(keyboardChanged:) name:UIKeyboardWillChangeFrameNotification object:nil];
   [nc addObserver:self selector:@selector(keyboardHidden:) name:UIKeyboardWillHideNotification object:nil];
   [nc addObserver:self selector:@selector(reduceMotionChanged:) name:UIAccessibilityReduceMotionStatusDidChangeNotification object:nil];
+  [nc addObserver:self selector:@selector(contentSizeChanged:) name:UIContentSizeCategoryDidChangeNotification object:nil];
   [self syncMotion];
-  NSURL *url = [NSBundle.mainBundle URLForResource:@"canvas" withExtension:@"html"];
-  [self.web loadFileURL:url allowingReadAccessToURL:url];
-  self.display = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
+  [self syncSystemPreferences];
+  [self loadCanvasHTML];
+  self.displayProxy = [XuDisplayProxy new];
+  self.displayProxy.target = self;
+  self.display = [CADisplayLink displayLinkWithTarget:self.displayProxy selector:@selector(onTick:)];
   [self.display addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
 - (void)viewSafeAreaInsetsDidChange {
@@ -596,6 +743,11 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
     if (error) NSLog(@"Xu Phone render: %@",error);
   }];
 }
+- (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
+  self.evaluating = NO;
+  xu_phone_renderer_reset();
+  [self loadCanvasHTML];
+}
 - (void)webView:(WKWebView *)web decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))decision {
   decision(action.request.URL.isFileURL ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
 }
@@ -610,10 +762,33 @@ static int xu_ios_clipboard_write(const char *utf8, unsigned len) {
 }
 - (void)sceneDidBecomeActive:(UIScene *)scene { xu_phone_active(1); }
 - (void)sceneWillResignActive:(UIScene *)scene { xu_phone_active(0); }
+- (void)sceneWillEnterForeground:(UIScene *)scene {
+  XuController *ctrl = (XuController *)self.window.rootViewController;
+  if ([ctrl isKindOfClass:XuController.class]) {
+    ctrl.display.paused = NO;
+    [ctrl syncSystemPreferences];
+  }
+  xu_phone_redraw();
+}
+- (void)sceneDidEnterBackground:(UIScene *)scene {
+  XuController *ctrl = (XuController *)self.window.rootViewController;
+  if ([ctrl isKindOfClass:XuController.class]) {
+    ctrl.display.paused = YES;
+  }
+}
+- (void)sceneDidDisconnect:(UIScene *)scene {
+  XuController *ctrl = (XuController *)self.window.rootViewController;
+  if ([ctrl isKindOfClass:XuController.class]) {
+    [ctrl detachDisplay];
+  }
+}
 @end
 @interface XuApp : UIResponder <UIApplicationDelegate>
 @end
 @implementation XuApp
+- (void)applicationWillTerminate:(UIApplication *)application {
+  xu_phone_stop();
+}
 @end
 int main(int argc,char **argv) {
   @autoreleasepool { return UIApplicationMain(argc,argv,nil,NSStringFromClass(XuApp.class)); }

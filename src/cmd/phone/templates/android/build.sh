@@ -24,8 +24,16 @@ mkdir -p build/classes build/dex build/apk/assets build/apk/lib/arm64-v8a
 # The IDE manifest uses AGP's applicationId; aapt2 needs it in its input XML.
 sed 's/<manifest /<manifest package="@BUNDLE_ID@" /; s/<application /<uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35"\/><application /' \
   app/src/main/AndroidManifest.xml > build/AndroidManifest.xml
-"$tools/aapt2" link -I "$android" --manifest build/AndroidManifest.xml -o build/unsigned.apk
+if [ -d app/src/main/res ]; then
+  "$tools/aapt2" compile --dir app/src/main/res -o build/res.zip
+  "$tools/aapt2" link -I "$android" --manifest build/AndroidManifest.xml \
+    --version-code '@VERSION_CODE@' --version-name '@APP_VERSION@' -o build/unsigned.apk build/res.zip
+else
+  "$tools/aapt2" link -I "$android" --manifest build/AndroidManifest.xml \
+    --version-code '@VERSION_CODE@' --version-name '@APP_VERSION@' -o build/unsigned.apk
+fi
 cp canvas.html build/apk/assets/
+if [ -d resources ]; then mkdir -p build/apk/assets/resources && cp -R resources/. build/apk/assets/resources/; fi
 cp build/native/libxuphone.so build/apk/lib/arm64-v8a/
 cp build/dex/classes.dex build/apk/
 (cd build/apk && zip -q -r ../unsigned.apk assets lib classes.dex)
