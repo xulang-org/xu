@@ -7,6 +7,8 @@ cmake -S . -B build/native -G Ninja -DCMAKE_SYSTEM_NAME=iOS \
 cmake --build build/native --parallel "${XU_BUILD_JOBS:-4}"
 mkdir -p build/XuPhoneGame.app
 cp build/native/XuPhoneGame.app/XuPhoneGame Info.plist build/XuPhoneGame.app/
+if [ -f ca-bundle.pem ]; then cp ca-bundle.pem build/XuPhoneGame.app/; fi
+if [ -d icons ]; then cp icons/AppIcon*.png build/XuPhoneGame.app/; fi
 mkdir -p build/XuPhoneGame.app/xu-resources
 cp -R resources/. build/XuPhoneGame.app/xu-resources/
 if [ -n "${PROVISIONING_PROFILE:-}" ]; then

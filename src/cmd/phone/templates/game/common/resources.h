@@ -20,7 +20,7 @@ static bool resource_name(const char *path) {
     return true;
 }
 static bool prepare_resources(void) {
-    char *data_root=SDL_GetPrefPath("xulang", "phone-game");
+    char *data_root=SDL_GetPrefPath("xulang", "@BUNDLE_ID@");
     if (!data_root) return false;
     bool data_ok=setenv("XU_PHONE_DATA_ROOT",data_root,1)==0;
     SDL_free(data_root);
