@@ -12,6 +12,7 @@
   - Enabled multi-core M:N coroutine scheduling by default on Linux and macOS (`#sync/pool`), with per-worker allocation caching, thread-safe heap/FFI/signal/I/O synchronization, and OS-thread/TLS/dual-return syscall stubs across `arm64`, `x64`, and Windows (PR #303).
   - Fixed macOS `SYS_SYSCALL_R1` (`nr -14`) stub across `x64` and `arm64` to clear the third syscall argument register (`rdx`/`x2`) before issuing `gettimeofday`/dual-return syscalls, resolving spurious X.509 certificate validity failures.
   - Set Windows M:N worker thread initial stack commit to `G0_STACK` (64 KiB) in `CreateThread` while keeping the PE 16 MiB reserve, avoiding eager 4 MiB `SizeOfStackCommit` overhead per worker thread.
+  - Accounted for M:N `task_yield()` calls during `task_drain()` (`PARK_DRAIN_YIELD`) so background tasks idling only on external timers or I/O exit cleanly when `main` returns without starving active I/O peers or preemptive CPU loops.
 - **UI Widgets & Focus Semantics**:
   - Added `:focus-visible` (`is_focus_visible()`) semantics across `#ui/widgets` non-text controls (`Button`, `Tabs`, `Select`, `ListBox`, `Slider`, `Stepper`, `Scroll`, and composite wrappers) to distinguish pointer vs keyboard `ROUTE_FOCUS`, fixed segmented `Tabs` double focus rings, and aligned `button`/`checkbox` `focus_inset` (PR #304).
 - **Platforms & Upgrade**: Upgrade the compiler, standard library, and SDK tools together. See also [Chinese release notes](https://github.com/xulang-org/xu/blob/v0.14.4/RELEASES.zh-CN.md#xu-0144).

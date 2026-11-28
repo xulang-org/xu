@@ -12,6 +12,7 @@
   - 在 Linux 与 macOS 上默认启用多核 M:N 协程调度器（`#sync/pool`），配套每工作线程分配缓存、线程安全的堆/FFI/信号/I/O 同步锁，以及跨 `arm64`、`x64` 与 Windows 的系统线程/TLS/双返回值系统调用存根（PR #303）。
   - 修复 macOS `SYS_SYSCALL_R1`（`nr -14`）在 `x64` 与 `arm64` 存根中未清零第三个系统调用参数寄存器（`rdx`/`x2`）的问题，避免 `gettimeofday` 等双返回值系统调用触发 X.509 证书有效期校验异常。
   - 将 Windows M:N 工作线程 `CreateThread` 的初始栈提交大小设为 `G0_STACK`（64 KiB）并保留 PE 默认 16 MiB 保留空间，避免每个工作线程按 `SizeOfStackCommit` 预提交 4 MiB 私有内存。
+  - 为 M:N 调度器的 `task_drain()` 补充 `task_yield()` 休眠统计（`PARK_DRAIN_YIELD`），使在 `main` 返回后仅等待外部定时器或 I/O 的后台任务可干净退出，同时不影响活跃 I/O 互助任务与 `task_poll()` 计算循环。
 - **UI 组件与焦点语义**：
   - 为 `#ui/widgets` 非文本控件（`Button`、`Tabs`、`Select`、`ListBox`、`Slider`、`Stepper`、`Scroll` 及复合包装控件）引入 `:focus-visible`（`is_focus_visible()`）语义以区分指针与键盘 `ROUTE_FOCUS`，修复分段 `Tabs` 双焦点框问题并统一 `button`/`checkbox` 的 `focus_inset`（PR #304）。
 - **平台与升级**：请一起更新编译器、标准库和 SDK 工具。另见[英文发行说明](https://github.com/xulang-org/xu/blob/v0.14.4/RELEASES.md#xu-0144)。
