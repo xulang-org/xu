@@ -1386,6 +1386,7 @@ fn wave(inspect bool) int {
     close(start)
     $sum := 0
     for i in 0:32 { sum += <-done }
+    sleep_ns(50000000)
     << sum
 }
 fn churn(p $&poller.Poller, n int) {
