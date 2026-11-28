@@ -6,6 +6,15 @@
 
 ---
 
+## Xu 0.14.4
+
+- **运行时与多核调度器**：
+  - 在 Linux 与 macOS 上默认启用多核 M:N 协程调度器（`#sync/pool`），配套每工作线程分配缓存、线程安全的堆/FFI/信号/I/O 同步锁，以及跨 `arm64`、`x64` 与 Windows 的系统线程/TLS/双返回值系统调用存根（PR #303）。
+  - 修复 macOS `SYS_SYSCALL_R1`（`nr -14`）在 `x64` 与 `arm64` 存根中未清零第三个系统调用参数寄存器（`rdx`/`x2`）的问题，避免 `gettimeofday` 等双返回值系统调用触发 X.509 证书有效期校验异常。
+- **UI 组件与焦点语义**：
+  - 为 `#ui/widgets` 非文本控件（`Button`、`Tabs`、`Select`、`ListBox`、`Slider`、`Stepper`、`Scroll` 及复合包装控件）引入 `:focus-visible`（`is_focus_visible()`）语义以区分指针与键盘 `ROUTE_FOCUS`，修复分段 `Tabs` 双焦点框问题并统一 `button`/`checkbox` 的 `focus_inset`（PR #304）。
+- **平台与升级**：请一起更新编译器、标准库和 SDK 工具。另见[英文发行说明](https://github.com/xulang-org/xu/blob/v0.14.4/RELEASES.md#xu-0144)。
+
 ## Xu 0.14.3
 
 - **语言与错误处理语法**：

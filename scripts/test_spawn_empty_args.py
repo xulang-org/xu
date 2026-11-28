@@ -82,8 +82,13 @@ def main():
             run = subprocess.run([program], capture_output=True, text=True, check=True, timeout=20,
                                  env=dict(os.environ, XU_DEBUG_FREE="1"))
             batch = ["10", "20", "0", "-21", "11", "42", "6", "30"]
-            if run.stdout.splitlines() != batch * 2 + ["77"] + batch:
+            expected = batch * 2 + ["77"] + batch
+            if sorted(run.stdout.splitlines()) != sorted(expected):
                 raise AssertionError(run.stdout)
+            run_1t = subprocess.run([program], capture_output=True, text=True, check=True, timeout=20,
+                                    env=dict(os.environ, XU_DEBUG_FREE="1", XU_PROCS="1"))
+            if run_1t.stdout.splitlines() != expected:
+                raise AssertionError(run_1t.stdout)
     print("single-word spawn, stack reuse, and owned argument fallbacks passed")
 
 
