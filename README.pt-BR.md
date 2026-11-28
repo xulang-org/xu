@@ -48,7 +48,7 @@ fn fetch_metric(task string) int {
 }
 
 fn worker(task string, ch chan int) {
-    val := fetch_metric(task) or (err) { << } // Tratamento local seguro obrigatório sem `if err != nil`
+    val := fetch_metric(task) >>> (err) { << } // Tratamento local seguro obrigatório sem `if err != nil`
     ch <- val                                 // Troca de mensagens em canais com segurança de tipos
 }
 
@@ -63,7 +63,7 @@ fn main() int {
 
 > **Por que os desenvolvedores adoram**:
 > 1. **Controle de fluxo simbólico**: `<<` retorna, `>>` lança erro, `<<<` encerra. Adeus às palavras-chave verbosas legadas.
-> 2. **Fluxo de erros ergonômico**: Tratado no ponto de chamada com `or (err) { ... }`. Elimina a poluição visual de `if err != nil` e os pânicos catastróficos de `unwrap()` em tempo de execução.
+> 2. **Fluxo de erros ergonômico**: Tratado no ponto de chamada com `>>> (err) { ... }` (ou propagado com `>>>`). Elimina a poluição visual de `if err != nil` e os pânicos catastróficos de `unwrap()` em tempo de execução.
 > 3. **Concorrência leve nativa**: Corrotinas `xu worker()` + canais `chan` oferecem concorrência intuitiva no estilo Go.
 > 4. **Segurança estática em compilação**: Rastreada por inferência de propriedade e empréstimo. **Sem coletor de lixo (Zero-GC)**, zero pausas e consumo determinístico ultraenxuto de memória.
 
@@ -88,7 +88,7 @@ Como engenheiros de software construindo sistemas e serviços de alto desempenho
   - *A solução Xu*: **Inferência implícita de propriedade e verificação de empréstimos**. Nenhuma anotação explícita de lifetime no código de aplicação. Semântica natural por valor para slices entrega segurança e velocidade juntas.
 - **Dor 3: Código repetitivo tomando a tela e camadas de wrappers de erro**
   - *Situação atual*: Bases de código Go ficam tomadas por `if err != nil` repetitivos. Rust envolve tipos em múltiplas camadas de `Result<T, E>` / `Option`.
-  - *A solução Xu*: **Símbolo `>>` combinado com `or (err) { ... }` obrigatório**, oferecendo propagação de erros leve, limpa e segura.
+  - *A solução Xu*: **Símbolo `>>` combinado com `>>> (err) { ... }` obrigatório**, oferecendo propagação de erros leve, limpa e segura.
 - **Dor 4: Toolchains fragmentadas e atrito na instalação**
   - *Situação atual*: Costurar CMake, Make, gerenciadores de pacotes e linkers de cada plataforma é notoriamente frágil.
   - *A solução Xu*: **Ciclo fechado em binário único**. Tudo — compilador, executor de testes, formatador (`xu fmt`), gerador de documentação (`xu doc`) e assistentes gráficos GUI autorrenderizados — já vem embutido.
@@ -225,7 +225,7 @@ O SDK publicado é a linha de base deste roadmap. Consulte [Status e Limitaçõe
 - [x] **Propriedade e inferência de empréstimos em tempo de compilação**: Limpeza determinística de recursos; 0.9.4 conclui verificações para expressões aninhadas e arestas de retorno de laço
 - [x] **Corrotinas e canais nativos**: Agendamento via palavra-chave `xu` aliado à comunicação `chan` tipada; portão de concorrência `select` multitarefa 100/100 aprovado
 - [x] **Completude da suíte criptográfica**: Conformidade completa SM2/SM3/SM4/SM9; quadro de pilha do emparelhamento SM9 reduzido em 71,5% com zero avisos de compilação
-- [x] **Fluxo simbólico e tratamento de erros**: Retorno `<<`, lançamento `>>` e guardas locais obrigatórias `or (err) { ... }`
+- [x] **Fluxo simbólico e tratamento de erros**: Retorno `<<`, lançamento `>>` e guardas locais obrigatórias `>>> (err) { ... }`
 - [x] **Geração de código multiplataforma**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM e alvos bare-metal
 - [x] **Suporte a kernels de SO e bare-metal**: Perfil freestanding, subsistema puramente estático `#core` (arch/mem/sync/task/alloc/virtio), spinlocks seguros a interrupções, troca de contexto atômica, framework VirtIO e scaffolding em um comando (`xu init --baremetal`)
 - [x] **Instalação e autoatualização do SDK**: Assistente Windows, PKG macOS, instalador multiplataforma em arquivo único e `xu up/update`
