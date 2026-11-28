@@ -48,7 +48,7 @@ fn fetch_metric(task string) int {
 }
 
 fn worker(task string, ch chan int) {
-    val := fetch_metric(task) or (err) { << } // Manejo local seguro obligatorio sin `if err != nil`
+    val := fetch_metric(task) >>> (err) { << } // Manejo local seguro obligatorio sin `if err != nil`
     ch <- val                                 // Mensajería por canales con seguridad de tipos
 }
 
@@ -63,7 +63,7 @@ fn main() int {
 
 > **Por qué encanta a los desarrolladores**:
 > 1. **Control de flujo simbólico**: `<<` retorna, `>>` lanza errores, `<<<` sale. Adiós a las palabras clave verbosas heredadas.
-> 2. **Flujo de errores ergonómico**: Gestionado en el punto de llamada con `or (err) { ... }`. Elimina los interminables `if err != nil` y los fallos catastróficos de `unwrap()` en tiempo de ejecución.
+> 2. **Flujo de errores ergonómico**: Gestionado en el punto de llamada con `>>> (err) { ... }` (o propagado con `>>>`). Elimina los interminables `if err != nil` y los fallos catastróficos de `unwrap()` en tiempo de ejecución.
 > 3. **Concurrencia ligera nativa**: Corrutinas `xu worker()` + canales `chan` ofrecen concurrencia tan sencilla como en Go.
 > 4. **Seguridad estática en compilación**: Verificada mediante inferencia de propiedad y préstamo. **Sin recolector de basura (Zero-GC)**, cero pausas y consumo de memoria determinista y ultraligero.
 
@@ -88,7 +88,7 @@ Como ingenieros de software que construimos sistemas y servicios de alto rendimi
   - *Solución de Xu*: **Inferencia implícita de propiedad y comprobación de préstamos**. Sin anotaciones explícitas de lifetime en código de aplicación. La semántica natural por valor para slices aporta seguridad y agilidad a la vez.
 - **Problema 3: Código repetitivo que llena la pantalla y envoltorios de error anidados**
   - *Situación actual*: Los proyectos en Go se llenan de `if err != nil` repetitivos. Rust envuelve tipos en múltiples capas de `Result<T, E>` / `Option`.
-  - *Solución de Xu*: **El operador simbólico `>>` combinado con el manejo obligatorio `or (err) { ... }`** ofrece una propagación de errores ligera, limpia y segura.
+  - *Solución de Xu*: **El operador simbólico `>>` combinado con el manejo obligatorio `>>> (err) { ... }`** ofrece una propagación de errores ligera, limpia y segura.
 - **Problema 4: Cadenas de herramientas fragmentadas y fricción al instalar**
   - *Situación actual*: Ensamblar CMake, Make, gestores de paquetes y enlazadores de cada plataforma es notoriamente frágil.
   - *Solución de Xu*: **Ciclo cerrado en un solo binario**. Todo —compilador, ejecutor de pruebas, formateador (`xu fmt`), generador de documentación (`xu doc`) y asistentes gráficos GUI autoproducidos— viene integrado.
@@ -225,7 +225,7 @@ El SDK publicado es la línea base de esta hoja de ruta. Consulta [Estado y Limi
 - [x] **Propiedad e inferencia de préstamos en tiempo de compilación**: Limpieza determinista de recursos; 0.9.4 completa la verificación en expresiones anidadas y aristas de retorno de bucles
 - [x] **Corrutinas y canales nativos**: Planificación mediante la palabra clave `xu` con comunicación `chan` tipada; compuerta de concurrencia `select` multitarea 100/100 superada
 - [x] **Suite criptográfica completa**: Conformidad completa con SM2/SM3/SM4/SM9; marco de pila de emparejamiento SM9 reducido en un 71.5 % sin advertencias de compilación
-- [x] **Flujo simbólico y manejo de errores**: Retorno `<<`, lanzamiento `>>` y guardas locales obligatorias `or (err) { ... }`
+- [x] **Flujo simbólico y manejo de errores**: Retorno `<<`, lanzamiento `>>` y guardas locales obligatorias `>>> (err) { ... }`
 - [x] **Generación de código multiplataforma**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM y objetivos bare-metal
 - [x] **Soporte de kernels de SO y bare-metal**: Perfil de compilación freestanding, subsistema estático puro `#core` (arch/mem/sync/task/alloc/virtio), spinlocks seguros ante interrupciones, cambio de contexto atómico, framework VirtIO y plantilla en un comando (`xu init --baremetal`)
 - [x] **Instalación y autoactualización del SDK**: Asistente Windows, PKG de macOS, instalador multiplataforma de archivo único y `xu up/update`

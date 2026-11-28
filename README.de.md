@@ -48,7 +48,7 @@ fn fetch_metric(task string) int {
 }
 
 fn worker(task string, ch chan int) {
-    val := fetch_metric(task) or (err) { << } // Verpflichtende sichere lokale Behandlung ohne `if err != nil`
+    val := fetch_metric(task) >>> (err) { << } // Verpflichtende sichere lokale Behandlung ohne `if err != nil`
     ch <- val                                 // Typsicherer Nachrichtenaustausch über Kanäle
 }
 
@@ -63,7 +63,7 @@ fn main() int {
 
 > **Warum Entwickler Xu schätzen**:
 > 1. **Symbolischer Kontrollfluss**: `<<` gibt zurück, `>>` meldet Fehler, `<<<` beendet. Schluss mit ausschweifenden Alt-Schlüsselwörtern.
-> 2. **Ergonomischer Fehlerfluss**: Direkt am Aufrufort über `or (err) { ... }` behandelt. Beseitigt endloses `if err != nil` und fatale `unwrap()`-Laufzeitabstürze.
+> 2. **Ergonomischer Fehlerfluss**: Direkt am Aufrufort über `>>> (err) { ... }` behandelt (oder mit `>>>` weitergegeben). Beseitigt endloses `if err != nil` und fatale `unwrap()`-Laufzeitabstürze.
 > 3. **Native leichtgewichtige Nebenläufigkeit**: `xu worker()`-Koroutinen + `chan`-Kanäle bieten mühelose Go-ähnliche Nebenläufigkeit.
 > 4. **Statische Sicherheit zur Kompilierzeit**: Verfolgt über Ownership- und Borrow-Inferenz. **Kein Garbage Collector (Zero-GC)**, keine Pausen und extrem schlanker, deterministischer Speicherverbrauch.
 
@@ -88,7 +88,7 @@ Bei der Entwicklung hochleistungsfähiger Systeme und Dienste müssen Softwareen
   - *Die Xu-Lösung*: **Implizite Ownership-Inferenz & Borrow-Prüfung**. Keine expliziten Lifetime-Annotationen im Anwendungscode. Natürliche Wertsemantik für Slices vereint Sicherheit und Geschwindigkeit.
 - **Schmerzpunkt 3: Bildschirmfüllender Boilerplate & verschachtelte Fehler-Wrapper**
   - *Status quo*: Go-Codebasen sind voller repetitivem `if err != nil`. Rust verpackt Typen in mehrere `Result<T, E>`-/`Option`-Schichten.
-  - *Die Xu-Lösung*: **Symbolisches `>>` kombiniert mit verpflichtendem `or (err) { ... }`** für schlanke, klare und sichere Fehlerweitergabe.
+  - *Die Xu-Lösung*: **Symbolisches `>>` kombiniert mit verpflichtendem `>>> (err) { ... }`** für schlanke, klare und sichere Fehlerweitergabe.
 - **Schmerzpunkt 4: Fragmentierte Toolchains & Einrichtungsaufwand**
   - *Status quo*: Das Zusammensetzen von CMake, Make, Paketmanagern und plattformspezifischen Linkern ist bekanntermaßen fehleranfällig.
   - *Die Xu-Lösung*: **Geschlossener Einzel-Binary-Kreislauf**. Alles – Compiler, Test-Runner, Formatierer (`xu fmt`), Dokumentationsgenerator (`xu doc`) und selbst gerenderte GUI-Setup-Assistenten – ist direkt integriert.
@@ -225,7 +225,7 @@ Das veröffentlichte SDK bildet die Grundlage dieser Roadmap. Zielspezifische La
 - [x] **Compile-Time-Ownership und Borrow-Inferenz**: Deterministische Ressourcenbereinigung; 0.9.4 vervollständigt Prüfungen für verschachtelte Ausdrücke und Schleifen-Rückkanten
 - [x] **Native Koroutinen & Kanäle**: Planung über das Schlüsselwort `xu` gepaart mit typisierter `chan`-Kommunikation; 100/100 Multitask-`select`-Nebenläufigkeitsgate bestanden
 - [x] **Vollständigkeit der Kryptografie-Suite**: Vollständige SM2/SM3/SM4/SM9-Konformität; SM9-Pairing-Stackframe um 71,5 % reduziert bei null Compilerwarnungen
-- [x] **Symbolischer Fluss & Fehlerbehandlung**: `<<` Rückgabe, `>>` Fehlerwurf und verpflichtende lokale `or (err) { ... }`-Guards
+- [x] **Symbolischer Fluss & Fehlerbehandlung**: `<<` Rückgabe, `>>` Fehlerwurf und verpflichtende lokale `>>> (err) { ... }`-Guards
 - [x] **Multi-Plattform-Codegenerierung**: Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM und Bare-Metal-Ziele
 - [x] **Betriebssystemkernel- & Bare-Metal-Unterstützung**: Freestanding-Kompilierprofil, rein statisches Subsystem `#core` (arch/mem/sync/task/alloc/virtio), interrupt-sichere Spinlocks, atomarer Kontextwechsel, VirtIO-Treiberframework und Ein-Befehl-Gerüst (`xu init --baremetal`)
 - [x] **SDK-Installation und Selbst-Updates**: Windows-Assistent, macOS-PKG, plattformübergreifendes Einzeldatei-Setup und `xu up/update`

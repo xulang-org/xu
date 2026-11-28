@@ -48,7 +48,7 @@ fn fetch_metric(task string) int {
 }
 
 fn worker(task string, ch chan int) {
-    val := fetch_metric(task) or (err) { << } // Gestion locale sûre obligatoire sans `if err != nil`
+    val := fetch_metric(task) >>> (err) { << } // Gestion locale sûre obligatoire sans `if err != nil`
     ch <- val                                 // Échange de messages par canaux typés
 }
 
@@ -63,7 +63,7 @@ fn main() int {
 
 > **Pourquoi les développeurs l'adoptent** :
 > 1. **Contrôle de flux symbolique** : `<<` retourne, `>>` lève une erreur, `<<<` quitte. Adieu les mots-clés verbeux hérités.
-> 2. **Gestion d'erreurs ergonomique** : Traitée au point d'appel avec `or (err) { ... }`. Élimine les `if err != nil` envahissants et les plantages catastrophiques de `unwrap()` à l'exécution.
+> 2. **Gestion d'erreurs ergonomique** : Traitée au point d'appel avec `>>> (err) { ... }` (ou propagée avec `>>>`). Élimine les `if err != nil` envahissants et les plantages catastrophiques de `unwrap()` à l'exécution.
 > 3. **Concurrence légère native** : Les coroutines `xu worker()` + canaux `chan` offrent une concurrence aussi fluide qu'en Go.
 > 4. **Sûreté statique à la compilation** : Suivie par inférence de propriété et d'emprunt. **Aucun ramasse-miettes (Zero-GC)**, zéro pause et consommation mémoire déterministe ultra-sobre.
 
@@ -88,7 +88,7 @@ En tant qu'ingénieurs concevant des systèmes et services haute performance, no
   - *Réponse de Xu* : **Inférence implicite de propriété et vérification d'emprunt**. Aucune annotation explicite de durée de vie dans le code applicatif. La sémantique naturelle par valeur des slices réunit sûreté et vélocité.
 - **Point de douleur 3 : Code répétitif envahissant et couches d'enveloppes d'erreurs**
   - *État actuel* : Les bases de code Go regorgent de `if err != nil`. Rust empile de multiples enveloppes `Result<T, E>` / `Option`.
-  - *Réponse de Xu* : **L'opérateur symbolique `>>` combiné à la gestion obligatoire `or (err) { ... }`**, offrant une propagation d'erreurs légère, lisible et sûre.
+  - *Réponse de Xu* : **L'opérateur symbolique `>>` combiné à la gestion obligatoire `>>> (err) { ... }`**, offrant une propagation d'erreurs légère, lisible et sûre.
 - **Point de douleur 4 : Chaînes d'outils fragmentées et installation laborieuse**
   - *État actuel* : Assembler CMake, Make, gestionnaires de paquets et éditeurs de liens propres à chaque plateforme reste notoirement fragile.
   - *Réponse de Xu* : **Boucle fermée en un seul binaire**. Tout — compilateur, exécuteur de tests, formateur (`xu fmt`), générateur de documentation (`xu doc`) et assistants d'installation GUI auto-rendus — est intégré.
@@ -225,7 +225,7 @@ Le SDK publié constitue la référence de cette feuille de route. Voir [Statut 
 - [x] **Propriété et inférence d'emprunt à la compilation** : Nettoyage déterministe des ressources ; la 0.9.4 complète la vérification pour les expressions imbriquées et les arêtes de retour de boucle
 - [x] **Coroutines natives et canaux** : Ordonnancement via le mot-clé `xu` et communication typée `chan` ; validation 100/100 de la porte de concurrence `select` multitâche
 - [x] **Suite cryptographique complète** : Conformité intégrale SM2/SM3/SM4/SM9 ; cadre de pile de couplage SM9 réduit de 71,5 % sans aucun avertissement de compilation
-- [x] **Flux symbolique et gestion d'erreurs** : Retour `<<`, levée `>>` et gardes locales obligatoires `or (err) { ... }`
+- [x] **Flux symbolique et gestion d'erreurs** : Retour `<<`, levée `>>` et gardes locales obligatoires `>>> (err) { ... }`
 - [x] **Génération de code multiplateforme** : Windows / macOS / Linux, ARM64 / x64 / LoongArch64 / RISC-V, WASM et cibles bare-metal
 - [x] **Support noyau d'OS et bare-metal** : Profil freestanding, sous-système statique pur `#core` (arch/mem/sync/task/alloc/virtio), spinlocks sûrs aux interruptions, commutation de contexte atomique, framework VirtIO et squelette en une commande (`xu init --baremetal`)
 - [x] **Installation SDK et auto-mises à jour** : Assistant Windows, PKG macOS, installeur multiplateforme mono-fichier et `xu up/update`
