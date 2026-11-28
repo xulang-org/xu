@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import tempfile
 
@@ -914,6 +915,150 @@ fn main() int {
     print("Coroutine + Channel torture matrix (10x MT + XU_DEBUG_FREE + no-opt + 1T + closed-send panic) PASS")
 
 
+def test_drain_external_poll_exits(work: Path):
+    # (a) Infinite background timer-polling task must not hang task_drain().
+    sleep_src = r'''@main
+fn idle_loop(ready chan int) {
+    ready <- 1
+    while true {
+        sleep_ns(1000000)
+    }
+}
+
+fn main() int {
+    ready := chan int{cap: 1}
+    xu idle_loop(ready)
+    _ := <- ready
+    println("SLEEP_DRAIN_OK")
+    << 0
+}
+'''
+    sleep_sfile = work / "drain_sleep.xu"
+    sleep_exe = work / "drain_sleep_bin"
+    sleep_sfile.write_text(sleep_src, encoding="utf-8")
+    subprocess.run([str(XU), "build", str(sleep_sfile), "-o", str(sleep_exe)], env=xu_env(work), check=True)
+    for procs in ("1", "4"):
+        r = subprocess.run([str(sleep_exe)], env=xu_env(work, {"XU_PROCS": procs}), text=True, capture_output=True, timeout=5, check=True)
+        assert "SLEEP_DRAIN_OK\n" in r.stdout, (procs, r.stdout, r.stderr)
+
+    # (b) Unclosed background http.serve_listener task must exit cleanly when main returns.
+    http_src = r'''@main
+#errors
+#net
+#net/http
+#os
+#strings
+
+fn close_quiet(fd int) {
+    net.conn_close(fd) >>> (err) { << }
+}
+
+fn exchange(fd int) int {
+    req := "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    $sent := 0
+    while sent < req.len {
+        part := req[sent:req.len]
+        n := net.conn_write(fd, &part) >>>
+        if n <= 0 || n > part.len { >> errors.new("write invalid") }
+        sent += n
+    }
+    $resp := ""
+    while resp.len < 8192 {
+        part := net.conn_read(fd, 1024) >>>
+        if part.len == 0 { >> errors.new("eof") }
+        resp = resp + part
+        if strings.index_of(&resp, "\r\n\r\nok") >= 0 { << 1 }
+    }
+    >> errors.new("too large")
+}
+
+fn client_worker(addr string, out chan int) {
+    $ok := 0
+    for _ in 0:3 {
+        fd := net.dial_ns(addr, 2000000000) >>> (err) {
+            eprintln(err.msg())
+            out <- -1
+            <<
+        }
+        os.set_sock_timeout(fd, 2000000000) >>> (err) {
+            close_quiet(fd)
+            out <- -1
+            <<
+        }
+        r := exchange(fd) >>> (err) {
+            close_quiet(fd)
+            out <- -1
+            <<
+        }
+        close_quiet(fd)
+        ok += r
+    }
+    out <- ok
+}
+
+fn handler(c http.Context) {
+    c.text(200, "ok") >>> (err) { << }
+}
+
+fn serve(lfd int) {
+    _ := http.serve_listener(lfd, handler) >>> (err) { << }
+}
+
+fn main() int {
+    av := args()
+    if av.len != 2 { << 2 }
+    addr := av[1] + ""
+    lfd := net.listen(addr + "") >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+    xu serve(lfd)
+    out := chan int{cap: 2}
+    for _ in 0:2 { xu client_worker(addr + "", out) }
+    if <- out != 3 || <- out != 3 { << 3 }
+    println("HTTP_DRAIN_OK")
+    << 0
+}
+'''
+    http_sfile = work / "drain_http.xu"
+    http_exe = work / "drain_http_bin"
+    http_sfile.write_text(http_src, encoding="utf-8")
+    subprocess.run([str(XU), "build", str(http_sfile), "-o", str(http_exe)], env=xu_env(work), check=True)
+    for procs in ("1", "4"):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            addr = f"127.0.0.1:{sock.getsockname()[1]}"
+        r = subprocess.run([str(http_exe), addr], env=xu_env(work, {"XU_PROCS": procs}), text=True, capture_output=True, timeout=5, check=True)
+        assert "HTTP_DRAIN_OK\n" in r.stdout, (procs, r.stdout, r.stderr)
+
+    # (c) CPU-bound tasks under XU_TASK_POLL=1 must still run to completion during task_drain().
+    cpu_poll_src = r'''@main
+pool #sync/pool
+
+fn busy_task(id int) {
+    $x := id + 1
+    for _ in 0:400000 {
+        x = (x * 1664525 + 1013904223) & 0x7FFFFFFF
+    }
+    println("TASK_DONE_" + str(id))
+}
+
+fn main() int {
+    _ := pool.set_max_procs(4)
+    for i in 0:16 {
+        xu busy_task(i)
+    }
+    println("MAIN_EXITING")
+    << 0
+}
+'''
+    r_poll = build_and_run(work, "drain_cpu_task_poll", cpu_poll_src, extra_env={"XU_TASK_POLL": "1", "XU_PROCS": "4"})
+    assert "MAIN_EXITING\n" in r_poll.stdout, r_poll.stdout
+    for i in range(16):
+        assert f"TASK_DONE_{i}\n" in r_poll.stdout, f"missing TASK_DONE_{i} with XU_TASK_POLL=1 in:\n{r_poll.stdout}"
+    print("M:N drain external-poll exit (sleep_ns + http.serve_listener + XU_TASK_POLL=1 CPU tasks) PASS")
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         work = Path(td)
@@ -925,6 +1070,7 @@ def main():
         test_mcache_alloc_scaling(work)
         test_chan_coro_correctness_matrix(work)
         test_preemption_and_drain(work)
+        test_drain_external_poll_exits(work)
         test_deadlock_detection(work)
 
 
